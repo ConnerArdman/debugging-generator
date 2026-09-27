@@ -2,8 +2,9 @@
  * CheckoutSummaryPanel - the order-review column of the /checkout page.
  *
  * Scope, deliberately narrow. This module owns the column's vertical rhythm, its heading, the
- * separator above the line list, the caption beneath the totals and the sticky treatment that
- * keeps the review beside a long form. Everything the column actually *looks* like arrives with
+ * separator above the line list and its held state while the order is placed, the captions, and
+ * the placement and sticky treatment that keep the review beside a long form. Everything the
+ * column actually *looks* like arrives with
  * the components it composes, each of which owns its own appearance:
  *
  *   - `../cart/CartLineList` (page variant) owns the list reset, the row grid, the thumbnail box,
@@ -44,15 +45,25 @@
  * meant to sit beside, so the treatment is added here rather than declared above and undone.
  *
  * The offset clears the sticky site header and leaves one spacing step of air under it.
- * `align-self` holds the panel at its natural height wherever it is itself the grid or flex item.
- * No `z-index`: the site header carries `--ls-z-header` and already paints above this column, and
- * the column has no sibling of its own to out-rank.
+ * `align-self` holds the panel at its natural height wherever it is itself the grid or flex item,
+ * which is how the checkout page places it: the panel is the grid item, with no wrapper around it,
+ * because a wrapper held at its own height by the grid would be exactly as tall as the panel and
+ * leave the sticky box no room to travel. No `z-index`: the site header carries `--ls-z-header`
+ * and already paints above this column, and the column has no sibling of its own to out-rank.
+ *
+ * The placement is the other half of the page's reading order. The review comes first in the
+ * document, so a single-column checkout lists the order above the form and its Place order
+ * control; with two tracks it is put into the second one, on the first row, and the form - which
+ * names no track - is auto-placed into the first. Neither declaration does anything where the
+ * parent is not a grid.
  */
 @media (min-width: calc(60 * 16px)) {
   .root {
     position: sticky;
     inset-block-start: calc(var(--ls-header-height, 64px) + var(--ls-space-4, 16px));
     align-self: start;
+    grid-column: 2;
+    grid-row: 1;
   }
 }
 
@@ -74,6 +85,35 @@
   line-height: var(--ls-leading-heading, 1.25);
 }
 
+/* The heading's row: the heading, and - only while the order is being placed - the locked-lines
+ * status after it on the same baseline. The heading never shrinks; the status takes what is left
+ * and is held to one line, so the row is exactly as tall as the heading and showing the status
+ * moves nothing in the column beneath it. The heading's own step of air stays on the heading, so
+ * the row adds no spacing of its own. */
+.head {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ls-space-3, 12px);
+}
+
+.head .heading {
+  flex: none;
+}
+
+/* The locked-lines status. The quiet caption register, held to its single line - the wording is
+ * short enough to fit beside the heading in the narrowest column, and a narrower one ends in an
+ * ellipsis rather than wrapping onto a second line that would push the lines down. */
+.locked {
+  overflow: hidden;
+  min-width: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Spacing wrapper for the line list. The rule separates the reviewed lines from the heading above
  * them and the padding gives the first row the air the rule takes; `min-width` is shrink
  * behaviour rather than decoration, and keeps a long product code from widening the column. The
@@ -83,6 +123,47 @@
   min-width: 0;
   border-block-start: calc(var(--ls-space-1, 4px) / 4) solid var(--ls-border, #cbd5e1);
   padding-block-start: var(--ls-space-4, 16px);
+}
+
+/* The lines while the order is being placed. The component makes the wrapper `inert`, which is what
+ * actually holds the controls; this is the visible half, so they do not look pressable while they
+ * are not. 0.85 is the dimming a cart row uses for its own in-flight state
+ * (`../cart/CartLineRow.module.css`), which keeps the dimmest text inside above 5:1, and the
+ * status the component prints beside the heading says why in words. */
+.lines[inert] {
+  opacity: 0.85;
+}
+
+/*
+ * A pinned review has to fit the viewport it is pinned in. A sticky box taller than the room under
+ * its offset cannot stay in view: it pins its top and hides its figures below the fold, and then
+ * the end of the form's row pushes the whole column up and away while the form is still being
+ * filled in - which a review of three lines beside this form already is at 1440x900. So on a
+ * two-track checkout the column is capped at the viewport less the header, the offset and one
+ * step of air below, and the line list is the part that gives: its wrapper keeps the rule above
+ * it, shrinks to the room left by the heading, the figures and the note, and scrolls the lines
+ * inside that room. The heading, the totals and the note therefore stay on screen for as long as
+ * the review is pinned beside the form, and a short cart - whose review fits - scrolls nothing.
+ *
+ * Two floors keep that from going wrong on a short window. The wrapper never shrinks below five
+ * 32px steps - one full line - so the lines cannot collapse to nothing while the figures stay, and
+ * the cap applies only where the viewport is at least 48rem tall, which leaves that line room
+ * beside the figures; on a shorter window the column is simply sticky, as above, rather than a
+ * scroller too cramped to use. The overscroll is left to chain, so a wheel over the list moves the
+ * page once the list reaches either end. `vh` rather than `dvh`: this is the two-track, desktop
+ * arrangement, whose viewport does not resize under a toolbar.
+ */
+@media (min-width: calc(60 * 16px)) and (min-height: calc(48 * 16px)) {
+  .root {
+    max-block-size: calc(
+      100vh - var(--ls-header-height, 64px) - var(--ls-space-4, 16px) - var(--ls-space-4, 16px)
+    );
+  }
+
+  .lines {
+    min-block-size: calc(var(--ls-space-6, 32px) * 5);
+    overflow-y: auto;
+  }
 }
 
 /* Placement for the totals block, and nothing besides - see the note at the head of this file.

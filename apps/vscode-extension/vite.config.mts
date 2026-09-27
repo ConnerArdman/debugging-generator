@@ -41,18 +41,19 @@
  * bundle - which is also what keeps `scripts/check-secrets.mjs` trivially
  * satisfiable and the output byte-identical between machines.
  *
- * One expected notice accompanies every run of this build: Vite's default
- * (bundled) config loader reports "ESM syntax in a file loaded as CommonJS",
- * because `apps/vscode-extension/package.json` declares no `"type": "module"` -
- * VS Code loads `main: dist/extension.js` as CommonJS, so that manifest has to
- * stay CommonJS. The notice is a forward-compatibility warning about the
- * not-yet-default `native` config loader, not an error: the config is loaded
- * and the build completes, and the ESM form is required here because
- * `import.meta.url` below has no CommonJS equivalent that survives bundling.
- * It is not silenced with `VITE_CONFIG_NATIVE_IGNORE_WARNING`, because this
- * build stays free of environment-dependent behaviour; the sibling
- * `apps/chrome-extension/vite.config.ts` documents a notice from the same
- * loader for the same reason.
+ * The file is `vite.config.mts`, not `vite.config.ts`, and the extension is
+ * load-bearing. This config is ESM - `import.meta.url` below has no CommonJS
+ * equivalent that survives bundling - while `apps/vscode-extension/package.json`
+ * declares no `"type": "module"`, because VS Code loads `main:
+ * dist/extension.js` as CommonJS and that manifest has to stay CommonJS. Under
+ * that manifest a `.ts` config has an ambiguous module format: Vite's default
+ * config loader reported "ESM syntax in a file loaded as CommonJS" on every
+ * build, and the `native` loader planned to become the default has Node warn
+ * about the same ambiguity. `.mts` is ESM by definition, so both loaders load it
+ * without a notice, and the bare `vite build` in every `package.json` script
+ * discovers `vite.config.mts` on its own. The sibling
+ * `apps/chrome-extension/vite.config.ts` needs no such rename: its package is
+ * `"type": "module"`.
  *
  * @module apps/vscode-extension/vite.config
  */
@@ -68,7 +69,7 @@ import { defineConfig } from 'vite';
  * Derived from this file's own location rather than left to `process.cwd()`:
  * `pnpm --filter ./apps/vscode-extension run build:webview` runs with the
  * workspace as the working directory, but `vite build -c
- * apps/vscode-extension/vite.config.ts` from the repository root does not, and
+ * apps/vscode-extension/vite.config.mts` from the repository root does not, and
  * `root` is what every relative path below - the entry, the output directory -
  * is resolved against. Pinning it makes the emitted paths independent of the
  * caller's directory.
@@ -116,6 +117,16 @@ const WEBVIEW_ENTRY = path.resolve(workspaceRoot, 'src/webview/main.tsx');
  * that hosts the webview.
  */
 const BUILD_TARGET = 'chrome148';
+
+/**
+ * The size budget of the webview bundle, in kB, as Vite's
+ * `build.chunkSizeWarningLimit` measures it (minified bytes / 1000). 1,000 kB
+ * is the budget the VS Code webview is held to. It replaces Vite's 500 kB
+ * default so a build inside the budget is warning-free, and it is a budget
+ * rather than a silencer: a `main.js` that outgrows it still prints Vite's
+ * "(!) Some chunks are larger than ..." warning.
+ */
+const CHUNK_SIZE_BUDGET_KB = 1000;
 
 export default defineConfig({
   // Pinned so every emitted path is independent of the caller's directory.
@@ -181,15 +192,25 @@ export default defineConfig({
     // actually carries.
     sourcemap: true,
 
-    // Not minified. This is a debugging product whose own webview is debugged
-    // in the webview developer tools, where readable identifiers are worth far
-    // more than bytes: the bundle is loaded from local disk by a single editor,
-    // so its size is not a shipping concern. It has a second, load-bearing
-    // effect - Vite disables `cssMinify` when `minify` is off for a client
-    // build, so `main.css` keeps its `--dg-*` declarations and theme selectors
-    // readable in the Elements pane and greppable on disk, which is how the
-    // design-system token contract is checked after a build.
-    minify: false,
+    // Minified with Oxc, identifiers mangled. Unlike the sibling
+    // `apps/chrome-extension` build, whose maps are 'hidden' and which
+    // therefore keeps function and class names, this bundle links its map
+    // (`sourcemap: true` above) and the webview developer tools load it, so
+    // every frame and variable is shown under its source name anyway and full
+    // mangling costs no debuggability. Measured against the unminified
+    // baseline, `main.js` drops from 1,919 kB to 775 kB, inside
+    // CHUNK_SIZE_BUDGET_KB.
+    minify: 'oxc',
+
+    // Never minified, stated explicitly because Vite would otherwise derive it
+    // from `minify` above. `main.css` keeps its `--dg-*` declarations and theme
+    // selectors readable in the Elements pane and greppable on disk, which is
+    // how the design-system token contract is checked after a build; it is a
+    // single stylesheet read once from local disk, so the bytes are immaterial.
+    cssMinify: false,
+
+    // The webview budget, not a silencer: see CHUNK_SIZE_BUDGET_KB.
+    chunkSizeWarningLimit: CHUNK_SIZE_BUDGET_KB,
 
     // One stylesheet for the whole webview, which is what the provider's single
     // static reference requires. With CSS code splitting on, styles are emitted

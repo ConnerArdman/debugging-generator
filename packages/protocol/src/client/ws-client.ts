@@ -397,13 +397,18 @@ export interface WsEventMapLike {
 
 /**
  * A socket, as this client uses it: four events, a state, a text write and a
- * close.
+ * close — plus one optional reading its owner may take.
  *
  * Narrower than either real implementation on purpose — no `binaryType`, no
- * `bufferedAmount`, no `ping`, no `on`/`once` — because a member absent here is
- * a member this client never touches, which is a reviewable statement rather
- * than a comment. `send` accepts a string alone for the same reason: every frame
- * this protocol carries is JSON text (`../envelope.ts`).
+ * `ping`, no `on`/`once` — because a member absent here is a member this client
+ * never touches, which is a reviewable statement rather than a comment. `send`
+ * accepts a string alone for the same reason: every frame this protocol carries
+ * is JSON text (`../envelope.ts`).
+ *
+ * The one member this client does not use is {@link WebSocketLike.bufferedAmount},
+ * declared optional so a consumer that observes the socket it injected — the
+ * Chrome service worker's heartbeat — can read it through this type, while a
+ * transport without it still satisfies the interface.
  */
 export interface WebSocketLike {
   /**
@@ -411,6 +416,21 @@ export interface WebSocketLike {
    * before a write.
    */
   readonly readyState: number;
+
+  /**
+   * The bytes of application data written with {@link WebSocketLike.send} that
+   * the transport has not yet handed to the network — the platform
+   * `WebSocket`'s and `ws`'s `bufferedAmount` alike.
+   *
+   * Never read by this client, whose behaviour does not depend on it; it is
+   * here for the owner of the socket. A heartbeat whose `client.ping` sits
+   * behind its own large outbound backlog can tell, from this value falling, a
+   * peer that is still consuming that backlog from one that has stopped — and
+   * so not retire a live connection merely because its ping has not reached
+   * the service yet. Optional because a test fake or a minimal transport may
+   * not report it; a consumer must treat its absence as "unknown".
+   */
+  readonly bufferedAmount?: number;
 
   /**
    * Subscribes to one event.

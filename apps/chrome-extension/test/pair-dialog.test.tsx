@@ -605,3 +605,66 @@ describe('resolveServiceEndpointAccessor', () => {
     expect(await accessor?.read()).toEqual(ok(OTHER_SERVICE_URL));
   });
 });
+
+describe('PairDialog: a refused code', () => {
+  /** The service's lockout sentence, as it reaches the panel without the client's lead. */
+  const PAUSED_MESSAGE =
+    'Too many failed pairing attempts; pairing is paused for up to 60 seconds.';
+
+  /** The generic advice, which a paused service would refuse. */
+  const FRESH_CODE_ADVICE = /Get a fresh code/;
+
+  /** Render an open pairing dialog whose submit is refused with `refusal`. */
+  function renderRefusing(refusal: DebuggenError): ReturnType<typeof userEvent.setup> {
+    const user = userEvent.setup();
+    render(
+      <PairDialog
+        open
+        onClose={() => undefined}
+        submitCode={() => Promise.reject(refusal)}
+        serviceEndpoint={undefined}
+      />,
+    );
+    return user;
+  }
+
+  it('says pairing is paused for the time the service states, and does not send the developer for a fresh code', async () => {
+    const user = renderRefusing(new DebuggenError('RATE_LIMITED', PAUSED_MESSAGE));
+
+    await user.type(codeField(), CODE);
+    await user.click(pairButton());
+
+    expect(await screen.findByText('Pairing paused')).toBeDefined();
+    expect(screen.getByText(PAUSED_MESSAGE)).toBeDefined();
+    expect(screen.getByText(/Wait until the pause ends/)).toBeDefined();
+    expect(screen.getByText(/a new code from VS Code is refused until then too/)).toBeDefined();
+    expect(screen.queryByText(FRESH_CODE_ADVICE)).toBeNull();
+    expect(screen.queryByText('Pairing failed')).toBeNull();
+    // The retry stays: it re-submits the current code once the developer has waited.
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeDefined();
+  });
+
+  it('still names a pause when the refusal carried no text', async () => {
+    const user = renderRefusing(new DebuggenError('RATE_LIMITED', ''));
+
+    await user.type(codeField(), CODE);
+    await user.click(pairButton());
+
+    expect(await screen.findByText('Pairing paused')).toBeDefined();
+    expect(screen.getByText(/paused pairing for a short while/)).toBeDefined();
+    expect(screen.queryByText(FRESH_CODE_ADVICE)).toBeNull();
+  });
+
+  it('keeps the fresh-code advice for a code the service did not accept', async () => {
+    const user = renderRefusing(
+      new DebuggenError('PAIRING_INVALID', 'The pairing code is not valid.'),
+    );
+
+    await user.type(codeField(), CODE);
+    await user.click(pairButton());
+
+    expect(await screen.findByText('Pairing failed')).toBeDefined();
+    expect(screen.getByText('The pairing code is not valid.')).toBeDefined();
+    expect(screen.getByText(FRESH_CODE_ADVICE)).toBeDefined();
+  });
+});

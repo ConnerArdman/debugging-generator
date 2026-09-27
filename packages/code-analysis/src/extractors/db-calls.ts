@@ -90,6 +90,17 @@
  *    `driver: 'pg'`, because "treating the borrowed-client form as something
  *    else would leave exactly the queries a developer hand-wrote for
  *    transactional work outside the analysis".
+ *
+ *    The generated client lends a connection the same way through an
+ *    interactive transaction: in `<clientHandle>.$transaction(async (tx) => …)`
+ *    the callback's first parameter is a transaction client with the same
+ *    delegates, so `tx.<model>.<operation>(…)` is a generated-client call site
+ *    and is recorded like one. The parameter is accepted only when the callback
+ *    is the *first argument* of a `$transaction` call whose receiver is itself
+ *    proved to be a generated-client handle — the same receiver-first rule the
+ *    pooled borrow follows — so a callback parameter of any other API never
+ *    becomes a handle, and the statements of every interactive transaction stay
+ *    inside the analysis instead of being invisible to it.
  * 4. **Type annotation.** A parameter, variable or class property annotated
  *    `PrismaClient`, `Pool` or `PoolClient` — bare, qualified (`pg.Pool`),
  *    import-qualified (`import('pg').Pool`) or as a member of a union — is a
@@ -287,6 +298,7 @@ import type {
   ExportDeclaration,
   FunctionDeclaration,
   ImportDeclaration,
+  ParameterDeclaration,
   SourceFile,
   TaggedTemplateExpression,
   TypeNode,
@@ -428,6 +440,13 @@ const PRISMA_STATEMENT_OPERATIONS: readonly string[] = Object.freeze([
   '$queryRaw',
   '$queryRawUnsafe',
 ]);
+
+/**
+ * The generated client's transaction entry point, a member of
+ * {@link PRISMA_RAW_OPERATIONS}: the call whose callback form lends the
+ * callback a transaction client (discovery step 3, {@link transactionClientHandle}).
+ */
+const PRISMA_TRANSACTION_OPERATION = '$transaction';
 
 /**
  * The verbs a generated client's delegate operations are spelled with,
@@ -735,7 +754,8 @@ interface Position {
  * what makes the step order in the module header executable rather than
  * aspirational, and what a failing assertion names when detection regresses.
  */
-type HandleDiscovery = 'construction' | 'import' | 'borrowed' | 'annotation' | 'heuristic';
+type HandleDiscovery =
+  'construction' | 'import' | 'borrowed' | 'transaction' | 'annotation' | 'heuristic';
 
 /**
  * Where a declaration under inspection came from, which decides how a
@@ -2690,7 +2710,10 @@ function handleFromDeclaration(
   }
 
   if (Node.isParameterDeclaration(declaration)) {
-    return annotatedHandle(declaration.getTypeNode());
+    return (
+      annotatedHandle(declaration.getTypeNode()) ??
+      transactionClientHandle(state, module, declaration, origin, hops)
+    );
   }
 
   if (Node.isExportAssignment(declaration) && !declaration.isExportEquals()) {
@@ -2754,6 +2777,93 @@ function borrowedConnectionHandle(
   const source = expressionHandle(state, module, callee.getExpression(), origin, hops + 1);
 
   return source?.driver === 'pg' ? { driver: 'pg', discovery: 'borrowed' } : undefined;
+}
+
+/**
+ * **Discovery step 3, generated-client form.** The handle an interactive
+ * transaction lends its callback, or `undefined` when `parameter` is not that
+ * callback's transaction client.
+ *
+ * `await prisma.$transaction(async (tx) => { await tx.order.create(…) })` runs
+ * the callback with a transaction client whose delegates are the generated
+ * client's own, so the statements written on `tx` are generated-client call
+ * sites. Three structural facts are required, and nothing about the
+ * parameter's name is read:
+ *
+ * 1. `parameter` is the **first** parameter of an arrow function or function
+ *    expression;
+ * 2. that function is the **first argument** of a call whose callee is a
+ *    `$transaction` member access (parentheses and type assertions around the
+ *    function are looked through, as {@link unwrapExpression} does for a
+ *    receiver);
+ * 3. the member access's receiver is itself proved — by construction, import,
+ *    annotation or an enclosing transaction — to be a **generated-client**
+ *    handle.
+ *
+ * The third is what keeps a callback of an unrelated `$transaction` method (a
+ * document store's, a hand-written unit-of-work) from producing a handle, the
+ * same receiver-first rule {@link borrowedConnectionHandle} applies to a pooled
+ * borrow. A nested transaction on a transaction client resolves through the
+ * enclosing one, within the shared hop budget.
+ *
+ * @param state The per-call memoisation and cycle guard.
+ * @param module The module the parameter belongs to.
+ * @param parameter The parameter declaration the name resolved to.
+ * @param origin Where the declaration was reached from.
+ * @param hops How many resolution hops have been spent.
+ * @returns The transaction-client handle, or `undefined`.
+ */
+function transactionClientHandle(
+  state: DiscoveryState,
+  module: SourceFile,
+  parameter: ParameterDeclaration,
+  origin: HandleOrigin,
+  hops: number,
+): DriverHandle | undefined {
+  if (hops > MAX_RESOLUTION_HOPS) {
+    return undefined;
+  }
+
+  const callback = parameter.getParent();
+
+  if (
+    !(Node.isArrowFunction(callback) || Node.isFunctionExpression(callback)) ||
+    callback.getParameters()[0] !== parameter
+  ) {
+    return undefined;
+  }
+
+  // Walk out through the wrappers `unwrapExpression` looks through, so
+  // `$transaction((async (tx) => …))` and a callback under a type assertion
+  // are the same callback.
+  let argument: Node = callback;
+  let call = argument.getParent();
+
+  for (
+    let depth = 0;
+    call !== undefined && depth < MAX_WRAPPER_DEPTH && unwrapExpression(call) === callback;
+    depth += 1
+  ) {
+    argument = call;
+    call = call.getParent();
+  }
+
+  if (call === undefined || !Node.isCallExpression(call) || call.getArguments()[0] !== argument) {
+    return undefined;
+  }
+
+  const callee = call.getExpression();
+
+  if (
+    !Node.isPropertyAccessExpression(callee) ||
+    memberName(callee.getNameNode()) !== PRISMA_TRANSACTION_OPERATION
+  ) {
+    return undefined;
+  }
+
+  const source = expressionHandle(state, module, callee.getExpression(), origin, hops + 1);
+
+  return source?.driver === 'prisma' ? { driver: 'prisma', discovery: 'transaction' } : undefined;
 }
 
 /**

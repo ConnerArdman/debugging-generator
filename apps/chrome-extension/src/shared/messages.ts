@@ -115,7 +115,7 @@
  * | ------------------------------ | --------------------------------- | --------------------------------------- |
  * | `AGENT_SOURCE_TAG`             | `AGENT_SOURCE_TAG`                | `'debuggen-agent'`                      |
  * | `BRIDGE_SOURCE_TAG`            | `BRIDGE_SOURCE_TAG`               | `'debuggen-bridge'`                     |
- * | `PAGE_CHANNEL_VERSION`         | `CHANNEL_VERSION`                 | `3`                                     |
+ * | `PAGE_CHANNEL_VERSION`         | `CHANNEL_VERSION`                 | `4`                                     |
  * | `PAGE_HANDSHAKE_REQUEST_EVENT` | `HANDSHAKE_REQUEST_EVENT`         | `'debuggen-bridge-handshake'`           |
  * | `PAGE_HANDSHAKE_OFFER_EVENT`   | `HANDSHAKE_OFFER_EVENT`           | `'debuggen-agent-handshake'`            |
  * | `PAGE_AGENT_FRAME_EVENT`       | `AGENT_FRAME_EVENT`               | `'debuggen-agent-frame'`                |
@@ -123,15 +123,16 @@
  * | `MAX_PAGE_FRAME_LENGTH`        | `MAX_MESSAGE_BYTES`               | `524_288` (512 Ki code units)           |
  * | `pageFrameLength`              | the agent's frame measure         | `detail.length` of the JSON string      |
  * | `AGENT_OUTBOUND_TYPES`         | `AgentOutboundType`               | four frame types                        |
- * | `BRIDGE_OUTBOUND_TYPES`        | `BridgeInboundType`               | five frame types                        |
+ * | `BRIDGE_OUTBOUND_TYPES`        | `BridgeInboundType`               | seven frame types                       |
  * | `AgentChannelPayloads`         | `postControl`/`buildBatchPayload` | payload field sets                      |
  * | `BridgeChannelPayloads`        | `agent.ts` inbound readers        | payload field sets                      |
  *
  * transport.ts is authoritative wherever an older description of the channel
- * differs, and this file follows it. At **version 3** the channel no longer
+ * differs, and this file follows it. Since **version 3** the channel no longer
  * uses `window.postMessage` at all, because anything posted on the page's
  * window — a secret token included — is readable and replayable by every
- * script on the page:
+ * script on the page; **version 4** adds the bridge's telemetry flow-control
+ * signals, `bridge.pause` and `bridge.resume` (item 4):
  *
  * 1. **Handshake, once per document, at `document_start`.** The bridge adds a
  *    {@link PAGE_HANDSHAKE_OFFER_EVENT} listener on `window`, dispatches one
@@ -149,6 +150,15 @@
  *    the frame is posted on the worker port or refused for good; an
  *    unacknowledged frame stays in the agent's buffer and is sent again after
  *    the next `bridge.ready`.
+ * 4. **Telemetry is flow-controlled.** The worker relays `bridge.pause` when
+ *    its lane for the tab backs up and `bridge.resume` when it has drained;
+ *    between the two the agent posts no `telemetry.batch` of its own accord
+ *    and keeps buffering — within its bounded buffer, whose oldest events it
+ *    evicts and counts as `droppedCount` — while every control frame still
+ *    flows. The signals are hints, never custody: a paused agent still
+ *    flushes at a capture change and on unload. A pause belongs to the port
+ *    it came through — every `bridge.ready` and `bridge.gone` ends it, a
+ *    capture ending does not.
  *
  * The size cap is **512 Ki code units**, measured as the `detail` string's
  * length — the agent's own measure, so a frame the agent sent can never be
@@ -1772,10 +1782,11 @@ export const BRIDGE_SOURCE_TAG = 'debuggen-bridge';
 /**
  * The page channel's version, carried on every frame in both directions and
  * compared exactly by both sides. Version 3 replaced `window.postMessage` and
- * its handshake token with the private channel node described above; a
+ * its handshake token with the private channel node described above; version
+ * 4 added the `bridge.pause` / `bridge.resume` flow-control signals. A
  * mismatched pair ignores each other until the page reloads.
  */
-export const PAGE_CHANNEL_VERSION = 3;
+export const PAGE_CHANNEL_VERSION = 4;
 
 /**
  * The `CustomEvent` the bridge dispatches on `window`, once per document and
@@ -1986,7 +1997,10 @@ export type AgentOutboundType = TupleCovering<
   keyof AgentChannelPayloads
 >;
 
-/** The empty payload of the bridge's `bridge.ready` and `bridge.gone` signals. */
+/**
+ * The empty payload of the bridge's signals: `bridge.ready`, `bridge.gone`,
+ * `bridge.pause` and `bridge.resume`.
+ */
 export type PageSignalPayload = Readonly<Record<string, never>>;
 
 /**
@@ -2028,6 +2042,15 @@ export interface BridgeChannelPayloads {
   readonly 'bridge.ready': PageSignalPayload;
   readonly 'bridge.gone': PageSignalPayload;
   /**
+   * Stop posting `telemetry.batch` of the agent's own accord — the worker's
+   * lane for the tab is backed up — and keep buffering until `bridge.resume`
+   * or the next `bridge.ready`. Control frames still flow, and the agent still
+   * flushes at a capture change and on unload.
+   */
+  readonly 'bridge.pause': PageSignalPayload;
+  /** Post buffered telemetry again, at the agent's usual bounded pace. */
+  readonly 'bridge.resume': PageSignalPayload;
+  /**
    * The protocol's `agent.config` payload, unchanged. The all-false hook set
    * is the dormancy instruction (AAP §0.5.1).
    */
@@ -2042,11 +2065,14 @@ export interface BridgeChannelPayloads {
  *
  * `bridge.ready` is sent whenever a worker port opens — at `document_start`
  * and after every reconnect; `bridge.gone` when the port's disconnect is
- * reported, when the bridge stops and when the extension context is gone.
+ * reported, when the bridge stops and when the extension context is gone;
+ * `bridge.pause` and `bridge.resume` when the worker relays them.
  */
 export const BRIDGE_OUTBOUND_TYPES = [
   'bridge.ready',
   'bridge.gone',
+  'bridge.pause',
+  'bridge.resume',
   'agent.config',
   'agent.snapshot',
   'target.request',
@@ -2177,6 +2203,8 @@ function hasBridgeChannelPayload(
   switch (type) {
     case 'bridge.ready':
     case 'bridge.gone':
+    case 'bridge.pause':
+    case 'bridge.resume':
       return isEmptyRecord(payload);
     case 'agent.config':
       return hasAgentConfigPayload(payload);
@@ -2540,10 +2568,13 @@ export type BridgeUpstreamMessage<Type extends AgentOutboundType = AgentOutbound
  * its `requestId` to required: the worker always correlates its requests. It
  * keeps the page channel's `cancel` flag: `cancel: true` ends the page's
  * active pick, which the agent answers with that pick's own `requestId`.
+ * `bridge.pause` and `bridge.resume` are the worker's telemetry flow-control
+ * signals, relayed to the page as they came; `bridge.ready` and
+ * `bridge.gone` stay the bridge's own, since only it knows its port's state.
  */
 export interface BridgeDownstreamPayloads extends Pick<
   BridgeChannelPayloads,
-  'agent.config' | 'agent.snapshot' | 'target.request'
+  'bridge.pause' | 'bridge.resume' | 'agent.config' | 'agent.snapshot' | 'target.request'
 > {
   readonly 'target.request': {
     readonly requestId: PortRequestId;
@@ -2553,6 +2584,8 @@ export interface BridgeDownstreamPayloads extends Pick<
 
 /** The frame types the worker sends the bridge. */
 export const BRIDGE_DOWNSTREAM_MESSAGE_TYPES = [
+  'bridge.pause',
+  'bridge.resume',
   'agent.config',
   'agent.snapshot',
   'target.request',
@@ -2610,6 +2643,9 @@ function hasBridgeDownstreamPayload(
   payload: Record<string, unknown>,
 ): boolean {
   switch (type) {
+    case 'bridge.pause':
+    case 'bridge.resume':
+      return isEmptyRecord(payload);
     case 'agent.config':
       return hasAgentConfigPayload(payload);
     case 'agent.snapshot':

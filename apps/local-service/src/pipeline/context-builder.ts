@@ -1879,6 +1879,21 @@ export interface AnalyzeRequestInput extends StageBuildOptions {
   readonly excerpts?: readonly CodeExcerpt[] | undefined;
 }
 
+/**
+ * One declaration a follow-up question names, resolved through the code graph
+ * (`CodeQueries.findByName`, declarations only) by `stages/followup.ts`.
+ */
+export interface FollowUpDeclarationCandidate {
+  /** The declaring file: project-relative, POSIX separators. */
+  readonly file: string;
+  /** The declared name, as the graph holds it. */
+  readonly symbol: string;
+  /** The graph node kind: `symbol`, `component` or `server-function`. */
+  readonly kind: string;
+  /** The graph's match score, from `0` to `1`. */
+  readonly score: number;
+}
+
 /** Input of {@link ContextBuilder.buildFollowUpRequest}. */
 export interface FollowUpRequestInput extends StageBuildOptions {
   /** The follow-up question, verbatim. Rendered into the prompt only. */
@@ -1893,6 +1908,23 @@ export interface FollowUpRequestInput extends StageBuildOptions {
   readonly analysis?: AnalysisResult | undefined;
   /** The latest panel specification. */
   readonly panel?: PanelSpec | undefined;
+  /**
+   * The wording-invariant lexical hints `stages/understand.ts`'s generic
+   * tokenizer derived from the redacted follow-up question (for example
+   * `identifierCandidates`): a plain object whose every own property is a list
+   * of strings. Each list is placed at the top level of the structured input,
+   * beside the artifact sections, which it may not shadow; the raw question
+   * never is.
+   */
+  readonly questionHints?: object | undefined;
+  /**
+   * The declarations those hints resolve to in the code graph, placed as the
+   * top-level `candidates` section — structural data the rules-based provider
+   * reads as the declarations the follow-up named, and the section the payload
+   * budget trims right after the excerpts. A member whose file is not a safe
+   * project-relative path is dropped.
+   */
+  readonly candidates?: readonly FollowUpDeclarationCandidate[] | undefined;
 }
 
 /** Collaborators of {@link createContextBuilder}; everything is injected. */
@@ -1931,7 +1963,11 @@ export interface ContextBuilder {
   buildPlanRequest(request: PlanRequestInput): Result<StageRequestBuild, DebuggenError>;
   /** Stage 5: the understanding, the capture's analysis input and the code excerpts. */
   buildAnalyzeRequest(request: AnalyzeRequestInput): Result<StageRequestBuild, DebuggenError>;
-  /** The follow-up decision: the new question against the stored plan, capture, analysis and panel. */
+  /**
+   * The follow-up decision: the new question against the stored plan, capture,
+   * analysis and panel, with the lexical hints and graph-resolved declarations
+   * the stage derived from the redacted question.
+   */
   buildFollowUpRequest(request: FollowUpRequestInput): Result<StageRequestBuild, DebuggenError>;
 }
 
@@ -1954,6 +1990,16 @@ const UNDERSTAND_RESERVED_KEYS: readonly string[] = Object.freeze([
   'target',
   'currentUrl',
   'projectSummary',
+]);
+
+/** Keys the follow-up stage's question hints may not use: they name its context sections. */
+const FOLLOW_UP_RESERVED_KEYS: readonly string[] = Object.freeze([
+  'understanding',
+  'plan',
+  'captureSummary',
+  'analysis',
+  'panel',
+  'candidates',
 ]);
 
 /** Analysis-input fields that are prompt-only (the question) or rendered separately (excerpts). */
@@ -2390,10 +2436,17 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
     return capped.text;
   };
 
-  /** Reads the understand stage's question hints: every own property must be a list of strings. */
+  /**
+   * Reads a stage's question hints: every own property must be a list of
+   * strings under a key that does not name one of `reserved`, the stage's own
+   * context sections. The understand stage's reserved set is the default; the
+   * follow-up stage passes its own.
+   */
   const questionHintSections = (
     hints: object | undefined,
     truncated: Set<string>,
+    reserved: readonly string[] = UNDERSTAND_RESERVED_KEYS,
+    stage: PromptStage = 'understand',
   ): Result<Record<string, JsonValue>, DebuggenError> => {
     const sections: Record<string, JsonValue> = {};
     if (hints === undefined) {
@@ -2401,14 +2454,14 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
     }
     const source = hints as Readonly<Record<string, unknown>>;
     const invalid: string[] = [];
-    const reserved: string[] = [];
+    const refused: string[] = [];
     for (const key of Object.keys(source).sort()) {
       const value = source[key];
       if (value === undefined) {
         continue;
       }
-      if (UNDERSTAND_RESERVED_KEYS.includes(key) || key === PROTO_KEY) {
-        reserved.push(key);
+      if (reserved.includes(key) || key === PROTO_KEY) {
+        refused.push(key);
         continue;
       }
       if (!Array.isArray(value)) {
@@ -2428,12 +2481,12 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
         capSectionText(entry, limits.maxStringChars, 'questionHints', truncated),
       );
     }
-    if (invalid.length > 0 || reserved.length > 0) {
+    if (invalid.length > 0 || refused.length > 0) {
       return err(
         new DebuggenError(
           'INTERNAL',
-          'The question hints handed to the understand request are malformed: every hint must be a list of strings under a key that does not name a context section.',
-          { details: { stage: 'understand', invalidKeys: invalid, reservedKeys: reserved } },
+          `The question hints handed to the ${stage} request are malformed: every hint must be a list of strings under a key that does not name a context section.`,
+          { details: { stage, invalidKeys: invalid, reservedKeys: refused } },
         ),
       );
     }
@@ -2493,6 +2546,41 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
       visit(results, 0);
     }
     return candidates;
+  };
+
+  /**
+   * The follow-up's graph-resolved declarations as the top-level `candidates`
+   * section, in the order given. A member is kept only when its file is a safe
+   * project-relative path, its symbol and kind are non-blank and within
+   * `maxStringChars` — a cut name would name a declaration the graph does not
+   * hold — and its score is finite; the survivors are capped at `maxListItems`.
+   * `candidates` is recorded as truncated when a cap removed a member.
+   */
+  const followUpCandidatesSection = (
+    candidates: readonly FollowUpDeclarationCandidate[] | undefined,
+    truncated: Set<string>,
+  ): JsonValue[] => {
+    if (candidates === undefined) {
+      return [];
+    }
+    const within = (text: string): boolean =>
+      text.trim().length > 0 && text.length <= limits.maxStringChars;
+    const kept: FollowUpDeclarationCandidate[] = [];
+    for (const candidate of candidates) {
+      if (!isSafeRelativePath(candidate.file) || !Number.isFinite(candidate.score)) {
+        continue;
+      }
+      if (!within(candidate.file) || !within(candidate.symbol) || !within(candidate.kind)) {
+        truncated.add('candidates');
+        continue;
+      }
+      kept.push(candidate);
+    }
+    const capped = capList(kept, limits.maxListItems);
+    if (capped.truncated) {
+      truncated.add('candidates');
+    }
+    return capped.items.map(({ file, symbol, kind, score }) => ({ file, symbol, kind, score }));
   };
 
   const buildStageRequest = (spec: StageRequestSpec): Result<StageRequestBuild, DebuggenError> =>
@@ -2733,6 +2821,19 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
     }
     const truncated = new Set<string>();
 
+    // The follow-up's only presence in the structured input: lexical hints the
+    // stage cut from the redacted question, and the declarations they resolve to.
+    const hints = questionHintSections(
+      request.questionHints,
+      truncated,
+      FOLLOW_UP_RESERVED_KEYS,
+      stage,
+    );
+    if (!hints.ok) {
+      return hints;
+    }
+    const candidates = followUpCandidatesSection(request.candidates, truncated);
+
     const understanding =
       request.understanding !== undefined
         ? boundSection(request.understanding, 'understanding', upstreamBounded, truncated)
@@ -2762,11 +2863,13 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
     );
 
     const input: JsonObject = {
+      ...hints.value,
       ...(understanding !== undefined ? { understanding } : {}),
       ...(plan !== undefined ? { plan } : {}),
       ...(captureSummary !== undefined ? { captureSummary } : {}),
       ...(analysis !== undefined ? { analysis } : {}),
       ...(panel !== undefined ? { panel } : {}),
+      ...(candidates.length > 0 ? { candidates } : {}),
     };
 
     return finishStage({

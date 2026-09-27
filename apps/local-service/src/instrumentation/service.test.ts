@@ -27,7 +27,10 @@
  * - **A follow-up installs only its delta** (AAP §0.4.2): the additive ids are
  *   the upstream `actionIdentityKey` difference, an empty delta installs
  *   nothing, and a failed delta leaves the previous plan version active with no
- *   rollback performed here — the installer owns reverse-restore.
+ *   rollback performed here — the installer owns reverse-restore. It also
+ *   *announces* only its delta: `instrumentation.ready.applied` lists plan
+ *   version *n + 1*'s records alone, `[]` for an empty delta — whose hooks and
+ *   gaps stay the session's — and never an earlier version's records.
  * - **The adapter context is complete and honest**: the journal is the injected
  *   one by identity, the backup store is rooted under the state directory, the
  *   project root is normalised absolute POSIX, and every field the upstream
@@ -1295,9 +1298,22 @@ function expectedEnabledLabels(result: AggregateInstallResult): string[] {
   return INSTRUMENTATION_ROW_ORDER.filter((label) => labels.has(label));
 }
 
-/** The AAP §0.5.5 sentence for one entry, composed from the imported labels. */
+/**
+ * The AAP §0.5.5 sentence for one entry, composed from the imported labels:
+ * the enabled list less the entry's own label, or "no confirmed signal" when
+ * nothing remains.
+ */
 function expectedSentence(entry: UnavailableSignal, enabled: readonly string[]): string {
-  return `Could not enable ${labelOf(entry.signal)}: ${entry.reason}. Continuing with: ${enabled.join(', ')}.`;
+  const label = labelOf(entry.signal);
+  const others = enabled.filter((candidate) => candidate !== label);
+  const continuing = others.length === 0 ? 'no confirmed signal' : others.join(', ');
+
+  return `Could not enable ${label}: ${entry.reason}. Continuing with: ${continuing}.`;
+}
+
+/** The checklist's ✗ rows, as the progress module renders them from one installed report. */
+function failedRows(installed: InstalledSignals): ProgressRow[] {
+  return buildInstrumentationRows(installed).filter((row) => row.status === 'failed');
 }
 
 /**
@@ -1728,7 +1744,7 @@ describe('message mapping', () => {
 // ---------------------------------------------------------------------------
 
 describe('degradation', () => {
-  it('emits one notice per unavailable signal and still reports the install ready', async () => {
+  it('reports each unavailable signal as one terminal ✗ row naming the enabled signals, and still reports the install ready', async () => {
     const h = createHarness();
     const plan = buildPlan();
     const expected = sentinelResult(h.home, plan);
@@ -1739,14 +1755,24 @@ describe('degradation', () => {
 
     expect(expected.unavailable).toHaveLength(2);
     expect(enabled.length).toBeGreaterThan(0);
-    expect(h.progress.emitted).toStrictEqual(
+    // No row of its own is emitted beside the checklist: a `running` row would
+    // stay spinning next to the ✗ row of a client merging by stage and message.
+    expect(h.progress.emitted).toEqual([]);
+    const report = first(h.progress.installed);
+    const rows = failedRows(report);
+    expect(rows.slice(0, expected.unavailable.length)).toStrictEqual(
       expected.unavailable.map((entry, index) => ({
         stage: 'instrument',
-        status: 'running',
+        status: 'failed',
         message: sentences[index],
         detail: entry.hint,
       })),
     );
+    for (const sentence of sentences) {
+      expect(rows.filter((row) => row.message === sentence)).toHaveLength(1);
+    }
+    // The ✗ rows' "Continuing with:" list is the checklist's own ✓ labels.
+    expect(rowMessages(report, 'done')).toEqual(enabled);
 
     for (const [index, entry] of expected.unavailable.entries()) {
       const sentence = sentences[index] ?? '';
@@ -1766,7 +1792,9 @@ describe('degradation', () => {
 
     await h.service.install(installRequest(h, buildPlan()));
 
-    const serverGap = h.progress.emitted.find((row) => row.message.includes(labelOf('pg')));
+    const serverGap = failedRows(first(h.progress.installed)).find((row) =>
+      row.message.startsWith(`Could not enable ${labelOf('pg')}: `),
+    );
     expect(serverGap?.detail).toBe(RELAUNCH_HINT);
     expect(
       first(framesOf(allMessages(h), 'instrumentation.ready')).payload.unavailable[0]?.hint,
@@ -1808,11 +1836,10 @@ describe('progress checklist', () => {
     const outcome = await h.service.install(installRequest(h, buildPlan()));
 
     expect(isOk(outcome) && outcome.value.readiness.satisfied).toBe(true);
-    // The header, the two degradation rows, the checklist, then the closing row, once.
+    // The header, the checklist — whose ✗ rows are the only report of the two
+    // unavailable signals — then the closing row, once.
     const order: readonly ProgressMethod[] = [
       'stageStarted',
-      'emit',
-      'emit',
       'reportInstrumentation',
       'readyToCapture',
     ];
@@ -1945,11 +1972,18 @@ describe('progress checklist', () => {
     const done = rowMessages(report, 'done');
     const failed = rowMessages(report, 'failed');
 
+    // With no tab bound yet, a page signal is waiting for the panel to bind
+    // one — shown once as a waiting row, never as ✓, ✗ or a degradation.
+    const waiting = h.progress.emitted.filter((row) => row.status === 'running');
     for (const signal of ['interactions', 'react', 'fetch', 'componentTree'] as const) {
       expect(done).not.toContain(labelOf(signal));
+      expect(failed.some((message) => message.includes(labelOf(signal)))).toBe(false);
+      expect(waiting.filter((row) => row.message === labelOf(signal))).toHaveLength(1);
       expect(
-        failed.some((message) => message.startsWith(`Could not enable ${labelOf(signal)}`)),
-      ).toBe(true);
+        h.progress.emitted.some((row) =>
+          row.message.startsWith(`Could not enable ${labelOf(signal)}`),
+        ),
+      ).toBe(false);
     }
 
     // The server signals the connected preload delivers stay checked.
@@ -1994,10 +2028,15 @@ describe('progress checklist', () => {
       expect(rowMessages(report, 'done')).toEqual([]);
       expect(rowMessages(report, 'failed')).toHaveLength(expected.unavailable.length);
 
-      // The degradation rows name no signal as one the capture continues with.
-      expect(h.progress.emitted.map((row) => row.message)).toStrictEqual(
+      // The ✗ rows are the only report of the gaps, and name no signal as one
+      // the capture continues with.
+      expect(h.progress.emitted).toEqual([]);
+      expect(rowMessages(report, 'failed')).toStrictEqual(
         buildDegradationNotice(expected.unavailable, []),
       );
+      for (const message of rowMessages(report, 'failed')) {
+        expect(message.endsWith(' Continuing with: no confirmed signal.')).toBe(true);
+      }
       expect(progressCalls(h, 'readyToCapture')).toHaveLength(0);
       expect(framesOf(allMessages(h), 'instrumentation.ready')).toHaveLength(1);
     },
@@ -2154,6 +2193,41 @@ describe('buildDegradationNotice', () => {
     expect(
       buildDegradationNotice([pgGap, { ...pgGap, hint: 'another hint' }], enabled),
     ).toHaveLength(1);
+  });
+
+  it('says it continues with no confirmed signal when the enabled list is empty', () => {
+    expect(buildDegradationNotice([pgGap], [])).toStrictEqual([
+      `Could not enable ${labelOf('pg')}: ${pgGap.reason}. Continuing with: no confirmed signal.`,
+    ]);
+  });
+
+  it('never lists the signal it could not enable among those it continues with', () => {
+    // `routeHandlers` shares the "Server spans" label with the enabled `http`.
+    const routeGap: UnavailableSignal = { ...pgGap, signal: 'routeHandlers' };
+
+    expect(buildDegradationNotice([routeGap], enabled)).toStrictEqual([
+      `Could not enable ${labelOf('routeHandlers')}: ${pgGap.reason}. Continuing with: ${CAPTURE_SIGNAL_LABELS.fetch}.`,
+    ]);
+  });
+
+  it('keeps the connective when the reason is blank', () => {
+    expect(buildDegradationNotice([{ ...pgGap, reason: ' \n ' }], enabled)).toStrictEqual([
+      `Could not enable ${labelOf('pg')}. ${continuing}`,
+    ]);
+  });
+
+  it('words each entry exactly as the checklist ✗ row for the same enabled labels', () => {
+    const unavailable = [errorsGap, pgGap, customGap];
+    const rows = buildInstrumentationRows({ runtimeHooks: enabled, unavailable });
+    // The checklist lists its ✓ labels in the progress view's display order.
+    const listed: readonly string[] = enabled;
+    const checked = INSTRUMENTATION_ROW_ORDER.filter((label) => listed.includes(label));
+
+    expect(rows.filter((row) => row.status === 'done').map((row) => row.message)).toEqual(checked);
+    expect(rows.filter((row) => row.status === 'failed').map((row) => row.message)).toStrictEqual(
+      buildDegradationNotice(unavailable, checked),
+    );
+    expect(rows.some((row) => row.status === 'running')).toBe(false);
   });
 });
 
@@ -2565,9 +2639,129 @@ describe('follow-up delta', () => {
       expect(adapter.installCalls).toEqual([]);
     }
     expect(bracketOf(h.sequence)).toEqual(['suspend', 'watchSession', 'resume']);
-    expect(first(framesOf(allMessages(h), 'instrumentation.ready')).payload.applied).toStrictEqual([
-      standing,
-    ]);
+
+    // Nothing was installed, so nothing is announced as applied: the record an
+    // earlier plan version left standing stays in the journal, untouched, and
+    // is not re-listed as this plan version's edit.
+    expect(first(framesOf(allMessages(h), 'instrumentation.ready')).payload.applied).toStrictEqual(
+      [],
+    );
+    expect(isOk(outcome) && outcome.value.applied).toStrictEqual([]);
+    expect(h.journal.records).toStrictEqual([standing, reverted]);
+  });
+
+  it('announces an empty delta with no records while keeping the session’s hooks and gaps', async () => {
+    const previous = buildPlan();
+    const next = buildPlan({ planVersion: 2, previousActions: previous.instrumentationTargets });
+    const journal = createMemoryJournal();
+    const h = createHarness({
+      journal,
+      // The first install's records reach the journal, as the real installer's do.
+      script: (call) => {
+        const result = sentinelResult(call.context.debuggenHome, call.plan);
+        journal.records.push(...result.applied);
+        return Promise.resolve(ok(result));
+      },
+    });
+
+    const installed = await h.service.install(installRequest(h, previous));
+    expect(isOk(installed)).toBe(true);
+    const firstApplied = isOk(installed) ? installed.value.applied : [];
+    expect(firstApplied).toHaveLength(2);
+    expect(journal.records).toStrictEqual(firstApplied);
+
+    const outcome = await h.service.install(
+      installRequest(h, next, {
+        previousPlanVersion: 1,
+        previousActions: previous.instrumentationTargets,
+      }),
+    );
+
+    expect(isOk(outcome)).toBe(true);
+    expect(h.installer.calls).toHaveLength(1);
+
+    const [firstReady, deltaReady] = framesOf(allMessages(h), 'instrumentation.ready').map(
+      (frame) => frame.payload,
+    );
+    expect(firstReady?.applied).toStrictEqual(firstApplied);
+    expect(deltaReady).toBeDefined();
+
+    // The delta wrote nothing, so `applied` is the required empty array…
+    expect(deltaReady?.applied).toStrictEqual([]);
+    expect(isOk(outcome) && outcome.value.applied).toStrictEqual([]);
+
+    // …while the hooks and gaps are the session's current ones, unchanged.
+    const expectedHooks = sentinelResult(h.home, previous).runtimeHooks;
+    expect(deltaReady?.runtimeHooks).toStrictEqual(expectedHooks);
+    expect(deltaReady?.unavailable).toStrictEqual(SENTINEL_UNAVAILABLE);
+    expect(isOk(outcome) && outcome.value.runtimeHooks).toStrictEqual(expectedHooks);
+    expect(isOk(outcome) && outcome.value.unavailable).toStrictEqual(SENTINEL_UNAVAILABLE);
+
+    // The earlier plan version's records are still the journal's, as applied.
+    expect(journal.records).toStrictEqual(firstApplied);
+    expect(h.service.arming(SESSION_ID)?.activePlanVersion).toBe(2);
+  });
+
+  it('announces only the delta’s records on a follow-up, never an earlier plan version’s', async () => {
+    const { previous, next } = followUpPlans();
+    const journal = createMemoryJournal();
+    const deltaRecords: ModificationRecord[] = [];
+    const h = createHarness({
+      journal,
+      // Plan version 1 applies the two sentinel records; the delta applies one
+      // record of its own, stamped with the new plan version.
+      script: (call) => {
+        const home = call.context.debuggenHome;
+        const clean = cleanResult(home, call.plan);
+        let result: AggregateInstallResult = clean;
+
+        if (call.plan.planVersion !== 1) {
+          const deltaRecord: ModificationRecord = {
+            ...sentinelRecord(home, SESSION_ID, 'src/server/beta-queue.ts', ['e', 'f'], 30),
+            planVersion: call.plan.planVersion,
+          };
+          deltaRecords.push(deltaRecord);
+          result = { ...clean, applied: [deltaRecord] };
+        }
+
+        journal.records.push(...result.applied);
+        return Promise.resolve(ok(result));
+      },
+    });
+
+    const installed = await h.service.install(installRequest(h, previous));
+    expect(isOk(installed)).toBe(true);
+    const planOneRecords = isOk(installed) ? installed.value.applied : [];
+    expect(planOneRecords.map((record) => record.planVersion)).toEqual([1, 1]);
+
+    const outcome = await h.service.install(
+      installRequest(h, next, {
+        previousPlanVersion: 1,
+        previousActions: previous.instrumentationTargets,
+      }),
+    );
+
+    expect(isOk(outcome)).toBe(true);
+    expect(first(h.installer.calls.slice(1)).options.delta).toStrictEqual({
+      previousPlanVersion: 1,
+      actionIds: additiveIds(previous, next),
+    });
+
+    const readies = framesOf(allMessages(h), 'instrumentation.ready').map((frame) => frame.payload);
+    expect(readies).toHaveLength(2);
+    expect(readies[0]?.applied).toStrictEqual(planOneRecords);
+
+    // Plan version 2's report lists plan version 2's record alone.
+    const deltaRecord = first(deltaRecords);
+    expect(deltaRecords).toHaveLength(1);
+    expect(deltaRecord.planVersion).toBe(2);
+    expect(readies[1]?.applied).toStrictEqual([deltaRecord]);
+    expect(isOk(outcome) && outcome.value.applied).toStrictEqual([deltaRecord]);
+    const planOneIds = new Set(planOneRecords.map((record) => record.id));
+    expect(readies[1]?.applied.some((record) => planOneIds.has(record.id))).toBe(false);
+
+    // The journal holds both plan versions' records; only the report is the delta.
+    expect(journal.records).toStrictEqual([...planOneRecords, deltaRecord]);
   });
 
   it('leaves the previous plan version active when a delta fails, rolling nothing back itself', async () => {
@@ -3172,7 +3366,8 @@ describe('arming is judged by the delivery receipt', () => {
     expect(h.service.arming(SESSION_ID)?.armedCaptureId).toBe(CAPTURE_ID);
 
     // One row per distinct label (two keys share "Server spans"), each a
-    // running degradation row whose continuing list omits what is missing.
+    // terminal ✗ row — never a `running` one a client would leave spinning —
+    // whose continuing list omits what is missing.
     const labels = [...new Set(keys.map(labelOf))];
     const rows = h.progress.emitted;
     expect(rows.map((row) => row.message.split(':')[0])).toEqual(
@@ -3180,7 +3375,7 @@ describe('arming is judged by the delivery receipt', () => {
     );
     for (const row of rows) {
       expect(row.stage).toBe('instrument');
-      expect(row.status).toBe('running');
+      expect(row.status).toBe('failed');
       expect(row.detail).toContain('Launch the dev server from Debug Generator');
       const continuing = row.message.split('Continuing with: ')[1] ?? '';
       expect(continuing).toContain(labelOf('interactions'));
@@ -3193,7 +3388,9 @@ describe('arming is judged by the delivery receipt', () => {
     const rearmed = h.service.armCapture({ sessionId: SESSION_ID, captureId: CAPTURE_ID });
     expect(isOk(rearmed) && rearmed.value.unavailable?.length).toBe(keys.length);
     expect(h.progress.emitted).toHaveLength(rows.length);
+    // A degradation is never a session failure.
     expect(progressCalls(h, 'stageFailed')).toHaveLength(0);
+    expect(framesOf(allMessages(h), 'instrumentation.failed')).toHaveLength(0);
   });
 
   it('keeps a signal the page still collects in the continuing list when only its server share is missing', async () => {
@@ -3202,7 +3399,12 @@ describe('arming is judged by the delivery receipt', () => {
         Promise.resolve(
           ok({
             ...cleanResult(call.context.debuggenHome, call.plan),
-            serverSignals: { ...DISABLED_SERVER_AGENT_SIGNALS, functions: [], fetch: true },
+            serverSignals: {
+              ...DISABLED_SERVER_AGENT_SIGNALS,
+              functions: [],
+              http: true,
+              fetch: true,
+            },
           }),
         ),
     });
@@ -3211,10 +3413,28 @@ describe('arming is judged by the delivery receipt', () => {
 
     const armed = h.service.armCapture({ sessionId: SESSION_ID, captureId: CAPTURE_ID });
 
-    expect(isOk(armed) && armed.value.unavailable?.map((entry) => entry.signal)).toEqual(['fetch']);
-    const row = first(h.progress.emitted);
-    expect(row.message.startsWith(`Could not enable ${labelOf('fetch')}: `)).toBe(true);
-    expect(row.message.split('Continuing with: ')[1]).toContain(labelOf('fetch'));
+    expect(
+      isOk(armed) && [...(armed.value.unavailable ?? [])].map((entry) => entry.signal).sort(),
+    ).toEqual(['fetch', 'http']);
+    const rowFor = (signal: string): ProgressRow | undefined =>
+      h.progress.emitted.find((row) =>
+        row.message.startsWith(`Could not enable ${labelOf(signal)}: `),
+      );
+    const serverSpans = rowFor('http');
+    const network = rowFor('fetch');
+    expect(h.progress.emitted).toHaveLength(2);
+    for (const row of [serverSpans, network]) {
+      expect(row?.stage).toBe('instrument');
+      expect(row?.status).toBe('failed');
+    }
+    // The page still traces the network, so the other gap's row keeps it…
+    const serverContinuing = serverSpans?.message.split('Continuing with: ')[1] ?? '';
+    expect(serverContinuing).toContain(labelOf('fetch'));
+    expect(serverContinuing).not.toContain(labelOf('http'));
+    // …while the row about the network's own server share never lists itself.
+    const networkContinuing = network?.message.split('Continuing with: ')[1] ?? '';
+    expect(networkContinuing).toContain(labelOf('interactions'));
+    expect(networkContinuing).not.toContain(labelOf('fetch'));
   });
 
   it('refuses the arm when only server signals are planned and no preload is connected', async () => {

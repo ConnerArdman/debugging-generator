@@ -150,7 +150,7 @@ import {
   panelGeneratedPayloadSchema,
   parseAnalysisResult,
 } from '@debuggen/protocol';
-import type { AnalysisResult, ClientKind, ProgressStage } from '@debuggen/protocol';
+import type { AnalysisResult, ClientKind, ProgressStage, SessionRecord } from '@debuggen/protocol';
 import { DebuggenError, err, newPanelId, noopLogger, ok, tryCatch } from '@debuggen/shared';
 import type {
   CaptureId,
@@ -177,6 +177,7 @@ import { sessionLogger, subsystemLogger } from '../logging.js';
 import { redactEmbeddedUrlsDeep, redactQuestionText } from '../pipeline/context-builder.js';
 import type { SessionBroadcaster } from '../sessions/manager.js';
 import type { PanelsRepo, PanelsRepoFailureReason } from '../store/panels-repo.js';
+import type { SessionsRepo } from '../store/sessions-repo.js';
 import type { FallbackPanelBuilder } from './fallback.js';
 import { PANEL_FAILURE_POLICY } from './validate.js';
 import type {
@@ -315,6 +316,13 @@ export type PanelStorePort = Pick<
 /** Where `panel.generated` frames go: the client registry in production. */
 export type PanelBroadcastPort = Pick<SessionBroadcaster, 'broadcastToKinds'>;
 
+/**
+ * The session store, as this module uses it: the record a panel answers, read
+ * for the problem category its understanding settled on and the target the
+ * developer selected ({@link PanelFraming}).
+ */
+export type PanelSessionPort = Pick<SessionsRepo, 'get'>;
+
 /** Everything {@link createPanelGenerator} is given; every collaborator is injected. */
 export interface PanelGeneratorDeps {
   /** The model boundary: the network-backed provider, or the rules-based one in every test. */
@@ -334,6 +342,14 @@ export interface PanelGeneratorDeps {
   readonly captures?: CaptureSummaryPort | undefined;
   /** Delivers `panel.generated`. Absent in unit contexts, where nothing is sent. */
   readonly broadcaster?: PanelBroadcastPort | undefined;
+  /**
+   * Reads the session a panel answers, so the structured context names the
+   * problem category and the selected target (see {@link PanelFraming}) on
+   * every path — the capture path and the existing-evidence regeneration alike.
+   * Absent, or when the read fails, the context carries neither and the panel
+   * is composed from the capture's evidence alone.
+   */
+  readonly sessions?: PanelSessionPort | undefined;
   /** The service logger; records are bound to `subsystem: "panels"`, the session and the capture. */
   readonly logger?: Logger | undefined;
   /** Mints the panel id; defaults to `newPanelId`. Injected for deterministic tests. */
@@ -768,6 +784,84 @@ function captureContext(summary: CaptureSummary): Readonly<Record<string, unknow
   };
 }
 
+/** Component names kept from a selected target's owner chain: the nearest few name it. */
+const MAX_FRAMING_CHAIN = 8;
+
+/**
+ * What the panel answers, as the session's earlier stages settled it: the
+ * problem category of the validated understanding, the capture signals it
+ * asked for, and the selected element's owner chain and tag. All of it is
+ * structured — closed-vocabulary values and code identifiers — so a rules-based
+ * author can read the category a panel is composed for and title it by the
+ * target, while the question itself stays out of the structured context.
+ */
+export interface PanelFraming {
+  /** The understanding's category, a member of the closed problem-category vocabulary. */
+  readonly category?: string | undefined;
+  /** The capture signals the understanding asked for. */
+  readonly signalsNeeded?: readonly string[] | undefined;
+  /** The selected element's component owner chain, nearest first. */
+  readonly componentChain?: readonly string[] | undefined;
+  /** The selected element's tag name. */
+  readonly tagName?: string | undefined;
+}
+
+/**
+ * The framing of a stored session: its understanding's category and signals
+ * and its selected target's owner chain and tag. The target's text, selector
+ * and URL are left behind — none of them helps compose a panel, and each can
+ * carry page content.
+ *
+ * @param record The session record, or `undefined` when none was read.
+ * @returns The framing; empty when the session has neither an understanding nor a target.
+ */
+export function panelFramingOf(record: SessionRecord | undefined): PanelFraming {
+  const understanding = record?.understanding;
+  const target = record?.target;
+  const chain: string[] = [];
+  for (const name of leading(target?.componentChain, MAX_FRAMING_CHAIN)) {
+    const bounded = boundedText(name);
+    if (bounded !== undefined && bounded.length > 0) {
+      chain.push(bounded);
+    }
+  }
+  const tagName = boundedText(target?.tagName);
+  return {
+    ...(understanding === undefined
+      ? {}
+      : { category: understanding.category, signalsNeeded: [...understanding.signalsNeeded] }),
+    ...(chain.length > 0 ? { componentChain: chain } : {}),
+    ...(tagName === undefined || tagName.length === 0 ? {} : { tagName }),
+  };
+}
+
+/**
+ * The framing half of the structured input: `understanding` and `target`,
+ * each present only when the framing carries something for it, in the field
+ * names the rules-based provider reads a category and a target label from.
+ */
+function framingContext(framing: PanelFraming): Readonly<Record<string, unknown>> {
+  const chain = framing.componentChain ?? [];
+  return {
+    ...(framing.category === undefined
+      ? {}
+      : {
+          understanding: {
+            category: framing.category,
+            signalsNeeded: [...(framing.signalsNeeded ?? [])],
+          },
+        }),
+    ...(chain.length === 0 && framing.tagName === undefined
+      ? {}
+      : {
+          target: {
+            componentChain: [...chain],
+            ...(framing.tagName === undefined ? {} : { tagName: framing.tagName }),
+          },
+        }),
+  };
+}
+
 /**
  * The structured context of one generate-panel request, and the source of
  * every data placeholder:
@@ -777,7 +871,10 @@ function captureContext(summary: CaptureSummary): Readonly<Record<string, unknow
  * - `nodeCatalog` → the registry `{{nodeCatalog}}` renders as text through
  *   `describeCatalogForPrompt`;
  * - `populatedSources` and `capture` → `{{captureOverview}}`, the two halves of
- *   the overview: how much each data source holds, and the bounded sections.
+ *   the overview: how much each data source holds, and the bounded sections;
+ * - `understanding` and `target` → no placeholder: the {@link PanelFraming} of
+ *   the session, structured data for a rules-based author (the model reads the
+ *   question itself), present only when the session has them.
  *
  * `analysis` and `capture` have every embedded URL's query values masked
  * (`redactEmbeddedUrlsDeep`) before either the input or the text is derived,
@@ -800,11 +897,13 @@ export interface PanelStageContext {
  *
  * @param analysis The validated analysis of the capture.
  * @param summary The capture's summary.
+ * @param framing What the session's earlier stages settled; empty by default.
  * @returns The structured input and the two data sections rendered from it.
  */
 export function buildPanelStageContext(
   analysis: AnalysisResult,
   summary: CaptureSummary,
+  framing: PanelFraming = {},
 ): PanelStageContext {
   // The analysis is model-authored prose and the overview carries captured
   // names and addresses, so either can quote a queried URL (`/api/x?id=7`). The
@@ -825,9 +924,11 @@ export function buildPanelStageContext(
   );
   const populatedSources = toJsonObject(populatedSourceCounts(summary));
   const capture = redactEmbeddedUrlsDeep(toJsonObject(captureContext(summary)));
+  const framed = toJsonObject(framingContext(framing));
 
   return {
     input: {
+      ...framed,
       analysis: analysisSection,
       nodeCatalog: nodeCatalog ?? [],
       populatedSources,
@@ -1109,6 +1210,30 @@ export function createPanelGenerator(deps: PanelGeneratorDeps): PanelGenerator {
       }
     });
     return current;
+  };
+
+  /**
+   * The session's {@link PanelFraming}, read through the injected store port.
+   * Framing is advisory: without a port, for a session the store does not
+   * hold, or when the read fails or throws, the panel is framed by nothing and
+   * composed from the capture's evidence alone — a failed read is logged with
+   * its code and never fails the generation.
+   */
+  const framingFor = (sessionId: SessionId, sessionLog: Logger): PanelFraming => {
+    const sessions = deps.sessions;
+    if (sessions === undefined) {
+      return {};
+    }
+    const read = tryCatch(() => sessions.get(sessionId), 'INTERNAL');
+    const record = read.ok ? read.value : read;
+    if (!record.ok) {
+      sessionLog.warn(
+        'The session a panel answers could not be read; the panel is framed by its capture alone.',
+        { stage: PANEL_PROMPT_STAGE, code: record.error.code },
+      );
+      return {};
+    }
+    return panelFramingOf(record.value);
   };
 
   /** `{{outputSchema}}`: the authoring schema's canonical JSON Schema text, rendered once. */
@@ -1558,7 +1683,11 @@ export function createPanelGenerator(deps: PanelGeneratorDeps): PanelGenerator {
       return err(schemaText.error);
     }
 
-    const stageContext = buildPanelStageContext(analysis.value, summary.value);
+    const stageContext = buildPanelStageContext(
+      analysis.value,
+      summary.value,
+      framingFor(sessionId, sessionLog),
+    );
     const values: PanelPromptValues = {
       question: questionTextFor(request.question, followUpQuestion),
       analysis: stageContext.analysisText,

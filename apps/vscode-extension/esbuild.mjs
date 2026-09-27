@@ -88,10 +88,16 @@
  * verification. The staged `LICENSE` is a generated copy; the root file stays
  * the single source of truth.
  *
- * ORDER WITH VITE: `build` is `node esbuild.mjs --production && vite build`.
- * This script removes `dist/` first (unless `--no-clean` or `--watch`), then
- * Vite writes `dist/webview/` with an `emptyOutDir` scoped to that directory,
- * so the webview is never verified here and never deleted by Vite's run.
+ * ORDER WITH VITE: `build` is `node esbuild.mjs --production && vite build`,
+ * and the two builds co-own `dist/`. Vite writes `dist/webview/` with an
+ * `emptyOutDir` scoped to that directory; this script owns every other entry.
+ * Before building (unless `--no-clean` or `--watch`), and again when a build
+ * that cleaned fails, this script removes every entry of `dist/` EXCEPT
+ * `webview/`, so `build:host` and `build:webview` compose in either order and
+ * neither run deletes the other's output. Everything else is removed, rather
+ * than an allow-list of known outputs, so leftovers of an older layout never
+ * survive into the VSIX. The webview is never verified here — it may not be
+ * built yet — but the `verify` line states whether it is present.
  *
  * DETERMINISM AND HYGIENE: every path is resolved from this module's location,
  * never from the working directory; esbuild runs with `absWorkingDir` fixed to
@@ -144,8 +150,19 @@ export const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 /** Absolute path of the repository root (two levels above this workspace). */
 export const REPO_ROOT = path.resolve(EXTENSION_DIR, '..', '..');
 
-/** The output directory this script owns, except `dist/webview/` (Vite's). */
+/**
+ * The output directory, co-owned with Vite: this script writes and cleans
+ * every entry of it except {@link VITE_OUTPUT_ENTRY}.
+ */
 export const DIST_DIR = path.join(EXTENSION_DIR, 'dist');
+
+/**
+ * The one entry of `dist/` this script never removes: the webview output
+ * directory `vite.config.ts` writes (`outDir: 'dist/webview'`, emptied by
+ * Vite's own scoped `emptyOutDir`). A contract with `vite.config.ts`; rename
+ * it in both files or not at all.
+ */
+export const VITE_OUTPUT_ENTRY = 'webview';
 
 /** Extension-relative POSIX paths of every artefact, for messages and checks. */
 export const LAYOUT = Object.freeze({
@@ -160,6 +177,10 @@ export const LAYOUT = Object.freeze({
   testSuiteOut: 'dist/test/suite',
   testProbeSrc: 'test/probe/installed-extension-probe.ts',
   testProbeOut: 'dist/test/probe/installed-extension-probe.js',
+  // Vite's output (`vite.config.ts`), which this script keeps and only reports.
+  webviewOut: `dist/${VITE_OUTPUT_ENTRY}`,
+  webviewScript: `dist/${VITE_OUTPUT_ENTRY}/main.js`,
+  webviewStyle: `dist/${VITE_OUTPUT_ENTRY}/main.css`,
   stagedLicense: 'LICENSE',
   icon: 'media/icon.png',
 });
@@ -300,6 +321,7 @@ Builds the Debug Generator VS Code extension into dist/:
             + its runtime dependency closure in ${LAYOUT.preloadVendor}/
   tests     ${LAYOUT.testSuiteSrc}/**/*.test.ts -> ${LAYOUT.testSuiteOut}/**/*.test.js  (with --tests)
             + ${LAYOUT.testProbeSrc} -> ${LAYOUT.testProbeOut}  (CommonJS, node20, only "vscode" external)
+  webview   ${LAYOUT.webviewOut}/ belongs to "vite build": never removed here, only reported
 
 Flags:
   --production  external sourcemaps without sources, NODE_ENV=production, warnings fail the
@@ -310,7 +332,8 @@ Flags:
   --tests       also build the extension-host test suites and the packaged-VSIX probe
   --package     also stage ${LAYOUT.stagedLicense} from the repository root, check ${LAYOUT.icon} and
                 verify every artefact this script owns (vsce runs this as vscode:prepublish)
-  --no-clean    keep the existing dist/ instead of removing it first
+  --no-clean    keep the existing dist/ instead of first removing every entry of it except
+                ${LAYOUT.webviewOut}/ (which no run of this script ever removes)
   --help        print this text
 
 Exit codes: 0 success, 1 build or verification rejected, 2 bad usage or missing input.`;
@@ -1657,7 +1680,8 @@ function stagePackage() {
 
 /**
  * The artefacts this script owns, extension-relative. `dist/webview/**` is
- * deliberately absent: Vite writes it after this script has finished.
+ * deliberately absent: Vite writes it, before or after this script runs, and
+ * {@link webviewStatus} only reports it.
  *
  * @param {CliOptions} options
  * @returns {string[]}
@@ -1675,12 +1699,37 @@ export function ownedArtifacts(options) {
 }
 
 /**
+ * The state of Vite's webview output, as the clause the `verify` line ends
+ * with. Never a failure: `build` runs `vite build` after this script, so on a
+ * first build the webview legitimately does not exist yet. Stating it keeps a
+ * standalone `build:host` run from reporting success while `dist/` lacks the
+ * Session view bundle, without making this script depend on Vite's run.
+ *
+ * @returns {string} e.g. `dist/webview/ (Vite's) kept`
+ */
+function webviewStatus() {
+  const expected = [LAYOUT.webviewScript, LAYOUT.webviewStyle];
+  const absent = expected.filter((relative) => {
+    const file = fromExtension(relative);
+    return !isFile(file) || fs.statSync(file).size === 0;
+  });
+  if (absent.length === 0) {
+    return `${LAYOUT.webviewOut}/ (Vite's) kept`;
+  }
+  if (absent.length === expected.length) {
+    return `${LAYOUT.webviewOut}/ not built yet (vite build writes it)`;
+  }
+  return `${LAYOUT.webviewOut}/ incomplete, ${absent.join(' and ')} missing or empty (vite build rewrites it)`;
+}
+
+/**
  * Verify every owned artefact exists and is non-empty (the packaged-VSIX probe
  * among them under `--tests`), that nothing staged beside the service is a
  * `*.sql` file (the DDL ships inside the bundle only), that the service marker
  * says ESM, that suites were emitted under `--tests`, and — in production —
  * that the service bundle and the preload each load with every module resolved
- * inside their own directory.
+ * inside their own directory. The status line ends with whether Vite's
+ * webview is present ({@link webviewStatus}), which is reported, never checked.
  *
  * @param {CliOptions} options
  * @throws {ExtensionBuildError}
@@ -1727,7 +1776,7 @@ function verifyArtifacts(options) {
   }
   report(
     'verify',
-    `${ownedArtifacts(options).length} artefacts present${suites > 0 ? `, ${suites} compiled suites` : ''}${options.production ? '; service and preload load self-contained' : ''}`,
+    `${ownedArtifacts(options).length} artefacts present${suites > 0 ? `, ${suites} compiled suites` : ''}${options.production ? '; service and preload load self-contained' : ''}; ${webviewStatus()}`,
   );
 }
 
@@ -1736,11 +1785,37 @@ function verifyArtifacts(options) {
 // ---------------------------------------------------------------------------
 
 /**
- * Remove `dist/`. A symbolic link named `dist` is removed as a link, never
- * followed, so the removal cannot reach outside this workspace.
+ * Remove this script's outputs from `dist/`: every entry of it except
+ * {@link VITE_OUTPUT_ENTRY}, which belongs to `vite build` and is left
+ * untouched, so this run never deletes the Session view bundle. Everything
+ * else is removed — not an allow-list of known outputs — so a leftover of an
+ * older layout (a renamed bundle, a stale `dist/test/`) never survives into
+ * the VSIX or the next test run.
+ *
+ * No symbolic link is ever followed, so the removal cannot reach outside this
+ * workspace: a `dist` that is a link, or not a directory at all, is removed as
+ * a whole (the link itself, never its target); inside a real `dist/` each
+ * entry is removed on its own, and `fs.rmSync` removes an entry that is a link
+ * as a link. A missing `dist/` has nothing to clean.
+ *
+ * @returns {void}
+ * @throws {Error} when `dist/` cannot be read or one of its entries cannot be
+ * removed; the caller reports it as an unexpected failure (exit 1)
  */
 function cleanDist() {
-  fs.rmSync(DIST_DIR, { recursive: true, force: true });
+  const stats = fs.lstatSync(DIST_DIR, { throwIfNoEntry: false });
+  if (stats === undefined) {
+    return;
+  }
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    fs.rmSync(DIST_DIR, { recursive: true, force: true });
+    return;
+  }
+  for (const entry of fs.readdirSync(DIST_DIR)) {
+    if (entry !== VITE_OUTPUT_ENTRY) {
+      fs.rmSync(path.join(DIST_DIR, entry), { recursive: true, force: true });
+    }
+  }
 }
 
 /**
@@ -1783,9 +1858,11 @@ async function buildEmbedded(mode) {
 }
 
 /**
- * One complete, non-watch run. When the run removed `dist/` first and then
- * fails, `dist/` is removed again, so a failed build never leaves a partial
- * tree for `vite build`, `vsce` or the editor to pick up; under `--no-clean`
+ * One complete, non-watch run. Unless `--no-clean`, {@link cleanDist} first
+ * removes every entry of `dist/` except Vite's `dist/webview/`; when such a
+ * run then fails, it removes them again, so a failed build never leaves a
+ * partial tree of this script's outputs for `vite build`, `vsce` or the editor
+ * to pick up, while the webview Vite built stays in place. Under `--no-clean`
  * the existing tree is the caller's to keep.
  *
  * @param {CliOptions} options

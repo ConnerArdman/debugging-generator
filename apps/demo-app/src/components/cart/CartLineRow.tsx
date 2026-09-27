@@ -29,9 +29,9 @@
  * `pending` is this row's own report that this row's mutation is in flight, deliberately not the
  * context's `syncStatus`, which is global to the cart and cannot say which line is changing. It
  * dims the row through `data-busy`, announces itself through `aria-busy`, holds the stepper with
- * its `busy` prop - which writes `disabled` on the stepper's two buttons and its field - and holds
- * the remove button with `aria-disabled`, for the focus reason given at that button, so those four
- * states cannot drift apart. It covers the request for the whole life of that request: it is set
+ * its `busy` prop - which writes `aria-disabled` on the stepper's two buttons and makes its field
+ * read-only, keeping all three focusable - and holds the remove button with `aria-disabled`, for
+ * the focus reason given at that button, so those four states cannot drift apart. It covers the request for the whole life of that request: it is set
  * before the call goes out and cleared in `finally` once the provider has settled, whether the
  * cart came back changed or the write was refused, so no failure can strand the row in a busy
  * state it has no way out of.
@@ -45,12 +45,13 @@
  * answers 404 because the first has already removed it. A ref is written the instant the first
  * press is handled, so the second sees the latch whatever React has or has not committed by then.
  *
- * `pending` and the attributes it drives - `disabled` inside the stepper, `aria-disabled` on the
- * remove button - are presentation on top of that: they dim the row, hold the controls and say
- * why, and they are the only thing a shopper can see. They are kept because a held control is the
- * right feedback for a press that will do nothing, not because the guarantee rests on them - React
- * writes both attributes at commit, tens of milliseconds after the press, and a double-click
- * inside that window is an ordinary thing for a mouse to produce.
+ * `pending` and the attributes it drives - `aria-disabled` inside the stepper and on the remove
+ * button - are presentation on top of that: they dim the row, hold the controls and say why, and
+ * they are the only thing a shopper can see. They are kept because a held control is the right
+ * feedback for a press that will do nothing, not because the guarantee rests on them - React
+ * writes the attributes at commit, tens of milliseconds after the press, and a double-click
+ * inside that window is an ordinary thing for a mouse to produce. None of them is the native
+ * `disabled`, because every one of them lands on a control the shopper may be focused on.
  *
  * WHY THERE IS NO STOCK BADGE
  * `.meta` was drawn wide enough for an availability chip beside the unit price, and the cart's own
@@ -75,10 +76,11 @@
  * focus when that happens - so unless focus is moved first it lands on `<body>`, outside the
  * drawer's `aria-modal` dialog, and a keyboard shopper's next Tab starts from the top of the
  * document. The row therefore resolves a landing place before the mutation goes out and focuses it
- * once the removal has been applied: the next row's remove control, the previous row's, or the
- * enclosing dialog when the list has emptied. `focusTargetForRemoval` below states the rule and
- * the one case that must not move focus at all - a removal provoked while focus sits somewhere
- * else entirely.
+ * once the removal has been applied: the next row's remove control, the previous row's, the
+ * enclosing dialog when the list has emptied inside the drawer, or the list's own root - the
+ * named, programmatically focusable group `./CartLineList.tsx` renders in every state - when it
+ * has emptied on a page. `focusTargetForRemoval` below states the rule and the one case that must
+ * not move focus at all - a removal provoked while focus sits somewhere else entirely.
  *
  * WHAT IT HOLDS
  * Beyond the two context reads at the top of the component - the cart and the toast centre - the
@@ -179,10 +181,23 @@ const REMOVE_CONTROL_SELECTOR = '[data-line-remove]';
  *
  * The drawer's sheet carries `role="dialog"` and `tabIndex={-1}`, so it can hold focus itself; it
  * is the right landing place when a removal empties the list and there is no neighbouring row to
- * move to. On `/cart` and on the checkout review there is no such ancestor, and that is a state
- * with a meaning of its own rather than a gap - see {@link focusTargetForRemoval}.
+ * move to. On `/cart` and on the checkout review there is no such ancestor, which is what the next
+ * selector is for - see {@link focusTargetForRemoval}.
  */
 const DIALOG_SELECTOR = '[role="dialog"]';
+
+/**
+ * The collection this row is listed in: the root `./CartLineList.tsx` renders around its `<ul>`,
+ * which is a named group with `tabIndex={-1}` so it can hold focus itself, and which is rendered in
+ * every state the collection can be in - lines, placeholders, failure notice or the empty block.
+ *
+ * It is the landing place when a removal empties the list on a page, where there is no dialog to
+ * fall back to and the emptied list leaves no control behind: without it, focus would stay on the
+ * removed button and fall to `<body>` with it. The attribute is written by that file and read only
+ * here; the two spellings are kept in step by hand, exactly as `REMOVE_CONTROL_SELECTOR` is within
+ * this file.
+ */
+const CART_LINES_SELECTOR = '[data-cart-lines]';
 
 /**
  * The thumbnail's intrinsic width and height in pixels, written as attributes so the browser
@@ -222,10 +237,11 @@ function cartFailureNotice(title: string, cause: unknown): ToastInput {
  *
  * The order of preference is the one a list gives: the next row's remove control, so repeated
  * removals walk down the list the way repeated presses of the same button would; the previous row's
- * when the removed row was last; and the enclosing dialog when the row was the only one left. On a
- * page there is no dialog to fall back to, and an emptied list has no control left to hold focus:
- * the answer is `null`, because inventing a tab stop for a list that no longer exists is worse than
- * letting the browser put focus where it puts it.
+ * when the removed row was last; the enclosing dialog when the row was the only one left inside the
+ * drawer; and, on a page, the collection's own root, which survives the removal as the group that
+ * now holds the empty block. That root is focusable only programmatically, so no tab stop is
+ * invented - it is a landing place, and the next Tab continues from it into the rest of the page.
+ * `null` is left for a row rendered outside any such collection, where there is nothing to name.
  *
  * It must be called BEFORE the mutation goes out, while the row and its siblings are still in the
  * document. The element it answers is a surviving sibling (the list keys rows by line id, so the
@@ -247,7 +263,8 @@ function focusTargetForRemoval(row: HTMLLIElement | null): HTMLElement | null {
   return (
     row.nextElementSibling?.querySelector<HTMLElement>(REMOVE_CONTROL_SELECTOR) ??
     row.previousElementSibling?.querySelector<HTMLElement>(REMOVE_CONTROL_SELECTOR) ??
-    row.closest<HTMLElement>(DIALOG_SELECTOR)
+    row.closest<HTMLElement>(DIALOG_SELECTOR) ??
+    row.closest<HTMLElement>(CART_LINES_SELECTOR)
   );
 }
 

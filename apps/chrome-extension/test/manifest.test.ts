@@ -7,9 +7,10 @@
  * Why the built file and not the authored one: the manifest a developer loads
  * unpacked, and the one the Playwright suites pass to `--load-extension`, is the
  * artefact - and the build is where the contract can silently break. crxjs
- * rewrites every source path it bundles, re-bundles anything named `*.iife.js`
- * unless the post-build hook keeps it out of its hands, and owns the order in
- * which it re-emits `content_scripts`. This spec is the load-order guard for the
+ * rewrites every source path it bundles and re-bundles anything named
+ * `*.iife.js` unless the build keeps it out of its hands; `../vite.config.ts`
+ * builds the bridge itself, outside crxjs, and re-assembles `content_scripts`
+ * from the authored order. This spec is the load-order guard for the
  * whole extension: if the two content-script entries swap, lose
  * `world: "MAIN"`, lose `run_at: "document_start"`, or if the pre-built agent
  * path is rewritten, the React DevTools hook is no longer installed before
@@ -98,8 +99,10 @@ const ICON_SIZES = ['16', '32', '48', '128'] as const;
  * `options_ui` is the other spelling of the options surface, and
  * `optional_permissions` / `optional_host_permissions` would let the extension
  * request at run time what the exact permission assertions below forbid.
- * `web_accessible_resources` is not listed: crxjs may add an entry for a bundled
- * chunk, which `manifest.config.ts` explicitly leaves to it.
+ * `web_accessible_resources` is not listed: crxjs may add an entry for a chunk
+ * it bundles. It bundles no content script today - the bridge is a
+ * self-contained IIFE `vite.config.ts` builds itself - but that key is crxjs's
+ * to manage, not a surface `manifest.config.ts` authors.
  */
 const UNDECLARED_SURFACES = [
   'action',
@@ -636,7 +639,7 @@ describe('Debug Generator extension build (dist/manifest.json)', () => {
       expect(
         files.length === 1 && /(?:^|\/)bridge[^/]*\.js$/.test(files[0] ?? ''),
         'content_scripts[1].js must name exactly one emitted bridge*.js bundle, built by ' +
-          `@crxjs/vite-plugin from src/content/bridge.ts (declared: [${files.join(', ')}])`,
+          `vite.config.ts from src/content/bridge.ts (declared: [${files.join(', ')}])`,
       ).toBe(true);
     });
 

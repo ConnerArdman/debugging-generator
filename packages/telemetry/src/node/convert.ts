@@ -511,6 +511,19 @@ const CANONICAL = Object.freeze({
 } as const);
 
 /**
+ * The current database semantic convention's row count, the key a database
+ * span reports how many rows its statement returned or affected under.
+ *
+ * Exported because two files have to agree on it: `register.ts` *writes* it,
+ * from the driver's own result in the `pg` instrumentation's `responseHook`
+ * (the pinned instrumentation records no count itself), and
+ * {@link ATTRIBUTE_KEY_TRANSLATIONS} *reads* it into the product's
+ * `db.rowCount`. A count of rows, never a row: nothing about a row's content
+ * travels under it.
+ */
+export const DRIVER_ROW_COUNT_ATTRIBUTE = 'db.response.returned_rows';
+
+/**
  * Incoming attribute spelling → canonical product spelling, in precedence
  * order.
  *
@@ -526,11 +539,16 @@ const CANONICAL = Object.freeze({
  *   the host process may use.
  * - `http.target` — the framework's request span carries the request URL here.
  * - `http.url` — the framework's outgoing-fetch span carries the target here.
- * - `db.system.name`, `db.query.text`, `db.operation.name`, `db.namespace`,
- *   `db.response.returned_rows` — the current database semantic conventions,
- *   which the pinned driver instrumentation emits. The product has no newer
- *   equivalent of `db.rowCount` at all, which is one reason the older
- *   spellings are the canonical ones.
+ * - `db.system.name`, `db.query.text`, `db.operation.name`, `db.namespace` —
+ *   the current database semantic conventions, which the pinned instrumentations
+ *   may emit.
+ * - `db.response.returned_rows` ({@link DRIVER_ROW_COUNT_ATTRIBUTE}) — the
+ *   current convention's row count. The pinned driver instrumentation
+ *   (`@opentelemetry/instrumentation-pg` 0.74.0) records **no** row count of its
+ *   own, so `register.ts` sets this key from the driver's result in the
+ *   instrumentation's `responseHook`; the alias is what turns it into
+ *   `db.rowCount`. The product has no newer equivalent of `db.rowCount` at all,
+ *   which is one reason the older spellings are the canonical ones.
  *
  * Ordering is the precedence: an alias is applied only when its canonical key
  * is still unset, so a span carrying both a canonical key and an alias keeps
@@ -553,7 +571,7 @@ export const ATTRIBUTE_KEY_TRANSLATIONS: readonly (readonly [string, string])[] 
   ['db.query.text', CANONICAL.dbStatement],
   ['db.operation.name', CANONICAL.dbOperation],
   ['db.namespace', CANONICAL.dbName],
-  ['db.response.returned_rows', CANONICAL.dbRowCount],
+  [DRIVER_ROW_COUNT_ATTRIBUTE, CANONICAL.dbRowCount],
 ] as const);
 
 /**
@@ -1296,19 +1314,31 @@ function classifyFrameworkSpan(
  * A span that reaches the end of that list is internal framework machinery
  * with no error to report — the render, component-tree, page-module and
  * response-writing spans, of which a single page request produces many. The
- * AAP prefers skipping pure framework noise over flooding the store, and
- * skipping is safe because the framework does not break its context chain for
- * the spans it never delegates: the operations this product reasons about —
- * request, route handler, named function, query, outgoing request — nest
- * directly under one another. Where an intermediate span *is* skipped, the
- * event underneath it names a parent that never arrived, and the correlator
- * attaches it to the trace root flagged `orphaned` rather than dropping it
- * (AAP §0.4.2), so its work still counts towards every duration in the
- * capture. Nothing is dropped on the basis of its trace, and an event's
- * `traceId` is never rewritten: it is the only thing that joins a click to the
- * queries it caused.
+ * AAP prefers skipping pure framework noise over flooding the store.
  *
- * Never throws: a span of any shape is answered, `null` at worst.
+ * Skipping a span must not orphan what ran inside it, and in the default
+ * configuration nothing is orphaned only because the framework delegates just
+ * its allowlisted spans, which nest directly under one another. That is not a
+ * guarantee: with `NEXT_OTEL_VERBOSE=1` the framework delegates *every* span,
+ * so the request span sits under request-handler spans and the route handler
+ * under four render and response spans, all of them skipped here. The parent
+ * an event names is therefore the processor's to settle: `./exporter.ts`
+ * classifies each span as it **starts** — every fact this function reads
+ * except the status is present by then — remembers the nearest emitted
+ * ancestor of each span it will not emit, and hands that ancestor to
+ * {@link spanToIngressEvent} as {@link ConvertContext.parentSpanId}. The tree
+ * the correlator builds is then the same with or without the verbose flag.
+ * Only a parent the producer could not see at all — one that ended in another
+ * process, or outlived the processor's bounded memory of skipped spans — still
+ * reaches the correlator as a missing parent, which attaches the event to the
+ * trace root flagged `orphaned` rather than dropping it (AAP §0.4.2), so its
+ * work still counts towards every duration in the capture. Nothing is dropped
+ * on the basis of its trace, and an event's `traceId` is never rewritten: it is
+ * the only thing that joins a click to the queries it caused.
+ *
+ * Never throws: a span of any shape is answered, `null` at worst. Safe to call
+ * on a span that has not ended yet, which is what the processor's start-time
+ * classification relies on.
  *
  * @param span A finished span from the host process's span pipeline.
  * @returns The kind and tier to emit it as, or `null` to skip it.
@@ -1777,12 +1807,57 @@ function fillIfAbsent(
 }
 
 /**
+ * The part of {@link ConvertContext} that shapes attributes rather than
+ * identity: what the processor learned about a span from its relatives.
+ */
+type ConvertHints = Pick<ConvertContext, 'routeHint' | 'inheritedRowCount'>;
+
+/**
+ * The longest route a {@link ConvertContext.routeHint} may name.
+ *
+ * A route is a file-system pattern (`/[segment]/…`), not captured data, but
+ * the hint crosses from one span to another inside the processor and is bounded
+ * like any other label that ends up in an event name.
+ */
+export const MAX_ROUTE_HINT_LENGTH = 512;
+
+/**
+ * A route hint fit to label a request span, or `undefined`.
+ *
+ * Accepted only in the shape the framework writes a route in — an absolute,
+ * whitespace-free path pattern — so a hint can never smuggle a query string,
+ * a URL with credentials or free text into the event's name.
+ */
+function acceptRouteHint(hint: unknown): string | undefined {
+  if (typeof hint !== 'string' || hint.length === 0 || hint.length > MAX_ROUTE_HINT_LENGTH) {
+    return undefined;
+  }
+  if (!hint.startsWith('/') || /[\s?#]/u.test(hint)) {
+    return undefined;
+  }
+  return hint;
+}
+
+/** A row count fit to record: a non-negative safe integer, or `undefined`. */
+function acceptRowCount(count: unknown): number | undefined {
+  return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : undefined;
+}
+
+/**
  * Pass C: the values this file owes a kind that no instrumentation reports.
  *
  * - `http.route` and `next.route` are filled from each other. The framework
  *   sets both on a request span but only its own spelling on a handler span,
  *   and both are keys the product declares for those kinds, so a consumer that
- *   reads either one finds a route.
+ *   reads either one finds a route. A request span that resolved no route at
+ *   all — the framework renames and labels its request span only when that
+ *   span is the root of the request's work, which `NEXT_OTEL_VERBOSE=1` breaks
+ *   by opening framework spans above it — takes the route its own route
+ *   handler reported ({@link ConvertContext.routeHint}), so the request still
+ *   reads `<METHOD> <route>` rather than a bare method.
+ * - `db.rowCount` is filled from {@link ConvertContext.inheritedRowCount} on a
+ *   database span that reports none of its own: the ORM's statement span, whose
+ *   count only the driver span nested inside it observed.
  * - `db.client` and `db.operation` are derived from the scope and the span
  *   name (see their own documentation).
  * - `error.type`, `error.message` and `error.stack` come from a recorded
@@ -1802,16 +1877,25 @@ function applyDerivedAttributes(
   kind: TelemetryKind,
   facts: SpanFacts,
   result: Record<string, unknown>,
+  hints: ConvertHints,
 ): void {
   if (kind === 'http.server' || kind === 'route.handler') {
     fillIfAbsent(result, CANONICAL.httpRoute, readStringAttribute(result, CANONICAL.nextRoute));
     fillIfAbsent(result, CANONICAL.nextRoute, readStringAttribute(result, CANONICAL.httpRoute));
+    // Only when the request span resolved no route of its own: the framework's
+    // own value always wins over what a descendant reported.
+    if (kind === 'http.server') {
+      const hint = acceptRouteHint(hints.routeHint);
+      fillIfAbsent(result, CANONICAL.httpRoute, hint);
+      fillIfAbsent(result, CANONICAL.nextRoute, hint);
+    }
     return;
   }
 
   if (kind === 'db.query') {
     fillIfAbsent(result, CANONICAL.dbClient, deriveDbClient(facts));
     fillIfAbsent(result, CANONICAL.dbOperation, deriveDbOperation(facts));
+    fillIfAbsent(result, CANONICAL.dbRowCount, acceptRowCount(hints.inheritedRowCount));
     return;
   }
 
@@ -1862,12 +1946,14 @@ function applyDerivedAttributes(
  *
  * @param consumeSourceKeys Whether {@link SOURCE_ONLY_ATTRIBUTE_KEYS} were
  * taken into a validated `source` and must therefore not travel here as well.
+ * @param hints What the processor learned about the span from its relatives.
  */
 function buildAttributes(
   span: ReadableSpan,
   kind: TelemetryKind,
   facts: SpanFacts,
   consumeSourceKeys: boolean,
+  hints: ConvertHints,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
 
@@ -1900,7 +1986,7 @@ function buildAttributes(
   }
 
   // Pass C - the derivations.
-  applyDerivedAttributes(span, kind, facts, result);
+  applyDerivedAttributes(span, kind, facts, result, hints);
 
   // Pass D - bounded, gated pass-through of everything left.
   let emitted = Object.keys(result).length;
@@ -2068,6 +2154,34 @@ function deriveFunctionSource(
  */
 
 /**
+ * The path of a request span's target, without its query or fragment, or
+ * `undefined`.
+ *
+ * Read from the canonical `url` key, which carries the framework's
+ * `http.target` — an origin-relative target such as `/path?key=value` — or an
+ * absolute URL from another instrumentation. Only the path survives: query
+ * values are captured data (AAP §0.5.2), and a name is a label rather than
+ * evidence.
+ */
+function readRequestPath(attributes: Readonly<Record<string, unknown>>): string | undefined {
+  const target = readStringAttribute(attributes, CANONICAL.url);
+  if (target === undefined) {
+    return undefined;
+  }
+  let path = target;
+  if (!target.startsWith('/')) {
+    try {
+      path = new URL(target).pathname;
+    } catch {
+      return undefined;
+    }
+  }
+  const end = path.search(/[?#]/u);
+  const bare = end === -1 ? path : path.slice(0, end);
+  return bare.startsWith('/') && bare.length <= MAX_ROUTE_HINT_LENGTH ? bare : undefined;
+}
+
+/**
  * The short, human-meaningful label a timeline row, a table cell and the event
  * log show.
  *
@@ -2092,6 +2206,10 @@ function deriveFunctionSource(
  *
  * Returns `''` when a span carries nothing usable; the caller substitutes the
  * kind, so an event always satisfies the schema's non-empty `name`.
+ *
+ * A request span with no route at all falls back to its request *path*
+ * ({@link readRequestPath}) — never the query, whose values are captured data —
+ * so even then it reads `<METHOD> <path>` rather than a bare method.
  */
 function deriveName(
   kind: TelemetryKind,
@@ -2099,17 +2217,26 @@ function deriveName(
   attributes: Readonly<Record<string, unknown>>,
 ): string {
   if (kind === 'http.server') {
-    if (facts.name.length > 0 && facts.name !== NEXT_SPAN_TYPES.request) {
+    const method = readStringAttribute(attributes, CANONICAL.httpMethod);
+    // The framework opens its request span named after the method alone and
+    // renames it `<METHOD> <route>` once the route resolves — but only when
+    // that span is the root of the request's work. A bare method is therefore
+    // as unlabelled as the span type, and is composed like one.
+    const labelled =
+      facts.name.length > 0 &&
+      facts.name !== NEXT_SPAN_TYPES.request &&
+      (method === undefined || facts.name !== method);
+    if (labelled) {
       return facts.name;
     }
-    const method = readStringAttribute(attributes, CANONICAL.httpMethod);
-    const route =
+    const target =
       readStringAttribute(attributes, CANONICAL.httpRoute) ??
-      readStringAttribute(attributes, CANONICAL.nextRoute);
+      readStringAttribute(attributes, CANONICAL.nextRoute) ??
+      readRequestPath(attributes);
     if (method !== undefined) {
-      return route === undefined ? method : `${method} ${route}`;
+      return target === undefined ? method : `${method} ${target}`;
     }
-    return route ?? facts.name;
+    return target ?? facts.name;
   }
 
   if (kind === 'db.query') {
@@ -2465,6 +2592,148 @@ export interface ConvertContext {
    * owns one per test to keep one case's numbering out of another's.
    */
   readonly seq?: SeqAllocator | undefined;
+
+  /**
+   * The parent to record in place of the span's own, or absent to record the
+   * span's own.
+   *
+   * Supplied by `./exporter.ts` when the span's recorded parent is a span this
+   * producer will **never** emit — a framework-internal span
+   * {@link classifySpan} skips, or one the capture's signals refuse — so the
+   * event names the nearest ancestor that *is* emitted instead of a parent
+   * that never arrives (which the correlator could only attach to the trace
+   * root as an orphan). `null` records the span as a trace root: every
+   * ancestor it had is one this producer drops. A value that is not a usable
+   * span id, or that names the span itself, is ignored and the span's own
+   * parent is recorded.
+   */
+  readonly parentSpanId?: string | null | undefined;
+
+  /**
+   * The route a request span's own route handler reported, used on an
+   * `http.server` span that resolved no route of its own. Ignored for every
+   * other kind, and ignored unless it is an absolute path pattern.
+   */
+  readonly routeHint?: string | undefined;
+
+  /**
+   * The row count a nested execution of the same statement reported, recorded
+   * as `db.rowCount` on a `db.query` span that reported none itself. Ignored
+   * for every other kind, and unless it is a non-negative safe integer.
+   */
+  readonly inheritedRowCount?: number | undefined;
+}
+
+/**
+ * A span's own id and the id of the parent it recorded — the two facts the
+ * processor's ancestry bookkeeping needs at both ends of a span's life.
+ */
+export interface SpanLineage {
+  /** The span's id: 16 lower-case hex characters, never all zeros. */
+  readonly spanId: string;
+  /** The recorded parent's id, or `undefined` for a trace root. */
+  readonly parentSpanId: string | undefined;
+}
+
+/**
+ * The span's lineage, or `null` when it has no usable span id.
+ *
+ * Reads the same fields, with the same validation, as the event
+ * {@link spanToIngressEvent} would emit, so the processor's bookkeeping and the
+ * event can never disagree about who a span is. Works on a span that has not
+ * ended. Never throws.
+ */
+export function readSpanLineage(span: ReadableSpan): SpanLineage | null {
+  try {
+    const ids = readSpanContextIds(span);
+    if (ids === null) {
+      return null;
+    }
+    return { spanId: ids.spanId, parentSpanId: readParentSpanId(span, ids.spanId) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One statement execution as a database span reports it: the statement text
+ * and the row count, read from whichever spelling the instrumentation used.
+ */
+export interface StatementExecution {
+  /** The statement text, exactly as the span carries it. */
+  readonly statement: string;
+  /** The rows it returned or affected, when the span reported a count. */
+  readonly rowCount: number | undefined;
+}
+
+/**
+ * The statement execution a database span reports, or `null` for a span that
+ * carries no statement (lifecycle work such as a connect, or any other kind).
+ *
+ * Used by `./exporter.ts` to carry a driver span's row count onto the ORM span
+ * that contains it: both observed one execution, the queries aggregate keeps
+ * the outer observation, and only the inner one saw the count. The statement
+ * is compared, never emitted, from here. Never throws.
+ */
+export function readStatementExecution(span: ReadableSpan): StatementExecution | null {
+  try {
+    const attributes = readAttributes(span);
+    const statement =
+      readStringAttribute(attributes, CANONICAL.dbStatement) ??
+      readStringAttribute(attributes, 'db.query.text');
+    if (statement === undefined) {
+      return null;
+    }
+    const rowCount =
+      acceptRowCount(attributes[CANONICAL.dbRowCount]) ??
+      acceptRowCount(attributes[DRIVER_ROW_COUNT_ATTRIBUTE]);
+    return { statement, rowCount };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The route a route-handler span reports, or `undefined`.
+ *
+ * The framework labels its handler span with `next.route` (and a
+ * third-party handler instrumentation with `http.route`); `./exporter.ts`
+ * hands it to the request span above the handler as a
+ * {@link ConvertContext.routeHint}. Never throws.
+ */
+export function readHandlerRoute(span: ReadableSpan): string | undefined {
+  try {
+    const attributes = readAttributes(span);
+    return acceptRouteHint(
+      readStringAttribute(attributes, CANONICAL.nextRoute) ??
+        readStringAttribute(attributes, CANONICAL.httpRoute),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The parent an event records: the processor's override where it supplied a
+ * usable one, the span's own otherwise.
+ */
+function resolveParentSpanId(
+  span: ReadableSpan,
+  spanId: string,
+  override: string | null | undefined,
+): string | undefined {
+  if (override === null) {
+    return undefined;
+  }
+  if (
+    typeof override === 'string' &&
+    isSpanId(override) &&
+    override !== ALL_ZERO_SPAN_ID &&
+    override !== spanId
+  ) {
+    return override;
+  }
+  return readParentSpanId(span, spanId);
 }
 
 /**
@@ -2538,9 +2807,12 @@ export function spanToIngressEvent(
     // consumes the three metadata keys it was built from, and one that did not
     // leaves them visible as ordinary attributes.
     const source = deriveFunctionSource(kind, facts.attributes);
-    const attributes = buildAttributes(span, kind, facts, source !== undefined);
+    const attributes = buildAttributes(span, kind, facts, source !== undefined, {
+      routeHint: context?.routeHint,
+      inheritedRowCount: context?.inheritedRowCount,
+    });
     const derivedName = deriveName(kind, facts, attributes);
-    const parentSpanId = readParentSpanId(span, ids.spanId);
+    const parentSpanId = resolveParentSpanId(span, ids.spanId, context?.parentSpanId);
     const allocator = context?.seq ?? processSeqAllocator;
     // One value, used twice: the id stamped on the event is the id its sequence
     // is scoped to, so the two can never describe different producers.

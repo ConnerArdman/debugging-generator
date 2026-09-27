@@ -1022,8 +1022,8 @@ export interface CodeQueries {
    *
    * Bound: {@link CodeQueryLimits.maxCallers}, lowerable per call. When the
    * answer is capped the result holds exactly that many entries and the drop is
-   * logged at `debug`; a caller that needs to know whether more exist asks for
-   * one more than it can use.
+   * logged at `trace` (see {@link CodeQueryOptions.logger}); a caller that needs
+   * to know whether more exist asks for one more than it can use.
    *
    * @param target A symbol name, or a `{ file, symbol }` pair to disambiguate
    * it.
@@ -1240,6 +1240,21 @@ export interface CodeQueryOptions {
    * Defaults to `noopLogger`. Names, paths, route paths and counts are logged;
    * **source text never is**, because an excerpt is prompt material and a log
    * line is not the place to copy it.
+   *
+   * Records are levelled by how often they can fire, because one surface
+   * serves every session of a project and its callers — source resolution at
+   * ingest, the instrumentation adapters while planning — run queries in
+   * loops, one per candidate:
+   *
+   * - `trace` for the ordinary outcome of a well-formed query answered
+   *   inside its bounds — a `pathBetween` miss, a capped `whoCalls` or
+   *   `handlersFor` answer, an endpoint selector clamped to the result limit.
+   *   These fire once per query, so at `debug` they would drown every other
+   *   record; the caller that owns the session aggregates them instead.
+   * - `debug` for what indicates a defect in a caller or in the data: a
+   *   refused argument, a node whose file is not a safe project-relative path,
+   *   a failing reference resolver, an excerpt that cannot be served, and the
+   *   one-off derivation of the route map.
    */
   readonly logger?: Logger | undefined;
 }
@@ -2772,7 +2787,8 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
       return Object.freeze(ordered);
     }
 
-    logger.debug('whoCalls result was capped', { found: ordered.length, limit });
+    // A bounded answer, not a defect: `trace`, per CodeQueryOptions.logger.
+    logger.trace('whoCalls result was capped', { found: ordered.length, limit });
     return Object.freeze(ordered.slice(0, limit));
   };
 
@@ -2852,7 +2868,8 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
 
     for (const method of route.methods) {
       if (handlers.length >= limits.maxResults) {
-        logger.debug('handlersFor result was capped', {
+        // A bounded answer, not a defect: `trace`, per CodeQueryOptions.logger.
+        logger.trace('handlersFor result was capped', {
           routePath: route.routePath,
           limit: limits.maxResults,
         });
@@ -3006,7 +3023,9 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
       return matched;
     }
 
-    logger.debug('endpoint selector matched more nodes than the limit', {
+    // A broad selector such as `{ kind: 'db-call' }` clamps on every call that
+    // names it, so this is `trace`, per CodeQueryOptions.logger.
+    logger.trace('endpoint selector matched more nodes than the limit', {
       matched: matched.length,
       limit: limits.maxResults,
     });
@@ -3195,7 +3214,11 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
       }
     }
 
-    logger.debug('pathBetween found no path within the bounds', {
+    // A miss is the common answer — callers probe candidate after candidate —
+    // and it reaches this project-scoped logger with no session or stage, so it
+    // is `trace`, per CodeQueryOptions.logger. The investigation's code-tool
+    // records, which are session-bound, count the searches and the hits.
+    logger.trace('pathBetween found no path within the bounds', {
       direction,
       maxDepth,
       maxNodes,

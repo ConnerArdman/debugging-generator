@@ -95,6 +95,7 @@
  * | `dg-split--gap-0` … `dg-split--gap-7`                               | variant: the space step between panes, one class per step      |
  * | `dg-split--align-start`, `-center`, `-end`, `-stretch`, `-baseline` | variant: cross-axis alignment of the panes                     |
  * | `dg-split--collapse`                                                | variant: the panes may fall into a single column when narrow   |
+ * | `dg-split--drawer`                                                  | variant: the last of two or more panes floats as a right drawer |
  *
  * And one component-scoped custom property:
  *
@@ -123,6 +124,31 @@
  * must degrade a horizontal division to a single column at narrow widths. The
  * global utilities a caller may pair with this component are declared once in
  * `../styles/base.css` and are reused, never redefined here.
+ *
+ * ## The drawer division
+ *
+ * {@link SplitProps.drawer} turns a division into a body and a drawer: the
+ * first pane is the body, and the last pane — only when there are at least two
+ * — is taken out of the line and floats over the inline end of the viewport as
+ * a full-height overlay with a scroll range of its own. That is the "right
+ * drawer" of AAP 0.7.3, and it is a division rather than a new primitive
+ * because the drawer is read against the body beside it, exactly as panes are.
+ *
+ * Floating rather than sharing the line is the point. A drawer that took its
+ * share of the line would narrow the body the moment it opened, re-wrapping
+ * everything in it and moving the very row the developer just selected; and a
+ * drawer at the top of an in-flow pane is as far from a row deep in a long
+ * body as the body is tall, so moving focus into it would scroll the document
+ * back to the top. A floating drawer does neither: the body keeps its width
+ * and its scroll position, and the drawer is in the viewport wherever the
+ * developer has scrolled to. It is as wide as one weighted pane basis
+ * (`--dg-split-pane-basis` × `--dgc-split-weight`), never wider than the
+ * viewport, so on a docked panel too narrow for both it covers the body until
+ * it is closed — the division's collapse, stated for an overlay. The overlay
+ * is non-modal: nothing behind it is made inert here, and closing it is the
+ * caller's control. While the drawer division holds a single pane that pane
+ * is simply the body, so a caller renders its drawer pane only while there is
+ * something to show and keeps the same division mounted either way.
  *
  * ## Naming a division, and when not to
  *
@@ -169,6 +195,14 @@
  * <Split weights={[2, 1]} align="start">
  *   {chart}
  *   {legend}
+ * </Split>
+ * ```
+ *
+ * @example A body with a right drawer that floats over it while open
+ * ```tsx
+ * <Split drawer align="start">
+ *   {body}
+ *   {selected === undefined ? null : <aside aria-label={drawerLabel}>{details}</aside>}
  * </Split>
  * ```
  *
@@ -452,6 +486,23 @@ export interface SplitProps {
   collapse?: boolean | undefined;
 
   /**
+   * Make the division a body and a right drawer (see the module note on the
+   * drawer division): the first pane keeps the whole line, and the last pane,
+   * when there are at least two, floats over the inline end of the viewport at
+   * full height with its own scroll range, one weighted pane basis wide and
+   * never wider than the viewport. Its entry in {@link SplitProps.weights}, if
+   * any, scales that width. With a single pane nothing floats, so a caller
+   * keeps the division mounted and renders the drawer pane only while it is
+   * open.
+   *
+   * Only meaningful for a horizontal division: a vertical one never emits the
+   * variant.
+   *
+   * @default false
+   */
+  drawer?: boolean | undefined;
+
+  /**
    * An optional heading for the division. Supplying it turns the container into
    * a labelled region (see the module note on naming a division); omitting it
    * leaves a plain, unnamed container. Absent, empty and whitespace-only are
@@ -527,6 +578,7 @@ export function Split(props: SplitProps): ReactElement {
     align = 'stretch',
     weights,
     collapse,
+    drawer = false,
     title,
     description,
     headingLevel = 3,
@@ -548,6 +600,9 @@ export function Split(props: SplitProps): ReactElement {
   // already a column, so it never carries the variant even if a caller asks for
   // it, and the stylesheet is spared a rule for a state that has no meaning.
   const collapses = direction === 'horizontal' && (collapse ?? true);
+  // The same ceiling for the drawer: a drawer floats beside the body at the
+  // inline end, which is an arrangement along the horizontal axis only.
+  const floatsDrawer = direction === 'horizontal' && drawer;
 
   const classes = clsx(
     'dg-split',
@@ -555,6 +610,7 @@ export function Split(props: SplitProps): ReactElement {
     GAP_CLASS[gap],
     ALIGN_CLASS[align],
     collapses && 'dg-split--collapse',
+    floatsDrawer && 'dg-split--drawer',
     className,
   );
 

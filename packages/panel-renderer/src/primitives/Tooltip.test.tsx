@@ -10,14 +10,28 @@
  * wrapper (no portal), it stays mounted - described, hidden - while closed, and Escape closes it
  * without moving focus.
  *
- * The controlled mode (`open`, `describesTrigger`) is pinned last: an owner-held bubble is placed
+ * The controlled mode (`open`, `describesTrigger`) is pinned next: an owner-held bubble is placed
  * by the same measurement, hover, focus and Escape are left to the owner, and handing control
  * back resumes the uncontrolled mode closed.
  *
- * happy-dom performs no layout, so every rect, the viewport size and the bubble's computed margin
- * and direction are stubbed; what is asserted is the arithmetic and the DOM contract, and the
- * rendered geometry is verified in a real browser separately.
+ * Last, the hoverable bubble (WCAG 1.4.13): only a bubble whose description overflows its capped
+ * box is marked `data-dg-scrollable` - measured on every placement, cleared on close - and only
+ * that bubble takes the pointer; any other lets it through, so leaving the trigger closes it at
+ * once and a neighbouring trigger's description opens in its turn. A pointer leaving the trigger
+ * of a marked bubble keeps it open only while it stays inside the corridor between the trigger's
+ * box and the bubble's box - judged again on every move and every scroll - while a touch pointer,
+ * a pointer leaving the window and a bubble with no box close it at once. A click inside the
+ * bubble never reaches the row around the trigger, and the stylesheet bounds the open bubble's
+ * block size, scrolls its overflow and lets exactly the marked bubble take the pointer.
+ *
+ * happy-dom performs no layout, so every rect, the viewport size, the bubble's scroll extent and
+ * its computed margin and direction are stubbed; what is asserted is the arithmetic and the DOM
+ * contract, and the rendered geometry is verified in a real browser separately.
  */
+
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -53,6 +67,12 @@ interface ComputedOverrides {
 /** The trigger rect the next measurement answers with; tests move it to simulate a scroll. */
 let triggerBox: Box = { left: 100, top: 200, width: 80, height: 20 };
 
+/**
+ * The bubble rect the next measurement answers with. Only its size matters to placement, so it
+ * sits at the origin by default; the hover-corridor cases put it where a top bubble opens.
+ */
+let bubbleBox: Box = { left: 0, top: 0, ...BUBBLE_SIZE };
+
 /** The computed style the next measurement answers with for the bubble. */
 let bubbleStyle: ComputedOverrides = {
   marginTop: `${String(-GAP)}px`,
@@ -60,6 +80,69 @@ let bubbleStyle: ComputedOverrides = {
   marginRight: '0px',
   direction: 'ltr',
 };
+
+/** What the open bubble's scroll box reports: its content's extent and its own, per axis. */
+interface ScrollExtent {
+  readonly scrollHeight: number;
+  readonly clientHeight: number;
+  readonly scrollWidth: number;
+  readonly clientWidth: number;
+}
+
+/** A description that fits the bubble's capped box on both axes. */
+const FITTING_EXTENT: ScrollExtent = {
+  scrollHeight: BUBBLE_SIZE.height,
+  clientHeight: BUBBLE_SIZE.height,
+  scrollWidth: BUBBLE_SIZE.width,
+  clientWidth: BUBBLE_SIZE.width,
+};
+
+/** A description taller than the bubble's capped box: the bubble must be scrolled to read it. */
+const OVERFLOWING_EXTENT: ScrollExtent = { ...FITTING_EXTENT, scrollHeight: 400 };
+
+/** The scroll extent the next measurement of a bubble answers with. */
+let bubbleExtent: ScrollExtent = FITTING_EXTENT;
+
+/** Puts back every scroll-extent accessor `stubBubbleExtent` replaced. */
+const extentRestorers: (() => void)[] = [];
+
+/**
+ * Answers one scroll-extent accessor from `bubbleExtent` for a tooltip bubble, and from the DOM's
+ * own accessor for every other element. The accessor is replaced where the DOM defines it - on
+ * whichever prototype of `HTMLElement` owns it - and put back after each test.
+ */
+function stubBubbleExtent(name: keyof ScrollExtent): void {
+  let owner: object | null = HTMLElement.prototype;
+  let inherited: PropertyDescriptor | undefined;
+
+  while (owner !== null && inherited === undefined) {
+    inherited = Object.getOwnPropertyDescriptor(owner, name);
+    if (inherited === undefined) {
+      owner = Object.getPrototypeOf(owner) as object | null;
+    }
+  }
+  if (owner === null || inherited === undefined) {
+    throw new Error(`the DOM defines no ${name} accessor to stub`);
+  }
+
+  const target = owner;
+  const saved = inherited;
+
+  Object.defineProperty(target, name, {
+    configurable: true,
+    get(this: Element): number {
+      if (this instanceof HTMLElement && this.classList.contains('dg-tooltip__bubble')) {
+        return bubbleExtent[name];
+      }
+      const value: unknown = saved.get?.call(this);
+
+      return typeof value === 'number' ? value : 0;
+    },
+  });
+  extentRestorers.push(() => {
+    Object.defineProperty(target, name, saved);
+  });
+}
 
 /** A DOMRect-shaped value for a box. */
 function toRect(box: Box): DOMRect {
@@ -133,7 +216,13 @@ function readCoordinates(bubble: HTMLElement): { block: number | null; inline: n
 
 beforeEach(() => {
   triggerBox = { left: 100, top: 200, width: 80, height: 20 };
+  bubbleBox = { left: 0, top: 0, ...BUBBLE_SIZE };
+  bubbleExtent = FITTING_EXTENT;
   bubbleStyle = { ...bubbleStyle, ...marginsFor('top'), marginRight: '0px', direction: 'ltr' };
+
+  for (const name of ['scrollHeight', 'clientHeight', 'scrollWidth', 'clientWidth'] as const) {
+    stubBubbleExtent(name);
+  }
 
   Object.defineProperty(document.documentElement, 'clientWidth', {
     configurable: true,
@@ -151,7 +240,7 @@ beforeEach(() => {
       return toRect(triggerBox);
     }
     if (this.classList.contains('dg-tooltip__bubble')) {
-      return toRect({ left: 0, top: 0, ...BUBBLE_SIZE });
+      return toRect(bubbleBox);
     }
     return toRect({ left: 0, top: 0, width: 0, height: 0 });
   });
@@ -194,6 +283,9 @@ afterEach(() => {
   vi.restoreAllMocks();
   Reflect.deleteProperty(document.documentElement, 'clientWidth');
   Reflect.deleteProperty(document.documentElement, 'clientHeight');
+  for (const restore of extentRestorers.splice(0).reverse()) {
+    restore();
+  }
 });
 
 describe('Tooltip fixed placement', () => {
@@ -296,6 +388,31 @@ describe('Tooltip fixed placement', () => {
       scroller.dispatchEvent(new Event('scroll'));
     });
     expect(readCoordinates(bubble)).toEqual({ block: null, inline: null });
+  });
+
+  it('lets a bubble leave with a trigger scrolled wholly out of the viewport, and holds it again on return', () => {
+    const { trigger, bubble } = renderTooltip('top');
+    const scroller = screen.getByTestId('scroller');
+
+    fireEvent.focus(trigger);
+    expect(readCoordinates(bubble).block).toBe(160);
+
+    // The trigger is now below the viewport's bottom edge (600). A clamped bubble would be pinned
+    // at 600 - 40 - 4 = 556 (published 560) over whatever the page scrolled in; instead it stays
+    // against its trigger, 700 - 4 - 40 = 656 (published 660), and leaves the screen with it.
+    triggerBox = { ...triggerBox, top: 700 };
+    act(() => {
+      scroller.dispatchEvent(new Event('scroll'));
+    });
+    expect(readCoordinates(bubble)).toEqual({ block: 660, inline: 100 });
+    expect(classesOf(bubble)).toContain('dg-is-open');
+
+    // Scrolled back into view, the bubble is placed and held on screen as before.
+    triggerBox = { ...triggerBox, top: 200 };
+    act(() => {
+      scroller.dispatchEvent(new Event('scroll'));
+    });
+    expect(readCoordinates(bubble)).toEqual({ block: 160, inline: 100 });
   });
 
   it('re-places the bubble on a viewport resize', () => {
@@ -599,5 +716,414 @@ describe('Tooltip controlled mode', () => {
     // One bubble per trigger in every mode, and the trigger is never remounted by the switch.
     expect(screen.getAllByRole('tooltip', { hidden: true })).toEqual([bubble]);
     expect(screen.getByRole('button', { name: 'Owned trigger' })).toBe(trigger);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The hoverable bubble (WCAG 1.4.13).
+ *
+ * A description longer than the bubble's bounded height is read - and scrolled
+ * - with the pointer ON the bubble, so a pointer travelling from the trigger to
+ * such a bubble must not close it on the way. The suite's bubble therefore
+ * overflows by default (OVERFLOWING_EXTENT); the cases that need a description
+ * which fits say so. The rects below put a `top` bubble where it opens: 4 px
+ * above the trigger (100, 200, 80 x 20), 120 x 40, so the gap between the two
+ * is the band y = 196..200 and the corridor is the hull of both boxes.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The mark an overflowing open bubble carries, and the only bubble that takes the pointer. */
+const SCROLLABLE_MARK = 'data-dg-scrollable';
+
+/** Where a `top` bubble opens above the stubbed trigger: 200 - 4 - 40 = 156. */
+const OPEN_TOP_BUBBLE: Box = { left: 100, top: 156, ...BUBBLE_SIZE };
+
+/** A point in the gap between the trigger's top edge and the bubble's bottom edge. */
+const IN_GAP = { clientX: 140, clientY: 198 } as const;
+
+/** A point on the bubble itself. */
+const ON_BUBBLE = { clientX: 150, clientY: 170 } as const;
+
+/** A point beside the trigger, outside the corridor in every direction. */
+const AWAY = { clientX: 500, clientY: 400 } as const;
+
+/** Opens the bubble by hover: the pointer enters and the dwell elapses. Needs fake timers. */
+function hoverOpen(trigger: HTMLElement): void {
+  fireEvent.pointerEnter(trigger, { pointerType: 'mouse' });
+  act(() => {
+    vi.advanceTimersByTime(10_000);
+  });
+}
+
+/** Whether the uncontrolled bubble is shown. */
+function isOpenBubble(bubble: HTMLElement): boolean {
+  return bubble.classList.contains('dg-is-open') && !bubble.hidden;
+}
+
+/** The declaration block of one selector in `../styles/components.css`. */
+function stylesheetRule(selector: string): string {
+  const stylesheet = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'styles', 'components.css'),
+    'utf8',
+  );
+  const start = stylesheet.indexOf(`\n${selector} {`);
+  expect(start, selector).toBeGreaterThanOrEqual(0);
+  const open = stylesheet.indexOf('{', start);
+
+  return stylesheet.slice(open + 1, stylesheet.indexOf('}', open));
+}
+
+describe('Tooltip hoverable bubble', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    bubbleBox = OPEN_TOP_BUBBLE;
+    bubbleExtent = OVERFLOWING_EXTENT;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('marks only a bubble whose description overflows, re-measured on every placement and cleared on close', () => {
+    bubbleExtent = FITTING_EXTENT;
+    const { trigger, bubble } = renderTooltip('top');
+    const scroller = screen.getByTestId('scroller');
+
+    // Closed, nothing is measured or marked.
+    expect(bubble.hasAttribute(SCROLLABLE_MARK)).toBe(false);
+
+    fireEvent.focus(trigger);
+    expect(isOpenBubble(bubble)).toBe(true);
+    expect(bubble.hasAttribute(SCROLLABLE_MARK), 'fits').toBe(false);
+
+    // Taller than its capped box: marked on the next placement a scroll makes.
+    bubbleExtent = OVERFLOWING_EXTENT;
+    act(() => {
+      scroller.dispatchEvent(new Event('scroll'));
+    });
+    expect(bubble.hasAttribute(SCROLLABLE_MARK), 'taller').toBe(true);
+
+    // Fitting again after a resize: the mark goes.
+    bubbleExtent = FITTING_EXTENT;
+    act(() => {
+      window.dispatchEvent(new Event('resize'));
+    });
+    expect(bubble.hasAttribute(SCROLLABLE_MARK), 'fits again').toBe(false);
+
+    // Wider than its box - a preformatted value - overflows as well.
+    bubbleExtent = { ...FITTING_EXTENT, scrollWidth: 360 };
+    act(() => {
+      window.dispatchEvent(new Event('resize'));
+    });
+    expect(bubble.hasAttribute(SCROLLABLE_MARK), 'wider').toBe(true);
+
+    // Closing removes the mark with the coordinates.
+    fireEvent.blur(trigger);
+    expect(isOpenBubble(bubble)).toBe(false);
+    expect(bubble.hasAttribute(SCROLLABLE_MARK), 'closed').toBe(false);
+  });
+
+  it('reopens a scrolled bubble at the top of its description, and never moves the scroll while it stays open', () => {
+    const view = render(
+      <Tooltip content={<span>Long description</span>}>
+        <button type="button">Scrolled trigger</button>
+      </Tooltip>,
+    );
+    const trigger = screen.getByRole('button', { name: 'Scrolled trigger' });
+
+    fireEvent.focus(trigger);
+    const bubble = screen.getByRole('tooltip');
+    bubble.scrollTop = 300;
+
+    // A re-render while open - a new content element - leaves the reader where they were.
+    view.rerender(
+      <Tooltip content={<span>Long description</span>}>
+        <button type="button">Scrolled trigger</button>
+      </Tooltip>,
+    );
+    expect(bubble.scrollTop, 'held open').toBe(300);
+
+    fireEvent.blur(trigger);
+    bubble.scrollTop = 300;
+    fireEvent.focus(trigger);
+    expect(isOpenBubble(bubble)).toBe(true);
+    expect(bubble.scrollTop, 'reopened').toBe(0);
+    expect(bubble.scrollLeft, 'reopened').toBe(0);
+  });
+
+  it('lets the pointer through a bubble that shows its whole description: leaving the trigger closes it, even toward the bubble', () => {
+    bubbleExtent = FITTING_EXTENT;
+    const added = vi.spyOn(document, 'addEventListener');
+    const { trigger, bubble } = renderTooltip('top');
+
+    hoverOpen(trigger);
+    expect(isOpenBubble(bubble)).toBe(true);
+    expect(bubble.hasAttribute(SCROLLABLE_MARK)).toBe(false);
+
+    // Into the gap, which would be the corridor of a bubble a pointer can rest on.
+    fireEvent.pointerLeave(trigger, {
+      pointerType: 'mouse',
+      relatedTarget: document.body,
+      ...IN_GAP,
+    });
+
+    expect(isOpenBubble(bubble)).toBe(false);
+    expect(added.mock.calls.some(([type]) => type === 'pointermove')).toBe(false);
+  });
+
+  it('opens a neighbouring trigger in its turn once the pointer leaves a bubble that fits, one bubble at a time', () => {
+    bubbleExtent = FITTING_EXTENT;
+    render(
+      <div>
+        <Tooltip content="First description" placement="bottom">
+          <button type="button">First</button>
+        </Tooltip>
+        <Tooltip content="Second description" placement="bottom">
+          <button type="button">Second</button>
+        </Tooltip>
+      </div>,
+    );
+    const first = screen.getByRole('button', { name: 'First' });
+    const second = screen.getByRole('button', { name: 'Second' });
+
+    hoverOpen(first);
+    expect(screen.getAllByRole('tooltip').map((bubble) => bubble.textContent)).toEqual([
+      'First description',
+    ]);
+
+    // The pointer moves down onto the next row, which the first bubble is drawn over: it passes
+    // through that bubble to the second trigger.
+    fireEvent.pointerLeave(first, { pointerType: 'mouse', relatedTarget: second, ...IN_GAP });
+    expect(screen.queryAllByRole('tooltip')).toEqual([]);
+
+    hoverOpen(second);
+    expect(screen.getAllByRole('tooltip').map((bubble) => bubble.textContent)).toEqual([
+      'Second description',
+    ]);
+  });
+
+  it('stays open while the pointer crosses the gap onto the bubble, and rests there', () => {
+    const { trigger, bubble } = renderTooltip('top');
+
+    hoverOpen(trigger);
+    expect(isOpenBubble(bubble)).toBe(true);
+
+    // Off the trigger and into the gap, which belongs to neither box but to the corridor.
+    fireEvent.pointerLeave(trigger, {
+      pointerType: 'mouse',
+      relatedTarget: document.body,
+      ...IN_GAP,
+    });
+    expect(isOpenBubble(bubble)).toBe(true);
+    fireEvent.pointerMove(document.body, { pointerType: 'mouse', ...ON_BUBBLE });
+    expect(isOpenBubble(bubble)).toBe(true);
+
+    // On the bubble - a descendant of the wrapper - the crossing is over, and the dwell that an
+    // enter would start never re-opens or re-times anything.
+    fireEvent.pointerEnter(bubble, { pointerType: 'mouse' });
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    fireEvent.pointerMove(document.body, { pointerType: 'mouse', ...AWAY });
+    expect(isOpenBubble(bubble)).toBe(true);
+
+    // Leaving the bubble for anywhere outside the corridor closes it at once.
+    fireEvent.pointerLeave(bubble, { pointerType: 'mouse', relatedTarget: document.body, ...AWAY });
+    expect(isOpenBubble(bubble)).toBe(false);
+  });
+
+  it('closes at once when the pointer leaves the trigger for anywhere but the bubble', () => {
+    const { trigger, bubble } = renderTooltip('top');
+
+    hoverOpen(trigger);
+    fireEvent.pointerLeave(trigger, {
+      pointerType: 'mouse',
+      relatedTarget: document.body,
+      ...AWAY,
+    });
+
+    expect(isOpenBubble(bubble)).toBe(false);
+  });
+
+  it('closes on the first move out of the corridor, and stops listening once it has', () => {
+    const added = vi.spyOn(document, 'addEventListener');
+    const removed = vi.spyOn(document, 'removeEventListener');
+    const { trigger, bubble } = renderTooltip('top');
+
+    hoverOpen(trigger);
+    fireEvent.pointerLeave(trigger, {
+      pointerType: 'mouse',
+      relatedTarget: document.body,
+      ...IN_GAP,
+    });
+    const follow = added.mock.calls.find(([type]) => type === 'pointermove')?.[1];
+    expect(follow).toBeDefined();
+
+    fireEvent.pointerMove(document.body, { pointerType: 'mouse', clientX: 400, clientY: 198 });
+
+    expect(isOpenBubble(bubble)).toBe(false);
+    expect(
+      removed.mock.calls.some(([type, listener]) => type === 'pointermove' && listener === follow),
+    ).toBe(true);
+  });
+
+  it('judges a crossing again on every scroll, closing it once the corridor moves off a still pointer', () => {
+    const view = document.defaultView;
+    if (view === null) {
+      throw new Error('the test document has no window');
+    }
+    const added = vi.spyOn(view, 'addEventListener');
+    const removed = vi.spyOn(view, 'removeEventListener');
+    const { trigger, bubble } = renderTooltip('top');
+    const scroller = screen.getByTestId('scroller');
+
+    hoverOpen(trigger);
+    fireEvent.pointerLeave(trigger, {
+      pointerType: 'mouse',
+      relatedTarget: document.body,
+      ...IN_GAP,
+    });
+    expect(isOpenBubble(bubble)).toBe(true);
+
+    // A one-pixel scroll leaves the still pointer (y = 198) in the new gap, y = 195..199.
+    triggerBox = { ...triggerBox, top: 199 };
+    bubbleBox = { ...OPEN_TOP_BUBBLE, top: 155 };
+    act(() => {
+      scroller.dispatchEvent(new Event('scroll'));
+    });
+    expect(isOpenBubble(bubble), 'still in the corridor').toBe(true);
+
+    // A long scroll carries both boxes away from it: the bubble closes without a pointer move.
+    triggerBox = { ...triggerBox, top: 500 };
+    bubbleBox = { ...OPEN_TOP_BUBBLE, top: 456 };
+    act(() => {
+      scroller.dispatchEvent(new Event('scroll'));
+    });
+    expect(isOpenBubble(bubble), 'carried away').toBe(false);
+
+    // Every scroll listener the bubble and its crossing added is gone with it.
+    const scrollListeners = added.mock.calls
+      .filter(([type]) => type === 'scroll')
+      .map(([, listener]) => listener);
+    expect(scrollListeners).toHaveLength(2);
+    for (const listener of scrollListeners) {
+      expect(
+        removed.mock.calls.some(([type, gone]) => type === 'scroll' && gone === listener),
+      ).toBe(true);
+    }
+  });
+
+  it('closes a crossing bubble when the pointer leaves the window', () => {
+    const { trigger, bubble } = renderTooltip('top');
+
+    hoverOpen(trigger);
+    fireEvent.pointerLeave(trigger, {
+      pointerType: 'mouse',
+      relatedTarget: document.body,
+      ...IN_GAP,
+    });
+    expect(isOpenBubble(bubble)).toBe(true);
+
+    fireEvent.pointerOut(document.body, { pointerType: 'mouse', relatedTarget: null });
+
+    expect(isOpenBubble(bubble)).toBe(false);
+  });
+
+  it('closes at once for a touch pointer, a pointer leaving the document and a bubble with no box', () => {
+    const touch = renderTooltip('top');
+    hoverOpen(touch.trigger);
+    fireEvent.pointerLeave(touch.trigger, {
+      pointerType: 'touch',
+      relatedTarget: document.body,
+      ...IN_GAP,
+    });
+    expect(isOpenBubble(touch.bubble), 'touch').toBe(false);
+    touch.view.unmount();
+
+    const exit = renderTooltip('top');
+    hoverOpen(exit.trigger);
+    fireEvent.pointerLeave(exit.trigger, { pointerType: 'mouse', relatedTarget: null, ...IN_GAP });
+    expect(isOpenBubble(exit.bubble), 'document exit').toBe(false);
+    exit.view.unmount();
+
+    // Nothing laid out - the layout-free DOM every other suite renders in - is nowhere a pointer
+    // can go, so there is no corridor to keep the bubble open for.
+    bubbleBox = { left: 0, top: 0, width: 0, height: 0 };
+    const boxless = renderTooltip('top');
+    hoverOpen(boxless.trigger);
+    fireEvent.pointerLeave(boxless.trigger, {
+      pointerType: 'mouse',
+      relatedTarget: document.body,
+      ...IN_GAP,
+    });
+    expect(isOpenBubble(boxless.bubble), 'no box').toBe(false);
+  });
+
+  it('ends a crossing with Escape, and nothing re-opens the bubble while the pointer stays put', () => {
+    const removed = vi.spyOn(document, 'removeEventListener');
+    const { trigger, bubble } = renderTooltip('top');
+
+    hoverOpen(trigger);
+    fireEvent.pointerLeave(trigger, {
+      pointerType: 'mouse',
+      relatedTarget: document.body,
+      ...IN_GAP,
+    });
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(isOpenBubble(bubble)).toBe(false);
+    expect(removed.mock.calls.some(([type]) => type === 'pointermove')).toBe(true);
+
+    fireEvent.pointerMove(document.body, { pointerType: 'mouse', ...ON_BUBBLE });
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(isOpenBubble(bubble)).toBe(false);
+  });
+
+  it('keeps a click inside the bubble from reaching the row around the trigger', () => {
+    const onRowClick = vi.fn();
+    render(
+      <div data-testid="row" onClick={onRowClick}>
+        <Tooltip content="Row description">
+          <button type="button">Row trigger</button>
+        </Tooltip>
+      </div>,
+    );
+    const trigger = screen.getByRole('button', { name: 'Row trigger' });
+
+    fireEvent.focus(trigger);
+    const bubble = screen.getByRole('tooltip');
+    fireEvent.click(bubble);
+    expect(onRowClick).not.toHaveBeenCalled();
+    // Still open: a click is reading, not dismissing.
+    expect(isOpenBubble(bubble)).toBe(true);
+
+    // The trigger's own click is untouched.
+    fireEvent.click(trigger);
+    expect(onRowClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('declares a bounded, scrolling open bubble in tokens only, taking the pointer only when marked', () => {
+    const open = stylesheetRule('.dg-tooltip__bubble.dg-is-open');
+
+    for (const declaration of [
+      'max-block-size: min(var(--dg-code-block-max-block-size), var(--dg-size-full));',
+      'overflow: auto;',
+      'overscroll-behavior: contain;',
+      'pointer-events: none;',
+      'max-inline-size: var(--dg-tooltip-max-inline-size);',
+    ]) {
+      expect(open, declaration).toContain(declaration);
+    }
+
+    // Exactly the bubble whose description overflows accepts the pointer.
+    expect(stylesheetRule(`.dg-tooltip__bubble.dg-is-open[${SCROLLABLE_MARK}]`)).toContain(
+      'pointer-events: auto;',
+    );
+
+    // The closed bubble's paint rule says nothing about the pointer: the open state decides.
+    expect(stylesheetRule('.dg-tooltip__bubble')).not.toContain('pointer-events');
   });
 });

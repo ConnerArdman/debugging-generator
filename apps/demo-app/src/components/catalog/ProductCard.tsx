@@ -41,15 +41,22 @@
  * and the availability chip carries its wording as text, so its colour is never the only thing
  * that reports the state.
  *
- * WHAT A FAILED QUICK-ADD SAYS
+ * WHAT A QUICK-ADD SAYS
  * The press goes to the cart provider, which owns the request and reads the cart back from the
  * server before it reports a failed addition - units are added to whatever the line already holds,
- * so a request that came back a failure may still have been carried out. The tile catches that
- * rejection and states it through the notification queue, because a press that went nowhere would
- * otherwise leave the button back at idle with nothing said: a failure where the cart found the
- * units absent, and otherwise a notice saying they may have gone in, with the buyer sent to look
- * at their cart rather than told it is unchanged. The tile keeps nothing of its own for the press:
- * the button reports the cart's saving status and the count beside it is the cart's own line.
+ * so a request that came back a failure may still have been carried out. The tile states the
+ * outcome through the notification queue either way, in the words the product page's own control
+ * uses: the product added to the cart once the cart has established it, a failure where the cart
+ * found the units absent, and otherwise a notice saying they may have gone in, with the buyer sent
+ * to look at their cart rather than told it is unchanged. A press that went nowhere would
+ * otherwise leave the button back at idle with nothing said, and one that succeeded would say
+ * nothing anywhere the buyer is looking.
+ *
+ * The one thing the tile keeps for itself is whether its own press is still waiting on the cart,
+ * which is what its control reports as busy. The cart's saving status is a fact about every
+ * change in flight, from any control on the page, so a tile that reported it would show every
+ * "Add to cart" in the grid as working while one of them was. The count beside the control is the
+ * cart's own line.
  *
  * ONE DISPLAY NAME
  * The inner function and the exported component both carry the `displayName` `ProductCard`, so
@@ -58,7 +65,7 @@
 
 import clsx from 'clsx';
 import Link from 'next/link';
-import { memo } from 'react';
+import { memo, useState } from 'react';
 
 import { StockBadge } from '@/components/product/StockBadge';
 import { Badge } from '@/components/ui/Badge';
@@ -76,7 +83,7 @@ import {
 } from '@/lib/format';
 import type { ProductSummary, StockState } from '@/lib/types';
 import { CartAdditionError } from '@/providers/CartProvider';
-import { useToastCenter } from '@/providers/ToastProvider';
+import { useToastActions } from '@/providers/ToastProvider';
 
 import styles from './ProductCard.module.css';
 
@@ -142,8 +149,11 @@ function ProductCardBody({
   onSelect,
   onCategorySelect,
 }: ProductCardProps) {
-  const { lines, addLine, syncStatus } = useCart();
-  const { showToast } = useToastCenter();
+  const { lines, addLine } = useCart();
+  const { showToast } = useToastActions();
+
+  // Whether this tile's own press is still waiting on the cart - see the header.
+  const [adding, setAdding] = useState<boolean>(false);
 
   // `find` answers `undefined` for a product that is not in the cart yet, which is the common case
   // and not a failure, so it is read as "no units" rather than asserted away.
@@ -180,28 +190,39 @@ function ProductCardBody({
   const specsId = `product-specs-${product.slug}`;
 
   function handleAdd(): void {
-    // The provider owns the request: it publishes `saving` while the cart is written and the cart
-    // the server answered with afterwards. What it cannot do is tell this tile how the press went,
-    // so the rejection is caught here and announced - a press that went nowhere would otherwise
-    // return the button to idle with nothing said about it. The press is not awaited: a tile in a
-    // grid holds no state of its own, so there is nothing here for an answer to come back to.
-    void addLine({ productId: product.id, quantity: ADD_TO_CART_QUANTITY }).catch(
-      (cause: unknown) => {
-        // Only an addition the cart read back and found had added nothing may be announced as a
-        // failure. Anything else it could not settle, so the notice says the units may not have
-        // gone in and sends the buyer to their cart rather than claiming it is unchanged.
-        const unitsFoundAbsent =
-          cause instanceof CartAdditionError && cause.outcome === 'not-applied';
+    // The provider owns the request and the cart the server answered with. What it cannot do is
+    // tell this tile how its own press went, so both outcomes are handled here and announced, and
+    // the control reports busy for exactly as long as this press is outstanding. The promise is
+    // handed off with `void` rather than awaited, because a click handler returns nothing; every
+    // outcome it can reach is settled inside the chain.
+    setAdding(true);
 
-        showToast({
-          tone: 'danger',
-          title: unitsFoundAbsent
-            ? `${product.name} could not be added to your cart`
-            : `${product.name} may not have been added to your cart`,
-          body: cause instanceof CartAdditionError ? cause.message : UNSETTLED_ADDITION_BODY,
-        });
-      },
-    );
+    void addLine({ productId: product.id, quantity: ADD_TO_CART_QUANTITY })
+      .then(
+        () => {
+          // The cart resolves only for units it has established are in it, including units a
+          // failed request turned out to have added anyway, so this states a fact.
+          showToast({ tone: 'success', title: `${product.name} added to your cart` });
+        },
+        (cause: unknown) => {
+          // Only an addition the cart read back and found had added nothing may be announced as a
+          // failure. Anything else it could not settle, so the notice says the units may not have
+          // gone in and sends the buyer to their cart rather than claiming it is unchanged.
+          const unitsFoundAbsent =
+            cause instanceof CartAdditionError && cause.outcome === 'not-applied';
+
+          showToast({
+            tone: 'danger',
+            title: unitsFoundAbsent
+              ? `${product.name} could not be added to your cart`
+              : `${product.name} may not have been added to your cart`,
+            body: cause instanceof CartAdditionError ? cause.message : UNSETTLED_ADDITION_BODY,
+          });
+        },
+      )
+      .finally(() => {
+        setAdding(false);
+      });
   }
 
   return (
@@ -285,7 +306,7 @@ function ProductCardBody({
           variant="primary"
           size="lg"
           className={clsx(styles.add)}
-          busy={syncStatus === 'saving'}
+          busy={adding}
           disabled={!STOCK_PURCHASABLE[product.stockState]}
           onClick={handleAdd}
         >

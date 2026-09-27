@@ -21,7 +21,15 @@
  *   keepalive — an extension API call, which refreshes the worker's idle timer
  *   while it is active — and sends `client.ping` on the socket itself, retiring
  *   the socket onto the backoff curve when no `service.pong` answers it within
- *   `SERVICE_PONG_TIMEOUT_MS`. The alarm does not prevent Manifest V3
+ *   `SERVICE_PONG_TIMEOUT_MS` (or, for a ping still queued behind the socket's
+ *   own draining outbound backlog, within {@link HEARTBEAT_MAX_PONG_WINDOWS}
+ *   such windows) and the auth-exempt health route does not answer either — a
+ *   service that answers is alive and reading this socket under backpressure,
+ *   so the socket is kept for up to
+ *   {@link HEARTBEAT_MAX_UNANSWERED_WHILE_ALIVE} such ticks in a row without
+ *   proof that it is still read (a backlog that keeps draining, or a late
+ *   answer to one of its earlier pings, is that proof). The
+ *   alarm does not prevent Manifest V3
  *   suspension: once the worker is suspended it fires within one period, and
  *   its tick revives the worker and reconnects
  *   ({@link WsBridge.handleKeepaliveAlarm});
@@ -43,6 +51,13 @@
  *   `session.bind`, where a restarted service (whose binding table starts
  *   empty) would refuse every queued batch. {@link WsBridge.awaitTabRoute} is
  *   how the worker's telemetry lane waits for that confirmation;
+ * - the **flow control** of that telemetry: a bounded window of events
+ *   written and not yet acknowledged, acknowledged by barrier `client.ping`s
+ *   the service answers in frame order, so no burst the page produces can
+ *   queue more work at the service than it stores in about a second — the
+ *   work every later frame of the connection, the heartbeat's ping included,
+ *   waits behind. {@link WsBridge.awaitTelemetryCapacity} is how the lane
+ *   waits for room (see "Telemetry flow control" in {@link createWsBridge});
  * - the relay of `agent.ready` under this connection, with the `tabId` the page
  *   cannot know filled in and named as the frame's acting tab;
  * - the re-announcement of every persisted tab binding after a reconnect, since
@@ -163,9 +178,13 @@
  * });
  * void bridge.connect();
  *
- * // The telemetry lane: wait for the service to confirm the tab's route, then send.
+ * // The telemetry lane: wait for the service to confirm the tab's route and
+ * // for room in the window, then send — with nothing awaited in between.
  * const route = await bridge.awaitTabRoute(tabId, sessionId, { signal: deadline });
- * if (route.ok) bridge.sendTelemetryBatch(tabId, events, sessionId);
+ * const room = route.ok
+ *   ? await bridge.awaitTelemetryCapacity(tabId, events.length, { signal: deadline })
+ *   : route;
+ * if (room.ok) bridge.sendTelemetryBatch(tabId, events, sessionId);
  * ```
  *
  * @module apps/chrome-extension/src/background/ws-bridge
@@ -338,11 +357,109 @@ const BRIDGE_CLOSED_REASON = 'the service worker bridge was disposed';
  * only that the service's HTTP listener answers, not that this socket still
  * carries frames; `client.ping` is authenticated, touches no session, and is
  * answered by exactly one `service.pong` to this connection, whose `ref` is
- * the ping's id. One unanswered ping retires the socket, so a dead peer is
- * detected at most one interval plus one pong window — about twenty-five
- * seconds — after the last answered ping.
+ * the ping's id. One unanswered ping, confirmed by a health route that does
+ * not answer either, retires the socket, so a dead peer is detected at most
+ * one interval plus one pong window and one health probe of at most
+ * {@link HEARTBEAT_HEALTH_TIMEOUT_MS} — about thirty-five seconds for a frozen
+ * service, sooner for a closed port — after the last answered ping. Two
+ * exceptions keep a live
+ * connection: a ping still queued behind this socket's own outbound backlog
+ * while that backlog drains is granted further windows up to
+ * {@link HEARTBEAT_MAX_PONG_WINDOWS}, and an unanswered ping while the health
+ * route answers keeps the socket for up to
+ * {@link HEARTBEAT_MAX_UNANSWERED_WHILE_ALIVE} ticks in a row without proof
+ * that the service still reads it.
  */
 export const SOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
+
+/**
+ * The most pong windows — `SERVICE_PONG_TIMEOUT_MS` each — one heartbeat ping
+ * may wait before its socket is retired: four, twenty seconds in all, as long
+ * as a heartbeat interval.
+ *
+ * A window is extended only while the ping is still queued behind bytes this
+ * bridge wrote to the socket before it, and only when that outbound buffer
+ * drained during the window that just elapsed (a platform socket's
+ * `bufferedAmount`, net of what the bridge wrote meanwhile): the service is
+ * reading this socket, and the ping simply has not reached it yet — the case
+ * of a worker flushing the telemetry it held while the service was stalled.
+ * Retiring that socket would only leave a second one queued behind the same
+ * backlog, and its close frame behind the first's. A ping written to an empty
+ * buffer, one behind a buffer that stopped draining, and one on a socket that
+ * reports no `bufferedAmount` still retire after one window, exactly as
+ * before; this bound caps the wait of a peer that consumes too slowly to be
+ * useful.
+ */
+export const HEARTBEAT_MAX_PONG_WINDOWS = 4;
+
+/**
+ * How many heartbeat ticks in a row may end with an unanswered ping while the
+ * service's auth-exempt `GET /health` still answers, before the socket is
+ * retired anyway: two.
+ *
+ * An unanswered `client.ping` alone does not tell a vanished peer from a busy
+ * one. A service applying read backpressure to this connection (it pauses
+ * reading a socket whose frame backlog is deep, so the ping waits in the
+ * kernel buffers until the backlog drains) looks exactly like a stopped one
+ * from inside the socket. So before a tick retires its socket it asks the
+ * health route: a service that does not answer is gone and the socket is
+ * retired at once, exactly as before; a service that answers is alive, and
+ * retiring its socket would only abandon a connection that is still being
+ * read — leaving its buffered telemetry and its close frame queued behind
+ * each other — and open a second one behind the same load. The socket is
+ * kept and the next tick pings again. This bound is what keeps a socket the
+ * service has somehow stopped reading for good from being kept forever: the
+ * third unanswered tick in a row without proof of reading retires it whatever
+ * the health route says.
+ *
+ * Two observations prove the service is still reading this socket, and start
+ * the count again just as an answered ping does:
+ *
+ * - **Its backlog keeps draining.** The socket's outbound buffer held bytes
+ *   when the span began (the previous kept tick, or the ping's write), still
+ *   holds bytes now, and less than was written meanwhile
+ *   ({@link sendBufferReadProgress}). A buffer that stays non-empty means the
+ *   network is taking bytes only as fast as the service reads them, so the
+ *   drain is the service's reading, not kernel slack: the service is working
+ *   through this connection's backlog and simply has not reached the ping. A
+ *   worker whose capture outpaces the service's ingest lives here for as long
+ *   as the overload lasts; retiring its socket would only leave the old one
+ *   draining beside a new one queued behind the same load.
+ * - **A late answer.** A `service.pong` (or the refusal of a service that
+ *   predates the liveness pair) naming one of the last
+ *   {@link HEARTBEAT_LATE_ANSWER_MEMORY} pings this connection kept
+ *   unanswered: the service read the socket at least that far.
+ *
+ * A socket whose buffer is empty, unreadable or stalled gets no such credit,
+ * so a vanished or wedged peer is still retired within this bound.
+ */
+export const HEARTBEAT_MAX_UNANSWERED_WHILE_ALIVE = 2;
+
+/**
+ * How many of the latest pings a connection kept unanswered the heartbeat
+ * remembers, so a late answer to any of them is recognised as proof that the
+ * socket is read ({@link HEARTBEAT_MAX_UNANSWERED_WHILE_ALIVE}): eight — more
+ * than two minutes of ticks. Older ids are forgotten; their answers are then
+ * ignored like any other pong naming no ping of this connection.
+ */
+export const HEARTBEAT_LATE_ANSWER_MEMORY = 8;
+
+/**
+ * How long the heartbeat waits for `GET /health` when it asks whether an
+ * unanswered ping means the service is gone: ten seconds, the backoff cap.
+ *
+ * The pill's own probe gives up after `CLIENT_HELLO_TIMEOUT_MS` (three
+ * seconds), which is right for "can a socket authenticate now?", but this
+ * question is "is the service still there at all?" — and a service busy
+ * enough to leave a ping unread (its event loop held for a second at a time
+ * by a deep ingest backlog) can take longer than three seconds to answer its
+ * cheapest route. Mistaking that for a stopped service retires a socket it is
+ * reading and opens a second one behind the same load. A stopped or frozen
+ * service answers neither within this bound, and a closed port refuses at
+ * once, so a vanished peer is still retired — the wait costs a frozen one at
+ * most these ten seconds more.
+ */
+export const HEARTBEAT_HEALTH_TIMEOUT_MS = 10_000;
 
 /**
  * The reason a socket retired by the heartbeat is closed with, and reported
@@ -447,6 +564,77 @@ export const TELEMETRY_ROUTE_WAIT_MS = 30_000;
 const WEBSOCKET_OPEN_READY_STATE = 1;
 
 /**
+ * The most telemetry events the bridge keeps written to the socket and not
+ * yet acknowledged by the service — the in-flight window of
+ * {@link WsBridge.awaitTelemetryCapacity} (see "Telemetry flow control" in
+ * {@link createWsBridge}).
+ *
+ * The service handles one connection's frames strictly in order, so a
+ * `client.ping` written behind the window is answered only once the window
+ * has been stored. At the measured service cost of about a millisecond per
+ * stored event, a thousand events is about a second of work: the heartbeat's
+ * ping — and every other frame — waits at most that long behind telemetry,
+ * far inside `SERVICE_PONG_TIMEOUT_MS`, however fast the page produces. Five
+ * of the page agent's 200-event batches.
+ */
+export const MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS = 1_000;
+
+/**
+ * The most `telemetry.event` frames in the in-flight window, whatever their
+ * size: bounds a stream of small or loss-only frames the event bound would
+ * let through, and stays an eighth of the service's per-connection backlog
+ * cap, so a full window never comes near it.
+ */
+export const MAX_UNACKNOWLEDGED_TELEMETRY_FRAMES = 32;
+
+/**
+ * How many telemetry events are written between two barrier pings: a
+ * quarter of {@link MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS}, so a steady stream
+ * is acknowledged four times per window and never waits a whole window for
+ * room.
+ */
+export const TELEMETRY_BARRIER_EVENTS = 250;
+
+/** How many telemetry frames are written between two barrier pings; see {@link TELEMETRY_BARRIER_EVENTS}. */
+export const TELEMETRY_BARRIER_FRAMES = 8;
+
+/**
+ * The most barrier pings outstanding at once while the service has not yet
+ * answered one to this bridge ({@link TelemetryFlowStatus.paced} false).
+ *
+ * Barriers are written on the same cadence before the first answer as after
+ * it, because every answer renews the heartbeat ping's deadline. The first
+ * burst a bridge writes — the page agent's whole buffer after the worker woke
+ * — goes out before any barrier can have been answered, so the window cannot
+ * hold it back; without barriers inside it, a heartbeat ping written behind it
+ * would wait for all of it with nothing vouching that the service is still
+ * storing. The bound keeps a peer that answers no ping at all (a test double;
+ * a real service that stops answering is retired by the heartbeat) to a fixed
+ * number of them per connection. Sixty-four barriers cover 16 000 events, more
+ * than a tab's lane and its page's buffer hold together.
+ */
+export const MAX_UNPACED_TELEMETRY_BARRIERS = 64;
+
+/** A capacity wait was asked for a value that is not a Chrome tab id. */
+const CAPACITY_INVALID_TAB_MESSAGE =
+  'Telemetry capacity was requested for a value that is not a Chrome tab id.';
+
+/** A capacity wait was asked for a count that is not a whole number of events. */
+const CAPACITY_INVALID_COUNT_MESSAGE =
+  'Telemetry capacity was requested for a count that is not a whole number of events.';
+
+/** The capacity wait ended because its bound expired first. */
+const CAPACITY_TIMED_OUT_MESSAGE =
+  'The local service did not acknowledge the telemetry in flight before the wait expired.';
+
+/** The capacity wait ended because its caller cancelled it. */
+const CAPACITY_ABORTED_MESSAGE = 'The wait for room in the telemetry window was cancelled.';
+
+/** The capacity wait ended because the bridge was disposed. */
+const CAPACITY_DISPOSED_MESSAGE =
+  'The service bridge was disposed while telemetry waited for room to be sent.';
+
+/**
  * Why a tab route cannot be awaited for the arguments given. Constant; names
  * neither value.
  */
@@ -486,6 +674,43 @@ const ROUTE_DISPOSED_MESSAGE =
 /** What restores a tab route the credential lost: pairing again. */
 const ROUTE_PAIRING_HINT =
   'Pair the Debug Generator panel with the local service again, then reopen DevTools on the application tab.';
+
+/**
+ * The refusal codes that end a re-announced binding: the service answered a
+ * `session.bind` naming a session with the statement that the session is over
+ * (`SESSION_INVALID_STATE` — ended or failed, `details.reason:
+ * 'session-ended'`) or no longer exists (`SESSION_NOT_FOUND`). Either is final
+ * for that pair: no later connection can revive it. Every other refusal
+ * (`RATE_LIMITED`, `STORE_ERROR`, `TAB_NOT_BOUND` for an origin that no longer
+ * matches, …) may clear on its own, so the pair is kept and the next open
+ * re-announces it.
+ */
+export type BindingRefusalCode = Extract<
+  DebuggenErrorCode,
+  'SESSION_INVALID_STATE' | 'SESSION_NOT_FOUND'
+>;
+
+/** The members of {@link BindingRefusalCode}, as the set {@link isBindingRefusalCode} reads. */
+const BINDING_REFUSAL_CODES: ReadonlySet<string> = new Set<BindingRefusalCode>([
+  'SESSION_INVALID_STATE',
+  'SESSION_NOT_FOUND',
+]);
+
+/** Whether an `error` frame's code refuses a re-announced binding for good. */
+function isBindingRefusalCode(code: string): code is BindingRefusalCode {
+  return BINDING_REFUSAL_CODES.has(code);
+}
+
+/**
+ * The most re-announced binds one connection remembers while it awaits their
+ * answers. One open re-announces every persisted binding once, and the tab
+ * registry persists at most 256, so this bound is never reached by a
+ * well-formed store; it only keeps a malformed one from growing the map
+ * without limit. Stated here rather than imported: this module never imports
+ * its sibling `./tab-registry` (the composition root is the only module that
+ * sees both), and a bound that merely matches the registry's is all it needs.
+ */
+const MAX_REANNOUNCED_BINDS = 256;
 
 /**
  * The frame bound used when the protocol's schema declares none: an unbounded
@@ -695,6 +920,35 @@ export interface WsBridgeDeps {
   readonly onTelemetryFrameDiscarded?: ((frame: DiscardedTelemetryFrame) => void) | undefined;
 
   /**
+   * Told when the service refused, for good, a binding this bridge
+   * re-announced after a reconnect — the persisted pair names a session that
+   * ended, failed or vanished while the socket was down (a stall, a service
+   * restart, an evicted worker), so the `session.updated` and
+   * `cleanup.completed` frames that would have ended it never reached this
+   * connection.
+   *
+   * By the time it is called the bridge has already forgotten the pair's
+   * routing memo and confirmed route and failed the pair's route waits; the
+   * receiver owns the persisted binding and the page agent, and must end both
+   * (`service-worker.ts` ends the tab's binding as `session-ended`, which
+   * returns its page agent to the dormant configuration — AAP §0.5.1: hooks
+   * disabled, not merely idled). The service cannot tell this connection
+   * itself: a devtools connection receives session-scoped frames only for the
+   * sessions it binds, and it binds none of an ended session's.
+   *
+   * Called once per refused `session.bind`, only for a refusal carrying a
+   * {@link BindingRefusalCode} whose `ref` names a bind re-announced on the
+   * current connection. Ids and the code only. A callback that throws is
+   * logged by code and contained, since it runs inside inbound dispatch.
+   *
+   * @example
+   * ```ts
+   * onBindingRefused: ({ sessionId }) => void registry.handleSessionEnded(sessionId),
+   * ```
+   */
+  readonly onBindingRefused?: ((refusal: BindingRefusal) => void) | undefined;
+
+  /**
    * Where lifecycle records go. Defaults to `noopLogger`. Records carry message
    * types, counts, tab and session ids, error codes and state names only.
    */
@@ -819,6 +1073,19 @@ export interface DiscardedTelemetryFrame {
 }
 
 /**
+ * A re-announced binding the service refused for good, as
+ * {@link WsBridgeDeps.onBindingRefused} reports it. Ids and the code only.
+ */
+export interface BindingRefusal {
+  /** The tab the persisted binding held. */
+  readonly tabId: TabId;
+  /** The session it named, which the service reports ended, failed or gone. */
+  readonly sessionId: SessionId;
+  /** Why the service refused it. */
+  readonly code: BindingRefusalCode;
+}
+
+/**
  * The options of one {@link WsBridge.awaitTabRoute} wait.
  *
  * @example
@@ -876,6 +1143,42 @@ export interface TelemetryBatchContext {
    * `{ events: [], armedCaptureId?, droppedCount }`.
    */
   readonly droppedCount?: number | undefined;
+}
+
+/**
+ * The options of one {@link WsBridge.awaitTelemetryCapacity} wait: the same
+ * cancellation and bound as a route wait.
+ *
+ * @example
+ * ```ts
+ * const room = await bridge.awaitTelemetryCapacity(tabId, events.length, {
+ *   signal: deadline.signal,
+ * });
+ * ```
+ */
+export type TelemetryCapacityWaitOptions = TabRouteWaitOptions;
+
+/**
+ * The bridge's telemetry flow control, as {@link WsBridge.getTelemetryFlow}
+ * reports it. Counts only.
+ */
+export interface TelemetryFlowStatus {
+  /**
+   * Whether the service has acknowledged a barrier to this bridge, which is
+   * what makes the in-flight window binding (see "Telemetry flow control" in
+   * {@link createWsBridge}).
+   */
+  readonly paced: boolean;
+  /** Telemetry events written on the current connection and not yet acknowledged, reservations included. */
+  readonly inFlightEvents: number;
+  /** Telemetry frames written on the current connection and not yet acknowledged, reservations included. */
+  readonly inFlightFrames: number;
+  /** Barrier pings written on the current connection and not yet answered. */
+  readonly outstandingBarriers: number;
+  /** Capacity waits pending now. */
+  readonly waiting: number;
+  /** Capacity waits that had to wait, since the bridge was created. */
+  readonly waits: number;
 }
 
 /**
@@ -1056,6 +1359,40 @@ export interface WsBridge {
     sessionId: SessionId,
     options?: TabRouteWaitOptions,
   ) => Promise<Result<void, DebuggenError>>;
+
+  /**
+   * Wait until the in-flight telemetry window has room for a batch of
+   * `events` from `tabId`, and reserve that room for the tab's next
+   * {@link WsBridge.sendTelemetryBatch} — the call to make immediately before
+   * it, with nothing awaited in between (see "Telemetry flow control" in
+   * {@link createWsBridge}).
+   *
+   * Answers at once while the window has room, while nothing is in flight (a
+   * batch larger than the window is then admitted whole), and while the
+   * service has not yet acknowledged a barrier to this bridge. Otherwise the
+   * wait lasts until enough of the telemetry in flight is acknowledged, a
+   * transport transition empties the window, the bound expires or the signal
+   * fires. Waits are granted in the order they began.
+   *
+   * Resolves — never rejects — with `ok` once the room is reserved, or with
+   * `TRANSPORT_DISCONNECTED` (`details.cancelled: 'timeout'` or `'aborted'`,
+   * or disposed), or `PROTOCOL_INVALID_MESSAGE` for a value that is not a tab
+   * id or a count that is not a whole number. A grant is not a delivery: the
+   * send that follows reports its own outcome.
+   *
+   * @param tabId The tab whose batch is about to be sent.
+   * @param events How many events the batch holds; zero for a loss-only report.
+   * @param options The caller's cancellation signal and the wait's bound.
+   * @returns `ok` once the room is reserved, or why it was not.
+   */
+  readonly awaitTelemetryCapacity: (
+    tabId: TabId,
+    events: number,
+    options?: TelemetryCapacityWaitOptions,
+  ) => Promise<Result<void, DebuggenError>>;
+
+  /** The telemetry flow control's counts, as they stand now. */
+  readonly getTelemetryFlow: () => TelemetryFlowStatus;
 
   /**
    * Relay the page agent's `agent.ready` report to the service with the
@@ -1475,13 +1812,23 @@ function createPlatformTimers(): WorkerTimerApi {
  * built, which is the client's current socket for as long as it reports
  * `open`.
  *
+ * Every frame the client writes is also counted, in the UTF-8 bytes a
+ * platform socket adds to its `bufferedAmount` for it, through `onWritten` —
+ * after the write, and only when the write did not throw. With that count the
+ * heartbeat can tell how much of the socket's outbound buffer drained over a
+ * pong window even while telemetry keeps being written to it
+ * ({@link sendBufferDrained}).
+ *
  * @param base The injected socket constructor.
  * @param onConstructed Told of every socket `base` constructs, in order.
+ * @param onWritten Told of every frame written to a socket `base` built: the
+ *   socket, and the frame's size in UTF-8 bytes.
  * @returns A constructor the socket client can use in `base`'s place.
  */
 function observeSockets(
   base: WebSocketConstructorLike,
   onConstructed: (socket: WebSocketLike) => void,
+  onWritten: (socket: WebSocketLike, bytes: number) => void,
 ): WebSocketConstructorLike {
   return class ObservedWebSocket implements WebSocketLike {
     /** The socket `base` built; every member delegates to it. */
@@ -1512,11 +1859,205 @@ function observeSockets(
 
     send(data: string): void {
       this.socket.send(data);
+      onWritten(this.socket, utf8ByteLength(data));
     }
 
     close(...args: Parameters<WebSocketLike['close']>): void {
       this.socket.close(...args);
     }
+  };
+}
+
+/**
+ * The number of bytes `text` occupies as UTF-8 — what the WebSocket API adds
+ * to a socket's `bufferedAmount` when `text` is sent — counted without
+ * encoding it. A lone surrogate counts as the three bytes of the U+FFFD it is
+ * encoded as.
+ *
+ * @example
+ * ```ts
+ * utf8ByteLength('ping');   // 4
+ * utf8ByteLength('é');      // 2
+ * utf8ByteLength('…');      // 3
+ * utf8ByteLength('😀');     // 4 (one surrogate pair)
+ * ```
+ */
+function utf8ByteLength(text: string): number {
+  let bytes = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const unit = text.charCodeAt(index);
+    if (unit < 0x80) {
+      bytes += 1;
+    } else if (unit < 0x800) {
+      bytes += 2;
+    } else if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < text.length) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+/**
+ * One reading of the observed socket's outbound buffer, taken by the
+ * heartbeat.
+ */
+interface SendBufferSample {
+  /** The socket read: samples of different sockets are never compared. */
+  readonly socket: WebSocketLike;
+  /** Its `bufferedAmount`: bytes written and not yet handed to the network. */
+  readonly buffered: number;
+  /** The UTF-8 bytes the bridge had written to it by then, in all. */
+  readonly written: number;
+}
+
+/**
+ * The bytes that left a socket's outbound buffer between two samples of it:
+ * what it held at `start`, plus what was written since, minus what it holds
+ * at `end`. Writes made between the samples are accounted, so a buffer that
+ * drains while telemetry keeps arriving still shows the drain.
+ *
+ * @example
+ * ```ts
+ * // 40 000 bytes buffered, 10 000 written meanwhile, 30 000 left: 20 000 drained.
+ * sendBufferDrained(
+ *   { socket, buffered: 40_000, written: 5_000 },
+ *   { socket, buffered: 30_000, written: 15_000 },
+ * ); // 20_000
+ * ```
+ */
+function sendBufferDrained(start: SendBufferSample, end: SendBufferSample): number {
+  return start.buffered + (end.written - start.written) - end.buffered;
+}
+
+/**
+ * The bytes the service demonstrably read from a socket between two samples,
+ * or zero when the samples prove nothing: both must be of the same socket,
+ * both must find its outbound buffer non-empty, and the buffer must have
+ * drained between them ({@link sendBufferDrained}).
+ *
+ * The non-empty buffer at both ends is what makes the drain the service's
+ * doing. Bytes leave the buffer as fast as the network takes them; while the
+ * kernel still has room they leave at once, whether or not the service reads,
+ * and the buffer empties. A buffer that stays non-empty across the span is one
+ * the network could not keep up with — the kernel buffers were full — so each
+ * byte that left it did so because the service read one. An empty buffer at
+ * either end (an idle socket, or a backlog that went entirely to the kernel)
+ * therefore earns no credit.
+ *
+ * @example
+ * ```ts
+ * // Backlogged at both ends, 60 000 drained net of 5 000 written: read.
+ * sendBufferReadProgress(
+ *   { socket, buffered: 300_000, written: 10_000 },
+ *   { socket, buffered: 245_000, written: 15_000 },
+ * ); // 60_000
+ * // The buffer emptied: nothing proves the service read it.
+ * sendBufferReadProgress(
+ *   { socket, buffered: 300_000, written: 10_000 },
+ *   { socket, buffered: 0, written: 15_000 },
+ * ); // 0
+ * ```
+ */
+function sendBufferReadProgress(
+  start: SendBufferSample | undefined,
+  end: SendBufferSample | undefined,
+): number {
+  if (
+    start === undefined ||
+    end === undefined ||
+    start.socket !== end.socket ||
+    start.buffered <= 0 ||
+    end.buffered <= 0
+  ) {
+    return 0;
+  }
+  return Math.max(0, sendBufferDrained(start, end));
+}
+
+/**
+ * Why a heartbeat ping whose pong window elapsed was given no further window:
+ *
+ * - `window-limit` — it has waited {@link HEARTBEAT_MAX_PONG_WINDOWS} windows;
+ * - `buffer-unknown` — the socket reports no usable `bufferedAmount`, or the
+ *   samples are of different sockets, so its progress cannot be judged;
+ * - `nothing-ahead` — nothing written before the ping was still waiting in the
+ *   socket's buffer when the window began: the ping had reached the network
+ *   (or never waited behind anything), so the silence is the service's;
+ * - `no-progress` — the buffer did not drain at all during the window.
+ */
+type PongWaitStop = 'window-limit' | 'buffer-unknown' | 'nothing-ahead' | 'no-progress';
+
+/** What {@link decidePongWindow} concluded about one elapsed pong window. */
+type PongWindowDecision =
+  | {
+      readonly extend: true;
+      /** Bytes that left the buffer during the window. */
+      readonly drainedBytes: number;
+      /** Bytes written before the ping still buffered ahead of it now. */
+      readonly aheadBytes: number;
+      /** The buffer's `bufferedAmount` now. */
+      readonly bufferedBytes: number;
+    }
+  | { readonly extend: false; readonly stop: PongWaitStop };
+
+/**
+ * Decide whether a heartbeat ping whose pong window has just elapsed is given
+ * another window rather than retiring its socket.
+ *
+ * Another window is granted only while all of this holds: fewer than
+ * {@link HEARTBEAT_MAX_PONG_WINDOWS} windows have elapsed; every sample is of
+ * the same socket and reports its `bufferedAmount`; bytes written *before*
+ * the ping were still buffered ahead of it when the window began — the ping
+ * was waiting behind this socket's own backlog, not on the service; and the
+ * buffer drained during the window — the service is consuming the backlog.
+ * The window after the one in which the backlog ahead fully drained is thus
+ * the last one granted: it is the ping's own window to reach the service and
+ * be answered.
+ *
+ * @param windowsElapsed The pong windows elapsed so far, this one included.
+ * @param beforePing The socket's buffer just before the ping was written.
+ * @param windowStart The buffer when the elapsed window began.
+ * @param now The buffer now, at the window's end.
+ */
+function decidePongWindow(
+  windowsElapsed: number,
+  beforePing: SendBufferSample | undefined,
+  windowStart: SendBufferSample | undefined,
+  now: SendBufferSample | undefined,
+): PongWindowDecision {
+  if (windowsElapsed >= HEARTBEAT_MAX_PONG_WINDOWS) {
+    return { extend: false, stop: 'window-limit' };
+  }
+  if (
+    beforePing === undefined ||
+    windowStart === undefined ||
+    now === undefined ||
+    windowStart.socket !== beforePing.socket ||
+    now.socket !== beforePing.socket
+  ) {
+    return { extend: false, stop: 'buffer-unknown' };
+  }
+  const aheadAtWindowStart = beforePing.buffered - sendBufferDrained(beforePing, windowStart);
+  if (aheadAtWindowStart <= 0) {
+    return { extend: false, stop: 'nothing-ahead' };
+  }
+  const drainedBytes = sendBufferDrained(windowStart, now);
+  if (drainedBytes <= 0) {
+    return { extend: false, stop: 'no-progress' };
+  }
+  return {
+    extend: true,
+    drainedBytes,
+    aheadBytes: Math.max(0, beforePing.buffered - sendBufferDrained(beforePing, now)),
+    bufferedBytes: now.buffered,
   };
 }
 
@@ -1614,25 +2155,89 @@ interface QueuedFrameRecord {
  *   the unknown type under the ping's id, and that refusal proves the socket
  *   carries frames both ways just as well;
  * - `timed-out` — nothing naming the ping arrived within
- *   `SERVICE_PONG_TIMEOUT_MS`;
+ *   `SERVICE_PONG_TIMEOUT_MS`, or — for a ping queued behind the socket's own
+ *   draining outbound backlog — within the further windows it was granted
+ *   ({@link decidePongWindow});
  * - `cancelled` — the heartbeat stopped while the ping waited (the transport
  *   left `open`, the credential was removed, or the bridge was disposed).
  */
 type HeartbeatPingOutcome = 'answered' | 'timed-out' | 'cancelled';
 
+/** How one heartbeat ping's wait ended, and how long it lasted. */
+interface HeartbeatPingResult {
+  readonly outcome: HeartbeatPingOutcome;
+  /** The ping's envelope id, which a late answer would name as its `ref`. */
+  readonly id: MessageId;
+  /** The socket's outbound buffer just before the ping was written; `undefined` when unreadable. */
+  readonly beforePing: SendBufferSample | undefined;
+  /** The pong windows the wait began: one, plus one per extension. */
+  readonly pongWindows: number;
+  /** For `timed-out`: why no further window was granted. */
+  readonly stop?: PongWaitStop;
+}
+
 /**
  * The heartbeat's one outstanding `client.ping`: the id its answer must name,
- * the handle of the `SERVICE_PONG_TIMEOUT_MS` deadline, and the resolver of
- * the tick's wait. At most one exists, because the next tick is scheduled only
- * once this one's wait has ended.
+ * the handle of the current `SERVICE_PONG_TIMEOUT_MS` deadline, the socket's
+ * outbound buffer before the ping and at the current window's start, and the
+ * resolver of the tick's wait. At most one exists, because the next tick is
+ * scheduled only once this one's wait has ended.
  */
 interface OutstandingPing {
   /** The ping's envelope id, which the answering `service.pong` or `error` names as its `ref`. */
   readonly id: MessageId;
-  /** The deadline timer on the bridge's timers. */
-  readonly deadline: number;
+  /**
+   * The current window's deadline timer on the bridge's timers; replaced by each
+   * extension, and when an acknowledged barrier renews the wait.
+   */
+  deadline: number;
+  /** The pong windows begun: one at the write, one more per extension. */
+  windows: number;
+  /** The socket's outbound buffer just before the ping was written; `undefined` when unreadable. */
+  readonly beforePing: SendBufferSample | undefined;
+  /** The buffer when the current window began; `undefined` when unreadable. */
+  windowStart: SendBufferSample | undefined;
+  /** Why the last window was not extended, once it was not. */
+  stop: PongWaitStop | undefined;
   /** Ends the tick's wait with the given outcome. */
   readonly finish: (outcome: HeartbeatPingOutcome) => void;
+}
+
+/**
+ * One barrier: a `client.ping` written on the current connection, and how
+ * much telemetry had been written before it. The service answers frames in
+ * order, so its answer acknowledges every telemetry frame written before the
+ * ping as processed.
+ */
+interface TelemetryBarrier {
+  /** The ping's envelope id, which its answer names as its `ref`. */
+  readonly id: MessageId;
+  /** Telemetry events written on the connection before the ping. */
+  readonly eventsThrough: number;
+  /** Telemetry frames written on the connection before the ping. */
+  readonly framesThrough: number;
+}
+
+/**
+ * One pending {@link WsBridge.awaitTelemetryCapacity} wait. `grant` and
+ * `settle` are idempotent — the first call wins, removes the wait from the
+ * queue and releases its timer and abort listener.
+ */
+interface CapacityWaiter {
+  /** The tab whose batch waits. */
+  readonly tabId: TabId;
+  /** The batch's events. */
+  readonly events: number;
+  /** The frames the batch will be written as. */
+  readonly frames: number;
+  /** Settle the wait once; later calls do nothing. */
+  readonly settle: (result: Result<void, DebuggenError>) => void;
+}
+
+/** The room one tab's granted batch holds in the window until its send. */
+interface TelemetryReservation {
+  readonly events: number;
+  readonly frames: number;
 }
 
 /**
@@ -1640,6 +2245,50 @@ interface OutstandingPing {
  * connected, no alarm is created, nothing is read from storage and nothing is
  * published until a member is called — `service-worker.ts` calls
  * {@link WsBridge.connect}.
+ *
+ * ## Telemetry flow control
+ *
+ * The service handles a connection's frames strictly in order and answers a
+ * `client.ping` when its turn comes, so a ping written after telemetry frame
+ * *n* is answered only once frames up to *n* have been processed. The bridge
+ * uses that as an acknowledgement, within the existing protocol:
+ *
+ * - every telemetry write is counted against the current connection, and
+ *   after each {@link TELEMETRY_BARRIER_EVENTS} events or
+ *   {@link TELEMETRY_BARRIER_FRAMES} frames a **barrier** `client.ping` is
+ *   written behind them; the heartbeat's ping is a barrier too. Its
+ *   `service.pong` — or an `error` naming it, from a service that predates
+ *   the pair — acknowledges everything written before it, and every barrier
+ *   older than it;
+ * - the telemetry written and not acknowledged is held to
+ *   {@link MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS} and
+ *   {@link MAX_UNACKNOWLEDGED_TELEMETRY_FRAMES}: the worker's lanes ask
+ *   {@link WsBridge.awaitTelemetryCapacity} before each send, and wait while
+ *   the window is full. A wait that cannot be granted makes sure a barrier
+ *   covers everything in flight, so an acknowledgement is always on its way.
+ *   A grant reserves the batch's room until its tab's next send, so waits
+ *   granted together never overfill the window; a batch larger than the
+ *   window is admitted whole once nothing else is in flight;
+ * - any acknowledgement renews the outstanding heartbeat ping's
+ *   `SERVICE_PONG_TIMEOUT_MS` deadline: a service that is still answering is
+ *   alive, however much it has queued, so the heartbeat's timeout keeps
+ *   meaning "the service stopped answering", never "the service is busy". A
+ *   service that stops answering altogether still times out one window
+ *   after its last answer;
+ * - every transport transition empties the window — what one socket carried
+ *   says nothing about the next — and lets the waits proceed, so the send
+ *   reports the transition the way it always did. Until the service has
+ *   answered a first barrier to this bridge the window is not enforced, but
+ *   barriers still go out on the same cadence — at most
+ *   {@link MAX_UNPACED_TELEMETRY_BARRIERS} at once — so a heartbeat ping
+ *   behind that first burst is renewed as the service works through it; from
+ *   then on the window binds on every later connection too, the burst after
+ *   a reconnect included.
+ *
+ * With the window bounded, what the service holds for this connection — and
+ * so how long any frame of it waits — is bounded too, whatever the page
+ * produces; the loss that remains is the lanes' and the page's, bounded and
+ * reported where it happens.
  *
  * @param deps The injected transport, credential, alarm, relay and status
  * collaborators.
@@ -1718,6 +2367,31 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    * wait.
    */
   let outstandingPing: OutstandingPing | undefined;
+  /**
+   * How many ticks of the current connection in a row ended with an
+   * unanswered ping while the health route still answered, and without proof
+   * that the service still reads the socket; reset by every answered ping, by
+   * every such proof (a draining backlog, a late answer) and by every new
+   * connection's heartbeat. Bounded by
+   * {@link HEARTBEAT_MAX_UNANSWERED_WHILE_ALIVE}.
+   */
+  let unansweredWhileAlive = 0;
+  /**
+   * The socket's outbound buffer when the current connection's latest kept
+   * tick settled: where the next unanswered tick's read-progress span starts
+   * ({@link sendBufferReadProgress}). `undefined` before the first kept tick,
+   * and again after every answered ping, late answer and new connection — the
+   * span then starts at the ping's own write.
+   */
+  let keptSince: SendBufferSample | undefined;
+  /**
+   * The ids of the latest pings the current connection kept unanswered, oldest
+   * first, at most {@link HEARTBEAT_LATE_ANSWER_MEMORY}: an answer naming one
+   * of them arrives late, and proves the socket is read. Cleared by every
+   * answered ping, late answer and new connection, but kept across a tick
+   * whose draining backlog proved the socket read.
+   */
+  let keptPingIds: MessageId[] = [];
   /** The last snapshot published, serialized, so an identical one is not re-sent. */
   let lastPublishedKey: string | undefined;
 
@@ -1746,14 +2420,71 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    */
   const confirmedRoutes = new Map<TabId, SessionId>();
 
+  /**
+   * The re-announced binds awaiting the service's answer on the **current**
+   * connection, keyed by the id each `session.bind` was sent with — the id the
+   * service's refusal names as its `ref` (it answers a success with a
+   * `session.bound`, which names the pair instead).
+   *
+   * This is what lets {@link handleInbound} recognise the refusal of a pair
+   * whose session ended while the socket was down, and act on it
+   * ({@link answerReannouncedBind}): nothing else on the connection says so.
+   * An entry leaves when an `error` answers it or a `session.bound`
+   * establishes its pair; the map is emptied on every transport transition —
+   * an answer only ever arrives on the socket the bind was written to — and
+   * on dispose. Bounded by {@link MAX_REANNOUNCED_BINDS}, the most bindings
+   * one open can re-announce; the oldest entry gives way beyond it.
+   */
+  const reannouncedBinds = new Map<
+    string,
+    { readonly tabId: TabId; readonly sessionId: SessionId }
+  >();
+
   /** The pending {@link WsBridge.awaitTabRoute} waits; each leaves the set when it settles. */
   const routeWaiters = new Set<RouteWaiter>();
 
+  /*
+   * Telemetry flow control (see the section of that name on createWsBridge).
+   * The counts and barriers are the current connection's, emptied on every
+   * transport transition; `peerPaced` and `capacityWaitCount` are the
+   * bridge's.
+   */
+  /** Telemetry events and frames written on the current connection. */
+  let telemetryWritten = { events: 0, frames: 0 };
+  /** How much of {@link telemetryWritten} the service has acknowledged. */
+  let telemetryAcknowledged = { events: 0, frames: 0 };
+  /** The barrier pings written on the current connection and not yet answered, oldest first. */
+  const telemetryBarriers: TelemetryBarrier[] = [];
+  /** The room each granted batch holds until its tab's next send. */
+  const telemetryReservations = new Map<TabId, TelemetryReservation>();
+  /** The pending capacity waits, in the order they began. */
+  const capacityWaiters: CapacityWaiter[] = [];
+  /**
+   * Whether the service has answered a barrier to this bridge. Until it has,
+   * the window is not enforced — a service that answers no ping would
+   * otherwise stop every tab's telemetry — and at most
+   * {@link MAX_UNPACED_TELEMETRY_BARRIERS} barriers are outstanding. Once it
+   * has, it is known to answer them, and the window
+   * binds on every later connection of this bridge too, the burst after a
+   * reconnect above all.
+   */
+  let peerPaced = false;
+  /** Capacity waits that had to wait, since the bridge was created. */
+  let capacityWaitCount = 0;
+
   /**
    * The socket the injected constructor built last — the client's socket for
-   * as long as the client reports `open` — observed for its `readyState` only.
+   * as long as the client reports `open` — observed for its `readyState` and,
+   * by the heartbeat, its `bufferedAmount`.
    */
   let currentSocket: WebSocketLike | undefined;
+
+  /**
+   * The UTF-8 bytes written to {@link currentSocket} since it was built: the
+   * other half of a {@link SendBufferSample}, so the heartbeat can tell a
+   * buffer that drained from one that merely stopped growing.
+   */
+  let bytesWrittenToCurrentSocket = 0;
 
   /**
    * The queue mirror: this module's record of the frames the socket client
@@ -1811,9 +2542,18 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
 
   const client = new ReconnectingWsClient({
     url: isErr(endpoint) ? initialServiceBaseUrl : endpoint.value,
-    webSocketConstructor: observeSockets(deps.webSocketConstructor, (socket) => {
-      currentSocket = socket;
-    }),
+    webSocketConstructor: observeSockets(
+      deps.webSocketConstructor,
+      (socket) => {
+        currentSocket = socket;
+        bytesWrittenToCurrentSocket = 0;
+      },
+      (socket, bytes) => {
+        if (socket === currentSocket) {
+          bytesWrittenToCurrentSocket += bytes;
+        }
+      },
+    ),
     identity,
     token: tokenProvider,
     backoff: DEFAULT_WS_BACKOFF,
@@ -1971,10 +2711,14 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    * generation — first forgets the confirmed routes: what the service
    * confirmed on one socket proves nothing about the next (a restarted
    * service's binding table starts empty). Pending route waits keep waiting
-   * for the confirmations the new connection brings.
+   * for the confirmations the new connection brings. The telemetry window is
+   * emptied for the same reason ({@link resetTelemetryFlow}).
    */
   function handleStateChange(state: ConnectionState, detail?: WsStateChangeDetail): void {
     confirmedRoutes.clear();
+    resetTelemetryFlow();
+    // A bind's answer arrives on the socket it was written to, or never.
+    reannouncedBinds.clear();
     // Frames flushed since the last tracked send left the queue delivered.
     settleQueueMirror();
     if (state !== 'open') {
@@ -2036,31 +2780,135 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    * An `error` naming the outstanding ping is that ping's answer — the refusal
    * of a service that predates the liveness pair — and is not relayed: it is
    * about this connection's heartbeat, which no panel shows. A `service.pong`
-   * is never relayed either way; one naming no outstanding ping — the answer
-   * to a ping the client queued and later flushed onto a new connection — is
-   * ignored.
+   * is never relayed either way. One naming a ping this connection kept
+   * unanswered is a late answer ({@link acceptLateAnswer}), as is an `error`
+   * naming one; a pong naming neither — the answer to a ping the client queued
+   * and later flushed onto a new connection — is ignored.
+   *
+   * Either answer is first offered to the telemetry flow control
+   * ({@link acknowledgeBarrier}): the heartbeat's ping is a barrier too, and a
+   * barrier's own answer is consumed there, never relayed.
+   *
+   * An `error` naming a re-announced bind is that bind's answer
+   * ({@link answerReannouncedBind}), and is still relayed like any other
+   * refusal.
    */
   function handleInbound(message: ProtocolMessage): void {
     if (message.type === MESSAGE_TYPE.SERVICE_PONG) {
-      answerOutstandingPing(message.payload.ref);
+      acknowledgeBarrier(message.payload.ref);
+      if (!answerOutstandingPing(message.payload.ref)) {
+        acceptLateAnswer(message.payload.ref);
+      }
       return;
     }
-    if (
-      message.type === MESSAGE_TYPE.ERROR &&
-      message.payload.ref !== undefined &&
-      answerOutstandingPing(message.payload.ref)
-    ) {
-      log.debug('the local service refused the heartbeat ping; the socket answered', {
-        code: message.payload.code,
-      });
-      return;
+    if (message.type === MESSAGE_TYPE.ERROR && message.payload.ref !== undefined) {
+      const barrier = acknowledgeBarrier(message.payload.ref);
+      if (answerOutstandingPing(message.payload.ref)) {
+        log.debug('the local service refused the heartbeat ping; the socket answered', {
+          code: message.payload.code,
+        });
+        return;
+      }
+      // A kept heartbeat ping is a barrier too: its late refusal is both.
+      const late = acceptLateAnswer(message.payload.ref);
+      if (barrier) {
+        log.debug('the local service refused a telemetry barrier ping; the socket answered', {
+          code: message.payload.code,
+        });
+      }
+      if (barrier || late) {
+        return;
+      }
+      answerReannouncedBind(message.payload.ref, message.payload.code);
     }
     if (message.type === MESSAGE_TYPE.SESSION_BOUND) {
       rememberBinding(message.payload);
       confirmRoute(message.payload);
+      settleReannouncedBinds(message.payload);
     }
     if (isRelayedMessage(message)) {
       relay(message);
+    }
+  }
+
+  /**
+   * Apply the service's refusal of one re-announced `session.bind`, named by
+   * the refusal's `ref`; a `ref` naming anything else is left alone.
+   *
+   * A {@link BindingRefusalCode} says the persisted pair names a session that
+   * is over — it ended, failed or vanished while the socket was down, so its
+   * `session.updated` and `cleanup.completed` never reached this connection,
+   * and none of its frames ever will. The pair is forgotten here (the routing
+   * memo and the confirmed route, each only while it still names that
+   * session, so a newer binding of the tab is never undone), its route waits
+   * fail as ended, and {@link WsBridgeDeps.onBindingRefused} is told so the
+   * worker ends the persisted binding and disarms the page agent. Without
+   * this the tab stayed bound to the ended session and its agent armed,
+   * producing telemetry the service drops, across reloads and restarts.
+   *
+   * Any other code is an answer too — the entry leaves — but a transient one:
+   * the pair is kept, and the next open re-announces it.
+   */
+  function answerReannouncedBind(ref: string, code: string): void {
+    const bind = reannouncedBinds.get(ref);
+    if (bind === undefined) {
+      return;
+    }
+    reannouncedBinds.delete(ref);
+    const { tabId, sessionId } = bind;
+    if (!isBindingRefusalCode(code)) {
+      log.debug('the local service could not re-bind a tab for now; the binding is kept', {
+        tabId,
+        sessionId,
+        code,
+      });
+      return;
+    }
+    if (sessionByTab.get(tabId) === sessionId) {
+      sessionByTab.delete(tabId);
+    }
+    if (confirmedRoutes.get(tabId) === sessionId) {
+      confirmedRoutes.delete(tabId);
+    }
+    settleRouteWaiters((waiter) =>
+      waiter.tabId === tabId && waiter.sessionId === sessionId
+        ? err(routeFailure('TAB_NOT_BOUND', ROUTE_ENDED_MESSAGE, waiter.tabId))
+        : undefined,
+    );
+    log.info('the local service refused a re-announced binding: its session is over', {
+      tabId,
+      sessionId,
+      code,
+    });
+    const report = deps.onBindingRefused;
+    if (report === undefined) {
+      return;
+    }
+    try {
+      report({ tabId, sessionId, code });
+    } catch (thrown) {
+      log.warn('the binding refusal sink threw', {
+        tabId,
+        sessionId,
+        code: DebuggenError.from(thrown).code,
+      });
+    }
+  }
+
+  /**
+   * Forget the re-announced binds a `session.bound` answered: an establishing
+   * reason for a pair is the service accepting the bind that named it. An
+   * ending reason answers nothing — the service sends one for its own reasons,
+   * never in reply to a bind.
+   */
+  function settleReannouncedBinds(bound: SessionBoundPayload): void {
+    if (bindingEnds(bound.reason)) {
+      return;
+    }
+    for (const [ref, bind] of reannouncedBinds) {
+      if (bind.tabId === bound.tabId && bind.sessionId === bound.sessionId) {
+        reannouncedBinds.delete(ref);
+      }
     }
   }
 
@@ -2431,6 +3279,10 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    * resolves after a newer connection opened is abandoned (that connection
    * announces for itself), and each tab is announced once. The service's
    * `session.bound` answers flow back through the normal inbound path.
+   *
+   * Each bind is sent with an id of its own, remembered in
+   * {@link reannouncedBinds} for this connection, so a refusal — which names
+   * the bind only by that id — can be tied back to the pair it refused.
    */
   async function reannounceBindings(generation: number): Promise<void> {
     const listed = await settle(listBindings, 'STORE_ERROR');
@@ -2463,9 +3315,12 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
         origin: record.origin,
         sessionId: record.sessionId,
       };
+      const id = newMessageId();
+      rememberReannouncedBind(id, record.tabId, record.sessionId);
       // Sent acting for the tab it binds, like every frame sent for a tab.
-      const outcome = sendTracked(MESSAGE_TYPE.SESSION_BIND, payload, { tabId: record.tabId });
+      const outcome = sendTracked(MESSAGE_TYPE.SESSION_BIND, payload, { id, tabId: record.tabId });
       if (isErr(outcome)) {
+        reannouncedBinds.delete(id);
         failed += 1;
         log.warn('a binding could not be re-announced', {
           tabId: record.tabId,
@@ -2475,6 +3330,24 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       }
     }
     log.info('re-announced the persisted tab bindings', { count: announced.size, failed });
+  }
+
+  /**
+   * Remember one re-announced bind under the id it is sent with, until the
+   * service answers it. Beyond {@link MAX_REANNOUNCED_BINDS} entries the
+   * oldest gives way — a bind that old on one connection was answered long
+   * ago, and a refusal of it that arrives anyway only goes unacted on until
+   * the next open re-announces the pair.
+   */
+  function rememberReannouncedBind(id: string, tabId: TabId, sessionId: SessionId): void {
+    while (reannouncedBinds.size >= MAX_REANNOUNCED_BINDS) {
+      const oldest = reannouncedBinds.keys().next();
+      if (oldest.done === true) {
+        break;
+      }
+      reannouncedBinds.delete(oldest.value);
+    }
+    reannouncedBinds.set(id, { tabId, sessionId });
   }
 
   // -------------------------------------------------------------------------
@@ -2561,10 +3434,53 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    */
   function startHeartbeat(generation: number): void {
     stopHeartbeat();
+    resetUnansweredCount();
     if (disposed) {
       return;
     }
     scheduleHeartbeatTick(generation);
+  }
+
+  /**
+   * Start the count of unanswered ticks again: the socket answered, proved it
+   * is read, or is a new connection. Forgets the kept pings and the span
+   * start with it, so neither outlives the evidence it was kept for.
+   */
+  function resetUnansweredCount(): void {
+    unansweredWhileAlive = 0;
+    keptSince = undefined;
+    keptPingIds = [];
+  }
+
+  /**
+   * Remember a ping the current connection kept unanswered, so a late answer
+   * naming it is recognised; only the latest
+   * {@link HEARTBEAT_LATE_ANSWER_MEMORY} are kept.
+   */
+  function rememberKeptPing(id: MessageId): void {
+    keptPingIds = [...keptPingIds, id].slice(-HEARTBEAT_LATE_ANSWER_MEMORY);
+  }
+
+  /**
+   * Treat an inbound reply naming `ref` as a late answer to a ping the current
+   * connection kept unanswered: proof the service read the socket at least
+   * that far, which starts the unanswered count again. Logged at debug, with
+   * counts only.
+   *
+   * @returns Whether `ref` named such a ping — the reply was the heartbeat's,
+   * and has been consumed.
+   */
+  function acceptLateAnswer(ref: string): boolean {
+    const index = keptPingIds.findIndex((id) => id === ref);
+    if (index < 0) {
+      return false;
+    }
+    log.debug('the local service answered an earlier heartbeat ping of this socket; it is read', {
+      pingsBehind: keptPingIds.length - index,
+      unansweredWhileAlive,
+    });
+    resetUnansweredCount();
+    return true;
   }
 
   /** Schedule the next tick of the heartbeat of connection `generation`. */
@@ -2591,25 +3507,133 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
   }
 
   /**
-   * Register the tick's `client.ping` under `id` and wait for its answer, at
-   * most {@link SERVICE_PONG_TIMEOUT_MS} on the bridge's timers. Registered
-   * before the ping is written, so no answer can arrive unregistered, however
-   * the transport schedules its events. Never rejects.
+   * Read the observed socket's outbound buffer: its `bufferedAmount` and the
+   * bytes this bridge has written to it. `undefined` when there is no socket,
+   * or it reports no finite, non-negative `bufferedAmount` — which the
+   * heartbeat treats as "unknown", never as "empty".
    */
-  function awaitPingAnswer(id: MessageId): Promise<HeartbeatPingOutcome> {
-    return new Promise<HeartbeatPingOutcome>((resolve) => {
-      const deadline = bridgeTimers.setTimeout(() => {
-        if (outstandingPing?.id === id) {
-          finishOutstandingPing('timed-out');
-        }
-      }, SERVICE_PONG_TIMEOUT_MS);
-      outstandingPing = { id, deadline, finish: resolve };
+  function sampleSendBuffer(): SendBufferSample | undefined {
+    const socket = currentSocket;
+    const buffered = socket?.bufferedAmount;
+    if (
+      socket === undefined ||
+      buffered === undefined ||
+      !Number.isFinite(buffered) ||
+      buffered < 0
+    ) {
+      return undefined;
+    }
+    return { socket, buffered, written: bytesWrittenToCurrentSocket };
+  }
+
+  /**
+   * Register the tick's `client.ping` under `id` and wait for its answer: one
+   * {@link SERVICE_PONG_TIMEOUT_MS} window on the bridge's timers, extended
+   * window by window while the ping is still queued behind this socket's own
+   * draining backlog ({@link handlePongWindowElapsed}). Registered before the
+   * ping is written, so no answer can arrive unregistered, however the
+   * transport schedules its events. Never rejects.
+   *
+   * @param beforePing The socket's outbound buffer just before the ping is
+   *   written: what the ping will wait behind.
+   */
+  function awaitPingAnswer(
+    id: MessageId,
+    beforePing: SendBufferSample | undefined,
+  ): Promise<HeartbeatPingResult> {
+    return new Promise<HeartbeatPingResult>((resolve) => {
+      const pending: OutstandingPing = {
+        id,
+        deadline: armPongWindow(id),
+        windows: 1,
+        beforePing,
+        windowStart: beforePing,
+        stop: undefined,
+        finish: (outcome) => {
+          resolve({
+            outcome,
+            id,
+            beforePing,
+            pongWindows: pending.windows,
+            ...(pending.stop === undefined ? {} : { stop: pending.stop }),
+          });
+        },
+      };
+      outstandingPing = pending;
     });
+  }
+
+  /** Arm one pong window's deadline for the ping `id`. */
+  function armPongWindow(id: MessageId): number {
+    return bridgeTimers.setTimeout(() => {
+      handlePongWindowElapsed(id);
+    }, SERVICE_PONG_TIMEOUT_MS);
+  }
+
+  /**
+   * A pong window of the outstanding ping `id` elapsed without an answer.
+   * Grant another window when {@link decidePongWindow} finds the ping still
+   * queued behind a backlog that drained over the window — logged at debug,
+   * with counts only — and otherwise end the wait as `timed-out`, recording
+   * why.
+   */
+  function handlePongWindowElapsed(id: MessageId): void {
+    const pending = outstandingPing;
+    if (pending?.id !== id) {
+      return;
+    }
+    const now = sampleSendBuffer();
+    const decision = decidePongWindow(
+      pending.windows,
+      pending.beforePing,
+      pending.windowStart,
+      now,
+    );
+    if (!decision.extend) {
+      pending.stop = decision.stop;
+      finishOutstandingPing('timed-out');
+      return;
+    }
+    pending.windows += 1;
+    pending.windowStart = now;
+    pending.deadline = armPongWindow(id);
+    log.debug(
+      'the heartbeat ping is still queued behind this socket’s draining backlog; waiting another pong window',
+      {
+        pongWindow: pending.windows,
+        maxPongWindows: HEARTBEAT_MAX_PONG_WINDOWS,
+        drainedBytes: decision.drainedBytes,
+        aheadBytes: decision.aheadBytes,
+        bufferedBytes: decision.bufferedBytes,
+      },
+    );
+  }
+
+  /**
+   * Give the outstanding heartbeat ping a fresh {@link SERVICE_PONG_TIMEOUT_MS}
+   * window from now: the service just answered an earlier ping on this socket,
+   * so it is alive, and the heartbeat's ping is merely queued behind telemetry
+   * it is still storing. A service that stops answering altogether answers no
+   * barrier either, and times out one window after its last answer — or after
+   * the windows {@link handlePongWindowElapsed} grants a draining backlog. The
+   * renewal is proof of life, not a backlog extension, so it does not count
+   * toward {@link HEARTBEAT_MAX_PONG_WINDOWS}; the new window's drain is
+   * measured from now.
+   */
+  function renewOutstandingPing(): void {
+    const pending = outstandingPing;
+    if (pending === undefined) {
+      return;
+    }
+    bridgeTimers.clearTimeout(pending.deadline);
+    pending.windowStart = sampleSendBuffer();
+    pending.deadline = armPongWindow(pending.id);
   }
 
   /**
    * End the outstanding ping's wait with `outcome`, if a ping is outstanding.
-   * Its deadline timer is cleared unless it is the deadline that fired.
+   * Its current deadline timer is cleared unless it is the deadline that
+   * fired.
    */
   function finishOutstandingPing(outcome: HeartbeatPingOutcome): void {
     const pending = outstandingPing;
@@ -2672,6 +3696,21 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    *    the client's jittered backoff curve through `client.restart`; the
    *    transition to `reconnecting` stops this heartbeat, probes the service
    *    for the pill, and the next open starts another heartbeat.
+   *    The one wait that outlasts a window is a ping written behind this
+   *    socket's own outbound backlog while the service is draining it: the
+   *    socket's buffer is sampled just before the write, and each elapsed
+   *    window is extended by another while {@link decidePongWindow} finds the
+   *    ping still behind bytes that drained — up to
+   *    {@link HEARTBEAT_MAX_PONG_WINDOWS} windows — so a busy but live service
+   *    does not have its connection retired and replaced by one queued behind
+   *    the same backlog.
+   * 3. A ping still unanswered when its windows end is settled by
+   *    {@link settleUnansweredPing}: the socket is retired only when the
+   *    health route does not answer either (the service is gone or frozen),
+   *    or after {@link HEARTBEAT_MAX_UNANSWERED_WHILE_ALIVE} such ticks in a
+   *    row without proof that the socket is read; a service that answers is
+   *    alive and reading this connection under backpressure, so the socket is
+   *    kept and the next tick pings again.
    *
    * A tick orphaned by {@link stopHeartbeat} or overtaken by a newer
    * connection while it awaited does nothing further.
@@ -2707,7 +3746,14 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       return;
     }
     const pingId = newMessageId();
-    const answer = awaitPingAnswer(pingId);
+    // Sampled before the write: what is buffered now is what the ping will
+    // wait behind.
+    const answer = awaitPingAnswer(pingId, sampleSendBuffer());
+    // Written behind whatever telemetry went before it, the ping is a barrier:
+    // its answer acknowledges that telemetry too. Registered before the write,
+    // like the wait; a write that fails retires the socket, and the transition
+    // empties the window with the barrier in it.
+    recordBarrier(pingId);
     const sent = sendTracked(MESSAGE_TYPE.CLIENT_PING, {}, { id: pingId });
     if (heartbeatTickGeneration !== generation) {
       // The write itself moved the transport off `open`, which stopped the
@@ -2723,7 +3769,7 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       );
       return;
     }
-    const outcome = await answer;
+    const result = await answer;
     if (heartbeatTickGeneration !== generation) {
       return;
     }
@@ -2731,20 +3777,113 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
     if (!isHeartbeatCurrent(generation)) {
       return;
     }
+    const { outcome } = result;
     switch (outcome) {
       case 'answered':
+        resetUnansweredCount();
         scheduleHeartbeatTick(generation);
         return;
       case 'timed-out':
-        retireSilentSocket('the local service did not answer the heartbeat ping; reconnecting', {
-          timeoutMs: SERVICE_PONG_TIMEOUT_MS,
-        });
+        await settleUnansweredPing(generation, result);
         return;
       case 'cancelled':
         return;
       default:
         assertNever(outcome);
     }
+  }
+
+  /**
+   * Decide what an unanswered ping of connection `generation` means.
+   *
+   * 1. Measure whether the service demonstrably read this socket since the
+   *    span began — the previous kept tick, or this ping's write
+   *    ({@link sendBufferReadProgress}).
+   * 2. Without that proof, and with
+   *    {@link HEARTBEAT_MAX_UNANSWERED_WHILE_ALIVE} consecutive unanswered
+   *    ticks already counted, retire the socket at once onto the backoff
+   *    curve.
+   * 3. Otherwise ask the auth-exempt health route whether the service answers
+   *    at all. A service that does not answer retires the socket at once; one
+   *    that answers keeps it — it is alive and applying backpressure to this
+   *    connection, so its ping is waiting to be read — and the next tick
+   *    pings again. A tick with read progress is logged as such and starts
+   *    the count again; one without it is counted.
+   *
+   * The probe is the heartbeat's own, bounded by
+   * {@link HEARTBEAT_HEALTH_TIMEOUT_MS} rather than the pill's three seconds,
+   * and it refreshes the pill's reachability like every probe. A tick
+   * orphaned while the probe ran (the connection ended, or the heartbeat was
+   * stopped) does nothing.
+   */
+  async function settleUnansweredPing(
+    generation: number,
+    result: HeartbeatPingResult,
+  ): Promise<void> {
+    const fields: LogFields = {
+      timeoutMs: SERVICE_PONG_TIMEOUT_MS,
+      pongWindows: result.pongWindows,
+      ...(result.stop === undefined ? {} : { stop: result.stop }),
+    };
+    const now = sampleSendBuffer();
+    const readBytes = sendBufferReadProgress(keptSince ?? result.beforePing, now);
+    if (readBytes === 0 && unansweredWhileAlive >= HEARTBEAT_MAX_UNANSWERED_WHILE_ALIVE) {
+      resetUnansweredCount();
+      retireSilentSocket('the local service did not answer the heartbeat ping; reconnecting', {
+        ...fields,
+        unansweredWhileAlive: HEARTBEAT_MAX_UNANSWERED_WHILE_ALIVE + 1,
+      });
+      return;
+    }
+    heartbeatTickGeneration = generation;
+    // Its own probe, not the pill's shared one: this question may wait longer
+    // for an answer (HEARTBEAT_HEALTH_TIMEOUT_MS). It refreshes reachability
+    // all the same.
+    const health = await probeService({ timeoutMs: HEARTBEAT_HEALTH_TIMEOUT_MS });
+    if (heartbeatTickGeneration !== generation) {
+      return;
+    }
+    heartbeatTickGeneration = undefined;
+    if (!isHeartbeatCurrent(generation)) {
+      return;
+    }
+    if (isErr(health)) {
+      resetUnansweredCount();
+      retireSilentSocket('the local service did not answer the heartbeat ping; reconnecting', {
+        ...fields,
+        health: health.error.code,
+      });
+      return;
+    }
+    if (readBytes > 0) {
+      // Proof of reading starts the count again. The pings kept so far stay
+      // remembered with this one: a late answer to any of them is still proof.
+      unansweredWhileAlive = 0;
+      keptSince = now;
+      rememberKeptPing(result.id);
+      log.info(
+        'the local service is reading this socket’s backlog and has not reached its heartbeat ping yet; keeping the socket',
+        {
+          ...fields,
+          readBytes,
+          bufferedBytes: now?.buffered ?? 0,
+        },
+      );
+      scheduleHeartbeatTick(generation);
+      return;
+    }
+    keptSince = now;
+    rememberKeptPing(result.id);
+    unansweredWhileAlive += 1;
+    log.info(
+      'the local service answers but has not read this socket’s heartbeat ping yet; keeping the socket',
+      {
+        ...fields,
+        unansweredWhileAlive,
+        maxUnansweredWhileAlive: HEARTBEAT_MAX_UNANSWERED_WHILE_ALIVE,
+      },
+    );
+    scheduleHeartbeatTick(generation);
   }
 
   /**
@@ -2858,12 +3997,15 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
     }
     disposed = true;
     stopHeartbeat();
+    // Before the close below, whose transition would otherwise let them proceed.
+    failCapacityWaiters(CAPACITY_DISPOSED_MESSAGE);
     // Disposal is the worker going away, not a loss to show: whatever is still
     // queued is forgotten unreported, and nothing is left to report it to.
     queueMirror.length = 0;
     client.close(NORMAL_CLOSURE_CODE, BRIDGE_CLOSED_REASON);
     sessionByTab.clear();
     confirmedRoutes.clear();
+    reannouncedBinds.clear();
     currentSocket = undefined;
     failRouteWaiters((tabId) =>
       routeFailure('TRANSPORT_DISCONNECTED', ROUTE_DISPOSED_MESSAGE, tabId),
@@ -3048,8 +4190,28 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    * through the same checks, the queue mirror recording it with no events;
    * without one there is nothing the protocol would accept, and nothing is
    * sent.
+   *
+   * The tab's capacity reservation ({@link WsBridge.awaitTelemetryCapacity}),
+   * when it holds one, is spent by the call whatever it does: what it writes
+   * is counted in the window instead, frame by frame, and the waits behind it
+   * are re-examined once it returns.
    */
   function sendTelemetryBatch(
+    tabId: TabId,
+    rawEvents: unknown,
+    sessionId?: SessionId,
+    context?: TelemetryBatchContext,
+  ): Result<TelemetryBatchOutcome, DebuggenError> {
+    const reserved = telemetryReservations.delete(tabId);
+    const outcome = writeTelemetryBatch(tabId, rawEvents, sessionId, context);
+    if (reserved) {
+      grantCapacityWaiters();
+    }
+    return outcome;
+  }
+
+  /** {@link sendTelemetryBatch} without the reservation's bookkeeping. */
+  function writeTelemetryBatch(
     tabId: TabId,
     rawEvents: unknown,
     sessionId?: SessionId,
@@ -3234,6 +4396,9 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       frames += 1;
       events += chunk.length;
       start += frameEventLimit;
+      // Counted per frame, so a barrier can fall between the chunks of a
+      // large batch as readily as between batches.
+      noteTelemetryWritten(chunk.length, 1);
     } while (start < total);
     log.debug('forwarded a telemetry batch', {
       tabId,
@@ -3257,6 +4422,312 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       client.state === 'open' &&
       currentSocket?.readyState === WEBSOCKET_OPEN_READY_STATE
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // Telemetry flow control (see the section of that name on createWsBridge)
+  // -------------------------------------------------------------------------
+
+  /** The frames a batch of `events` is written as: at least one, a loss-only report's included. */
+  function framesFor(events: number): number {
+    return Math.max(1, Math.ceil(events / frameEventLimit));
+  }
+
+  /** The telemetry in the window: written and not acknowledged, plus every reservation. */
+  function inFlight(): { readonly events: number; readonly frames: number } {
+    let events = telemetryWritten.events - telemetryAcknowledged.events;
+    let frames = telemetryWritten.frames - telemetryAcknowledged.frames;
+    for (const reservation of telemetryReservations.values()) {
+      events += reservation.events;
+      frames += reservation.frames;
+    }
+    return { events, frames };
+  }
+
+  /**
+   * Whether a batch of `events` written as `frames` may take the window now:
+   * always while the service has not been seen to answer a barrier and while
+   * nothing is in flight (a batch larger than the window is admitted whole
+   * then), otherwise only within both bounds.
+   */
+  function windowAdmits(events: number, frames: number): boolean {
+    if (!peerPaced) {
+      return true;
+    }
+    const current = inFlight();
+    if (current.events === 0 && current.frames === 0) {
+      return true;
+    }
+    return (
+      current.events + events <= MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS &&
+      current.frames + frames <= MAX_UNACKNOWLEDGED_TELEMETRY_FRAMES
+    );
+  }
+
+  /** How much of the connection's telemetry the newest outstanding barrier covers, or the acknowledged part when none is outstanding. */
+  function barrierCoverage(): { readonly events: number; readonly frames: number } {
+    const newest = telemetryBarriers.at(-1);
+    return newest === undefined
+      ? telemetryAcknowledged
+      : { events: newest.eventsThrough, frames: newest.framesThrough };
+  }
+
+  /**
+   * Record the ping `id` as a barrier covering every telemetry frame written
+   * on the connection so far. Called just before the ping is written, so no
+   * answer can arrive unrecorded.
+   */
+  function recordBarrier(id: MessageId): void {
+    telemetryBarriers.push({
+      id,
+      eventsThrough: telemetryWritten.events,
+      framesThrough: telemetryWritten.frames,
+    });
+  }
+
+  /**
+   * Write a barrier `client.ping` behind the telemetry written so far — only
+   * to a socket that takes the write now, like telemetry itself: a ping the
+   * socket client queued would be answered on another connection, and
+   * acknowledges nothing on this one, so it is forgotten as a barrier.
+   */
+  function writeBarrier(): void {
+    if (!socketWritable()) {
+      return;
+    }
+    const id = newMessageId();
+    recordBarrier(id);
+    const sent = sendTracked(MESSAGE_TYPE.CLIENT_PING, {}, { id });
+    if (isErr(sent) || sent.value !== 'sent') {
+      const index = telemetryBarriers.findIndex((barrier) => barrier.id === id);
+      if (index >= 0) {
+        telemetryBarriers.splice(index, 1);
+      }
+      log.debug('a telemetry barrier ping was not written to the open socket', {
+        ...(isErr(sent) ? { code: sent.error.code } : { outcome: sent.value }),
+      });
+    }
+  }
+
+  /**
+   * Count `events` in `frames` just written to the socket, and write a
+   * barrier behind them once {@link TELEMETRY_BARRIER_EVENTS} events or
+   * {@link TELEMETRY_BARRIER_FRAMES} frames have gone out since the newest
+   * one — on that cadence whether or not the service is yet known to answer
+   * barriers, so the answers that renew the heartbeat keep coming behind a
+   * connection's first burst too; before the first answer, at most
+   * {@link MAX_UNPACED_TELEMETRY_BARRIERS} are outstanding.
+   */
+  function noteTelemetryWritten(events: number, frames: number): void {
+    telemetryWritten = {
+      events: telemetryWritten.events + events,
+      frames: telemetryWritten.frames + frames,
+    };
+    const covered = barrierCoverage();
+    const due =
+      telemetryWritten.events - covered.events >= TELEMETRY_BARRIER_EVENTS ||
+      telemetryWritten.frames - covered.frames >= TELEMETRY_BARRIER_FRAMES;
+    if (due && (peerPaced || telemetryBarriers.length < MAX_UNPACED_TELEMETRY_BARRIERS)) {
+      writeBarrier();
+    }
+  }
+
+  /**
+   * Make sure an acknowledgement is on its way while a wait cannot be
+   * granted: with telemetry in flight and no barrier outstanding to answer
+   * for it, write one now. An outstanding barrier's answer re-examines the
+   * waits, and covers the rest then if it must.
+   */
+  function coverTelemetryInFlight(): void {
+    if (telemetryBarriers.length > 0) {
+      return;
+    }
+    if (
+      telemetryWritten.events > telemetryAcknowledged.events ||
+      telemetryWritten.frames > telemetryAcknowledged.frames
+    ) {
+      writeBarrier();
+    }
+  }
+
+  /**
+   * Treat an inbound answer naming `ref` as the acknowledgement of that
+   * barrier — and, since the service answers in order, of every older one:
+   * the telemetry they cover leaves the window, the outstanding heartbeat
+   * ping (when it is another ping) gets a fresh deadline, and the waits are
+   * re-examined.
+   *
+   * @returns Whether `ref` named an outstanding barrier.
+   */
+  function acknowledgeBarrier(ref: string): boolean {
+    const index = telemetryBarriers.findIndex((barrier) => barrier.id === ref);
+    const barrier = telemetryBarriers[index];
+    if (index < 0 || barrier === undefined) {
+      return false;
+    }
+    telemetryBarriers.splice(0, index + 1);
+    telemetryAcknowledged = { events: barrier.eventsThrough, frames: barrier.framesThrough };
+    if (!peerPaced) {
+      peerPaced = true;
+      log.debug('the local service answers telemetry barriers; telemetry is paced by them', {
+        maxEvents: MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS,
+        maxFrames: MAX_UNACKNOWLEDGED_TELEMETRY_FRAMES,
+      });
+    }
+    if (outstandingPing !== undefined && outstandingPing.id !== ref) {
+      renewOutstandingPing();
+    }
+    grantCapacityWaiters();
+    return true;
+  }
+
+  /**
+   * Grant the waits the window admits, oldest first, each reserving its room
+   * before the next is examined; the first that does not fit stops the
+   * examination — later waits never overtake it — and makes sure an
+   * acknowledgement is coming.
+   */
+  function grantCapacityWaiters(): void {
+    for (;;) {
+      const next = capacityWaiters[0];
+      if (next === undefined) {
+        return;
+      }
+      if (!windowAdmits(next.events, next.frames)) {
+        coverTelemetryInFlight();
+        return;
+      }
+      telemetryReservations.set(next.tabId, { events: next.events, frames: next.frames });
+      next.settle(ok(undefined));
+    }
+  }
+
+  /** Fail every pending capacity wait with `message`. */
+  function failCapacityWaiters(message: string): void {
+    for (const waiter of [...capacityWaiters]) {
+      waiter.settle(err(routeFailure('TRANSPORT_DISCONNECTED', message, waiter.tabId)));
+    }
+  }
+
+  /**
+   * Empty the window on a transport transition: what the last socket carried
+   * and acknowledged says nothing about the next, and its barriers' answers,
+   * should any still arrive, name nothing on it. The waits are then examined
+   * against the empty window, so each proceeds to its send — which reports the
+   * transition as it always did, and the lane waits for the route again.
+   */
+  function resetTelemetryFlow(): void {
+    telemetryWritten = { events: 0, frames: 0 };
+    telemetryAcknowledged = { events: 0, frames: 0 };
+    telemetryBarriers.length = 0;
+    telemetryReservations.clear();
+    grantCapacityWaiters();
+  }
+
+  /** See {@link WsBridge.awaitTelemetryCapacity}. */
+  function awaitTelemetryCapacity(
+    tabId: TabId,
+    events: number,
+    options: TelemetryCapacityWaitOptions = {},
+  ): Promise<Result<void, DebuggenError>> {
+    if (!isTabId(tabId)) {
+      return Promise.resolve(
+        err(workerError('PROTOCOL_INVALID_MESSAGE', CAPACITY_INVALID_TAB_MESSAGE)),
+      );
+    }
+    if (!Number.isSafeInteger(events) || events < 0) {
+      return Promise.resolve(
+        err(routeFailure('PROTOCOL_INVALID_MESSAGE', CAPACITY_INVALID_COUNT_MESSAGE, tabId)),
+      );
+    }
+    if (disposed) {
+      return Promise.resolve(
+        err(routeFailure('TRANSPORT_DISCONNECTED', CAPACITY_DISPOSED_MESSAGE, tabId)),
+      );
+    }
+    const { signal } = options;
+    if (signal?.aborted === true) {
+      return Promise.resolve(
+        err(
+          routeFailure('TRANSPORT_DISCONNECTED', CAPACITY_ABORTED_MESSAGE, tabId, {
+            cancelled: 'aborted',
+          }),
+        ),
+      );
+    }
+    // A lane forwards one batch at a time, so a new request replaces the
+    // tab's unspent reservation rather than adding to it.
+    telemetryReservations.delete(tabId);
+    const frames = framesFor(events);
+    if (capacityWaiters.length === 0 && windowAdmits(events, frames)) {
+      telemetryReservations.set(tabId, { events, frames });
+      return Promise.resolve(ok(undefined));
+    }
+
+    capacityWaitCount += 1;
+    const current = inFlight();
+    log.debug('telemetry waits for the local service to acknowledge what is in flight', {
+      tabId,
+      events,
+      inFlightEvents: current.events,
+      inFlightFrames: current.frames,
+      waiting: capacityWaiters.length + 1,
+    });
+    const timeoutMs = resolveRouteTimeout(options.timeoutMs);
+    return new Promise<Result<void, DebuggenError>>((resolve) => {
+      let handle: number | undefined;
+      const fail = (message: string, cancelled: RouteCancellation): void => {
+        waiter.settle(err(routeFailure('TRANSPORT_DISCONNECTED', message, tabId, { cancelled })));
+        // The wait that left may have been what held the ones behind it.
+        grantCapacityWaiters();
+      };
+      const onAbort = (): void => {
+        fail(CAPACITY_ABORTED_MESSAGE, 'aborted');
+      };
+      const waiter: CapacityWaiter = {
+        tabId,
+        events,
+        frames,
+        settle: (result) => {
+          const index = capacityWaiters.indexOf(waiter);
+          if (index < 0) {
+            return;
+          }
+          capacityWaiters.splice(index, 1);
+          if (handle !== undefined) {
+            bridgeTimers.clearTimeout(handle);
+            handle = undefined;
+          }
+          signal?.removeEventListener('abort', onAbort);
+          resolve(result);
+        },
+      };
+      capacityWaiters.push(waiter);
+      handle = bridgeTimers.setTimeout(() => {
+        handle = undefined;
+        log.debug('telemetry waited for room in the window until its bound', {
+          tabId,
+          events,
+          timeoutMs,
+        });
+        fail(CAPACITY_TIMED_OUT_MESSAGE, 'timeout');
+      }, timeoutMs);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      coverTelemetryInFlight();
+    });
+  }
+
+  /** See {@link WsBridge.getTelemetryFlow}. */
+  function getTelemetryFlow(): TelemetryFlowStatus {
+    const current = inFlight();
+    return Object.freeze({
+      paced: peerPaced,
+      inFlightEvents: current.events,
+      inFlightFrames: current.frames,
+      outstandingBarriers: telemetryBarriers.length,
+      waiting: capacityWaiters.length,
+      waits: capacityWaitCount,
+    });
   }
 
   /**
@@ -3581,6 +5052,8 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
     subscribe,
     sendTelemetryBatch,
     awaitTabRoute,
+    awaitTelemetryCapacity,
+    getTelemetryFlow,
     relayAgentReady,
     queryPanelData,
     startCapture,

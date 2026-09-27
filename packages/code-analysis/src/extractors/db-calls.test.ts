@@ -819,6 +819,38 @@ const SCRATCH_MODULES: Readonly<Record<string, string>> = {
     '',
   ].join('\n'),
 
+  // Interactive transactions. The callback's first parameter is a transaction
+  // client only when the callback is the first argument of `$transaction` on a
+  // proved generated-client handle; the other two callbacks each miss one of
+  // those conditions and must contribute nothing. `unit` and `lookalike` are
+  // outside every generic-name list, so the name heuristic cannot rescue them.
+  'src/transaction.ts': [
+    "import { alpha } from './handles';",
+    '',
+    'interface Unrelated {',
+    '  $transaction(work: (unit: Unrelated) => Promise<void>): Promise<void>;',
+    '  widget: { findMany(args: unknown): Promise<unknown[]> };',
+    '}',
+    '',
+    'export async function interactive(kind: string): Promise<void> {',
+    '  await alpha.$transaction(async (unit) => {',
+    '    await unit.widget.findMany({ where: { kind } });',
+    '    await unit.gadget.create({ data: { kind } });',
+    '  });',
+    '}',
+    '',
+    'export async function unrelatedReceiver(lookalike: Unrelated): Promise<void> {',
+    '  await lookalike.$transaction(async (unit) => {',
+    '    await unit.widget.findMany({});',
+    '  });',
+    '}',
+    '',
+    'export async function unrelatedCallback(kinds: string[]): Promise<void> {',
+    '  await Promise.all(kinds.map(async (unit) => unit.length));',
+    '}',
+    '',
+  ].join('\n'),
+
   // Deliberately unparseable after the first declaration.
   'src/broken.ts': [
     "import { beta } from './handles';",
@@ -1668,6 +1700,63 @@ describe('dbCallsExtractor: handle discovery across modules', () => {
       { name: 'handle.query', driver: 'pg', operation: 'update', heuristic: false },
       { name: 'handle.query', driver: 'pg', operation: 'with', heuristic: false },
     ]);
+  });
+
+  it('records the calls written on an interactive transaction client', () => {
+    // The transaction client is lent by `alpha.$transaction`, whose receiver the
+    // cross-module walk proves: its delegate calls are generated-client call
+    // sites like any other, structurally discovered and never heuristic.
+    expect(
+      scratchNodes('transaction').map((node) => ({
+        name: node.name,
+        driver: node.data.driver,
+        model: node.data.model,
+        operation: node.data.operation,
+        symbol: node.symbol,
+        heuristic: isHeuristicDbCall(node.data),
+      })),
+    ).toStrictEqual([
+      {
+        name: 'alpha.$transaction',
+        driver: 'prisma',
+        model: undefined,
+        operation: '$transaction',
+        symbol: 'interactive',
+        heuristic: false,
+      },
+      {
+        name: 'unit.widget.findMany',
+        driver: 'prisma',
+        model: 'widget',
+        operation: 'findMany',
+        symbol: 'interactive',
+        heuristic: false,
+      },
+      {
+        name: 'unit.gadget.create',
+        driver: 'prisma',
+        model: 'gadget',
+        operation: 'create',
+        symbol: 'interactive',
+        heuristic: false,
+      },
+    ]);
+  });
+
+  it('places each transaction-client call inside the source range of its transaction', () => {
+    // The source resolver narrows a statement run inside a transaction to the
+    // call sites inside that transaction's range, so the entry point's range
+    // must enclose the calls its callback makes.
+    const nodes = scratchNodes('transaction');
+    const transaction = nodeNamed(nodes, 'alpha.$transaction');
+    const end = transaction.endLine ?? transaction.line;
+
+    for (const name of ['unit.widget.findMany', 'unit.gadget.create']) {
+      const inner = nodeNamed(nodes, name);
+
+      expect(inner.line).toBeGreaterThan(transaction.line);
+      expect(inner.line).toBeLessThanOrEqual(end);
+    }
   });
 
   it('falls back to the marked name heuristic for a borrow taken without await', () => {

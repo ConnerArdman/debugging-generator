@@ -31,7 +31,7 @@
  * | Client kind | Receives a session's fan-out when | Direct deliveries |
  * | --- | --- | --- |
  * | `vscode` | the session's project root lies under a workspace folder its principal announced; while the project is not yet known, when the client explicitly attached to the session | editor-bound pushes for a project its scope covers ({@link ClientRegistry.sendToEditors}) |
- * | `devtools` | it is the connection carrying the tab bound to the session by **its own** credential ({@link ClientRegistry.bindTab}) | frames with no session, or for a session its credential has bound |
+ * | `devtools` | it is the connection carrying the tab bound to the session by **its own** credential ({@link ClientRegistry.bindTab}); for `session.created` alone, also the connection carrying a tab its credential announced that awaits a session for the new session's dev-server origin ({@link ClientRegistry.awaitSession}) | frames with no session, or for a session its credential has bound |
  * | `agent` | never directly: the MAIN-world page agent owns no socket and no credential, so its frames travel "under the tab's connection" (AAP §0.4.2) — a fan-out or delivery addressed to the `agent` kind is carried by the bound tab's DevTools connection, and relayed `agent.ready` / telemetry batches arrive on that same connection | — |
  * | `server-agent` | never: a dev-server preload is not a session client | only its own project's `server-agent.config` ({@link ClientRegistry.sendToServerAgent}), and the `error` or `service.pong` reply to a frame it sent |
  *
@@ -65,6 +65,33 @@
  * `routes/binding.ts` can tell the displaced panel it lost the binding with an
  * ordinary `broadcastToKinds` — and for nothing else.
  *
+ * ## Tabs awaiting a session
+ *
+ * A DevTools panel is normally opened — and its tab announced with
+ * `session.bind` — before the developer asks the question that creates the
+ * session, and a panel stays open across a session's end while the next
+ * question is asked. The service is the binding authority (AAP §0.2.3), so it
+ * remembers such a tab: `routes/binding.ts` records it with
+ * {@link ClientRegistry.awaitSession} when an origin bind finds no session, when
+ * the tab's session ended and the worker unbound it, and when the tab left its
+ * session's origin for another. The record holds the tab, the serialized
+ * HTTP(S) origin of its document and the announcing credential — never a URL.
+ *
+ * When a session is created, its `session.created` also reaches the connection
+ * carrying every tab awaiting that session's dev-server origin (and nothing
+ * else of the session), which is the worker's cue to announce the tab again:
+ * the service then binds it exactly as it binds a freshly opened panel. A
+ * session created while the tab was still bound to the one that ended cannot
+ * reach it that way, so when the tab starts awaiting, the binding route offers
+ * the newest open session already serving its origin to that one connection
+ * ({@link ClientRegistry.offerSessionToAwaitingTab}).
+ * Nothing more is disclosed than the bind itself would answer — the tab's
+ * credential announced that very origin — and no other frame follows until
+ * the tab is bound. A record ends when its tab is bound, when its DevTools
+ * closes (`session.unbind` of the unbound tab, {@link ClientRegistry.forgetAwaitingTab}),
+ * when no connection of its credential remains registered, and on revocation;
+ * at most {@link MAX_AWAITING_TABS} are held, the oldest evicted first.
+ *
  * ## Delivery semantics
  *
  * - **Serialize once.** A message is encoded with protocol's `encodeMessage`
@@ -84,9 +111,16 @@
  *   sessions and its bindings. Frames addressed to it are **dropped and
  *   counted**, not queued — the DevTools panel and the VS Code view re-render
  *   from stored data on reconnect (`sessions/reopen.ts`), so a queue would only
- *   replay stale frames ahead of fresh ones. Drops are logged at debug.
- *   {@link ClientRegistry.sweep} removes a client that has stayed offline past
- *   the grace period and closes any connection whose credential has expired.
+ *   replay stale frames ahead of fresh ones. Drops are logged at debug, one
+ *   record per delivery naming the frame's session and each client that
+ *   missed it by id, kind and reason. {@link ClientRegistry.sweep} removes a
+ *   client that has stayed offline past the grace period and closes any
+ *   connection whose credential has expired. An offline registration whose
+ *   socket has closed holds no slot under the connection bound: when a new
+ *   connection would pass it, {@link ClientRegistry.register} releases the
+ *   longest-offline such registrations (their bindings stay with the
+ *   credential), so reconnect churn inside the grace period is never refused
+ *   on their account.
  *
  * ## Privacy
  *
@@ -120,6 +154,7 @@ import {
   serverAgentConfigPayloadSchema,
   servicePongPayloadSchema,
   sessionBoundPayloadSchema,
+  sessionCreatedPayloadSchema,
 } from '@debuggen/protocol';
 import type { BindingReason, ClientKind, MessageType, ProtocolMessage } from '@debuggen/protocol';
 import {
@@ -182,14 +217,24 @@ export const MAX_CLOSE_REASON_BYTES = 123;
  * removes it: comfortably longer than the MV3 service worker's reconnect
  * backoff ceiling of 10 s (AAP §0.5.5), so a suspended worker is never swept
  * between two reconnect attempts.
+ *
+ * Retention is not occupancy: an offline registration whose socket has closed
+ * holds no slot under {@link DEFAULT_MAX_CLIENTS}, so the grace period never
+ * refuses a reconnect (see {@link ClientRegistry.register}).
  */
 export const DEFAULT_OFFLINE_GRACE_MS = 60_000;
 
 /**
- * The most connections one registry accepts. A local developer tool has a
+ * The most live connections one registry accepts. A local developer tool has a
  * handful (an editor window or two, one Chrome service worker, one or two
  * dev-server processes); the bound exists so a runaway reconnect loop cannot
  * exhaust memory.
+ *
+ * Live means online, or offline over a socket that is still open. A closed
+ * connection `ws.ts` retains offline for {@link DEFAULT_OFFLINE_GRACE_MS} does
+ * not hold a slot: {@link ClientRegistry.register} releases the longest-offline
+ * of them to make room, and refuses with `RATE_LIMITED` only when live
+ * connections alone fill the bound.
  */
 export const DEFAULT_MAX_CLIENTS = 256;
 
@@ -206,6 +251,14 @@ export const DEFAULT_MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
  * store write in between.
  */
 export const RELEASED_BINDING_NOTICE_WINDOW_MS = 5_000;
+
+/**
+ * The most tabs held as awaiting a session ({@link ClientRegistry.awaitSession})
+ * at once — the same bound the Chrome worker keeps on its own tab bindings. A
+ * record past it evicts the oldest, whose tab then binds when its panel next
+ * announces it.
+ */
+export const MAX_AWAITING_TABS = 256;
 
 /** The most released-binding notices kept per session. */
 const MAX_RELEASED_NOTICES_PER_SESSION = 8;
@@ -291,6 +344,12 @@ const BINDING_ANNOUNCEMENT_TYPE = messageTypeForSchema(
 
 /** The generic failure reply, which any connection may receive in answer to its own frame. */
 const ERROR_REPLY_TYPE = messageTypeForSchema(errorPayloadSchema, 'error');
+
+/**
+ * The session-creation announcement: the one frame of a session a DevTools
+ * connection whose tab awaits that session's origin receives before binding.
+ */
+const SESSION_CREATED_TYPE = messageTypeForSchema(sessionCreatedPayloadSchema, 'session creation');
 
 /**
  * The liveness answer, which any connection may receive in answer to its own
@@ -471,6 +530,21 @@ export interface UnbindTabOptions {
   readonly principal?: Principal | undefined;
 }
 
+/** What {@link ClientRegistry.awaitSession} is given. */
+export interface AwaitSessionInput {
+  /** The announced tab. */
+  readonly tabId: number;
+  /**
+   * The serialized HTTP(S) origin of the tab's document (`new URL(url).origin`)
+   * — the value a new session's dev-server origin is compared with. Never a URL.
+   */
+  readonly origin: string;
+  /** The announcing connection's principal; must be a DevTools one. */
+  readonly principal: Principal;
+  /** The connection that announced the tab, preferred as the recipient. */
+  readonly clientId?: string | undefined;
+}
+
 /** What {@link ClientRegistry.forgetSession} released. */
 export interface ForgetSessionOutcome {
   /** The session's binding, when it had one. */
@@ -520,8 +594,16 @@ export interface ClientRegistry {
    * match the principal's role (the page agent, which owns no socket, is always
    * refused) or a server agent announces a project other than its credential's;
    * `PROTOCOL_INVALID_MESSAGE` for a socket registered twice or a malformed
-   * announcement; `RATE_LIMITED` past the connection bound;
-   * `TRANSPORT_DISCONNECTED` after {@link closeAll}.
+   * announcement; `RATE_LIMITED` when live connections — online, or offline
+   * over a socket that is still open — fill the connection bound
+   * ({@link DEFAULT_MAX_CLIENTS}); `TRANSPORT_DISCONNECTED` after
+   * {@link closeAll}.
+   *
+   * At the bound, registrations retained offline over a closed socket are
+   * released first, the longest-offline first and only as many as the new
+   * connection needs, through the same path as {@link unregister}: their
+   * bindings stay with the credential, and a later `unregister` of a released
+   * id (`ws.ts`'s offline-grace timer) returns `undefined` and changes nothing.
    */
   register(registration: ClientRegistration): Result<RegisteredClient, DebuggenError>;
 
@@ -729,6 +811,51 @@ export interface ClientRegistry {
   /** The live binding of a session, or `undefined`. */
   bindingForSession(sessionId: string): TabBindingView | undefined;
 
+  /* ---- tabs awaiting a session ---- */
+
+  /**
+   * Records that a tab a DevTools credential announced awaits a session for
+   * `origin`, so the next session created for that dev-server origin reaches
+   * the connection carrying the tab with its `session.created` (see "Tabs
+   * awaiting a session" in the module overview). Replaces the tab's previous
+   * record; the oldest record is evicted past {@link MAX_AWAITING_TABS}.
+   *
+   * @returns `UNAUTHORIZED` for a non-DevTools principal or a `clientId` that
+   * is not a connection of that credential; `PROTOCOL_INVALID_MESSAGE` for a
+   * malformed tab id or a value that is not a serialized HTTP(S) origin.
+   */
+  awaitSession(input: AwaitSessionInput): Result<void, DebuggenError>;
+
+  /**
+   * Ends a tab's awaiting record — its DevTools closed. With a DevTools
+   * `principal`, only a record that credential made is ended.
+   *
+   * @returns Whether a record was ended.
+   */
+  forgetAwaitingTab(tabId: number, principal?: Principal): boolean;
+
+  /** The origin a tab awaits a session for, or `undefined` when it awaits none. */
+  awaitedOriginForTab(tabId: number): string | undefined;
+
+  /**
+   * Offers a session that already serves the origin a tab awaits — one created
+   * while the tab was still bound to the session that just ended, so its
+   * `session.created` fan-out could not reach the tab — by delivering that
+   * session's `session.created` to the one connection carrying the tab, and to
+   * nothing else. The worker then announces the tab with `session.bind`, as
+   * for a session created afterwards.
+   *
+   * @returns The delivery receipt; `PROTOCOL_INVALID_MESSAGE` for any frame
+   * other than a `session.created` whose session serves the awaited origin;
+   * `TAB_NOT_BOUND` when the tab awaits no session; `TRANSPORT_DISCONNECTED`
+   * when the registry is closed or no connection of the announcing credential
+   * is online.
+   */
+  offerSessionToAwaitingTab(
+    tabId: number,
+    message: ProtocolMessage,
+  ): Result<DeliveryReceipt, DebuggenError>;
+
   /* ---- liveness ---- */
 
   /**
@@ -885,8 +1012,36 @@ interface ReleasedNotice {
   readonly until: number;
 }
 
+/** One tab awaiting a session for its document's origin (see "Tabs awaiting a session"). */
+interface AwaitingTab {
+  readonly tabId: number;
+  /** The serialized HTTP(S) origin of the tab's document. */
+  readonly origin: string;
+  /** The announcing credential's `tokenHash`. */
+  readonly awaitedBy: string;
+  /** The connection last known to carry the tab; re-resolved on every delivery. */
+  recipientId: string | undefined;
+}
+
 /** Which single recipient a failed delivery was missing, carried in the error's `details`. */
 type MissingRecipient = 'bound-tab' | 'server-agent' | 'editor' | 'client' | 'registry';
+
+/**
+ * Why one recipient of a delivery could not take the frame, as the drop log
+ * names it: its registration was already removed (`unregistered`), it is
+ * marked offline (`offline`), its credential expired and it was closed
+ * (`expired`), its socket no longer reports itself open (`closed`), it was
+ * closed for not draining its buffer (`backpressure`), or the write threw
+ * (`send-failed`).
+ */
+type DropReason =
+  'unregistered' | 'offline' | 'expired' | 'closed' | 'backpressure' | 'send-failed';
+
+/** One recipient a delivery dropped the frame for, and why. */
+interface DroppedRecipient {
+  readonly entry: ClientEntry;
+  readonly reason: DropReason;
+}
 
 /** The longest URL a binding records; longer ones are refused rather than truncated. */
 const MAX_BINDING_URL_LENGTH = 8_192;
@@ -988,12 +1143,52 @@ function failure(
  */
 function embeddedSessionRecord(
   message: ProtocolMessage,
-): { readonly id: string; readonly projectRoot: string } | undefined {
+):
+  { readonly id: string; readonly projectRoot: string; readonly devServerUrl: string } | undefined {
   const payload = message.payload;
   if (!('session' in payload)) {
     return undefined;
   }
-  return { id: payload.session.id, projectRoot: payload.session.projectRoot };
+  return {
+    id: payload.session.id,
+    projectRoot: payload.session.projectRoot,
+    devServerUrl: payload.session.devServerUrl,
+  };
+}
+
+/**
+ * The serialized HTTP(S) origin of a URL, or `undefined` for one that does not
+ * parse or whose origin is opaque — the comparison `routes/binding.ts` matches
+ * a tab to a session's dev server with, so a different port, scheme or host
+ * never matches.
+ */
+function httpOriginOf(url: string): string | undefined {
+  const parsed = URL.parse(url);
+  if (parsed === null || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+    return undefined;
+  }
+  return parsed.origin;
+}
+
+/**
+ * The session a frame belongs to, for its log records: the envelope's routing
+ * key, else a string `sessionId` its payload carries, else the id of a session
+ * record it embeds; `undefined` for a session-less frame.
+ */
+function frameSessionId(message: ProtocolMessage): string | undefined {
+  if (message.sessionId !== undefined) {
+    return message.sessionId;
+  }
+  const payload: unknown = message.payload;
+  if (
+    typeof payload === 'object' &&
+    payload !== null &&
+    'sessionId' in payload &&
+    typeof payload.sessionId === 'string'
+  ) {
+    return payload.sessionId;
+  }
+  return embeddedSessionRecord(message)?.id;
 }
 
 /** Adds `id` to the set under `key`, creating the set on first use. */
@@ -1092,6 +1287,8 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
   const tabBySession = new Map<string, number>();
   const sessionProjects = new Map<string, string>();
   const released = new Map<string, ReleasedNotice[]>();
+  /** Tabs awaiting a session, oldest record first (insertion order). */
+  const awaitingByTab = new Map<number, AwaitingTab>();
 
   let closed = false;
   let totalDelivered = 0;
@@ -1152,6 +1349,21 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     for (const binding of bindingsByTab.values()) {
       if (binding.recipientId === entry.id) {
         binding.recipientId = undefined;
+      }
+    }
+    // A credential with no registered connection left can announce nothing
+    // any more: its awaiting tabs end with it. A reconnecting worker registers
+    // its new connection before the old one is swept, and re-announces its
+    // tabs on connect either way.
+    const credentialLive = byCredential.has(entry.principal.tokenHash);
+    for (const [tabId, awaiting] of [...awaitingByTab]) {
+      if (awaiting.awaitedBy !== entry.principal.tokenHash) {
+        continue;
+      }
+      if (!credentialLive) {
+        awaitingByTab.delete(tabId);
+      } else if (awaiting.recipientId === entry.id) {
+        awaiting.recipientId = undefined;
       }
     }
   }
@@ -1488,11 +1700,44 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
   /* ---- the delivery engine ---- */
 
   /**
+   * The fields of a delivery's one drop record: the frame's type and session,
+   * the delivered and dropped counts, and who missed the frame and why. One
+   * dropped recipient is named directly (`clientId`, `client`, `reason`);
+   * several are named by parallel arrays in delivery order (`clientIds`,
+   * `clients`, `reasons`). Identity only, per this module's privacy rule: never
+   * a principal, never its digest.
+   */
+  function dropFields(
+    message: ProtocolMessage,
+    delivered: number,
+    missed: readonly DroppedRecipient[],
+  ): LogFields {
+    const fields: LogFields = { type: message.type, dropped: missed.length, delivered };
+    const sessionId = frameSessionId(message);
+    if (sessionId !== undefined) {
+      fields[LOG_BINDING_KEYS.sessionId] = sessionId;
+    }
+    const [only] = missed;
+    if (missed.length === 1 && only !== undefined) {
+      fields['clientId'] = only.entry.id;
+      fields[LOG_BINDING_KEYS.client] = only.entry.kind;
+      fields['reason'] = only.reason;
+    } else {
+      fields['clientIds'] = missed.map((drop) => drop.entry.id);
+      fields['clients'] = missed.map((drop) => drop.entry.kind);
+      fields['reasons'] = missed.map((drop) => drop.reason);
+    }
+    return fields;
+  }
+
+  /**
    * Writes one frame to each recipient, in order, encoding it once.
    *
    * Synchronous and failure-isolated: a recipient that cannot take the frame is
    * counted as dropped (and, where the socket is at fault, marked offline or
-   * closed) and the loop continues.
+   * closed) and the loop continues. A delivery that dropped the frame for
+   * anyone writes one debug record naming each such recipient and its reason
+   * (see {@link dropFields}).
    */
   function deliver(recipients: readonly ClientEntry[], message: ProtocolMessage): DeliveryReceipt {
     if (recipients.length === 0) {
@@ -1514,24 +1759,25 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
 
     const now = clock();
     const sent: string[] = [];
-    let dropped = 0;
+    const missed: DroppedRecipient[] = [];
+    const drop = (entry: ClientEntry, reason: DropReason): void => {
+      recordDrop(entry);
+      missed.push({ entry, reason });
+    };
     for (const entry of recipients) {
       if (clients.get(entry.id) !== entry || !entry.online) {
-        recordDrop(entry);
-        dropped += 1;
+        drop(entry, clients.get(entry.id) === entry ? 'offline' : 'unregistered');
         continue;
       }
       if (credentialExpired(entry, now)) {
         log.info('Closed a connection whose credential expired', clientFields(entry));
         closeAndRemove(entry, WS_CLOSE_UNAUTHORIZED, EXPIRED_CLOSE_REASON);
-        recordDrop(entry);
-        dropped += 1;
+        drop(entry, 'expired');
         continue;
       }
       if (!socketIsOpen(entry.socket)) {
         setOffline(entry, now);
-        recordDrop(entry);
-        dropped += 1;
+        drop(entry, 'closed');
         continue;
       }
       const buffered = entry.socket.bufferedAmount;
@@ -1541,8 +1787,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
           bufferedAmount: buffered,
         });
         closeAndRemove(entry, WS_CLOSE_TRY_AGAIN_LATER, BACKPRESSURE_CLOSE_REASON);
-        recordDrop(entry);
-        dropped += 1;
+        drop(entry, 'backpressure');
         continue;
       }
       try {
@@ -1552,8 +1797,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
         sent.push(entry.id);
       } catch (cause) {
         setOffline(entry, now);
-        recordDrop(entry);
-        dropped += 1;
+        drop(entry, 'send-failed');
         log.debug('A send failed; the client is marked offline', {
           ...clientFields(entry),
           type: message.type,
@@ -1561,13 +1805,17 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
         });
       }
     }
-    if (dropped > 0) {
-      log.debug('Frames dropped for clients that could not take them', {
-        type: message.type,
-        dropped,
-      });
+    if (missed.length > 0) {
+      log.debug(
+        'Frames dropped for clients that could not take them',
+        dropFields(message, sent.length, missed),
+      );
     }
-    return Object.freeze({ delivered: sent.length, dropped, recipients: Object.freeze(sent) });
+    return Object.freeze({
+      delivered: sent.length,
+      dropped: missed.length,
+      recipients: Object.freeze(sent),
+    });
   }
 
   /** Delivers to a resolved recipient list and turns "nobody took it" into a named failure. */
@@ -1704,7 +1952,53 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
         }
       }
     }
+    if (kinds.has(KIND_DEVTOOLS) && message.type === SESSION_CREATED_TYPE) {
+      for (const relay of awaitingRelays(message)) {
+        add(relay);
+      }
+    }
     return recipients;
+  }
+
+  /**
+   * The connections carrying a tab that awaits the dev-server origin of the
+   * session a `session.created` embeds — each announcing credential's
+   * connection once, preferring the one that announced the tab.
+   */
+  function awaitingRelays(message: ProtocolMessage): ClientEntry[] {
+    const record = embeddedSessionRecord(message);
+    if (record === undefined || awaitingByTab.size === 0) {
+      return [];
+    }
+    const origin = httpOriginOf(record.devServerUrl);
+    if (origin === undefined) {
+      return [];
+    }
+    const relays: ClientEntry[] = [];
+    let tabs = 0;
+    for (const awaiting of awaitingByTab.values()) {
+      if (awaiting.origin !== origin) {
+        continue;
+      }
+      tabs += 1;
+      const relay = relayForCredential(awaiting.awaitedBy, awaiting.recipientId);
+      if (relay === undefined) {
+        recordDrop(undefined);
+        continue;
+      }
+      awaiting.recipientId = relay.id;
+      if (!relays.includes(relay)) {
+        relays.push(relay);
+      }
+    }
+    if (tabs > 0) {
+      log.debug('A new session reaches the DevTools connections of tabs awaiting its origin', {
+        [LOG_BINDING_KEYS.sessionId]: record.id,
+        tabs,
+        connections: relays.length,
+      });
+    }
+    return relays;
   }
 
   function fanOut(
@@ -1777,6 +2071,54 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
 
   /* ---- registration ---- */
 
+  /**
+   * Whether a registration is retained offline over a socket that can never
+   * carry a frame again. `ws.ts` keeps a closed connection's registration for
+   * the offline grace period so its identity stays visible, but such a
+   * registration is not a live connection and holds no slot under the
+   * connection bound. An offline registration whose socket still reports
+   * itself open can come back online (a frame on it `touch`es it) and keeps
+   * its slot.
+   */
+  function holdsNoSlot(entry: ClientEntry): boolean {
+    return !entry.online && !socketIsOpen(entry.socket);
+  }
+
+  /**
+   * Makes room under the connection bound by releasing up to `needed`
+   * registrations retained offline over a closed socket, the longest-offline
+   * first (registration order among equals, as the sort is stable).
+   *
+   * Released through {@link unindexClient}, the same path `unregister` takes:
+   * nothing is closed (the socket already is), and every binding stays with
+   * the credential that made it, so the credential's next connection carries
+   * it. `ws.ts`'s offline-grace timer later unregisters the released id, which
+   * finds nothing and returns `undefined`.
+   *
+   * @returns How many registrations were released.
+   */
+  function releaseClosedSlots(needed: number): number {
+    if (needed <= 0) {
+      return 0;
+    }
+    const candidates = [...clients.values()].filter(holdsNoSlot);
+    if (candidates.length === 0) {
+      return 0;
+    }
+    const offlineAt = (entry: ClientEntry): number => entry.offlineSince ?? entry.lastSeenAt;
+    candidates.sort((left, right) => offlineAt(left) - offlineAt(right));
+    const now = clock();
+    const releasing = candidates.slice(0, needed);
+    for (const entry of releasing) {
+      unindexClient(entry);
+      log.debug('Released the connection slot of a closed connection retained offline', {
+        ...clientFields(entry),
+        offlineForMs: Math.max(0, now - offlineAt(entry)),
+      });
+    }
+    return releasing.length;
+  }
+
   function register(registration: ClientRegistration): Result<RegisteredClient, DebuggenError> {
     if (closed) {
       return failure(
@@ -1813,6 +2155,11 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
         'This connection is already registered.',
         'client',
       );
+    }
+    // Only live connections count against the bound: a closed connection
+    // retained offline gives up its slot the moment a new one needs it.
+    if (clients.size >= maxClients) {
+      releaseClosedSlots(clients.size - maxClients + 1);
     }
     if (clients.size >= maxClients) {
       log.warn('Refused a connection past the connection bound', { maxClients });
@@ -2199,6 +2546,8 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
       preferredId = sender.id;
     }
     const now = input.boundAt ?? clock();
+    // A bound tab awaits nothing: its session reached it.
+    awaitingByTab.delete(tabId);
 
     const current = bindingsByTab.get(tabId);
     if (
@@ -2309,6 +2658,131 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
       reason,
     });
     return ok(change);
+  }
+
+  /* ---- tabs awaiting a session ---- */
+
+  function awaitSession(input: AwaitSessionInput): Result<void, DebuggenError> {
+    if (closed) {
+      return failure('TRANSPORT_DISCONNECTED', 'The client registry is closed.', 'registry');
+    }
+    const { tabId, origin, principal } = input;
+    if (!isValidTabId(tabId)) {
+      return failure('PROTOCOL_INVALID_MESSAGE', 'The tab id is not a Chrome tab id.', 'client');
+    }
+    if (httpOriginOf(origin) !== origin) {
+      return failure(
+        'PROTOCOL_INVALID_MESSAGE',
+        'An awaited origin must be a serialized HTTP(S) origin.',
+        'client',
+      );
+    }
+    if (principal.role !== KIND_DEVTOOLS) {
+      return failure('UNAUTHORIZED', 'Only a DevTools credential announces a tab.', 'client');
+    }
+    let recipientId: string | undefined;
+    if (input.clientId !== undefined) {
+      const sender = clients.get(input.clientId);
+      if (
+        sender === undefined ||
+        sender.kind !== KIND_DEVTOOLS ||
+        sender.principal.tokenHash !== principal.tokenHash
+      ) {
+        return failure(
+          'UNAUTHORIZED',
+          'The announcing connection does not hold the announcing credential.',
+          'client',
+        );
+      }
+      recipientId = sender.id;
+    }
+    // Re-inserted, so the map's insertion order stays oldest-record-first.
+    awaitingByTab.delete(tabId);
+    while (awaitingByTab.size >= MAX_AWAITING_TABS) {
+      const oldest = awaitingByTab.keys().next();
+      if (oldest.done === true) {
+        break;
+      }
+      awaitingByTab.delete(oldest.value);
+      log.debug('Evicted the oldest tab awaiting a session to stay within the bound', {
+        tabId: oldest.value,
+        limit: MAX_AWAITING_TABS,
+      });
+    }
+    awaitingByTab.set(tabId, {
+      tabId,
+      origin,
+      awaitedBy: principal.tokenHash,
+      recipientId,
+    });
+    log.debug('Tab awaits a session for its origin', { tabId, awaiting: awaitingByTab.size });
+    return ok(undefined);
+  }
+
+  function forgetAwaitingTab(tabId: number, principal?: Principal): boolean {
+    const awaiting = awaitingByTab.get(tabId);
+    if (
+      awaiting === undefined ||
+      (principal !== undefined &&
+        principal.role === KIND_DEVTOOLS &&
+        principal.tokenHash !== awaiting.awaitedBy)
+    ) {
+      return false;
+    }
+    awaitingByTab.delete(tabId);
+    log.debug('Tab no longer awaits a session', { tabId });
+    return true;
+  }
+
+  function offerSessionToAwaitingTab(
+    tabId: number,
+    message: ProtocolMessage,
+  ): Result<DeliveryReceipt, DebuggenError> {
+    if (closed) {
+      return failure('TRANSPORT_DISCONNECTED', 'The client registry is closed.', 'registry');
+    }
+    if (message.type !== SESSION_CREATED_TYPE) {
+      return failure(
+        'PROTOCOL_INVALID_MESSAGE',
+        'Only a session creation may be offered to a tab awaiting a session.',
+        'client',
+      );
+    }
+    const awaiting = awaitingByTab.get(tabId);
+    if (awaiting === undefined) {
+      return failure('TAB_NOT_BOUND', 'The tab awaits no session.', 'client');
+    }
+    const record = embeddedSessionRecord(message);
+    if (record === undefined || httpOriginOf(record.devServerUrl) !== awaiting.origin) {
+      return failure(
+        'PROTOCOL_INVALID_MESSAGE',
+        'The offered session does not serve the origin the tab awaits.',
+        'client',
+      );
+    }
+    if (!learnFromFrame(message, message.sessionId)) {
+      return failure(
+        'PROTOCOL_INVALID_MESSAGE',
+        'The frame contradicts its own routing key.',
+        'client',
+      );
+    }
+    const relay = relayForCredential(awaiting.awaitedBy, awaiting.recipientId);
+    if (relay === undefined) {
+      recordDrop(undefined);
+      return failure(
+        'TRANSPORT_DISCONNECTED',
+        'No connection of the credential that announced the tab is online.',
+        'client',
+        'The worker announces the tab again when its socket reopens.',
+      );
+    }
+    awaiting.recipientId = relay.id;
+    log.debug('An open session was offered to a tab awaiting its origin', {
+      [LOG_BINDING_KEYS.sessionId]: record.id,
+      tabId,
+    });
+    return deliverOrFail([relay], message, 'client');
   }
 
   /* ---- liveness ---- */
@@ -2433,6 +2907,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     tabBySession.clear();
     sessionProjects.clear();
     released.clear();
+    awaitingByTab.clear();
     if (count > 0) {
       log.info('Closed every client connection', { closed: count, code });
     }
@@ -2446,6 +2921,7 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
     bindingsByTab.clear();
     tabBySession.clear();
     released.clear();
+    awaitingByTab.clear();
     log.info('Revoked every client connection', { closed: count, code });
     return count;
   }
@@ -2521,6 +2997,10 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
       const binding = bindingOfSession(sessionId);
       return binding === undefined ? undefined : bindingView(binding);
     },
+    awaitSession,
+    forgetAwaitingTab,
+    awaitedOriginForTab: (tabId) => awaitingByTab.get(tabId)?.origin,
+    offerSessionToAwaitingTab,
     markOffline,
     markOnline,
     touch,

@@ -19,10 +19,13 @@
  *
  * **A cart is addressed by its session token.** The token is the caller's -
  * carried by the storefront's own cookie and resolved to a default by the route
- * handler's schema before it reaches this module - so no function here names a
- * cart, and no token literal appears in this file. A token identifies the
- * session rather than one row: a cart that has converted into an order is that
- * session's history, and the session shops on with the next one.
+ * handler's schema before it reaches this module - so no function a shopper
+ * reaches names a cart, and no token literal appears in this file. A token
+ * identifies the session rather than one row: a cart that has converted into an
+ * order is that session's history, and the session shops on with the next one.
+ * The one function that does name a cart, {@link vacate}, is not a shopper's:
+ * `./checkout.service` calls it for the cart its own attempt claimed, and it can
+ * only ever take the open-cart pointer off a cart a checkout is holding.
  *
  * **A session always has a cart to shop with, and this module is what opens
  * it.** Every function below resolves the session's open cart and opens one
@@ -41,7 +44,15 @@
  * failed checkout can put the very cart the customer filled back in their
  * hands, lines and prices intact - and while it does, this module reports
  * {@link CART_HELD} rather than opening a second cart behind the checkout's
- * back.
+ * back. An attempt leaves no hold behind whichever way it ends: the order's
+ * conversion releases the pointer, a checkout that took nothing puts the cart
+ * back open, and a checkout whose payment was left unsettled keeps its cart held
+ * under the attempt's name for the store to settle but sets the pointer aside
+ * through {@link vacate}, so the session shops on with a fresh cart instead of
+ * waiting on a settlement only the store can make. A hold whose attempt never
+ * reached its end - the process running it stopped mid-checkout - is the one
+ * that could otherwise last forever, and {@link recover} ends it once it has
+ * outlived {@link HOLD_HORIZON}, which no running attempt can.
  *
  * **Money is recomputed here and multiplied nowhere else.** A line's unit price
  * is the price the line was captured at, its total is that price taken as many
@@ -127,20 +138,54 @@ const UNIQUE_VIOLATION = 'P2002';
 
 /**
  * What a caller is told when the session's cart cannot be shopped with because
- * a checkout is holding it.
+ * a checkout is running against it right now.
  *
  * It is the one reason this module reports no cart: every other session -
- * including one whose cart has just become an order - is answered with a cart
- * that either already existed or was opened for it. The sentence therefore says
- * what is happening and what to do about it rather than reporting a cart that
- * could not be found, and a read and all four writes say it identically.
+ * including one whose cart has just become an order, and one whose last
+ * checkout ended with its payment unsettled - is answered with a cart that
+ * either already existed or was opened for it. The sentence therefore says what
+ * is happening and what to do about it rather than reporting a cart that could
+ * not be found, and a read and all four writes say it identically.
  *
- * The hold ends by itself: the checkout either writes the order, which converts
- * the cart and frees the session to open the next one, or fails and puts this
- * very cart back in the session's hands.
+ * The hold ends by itself, and within seconds: the checkout either writes the
+ * order, which converts the cart and frees the session to open the next one,
+ * fails having taken nothing and puts this very cart back in the session's
+ * hands, or fails with its payment unsettled and sets the pointer aside so the
+ * session opens a fresh cart. A hold no attempt is left to end is ended by
+ * {@link recover} once it is older than {@link HOLD_HORIZON}, so this is never
+ * the answer for longer than that.
  */
 const CART_HELD =
-  'This cart is being checked out. Wait for that order to finish, then open your cart again.';
+  'This cart is being checked out right now. Wait for that order to finish, then open your cart again.';
+
+/**
+ * How long a checkout's hold on the session's open-cart pointer may stand
+ * before it is taken to have outlived the attempt that raised it, in
+ * milliseconds.
+ *
+ * Every attempt that ends leaves no hold behind - see the top of this file - so
+ * a hold older than any attempt can run is one whose attempt never reached its
+ * end, and nothing but this bound will ever end it. The bound is derived from
+ * what one attempt can wait on, measured from the claim that raised the hold,
+ * which is the write that dates the held cart (Prisma stamps `updatedAt` on
+ * that conditional `updateMany` like on any other update). Its two network
+ * calls are capped by their own services: the carrier's quote by `BUDGET` in
+ * `./shipping.service` (eight seconds) and the processor's authorization by
+ * `TIMEOUT` in `./payment.service` (ten seconds), eighteen seconds between
+ * them. Everything else it does is queries against this database, each given at
+ * most five seconds to get a connection by `@/server/db/pool`. Five minutes is
+ * more than fifteen times the network ceilings and leaves well over four
+ * minutes for those queries, so no attempt still running is mistaken for one
+ * that stopped.
+ *
+ * Erring the other way would cost a cart, never a charge. A hold set aside
+ * while its attempt was somehow still running leaves that cart `ABANDONED`
+ * under the attempt's name, so the attempt can still convert it into its order
+ * and a repeat of the name is still answered from it; the session merely shops
+ * on with the next cart. Nothing here reopens the held cart, so nothing here
+ * can let a second attempt authorize it.
+ */
+const HOLD_HORIZON = 300_000;
 
 /**
  * What a caller is told when the line a change named is not in its cart.
@@ -289,8 +334,8 @@ async function openCart(token: string): Promise<Row | null> {
  * session's carts happens in between for a concurrent caller to invalidate:
  * two tabs that both find no open cart and both try to open one produce exactly
  * one cart, and the tab that lost reads the cart the other opened. The same
- * refusal is what keeps a checkout's hold intact, because the cart it is
- * holding still carries the pointer.
+ * refusal is what keeps a running checkout's hold intact, because the cart it
+ * is holding carries the pointer until the attempt ends.
  *
  * The account carries over from the session's own history. A visitor who has
  * bought before keeps the account their last cart was attached to, which is
@@ -338,6 +383,123 @@ async function mintCart(token: string): Promise<OpenedCart | null> {
 }
 
 /**
+ * Takes the session's open-cart pointer off a cart a checkout is holding, and
+ * leaves the cart itself held.
+ *
+ * This is the one function in this module that names a cart rather than a
+ * session, and the reason is its caller: not a shopper but `./checkout.service`,
+ * for the cart its own attempt claimed, once that attempt has ended with an
+ * amount sent to the processor and no order written. That cart has to stay held
+ * - reopening it is what would let a second attempt authorize the same order -
+ * but a held cart that also kept the pointer would leave its session with no
+ * cart at all until the store settled the payment by hand. So only the pointer
+ * moves. The cart keeps its `ABANDONED` status and the attempt's name, which is
+ * what `./order.service` answers a repeat of that name from, whatever the
+ * pointer says, and the session's next read opens a fresh cart for it.
+ *
+ * The condition is what makes naming a cart safe. Only a held cart that still
+ * carries a pointer matches, so this can never take the pointer off a cart a
+ * visitor is shopping with, never touches a cart that has become an order - its
+ * conversion released the pointer already - and does nothing on a second call.
+ * The cart's status and its attempt's name are left exactly as they were.
+ *
+ * @param id The cart the calling checkout claimed.
+ */
+export async function vacate(id: string): Promise<void> {
+  await prisma.cart.updateMany({
+    where: { id, status: CartStatus.ABANDONED, openToken: { not: null } },
+    data: { openToken: null },
+  });
+}
+
+/**
+ * The session's open cart once its pointer has turned out to be held by a cart
+ * that is not open, opening the session's next cart when that hold has outlived
+ * any attempt that could have raised it.
+ *
+ * A pointer held by a cart that is not open is held by a checkout. While that
+ * checkout is running the hold is exactly right, and the answer is
+ * {@link CART_HELD}. Every checkout that ends leaves no hold behind, so a hold
+ * older than {@link HOLD_HORIZON} is one whose attempt never got that far - the
+ * process running it stopped mid-checkout - and nothing else will ever end it.
+ * The holder is therefore read, and a held cart that old has its pointer set
+ * aside exactly as {@link vacate} would: the cart stays `ABANDONED` under its
+ * attempt's name for the store to settle, and the session's next cart is opened.
+ *
+ * The write that sets the pointer aside repeats the staleness as its own
+ * condition rather than trusting the read before it, so a hold that became
+ * fresh in between - the cart put back and claimed again by a checkout that has
+ * just started - no longer matches, and a claim in flight is never robbed of
+ * its pointer. The cut-off is taken from this process's clock, the same clock
+ * Prisma stamped the claim's `updatedAt` with, so the comparison does not
+ * depend on the database server's clock agreeing with the application's.
+ *
+ * Opening the next cart is then the race {@link readActiveCart} already runs: a
+ * concurrent caller that recovered the same hold may open it first, and then
+ * the cart that caller opened is the answer.
+ *
+ * Both {@link readActiveCart} and {@link activeCartId} end here, so a read and
+ * all four writes recover a hold identically.
+ *
+ * @param token The cart's session token, as {@link readActiveCart} takes it.
+ * @returns The session's open cart: the empty one opened here, or the one a
+ * concurrent caller opened first.
+ * @throws StorefrontNotFoundError with {@link CART_HELD} while the pointer is
+ * held by a checkout that may still be running.
+ */
+async function recover(token: string): Promise<Row> {
+  const holder = await prisma.cart.findUnique({
+    where: { openToken: token },
+    select: { id: true, status: true, updatedAt: true },
+  });
+
+  // A holder that is not held is not this function's business: no holder at all
+  // means the attempt has just given the pointer up, and an open holder means a
+  // concurrent caller has just opened the session's cart. Either way the pointer
+  // is decided below exactly as it is for a session with no cart.
+  if (holder?.status === CartStatus.ABANDONED) {
+    const cutoff = new Date(Date.now() - HOLD_HORIZON);
+
+    if (holder.updatedAt.getTime() >= cutoff.getTime()) {
+      throw new StorefrontNotFoundError(CART_HELD);
+    }
+
+    const { count } = await prisma.cart.updateMany({
+      where: {
+        id: holder.id,
+        status: CartStatus.ABANDONED,
+        openToken: token,
+        updatedAt: { lt: cutoff },
+      },
+      data: { openToken: null },
+    });
+
+    if (count > 0) {
+      // The attempt that took this cart may have sent an amount to the processor
+      // before it stopped, so the operator is told what was held, since when, and
+      // that the cart is left held rather than reopened.
+      console.error(
+        `cart: cart ${holder.id} had been held by a checkout since ${holder.updatedAt.toISOString()} with no attempt left to end the hold - its session has been given a fresh cart and the held cart stays held under its attempt's name. An authorization may stand against it: settle it before converting the cart`,
+      );
+    }
+  }
+
+  const opened = await mintCart(token);
+
+  if (opened !== null) {
+    return { ...opened, items: [] };
+  }
+
+  const contended = await openCart(token);
+
+  if (contended === null) {
+    throw new StorefrontNotFoundError(CART_HELD);
+  }
+
+  return contended;
+}
+
+/**
  * The identifier of the cart a session is shopping with, opening one when the
  * session has none.
  *
@@ -347,10 +509,13 @@ async function mintCart(token: string): Promise<OpenedCart | null> {
  * One lookup written once is therefore what all four share, and the columns it
  * selects are the one column they use.
  *
- * Three steps at most, and the common one is the first: the session's open cart
- * is found, or a cart is opened for it, or - when the open-cart pointer turns
- * out to be held - the cart the winner of that race opened is read. A pointer
- * held by a checkout leaves nothing to read, which is the one case that fails.
+ * Three steps in all but the rarest case, and the common one is the first: the
+ * session's open cart is found, or a cart is opened for it, or - when the
+ * open-cart pointer turns out to be held - the cart the winner of that race
+ * opened is read. A pointer held by a checkout leaves nothing to read, and
+ * {@link recover} decides that case: a checkout that may still be running keeps
+ * it, which is the one case that fails, and a hold no attempt is left to end is
+ * set aside so the session's next cart can be opened.
  *
  * @param token The cart's session token, as {@link readActiveCart} takes it.
  * @returns The `carts.id` of the session's open cart.
@@ -379,7 +544,7 @@ async function activeCartId(token: string): Promise<string> {
   });
 
   if (contended === null) {
-    throw new StorefrontNotFoundError(CART_HELD);
+    return (await recover(token)).id;
   }
 
   return contended.id;
@@ -456,20 +621,24 @@ async function addUnits(cartId: string, draft: CartItemDraft): Promise<boolean> 
  * costs one more - the write that opens it - and the cart that comes back has
  * no lines, so nothing has to be read again to describe it.
  *
- * A first visit, a cart that has just become an order and a store that has been
- * reseeded are therefore all answered with an empty cart rather than with a
- * failure. That is what keeps the storefront usable after a purchase: the
- * browser is told the cart is empty, and the next thing put in it opens a line
- * of the cart opened here.
+ * A first visit, a cart that has just become an order, a cart whose checkout
+ * ended with its payment unsettled and a store that has been reseeded are
+ * therefore all answered with an empty cart rather than with a failure. That is
+ * what keeps the storefront usable after a purchase, and after a payment only
+ * the store can settle: the browser is told the cart is empty, and the next
+ * thing put in it opens a line of the cart opened here.
  *
  * @param token The cart's session token, as the storefront's cookie carries it
  * and the request schema resolved it.
  * @returns The cart's view: its lines in a stable order, the units across them
  * and their subtotal in cents.
- * @throws StorefrontNotFoundError with {@link CART_HELD} when a checkout is
- * holding this session's cart. It is the one state that is not a cart to shop
- * with, and it is reported rather than worked around: opening a second cart
- * would take the pointer the checkout needs to put this one back if it fails.
+ * @throws StorefrontNotFoundError with {@link CART_HELD} when a checkout that
+ * may still be running is holding this session's cart. It is the one state that
+ * is not a cart to shop with, and it is reported rather than worked around:
+ * opening a second cart would take the pointer the checkout needs to put this
+ * one back if it fails. A checkout that has ended no longer holds the pointer,
+ * and a hold older than {@link HOLD_HORIZON} is ended by {@link recover}, so
+ * neither is reported.
  */
 export async function readActiveCart(token: string): Promise<CartView> {
   const row = await openCart(token);
@@ -486,17 +655,16 @@ export async function readActiveCart(token: string): Promise<CartView> {
     return buildCartView({ ...opened, items: [] });
   }
 
-  // The pointer is held, so exactly one more read decides which of the two
-  // holders has it. A concurrent caller that opened the session's cart between
-  // the read and the write leaves a cart to answer with - the one this request
-  // was asking for - and a checkout holding the cart it took leaves none. There
-  // is no third possibility and therefore no further attempt: the write above
-  // was refused because a row holds the pointer, and that row is either open or
-  // held.
+  // The pointer is held, so one more read decides which of the two holders has
+  // it. A concurrent caller that opened the session's cart between the read and
+  // the write leaves a cart to answer with - the one this request was asking
+  // for. A checkout holding the cart it took leaves none, and `recover` decides
+  // what that hold is: one that may still be running is reported, and one that
+  // has outlived every attempt is set aside and the session's next cart opened.
   const contended = await openCart(token);
 
   if (contended === null) {
-    throw new StorefrontNotFoundError(CART_HELD);
+    return buildCartView(await recover(token));
   }
 
   return buildCartView(contended);

@@ -29,7 +29,9 @@
  * duplicate nothing — whether the developer dismissed the pairing dialog,
  * whether they asked for the service-address dialog, the service-address
  * accessor resolved once for the document, whether the live tail is
- * collapsed, whether the reload notice's own consent is in flight, and where
+ * collapsed, the developer's own choice to collapse or expand the session
+ * summary (see {@link SummaryDisclosureChoice}), whether the reload notice's
+ * own consent is in flight, and where
  * the selection on screen was raised (the store keeps the selection, not its
  * origin; see {@link SelectionProvenance}).
  *
@@ -41,13 +43,21 @@
  * │                                          and status badge · TargetPicker · CaptureControls
  * ├── PairDialog                             while the connection says "Not paired", or
  * │                                          in address mode on the developer's request
- * ├── Split                                  the body and the right drawer
+ * ├── Split (drawer division)               the body and the right drawer
  * │   ├── <main>                             lastError notice · EmptyPanel, or
+ * │   │                                      the session-failure notice (failed) +
  * │   │                                      the reload notice (while offered) +
  * │   │                                      SessionSummary + PanelView (PanelHost)
- * │   └── <aside> → Section (card)           EventDetails — only while an event is selected
+ * │   └── <aside> → Section (card)           EventDetails — only while an event is selected,
+ * │                                          floating over the body's inline end
  * └── <section> "Live event tail"            LiveTail, with its own collapse Button
  * ```
+ *
+ * Everything below the header mounts only once the connection state has been
+ * observed (`usePanelConnectionObserved`); until then the pill reads a neutral
+ * "Connecting…". The first report therefore brings the pairing dialog (when it
+ * says "Not paired") and the body in one commit — neither is ever inserted
+ * above content already painted, so opening the panel shifts nothing.
  *
  * There is **no second `PanelShell`**. `PanelHost` renders the generated panel's
  * shell — its theme root and its one scroll region — and wrapping the whole
@@ -60,11 +70,13 @@
  *
  * `PairDialog` declares `aria-modal="true"`, and this file makes that true: while
  * the dialog is open, every other region — the `<header>` (through `Header`'s
- * `inert` prop), `<main>`, the drawer's `<aside>` and the live tail's
- * `<section>` — carries the native `inert` attribute, so nothing behind the
- * dialog can be focused, clicked or reached by assistive technology. `Split`
- * renders only non-interactive pane wrappers around `<main>` and `<aside>`, and
- * no title here, so those two cover it. The dialog itself is a direct child of
+ * `inert` prop), `<main>` and the live tail's `<section>` — carries the native
+ * `inert` attribute, so nothing behind the dialog can be focused, clicked or
+ * reached by assistive technology. The drawer's `<aside>` is not rendered at
+ * all meanwhile: it floats over the page, so it would cover the dialog it may
+ * not be used with, and it returns with the same selection once the dialog
+ * closes. `Split` renders only non-interactive pane wrappers around `<main>`
+ * and `<aside>`, and no title here, so those cover it. The dialog itself is a direct child of
  * the top-level `Stack`, outside every inert subtree; its own focus containment
  * catches focus that is moved programmatically. The renderer ships no overlay
  * primitive, so the dialog stays an in-flow card directly under the header —
@@ -92,9 +104,14 @@
  * - **Session, panel being generated** (`analyzing`) — `PanelView`'s
  *   `LoadingState`, or, while a follow-up regenerates a panel already on screen,
  *   a one-row `LoadingState` beside it.
- * - **Failed** — `PanelView`'s `ErrorState` naming the failing stage, with a retry
- *   that re-hydrates the panel from the service; beside the panel instead of it
- *   when a panel from an earlier run is on screen. Never a successful analysis.
+ * - **Failed** — this file's own `ErrorState`, above the summary, stating the
+ *   failure exactly as the service worded it: the stage's failure row
+ *   (`‹stage title› failed: ‹summary›`, its hint and error code as the detail),
+ *   otherwise the instrumentation failure, otherwise an honest statement that
+ *   the failing stage has not reached this panel. Its retry re-reads the
+ *   session from the service. A panel from an earlier run stays on screen
+ *   below it; without one, `PanelView` renders nothing — never a claim that
+ *   analysis stopped — and never a successful analysis.
  * - **Panel present** — `PanelView` → `PanelHost`, with the layout exactly as it
  *   was generated. `meta.fallback` is a legitimate success: `PanelHost` renders
  *   its own fallback banner, and nothing here reads the flag.
@@ -189,12 +206,12 @@
  * - No node filtering and no branching on a panel's title or the session's
  *   question (AAP 0.5.4, 0.6.5): the two demonstrated questions produce panels
  *   with different component sets, and this file passes either through intact.
- * - No visual value: every gap is a `SpaceStep`, the drawer's width is a unitless
- *   `Split` pane weight, and every element with an appearance is a renderer
- *   primitive. The raw elements are the landmarks no primitive renders:
- *   `<main>`, `<aside>` and the live tail's `<section>`; their only attributes
- *   beyond landmark semantics and focus management are `inert` while the
- *   dialog is open, in either mode.
+ * - No visual value: every gap is a `SpaceStep`, the drawer's placement and
+ *   width are the `Split` drawer division's, and every element with an
+ *   appearance is a renderer primitive. The raw elements are the landmarks no
+ *   primitive renders: `<main>`, `<aside>` and the live tail's `<section>`;
+ *   their only attributes beyond landmark semantics and focus management are
+ *   `inert` while the dialog is open, in either mode.
  *
  * @module apps/chrome-extension/src/panel/App
  */
@@ -211,7 +228,6 @@ import {
 import type { EventRef } from '@debuggen/panel-schema';
 import type {
   ErrorPayload,
-  ProgressStage,
   SelectedTarget,
   SessionStatus,
   TelemetryEvent,
@@ -247,7 +263,7 @@ import { LiveTail } from './components/LiveTail';
 import { PairDialog, resolveServiceEndpointAccessor } from './components/PairDialog';
 import type { PairDialogMode } from './components/PairDialog';
 import { PanelView } from './components/PanelView';
-import type { PanelViewError, PanelViewStatus } from './components/PanelView';
+import type { PanelViewStatus } from './components/PanelView';
 import { SessionSummary } from './components/SessionSummary';
 import { TargetPicker } from './components/TargetPicker';
 import type { TargetPickerAction } from './components/TargetPicker';
@@ -269,11 +285,16 @@ import {
   panelRequestOwningSessionId,
   readInspectedTabId,
   startPanelConnection,
+  usePanelConnectionObserved,
   usePanelReloadState,
 } from './state/connection';
 import {
+  awaitCaptureStopSettled,
   getPanelSnapshot,
   getSessionId,
+  isEndedSessionShown,
+  isStageFailureEntry,
+  reportCaptureStopFailure,
   selectEvent,
   setLastError,
   setPendingTarget,
@@ -315,17 +336,6 @@ const LIVE_TAIL_REGION_LABEL = 'Live event tail';
 /** The accessible name of the right drawer's complementary landmark. */
 const DRAWER_LABEL = 'Selected event';
 
-/**
- * The body and the drawer as unitless `Split` pane weights: the drawer grows at
- * six tenths of the body's rate, so beside it the drawer takes three eighths of
- * the width. A pane's weight also scales the width it asks for before sharing a
- * line, so these small weights keep the drawer beside the body in an ordinary
- * DevTools window, and a docked panel too narrow for both collapses them into
- * one column (the `Split` default for a horizontal division). Neither pane
- * states a width.
- */
-const DRAWER_PANE_WEIGHTS: readonly number[] = Object.freeze([1, 0.6]);
-
 /** Why capture is unavailable while the worker is not connected to the service. */
 const CAPTURE_NEEDS_CONNECTION =
   'Capture is unavailable until this panel is connected to the local Debug Generator service.';
@@ -333,12 +343,22 @@ const CAPTURE_NEEDS_CONNECTION =
 /** Announced while a follow-up regenerates a panel that is already on screen. */
 const REGENERATING_LABEL = 'Regenerating the debugging panel';
 
-/** The first line of the notice shown beside a panel from an earlier run when the session failed. */
+/** The first line of the notice a failed session shows, with or without an earlier panel. */
 const SESSION_FAILED_TITLE = 'The debugging session failed';
 
 /** The message used when a failed session carries no failing stage the panel can name. */
 const SESSION_FAILED_FALLBACK =
   'The session stopped before the failing stage was reported to this panel.';
+
+/**
+ * Where the developer finds the failing stage meanwhile, stated beneath
+ * {@link SESSION_FAILED_FALLBACK}: the editor view renders every progress row
+ * the service reported, the failing stage's row with its next step included.
+ * The notice here names that stage itself as soon as the row reaches this
+ * panel, live or replayed; it promises no delivery it does not control.
+ */
+const SESSION_FAILED_FALLBACK_HINT =
+  'The failing stage and its next step are listed in the Debug Generator view in VS Code.';
 
 /** The first line of the non-blocking failure notice. */
 const LAST_ERROR_TITLE = 'A Debug Generator request did not complete';
@@ -355,7 +375,11 @@ const LAST_ERROR_RETRY_LABEL = 'Retry';
  */
 const LAST_ERROR_RETRY_HINT = 'Retry reloads this panel’s session state from the local service.';
 
-/** The retry control's label on the session-failure notice: it re-reads the session. */
+/**
+ * The retry control's label on the session-failure notice. It re-reads the
+ * session from the service and promises nothing more: a failed session is not
+ * re-run from this panel.
+ */
 const RELOAD_SESSION_LABEL = 'Reload session state';
 
 /** The lead of each command's failure message; the cause follows a colon. */
@@ -738,44 +762,35 @@ function requireSession(lead: string): SessionId | undefined {
   return sessionId;
 }
 
-/**
- * The developer-facing name of a pipeline stage, for the failure notice that
- * names the failing stage (AAP 0.5.5). Exhaustive over `PROGRESS_STAGES`, so a
- * stage added to the protocol is a compile error here rather than a blank name.
- *
- * @param stage The stage that reported the failure.
- * @returns The stage's name, capitalised to open a sentence.
- */
-function stageLabel(stage: ProgressStage): string {
-  switch (stage) {
-    case 'understand':
-      return 'Problem understanding';
-    case 'investigate':
-      return 'Code investigation';
-    case 'plan':
-      return 'Instrumentation planning';
-    case 'instrument':
-      return 'Instrumentation';
-    case 'capture':
-      return 'Runtime capture';
-    case 'analyze':
-      return 'Analysis';
-    case 'generate-panel':
-      return 'Panel generation';
-    case 'followup':
-      return 'Follow-up';
-    case 'cleanup':
-      return 'Cleanup';
-    default:
-      return assertNever(stage, 'Unhandled progress stage in the panel');
-  }
+/** What the session-failure notice states, in the words of the layer that reported it. */
+interface SessionFailureNotice {
+  /** The failure's first line, verbatim. */
+  readonly message: string;
+  /** The next step, verbatim — for a stage failure, followed by its error code and reference. */
+  readonly hint?: string | undefined;
+  /** The closed error code, when the report carries it outside its hint. */
+  readonly code?: string | undefined;
+}
+
+/** Whether an optional string carries anything to render. */
+function hasDisplayText(value: string | undefined): value is string {
+  return value !== undefined && value.trim() !== '';
 }
 
 /**
- * What a failed session reports, naming the failing stage: the latest progress
- * row the service marked failed, otherwise the latest instrumentation failure,
- * otherwise nothing — in which case the caller's generic wording applies. Every
- * sentence here was composed by the service; this only prefixes the stage.
+ * What a failed session reports, naming the failing stage (AAP 0.5.5).
+ *
+ * - The latest stage failure row ({@link isStageFailureEntry}): its message
+ *   already names the stage (`‹stage title› failed: ‹summary›`) and its detail
+ *   carries the hint, the error code and the diagnostic reference, so both are
+ *   shown exactly as the service composed them — no stage prefix is added.
+ *   "Latest" is by the service's stamp, because a failure that replaced its
+ *   stage's header sits at that header's position rather than at the end.
+ * - Otherwise the latest `instrumentation.failed` report: its message, hint
+ *   and code, verbatim.
+ * - Otherwise nothing, and the caller states that the failing stage has not
+ *   reached this panel. An ordinary ✗ row — a signal that could not be enabled
+ *   while its stage carried on — is never taken for the session's failure.
  *
  * @param progress The session's progress rows, in first-arrival order.
  * @param failure The latest `instrumentation.failed` report, if any.
@@ -784,36 +799,40 @@ function stageLabel(stage: ProgressStage): string {
 function describeSessionFailure(
   progress: readonly PanelProgressEntry[],
   failure: PanelInstrumentationFailure | undefined,
-): PanelViewError | undefined {
-  for (let index = progress.length - 1; index >= 0; index -= 1) {
-    const entry = progress[index];
-    if (entry !== undefined && entry.status === 'failed') {
-      const detail =
-        entry.detail === undefined || entry.detail.trim() === '' ? '' : ` ${entry.detail}`;
-      return { message: `${stageLabel(entry.stage)} failed: ${entry.message}${detail}` };
+): SessionFailureNotice | undefined {
+  let latest: PanelProgressEntry | undefined;
+  for (const entry of progress) {
+    if (
+      isStageFailureEntry(entry) &&
+      hasDisplayText(entry.message) &&
+      (latest === undefined || entry.ts >= latest.ts)
+    ) {
+      latest = entry;
     }
   }
-  if (failure !== undefined) {
-    return { message: `${stageLabel('instrument')} failed: ${failure.message} ${failure.hint}` };
+  if (latest !== undefined) {
+    return {
+      message: latest.message,
+      hint: hasDisplayText(latest.detail) ? latest.detail : undefined,
+    };
+  }
+  if (failure !== undefined && hasDisplayText(failure.message)) {
+    return { message: failure.message, hint: failure.hint, code: failure.code };
   }
   return undefined;
 }
 
 /**
  * What the generated-panel region knows about generation from the session's
- * status: `analyzing` is analysis and panel generation in flight, `failed` is a
- * stop without a result, and every other status leaves the region idle.
+ * status: `analyzing` is analysis and panel generation in flight, and every
+ * other status leaves the region idle. A `failed` session is idle here on
+ * purpose: its failure is this file's own notice, which names the failing
+ * stage, and the region then renders the earlier panel, if any, or nothing.
  *
  * @param status The session's status, or `undefined` without a session.
  */
 function generationStatus(status: SessionStatus | undefined): PanelViewStatus {
-  if (status === 'analyzing') {
-    return 'generating';
-  }
-  if (status === 'failed') {
-    return 'error';
-  }
-  return 'idle';
+  return status === 'analyzing' ? 'generating' : 'idle';
 }
 
 /**
@@ -1287,17 +1306,35 @@ async function startCapture(): Promise<void> {
   }
 }
 
-/** "Stop capture": the worker calls the service's capture-stop route for the session. */
+/**
+ * "Stop capture": the worker calls the service's capture-stop route for the session. A failure is
+ * reported against the capture (`reportCaptureStopFailure`): the request can fail although the
+ * stop happened, so it is not shown once the capture is seen stopped.
+ */
 async function stopCapture(): Promise<void> {
   const sessionId = requireSession(FAILURE_LEADS.captureStop);
   if (sessionId === undefined) {
     return;
   }
+  // The capture this stop is for: a failure that settles after another capture took its place is
+  // not that capture's outcome.
+  const captureId = getPanelSnapshot().capture.captureId;
   try {
     // The summary also arrives as the relayed `capture.stopped` push.
     await panelRequest('capture.stop', { sessionId });
   } catch (cause: unknown) {
-    reportFailure(FAILURE_LEADS.captureStop, cause, 'TRANSPORT_DISCONNECTED');
+    const failure = failurePayload(FAILURE_LEADS.captureStop, cause, 'TRANSPORT_DISCONNECTED');
+    // A request that ended without an answer says nothing about the stop, which the service may
+    // still be completing: wait for the store to see this capture stop before calling it failed.
+    // The control keeps its "Stopping capture…" cue meanwhile.
+    if (
+      failure.code === 'TRANSPORT_DISCONNECTED' &&
+      captureId !== undefined &&
+      (await awaitCaptureStopSettled(captureId))
+    ) {
+      return;
+    }
+    reportCaptureStopFailure(failure, captureId);
   }
 }
 
@@ -2451,6 +2488,44 @@ function recordingSelections(
 }
 
 /**
+ * The developer's own choice to collapse or expand the session summary, and the
+ * generated panel it was made beside — presentation-only state, like the live
+ * tail's disclosure. A choice holds for that panel alone: a new panel (a new
+ * version after a follow-up) returns the summary to its default.
+ */
+interface SummaryDisclosureChoice {
+  /** The `id` of the panel on screen when the developer chose; `undefined` for none. */
+  readonly panelId: string | undefined;
+  /** Whether the developer collapsed the summary (`true`) or expanded it. */
+  readonly collapsed: boolean;
+}
+
+/**
+ * Whether the session summary is collapsed to its digest.
+ *
+ * By default it collapses once a generated panel is on screen, because that
+ * panel is the body of the DevTools panel (AAP 0.7.3) and a session's few dozen
+ * progress rows would push it below the fold; a failed session keeps it
+ * expanded, because its rows are the failure's context; with no panel it is
+ * expanded. The developer's choice for the panel on screen overrides both.
+ *
+ * @param choice The developer's latest choice, if any.
+ * @param panelId The `id` of the generated panel on screen, if any.
+ * @param failed Whether the session failed.
+ * @returns `true` to render the summary's digest.
+ */
+function summaryCollapsedFor(
+  choice: SummaryDisclosureChoice | undefined,
+  panelId: string | undefined,
+  failed: boolean,
+): boolean {
+  if (choice !== undefined && choice.panelId === panelId) {
+    return choice.collapsed;
+  }
+  return panelId !== undefined && !failed;
+}
+
+/**
  * The "Debug Generator" DevTools panel.
  *
  * @param props See {@link AppProps}.
@@ -2493,6 +2568,10 @@ export function App(props: AppProps): ReactElement {
         getSessionId,
         getCaptureId: readCaptureId,
         canServeCached: canServeCachedTrace,
+        // The store keeps an ended session's final state after its end
+        // unbinds the tab; a read of it could only be refused (AAP §0.5.6),
+        // so the provider refuses it itself, saying the views on screen stay.
+        isSessionEnded: isEndedSessionShown,
         onPortDisconnect,
       }),
     [],
@@ -2514,6 +2593,12 @@ export function App(props: AppProps): ReactElement {
 
   const snapshot = usePanelSnapshot();
   const reload = usePanelReloadState();
+  // Until the connection state is observed, the pill reads a neutral
+  // "Connecting…" and nothing renders below the header: whatever the first
+  // report says — "Not paired" puts the pairing dialog directly under the
+  // header — the dialog and the body then appear in one commit, so neither is
+  // inserted above content already on screen.
+  const connectionObserved = usePanelConnectionObserved();
   const {
     connection,
     session,
@@ -2539,12 +2624,16 @@ export function App(props: AppProps): ReactElement {
 
   // Presentation-only state, duplicating nothing in the store: the pairing
   // dialog dismissed for the current connection episode, whether the developer
-  // asked for the address dialog, and the tail's disclosure. `lastChangeAt`
-  // moves on every connection change, so a dismissal holds only until the
-  // connection changes again.
+  // asked for the address dialog, the tail's disclosure, and the developer's
+  // own choice for the summary's disclosure. `lastChangeAt` moves on every
+  // connection change, so a dismissal holds only until the connection changes
+  // again.
   const [pairDismissedAt, setPairDismissedAt] = useState<number | undefined>(undefined);
   const [addressDialogRequested, setAddressDialogRequested] = useState(false);
   const [tailCollapsed, setTailCollapsed] = useState(false);
+  const [summaryChoice, setSummaryChoice] = useState<SummaryDisclosureChoice | undefined>(
+    undefined,
+  );
 
   // The service-address setting, resolved once: whether this document has
   // extension storage cannot change while it is loaded. It decides whether the
@@ -2605,7 +2694,10 @@ export function App(props: AppProps): ReactElement {
     }
     const opener = document.activeElement;
     const main = mainRef.current;
-    drawerRef.current?.focus();
+    // The drawer floats in the viewport (the `Split` drawer division), so it is
+    // already in view: focusing it must not scroll the document, which would
+    // carry the body away from the row the developer just selected.
+    drawerRef.current?.focus({ preventScroll: true });
     return () => {
       restoreFocus(opener, main);
     };
@@ -2672,8 +2764,23 @@ export function App(props: AppProps): ReactElement {
   const spec = panel?.spec;
   const sessionStatus = session?.status;
   const viewStatus = generationStatus(sessionStatus);
-  const sessionFailure =
-    viewStatus === 'error' ? describeSessionFailure(progress, instrumentation.failure) : undefined;
+  // A failed session is stated once, by the notice above the summary, in the
+  // service's own words; `PanelView` stays idle, so it never adds a second,
+  // generic failure of its own.
+  const sessionFailed = sessionStatus === 'failed';
+  const sessionFailure = sessionFailed
+    ? describeSessionFailure(progress, instrumentation.failure)
+    : undefined;
+
+  // The summary's disclosure: collapsed to its digest beside a generated panel
+  // so the panel starts near the top, unless the session failed or the
+  // developer chose otherwise for the panel on screen (see
+  // `summaryCollapsedFor`). The toggle records the choice against that panel.
+  const shownPanelId = spec?.id;
+  const summaryCollapsed = summaryCollapsedFor(summaryChoice, shownPanelId, sessionFailed);
+  const toggleSummary = useCallback(() => {
+    setSummaryChoice({ panelId: shownPanelId, collapsed: !summaryCollapsed });
+  }, [shownPanelId, summaryCollapsed]);
   const querySessionId: string | undefined = spec?.sessionId ?? session?.id;
   const hasSession = session !== undefined || spec !== undefined;
 
@@ -2720,19 +2827,21 @@ export function App(props: AppProps): ReactElement {
       ? undefined
       : drawerEvidencePanel(selectedEvent.eventId, provenance, renderedPanelId, capture.captureId);
 
-  // design-system gap: the drawer pane has no scroll region of its own. The
-  // renderer sanctions exactly one `overflow` container (`PanelShell`, which
-  // `PanelHost` already renders for the body), so a drawer taller than the
-  // viewport scrolls with the document rather than inside its pane.
+  // The drawer is the last pane of the `Split` drawer division, which floats it
+  // over the inline end of the viewport at full height with a scroll range of
+  // its own: the body keeps its width and its scroll position when it opens,
+  // and the details are beside the row wherever the developer has scrolled.
   // The drawer's surface is the renderer's card `Section`: the elevated
-  // surface the token table assigns to cards, tables and the drawer.
+  // surface the token table assigns to cards, tables and the drawer. It is not
+  // rendered while the modal dialog is open — an overlay would cover the
+  // dialog it cannot interact with — and returns, with the same selection,
+  // when the dialog closes.
   const drawer =
-    selectedEvent === undefined ? null : (
+    selectedEvent === undefined || modalOpen ? null : (
       <aside
         ref={drawerRef}
         tabIndex={-1}
         aria-label={DRAWER_LABEL}
-        inert={modalOpen}
         onKeyDown={handleDrawerKeyDown}
       >
         <Section variant="card">
@@ -2754,6 +2863,7 @@ export function App(props: AppProps): ReactElement {
         connectionStatus={
           <ConnectionStatus
             status={connection.status}
+            pending={!connectionObserved}
             binding={connection.binding}
             serviceUrl={connection.serviceUrl}
             serviceStartCommand={SERVICE_START_COMMAND}
@@ -2791,7 +2901,14 @@ export function App(props: AppProps): ReactElement {
         inert={modalOpen}
       />
 
-      {/* Directly under the header, so the dialog is in view the moment the
+      {/* Nothing below the header until the connection state is observed (see
+          `connectionObserved`): the dialog, the body and the tail then mount
+          together, in the commit that applies the first report. Once
+          observed they stay mounted — a later lost port reads "Reconnecting…"
+          without taking the body away. */}
+      {connectionObserved ? (
+        <>
+          {/* Directly under the header, so the dialog is in view the moment the
           connection reports "Not paired" — or the developer asks to change
           the service address — whatever the body holds below it. The only
           region never made inert: every sibling below and the header above
@@ -2799,96 +2916,112 @@ export function App(props: AppProps): ReactElement {
           keys its body by the mode, so a switch from the address mode to
           pairing (the connection reported "Not paired" meanwhile) starts a
           fresh dialog. */}
-      <PairDialog
-        mode={dialogMode}
-        open={modalOpen}
-        onClose={dialogMode === 'address' ? closeAddressDialog : closePairDialog}
-        submitCode={submitPairingCode}
-        onPaired={reloadSessionState}
-        serviceEndpoint={serviceEndpoint}
-      />
+          <PairDialog
+            mode={dialogMode}
+            open={modalOpen}
+            onClose={dialogMode === 'address' ? closeAddressDialog : closePairDialog}
+            submitCode={submitPairingCode}
+            onPaired={reloadSessionState}
+            serviceEndpoint={serviceEndpoint}
+          />
 
-      <Split weights={drawerOpen ? DRAWER_PANE_WEIGHTS : undefined} align="start">
-        <main ref={mainRef} tabIndex={-1} inert={modalOpen}>
-          <Stack direction="vertical" gap={3}>
-            {lastError === undefined ? null : (
-              <Stack direction="vertical" gap={2} align="start">
-                <ErrorState
-                  title={LAST_ERROR_TITLE}
-                  message={lastError.message}
-                  code={lastError.code}
-                  hint={LAST_ERROR_RETRY_HINT}
-                  announce="polite"
-                  onRetry={retryLastError}
-                  retryLabel={LAST_ERROR_RETRY_LABEL}
-                />
-                <Button variant="secondary" size="sm" onClick={dismissLastErrorNotice}>
-                  {DISMISS_LABEL}
-                </Button>
-              </Stack>
-            )}
+          <Split drawer align="start">
+            <main ref={mainRef} tabIndex={-1} inert={modalOpen}>
+              <Stack direction="vertical" gap={3}>
+                {/* Both controls sit in the notice's own action row, so a reader
+                can tell which failure they act on; the start alignment keeps
+                the card as wide as its content. */}
+                {lastError === undefined ? null : (
+                  <Stack direction="vertical" align="start">
+                    <ErrorState
+                      title={LAST_ERROR_TITLE}
+                      message={lastError.message}
+                      code={lastError.code}
+                      hint={LAST_ERROR_RETRY_HINT}
+                      announce="polite"
+                      onRetry={retryLastError}
+                      retryLabel={LAST_ERROR_RETRY_LABEL}
+                      onDismiss={dismissLastErrorNotice}
+                      dismissLabel={DISMISS_LABEL}
+                    />
+                  </Stack>
+                )}
 
-            {hasSession ? (
-              <>
-                {/* Above the summary, because new React activity on this
+                {hasSession ? (
+                  <>
+                    {/* First, because a failed session is the state of everything
+                    below it: the failing stage in the service's own words,
+                    with its hint and code, whether or not a panel from an
+                    earlier run is on screen (AAP 0.5.5, 0.7.3). */}
+                    {sessionFailed ? (
+                      <ErrorState
+                        title={SESSION_FAILED_TITLE}
+                        message={sessionFailure?.message ?? SESSION_FAILED_FALLBACK}
+                        hint={
+                          sessionFailure === undefined
+                            ? SESSION_FAILED_FALLBACK_HINT
+                            : sessionFailure.hint
+                        }
+                        code={sessionFailure?.code}
+                        announce="polite"
+                        onRetry={reloadSessionState}
+                        retryLabel={RELOAD_SESSION_LABEL}
+                      />
+                    ) : null}
+
+                    {/* Above the summary, because new React activity on this
                     document cannot be captured until it is reloaded; the
                     stored session summary and panel below still render. */}
-                {reload.kind === 'not-needed' ? null : <PageReloadNotice reload={reload} />}
+                    {reload.kind === 'not-needed' ? null : <PageReloadNotice reload={reload} />}
 
-                <SessionSummary
-                  session={session}
-                  progress={progress}
-                  modifications={session?.modifications ?? []}
-                  runtimeHooks={instrumentation.runtimeHooks}
-                  unavailable={instrumentation.unavailable}
-                  instrumentationFailure={instrumentation.failure}
-                  cleanup={cleanup}
-                  onOpenSource={actions.onOpenSource}
-                />
+                    <SessionSummary
+                      session={session}
+                      progress={progress}
+                      modifications={session?.modifications ?? []}
+                      runtimeHooks={instrumentation.runtimeHooks}
+                      unavailable={instrumentation.unavailable}
+                      instrumentationFailure={instrumentation.failure}
+                      cleanup={cleanup}
+                      onOpenSource={actions.onOpenSource}
+                      collapsed={summaryCollapsed}
+                      onToggleCollapsed={toggleSummary}
+                    />
 
-                {spec !== undefined && viewStatus === 'generating' ? (
-                  <LoadingState variant="rows" rows={1} label={REGENERATING_LABEL} />
-                ) : null}
-                {spec !== undefined && viewStatus === 'error' ? (
-                  <ErrorState
-                    title={SESSION_FAILED_TITLE}
-                    message={sessionFailure?.message ?? SESSION_FAILED_FALLBACK}
-                    onRetry={reloadSessionState}
-                    retryLabel={RELOAD_SESSION_LABEL}
-                  />
-                ) : null}
+                    {spec !== undefined && viewStatus === 'generating' ? (
+                      <LoadingState variant="rows" rows={1} label={REGENERATING_LABEL} />
+                    ) : null}
 
-                <PanelView
-                  spec={spec}
-                  dataProvider={dataProvider}
-                  actions={panelActions}
-                  theme={theme}
-                  status={viewStatus}
-                  error={sessionFailure}
-                  onRetry={reloadSessionState}
-                  selectedEventId={selectedEvent?.eventId ?? null}
-                />
-              </>
-            ) : (
-              <EmptyPanel />
-            )}
-          </Stack>
-        </main>
-        {drawer}
-      </Split>
+                    <PanelView
+                      spec={spec}
+                      dataProvider={dataProvider}
+                      actions={panelActions}
+                      theme={theme}
+                      status={viewStatus}
+                      selectedEventId={selectedEvent?.eventId ?? null}
+                    />
+                  </>
+                ) : (
+                  <EmptyPanel />
+                )}
+              </Stack>
+            </main>
+            {drawer}
+          </Split>
 
-      {hasSession ? (
-        <section aria-label={LIVE_TAIL_REGION_LABEL} inert={modalOpen}>
-          <LiveTail
-            events={liveTail}
-            droppedCount={liveTailDropped}
-            capturing={capture.active}
-            collapsed={tailCollapsed}
-            onToggleCollapsed={toggleTail}
-            actions={liveTailActions}
-            selected={selectedEvent}
-          />
-        </section>
+          {hasSession ? (
+            <section aria-label={LIVE_TAIL_REGION_LABEL} inert={modalOpen}>
+              <LiveTail
+                events={liveTail}
+                droppedCount={liveTailDropped}
+                capturing={capture.active}
+                collapsed={tailCollapsed}
+                onToggleCollapsed={toggleTail}
+                actions={liveTailActions}
+                selected={selectedEvent}
+              />
+            </section>
+          ) : null}
+        </>
       ) : null}
     </Stack>
   );

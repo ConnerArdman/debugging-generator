@@ -36,7 +36,7 @@
  *     really re-queries. The node's fixed empty sentence is asserted exactly.
  *  2. **Rows, figures and column order**: one row per component, counts and
  *     durations formatted by the package's own helpers rather than by literals
- *     restated here, and the ten columns in their display order — each with a
+ *     restated here, and the eleven columns in their display order — each with a
  *     non-zero floor, so a narrow panel scrolls instead of squeezing a column
  *     to nothing.
  *  3. **Prop names only, never values**: the names render, no control exists to
@@ -162,12 +162,15 @@ import { DATA_TABLE_COLUMN_TRACKS } from '../primitives/DataTable';
 import type { DataTableColumnWidth } from '../primitives/DataTable';
 import { DESIGN_TOKENS, cssVar } from '../tokens/tokens';
 import type { TokenKey, TokenValues } from '../tokens/tokens';
+import { RENDER_TRIGGER_TOKEN_KEYS } from '../utils/color';
 import {
+  MAX_PREVIEW_LENGTH,
   formatCount,
   formatDuration,
   formatOffset,
   formatRenderTriggerLabel,
   formatSourceTooltip,
+  truncate,
 } from '../utils/format';
 import { RenderTable } from './RenderTable';
 import { sourceLinkAccessibleName } from './SourceLink';
@@ -234,6 +237,12 @@ function nameChipName(component: string, location: SourceLocation = WIDGET_SOURC
 const LONG_COMPONENT = 'ExampleWidgetWithADeliberatelyLongDescriptiveName';
 
 /**
+ * The heading an expanded row puts over the component's whole name. Spelled out
+ * rather than imported, so the suite pins the word a reader sees.
+ */
+const COMPONENT_NAME_HEADING = 'Component';
+
+/**
  * The width role of each column, in display order, as the component declares
  * them. See `COLUMN_WIDTHS` in `./RenderTable` for why each column takes its
  * role. Pinned exactly, because the role decides the column's floor, and a floor
@@ -250,6 +259,7 @@ const COLUMN_WIDTHS: readonly DataTableColumnWidth[] = [
   'text',
   'count',
   'count',
+  'text',
   'text',
   'label',
 ];
@@ -410,6 +420,7 @@ const COLUMN_LABELS = [
   'Stable inputs',
   'Unclassified',
   'Changed props',
+  'Changed contexts',
   'Phases',
 ] as const;
 
@@ -489,7 +500,12 @@ type OccurrenceOverrides = Partial<
 > & {
   readonly phase?: RenderPhase | undefined;
   readonly changedPropKeys?: readonly string[] | undefined;
+  readonly changedContexts?: readonly string[] | undefined;
   readonly source?: SourceLocation | undefined;
+  /** The group size of a coalesced render; omitted for a single render. */
+  readonly instanceCount?: number | undefined;
+  /** The slowest instance of a coalesced render; omitted for a single render. */
+  readonly maxInstanceDurationMs?: number | undefined;
 };
 
 /**
@@ -513,7 +529,10 @@ function makeOccurrence(overrides: OccurrenceOverrides = {}): RenderOccurrence {
     trigger = 'props',
     phase = 'update',
     changedPropKeys = [FIRST_PROP],
+    changedContexts = [],
     source,
+    instanceCount,
+    maxInstanceDurationMs,
   } = overrides;
 
   return {
@@ -526,7 +545,10 @@ function makeOccurrence(overrides: OccurrenceOverrides = {}): RenderOccurrence {
     trigger,
     phase,
     changedPropKeys,
+    changedContexts,
     ...(source === undefined ? {} : { source }),
+    ...(instanceCount === undefined ? {} : { instanceCount }),
+    ...(maxInstanceDurationMs === undefined ? {} : { maxInstanceDurationMs }),
   };
 }
 
@@ -548,6 +570,9 @@ type RenderStatOverrides = Partial<
     | 'phaseCounts'
     | 'changedPropKeys'
     | 'changedPropCounts'
+    | 'changedContexts'
+    | 'changedContextCounts'
+    | 'declaredInProject'
     | 'occurrences'
     | 'occurrencesTruncated'
   >
@@ -572,7 +597,10 @@ type RenderStatOverrides = Partial<
  *
  * The default row reports counts only, with no per-render list and
  * `occurrencesTruncated: true`, which is what the service answers when
- * occurrences were not requested; the expansion cases supply their own.
+ * occurrences were not requested; the expansion cases supply their own. It
+ * names no changed context, and it is declared in the project — so no default
+ * page mixes project and outside rows, and the scope control stays out of
+ * every case that does not ask for it.
  *
  * @param overrides Fields to replace, or `undefined` to omit an optional one.
  * @returns A fresh row; nothing is shared between calls.
@@ -590,6 +618,9 @@ function makeRenderStat(overrides: RenderStatOverrides = {}): RenderStat {
     phaseCounts = makePhases({ mount: 1, update: 11 }),
     changedPropKeys = [FIRST_PROP, SECOND_PROP],
     changedPropCounts = { [FIRST_PROP]: 4, [SECOND_PROP]: 2 },
+    changedContexts = [],
+    changedContextCounts = {},
+    declaredInProject = true,
     occurrences = [],
     occurrencesTruncated = true,
     source,
@@ -610,10 +641,32 @@ function makeRenderStat(overrides: RenderStatOverrides = {}): RenderStat {
     phaseCounts,
     changedPropKeys,
     changedPropCounts,
+    changedContexts,
+    changedContextCounts,
+    declaredInProject,
     occurrences,
     occurrencesTruncated,
     ...(source === undefined ? {} : { source }),
   };
+}
+
+/**
+ * A copy of a fixture with some of its fields removed — the shape a stored
+ * answer from a build that predates those fields arrives in. The type still
+ * claims every field, exactly as it does for a consumer reading such a row.
+ *
+ * @param value The fixture to copy; it is not modified.
+ * @param keys The fields to leave out of the copy.
+ * @returns A shallow copy without those fields.
+ */
+function without<T extends object>(value: T, ...keys: readonly (keyof T & string)[]): T {
+  const copy = { ...value };
+
+  for (const key of keys) {
+    Reflect.deleteProperty(copy, key);
+  }
+
+  return copy;
 }
 
 /** Overrides accepted by {@link makeNode}, with the same `undefined` policy. */
@@ -950,12 +1003,12 @@ function floorChOf(width: DataTableColumnWidth, theme: TokenValues): number | un
 /**
  * The cells of one data row, in column order.
  *
- * The identity column is a `rowheader` and the other nine are `gridcell`s, so
+ * The identity column is a `rowheader` and the other ten are `gridcell`s, so
  * the two role queries are concatenated in that order — which is the columns'
  * own order, since the identity column is the leftmost.
  *
  * @param row The data row.
- * @returns Its ten cells.
+ * @returns Its eleven cells.
  */
 function cellsOf(row: HTMLElement): HTMLElement[] {
   return [...within(row).getAllByRole('rowheader'), ...within(row).getAllByRole('gridcell')];
@@ -981,7 +1034,7 @@ function cellFor(row: HTMLElement, label: ColumnLabel): HTMLElement {
 /**
  * The header cell of the column with the given header text.
  *
- * Matched by prefix rather than by equality: five of the ten headers carry a
+ * Matched by prefix rather than by equality: six of the eleven headers carry a
  * `Tooltip`, whose bubble stays mounted — hidden — while it is closed, so the
  * cell's text is its label followed by its description.
  *
@@ -1394,7 +1447,7 @@ describe('RenderTable rows', () => {
     await screen.findByRole('grid', { name: GRID_NAME });
     expect(dataRows()).toHaveLength(PROVIDER_ORDER.length);
 
-    // Ten columns, in display order. Matched by prefix because five of the
+    // Eleven columns, in display order. Matched by prefix because six of the
     // headers carry a description that stays in the accessibility tree.
     const headers = screen.getAllByRole('columnheader');
     expect(headers).toHaveLength(COLUMN_LABELS.length);
@@ -1647,6 +1700,74 @@ describe('RenderTable trigger attribution', () => {
     expect(cellFor(row, UNCLASSIFIED_COLUMN).textContent).toBe(formatCount(0));
   });
 
+  it('tells the triggers apart by hue, draws empty buckets idle and dashes unknown', async () => {
+    // Three populated inputs, a populated `unchanged` bucket and an empty
+    // `unknown` one: the three inputs must not share one colour, a populated
+    // `unchanged` bucket carries the warning, and an empty bucket — whatever
+    // its trigger — carries no colour claim at all.
+    const stat = makeRenderStat({
+      triggers: makeTriggers({ props: 4, state: 2, context: 1, unchanged: 3, unknown: 0 }),
+      unchangedRenderCount: 3,
+      unknownTriggerCount: 0,
+    });
+    const stub = resolvingProvider([stat]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    const triggers = cellFor(rowFor(WIDGET_COMPONENT), 'Triggers');
+    const chipFor = (trigger: RenderTrigger): HTMLElement =>
+      within(triggers).getByText(`${trigger} ${formatCount(stat.triggers[trigger])}`);
+
+    const inputHues = (['props', 'state', 'context'] as const).map((trigger) =>
+      chipFor(trigger).style.getPropertyValue('--dgc-badge-color'),
+    );
+    expect(inputHues).toEqual([
+      cssVar(RENDER_TRIGGER_TOKEN_KEYS.props),
+      cssVar(RENDER_TRIGGER_TOKEN_KEYS.state),
+      cssVar(RENDER_TRIGGER_TOKEN_KEYS.context),
+    ]);
+    expect(new Set(inputHues).size).toBe(3);
+
+    const unchanged = chipFor('unchanged');
+    expect(unchanged.style.getPropertyValue('--dgc-badge-color')).toBe(cssVar('warning'));
+    expect(unchanged.classList.contains('dg-badge--warning')).toBe(true);
+    expect(unchanged.hasAttribute('data-trigger-idle')).toBe(false);
+
+    const unknown = chipFor('unknown');
+    expect(unknown.getAttribute('data-trigger-idle')).toBe('true');
+    expect(unknown.style.getPropertyValue('--dgc-badge-color')).toBe(cssVar('textMuted'));
+    expect(unknown.classList.contains('dg-badge--neutral')).toBe(true);
+    expect(unknown.classList.contains('dg-trigger-chip--dashed')).toBe(true);
+    expect(unknown.classList.contains('dg-trigger-chip--idle')).toBe(true);
+    expect(unchanged.classList.contains('dg-trigger-chip--idle')).toBe(false);
+
+    for (const trigger of ['props', 'state', 'context', 'unchanged'] as const) {
+      expect(chipFor(trigger).classList.contains('dg-trigger-chip--dashed'), trigger).toBe(false);
+      expect(chipFor(trigger).classList.contains('dg-trigger-chip'), trigger).toBe(true);
+    }
+  });
+
+  it('draws an empty unchanged bucket idle rather than as a warning', async () => {
+    const stat = makeRenderStat({
+      triggers: makeTriggers({ props: 6 }),
+      unchangedRenderCount: 0,
+      unknownTriggerCount: 0,
+    });
+    const stub = resolvingProvider([stat]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    const chip = within(cellFor(rowFor(WIDGET_COMPONENT), 'Triggers')).getByText(
+      `unchanged ${formatCount(0)}`,
+    );
+
+    expect(chip.getAttribute('data-trigger-idle')).toBe('true');
+    expect(chip.classList.contains('dg-badge--warning')).toBe(false);
+    expect(chip.style.getPropertyValue('--dgc-badge-color')).toBe(cssVar('textMuted'));
+  });
+
   it('prints the figures a row reports rather than recomputing them from the histogram', async () => {
     // A row that disagrees with itself — the aggregate guarantees these two
     // fields equal the matching buckets, so this can only arrive from a stored
@@ -1747,6 +1868,486 @@ describe('RenderTable changed props', () => {
         new RegExp(`^${key}\\b\\D*${formatCount(count ?? 0)}$`),
       );
       expect(chip.textContent ?? '').not.toMatch(/[=:"']/);
+    }
+  });
+});
+
+describe('RenderTable changed contexts', () => {
+  /**
+   * Six providers, in the aggregate's order — most frequent first — with
+   * distinct counts, so an assertion on the order or on one count cannot pass
+   * against another. Application-neutral names, like every fixture here.
+   */
+  const PROVIDERS: readonly (readonly [string, number])[] = [
+    ['ExampleProviderA', 9],
+    ['ExampleProviderB', 7],
+    ['ExampleProviderC', 4],
+    ['ExampleProviderD', 3],
+    ['ExampleProviderE', 2],
+    ['ExampleProviderF', 1],
+  ];
+
+  /** The provider names alone, in that order. */
+  const PROVIDER_NAMES: readonly string[] = PROVIDERS.map(([name]) => name);
+
+  /** A row whose context renders name all six providers. */
+  const CONTEXT_ROW = makeRenderStat({
+    triggers: makeTriggers({ props: 4, state: 2, context: 9, unchanged: 3, unknown: 2 }),
+    renderCount: 20,
+    changedContexts: PROVIDER_NAMES,
+    changedContextCounts: Object.fromEntries(PROVIDERS),
+  });
+
+  /** The chip text of one provider: its name, then its count behind `×`. */
+  function chipText(name: string, count: number): string {
+    return `${name} ×${formatCount(count)}`;
+  }
+
+  it('names each changed context by its provider, with its count, most frequent first, and caps the cell', async () => {
+    const stub = resolvingProvider([CONTEXT_ROW]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    // Right after the changed props, as its own column.
+    expect(COLUMN_LABELS.indexOf('Changed contexts')).toBe(
+      COLUMN_LABELS.indexOf('Changed props') + 1,
+    );
+
+    const cell = cellFor(rowFor(WIDGET_COMPONENT), 'Changed contexts');
+    const chips = [...cell.querySelectorAll('.dg-code')].map((chip) => chip.textContent);
+
+    // The first four providers, in the order the aggregate gave them — the
+    // provider behind most of the row's context renders is the first chip —
+    // and the remainder counted, not hidden.
+    expect(chips).toEqual(PROVIDERS.slice(0, 4).map(([name, count]) => chipText(name, count)));
+    expect(within(cell).getByText(`+${formatCount(2)} more`)).toBeDefined();
+
+    // Names and counts only: nothing in the cell reads as a value, and no
+    // control offers one.
+    expect(cell.textContent ?? '').not.toMatch(/[=:"']/);
+    expect(within(cell).queryAllByRole('button')).toHaveLength(0);
+
+    // The header says what a name is: the component providing the context.
+    const header = openedDescriptions(headerFor('Changed contexts')).join(' ');
+    expect(header).toMatch(/component that provides a context whose value changed/i);
+    expect(header).toMatch(/context values are never captured/i);
+  });
+
+  it('says a row reported no context changes, also for a row stored without the field', async () => {
+    const legacy = without(
+      makeRenderStat({ component: LIST_COMPONENT }),
+      'changedContexts',
+      'changedContextCounts',
+      'declaredInProject',
+    );
+    const stub = resolvingProvider([WIDGET_ROW, legacy]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    // An empty list and an absent one are the same answer: nothing reported,
+    // which is not the claim that nothing changed.
+    for (const component of [WIDGET_COMPONENT, LIST_COMPONENT]) {
+      const row = rowFor(component);
+      const cell = cellFor(row, 'Changed contexts');
+
+      expect(cell.textContent).toBe('No context changes reported');
+
+      // And with no provider to name, the `context` chip is the plain chip its
+      // header explains: no description, and no focus stop.
+      const chip = within(cellFor(row, 'Triggers')).getByText(/^context \d+$/);
+      expect(chip.hasAttribute('tabindex')).toBe(false);
+      expect(chip.getAttribute('aria-describedby')).toBeNull();
+    }
+  });
+
+  it('describes the context chip of the histogram with the providers the row names', async () => {
+    const stub = resolvingProvider([CONTEXT_ROW]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    const triggers = cellFor(rowFor(WIDGET_COMPONENT), 'Triggers');
+
+    // The one described chip is `context`, focusable but never a Tab stop, and
+    // its description names the leading providers with their counts.
+    const context = within(triggers).getByText(`context ${formatCount(9)}`);
+    expect(context.getAttribute('tabindex')).toBe('-1');
+    expect(openedDescriptions(triggers)).toEqual([
+      `Contexts that changed, by providing component: ${PROVIDERS.slice(0, 3)
+        .map(([name, count]) => chipText(name, count))
+        .join(', ')}, +${formatCount(3)} more.`,
+    ]);
+
+    // Every other bucket stays the plain, unfocusable chip.
+    for (const trigger of RENDER_TRIGGERS.filter((member) => member !== 'context')) {
+      const chip = within(triggers).getByText(
+        `${trigger} ${formatCount(CONTEXT_ROW.triggers[trigger])}`,
+      );
+      expect(chip.hasAttribute('tabindex')).toBe(false);
+    }
+  });
+
+  it('lists every changed context with its count, and what the names are, in the expanded row', async () => {
+    const stub = resolvingProvider([CONTEXT_ROW]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
+
+    const detail = onlyDetailRow();
+
+    expect(within(detail).getByText('Changed contexts')).toBeDefined();
+    expect(within(detail).getByText(/context values are never captured/i)).toBeDefined();
+
+    // All six, where the cell showed four and a remainder.
+    for (const [name, count] of PROVIDERS) {
+      expect(within(detail).getByText(chipText(name, count))).toBeDefined();
+    }
+  });
+
+  it('names the contexts that changed at an individual render beside its trigger chip', async () => {
+    const named = makeOccurrence({
+      eventId: 'event-example-0031',
+      spanId: spanIdFor(31),
+      startTime: BASE_START_MS,
+      trigger: 'context',
+      changedContexts: ['ExampleProviderA', 'ExampleProviderB'],
+    });
+    const unnamed = without(
+      makeOccurrence({
+        eventId: 'event-example-0032',
+        spanId: spanIdFor(32),
+        startTime: BASE_START_MS + 40,
+        trigger: 'context',
+      }),
+      'changedContexts',
+    );
+    const stat = makeRenderStat({
+      renderCount: 2,
+      triggers: makeTriggers({ context: 2 }),
+      phaseCounts: makePhases({ update: 2 }),
+      changedContexts: ['ExampleProviderA', 'ExampleProviderB'],
+      changedContextCounts: { ExampleProviderA: 1, ExampleProviderB: 1 },
+      occurrences: [named, unnamed],
+      occurrencesTruncated: false,
+    });
+    const stub = resolvingProvider([stat]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
+
+    const lines = [
+      ...onlyDetailRow().querySelectorAll<HTMLElement>('.dg-render-table__occurrence'),
+    ];
+    expect(lines).toHaveLength(2);
+
+    const [namedLine, unnamedLine] = lines;
+    if (namedLine === undefined || unnamedLine === undefined) {
+      throw new Error('the expanded row lists fewer than two renders');
+    }
+
+    // `context · <ProviderA>, <ProviderB>`: the chip keeps its own word and
+    // description, and the names follow it as text — the separator hidden from
+    // assistive technology, which hears a lead naming the list instead.
+    const chip = within(namedLine).getByText('context');
+    expect(chip.getAttribute('data-trigger')).toBe('context');
+
+    const names = within(namedLine).getByText('ExampleProviderA, ExampleProviderB', {
+      exact: false,
+    });
+    expect(names.textContent).toBe('· Changed contexts: ExampleProviderA, ExampleProviderB');
+    expect(within(names).getByText('·').getAttribute('aria-hidden')).toBe('true');
+    expect(
+      within(names).getByText('Changed contexts:').classList.contains('dg-visually-hidden'),
+    ).toBe(true);
+
+    // Text, not a control: nothing in it can take focus.
+    expect(names.querySelector('[tabindex]')).toBeNull();
+    expect(names.hasAttribute('tabindex')).toBe(false);
+
+    // A render that names no context — here, one stored without the field —
+    // shows its chip alone.
+    expect(within(unnamedLine).getByText('context')).toBeDefined();
+    expect(unnamedLine.textContent ?? '').not.toContain('Changed contexts');
+    expect(unnamedLine.textContent ?? '').not.toContain('ExampleProvider');
+  });
+});
+
+describe('RenderTable component scope', () => {
+  /** The scope control, named for this table like the order control. */
+  const SCOPE_CONTROL_NAME = 'Render table components';
+
+  /** The toolbar's name while it holds both controls. */
+  const SCOPED_TOOLBAR_NAME = 'Render table order and scope';
+
+  /** The mark an outside row carries under "All components". */
+  const OUTSIDE_MARK = 'Outside project';
+
+  /**
+   * Two components outside the project, named as a minifier names them — the
+   * shape that made an unscoped table unreadable — and rendering far more
+   * often than the project's own, so provider order puts them first.
+   */
+  const OUTSIDE_FIRST = makeRenderStat({
+    component: 'xq',
+    renderCount: 124,
+    declaredInProject: false,
+  });
+  const OUTSIDE_SECOND = makeRenderStat({
+    component: 'yr',
+    renderCount: 34,
+    declaredInProject: false,
+  });
+
+  /** Two components the project declares. */
+  const PROJECT_FIRST = makeRenderStat({ renderCount: 29, declaredInProject: true });
+  const PROJECT_SECOND = makeRenderStat({
+    component: LIST_COMPONENT,
+    renderCount: 12,
+    declaredInProject: true,
+  });
+
+  /** A row stored by a build that predates the field: it says neither. */
+  const UNSAID = without(
+    makeRenderStat({ component: 'ExampleUnsaid', renderCount: 8 }),
+    'declaredInProject',
+  );
+
+  /** A mixed page, in provider order: outside rows interleaved with the rest. */
+  const MIXED_PAGE: readonly RenderStat[] = [
+    OUTSIDE_FIRST,
+    PROJECT_FIRST,
+    OUTSIDE_SECOND,
+    PROJECT_SECOND,
+    UNSAID,
+  ];
+
+  /** The scope control, narrowed to the element its value and options are read from. */
+  function scopeControl(): HTMLSelectElement {
+    const control = screen.getByRole('combobox', { name: SCOPE_CONTROL_NAME });
+
+    if (!(control instanceof HTMLSelectElement)) {
+      throw new Error('the scope control is not a select element');
+    }
+
+    return control;
+  }
+
+  /** The texts of a select's options, in order. */
+  function optionTexts(control: HTMLSelectElement): string[] {
+    return [...control.options].map((option) => option.textContent);
+  }
+
+  it('leads with the project’s own components when the loaded rows hold both kinds, and says how many it hides', async () => {
+    const stub = resolvingProvider(MIXED_PAGE, { total: MIXED_PAGE.length });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    // Only the rows marked outside are out of view — a row that does not say
+    // stays — and the rows kept are in provider order, not re-ranked.
+    expect(renderedNames()).toEqual([WIDGET_COMPONENT, LIST_COMPONENT, 'ExampleUnsaid']);
+
+    // The control is offered beside the order control, defaulting to the
+    // project, and each option states how many loaded rows it shows.
+    const control = scopeControl();
+    expect(control.value).toBe('project');
+    expect(optionTexts(control)).toEqual([
+      `Project components (${formatCount(3)})`,
+      `All components (${formatCount(5)})`,
+    ]);
+    expect(screen.getByRole('group', { name: SCOPED_TOOLBAR_NAME })).toBeDefined();
+    expect(orderControl().value).toBe(MOST_RENDERS_FIRST);
+
+    // The paging counter still counts every loaded row, and the rows the scope
+    // hides are stated in the same live line.
+    const footer = screen.getByText(
+      `Showing ${formatCount(5)} of ${formatCount(5)} components. ${formatCount(2)} components outside the project hidden.`,
+    );
+    expect(footer.getAttribute('aria-live')).toBe('polite');
+
+    // Nothing in view is marked as outside: nothing outside is in view.
+    expect(screen.queryByText(OUTSIDE_MARK)).toBeNull();
+
+    // A scope is not a query.
+    expect(soleQuery(stub)).toEqual({
+      source: 'renders',
+      sort: MOST_RENDERS_FIRST,
+      limit: DATA_QUERY_DEFAULT_LIMIT,
+    });
+  });
+
+  it('shows every loaded row under “All components”, marks the outside ones, and reports the scope', async () => {
+    const stub = resolvingProvider(MIXED_PAGE, { total: MIXED_PAGE.length });
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.selectOptions(scopeControl(), 'all');
+
+    // Every loaded row, in provider order.
+    await waitFor(() => {
+      expect(renderedNames()).toEqual(MIXED_PAGE.map((stat) => stat.component));
+    });
+    expect(scopeControl().value).toBe('all');
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { componentScope: 'all' });
+
+    // The two outside rows carry the mark beside their name — never inside
+    // it — described as what it means and reachable by the grid's keys only.
+    for (const stat of [OUTSIDE_FIRST, OUTSIDE_SECOND]) {
+      const cell = cellFor(rowFor(stat.component), 'Component');
+      const mark = within(cell).getByText(OUTSIDE_MARK);
+
+      expect(mark.classList.contains('dg-badge--neutral')).toBe(true);
+      expect(mark.getAttribute('tabindex')).toBe('-1');
+      expect(nameOf(rowFor(stat.component)).textContent).toBe(stat.component);
+      expect(openedDescriptions(cell)).toContain(
+        'Not declared in this project’s source — typically a framework or library component that the project’s own code renders.',
+      );
+    }
+
+    // No project row, and not the row that does not say, carries it.
+    for (const component of [WIDGET_COMPONENT, LIST_COMPONENT, 'ExampleUnsaid']) {
+      expect(within(cellFor(rowFor(component), 'Component')).queryByText(OUTSIDE_MARK)).toBeNull();
+    }
+
+    // Nothing is hidden, so the footer is the paging counter alone.
+    expect(
+      screen.getByText(`Showing ${formatCount(5)} of ${formatCount(5)} components.`),
+    ).toBeDefined();
+
+    // Back to the project, reported the same way; and neither change asked the
+    // provider for anything.
+    await user.selectOptions(scopeControl(), 'project');
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([WIDGET_COMPONENT, LIST_COMPONENT, 'ExampleUnsaid']);
+    });
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, {
+      componentScope: 'project',
+    });
+    expect(spies.onFilterChange).toHaveBeenCalledTimes(2);
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers no scope, and hides and marks nothing, when the loaded rows are all of one kind', async () => {
+    for (const page of [
+      [OUTSIDE_FIRST, OUTSIDE_SECOND],
+      [PROJECT_FIRST, PROJECT_SECOND],
+      [PROJECT_FIRST, UNSAID],
+    ]) {
+      const stub = resolvingProvider(page);
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+      await screen.findByRole('grid', { name: GRID_NAME });
+
+      expect(renderedNames()).toEqual(page.map((stat) => stat.component));
+      expect(screen.queryByRole('combobox', { name: SCOPE_CONTROL_NAME })).toBeNull();
+      expect(screen.getByRole('group', { name: 'Render table order' })).toBeDefined();
+      expect(screen.queryByText(OUTSIDE_MARK)).toBeNull();
+      expect(screen.queryByText(/outside the project hidden/)).toBeNull();
+
+      cleanup();
+    }
+  });
+
+  it('keeps paging over every loaded row, and offers the scope once a later page brings the other kind', async () => {
+    const stub = pagingProvider([
+      { data: [PROJECT_FIRST, PROJECT_SECOND], total: 4, nextOffset: 2 },
+      { data: [OUTSIDE_FIRST, OUTSIDE_SECOND], total: 4 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(4)} components.`);
+    expect(screen.queryByRole('combobox', { name: SCOPE_CONTROL_NAME })).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The next page is requested exactly as before — at the provider's offset,
+    // with the same page size — and counted in full, though the project scope
+    // the control now offers keeps both of its rows out of view.
+    expect(queryOfCall(stub, 2)).toEqual({
+      source: 'renders',
+      sort: MOST_RENDERS_FIRST,
+      limit: DATA_QUERY_DEFAULT_LIMIT,
+      offset: 2,
+    });
+    await screen.findByText(
+      `Showing ${formatCount(4)} of ${formatCount(4)} components. ${formatCount(2)} components outside the project hidden.`,
+    );
+    expect(renderedNames()).toEqual([WIDGET_COMPONENT, LIST_COMPONENT]);
+    expect(scopeControl().value).toBe('project');
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+
+    // Under "All components" the appended rows follow the first page's.
+    await user.selectOptions(scopeControl(), 'all');
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([WIDGET_COMPONENT, LIST_COMPONENT, 'xq', 'yr']);
+    });
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+  });
+
+  it('measures the outlier mark against the rows in view', async () => {
+    // In view under the project scope: counts 2, 2, 2 and 40 — a median of two,
+    // so forty stands out. Under "All components" three outside rows at 100
+    // join them, the median becomes forty, and nothing stands out any more.
+    const quiet = ['ExampleCard', 'ExamplePanel', 'ExampleForm'].map((component) =>
+      makeRenderStat({ component, renderCount: 2, declaredInProject: true }),
+    );
+    const loud = makeRenderStat({ renderCount: 40, declaredInProject: true });
+    const outside = ['xa', 'xb', 'xc'].map((component) =>
+      makeRenderStat({ component, renderCount: 100, declaredInProject: false }),
+    );
+    const stub = resolvingProvider([...outside, loud, ...quiet]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    const figure = (): HTMLElement =>
+      within(cellFor(rowFor(WIDGET_COMPONENT), 'Renders')).getByText(formatCount(40));
+
+    expect(figure().classList.contains('dg-is-outlier')).toBe(true);
+    expect(openedDescriptions(cellFor(rowFor(WIDGET_COMPONENT), 'Renders')).join(' ')).toMatch(
+      /median of the loaded rows in view/i,
+    );
+
+    await user.selectOptions(scopeControl(), 'all');
+    await waitFor(() => {
+      expect(renderedNames()).toHaveLength(7);
+    });
+
+    expect(figure().classList.contains('dg-is-outlier')).toBe(false);
+    for (const component of ['xa', 'xb', 'xc']) {
+      expect(
+        within(cellFor(rowFor(component), 'Renders'))
+          .getByText(formatCount(100))
+          .classList.contains('dg-is-outlier'),
+      ).toBe(false);
     }
   });
 });
@@ -1888,6 +2489,88 @@ describe('RenderTable expansion', () => {
     expect(within(detail).getByText(/not every render is listed/i)).toBeDefined();
   });
 
+  it('counts a coalesced line as the renders it stands for and says its time is their total', async () => {
+    // One line for eleven fibers that rendered alike in one commit, plus one
+    // single render: twelve renders, all listed. Counting lines would print
+    // "Listing 2 of 12" and read as truncation when nothing was bounded.
+    const grouped = makeOccurrence({
+      eventId: 'event-example-0003',
+      spanId: spanIdFor(3),
+      startTime: BASE_START_MS,
+      durationMs: 44,
+      instanceCount: 11,
+      maxInstanceDurationMs: 7.5,
+      trigger: 'context',
+    });
+    const single = makeOccurrence({
+      eventId: 'event-example-0004',
+      spanId: spanIdFor(4),
+      startTime: BASE_START_MS + 250,
+      durationMs: 3,
+      trigger: 'context',
+    });
+    const coalesced = makeRenderStat({
+      renderCount: 12,
+      occurrences: [grouped, single],
+      occurrencesTruncated: false,
+    });
+    const stub = resolvingProvider([coalesced]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
+
+    const detail = onlyDetailRow();
+    expect(within(detail).getByText(/listing 12 of 12 renders/i)).toBeDefined();
+    expect(within(detail).queryByText(/not every render is listed/i)).toBeNull();
+
+    // Only the grouped line is badged, with its size.
+    const badges = detail.querySelectorAll<HTMLElement>('[data-instance-count]');
+    expect(badges).toHaveLength(1);
+    const badge = badges[0] as HTMLElement;
+    expect(badge.textContent).toBe('×11');
+    expect(badge.getAttribute('data-instance-count')).toBe('11');
+
+    // The badge's description says the duration beside it is a total and how
+    // long the slowest instance took.
+    const [bubble] = describingBubbles(badge);
+    expect(bubble?.textContent ?? '').toContain('11 renders of this component in one commit');
+    expect(bubble?.textContent ?? '').toContain('The time shown is their total');
+    expect(bubble?.textContent ?? '').toContain(`the slowest took ${formatDuration(7.5)}`);
+
+    // Both lines stay selectable as the one event each of them is.
+    expect(
+      within(detail).getAllByRole('button', { name: selectOccurrencePatternOf(WIDGET_COMPONENT) }),
+    ).toHaveLength(2);
+  });
+
+  it('treats a malformed instance count as one render', async () => {
+    const malformed = makeOccurrence({ instanceCount: 2.5 });
+    const stub = resolvingProvider([
+      makeRenderStat({ renderCount: 1, occurrences: [malformed], occurrencesTruncated: false }),
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
+
+    const detail = onlyDetailRow();
+    expect(within(detail).getByText(/listing 1 of 1 renders/i)).toBeDefined();
+    expect(detail.querySelectorAll('[data-instance-count]')).toHaveLength(0);
+  });
+
   it('says a row carrying counts reported no individual renders at all', async () => {
     const stub = resolvingProvider([WIDGET_ROW]);
     const user = userEvent.setup();
@@ -1908,6 +2591,71 @@ describe('RenderTable expansion', () => {
         name: selectOccurrencePatternOf(WIDGET_COMPONENT),
       }),
     ).toHaveLength(0);
+  });
+
+  it('keeps the whole of a name past the preview budget reachable, linked or not', async () => {
+    // Longer than the shared preview budget, so the Component column's caption
+    // is the budgeted preview and the column ellipsizes even that. The rest of
+    // the name must still be somewhere a reader can get to.
+    const unlinkedName = `ExampleUnlinked${'WidgetSegment'.repeat(9)}Tail`;
+    const linkedName = `ExampleLinked${'WidgetSegment'.repeat(9)}Tail`;
+    for (const name of [unlinkedName, linkedName]) {
+      expect(Array.from(name).length).toBeGreaterThan(MAX_PREVIEW_LENGTH);
+    }
+    const stub = resolvingProvider([
+      makeRenderStat({ component: unlinkedName }),
+      makeRenderStat({ component: linkedName, source: WIDGET_SOURCE }),
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    // An unlinked name's tooltip is the WHOLE name, not the caption it describes.
+    const unlinkedTrigger = nameOf(rowFor(truncate(unlinkedName)));
+    expect(unlinkedTrigger.textContent).toBe(truncate(unlinkedName));
+    const unlinkedBubble = document.getElementById(
+      unlinkedTrigger.getAttribute('aria-describedby') ?? '',
+    );
+    expect(unlinkedBubble?.getAttribute('role')).toBe('tooltip');
+    expect(unlinkedBubble?.textContent).toBe(unlinkedName);
+
+    // A linked name's chip leads its tooltip with the WHOLE name as well, ahead
+    // of the location it opens, while its caption stays the budgeted preview.
+    const linkedChip = nameOf(rowFor(truncate(linkedName)));
+    expect(linkedChip.tagName.toLowerCase()).toBe('button');
+    expect(linkedChip.textContent).toBe(truncate(linkedName));
+    const linkedBubble = document.getElementById(linkedChip.getAttribute('aria-describedby') ?? '');
+    expect(linkedBubble?.getAttribute('role')).toBe('tooltip');
+    expect(linkedBubble?.textContent?.startsWith(`${linkedName} — `)).toBe(true);
+
+    // And each row's detail opens with the whole name, as captured, whether the
+    // row's name is text or the link to its declaration.
+    for (const name of [unlinkedName, linkedName]) {
+      await user.click(toggleOf(truncate(name)));
+
+      const detail = onlyDetailRow();
+      expect(within(detail).getByText(COMPONENT_NAME_HEADING)).toBeDefined();
+      const whole = within(detail).getByText(name);
+      expect(whole.tagName.toLowerCase()).toBe('code');
+      expect(whole.classList.contains('dg-code--wrap')).toBe(true);
+
+      await user.click(toggleOf(truncate(name)));
+      expect(detailRows()).toHaveLength(0);
+    }
+  });
+
+  it('shows no name heading over a blank component name', async () => {
+    const stub = resolvingProvider([makeRenderStat({ component: '  ' })]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(toggleOf('  '));
+
+    expect(within(onlyDetailRow()).queryByText(COMPONENT_NAME_HEADING)).toBeNull();
   });
 });
 
@@ -3735,12 +4483,13 @@ describe('RenderTable keyboard model', () => {
    */
   const HOVER_OPEN_WAIT_MS = 2_000;
 
-  /** The five columns whose header carries a definition, in display order. */
+  /** The six columns whose header carries a definition, in display order. */
   const DESCRIBED_COLUMNS: readonly ColumnLabel[] = [
     'Triggers',
     STABLE_INPUTS_COLUMN,
     UNCLASSIFIED_COLUMN,
     'Changed props',
+    'Changed contexts',
     'Phases',
   ];
 
@@ -3930,7 +4679,7 @@ describe('RenderTable keyboard model', () => {
     return chip;
   }
 
-  it('keeps the grid one Tab stop: Tab enters on the active row and the next Tab leaves it', async () => {
+  it('keeps the grid one Tab stop: Tab enters on the active row, walks that row alone and leaves', async () => {
     const stub = resolvingProvider(KEYBOARD_ROWS, {
       total: KEYBOARD_ROWS.length + 4,
       nextOffset: KEYBOARD_ROWS.length,
@@ -3956,13 +4705,27 @@ describe('RenderTable keyboard model', () => {
     expect(tabStopsIn(grid)).toEqual([rowFor(WIDGET_COMPONENT)]);
     expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
 
-    // Tab from the control before the grid lands on the active row, and the
-    // next Tab leaves the grid for the control after it.
+    // Tab from the control before the grid lands on the active row; further
+    // Tabs walk THAT row's controls in document order - its toggle, its name
+    // chip and its marked figure, whose explanation opens as focus lands - and
+    // the Tab after the last one leaves the grid for the control after it,
+    // past every other row's controls.
     act(() => {
       orderControl().focus();
     });
     await user.tab();
     expect(document.activeElement).toBe(rowFor(WIDGET_COMPONENT));
+    const activeRow = rowFor(WIDGET_COMPONENT);
+    const figure = figureOf(WIDGET_COMPONENT, 40);
+    for (const control of [
+      toggleOf(WIDGET_COMPONENT),
+      within(activeRow).getByRole('button', { name: nameChipName(WIDGET_COMPONENT) }),
+      figure,
+    ]) {
+      await user.tab();
+      expect(document.activeElement).toBe(control);
+    }
+    expect(isOpen(figure)).toBe(true);
     await user.tab();
     expect(document.activeElement).toBe(loadMore);
 
@@ -4100,7 +4863,7 @@ describe('RenderTable keyboard model', () => {
     expect(totalSort.getAttribute('tabindex')).toBe('-1');
 
     // ArrowUp from the first row reaches the header's first control; from
-    // there ArrowRight walks the sort buttons and then the five definitions in
+    // there ArrowRight walks the sort buttons and then the six definitions in
     // display order, each opening as focus arrives and closing as it leaves.
     // What each open bubble says is kept, because that is what the reader heard.
     const [firstRow] = dataRows();

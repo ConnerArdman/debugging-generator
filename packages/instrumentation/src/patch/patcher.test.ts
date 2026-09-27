@@ -152,7 +152,14 @@ import type {
 } from './backup-store.js';
 import { FunctionTimingPatcher } from './function-timing.js';
 import { SPAN_HELPER_GLOBAL, SPAN_HELPER_TYPE_NAME } from './wrap-template.js';
-import { PATCH_STAGES, createPatcher, defaultPatchFileSystem } from './patcher.js';
+import {
+  PATCH_STAGES,
+  PATCH_TARGET_HELD_REASON,
+  PATCH_TARGET_YIELD_REASONS,
+  createPatcher,
+  defaultPatchFileSystem,
+  describeTargetYield,
+} from './patcher.js';
 import type {
   PatchFileSystem,
   PatchOutcome,
@@ -3133,10 +3140,11 @@ describe('a chain of plan versions over one file', () => {
     expect(Buffer.compare(readFileSync(pristine.path), pristine.bytes)).toBe(0);
 
     // Both copies of the developer's content are gone, each after its own
-    // restore was verified. The session directory itself is left behind by a
-    // reconciliation pass — removing it belongs to `cleanupSession`, the
-    // `session.end` entry point — so it is the files that are asserted, not the
-    // directory.
+    // restore was verified. A reconciliation pass that leaves the session with
+    // nothing open also removes the emptied session directory, as
+    // `cleanupSession` does on `session.end`; the assertion accepts either state
+    // of the directory so that it pins the backup files, which is what this
+    // test is about.
     const sessionBackups = join(sandbox.debuggenHome, 'backups', sandbox.sessionId);
 
     expect(existsSync(sessionBackups) ? readdirSync(sessionBackups) : []).toEqual([]);
@@ -4384,6 +4392,396 @@ describe('byte fidelity across file kinds', () => {
     ).toBe(0);
     expect(sha256Hex(installed)).toBe(outcome.instrumentedHash);
     expectDiffKeepsMark(outcome.record.diff, pristine.bytes, installed);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A file another session already instrumented
+ * ---------------------------------------------------------------------------
+ *
+ * Several sessions may be open on one project, and two of them routinely plan
+ * the same symbol. The second must not layer a record over the first's — its
+ * `originalHash` would name bytes the developer never had, and the two
+ * cleanups would each restore the other's state — so the file is refused at
+ * step 1a with `PATCH_TARGET_HELD_REASON`, having backed up, journaled and
+ * written nothing. These cases run two real sessions over one project copy
+ * and one shared journal, which is how the service holds them.
+ */
+
+/**
+ * A patcher for `sessionId` over `sandbox`'s project, appending to a journal
+ * another session already uses.
+ *
+ * The service keeps one journal for every session, and `listOpen` reaches
+ * across all of them — which is the only way one session can see that another
+ * holds a file. The backup store is this session's own, as it is in the
+ * service, so "took no backup" is a statement about a directory nobody else
+ * writes.
+ */
+function sessionSharing(
+  sandbox: Sandbox,
+  journal: ModificationJournal,
+  sessionId: string,
+  onStage?: (event: PatchStageEvent) => void,
+): Omit<Harness, 'journal'> & { readonly sessionId: string } {
+  const backups = createBackupStore({ debuggenHome: sandbox.debuggenHome, sessionId });
+  const { files, log } = recordingFileSystem();
+  const stages: PatchStage[] = [];
+
+  const patcher = createPatcher({
+    projectRoot: sandbox.projectRoot,
+    sessionId,
+    planVersion: 1,
+    backups,
+    journal,
+    files,
+    onStage: (event: PatchStageEvent) => {
+      stages.push(event.stage);
+      onStage?.(event);
+    },
+  });
+
+  return { patcher, backups, log, stages, sessionId };
+}
+
+/** Whether a session has a backup directory at all under the sandbox's state root. */
+function hasBackupsFor(sandbox: Sandbox, sessionId: string): boolean {
+  return existsSync(join(sandbox.debuggenHome, 'backups', sessionId));
+}
+
+/** The held-target wording the patcher and `describeTargetYield` share. */
+function heldWording(
+  file: string,
+  symbol: string,
+  owningSessionId: string,
+): { reason: string; hint: string } {
+  return {
+    reason: `${file} is already instrumented by session ${owningSessionId}`,
+    hint: `End session ${owningSessionId} — its cleanup restores ${file} — then ask again to time ${symbol} in this session.`,
+  };
+}
+
+describe('a file another session already instrumented', () => {
+  it('refuses the file before backing up, journaling or writing anything, naming the holding session', async () => {
+    const sandbox = makeSandbox();
+    const first = buildPatcher(sandbox);
+    const holding = appliedOutcome(
+      await first.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+    );
+    const instrumented = readFileSync(sandbox.targetPath);
+    const second = sessionSharing(sandbox, first.journal, newSessionId());
+
+    const error = refusalOf(
+      await second.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+    );
+    const wording = heldWording(TARGET_FILE, TARGET_SYMBOL, sandbox.sessionId);
+
+    expect(error.code).toBe('PATCH_UNSUPPORTED');
+    expect(error.details).toEqual({
+      reason: PATCH_TARGET_HELD_REASON,
+      file: TARGET_FILE,
+      symbol: TARGET_SYMBOL,
+      owningSessionId: sandbox.sessionId,
+      recordId: holding.record.id,
+    });
+    expect(error.message).toBe(`${wording.reason}, so this session cannot patch it as well.`);
+    expect(error.hint).toBe(wording.hint);
+
+    // Refused at step 1a: the target was resolved and read, and nothing after.
+    expect(second.stages).toEqual(['resolve-target', 'read-original']);
+    expect(second.log.writes).toEqual([]);
+    expect(hasBackupsFor(sandbox, second.sessionId)).toBe(false);
+    expect(first.journal.rows).toHaveLength(1);
+    expect(first.journal.rows[0]?.sessionId).toBe(sandbox.sessionId);
+    expectFileBytes(sandbox.targetPath, instrumented);
+    expect(digestOnDisk(sandbox.targetPath)).toBe(holding.instrumentedHash);
+
+    // The record claims the file, not the symbol: a different declaration in
+    // it is held just the same, because a record over it would still name the
+    // first session's bytes as the original.
+    const otherSymbol = refusalOf(
+      await second.patcher.patchAction(patchAction(TARGET_FILE, OTHER_SYMBOL)),
+    );
+
+    expect(otherSymbol.details?.['reason']).toBe(PATCH_TARGET_HELD_REASON);
+    expect(first.journal.rows).toHaveLength(1);
+    expectFileBytes(sandbox.targetPath, instrumented);
+  });
+
+  it.each(['pending', 'failed'] as const)(
+    'holds the file for a %s record whose write landed',
+    async (status) => {
+      // A `pending` or `failed` row whose bytes are on disk is a patch the
+      // reconciliation table will restore; layering over it would restore the
+      // wrong original.
+      const sandbox = makeSandbox();
+      const first = buildPatcher(sandbox);
+      const holding = appliedOutcome(
+        await first.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+      );
+
+      expect(isOk(await first.journal.updateStatus(holding.record.id, status))).toBe(true);
+
+      const second = sessionSharing(sandbox, first.journal, newSessionId());
+      const error = refusalOf(
+        await second.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+      );
+
+      expect(error.details?.['reason']).toBe(PATCH_TARGET_HELD_REASON);
+      expect(error.details?.['recordId']).toBe(holding.record.id);
+      expect(second.log.writes).toEqual([]);
+      expect(hasBackupsFor(sandbox, second.sessionId)).toBe(false);
+      expect(digestOnDisk(sandbox.targetPath)).toBe(holding.instrumentedHash);
+    },
+  );
+
+  it('reports a held target in a batch with nothing applied, leaving the unheld file untouched', async () => {
+    const sandbox = makeSandbox();
+    const first = buildPatcher(sandbox);
+    const holding = appliedOutcome(
+      await first.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+    );
+    const unheldPristine = pristineFile(sandbox, CHAIN_FILE);
+    const unheld = patchAction(CHAIN_FILE, CHAIN_FIRST_SYMBOL);
+    const held = patchAction(TARGET_FILE, TARGET_SYMBOL);
+
+    // An observer that throws at every stage while armed: had the probe
+    // reported a stage, it would have failed with `stage-hook-failed` rather
+    // than finding the hold, and so would the unheld action's attempt had it
+    // been made.
+    let armed = true;
+    const second = sessionSharing(sandbox, first.journal, newSessionId(), () => {
+      if (armed) {
+        throw new Error('injected: no stage may be reported for a batch that attempted nothing');
+      }
+    });
+
+    const batch = await second.patcher.patchActions([unheld, held]);
+
+    expect(batch.applied).toEqual([]);
+    expect(batch.journaled).toEqual([]);
+    expect(batch.failure?.actionId).toBe(held.id);
+    expect(batch.failure?.file).toBe(TARGET_FILE);
+    expect(batch.failure?.symbol).toBe(TARGET_SYMBOL);
+    expect(batch.failure?.stage).toBe('baseline-check');
+    expect(batch.failure?.record).toBeUndefined();
+    expect(batch.failure?.conflict).toBeUndefined();
+    expect(batch.failure?.fileMayHoldPatch).toBe(false);
+    expect(batch.failure?.error.code).toBe('PATCH_UNSUPPORTED');
+    expect(batch.failure?.error.details?.['reason']).toBe(PATCH_TARGET_HELD_REASON);
+    expect(batch.failure?.error.details?.['owningSessionId']).toBe(sandbox.sessionId);
+
+    // Read-only throughout: only the held file was pinned and read, nothing
+    // was written, no backup was taken and the journal holds the first
+    // session's record alone.
+    expect(second.stages).toEqual([]);
+    expect(second.log.pins).toEqual([`${realpathSync(sandbox.projectRoot)}::${TARGET_FILE}`]);
+    expect(second.log.snapshots).toHaveLength(1);
+    expect(second.log.writes).toEqual([]);
+    expect(hasBackupsFor(sandbox, second.sessionId)).toBe(false);
+    expect(first.journal.rows).toHaveLength(1);
+    expectPristine(unheldPristine);
+    expect(digestOnDisk(sandbox.targetPath)).toBe(holding.instrumentedHash);
+    expect(second.patcher.journaledRecords()).toEqual([]);
+
+    // Asked again without the held action, the same patcher instruments the
+    // rest: the probe reserved nothing.
+    armed = false;
+    const retried = await second.patcher.patchActions([unheld]);
+
+    expect(retried.failure).toBeUndefined();
+    expect(retried.applied).toHaveLength(1);
+    expect(retried.applied[0]?.record.sessionId).toBe(second.sessionId);
+  });
+
+  it('probes nothing when no other session has a record for the batch’s files', async () => {
+    const sandbox = makeSandbox();
+    const first = buildPatcher(sandbox);
+
+    appliedOutcome(await first.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)));
+
+    const second = sessionSharing(sandbox, first.journal, newSessionId());
+    const batch = await second.patcher.patchActions([patchAction(CHAIN_FILE, CHAIN_FIRST_SYMBOL)]);
+
+    expect(batch.failure).toBeUndefined();
+    expect(batch.applied).toHaveLength(1);
+    // One pin and one read of the one target — the attempt's own — and no
+    // probe of it.
+    expect(second.log.pins).toEqual([`${realpathSync(sandbox.projectRoot)}::${CHAIN_FILE}`]);
+    expect(second.log.snapshots).toHaveLength(1);
+  });
+
+  it('does not hold a second copy of the project whose file shares the path but not the bytes', async () => {
+    // Two project copies share every relative path; only the digest of the
+    // bytes on disk tells the copy holding a patch from the copy that does
+    // not, which is why the hold check never matches on the path alone.
+    const copyA = makeSandbox('copy-a');
+    const copyB = makeSandbox('copy-b');
+    const first = buildPatcher(copyA);
+    const holding = appliedOutcome(
+      await first.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+    );
+    const second = sessionSharing(copyB, first.journal, copyB.sessionId);
+
+    const batch = await second.patcher.patchActions([patchAction(TARGET_FILE, TARGET_SYMBOL)]);
+
+    expect(batch.failure).toBeUndefined();
+    expect(batch.applied).toHaveLength(1);
+    expect(batch.applied[0]?.record.sessionId).toBe(copyB.sessionId);
+    expect(batch.applied[0]?.originalHash).toBe(copyB.originalHash);
+    expect(digestOnDisk(copyB.targetPath)).toBe(batch.applied[0]?.instrumentedHash);
+    // The first copy still holds the first session's patch, untouched.
+    expect(digestOnDisk(copyA.targetPath)).toBe(holding.instrumentedHash);
+    // The candidate path was probed once, then read once more to be patched.
+    const pinnedTarget = `${realpathSync(copyB.projectRoot)}::${TARGET_FILE}`;
+
+    expect(second.log.pins).toEqual([pinnedTarget, pinnedTarget]);
+    expect(second.log.snapshots).toHaveLength(2);
+  });
+
+  it('fails the attempt with the journal’s own error when the open records cannot be listed', async () => {
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, CHAIN_FILE);
+    const inner = createTestJournal();
+    const unreadable = new DebuggenError('STORE_ERROR', 'The suite journal could not be read.', {
+      details: { reason: 'suite-listing-broken' },
+    });
+    const journal: ModificationJournal = {
+      append: (record) => inner.append(record),
+      updateStatus: (id, status, patch) => inner.updateStatus(id, status, patch),
+      listBySession: (sessionId) => inner.listBySession(sessionId),
+      listOpen: () => Promise.resolve(err(unreadable)),
+    };
+    const session = sessionSharing(sandbox, journal, sandbox.sessionId);
+
+    // Without the listing, "nobody else holds this file" would be a guess, so
+    // the batch's own check steps aside and the attempt reports the failure.
+    const batch = await session.patcher.patchActions([patchAction(CHAIN_FILE, CHAIN_FIRST_SYMBOL)]);
+
+    expect(batch.applied).toEqual([]);
+    expect(batch.failure?.error).toBe(unreadable);
+    expect(batch.failure?.stage).toBe('baseline-check');
+    expect(session.log.writes).toEqual([]);
+    expect(inner.rows).toEqual([]);
+    expect(hasBackupsFor(sandbox, sandbox.sessionId)).toBe(false);
+    expectPristine(pristine);
+  });
+});
+
+describe('describeTargetYield', () => {
+  it('lists exactly the two reasons that mean the target is already instrumented', () => {
+    expect(PATCH_TARGET_YIELD_REASONS).toEqual([PATCH_TARGET_HELD_REASON, 'already-instrumented']);
+    expect(Object.isFrozen(PATCH_TARGET_YIELD_REASONS)).toBe(true);
+  });
+
+  it('words a held target as the gap a capture proceeds without', async () => {
+    const sandbox = makeSandbox();
+    const first = buildPatcher(sandbox);
+
+    appliedOutcome(await first.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)));
+
+    const second = sessionSharing(sandbox, first.journal, newSessionId());
+    const error = refusalOf(
+      await second.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+    );
+
+    expect(describeTargetYield(error)).toEqual(
+      heldWording(TARGET_FILE, TARGET_SYMBOL, sandbox.sessionId),
+    );
+  });
+
+  it('words the transform’s already-instrumented refusal with that refusal’s own hint', async () => {
+    // The same session asking for the same symbol in its next plan version:
+    // the chain parent is found, and the transform refuses to wrap a wrapper.
+    const sandbox = makeSandbox();
+    const journal = createTestJournal();
+    const backups = createBackupStore({
+      debuggenHome: sandbox.debuggenHome,
+      sessionId: sandbox.sessionId,
+    });
+    const patcherAt = (planVersion: number): Patcher =>
+      createPatcher({
+        projectRoot: sandbox.projectRoot,
+        sessionId: sandbox.sessionId,
+        planVersion,
+        backups,
+        journal,
+      });
+
+    appliedOutcome(await patcherAt(1).patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }));
+
+    const error = refusalOf(
+      await patcherAt(2).patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+    );
+
+    expect(error.code).toBe('PATCH_UNSUPPORTED');
+    expect(error.details?.['reason']).toBe('already-instrumented');
+    expect(typeof error.hint).toBe('string');
+    expect(describeTargetYield(error)).toEqual({
+      reason: `${TARGET_SYMBOL} in ${TARGET_FILE} is already instrumented`,
+      hint: error.hint,
+    });
+  });
+
+  it('answers undefined for every refusal it cannot word honestly', () => {
+    const held = {
+      reason: PATCH_TARGET_HELD_REASON,
+      file: TARGET_FILE,
+      symbol: TARGET_SYMBOL,
+      owningSessionId: 'ses_holding000000001',
+    };
+    // `null` rather than `undefined` for "no hint": an explicit `undefined`
+    // argument would take the parameter's default.
+    const refusal = (
+      code: 'PATCH_UNSUPPORTED' | 'INSTRUMENTATION_INSTALL_FAILED',
+      details: Record<string, unknown> | undefined,
+      hint: string | null = 'Revert the existing modification first.',
+    ): DebuggenError =>
+      new DebuggenError(code, 'A refusal the suite composed.', {
+        ...(hint === null ? {} : { hint }),
+        ...(details === undefined ? {} : { details }),
+      });
+
+    // The composed held refusal is worded, so each undefined below is down to
+    // the one thing that case changes.
+    expect(describeTargetYield(refusal('PATCH_UNSUPPORTED', held))).toEqual(
+      heldWording(TARGET_FILE, TARGET_SYMBOL, held.owningSessionId),
+    );
+
+    expect(describeTargetYield(refusal('INSTRUMENTATION_INSTALL_FAILED', held))).toBeUndefined();
+    expect(describeTargetYield(refusal('PATCH_UNSUPPORTED', undefined))).toBeUndefined();
+    expect(
+      describeTargetYield(
+        refusal('PATCH_UNSUPPORTED', { ...held, reason: 'unsupported-generator' }),
+      ),
+    ).toBeUndefined();
+    expect(
+      describeTargetYield(refusal('PATCH_UNSUPPORTED', { ...held, owningSessionId: undefined })),
+    ).toBeUndefined();
+    expect(
+      describeTargetYield(refusal('PATCH_UNSUPPORTED', { ...held, owningSessionId: 7 })),
+    ).toBeUndefined();
+    expect(
+      describeTargetYield(refusal('PATCH_UNSUPPORTED', { ...held, file: 'app/a.ts\nforged' })),
+    ).toBeUndefined();
+    expect(
+      describeTargetYield(refusal('PATCH_UNSUPPORTED', { ...held, symbol: '   ' })),
+    ).toBeUndefined();
+    expect(
+      describeTargetYield(
+        refusal('PATCH_UNSUPPORTED', { reason: 'already-instrumented', file: TARGET_FILE }),
+      ),
+    ).toBeUndefined();
+    expect(
+      describeTargetYield(
+        refusal(
+          'PATCH_UNSUPPORTED',
+          { reason: 'already-instrumented', file: TARGET_FILE, symbol: TARGET_SYMBOL },
+          null,
+        ),
+      ),
+    ).toBeUndefined();
   });
 });
 

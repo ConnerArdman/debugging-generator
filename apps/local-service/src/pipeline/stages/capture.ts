@@ -58,9 +58,10 @@
  *    already holds it, otherwise `computeCaptureSummary` from
  *    `@debuggen/telemetry` over the capture's persisted, already-redacted
  *    events — read page by page, yielding between pages, and bounded by
- *    {@link MAX_SUMMARY_EVENTS} and {@link MAX_SUMMARY_BYTES}, whichever comes
- *    first, so the one synchronous aggregate over them stays short and the
- *    events it holds stay small. No metric, aggregate, correlation or redaction
+ *    {@link MAX_SUMMARY_EVENTS} (the panel-data resolver's aggregate ceiling,
+ *    so the summary, the analysis input and the panel's metrics share one
+ *    bound) and {@link MAX_SUMMARY_BYTES}, whichever comes first, so the
+ *    events it holds stay bounded. No metric, aggregate, correlation or redaction
  *    is computed here. A computed summary carries its `coverage`: stored versus
  *    summarised events, the events the producers reported discarding, and how
  *    the barrier ended — `'unverified'` rather than `'quiescent'` when a
@@ -69,9 +70,11 @@
  * 4. **The empty-capture rule of AAP §0.5.5**, as the pure
  *    {@link classifyCaptureEmptiness}: zero events, or zero browser interactions
  *    for a question whose validated, classified understanding needs
- *    interactions — whether or not the interaction hook was armed. A capped summary is judged by the
- *    store's exact per-kind counts. An empty capture is a legitimate outcome,
- *    not a crash.
+ *    interactions — whether or not the interaction hook was armed — unless its
+ *    category is answered by evidence the page records on its own and the
+ *    capture holds it ({@link PASSIVE_EVIDENCE_SIGNALS}). A capped summary is
+ *    judged by the store's exact per-kind counts. An empty capture is a
+ *    legitimate outcome, not a crash.
  * 5. Closes the window through `SessionManager.stopCapture` with
  *    `next: "ready"` for an empty capture and `next: "analyzing"` otherwise —
  *    the decision the manager's contract assigns to this stage. The manager
@@ -87,7 +90,8 @@
  *
  * - **No hardcoded behaviour (AAP §0.5.4).** Nothing here reads the
  *   developer's question: whether a capture needed interactions is decided from
- *   the understanding's closed `signalsNeeded` vocabulary. No application
+ *   the understanding's closed `category` and `signalsNeeded` vocabularies and
+ *   the capture's per-kind counts. No application
  *   identifier, route or path appears, and no hook or signal configuration is
  *   built by hand.
  * - **Nothing is written to the developer's project.** No filesystem access and
@@ -159,6 +163,7 @@ import type {
   ReadinessVerdict,
 } from '../../instrumentation/readiness.js';
 import { LOG_BINDING_KEYS, sessionLogger, subsystemLogger } from '../../logging.js';
+import { MAX_AGGREGATE_INPUT_EVENTS } from '../../panels/data.js';
 import type { CaptureStopNext, SessionManager } from '../../sessions/manager.js';
 import {
   CAPTURE_SIGNAL_LABELS,
@@ -171,6 +176,7 @@ import type { PublicFailureCopy, SessionProgress } from '../../sessions/progress
 import { STAGE_STATUS, transition } from '../../sessions/state-machine.js';
 import type { SessionFailure } from '../../sessions/state-machine.js';
 import type { SessionsRepo } from '../../store/sessions-repo.js';
+import { TELEMETRY_QUERY_MAX_LIMIT } from '../../store/telemetry-repo.js';
 import type { CaptureIngestWatermark, TelemetryRepo } from '../../store/telemetry-repo.js';
 import type { PipelineStageContext } from '../context-builder.js';
 
@@ -227,8 +233,9 @@ export const INTERACTION_HOOK_OFF_MESSAGE =
  * - `'no-events'` — the capture window recorded no event at all, on any tier.
  * - `'no-interaction'` — events arrived, but the validated understanding
  *   classifies the problem and needs the interaction signal
- *   ({@link understandingNeedsInteraction}), and the capture recorded no user
- *   interaction.
+ *   ({@link understandingNeedsInteraction}), the capture recorded no user
+ *   interaction, and it holds none of the evidence the page records on its
+ *   own for the problem's category ({@link PASSIVE_EVIDENCE_SIGNALS}).
  *   Without an interaction there is no trace root to hang the browser and
  *   server evidence off, so an analysis would answer a question nobody
  *   reproduced. This holds whether or not the page's interaction hook was
@@ -256,6 +263,33 @@ const INTERACTION_SIGNAL = 'interactions' as const satisfies CaptureSignal;
  */
 const UNCLASSIFIED_CATEGORY = 'other' as const satisfies ProblemUnderstanding['category'];
 
+/**
+ * The classified problem categories whose evidence the page records without a
+ * user interaction, each with the capture signal that records it:
+ *
+ * - `'rendering'` — `'react'`: renders and commits of components re-rendering
+ *   while the developer does nothing are the evidence a rendering question is
+ *   answered by.
+ * - `'network'` — `'fetch'`: requests the page sends on its own — polling, a
+ *   refetch on focus, a request loop — are the evidence a network question is
+ *   answered by.
+ *
+ * A question of one of these categories may still list the interaction signal
+ * among the signals it needs — the rules-based provider adds it for any
+ * selected element — and a capture that holds the category's evidence is not
+ * emptied for lacking the interaction. Every other category keeps the
+ * interaction condition: a `'performance'` question about a slow button is
+ * not answered by the renders of a page idling in the background.
+ *
+ * Typed against the closed category and signal vocabularies, so a rename
+ * upstream is a compile error; the telemetry kinds each signal produces are
+ * looked up through `telemetryKindsForSignal`, never restated.
+ */
+export const PASSIVE_EVIDENCE_SIGNALS = Object.freeze({
+  rendering: 'react',
+  network: 'fetch',
+} as const satisfies Partial<Readonly<Record<ProblemUnderstanding['category'], CaptureSignal>>>);
+
 /** The session status the capture stage runs under, from the state machine's own table. */
 const CAPTURING_STATUS = STAGE_STATUS[CAPTURE_STAGE];
 
@@ -266,66 +300,131 @@ const NEXT_WITH_EVIDENCE: CaptureStopNext = STAGE_STATUS.analyze;
 const NEXT_WHEN_EMPTY: CaptureStopNext = 'ready';
 
 /**
- * The most stored events one capture summary is computed from: **10 000**
- * (AAP §0.5.5).
+ * The most stored events one capture summary is computed from: **250 000**
+ * — {@link MAX_AGGREGATE_INPUT_EVENTS}, the panel-data resolver's aggregate
+ * ceiling, imported rather than restated.
+ *
+ * **One bound for a capture's evidence.** The summary this stage stores is
+ * what the headline, the analysis stage's metrics and the choice of panel
+ * views are built from; the panel-data resolver aggregates every table and
+ * metric card from at most this many events per read; and the analysis input
+ * (`../../analysis/summarize.ts`) is held to the same constant. A capture
+ * within it is therefore summarised, analysed and drawn from every one of its
+ * events, so the headline, the summary and the cards agree by construction.
+ * Beyond it the summary covers the capture's first events and says so (the
+ * coverage row of {@link coverageNotice}), and the unfiltered metric cards —
+ * which the resolver can then no longer aggregate — answer from this summary
+ * with a note stating the same coverage.
+ *
+ * The ceiling this replaces, 10 000, left the reproduction of a noisy capture
+ * outside its own summary: a 47 s capture of a slow button, on a page
+ * re-rendering in the background, stored 42 704 events, and the 10 000
+ * summarised held none of the interaction, requests or queries the question
+ * was about.
  *
  * `computeCaptureSummary` needs every event it summarises in memory at once
- * and runs synchronously over all of them, so a noisy capture read in full
- * could exhaust the service's heap and hold the one event loop — ingest, both
- * user interfaces' requests — for as long as the aggregate took. The stage
- * therefore reads the capture page by page in canonical order, yields to the
- * event loop between pages, and stops at whichever ceiling comes first, this
- * one or {@link MAX_SUMMARY_BYTES}: the summary then covers the capture's
- * earliest events, the emptiness rule reads the store's exact per-kind counts
- * instead of the summary's, and the summary's coverage reports how many stored
- * events it left out — `summary.truncated` keeps its own meaning, the top-N
- * clipping of its sections.
+ * and runs synchronously over all of them. The stage therefore reads the
+ * capture page by page in canonical order ({@link SUMMARY_PAGE_SIZE}), yields
+ * to the event loop between pages, and stops at whichever ceiling comes first,
+ * this one or {@link MAX_SUMMARY_BYTES}: past either, the emptiness rule reads
+ * the store's exact per-kind counts instead of the summary's, and the summary's
+ * coverage reports how many stored events it left out — `summary.truncated`
+ * keeps its own meaning, the top-N clipping of its sections.
  *
- * The value is measured, not chosen: `computeCaptureSummary` costs about
- * 12 ms per 1 000 events on the development host (Node 24.21.0), almost
- * independently of attribute size. Over events of a realistic cross-tier mix
- * (about 520 stored characters each) 10 000 events took 116–136 ms, where the
- * previous ceiling of 50 000 took 570–640 ms — more than half a second of a
- * frozen service at every stop of a noisy capture.
+ * Measured over the real store (Node 24.21.0) with a realistic cross-tier mix
+ * of about 650 stored characters per event, on a shared host at a load of
+ * 10–36 on 12 cores — so every duration here is several times what a
+ * developer's machine takes: `computeCaptureSummary` alone ran in 929 ms at
+ * 100 000 events and 2.8 s at 250 000 on a quieter one.
+ *
+ * | Events | Walk ({@link SUMMARY_PAGE_SIZE} rows a page) | `computeCaptureSummary` | Heap the events hold | Heap growth after the aggregate, garbage included |
+ * | --- | --- | --- | --- | --- |
+ * | 100 000 | 4.2–9.9 s | 4.3–10.5 s | 103–146 MiB | 150–208 MiB |
+ * | 250 000 | 9.5–18.9 s | 8.1–26.4 s | 230–284 MiB | 333–471 MiB |
+ *
+ * The aggregate is the stop's one long synchronous step; the walk before it
+ * yields between pages. Both are paid once, at the stop of a capture this
+ * large, and the resulting summary is what both user interfaces then read —
+ * the panel-data resolver holds a slice of the same size for as long as one
+ * of its reads takes.
  */
-export const MAX_SUMMARY_EVENTS = 10_000;
+export const MAX_SUMMARY_EVENTS = MAX_AGGREGATE_INPUT_EVENTS;
 
 /**
- * The most stored event data one capture summary is computed from: **16 MiB**
+ * The most stored event data one capture summary is computed from: **256 MiB**
  * of stored JSON, counted in characters of the events' stored documents
  * (AAP §0.5.5).
  *
  * The event ceiling alone does not bound memory: attributes are open JSON and
- * one dev-server ingest request may carry 32 MiB, so 10 000 rich events could
- * still hold hundreds of megabytes. The events a summary holds occupy about
- * their stored size in heap (measured at 1.05×), so this ceiling is what bounds
- * the read's memory. Measured on the development host:
- *
- * | Events offered | Stored each | Summarised | Held heap | Heap after the aggregate | `computeCaptureSummary` |
- * | --- | --- | --- | --- | --- | --- |
- * | 12 000, realistic mix | ~0.5 KB | 10 000 (event ceiling) | ~7 MiB | ~35 MiB | 116–172 ms |
- * | 50 000, 2 KB attributes | ~2.6 KB | 6 750 (this ceiling) | 18 MiB | ~80 MiB | 81–97 ms |
- * | 12 000, 10 KB attributes | ~10.8 KB | 1 750 (this ceiling) | 19 MiB | ~37 MiB | 23–48 ms |
- *
- * Under the previous, count-only ceiling the second row held 132 MiB and took
- * 552–628 ms, and the third held 126 MiB.
+ * one dev-server ingest request may carry 32 MiB, so {@link MAX_SUMMARY_EVENTS}
+ * rich events could hold gigabytes. This ceiling is the guard against
+ * pathological attributes, sized so that it never binds first for realistic
+ * events: 250 000 events of up to 1 KiB stored each — the agent and the preload
+ * emit about 0.65–0.9 KiB, their string attributes cut to 120-character
+ * previews — stay below it, so such a capture is always summarised up to the
+ * event ceiling. The events a summary holds occupy 1.05× (large attribute
+ * strings) to 1.6× (realistic small events) their stored size in heap.
  */
-export const MAX_SUMMARY_BYTES = 16 * 1024 * 1024;
+export const MAX_SUMMARY_BYTES = 256 * 1024 * 1024;
 
 /**
- * How many rows one page of the summary walk reads: **250**.
+ * The most rows one page of the summary walk reads: **5 000**, the store's own
+ * page ceiling (`TELEMETRY_QUERY_MAX_LIMIT`), which it clamps any larger
+ * request to.
  *
- * Both ceilings are checked between pages, so a walk overshoots the one that
- * stops it by at most one page. At 250 rows that is 2.5 % of
- * {@link MAX_SUMMARY_EVENTS}, and about 2.6 MiB — 16 % of
- * {@link MAX_SUMMARY_BYTES} — for events with 10 KB of attributes; the one row
- * a page cannot bound is a single stored event larger than that, which only
- * the ingest request ceiling limits. A page is also one synchronous slice of
- * the store read and the event validation between two yields: measured at
- * 1.4–9 ms for 250 rows on the development host, against 19–52 ms for a
- * page at the store's 5 000-row ceiling.
+ * The store serves a page by `LIMIT … OFFSET …` over the capture's index,
+ * sorting ties of its canonical order in a temporary B-tree, so every row
+ * before a page's offset is read again to reach it: measured at about 0.8 µs a
+ * skipped row (190–200 ms at an offset of 245 000) against about 9.6 µs a row
+ * returned (4.3 ms for 250 rows, 24 ms for 2 500, 48 ms for 5 000, at offset
+ * 0). A walk's cost is therefore quadratic in its page count, and the longest
+ * slice between two yields is set by that skip rather than by the page size:
+ *
+ * | Rows a page | Pages at 250 000 | Walk at 100 000 | Walk at 250 000 | Longest slice at 250 000 |
+ * | --- | --- | --- | --- | --- |
+ * | 250 (the previous value) | 1 000 | 69 s | 374 s | ~202 ms |
+ * | 1 000 | 250 | 8.2–17.6 s | 53–105 s | ~210 ms |
+ * | 2 500 | 100 | 4.5–6.3 s | 13.3–30 s | ~224 ms |
+ * | 5 000 | 50 | 4.2–9.9 s | 9.5–18.9 s | ~248 ms |
+ *
+ * (Same host and mix as {@link MAX_SUMMARY_EVENTS}; the walks are measured, the
+ * slices modelled from the skip and read costs above.) The largest page the
+ * store serves makes the fewest skips: against the previous 250 rows it makes
+ * the walk of 250 000 events some twenty times shorter and its longest slice
+ * about 46 ms longer.
+ *
+ * A page of rich events is also bounded by size, so neither a slice nor the
+ * read past {@link MAX_SUMMARY_BYTES} grows with its attributes: the first page
+ * reads {@link SUMMARY_PROBE_PAGE_SIZE} rows, and every later one at most the
+ * rows that fit {@link SUMMARY_PAGE_CHARS} — and the byte budget left — at the
+ * stored size per row the walk has seen so far.
  */
-export const SUMMARY_PAGE_SIZE = 250;
+export const SUMMARY_PAGE_SIZE = TELEMETRY_QUERY_MAX_LIMIT;
+
+/**
+ * How many rows the first page of the summary walk reads: **250**.
+ *
+ * Nothing is known of a capture's stored size per row before its first page,
+ * so that page is small enough that a pathological one — events near the
+ * redactor's attribute bounds — stays a short slice and a small read (about
+ * 17 MB at 70 KB an event); it costs every other capture one read of 4–6 ms.
+ * Every later page is sized from what the pages before it measured.
+ */
+export const SUMMARY_PROBE_PAGE_SIZE = 250;
+
+/**
+ * The stored size one page of the summary walk reads at most, once the walk
+ * has measured the capture's stored size per row: **8 MiB** of stored JSON, in
+ * characters.
+ *
+ * Realistic events — up to about 1.6 KiB stored each — read whole
+ * {@link SUMMARY_PAGE_SIZE} pages under it; richer ones read fewer rows a
+ * page, so one page is never more than about 8 MiB of documents to parse and
+ * validate (about 125 ms at the measured read cost), and a walk passes
+ * {@link MAX_SUMMARY_BYTES} by no more than the rows of one page deviate from
+ * the capture's average size.
+ */
+export const SUMMARY_PAGE_CHARS = 8 * 1024 * 1024;
 
 /** The `subsystem` binding of this stage's log records, shared by every pipeline module. */
 const PIPELINE_SUBSYSTEM = 'pipeline';
@@ -386,8 +485,10 @@ export interface CaptureEvidenceCounts {
   readonly interactionCount: number;
   /**
    * Whether this capture had to record an interaction to be worth analysing:
-   * the understanding needs the interaction signal. Independent of what was
-   * armed (AAP §0.5.5).
+   * the understanding needs the interaction signal, and the capture holds none
+   * of the evidence the page records on its own for the problem's category
+   * ({@link PASSIVE_EVIDENCE_SIGNALS}). Independent of what was armed
+   * (AAP §0.5.5).
    */
   readonly interactionRequired: boolean;
   /**
@@ -434,8 +535,10 @@ export interface ClassifyCaptureEmptinessOptions {
    * The hooks never exempt a capture from the interaction condition. An
    * interaction question whose capture recorded no interaction is empty
    * whether the hook was off or on — events from other signals are not a
-   * reproduction of the interaction — so the session returns to `ready`
-   * instead of an analysis answering a question nobody reproduced (AAP §0.5.5).
+   * reproduction of the interaction, save the evidence a rendering or network
+   * question is answered by without one ({@link PASSIVE_EVIDENCE_SIGNALS}) —
+   * so the session returns to `ready` instead of an analysis answering a
+   * question nobody reproduced (AAP §0.5.5).
    */
   readonly agentHooks?: AgentHookConfig | undefined;
 }
@@ -484,6 +587,11 @@ function isList<T>(value: readonly T[] | undefined): value is readonly T[] {
  * re-renders or re-requests while the developer does nothing (AAP §0.5.5 asks
  * for an interaction only for an interaction question).
  *
+ * A classified question that needs the interaction signal can still be
+ * answered without one when its category's evidence is recorded passively;
+ * {@link classifyCaptureEmptiness} weighs that against the capture's counts
+ * ({@link PASSIVE_EVIDENCE_SIGNALS}), which this predicate does not see.
+ *
  * @param understanding The session's validated Stage 1 understanding, when it
  * has one.
  * @returns `true` when the problem is classified and the interaction signal is
@@ -499,6 +607,42 @@ export function understandingNeedsInteraction(
 }
 
 /**
+ * The capture signal that records, without any input, the evidence a problem
+ * category is answered by ({@link PASSIVE_EVIDENCE_SIGNALS}), or `undefined`
+ * for a category that has none: every category the table does not name,
+ * `'other'` included, and any value outside the vocabulary that a stored
+ * record might carry.
+ */
+function passiveEvidenceSignalOf(category: string): CaptureSignal | undefined {
+  const signals: Readonly<Partial<Record<string, CaptureSignal>>> = PASSIVE_EVIDENCE_SIGNALS;
+  return Object.hasOwn(signals, category) ? signals[category] : undefined;
+}
+
+/**
+ * How many of a capture's events are the evidence its understanding's
+ * category is answered by without a user interaction: the zero-filled per-kind
+ * counts summed over the telemetry kinds of the category's passive-evidence
+ * signal (`telemetryKindsForSignal`), so no kind name is restated here. `0`
+ * without an understanding and for a category with no such signal. Pure, and
+ * the question text is never consulted (AAP §0.5.4).
+ */
+function passiveEvidenceCount(
+  counts: Pick<CaptureSummary, 'kindCounts'>,
+  understanding: ProblemUnderstanding | undefined,
+): number {
+  const signal =
+    understanding === undefined ? undefined : passiveEvidenceSignalOf(understanding.category);
+  if (signal === undefined) {
+    return 0;
+  }
+  let count = 0;
+  for (const kind of telemetryKindsForSignal(signal)) {
+    count += countOf(counts.kindCounts[kind]);
+  }
+  return count;
+}
+
+/**
  * Classifies a capture as holding evidence or as empty, per AAP §0.5.5: **zero
  * events**, or **zero browser interactions for an interaction question**.
  *
@@ -508,8 +652,15 @@ export function understandingNeedsInteraction(
  * (`telemetryKindsForSignal`), read from the summary's zero-filled per-kind
  * counts, so no kind name is restated here. A malformed count reads as zero.
  *
- * The interaction condition depends on the question alone. What was armed is
- * reported (`interactionHookArmed`) but never exempts a capture: an interaction
+ * An interaction question is one whose classified understanding needs the
+ * interaction signal ({@link understandingNeedsInteraction}), unless its
+ * category is answered by evidence the page records on its own and the
+ * capture holds some ({@link PASSIVE_EVIDENCE_SIGNALS}): a `'rendering'`
+ * question over a capture of renders, or a `'network'` question over a capture
+ * of requests, is analysed without a click. Both decisions read the
+ * understanding's closed vocabularies and the capture's counts, never the
+ * question text (AAP §0.5.4). What was armed is reported
+ * (`interactionHookArmed`) but never exempts a capture: an interaction
  * question's capture with no interaction is empty even when the plan left the
  * interaction hook off.
  *
@@ -544,7 +695,9 @@ export function classifyCaptureEmptiness(
   for (const kind of telemetryKindsForSignal(INTERACTION_SIGNAL)) {
     interactionCount += countOf(summary.kindCounts[kind]);
   }
-  const interactionRequired = understandingNeedsInteraction(understanding);
+  const interactionRequired =
+    understandingNeedsInteraction(understanding) &&
+    passiveEvidenceCount(summary, understanding) === 0;
   const hooks = options?.agentHooks;
   const counts: CaptureEvidenceCounts = {
     eventCount,
@@ -648,6 +801,39 @@ export interface CaptureDrainTiming {
  * (`'bytes'`).
  */
 type SummaryCeiling = 'events' | 'bytes';
+
+/**
+ * How many rows the next page of the summary walk asks for, given what the
+ * walk has read so far. Pure.
+ *
+ * - The first page reads {@link SUMMARY_PROBE_PAGE_SIZE} rows: nothing is
+ *   known yet of the capture's stored size per row.
+ * - Every later page reads at most {@link SUMMARY_PAGE_SIZE} rows, at most the
+ *   rows the event ceiling leaves, and — at the stored size per row read so
+ *   far — at most the rows that fit {@link SUMMARY_PAGE_CHARS} and the rows
+ *   that reach what is left of {@link MAX_SUMMARY_BYTES}, so a page of rich
+ *   events is a short slice and the walk lands on the byte ceiling rather than
+ *   a page past it. Realistic events read whole {@link SUMMARY_PAGE_SIZE}
+ *   pages.
+ *
+ * Always at least one row while either ceiling leaves room; the caller stops
+ * the walk before asking once one is reached.
+ *
+ * @param rowsRead The rows read so far, readable or not.
+ * @param storedChars Their stored size, in characters of their JSON documents.
+ * @returns The page's row limit.
+ */
+function summaryPageLimit(rowsRead: number, storedChars: number): number {
+  const rowsLeft = Math.max(1, MAX_SUMMARY_EVENTS - rowsRead);
+  if (rowsRead <= 0) {
+    return Math.min(SUMMARY_PROBE_PAGE_SIZE, rowsLeft);
+  }
+  // A capture whose rows report no size is sized by rows alone.
+  const charsPerRow = Math.max(1, storedChars / rowsRead);
+  const rowsForPage = Math.floor(SUMMARY_PAGE_CHARS / charsPerRow);
+  const rowsForBudget = Math.ceil(Math.max(0, MAX_SUMMARY_BYTES - storedChars) / charsPerRow);
+  return Math.max(1, Math.min(SUMMARY_PAGE_SIZE, rowsLeft, rowsForPage, rowsForBudget));
+}
 
 /** What a bounded read of one capture's stored events produced: the summary and its counts. */
 interface SummarizedCapture {
@@ -1833,19 +2019,21 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
   };
 
   /**
-   * Reads one capture's persisted events page by page, {@link SUMMARY_PAGE_SIZE}
-   * rows at a time in canonical order, and summarises them with the upstream
-   * `computeCaptureSummary`. The events are the already-redacted rows ingest
-   * stored; nothing is re-redacted, correlated or aggregated here.
+   * Reads one capture's persisted events page by page in canonical order —
+   * pages sized by {@link summaryPageLimit} — and summarises them with the
+   * upstream `computeCaptureSummary`. The events are the already-redacted rows
+   * ingest stored; nothing is re-redacted, correlated or aggregated here.
    *
    * Bounded twice: the walk stops once {@link MAX_SUMMARY_EVENTS} rows or
    * {@link MAX_SUMMARY_BYTES} of stored documents have been read — unreadable
    * rows count towards both, so a capture of poisoned rows is bounded too —
-   * checking both between pages, so it overshoots the ceiling that stops it by
-   * at most one page. It yields to the event loop between pages, so ingest and
-   * every other request keep being served while a large capture is read, and
-   * the one synchronous aggregate at the end runs over at most one bounded
-   * summary's events.
+   * checking both between pages. No page asks for more rows than the event
+   * ceiling leaves, so that ceiling is met exactly; the byte ceiling is
+   * overshot only by how far one page's rows deviate from the stored size per
+   * row measured before it. It yields to the event loop between pages, so
+   * ingest and every other request keep being served while a large capture is
+   * read, and the one synchronous aggregate at the end runs over at most one
+   * bounded summary's events.
    *
    * @returns The summary with its counts. `rowsRead` is the capture's full size
    * only when no ceiling stopped the walk; `evidenceCountsOf` reconciles a
@@ -1867,7 +2055,7 @@ export function createCaptureStage(deps: CaptureStageDeps): CaptureStage {
       if (isAborted(signal)) {
         return err(cancelledError(sessionId, captureId));
       }
-      const limit = Math.min(SUMMARY_PAGE_SIZE, MAX_SUMMARY_EVENTS - rowsRead);
+      const limit = summaryPageLimit(rowsRead, storedChars);
       const page = attempt(
         () => deps.telemetry.pageCaptureForSummary(sessionId, captureId, { limit, offset }),
         'STORE_ERROR',

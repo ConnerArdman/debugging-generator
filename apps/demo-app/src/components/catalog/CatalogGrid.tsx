@@ -57,6 +57,21 @@
  * section is named by that one title, which is also the level-2 heading the cards' own titles sit
  * under.
  *
+ * FOCUS SURVIVES THE LISTING IT ASKED FOR
+ * A control the reader changes asks for a new listing, and the answer can take the control they
+ * were on away with it: "Clear filters" and "Go to the first page" live in the blank slate the
+ * new listing replaces, a card's category chip lives in a card the new listing may not hold, and a
+ * route that remounts its segment for a new query string would replace the toolbar and the chip
+ * row as well. A focused element that leaves the document leaves focus on `<body>`, where the next
+ * Tab starts from the top of the page (WCAG 2.4.3). So every request names the control that
+ * stands for it - the search field for a search, for "Clear filters" (the term it cleared) and for
+ * "Go to the first page"; the sort dropdown for an ordering; the chip that is on for a category -
+ * and once the listing for that request is on screen, focus is returned to that control if it was
+ * lost on the way. Focus the reader still has anywhere - the dropdown they just changed, the chip
+ * they just pressed - is never moved. The request is held in module scope rather than in this
+ * component, because a remounted surface is a new instance that would not have seen it; it is
+ * written only by the handlers and read only by the effect, never while rendering.
+ *
  * NOTHING HERE VARIES BETWEEN THE SERVER'S MARKUP AND THE BROWSER'S FIRST RENDER
  * Every value rendered is derived from the props - the page of products and the query it was read
  * under - and no clock, random number, ambient locale, address bar or document is read while
@@ -65,7 +80,7 @@
  */
 
 import { usePathname, useRouter } from 'next/navigation';
-import { useState, useTransition } from 'react';
+import { useEffect, useRef, useState, useTransition } from 'react';
 import type { ReactNode } from 'react';
 
 import { Button } from '@/components/ui/Button';
@@ -82,8 +97,10 @@ import { CatalogEmptyNotice } from './CatalogEmptyNotice';
 import type { CatalogEmptyNoticeProps } from './CatalogEmptyNotice';
 import { CatalogPager } from './CatalogPager';
 import {
+  CATALOG_SEARCH_FIELD_ID,
   CATALOG_SEARCH_MAX_LENGTH,
   CATALOG_SEARCH_PARAM,
+  CATALOG_SORT_FIELD_ID,
   CATALOG_SORT_PARAM,
   CatalogToolbar,
 } from './CatalogToolbar';
@@ -305,6 +322,76 @@ function catalogRequestFor(query: CatalogGridQuery): CatalogRequest {
 }
 
 /**
+ * The control that stands for a request once its listing is on screen: the search field, the sort
+ * dropdown, or the category chip that is on. See FOCUS SURVIVES THE LISTING IT ASKED FOR above.
+ */
+type CatalogFocusControl = 'search' | 'sort' | 'category';
+
+/**
+ * The request whose listing is on its way, and the control to return focus to when it lands.
+ *
+ * Module scope, deliberately: a segment remounted for a new query string mounts a new instance of
+ * this component, and only something outside the instance survives that. It is one slot, because
+ * one listing is ever on its way - a newer request supersedes an older one here exactly as it does
+ * in the router - and it names the address it is waiting for, so it is honoured only by the listing
+ * that answers it and never by some later mount of an unrelated one. It is reached only through
+ * the two functions below: {@link recordCatalogFocus}, which `commit` calls as a navigation is
+ * issued, and {@link takeCatalogFocus}, which the component's effect calls once that address is the
+ * applied one. Both run only in the browser, from an event handler and from an effect, so the slot
+ * is never touched while anything renders and nothing on the server ever writes it.
+ */
+const catalogFocus: {
+  request: { readonly catalogQuery: string; readonly control: CatalogFocusControl } | null;
+} = { request: null };
+
+/**
+ * Record that the listing at `catalogQuery` is on its way and that `control` stands for it,
+ * superseding any request still waiting.
+ */
+function recordCatalogFocus(catalogQuery: string, control: CatalogFocusControl): void {
+  catalogFocus.request = { catalogQuery, control };
+}
+
+/**
+ * The control to return focus to now that the listing at `catalogQuery` is on screen, or `null`
+ * when no request is waiting for that address. A request that is answered is consumed, so it is
+ * honoured once; one waiting for another address is left for the listing that answers it.
+ */
+function takeCatalogFocus(catalogQuery: string): CatalogFocusControl | null {
+  const request = catalogFocus.request;
+
+  if (request === null || request.catalogQuery !== catalogQuery) {
+    return null;
+  }
+
+  catalogFocus.request = null;
+
+  return request.control;
+}
+
+/**
+ * Focus the control that stands for `control` in the listing now on screen.
+ *
+ * The two toolbar fields are found by the ids `CatalogToolbar` gives them. The category is the chip
+ * that is on, found inside `filters` - the element this surface wraps the chip row in - through
+ * `aria-pressed`, which is the state `ui/Pill` announces for a toggle and therefore the one thing
+ * that says which chip describes the listing. A control that is not in the document moves nothing.
+ */
+function focusCatalogControl(control: CatalogFocusControl, filters: HTMLElement | null): void {
+  let target: HTMLElement | null;
+
+  if (control === 'search') {
+    target = document.getElementById(CATALOG_SEARCH_FIELD_ID);
+  } else if (control === 'sort') {
+    target = document.getElementById(CATALOG_SORT_FIELD_ID);
+  } else {
+    target = filters?.querySelector<HTMLElement>('[aria-pressed="true"]') ?? null;
+  }
+
+  target?.focus();
+}
+
+/**
  * Render the catalog surface.
  *
  * Each card's two handlers are declared where the card is, because the values they report are that
@@ -332,6 +419,36 @@ export function CatalogGrid({ products, categories, query }: CatalogGridProps) {
   const [searchDraft, setSearchDraft] = useState(applied.search);
   const [shownCatalogQuery, setShownCatalogQuery] = useState(appliedCatalogQuery);
   const [requestedCatalogQuery, setRequestedCatalogQuery] = useState<string | null>(null);
+
+  // The element the chip row is placed in, where the chip that is on is found when focus has to
+  // return to it. Read only from the effect below, never while rendering.
+  const filtersRow = useRef<HTMLDivElement | null>(null);
+
+  /*
+   * Return focus to the control a request stands for, once that request's listing is on screen.
+   *
+   * It runs after every commit in which the applied address changes, and on mount - which is the
+   * commit a remounted segment's listing arrives in - so it sees the answer whichever way the route
+   * delivers it. Only the request waiting for this very address is honoured, and it is consumed
+   * then. Focus is moved only when it was lost: `<body>` (or nothing) is what a focused element that
+   * left the document leaves behind, so any other element holding focus is the reader's own - the
+   * dropdown they just changed, the chip they just pressed, a link they went on to - and stays put.
+   * No state is written, so this adds no render of its own and leaves the surface's render cadence
+   * exactly as it was.
+   */
+  useEffect(() => {
+    const control = takeCatalogFocus(appliedCatalogQuery);
+
+    if (control === null) {
+      return;
+    }
+
+    const active = document.activeElement;
+
+    if (active === null || active === document.body) {
+      focusCatalogControl(control, filtersRow.current);
+    }
+  }, [appliedCatalogQuery]);
 
   /*
    * The address changed, so this surface catches up with it: the field returns to the term now in
@@ -382,8 +499,12 @@ export function CatalogGrid({ products, categories, query }: CatalogGridProps) {
    * through. `scroll: false` keeps the reader's position, because the narrowed listing appears in
    * the same place on the page. The navigation runs inside a transition, so the listing on screen
    * stays legible while the server produces the next one instead of the region blanking.
+   *
+   * `control` is the control that stands for this request once its listing arrives, recorded
+   * beside the address it is waiting for as the navigation is issued, and only then: a request
+   * that asks for nothing moves nothing, so it records nothing either.
    */
-  function commit(next: CatalogRequest): void {
+  function commit(next: CatalogRequest, control: CatalogFocusControl): void {
     const wantedCatalogQuery = buildCatalogQuery(next, products.pageSize, FIRST_PAGE);
 
     if (wantedCatalogQuery === (requestedCatalogQuery ?? appliedCatalogQuery)) {
@@ -393,6 +514,7 @@ export function CatalogGrid({ products, categories, query }: CatalogGridProps) {
 
     setSearchDraft(next.search);
     setRequestedCatalogQuery(wantedCatalogQuery);
+    recordCatalogFocus(wantedCatalogQuery, control);
 
     const href = wantedCatalogQuery.length === 0 ? pathname : `${pathname}?${wantedCatalogQuery}`;
 
@@ -406,24 +528,34 @@ export function CatalogGrid({ products, categories, query }: CatalogGridProps) {
    *
    * The toolbar's submission and the control offered when the requested page lies past the end of a
    * listing are the same request: the term, filter and ordering the reader can see, at the page
-   * every listing starts at.
+   * every listing starts at. The search field stands for both: it holds the term the listing was
+   * asked for, and it is where a reader whose blank-slate control has gone picks the listing up.
    */
   function handleCatalogApply(): void {
-    commit(controls);
+    commit(controls, 'search');
   }
 
   function handleSortChange(sort: CatalogSort): void {
-    commit({ ...controls, sort });
+    commit({ ...controls, sort }, 'sort');
   }
 
+  /*
+   * Shared by the chip row and by each card's category chip, so both land on the chip that is on
+   * in the row once the listing arrives - which, for a card whose listing no longer holds it, is
+   * the one control left that says what the listing is filtered to.
+   */
   function handleCategorySelect(categorySlug: string | null): void {
-    commit({ ...controls, categorySlug });
+    commit({ ...controls, categorySlug }, 'category');
   }
 
-  /** Back to the whole catalog in its own order, with no card's specifications left open. */
+  /**
+   * Back to the whole catalog in its own order, with no card's specifications left open. The
+   * control that asked for it lives in the blank slate the full listing replaces, so the search
+   * field - the filter it cleared - is where focus lands.
+   */
   function handleClearFilters(): void {
     setSelectedSlug(null);
-    commit({ search: '', categorySlug: null, sort: DEFAULT_CATALOG_SORT });
+    commit({ search: '', categorySlug: null, sort: DEFAULT_CATALOG_SORT }, 'search');
   }
 
   /**
@@ -535,7 +667,7 @@ export function CatalogGrid({ products, categories, query }: CatalogGridProps) {
         pending={pending}
       />
 
-      <div className={styles.filters}>
+      <div className={styles.filters} ref={filtersRow}>
         <CategoryFilterChips
           categories={categories}
           activeSlug={applied.categorySlug}

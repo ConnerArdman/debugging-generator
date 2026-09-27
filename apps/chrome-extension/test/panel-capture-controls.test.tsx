@@ -54,8 +54,11 @@ const FIRST_CAPTURE = 'capture-1';
 /** A second generic capture id, for a capture that replaces the first. */
 const SECOND_CAPTURE = 'capture-2';
 
-/** The shortest spacing between two count announcements the component promises, in ms. */
-const COUNT_INTERVAL_MS = 5_000;
+/**
+ * A long wait, in ms: longer than any schedule the region could have. Waited through to prove
+ * that nothing further is ever said, not merely that it has not been said yet.
+ */
+const LONG_WAIT_MS = 60_000;
 
 /** The visible counter's accessible name while a capture runs. */
 const LIVE_COUNTER_NAME = 'Events received during the running capture';
@@ -82,24 +85,22 @@ function events(count: number): string {
   return `${COUNT_FORMAT.format(count)} ${count === 1 ? 'event' : 'events'}`;
 }
 
-/** The sentence announced when a capture starts. */
-function startSentence(count: number): string {
-  return `Capture running. ${events(count)} received.`;
-}
-
-/** The throttled sentence while a capture runs. */
-function progressSentence(count: number): string {
-  return `${events(count)} received during the running capture.`;
-}
+/** The sentence announced when a capture starts: it states no count. */
+const START_SENTENCE = 'Capture running.';
 
 /** The sentence announced when the capture stops. */
 function stopSentence(count: number): string {
   return `Capture stopped. ${events(count)} captured.`;
 }
 
-/** The throttled sentence for a count corrected after the stop. */
+/** The sentence for a stopped capture's total corrected after its stop was announced. */
 function totalSentence(count: number): string {
   return `${events(count)} captured.`;
+}
+
+/** Every run of digits a sentence states — the numbers a screen reader would hear. */
+function numbersIn(sentence: string): string[] {
+  return sentence.match(/\d[\d.,\u00a0\u202f ]*/gu) ?? [];
 }
 
 // ---------------------------------------------------------------------------
@@ -496,19 +497,15 @@ describe('CaptureControls — progress announcement', () => {
     // The region existed before its text changes, and the text changes from a timer.
     expect(live.textContent).toBe('');
     advance(0);
-    expect(live.textContent).toBe(startSentence(0));
+    expect(live.textContent).toBe(START_SENTENCE);
     expect(region()).toBe(live);
-
-    update({ sessionStatus: 'capturing', captureId: FIRST_CAPTURE, eventCount: 4 });
-    advance(COUNT_INTERVAL_MS);
-    expect(live.textContent).toBe(progressSentence(4));
 
     update({ sessionStatus: 'capturing', captureId: SECOND_CAPTURE, eventCount: 1 });
     advance(0);
-    expect(live.textContent).toBe(startSentence(1));
+    expect(live.textContent).toBe(START_SENTENCE);
   });
 
-  it('throttles count changes to one announcement per interval with the latest count', () => {
+  it('never states a running count, so the visible counter is the one running number', () => {
     const { update } = mount({
       sessionStatus: 'capturing',
       captureId: FIRST_CAPTURE,
@@ -516,43 +513,26 @@ describe('CaptureControls — progress announcement', () => {
     });
     advance(0);
     const live = region();
-    expect(live.textContent).toBe(startSentence(0));
+    expect(live.textContent).toBe(START_SENTENCE);
+    expect(numbersIn(live.textContent)).toEqual([]);
 
-    const spoken = new Set<string>([live.textContent]);
-    // Forty updates 100 ms apart: the whole burst fits inside one interval.
+    // Forty updates 100 ms apart, then a long wait: the region never speaks a count, while the
+    // visible counter is current on every render.
     for (let step = 1; step <= 40; step += 1) {
       const count = step * 31;
       update({ sessionStatus: 'capturing', captureId: FIRST_CAPTURE, eventCount: count });
-      // The visible counter is current on every render.
       expect(screen.getByRole('group', { name: LIVE_COUNTER_NAME }).textContent).toBe(
         events(count),
       );
       advance(100);
-      spoken.add(live.textContent);
+      expect(live.textContent).toBe(START_SENTENCE);
     }
-    expect([...spoken]).toEqual([startSentence(0)]);
-
-    // The interval started at the first change, 4 000 ms ago.
-    advance(COUNT_INTERVAL_MS - 4_000 - 1);
-    expect(live.textContent).toBe(startSentence(0));
-    advance(1);
-    expect(live.textContent).toBe(progressSentence(1_240));
-
-    // An unchanged count says nothing more.
-    advance(COUNT_INTERVAL_MS * 3);
-    expect(live.textContent).toBe(progressSentence(1_240));
-
-    // The next burst collapses the same way.
-    update({ sessionStatus: 'capturing', captureId: FIRST_CAPTURE, eventCount: 1_250 });
-    advance(1_000);
-    update({ sessionStatus: 'capturing', captureId: FIRST_CAPTURE, eventCount: 1_261 });
-    advance(COUNT_INTERVAL_MS - 1_001);
-    expect(live.textContent).toBe(progressSentence(1_240));
-    advance(1);
-    expect(live.textContent).toBe(progressSentence(1_261));
+    advance(LONG_WAIT_MS);
+    expect(live.textContent).toBe(START_SENTENCE);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('announces the stop promptly, superseding a pending count, then throttles a correction', () => {
+  it('announces the stop promptly with the latest count, then a corrected total at once', () => {
     const { update } = mount({
       sessionStatus: 'capturing',
       captureId: FIRST_CAPTURE,
@@ -560,27 +540,31 @@ describe('CaptureControls — progress announcement', () => {
     });
     advance(0);
     const live = region();
-    expect(live.textContent).toBe(startSentence(1));
+    expect(live.textContent).toBe(START_SENTENCE);
 
     update({ sessionStatus: 'capturing', captureId: FIRST_CAPTURE, eventCount: 5 });
     advance(1_000);
     update({ sessionStatus: 'analyzing', captureId: FIRST_CAPTURE, eventCount: 7 });
+    // A total that moves before the stop sentence is spoken is folded into it.
+    update({ sessionStatus: 'analyzing', captureId: FIRST_CAPTURE, eventCount: 8 });
     advance(0);
-    expect(live.textContent).toBe(stopSentence(7));
-
-    // The superseded running-count sentence never arrives.
-    advance(COUNT_INTERVAL_MS * 2);
-    expect(live.textContent).toBe(stopSentence(7));
-
-    // A later correction for the same capture is announced, throttled.
-    update({ sessionStatus: 'analyzing', captureId: FIRST_CAPTURE, eventCount: 9 });
+    expect(live.textContent).toBe(stopSentence(8));
     expect(screen.getByRole('group', { name: LAST_COUNTER_NAME }).textContent).toBe(
-      `${events(9)} captured`,
+      `${events(8)} captured`,
     );
-    advance(COUNT_INTERVAL_MS - 1);
-    expect(live.textContent).toBe(stopSentence(7));
-    advance(1);
-    expect(live.textContent).toBe(totalSentence(9));
+
+    // The store's stored count arrives after the stop: the region follows the counter at once.
+    update({ sessionStatus: 'analyzing', captureId: FIRST_CAPTURE, eventCount: 9_000 });
+    expect(screen.getByRole('group', { name: LAST_COUNTER_NAME }).textContent).toBe(
+      `${events(9_000)} captured`,
+    );
+    advance(0);
+    expect(live.textContent).toBe(totalSentence(9_000));
+
+    // An unchanged total says nothing more.
+    update({ sessionStatus: 'generated', captureId: FIRST_CAPTURE, eventCount: 9_000 });
+    advance(LONG_WAIT_MS);
+    expect(live.textContent).toBe(totalSentence(9_000));
   });
 
   it('says nothing about a capture only ever seen stopped', () => {
@@ -590,11 +574,11 @@ describe('CaptureControls — progress announcement', () => {
       eventCount: 30,
     });
     const live = region();
-    advance(COUNT_INTERVAL_MS * 2);
+    advance(LONG_WAIT_MS);
     expect(live.textContent).toBe('');
 
     update({ sessionStatus: 'generated', captureId: FIRST_CAPTURE, eventCount: 31 });
-    advance(COUNT_INTERVAL_MS * 2);
+    advance(LONG_WAIT_MS);
     expect(live.textContent).toBe('');
     expect(screen.getByRole('group', { name: LAST_COUNTER_NAME }).textContent).toBe(
       `${events(31)} captured`,
@@ -609,12 +593,12 @@ describe('CaptureControls — progress announcement', () => {
     });
     advance(0);
     const live = region();
-    expect(live.textContent).toBe(startSentence(2));
+    expect(live.textContent).toBe(START_SENTENCE);
 
     update({ sessionStatus: 'ready', captureId: SECOND_CAPTURE, eventCount: 3 });
     advance(0);
     expect(live.textContent).toBe('');
-    advance(COUNT_INTERVAL_MS * 2);
+    advance(LONG_WAIT_MS);
     expect(live.textContent).toBe('');
   });
 
@@ -626,7 +610,7 @@ describe('CaptureControls — progress announcement', () => {
     });
     advance(0);
     const live = region();
-    expect(live.textContent).toBe(startSentence(6));
+    expect(live.textContent).toBe(START_SENTENCE);
 
     update({ sessionStatus: 'ready', captureId: undefined, eventCount: 0 });
     advance(0);
@@ -642,9 +626,10 @@ describe('CaptureControls — progress announcement', () => {
       (element) => <StrictMode>{element}</StrictMode>,
     );
     advance(0);
-    expect(region().textContent).toBe(startSentence(0));
+    expect(region().textContent).toBe(START_SENTENCE);
 
-    update({ sessionStatus: 'capturing', captureId: FIRST_CAPTURE, eventCount: 8 });
+    // A stop schedules its sentence; unmounting cancels it.
+    update({ sessionStatus: 'analyzing', captureId: FIRST_CAPTURE, eventCount: 8 });
     expect(vi.getTimerCount()).toBe(1);
     unmount();
     expect(vi.getTimerCount()).toBe(0);

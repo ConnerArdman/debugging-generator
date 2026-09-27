@@ -29,9 +29,30 @@
  *
  * | Message | Effect |
  * | --- | --- |
- * | `session.bind` | Only a `devtools` principal binds. The payload's `origin` must be the origin of its `url`. Without `sessionId` the tab binds to the most recently updated non-ended session whose dev-server origin equals the tab's origin; with `sessionId` it binds to that session only if its dev-server origin matches — a mismatch is a refusal, never a silent bind. |
- * | `tab.navigated` | Every accepted navigation — kept, dropped, or of a tab not yet bound — is first recorded with the injected {@link NavigationRecorder}, so readiness can tell a page-agent report a reload or a same-URL load left behind. Same origin then keeps the binding, records the new URL and re-arms the agent the new document started dormant — reporting `Page reloaded during capture` when a capture is open; a different origin drops the binding. A navigation of an unbound tab changes no binding. |
+ * | `session.bind` | Only a `devtools` principal binds. The payload's `origin` must be the origin of its `url`. Without `sessionId` the tab binds to the most recently updated live session — neither ended nor failed — whose dev-server origin equals the tab's origin, and to the most recently updated failed one only when no live session serves that origin; with `sessionId` it binds to that session only if its dev-server origin matches — a mismatch is a refusal, never a silent bind. A named session that ended or vanished is refused, and the injected {@link EndedSessionAgentPort} is told so the page disarm it owes is settled. |
+ * | `tab.navigated` | Every accepted navigation — kept, dropped, or of a tab not yet bound — is first recorded with the injected {@link NavigationRecorder}, so readiness can tell a page-agent report a reload or a same-URL load left behind. Same origin then keeps the binding, records the new URL, announces it as the binding now stands (`reason: 'bound'`) and re-arms the agent a new document starts dormant; a different origin drops the binding. A navigation of an unbound tab changes no binding. |
+ * | page-agent report | Every `agent.ready` the readiness path accepts reaches {@link BindingDocumentObserver.documentReported}. A report naming a document other than the one the tab showed before its kept navigation proves that navigation a reload: it is announced (`reason: 'navigated'`) and, while its capture is open, reported as `Page reloaded during capture`. |
  * | `session.unbind` | Drops the binding. Idempotent: an unbound tab is a no-op. It never ends the session, cancels a capture or disarms instrumentation. |
+ *
+ * **A tab that has no session yet awaits one.** A panel is opened — and its
+ * tab announced — before the question that creates its session is asked, and
+ * stays open while the next question follows a session's end. So the tab is
+ * recorded as awaiting a session for its document's origin with
+ * {@link ClientRegistry.awaitSession} whenever it is left without one: an
+ * origin bind that finds no session, an unbind of a binding whose session has
+ * ended (the Chrome worker's own cleanup after `session.end`, while its
+ * DevTools stays open), and a navigation that took the tab off its session's
+ * origin (recorded for the new origin; the panel shows "Tab left ‹origin›").
+ * The next session created for that origin reaches the tab's connection with
+ * its `session.created`, and the worker announces the tab again, which binds
+ * it here exactly as a freshly opened panel is bound. A session may already
+ * serve the origin when the tab starts awaiting — `session.end` and the next
+ * `POST /sessions` can both land before the worker's unbind does, so that
+ * session's `session.created` found the tab still bound — and then the newest
+ * such session is offered to the tab's connection at once
+ * ({@link ClientRegistry.offerSessionToAwaitingTab}), with the same effect. An
+ * unbind of an unbound tab, or of a binding whose session is still open, is
+ * its DevTools closing: the tab awaits nothing more.
  *
  * **Cardinality** (AAP §0.2.3): one tab binds to at most one session and one
  * session accepts one tab at a time. A second bind replaces the first and is
@@ -104,14 +125,24 @@
  * newly bound tab or a reloaded document continues the capture (AAP §0.5.5,
  * "Page reloaded during capture").
  *
- * **The reload is reported, once.** A same-origin navigation kept while the
- * session has an open capture is also told to the developer: exactly one
+ * **The reload is reported, once — and only a reload.** A `tab.navigated`
+ * cannot tell a reload from a same-document URL change (the history API):
+ * both keep the binding on a new URL. Only a reload brings a new page-agent
+ * document, so a kept navigation is announced at once as the binding as it
+ * stands (`reason: 'bound'`) and held until the tab's next accepted report
+ * (`agent.ready`, through {@link BindingDocumentObserver}): a report naming
+ * another document than the one last reported for the tab before the
+ * navigation — or the first report, when none was — proves the reload. It is
+ * then announced with `reason: 'navigated'` (the one reason the panel shows a
+ * reload notice for), and, while the capture the navigation re-armed is still
+ * the session's open capture, told to the developer as exactly one
  * `Page reloaded during capture` progress row of the capture stage, emitted
  * through the injected progress port (`../../sessions/progress.ts`, which
  * persists it for replay and sends it to the session's editor and panel), its
- * detail saying whether the agent resumed. A navigation without an open
- * capture, a refused navigation and a bind report nothing; the INFO log line
- * stays.
+ * detail saying whether the agent resumed. A same-document change, a
+ * navigation without an open capture, a refused navigation, a re-relayed
+ * report of the previous document and a bind report nothing; a binding that
+ * ends forgets its held navigation. The INFO log lines stay.
  *
  * **Explicit unbind versus a dropped socket.** A socket that closes is marked
  * offline by `../ws.ts` and `../clients.ts` and keeps its bindings, because the
@@ -196,8 +227,11 @@ import {
   progressStageSchema,
   progressStatusSchema,
   sessionBoundPayloadSchema,
+  sessionCreatedPayloadSchema,
+  sessionStatusSchema,
 } from '@debuggen/protocol';
 import type {
+  AgentReadyPayload,
   BoundTab,
   ClientKind,
   MessagePayload,
@@ -222,7 +256,11 @@ import {
 import type { DebuggenErrorCode, LogFields, Logger, Result, SessionId } from '@debuggen/shared';
 import { REDACTION_MARKER, redactTextUrls, redactUrl, scrub, truncate } from '@debuggen/telemetry';
 
-import type { InstrumentationService } from '../../instrumentation/service.js';
+import type {
+  InstrumentationService,
+  ProducerReconciler,
+  SignalReportPublisher,
+} from '../../instrumentation/service.js';
 import { LOG_BINDING_KEYS, subsystemLogger } from '../../logging.js';
 import type { SessionManager } from '../../sessions/manager.js';
 import type { SessionProgress } from '../../sessions/progress.js';
@@ -305,8 +343,42 @@ function resolveSessionBoundType(): SessionBoundMessageType {
   return type;
 }
 
-/** The one message type this module sends. */
+/** The binding announcement: the message type this module answers binds with. */
 const SESSION_BOUND_TYPE = resolveSessionBoundType();
+
+/**
+ * The new-session announcement's message type(s), by payload structure — the
+ * `session.updated` payload shares its shape, so this may be a union; the
+ * value below is resolved by schema identity and is exactly one of them.
+ */
+type SessionCreatedMessageType = MessageTypeOfSchema<typeof sessionCreatedPayloadSchema>;
+
+/** Narrows a message type to the new-session announcement, by schema identity in protocol's registry. */
+function isSessionCreatedType(candidate: MessageType): candidate is SessionCreatedMessageType {
+  return MESSAGE_PAYLOAD_SCHEMAS[candidate] === sessionCreatedPayloadSchema;
+}
+
+/**
+ * The new-session announcement's message type, looked up in protocol's
+ * registry so no message name is spelled in this module.
+ *
+ * @throws DebuggenError `INTERNAL` at module load when the schema is not
+ * registered — an impossible state for a schema protocol exports.
+ */
+function resolveSessionCreatedType(): SessionCreatedMessageType {
+  const type = MESSAGE_TYPES.find(isSessionCreatedType);
+  assertDefined(
+    type,
+    "The new-session announcement's payload schema is not registered in protocol's message registry.",
+  );
+  return type;
+}
+
+/**
+ * The new-session announcement, sent only to offer an open session to one
+ * tab awaiting its origin (see "A tab that has no session yet awaits one").
+ */
+const SESSION_CREATED_TYPE = resolveSessionCreatedType();
 
 /** Protocol's binding-reason vocabulary, keyed by member. */
 const REASONS = bindingReasonSchema.enum;
@@ -319,6 +391,26 @@ const REASON_UNBOUND = REASONS.unbound;
 
 /** A binding was taken over by another bind. */
 const REASON_REPLACED = REASONS.replaced;
+
+/**
+ * A binding as it now stands: the announcement of a same-origin navigation
+ * when it is committed, which may be a same-document URL change.
+ */
+const REASON_BOUND = REASONS.bound;
+
+/** A binding kept across a reload: its tab's page agent reported a new document. */
+const REASON_NAVIGATED = REASONS.navigated;
+
+/**
+ * The most tabs whose latest page-agent document, and whose navigation still
+ * awaiting a new document, this module remembers. A tab reports one document
+ * per load and a service serves a handful of tabs, so the bound only keeps a
+ * misbehaving connection from growing either map without limit. Beyond it the
+ * least recently reported tab is forgotten: at worst that tab's next report is
+ * compared with no earlier document, and — as for a tab never seen — confirms
+ * the navigation it awaits.
+ */
+const MAX_DOCUMENT_TRACKED_TABS = 1024;
 
 /** The reasons this module ends a binding with. */
 type DropReason = typeof REASON_ORIGIN_CHANGED | typeof REASON_UNBOUND;
@@ -357,6 +449,38 @@ const REPLAY_KINDS: readonly ClientKind[] = Object.freeze([KINDS.devtools]);
 const ACTIVE_SESSION_STATUSES: readonly SessionStatus[] = Object.freeze(
   SESSION_STATUSES.filter((status) => !isTerminalSessionStatus(status)),
 );
+
+/** Protocol's session-status vocabulary, keyed by member. */
+const SESSION_STATUS = sessionStatusSchema.enum;
+
+/**
+ * The bindable status of a session a pipeline stage failed: still bindable —
+ * the panel shows the failing stage and its retry (AAP §0.5.5) — but never
+ * preferred over a session that is still running. Drawn from
+ * {@link ACTIVE_SESSION_STATUSES}, so it can never name a terminal status.
+ */
+const FAILED_SESSION_STATUSES: readonly SessionStatus[] = Object.freeze(
+  ACTIVE_SESSION_STATUSES.filter((status) => status === SESSION_STATUS.failed),
+);
+
+/**
+ * The bindable statuses of a session that is still running: every
+ * {@link ACTIVE_SESSION_STATUSES} member except `failed`. A bind by origin
+ * searches these first, so a failed second session on the same dev server
+ * never takes a new tab from the ready or capturing session beside it.
+ */
+const LIVE_SESSION_STATUSES: readonly SessionStatus[] = Object.freeze(
+  ACTIVE_SESSION_STATUSES.filter((status) => status !== SESSION_STATUS.failed),
+);
+
+/**
+ * The passes of a bind by origin, in order of preference: a live session, and
+ * only when no live session serves the origin, a failed one.
+ */
+const ORIGIN_LOOKUP_PASSES: readonly (readonly SessionStatus[])[] = Object.freeze([
+  LIVE_SESSION_STATUSES,
+  FAILED_SESSION_STATUSES,
+]);
 
 /** The two URL schemes a document a session can bind to is served over. */
 const HTTP_PROTOCOLS: ReadonlySet<string> = new Set(['http:', 'https:']);
@@ -433,8 +557,37 @@ const UNEXPECTED_FAILURE_HINT =
  * the configuration to the session's bound tab. This module only supplies the
  * capture id and — for a service that restarted and holds no arming state —
  * the session's project root and the plan version the capture runs under.
+ *
+ * The optional `replaySignalReport` — `SignalReportPublisher`'s, which the
+ * instrumentation driver implements — is how a freshly bound panel learns
+ * which signals the session's instrumentation enabled: the stored-state
+ * replay of `../../sessions/reopen.ts` carries the record, the progress rows,
+ * the analysis and the panel, never the latest `instrumentation.ready` or
+ * `instrumentation.failed`, so without it the panel's signal list stays empty
+ * for every session installed before the panel bound. The call also names the
+ * tab to the driver, which re-judges a report that still waits for the page
+ * once that tab's page agent reports. It is optional so a port that only arms
+ * captures (a test double, a driver without a report to replay) still fits.
  */
-export type AgentArmingPort = Pick<InstrumentationService, 'armCapture'>;
+export type AgentArmingPort = Pick<InstrumentationService, 'armCapture'> &
+  Partial<Pick<SignalReportPublisher, 'replaySignalReport'>>;
+
+/**
+ * The ended-session port: told that a DevTools connection was refused a bind
+ * naming a session that ended, failed or no longer exists.
+ *
+ * Satisfied structurally by `../../instrumentation/service.ts`'s producer
+ * reconciler. Only the DevTools service worker names a session in
+ * `session.bind`, and only when it re-announces a persisted binding on a new
+ * connection — so this refusal is the one moment a tab whose session ended
+ * while its connection was away is seen again. The worker answers the refusal
+ * (delivered on that live connection, `ref` naming its bind) by ending the
+ * tab's binding and returning its page agent to dormant; the reconciler
+ * settles the page disarm the session still owed, so a `partial` cleanup can
+ * become `clean`. Best effort: the refusal is returned unchanged whatever the
+ * port does.
+ */
+export type EndedSessionAgentPort = Pick<ProducerReconciler, 'pageAgentReleased'>;
 
 /**
  * Where the route records every committed navigation it accepts: a
@@ -473,7 +626,17 @@ export interface BindingRoutesDeps {
    */
   readonly clients: Pick<
     ClientRegistry,
-    'bindTab' | 'updateTabUrl' | 'unbindTab' | 'bindingForTab' | 'broadcastToKinds' | 'get' | 'list'
+    | 'bindTab'
+    | 'updateTabUrl'
+    | 'unbindTab'
+    | 'bindingForTab'
+    | 'bindingForSession'
+    | 'broadcastToKinds'
+    | 'get'
+    | 'list'
+    | 'awaitSession'
+    | 'forgetAwaitingTab'
+    | 'offerSessionToAwaitingTab'
   >;
   /**
    * The durable `bindings` rows, session records, the indexed origin lookup
@@ -500,6 +663,12 @@ export interface BindingRoutesDeps {
   readonly reopener: Pick<SessionReopener, 'reopen'>;
   /** Re-sends `agent.config` for an open capture. */
   readonly arming: AgentArmingPort;
+  /**
+   * Told when a bind naming a session is refused because that session ended or
+   * vanished, so the page disarm it still owes is settled; the instrumentation
+   * service in production. Omitted, the refusal is only returned.
+   */
+  readonly endedSessions?: EndedSessionAgentPort | undefined;
   /**
    * Where a same-origin reload during an open capture is reported: one `done`
    * row of the capture stage, persisted and sent to the session's editor and
@@ -640,6 +809,90 @@ export interface BindingRoutes {
     payload: SessionUnbindPayload,
     connection: BindingConnection,
   ): Promise<Result<SessionUnbindOutcome, DebuggenError>>;
+}
+
+/** One page-agent document report the readiness path accepted for a tab. */
+export interface DocumentReport {
+  readonly tabId: number;
+  /** The reporting document's id, as the page agent minted it. */
+  readonly documentId: string;
+}
+
+/** A kept navigation of a tab, waiting for a new page-agent document to prove it a reload. */
+interface AwaitingDocument {
+  /** The session the navigation kept the tab bound to. */
+  readonly sessionId: SessionId;
+  /** What re-arming the agent for the session's open capture achieved at the navigation. */
+  readonly rearm: AgentRearmOutcome;
+  /** The document last reported for the tab before the navigation; unknown when none was. */
+  readonly previousDocumentId: string | undefined;
+}
+
+/**
+ * The second thing {@link createBindingRoutes} answers: the observer of every
+ * page-agent document report the service accepted, which is what proves a
+ * kept navigation a reload.
+ *
+ * A `tab.navigated` alone cannot: a same-document URL change (the history
+ * API) is reported exactly like a reload, and only a reload brings a new page
+ * agent document. So a kept navigation is announced at once as the binding as
+ * it now stands (`reason: 'bound'`, the new URL), and a report naming a
+ * document other than the one the tab showed before it is what announces the
+ * reload (`reason: 'navigated'`) and, while the capture it re-armed is still
+ * open, emits the one `Page reloaded during capture` row.
+ */
+export interface BindingDocumentObserver {
+  /**
+   * Applies one accepted report, in order with the binding operations. Never
+   * rejects; a failure inside is logged and contained.
+   */
+  documentReported(report: DocumentReport): Promise<void>;
+}
+
+/** A value, or a promise of one. */
+type MaybePromise<T> = T | Promise<T>;
+
+/**
+ * The page-agent readiness port of `../ws.ts` (`AgentReadinessPort`),
+ * declared structurally over the connection type it is handed, because this
+ * module never imports the router.
+ */
+export interface AgentReadyPort<Client> {
+  agentReady(
+    payload: AgentReadyPayload,
+    client: Client,
+  ): MaybePromise<Result<unknown, DebuggenError>>;
+}
+
+/**
+ * Wraps a readiness port so every `agent.ready` it accepts is also told to
+ * `observer`, after the port answered `Ok` and before that answer is returned
+ * — so the service has applied the report to the tab's binding by the time
+ * the router moves on to the connection's next frame. A refused report is
+ * told nothing; a throw from the port propagates unchanged (the router answers
+ * it as `INTERNAL`).
+ *
+ * @example
+ * ```ts
+ * const readiness = observingDocumentReports(ledger, binding); // then wrapped for re-gating
+ * ```
+ */
+export function observingDocumentReports<Client>(
+  port: AgentReadyPort<Client>,
+  observer: BindingDocumentObserver,
+): AgentReadyPort<Client> {
+  return Object.freeze({
+    agentReady: async (
+      payload: AgentReadyPayload,
+      client: Client,
+    ): Promise<Result<unknown, DebuggenError>> => {
+      const recorded = await port.agentReady(payload, client);
+      if (recorded.ok) {
+        await observer.documentReported({ tabId: payload.tabId, documentId: payload.documentId });
+      }
+      return recorded;
+    },
+  });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -981,11 +1234,15 @@ type DropRestoration = 'restored' | 'session-closed';
  * Constructing it has no side effect: no timer, no socket, no store access.
  *
  * @param deps The registry, the repository, the manager, the reopener, the
- * arming port, the navigation recorder, and the optional progress port,
- * logger and clock.
- * @returns The three handlers `../ws.ts` dispatches to.
+ * arming port, the navigation recorder, and the optional ended-session port,
+ * progress port, logger and clock.
+ * @returns The three handlers `../ws.ts` dispatches to, and the
+ * {@link BindingDocumentObserver} the readiness path tells of each accepted
+ * page-agent report (wire it with {@link observingDocumentReports}).
  */
-export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
+export function createBindingRoutes(
+  deps: BindingRoutesDeps,
+): BindingRoutes & BindingDocumentObserver {
   const { clients, sessions, manager, reopener, arming, navigations } = deps;
   const clock = deps.now ?? nowEpochMs;
   const log = subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM);
@@ -1030,6 +1287,98 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       () => undefined,
     );
     return run;
+  }
+
+  /* ---- page-agent documents ---- */
+
+  /**
+   * Per tab: the last page-agent document reported for it — what a kept
+   * navigation's new document is told apart from. Oldest report first,
+   * bounded by {@link MAX_DOCUMENT_TRACKED_TABS}.
+   */
+  const reportedDocuments = new Map<number, string>();
+
+  /**
+   * Per tab: the kept navigation still waiting for a new page-agent document
+   * to prove it a reload, bounded like {@link reportedDocuments}. An entry
+   * leaves when a report confirms it, when the next kept navigation replaces
+   * it, and when the tab's binding ends.
+   */
+  const awaitingDocument = new Map<number, AwaitingDocument>();
+
+  /** Sets `key` as the most recent entry of a bounded map, evicting the oldest beyond the bound. */
+  function rememberBounded<V>(map: Map<number, V>, key: number, value: V): void {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > MAX_DOCUMENT_TRACKED_TABS) {
+      const oldest = map.keys().next();
+      if (oldest.done === true) {
+        break;
+      }
+      map.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Applies one accepted page-agent report: remembers the tab's document and,
+   * when a kept navigation of the tab awaits a new document and this is one,
+   * announces the reload — `reason: 'navigated'` with the live binding's URL —
+   * and, while the capture the navigation re-armed is still the session's
+   * open capture, reports `Page reloaded during capture` once. A navigation
+   * whose tab has since been bound elsewhere, or whose capture has closed, is
+   * forgotten without a word about the capture.
+   */
+  function applyDocumentReport(report: DocumentReport): Result<void, DebuggenError> {
+    const { tabId, documentId } = report;
+    rememberBounded(reportedDocuments, tabId, documentId);
+    const awaiting = awaitingDocument.get(tabId);
+    if (awaiting === undefined || awaiting.previousDocumentId === documentId) {
+      // No navigation awaits a document, or the document the tab showed
+      // before it reported again (a re-relayed report): nothing is proven.
+      return ok(undefined);
+    }
+    awaitingDocument.delete(tabId);
+    const { sessionId, rearm } = awaiting;
+    const live = clients.bindingForTab(tabId);
+    if (live?.sessionId !== sessionId) {
+      log.debug(
+        'A reload was confirmed for a tab no longer bound to its session; nothing was announced',
+        sessionFields(sessionId, { tabId }),
+      );
+      return ok(undefined);
+    }
+    const announced = announce({ sessionId, tabId, url: live.url, reason: REASON_NAVIGATED });
+    if (isErr(announced)) {
+      return announced;
+    }
+    const reloadNotice = captureStillOpen(sessionId, rearm)
+      ? reportReloadDuringCapture(sessionId, rearm)
+      : false;
+    log.info(
+      'A new page-agent document confirmed a reload of the bound tab',
+      sessionFields(sessionId, { tabId, reloadNotice }),
+    );
+    return ok(undefined);
+  }
+
+  /**
+   * Whether the capture a kept navigation re-armed (or tried to) is still the
+   * session's open capture. A store that cannot answer is taken as closed: a
+   * missing notice is logged, a false one would mislead.
+   */
+  function captureStillOpen(sessionId: SessionId, rearm: AgentRearmOutcome): boolean {
+    if (rearm.captureId === undefined) {
+      return false;
+    }
+    const active = sessions.getActiveCapture(sessionId);
+    if (isErr(active)) {
+      log.warn(
+        'The open capture could not be read; the reload was not reported to it',
+        sessionFields(sessionId, errorFields(active.error)),
+      );
+      return false;
+    }
+    return active.value?.capture.id === rearm.captureId;
   }
 
   /* ---- announcements ---- */
@@ -1129,6 +1478,53 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       sessionFields(sessionId, { [LOG_BINDING_KEYS.captureId]: capture.id }),
     );
     return { status: 'rearmed', captureId: capture.id };
+  }
+
+  /**
+   * Replays the session's latest signal report — the `instrumentation.ready`
+   * (or `instrumentation.failed`) the instrumentation driver holds for it — to
+   * the freshly bound panel, and names the bound tab to the driver so a report
+   * still waiting for the page is re-judged once that tab's page agent reports.
+   *
+   * Runs after the stored-state replay, so the panel receives the signal
+   * report after the record and the progress rows it belongs to. Best effort
+   * and bounded to the port's synchronous answer: a port without the method,
+   * a session with nothing to replay, a refusal or a throw is logged (ids and
+   * codes only — never the URL) and never changes the bind's answer.
+   *
+   * @param sessionId - The session the tab was just bound to.
+   * @param boundTab - The tab now bound, with the redacted URL the stores hold.
+   * @returns `true` when a signal report was sent to the panel.
+   */
+  function replaySignalReport(
+    sessionId: SessionId,
+    boundTab: { readonly tabId: number; readonly url: string },
+  ): boolean {
+    if (arming.replaySignalReport === undefined) {
+      return false;
+    }
+    try {
+      // Called on the port, so an implementation that reads `this` keeps it.
+      const replayed = arming.replaySignalReport({ sessionId, boundTab, kinds: REPLAY_KINDS });
+      if (isErr(replayed)) {
+        log.warn(
+          'The signal report could not be replayed to the bound panel',
+          sessionFields(sessionId, { tabId: boundTab.tabId, ...errorFields(replayed.error) }),
+        );
+        return false;
+      }
+      log.debug(
+        'Signal report replay to the bound panel settled',
+        sessionFields(sessionId, { tabId: boundTab.tabId, outcome: replayed.value }),
+      );
+      return replayed.value === 'replayed';
+    } catch (thrown) {
+      log.warn(
+        'Replaying the signal report to the bound panel threw',
+        sessionFields(sessionId, { tabId: boundTab.tabId, errorName: thrownName(thrown) }),
+      );
+      return false;
+    }
   }
 
   /**
@@ -1458,59 +1854,255 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
   }
 
   /**
-   * The most recently updated session that has not ended and whose dev server
-   * serves `origin`.
+   * The most recently updated session in one of `statuses` whose dev server
+   * serves `origin`, or `undefined` when none does.
    *
    * The store answers from its projections alone —
    * {@link SessionsRepo.findLatestByDevServer} reads only the `id`,
-   * `dev_server_url` and `updated_at` columns of the active sessions
+   * `dev_server_url` and `updated_at` columns of the sessions in `statuses`
    * `idx_sessions_status` narrows the read to, newest first, and stops at the
    * first whose URL
    * canonicalises to `origin` through {@link serializedOriginOf} — so the
    * record of the winner is the only one read and parsed, and an ended
-   * session's history is never touched. A winner whose record cannot be read is
-   * skipped, and the lookup continues past it, rather than allowed to hide
-   * every older match.
+   * session's history is never touched. The winner's record is re-checked
+   * against both rules — its status still in `statuses`, its dev server still
+   * serving `origin` — because the session may have moved since its
+   * projections were read: one that failed in between is not taken by the live
+   * pass, and the failed pass meets it afresh. A winner whose record cannot be
+   * read or no longer matches is skipped, and the lookup continues past it,
+   * rather than allowed to hide every older match.
+   *
+   * @param statuses One of {@link ORIGIN_LOOKUP_PASSES}; each is drawn from
+   * {@link ACTIVE_SESSION_STATUSES}, so no terminal status is ever searched.
    */
-  function resolveByOrigin(origin: string): Result<ResolvedSession, DebuggenError> {
-    const unreadable = new Set<SessionId>();
+  function latestServingOrigin(
+    origin: string,
+    statuses: readonly SessionStatus[],
+  ): Result<SessionRecord | undefined, DebuggenError> {
+    const skipped = new Set<SessionId>();
     for (;;) {
       const found = sessions.findLatestByDevServer({
-        statuses: ACTIVE_SESSION_STATUSES,
+        statuses,
         matches: (devServerUrl, candidate) =>
-          !unreadable.has(candidate) && serializedOriginOf(devServerUrl) === origin,
+          !skipped.has(candidate) && serializedOriginOf(devServerUrl) === origin,
       });
       if (isErr(found)) {
         return found;
       }
       const candidate = found.value;
       if (candidate === undefined) {
-        break;
+        return ok(undefined);
       }
       const loaded = sessions.get(candidate);
       const record = loaded.ok ? loaded.value : undefined;
       if (
         record !== undefined &&
-        !isTerminalSessionStatus(record.status) &&
+        statuses.includes(record.status) &&
         serializedOriginOf(record.devServerUrl) === origin
       ) {
-        return ok({ record, matchedBy: 'origin' });
+        return ok(record);
       }
       // Unreadable, gone, or no longer what its projections said: excluded, so
       // the next lookup answers with the next-newest match.
       log.warn(
-        'A session matching a tab origin could not be read; skipped',
+        'A session matching a tab origin could not be read or no longer matches; skipped',
         sessionFields(
           candidate,
           loaded.ok ? { present: record !== undefined } : errorFields(loaded.error),
         ),
       );
-      unreadable.add(candidate);
+      skipped.add(candidate);
+    }
+  }
+
+  /**
+   * The newest open session whose dev server serves `origin`, or `undefined`
+   * when none does: the most recently updated **live** session — any status
+   * but `ended` and `failed` — and only when no live session serves it, the
+   * most recently updated failed one, so the panel can still show that
+   * failure and its retry. A failed second session on the same project
+   * therefore never takes a tab from the ready or capturing session beside
+   * it, however recently it was updated. Each pass is
+   * {@link latestServingOrigin}, in the order of {@link ORIGIN_LOOKUP_PASSES};
+   * a store refusal in either pass is returned as it is.
+   *
+   * It is the lookup {@link resolveByOrigin} refuses a bind on, and the one
+   * that offers a session to a tab starting to await `origin`.
+   */
+  function findOpenSessionByOrigin(
+    origin: string,
+  ): Result<SessionRecord | undefined, DebuggenError> {
+    for (const statuses of ORIGIN_LOOKUP_PASSES) {
+      const found = latestServingOrigin(origin, statuses);
+      if (isErr(found)) {
+        return found;
+      }
+      const record = found.value;
+      if (record !== undefined) {
+        if (statuses === FAILED_SESSION_STATUSES) {
+          log.info(
+            'A lookup by origin found no live session; it matched a failed session',
+            sessionFields(record.id),
+          );
+        }
+        return ok(record);
+      }
+    }
+    return ok(undefined);
+  }
+
+  /**
+   * The session a bind without a `sessionId` goes to: the one
+   * {@link findOpenSessionByOrigin} answers, or a `SESSION_NOT_FOUND` refusal
+   * when no open session serves `origin`.
+   */
+  function resolveByOrigin(origin: string): Result<ResolvedSession, DebuggenError> {
+    const found = findOpenSessionByOrigin(origin);
+    if (isErr(found)) {
+      return found;
+    }
+    if (found.value !== undefined) {
+      return ok({ record: found.value, matchedBy: 'origin' });
     }
     log.info('A bind matched no active session by origin');
     return refusal('SESSION_NOT_FOUND', NO_SESSION_FOR_ORIGIN_MESSAGE, NO_SESSION_FOR_ORIGIN_HINT, {
       reason: 'no-session-for-origin',
     });
+  }
+
+  /* ---- tabs awaiting a session ---- */
+
+  /**
+   * Records that `tabId`, announced on `connection`, awaits a session for
+   * `origin` (or forgets it when the document has no HTTP(S) origin). A
+   * refusal is logged by code and never changes the frame's own answer: the
+   * worker's next announcement records the tab again.
+   *
+   * @param offerOpen Whether to offer, at once, the newest open session that
+   *   already serves `origin` and holds no tab — `false` only where a bind has
+   *   just found none.
+   */
+  function awaitSessionFor(
+    tabId: number,
+    origin: string | undefined,
+    connection: BindingConnection,
+    offerOpen = true,
+  ): void {
+    if (origin === undefined) {
+      clients.forgetAwaitingTab(tabId, connection.principal);
+      return;
+    }
+    const recorded = clients.awaitSession({
+      tabId,
+      origin,
+      principal: connection.principal,
+      clientId: connection.clientId,
+    });
+    if (isErr(recorded)) {
+      log.warn('The tab could not be recorded as awaiting a session', {
+        tabId,
+        ...errorFields(recorded.error),
+      });
+      return;
+    }
+    if (offerOpen) {
+      offerOpenSession(tabId, origin);
+    }
+  }
+
+  /**
+   * Offers a tab that has just started awaiting `origin` the newest open
+   * session already serving it, when that session holds no tab: it was
+   * created while the tab was still bound elsewhere (typically to the session
+   * whose end the worker is unbinding), so its `session.created` could not
+   * reach the tab. A session another tab holds is never offered — the bind it
+   * would prompt replaces that tab's binding.
+   */
+  function offerOpenSession(tabId: number, origin: string): void {
+    const found = findOpenSessionByOrigin(origin);
+    if (isErr(found)) {
+      log.warn('No open session could be looked up for a tab awaiting its origin', {
+        tabId,
+        ...errorFields(found.error),
+      });
+      return;
+    }
+    const record = found.value;
+    if (record === undefined || clients.bindingForSession(record.id) !== undefined) {
+      return;
+    }
+    const message = createEnvelope(SESSION_CREATED_TYPE, { session: record }, { ts: clock() });
+    const offered = clients.offerSessionToAwaitingTab(tabId, message);
+    if (isErr(offered)) {
+      log.debug(
+        'An open session could not be offered to a tab awaiting its origin',
+        sessionFields(record.id, { tabId, ...errorFields(offered.error) }),
+      );
+      return;
+    }
+    log.info(
+      'Offered an open session to a tab awaiting its origin',
+      sessionFields(record.id, { tabId }),
+    );
+  }
+
+  /**
+   * After an unbind dropped `binding`: a binding whose session has ended (or
+   * vanished) was ended by the Chrome worker's cleanup after `session.end`,
+   * while the tab's DevTools stays open, so the tab awaits the next session for
+   * its document's origin; any other unbind is its DevTools or tab closing.
+   */
+  function settleAwaitingAfterUnbind(binding: TabBindingView, connection: BindingConnection): void {
+    const loaded = sessions.get(binding.sessionId);
+    const ended = loaded.ok && isClosedSession(loaded.value);
+    if (ended) {
+      awaitSessionFor(binding.tabId, serializedOriginOf(binding.url), connection);
+    } else {
+      clients.forgetAwaitingTab(binding.tabId, connection.principal);
+    }
+  }
+
+  /**
+   * Tells {@link BindingRoutesDeps.endedSessions} that a bind naming
+   * `sessionId` was refused because that session is over — ended or failed
+   * (`SESSION_INVALID_STATE`), or gone (`SESSION_NOT_FOUND`) — so the page
+   * disarm it still owes is settled: the DevTools worker answers exactly this
+   * refusal by returning the tab's page agent to dormant (see
+   * {@link EndedSessionAgentPort}). An origin bind (no `sessionId`) and every
+   * other refusal code are left alone. Best effort: a port that refuses or
+   * throws is logged, and the bind's refusal is returned unchanged.
+   */
+  function releaseEndedSessionAgent(
+    sessionId: SessionId | undefined,
+    refused: DebuggenError,
+  ): void {
+    const port = deps.endedSessions;
+    if (
+      port === undefined ||
+      sessionId === undefined ||
+      (refused.code !== 'SESSION_INVALID_STATE' && refused.code !== 'SESSION_NOT_FOUND')
+    ) {
+      return;
+    }
+    try {
+      const released = port.pageAgentReleased(sessionId);
+      if (isErr(released)) {
+        log.warn(
+          'The owed page disarm of a refused ended session could not be settled',
+          sessionFields(sessionId, errorFields(released.error)),
+        );
+        return;
+      }
+      log.info(
+        'A bind naming an ended session was refused; its page agent is released',
+        sessionFields(sessionId, { code: refused.code, owedDisarm: released.value }),
+      );
+    } catch (thrown) {
+      log.error(
+        'Settling the owed page disarm of a refused ended session threw',
+        sessionFields(sessionId, { errorName: thrownName(thrown) }),
+      );
+    }
   }
 
   /* ---- session.bind ---- */
@@ -1539,6 +2131,12 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
         ? resolveByOrigin(origin)
         : resolveNamed(request.sessionId, origin);
     if (isErr(resolved)) {
+      if (request.sessionId === undefined && resolved.error.code === 'SESSION_NOT_FOUND') {
+        // The panel was opened before the question: the next session created
+        // for this origin reaches the tab (see the module overview).
+        awaitSessionFor(request.tabId, origin, connection, false);
+      }
+      releaseEndedSessionAgent(request.sessionId, resolved.error);
       return resolved;
     }
     const { record, matchedBy } = resolved.value;
@@ -1624,6 +2222,12 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
           ...errorFields(written.error),
         }),
       );
+      // A named session `session.end` closed while the mirror was awaited is
+      // refused as ended too, and answered by the worker the same way — but a
+      // refusal about a session the bind displaced says nothing of this one.
+      if (written.error.details?.['sessionId'] === sessionId) {
+        releaseEndedSessionAgent(request.sessionId, written.error);
+      }
       return written;
     }
 
@@ -1661,6 +2265,13 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       );
     }
     const replayed = replay.ok && replay.value.replayed.length > 0;
+    // … and the latest signal report, which the stored replay does not carry,
+    // so the panel's signal list shows what the session's instrumentation
+    // enabled. Named before the re-arm so the driver knows the tab it arms.
+    const signalsReplayed = replaySignalReport(sessionId, {
+      tabId,
+      url: live.value.binding.url,
+    });
 
     // 7. An open capture continues in the newly bound tab.
     const rearm = rearmAgent(record);
@@ -1672,6 +2283,7 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
         matchedBy,
         displaced: displaced.length,
         rearm: rearm.status,
+        signalsReplayed,
       }),
     );
     return ok({
@@ -1823,6 +2435,10 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       );
       return change;
     }
+    // The live binding is gone, and with it any navigation of the tab that
+    // awaited a new document: a binding a refused mirror restores below
+    // starts with none awaiting.
+    awaitingDocument.delete(tabId);
     if (change.value === undefined) {
       return ok(undefined);
     }
@@ -1970,20 +2586,27 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
         return mirrored;
       }
     }
+    // Announced as the binding now stands, not as a reload: the navigation may
+    // be a same-document URL change, and only a new page-agent document —
+    // reported through `documentReported` — proves a reload.
     const announced = announce({
       sessionId,
       tabId,
       url: updated.value.binding.url,
-      reason: updated.value.reason,
+      reason: REASON_BOUND,
     });
     if (isErr(announced)) {
       return announced;
     }
     const rearm = rearmAgent(record);
-    const reloadNotice = reportReloadDuringCapture(sessionId, rearm);
+    rememberBounded(awaitingDocument, tabId, {
+      sessionId,
+      rearm,
+      previousDocumentId: reportedDocuments.get(tabId),
+    });
     log.info(
       'Bound tab navigated within its origin',
-      sessionFields(sessionId, { tabId, rearm: rearm.status, reloadNotice }),
+      sessionFields(sessionId, { tabId, rearm: rearm.status }),
     );
     return ok({ kind: 'kept', announced: announced.value, rearm });
   }
@@ -2056,6 +2679,10 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     if (isErr(dropped)) {
       return dropped;
     }
+    // The tab's DevTools stays open on the new document: a session serving its
+    // origin — one already open and held by no tab, or one created later —
+    // reaches it, as it would reach a panel opened there.
+    awaitSessionFor(tabId, serializedOriginOf(url), connection);
     return ok(
       dropped.value === undefined
         ? { kind: 'ignored' }
@@ -2084,6 +2711,8 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     }
     const binding = authorized.value;
     if (binding === undefined) {
+      // DevTools closed on a tab that had no session: it awaits none any more.
+      clients.forgetAwaitingTab(parsed.value.tabId, principal);
       log.debug('An unbind of an unbound tab was ignored', { tabId: parsed.value.tabId });
       return ok({ kind: 'ignored' });
     }
@@ -2091,6 +2720,7 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     if (isErr(dropped)) {
       return dropped;
     }
+    settleAwaitingAfterUnbind(binding, connection);
     return ok(
       dropped.value === undefined
         ? { kind: 'ignored' }
@@ -2105,5 +2735,18 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
       exclusive('tab-navigated', () => navigated(payload, connection)),
     handleSessionUnbind: (payload, connection) =>
       exclusive('session-unbind', () => unbind(payload, connection)),
-  } satisfies BindingRoutes);
+    // On the binding queue, so a report is applied in order with the
+    // navigation that preceded it on the connection.
+    documentReported: (report) =>
+      exclusive('document-reported', () => Promise.resolve(applyDocumentReport(report))).then(
+        (applied) => {
+          if (isErr(applied)) {
+            log.warn('A page-agent document report could not be applied', {
+              tabId: report.tabId,
+              ...errorFields(applied.error),
+            });
+          }
+        },
+      ),
+  } satisfies BindingRoutes & BindingDocumentObserver);
 }

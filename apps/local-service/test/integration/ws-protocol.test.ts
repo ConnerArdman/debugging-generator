@@ -34,7 +34,14 @@
  *   503 over bare HTTP, with `Retry-After`, and no WebSocket is created — and
  *   every reservation is given back when a hello authenticates, a socket
  *   closes or times out, or `ws` aborts a handshake, so the counters read zero
- *   after `close()`.
+ *   after `close()`;
+ * - one connection's backlog starves nothing: while a DevTools socket's flood
+ *   of CPU-bound `telemetry.event` frames drains, a fresh connection's hello
+ *   and `client.ping`, and the service's `GET /health`, are answered within a
+ *   bound; a ping written behind the flood is answered on arrival, before the
+ *   flood's last frames; the flood is still handled in order, in full, with
+ *   read flow control engaged and no 1013 close; and `close()` ends a socket
+ *   whose reads are paused at once, leaving no queued frame to run after it.
  *
  * It deliberately does not restate what other suites pin: the envelope and
  * payload schemas are `packages/protocol/src/__tests__/*`, the handshake's
@@ -150,6 +157,7 @@ import {
   DEFAULT_MAX_OPEN_CONNECTIONS,
   DEFAULT_MAX_PENDING_HANDSHAKES,
   DEFAULT_MAX_PENDING_HANDSHAKES_PER_PEER,
+  EARLY_PING_MAX_FRAME_BYTES,
   MAX_WS_MESSAGE_BYTES,
   createWsServer,
 } from '../../src/server/ws.js';
@@ -271,6 +279,7 @@ const REASON = Object.freeze({
 const INSTRUMENT_STAGE = 'instrument' satisfies ProgressStage;
 const ROW_DONE = 'done' satisfies ProgressStatus;
 const ROW_FAILED = 'failed' satisfies ProgressStatus;
+const ROW_RUNNING = 'running' satisfies ProgressStatus;
 
 /** The telemetry tier a relayed page-agent batch belongs to. */
 const BROWSER_TIER = 'browser' satisfies TelemetryTier;
@@ -530,6 +539,7 @@ const TAB = Object.freeze({
   reconnecting: 401,
   failedInstall: 501,
   failureRefs: 601,
+  flood: 701,
 });
 
 /** The question every session asks; the pipeline never branches on it (AAP §0.5.4). */
@@ -1258,7 +1268,8 @@ describe('routing across a live multi-client topology', () => {
       const ping = sender.send(T.ping, {});
       expect(isErr(ping.result), `${label} wrote its ping`).toBe(false);
       // Every connection has drained what the service wrote before its
-      // barrier, the pong included: frames are answered in arrival order.
+      // barrier, the pong included: a ping is answered on arrival, so its pong
+      // precedes the reply to the barrier frame written after it.
       for (const [, client] of labelled) {
         expect(await client.flush(), client.describe()).toBe(true);
       }
@@ -1340,8 +1351,9 @@ describe('routing across a live multi-client topology', () => {
     gate.open();
     await h.waitForSession(session.id, (record) => record.status === STATUS.ready);
 
-    // The readiness rows reach both interfaces as ✓ rows; the rows a session
-    // with no page agent gets are ✗ rows (the absent-recipient suite below).
+    // The readiness rows reach both interfaces as ✓ rows; a session no tab is
+    // bound to gets waiting rows that name what is missing (the
+    // absent-recipient suite below), never ✗ rows.
     for (const [client, from] of [
       [editor, editorFrom],
       [devtools, devtoolsFrom],
@@ -1515,6 +1527,9 @@ describe('routing across a live multi-client topology', () => {
     const editorFrom = editor.received.length;
     const devtoolsFrom = devtools.received.length;
     const receipt = devtools.send(T.navigated, { tabId: TAB.bound, url });
+    // Announced as the binding now stands: the navigation alone cannot tell a
+    // reload from a same-document URL change, and only a new page-agent
+    // document reported after it is announced as `navigated`.
     for (const [client, from] of [
       [editor, editorFrom],
       [devtools, devtoolsFrom],
@@ -1524,7 +1539,7 @@ describe('routing across a live multi-client topology', () => {
         T.bound,
         session.id,
         from,
-        (message) => message.payload.reason === REASON.navigated && message.payload.url === url,
+        (message) => message.payload.reason === REASON.bound && message.payload.url === url,
       );
     }
     expect(devtools.errorsFor(receipt.id)).toEqual([]);
@@ -1789,18 +1804,33 @@ describe('a single-recipient push whose recipient is absent', () => {
     const h = harness();
     const session = await h.createSession({ projectRoot: project.root, question: QUESTION });
 
-    // The readiness gate answers the missing tab with ✗ rows that say what to
-    // do, rather than holding the session silently.
-    const failedRow = await waitForSessionMessage(
+    // The readiness gate answers the missing tab with waiting rows that say
+    // what to do — open the panel on the application's tab — rather than
+    // holding the session silently, and never presents the wait as a failure.
+    const waitingRow = await waitForSessionMessage(
       editor,
       T.progress,
       session.id,
       0,
       (message) =>
-        message.payload.stage === INSTRUMENT_STAGE && message.payload.status === ROW_FAILED,
+        message.payload.stage === INSTRUMENT_STAGE &&
+        message.payload.status === ROW_RUNNING &&
+        (message.payload.detail ?? '').includes('"Debug Generator" panel'),
     );
-    expect(failedRow.payload.message.length).toBeGreaterThan(0);
+    expect(waitingRow.payload.message.length).toBeGreaterThan(0);
+    expect(waitingRow.payload.detail).toMatch(
+      /^Waiting: no Chrome tab is bound to this session\./u,
+    );
     expect((await fetchSession(h, session.id)).status).toBe(STATUS.instrumenting);
+    expect(
+      messagesOf(editor, T.progress).filter(
+        (message) =>
+          message.payload.sessionId === session.id &&
+          message.payload.stage === INSTRUMENT_STAGE &&
+          message.payload.status === ROW_FAILED &&
+          message.payload.message.startsWith(`Could not enable ${waitingRow.payload.message}`),
+      ),
+    ).toEqual([]);
 
     // A capture cannot be armed: the refusal is typed and named, not a drop.
     expect(refusalOf(await h.startCapture(session.id))).toEqual({
@@ -3547,6 +3577,426 @@ describe('admission before the hello', () => {
     // The service's defaults admit an ordinary upgrade.
     const admitted = await rawUpgrade(host, h.port);
     expect(admitted.status).toBe(HTTP_SWITCHING_PROTOCOLS);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 6b. One flooded connection starves nothing
+ *
+ * The fairness contract of `src/server/ws.ts` — "One connection cannot starve
+ * the others" and "Liveness" in its module notes — proved on a WebSocket
+ * server of its own, built like the admission rig's over the harness's real
+ * access boundary and a fresh registry, but with a telemetry port that costs
+ * a fixed number of CPU-bound milliseconds per frame: the synchronous share
+ * of the real ingest path, which is what turned a service worker's pre-stall
+ * backlog into a service that answered nothing. Every socket is a real `ws`
+ * client over loopback, and the harness's own service shares this process —
+ * and so its event loop — with the rig, which is what makes its `GET /health`
+ * a probe of starvation rather than of a second process.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The CPU each flooded frame costs the rig's telemetry port, in milliseconds. */
+const FLOOD_FRAME_COST_MS = 40;
+
+/**
+ * The frames of one flood: a backlog of {@link FLOOD_FRAMES} ×
+ * {@link FLOOD_FRAME_COST_MS} = 4 s of handling, written in one burst.
+ */
+const FLOOD_FRAMES = 100;
+
+/**
+ * The page-agent events of each flood frame: small frames, so one 64 KiB read
+ * holds dozens of them, as a service worker's buffered backlog does — and each
+ * still above the size a ping is decoded on arrival at.
+ */
+const FLOOD_EVENTS_PER_FRAME = 2;
+
+/**
+ * What a fresh connection's hello-and-ping round trip, and `GET /health`, may
+ * take while the flood drains, in milliseconds: a quarter of the backlog, and
+ * several times the few frame-costs a fair server adds to each.
+ */
+const FAIR_LATENCY_BOUND_MS = 1_000;
+
+/** How long the whole flood may take to drain, with the harness's message allowance on top. */
+const FLOOD_DRAIN_TIMEOUT_MS = FLOOD_FRAMES * FLOOD_FRAME_COST_MS + HARNESS_TIMEOUTS.message;
+
+/**
+ * The refusal the rig's telemetry port answers every frame with — the code the
+ * real route answers a batch for a tab no session is bound to with — so each
+ * frame is answered by exactly one `error` naming it, in handling order.
+ */
+const FLOOD_REFUSAL_MESSAGE = 'The flood rig binds no tab; every batch is refused after its cost.';
+
+/** The `server.ws` record messages of read flow control and of a backlog overflow (`src/server/ws.ts`). */
+const READS_PAUSED_LOG =
+  'paused reading a connection whose frame backlog reached its high-water mark';
+const READS_RESUMED_LOG = 'resumed reading a connection whose frame backlog drained';
+const BACKLOG_OVERFLOW_LOG = 'closed a connection whose frame backlog overflowed';
+
+/** Spins for `ms` milliseconds: a frame handler's synchronous cost, which no `await` can hide. */
+function burnCpu(ms: number): void {
+  const until = performance.now() + ms;
+  while (performance.now() < until) {
+    // Deliberately empty: the loop's condition is the work.
+  }
+}
+
+/** One frame a rig socket received, with what the rig had handled when it arrived. */
+interface RigArrival {
+  readonly message: ProtocolMessage;
+  /** `performance.now()` when the socket delivered it. */
+  readonly at: number;
+  /** How many flood frames the rig's port had handled by then. */
+  readonly handled: number;
+}
+
+/** A bare DevTools WebSocket to the flood rig, presenting the rig's credential from its origin. */
+interface RigSocket {
+  readonly socket: NodeWebSocket;
+  /** Every protocol frame received, in arrival order. */
+  readonly received: readonly RigArrival[];
+  /** The close code, once the socket has closed. */
+  readonly closed: Promise<number>;
+  /** Whether the socket has closed. */
+  readonly isClosed: () => boolean;
+  /** Writes one envelope. */
+  send(message: ProtocolMessage): void;
+  /** Resolves with the first frame received that satisfies `predicate`. */
+  next(
+    predicate: (message: ProtocolMessage) => boolean,
+    description: string,
+    timeoutMs?: number,
+  ): Promise<RigArrival>;
+}
+
+/** The flood rig: a WebSocket server of its own with a CPU-bound telemetry port. */
+interface FloodRig {
+  readonly ws: WsServer;
+  /** The ids of the `telemetry.event` frames the port handled, in handling order. */
+  readonly handled: readonly string[];
+  /** Opens a socket and resolves once it is upgraded; nothing is sent yet. */
+  open(): Promise<RigSocket>;
+  /** A `client.hello` presenting the rig's DevTools credential. */
+  hello(): ProtocolMessage;
+  /** Waits until the server's counters satisfy `predicate`. */
+  until(predicate: (stats: WsServerStats) => boolean, description: string): Promise<WsServerStats>;
+  /** Closes the server, the registry and the listener; answers the counters `close()` left. */
+  close(): Promise<WsServerStats>;
+}
+
+/** Builds and starts a {@link FloodRig} on the harness service's host. */
+async function startFloodRig(h: Harness): Promise<FloodRig> {
+  const host = new URL(h.url).hostname;
+  const clients = createClientRegistry({ logger: h.logger.root });
+  const credential = h.issueDevtoolsCredential();
+  const handled: string[] = [];
+  let closedRig = false;
+  const ws = unwrap(
+    createWsServer({
+      ...admissionDeps(h, clients, () => undefined),
+      telemetry: {
+        handleTelemetryEventFrame: ({ message }) => {
+          burnCpu(FLOOD_FRAME_COST_MS);
+          handled.push(message.id);
+          return Promise.resolve(err(new DebuggenError(CODE.tabNotBound, FLOOD_REFUSAL_MESSAGE)));
+        },
+      },
+    }),
+    'creating the flood server',
+  );
+  const listener = createServer((_request, response) => {
+    response.statusCode = HTTP_NOT_FOUND;
+    response.end();
+  });
+  unwrap(ws.attach(listener), 'attaching the flood server');
+  await new Promise<void>((resolveListen, rejectListen) => {
+    listener.once('error', rejectListen);
+    listener.listen(0, host, () => {
+      resolveListen();
+    });
+  });
+  const address = listener.address();
+  if (address === null || typeof address === 'string') {
+    throw new Error('The flood rig listener has no TCP port.');
+  }
+  const wsUrl = unwrap(
+    resolveWsUrl(`http://${host}:${String(address.port)}`),
+    'resolving the flood rig URL',
+  );
+  const sockets: RigSocket[] = [];
+
+  const until = async (
+    predicate: (stats: WsServerStats) => boolean,
+    description: string,
+  ): Promise<WsServerStats> => {
+    try {
+      return await waitUntil(() => {
+        const stats = ws.stats();
+        return predicate(stats) ? stats : undefined;
+      }, description);
+    } catch (cause) {
+      throw new Error(`${description}; last counters ${JSON.stringify(ws.stats())}`, { cause });
+    }
+  };
+
+  const open = async (): Promise<RigSocket> => {
+    const socket = new NodeWebSocket(wsUrl, [], {
+      origin: credential.origin,
+      handshakeTimeout: HARNESS_TIMEOUTS.message,
+    });
+    const received: RigArrival[] = [];
+    const errors: string[] = [];
+    let isClosed = false;
+    socket.on('message', (data: RawData, isBinary: boolean) => {
+      if (isBinary) {
+        return;
+      }
+      const decoded = decodeMessage(rawDataToText(data));
+      if (!isErr(decoded)) {
+        received.push({ message: decoded.value, at: performance.now(), handled: handled.length });
+      }
+    });
+    socket.on('error', (error: Error) => {
+      errors.push(error.message);
+    });
+    const closed = new Promise<number>((resolveClose) => {
+      socket.once('close', (code: number) => {
+        isClosed = true;
+        resolveClose(code);
+      });
+    });
+    const rigSocket: RigSocket = {
+      socket,
+      received,
+      closed,
+      isClosed: () => isClosed,
+      send(message) {
+        socket.send(encodeMessage(message));
+      },
+      // The arrival time is stamped by the socket's own listener, so the
+      // poll's interval never enters a measured latency.
+      next: (predicate, description, timeoutMs = HARNESS_TIMEOUTS.message) =>
+        waitUntil(
+          () => received.find((arrival) => predicate(arrival.message)),
+          `${description} (errors: ${errors.join('; ') || 'none'})`,
+          timeoutMs,
+        ),
+    };
+    sockets.push(rigSocket);
+    const opened = await new Promise<boolean>((resolveOpen) => {
+      socket.once('open', () => {
+        resolveOpen(true);
+      });
+      socket.once('close', () => {
+        resolveOpen(false);
+      });
+    });
+    if (!opened) {
+      throw new Error(`The flood rig refused an upgrade: ${errors.join('; ') || 'no error'}`);
+    }
+    return rigSocket;
+  };
+
+  return {
+    ws,
+    handled,
+    open,
+    hello: () =>
+      createEnvelope(T.hello, {
+        client: KIND.devtools,
+        version: PROTOCOL_VERSION,
+        token: credential.token,
+      }),
+    until,
+    async close() {
+      if (closedRig) {
+        return ws.stats();
+      }
+      closedRig = true;
+      await ws.close();
+      const after = ws.stats();
+      clients.closeAll();
+      listener.closeAllConnections();
+      await new Promise<void>((resolveClose) => {
+        listener.close(() => {
+          resolveClose();
+        });
+      });
+      await Promise.all(sockets.map((client) => client.closed));
+      return after;
+    },
+  };
+}
+
+/** A burst of {@link FLOOD_FRAMES} `telemetry.event` frames for the flood tab, each a fresh batch. */
+function floodFrames(): ProtocolMessage[] {
+  return Array.from({ length: FLOOD_FRAMES }, () =>
+    createEnvelope(
+      T.telemetry,
+      { events: browserEvents(FLOOD_EVENTS_PER_FRAME) },
+      { tabId: TAB.flood },
+    ),
+  );
+}
+
+/** Opens the rig's flooded connection: upgraded, hello sent, and counted authenticated. */
+async function openAuthenticated(rig: FloodRig): Promise<RigSocket> {
+  const before = rig.ws.stats().authenticated;
+  const socket = await rig.open();
+  socket.send(rig.hello());
+  await rig.until(
+    (stats) => stats.authenticated === before + 1,
+    'the hello authenticated the connection',
+  );
+  return socket;
+}
+
+/** Whether `message` is the `service.pong` answering the ping whose id is `pingId`. */
+function isPongFor(message: ProtocolMessage, pingId: string): boolean {
+  return isMessageOfType(message, T.pong) && message.payload.ref === pingId;
+}
+
+describe('one flooded connection starves nothing', () => {
+  const harness = useHarness();
+
+  it('answers a fresh connection, GET /health and a ping written behind the flood while it drains, and still handles the flood in order, in full', async () => {
+    const h = harness();
+    const rig = await startFloodRig(h);
+    try {
+      const flooded = await openAuthenticated(rig);
+      const logFrom = h.logger.records.length;
+      const frames = floodFrames();
+      // Each frame is a queued frame, never one decoded on arrival.
+      for (const frame of frames) {
+        expect(Buffer.byteLength(encodeMessage(frame), 'utf8')).toBeGreaterThan(
+          EARLY_PING_MAX_FRAME_BYTES,
+        );
+      }
+      const behindFlood = createEnvelope(T.ping, {});
+      for (const frame of frames) {
+        flooded.send(frame);
+      }
+      flooded.send(behindFlood);
+
+      // (a) While the backlog drains: a fresh connection upgrades,
+      // authenticates and has its ping answered, and the service's own
+      // `GET /health` answers — each within the bound, and each before the
+      // flood has been handled.
+      const healthStart = performance.now();
+      const health = h.rawFetch('health').then((response) => ({
+        status: response.status,
+        at: performance.now(),
+        handled: rig.handled.length,
+      }));
+      const freshStart = performance.now();
+      const fresh = await rig.open();
+      const freshPing = createEnvelope(T.ping, {});
+      fresh.send(rig.hello());
+      fresh.send(freshPing);
+      const freshPong = await fresh.next(
+        (message) => isPongFor(message, freshPing.id),
+        'the fresh connection’s ping was answered',
+      );
+      const healthAnswer = await health;
+
+      expect(freshPong.at - freshStart, 'fresh hello + ping round trip, ms').toBeLessThan(
+        FAIR_LATENCY_BOUND_MS,
+      );
+      expect(freshPong.handled, 'flood frames handled before the fresh pong').toBeLessThan(
+        FLOOD_FRAMES,
+      );
+      expect(healthAnswer.status).toBe(HTTP_OK);
+      expect(healthAnswer.at - healthStart, 'GET /health, ms').toBeLessThan(FAIR_LATENCY_BOUND_MS);
+      expect(healthAnswer.handled, 'flood frames handled before /health answered').toBeLessThan(
+        FLOOD_FRAMES,
+      );
+
+      // (b) The ping written after the whole flood is answered on arrival,
+      // before the flood's last frames are handled — and on the wire, before
+      // their refusals.
+      const behindPong = await flooded.next(
+        (message) => isPongFor(message, behindFlood.id),
+        'the ping behind the flood was answered',
+        FLOOD_DRAIN_TIMEOUT_MS,
+      );
+      expect(behindPong.handled, 'flood frames handled before the pong').toBeLessThan(FLOOD_FRAMES);
+      const lastFrameId = frames[frames.length - 1]?.id ?? '';
+      const lastRefusal = await flooded.next(
+        (message) => isMessageOfType(message, T.error) && message.payload.ref === lastFrameId,
+        'the last flood frame was answered',
+        FLOOD_DRAIN_TIMEOUT_MS,
+      );
+      expect(flooded.received.indexOf(behindPong)).toBeLessThan(
+        flooded.received.indexOf(lastRefusal),
+      );
+
+      // (c) Every frame was handled, once, in the order it was written, and
+      // answered in that order; flow control paused and resumed the socket;
+      // nothing overflowed and the connection is still open.
+      expect(rig.handled).toEqual(frames.map((frame) => frame.id));
+      const refusals = flooded.received.flatMap(({ message }) =>
+        isMessageOfType(message, T.error) ? [message.payload] : [],
+      );
+      expect(refusals.map((refusal) => refusal.ref)).toEqual(frames.map((frame) => frame.id));
+      expect(new Set(refusals.map((refusal) => refusal.code))).toEqual(new Set([CODE.tabNotBound]));
+      const wsMessages = h.logger.records
+        .slice(logFrom)
+        .filter((record) => record.fields['subsystem'] === WS_LOG_SUBSYSTEM)
+        .map((record) => record.message);
+      expect(wsMessages).toContain(READS_PAUSED_LOG);
+      expect(wsMessages).toContain(READS_RESUMED_LOG);
+      expect(wsMessages).not.toContain(BACKLOG_OVERFLOW_LOG);
+      expect(flooded.isClosed()).toBe(false);
+      expect(flooded.socket.readyState).toBe(NodeWebSocket.OPEN);
+      expect(rig.ws.stats()).toMatchObject({ authenticated: 2, pendingFrames: 0, readPaused: 0 });
+    } finally {
+      await rig.close();
+    }
+  });
+
+  it('closes a connection whose reads flow control paused at once, leaving no queued frame to run after close()', async () => {
+    const h = harness();
+    const rig = await startFloodRig(h);
+    try {
+      const flooded = await openAuthenticated(rig);
+      for (const frame of floodFrames()) {
+        flooded.send(frame);
+      }
+      await rig.until(
+        (stats) => stats.readPaused === 1,
+        'flow control paused the flooded connection',
+      );
+
+      const closeStart = performance.now();
+      const after = await rig.close();
+      const closeMs = performance.now() - closeStart;
+      const handledAtClose = rig.handled.length;
+
+      // `close()` ended the paused socket within its closing grace — it did
+      // not wait for the backlog, most of which was never handled.
+      expect(closeMs, 'close() of a paused connection, ms').toBeLessThan(
+        3 * CLOSE_HANDSHAKE_GRACE_MS,
+      );
+      expect(handledAtClose).toBeLessThan(FLOOD_FRAMES);
+      expect(await flooded.closed).toBe(WS_CLOSE_GOING_AWAY);
+      expect(after).toMatchObject({
+        open: 0,
+        authenticated: 0,
+        pendingFrames: 0,
+        readPaused: 0,
+        heartbeatActive: false,
+        closed: true,
+      });
+      // No frame the queue still held runs after `close()` resolved.
+      await new Promise<void>((resolveLater) => {
+        setTimeout(resolveLater, 5 * FLOOD_FRAME_COST_MS);
+      });
+      expect(rig.handled).toHaveLength(handledAtClose);
+    } finally {
+      // Idempotent: answers the same counters when the case already closed it.
+      await rig.close();
+    }
   });
 });
 

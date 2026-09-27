@@ -164,6 +164,40 @@ const NOW = 1_700_000_000_000;
 /** A project root that is not the corpus, for the foreign-preload case. */
 const FOREIGN_PROJECT_ROOT = toPosix(join(tmpdir(), 'debuggen-some-other-project'));
 
+/**
+ * The editor command every default hint names, spelled as the VS Code command
+ * palette shows `debuggen.launchDevServer`: its contributed category and title
+ * (`apps/vscode-extension/package.json`). Restated rather than read from
+ * {@link POSTGRES_ADAPTER_DEFAULTS}, so a drift in the default is caught here.
+ */
+const LAUNCH_DEV_SERVER_PALETTE_LABEL = 'Debug Generator: Launch Dev Server';
+
+/**
+ * The default relaunch hint for a project root that fits whole.
+ *
+ * @param root The project root.
+ * @returns The exact hint.
+ */
+function editorHintFor(root: string): string {
+  return `Run "${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code for ${root}, which starts this project's dev server with the preload and a fresh ingest credential.`;
+}
+
+/**
+ * Asserts that a hint carries no hand-typed preload command.
+ *
+ * The published specifier cannot be resolved from a target project, which
+ * declares no `@debuggen/*` dependency, and a bare `NODE_OPTIONS` line sets no
+ * ingest credential: a default hint quoting either is a command that fails, or
+ * runs and reports nothing (QA INT-F05).
+ *
+ * @param hint The hint.
+ */
+function expectNoHandTypedCommand(hint: string): void {
+  expect(hint).not.toContain(POSTGRES_ADAPTER_DEFAULTS.preloadSpecifier);
+  expect(hint).not.toContain('NODE_OPTIONS');
+  expect(hint).not.toContain('--import');
+}
+
 /** The owner node kinds a query call site may be attributed to. */
 const OWNER_NODE_KINDS: readonly string[] = Object.freeze(['server-function', 'symbol']);
 
@@ -290,8 +324,8 @@ const SCRATCH_TSCONFIG = `${JSON.stringify(
  * `tallyTideWindows` sends its statement straight to the handle. One module
  * above them calls exactly one of the two, which is what lets the narrowing
  * case assert that naming a caller promotes the query site it reaches. No
- * `package.json`, so the project's package manager is unknown and the relaunch
- * hint must fall back to naming the editor command.
+ * `package.json`, so the project's package manager is unknown — which must not
+ * change the relaunch hint, the editor command, from what a known one gets.
  */
 const PG_ONLY_FILES: Readonly<Record<string, string>> = Object.freeze({
   'tsconfig.json': SCRATCH_TSCONFIG,
@@ -1654,7 +1688,9 @@ describe('identity and claim declaration', () => {
     );
     expect(POSTGRES_ADAPTER_DEFAULTS.heartbeatStalenessMs).toBeGreaterThan(0);
     expect(POSTGRES_ADAPTER_DEFAULTS.preloadSpecifier).toContain('@debuggen/telemetry');
-    expect(POSTGRES_ADAPTER_DEFAULTS.editorCommandTitle.length).toBeGreaterThan(0);
+    // Exactly the VS Code palette label of `debuggen.launchDevServer`, so the
+    // hint can be typed into the palette verbatim.
+    expect(POSTGRES_ADAPTER_DEFAULTS.editorCommandTitle).toBe(LAUNCH_DEV_SERVER_PALETTE_LABEL);
   });
 
   it('hands out independent instances', () => {
@@ -2282,11 +2318,15 @@ describe('install', () => {
     expect(gap.hint.trim()).toBe(gap.hint);
     expect(gap.hint).not.toContain('\n');
     expect(gap.hint).toContain(fixture.root);
-    expect(gap.hint).toContain(POSTGRES_ADAPTER_DEFAULTS.editorCommandTitle);
+    expect(gap.hint).toContain(`"${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code`);
+    expectNoHandTypedCommand(gap.hint);
     expect(gap.hint.length).toBeLessThanOrEqual(500);
   });
 
-  it('composes the hint from the project own package manager when it is known', async () => {
+  it('names the editor command rather than a preload line the project cannot run', async () => {
+    // A known package manager changes nothing: a command composed from it and
+    // the published specifier fails with ERR_MODULE_NOT_FOUND in a target that
+    // has no `@debuggen/*` dependency, and sets no ingest credential.
     expect(fixture.projectSummary.packageManager).toBe('npm');
 
     const probe = harnessFor(fixture);
@@ -2296,10 +2336,43 @@ describe('install', () => {
     );
     const gap = onlyGap(await result);
 
-    expect(gap.hint).toBe(
-      `Stop the dev server for ${fixture.root} and start it with NODE_OPTIONS="--import ${POSTGRES_ADAPTER_DEFAULTS.preloadSpecifier}" npm run dev - or run the "${POSTGRES_ADAPTER_DEFAULTS.editorCommandTitle}" command in VS Code, which does it for you.`,
-    );
+    expect(gap.hint).toBe(editorHintFor(fixture.root));
+    expectNoHandTypedCommand(gap.hint);
+    expect(gap.hint).not.toContain('npm run dev');
     expect(reads).toEqual([]);
+  });
+
+  it('composes no preload line from an injected specifier that brings no credential', async () => {
+    // The descriptor names none of the ingest variables, so a line built from
+    // the specifier would start a preload that reports nothing.
+    const preloadSpecifier = 'file:///opt/debuggen/telemetry/node/register.mjs';
+    const adapter = createPostgresAdapter({ relaunch: { preloadSpecifier } });
+    const gap = onlyGap((await planAndInstall(harnessFor(fixture), adapter)).result);
+
+    expect(gap.hint).toBe(editorHintFor(fixture.root));
+    expect(gap.hint).not.toContain(preloadSpecifier);
+    expectNoHandTypedCommand(gap.hint);
+  });
+
+  it('drops a project root that cannot be carried whole, never clipping it', async () => {
+    const actions = await createPostgresAdapter().createPlan(
+      harnessFor(fixture).context,
+      databaseQuestion,
+    );
+    const rootless = `Run "${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code, which starts this project's dev server with the preload and a fresh ingest credential.`;
+
+    // Longer than the whole bound, and a path whose bell the readiness schema
+    // would refuse: naming either would mean a clipped or rejected hint.
+    for (const root of [`/${'r'.repeat(500)}`, '/work/bell\u0007shop']) {
+      const context: InstrumentationContext = { ...harnessFor(fixture).context, projectRoot: root };
+      const adapter = createPostgresAdapter();
+      const gap = onlyGap(await adapter.install(actions, context));
+      const report = await adapter.readiness(context);
+
+      expect(gap.hint).toBe(rootless);
+      expect(report.signals[0]?.hint).toBe(rootless);
+      expect(() => readinessSchema.parse(report)).not.toThrow();
+    }
   });
 
   it('prefers an injected relaunch command, and reads no environment variable', async () => {
@@ -2329,9 +2402,7 @@ describe('install', () => {
     const { result } = await planAndInstall(probe);
     const gap = onlyGap(result);
 
-    expect(gap.hint).toBe(
-      `Run the "${POSTGRES_ADAPTER_DEFAULTS.editorCommandTitle}" command in VS Code for ${pgOnlyProject.root}, which restarts the dev server with the Debug Generator Node preload attached.`,
-    );
+    expect(gap.hint).toBe(editorHintFor(pgOnlyProject.root));
   });
 
   it('treats a preload attached to another project, or a closed socket, as absent', async () => {
@@ -2361,7 +2432,8 @@ describe('install', () => {
       // attached".
       expect(result.runtimeHooks.length).toBeGreaterThan(0);
       expect(gap.reason).not.toBe(absent.reason);
-      expect(gap.hint).toContain(POSTGRES_ADAPTER_DEFAULTS.editorCommandTitle);
+      expect(gap.hint).toContain(`"${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code`);
+      expectNoHandTypedCommand(gap.hint);
     }
   });
 

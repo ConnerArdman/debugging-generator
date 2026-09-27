@@ -1,14 +1,17 @@
 /**
  * Tests for `./progress.ts`: the public failure copy a failed stage is shown
- * with, and the emitter's handling of its own collaborators failing.
+ * with, the emitter's handling of its own collaborators failing, the Step-8
+ * groups every row is filed under, and the wording of the investigation's
+ * class rows.
  *
  * The from-findings guarantee of the row builders is asserted by
  * `apps/local-service/test/integration/session-lifecycle.test.ts`; this suite
  * covers what that one cannot observe from the outside — that no failure's own
  * text, and no hint a product builder did not register, can become a row; that
- * the reference a row shows leads to a `debug` diagnostic of the failure; and
- * that a failing logger, store or transport never costs a connected client its
- * row.
+ * the reference a row shows leads to a `debug` diagnostic of the failure; that
+ * a failing logger, store or transport never costs a connected client its row;
+ * and that the investigation and the planning report inside the groups Step 8
+ * shows while a failure keeps the stage that failed.
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -33,12 +36,15 @@ import type { AppendProgressInput } from '../store/sessions-repo.js';
 import {
   FAILURE_COPY_BY_CODE,
   PROGRESS_RECIPIENT_KINDS,
+  PROGRESS_STAGE_GROUPS,
   PROGRESS_STAGE_TITLES,
   PRODUCT_TEXT_MAX_LENGTH,
   PRODUCT_TEXT_REGISTRY_LIMIT,
+  READY_TO_CAPTURE_MESSAGE,
   STAGE_FAILURE_DIAGNOSTIC_MESSAGE,
   STAGE_FAILURE_LOG_MESSAGE,
   authorProductText,
+  buildInvestigationRows,
   carriesWrappedExceptionText,
   createSessionProgress,
   isProductAuthoredText,
@@ -520,9 +526,18 @@ describe('the public projection of a stage failure', () => {
     expectNoSentinel(atDebug.probe.appended, 'the stored row');
   });
 
-  it('falls back to the code hint for a blank hint and clips a long one, never the suffix', () => {
+  it('falls back to the code hint for a blank hint and shows a long proven one whole, before the suffix', () => {
     const probe = emitter({ newRef: () => 'ref_projection04' });
     const sessionId = newSessionId();
+    // As long as the registry proves, and well past the row's display bound
+    // of 1000: a projection that clipped it would cut the sentence short.
+    const opening = `Ask again ${newSessionId()}.`;
+    const long = authorProductText(
+      `${opening}${' Ask again.'.repeat(Math.floor((PRODUCT_TEXT_MAX_LENGTH - opening.length) / 11))}`,
+    );
+    expect(long.length).toBeGreaterThan(1000);
+    expect(long.length).toBeLessThanOrEqual(PRODUCT_TEXT_MAX_LENGTH);
+    expect(isProductAuthoredText(long)).toBe(true);
 
     probe.progress.stageFailed(sessionId, {
       stage: 'plan',
@@ -534,20 +549,51 @@ describe('the public projection of a stage failure', () => {
       stage: 'plan',
       code: 'PLAN_INVALID',
       message: LEAKY_MESSAGE,
-      hint: authorProductText(`Ask again ${newSessionId()}. ${'Ask again. '.repeat(170)}`),
+      hint: long,
     });
 
     expect(probe.appended[0]?.detail).toBe(
       `${FAILURE_COPY_BY_CODE.PLAN_INVALID.hint} (error code: PLAN_INVALID, ref: ref_projection04)`,
     );
-    const clipped = String(probe.appended[1]?.detail);
-    expect([...clipped].length).toBeLessThanOrEqual(1000);
-    expect(clipped).toMatch(/…\s\(error code: PLAN_INVALID, ref: ref_projection04\)$/u);
+    const whole = String(probe.appended[1]?.detail);
+    expect(whole).toBe(`${long} (error code: PLAN_INVALID, ref: ref_projection04)`);
+    expect(whole).not.toContain('…');
+    // Within protocol's transport bound for `session.progress` detail.
+    expect(whole.length).toBeLessThanOrEqual(4000);
+    expect(progressPayloadOf(probe.broadcasts[1]).detail).toBe(whole);
     expect(
       probe.logs
         .filter((record) => record.message === STAGE_FAILURE_LOG_MESSAGE)
         .map((record) => record.fields['hintSource']),
     ).toEqual(['code', 'failure']);
+  });
+
+  it('never cuts a proven relaunch command mid-command in the failed row', () => {
+    const probe = emitter({ newRef: () => 'ref_projection07' });
+    const sessionId = newSessionId();
+    // A relaunch hint as long as a readiness hint may be (1000): its command,
+    // which ends the hint, would lose its tail to a 1000-character detail.
+    const lead =
+      'This project’s dev server is running without the Debug Generator preload. Start it by hand: cd ';
+    const tail =
+      ' && NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import file:///opt/debuggen/telemetry/node/register.mjs" DEBUGGEN_TOKEN="$DEBUGGEN_TOKEN" pnpm run dev';
+    const relaunch = authorProductText(
+      `${lead}/work/${'nested/'.repeat(Math.floor((1000 - lead.length - tail.length - 6) / 7))}${'p'.repeat((1000 - lead.length - tail.length - 6) % 7)}${tail}`,
+    );
+    expect(relaunch.length).toBe(1000);
+
+    probe.progress.stageFailed(sessionId, {
+      stage: 'instrument',
+      code: 'INSTRUMENTATION_UNAVAILABLE',
+      message: LEAKY_MESSAGE,
+      hint: relaunch,
+    });
+
+    expect(probe.appended[0]?.detail).toBe(
+      `${relaunch} (error code: INSTRUMENTATION_UNAVAILABLE, ref: ref_projection07)`,
+    );
+    expect(progressPayloadOf(probe.broadcasts[0]).detail).toBe(probe.appended[0]?.detail);
+    expect(failureRecordOf(probe.logs).fields['hintSource']).toBe('failure');
   });
 
   it('names and words a code outside the closed vocabulary as INTERNAL', () => {
@@ -848,5 +894,201 @@ describe('product-authored text provenance', () => {
     expect(isProductAuthoredText(second)).toBe(false);
     expect(isProductAuthoredText(first)).toBe(true);
     expect(isProductAuthoredText(texts[PRODUCT_TEXT_REGISTRY_LIMIT])).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The Step-8 groups: the investigation reports inside "Understanding problem", planning inside
+ * "Preparing instrumentation", and a failure keeps the stage that failed
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A component the code graph found, and the file that declares it. */
+const PANEL_COMPONENT = 'OrbitPanel';
+const PANEL_FILE = 'src/panels/OrbitPanel.tsx';
+
+/** The event handler the panel binds, declared in the same file. */
+const PANEL_HANDLER = 'handlePlotClick';
+
+/** The stored rows of a probe, as `[stage, status, message]` triples. */
+function storedRows(probe: EmitterProbe): (readonly [string, string, string])[] {
+  return probe.appended.map((row) => [row.stage, row.status, row.message] as const);
+}
+
+describe('the Step-8 groups', () => {
+  it('places every stage in a group that heads itself', () => {
+    expect(Object.keys(PROGRESS_STAGE_GROUPS).sort()).toEqual([...PROGRESS_STAGES].sort());
+    for (const stage of PROGRESS_STAGES) {
+      const group = PROGRESS_STAGE_GROUPS[stage];
+      expect(PROGRESS_STAGES).toContain(group);
+      expect(PROGRESS_STAGE_GROUPS[group], `${stage} reports in a group of its own`).toBe(group);
+    }
+    expect(PROGRESS_STAGE_GROUPS.investigate).toBe('understand');
+    expect(PROGRESS_STAGE_GROUPS.plan).toBe('instrument');
+  });
+
+  it('files the investigation under "Understanding problem": re-opened as it starts, settled as it closes', () => {
+    const sessionId = newSessionId();
+    const probe = emitter();
+
+    probe.progress.stageStarted(sessionId, 'understand');
+    probe.progress.stageCompleted(sessionId, 'understand');
+    probe.progress.stageStarted(sessionId, 'investigate');
+    probe.progress.reportInvestigation(sessionId, {
+      components: [PANEL_COMPONENT],
+      eventHandlers: [PANEL_HANDLER],
+      routes: [],
+      databaseDependencies: [],
+      origins: new Map([
+        [PANEL_COMPONENT, PANEL_FILE],
+        [PANEL_HANDLER, PANEL_FILE],
+      ]),
+    });
+    probe.progress.stageCompleted(sessionId, 'investigate');
+
+    const title = PROGRESS_STAGE_TITLES.understand;
+    expect(storedRows(probe)).toEqual([
+      ['understand', 'running', title],
+      ['understand', 'done', title],
+      ['understand', 'running', title],
+      ['understand', 'done', `Found ${PANEL_COMPONENT}`],
+      ['understand', 'done', 'Traced event handler'],
+      ['understand', 'done', title],
+    ]);
+    // The frames carry the same group as the stored rows, so a replay reads as the live view did.
+    expect(
+      probe.broadcasts.map((call) =>
+        call.frame.type === 'session.progress' ? call.frame.payload.stage : call.frame.type,
+      ),
+    ).toEqual(probe.appended.map((row) => row.stage));
+    expect(JSON.stringify(probe.appended)).not.toContain(PROGRESS_STAGE_TITLES.investigate);
+  });
+
+  it('opens "Preparing instrumentation" with planning and files its own rows there', () => {
+    const sessionId = newSessionId();
+    const probe = emitter();
+    const fallback = 'Continuing with the runtime-only plan';
+
+    probe.progress.stageStarted(sessionId, 'plan');
+    probe.progress.emit(sessionId, { stage: 'plan', status: 'running', message: fallback });
+    probe.progress.stageCompleted(sessionId, 'plan');
+    probe.progress.stageStarted(sessionId, 'instrument');
+    probe.progress.readyToCapture(sessionId);
+
+    const title = PROGRESS_STAGE_TITLES.instrument;
+    expect(storedRows(probe)).toEqual([
+      ['instrument', 'running', title],
+      ['instrument', 'running', fallback],
+      ['instrument', 'done', title],
+      ['instrument', 'running', title],
+      ['instrument', 'done', title],
+      ['instrument', 'done', READY_TO_CAPTURE_MESSAGE],
+    ]);
+    expect(JSON.stringify(probe.appended)).not.toContain(PROGRESS_STAGE_TITLES.plan);
+  });
+
+  it('keeps a caller’s own header line, filed under the group', () => {
+    const sessionId = newSessionId();
+    const probe = emitter();
+    probe.progress.stageStarted(sessionId, 'investigate', 'Reading the project index');
+    expect(storedRows(probe)).toEqual([['understand', 'running', 'Reading the project index']]);
+  });
+
+  it.each(['investigate', 'plan'] as const)(
+    'keeps a %s failure on the stage that failed, worded with that stage’s own title',
+    (stage) => {
+      const sessionId = newSessionId();
+      const probe = emitter({ newRef: () => `ref_group_${stage}` });
+      const failure: SessionFailure = { stage, code: 'STORE_ERROR', message: LEAKY_MESSAGE };
+
+      probe.progress.stageStarted(sessionId, stage);
+      probe.progress.stageFailed(sessionId, failure);
+
+      const copy = publicFailureCopy(stage, 'STORE_ERROR');
+      expect(copy.message.startsWith(PROGRESS_STAGE_TITLES[stage])).toBe(true);
+      expect(storedRows(probe)).toEqual([
+        [
+          PROGRESS_STAGE_GROUPS[stage],
+          'running',
+          PROGRESS_STAGE_TITLES[PROGRESS_STAGE_GROUPS[stage]],
+        ],
+        [stage, 'failed', copy.message],
+      ]);
+      // A failed row sent directly keeps its stage too.
+      probe.progress.emit(sessionId, { stage, status: 'failed', message: copy.message });
+      expect(probe.appended.at(-1)?.stage).toBe(stage);
+    },
+  );
+});
+
+describe('the investigation’s class rows', () => {
+  it('words a traced handler as one "Traced event handler" row: its symbol, then its file', () => {
+    const rows = buildInvestigationRows({
+      components: [PANEL_COMPONENT],
+      eventHandlers: [PANEL_HANDLER],
+      routes: [],
+      databaseDependencies: [],
+      relevantFiles: [
+        { file: PANEL_FILE, symbol: PANEL_COMPONENT, reason: 'Renders the panel.', score: 1 },
+        { file: PANEL_FILE, symbol: PANEL_HANDLER, reason: 'Handles the click.', score: 0.8 },
+      ],
+    });
+
+    expect(rows).toEqual([
+      {
+        stage: 'understand',
+        status: 'done',
+        message: `Found ${PANEL_COMPONENT}`,
+        detail: PANEL_FILE,
+      },
+      {
+        stage: 'understand',
+        status: 'done',
+        message: 'Traced event handler',
+        detail: `${PANEL_HANDLER} · ${PANEL_FILE}`,
+      },
+    ]);
+    // No handler traced, no row: the label is never shown without its evidence.
+    expect(
+      buildInvestigationRows({ components: [PANEL_COMPONENT], eventHandlers: [] }).map(
+        (row) => row.message,
+      ),
+    ).toEqual([`Found ${PANEL_COMPONENT}`]);
+  });
+
+  it('names every file holding a call site once, where the code graph located it', () => {
+    const [row] = buildInvestigationRows({
+      databaseDependencies: ['ledger.query', 'ledger.insert', 'cache.write'],
+      origins: new Map([
+        ['ledger.query', 'src/server/ledger.ts'],
+        ['ledger.insert', 'src/server/ledger.ts'],
+        ['cache.write', 'src/server/cache.ts'],
+      ]),
+      relevantFiles: [],
+    });
+
+    expect(row).toEqual({
+      stage: 'understand',
+      status: 'done',
+      message: 'Found database dependency',
+      detail:
+        'ledger.query, ledger.insert, cache.write · src/server/ledger.ts, src/server/cache.ts',
+    });
+  });
+
+  it('prefers the file the code graph located a finding in over a relevant file of that name', () => {
+    const rows = buildInvestigationRows({
+      components: [PANEL_COMPONENT],
+      origins: new Map([[PANEL_COMPONENT, PANEL_FILE]]),
+      relevantFiles: [
+        {
+          file: 'src/panels/index.ts',
+          symbol: PANEL_COMPONENT,
+          reason: 'Re-exports it.',
+          score: 1,
+        },
+      ],
+    });
+
+    expect(rows.map((row) => row.detail)).toEqual([PANEL_FILE]);
   });
 });

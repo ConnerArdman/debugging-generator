@@ -35,8 +35,10 @@
  *
  * - **No patch without a preload.** A file modification that cannot produce a
  *   span is pure risk to a developer's working tree, so when no preload is
- *   attached this adapter applies nothing and reports the gap with the exact
- *   relaunch command instead (see {@link NextJsAdapterOptions.relaunch}).
+ *   attached this adapter applies nothing and reports the gap with the relaunch
+ *   instruction instead: the "Debug Generator: Launch Dev Server" editor
+ *   command, plus the exact hand-typed command when a caller injects what it
+ *   needs (see {@link NextJsAdapterOptions.relaunch}).
  * - **No stepping past a failed patch, and no rollback of its own.** The
  *   patcher stops at the first target it cannot complete, and this adapter
  *   stops with it: the records applied so far go back in
@@ -238,25 +240,51 @@ export const NEXTJS_RUNTIME_HOOKS: readonly string[] = Object.freeze(
 );
 
 /**
- * The module specifier the dev server preloads to become observable.
+ * The published package subpath of the product's dev-server preload
+ * (`packages/telemetry`'s `./node/register` export).
  *
- * The product's own preload entry (`packages/telemetry`'s `./node/register`
- * export), named here so a relaunch hint can be exact without this file reading
- * an environment variable or guessing a path. A service that resolves it
- * differently — from a packaged extension, say — overrides it through
+ * Exported as the name of record, and **never** put in a default hint: a target
+ * project declares no `@debuggen/*` dependency (AAP §0.4.2), so
+ * `--import @debuggen/telemetry/node/register` fails there with
+ * `ERR_MODULE_NOT_FOUND`, and a bare specifier carries none of the ingest
+ * variables the preload needs to report. Only a caller that knows a specifier
+ * the target *can* load — the absolute `file:` URL of a bundled preload, say —
+ * gets a hand-typed command, by injecting it through
  * {@link NextJsAdapterRelaunchDescriptor.preloadSpecifier}.
  */
 export const DEBUGGEN_NODE_PRELOAD_SPECIFIER = '@debuggen/telemetry/node/register';
 
 /**
- * The editor command a developer can use instead of a shell, named in every
- * relaunch hint as the one-click alternative.
+ * The editor command every relaunch hint names: the VS Code palette label of
+ * `debuggen.launchDevServer` (category "Debug Generator", title "Launch Dev
+ * Server" in `apps/vscode-extension/package.json`), spelled exactly as the
+ * palette shows it so a developer can type it into the palette verbatim.
  *
- * The service is what actually launches the dev server with the preload and the
- * credentials attached (AAP §0.7.1 Group 2), so this is the recovery path that
- * needs no environment of its own.
+ * The service is what actually launches the dev server with the preload and a
+ * freshly minted ingest credential attached (AAP §0.5.6), so this is the one
+ * recovery path this adapter can state exactly without knowing the preload's
+ * path, the ingest URL or a credential — none of which it is handed by default.
  */
-const LAUNCH_COMMAND_LABEL = 'Debug Generator: Launch dev server';
+const LAUNCH_COMMAND_LABEL = 'Debug Generator: Launch Dev Server';
+
+/**
+ * What an environment variable name must look like to be referenced from a
+ * POSIX shell as `NAME="$NAME"`.
+ *
+ * A name outside this shape cannot be spelled as an assignment on a command
+ * line, so a descriptor carrying one gets no hand-typed command at all rather
+ * than a command that silently omits a variable the preload needs.
+ */
+const SHELL_VARIABLE_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Highest code point of the C0 control block. */
+const C0_CONTROL_MAX = 0x1f;
+
+/** Lowest code point of the DEL/C1 control block. */
+const C1_CONTROL_MIN = 0x7f;
+
+/** Highest code point of the C1 control block. */
+const C1_CONTROL_MAX = 0x9f;
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -357,15 +385,45 @@ const CALLS_EDGE: CodeEdge['kind'] = 'calls';
  *
  * Every field is injected so the hint can be exact while this file stays free
  * of environment reads and of any assumption about how the target project is
- * started (AAP §0.5.5). Omit a field and the composition below falls back to
- * the documented preload specifier, the package manager the project summary
- * reports, and finally the editor command that needs neither.
+ * started (AAP §0.5.5).
+ *
+ * With no {@link NextJsAdapterRelaunchDescriptor.preloadSpecifier} — which is
+ * how `../registry.ts` constructs this adapter — the hint names only the editor
+ * command "Debug Generator: Launch Dev Server" and the project root: this
+ * adapter then knows no preload path the target can load, no ingest URL and no
+ * credential, so any shell command it composed would fail or stay inert. With a
+ * specifier, a hand-typed command is composed as well, from the specifier, the
+ * {@link NextJsAdapterRelaunchDescriptor.devCommand} (or the package manager
+ * the project summary reports) and a `NAME="$NAME"` reference for every
+ * {@link NextJsAdapterRelaunchDescriptor.envVarNames} entry.
+ *
+ * @example
+ * ```ts
+ * createNextJsAdapter({
+ *   relaunch: {
+ *     preloadSpecifier: 'file:///opt/debuggen/telemetry/node/register.mjs',
+ *     envVarNames: ['DEBUGGEN_INGEST_URL', 'DEBUGGEN_TOKEN'],
+ *   },
+ * });
+ * // … By hand, with DEBUGGEN_INGEST_URL, DEBUGGEN_TOKEN exported: cd ‹root› &&
+ * // DEBUGGEN_INGEST_URL="$DEBUGGEN_INGEST_URL" DEBUGGEN_TOKEN="$DEBUGGEN_TOKEN"
+ * // NODE_OPTIONS="--import file:///opt/…/register.mjs" pnpm dev
+ * ```
  */
 export interface NextJsAdapterRelaunchDescriptor {
-  /** The module specifier to preload, when it is not the published entry. */
+  /**
+   * A module specifier the **target project** can load with `--import` — an
+   * absolute `file:` URL or path, typically.
+   *
+   * The only field that turns on a hand-typed command. Never defaulted to
+   * {@link DEBUGGEN_NODE_PRELOAD_SPECIFIER}, which a target cannot resolve.
+   */
   readonly preloadSpecifier?: string | undefined;
 
-  /** The target's own dev-server command, exactly as it should be typed. */
+  /**
+   * The target's own dev-server command, exactly as it should be typed. Read
+   * only alongside {@link NextJsAdapterRelaunchDescriptor.preloadSpecifier}.
+   */
   readonly devCommand?: string | undefined;
 
   /**
@@ -373,8 +431,11 @@ export interface NextJsAdapterRelaunchDescriptor {
    *
    * Names only, never values: the ingest URL and the per-launch credential are
    * minted by the launcher (AAP §0.5.6), and a hint that quoted one would be a
-   * credential in a user interface. Named so a developer relaunching by hand
-   * knows which variables the editor command would have set for them.
+   * credential in a user interface. Each name is rendered in the hand-typed
+   * command as the shell reference `NAME="$NAME"`, and the developer is told to
+   * export them first, so the command hands the preload what it needs. Every
+   * name must be a POSIX shell variable name; a descriptor with one that is not
+   * gets the editor command only, never a command missing a variable.
    */
   readonly envVarNames?: readonly string[] | undefined;
 }
@@ -713,13 +774,40 @@ function singleLine(text: string, bound: number): string {
 }
 
 /**
+ * Whether a string contains a C0, DEL or C1 control character.
+ *
+ * A code-point scan rather than a regular expression, because a character class
+ * over the control ranges is itself a lint failure (`no-control-regex`).
+ * Whitespace collapsing does not remove every control character — a bell or an
+ * escape is not whitespace — and the readiness schema refuses a `hint` that
+ * carries one, which would discard the whole report over one path.
+ *
+ * @param text The text to inspect.
+ * @returns `true` when any code point is a control character.
+ */
+function hasControlCharacter(text: string): boolean {
+  for (const character of text) {
+    const code = character.codePointAt(0) ?? 0;
+
+    if (code <= C0_CONTROL_MAX || (code >= C1_CONTROL_MIN && code <= C1_CONTROL_MAX)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * The first candidate that fits `bound` as one line, returned whole.
  *
  * How a hint carrying injected, unbounded material — a project root, a preload
  * specifier, a dev command, environment variable names — is fitted to its
  * field: the caller spells the same instruction from most to least prose, each
  * spelling complete in itself, and nothing is ever cut out of the middle of a
- * command. A developer who copies a sliced command runs it.
+ * command. A developer who copies a sliced command runs it. A candidate that
+ * still carries a control character once its whitespace is collapsed — a
+ * project root with an escape in its name, say — is passed over the same way,
+ * so the next, root-free spelling is used instead of a hint the schema refuses.
  *
  * @param candidates The instruction, from the most to the least complete
  * spelling.
@@ -733,7 +821,7 @@ function firstFitting(candidates: readonly string[], fallback: string, bound: nu
   for (const candidate of candidates) {
     const line = collapseWhitespace(candidate);
 
-    if (line.length <= bound) {
+    if (line.length <= bound && !hasControlCharacter(line)) {
       return line;
     }
   }
@@ -742,91 +830,190 @@ function firstFitting(candidates: readonly string[], fallback: string, bound: nu
 }
 
 /**
- * The exact command that relaunches this project's dev server with the preload
- * attached, as one copy-pasteable line.
+ * Whether `specifier` can be typed inside `NODE_OPTIONS="--import ‹specifier›"`
+ * exactly as it is.
  *
- * The composition order is the one AAP §0.5.5 requires, and every part of it is
- * either injected or read from the project summary as data — the specifier from
- * {@link NextJsAdapterRelaunchDescriptor.preloadSpecifier} or the published
- * entry, the command from the descriptor or from the package manager the
- * summary reports, and the project root from the context. Nothing is read from
- * the environment, and the editor command is always named as the alternative
- * that needs no shell.
+ * `NODE_OPTIONS` splits its value on whitespace, and a double-quoted shell word
+ * gives `"`, `$`, `` ` `` and `\` a meaning of their own, so a specifier holding
+ * any of them — or a control character — would be a different command once
+ * typed. Such a specifier gets no hand-typed command: the editor command, which
+ * needs none, is exact whatever the path looks like.
  *
- * The project root is named **once**, inside the hand-typed command
- * (`cd ‹root› && NODE_OPTIONS="--import ‹specifier›" ‹command›`), because that is
- * the one place it is actionable. Everything in the line except this module's
- * own words is injected and unbounded, so the hint is fitted to
- * {@link READINESS_HINT_MAX_LENGTH} by {@link firstFitting}, never by cutting.
- * The spellings, most complete first, drop what matters least first:
+ * @param specifier The injected specifier.
+ * @returns `true` when the specifier survives the command line unchanged.
+ */
+function isTypeableSpecifier(specifier: string): boolean {
+  return specifier.length > 0 && !/[\s"$`\\]/u.test(specifier) && !hasControlCharacter(specifier);
+}
+
+/**
+ * A directory as one POSIX shell word: as it is when every character is inert
+ * in a shell, otherwise single-quoted with each embedded quote closed, escaped
+ * and reopened (`'\''`), so `cd` receives the path byte for byte.
  *
- * 1. The full sentences: the editor command and what it does, the hand-typed
- *    command, and the environment variable names the editor command sets.
- * 2. The compact form: the editor command's label, the variable names and the
- *    exact command, with the explanatory prose gone.
- * 3. The compact form without the root, telling the developer to run the
- *    command from the project root. Only a root too long for the second form to
- *    fit — a deeply nested checkout — reaches it.
- * 4. The second and third forms without the variable names, for a variable
- *    list so long that it alone would push the command out.
- * 5. The editor command with the variable names and no command at all, for a
- *    specifier or dev command so long that no spelling of the command fits.
- *    A missing command sends the developer to the editor command, which needs
- *    none; a truncated one would run.
- * 6. The editor command alone, built only from this module's own words.
+ * @param path The directory.
+ * @returns The path, safe to follow `cd `.
+ */
+function shellWord(path: string): string {
+  return /^[\w@%+=:,./-]+$/u.test(path) ? path : `'${path.replaceAll("'", `'\\''`)}'`;
+}
+
+/** The two spellings of a hand-typed relaunch: naming the project root, and relative to it. */
+interface HandTypedRelaunch {
+  /** The instruction with the root as the command's directory. */
+  readonly rooted: string;
+
+  /** The same instruction, told to run from the project root. */
+  readonly rootless: string;
+}
+
+/**
+ * The hand-typed relaunch a caller's descriptor makes exact, or `undefined`
+ * when it does not make one exact.
+ *
+ * Composed only from what was injected, or read from the project summary as
+ * data — never from the environment:
+ *
+ * - the preload from {@link NextJsAdapterRelaunchDescriptor.preloadSpecifier},
+ *   which must be present and typeable ({@link isTypeableSpecifier}); the
+ *   published {@link DEBUGGEN_NODE_PRELOAD_SPECIFIER} is never substituted,
+ *   because a target project cannot resolve it;
+ * - one `NAME="$NAME"` reference per
+ *   {@link NextJsAdapterRelaunchDescriptor.envVarNames} entry, in front of the
+ *   preload, so the line hands the preload the ingest URL and credential the
+ *   developer exported — the instruction says to export them first. A name
+ *   that is not a shell variable name makes the whole command unavailable
+ *   rather than one variable short;
+ * - the dev command from {@link NextJsAdapterRelaunchDescriptor.devCommand},
+ *   or the package manager's run prefix and the conventional dev script. With
+ *   neither, the instruction is the assignments to put in front of whatever
+ *   command the developer uses.
+ *
+ * A spelling that ends in a command ends *without* punctuation, so a developer
+ * who selects to the end of the line copies nothing the shell would read.
+ *
+ * @param context The session's context, for the project root and the summary.
+ * @param relaunch The injected descriptor.
+ * @param names The injected variable names, de-duplicated and sorted.
+ * @returns Both spellings, or `undefined` when no exact command can be composed.
+ */
+function handTypedRelaunch(
+  context: InstrumentationContext,
+  relaunch: NextJsAdapterRelaunchDescriptor,
+  names: readonly string[],
+): HandTypedRelaunch | undefined {
+  const specifier = relaunch.preloadSpecifier?.trim();
+
+  if (specifier === undefined || !isTypeableSpecifier(specifier)) {
+    return undefined;
+  }
+
+  if (!names.every((name) => SHELL_VARIABLE_NAME_PATTERN.test(name))) {
+    return undefined;
+  }
+
+  const injectedCommand = relaunch.devCommand?.trim();
+  const prefix = RUN_SCRIPT_PREFIXES[context.projectSummary.packageManager];
+  const devCommand =
+    injectedCommand !== undefined && injectedCommand !== ''
+      ? injectedCommand
+      : prefix === undefined
+        ? undefined
+        : `${prefix} ${DEV_SCRIPT_NAME}`;
+  const assignments = [
+    ...names.map((name) => `${name}="$${name}"`),
+    `NODE_OPTIONS="--import ${specifier}"`,
+  ].join(' ');
+  const byHand = names.length === 0 ? 'By hand' : `By hand, with ${names.join(', ')} exported`;
+  const root = context.projectRoot;
+
+  if (devCommand === undefined) {
+    return {
+      rooted: `${byHand}, start the dev server from ${root} with ${assignments} in front of its command.`,
+      rootless: `${byHand}, start the dev server from the project root with ${assignments} in front of its command.`,
+    };
+  }
+
+  return {
+    rooted: `${byHand}: cd ${shellWord(root)} && ${assignments} ${devCommand}`,
+    rootless: `${byHand}, from the project root: ${assignments} ${devCommand}`,
+  };
+}
+
+/**
+ * The relaunch instruction for a project whose dev server carries no preload,
+ * as one line within {@link READINESS_HINT_MAX_LENGTH}.
+ *
+ * **By default — no {@link NextJsAdapterRelaunchDescriptor.preloadSpecifier}
+ * injected, which is how `../registry.ts` builds this adapter — the hint is the
+ * editor command alone**: "Run "Debug Generator: Launch Dev Server" in VS Code
+ * for ‹root›, which starts this project's dev server with the preload and a
+ * fresh ingest credential." That command is exact — the service launches the
+ * dev server with its own preload path and a freshly minted credential (AAP
+ * §0.5.6) — while any shell line this adapter could compose unaided would name
+ * a preload the target cannot resolve and set no credential, which is the
+ * defect this composition exists to avoid. The service replaces this text with
+ * its own exact command wherever its dev-server detection has one
+ * (`apps/local-service/src/dev-server/detect.ts`), so this is the fallback.
+ *
+ * With a typeable specifier injected, the editor command still leads — it needs
+ * no shell and no credential of its own — and {@link handTypedRelaunch} follows
+ * it. Everything but this module's own words is injected and unbounded, so the
+ * line is fitted by {@link firstFitting}, never by cutting; the spellings, most
+ * complete first:
+ *
+ * 1. The editor sentence, then the hand-typed command naming the root.
+ * 2. The editor label alone, then that command.
+ * 3. and 4. The same two with the command relative to the project root, for a
+ *    root too long to fit — a deeply nested checkout.
+ * 5. The editor sentence naming the root, with the variable names it sets, for
+ *    a specifier, dev command or variable list so long that no spelling of the
+ *    command fits. A missing command sends the developer to the editor command,
+ *    which needs none; a truncated one, or one missing a variable, would run.
+ * 6. The same without the variable names, when they alone do not fit.
+ * 7. The same without the root but with the variable names.
+ * 8. The editor sentence alone, built only from this module's own words.
+ *
+ * The project root is named at most **once**: inside the command when there is
+ * one, since that is where it is actionable, and otherwise after the editor
+ * command. Nothing is read from the environment.
  *
  * @param context The session's context, for the project root and the summary.
  * @param options The resolved options, for the injected descriptor.
- * @returns A single line within the hint bound, carrying the exact command
- * whenever any spelling of it fits and naming the project root whenever the
- * command still fits with it.
+ * @returns A single, never-truncated line within the hint bound, naming the
+ * project root whenever a spelling carrying it fits.
  */
 function relaunchHint(context: InstrumentationContext, options: ResolvedOptions): string {
   const root = context.projectRoot;
-  const specifier = options.relaunch.preloadSpecifier ?? DEBUGGEN_NODE_PRELOAD_SPECIFIER;
-  const prefix = RUN_SCRIPT_PREFIXES[context.projectSummary.packageManager];
-  const devCommand =
-    options.relaunch.devCommand ??
-    (prefix === undefined ? undefined : `${prefix} ${DEV_SCRIPT_NAME}`);
-  const variables = [...(options.relaunch.envVarNames ?? [])].sort().join(', ');
-  const preload = `NODE_OPTIONS="--import ${specifier}"`;
-  const editor = `Run "${LAUNCH_COMMAND_LABEL}"`;
-
-  // The editor command first, because it is the recovery path that needs no
-  // shell and no credentials of its own, and the hand-typed form second — in
-  // full where the project's own dev command is known, and otherwise as the one
-  // fragment that has to be added to whatever command the developer uses.
-  const full = [
-    `${editor}, which starts this project's dev server with the preload and the ingest credentials already set.`,
-    devCommand === undefined
-      ? `To do it by hand, start it from ${root} with ${preload}.`
-      : `To do it by hand: cd ${root} && ${preload} ${devCommand}.`,
-    variables === '' ? '' : `The editor command also sets ${variables} for you.`,
-  ].join(' ');
-
-  // The hand-typed tail of a compact spelling, with the root or without it.
-  const rooted =
-    devCommand === undefined
-      ? `, start the dev server from ${root} with ${preload}`
-      : `: cd ${root} && ${preload} ${devCommand}`;
-  const rootless =
-    devCommand === undefined
-      ? `, start the dev server from the project root with ${preload}`
-      : `, from the project root: ${preload} ${devCommand}`;
+  const names = [...new Set(options.relaunch.envVarNames ?? [])].sort();
+  const variables = names.join(', ');
+  const editor = `Run "${LAUNCH_COMMAND_LABEL}" in VS Code`;
+  const effect =
+    "which starts this project's dev server with the preload and a fresh ingest credential";
   const sets = variables === '' ? '' : ` (it sets ${variables} for you)`;
-  const compact = (variableClause: string, byHand: string): string =>
-    `${editor}${variableClause} or, by hand${byHand}.`;
+
+  // The editor-only spellings: the whole ladder by default, and the tail of the
+  // ladder when a hand-typed command is on offer but too long to fit.
+  const editorOnly = [
+    `${editor} for ${root}, ${effect}${sets}.`,
+    ...(sets === '' ? [] : [`${editor} for ${root}, ${effect}.`, `${editor}, ${effect}${sets}.`]),
+  ];
+  const fallback = `${editor}, ${effect}.`;
+  const byHand = handTypedRelaunch(context, options.relaunch, names);
+
+  if (byHand === undefined) {
+    return firstFitting(editorOnly, fallback, READINESS_HINT_MAX_LENGTH);
+  }
 
   return firstFitting(
     [
-      full,
-      compact(sets, rooted),
-      compact(sets, rootless),
-      compact('', rooted),
-      compact('', rootless),
-      ...(variables === '' ? [] : [`${editor} for this project; it sets ${variables} for you.`]),
+      `${editor}, ${effect}. ${byHand.rooted}`,
+      `${editor}. ${byHand.rooted}`,
+      `${editor}, ${effect}. ${byHand.rootless}`,
+      `${editor}. ${byHand.rootless}`,
+      ...editorOnly,
     ],
-    `${editor} for this project.`,
+    fallback,
     READINESS_HINT_MAX_LENGTH,
   );
 }
@@ -865,7 +1052,8 @@ function reasonFor(signal: CaptureSignal, verdict: PreloadVerdict): string {
  * What the developer can do about a missing or silent preload.
  *
  * A missing preload gets {@link relaunchHint}. A silent one gets the restart
- * instruction, which names the project root when it fits the hint bound and
+ * instruction through the same editor command, named exactly as the VS Code
+ * palette shows it; it names the project root when it fits the hint bound and
  * otherwise says "this project" — the sentence degrades by losing the root,
  * never by being cut.
  *
@@ -886,9 +1074,9 @@ function hintFor(
 
   return firstFitting(
     [
-      `Restart the dev server for ${context.projectRoot} with "${LAUNCH_COMMAND_LABEL}" so its preload reconnects.`,
+      `Restart the dev server for ${context.projectRoot} with "${LAUNCH_COMMAND_LABEL}" in VS Code so its preload reconnects.`,
     ],
-    `Restart this project's dev server with "${LAUNCH_COMMAND_LABEL}" so its preload reconnects.`,
+    `Restart this project's dev server with "${LAUNCH_COMMAND_LABEL}" in VS Code so its preload reconnects.`,
     READINESS_HINT_MAX_LENGTH,
   );
 }

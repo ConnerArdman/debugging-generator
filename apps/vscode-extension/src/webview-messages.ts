@@ -127,6 +127,7 @@
 
 import {
   CONNECTION_STATES,
+  MAX_QUESTION_LENGTH,
   PROGRESS_STATUSES,
   analysisResultSchema,
   relevantFileSchema,
@@ -477,17 +478,52 @@ export type HostToWebviewMessageOf<K extends HostToWebviewMessageType> = Extract
 // ---------------------------------------------------------------------------
 
 /**
- * The longest `question` an `askQuestion` or `askFollowUp` frame may carry:
- * **16 384** UTF-16 code units.
+ * The longest `question` an `askQuestion` or `askFollowUp` frame may carry, in
+ * UTF-16 code units: `@debuggen/protocol`'s `MAX_QUESTION_LENGTH` (2 000), the
+ * product's one question limit, bound here rather than restated (AAP §0.2.3).
  *
- * A transport bound, not the product rule. It sits deliberately above the
- * service's own 2 000-character question limit, so an over-long question still
- * reaches the service and is refused there with the service's precise message
- * and hint, while a frame the webview could never legitimately produce — a
- * megabyte pasted into a message, or a question field that is not text at all —
- * is refused here before the host acts on it.
+ * One number serves every layer a question crosses, so none of them can accept
+ * what the next refuses:
+ *
+ * - the question and follow-up text areas (`webview/components/QuestionForm`
+ *   and `FollowUp`) set it as their native `maxLength`, so the browser stops
+ *   typing and truncates a paste at it, and count the draft against it;
+ * - `webview/App.tsx` checks every question with {@link isSubmittableQuestion}
+ *   before posting it, so a frame this contract refuses is never sent — the
+ *   host answers such a frame with a notice and no `actionResult`, which would
+ *   leave the form waiting for the safety timeout;
+ * - the host's {@link parseWebviewToHostMessage} refuses a longer frame;
+ * - the service's `session.create` and `session.question` bodies embed the
+ *   protocol's `questionSchema`, which applies the same bound.
  */
-export const MAX_WEBVIEW_QUESTION_LENGTH = 16_384;
+export const MAX_WEBVIEW_QUESTION_LENGTH = MAX_QUESTION_LENGTH;
+
+/**
+ * Whether a question, exactly as typed, is one the host will forward: it
+ * carries at least one non-whitespace character and is at most
+ * {@link MAX_WEBVIEW_QUESTION_LENGTH} code units long.
+ *
+ * The one predicate both halves apply — the host's parser to every
+ * `askQuestion` / `askFollowUp` frame, and `webview/App.tsx` before it posts
+ * one — so the view never sends a question the host would refuse. Length checks
+ * only: the question is data and is never searched, matched or compared with a
+ * literal (AAP §0.5.4). Control characters are the service's to refuse
+ * (`questionSchema`), which it does with a readable 400 that the host reports
+ * as the request's failure.
+ *
+ * @param value The question as typed, untrimmed.
+ * @returns `true` when the question is non-blank and within the limit.
+ *
+ * @example
+ * ```ts
+ * isSubmittableQuestion('Why is this slow?'); // true
+ * isSubmittableQuestion(' \n\t '); // false: blank
+ * isSubmittableQuestion('q'.repeat(MAX_WEBVIEW_QUESTION_LENGTH + 1)); // false: too long
+ * ```
+ */
+export function isSubmittableQuestion(value: string): boolean {
+  return value.length <= MAX_WEBVIEW_QUESTION_LENGTH && value.trim().length > 0;
+}
 
 /**
  * The longest `stage` a `retryStage` frame may carry: **128** characters.
@@ -541,8 +577,10 @@ interface WebviewToHostPayloads {
    */
   ready: NoPayload;
   /**
-   * Starts a session with the developer's question, as typed: not blank, at
-   * most {@link MAX_WEBVIEW_QUESTION_LENGTH} code units, forwarded untrimmed.
+   * Starts a session with the developer's question, as typed: a value
+   * {@link isSubmittableQuestion} accepts — not blank, at most
+   * {@link MAX_WEBVIEW_QUESTION_LENGTH} (the protocol's `MAX_QUESTION_LENGTH`)
+   * code units — forwarded untrimmed.
    */
   askQuestion: RequestPayload & { question: string };
   /** Asks a follow-up question on the active session, under the same rule as `askQuestion`. */
@@ -804,10 +842,12 @@ export function parseHostToWebviewMessage(
  * as a {@link WebviewToHostMessage}, validating the whole frame: `ready` must be
  * exactly `{ type }`, every request must carry a `requestId` of 1 to
  * {@link MAX_WEBVIEW_REQUEST_ID_LENGTH} characters from `[A-Za-z0-9_-]` and no
- * key beyond its own fields, a question must be non-blank text of at most
- * {@link MAX_WEBVIEW_QUESTION_LENGTH} code units, an `openFile` location must
- * pass the shared `SourceLocation` schema, and a retried stage must be a name
- * of 1 to {@link MAX_RETRY_STAGE_LENGTH} characters. Never throws.
+ * key beyond its own fields, a question must be text that
+ * {@link isSubmittableQuestion} accepts (non-blank, at most
+ * {@link MAX_WEBVIEW_QUESTION_LENGTH} code units, the protocol's own question
+ * limit), an `openFile` location must pass the shared `SourceLocation` schema,
+ * and a retried stage must be a name of 1 to {@link MAX_RETRY_STAGE_LENGTH}
+ * characters. Never throws.
  *
  * Shape validation is not authorization: the host still resolves an `openFile`
  * location against the session's project root before opening anything, and
@@ -1119,13 +1159,12 @@ function checkPositiveInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 ? value : undefined;
 }
 
-/** A question as typed: not blank, at most {@link MAX_WEBVIEW_QUESTION_LENGTH} code units. */
+/**
+ * A question as typed, forwarded untrimmed: text that {@link isSubmittableQuestion}
+ * accepts — not blank, at most {@link MAX_WEBVIEW_QUESTION_LENGTH} code units.
+ */
 function checkQuestion(value: unknown): string | undefined {
-  return typeof value === 'string' &&
-    value.length <= MAX_WEBVIEW_QUESTION_LENGTH &&
-    value.trim().length > 0
-    ? value
-    : undefined;
+  return typeof value === 'string' && isSubmittableQuestion(value) ? value : undefined;
 }
 
 /** A stage name of 1 to {@link MAX_RETRY_STAGE_LENGTH} characters. */

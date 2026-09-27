@@ -39,14 +39,14 @@
  * `src/service/process.ts` names a developer-chosen restart as the remedy for
  * both: a child of this window that answered before but has stopped answering
  * (its failure hint points back at this command), and a child started with a
- * `debuggen.serviceUrl` or `debuggen.provider` value that has changed since
- * (`ServiceStatus.settingsChanged`). In exactly those cases the notice offers a
- * "Restart service" action. Choosing it calls {@link ServiceProcess.restart}
- * once — after a modal confirmation when a session is live, because the
- * restarted service reconciles every modification record on start, which
- * restores the instrumented files and so removes that session's instrumentation
- * (AAP §0.5.1) — and the restart's own outcome is reported without offering a
- * further restart, so the flow is bounded.
+ * `debuggen.serviceUrl`, `debuggen.provider` or `debuggen.model` value that has
+ * changed since (`ServiceStatus.settingsChanged`). In exactly those cases the
+ * notice offers a "Restart service" action. Choosing it calls
+ * {@link ServiceProcess.restart} once — after a modal confirmation when a
+ * session is live, because the restarted service reconciles every modification
+ * record on start, which restores the instrumented files and so removes that
+ * session's instrumentation (AAP §0.5.1) — and the restart's own outcome is
+ * reported without offering a further restart, so the flow is bounded.
  *
  * ## The restart is also the refused-credential remedy
  *
@@ -117,7 +117,7 @@ const RESTART_FAILED_PREFIX = 'Could not restart the Debug Generator service';
 
 /** Why a running service is offered a restart after a successful start request. */
 const SETTINGS_CHANGED_DETAIL =
-  'A setting it was started with (debuggen.serviceUrl or debuggen.provider) has changed since; restart the service to apply it.';
+  'A setting it was started with (debuggen.serviceUrl, debuggen.provider or debuggen.model) has changed since; restart the service to apply it.';
 
 /**
  * The confirmation shown before a restart while a session is live (see

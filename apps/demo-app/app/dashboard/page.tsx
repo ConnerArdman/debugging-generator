@@ -65,7 +65,9 @@
  * stock lines together with the products naming them, and the most urgent lines at or below their
  * reorder point. The page composes exactly that and invents nothing: `page` and `pageSize` in the
  * address window the stock table, which is the surface that carries a pager, while the low-stock
- * list is the lines worth acting on today and reports its own total through the figure row.
+ * list is the lines worth acting on today, and its total - the payload's own count, printed in the
+ * figure row and, whenever the list holds only the most urgent of those lines, under its heading -
+ * is never the length of the list.
  *
  * NO CLOCK, NO CACHE
  * `formatTimeAgoLabel` takes its reference instant as an argument so that a server render and the
@@ -107,11 +109,21 @@ import {
 /** The page's heading, and the title the root layout's template suffixes. */
 const PAGE_TITLE = 'Inventory';
 
-/** The sentence under the heading: what the page shows, and how current it is. */
+/**
+ * The sentence under the heading: what the page shows, in the order it shows it, and how current
+ * it is.
+ *
+ * Each order it names is the order that part of the page really has. The stock table is listed by
+ * category and then by product, because it renders a grouping row per category and its pages hold
+ * still as stock moves; ranking by urgency is the low-stock list's job, and the sentence sends the
+ * reader there by that list's own heading rather than by where it sits, since the two columns
+ * stack on a narrow screen.
+ */
 const PAGE_LEDE =
-  'Stock held across every location this network ships from, with the lines closest to their ' +
-  'reorder point listed first. The figures are read from the warehouse records for each visit, ' +
-  'so a reload answers with the position as it stands.';
+  'Stock held across every location this network ships from, listed by category and then by ' +
+  'product, with the lines at or near their reorder point ranked most urgent first in the Low ' +
+  'stock list. The figures are read from the warehouse records for each visit, so a reload ' +
+  'answers with the position as it stands.';
 
 /**
  * The ancestry the trail prints. Two entries, which is the minimum
@@ -505,7 +517,15 @@ async function DashboardData({
           </div>
 
           <div className="ls-split-side">
-            <LowStockList rows={summary.lowStock} threshold={query.threshold} />
+            {/*
+              The most urgent lines, with the number the filters matched in full, so the list
+              can say when it is showing only the top of a longer one.
+            */}
+            <LowStockList
+              rows={summary.lowStock}
+              threshold={query.threshold}
+              total={summary.lowStockCount}
+            />
           </div>
         </div>
       </WarehouseFilter>

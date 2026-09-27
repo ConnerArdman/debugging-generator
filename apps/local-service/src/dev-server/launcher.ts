@@ -131,7 +131,10 @@
  * ## Launch, readiness and shutdown
  *
  * {@link DevServerLauncher.launch} validates the project root, reuses a child
- * it launched for the project, and otherwise asks `./detect.js` whether a dev
+ * it launched for the project — after judging the request's command by the
+ * same policy a fresh launch applies, so a command a fresh launch refuses is
+ * refused on reuse, on joining a launch in flight and beside a preloaded
+ * server detection found too — and otherwise asks `./detect.js` whether a dev
  * server already answers at the requested address — one it did not launch is
  * refused with the exact relaunch command rather than a second server fighting
  * for its port, because the preload is attributed only to its own children
@@ -143,7 +146,9 @@
  * {@link DEV_SERVER_COMMAND_ENV_ALLOWLIST}, and what it runs against
  * {@link checkLaunchCommand} — a package-manager run of one of the project's
  * dev-server scripts (a `package.json` script that runs `next dev`), `next
- * dev`, or the service's own Node running the project's
+ * dev` (resolved, as a package-manager script would resolve it, through the
+ * project's trusted `node_modules/.bin` directories put first on the child's
+ * `PATH` — {@link projectBinDirectories}), or the service's own Node running the project's
  * `node_modules/next/dist/bin/next dev`, each with only the Next.js dev
  * options {@link DEV_SERVER_ARGUMENT_ALLOWLIST} lists and no positional
  * argument, from `NODE_PATH` directories the service's user alone can write,
@@ -183,11 +188,17 @@
  *    requested URL, when the caller supplied one, is tried after the
  *    candidates.
  * 2. **Probe.** Each verification round probes every current candidate (and
- *    the requested URL) concurrently, with a readiness probe timeout long
- *    enough for a cold `next dev` compiling its first request. A new
- *    candidate starts a round at once; otherwise rounds repeat every poll
- *    interval.
- * 3. **Ownership.** An answer (any HTTP status) is ready only when the
+ *    the requested URL) concurrently, two ways at once: an HTTP `GET` and a
+ *    bare TCP connection ({@link DevServerLauncherDeps.acceptProbe}). A target
+ *    answers with whichever comes first — any HTTP status, or a connection
+ *    accepted and still held open after {@link DEFAULT_READY_ACCEPT_HOLD_MS}
+ *    — so a cold `next dev` that listens but is still compiling the route the
+ *    `GET` asked for answers within the hold instead of timing out every
+ *    probe until its compile ends, while one that listens and then fails to
+ *    load its config drops the held connection and never answers. Each probe
+ *    is bounded by the readiness probe timeout. A new candidate starts a round at once;
+ *    otherwise rounds repeat every poll interval.
+ * 3. **Ownership.** An answer (either kind) is ready only when the
  *    operating system shows that **every** TCP listener on the answering
  *    port is held by the launched child or a process descended from it
  *    ({@link ListenerOwnership}, bounded by the readiness probe timeout):
@@ -202,7 +213,10 @@
  * stopped; a timeout during which an address answered but was never shown to
  * be the child's own is reported as `ready-unverified` — with `ownership:
  * "other-process"` when another process held the port, `"unknown"` when the
- * lookup could not tell — distinct from `ready-timeout`.
+ * lookup could not tell — distinct from `ready-timeout`, which says which of
+ * two things failed (`details.probed`): the child never announced an address
+ * and the session named none, or the addresses probed never accepted a
+ * connection.
  * Every failure is a typed `Err` with a developer-facing hint (AAP §0.5.5);
  * none leaves an orphan child, a pending timer or a live credential behind.
  * `stop` sends `SIGTERM` to the child's process group (a real POSIX spawn
@@ -244,17 +258,14 @@
  * A launch for a session that has already ended is refused, because its child
  * would have no owner left to stop it.
  *
- * ## Child output: digested, never kept (CWE-532)
+ * ## Child output: digested, and a redacted tail for a failed start (CWE-532)
  *
  * A developer's dev server prints whatever its code and dependencies print:
  * source code frames, SQL with its literals, URLs with query values, props,
- * an echoed environment. None of that is this service's to keep, so **no line
- * of child output is ever logged (at any level), retained, or returned** — not
- * in a log record, an error message, hint or `details`, nor a
- * {@link LaunchedDevServer} record. Each line is read once, with terminal
- * control sequences stripped, for exactly three things — the first two kept
- * in the child's {@link DevServerOutputSummary}, the third on the child's
- * readiness state:
+ * an echoed environment. Output is never relayed line by line, never kept for
+ * a child that became ready, and **never returned** — not in an error
+ * message, hint or `details`, a response, nor a {@link LaunchedDevServer}
+ * record. Each line is read, with terminal control sequences stripped, for:
  *
  * - a line count per stream, and how many lines exceeded the inspected length;
  * - the closed set of {@link DevServerOutputDiagnostic} ids its fixed patterns
@@ -262,15 +273,23 @@
  *   a missing command, a permission error, a build error, running out of
  *   memory;
  * - the loopback addresses announced after a serving-address label — the
- *   readiness candidates, bounded and kept only as `origin/`.
+ *   readiness candidates, bounded and kept only as `origin/`;
+ * - while the child is starting, its {@link OutputTail}: the last
+ *   {@link MAX_OUTPUT_TAIL_LINES} non-blank lines, the child's own credential
+ *   removed as each arrives. The tail is discarded at readiness.
  *
- * Startup failures turn the ids into fixed sentences and point the developer
- * at the dev script in a terminal for the full output; their `details.output`
- * and the ready, exited-before-ready, timeout, unverified and spawn-failure
- * log records carry the counts and ids alone, plus — for the timeout and
- * unverified cases — the candidates' count or loopback origins and the
- * ownership verdict, never text. The ownership lookups' own output is parsed
- * for process ids and dropped the same way: never logged, kept or returned.
+ * A start that fails — exited before ready, never ready, answered but
+ * unverified, could not be spawned — logs its `warn` record with the counts,
+ * ids and verdicts **and the tail as `outputTail`, redacted line by line**
+ * (a sensitive `NAME=value` loses its value, e-mail addresses go, and
+ * `../logging.ts`'s `redactDiagnosticText` removes credential-shaped text and
+ * source codeframes, masks URL query values and parameterises SQL literals;
+ * each line is cut to {@link MAX_OUTPUT_TAIL_LINE_LENGTH} characters), so the
+ * developer can read why in the service log. The error's hint says only that
+ * the redacted last lines are there, and points at the dev script in a
+ * terminal for the full output; `details.output` carries the counts and ids
+ * alone. The ownership lookups' own output is parsed for process ids and
+ * dropped: never logged, kept or returned.
  *
  * A child is reported stopped only once its exit has been observed. One still
  * running when its termination has run to the end — a refused or undelivered
@@ -337,11 +356,14 @@ import {
   type Result,
 } from '@debuggen/shared';
 import { sha256Hex } from '@debuggen/shared/node';
+import { REDACTION_MARKER, isSensitiveKeyName } from '@debuggen/telemetry';
 
 import type { ServiceConfig } from '../config.js';
 import {
+  SERVICE_DATABASE_URL_KEY_NAMES,
   describeException,
   guardLogger,
+  redactDiagnosticText,
   subsystemLogger,
   type ExceptionClass,
   type ExceptionDescription,
@@ -349,10 +371,12 @@ import {
 import {
   FRAMEWORK_DEV_CLIS,
   PRELOAD_DEPENDENT_SIGNALS,
+  acceptDevServerConnection,
   buildRelaunchHint,
   detectDevServer,
   packageManagerRunArgs,
   probeDevServer,
+  type DevServerAcceptResult,
   type DevServerDetectDeps,
   type DevServerDetection,
   type ServerAgentPresence,
@@ -400,6 +424,21 @@ export const DEFAULT_READY_POLL_INTERVAL_MS = 250;
  * clamped to it), so one probe can never outlast the whole wait.
  */
 export const DEFAULT_READY_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * How long a readiness candidate's accepted TCP connection is held open before
+ * it counts as an answer, in milliseconds (`holdMs` of
+ * {@link acceptDevServerConnection}).
+ *
+ * A listening socket alone does not prove a dev server started: Next.js 16
+ * binds its port and prints "Ready" before it loads `next.config`, so a config
+ * that throws exits the child moments later, dropping every connection it had
+ * accepted. A server compiling its first route holds them. Holding the probe's
+ * connection this long tells the two apart without waiting for the compile,
+ * and an HTTP answer arriving sooner still wins at once. Never longer than the
+ * ready timeout (clamped to it).
+ */
+export const DEFAULT_READY_ACCEPT_HOLD_MS = 1_500;
 
 /**
  * The most readiness candidates one launch keeps: distinct loopback origins
@@ -545,6 +584,63 @@ const MAX_PENDING_LINE_LENGTH = 8 * 1024;
  * pointed at the one place it is visible in full.
  */
 const FULL_OUTPUT_SENTENCE = 'Run the dev script in a terminal to read its full output.';
+
+/**
+ * The sentence of a startup failure's hint, before {@link FULL_OUTPUT_SENTENCE},
+ * whenever the child printed anything: the redacted {@link OutputTail} is in the
+ * warning the launcher logged for that failure, which a developer reads in the
+ * service's output channel in VS Code. The hint itself never quotes it.
+ */
+const OUTPUT_TAIL_SENTENCE =
+  'The last lines it printed, redacted, are in the Debug Generator service log (the "Debug Generator Service" output in VS Code).';
+
+/**
+ * How many of a starting child's last non-blank output lines the launcher keeps
+ * for the warning a failed start logs ({@link OutputTail}). Twenty lines hold a
+ * framework's banner and the error that stopped it without turning one record
+ * into a transcript.
+ */
+export const MAX_OUTPUT_TAIL_LINES = 20;
+
+/**
+ * The longest one logged output-tail line may be, in characters, after
+ * redaction; a longer one is cut and ends with an ellipsis. Enough for an
+ * error message and its file position, not for a minified bundle line.
+ */
+export const MAX_OUTPUT_TAIL_LINE_LENGTH = 400;
+
+/** The prefix a logged output-tail line carries when the child wrote it to stderr. */
+const STDERR_TAIL_PREFIX = '[stderr] ';
+
+/**
+ * A `NAME=value` or `NAME: value` pair inside an output line — how a dev
+ * server, a dependency or a shell echoes a variable. The value runs to the
+ * next whitespace, or is one quoted string. Linear: no nested quantifier.
+ */
+const NAMED_VALUE_PATTERN =
+  /\b([A-Za-z_][A-Za-z0-9_.-]{0,127})(\s{0,4}[=:]\s{0,4})("[^"]*"|'[^']*'|\S+)/g;
+
+/**
+ * An e-mail address inside an output line. Removed from the output tail: an
+ * address is personal data, and no redaction rule of the diagnostic text
+ * recognises one outside a URL query. The top-level label must be letters, so
+ * a package specifier such as `next@16.3.6` is not an address.
+ */
+const EMAIL_ADDRESS_PATTERN =
+  /[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b/g;
+
+/** {@link SERVICE_DATABASE_URL_KEY_NAMES} as a set of names, for the output tail's pair masking. */
+const DATABASE_URL_KEY_NAMES: ReadonlySet<string> = new Set<string>(SERVICE_DATABASE_URL_KEY_NAMES);
+
+/** Where Node, npm, pnpm, Yarn and Bun look for a project's own executables. */
+const NODE_MODULES_BIN_SEGMENTS: readonly string[] = Object.freeze(['node_modules', '.bin']);
+
+/**
+ * How many directories {@link projectBinDirectories} walks up from a project
+ * root, the root included. Deeper than any real checkout; it bounds the walk
+ * on a pathological path.
+ */
+const MAX_BIN_DIRECTORY_DEPTH = 64;
 
 /**
  * A loopback URL a dev server prints — `http://localhost:3000`,
@@ -1577,6 +1673,107 @@ function isAbsolutePath(value: string): boolean {
     return false;
   }
   return isNativeAbsolute(value) || isAbsolutePosix(toPosix(value)) || isWindowsAbsolute(value);
+}
+
+/** Options of {@link projectBinDirectories}. */
+export interface ProjectBinDirectoriesOptions {
+  /** Whose path grammar applies. Default: this process's platform. */
+  readonly platform?: NodeJS.Platform | undefined;
+  /**
+   * Whether a `node_modules/.bin` directory may join the child's search path.
+   * Default: {@link isTrustedNodePathDirectory} — an existing directory owned
+   * by the service's user that neither its group nor anyone else can write.
+   */
+  readonly isTrustedDirectory?: ((path: string) => boolean) | undefined;
+}
+
+/**
+ * The `node_modules/.bin` directories a project's own executables resolve
+ * from, nearest first: the project root's, then each ancestor's up to the
+ * filesystem root — the directories npm, pnpm, Yarn and Bun put in front of
+ * `PATH` when they run a package script, so `next dev` launched directly finds
+ * the same `next` a `pnpm run dev` would, including one a workspace hoisted.
+ *
+ * Only directories `options.isTrustedDirectory` accepts are listed: an
+ * ancestor another account can write (a shared `/tmp/node_modules/.bin`) could
+ * hold a planted `next`, and the launcher's trust boundary
+ * ({@link checkLaunchCommand}) is that a request runs only code the service's
+ * own user owns and no one else can change. A missing directory is not listed.
+ * At most {@link MAX_BIN_DIRECTORY_DEPTH} directories are examined, and a
+ * relative root lists nothing.
+ *
+ * @param projectRoot The directory the child runs in, in its native spelling.
+ * @param options The platform and the trust check.
+ * @returns The trusted directories, nearest first; empty when none qualifies.
+ *
+ * @example
+ * ```ts
+ * projectBinDirectories('/home/dev/shop/apps/web');
+ * // → ['/home/dev/shop/apps/web/node_modules/.bin', '/home/dev/shop/node_modules/.bin']
+ * ```
+ */
+export function projectBinDirectories(
+  projectRoot: string,
+  options: ProjectBinDirectoriesOptions = {},
+): readonly string[] {
+  if (typeof projectRoot !== 'string' || !isAbsolutePath(projectRoot)) {
+    return Object.freeze([]);
+  }
+  const paths = (options.platform ?? process.platform) === 'win32' ? win32 : posix;
+  const trusted = options.isTrustedDirectory ?? isTrustedNodePathDirectory;
+  const directories: string[] = [];
+  let current = paths.resolve(projectRoot);
+  for (let depth = 0; depth < MAX_BIN_DIRECTORY_DEPTH; depth += 1) {
+    const candidate = paths.join(current, ...NODE_MODULES_BIN_SEGMENTS);
+    if (answersTrue(() => trusted(candidate))) {
+      directories.push(candidate);
+    }
+    const parent = paths.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return Object.freeze(directories);
+}
+
+/**
+ * A child environment with `directories` put in front of its search path, in
+ * order, each once: an inherited entry equal to one of them is dropped from
+ * where it stood (compared case-insensitively on Windows). The variable keeps
+ * the spelling it already has — on Windows `Path` stays `Path` — and is
+ * created as `PATH` when the environment has none. Pure: `env` is not mutated.
+ *
+ * @param env The environment {@link buildDevServerEnv} built.
+ * @param directories Absolute directories to search first, nearest first.
+ * @param platform Whose delimiter and name folding apply. Default: this process's.
+ * @returns A fresh environment; a copy of `env` when `directories` is empty.
+ *
+ * @example
+ * ```ts
+ * prependSearchPath({ PATH: '/usr/bin' }, ['/home/dev/shop/node_modules/.bin'], 'linux');
+ * // → { PATH: '/home/dev/shop/node_modules/.bin:/usr/bin' }
+ * ```
+ */
+export function prependSearchPath(
+  env: Readonly<Record<string, string>>,
+  directories: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  const result: Record<string, string> = { ...env };
+  if (directories.length === 0) {
+    return result;
+  }
+  const windows = platform === 'win32';
+  const fold = (value: string): string => (windows ? value.toUpperCase() : value);
+  const key = Object.keys(result).find((name) => fold(name) === 'PATH') ?? 'PATH';
+  const prefix = [...new Set(directories)];
+  const prefixed = new Set(prefix.map(fold));
+  const inherited = (result[key] ?? '')
+    .split(windows ? ';' : ':')
+    .filter((entry) => entry.length > 0 && !prefixed.has(fold(entry)));
+  result[key] = [...prefix, ...inherited].join(windows ? ';' : ':');
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -3567,6 +3764,20 @@ export interface DevServerLauncherDeps {
   /** Default: `./detect.ts`'s {@link probeDevServer}. */
   readonly probe?: typeof probeDevServer | undefined;
   /**
+   * The TCP-accept half of readiness: whether a candidate address accepts a
+   * connection and holds it for {@link DevServerLauncherDeps.readyAcceptHoldMs},
+   * which a dev server does as soon as it listens — long before a cold
+   * `next dev` answers the HTTP request that makes it compile its first route
+   * — and one that exits right after binding its port does not. Default:
+   * `./detect.ts`'s {@link acceptDevServerConnection},
+   * but only while neither {@link DevServerLauncherDeps.probe} nor
+   * `detectDeps.fetchImpl` is injected: a caller that substituted the HTTP
+   * transport decides what answers, so no address it scripted is ever dialled
+   * for real behind it. With no accept probe, readiness rests on the HTTP
+   * probe alone.
+   */
+  readonly acceptProbe?: typeof acceptDevServerConnection | undefined;
+  /**
    * Forwarded to detection: fetch, manifest reader… Readiness reuses
    * `fetchImpl` for its probes (see
    * {@link DevServerLauncherDeps.readyProbeTimeoutMs} for their timeout;
@@ -3635,12 +3846,19 @@ export interface DevServerLauncherDeps {
   /** Default {@link DEFAULT_READY_POLL_INTERVAL_MS}. */
   readonly readyPollIntervalMs?: number | undefined;
   /**
-   * How long each readiness probe waits for an HTTP response. Default
+   * How long each readiness probe waits for an HTTP response — and each
+   * accept probe for a connection. Default
    * {@link DEFAULT_READY_PROBE_TIMEOUT_MS}; a non-positive or non-finite
    * value takes the default, and a value above the ready timeout is clamped
    * to it.
    */
   readonly readyProbeTimeoutMs?: number | undefined;
+  /**
+   * How long an accept probe holds a connection before it counts. Default
+   * {@link DEFAULT_READY_ACCEPT_HOLD_MS}; a non-positive or non-finite value
+   * takes the default, and a value above the ready timeout is clamped to it.
+   */
+  readonly readyAcceptHoldMs?: number | undefined;
   /** Default {@link DEFAULT_STOP_GRACE_MS}. */
   readonly stopGraceMs?: number | undefined;
   /** Default {@link DEFAULT_CLI_CREDENTIAL_LEASE_MS}. */
@@ -4333,6 +4551,133 @@ class OutputDigest {
 
 /** The summary of a child that printed nothing — or never ran. */
 const EMPTY_OUTPUT_SUMMARY: DevServerOutputSummary = new OutputDigest().summary();
+
+/** One kept output line of a starting child: which stream, and its text with the credential removed. */
+interface TailLine {
+  readonly stream: 'stdout' | 'stderr';
+  readonly text: string;
+}
+
+/**
+ * The last {@link MAX_OUTPUT_TAIL_LINES} non-blank lines a child printed while
+ * it was **starting** — the evidence of why a start failed, which counts and
+ * diagnostic ids alone cannot give (a dev server that prints an error the
+ * fixed patterns do not know, or answers nothing for a reason only its output
+ * states).
+ *
+ * Bounded in every dimension and short-lived:
+ *
+ * - it keeps at most {@link MAX_OUTPUT_TAIL_LINES} lines of at most
+ *   {@link MAX_OUTPUT_LINE_LENGTH} characters each, the oldest dropped first;
+ * - the child's own credential is removed from each line **as it arrives**, so
+ *   the token is never held in a kept line, whatever the child echoes;
+ * - it records only while the child starts: {@link OutputTail.discard} — at
+ *   readiness, or once a failed start's warning has been logged — drops every
+ *   line and the credential, and nothing is recorded again.
+ *
+ * {@link OutputTail.redactedLines} is the only way out, and it applies
+ * {@link redactOutputTailLine} to every line. A tail is logged with the
+ * warning of a failed start and nowhere else: never in an error's message,
+ * hint or `details`, never in a response, never for a child that became ready.
+ */
+class OutputTail {
+  readonly #lines: TailLine[] = [];
+  #secret: string | undefined;
+  #open = true;
+
+  /** @param secret The child's credential, removed from every line recorded. */
+  constructor(secret: string | undefined) {
+    this.#secret = nonEmpty(secret);
+  }
+
+  /**
+   * Keep one raw output line while the tail is open: control sequences
+   * stripped, the credential removed from the **whole** line (before it is cut
+   * to {@link MAX_OUTPUT_LINE_LENGTH}, so no cut can leave a fragment of it),
+   * and a blank result skipped.
+   */
+  record(stream: 'stdout' | 'stderr', raw: string): void {
+    if (!this.#open) {
+      return;
+    }
+    const secret = this.#secret;
+    const stripped = stripControlSequences(raw);
+    const text = (
+      secret === undefined ? stripped : stripped.split(secret).join(REDACTION_MARKER)
+    ).trimEnd();
+    if (text.trim().length === 0) {
+      return;
+    }
+    this.#lines.push({ stream, text: text.slice(0, MAX_OUTPUT_LINE_LENGTH) });
+    if (this.#lines.length > MAX_OUTPUT_TAIL_LINES) {
+      this.#lines.shift();
+    }
+  }
+
+  /**
+   * The kept lines in the order printed, each redacted by
+   * {@link redactOutputTailLine}, a stderr line prefixed with
+   * {@link STDERR_TAIL_PREFIX}, and a run of lines that each redacted to the
+   * bare marker (a source codeframe) collapsed into one. Empty when nothing
+   * was kept.
+   */
+  redactedLines(): readonly string[] {
+    const rendered: string[] = [];
+    let previousBare = false;
+    for (const line of this.#lines) {
+      const text = redactOutputTailLine(line.text);
+      const bare = text === REDACTION_MARKER;
+      if (bare && previousBare) {
+        continue;
+      }
+      previousBare = bare;
+      rendered.push(line.stream === 'stderr' ? `${STDERR_TAIL_PREFIX}${text}` : text);
+    }
+    return Object.freeze(rendered);
+  }
+
+  /** Drop every kept line and the credential, and stop recording for good. */
+  discard(): void {
+    this.#open = false;
+    this.#lines.length = 0;
+    this.#secret = undefined;
+  }
+}
+
+/**
+ * Redact one output line for the service log, strictest first:
+ *
+ * 1. a `NAME=value` or `NAME: value` pair whose name is sensitive
+ *    (`isSensitiveKeyName`: a token, key, secret or password name) or names a
+ *    database connection ({@link SERVICE_DATABASE_URL_KEY_NAMES}) keeps its
+ *    name and loses its value — an echoed environment;
+ * 2. e-mail addresses are removed;
+ * 3. `../logging.ts`'s {@link redactDiagnosticText} removes credential-shaped
+ *    text, replaces a source codeframe line with the marker, masks URL query
+ *    values and parameterises SQL literals — one line at a time, so a
+ *    statement is never read as continuing into the next line;
+ * 4. the result is cut to {@link MAX_OUTPUT_TAIL_LINE_LENGTH} characters.
+ *
+ * Over-masking is the accepted failure mode: it costs a word of an error
+ * message, never data. Total: nothing throws.
+ *
+ * @param text One control-stripped output line.
+ * @returns The line as it may be logged.
+ */
+function redactOutputTailLine(text: string): string {
+  const withoutNamedSecrets = text.replace(
+    NAMED_VALUE_PATTERN,
+    (pair: string, name: string, separator: string) =>
+      isSensitiveKeyName(name) || DATABASE_URL_KEY_NAMES.has(name)
+        ? `${name}${separator}${REDACTION_MARKER}`
+        : pair,
+  );
+  const withoutAddresses = withoutNamedSecrets.replace(EMAIL_ADDRESS_PATTERN, REDACTION_MARKER);
+  const redacted = redactDiagnosticText(withoutAddresses);
+  return redacted.length > MAX_OUTPUT_TAIL_LINE_LENGTH
+    ? `${redacted.slice(0, MAX_OUTPUT_TAIL_LINE_LENGTH - 1)}\u2026`
+    : redacted;
+}
 
 /**
  * The readiness candidates one normalized output line announces: every
@@ -5555,6 +5900,8 @@ type ReadyOutcome =
       readonly url: string;
       /** The framework signature the ready answer carried, logged for information only. */
       readonly framework?: DevServerFramework | undefined;
+      /** What answered first at the ready address: an HTTP response, or an accepted connection. */
+      readonly answeredBy: ReadyAnswerKind;
     }
   | {
       readonly kind: 'exited';
@@ -5562,7 +5909,15 @@ type ReadyOutcome =
       readonly signal: NodeJS.Signals | null;
     }
   | { readonly kind: 'spawn-error'; readonly errorCode: string | undefined }
-  | { readonly kind: 'timeout' }
+  | {
+      readonly kind: 'timeout';
+      /**
+       * Whether any address was probed at all: `false` when the child never
+       * announced a serving address and the session named none, `true` when
+       * addresses were probed but none answered or accepted a connection.
+       */
+      readonly probed: boolean;
+    }
   | {
       readonly kind: 'unverified';
       /** The `origin/` of every address that answered unconfirmed, in probe order. */
@@ -5728,6 +6083,45 @@ interface ReadyTarget {
 }
 
 /**
+ * What answered at a readiness target: `'http'` — the HTTP probe got a
+ * response (any status); `'accept'` — the address accepted a TCP connection
+ * before any HTTP response arrived, as a dev server compiling its first route
+ * does. Either is only an answer; ownership still decides readiness.
+ */
+type ReadyAnswerKind = 'http' | 'accept';
+
+/**
+ * What one readiness target gave in one round: `refused` — the probe may not
+ * probe it (not loopback), so it is dropped for the rest of the wait;
+ * `silent` — nothing answered this round; `answered` — see
+ * {@link ReadyAnswerKind}, with the URL in its recorded form (a candidate's
+ * `origin/`, else the probe's origin-and-pathname form).
+ */
+type TargetAnswer =
+  | { readonly kind: 'refused' }
+  | { readonly kind: 'silent' }
+  | {
+      readonly kind: 'answered';
+      readonly url: string;
+      readonly by: ReadyAnswerKind;
+      readonly framework?: DevServerFramework | undefined;
+    };
+
+/** The {@link TargetAnswer} of a target nothing answered at this round. */
+const SILENT_ANSWER: TargetAnswer = Object.freeze({ kind: 'silent' });
+
+/** The {@link TargetAnswer} of a target the probes may not probe. */
+const REFUSED_ANSWER: TargetAnswer = Object.freeze({ kind: 'refused' });
+
+/** See {@link ChildState.commandPolicy}. */
+interface ChildCommandPolicy {
+  /** The directory the child's command was judged in and runs in (native spelling). */
+  readonly projectRoot: string;
+  /** Detection's {@link DevServerDetection.devServerScripts} for that directory. */
+  readonly scripts: readonly string[] | undefined;
+}
+
+/**
  * How one termination of a child ended — what every stop path reads, so none
  * of them can report a child as stopped whose exit was never observed.
  *
@@ -5772,8 +6166,21 @@ class ChildState {
    * one is outstanding, even when every owning session has ended.
    */
   readonly holds = new Set<number>();
-  /** Counts and diagnostic ids of the child's output — never its text. */
+  /** Counts and diagnostic ids of the child's output. */
   readonly output = new OutputDigest();
+  /**
+   * The last lines the child printed while starting, credential removed —
+   * logged, redacted, only with the warning of a failed start, and discarded
+   * at readiness (see {@link OutputTail}).
+   */
+  readonly outputTail: OutputTail;
+  /**
+   * What a later launch's `command` is judged against when this child is
+   * reused or joined instead of a new one spawned: the directory this child's
+   * own command was judged in, and the dev-server scripts detection read
+   * there — so a command a fresh launch would refuse is refused on reuse too.
+   */
+  readonly commandPolicy: ChildCommandPolicy;
   readonly lease: CredentialLease;
   readonly exited: Promise<void>;
 
@@ -5839,6 +6246,8 @@ class ChildState {
     readonly sessionId: string | undefined;
     readonly lease: CredentialLease;
     readonly devServerUrl: string | undefined;
+    readonly outputTail: OutputTail;
+    readonly commandPolicy: ChildCommandPolicy;
   }) {
     this.key = init.key;
     this.child = init.child;
@@ -5851,6 +6260,8 @@ class ChildState {
     if (init.sessionId !== undefined) {
       this.sessionIds.add(init.sessionId);
     }
+    this.outputTail = init.outputTail;
+    this.commandPolicy = init.commandPolicy;
     this.lease = init.lease;
     this.devServerUrl = init.devServerUrl;
     this.exited = new Promise<void>((resolve) => {
@@ -5921,6 +6332,11 @@ class ChildState {
 /** Whether a child is ready and serving: neither stopping nor exited. */
 function isServing(state: ChildState): boolean {
   return state.status === 'ready' && !state.hasExited;
+}
+
+/** Whether a later launch for the project may be answered with this child: serving, with a pid and an address. */
+function isReusable(state: ChildState): boolean {
+  return isServing(state) && state.pid !== undefined && state.devServerUrl !== undefined;
 }
 
 /** Whether no session and no pending session creation relies on a child any more. */
@@ -6144,6 +6560,8 @@ interface LauncherSettings {
   readonly pollIntervalMs: number;
   /** Each readiness probe's timeout; never above {@link LauncherSettings.readyTimeoutMs}. */
   readonly readyProbeTimeoutMs: number;
+  /** How long an accept probe holds a connection; never above {@link LauncherSettings.readyTimeoutMs}. */
+  readonly readyAcceptHoldMs: number;
   readonly stopGraceMs: number;
   /** One lease of a {@link DEV_SERVER_CREDENTIAL_PATH} credential. */
   readonly cliCredentialLeaseMs: number;
@@ -6219,6 +6637,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
   readonly #groupInspector: ProcessGroupInspector;
   readonly #detect: typeof detectDevServer;
   readonly #probe: typeof probeDevServer;
+  readonly #accept: typeof acceptDevServerConnection | undefined;
   readonly #ownership: ListenerOwnership;
   readonly #now: () => number;
   readonly #setTimeout: SetTimeoutLike;
@@ -6287,6 +6706,15 @@ class DevServerLauncherImpl implements DevServerLauncher {
         : UNVERIFIABLE_GROUP_INSPECTOR);
     this.#detect = deps.detect ?? detectDevServer;
     this.#probe = deps.probe ?? probeDevServer;
+    // The accept probe dials the same addresses the HTTP probe does. A caller
+    // that injected the HTTP transport (a probe, or detection's fetch) has
+    // scripted what answers, so no address of its script is dialled for real
+    // unless it injects the accept probe too.
+    this.#accept =
+      deps.acceptProbe ??
+      (deps.probe === undefined && deps.detectDeps?.fetchImpl === undefined
+        ? acceptDevServerConnection
+        : undefined);
     this.#ownership =
       deps.listenerOwnership ??
       createListenerOwnership({ platform: this.#platform, env: deps.parentEnv ?? process.env });
@@ -6299,6 +6727,10 @@ class DevServerLauncherImpl implements DevServerLauncher {
       pollIntervalMs: positiveOr(deps.readyPollIntervalMs, DEFAULT_READY_POLL_INTERVAL_MS),
       readyProbeTimeoutMs: Math.min(
         positiveOr(deps.readyProbeTimeoutMs, DEFAULT_READY_PROBE_TIMEOUT_MS),
+        readyTimeoutMs,
+      ),
+      readyAcceptHoldMs: Math.min(
+        positiveOr(deps.readyAcceptHoldMs, DEFAULT_READY_ACCEPT_HOLD_MS),
         readyTimeoutMs,
       ),
       stopGraceMs: positiveOr(deps.stopGraceMs, DEFAULT_STOP_GRACE_MS),
@@ -6361,6 +6793,15 @@ class DevServerLauncherImpl implements DevServerLauncher {
           return err(survivedTerminationError([retried.survivor]));
         }
       }
+      // A command the request names is judged before any reuse: a fresh launch
+      // refuses what the policy refuses, and handing back a running child
+      // instead must not turn that refusal into a success.
+      if (existing !== undefined && isReusable(existing)) {
+        const checked = this.#checkRequestedCommand(request.command, existing.commandPolicy);
+        if (isErr(checked)) {
+          return err(checked.error);
+        }
+      }
       const reused = existing === undefined ? undefined : this.#reusable(existing, sessionId);
       if (reused !== undefined) {
         return ok(reused);
@@ -6372,12 +6813,30 @@ class DevServerLauncherImpl implements DevServerLauncher {
         if (endedMeanwhile()) {
           return err(cancelledError());
         }
-        if (isErr(outcome) || !outcome.value.managed) {
+        if (isErr(outcome)) {
           return outcome;
         }
         const joined = this.#registry.get(root.value.key);
+        const joinedChild =
+          outcome.value.managed && joined?.pid === outcome.value.pid ? joined : undefined;
+        // Judged where the joined launch judged its own command: in its child's
+        // directory, else against the detection it ran.
+        const checked = this.#checkRequestedCommand(
+          request.command,
+          joinedChild?.commandPolicy ?? {
+            projectRoot: root.value.native,
+            scripts: outcome.value.detection?.devServerScripts,
+          },
+        );
+        if (isErr(checked)) {
+          return err(checked.error);
+        }
+        if (!outcome.value.managed) {
+          return outcome;
+        }
         return ok(
-          (joined === undefined ? undefined : this.#reusable(joined, sessionId)) ?? outcome.value,
+          (joinedChild === undefined ? undefined : this.#reusable(joinedChild, sessionId)) ??
+            outcome.value,
         );
       }
 
@@ -6414,7 +6873,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
   #reusable(state: ChildState, sessionId: string | undefined): ManagedDevServerLaunch | undefined {
     const pid = state.pid;
     const devServerUrl = state.devServerUrl;
-    if (!isServing(state) || pid === undefined || devServerUrl === undefined) {
+    if (!isReusable(state) || pid === undefined || devServerUrl === undefined) {
       return undefined;
     }
     if (sessionId !== undefined && state.sessionOwned) {
@@ -6491,6 +6950,15 @@ class DevServerLauncherImpl implements DevServerLauncher {
     );
     if (detection.running) {
       if (detection.preloadAttached) {
+        // Nothing is spawned here, but a command the policy refuses is refused
+        // all the same rather than answered with the running server.
+        const checked = this.#checkRequestedCommand(request.command, {
+          projectRoot: actingDirectory,
+          scripts: detection.devServerScripts,
+        });
+        if (isErr(checked)) {
+          return err(checked.error);
+        }
         const devServerUrl = detection.devServerUrl ?? requestedUrl;
         if (devServerUrl === undefined) {
           return err(
@@ -6610,6 +7078,8 @@ class DevServerLauncherImpl implements DevServerLauncher {
     }
 
     let env: Record<string, string>;
+    /** How many `node_modules/.bin` directories were put in front of the child's `PATH`. */
+    let binDirectoryCount = 0;
     try {
       env = buildDevServerEnv({
         parentEnv: this.#deps.parentEnv ?? process.env,
@@ -6620,6 +7090,18 @@ class DevServerLauncherImpl implements DevServerLauncher {
         preloadPath,
         platform: this.#platform,
       });
+      if (command.value.form === 'framework-cli') {
+        // A bare `next` resolves through the child's PATH, exactly as a
+        // package-manager script would resolve it: the project's own trusted
+        // `node_modules/.bin` directories first, judged in the directory the
+        // child runs in.
+        const binDirectories = projectBinDirectories(actingDirectory, {
+          platform: this.#platform,
+          isTrustedDirectory: this.#deps.isTrustedDevDirectory,
+        });
+        env = prependSearchPath(env, binDirectories, this.#platform);
+        binDirectoryCount = binDirectories.length;
+      }
     } catch (error) {
       await revokeUnused();
       return err(DebuggenError.from(error, 'CONFIG_INVALID'));
@@ -6680,6 +7162,11 @@ class DevServerLauncherImpl implements DevServerLauncher {
       sessionId,
       lease,
       devServerUrl: requestedUrl,
+      outputTail: new OutputTail(token),
+      commandPolicy: Object.freeze({
+        projectRoot: actingDirectory,
+        scripts: detection.devServerScripts,
+      }),
     });
     this.#attach(state);
 
@@ -6689,7 +7176,14 @@ class DevServerLauncherImpl implements DevServerLauncher {
       await this.#releaseCredential(lease);
       const errorCode = outcome.kind === 'spawn-error' ? outcome.errorCode : undefined;
       return err(
-        this.#spawnFailed(root.key, command.value.file, errorCode, state.output.summary()),
+        this.#spawnFailed(
+          root.key,
+          command.value.file,
+          errorCode,
+          state.output.summary(),
+          undefined,
+          this.#takeOutputTail(state),
+        ),
       );
     }
 
@@ -6705,6 +7199,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
       command: state.command,
       ...(state.script === undefined ? {} : { script: state.script }),
       ...(sessionId === undefined ? {} : { sessionId }),
+      ...(command.value.form === 'framework-cli' ? { binDirectories: binDirectoryCount } : {}),
     });
 
     if (this.#isCancelled(ticket)) {
@@ -6720,6 +7215,9 @@ class DevServerLauncherImpl implements DevServerLauncher {
     if (outcome.kind === 'ready' && !state.stopRequested && !state.hasExited) {
       state.status = 'ready';
       state.devServerUrl = outcome.url;
+      // A ready child's output is never kept: the tail existed only to explain
+      // a start that failed.
+      state.outputTail.discard();
       // A ready framework has started its server workers: pin them too.
       this.#pinGroupInBackground(state);
       this.#log('info', 'The launched dev server is ready', {
@@ -6729,6 +7227,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
         // The listener's owner, not a header, identified it; a signature the
         // answer carried is recorded for information only.
         identifiedBy: 'launched-child',
+        answeredBy: outcome.answeredBy,
         ...(outcome.framework === undefined ? {} : { framework: outcome.framework }),
         startupMs: Math.max(0, this.#now() - startedAt),
         output: state.output.summary(),
@@ -6830,11 +7329,15 @@ class DevServerLauncherImpl implements DevServerLauncher {
       : await this.#terminate(state, terminationReasonOf(outcome));
     await this.#releaseCredential(state.lease);
     if (termination.kind === 'survived') {
+      state.outputTail.discard();
       return survivedTerminationError([termination.survivor]);
     }
     this.#forget(state);
 
     const output = state.output.summary();
+    // Taken once, whatever the outcome: a cancelled start logs no warning, and
+    // its lines are dropped with the rest.
+    const tail = this.#takeOutputTail(state);
     if (stopped) {
       return cancelledError();
     }
@@ -6847,19 +7350,28 @@ class DevServerLauncherImpl implements DevServerLauncher {
           pid: state.pid,
           timeoutMs: this.#settings.readyTimeoutMs,
           candidateCount: state.readyCandidates.length,
+          probed: outcome.probed,
           output,
+          ...tailField(tail),
         });
+        // Worded by what actually failed: no address to probe at all, or
+        // addresses that were probed and never accepted a connection.
         return new DebuggenError(
           'DEV_SERVER_UNAVAILABLE',
-          `The dev server did not answer within ${timeoutSeconds} s of starting, so it was stopped.`,
+          outcome.probed
+            ? `The dev server's address did not accept a connection within ${timeoutSeconds} s of starting, so it was stopped.`
+            : `The dev server did not announce a local address within ${timeoutSeconds} s of starting, so it was stopped.`,
           {
             hint: withOutputDigest(
-              'It never announced a local address that answered. If it prints its address late, or at a non-loopback address, set debuggen.devServerUrl to its local address and launch again.',
+              outcome.probed
+                ? 'Nothing accepted a connection at the local address it announced or the session named. If it listens on another port or interface, set debuggen.devServerUrl to its local address and launch again.'
+                : 'It printed no local serving address (such as "Local: http://localhost:3000"), and the session named none. If it prints its address late, or at a non-loopback address, set debuggen.devServerUrl to its local address and launch again.',
               output,
             ),
             details: {
               reason: 'ready-timeout',
               timeoutMs: this.#settings.readyTimeoutMs,
+              probed: outcome.probed,
               ...(firstCandidate === undefined ? {} : { lastSeenUrl: firstCandidate }),
               output: outputDetails(output),
             },
@@ -6877,6 +7389,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
             candidates: [...outcome.origins],
             ownership: outcome.ownership,
             output,
+            ...tailField(tail),
           },
         );
         const where = outcome.announced
@@ -6907,7 +7420,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
         );
       }
       case 'spawn-error':
-        return this.#spawnFailed(state.key, file, outcome.errorCode, output);
+        return this.#spawnFailed(state.key, file, outcome.errorCode, output, undefined, tail);
       case 'exited':
       case 'ready':
         this.#log('warn', 'The launched dev server exited before it was ready', {
@@ -6916,6 +7429,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
           exitCode: state.exitCode,
           signal: state.exitSignal,
           output,
+          ...tailField(tail),
         });
         return new DebuggenError(
           'DEV_SERVER_LAUNCH_FAILED',
@@ -6942,8 +7456,9 @@ class DevServerLauncherImpl implements DevServerLauncher {
 
   /**
    * Log a command that could not be started — the executable's name, the
-   * errno code and the output summary, never an argument or a line — and
-   * describe it as {@link spawnFailedError}.
+   * errno code, the output summary and, when the child printed anything, its
+   * redacted output tail; never an argument — and describe it as
+   * {@link spawnFailedError}.
    */
   #spawnFailed(
     projectRoot: string,
@@ -6951,14 +7466,27 @@ class DevServerLauncherImpl implements DevServerLauncher {
     errorCode: string | undefined,
     output: DevServerOutputSummary,
     cause?: unknown,
+    tail: readonly string[] = [],
   ): DebuggenError {
     this.#log('warn', 'The dev-server command could not be started', {
       projectRoot,
       command: executableName(file),
       errorCode,
       output,
+      ...tailField(tail),
     });
     return spawnFailedError(file, errorCode, output, cause);
+  }
+
+  /**
+   * A starting child's redacted output tail ({@link OutputTail.redactedLines}),
+   * taken once: the tail is discarded in the same step, so its lines and the
+   * credential it scrubbed are gone whatever the caller does next.
+   */
+  #takeOutputTail(state: ChildState): readonly string[] {
+    const lines = state.outputTail.redactedLines();
+    state.outputTail.discard();
+    return lines;
   }
 
   /**
@@ -7004,24 +7532,21 @@ class DevServerLauncherImpl implements DevServerLauncher {
     actingDirectory: string,
     detection: DevServerDetection,
   ): Result<ResolvedCommand, DebuggenError> {
-    const policy: LaunchCommandContext = {
+    const checked = this.#checkRequestedCommand(requested, {
       projectRoot: actingDirectory,
       scripts: detection.devServerScripts,
-      platform: this.#platform,
-      nodeExecutablePath: this.#deps.nodeExecutablePath ?? process.execPath,
-      isTrustedFile: this.#deps.isTrustedDevCli ?? isTrustedDevCliFile,
-      isTrustedDirectory: this.#deps.isTrustedDevDirectory ?? isTrustedNodePathDirectory,
-      realpath: this.#deps.realpath,
-    };
-    if (requested !== undefined && requested.trim().length > 0) {
-      const parsed = parseLaunchCommand(requested, this.#platform);
-      if (isErr(parsed)) {
-        return parsed;
-      }
-      const accepted = checkLaunchCommand(parsed.value, policy);
-      return isErr(accepted) ? accepted : ok({ ...parsed.value, script: accepted.value.script });
+    });
+    if (isErr(checked)) {
+      return err(checked.error);
+    }
+    if (checked.value !== undefined) {
+      return ok(checked.value);
     }
 
+    const policy = this.#commandPolicyContext({
+      projectRoot: actingDirectory,
+      scripts: detection.devServerScripts,
+    });
     const script = detection.devScript?.name;
     const runArgs =
       script === undefined ? undefined : packageManagerRunArgs(detection.packageManager, script);
@@ -7057,7 +7582,54 @@ class DevServerLauncherImpl implements DevServerLauncher {
         scripts: detection.devServerScripts ?? (script === undefined ? undefined : [script]),
       },
     );
-    return isErr(accepted) ? accepted : ok({ file, args, env: {}, script });
+    return isErr(accepted)
+      ? accepted
+      : ok({ file, args, env: {}, script, form: accepted.value.form });
+  }
+
+  /**
+   * Judge the command a launch request names against the dev-server command
+   * policy — {@link parseLaunchCommand}, then {@link checkLaunchCommand} in
+   * `policy.projectRoot` against `policy.scripts` — **whichever path the launch
+   * then takes**: a fresh spawn, a running child it reuses, a launch in flight
+   * it joins, or a dev server detection found running with the preload. So a
+   * command a fresh launch refuses (a shell, `rm -rf /`, an undeclared script)
+   * is refused with the same `DEV_SERVER_LAUNCH_FAILED` and reason when a
+   * child already serves the project, and nothing is spawned or minted.
+   *
+   * @param requested The request's command; blank or absent names none.
+   * @param policy Where and against which dev-server scripts it is judged.
+   * @returns The resolved command, `Ok(undefined)` when the request names
+   *   none, or the policy's refusal.
+   */
+  #checkRequestedCommand(
+    requested: string | undefined,
+    policy: ChildCommandPolicy,
+  ): Result<ResolvedCommand | undefined, DebuggenError> {
+    if (requested === undefined || requested.trim().length === 0) {
+      return ok(undefined);
+    }
+    const parsed = parseLaunchCommand(requested, this.#platform);
+    if (isErr(parsed)) {
+      return parsed;
+    }
+    const accepted = checkLaunchCommand(parsed.value, this.#commandPolicyContext(policy));
+    return isErr(accepted)
+      ? accepted
+      : ok({ ...parsed.value, script: accepted.value.script, form: accepted.value.form });
+  }
+
+  /** The {@link LaunchCommandContext} of `policy`, with this launcher's platform and trust checks. */
+  #commandPolicyContext(policy: ChildCommandPolicy): LaunchCommandContext {
+    return {
+      projectRoot: policy.projectRoot,
+      scripts: policy.scripts,
+      platform: this.#platform,
+      nodeExecutablePath: this.#deps.nodeExecutablePath ?? process.execPath,
+      isTrustedFile: this.#deps.isTrustedDevCli ?? isTrustedDevCliFile,
+      isTrustedDirectory: this.#deps.isTrustedDevDirectory ?? isTrustedNodePathDirectory,
+      realpath: this.#deps.realpath,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -7096,14 +7668,15 @@ class DevServerLauncherImpl implements DevServerLauncher {
   }
 
   /**
-   * One output line: counted and classified into the child's digest, and —
-   * when it is an address announcement — mined for readiness candidates
+   * One output line: counted and classified into the child's digest, kept —
+   * credential removed — in the child's {@link OutputTail} while it starts,
+   * and — when it is an address announcement — mined for readiness candidates
    * ({@link announcedLoopbackUrls}): each new loopback `origin/` is appended,
    * up to {@link MAX_READY_CANDIDATES}, and wakes the readiness wait for a
-   * verification round. A candidate is never readiness by itself. The line is
-   * then dropped — it is never logged, kept or returned (CWE-532), because a
-   * developer's dev server prints source frames, SQL literals, query values
-   * and echoed environment.
+   * verification round. A candidate is never readiness by itself. Nothing is
+   * logged here (CWE-532): a developer's dev server prints source frames, SQL
+   * literals, query values and echoed environment, so its lines reach the log
+   * only as a failed start's redacted tail.
    */
   #recordOutput(state: ChildState, stream: 'stdout' | 'stderr', raw: string): void {
     const line = normalizeOutputLine(raw);
@@ -7111,6 +7684,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
       return;
     }
     state.output.record(stream, line);
+    state.outputTail.record(stream, raw);
     if (state.readyCandidates.length >= MAX_READY_CANDIDATES) {
       return;
     }
@@ -7224,6 +7798,8 @@ class DevServerLauncherImpl implements DevServerLauncher {
       let settled = false;
       let verifying = false;
       let roundRequested = false;
+      /** Whether any round probed a target, which decides how a timeout is worded. */
+      let probed = false;
       let fallbackUrl = requestedUrl;
       /** Targets the probe refused to probe; never tried again in this wait. */
       const refused = new Set<string>();
@@ -7278,8 +7854,16 @@ class DevServerLauncherImpl implements DevServerLauncher {
       /** One round over `current`: the ready target it confirmed, or `undefined`. */
       const runRound = async (
         current: readonly ReadyTarget[],
-      ): Promise<{ readonly url: string; readonly framework?: DevServerFramework } | undefined> => {
-        const answers = await Promise.all(current.map((target) => this.#probeForReady(target.url)));
+      ): Promise<
+        | {
+            readonly url: string;
+            readonly framework?: DevServerFramework;
+            readonly answeredBy: ReadyAnswerKind;
+          }
+        | undefined
+      > => {
+        probed = true;
+        const answers = await Promise.all(current.map((target) => this.#answerForReady(target)));
         if (settled) {
           return undefined;
         }
@@ -7287,15 +7871,16 @@ class DevServerLauncherImpl implements DevServerLauncher {
           readonly url: string;
           readonly announced: boolean;
           readonly port: number | undefined;
+          readonly by: ReadyAnswerKind;
           readonly framework?: DevServerFramework;
         }[] = [];
         current.forEach((target, index) => {
           const answer = answers[index];
-          if (answer === undefined) {
-            // The probe threw: no answer this round; the next round retries.
+          if (answer === undefined || answer.kind === 'silent') {
+            // Nothing answered this round; the next round retries.
             return;
           }
-          if (isErr(answer)) {
+          if (answer.kind === 'refused') {
             // A URL the probe may not probe (not loopback): drop it for good.
             refused.add(target.url);
             if (!target.announced) {
@@ -7303,17 +7888,12 @@ class DevServerLauncherImpl implements DevServerLauncher {
             }
             return;
           }
-          if (answer.value.reachable !== true) {
-            return;
-          }
-          // A candidate is recorded in its announced `origin/` form; the
-          // requested URL in the probe's origin-and-pathname form.
-          const url = target.announced ? target.url : answer.value.url;
-          const framework = answer.value.framework;
+          const framework = answer.framework;
           answered.push({
-            url,
+            url: answer.url,
             announced: target.announced,
-            port: listeningPortOf(url),
+            port: listeningPortOf(answer.url),
+            by: answer.by,
             ...(framework === undefined ? {} : { framework }),
           });
         });
@@ -7339,8 +7919,8 @@ class DevServerLauncherImpl implements DevServerLauncher {
         const owned = answered.find(({ port }) => port !== undefined && owners.get(port) === true);
         if (owned !== undefined) {
           return owned.framework === undefined
-            ? { url: owned.url }
-            : { url: owned.url, framework: owned.framework };
+            ? { url: owned.url, answeredBy: owned.by }
+            : { url: owned.url, framework: owned.framework, answeredBy: owned.by };
         }
         for (const { url, announced, port } of answered) {
           const origin = originFormOf(url);
@@ -7420,7 +8000,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
         handle: this.#setTimeout(() => {
           finish(
             unverified.size === 0
-              ? { kind: 'timeout' }
+              ? { kind: 'timeout', probed }
               : {
                   kind: 'unverified',
                   origins: Object.freeze([...unverified.keys()]),
@@ -7505,6 +8085,83 @@ class DevServerLauncherImpl implements DevServerLauncher {
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * Ask the accept probe whether a readiness target accepts a connection and
+   * holds it for the accept hold, the connect bounded by the readiness probe
+   * timeout — `undefined` when there is no
+   * accept probe, or it threw (an injected one misbehaving), which the round
+   * reads as no answer.
+   */
+  async #acceptForReady(
+    url: string,
+  ): Promise<Result<DevServerAcceptResult, DebuggenError> | undefined> {
+    const accept = this.#accept;
+    if (accept === undefined) {
+      return undefined;
+    }
+    try {
+      return await accept(url, {
+        timeoutMs: this.#settings.readyProbeTimeoutMs,
+        holdMs: this.#settings.readyAcceptHoldMs,
+        logger: this.#parentLogger,
+        now: this.#now,
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * What one readiness target gives this round: the first of an HTTP response
+   * (any status, carrying the framework signature when there is one) and an
+   * accepted connection — so a dev server that listens but is still compiling
+   * the route the HTTP probe asked for answers at once rather than after the
+   * compile. Either probe refusing the URL (not loopback) refuses the target;
+   * both finding nothing is `silent`.
+   *
+   * Both probes start together. An HTTP answer that arrives first wins; a
+   * connection accepted and held through the accept hold wins without waiting
+   * for the HTTP probe, whose late result is ignored. A connection the other
+   * side drops during the hold is no answer. A failed or silent half defers to the
+   * other. A candidate's answer is recorded in its announced `origin/` form,
+   * the requested URL's in the probe's origin-and-pathname form.
+   */
+  #answerForReady(target: ReadyTarget): Promise<TargetAnswer> {
+    const recorded = (probedUrl: string): string => (target.announced ? target.url : probedUrl);
+    const http = this.#probeForReady(target.url).then((answer): TargetAnswer => {
+      if (answer === undefined) {
+        return SILENT_ANSWER;
+      }
+      if (isErr(answer)) {
+        return REFUSED_ANSWER;
+      }
+      if (answer.value.reachable !== true) {
+        return SILENT_ANSWER;
+      }
+      const framework = answer.value.framework;
+      return {
+        kind: 'answered',
+        url: recorded(answer.value.url),
+        by: 'http',
+        ...(framework === undefined ? {} : { framework }),
+      };
+    });
+    const accepted = this.#acceptForReady(target.url).then((answer): TargetAnswer => {
+      if (answer === undefined) {
+        return SILENT_ANSWER;
+      }
+      if (isErr(answer)) {
+        return REFUSED_ANSWER;
+      }
+      return answer.value.accepted
+        ? { kind: 'answered', url: recorded(answer.value.url), by: 'accept' }
+        : SILENT_ANSWER;
+    });
+    const viaHttp = http.then((answer) => (answer.kind === 'silent' ? accepted : answer));
+    const viaAccept = accepted.then((answer) => (answer.kind === 'answered' ? answer : http));
+    return Promise.race([viaHttp, viaAccept]);
   }
 
   /**
@@ -9164,6 +9821,14 @@ interface ResolvedCommand extends ParsedLaunchCommand {
    * `undefined` for the framework-CLI forms.
    */
   readonly script: string | undefined;
+  /**
+   * Which accepted form the command is ({@link checkLaunchCommand}). A
+   * `'framework-cli'` run (`next dev`) gets the project's trusted
+   * `node_modules/.bin` directories in front of its `PATH`
+   * ({@link projectBinDirectories}); the package manager does that itself
+   * for a `'package-script'` run, and `'node-framework-cli'` names its file.
+   */
+  readonly form: LaunchCommandForm;
 }
 
 /** Exactly what one launch hands `spawn`: executable, arguments and quoting mode. */
@@ -9432,15 +10097,25 @@ function spawnFailedError(
 /**
  * A startup failure's hint: the constant hint, then one fixed sentence per
  * diagnostic the child's output reported, then — when it printed anything —
- * {@link FULL_OUTPUT_SENTENCE}. Nothing the child printed is quoted, so the
- * hint is safe to forward to an editor notification verbatim.
+ * {@link OUTPUT_TAIL_SENTENCE} and {@link FULL_OUTPUT_SENTENCE}. Nothing the
+ * child printed is quoted, so the hint is safe to forward to an editor
+ * notification verbatim.
  */
 function withOutputDigest(hint: string, output: DevServerOutputSummary): string {
   const sentences = output.diagnostics.map((id) => OUTPUT_DIAGNOSTIC_SENTENCES[id]);
   if (output.stdoutLines + output.stderrLines > 0) {
-    sentences.push(FULL_OUTPUT_SENTENCE);
+    sentences.push(OUTPUT_TAIL_SENTENCE, FULL_OUTPUT_SENTENCE);
   }
   return sentences.length === 0 ? hint : `${hint} ${sentences.join(' ')}`;
+}
+
+/**
+ * The `outputTail` field of a failed start's warning: the redacted tail when
+ * the child printed anything, else nothing, so a record of a child that
+ * printed nothing carries no empty field.
+ */
+function tailField(tail: readonly string[]): { readonly outputTail?: readonly string[] } {
+  return tail.length === 0 ? {} : { outputTail: tail };
 }
 
 /**

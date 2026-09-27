@@ -125,10 +125,16 @@
 
 /* The divider: decorative, hidden from assistive technology by the component, excluded from text
  * selection so copying the trail yields the labels, and never the element that gives up room when
- * the row runs short. */
+ * the row runs short.
+ *
+ * It is painted in the hairline colour, the same `--ls-border` that draws every control edge in
+ * the storefront, because a sighted reader still has to see where one crumb ends and the next
+ * begins: the steel hairline measures 3.25:1 on the page surface, clearing the 3:1 non-text
+ * minimum (WCAG 1.4.11), where the fainter mist step measured 1.48:1. It stays lighter than both
+ * kinds of crumb, so it reads as punctuation rather than as a label. */
 .separator {
   flex: none;
-  color: var(--ls-mist, #cbd5e1);
+  color: var(--ls-border, #8190a5);
   font-size: var(--ls-text-sm, 13px);
   user-select: none;
 }

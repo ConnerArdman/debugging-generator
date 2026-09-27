@@ -31,9 +31,18 @@
  *     not be evaluated at all. They are never added, grouped, relabelled or
  *     presented as one another — an unevaluated render is not an unnecessary
  *     one.
- *   - the metric vocabulary is closed and owned upstream. This file names no id
- *     of it. Ordering, labelling and units all arrive with the data, so adding
- *     a metric upstream needs no change here.
+ *   - the metric vocabulary is closed and owned upstream. Ordering, labelling
+ *     and units all arrive with the data, so adding a metric upstream needs no
+ *     change here. The one place this file names ids of it is
+ *     {@link DURATION_QUALIFIERS}, and it names only four: the tier durations
+ *     are wall-clock spans with overlapping work counted once, as the
+ *     aggregate's `METRIC_DEFINITIONS` define them, while a dependency graph
+ *     in the same panel adds up its participants' records — so a duration tile
+ *     says under its heading which kind of time it is, and a database
+ *     participant showing more time than the database tile reads as the
+ *     different measure it is rather than as a contradiction. The table is
+ *     partial: an id it does not name gets no qualifier, so a new metric still
+ *     needs no change here.
  *
  * ## AN UNOBSERVABLE VALUE SAYS SO
  *
@@ -206,9 +215,10 @@
  * explicitly: the stylesheet lays the grid out with `display: grid` and each
  * tile with `display: flex`, and a changed display value drops the implicit
  * list semantics in WebKit-derived engines. Every tile carries an accessible
- * name pairing its heading with its figure and unit, because a list item takes
- * its name from the author rather than from its contents, and a figure
- * announced without its heading is a number with no subject. That name carries
+ * name pairing its heading — and a duration's qualifier, which says what kind
+ * of time it is — with its figure and unit, because a list item takes its name
+ * from the author rather than from its contents, and a figure announced
+ * without its heading is a number with no subject. That name carries
  * the tile's own figure, so a not-on-page tile is announced as not on the page
  * and an unavailable one as the absent label: a screen-reader user hears the
  * same distinction a sighted one sees. The advisory note is a focusable
@@ -338,6 +348,36 @@ const OFF_PAGE_EMPTY_MESSAGE =
 const NOTE_AFFORDANCE_LABEL = 'Coverage note';
 
 /**
+ * The line a duration tile carries under its heading: what kind of time the
+ * figure is.
+ *
+ * Each is the aggregate's own definition (`METRIC_DEFINITIONS` in
+ * `@debuggen/telemetry`) cut to the words a tile has room for — every one a
+ * wall-clock span, and each saying how overlapping work is treated. They are
+ * restated rather than read because this package takes the telemetry package
+ * as types only; the definitions are the authority, and a changed definition
+ * means a changed line here. The table is partial on purpose: an id it does
+ * not name — every count, every size — gets no qualifier and no extra line.
+ */
+const DURATION_QUALIFIERS: Readonly<Partial<Record<MetricId, string>>> = Object.freeze({
+  total_duration: 'wall clock: first start to last end',
+  frontend_duration: 'wall clock, not covered by the server',
+  backend_duration: 'wall clock: parallel work counted once',
+  database_duration: 'wall clock: overlapping statements counted once',
+});
+
+/**
+ * The qualifier of a metric's tile, or `undefined` for a metric with none.
+ *
+ * Read as an own property, so an id that arrived from a malformed payload and
+ * happens to name something on `Object.prototype` gets no qualifier rather
+ * than a function's source.
+ */
+function qualifierOf(id: MetricId): string | undefined {
+  return Object.hasOwn(DURATION_QUALIFIERS, id) ? DURATION_QUALIFIERS[id] : undefined;
+}
+
+/**
  * What the loading state announces to a screen reader, ending in the single
  * `…` every busy region in a panel announces itself with.
  */
@@ -359,6 +399,11 @@ interface MetricCard {
   readonly id: MetricId;
   /** The tile's heading, as the aggregate layer labelled it. */
   readonly label: string;
+  /**
+   * What kind of time the figure is, drawn under the heading — for the four
+   * tier durations only; see {@link DURATION_QUALIFIERS}.
+   */
+  readonly qualifier: string | undefined;
   /**
    * The figure, already formatted — or {@link NOT_AVAILABLE_LABEL}, or
    * {@link NOT_ON_PAGE_LABEL}.
@@ -446,6 +491,7 @@ function describeMetric(metric: MetricValue): MetricCard {
     // tile with no heading is a number with no subject, so the same humanizer
     // the absent-value tile uses stands in for it.
     label: display.label === '' ? humanizeLabel(display.id) : display.label,
+    qualifier: qualifierOf(display.id),
     figure,
     unit,
     // Severity is a judgement about *duration* against the product's four
@@ -475,6 +521,7 @@ function describeMissingMetric(id: MetricId): MetricCard {
   return {
     id,
     label: humanizeLabel(id),
+    qualifier: qualifierOf(id),
     figure: NOT_AVAILABLE_LABEL,
     unit: undefined,
     severityColor: undefined,
@@ -495,6 +542,7 @@ function describeOffPageMetric(id: MetricId): MetricCard {
   return {
     id,
     label: humanizeLabel(id),
+    qualifier: qualifierOf(id),
     figure: NOT_ON_PAGE_LABEL,
     unit: undefined,
     severityColor: undefined,
@@ -635,11 +683,54 @@ function offPageEmptyMessage(total: number | undefined): string {
   return `${OFF_PAGE_EMPTY_MESSAGE} The capture reports ${formatCount(total)} computed ${noun} in total.`;
 }
 
-/** A tile's accessible name: its heading, its figure and its unit, in that order. */
+/**
+ * A tile's accessible name: its heading — with its qualifier in parentheses,
+ * when it has one — its figure and its unit, in that order. A list item takes
+ * its name from the author, so the qualifier drawn under the heading would
+ * otherwise never reach a screen reader: `Database duration (wall clock:
+ * overlapping statements counted once): 980 ms`.
+ */
 function accessibleName(card: MetricCard): string {
+  const heading = card.qualifier === undefined ? card.label : `${card.label} (${card.qualifier})`;
   return card.unit === undefined
-    ? `${card.label}: ${card.figure}`
-    : `${card.label}: ${card.figure} ${card.unit}`;
+    ? `${heading}: ${card.figure}`
+    : `${heading}: ${card.figure} ${card.unit}`;
+}
+
+/**
+ * A tile's heading, and under it — for a tile with one — its qualifier.
+ *
+ * The heading element holds the heading alone, qualified or not. A qualified
+ * one is wrapped with its qualifier in one vertical stack, so the tile still
+ * has exactly two children — the heading block and the figure row — and its
+ * `space-between` keeps the figure at the bottom, level with the figures of
+ * unqualified tiles beside it. An unqualified tile keeps its heading as a
+ * direct child, exactly as before.
+ */
+function TileHeading({ card }: { readonly card: MetricCard }): ReactElement {
+  const heading = (
+    <Text
+      as="span"
+      size="sm"
+      tone="muted"
+      className={clsx('dg-metric-card__label', 'dg-metric-cards__label')}
+    >
+      {card.label}
+    </Text>
+  );
+
+  if (card.qualifier === undefined) {
+    return heading;
+  }
+
+  return (
+    <Stack direction="vertical" gap={0}>
+      {heading}
+      <Text as="span" size="xs" tone="muted">
+        {card.qualifier}
+      </Text>
+    </Stack>
+  );
 }
 
 /**
@@ -749,14 +840,7 @@ function renderRead(
           )}
           aria-label={accessibleName(card)}
         >
-          <Text
-            as="span"
-            size="sm"
-            tone="muted"
-            className={clsx('dg-metric-card__label', 'dg-metric-cards__label')}
-          >
-            {card.label}
-          </Text>
+          <TileHeading card={card} />
           <Stack direction="horizontal" gap={1} align="baseline" wrap>
             {/* No tone is passed: the tile's own rules decide this colour -
                 the severity property when one is set, and the muted

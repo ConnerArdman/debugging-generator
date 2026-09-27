@@ -30,10 +30,11 @@
  *   developer-facing sentence "Could not enable ‹signal›: ‹reason›. Continuing
  *   with: ‹enabled list›." — and the action is dropped rather than attempted.
  * - `apps/local-service/src/pipeline/stages/plan.ts` runs it immediately after
- *   normalisation, so a plan that would instrument nothing is caught while the
- *   session can still fall back to a runtime-only default plan. Its rejections
- *   become `session.progress` detail and, where nothing at all survives,
- *   `instrumentation.failed` detail.
+ *   normalisation and records only the actions it accepts, so a refused target
+ *   never reaches a plan version or the installer, and a plan that would
+ *   instrument nothing is caught while the session can still fall back to a
+ *   runtime-only default plan — whose refusals then become `session.progress`
+ *   detail.
  *
  * Both callers get **data, not exceptions**: a rejection is a finding on the
  * report, because "this target cannot be instrumented" is an ordinary answer
@@ -71,14 +72,17 @@
  * ## Necessary, deliberately not sufficient
  *
  * The gate stays cheap on purpose: the code graph, and at most one parsed file
- * per patch-mode action, read and never edited. It does **not** run the support
- * checks that depend on the emitted wrapper, which `./patch/function-timing.ts`
- * keeps beside its template: an already-instrumented target, a React component
- * or hook, a body that reaches for `super` or `new.target`, and a sloppy-mode
- * body whose `arguments` object is observable. Those need the whole transform;
- * reaching for it here would make every planning round pay for the patch layer.
- * The one wrapper constraint this gate owns outright — a generator cannot be
- * wrapped — is checked here, on the declaration the shared resolver returned.
+ * per patch-mode action, read and never edited. On the declaration the shared
+ * resolver returned it applies the two wrapper constraints that are facts about
+ * the declaration itself: a generator cannot be wrapped, and a React component
+ * or hook must not be — recognised by the patcher's own `reactComponentSite`,
+ * so a render function is refused while the plan is made rather than when the
+ * patch is attempted. It does **not** run the support checks that depend on the
+ * emitted wrapper, which `./patch/function-timing.ts` keeps beside its
+ * template: an already-instrumented target, a body that reaches for `super` or
+ * `new.target`, and a sloppy-mode body whose `arguments` object is observable.
+ * Those need the whole transform; reaching for it here would make every
+ * planning round pay for the patch layer.
  *
  * What this module guarantees is the half the planner needs: a plan that passes
  * it names files and symbols that exist, and patch targets that resolve to one
@@ -133,6 +137,7 @@ import {
 } from './schema/plan.js';
 import type {
   InstrumentationAction,
+  InstrumentationActionType,
   InstrumentationPlan,
   PlanAdapterResolver,
 } from './schema/plan.js';
@@ -207,6 +212,33 @@ const NON_ADDRESSABLE_DECLARATION_KINDS: readonly SymbolDeclarationKind[] = Obje
   'unknown',
 ]);
 
+/** What a plan should ask for instead of a call site of one kind. */
+interface CallSiteRuntime {
+  /** The runtime action type that observes this kind of call. */
+  readonly type: InstrumentationActionType;
+  /** The call site's kind in a developer's words, completing "records it as …". */
+  readonly what: string;
+}
+
+/**
+ * The graph node kinds that record a **call site** rather than a declaration,
+ * and the runtime action type that observes each one without editing a file.
+ *
+ * An `api-call` or `db-call` node is named for what it calls — the receiver and
+ * member chain as written, `client.query`, `fetch` — and carries the function
+ * it sits inside as `CodeNodeBase.symbol`. A plan that spells one of those
+ * names as its target has mistaken a call for a declaration: nothing of that
+ * name can be wrapped, and the signals the call produces are what the runtime
+ * request and database hooks already capture. Keyed by node kind so the table
+ * is the only place the pairing is written; the action types are members of
+ * `INSTRUMENTATION_ACTION_TYPES`, checked by the annotation.
+ */
+const CALL_SITE_RUNTIME_TYPES: Readonly<Partial<Record<CodeNodeKind, CallSiteRuntime>>> =
+  Object.freeze({
+    'api-call': Object.freeze({ type: 'fetch-tracking', what: 'a request call site' }),
+    'db-call': Object.freeze({ type: 'db-query-tracking', what: 'a database call site' }),
+  });
+
 // ---------------------------------------------------------------------------
 // The rejection vocabulary
 // ---------------------------------------------------------------------------
@@ -237,7 +269,9 @@ const NON_ADDRESSABLE_DECLARATION_KINDS: readonly SymbolDeclarationKind[] = Obje
  *   nothing is known about what it declares.
  * - `'symbol-not-found'` — the file is indexed and declares no addressable
  *   symbol of that name, or — for a qualified spelling — none under the class
- *   or enclosing declaration the spelling names.
+ *   or enclosing declaration the spelling names. A request or database call
+ *   site spelled as a symbol (`receiver.method`) is this case too: the index
+ *   records it as a call, and the refusal names the function that makes it.
  * - `'ambiguous-symbol'` — the file declares the name more than once where the
  *   spelling cannot tell the declarations apart (two nested functions of one
  *   name, say), so the patcher would refuse to guess which one to wrap. The
@@ -251,9 +285,10 @@ const NON_ADDRESSABLE_DECLARATION_KINDS: readonly SymbolDeclarationKind[] = Obje
  * - `'unsupported-declaration'` — the file declares the name, but not as
  *   something a timing wrapper can replace the body of: a class, a type, an
  *   enum, a namespace, a constructor, an accessor, a variable holding a
- *   non-function, a signature with no body, or a declaration in a position no
- *   wrapper can address — an object-literal member, a parameter, a binding
- *   pattern, or under a qualification that does not contain it.
+ *   non-function, a signature with no body, a React component or hook, or a
+ *   declaration in a position no wrapper can address — an object-literal
+ *   member, a parameter, a binding pattern, or under a qualification that does
+ *   not contain it.
  * - `'ast-unavailable'` — the declaration's shape could not be checked because
  *   no syntax tree was available: the context carries no loaded project, or the
  *   loaded program holds no parsed source for the file. Reported rather than
@@ -711,6 +746,11 @@ function checkFileIndexed(
  * accepted only when the graph records a declaration of that name *under*
  * that owner ({@link checkQualifiedOwner}), which needs no syntax tree.
  *
+ * A name the file does not declare but does **call** — `receiver.method`
+ * spelled as a target — is refused with an explanation of what it is and of
+ * the function it sits in ({@link callSiteRejection}), rather than with a
+ * search for declarations of a name that only ever occurs as a call.
+ *
  * @param file The normalised project-relative path.
  * @param action The action under test.
  * @param spelling The parsed spelling, whose `name` is the bare member name.
@@ -735,10 +775,85 @@ function checkSymbolDeclared(
       : checkQualifiedOwner(file, spelling.name, spelling.container, graph);
   }
 
+  return (
+    callSiteRejection(file, action, graph) ?? {
+      code: 'symbol-not-found',
+      reason: `'${reportable(file)}' declares no addressable symbol named '${reportable(action.symbol)}'`,
+      hint: nearMissHint(spelling.name, file, action, queries),
+    }
+  );
+}
+
+/**
+ * The refusal for a target that names a **call site** of its own file — a
+ * request or database call spelled as though it were a declaration — or
+ * `undefined` when the file records no call of that name.
+ *
+ * Asked only once check 5 has established that the file declares nothing of
+ * the name, so it never shadows a real declaration. The graph is the authority:
+ * the file's `api-call` and `db-call` nodes ({@link CALL_SITE_RUNTIME_TYPES})
+ * are compared by their recorded name, exactly as the plan spelled it. The
+ * refusal names the first such call's line and the functions the calls sit in
+ * — the declarations a timing wrapper *can* reach — and the runtime action
+ * that observes the calls themselves, which is the one-edit correction.
+ *
+ * Still `'symbol-not-found'`, because that is the fact: the file declares no
+ * symbol of that name. Only the explanation is specific.
+ *
+ * @param file The normalised project-relative path.
+ * @param action The action under test.
+ * @param graph The indexed code graph.
+ * @returns The rejection, or `undefined` when the name is not a call site here.
+ */
+function callSiteRejection(
+  file: string,
+  action: InstrumentationAction,
+  graph: CodeGraph,
+): Rejection | undefined {
+  let first: { readonly line: number; readonly runtime: CallSiteRuntime } | undefined;
+  const owners: string[] = [];
+
+  for (const node of graph.nodesByFile(file)) {
+    const runtime = CALL_SITE_RUNTIME_TYPES[node.kind];
+
+    if (runtime === undefined || node.name !== action.symbol) {
+      continue;
+    }
+
+    first ??= { line: node.line, runtime };
+
+    if (
+      node.symbol !== undefined &&
+      !owners.includes(node.symbol) &&
+      owners.length < MAX_NEAR_MISS_CANDIDATES
+    ) {
+      owners.push(node.symbol);
+    }
+  }
+
+  if (first === undefined) {
+    return undefined;
+  }
+
+  const { type, what } = first.runtime;
+  const [owner] = owners;
+  const named = owners.map((candidate) => `'${reportable(candidate)}'`).join(', ');
+  const subject = `'${reportable(action.symbol)}'`;
+
   return {
     code: 'symbol-not-found',
-    reason: `'${reportable(file)}' declares no addressable symbol named '${reportable(action.symbol)}'`,
-    hint: nearMissHint(spelling.name, file, action, queries),
+    reason:
+      owner === undefined
+        ? `'${reportable(file)}' declares nothing named ${subject}: the code index records it as ${what} at line ${String(first.line)}`
+        : `'${reportable(file)}' declares nothing named ${subject}: the code index records it as ${what} at line ${String(first.line)}, inside '${reportable(owner)}'`,
+    hint:
+      action.type === type
+        ? owner === undefined
+          ? `Name the function that makes the call as the subject of this '${type}' action, or the targetless marker ('${TARGETLESS_FILE}', '${TARGETLESS_SYMBOL}') for every such call.`
+          : `Name the function that makes the call — ${named} — as the subject of this '${type}' action.`
+        : owner === undefined
+          ? `Plan a '${type}' action to observe these calls at run time. ${RUNTIME_ALTERNATIVE}`
+          : `Plan a '${type}' action to observe these calls at run time, or name the function that makes the call — ${named} — to time it instead.`,
   };
 }
 
@@ -749,10 +864,14 @@ function checkSymbolDeclared(
  * `findByName` is the bounded, ranked lookup — exact, then case-insensitive
  * exact, then prefix, then substring, ties broken by node id — so the
  * candidates are deterministic and the list is capped at
- * {@link MAX_NEAR_MISS_CANDIDATES} before it is rendered. Candidates in the
- * target file itself are kept: a name that occurs there as a binding rather
- * than a declaration is precisely the confusion that produced the plan, and
- * naming its line is what resolves it.
+ * {@link MAX_NEAR_MISS_CANDIDATES} before it is rendered. It is asked for
+ * declarations only ({@link DECLARING_NODE_KINDS}), because the sentence says
+ * where the name *is declared*: a call site or a markup binding of the same
+ * name elsewhere declares nothing, and naming one as a declaration sends the
+ * planner to a file that holds no such symbol. (A call site in the target file
+ * itself has already been explained by {@link callSiteRejection}.) Candidates
+ * in the target file itself are kept: a declaration of a near name there is
+ * usually the one the plan meant, and naming its line is what resolves it.
  *
  * With no candidate to name, the hint offers the alternative that fits the
  * action: a patch can become a runtime signal, and a runtime signal that is
@@ -774,7 +893,10 @@ function nearMissHint(
   const rendered: string[] = [];
   const seen = new Set<string>();
 
-  for (const match of queries.findByName(name, { limit: MAX_NEAR_MISS_CANDIDATES })) {
+  for (const match of queries.findByName(name, {
+    kinds: DECLARING_NODE_KINDS,
+    limit: MAX_NEAR_MISS_CANDIDATES,
+  })) {
     const position = `${match.file}:${String(match.location.line)}`;
 
     if (seen.has(position)) {
@@ -903,10 +1025,12 @@ function declaredOwnersOf(nodes: readonly CodeNode[], name: string): (string | u
  * declaration in a position no wrapper can address is refused here rather than
  * at install time.
  *
- * On the declaration the resolver returns, the wrapper template's constraint
- * is applied: the wrapper moves the original body into an inner function and
+ * On the declaration the resolver returns, the wrapper template's constraints
+ * are applied: the wrapper moves the original body into an inner function and
  * calls it, which a generator's `yield` cannot survive — the consumer would
- * receive the wrapper's return value instead of an iterator.
+ * receive the wrapper's return value instead of an iterator — and which would
+ * move a React component's render and hook calls out of the function React
+ * analyses ({@link reactComponentRejection}).
  *
  * **Absence of a tree is reported, never guessed.** A context with no loaded
  * project is a legitimate state — the service withholds it when no patch-mode
@@ -1345,8 +1469,8 @@ function patchSiteKey(file: string, symbol: string): string {
  * 5. The file declares the symbol — under the class or enclosing declaration
  *    a qualified spelling names, corroborated from the graph.
  * 6. `patch`-mode only: the shared target resolver resolves the spelling to
- *    exactly one declaration a timing wrapper can reach, and it is not a
- *    generator.
+ *    exactly one declaration a timing wrapper can reach, and it is neither a
+ *    generator nor a React component or hook.
  * 7. No earlier action in this same call already asked for the work.
  *
  * Checks 3 to 5 apply to **every** action that names a target, runtime or

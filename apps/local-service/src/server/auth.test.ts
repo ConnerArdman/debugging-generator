@@ -104,10 +104,12 @@ import type { ServiceConfig } from '../config.js';
 import { openStore } from '../store/db.js';
 import type { Store } from '../store/db.js';
 import {
+  ABSENT_ORIGIN_DESCRIPTION,
   AUTH_FAILURE_REASONS,
   AUTH_FILE_STAGE_SUFFIX,
   CREDENTIAL_ROLES,
   CREDENTIAL_TOKEN_BYTES,
+  MAX_DESCRIBED_ORIGIN_LENGTH,
   MAX_WORKSPACE_ANNOUNCEMENT_LEASE_MS,
   OPERATION_ROLES,
   PAIRING_CODE_ALPHABET,
@@ -116,6 +118,9 @@ import {
   PAIRING_CODE_TTL_MS,
   PAIRING_LOCKOUT_MS,
   PAIRING_MAX_FAILURES,
+  REFUSAL_LOG_BURST,
+  REFUSAL_LOG_WINDOW_MS,
+  UNREADABLE_ORIGIN_DESCRIPTION,
   admitProjectRoot,
   authErrorResponse,
   authFailureReasonOf,
@@ -124,6 +129,8 @@ import {
   classifyOrigin,
   createAuthMiddleware,
   createAuthService,
+  createRefusalLogThrottle,
+  describeRefusedOrigin,
   identifyProjectRoot,
   isAllowedOrigin,
   reconfirmProjectRoot,
@@ -1442,6 +1449,179 @@ describe('the origin policy', () => {
       ]);
       asDevtools(expectOk(readWith('session.get', repaired, readProofOf(repaired))));
     });
+  });
+});
+
+/* =================================================================================================
+ * Logging a refused origin
+ * ============================================================================================== */
+
+/** One record a service of the suite emitted, decoded from its captured line. */
+interface CapturedRecord {
+  readonly level: string;
+  readonly message: string;
+  readonly fields: Readonly<Record<string, unknown>>;
+}
+
+/** The records every service of the suite emitted since `mark` captured lines. */
+function recordsSince(mark: number): readonly CapturedRecord[] {
+  return capturedLogLines.slice(mark).map((line) => JSON.parse(line) as CapturedRecord);
+}
+
+/**
+ * `url` with a user and a password added at run time, so the committed source
+ * holds no credential-shaped URL for `scripts/check-secrets.mjs` to flag.
+ */
+function withUserinfo(url: string, user: string, password: string): string {
+  const parsed = new URL(url);
+  parsed.username = user;
+  parsed.password = password;
+  return parsed.href;
+}
+
+describe('logging a refused origin', () => {
+  it.each([
+    ['a web origin', 'http://evil.example', 'http://evil.example'],
+    ['a web origin with its port', 'https://evil.example:8443', 'https://evil.example:8443'],
+    [
+      'a default port, which the origin does not name',
+      'http://evil.example:80',
+      'http://evil.example',
+    ],
+    [
+      'userinfo, path, query and fragment, which are stripped',
+      withUserinfo('https://evil.example/path/x?token=zz#frag', 'user', 'secret'),
+      'https://evil.example',
+    ],
+    [
+      'an extension scheme whose userinfo names the extension',
+      `chrome-extension://${EXTENSION_ID}@${ATTACKER_HOST}`,
+      `chrome-extension://${ATTACKER_HOST}`,
+    ],
+    [
+      'an internationalised host, in its punycode form',
+      'http://évil.example',
+      'http://xn--vil-9la.example',
+    ],
+    ['an IPv6 loopback with a port', 'http://[::1]:3000', 'http://[::1]:3000'],
+    ['the opaque origin', 'null', 'null'],
+    ['a data: document, by its scheme alone', 'data:text/html,<p>hello</p>', 'data:'],
+    ['a file: document, by its scheme alone', 'file:///etc/passwd', 'file:'],
+    [
+      'a CRLF that would forge a log line',
+      'http://evil.example\r\nX-Forged: 1',
+      UNREADABLE_ORIGIN_DESCRIPTION,
+    ],
+    ['a tab', 'http://evil\t.example', UNREADABLE_ORIGIN_DESCRIPTION],
+    ['a DEL', 'http://evil.example\u007f', UNREADABLE_ORIGIN_DESCRIPTION],
+    ['a value with a space', 'not an origin', UNREADABLE_ORIGIN_DESCRIPTION],
+    ['a value that is not a URL', 'evil.example', UNREADABLE_ORIGIN_DESCRIPTION],
+    ['no header', undefined, ABSENT_ORIGIN_DESCRIPTION],
+    ['an empty header', '', ABSENT_ORIGIN_DESCRIPTION],
+  ])('renders %s safely', (_label, origin, expected) => {
+    expect(describeRefusedOrigin(origin)).toBe(expected);
+  });
+
+  it(`caps a rendering at ${String(MAX_DESCRIBED_ORIGIN_LENGTH)} characters`, () => {
+    const origin = `https://${'a'.repeat(60)}.${'b'.repeat(60)}.${'c'.repeat(60)}.example`;
+
+    const rendered = describeRefusedOrigin(origin);
+
+    expect(rendered).toHaveLength(MAX_DESCRIBED_ORIGIN_LENGTH);
+    expect(rendered.startsWith(`https://${'a'.repeat(60)}.`)).toBe(true);
+    expect(rendered.endsWith('…')).toBe(true);
+  });
+
+  it(`files the first ${String(REFUSAL_LOG_BURST)} refusals of a window at warn, and counts the rest into the next warn`, () => {
+    let now = 1_000;
+    const throttle = createRefusalLogThrottle({ now: () => now });
+
+    const burst = Array.from({ length: REFUSAL_LOG_BURST }, () => throttle.next());
+    expect(burst).toEqual(
+      Array.from({ length: REFUSAL_LOG_BURST }, () => ({ level: 'warn', suppressed: 0 })),
+    );
+    expect([throttle.next(), throttle.next(), throttle.next()]).toEqual([
+      { level: 'debug' },
+      { level: 'debug' },
+      { level: 'debug' },
+    ]);
+
+    // Still inside the window: still demoted.
+    now += REFUSAL_LOG_WINDOW_MS - 1;
+    expect(throttle.next()).toEqual({ level: 'debug' });
+
+    // A new window: the first warn reports the four demoted since the last warn.
+    now += 1;
+    expect(throttle.next()).toEqual({ level: 'warn', suppressed: 4 });
+    expect(throttle.next()).toEqual({ level: 'warn', suppressed: 0 });
+  });
+
+  it('takes its burst and window from its options, and falls back to the defaults for invalid ones', () => {
+    let now = 0;
+    const custom = createRefusalLogThrottle({ burst: 1, windowMs: 10, now: () => now });
+    expect(custom.next()).toEqual({ level: 'warn', suppressed: 0 });
+    expect(custom.next()).toEqual({ level: 'debug' });
+    now = 10;
+    expect(custom.next()).toEqual({ level: 'warn', suppressed: 1 });
+
+    const fallback = createRefusalLogThrottle({ burst: 0, windowMs: Number.NaN, now: () => 0 });
+    const levels = Array.from({ length: REFUSAL_LOG_BURST + 1 }, () => fallback.next().level);
+    expect(levels.filter((level) => level === 'warn')).toHaveLength(REFUSAL_LOG_BURST);
+    expect(levels.at(-1)).toBe('debug');
+  });
+
+  it('names the refused origin, sanitized, in the warn record of every refusal the origin decided', () => {
+    const token = editorToken();
+    const mark = capturedLogLines.length;
+
+    expectRefusal(
+      authorize('session.list', token, 'https://evil.example/zz-path?zz-query=1'),
+      'forbidden-origin',
+      [token],
+    );
+    expectRefusal(
+      authorize('session.list', token, extensionOrigin(EXTENSION_ID)),
+      'origin-not-permitted-for-role',
+      [token],
+    );
+    expectRefusal(
+      harness.auth.authorizeHello({
+        payload: helloPayload('vscode', token),
+        origin: 'http://evil.example',
+      }),
+      'forbidden-origin',
+      [token],
+    );
+    const code = startCode();
+    expectRefusal(
+      harness.auth.completePairing({ code, origin: WEBVIEW_ORIGIN }),
+      'pairing-origin-required',
+      [code],
+    );
+
+    const refusals = recordsSince(mark).filter((record) => record.message.startsWith('refused'));
+    expect(
+      refusals.map((record) => [record.level, record.fields['reason'], record.fields['origin']]),
+    ).toEqual([
+      ['warn', 'forbidden-origin', 'https://evil.example'],
+      ['warn', 'origin-not-permitted-for-role', extensionOrigin(EXTENSION_ID)],
+      ['warn', 'forbidden-origin', 'http://evil.example'],
+      ['warn', 'pairing-origin-required', WEBVIEW_ORIGIN],
+    ]);
+    expect(JSON.stringify(refusals)).not.toContain('zz-path');
+    expect(JSON.stringify(refusals)).not.toContain('zz-query');
+  });
+
+  it('names no origin on a refusal the origin did not decide', () => {
+    const mark = capturedLogLines.length;
+
+    expectRefusal(authorize('session.list', undefined, WEBVIEW_ORIGIN), 'missing-credential');
+
+    const refusals = recordsSince(mark).filter(
+      (record) => record.message === 'refused an HTTP request',
+    );
+    expect(refusals).toHaveLength(1);
+    expect(Object.keys(refusals[0]?.fields ?? {})).not.toContain('origin');
   });
 });
 
@@ -4511,5 +4691,44 @@ describe('what the boundary keeps to itself', () => {
     expect(lines.some((line) => line.includes('"reason":"pairing-invalid"'))).toBe(true);
     expect(lines.some((line) => line.includes('"subsystem":"auth"'))).toBe(true);
     expectNoLeak(lines, [forged, formatBearer(forged), wrongCode]);
+  });
+
+  it('files an HTTP refusal under the ref its body carries, when the request context minted one', async () => {
+    const ref = 'msg_middlewareref0001';
+    const withContext = new Hono<ServerEnv>();
+    withContext.use(async (c, next) => {
+      c.set('requestRef', ref);
+      await next();
+    });
+    withContext.get('/probe', createAuthMiddleware(harness.auth)('session.list'), (c) =>
+      c.json({ ok: true }, 200),
+    );
+    const firstLine = capturedLogLines.length;
+
+    const refused = await withContext.request('/probe');
+
+    expect(refused.status).toBe(AUTH_FAILURE_REASONS['missing-credential'].status);
+    expect(await refused.json()).toEqual({
+      code: AUTH_FAILURE_REASONS['missing-credential'].code,
+      message: AUTH_FAILURE_REASONS['missing-credential'].message,
+      ref,
+    });
+    const refusals = capturedLogLines
+      .slice(firstLine)
+      .map((line) => JSON.parse(line) as { level: string; message: string; fields: object })
+      .filter((record) => record.message === 'refused an HTTP request');
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toMatchObject({
+      level: 'warn',
+      fields: { ref, operation: 'session.list', reason: 'missing-credential' },
+    });
+
+    // Composed without a request context, the refusal names no ref at all.
+    const bare = new Hono<ServerEnv>();
+    bare.get('/probe', createAuthMiddleware(harness.auth)('session.list'), (c) =>
+      c.json({ ok: true }, 200),
+    );
+    const plain = await bare.request('/probe');
+    expect(Object.keys((await plain.json()) as object).sort()).toEqual(['code', 'message']);
   });
 });

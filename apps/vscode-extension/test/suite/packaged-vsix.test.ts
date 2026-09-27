@@ -4,7 +4,7 @@
  * (AAP 0.8.5).
  *
  * It is the only place the whole packaging contract is exercised end to end:
- * the `dist/` layout `esbuild.mjs` and `vite.config.ts` write, the keep-set of
+ * the `dist/` layout `esbuild.mjs` and `vite.config.mts` write, the keep-set of
  * `.vscodeignore`, vsce's license and icon checks (evaluated against the
  * packaged file list, not the working directory), the VS Code CLI's install
  * path, and the INSTALLED extension running in an editor: its activation, the
@@ -228,7 +228,7 @@ const FORBIDDEN_ENTRIES: readonly string[] = Object.freeze([
   'dist/test',
   '.tsbuild',
   'esbuild.mjs',
-  'vite.config.ts',
+  'vite.config.mts',
   '.vscode-test.mjs',
   'tsconfig.json',
   'tsconfig.webview.json',
@@ -773,7 +773,7 @@ describe('packaged VSIX: a self-contained install with a working embedded servic
       missing,
       [],
       `vsce ls does not list ${missing.join(', ')}. The VSIX would lack them: check .vscodeignore's ` +
-        `re-include rules, the dist/ layout of esbuild.mjs and vite.config.ts, and that ` +
+        `re-include rules, the dist/ layout of esbuild.mjs and vite.config.mts, and that ` +
         `"esbuild.mjs --package" (${PREPUBLISH_SCRIPT}) staged ${STAGED_LICENSE}.${lsSection}`,
     );
 

@@ -1,9 +1,10 @@
 /**
  * Integration suite `binding` (AAP §0.8.3): tab↔session binding over a live
  * service — bind, replacement, same-origin and cross-origin navigation, unbind,
- * a dropped DevTools socket, and the reopen replay a freshly bound panel
- * receives (AAP §0.2.3 "Tab/session binding", §0.4.2's four binding rows,
- * §0.5.5).
+ * a dropped DevTools socket, and the reopen replay a freshly bound or re-bound
+ * panel receives — the only replay that carries it the progress history, which
+ * an editor's reopen leaves out (AAP §0.2.3 "Tab/session binding", §0.4.2's
+ * four binding rows, §0.5.5).
  *
  * ## What this suite proves that no unit suite can
  *
@@ -50,6 +51,11 @@
  * - `created` — freshly created, a second origin for matching and replacement;
  * - `generated` — a completed session with a stored capture, analysis, panel
  *   and progress history, for the reopen replay.
+ *
+ * One `session.bind` test copies a fourth project for two sessions on one dev
+ * server — a ready one and a newer one failed at the instrument stage — to
+ * prove a bind by origin prefers the live session, and ends both before it
+ * returns, so no other test's origin matching ever sees them.
  *
  * Sessions are advanced through the in-process `SessionManager` rather than the
  * HTTP pipeline: the manager is the only writer of session state either way,
@@ -121,7 +127,9 @@ import {
   MESSAGE_TYPES,
   PROGRESS_STAGES,
   PROGRESS_STATUSES,
+  SESSION_STATUSES,
   agentConfigPayloadSchema,
+  agentReadyPayloadSchema,
   createAnalysisResult,
   decodeMessage,
   errorCodeSchema,
@@ -129,6 +137,8 @@ import {
   progressStageSchema,
   sessionBindPayloadSchema,
   sessionBoundPayloadSchema,
+  sessionCreatedPayloadSchema,
+  sessionStatusSchema,
   sessionUnbindPayloadSchema,
   tabNavigatedPayloadSchema,
   targetRequestPayloadSchema,
@@ -149,7 +159,16 @@ import type {
   SessionRecord,
   SessionStatus,
 } from '@debuggen/protocol';
-import { DebuggenError, err, isErr, newPanelId, newSessionId } from '@debuggen/shared';
+import {
+  DebuggenError,
+  err,
+  isErr,
+  newId,
+  newPanelId,
+  newProducerId,
+  newSessionId,
+  ok,
+} from '@debuggen/shared';
 import type { CaptureId, Result, SessionId } from '@debuggen/shared';
 import { REDACTION_MARKER, computeCaptureSummary, scrub } from '@debuggen/telemetry';
 
@@ -162,6 +181,7 @@ import { createBindingRoutes, redactSelectedTarget } from '../../src/server/rout
 import type {
   BindingConnection,
   BindingRoutes,
+  EndedSessionAgentPort,
   NavigationRecorder,
 } from '../../src/server/routes/binding.js';
 import type { WsConnectionFacts } from '../../src/server/ws.js';
@@ -169,6 +189,7 @@ import { createSessionManager } from '../../src/sessions/manager.js';
 import type { SessionManager } from '../../src/sessions/manager.js';
 import { createSessionProgress } from '../../src/sessions/progress.js';
 import { REPLAY_MESSAGE_ORDER, createSessionReopener } from '../../src/sessions/reopen.js';
+import { isTerminalSessionStatus } from '../../src/sessions/state-machine.js';
 import { openStore } from '../../src/store/db.js';
 import type { Store } from '../../src/store/db.js';
 import { createPanelsRepo } from '../../src/store/panels-repo.js';
@@ -222,6 +243,21 @@ const [PROGRESS_RUNNING, PROGRESS_DONE] = PROGRESS_STATUSES;
 /** The stage a reload during capture is reported under, from protocol's stage vocabulary. */
 const PROGRESS_CAPTURE = progressStageSchema.enum.capture;
 
+/** The stage a second session on an already-instrumented project fails at, from protocol's stage vocabulary. */
+const PROGRESS_INSTRUMENT = progressStageSchema.enum.instrument;
+
+/** Protocol's session-status vocabulary, keyed by member. */
+const STATUS = sessionStatusSchema.enum;
+
+/**
+ * Every status a session has not ended in — the statuses a bind by origin
+ * searched before live sessions were preferred to failed ones — derived as
+ * `src/server/routes/binding.ts` derives them.
+ */
+const NON_ENDED_STATUSES: readonly SessionStatus[] = SESSION_STATUSES.filter(
+  (status) => !isTerminalSessionStatus(status),
+);
+
 /**
  * The developer-facing entry AAP §0.5.5 prescribes for an application that
  * reloads while a capture is open.
@@ -271,7 +307,9 @@ const SESSION_BIND = messageTypeOf(sessionBindPayloadSchema);
 const SESSION_BOUND = messageTypeOf(sessionBoundPayloadSchema);
 const TAB_NAVIGATED = messageTypeOf(tabNavigatedPayloadSchema);
 const SESSION_UNBIND = messageTypeOf(sessionUnbindPayloadSchema);
+const SESSION_CREATED = messageTypeOf(sessionCreatedPayloadSchema);
 const AGENT_CONFIG = messageTypeOf(agentConfigPayloadSchema);
+const AGENT_READY = messageTypeOf(agentReadyPayloadSchema);
 const TARGET_REQUEST = messageTypeOf(targetRequestPayloadSchema);
 const TARGET_SELECTED = messageTypeOf(targetSelectedPayloadSchema);
 
@@ -743,6 +781,25 @@ function waitForArming(
   );
 }
 
+/**
+ * A schema-valid `agent.ready` of a newly loaded page-agent document in
+ * `tabId`, as the service worker relays one when a document loads: a fresh
+ * document and producer id on every call, so each call is another load of the
+ * page. `url` is reported without its query and fragment, which is at most
+ * what the page's own redaction lets through.
+ */
+function newDocumentReport(tabId: number, url: string): MessagePayload<typeof AGENT_READY> {
+  const { origin, pathname } = new URL(url);
+  return agentReadyPayloadSchema.parse({
+    tabId,
+    documentId: newId('doc'),
+    producerId: newProducerId(),
+    url: `${origin}${pathname}`,
+    installedBeforeReact: true,
+    reactDetected: true,
+  });
+}
+
 /** Settles several connections in turn, so every frame already pushed to them has arrived. */
 async function settleAll(...clients: readonly HarnessWsClient[]): Promise<void> {
   for (const client of clients) {
@@ -864,11 +921,13 @@ async function advance(
 }
 
 /**
- * Plans the browser-tier runtime signals, reaches `ready` and opens a capture
- * window — the state in which a newly bound tab or a reloaded document must be
- * re-armed for the same capture (AAP §0.5.5, "Page reloaded during capture").
+ * Plans the browser-tier runtime signals and reaches `ready`, returning the
+ * recorded plan — a session ready to capture, whose plan touches no file.
  */
-async function openCapture(running: Harness, target: ProjectUnderTest): Promise<CapturingProject> {
+async function reachReady(
+  running: Harness,
+  target: ProjectUnderTest,
+): Promise<InstrumentationPlan> {
   await advance(running, target.sessionId, ['understanding', 'investigating', 'planning']);
   const plan = unwrap(
     normalizePlan(
@@ -894,11 +953,21 @@ async function openCapture(running: Harness, target: ProjectUnderTest): Promise<
     await running.manager.transitionTo(target.sessionId, 'ready', { readinessSatisfied: true }),
     'Moving to ready',
   );
+  return recorded.plan;
+}
+
+/**
+ * Reaches `ready` through {@link reachReady} and opens a capture window — the
+ * state in which a newly bound tab or a reloaded document must be re-armed for
+ * the same capture (AAP §0.5.5, "Page reloaded during capture").
+ */
+async function openCapture(running: Harness, target: ProjectUnderTest): Promise<CapturingProject> {
+  const plan = await reachReady(running, target);
   const capture = unwrap(
     await running.manager.startCapture(target.sessionId),
     'Opening the capture window',
   );
-  return { ...target, plan: recorded.plan, captureId: capture.captureId };
+  return { ...target, plan, captureId: capture.captureId };
 }
 
 /**
@@ -1074,6 +1143,114 @@ describe(SESSION_BIND, () => {
     // The open capture continues in the newly bound tab.
     const armed = await waitForArming(client, capturing, 0);
     expectArmedFor(armed.payload, capturing);
+  });
+
+  it('binds a tab to the ready session rather than a newer failed one on the same dev server, and to the failed one only when no live session serves the origin', async () => {
+    const running = service();
+
+    // A project of its own, so no other test's origin matching sees these
+    // sessions: a first session that reached `ready`, then a second session on
+    // the same project and dev server that failed at the instrument stage.
+    const ready = await startProject(
+      running,
+      await running.copyFixtureProject(),
+      'Why does the report take so long?',
+    );
+    await reachReady(running, ready);
+    const second = unwrap(
+      await running.manager.create({
+        projectRoot: ready.project.root,
+        question: 'Why are these requests duplicated?',
+        devServerUrl: ready.devServerUrl,
+      }),
+      'Creating the second session',
+    );
+    await advance(running, second.id, [
+      'understanding',
+      'investigating',
+      'planning',
+      'instrumenting',
+    ]);
+    const failed = unwrap(
+      await running.manager.fail(second.id, {
+        stage: PROGRESS_INSTRUMENT,
+        code: CODES.PATCH_UNSUPPORTED,
+        message: 'The target is already instrumented by another session of this project.',
+      }),
+      'Failing the second session',
+    );
+    expect(failed.status).toBe(STATUS.failed);
+    expect(recordOf(ready.sessionId).status).toBe(STATUS.ready);
+
+    // The precondition of the regression: the failed session is the most
+    // recently updated non-ended session on the origin, the one a lookup over
+    // every non-ended status answers with.
+    const newestNonEnded = unwrap(
+      running.repos.sessions.findLatestByDevServer({
+        statuses: NON_ENDED_STATUSES,
+        matches: (devServerUrl) => new URL(devServerUrl).origin === ready.origin,
+      }),
+      'Looking up the newest non-ended session on the origin',
+    );
+    expect(newestNonEnded).toBe(failed.id);
+
+    // A bind by origin goes to the ready session all the same.
+    const liveTab = freshTab();
+    const livePanel = await openPanel(liveTab);
+    const liveUrl = pageOf(ready, '/reports');
+    const liveBind = await bind(livePanel.client, { tabId: liveTab, url: liveUrl });
+    expect(expectEstablished(livePanel.client, liveBind, ready.sessionId, liveTab)).toEqual({
+      sessionId: ready.sessionId,
+      tabId: liveTab,
+      url: liveUrl,
+      reason: REASON_BOUND,
+    });
+    expect(storedBindingOfTab(liveTab)).toMatchObject({
+      sessionId: ready.sessionId,
+      tab: { tabId: liveTab, url: liveUrl },
+    });
+    expect(storedBindingOfSession(failed.id)).toBeUndefined();
+    expect(recordOf(ready.sessionId).boundTab).toEqual({ tabId: liveTab, url: liveUrl });
+    expect(recordOf(failed.id).boundTab).toBeUndefined();
+
+    // With the ready session ended, no live session serves the origin: a bind
+    // by origin falls back to the failed session, so its panel shows the failure.
+    unwrap(await running.manager.end(ready.sessionId), 'Ending the ready session');
+    expect(storedBindingOfTab(liveTab)).toBeUndefined();
+    const failedTab = freshTab();
+    const failedPanel = await openPanel(failedTab);
+    const failedUrl = pageOf(ready, '/orders');
+    const fallbackBind = await bind(failedPanel.client, { tabId: failedTab, url: failedUrl });
+    expect(expectEstablished(failedPanel.client, fallbackBind, failed.id, failedTab)).toEqual({
+      sessionId: failed.id,
+      tabId: failedTab,
+      url: failedUrl,
+      reason: REASON_BOUND,
+    });
+    expect(storedBindingOfTab(failedTab)).toMatchObject({
+      sessionId: failed.id,
+      tab: { tabId: failedTab, url: failedUrl },
+    });
+    expect(rowsFor({ tabId: failedTab, sessionId: failed.id })).toEqual([
+      { tabId: failedTab, sessionId: failed.id, url: failedUrl },
+    ]);
+    expect(recordOf(failed.id)).toMatchObject({
+      status: STATUS.failed,
+      boundTab: { tabId: failedTab, url: failedUrl },
+    });
+
+    // Ending the failed session too leaves the origin served by no session at
+    // all — a typed refusal — and keeps it out of every later test's matching.
+    unwrap(await running.manager.end(failed.id), 'Ending the failed session');
+    const noneTab = freshTab();
+    const nonePanel = await openPanel(noneTab);
+    const refused = await bind(nonePanel.client, {
+      tabId: noneTab,
+      url: pageOf(ready, '/reports'),
+    });
+    expectRefused(refused, CODES.SESSION_NOT_FOUND);
+    expect(announcementsSince(nonePanel.client, 0)).toEqual([]);
+    expect(storedBindingOfTab(noneTab)).toBeUndefined();
   });
 
   it('binds to a named session whose origin matches, and refuses a named session served from another origin', async () => {
@@ -1499,8 +1676,9 @@ describe('replacement', () => {
     await settleAll(second.client);
     expect(framesSince(second.client, REPLAY_SESSION_UPDATED, secondLater)).toEqual([]);
 
-    // … and the first tab's credential still owns the binding: its reload is
-    // kept and re-arms the open capture there.
+    // … and the first tab's credential still owns the binding: its navigation
+    // is kept, announced as the binding now stands, and re-arms the open
+    // capture there.
     const reloaded = await sendSettled(
       first.client,
       TAB_NAVIGATED,
@@ -1512,7 +1690,7 @@ describe('replacement', () => {
         sessionId: capturing.sessionId,
         tabId: firstTab,
         url: firstUrl,
-        reason: REASON_NAVIGATED,
+        reason: REASON_BOUND,
       },
     ]);
     expectArmedFor(
@@ -1573,7 +1751,7 @@ describe('replacement', () => {
     expect(recordOf(capturing.sessionId).boundTab).toEqual({ tabId, url: firstUrl });
     expect(recordOf(created.sessionId).boundTab).toEqual({ tabId: otherTab, url: otherUrl });
 
-    // Live: the tab is bound to its first session again — a reload is kept
+    // Live: the tab is bound to its first session again — a navigation is kept
     // there and re-arms that session's capture …
     const reloaded = await sendSettled(
       client,
@@ -1582,7 +1760,7 @@ describe('replacement', () => {
     );
     expect(reloaded.errors).toEqual([]);
     expect(announcementsSince(client, reloaded.mark)).toEqual([
-      { sessionId: capturing.sessionId, tabId, url: firstUrl, reason: REASON_NAVIGATED },
+      { sessionId: capturing.sessionId, tabId, url: firstUrl, reason: REASON_BOUND },
     ]);
     expectArmedFor((await waitForArming(client, capturing, reloaded.mark)).payload, capturing);
 
@@ -1668,7 +1846,7 @@ describe('replacement', () => {
     );
     expect(reloaded.errors).toEqual([]);
     expect(announcementsSince(client, reloaded.mark)).toEqual([
-      { sessionId: created.sessionId, tabId, url: firstUrl, reason: REASON_NAVIGATED },
+      { sessionId: created.sessionId, tabId, url: firstUrl, reason: REASON_BOUND },
     ]);
     expect(storedBindingOfTab(tabId)).toEqual(storedBefore);
     const unbound = await sendSettled(
@@ -1853,12 +2031,14 @@ describe(TAB_NAVIGATED, () => {
     );
     expect(navigated.errors).toEqual([]);
 
-    // Announced as a kept binding about the new document, to the panel and the editor.
+    // Announced as the kept binding now stands, on its new URL, to the panel
+    // and the editor — not as a reload: the navigation alone cannot tell one
+    // from a same-document URL change.
     const kept = {
       sessionId: capturing.sessionId,
       tabId,
       url: nextUrl,
-      reason: REASON_NAVIGATED,
+      reason: REASON_BOUND,
     };
     expect(announcementsSince(panel.client, navigated.mark)).toEqual([kept]);
     await settleAll(capturing.editor, bystander.client);
@@ -1981,7 +2161,7 @@ describe(TAB_NAVIGATED, () => {
     expect(client.authenticated).toBe(true);
   });
 
-  it('reports each reload during an open capture exactly once, as a stored capture-stage progress row the panel and the editor both receive', async () => {
+  it('reports each reload during an open capture exactly once — when the page agent reports a new document — as a stored capture-stage progress row the panel and the editor both receive', async () => {
     const { capturing } = suite();
     const tabId = freshTab();
     const { client } = await openPanel(tabId);
@@ -1996,6 +2176,13 @@ describe(TAB_NAVIGATED, () => {
     const again = await bind(client, { tabId, url });
     expectEstablished(client, again, capturing.sessionId, tabId);
     await waitForArming(client, capturing, again.mark);
+    expect(progressOf(capturing.sessionId)).toEqual(progressBefore);
+
+    // Nor is the report of the document the tab showed when it was bound.
+    let previous = newDocumentReport(tabId, url);
+    const first = await sendSettled(client, AGENT_READY, previous);
+    expect(first.errors).toEqual([]);
+    expect(announcementsSince(client, first.mark)).toEqual([]);
     expect(progressOf(capturing.sessionId)).toEqual(progressBefore);
 
     const expectedRow = {
@@ -2019,14 +2206,50 @@ describe(TAB_NAVIGATED, () => {
       await waitForArming(client, capturing, panelMark);
       await settleAll(capturing.editor);
 
-      // One stored row per navigation, appended after everything before it.
+      // The navigation alone proves no reload: it is announced as the binding
+      // now stands and stores no row.
+      const [standing, ...moreStanding] = announcementsSince(client, navigated.mark);
+      expect(moreStanding).toEqual([]);
+      expect(standing).toMatchObject({
+        sessionId: capturing.sessionId,
+        tabId,
+        reason: REASON_BOUND,
+      });
+      const since = `after navigation ${String(count)}`;
+      expect(progressOf(capturing.sessionId).slice(progressBefore.length), since).toHaveLength(
+        count - 1,
+      );
+
+      // Neither does the document the tab showed before, relayed again.
+      const replayed = await sendSettled(client, AGENT_READY, previous);
+      expect(replayed.errors).toEqual([]);
+      expect(announcementsSince(client, replayed.mark)).toEqual([]);
+      expect(progressOf(capturing.sessionId).slice(progressBefore.length), since).toHaveLength(
+        count - 1,
+      );
+
+      // The new document's report is what proves the reload: announced as one,
+      // on the URL the binding now stands at, to the panel and the editor …
+      const loaded = newDocumentReport(tabId, next);
+      const reported = await sendSettled(client, AGENT_READY, loaded);
+      expect(reported.errors).toEqual([]);
+      await settleAll(capturing.editor);
+      const reload = { ...standing, reason: REASON_NAVIGATED };
+      expect(announcementsSince(client, reported.mark)).toEqual([reload]);
+      expect(
+        announcementsSince(capturing.editor, editorMark).filter(
+          (payload) => payload.reason === REASON_NAVIGATED,
+        ),
+      ).toEqual([reload]);
+
+      // … and as one stored row per reload, appended after everything before it.
       const added = progressOf(capturing.sessionId).slice(progressBefore.length);
-      expect(added, `after navigation ${String(count)}`).toHaveLength(count);
+      expect(added, since).toHaveLength(count);
       const row = added.at(-1);
       expect(row).toMatchObject({ sessionId: capturing.sessionId, ...expectedRow });
       expect(typeof row?.detail).toBe('string');
 
-      // Exactly one frame per navigation, to the bound panel and to the editor.
+      // Exactly one frame per reload, to the bound panel and to the editor.
       for (const [receiver, from] of [
         [client, panelMark],
         [capturing.editor, editorMark],
@@ -2043,18 +2266,112 @@ describe(TAB_NAVIGATED, () => {
       // The notice says whether the agent resumed; it carries no URL.
       expect(JSON.stringify(row)).not.toContain(capturing.origin);
       expect(JSON.stringify(row)).not.toContain('range=');
+
+      // The same document reporting once more proves nothing further.
+      const repeated = await sendSettled(client, AGENT_READY, loaded);
+      expect(repeated.errors).toEqual([]);
+      await settleAll(capturing.editor);
+      expect(announcementsSince(client, repeated.mark)).toEqual([]);
+      expect(progressOf(capturing.sessionId).slice(progressBefore.length)).toHaveLength(count);
+      previous = loaded;
     }
   });
 
-  it('reports no reload for a navigation of a session without an open capture', async () => {
+  it('reports a same-document URL change during an open capture as the binding now stands, never as a reload', async () => {
+    const { capturing } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = pageOf(capturing, '/checkout');
+    const nextUrl = pageOf(capturing, '/checkout?order=ord_7');
+    const bound = await bind(client, { tabId, url });
+    expectEstablished(client, bound, capturing.sessionId, tabId);
+    await waitForArming(client, capturing, bound.mark);
+    const document = newDocumentReport(tabId, url);
+    expect((await sendSettled(client, AGENT_READY, document)).errors).toEqual([]);
+    await settleAll(capturing.editor);
+    const progressBefore = progressOf(capturing.sessionId);
+    const panelMark = client.received.length;
+    const editorMark = capturing.editor.received.length;
+
+    // The history API moved the URL on within the one document: the binding
+    // follows it, announced as it now stands, and the open capture is re-armed.
+    const navigated = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: nextUrl }),
+    );
+    expect(navigated.errors).toEqual([]);
+    await waitForArming(client, capturing, panelMark);
+    const standing = announcementsSince(client, navigated.mark);
+    expect(standing).toHaveLength(1);
+    expect(standing[0]).toMatchObject({
+      sessionId: capturing.sessionId,
+      tabId,
+      reason: REASON_BOUND,
+    });
+    expect(storedBindingOfTab(tabId)?.tab.url).toBe(standing[0]?.url);
+
+    // The page agent the document still runs reports again (a re-arm answer, a
+    // re-relayed report): the same document, so nothing is a reload.
+    const reported = await sendSettled(client, AGENT_READY, document);
+    expect(reported.errors).toEqual([]);
+    await settleAll(capturing.editor);
+    expect(announcementsSince(client, reported.mark)).toEqual([]);
+    expect(
+      announcementsSince(capturing.editor, editorMark).map((payload) => payload.reason),
+    ).toEqual([REASON_BOUND]);
+    expect(progressOf(capturing.sessionId)).toEqual(progressBefore);
+    expect(framesSince(client, REPLAY_SESSION_PROGRESS, panelMark)).toEqual([]);
+    expect(framesSince(capturing.editor, REPLAY_SESSION_PROGRESS, editorMark)).toEqual([]);
+    expect(openCaptureId(capturing.sessionId)).toBe(capturing.captureId);
+  });
+
+  it('forgets a kept navigation whose binding ends before a new document reports', async () => {
+    const { capturing } = suite();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = pageOf(capturing, '/reports');
+    const bound = await bind(client, { tabId, url });
+    expectEstablished(client, bound, capturing.sessionId, tabId);
+    await waitForArming(client, capturing, bound.mark);
+    expect((await sendSettled(client, AGENT_READY, newDocumentReport(tabId, url))).errors).toEqual(
+      [],
+    );
+    const progressBefore = progressOf(capturing.sessionId);
+
+    const navigated = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url }),
+    );
+    expect(navigated.errors).toEqual([]);
+    const unbound = await sendSettled(
+      client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(unbound.errors).toEqual([]);
+
+    // The tab binds again and only then reports its new document: the
+    // navigation the ended binding held is not replayed as a reload.
+    const rebound = await bind(client, { tabId, url });
+    expectEstablished(client, rebound, capturing.sessionId, tabId);
+    const reported = await sendSettled(client, AGENT_READY, newDocumentReport(tabId, url));
+    expect(reported.errors).toEqual([]);
+    await settleAll(capturing.editor);
+    expect(announcementsSince(client, reported.mark)).toEqual([]);
+    expect(progressOf(capturing.sessionId)).toEqual(progressBefore);
+  });
+
+  it('reports no reload for a navigation of a session without an open capture, though a new document announces it', async () => {
     const { created } = suite();
     const tabId = freshTab();
     const { client } = await openPanel(tabId);
-    expectEstablished(
-      client,
-      await bind(client, { tabId, url: pageOf(created, '/orders') }),
-      created.sessionId,
-      tabId,
+    const url = pageOf(created, '/orders');
+    const nextUrl = pageOf(created, '/orders/7');
+    expectEstablished(client, await bind(client, { tabId, url }), created.sessionId, tabId);
+    expect((await sendSettled(client, AGENT_READY, newDocumentReport(tabId, url))).errors).toEqual(
+      [],
     );
     const progressBefore = progressOf(created.sessionId);
     const panelMark = client.received.length;
@@ -2063,10 +2380,20 @@ describe(TAB_NAVIGATED, () => {
     const navigated = await sendSettled(
       client,
       TAB_NAVIGATED,
-      tabNavigatedPayloadSchema.parse({ tabId, url: pageOf(created, '/orders/7') }),
+      tabNavigatedPayloadSchema.parse({ tabId, url: nextUrl }),
     );
     expect(navigated.errors).toEqual([]);
-    expect(announcementsSince(client, navigated.mark)).toHaveLength(1);
+    expect(announcementsSince(client, navigated.mark)).toEqual([
+      { sessionId: created.sessionId, tabId, url: nextUrl, reason: REASON_BOUND },
+    ]);
+
+    // The new document proves a reload, which is announced — but with no open
+    // capture there is nothing it happened during.
+    const reported = await sendSettled(client, AGENT_READY, newDocumentReport(tabId, nextUrl));
+    expect(reported.errors).toEqual([]);
+    expect(announcementsSince(client, reported.mark)).toEqual([
+      { sessionId: created.sessionId, tabId, url: nextUrl, reason: REASON_NAVIGATED },
+    ]);
     await settleAll(created.editor);
 
     expect(progressOf(created.sessionId)).toEqual(progressBefore);
@@ -2573,8 +2900,8 @@ describe(SESSION_UNBIND, () => {
     );
     await waitFor(client, REPLAY_SESSION_UPDATED, (_message, index) => index >= later);
 
-    // … and the tab's credential still owns it: a reload is kept and re-arms
-    // the open capture there.
+    // … and the tab's credential still owns it: a navigation is kept and
+    // re-arms the open capture there.
     const reloaded = await sendSettled(
       client,
       TAB_NAVIGATED,
@@ -2582,7 +2909,7 @@ describe(SESSION_UNBIND, () => {
     );
     expect(reloaded.errors).toEqual([]);
     expect(announcementsSince(client, reloaded.mark)).toEqual([
-      { sessionId: capturing.sessionId, tabId, url, reason: REASON_NAVIGATED },
+      { sessionId: capturing.sessionId, tabId, url, reason: REASON_BOUND },
     ]);
     expectArmedFor((await waitForArming(client, capturing, reloaded.mark)).payload, capturing);
 
@@ -2652,6 +2979,246 @@ describe(SESSION_UNBIND, () => {
     );
     expect(twice.errors).toEqual([]);
     expect(announcementsSince(client, twice.mark)).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * A tab awaiting a session
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A stand-in dev server of a fresh fixture project, with no session yet. */
+interface IdleProject {
+  readonly project: FixtureProjectCopy;
+  readonly devServerUrl: string;
+  readonly origin: string;
+}
+
+/** Copies a fixture project and launches its stand-in dev server, creating no session. */
+async function idleProject(): Promise<IdleProject> {
+  const running = service();
+  const project = await running.copyFixtureProject();
+  const launched = unwrap(
+    await running.launchDevServer(project.root),
+    `Launching the dev server of ${project.root}`,
+  );
+  return {
+    project,
+    devServerUrl: launched.devServerUrl,
+    origin: new URL(launched.devServerUrl).origin,
+  };
+}
+
+/** Creates a session for an idle project's dev server, as `POST /sessions` does. */
+async function createSessionFor(target: IdleProject, question: string): Promise<SessionRecord> {
+  return unwrap(
+    await service().manager.create({
+      projectRoot: target.project.root,
+      question,
+      devServerUrl: target.devServerUrl,
+    }),
+    'Creating a session',
+  );
+}
+
+/** The ids of the sessions whose `session.created` a client received at or after `from`. */
+async function createdSince(client: HarnessWsClient, from: number): Promise<string[]> {
+  await settleAll(client);
+  return framesSince(client, SESSION_CREATED, from).map((message) => message.payload.session.id);
+}
+
+describe('a tab awaiting a session', () => {
+  it('sends a session created for an origin to the panel whose tab announced it before the session existed, and to no other panel', async () => {
+    const target = await idleProject();
+    const elsewhere = await idleProject();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const otherTab = freshTab();
+    const { client: bystander } = await openPanel(otherTab);
+    const url = new URL('/reports?view=weekly', target.origin).toString();
+
+    // The panel opens before the question: no session serves the origin yet.
+    expectRefused(await bind(client, { tabId, url }), CODES.SESSION_NOT_FOUND);
+    expectRefused(
+      await bind(bystander, { tabId: otherTab, url: new URL('/', elsewhere.origin).toString() }),
+      CODES.SESSION_NOT_FOUND,
+    );
+    const mark = client.received.length;
+    const bystanderMark = bystander.received.length;
+
+    const created = await createSessionFor(target, 'Why does the report take so long?');
+
+    expect(await createdSince(client, mark)).toEqual([created.id]);
+    expect(await createdSince(bystander, bystanderMark)).toEqual([]);
+    // Nothing else of the session reaches the panel before it binds.
+    expect(typesSince(client, mark).filter((type) => type !== SESSION_CREATED)).toEqual([]);
+
+    // The worker announces the tab again on that cue, and the service binds it.
+    expectEstablished(client, await bind(client, { tabId, url }), created.id, tabId);
+    expect(recordOf(created.id).boundTab?.tabId).toBe(tabId);
+
+    // A bound tab awaits nothing: a second session for the origin is not sent to it.
+    const afterBind = client.received.length;
+    const second = await createSessionFor(target, 'Why does the report render twice?');
+    expect(await createdSince(client, afterBind)).not.toContain(second.id);
+  });
+
+  it('sends the next session for the origin to a panel whose session ended while it stayed open', async () => {
+    const target = await idleProject();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = new URL('/orders', target.origin).toString();
+    const first = await createSessionFor(target, 'Why is the order list slow?');
+    expectEstablished(client, await bind(client, { tabId, url }), first.id, tabId);
+
+    unwrap(await service().manager.end(first.id), 'Ending the first session');
+    // The Chrome worker unbinds the tab once it hears the session ended; its
+    // DevTools stays open.
+    const unbound = await sendSettled(
+      client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(unbound.errors).toEqual([]);
+    const mark = client.received.length;
+
+    const next = await createSessionFor(target, 'Why does the order list render so often?');
+
+    expect(await createdSince(client, mark)).toEqual([next.id]);
+    expectEstablished(client, await bind(client, { tabId, url }), next.id, tabId);
+  });
+
+  it('offers the next session to the panel when it was created before the worker’s unbind of the ended session arrived', async () => {
+    const target = await idleProject();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = new URL('/orders', target.origin).toString();
+    const first = await createSessionFor(target, 'Why is the order list slow?');
+    expectEstablished(client, await bind(client, { tabId, url }), first.id, tabId);
+
+    // `session.end` and the next `POST /sessions` both land before the Chrome
+    // worker's unbind: the tab is still bound when the new session is created.
+    unwrap(await service().manager.end(first.id), 'Ending the first session');
+    const beforeCreate = client.received.length;
+    const next = await createSessionFor(target, 'Why does the order list render so often?');
+    expect(await createdSince(client, beforeCreate)).not.toContain(next.id);
+
+    const unbound = await sendSettled(
+      client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(unbound.errors).toEqual([]);
+
+    // Awaiting the origin, the tab is offered the session already serving it.
+    expect(await createdSince(client, unbound.mark)).toEqual([next.id]);
+    expectEstablished(client, await bind(client, { tabId, url }), next.id, tabId);
+    expect(recordOf(next.id).boundTab?.tabId).toBe(tabId);
+  });
+
+  it('never offers a tab that starts awaiting an origin a session another tab holds', async () => {
+    const target = await idleProject();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const holderTab = freshTab();
+    const { client: holder } = await openPanel(holderTab);
+    const url = new URL('/orders', target.origin).toString();
+    const first = await createSessionFor(target, 'Why is the order list slow?');
+    expectEstablished(client, await bind(client, { tabId, url }), first.id, tabId);
+    const held = await createSessionFor(target, 'Why is the order form slow?');
+    expectEstablished(
+      holder,
+      await bind(holder, { tabId: holderTab, url, sessionId: held.id }),
+      held.id,
+      holderTab,
+    );
+
+    unwrap(await service().manager.end(first.id), 'Ending the first session');
+    const unbound = await sendSettled(
+      client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(unbound.errors).toEqual([]);
+
+    expect(await createdSince(client, unbound.mark)).toEqual([]);
+    expect(recordOf(held.id).boundTab?.tabId).toBe(holderTab);
+
+    // The origin's next session still reaches the awaiting tab.
+    const mark = client.received.length;
+    const next = await createSessionFor(target, 'Why does the order list render so often?');
+    expect(await createdSince(client, mark)).toEqual([next.id]);
+  });
+
+  it('offers the open session of the origin a tab moved to, when no tab holds it', async () => {
+    const home = await idleProject();
+    const away = await idleProject();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = new URL('/dashboard', home.origin).toString();
+    const session = await createSessionFor(home, 'Why is the dashboard slow?');
+    expectEstablished(client, await bind(client, { tabId, url }), session.id, tabId);
+    const waiting = await createSessionFor(away, 'Why does the landing page flicker?');
+
+    const awayUrl = new URL('/', away.origin).toString();
+    const left = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: awayUrl }),
+    );
+    expect(left.errors).toEqual([]);
+    expect(announcementsSince(client, left.mark)).toContainEqual(
+      expect.objectContaining({ sessionId: session.id, tabId, reason: REASON_ORIGIN_CHANGED }),
+    );
+
+    expect(await createdSince(client, left.mark)).toEqual([waiting.id]);
+    expectEstablished(client, await bind(client, { tabId, url: awayUrl }), waiting.id, tabId);
+  });
+
+  it('sends a session created for the origin a tab moved to after leaving its session’s origin', async () => {
+    const home = await idleProject();
+    const away = await idleProject();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = new URL('/dashboard', home.origin).toString();
+    const session = await createSessionFor(home, 'Why is the dashboard slow?');
+    expectEstablished(client, await bind(client, { tabId, url }), session.id, tabId);
+
+    const left = await sendSettled(
+      client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url: new URL('/', away.origin).toString() }),
+    );
+    expect(left.errors).toEqual([]);
+    expect(announcementsSince(client, left.mark)).toContainEqual(
+      expect.objectContaining({ sessionId: session.id, tabId, reason: REASON_ORIGIN_CHANGED }),
+    );
+    const mark = client.received.length;
+
+    const arrived = await createSessionFor(away, 'Why does the landing page flicker?');
+    const otherForHome = await createSessionFor(home, 'Why is the dashboard slow again?');
+
+    expect(await createdSince(client, mark)).toEqual([arrived.id]);
+    expect(await createdSince(client, mark)).not.toContain(otherForHome.id);
+  });
+
+  it('forgets a tab whose DevTools closed before any session was created for its origin', async () => {
+    const target = await idleProject();
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = new URL('/', target.origin).toString();
+    expectRefused(await bind(client, { tabId, url }), CODES.SESSION_NOT_FOUND);
+
+    const closed = await sendSettled(
+      client,
+      SESSION_UNBIND,
+      sessionUnbindPayloadSchema.parse({ tabId }),
+    );
+    expect(closed.errors).toEqual([]);
+    const mark = client.received.length;
+
+    await createSessionFor(target, 'Why is the home page slow?');
+
+    expect(await createdSince(client, mark)).toEqual([]);
   });
 });
 
@@ -2742,8 +3309,13 @@ interface RaceRig {
  *
  * @param recorder The routes' navigation recorder in place of the ledger, for a
  * case about a recorder that fails; the ledger is still built and released.
+ * @param endedSessions The routes' ended-session port, for a case about a bind
+ * refused because its session is over; omitted, the routes are given none.
  */
-async function openRaceRig(recorder?: NavigationRecorder): Promise<RaceRig> {
+async function openRaceRig(
+  recorder?: NavigationRecorder,
+  endedSessions?: EndedSessionAgentPort,
+): Promise<RaceRig> {
   const running = service();
   const logger = running.logger.root;
   const directory = await mkdtemp(join(realpathSync(tmpdir()), RACE_RIG_PREFIX));
@@ -2805,6 +3377,7 @@ async function openRaceRig(recorder?: NavigationRecorder): Promise<RaceRig> {
           );
         },
       },
+      endedSessions,
       progress,
       navigations: recorder ?? ledger,
       logger,
@@ -3166,6 +3739,233 @@ describe('binding restoration racing session.end', () => {
   }
 });
 
+/** A recording {@link EndedSessionAgentPort}: every session it was told of, answered as scripted. */
+interface RecordingEndedSessions extends EndedSessionAgentPort {
+  readonly released: string[];
+  /** How the next call answers: settled, refused, or by throwing. */
+  answer: 'settled' | 'refuse' | 'throw';
+}
+
+function recordingEndedSessions(): RecordingEndedSessions {
+  const released: string[] = [];
+  const port: RecordingEndedSessions = {
+    released,
+    answer: 'settled',
+    pageAgentReleased: (sessionId) => {
+      released.push(sessionId);
+      if (port.answer === 'throw') {
+        throw new Error('The ended-session port failed.');
+      }
+      return port.answer === 'refuse'
+        ? err(new DebuggenError(CODES.INTERNAL, 'The ended-session port refused.'))
+        : ok('settled');
+    },
+  };
+  return port;
+}
+
+/** The binding route's log line for a refused bind whose ended session's page agent was released. */
+const PAGE_AGENT_RELEASED_LOG =
+  'A bind naming an ended session was refused; its page agent is released';
+
+describe('a bind naming a session that is over settles the page disarm it owes', () => {
+  let rig: RaceRig | undefined;
+  let port = recordingEndedSessions();
+
+  beforeEach(async () => {
+    port = recordingEndedSessions();
+    rig = await openRaceRig(undefined, port);
+  });
+
+  afterEach(async () => {
+    const current = rig;
+    rig = undefined;
+    if (current !== undefined) {
+      await closeRaceRig(current);
+    }
+  });
+
+  /** The current case's rig. @throws Error When `beforeEach` did not build it. */
+  function currentRig(): RaceRig {
+    if (rig === undefined) {
+      throw new Error('The ended-session case did not build its rig.');
+    }
+    return rig;
+  }
+
+  /** Re-announces the rig tab's binding to `sessionId`, as a reconnected service worker does. */
+  function rebind(
+    current: RaceRig,
+    binding: RigBinding,
+    sessionId: SessionId,
+  ): ReturnType<BindingRoutes['handleSessionBind']> {
+    return current.routes.handleSessionBind(
+      sessionBindPayloadSchema.parse({
+        tabId: binding.tabId,
+        url: binding.url,
+        origin: suite().created.origin,
+        sessionId,
+      }),
+      current.connection,
+    );
+  }
+
+  it('tells the port of a bind naming an ended session, and returns the refusal unchanged', async () => {
+    const current = currentRig();
+    const bound = await bindRigSession(current);
+    unwrap(await current.manager.end(bound.sessionId), 'Ending the session');
+    const logMark = service().logger.records.length;
+
+    const refused = refusalOf(await rebind(current, bound, bound.sessionId), 'Re-binding');
+
+    expect(refused.code).toBe(CODES.SESSION_INVALID_STATE);
+    expect(refused.details).toEqual({ reason: 'session-ended' });
+    expect(port.released).toEqual([bound.sessionId]);
+    expect(rigBindingRows(current)).toEqual([]);
+    const released = bindingLogSince(logMark).filter(
+      (entry) => entry.message === PAGE_AGENT_RELEASED_LOG,
+    );
+    expect(released).toHaveLength(1);
+    expect(released[0]?.level).toBe('info');
+    expect(released[0]?.fields).toMatchObject({
+      sessionId: bound.sessionId,
+      code: CODES.SESSION_INVALID_STATE,
+      owedDisarm: 'settled',
+    });
+  });
+
+  it('tells the port of a bind naming a session that no longer exists', async () => {
+    const current = currentRig();
+    const bound = await bindRigSession(current);
+    const vanished = newSessionId();
+
+    const refused = refusalOf(await rebind(current, bound, vanished), 'Re-binding');
+
+    expect(refused.code).toBe(CODES.SESSION_NOT_FOUND);
+    expect(port.released).toEqual([vanished]);
+  });
+
+  it('tells the port nothing for a live session, an origin mismatch or an origin bind', async () => {
+    const current = currentRig();
+    const bound = await bindRigSession(current);
+    const { capturing } = suite();
+
+    // The live session: the re-bind is accepted.
+    unwrap(await rebind(current, bound, bound.sessionId), 'Re-binding the live session');
+    // Named, but served by another dev server: refused before its status is read.
+    unwrap(await current.manager.end(bound.sessionId), 'Ending the session');
+    const mismatch = refusalOf(
+      await current.routes.handleSessionBind(
+        sessionBindPayloadSchema.parse({
+          tabId: bound.tabId,
+          url: pageOf(capturing, '/reports'),
+          origin: capturing.origin,
+          sessionId: bound.sessionId,
+        }),
+        current.connection,
+      ),
+      'Binding across origins',
+    );
+    expect(mismatch.code).toBe(CODES.TAB_NOT_BOUND);
+    // By origin: no session is named, so none is released.
+    const byOrigin = refusalOf(
+      await current.routes.handleSessionBind(
+        sessionBindPayloadSchema.parse({
+          tabId: bound.tabId,
+          url: bound.url,
+          origin: suite().created.origin,
+        }),
+        current.connection,
+      ),
+      'Binding by origin',
+    );
+    expect(byOrigin.code).toBe(CODES.SESSION_NOT_FOUND);
+
+    expect(port.released).toEqual([]);
+  });
+
+  it('returns the refusal unchanged when the port refuses or throws, logging which', async () => {
+    const current = currentRig();
+    const bound = await bindRigSession(current);
+    unwrap(await current.manager.end(bound.sessionId), 'Ending the session');
+
+    for (const answer of ['refuse', 'throw'] as const) {
+      port.answer = answer;
+      const logMark = service().logger.records.length;
+
+      const refused = refusalOf(
+        await rebind(current, bound, bound.sessionId),
+        `Re-binding (${answer})`,
+      );
+
+      expect(refused.code).toBe(CODES.SESSION_INVALID_STATE);
+      const logged = bindingLogSince(logMark);
+      expect(logged.filter((entry) => entry.message === PAGE_AGENT_RELEASED_LOG)).toEqual([]);
+      expect(
+        logged.filter(
+          (entry) =>
+            entry.level === (answer === 'refuse' ? 'warn' : 'error') &&
+            entry.message.includes('owed page disarm of a refused ended session'),
+        ),
+      ).toHaveLength(1);
+    }
+    expect(port.released).toEqual([bound.sessionId, bound.sessionId]);
+  });
+
+  it('tells the port of a named bind session.end closes while its record mirror is awaited, and not of a refusal about another session', async () => {
+    const current = currentRig();
+    const { created } = suite();
+    const url = pageOf(created, '/orders');
+    const endedMidBind: SessionId[] = [];
+
+    for (const about of ['this', 'another'] as const) {
+      const session = unwrap(
+        await current.manager.create({
+          projectRoot: created.project.root,
+          question: 'Why does the order list stall after a filter change?',
+          devServerUrl: created.devServerUrl,
+        }),
+        'Creating a race rig session',
+      );
+      const tabId = freshTab();
+      const held = current.holdNextMirror();
+      const binding = current.routes.handleSessionBind(
+        sessionBindPayloadSchema.parse({
+          tabId,
+          url,
+          origin: created.origin,
+          sessionId: session.id,
+        }),
+        current.connection,
+      );
+      const reached = await held.reached;
+      expect(reached.sessionId).toBe(session.id);
+      unwrap(await current.manager.end(session.id), 'Ending the session mid-bind');
+      if (about === 'this') {
+        // The real manager's answer, now that the session has ended.
+        endedMidBind.push(session.id);
+        held.answer(await current.manager.setBoundTab(session.id, reached.boundTab));
+      } else {
+        held.answer(
+          err(
+            new DebuggenError(CODES.SESSION_NOT_FOUND, 'A displaced session vanished.', {
+              details: { sessionId: newSessionId() },
+            }),
+          ),
+        );
+      }
+
+      const refused = refusalOf(await binding, `Binding while the session ends (${about})`);
+
+      expect(refused.code).toBe(
+        about === 'this' ? CODES.SESSION_INVALID_STATE : CODES.SESSION_NOT_FOUND,
+      );
+      expect(port.released).toEqual(endedMidBind);
+    }
+    expect(port.released).toHaveLength(1);
+  });
+});
+
 describe('the navigations the binding route records for readiness', () => {
   let rig: RaceRig | undefined;
 
@@ -3475,7 +4275,7 @@ describe('privacy of the inspected document', () => {
     );
     expect(navigated.errors).toEqual([]);
     expect(announcementsSince(client, navigated.mark)).toEqual([
-      { sessionId: created.sessionId, tabId, url: nextRedacted, reason: REASON_NAVIGATED },
+      { sessionId: created.sessionId, tabId, url: nextRedacted, reason: REASON_BOUND },
     ]);
     expect(rowsFor({ tabId })).toEqual([
       { tabId, sessionId: created.sessionId, url: nextRedacted },
@@ -3847,5 +4647,69 @@ describe('replay on bind', () => {
     expect(editorTypes).not.toContain(REPLAY_SESSION_PROGRESS);
     expect(editorTypes).not.toContain(REPLAY_ANALYSIS_COMPLETED);
     expect(editorTypes).not.toContain(REPLAY_PANEL_GENERATED);
+  });
+
+  it('sends the bound panel no progress row on an editor reopen, and the whole history again, to it alone, when it re-binds', async () => {
+    const { generated } = suite();
+    const progressBefore = progressOf(generated.sessionId);
+    expect(progressBefore.length).toBeGreaterThan(0);
+
+    const tabId = freshTab();
+    const { client } = await openPanel(tabId);
+    const url = pageOf(generated, '/');
+    expectEstablished(client, await bind(client, { tabId, url }), generated.sessionId, tabId);
+    await settleAll(generated.editor);
+
+    // The editor's reopen re-renders the bound panel from stored data — the
+    // record, the analysis and the panel — without the history it already holds.
+    const readMark = client.received.length;
+    const editorReadMark = generated.editor.received.length;
+    unwrap(
+      await service()
+        .http()
+        .request('session.get', { params: { id: generated.sessionId } }),
+      'Reopening the session from the editor',
+    );
+    await settleAll(client, generated.editor);
+    expect(typesSince(client, readMark)).toEqual([
+      REPLAY_SESSION_UPDATED,
+      REPLAY_ANALYSIS_COMPLETED,
+      REPLAY_PANEL_GENERATED,
+    ]);
+    // The editor that asked is replayed the history, each row with its stored stamp.
+    expect(
+      framesSince(generated.editor, REPLAY_SESSION_PROGRESS, editorReadMark).map(
+        (message) => message.ts,
+      ),
+    ).toEqual(progressBefore.map((row) => row.ts));
+
+    // The panel's catch-up is its bind: a re-bind of the same tab replays the
+    // whole stored history, in stored order with the stored stamps, to it alone.
+    const editorMark = generated.editor.received.length;
+    const again = await bind(client, { tabId, url });
+    expectEstablished(client, again, generated.sessionId, tabId);
+    const establishedAt = client.received.findIndex(
+      (message, index) =>
+        index >= again.mark &&
+        isMessageOfType(message, SESSION_BOUND) &&
+        message.payload.sessionId === generated.sessionId &&
+        message.payload.tabId === tabId,
+    );
+    expect(establishedAt).toBeGreaterThanOrEqual(again.mark);
+    const replayFrom = establishedAt + 1;
+    expect(typesSince(client, replayFrom)).toEqual([
+      REPLAY_SESSION_UPDATED,
+      ...progressBefore.map(() => REPLAY_SESSION_PROGRESS),
+      REPLAY_ANALYSIS_COMPLETED,
+      REPLAY_PANEL_GENERATED,
+    ]);
+    expect(
+      framesSince(client, REPLAY_SESSION_PROGRESS, replayFrom).map((message) => message.ts),
+    ).toEqual(progressBefore.map((row) => row.ts));
+    await settleAll(generated.editor);
+    expect(typesSince(generated.editor, editorMark)).not.toContain(REPLAY_SESSION_PROGRESS);
+
+    // Neither the reopen nor the re-bind appended anything.
+    expect(progressOf(generated.sessionId)).toEqual(progressBefore);
   });
 });

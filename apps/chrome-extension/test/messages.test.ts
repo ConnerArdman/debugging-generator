@@ -21,6 +21,10 @@
  *   admits exactly `{ active: boolean }`; `target.request` admits a `cancel`
  *   flag that is absent or exactly `true`, on the page channel and on the
  *   bridge port alike, and the bridge port still requires the request id.
+ * - **The flow-control signals carry nothing but their type.** `bridge.pause`
+ *   and `bridge.resume` are admitted downstream on the bridge port and on the
+ *   page channel with an empty payload only, and refused with a field, a
+ *   non-record payload, the wrong direction or the wrong channel version.
  *
  * Every fixture is built from the protocol's own constructors (`createEnvelope`)
  * and the shared id minters, so ids and envelopes are exactly what the running
@@ -562,6 +566,52 @@ describe('the reload offer vocabulary', () => {
     ]) {
       expect(isPanelReloadState(value)).toBe(false);
     }
+  });
+});
+
+describe('bridge.pause and bridge.resume — the worker holds the page agent back and lets it go', () => {
+  const SIGNALS = ['bridge.pause', 'bridge.resume'] as const;
+
+  /** A worker → bridge signal, as the worker posts it on the bridge port. */
+  function downstreamSignal(type: string, payload: unknown): Readonly<Record<string, unknown>> {
+    return { ...FRAMING, direction: 'downstream', type, payload };
+  }
+
+  /** A bridge → page signal, as the bridge dispatches it on the channel node. */
+  function pageSignal(
+    type: string,
+    payload: unknown,
+    version: number = PAGE_CHANNEL_VERSION,
+  ): Readonly<Record<string, unknown>> {
+    return { source: BRIDGE_SOURCE_TAG, version, type, payload };
+  }
+
+  it.each(SIGNALS)(
+    'admits %s with an empty payload on the bridge port and the page channel',
+    (type) => {
+      expect(isBridgeDownstreamMessage(downstreamSignal(type, {}))).toBe(true);
+      expect(isBridgeChannelMessage(pageSignal(type, {}))).toBe(true);
+    },
+  );
+
+  it.each(SIGNALS)('refuses %s with a field, a non-record payload or no payload', (type) => {
+    for (const payload of [{ paused: true }, { reason: 'lane' }, [], null, 'pause', 1]) {
+      expect(
+        isBridgeDownstreamMessage(downstreamSignal(type, payload)),
+        JSON.stringify(payload),
+      ).toBe(false);
+      expect(isBridgeChannelMessage(pageSignal(type, payload)), JSON.stringify(payload)).toBe(
+        false,
+      );
+    }
+    expect(isBridgeDownstreamMessage({ ...FRAMING, direction: 'downstream', type })).toBe(false);
+  });
+
+  it.each(SIGNALS)('refuses %s travelling upstream, or on an earlier page channel', (type) => {
+    expect(
+      isBridgeDownstreamMessage({ ...downstreamSignal(type, {}), direction: 'upstream' }),
+    ).toBe(false);
+    expect(isBridgeChannelMessage(pageSignal(type, {}, PAGE_CHANNEL_VERSION - 1))).toBe(false);
   });
 });
 

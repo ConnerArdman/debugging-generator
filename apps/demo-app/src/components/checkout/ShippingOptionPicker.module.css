@@ -82,7 +82,7 @@
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: var(--ls-space-3, 12px);
-  border: 1px solid var(--ls-border, #cbd5e1);
+  border: 1px solid var(--ls-border, #8190a5);
   border-radius: var(--ls-radius-md, 8px);
   background-color: var(--ls-surface, #ffffff);
   padding: var(--ls-space-3, 12px);
@@ -112,10 +112,19 @@
 }
 
 /* Hover is a pointer-only affordance, and it yields to the selected and disabled treatments
- * below rather than painting over them. */
+ * below rather than painting over them.
+ *
+ * The cue is the secondary Button's, computed from the ink token in the same proportions: 24% of
+ * ink into the hairline and 8% into the surface. Swapping in the recessed surface alone is a
+ * 1.05:1 step, which a buyer cannot tell from a row at rest; the mixed border measures 4.8:1 on
+ * white against the resting hairline's 3.25:1, and the row's text keeps its contrast on the
+ * tinted fill (the muted delivery line 6.4:1, the carrier name 15.2:1). Only colours change, and
+ * both are already in `.option`'s transition list, so the row neither reflows nor gains new
+ * motion. */
 @media (hover: hover) {
   .option:not(:has(:checked)):not(:has(:disabled)):hover {
-    background-color: var(--ls-surface-sunken, #f8fafc);
+    border-color: color-mix(in srgb, var(--ls-ink, #0f172a) 24%, var(--ls-border, #8190a5));
+    background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 8%, var(--ls-surface, #ffffff));
   }
 }
 
@@ -151,7 +160,7 @@
  * as it matches one disabled by its own attribute - `:disabled` is about the control's state, not
  * about where the attribute sits - so the group locks as a whole. */
 .option:has(:disabled) {
-  border-color: var(--ls-border, #cbd5e1);
+  border-color: var(--ls-border, #8190a5);
   background-color: var(--ls-surface-sunken, #f8fafc);
   opacity: var(--option-disabled-opacity);
   color: var(--ls-text-muted, #475569);

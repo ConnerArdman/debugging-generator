@@ -34,12 +34,19 @@
  *     the first record) reads as "nothing was captured".
  *
  * Two further properties belong to the privacy model (`docs/SECURITY.md`,
- * "Never captured"). Attribute values arrive already redacted and already
- * bounded to {@link MAX_PREVIEW_LENGTH} characters, so this suite asserts that
- * a preview renders byte-for-byte as supplied — including one that already
- * ends in the upstream truncation marker — that no control offers to expand
- * it, and that the compact strip counts what it does not show instead of
- * unpacking a structured summary.
+ * "Never captured"). Attribute values arrive already redacted, and a preview
+ * already bounded to {@link MAX_PREVIEW_LENGTH} characters, so this suite
+ * asserts that a preview renders byte-for-byte as supplied — including one that
+ * already ends in the upstream truncation marker — that a row showing every
+ * value whole offers nothing to expand, and that the compact strip counts what
+ * it does not show instead of unpacking a structured summary. A redacted URL or
+ * a parameterized statement is not a preview and may be far longer: the strip
+ * cuts it, and the suite asserts the whole value stays reachable — in the
+ * chip's title and in the row's detail, opened by keyboard or pointer — exactly
+ * as it arrived, with structured summaries still counted, never unpacked.
+ * Where the host can open a record, the strip's count is also a control, and
+ * the only thing it does is select the record for the host's detail drawer:
+ * the strip still unpacks nothing.
  *
  * Alongside those, like every component suite here, this one covers the three
  * states of a query-backed view — loading, empty and error — and the
@@ -51,15 +58,17 @@
  *
  * ## The case that guards a layering boundary
  *
- * `renders exactly the kinds its data and its node name` is not a test of a
+ * `offers exactly the kinds its data and its node name` is not a test of a
  * picker. `@debuggen/telemetry` is a **type-only** dependency of this package,
  * so the kind vocabulary — a runtime value of that package — may not be
- * imported here; the component discovers its options from the records that
- * arrived plus the kinds the panel's author named. An edit that reached for the
- * runtime vocabulary instead would pull zod-adjacent code into the browser
- * bundle, and the option list would grow from the handful the capture can
- * prove to the whole taxonomy. Asserting the option set *exactly* is the
- * cheapest place to catch that.
+ * imported here. While the loaded page is the whole source, the component
+ * discovers its options from the records that arrived plus the kinds the
+ * panel's author named, and asks for nothing more; an edit that enumerated a
+ * vocabulary instead would offer the whole taxonomy where the capture proves
+ * a handful. Asserting the option set *exactly*, and that no count was asked
+ * for, is the cheapest place to catch that. Only a page that falls short of
+ * its source takes the kind census (the "kind census" cases), whose vocabulary
+ * is the one the query filter schema of `@debuggen/panel-schema` admits.
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
@@ -74,11 +83,16 @@
  *     so these cases exercise the very seam the DevTools panel and the editor
  *     webview implement. The resolver is a `vi.fn`, and every query it receives
  *     is recorded in an array the cases assert on: what the component *asked
- *     for* is as much of its contract as what it drew. The provider and
+ *     for* is as much of its contract as what it drew. The kind census's
+ *     count-only requests are routed apart and recorded in their own array,
+ *     so the paging cases read the page sequence alone. The provider and
  *     response types are imported from `../host/DataProvider` rather than
  *     restated here: a local copy of that contract would keep compiling after
  *     the real one changed, which is the one drift this suite is meant to
  *     catch.
+ *   - **One transparent wrapper**: the code primitive is wrapped to count its
+ *     renders (see `codeRenders`), the only observable of the cell cache. It
+ *     renders the real primitive, so every DOM assertion reads real output.
  *   - **In-file synthetic builders, no fixture files.** {@link makeEvent} and
  *     {@link makeNode} take overrides; nothing here is read from disk or shared
  *     with another suite.
@@ -108,11 +122,12 @@ import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
   DATA_QUERY_MAX_LIMIT,
+  dataQueryFilterSchema,
 } from '@debuggen/panel-schema';
 import type { DataQuery, EventLogNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
-import type { TelemetryEvent } from '@debuggen/telemetry';
+import type { TelemetryEvent, TelemetryKind } from '@debuggen/telemetry';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
@@ -124,16 +139,45 @@ import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host
 import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
 import { Button } from '../primitives/Button';
+import type * as CodeModule from '../primitives/Code';
 import { kindColorVar } from '../utils/color';
 import {
   MAX_PREVIEW_LENGTH,
   NOT_AVAILABLE_LABEL,
+  collapseWhitespace,
   formatCount,
   formatKindLabel,
   formatOffset,
   formatStatusLabel,
+  oneLinePreview,
 } from '../utils/format';
 import { EventLog } from './EventLog';
+
+/**
+ * How many times the code primitive — the attribute strip's chip — has
+ * rendered.
+ *
+ * The one observable of the cell cache: a row's cells are built once per row
+ * model, so re-rendering the grid over the same rows (a selection, a scroll
+ * step of the virtualizer) must not render a chip again. The wrapper renders
+ * the real primitive, so every DOM assertion in this suite still reads the
+ * real output. Hoisted, because Vitest lifts the `vi.mock` factory above the
+ * imports and the factory closes over it.
+ */
+const codeRenders = vi.hoisted(() => ({ count: 0 }));
+
+vi.mock('../primitives/Code', async (importOriginal) => {
+  const actual = await importOriginal<typeof CodeModule>();
+  const { createElement } = await import('react');
+
+  const Code: typeof actual.Code = (props) => {
+    codeRenders.count += 1;
+
+    return createElement(actual.Code, props);
+  };
+
+  return { ...actual, Code };
+});
 
 /*
  * ---------------------------------------------------------------------------
@@ -247,6 +291,17 @@ const EMPTY_PAGE_TITLE = 'Nothing on this page';
 
 /** The generic substring of the product's own empty-capture copy. */
 const EMPTY_CAPTURE_PATTERN = /no records were captured/i;
+
+/**
+ * The accessible name of a row's "+N more" control: its visible count, the
+ * counted noun, and what pressing it does.
+ *
+ * @param hidden How many attributes the strip does not show.
+ * @returns The name, spelled out.
+ */
+function moreAttributesName(hidden: number): string {
+  return `+${formatCount(hidden)} more ${hidden === 1 ? 'attribute' : 'attributes'}: select this record to see every attribute`;
+}
 
 /*
  * ---------------------------------------------------------------------------
@@ -407,34 +462,95 @@ interface StubProvider {
   readonly provider: DataProvider;
 
   /**
-   * Every query the component has asked for, in call order.
+   * Every PAGE query the component has asked for, in call order.
    *
    * The assertion surface for the paging and filtering cases: what the
-   * component *requested* is as much of its contract as what it rendered.
+   * component *requested* is as much of its contract as what it rendered. The
+   * kind census's count-only requests are recorded apart, in
+   * {@link StubProvider.censusQueries}, so a case about the page sequence reads
+   * that sequence alone.
    */
   readonly queries: readonly DataQuery[];
 
-  /** The recorded resolver, for call counts. */
+  /** The recorded page resolver, for call counts; census requests never reach it. */
   readonly resolve: Mock<DataQueryResolver>;
+
+  /** Every kind-census request the component has sent, in call order. */
+  readonly censusQueries: readonly DataQuery[];
 }
+
+/**
+ * How many records of each kind a stub's source holds, as the component's kind
+ * census asks for them. A kind left out holds none.
+ */
+type CensusCounts = Readonly<Partial<Record<TelemetryKind, number>>>;
+
+/**
+ * Whether a query is one of the kind census's count-only requests rather than
+ * a page of the log: `limit: 0` from the first record, narrowed to exactly one
+ * kind, with no ordering. No page request of these cases has that shape — an
+ * authored count-only node names no kind — so the split is exact.
+ *
+ * @param query A query the component sent.
+ * @returns `true` for a census request.
+ */
+function isCensusQuery(query: DataQuery): boolean {
+  return (
+    query.limit === 0 &&
+    query.offset === DATA_QUERY_DEFAULT_OFFSET &&
+    query.sort === undefined &&
+    query.filter?.kinds?.length === 1
+  );
+}
+
+/**
+ * The cause a stub with no census rejects census requests with, so every case
+ * that is not about the census sees the component's fallback: the picker's
+ * options discovered from what loaded.
+ */
+const CENSUS_UNAVAILABLE = 'This stub answers no kind counts.';
 
 /**
  * A provider whose answers are computed per call.
  *
- * @param respond Called with each query and the 1-based number of the call.
+ * @param respond Called with each page query and the 1-based number of the
+ * call.
+ * @param census The kind counts census requests are answered with, or
+ * `undefined` to reject them.
  * @returns The stub, its recorded queries and its resolver.
  */
 function recordingProvider(
   respond: (query: DataQuery, call: number) => Promise<DataQueryResponse>,
+  census?: CensusCounts,
 ): StubProvider {
   const queries: DataQuery[] = [];
+  const censusQueries: DataQuery[] = [];
   const resolve = vi.fn<DataQueryResolver>((query) => {
     queries.push(query);
 
     return respond(query, queries.length);
   });
+  const route: DataQueryResolver = (query, context) => {
+    if (!isCensusQuery(query)) {
+      return resolve(query, context);
+    }
 
-  return { provider: createDataProvider(resolve), queries, resolve };
+    censusQueries.push(query);
+
+    const kind = query.filter?.kinds?.[0];
+
+    if (census === undefined || kind === undefined) {
+      return Promise.reject(new DebuggenError('TRANSPORT_DISCONNECTED', CENSUS_UNAVAILABLE));
+    }
+
+    return Promise.resolve<DataQueryResponse>({
+      source: 'events',
+      data: [],
+      total: census[kind] ?? 0,
+    });
+  };
+
+  return { provider: createDataProvider(route), queries, resolve, censusQueries };
 }
 
 /**
@@ -447,9 +563,15 @@ function recordingProvider(
  *
  * @param source The source the responses answer for.
  * @param pages The pages, in call order. At least one.
+ * @param census The kind counts census requests are answered with, or
+ * `undefined` to reject them.
  * @returns The stub provider.
  */
-function pagingProvider(source: EventLogSource, pages: readonly EventPage[]): StubProvider {
+function pagingProvider(
+  source: EventLogSource,
+  pages: readonly EventPage[],
+  census?: CensusCounts,
+): StubProvider {
   return recordingProvider((_query, call) => {
     const page = pages[Math.min(call, pages.length) - 1];
 
@@ -463,7 +585,7 @@ function pagingProvider(source: EventLogSource, pages: readonly EventPage[]): St
       ...(page.total === undefined ? {} : { total: page.total }),
       ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
     });
-  });
+  }, census);
 }
 
 /**
@@ -948,6 +1070,11 @@ describe('EventLog states', () => {
     // project.
     const message = await screen.findByText(/no records were captured/i);
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
+    // Worded like every other view's empty capture: what was captured "for
+    // this interaction", never "for this query", which names the mechanism
+    // rather than what the reader did.
+    expect(message.textContent).toContain('for this interaction');
+    expect(message.textContent).not.toContain('query');
 
     for (const name of PROVIDER_ORDER_NAMES) {
       expect(message.textContent).not.toContain(name);
@@ -1188,6 +1315,11 @@ describe('EventLog kind filter', () => {
     const labels = kindOptions().map((option) => option.label);
     expect(labels).not.toContain(formatKindLabel('db.query'));
     expect(labels).not.toContain(formatKindLabel('http.server'));
+
+    // The page is the whole source — no total beyond it, no further page — so
+    // the records that arrived already prove every kind it holds, and no
+    // count is asked for.
+    expect(stub.censusQueries).toHaveLength(0);
   });
 
   it('turns a chosen kind into a new query and follows the response', async () => {
@@ -1296,7 +1428,7 @@ describe('EventLog text filter', () => {
     // Both ratios are stated: what the filter kept of the loaded page, and what
     // the loaded page covers of the source.
     expect(
-      screen.getByText(`${formatCount(1)} of ${formatCount(3)} loaded records match`),
+      screen.getByText(`${formatCount(1)} of ${formatCount(3)} loaded records matches`),
     ).toBeDefined();
     expect(
       screen.getByText(`${formatCount(3)} of ${formatCount(40)} records loaded`),
@@ -1406,7 +1538,7 @@ describe('EventLog text filter', () => {
     await user.type(searchField(), 'click');
 
     // Exactly the statement the toolbar draws, so what is heard is what is shown.
-    const statement = `${formatCount(1)} of ${formatCount(3)} loaded records match`;
+    const statement = `${formatCount(1)} of ${formatCount(3)} loaded records matches`;
     await waitFor(() => {
       expect(liveRegion().textContent).toBe(statement);
     });
@@ -1524,7 +1656,7 @@ describe('EventLog announcements', () => {
     await user.type(searchField(), 'c');
     await waitFor(() => {
       expect(region.textContent).toBe(
-        `${formatCount(1)} of ${formatCount(3)} loaded records match`,
+        `${formatCount(1)} of ${formatCount(3)} loaded records matches`,
       );
     });
     expect(matchCountRegion()).toBe(region);
@@ -1549,7 +1681,7 @@ describe('EventLog announcements', () => {
     // One atomic sentence, the two toolbar statements in their toolbar order.
     await waitFor(() => {
       expect(matchCountRegion().textContent).toBe(
-        `${formatCount(1)} of ${formatCount(3)} loaded records match. ${PARTIAL_SEARCH_NOTE}`,
+        `${formatCount(1)} of ${formatCount(3)} loaded records matches. ${PARTIAL_SEARCH_NOTE}`,
       );
     });
     expect(liveCopiesOfMatchCount()).toHaveLength(1);
@@ -1608,7 +1740,7 @@ describe('EventLog announcements', () => {
     // In flight, the count keeps the total it was last given rather than
     // announcing one that claims no total was ever reported.
     expect(coverage.textContent).toBe(loadedOne);
-    expect(screen.queryByText(`${formatCount(1)} records loaded`)).toBeNull();
+    expect(screen.queryByText(`${formatCount(1)} record loaded`)).toBeNull();
 
     act(() => {
       second.settle?.({ source: 'events', data: [FETCH_RECORD], total: 40, nextOffset: 2 });
@@ -1652,6 +1784,47 @@ function ruleOf(selector: string): { readonly body: string } {
   return { body: COMPONENT_STYLESHEET.slice(open + 1, close) };
 }
 
+/** How an attribute disclosure's name begins while its row is collapsed. */
+const SHOW_ATTRIBUTES_PREFIX = 'Show the full attributes of';
+
+/** How it begins while the row is expanded. */
+const HIDE_ATTRIBUTES_PREFIX = 'Hide the full attributes of';
+
+/**
+ * The detail an expanded row shows: the element its disclosure controls,
+ * which must be in the document, holding the component's detail block.
+ *
+ * @param row The expanded data row.
+ * @returns The detail block.
+ */
+function attributeDetailOf(row: HTMLElement): HTMLElement {
+  const disclosure = within(row).getByRole('button', {
+    name: new RegExp(`^${HIDE_ATTRIBUTES_PREFIX} `),
+  });
+  expect(disclosure.getAttribute('aria-expanded')).toBe('true');
+  const controlled = document.getElementById(disclosure.getAttribute('aria-controls') ?? '');
+  const detail = controlled?.querySelector<HTMLElement>('.dg-event-log__detail') ?? null;
+  if (controlled === null || detail === null) {
+    throw new Error('the expanded row controls no attribute detail');
+  }
+  // The detail is its own row after the data row, never part of the row's cells.
+  expect(row.contains(detail)).toBe(false);
+  return detail;
+}
+
+/**
+ * The entries of a detail, as `[key, whole value]` pairs in document order:
+ * each value block with the key printed directly above it.
+ *
+ * @param detail The detail block.
+ * @returns Its entries.
+ */
+function detailEntries(detail: HTMLElement): (readonly [string, string])[] {
+  return Array.from(detail.querySelectorAll('pre')).map(
+    (block) => [block.previousElementSibling?.textContent ?? '', block.textContent ?? ''] as const,
+  );
+}
+
 describe('EventLog attributes', () => {
   /** A value exactly as long as the preview bound a producer is held to. */
   const BOUNDED_VALUE = 'redacted-value-'.repeat(8);
@@ -1684,13 +1857,14 @@ describe('EventLog attributes', () => {
     // re-expands or reconstructs a value it was handed.
     expect(preview.textContent?.endsWith(TRUNCATED_VALUE)).toBe(true);
 
-    // A chip the cell cuts short is readable on hover, and the hover shows the
-    // very preview the chip renders — never a fuller value than was captured.
+    // A chip the cell cuts short is readable on hover. The hover shows the whole
+    // pair, which for a value within the preview bound is the very text the
+    // chip renders — never a fuller value than was captured.
     expect(bounded.getAttribute('title')).toBe(bounded.textContent);
     expect(preview.getAttribute('title')).toBe(preview.textContent);
 
-    // No affordance offers more than the producer was permitted to capture: the
-    // row holds no control at all, and the strip claims nothing is withheld.
+    // Everything is shown whole already, so nothing offers more: the row holds
+    // no control at all, and the strip claims nothing is withheld.
     expect(within(row).queryAllByRole('button')).toHaveLength(0);
     expect(within(row).queryByText(/more$/)).toBeNull();
   });
@@ -1718,13 +1892,30 @@ describe('EventLog attributes', () => {
     expect(within(row).getByText('example.third=true')).toBeDefined();
 
     // The pair beyond the row's bound and the structured summary are counted,
-    // never dropped and never expanded: an upstream summary stays a summary,
-    // and the whole attribute bag belongs to the host's detail drawer.
+    // never dropped and never expanded on the row: an upstream summary stays a
+    // summary, and the whole attribute bag belongs to the host's detail drawer.
     expect(within(row).getByText(`+${formatCount(2)} more`)).toBeDefined();
     expect(row.textContent).not.toContain('example.fourth');
     expect(row.textContent).not.toContain('delta');
     expect(row.textContent).not.toContain('nested');
     expect(row.textContent).not.toContain('kept-for-the-detail-drawer');
+
+    // A primitive pair was left out, so the row opens into its detail: every
+    // primitive whole, in the producer's order, and the structured summary
+    // counted there too — still never unpacked, anywhere on the page.
+    await userEvent
+      .setup()
+      .click(within(row).getByRole('button', { name: `${SHOW_ATTRIBUTES_PREFIX} ${record.name}` }));
+    const detail = attributeDetailOf(rowNamed(record.name));
+    expect(detailEntries(detail)).toEqual([
+      ['example.first', 'alpha'],
+      ['example.second', '2'],
+      ['example.third', 'true'],
+      ['example.fourth', 'delta'],
+    ]);
+    expect(within(detail).getByText('1 structured value not unpacked here')).toBeDefined();
+    expect(document.body.textContent).not.toContain('nested');
+    expect(document.body.textContent).not.toContain('kept-for-the-detail-drawer');
   });
 
   it('draws the pairs as shrinking chips, followed by a count that never shrinks', async () => {
@@ -1760,8 +1951,10 @@ describe('EventLog attributes', () => {
 
     // The count carries the class that keeps it whole, and it is the strip's
     // last item, directly after the chips — so the chips give way to it and
-    // never the other way round.
-    const more = within(row).getByText(`+${formatCount(2)} more`);
+    // never the other way round. Under a host that can open a record it is
+    // the control that does so, showing exactly the count.
+    const more = within(row).getByRole('button', { name: moreAttributesName(2) });
+    expect(more.textContent).toBe(`+${formatCount(2)} more`);
     expect(more.classList.contains('dg-event-log__more')).toBe(true);
     expect(more.classList.contains('dg-event-log__attr')).toBe(false);
     expect(more.closest('.dg-event-log__attrs')).not.toBeNull();
@@ -1790,6 +1983,154 @@ describe('EventLog attributes', () => {
     expect(chip.body.indexOf('flex-basis: 0;')).toBeGreaterThan(chip.body.indexOf('flex: auto;'));
 
     expect(ruleOf('.dg-event-log__more').body).toContain('flex: none;');
+
+    // The strip clips at its own box, which the count's button fills, so the
+    // button's focus ring is pulled inward and drawn whole — by offset alone,
+    // never by removing or restyling the ring.
+    const focusRule = ruleOf('.dg-event-log__more:focus-visible').body;
+    expect(focusRule).toContain('outline-offset: var(--dg-space-inverse-0);');
+    expect(focusRule).not.toContain('outline:');
+  });
+});
+
+describe('EventLog long values', () => {
+  /** The words at the very end of the long URL, which only the whole value holds. */
+  const URL_TAIL = 'tail=?';
+
+  /** A redacted URL far past the preview budget: its query values already replaced. */
+  const LONG_URL = `http://127.0.0.1:3000/example/${'segment/'.repeat(30)}resource?page=?&${URL_TAIL}`;
+
+  /** The words at the very end of the long statement. */
+  const STATEMENT_TAIL = 'example-end-of-statement';
+
+  /** A parameterized statement laid out over lines, past the budget: literals already replaced. */
+  const LONG_STATEMENT = [
+    'SELECT',
+    Array.from(
+      { length: 30 },
+      (_, at) => `  COALESCE(example_ledger.column_${String(at)}, ?) AS column_${String(at)}`,
+    ).join(',\n'),
+    'FROM example_ledger WHERE tenant_id = $1',
+    `LIMIT ? /* ${STATEMENT_TAIL} */`,
+  ].join('\n');
+
+  /** A request record carrying both, as a server span of a database-backed route would. */
+  const LONG_RECORD = makeEvent({
+    id: 'event-example-0301',
+    kind: 'http.server',
+    tier: 'server',
+    name: 'example.long-values',
+    attributes: { 'http.method': 'GET', url: LONG_URL, 'db.statement': LONG_STATEMENT },
+  });
+
+  it('carries the whole of a cut value in its chip, and opens it whole from the keyboard', async () => {
+    const stub = resolvingProvider('events', [LONG_RECORD]);
+    const spies = makeActions();
+    const onExpand = vi.fn<(nodeId: string, itemId: string, expanded: boolean) => void>();
+    const user = userEvent.setup();
+
+    renderBeforeControl(makeNode(), {
+      provider: stub.provider,
+      actions: { ...spies.actions, onExpand },
+    });
+
+    const grid = await screen.findByRole('grid', { name: GRID_NAME });
+    const row = rowNamed(LONG_RECORD.name);
+
+    // The strip cuts both values to the preview budget; each chip's title holds
+    // the whole pair, whitespace folded onto the chip's one line.
+    const url = within(row).getByText(`url=${oneLinePreview(LONG_URL)}`);
+    expect(url.textContent?.endsWith('…')).toBe(true);
+    expect(url.textContent).not.toContain(URL_TAIL);
+    expect(url.getAttribute('title')).toBe(`url=${LONG_URL}`);
+    const statement = within(row).getByText(`db.statement=${oneLinePreview(LONG_STATEMENT)}`);
+    expect(statement.getAttribute('title')).toBe(
+      `db.statement=${collapseWhitespace(LONG_STATEMENT)}`,
+    );
+    expect(statement.getAttribute('title')).toContain(STATEMENT_TAIL);
+
+    // The row is expandable through its disclosure, which leads the record's
+    // name, names the record, and stays out of the Tab order.
+    const show = within(row).getByRole('button', {
+      name: `${SHOW_ATTRIBUTES_PREFIX} ${LONG_RECORD.name}`,
+    });
+    expect(show.closest('[role="rowheader"]')).not.toBeNull();
+    expect(show.getAttribute('tabindex')).toBe('-1');
+    expect(show.getAttribute('aria-expanded')).toBe('false');
+    expect(show.hasAttribute('aria-controls')).toBe(false);
+    expect(tabStopsIn(grid)).toEqual([row]);
+
+    // The keyboard: Tab onto the row, ArrowRight onto its disclosure, Enter.
+    focusDirectly(kindPicker());
+    await user.tab();
+    expect(document.activeElement).toBe(row);
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(show);
+    await user.keyboard('{Enter}');
+    expect(onExpand).toHaveBeenCalledTimes(1);
+    expect(onExpand).toHaveBeenLastCalledWith(NODE_ID, LONG_RECORD.id, true);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // The detail: every primitive, whole and exactly as it arrived — the
+    // statement's line breaks kept — in the producer's key order.
+    const detail = attributeDetailOf(rowNamed(LONG_RECORD.name));
+    expect(detailEntries(detail)).toEqual([
+      ['http.method', 'GET'],
+      ['url', LONG_URL],
+      ['db.statement', LONG_STATEMENT],
+    ]);
+
+    // Each value is a wrapping code block the row's keyboard walk reaches: out
+    // of the Tab order of the page, and the next stop after the disclosure.
+    const blocks = Array.from(detail.querySelectorAll<HTMLElement>('pre'));
+    for (const block of blocks) {
+      expect(block.getAttribute('tabindex')).toBe('-1');
+      expect(block.classList.contains('dg-code--block')).toBe(true);
+      expect(block.classList.contains('dg-code--wrap')).toBe(true);
+    }
+    const hide = within(rowNamed(LONG_RECORD.name)).getByRole('button', {
+      name: `${HIDE_ATTRIBUTES_PREFIX} ${LONG_RECORD.name}`,
+    });
+    expect(document.activeElement).toBe(hide);
+    await user.tab();
+    expect(document.activeElement).toBe(blocks[0]);
+    expect(tabStopsIn(grid)).toEqual([rowNamed(LONG_RECORD.name)]);
+
+    // Escape returns to the row; the disclosure closes the detail again.
+    await user.keyboard('{Escape}');
+    expect(document.activeElement).toBe(rowNamed(LONG_RECORD.name));
+    await user.click(hide);
+    expect(onExpand).toHaveBeenLastCalledWith(NODE_ID, LONG_RECORD.id, false);
+    expect(document.querySelector('.dg-event-log__detail')).toBeNull();
+    expect(
+      within(rowNamed(LONG_RECORD.name))
+        .getByRole('button', { name: `${SHOW_ATTRIBUTES_PREFIX} ${LONG_RECORD.name}` })
+        .getAttribute('aria-expanded'),
+    ).toBe('false');
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('offers no disclosure when what it leaves out is only structured summaries', async () => {
+    const record = makeEvent({
+      attributes: {
+        'example.first': 'alpha',
+        'example.structured': { nested: 'kept-for-the-detail-drawer' },
+      },
+    });
+    const stub = resolvingProvider('events', [record]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    const row = rowNamed(record.name);
+
+    // The strip counts the summary; a detail would add nothing it may show,
+    // so the row has no disclosure — its one control is the count's own.
+    expect(within(row).getByText(`+${formatCount(1)} more`)).toBeDefined();
+    expect(
+      within(row).queryAllByRole('button', { name: `${SHOW_ATTRIBUTES_PREFIX} ${record.name}` }),
+    ).toHaveLength(0);
+    expect(document.querySelector('.dg-event-log__detail')).toBeNull();
   });
 });
 
@@ -2156,7 +2497,7 @@ describe('EventLog paging', () => {
 
     // A service that reported no total leaves this view unable to know whether
     // more records exist, and saying only what it has is the truthful option.
-    const coverage = await screen.findByText(`${formatCount(1)} records loaded`);
+    const coverage = await screen.findByText(`${formatCount(1)} record loaded`);
     expect(coverage.textContent).not.toContain(' of ');
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
   });
@@ -2216,7 +2557,7 @@ describe('EventLog authored offset', () => {
     renderComponent(nodeFrom(200), { provider: stub.provider, actions: makeActions().actions });
 
     const coverage = await screen.findByText(
-      `${formatCount(1)} records loaded, from position ${formatCount(201)}`,
+      `${formatCount(1)} record loaded, from position ${formatCount(201)}`,
     );
     expect(coverage.textContent).not.toContain(' of ');
     expect(soleQuery(stub).offset).toBe(200);
@@ -2736,5 +3077,543 @@ describe('EventLog shared selection', () => {
 
     expect(dataRows()).toHaveLength(PROVIDER_ORDER.length);
     expect(dataRows().every((row) => row.getAttribute('aria-selected') === null)).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The kind census
+ *
+ * A page that does not reach the end of its source cannot stand for the kinds
+ * the source holds: a capture that opens with renders keeps its statements and
+ * requests thousands of records further on. While the loaded page falls short,
+ * the log counts every kind the query filter can name with one count-only
+ * request each, and offers exactly the kinds the source holds, with their
+ * counts. The expected vocabulary is read from the query schema — the contract
+ * the census requests must satisfy — rather than from the component.
+ * ---------------------------------------------------------------------------
+ */
+
+/** Every kind a `DataQueryFilter.kinds` entry may name, from the query schema. */
+const FILTER_KINDS: readonly string[] = dataQueryFilterSchema.shape.kinds.unwrap().element.options;
+
+/** A kind label as the picker shows it with a census count beside it. */
+function countedLabel(label: string, count: number): string {
+  return `${label} (${formatCount(count)})`;
+}
+
+describe('EventLog kind census', () => {
+  it('offers every kind the source holds, with its count, when the page does not cover it', async () => {
+    // The first page holds a render, a fetch and an interaction; the source
+    // also holds statements the page never reached.
+    const stub = pagingProvider('events', [{ data: PROVIDER_ORDER, total: 40, nextOffset: 3 }], {
+      render: 20,
+      fetch: 8,
+      interaction: 2,
+      'db.query': 10,
+    });
+
+    renderComponent(
+      makeNode({
+        query: { source: 'events', filter: { traceId: TRACE_ID }, limit: DATA_QUERY_DEFAULT_LIMIT },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByRole('grid');
+
+    // A kind no loaded record shows is offered, and every option says how many
+    // records it narrows to; "all kinds" is the whole source.
+    await waitFor(() => {
+      expect(kindOptions()).toEqual([
+        { value: '', label: countedLabel(ALL_KINDS_LABEL, 40) },
+        { value: 'db.query', label: countedLabel(formatKindLabel('db.query'), 10) },
+        { value: 'fetch', label: countedLabel(formatKindLabel('fetch'), 8) },
+        { value: 'interaction', label: countedLabel(formatKindLabel('interaction'), 2) },
+        { value: 'render', label: countedLabel(formatKindLabel('render'), 20) },
+      ]);
+    });
+
+    // One count-only request per kind the filter can name, each the node's own
+    // narrowing plus that one kind, from the first record — and none of them
+    // part of the page sequence.
+    expect(stub.censusQueries.map((query) => query.filter?.kinds?.[0])).toEqual([...FILTER_KINDS]);
+    for (const query of stub.censusQueries) {
+      expect(query).toEqual({
+        source: 'events',
+        filter: { traceId: TRACE_ID, kinds: [query.filter?.kinds?.[0]] },
+        limit: 0,
+        offset: DATA_QUERY_DEFAULT_OFFSET,
+      });
+    }
+    expect(stub.queries).toHaveLength(1);
+  });
+
+  it('narrows to a kind the page never showed, and keeps its census without taking it again', async () => {
+    const statement = makeEvent({
+      id: 'event-example-0010',
+      spanId: spanIdFor(10),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.statement',
+      seq: 10,
+    });
+    const stub = pagingProvider(
+      'events',
+      [
+        { data: PROVIDER_ORDER, total: 40, nextOffset: 3 },
+        { data: [statement], total: 1 },
+      ],
+      { render: 20, fetch: 8, interaction: 2, 'db.query': 1 },
+    );
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+    await waitFor(() => {
+      expect(kindOptions().map((option) => option.value)).toContain('db.query');
+    });
+    const counted = stub.censusQueries.length;
+
+    await user.selectOptions(kindPicker(), 'db.query');
+
+    // The narrowing is a re-query for that kind, and it draws the records the
+    // first page could not have shown.
+    expect(queryOfCall(stub, 2).filter).toEqual({ kinds: ['db.query'] });
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([statement.name]);
+    });
+    expect(spies.onFilterChange).toHaveBeenCalledWith(NODE_ID, { kinds: 'db.query' });
+
+    // The census counts what the reader can narrow TO, so narrowing never
+    // re-takes it, and the other kinds stay on offer with their counts even
+    // though the narrowed page now covers its own source.
+    expect(stub.censusQueries).toHaveLength(counted);
+    expect(kindOptions()).toEqual([
+      { value: '', label: countedLabel(ALL_KINDS_LABEL, 31) },
+      { value: 'db.query', label: countedLabel(formatKindLabel('db.query'), 1) },
+      { value: 'fetch', label: countedLabel(formatKindLabel('fetch'), 8) },
+      { value: 'interaction', label: countedLabel(formatKindLabel('interaction'), 2) },
+      { value: 'render', label: countedLabel(formatKindLabel('render'), 20) },
+    ]);
+  });
+
+  it('counts only the kinds the node narrows to, and drops the ones the source lacks', async () => {
+    const stub = pagingProvider('events', [{ data: [RENDER_RECORD], total: 35, nextOffset: 1 }], {
+      render: 30,
+      'db.query': 5,
+    });
+
+    renderComponent(
+      makeNode({
+        query: {
+          source: 'events',
+          filter: { kinds: ['render', 'db.query', 'log'] },
+          limit: DATA_QUERY_DEFAULT_LIMIT,
+        },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByRole('grid');
+
+    // The reader can never narrow outside the node's own query, so only its
+    // three kinds are counted; the one the source holds none of is not offered,
+    // because choosing it could only draw nothing.
+    await waitFor(() => {
+      expect(kindOptions()).toEqual([
+        { value: '', label: countedLabel(ALL_KINDS_LABEL, 35) },
+        { value: 'db.query', label: countedLabel(formatKindLabel('db.query'), 5) },
+        { value: 'render', label: countedLabel(formatKindLabel('render'), 30) },
+      ]);
+    });
+    const authored = ['render', 'db.query', 'log'];
+    expect(stub.censusQueries.map((query) => query.filter?.kinds)).toEqual(
+      FILTER_KINDS.filter((kind) => authored.includes(kind)).map((kind) => [kind]),
+    );
+  });
+
+  it('takes no census when the loaded page reaches the reported total', async () => {
+    const stub = pagingProvider('events', [{ data: PROVIDER_ORDER, total: 3 }], { render: 1 });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(`${formatCount(3)} of ${formatCount(3)} records loaded`);
+
+    expect(stub.censusQueries).toHaveLength(0);
+    expect(kindOptions().map((option) => option.label)).toEqual([
+      ALL_KINDS_LABEL,
+      formatKindLabel('fetch'),
+      formatKindLabel('interaction'),
+      formatKindLabel('render'),
+    ]);
+  });
+
+  it('takes no census for a node that starts at an authored offset', async () => {
+    const stub = pagingProvider('events', [{ data: PROVIDER_ORDER, total: 240, nextOffset: 203 }], {
+      render: 240,
+    });
+
+    renderComponent(nodeFrom(200), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // A window into its sequence: counting kinds the window can never reach
+    // would offer narrowings that draw nothing from where it starts.
+    expect(stub.censusQueries).toHaveLength(0);
+    expect(kindOptions().map((option) => option.label)).not.toContain(
+      countedLabel(ALL_KINDS_LABEL, 240),
+    );
+  });
+
+  it('falls back to the kinds that loaded, with no error, when the census cannot be taken', async () => {
+    // No census answer: every count request is rejected.
+    const stub = pagingProvider('events', [{ data: PROVIDER_ORDER, total: 40, nextOffset: 3 }]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await waitFor(() => {
+      expect(stub.censusQueries).toHaveLength(FILTER_KINDS.length);
+    });
+
+    // The log itself is unaffected: no failure is drawn for a census, and the
+    // picker offers what the loaded records prove, as it would without one.
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(renderedNames()).toEqual([...PROVIDER_ORDER_NAMES]);
+    expect(kindOptions()).toEqual([
+      { value: '', label: ALL_KINDS_LABEL },
+      { value: 'fetch', label: formatKindLabel('fetch') },
+      { value: 'interaction', label: formatKindLabel('interaction') },
+      { value: 'render', label: formatKindLabel('render') },
+    ]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Appending a page
+ *
+ * A further page never replaces what is on screen: the grid stays the same
+ * mounted element — so its virtualizer, its scroll position and its active row
+ * survive the request — and the control that was pressed keeps its place and
+ * its focus. A failure is reported beneath the rows it could not extend.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The paging control's name while the page it asked for is on its way. */
+const LOADING_MORE_NAME = 'Loading more…';
+
+/** The title the shared error contract gives a failed further page. */
+const PAGE_FAILURE_TITLE = 'Could not load the next page';
+
+/** The first page every appending case starts from: one of forty records. */
+const FIRST_OF_FORTY: DataQueryResponse = {
+  source: 'events',
+  data: [RENDER_RECORD],
+  total: 40,
+  nextOffset: 1,
+};
+
+describe('EventLog appending a page', () => {
+  it('keeps the grid, its rows and the focused control in place while the next page loads', async () => {
+    const second: { settle?: (response: DataQueryResponse) => void } = {};
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve(FIRST_OF_FORTY)
+        : new Promise<DataQueryResponse>((resolve) => {
+            second.settle = resolve;
+          }),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    const control = screen.getByRole('button', { name: LOAD_MORE_NAME });
+
+    await user.click(control);
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+
+    // In flight: the same grid, the same rows, no view-wide busy state, and the
+    // pressed control still there, still focused, saying what it is doing.
+    expect(screen.getByRole('grid')).toBe(grid);
+    expect(renderedNames()).toEqual([RENDER_RECORD.name]);
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
+    expect(screen.getByRole('button', { name: LOADING_MORE_NAME })).toBe(control);
+    expect(document.activeElement).toBe(control);
+    expect(control.getAttribute('aria-disabled')).toBe('true');
+    expect(control.getAttribute('aria-busy')).toBe('true');
+
+    // Pressing it again asks for nothing more.
+    await user.click(control);
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      second.settle?.({ source: 'events', data: [FETCH_RECORD], total: 40, nextOffset: 2 });
+    });
+
+    // Appended into the same grid, and the control — the same element — is
+    // ready again with focus still on it.
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([RENDER_RECORD.name, FETCH_RECORD.name]);
+    });
+    expect(screen.getByRole('grid')).toBe(grid);
+    expect(screen.getByRole('button', { name: LOAD_MORE_NAME })).toBe(control);
+    expect(document.activeElement).toBe(control);
+    expect(control.getAttribute('aria-disabled')).toBeNull();
+    expect(control.getAttribute('aria-busy')).toBeNull();
+  });
+
+  it('moves a reader on the control to the grid when the last page arrives', async () => {
+    const stub = pagingProvider('events', [
+      { data: [RENDER_RECORD], total: 2, nextOffset: 1 },
+      { data: [FETCH_RECORD], total: 2 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([RENDER_RECORD.name, FETCH_RECORD.name]);
+    });
+
+    // Nothing is left to load, so the control is gone — and the reader who was
+    // on it is on the grid's tab stop, not on the document body.
+    expect(screen.queryByRole('button', { name: /load/i })).toBeNull();
+    expect(screen.getByRole('grid')).toBe(grid);
+
+    const active = document.activeElement;
+    expect(active).not.toBe(document.body);
+    expect(active?.getAttribute('role')).toBe('row');
+    expect(active?.getAttribute('tabindex')).toBe('0');
+    expect(active instanceof HTMLElement && grid.contains(active)).toBe(true);
+  });
+
+  it('reports a failed page beneath the rows it could not extend, and retries that page', async () => {
+    const stub = recordingProvider((_query, call) => {
+      if (call === 1) {
+        return Promise.resolve(FIRST_OF_FORTY);
+      }
+      if (call === 2) {
+        return Promise.reject(
+          new DebuggenError('TRANSPORT_DISCONNECTED', PROVIDER_CAUSE, { hint: PROVIDER_HINT }),
+        );
+      }
+
+      return Promise.resolve<DataQueryResponse>({
+        source: 'events',
+        data: [FETCH_RECORD],
+        total: 40,
+        nextOffset: 2,
+      });
+    });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    const alert = await screen.findByRole('alert');
+
+    // The rows already read stay where they were, in the same grid, and the
+    // footer keeps its count; the failure names the page, not the view.
+    expect(screen.getByRole('grid')).toBe(grid);
+    expect(renderedNames()).toEqual([RENDER_RECORD.name]);
+    expect(within(alert).getByText(PAGE_FAILURE_TITLE)).toBeDefined();
+    expect(within(alert).queryByText(QUERY_FAILURE_TITLE)).toBeNull();
+    expect(within(alert).getByText(PROVIDER_CAUSE, { exact: false })).toBeDefined();
+    expect(
+      screen.getByText(`${formatCount(1)} of ${formatCount(40)} records loaded`),
+    ).toBeDefined();
+    expect(grid.compareDocumentPosition(alert) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+
+    // The reader who pressed the control is on the retry, which asks for
+    // exactly the page that failed.
+    const retry = within(alert).getByRole('button', { name: RETRY_NAME });
+    expect(document.activeElement).toBe(retry);
+
+    await user.click(retry);
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3).offset).toBe(1);
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([RENDER_RECORD.name, FETCH_RECORD.name]);
+    });
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByRole('grid')).toBe(grid);
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The hidden-attribute count
+ * ---------------------------------------------------------------------------
+ */
+
+describe('EventLog hidden attributes', () => {
+  /** A record with three shown pairs and two counted ones. */
+  const WIDE_RECORD = makeEvent({
+    attributes: {
+      'example.first': 'alpha',
+      'example.second': 2,
+      'example.third': true,
+      'example.fourth': 'delta',
+      'example.structured': { nested: 'kept-for-the-detail-drawer' },
+    },
+  });
+
+  it('selects the record from its count, so the host can show every attribute', async () => {
+    const stub = resolvingProvider('events', [WIDE_RECORD]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    const grid = await screen.findByRole('grid');
+    const row = rowNamed(WIDE_RECORD.name);
+    const more = within(row).getByRole('button', { name: moreAttributesName(2) });
+
+    // A control that adds no Tab stop: the grid stays one.
+    expect(more.tabIndex).toBe(-1);
+    expect(tabStopsIn(grid)).toHaveLength(1);
+    expect(more.getAttribute('title')).toBe('Select this record to see all 5 attributes');
+
+    await user.click(more);
+
+    // It reports the selection a row activation reports, once, and nothing
+    // else; the strip itself still unpacks nothing.
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: WIDE_RECORD.id,
+      spanId: WIDE_RECORD.spanId,
+      traceId: WIDE_RECORD.traceId,
+    });
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(spies.onFilterChange).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(rowNamed(WIDE_RECORD.name).getAttribute('aria-selected')).toBe('true');
+    });
+    expect(row.textContent).not.toContain('kept-for-the-detail-drawer');
+    expect(row.textContent).not.toContain('delta');
+  });
+
+  it('names a single hidden attribute in the singular', async () => {
+    const record = makeEvent({
+      attributes: { a: 1, b: 2, c: 3, d: 4 },
+    });
+    const stub = resolvingProvider('events', [record]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    const more = within(rowNamed(record.name)).getByRole('button', {
+      name: moreAttributesName(1),
+    });
+    expect(more.textContent).toBe(`+${formatCount(1)} more`);
+    expect(more.getAttribute('title')).toBe('Select this record to see all 4 attributes');
+  });
+
+  it('keeps the count as plain text where nothing can open the record', async () => {
+    const stub = resolvingProvider('events', [WIDE_RECORD]);
+
+    renderWithSelection(makeNode(), {
+      provider: stub.provider,
+      actions: undefined,
+      hosted: undefined,
+    });
+
+    await screen.findByRole('grid');
+    const row = rowNamed(WIDE_RECORD.name);
+
+    // No control that cannot act: the count is text, with the same class. (The
+    // row's disclosure, which opens its own detail, still acts here.)
+    expect(within(row).queryAllByRole('button', { name: /select this record/u })).toHaveLength(0);
+    const more = within(row).getByText(`+${formatCount(2)} more`);
+    expect(more.closest('button')).toBeNull();
+    expect(more.classList.contains('dg-event-log__more')).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Counted words
+ * ---------------------------------------------------------------------------
+ */
+
+describe('EventLog counted words', () => {
+  it('reads a one-record capture in the singular, in the footer and the match count', async () => {
+    const stub = resolvingProvider('events', [RENDER_RECORD], { total: 1 });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(`${formatCount(1)} of ${formatCount(1)} record loaded`);
+    expect(screen.queryByText(/\b1 of 1 records\b/)).toBeNull();
+
+    await user.type(searchField(), RENDER_RECORD.name);
+
+    await waitFor(() => {
+      expect(liveRegion().textContent).toBe(
+        `${formatCount(1)} of ${formatCount(1)} loaded record matches`,
+      );
+    });
+    expect(
+      within(screen.getByRole('group', { name: TOOLBAR_NAME })).getByText(
+        `${formatCount(1)} of ${formatCount(1)} loaded record matches`,
+      ),
+    ).toBeDefined();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Rendering cost
+ * ---------------------------------------------------------------------------
+ */
+
+describe('EventLog cell rendering', () => {
+  it('renders each row’s cells once, however often the grid re-renders over the same rows', async () => {
+    const records = [0, 1, 2].map((index) =>
+      makeEvent({
+        id: `event-example-01${String(index)}`,
+        spanId: spanIdFor(20 + index),
+        name: `example.row-${String(index)}`,
+        seq: index,
+        attributes: { 'example.first': `value-${String(index)}`, 'example.second': index },
+      }),
+    );
+    const stub = resolvingProvider('events', records);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await waitFor(() => {
+      expect(dataRows()).toHaveLength(records.length);
+    });
+    const settled = codeRenders.count;
+    expect(settled).toBeGreaterThan(0);
+
+    // A selection re-renders the grid and every row in its window — the path
+    // each scroll step of the virtualizer takes — over the same row models, so
+    // no chip is rendered again.
+    const target = records[1];
+    if (target === undefined) {
+      throw new Error('the fixture has no second record');
+    }
+    await user.click(within(rowNamed(target.name)).getByRole('rowheader'));
+    await waitFor(() => {
+      expect(rowNamed(target.name).getAttribute('aria-selected')).toBe('true');
+    });
+
+    expect(codeRenders.count).toBe(settled);
   });
 });

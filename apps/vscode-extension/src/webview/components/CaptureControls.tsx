@@ -28,9 +28,15 @@
  *   pending      `LoadingState`, which owns `role="status"` and `aria-busy`, REPLACING the
  *                controls while a start or stop request is in flight - so neither action can be
  *                raised twice before the host reports the outcome.
- *   unavailable  `EmptyState` explaining that capture opens once instrumentation is ready (neither
- *                action is possible and no capture is running). An enabled-looking control that
- *                could not do anything is never rendered.
+ *   unavailable  `EmptyState` explaining why neither action is possible while no capture is
+ *                running, in words that follow `sessionStatus`: before the session is armed,
+ *                that capture opens once instrumentation is ready; while `analyzing`, that the
+ *                result is on its way; once `generated`, that a follow-up question is the next
+ *                step and capture reopens here if it needs new evidence (AAP 0.4.2); once
+ *                `ended`, a "Session ended" title and that a new question starts another
+ *                session; once `failed`, that the failed stage can be retried or the session
+ *                ended. An absent status keeps the instrumentation sentence. An enabled-looking
+ *                control that could not do anything is never rendered.
  *   controls     the "Start capture" and "Stop capture" buttons, the capture state region and,
  *                while the session is armed but not yet capturing, the arming prompt: "Reproduce
  *                the issue now." for the first capture, and "Reproduce the issue again." when a
@@ -74,6 +80,8 @@ import {
   Stack,
   Text,
 } from '@debuggen/panel-renderer';
+import type { SessionStatus } from '@debuggen/protocol';
+import { assertNever } from '@debuggen/shared';
 import { useEffect, useId, useRef } from 'react';
 import type { ReactElement } from 'react';
 
@@ -125,6 +133,14 @@ export interface CaptureControlsProps {
   /** Recovers from the reported error. The "Capture again" control renders only when supplied. */
   onRetry?: (() => void) | undefined;
 
+  /**
+   * The active session's status, as the host last reported it. It chooses the wording of the
+   * unavailable state only - which controls render is still decided by `canStart`, `canStop` and
+   * `capturing` - so the card never claims capture is waiting for instrumentation once the
+   * session has moved past it. Omitted, the unavailable state keeps its instrumentation sentence.
+   */
+  sessionStatus?: SessionStatus | undefined;
+
   /** Extra classes composed after the `dgv-capture` block, for the layout `App.tsx` owns. */
   className?: string | undefined;
 }
@@ -174,8 +190,36 @@ const ARMED_PROMPT = 'Reproduce the issue now.';
  */
 const FOLLOW_UP_ARMED_PROMPT = 'Reproduce the issue again.';
 
-/** The copy of the unavailable state - generic product vocabulary only (AAP 0.5.4). */
+/*
+ * The copy of the unavailable state, one sentence per stretch of the session lifecycle it can be
+ * shown in (see `describeUnavailable`). Generic product vocabulary only (AAP 0.5.4): none of it
+ * names a project, a route or the question being debugged.
+ */
+
+/** Before the session is armed, and whenever no status is supplied. */
 const UNAVAILABLE_MESSAGE = 'Capture becomes available once instrumentation is ready.';
+
+/** While the capture is analyzed - the first result, or a follow-up over the stored evidence. */
+const ANALYZING_MESSAGE =
+  'The capture is being analyzed. The result appears under Analysis when it is ready.';
+
+/**
+ * Once a result exists. A follow-up that needs new evidence re-arms the session through
+ * `generated -> planning -> ... -> ready` (AAP 0.4.2), which brings the controls back here.
+ */
+const GENERATED_MESSAGE =
+  'This capture has been analyzed. Ask a follow-up question below; if it needs new evidence, capture opens here again.';
+
+/** The first line of the ended session's copy; `EmptyState` renders it as text, not a heading. */
+const ENDED_TITLE = 'Session ended';
+
+/** Once the session has ended: no capture window can open for it again. */
+const ENDED_MESSAGE =
+  'Capture is closed for this session. Ask a new question to start another session.';
+
+/** Once a pipeline stage has failed; the failure notice above names the stage. */
+const FAILED_MESSAGE =
+  'Capture is unavailable because the session failed. Retry the failed stage, or end the session and ask the question again.';
 
 /** Announced, not painted, while a request is in flight; `LoadingState` appends the `…`. */
 const PENDING_LABEL = 'Updating the capture';
@@ -191,6 +235,15 @@ const RETRY_LABEL = 'Capture again';
 
 /** Which of the four states the props select, in precedence order. */
 type CaptureView = 'error' | 'pending' | 'unavailable' | 'controls';
+
+/** The `EmptyState` copy of the unavailable state for one session status. */
+interface UnavailableCopy {
+  /** The optional first line; omitted where the message stands on its own. */
+  readonly title?: string;
+
+  /** The explanation. */
+  readonly message: string;
+}
 
 /**
  * The control that should receive focus once the outcome of an activated action arrives: after
@@ -242,6 +295,43 @@ function resolveView(props: CaptureControlsProps): CaptureView {
 }
 
 /**
+ * The copy of the unavailable state for the session's status. Closed by {@link assertNever}, so a
+ * status added to the protocol's `SESSION_STATUSES` is a compile error here until the card says
+ * what capture means in it.
+ *
+ * `ready` and `capturing` normally render the controls; they reach this state only when the host
+ * withholds both actions, and then the instrumentation sentence is their fallback.
+ *
+ * @param status The active session's status, or `undefined` when the caller supplies none.
+ * @returns The title and message the `EmptyState` renders.
+ */
+function describeUnavailable(status: SessionStatus | undefined): UnavailableCopy {
+  if (status === undefined) {
+    return { message: UNAVAILABLE_MESSAGE };
+  }
+  switch (status) {
+    case 'created':
+    case 'understanding':
+    case 'investigating':
+    case 'planning':
+    case 'instrumenting':
+    case 'ready':
+    case 'capturing':
+      return { message: UNAVAILABLE_MESSAGE };
+    case 'analyzing':
+      return { message: ANALYZING_MESSAGE };
+    case 'generated':
+      return { message: GENERATED_MESSAGE };
+    case 'ended':
+      return { title: ENDED_TITLE, message: ENDED_MESSAGE };
+    case 'failed':
+      return { message: FAILED_MESSAGE };
+    default:
+      return assertNever(status, 'Unhandled session status');
+  }
+}
+
+/**
  * The text label of the capture state region.
  *
  * @param capturing Whether a capture window is open.
@@ -272,6 +362,7 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
     followUpCapture = false,
     error,
     onRetry,
+    sessionStatus,
     className,
   } = props;
 
@@ -345,9 +436,10 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
   }
 
   if (view === 'unavailable') {
+    const copy = describeUnavailable(sessionStatus);
     return (
       <div className={rootClassName}>
-        <EmptyState className={PLACEHOLDER_CLASS} message={UNAVAILABLE_MESSAGE} />
+        <EmptyState className={PLACEHOLDER_CLASS} title={copy.title} message={copy.message} />
       </div>
     );
   }

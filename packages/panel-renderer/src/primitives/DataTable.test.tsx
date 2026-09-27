@@ -15,9 +15,16 @@
  *   measure, scroll, re-window) and checks that React logged no `flushSync` warning.
  *
  *   **One Tab stop per grid.** The active row is the grid's only Tab stop, and the header sort
- *   controls leave the Tab order while rows exist. Arrow keys, Home/End, Enter, F2 and Escape reach
- *   the `tabIndex={-1}` controls in cells, in an open detail row and in the header; a text field, a
- *   scrollable box and a nested grid keep their own keys.
+ *   controls leave the Tab order while rows exist. Tab from the active row walks that row's
+ *   `tabIndex={-1}` controls (cells, then an open detail row) and the Tab after the last leaves the
+ *   grid; Shift+Tab walks back to the row. Arrow keys, Home/End, Enter, F2 and Escape reach the
+ *   same controls and the header's; a text field, a scrollable box and a nested grid keep their
+ *   own keys. A visually hidden keyboard description, named by the grid's `aria-describedby`,
+ *   states the route.
+ *
+ *   **The active row stays in the virtual window.** Home and End under a measured, virtualized
+ *   table land focus on their target in the commit the key causes, row to row with nothing in
+ *   between, and a focused row scrolled out of view stays mounted and focused.
  *
  *   **No `aria-expanded` on a grid row.** ARIA supports the state on `treegrid` rows only, so the
  *   expansion state reaches the caller's toggle through the `DataTableCellMeta` each cell receives,
@@ -612,13 +619,17 @@ describe('DataTable measured virtualized path', () => {
       return;
     }
 
-    const firstIndexBeforeScroll = renderedRowIndices(container)[0];
+    // The active row - row 0, never navigated - is kept in every window, so the window proper is
+    // every other rendered row.
+    const windowOf = (indices: readonly number[]): readonly number[] =>
+      indices.filter((index) => index !== 0);
+    const firstIndexBeforeScroll = windowOf(renderedRowIndices(container))[0];
 
     viewport.scrollTop = STUBBED_ROW_BLOCK_SIZE * SCROLLED_ROWS;
     fireEvent.scroll(viewport);
 
     const afterScroll = renderedRowIndices(container);
-    const firstIndexAfterScroll = afterScroll[0];
+    const firstIndexAfterScroll = windowOf(afterScroll)[0];
 
     // The notification reached React and the window MOVED - the update path `useFlushSync` governs,
     // rather than a render that merely survived the event.
@@ -628,16 +639,17 @@ describe('DataTable measured virtualized path', () => {
     expect(firstIndexAfterScroll).toBeDefined();
     expect(firstIndexAfterScroll ?? 0).toBeGreaterThan(firstIndexBeforeScroll ?? 0);
 
-    // The scroll left the active row (row 0, never navigated) outside the window, which is the
-    // state the tab-stop fallback exists for: with every rendered row carrying `tabIndex={-1}` the
-    // grid body would be unreachable by Tab, so the topmost rendered row takes the stop instead.
-    const topRendered = container.querySelector(
-      `[data-row-index="${String(firstIndexAfterScroll ?? 0)}"]`,
-    );
+    // The scroll moved the window away from the active row, and the row stayed: the virtualizer's
+    // window always holds it, so the roving tab stop is still in the DOM - positioned at its own
+    // offset, outside the visible band - and it is still the grid body's only Tab stop. Every row
+    // of the window proper carries `tabIndex={-1}`.
+    const activeRow = container.querySelector('[data-row-index="0"]');
 
-    expect(topRendered).not.toBeNull();
-    expect(topRendered?.getAttribute('tabindex')).toBe('0');
-    expect(container.querySelector('[data-row-index="0"]')).toBeNull();
+    expect(firstIndexAfterScroll ?? 0).toBeGreaterThan(EXPECTED_DEFAULT_OVERSCAN);
+    expect(afterScroll[0]).toBe(0);
+    expect(activeRow?.getAttribute('tabindex')).toBe('0');
+    expect(activeRow?.parentElement?.classList.contains(VIRTUAL_ROW_CLASS)).toBe(true);
+    expect(container.querySelectorAll('[data-row-index][tabindex="0"]')).toHaveLength(1);
 
     // The runtime symptom of `useFlushSync: true`, asserted negatively across the whole
     // mount-measure-scroll sequence: React 19 reports a `flushSync` that ran while it was rendering
@@ -683,6 +695,139 @@ describe('DataTable measured virtualized path', () => {
     expect(document.activeElement).toBe(secondRow);
     expect(secondRow?.getAttribute('tabindex')).toBe('0');
     expect(firstRow.getAttribute('tabindex')).toBe('-1');
+  });
+
+  it('lands End and Home on their rows in the same commit, before the window moves, with focus never outside the grid', () => {
+    const { container } = render(
+      <DataTable
+        caption="Measured, Home and End"
+        rows={makeRows(MODEST_RESULT_ROWS)}
+        rowKey={(row) => row.id}
+        columns={columns}
+        virtualize={{ enabled: true }}
+      />,
+    );
+    const grid = firstWithRole(container, 'grid');
+    const viewport = viewportOf(container);
+    const lastIndex = MODEST_RESULT_ROWS - 1;
+
+    // Every element focus arrives on, for the whole sequence: a row that unmounted while it held
+    // focus would hand focus to the body, and a host's focus keeper would then park it elsewhere.
+    // Described at the moment focus arrives, since a row that later scrolls out of the window is
+    // no longer inside the grid by the time the sequence ends.
+    const arrivals: string[] = [];
+    const recordArrival = (event: FocusEvent): void => {
+      const target = event.target;
+
+      arrivals.push(
+        target instanceof HTMLElement &&
+          grid.contains(target) &&
+          target.hasAttribute('data-row-index')
+          ? `row ${target.getAttribute('data-row-index') ?? ''}`
+          : `outside the rows: ${target instanceof Element ? target.tagName : 'a non-element'}`,
+      );
+    };
+
+    document.addEventListener('focusin', recordArrival);
+
+    try {
+      const origin = rowAt(container, 5);
+
+      focusDirectly(origin);
+
+      // End: the target row renders in the commit the key causes - the window has not moved yet,
+      // since the scroll the key asked for has not been observed - and focus is already on it,
+      // handed over by the origin row, which is still mounted.
+      fireEvent.keyDown(origin, { key: 'End' });
+
+      const last = rowAt(container, lastIndex);
+
+      expect(document.activeElement).toBe(last);
+      expect(origin.isConnected).toBe(true);
+      expect(last.getAttribute('tabindex')).toBe('0');
+
+      // The scroll arrives and the window moves to the end: the origin row leaves the DOM, with
+      // focus already gone from it.
+      viewport.scrollTop = STUBBED_ROW_BLOCK_SIZE * MODEST_RESULT_ROWS;
+      fireEvent.scroll(viewport);
+
+      expect(origin.isConnected).toBe(false);
+      expect(document.activeElement).toBe(last);
+
+      // Home: the same, back to the first row.
+      fireEvent.keyDown(last, { key: 'Home' });
+
+      const first = rowAt(container, 0);
+
+      expect(document.activeElement).toBe(first);
+      expect(last.isConnected).toBe(true);
+
+      viewport.scrollTop = 0;
+      fireEvent.scroll(viewport);
+
+      expect(document.activeElement).toBe(first);
+
+      // And End once more from a row reached this way, so the path is not a one-off.
+      fireEvent.keyDown(first, { key: 'End' });
+      expect(document.activeElement).toBe(rowAt(container, lastIndex));
+    } finally {
+      document.removeEventListener('focusin', recordArrival);
+    }
+
+    // Focus arrived only ever on this grid's rows, and exactly on the ones each key named - never on
+    // the body, the viewport or the grid element itself, and never twice for one key.
+    expect(arrivals).toEqual([
+      'row 5',
+      `row ${String(lastIndex)}`,
+      'row 0',
+      `row ${String(lastIndex)}`,
+    ]);
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it('keeps the focused row mounted and focused while the reader scrolls it out of the window and back', () => {
+    const { container } = render(
+      <DataTable
+        caption="Measured, scrolled away"
+        rows={makeRows(MODEST_RESULT_ROWS)}
+        rowKey={(row) => row.id}
+        columns={columns}
+        virtualize={{ enabled: true }}
+      />,
+    );
+    const viewport = viewportOf(container);
+    const focused = rowAt(container, 3);
+
+    focusDirectly(focused);
+
+    // Scrolled a hundred rows away: the window is far from the focused row, which stays in the DOM
+    // - positioned out of view by its own offset - and keeps both focus and the roving tab stop.
+    viewport.scrollTop = STUBBED_ROW_BLOCK_SIZE * 100;
+    fireEvent.scroll(viewport);
+
+    const windowIndices = renderedRowIndices(container).filter((index) => index !== 3);
+
+    expect(windowIndices[0] ?? 0).toBeGreaterThan(3 + EXPECTED_DEFAULT_OVERSCAN);
+    expect(focused.isConnected).toBe(true);
+    expect(document.activeElement).toBe(focused);
+    expect(focused.getAttribute('tabindex')).toBe('0');
+    expect(focused.parentElement?.getAttribute('style') ?? '').toContain('--dgc-virtual-start');
+
+    // Exactly one row is the tab stop, and document order still follows row order.
+    expect(container.querySelectorAll('[data-row-index][tabindex="0"]')).toHaveLength(1);
+    expect(renderedRowIndices(container)).toEqual(
+      [...renderedRowIndices(container)].sort((left, right) => left - right),
+    );
+
+    // Back again: the same element, never remounted, still focused; and the keys continue from it.
+    viewport.scrollTop = 0;
+    fireEvent.scroll(viewport);
+
+    expect(rowAt(container, 3)).toBe(focused);
+    expect(document.activeElement).toBe(focused);
+
+    fireEvent.keyDown(focused, { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(rowAt(container, 4));
   });
 });
 
@@ -1318,12 +1463,13 @@ describe('DataTable one Tab stop per grid', () => {
     expect(document.activeElement).toBe(byText(container, AFTER_TABLE));
   });
 
-  it('is entered on the active row by one Tab and left by the next, past every control', async () => {
+  it("is entered on the active row by one Tab, walks only that row's controls, and leaves after the last", async () => {
     const user = userEvent.setup();
     const { container } = render(<KeyboardTable />);
     const grid = firstWithRole(container, 'grid');
 
-    // Exactly one element inside the grid is in the Tab order, however many controls it holds.
+    // Exactly one element inside the grid is in the document's Tab order, however many controls
+    // it holds: the grid's own Tab handling, not the tab indices, reaches the active row's controls.
     const tabbable = Array.from(grid.querySelectorAll('button, [tabindex]')).filter(
       (element) => element instanceof HTMLElement && element.tabIndex >= 0,
     );
@@ -1334,6 +1480,17 @@ describe('DataTable one Tab stop per grid', () => {
     await user.tab();
     expect(document.activeElement).toBe(rowAt(container, 0));
 
+    // Tab from the row reaches its first control, then the next.
+    await user.tab();
+    expect(document.activeElement).toBe(byText(container, inspectLabel(sampleRow(0))));
+    await user.tab();
+    expect(document.activeElement).toBe(byText(container, copyLabel(sampleRow(0))));
+
+    // Tab from the last control is left to the browser - the key is not cancelled - and nothing
+    // after it in the grid is a Tab stop, so it leaves the grid past every other row.
+    expect(fireEvent.keyDown(byText(container, copyLabel(sampleRow(0))), { key: 'Tab' })).toBe(
+      true,
+    );
     await user.tab();
     expect(document.activeElement).toBe(byText(container, AFTER_TABLE));
 
@@ -1344,26 +1501,305 @@ describe('DataTable one Tab stop per grid', () => {
     await user.keyboard('{ArrowDown}{ArrowDown}');
     expect(document.activeElement).toBe(rowAt(container, 2));
 
+    // The Tab sequence follows the roving stop: the controls walked are row 2's, never row 0's.
+    await user.tab();
+    expect(document.activeElement).toBe(byText(container, inspectLabel(sampleRow(2))));
+    await user.tab();
+    expect(document.activeElement).toBe(byText(container, copyLabel(sampleRow(2))));
     await user.tab();
     expect(document.activeElement).toBe(byText(container, AFTER_TABLE));
     await user.tab({ shift: true });
     expect(document.activeElement).toBe(rowAt(container, 2));
   });
 
-  it('returns Shift+Tab from a control to its row, and the next Shift+Tab leaves the grid', async () => {
+  it('walks back with Shift+Tab across the controls to the row, and the next Shift+Tab leaves the grid', async () => {
     const user = userEvent.setup();
     const { container } = render(<KeyboardTable />);
+    const inspect = byText(container, inspectLabel(sampleRow(0)));
+    const copy = byText(container, copyLabel(sampleRow(0)));
 
     focusDirectly(byText(container, BEFORE_TABLE));
     await user.tab();
-    await user.keyboard('{ArrowRight}');
-    expect(document.activeElement).toBe(byText(container, inspectLabel(sampleRow(0))));
+    await user.tab();
+    await user.tab();
+    expect(document.activeElement).toBe(copy);
+
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(inspect);
 
     await user.tab({ shift: true });
     expect(document.activeElement).toBe(rowAt(container, 0));
 
+    // Shift+Tab on the row itself is the browser's: not cancelled, and out of the grid backwards.
+    expect(fireEvent.keyDown(rowAt(container, 0), { key: 'Tab', shiftKey: true })).toBe(true);
     await user.tab({ shift: true });
     expect(document.activeElement).toBe(byText(container, BEFORE_TABLE));
+
+    // An arrow key into the row leaves Shift+Tab walking back the same way.
+    await user.tab();
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(inspect);
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(rowAt(container, 0));
+  });
+});
+
+describe('DataTable Tab within the active row', () => {
+  it('runs on from the cells into the open detail row, and leaves after its last control', async () => {
+    const user = userEvent.setup();
+    const first = sampleRow(0);
+    const { container } = render(<KeyboardTable expandable />);
+
+    focusDirectly(byText(container, BEFORE_TABLE));
+    await user.tab();
+    await user.keyboard('{ArrowRight}');
+    expect(container.querySelector('.dg-data-table__expanded')).not.toBeNull();
+
+    const sequence: string[] = [];
+
+    for (let press = 0; press < 5; press += 1) {
+      await user.tab();
+      sequence.push(document.activeElement?.textContent ?? '');
+    }
+
+    expect(sequence).toEqual([
+      toggleLabel(first),
+      inspectLabel(first),
+      copyLabel(first),
+      detailActionLabel(first),
+      AFTER_TABLE,
+    ]);
+
+    // Backwards from the detail's control returns across the cells to the data row.
+    focusDirectly(byText(container, detailActionLabel(first)));
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(byText(container, copyLabel(first)));
+    await user.tab({ shift: true });
+    await user.tab({ shift: true });
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(rowAt(container, 0));
+  });
+
+  it('moves a text field on with Tab like any other control, and leaves its value alone', async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <KeyboardTable
+        extraColumns={[{ key: 'field', header: 'Field', cell: (row) => <FieldCell row={row} /> }]}
+      />,
+    );
+
+    focusDirectly(byText(container, BEFORE_TABLE));
+    await user.tab();
+    await user.tab();
+    await user.tab();
+    await user.tab();
+
+    const field = document.activeElement;
+
+    if (!(field instanceof HTMLInputElement)) {
+      throw new Error('Tab did not reach the field in the last column');
+    }
+
+    await user.keyboard('abc');
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(byText(container, copyLabel(sampleRow(0))));
+    expect(field.value).toBe('abc');
+
+    // Forward from the field, the row's last control, is the browser's.
+    focusDirectly(field);
+    await user.tab();
+    expect(document.activeElement).toBe(byText(container, AFTER_TABLE));
+  });
+
+  it('leaves Tab from a row with no control, a chord and a Tab a control consumed to their owners', async () => {
+    const user = userEvent.setup();
+    const plain = render(
+      <>
+        <Button>{BEFORE_TABLE}</Button>
+        <DataTable
+          caption="No controls"
+          rows={makeRows(SHORT_RESULT_ROWS)}
+          rowKey={(row) => row.id}
+          columns={columns}
+        />
+        <Button>{AFTER_TABLE}</Button>
+      </>,
+    );
+
+    // A row with nothing to move into leaves Tab to the browser, which leaves the grid.
+    focusDirectly(byText(plain.container, BEFORE_TABLE));
+    await user.tab();
+    expect(document.activeElement).toBe(rowAt(plain.container, 0));
+    expect(fireEvent.keyDown(rowAt(plain.container, 0), { key: 'Tab' })).toBe(true);
+    await user.tab();
+    expect(document.activeElement).toBe(byText(plain.container, AFTER_TABLE));
+    plain.unmount();
+
+    const { container } = render(
+      <KeyboardTable
+        extraColumns={[
+          {
+            key: 'own',
+            header: 'Own',
+            cell: (row) => (
+              <Button
+                size="sm"
+                tabIndex={-1}
+                onKeyDown={(event) => {
+                  if (event.key === 'Tab') {
+                    event.preventDefault();
+                  }
+                }}
+              >
+                {`Keeps Tab for ${row.label}`}
+              </Button>
+            ),
+          },
+        ]}
+      />,
+    );
+    const row = rowAt(container, 0);
+    const keeper = byText(container, `Keeps Tab for ${sampleRow(0).label}`);
+
+    focusDirectly(row);
+
+    // Alt, Control and Meta chords belong to the browser and the platform.
+    for (const chord of [{ altKey: true }, { ctrlKey: true }, { metaKey: true }]) {
+      expect(fireEvent.keyDown(row, { key: 'Tab', ...chord })).toBe(true);
+      expect(document.activeElement).toBe(row);
+    }
+
+    // A Tab the control consumed stays where the control left it; the grid moves nothing.
+    focusDirectly(byText(container, copyLabel(sampleRow(0))));
+    await user.tab();
+    expect(document.activeElement).toBe(keeper);
+    expect(fireEvent.keyDown(keeper, { key: 'Tab', shiftKey: true })).toBe(false);
+    expect(document.activeElement).toBe(keeper);
+  });
+
+  it("never skips a Tab stop of a grid nested between the row's controls", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <KeyboardTable
+        extraColumns={[
+          {
+            key: 'nested',
+            header: 'Nested',
+            cell: (row) =>
+              row.id === 'row-0' ? (
+                <DataTable
+                  caption="Nested fixture"
+                  rows={makeRows(2)}
+                  rowKey={(inner) => inner.id}
+                  columns={columns}
+                />
+              ) : null,
+          },
+          {
+            key: 'last',
+            header: 'Last',
+            cell: (row) => (
+              <Button size="sm" tabIndex={-1}>
+                {`Last for ${row.label}`}
+              </Button>
+            ),
+          },
+        ]}
+      />,
+    );
+    const [, nestedGrid] = Array.from(container.querySelectorAll('[role="grid"]'));
+
+    if (!(nestedGrid instanceof HTMLElement)) {
+      throw new Error('the nested grid is not rendered');
+    }
+
+    focusDirectly(byText(container, copyLabel(sampleRow(0))));
+
+    // The nested grid's active row is a document Tab stop before the outer row's next control, so
+    // the browser's Tab goes there rather than the outer table jumping past it.
+    expect(fireEvent.keyDown(byText(container, copyLabel(sampleRow(0))), { key: 'Tab' })).toBe(
+      true,
+    );
+    await user.tab();
+    expect(document.activeElement).toBe(rowAt(nestedGrid, 0));
+
+    // And backwards from the control after the nested grid, the same stop is not skipped.
+    focusDirectly(byText(container, `Last for ${sampleRow(0).label}`));
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(rowAt(nestedGrid, 0));
+  });
+});
+
+describe('DataTable keyboard description', () => {
+  /**
+   * The keyboard description a grid names in its `aria-describedby`.
+   *
+   * @param grid The grid element.
+   * @returns The description element.
+   */
+  function descriptionOf(grid: HTMLElement): HTMLElement {
+    const description = document.getElementById(grid.getAttribute('aria-describedby') ?? '');
+
+    if (description === null) {
+      throw new Error('the grid names no keyboard description');
+    }
+
+    return description;
+  }
+
+  it("describes the grid with a visually hidden sentence outside it, naming the route to a row's controls", () => {
+    const { container } = render(<KeyboardTable />);
+    const grid = firstWithRole(container, 'grid');
+    const description = descriptionOf(grid);
+
+    expect(grid.contains(description)).toBe(false);
+    expect(description.classList.contains('dg-visually-hidden')).toBe(true);
+
+    // No activation and no expansion: Enter and Right arrow both move into the row.
+    expect(description.textContent).toBe(
+      'Up and Down arrows move between rows; Home and End go to the first and last row. ' +
+        "Tab moves through the row's controls, when it has any, and then leaves the table; " +
+        'Escape returns to the row. Enter, F2 or Right arrow also moves into them.',
+    );
+  });
+
+  it('names activation and expansion only for a table whose rows do them', () => {
+    const { container } = render(<KeyboardTable expandable onRowActivate={() => {}} />);
+    const text = descriptionOf(firstWithRole(container, 'grid')).textContent;
+
+    expect(text).toContain('Enter or Space activates the row.');
+    expect(text).toContain('Right arrow expands the row and Left arrow collapses it.');
+    expect(text).toContain('F2 also moves into them.');
+    expect(text).not.toContain('Enter, F2');
+    expect(text).not.toContain('or Right arrow also');
+  });
+
+  it("keeps two tables' descriptions apart, and renders none for an empty table", () => {
+    const { container } = render(
+      <>
+        <KeyboardTable />
+        <KeyboardTable />
+      </>,
+    );
+    const [firstGrid, secondGrid] = Array.from(container.querySelectorAll('[role="grid"]'));
+
+    if (!(firstGrid instanceof HTMLElement) || !(secondGrid instanceof HTMLElement)) {
+      throw new Error('two grids are not rendered');
+    }
+
+    expect(firstGrid.getAttribute('aria-describedby')).not.toBe(
+      secondGrid.getAttribute('aria-describedby'),
+    );
+
+    const empty = render(<KeyboardTable rowCount={0} />);
+    const emptyGrid = firstWithRole(empty.container, 'grid');
+
+    expect(emptyGrid.hasAttribute('aria-describedby')).toBe(false);
+    expect(
+      empty.container.querySelector(
+        '.dg-data-table > .dg-visually-hidden:not(.dg-data-table__caption)',
+      ),
+    ).toBeNull();
   });
 });
 

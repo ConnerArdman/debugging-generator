@@ -136,6 +136,26 @@
  * redaction would hash `productId=?` for every request and merge distinct
  * requests into one "duplicate" group.
  *
+ * ## Sharing the event loop
+ *
+ * Every call ends — after step 11, whatever the outcome, a refusal or a typed
+ * `Err` included — with one genuine **macrotask** turn (`setImmediate` from
+ * `node:timers/promises`, or the injected {@link TelemetryIngestDeps.yieldTurn})
+ * before its promise settles. The report is decided before the turn and is
+ * returned unchanged after it; nothing is read, written or logged during it.
+ *
+ * The turn exists because a batch need not await any real I/O: the store is
+ * synchronous (`node:sqlite`), a render-only batch computes no `request_key`
+ * digest, and a locator that answers from memory settles in microtasks. The
+ * WebSocket surface (`../server/ws.ts`) chains one connection's frames on a
+ * promise, so without the turn a connection's whole backlog of such batches
+ * would drain inside a single macrotask — and every other client of the
+ * process would wait for it: `GET /health`, the other sockets, and the
+ * `client.ping` the same connection queued behind its telemetry, answered in
+ * frame order only once the backlog is gone. With the turn, the event loop
+ * services timers, sockets and HTTP between any two batches, so one
+ * producer's backlog delays the others by at most one batch.
+ *
  * ## Failure contract
  *
  * Nothing here throws and no returned promise rejects — not for `null`, not
@@ -231,6 +251,8 @@
  *
  * @module
  */
+
+import { setImmediate as nextMacrotask } from 'node:timers/promises';
 
 import { telemetryEventPayloadSchema, telemetryIngestRequestSchema } from '@debuggen/protocol';
 import type { TelemetryIngestResponse } from '@debuggen/protocol';
@@ -510,6 +532,23 @@ export const MAX_APPLIED_LOSS_REPORTS = 4_096;
  */
 const MAX_LOSS_REPORT_ID_LENGTH = 64;
 
+/**
+ * The default end-of-call turn (see "Sharing the event loop" in the module
+ * notes): resolves in the check phase of the next event-loop iteration, after
+ * the timers, the socket reads and the HTTP requests that were ready — the one
+ * scheduling primitive Node guarantees to let pending I/O callbacks run first.
+ *
+ * `setImmediate` rather than `setTimeout(0)`, which Node clamps to 1 ms and
+ * would cap a connection's ingest rate at a thousand batches a second for no
+ * gain; and rather than `process.nextTick` or a resolved promise, which run
+ * before I/O and so would yield nothing.
+ *
+ * @returns A promise that settles one macrotask later; it never rejects.
+ */
+export function yieldMacrotask(): Promise<void> {
+  return nextMacrotask();
+}
+
 /* -------------------------------------------------------------------------------------------------
  * Consumer-side ports
  *
@@ -733,6 +772,14 @@ export interface TelemetryIngestDeps {
   readonly maxBatch?: number | undefined;
   /** The privacy primitives; defaults to {@link DEFAULT_INGEST_PRIVACY}. See its notes. */
   readonly privacy?: IngestPrivacyPrimitives | undefined;
+  /**
+   * The turn every call yields before its promise settles; defaults to
+   * {@link yieldMacrotask}. See "Sharing the event loop" in the module notes.
+   * An override must resolve after at least one macrotask for the guarantee to
+   * hold — a suite injects a recording one to observe where the turn falls. A
+   * throw or rejection is contained: the batch's report is returned regardless.
+   */
+  readonly yieldTurn?: (() => Promise<unknown>) | undefined;
 }
 
 /**
@@ -2138,6 +2185,7 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
   // dropped and counted by the shared best-effort policy of `../logging.ts`.
   const root = guardLogger(deps.logger ?? noopLogger);
   const log = subsystemLogger(root, INGEST_SUBSYSTEM);
+  const yieldTurn = deps.yieldTurn ?? yieldMacrotask;
 
   /** Writes one record through a logger derived from the guarded root; it never throws. */
   function emit(target: Logger, level: IngestLogLevel, message: string, fields: LogFields): void {
@@ -3070,15 +3118,42 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     return ok(toReport(state));
   }
 
-  /** {@link run} behind the never-rejects guarantee, with the transport's loss report and its id. */
+  /**
+   * The end-of-call turn (see "Sharing the event loop"): awaited once per
+   * call, after the outcome is decided. An injected turn that throws or
+   * rejects costs the yield, never the report — the batch has already been
+   * processed, and a rejection here would break the never-rejects guarantee.
+   */
+  async function afterTurn(
+    outcome: Result<IngestReport, DebuggenError>,
+  ): Promise<Result<IngestReport, DebuggenError>> {
+    try {
+      await yieldTurn();
+    } catch {
+      emitThrottled(
+        log,
+        'warn',
+        throttleKey(WARNING_CLASS.unexpected, 'yield'),
+        'the end-of-batch event-loop turn failed; the batch report is unaffected',
+        { code: 'INTERNAL' },
+      );
+    }
+    return outcome;
+  }
+
+  /**
+   * {@link run} behind the never-rejects guarantee, with the transport's loss
+   * report and its id, followed by the end-of-call macrotask turn.
+   */
   async function execute(
     context: IngestContext,
     events: unknown,
     reportedLoss: unknown,
     reportedLossId: unknown,
   ): Promise<Result<IngestReport, DebuggenError>> {
+    let outcome: Result<IngestReport, DebuggenError>;
     try {
-      return await run(context, events, reportedLoss, reportedLossId);
+      outcome = await run(context, events, reportedLoss, reportedLossId);
     } catch {
       // Every step above guards its own dependency; reaching this is a defect,
       // reported as a typed error rather than a rejected promise.
@@ -3089,8 +3164,11 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
         'telemetry ingest failed unexpectedly',
         { code: 'INTERNAL' },
       );
-      return err(dependencyError('ingest', 'INTERNAL'));
+      outcome = err(dependencyError('ingest', 'INTERNAL'));
     }
+    // Whatever the outcome, the next batch — of this connection or any other —
+    // and every waiting timer, socket read and HTTP request get the loop first.
+    return afterTurn(outcome);
   }
 
   function ingest(
@@ -3117,7 +3195,7 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       events = input.events;
       reportedLoss = input.droppedCount;
     } catch {
-      return Promise.resolve(err(invalidBatchError('unreadable-input')));
+      return afterTurn(err(invalidBatchError('unreadable-input')));
     }
 
     // A relayed frame names no loss report — only the HTTP transport retries a
@@ -3145,7 +3223,7 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       reportedLoss = input.droppedCount;
       reportedLossId = input.lossReportId;
     } catch {
-      return Promise.resolve(err(invalidBatchError('unreadable-input')));
+      return afterTurn(err(invalidBatchError('unreadable-input')));
     }
 
     // The same delivery context as a relayed frame: the named capture is

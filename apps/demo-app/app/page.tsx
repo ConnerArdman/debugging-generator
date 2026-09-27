@@ -93,22 +93,24 @@ import {
 export const dynamic = 'force-dynamic';
 
 /**
- * The tab's title. Short on purpose: the store's name belongs to the root layout, which declares
- * it once as both the fallback title and the `'%s · Lumen Supply'` template every route inherits.
+ * The tab's title: `Catalog · Lumen Supply`, the same `<page> · <store>` form every other route's
+ * tab reads.
  *
  * A static `metadata` export rather than `generateMetadata`: the title is the same for every
  * filter, sort and page, so deriving it would mean a second pass over the same query for a value
  * that never changes.
  *
- * One Next.js rule shapes what a reader actually sees here, and it is stated so that the tab is
- * not "corrected" later by writing the store's name into this string: a title template applies to
- * *child* route segments, never to a page of the segment that declares it. This page and the root
- * layout are the same segment, so `/` renders `Catalog` while every nested route renders
- * `<page> · Lumen Supply`. Naming the store here instead would print it twice on every other page
- * or force this one to opt out of the template it should be inheriting from.
+ * It is written out whole, as an `absolute` title, because of one Next.js rule: a title template
+ * applies to *child* route segments, never to a page of the segment that declares it. The root
+ * layout declares `'%s · Lumen Supply'`, and this page and that layout are the same segment, so a
+ * bare `'Catalog'` here is printed as `Catalog` alone - the one tab in the storefront without the
+ * store's name. `absolute` states the finished title and opts out of templating explicitly, so the
+ * suffix is printed exactly once; it must stay in step with the layout's template by hand, since
+ * the template is not applied here to keep it so. Every nested route keeps its short title and
+ * inherits the suffix as before.
  */
 export const metadata: Metadata = {
-  title: 'Catalog',
+  title: { absolute: 'Catalog · Lumen Supply' },
 };
 
 /**

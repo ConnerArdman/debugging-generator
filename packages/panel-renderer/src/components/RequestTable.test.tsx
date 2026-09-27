@@ -50,9 +50,20 @@
  *     past the end, a page inside a positive total and a later page without a
  *     total each say which absence they are, and only a zero total — or an
  *     unreported one for the whole result — says nothing was captured.
- *   - **Ordering is a re-query, never a local sort**: a sortable header
- *     activation issues a new provider call carrying the mapped
- *     `DataQuerySort`, and the rows then follow the second response.
+ *   - **A service ordering is a re-query**: a header activation that names one
+ *     of the service's orderings issues a new provider call carrying the mapped
+ *     `DataQuerySort`, and the rows then follow the second response. Every
+ *     other header order is a **view order** over the groups loaded — stable,
+ *     named in the select, disclosed in the footer while it covers less than
+ *     the whole result — and never re-queries. The header and the select always
+ *     name the same order, and the control the reader used keeps its element and
+ *     focus through the re-query.
+ *   - **Rows share the panel's selection**: activating a row selects its
+ *     representative occurrence, and the row holding the selected event reports
+ *     `aria-selected="true"` with `dg-is-selected`.
+ *   - **A successful retry has a successor**: the first recovered group's
+ *     disclosure toggle carries the error state's focus key, and the host's node
+ *     frame hands focus from the pressed Retry to it.
  *   - **Honest labelling of what the data marks**: a group formed from the
  *     coarser `method-path` key says so, a bounded occurrence list says it is
  *     bounded, and the local duplicates filter says it applies only to the
@@ -95,10 +106,16 @@
  * @see ../host/useQuery for the loading/empty/error machine they drive.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
   DATA_QUERY_MAX_LIMIT,
+  DATA_QUERY_SORTS,
+  PANEL_SPEC_VERSION,
   catalogEntryFor,
 } from '@debuggen/panel-schema';
 import type { DataQuery, DataQuerySort, RequestTableNode } from '@debuggen/panel-schema';
@@ -114,6 +131,7 @@ import type { Mock } from 'vitest';
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import { PanelHost } from '../host/PanelHost';
 import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
 import { PAGE_FAILURE_TITLE, formatDataQuery } from '../host/useQuery';
 import { DATA_TABLE_COLUMN_TRACKS } from '../primitives/DataTable';
@@ -121,6 +139,7 @@ import type { DataTableColumnWidth } from '../primitives/DataTable';
 import { FOCUS_KEY_ATTRIBUTE } from '../primitives/ErrorState';
 import { DESIGN_TOKENS, cssVar } from '../tokens/tokens';
 import type { TokenKey, TokenValues } from '../tokens/tokens';
+import { httpStatusTone, statusTone } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
   formatBytes,
@@ -322,6 +341,8 @@ type OccurrenceOverrides = Partial<
 > & {
   readonly statusCode?: number | undefined;
   readonly initiator?: string | undefined;
+  readonly initiatorBasis?: RequestOccurrence['initiatorBasis'] | undefined;
+  readonly initiatorStack?: string | undefined;
   readonly source?: SourceLocation | undefined;
 };
 
@@ -350,6 +371,8 @@ function makeOccurrence(overrides: OccurrenceOverrides = {}): RequestOccurrence 
     kind = 'fetch',
     statusCode = 200,
     initiator,
+    initiatorBasis,
+    initiatorStack,
     source,
   } = overrides;
 
@@ -366,6 +389,8 @@ function makeOccurrence(overrides: OccurrenceOverrides = {}): RequestOccurrence 
     kind,
     ...(statusCode === undefined ? {} : { statusCode }),
     ...(initiator === undefined ? {} : { initiator }),
+    ...(initiatorBasis === undefined ? {} : { initiatorBasis }),
+    ...(initiatorStack === undefined ? {} : { initiatorStack }),
     ...(source === undefined ? {} : { source }),
   };
 }
@@ -871,35 +896,103 @@ function renderedUrls(): string[] {
  * group with one occurrence.
  *
  * @param row A data row.
- * @returns That row's eight data cells.
+ * @returns That row's five data cells.
  */
 function cellsOf(row: HTMLElement): {
   readonly status: HTMLElement;
   readonly count: HTMLElement;
-  readonly duplicates: HTMLElement;
-  readonly average: HTMLElement;
-  readonly slowest: HTMLElement;
-  readonly total: HTMLElement;
+  readonly duration: HTMLElement;
   readonly transferred: HTMLElement;
   readonly initiators: HTMLElement;
 } {
   const cells = within(row).getAllByRole('gridcell');
-  const [status, count, duplicates, average, slowest, total, transferred, initiators] = cells;
+  const [status, count, duration, transferred, initiators] = cells;
 
   if (
     status === undefined ||
     count === undefined ||
-    duplicates === undefined ||
-    average === undefined ||
-    slowest === undefined ||
-    total === undefined ||
+    duration === undefined ||
     transferred === undefined ||
     initiators === undefined
   ) {
-    throw new Error(`a data row rendered ${String(cells.length)} cells, not eight`);
+    throw new Error(`a data row rendered ${String(cells.length)} cells, not five`);
   }
 
-  return { status, count, duplicates, average, slowest, total, transferred, initiators };
+  return { status, count, duration, transferred, initiators };
+}
+
+/**
+ * The occurrence count an occurrences cell prints: the cell's first item,
+ * read on its own because the duplicate badge beside it — and that badge's
+ * tooltip description — are part of the cell's text.
+ *
+ * @param cell A row's occurrences cell.
+ * @returns The printed count.
+ */
+function occurrenceCountIn(cell: HTMLElement): string {
+  const [count] = stackItemsOf(cell);
+
+  if (count === undefined) {
+    throw new Error('the occurrences cell printed no count');
+  }
+
+  return count.textContent ?? '';
+}
+
+/**
+ * The duplicate badge in an occurrences cell, or `null` when the group has none.
+ *
+ * @param cell A row's occurrences cell.
+ * @returns The badge element.
+ */
+function duplicateBadgeIn(cell: HTMLElement): HTMLElement | null {
+  return cell.querySelector<HTMLElement>('.dg-request-table__duplicate-badge');
+}
+
+/**
+ * The figures a duration cell draws, each as its label and its formatted value,
+ * in drawing order — one unlabelled figure (`''`) for a group whose average,
+ * slowest and total are one value. Only figures the duration primitive drew
+ * are read, since it is what places a figure and gives it its severity, so a
+ * value printed any other way reads as missing.
+ *
+ * @param cell A row's duration cell.
+ * @returns `[label, figure]` pairs.
+ */
+function durationFiguresIn(cell: HTMLElement): (readonly [string, string])[] {
+  const figures = Array.from(cell.querySelectorAll<HTMLElement>('.dg-duration-cell'));
+
+  if (cell.querySelector('.dg-request-table__durations') === null) {
+    return figures.map((figure) => ['', figure.textContent ?? ''] as const);
+  }
+
+  return figures.map((figure) => {
+    const line = figure.closest('.dg-stack__items');
+    const [label] = line === null ? [] : Array.from(line.children);
+
+    return [label?.textContent ?? '', figure.textContent ?? ''] as const;
+  });
+}
+
+/**
+ * What {@link durationFiguresIn} reads for a group: its one duration when the
+ * three aggregates agree, otherwise the labelled average, slowest and total.
+ *
+ * @param group The group whose durations the cell draws.
+ * @returns The expected `[label, figure]` pairs.
+ */
+function expectedDurationFigures(group: RequestGroup): (readonly [string, string])[] {
+  const { averageDurationMs, maxDurationMs, totalDurationMs } = group;
+
+  if (averageDurationMs === maxDurationMs && maxDurationMs === totalDurationMs) {
+    return [['', formatDuration(averageDurationMs)]];
+  }
+
+  return [
+    ['avg', formatDuration(averageDurationMs)],
+    ['max', formatDuration(maxDurationMs)],
+    ['total', formatDuration(totalDurationMs)],
+  ];
 }
 
 /**
@@ -1140,10 +1233,7 @@ const COLUMN_HEADERS: readonly string[] = [
   'Request',
   'Status',
   'Occurrences',
-  'Duplicates',
-  'Average',
-  'Slowest',
-  'Total',
+  'Duration',
   'Transferred',
   'Initiated by',
 ];
@@ -1347,22 +1437,22 @@ describe('RequestTable rows', () => {
       }
 
       // Counts are printed through the shared count formatter, so a grouped
-      // thousand reads as one. The duplicates figure is queried rather than
-      // read off the cell, because a group with duplicates wraps its badge in a
-      // tooltip whose description is part of the cell's text.
-      expect(cells.count.textContent).toBe(formatCount(group.count));
-      expect(within(cells.duplicates).getByText(formatCount(group.duplicateCount))).toBeDefined();
+      // thousand reads as one. The redundant count shares the cell as the
+      // duplicate badge, present exactly when the group has duplicates, and is
+      // queried rather than read off the cell because the badge's tooltip
+      // description is part of the cell's text.
+      expect(occurrenceCountIn(cells.count)).toBe(formatCount(group.count));
+      const badge = duplicateBadgeIn(cells.count);
+      if (group.hasDuplicates) {
+        expect(within(cells.count).getByText(formatCount(group.duplicateCount))).toBe(badge);
+      } else {
+        expect(badge).toBeNull();
+      }
 
-      // Each duration cell draws its own aggregate, formatted with its unit and
-      // placed by the duration primitive.
-      expect(cells.average.textContent).toBe(formatDuration(group.averageDurationMs));
-      expect(cells.slowest.textContent).toBe(formatDuration(group.maxDurationMs));
-      expect(cells.total.textContent).toBe(formatDuration(group.totalDurationMs));
-      expect(
-        within(cells.average)
-          .getByText(formatDuration(group.averageDurationMs))
-          .classList.contains('dg-duration-cell'),
-      ).toBe(true);
+      // The duration cell draws the group's own aggregates, formatted with
+      // their unit and placed by the duration primitive: the one duration a
+      // group whose three figures agree has, otherwise each figure labelled.
+      expect(durationFiguresIn(cells.duration)).toEqual(expectedDurationFigures(group));
 
       // No epoch timestamp is rendered anywhere in the row: a group's times are
       // aggregates and offsets, never wall-clock readings.
@@ -1378,7 +1468,7 @@ describe('RequestTable rows', () => {
       throw new Error('the repeated group rendered no row');
     }
 
-    expect(cellsOf(repeated).total.textContent).toBe('471.00 ms');
+    expect(durationFiguresIn(cellsOf(repeated).duration).at(-1)).toEqual(['total', '471.00 ms']);
     expect(cellsOf(repeated).transferred.textContent).toBe('2.0 kB');
     expect(cellsOf(repeated).transferred.textContent).toBe(formatBytes(2048));
   });
@@ -1461,10 +1551,12 @@ describe('RequestTable rows', () => {
 
     // Each row states its own counts. A merged row would read `6`, and a row
     // that had absorbed the other's evidence would badge duplicates on both.
-    expect(cellsOf(first).count.textContent).toBe(formatCount(4));
-    expect(cellsOf(second).count.textContent).toBe(formatCount(2));
-    expect(within(cellsOf(first).duplicates).getByText(formatCount(3))).toBeDefined();
-    expect(cellsOf(second).duplicates.textContent).toBe(formatCount(0));
+    expect(occurrenceCountIn(cellsOf(first).count)).toBe(formatCount(4));
+    expect(occurrenceCountIn(cellsOf(second).count)).toBe(formatCount(2));
+    expect(within(cellsOf(first).count).getByText(formatCount(3))).toBe(
+      duplicateBadgeIn(cellsOf(first).count),
+    );
+    expect(duplicateBadgeIn(cellsOf(second).count)).toBeNull();
 
     // The key itself is evidence the service holds, not text for a reader: it
     // is never printed, and neither is any grouping claim derived from it here.
@@ -1539,13 +1631,17 @@ describe('RequestTable duplicate evidence', () => {
         throw new Error('the grid rendered no data row');
       }
 
-      const cell = cellsOf(row).duplicates;
+      const cell = cellsOf(row).count;
 
-      // The redundant count is badged rather than printed plainly, and the row
-      // carries the duplicate state class the stylesheet emphasises.
+      // The redundant count is badged beside the occurrence count rather than
+      // printed plainly, and the row carries the duplicate state class the
+      // stylesheet emphasises. The badge names its figure to a reader, who
+      // hears the cell under its "Occurrences" heading without the glyph.
       const badge = within(cell).getByText(formatCount(group.duplicateCount));
       expect(badge.classList.contains('dg-badge')).toBe(true);
       expect(badge.classList.contains('dg-request-table__duplicate-badge')).toBe(true);
+      expect(occurrenceCountIn(cell)).toBe(formatCount(group.count));
+      expect(badge.querySelector('.dg-visually-hidden')?.textContent).toBe(' redundant');
       expect(within(row).getByRole('rowheader').querySelector('.dg-is-duplicate') !== null).toBe(
         true,
       );
@@ -1581,7 +1677,7 @@ describe('RequestTable duplicate evidence', () => {
     expect(second).not.toContain(formatDuration(22));
   });
 
-  it('prints a plain redundant count, and no badge, for a group without duplicates', async () => {
+  it('prints the occurrence count alone, with no badge, for a group without duplicates', async () => {
     const stub = resolvingProvider([SINGLE_GROUP]);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -1594,14 +1690,16 @@ describe('RequestTable duplicate evidence', () => {
       throw new Error('the grid rendered no data row');
     }
 
-    const cell = cellsOf(row).duplicates;
+    const cell = cellsOf(row).count;
 
-    // Zero redundant occurrences is an observation, so it is printed — and it is
-    // printed as text, with no badge and no cluster description to explain
-    // evidence that does not exist.
-    expect(cell.textContent).toBe(formatCount(0));
+    // Zero redundant occurrences is stated by the badge's absence — beside
+    // every ordinary count a zero would be noise — so the cell holds the count
+    // alone, with no cluster description to explain evidence that does not
+    // exist, and the row carries no duplicate edge.
+    expect(cell.textContent).toBe(formatCount(SINGLE_GROUP.count));
     expect(cell.querySelector('.dg-badge')).toBeNull();
     expect(tooltipTexts(cell)).toEqual([]);
+    expect(within(row).getByRole('rowheader').querySelector('.dg-is-duplicate')).toBeNull();
   });
 
   it('says at page level when a fallback-grouped row shares the page with a keyed one', async () => {
@@ -2006,6 +2104,298 @@ describe('RequestTable callers and click-to-source', () => {
     expect(within(cell).queryByText(pathLabel)).toBeNull();
   });
 
+  describe('labels the aggregate derived', () => {
+    /**
+     * Two mounts of one component, each named by the component and the one
+     * owner that tells them apart — the labels the aggregate derives for them.
+     */
+    const HEADER_MOUNT = 'ExampleRail ‹ ExampleHeader';
+    const DETAIL_MOUNT = 'ExampleRail ‹ ExampleDetail';
+
+    /** The call site both mounts run, and the label a stack resolved there carries. */
+    const RAIL_SOURCE: SourceLocation = {
+      file: 'src/example/use-rail.ts',
+      line: 44,
+      column: 9,
+      symbol: 'useExampleRail',
+      resolvedBy: 'source-map',
+      confidence: 0.75,
+    };
+    const RAIL_SOURCE_LABEL = 'useExampleRail (src/example/use-rail.ts:44)';
+
+    /** A captured stack of generated-chunk frames, and the first-frame label reduced from it. */
+    const CHUNK_STACK = [
+      '    at __orig (http://127.0.0.1:4100/_next/static/chunks/src_lib_client_1a._.js:610:30)',
+      '    at useExampleRail.useEffect (http://127.0.0.1:4100/_next/static/chunks/src_2b._.js:44:9)',
+    ].join('\n');
+    const FRAME_LABEL = '__orig (src_lib_client_1a._.js:610:30)';
+
+    /** Two occurrences per mount, all four at the one shared location. */
+    const TWO_MOUNTS_GROUP = makeRequestGroup({
+      id: 'request-group-example-0071',
+      requestKey: 'request-key-example-0071',
+      count: 4,
+      duplicateCount: 3,
+      hasDuplicates: true,
+      initiators: [DETAIL_MOUNT, HEADER_MOUNT],
+      occurrences: [HEADER_MOUNT, DETAIL_MOUNT, HEADER_MOUNT, DETAIL_MOUNT].map(
+        (initiator, index) =>
+          makeOccurrence({
+            eventId: eventIdFor(index + 1),
+            spanId: spanIdFor(index + 1),
+            startTime: BASE_START_MS + index * 3,
+            initiator,
+            initiatorBasis: 'component',
+            initiatorStack: CHUNK_STACK,
+            source: { ...RAIL_SOURCE },
+          }),
+      ),
+    });
+
+    it('keeps two mounts of one component as two callers although they share a location', async () => {
+      const row = await renderSoleGroup(TWO_MOUNTS_GROUP);
+      const cell = cellsOf(row).initiators;
+
+      // The first mount beside the chip of the line both run, and the second
+      // counted beside it: one duplicate group, two initiating components.
+      expect(stackItemsOf(cell)).toHaveLength(2);
+      const label = within(cell).getByText(DETAIL_MOUNT);
+      const chip = within(cell).getByRole('button', { name: initiatorChipName(RAIL_SOURCE) });
+      expect(label.nextElementSibling?.contains(chip)).toBe(true);
+
+      const overflow = within(cell).getByText(`+${formatCount(1)}`);
+      expect(describingTooltip(overflow).textContent ?? '').toContain(
+        `Also initiated by: ${HEADER_MOUNT}.`,
+      );
+      // No raw frame reaches the row.
+      expect(visibleText(cell)).not.toContain('__orig');
+    });
+
+    it('discloses the whole creator chain of a component caller its column truncates', async () => {
+      // The owner that tells the mounts apart is the part of the label a
+      // narrow column's ellipsis cuts, so the label discloses it — and the
+      // rest of the chain — on hover and on focus.
+      const created = makeRequestGroup({
+        ...TWO_MOUNTS_GROUP,
+        occurrences: TWO_MOUNTS_GROUP.occurrences.map((occurrence) => ({
+          ...occurrence,
+          initiatorOwners:
+            occurrence.initiator === HEADER_MOUNT
+              ? ['ExampleHeader', 'ExampleShell']
+              : ['ExampleDetail'],
+        })),
+      });
+      const cell = cellsOf(await renderSoleGroup(created)).initiators;
+
+      const label = within(cell).getByText(DETAIL_MOUNT);
+      expect(label.closest('button')).toBeNull();
+      expect(label.getAttribute('tabindex')).toBe('-1');
+      expect(describingTooltip(label).textContent).toBe(
+        `${DETAIL_MOUNT}. Created by ExampleDetail.`,
+      );
+      // Still immediately before the chip of the line both mounts run.
+      const chip = within(cell).getByRole('button', { name: initiatorChipName(RAIL_SOURCE) });
+      expect(label.closest('.dg-tooltip')?.nextElementSibling?.contains(chip)).toBe(true);
+    });
+
+    it('discloses each occurrence’s creator chain beside its own chip', async () => {
+      const created = makeRequestGroup({
+        ...TWO_MOUNTS_GROUP,
+        occurrences: TWO_MOUNTS_GROUP.occurrences.map((occurrence) => ({
+          ...occurrence,
+          initiatorOwners:
+            occurrence.initiator === HEADER_MOUNT
+              ? ['ExampleHeader', 'ExampleShell']
+              : ['ExampleDetail'],
+        })),
+      });
+      const stub = resolvingProvider([created]);
+      const user = userEvent.setup();
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+      await screen.findByRole('grid');
+      await user.click(screen.getByRole('button', { name: disclosureName(created, false) }));
+
+      const [detail] = detailRows();
+      if (detail === undefined) {
+        throw new Error('the opened group rendered no detail row');
+      }
+      const headerLabels = within(detail).getAllByText(HEADER_MOUNT);
+      expect(headerLabels).toHaveLength(2);
+      for (const label of headerLabels) {
+        expect(label.closest('button')).toBeNull();
+        expect(describingTooltip(label).textContent).toBe(
+          `${HEADER_MOUNT}. Created by ExampleHeader ‹ ExampleShell.`,
+        );
+      }
+    });
+
+    it('shows each occurrence its own mount beside its own chip', async () => {
+      const stub = resolvingProvider([TWO_MOUNTS_GROUP]);
+      const user = userEvent.setup();
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+      await screen.findByRole('grid');
+      await user.click(
+        screen.getByRole('button', { name: disclosureName(TWO_MOUNTS_GROUP, false) }),
+      );
+
+      const [detail] = detailRows();
+
+      if (detail === undefined) {
+        throw new Error('the opened group rendered no detail row');
+      }
+
+      const labels = within(detail).getAllByText(/^ExampleRail ‹ /);
+      expect(labels.map((label) => label.textContent)).toStrictEqual([
+        HEADER_MOUNT,
+        DETAIL_MOUNT,
+        HEADER_MOUNT,
+        DETAIL_MOUNT,
+      ]);
+      expect(
+        within(detail).getAllByRole('button', { name: occurrenceChipName(RAIL_SOURCE) }),
+      ).toHaveLength(4);
+      for (const label of labels) {
+        expect(label.closest('button')).toBeNull();
+      }
+      expect(visibleText(detail)).not.toContain('__orig');
+    });
+
+    it('folds a place-only label into the component caller that names its location', async () => {
+      // The same line observed once where the renderer reported no component:
+      // the code is the mounts' code, so it is not a third caller — whatever
+      // the order the labels arrive in.
+      const mixed = makeRequestGroup({
+        id: 'request-group-example-0072',
+        requestKey: 'request-key-example-0072',
+        initiators: [HEADER_MOUNT, RAIL_SOURCE_LABEL],
+        occurrences: [
+          makeOccurrence({
+            eventId: eventIdFor(1),
+            spanId: spanIdFor(1),
+            initiator: RAIL_SOURCE_LABEL,
+            initiatorBasis: 'source',
+            initiatorStack: CHUNK_STACK,
+            source: { ...RAIL_SOURCE },
+          }),
+          makeOccurrence({
+            eventId: eventIdFor(2),
+            spanId: spanIdFor(2),
+            initiator: HEADER_MOUNT,
+            initiatorBasis: 'component',
+            source: { ...RAIL_SOURCE },
+          }),
+        ],
+      });
+      const cell = cellsOf(await renderSoleGroup(mixed)).initiators;
+
+      expect(stackItemsOf(cell)).toHaveLength(1);
+      expect(within(cell).getByText(HEADER_MOUNT)).toBeDefined();
+      expect(within(cell).queryByText(/^\+/)).toBeNull();
+    });
+
+    it('shows a caller labelled by its own location as that location’s chip alone', async () => {
+      const resolved = makeRequestGroup({
+        id: 'request-group-example-0073',
+        requestKey: 'request-key-example-0073',
+        initiators: [RAIL_SOURCE_LABEL],
+        occurrences: [
+          makeOccurrence({
+            initiator: RAIL_SOURCE_LABEL,
+            initiatorBasis: 'source',
+            initiatorStack: CHUNK_STACK,
+            source: RAIL_SOURCE,
+          }),
+        ],
+      });
+      const cell = cellsOf(await renderSoleGroup(resolved)).initiators;
+      const chip = within(cell).getByRole('button', { name: initiatorChipName(RAIL_SOURCE) });
+
+      // The chip already reads the symbol and `file:line` the label spells.
+      expect(stackItemsOf(cell)).toHaveLength(1);
+      expect(visibleText(chip)).toBe(initiatorChipCaption(RAIL_SOURCE));
+      expect(visibleText(cell)).toBe(initiatorChipCaption(RAIL_SOURCE));
+    });
+
+    it('does not repeat a component named alone beside the chip that already leads with it', async () => {
+      const declared: SourceLocation = { ...RAIL_SOURCE, symbol: 'ExampleRail' };
+      const alone = makeRequestGroup({
+        id: 'request-group-example-0076',
+        requestKey: 'request-key-example-0076',
+        initiators: ['ExampleRail'],
+        occurrences: [
+          makeOccurrence({
+            initiator: 'ExampleRail',
+            initiatorBasis: 'component',
+            source: declared,
+          }),
+        ],
+      });
+      const cell = cellsOf(await renderSoleGroup(alone)).initiators;
+
+      expect(stackItemsOf(cell)).toHaveLength(1);
+      expect(within(cell).getAllByRole('button')).toHaveLength(1);
+      expect(visibleText(cell)).toBe(initiatorChipCaption(declared));
+    });
+
+    it('names a location-labelled occurrence by its symbol beside the compact chip', async () => {
+      const resolved = makeRequestGroup({
+        id: 'request-group-example-0074',
+        requestKey: 'request-key-example-0074',
+        initiators: [RAIL_SOURCE_LABEL],
+        occurrences: [
+          makeOccurrence({
+            initiator: RAIL_SOURCE_LABEL,
+            initiatorBasis: 'source',
+            source: RAIL_SOURCE,
+          }),
+        ],
+      });
+      const stub = resolvingProvider([resolved]);
+      const user = userEvent.setup();
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+      await screen.findByRole('grid');
+      await user.click(screen.getByRole('button', { name: disclosureName(resolved, false) }));
+
+      const [detail] = detailRows();
+
+      if (detail === undefined) {
+        throw new Error('the opened group rendered no detail row');
+      }
+
+      const chip = within(detail).getByRole('button', { name: occurrenceChipName(RAIL_SOURCE) });
+      const symbol = within(detail).getByText(RAIL_SOURCE.symbol ?? '');
+      expect(symbol.nextElementSibling?.contains(chip)).toBe(true);
+      expect(within(detail).queryByText(RAIL_SOURCE_LABEL)).toBeNull();
+    });
+
+    it('describes a caller reduced to its first frame with the stack it came from', async () => {
+      const unresolved = makeRequestGroup({
+        id: 'request-group-example-0075',
+        requestKey: 'request-key-example-0075',
+        initiators: [FRAME_LABEL],
+        occurrences: [
+          makeOccurrence({
+            initiator: FRAME_LABEL,
+            initiatorBasis: 'frame',
+            initiatorStack: CHUNK_STACK,
+          }),
+        ],
+      });
+      const cell = cellsOf(await renderSoleGroup(unresolved)).initiators;
+      const label = cell.querySelector<HTMLElement>('code.dg-truncate');
+
+      if (label === null) {
+        throw new Error('the cell rendered no caller label');
+      }
+
+      expect(label.textContent).toBe(FRAME_LABEL);
+      expect(describingTooltip(label).textContent).toBe(CHUNK_STACK);
+    });
+  });
+
   it('hands the host the very location the activated caller resolved to', async () => {
     const stub = resolvingProvider([MIXED_INITIATOR_GROUP]);
     const spies = makeActions();
@@ -2369,7 +2759,7 @@ describe('RequestTable occurrences', () => {
       throw new Error('the grid rendered no data row');
     }
 
-    expect(cellsOf(row).count.textContent).toBe(formatCount(9));
+    expect(occurrenceCountIn(cellsOf(row).count)).toBe(formatCount(9));
   });
 
   it('carries each disclosure state on its toggle, naming the detail row it opens', async () => {
@@ -2477,9 +2867,60 @@ function footerNote(): string {
   return screen.getByText(/^Groups loaded:/).textContent ?? '';
 }
 
-/** The header cell of the one sortable column, for its `aria-sort`. */
-function countHeader(): Element | null {
-  return screen.getByRole('button', { name: COUNT_SORT_NAME }).closest('[role="columnheader"]');
+/**
+ * The header cell of a sortable column, for its `aria-sort`, found through the
+ * sort control the grid renders inside it.
+ *
+ * @param name The column's sort control name, which is its visible header.
+ * @returns The `columnheader` cell.
+ */
+function sortHeader(name: string): Element {
+  const cell = screen.getByRole('button', { name }).closest('[role="columnheader"]');
+
+  if (cell === null) {
+    throw new Error(`the sort control "${name}" sits outside any column header`);
+  }
+
+  return cell;
+}
+
+/** The header cell of the occurrence column, for its `aria-sort`. */
+function countHeader(): Element {
+  return sortHeader(COUNT_SORT_NAME);
+}
+
+/**
+ * The sort control names of the other two sortable columns: the folded
+ * Duration column orders by each group's total duration.
+ */
+const DURATION_SORT_NAME = 'Duration';
+const TRANSFERRED_SORT_NAME = 'Transferred';
+
+/** The select's value while a header arranges the loaded groups. */
+const VIEW_ORDER_VALUE = 'view-order';
+
+/**
+ * The toolbar's ordering select.
+ *
+ * @returns The native select element.
+ */
+function sortSelect(): HTMLSelectElement {
+  const select = screen.getByRole('combobox', { name: SORT_CONTROL_NAME });
+
+  if (!(select instanceof HTMLSelectElement)) {
+    throw new Error('the ordering control is not a native select');
+  }
+
+  return select;
+}
+
+/**
+ * The text of the ordering select's chosen option: the order it names.
+ *
+ * @returns The chosen option's label.
+ */
+function selectedOptionText(): string {
+  return sortSelect().selectedOptions[0]?.textContent ?? '';
 }
 
 describe('RequestTable ordering', () => {
@@ -2504,10 +2945,11 @@ describe('RequestTable ordering', () => {
     expect(renderedUrls()).toEqual([...PROVIDER_ORDER_URLS]);
     expect(soleQuery(stub).sort).toBe(LONGEST_FIRST);
 
-    // A group carries three durations and two timestamps, and the contract does
-    // not say which one its duration ordering ranks by, so no column claims it:
-    // the occurrence column reports `none` while that ordering is in force.
-    expect(countHeader()?.getAttribute('aria-sort')).toBe('none');
+    // The service ranks its duration ordering by the summed duration of every
+    // occurrence, so the Duration column claims it and the occurrence column
+    // reports `none` while that ordering is in force.
+    expect(sortHeader(DURATION_SORT_NAME).getAttribute('aria-sort')).toBe('descending');
+    expect(countHeader().getAttribute('aria-sort')).toBe('none');
 
     await user.click(screen.getByRole('button', { name: COUNT_SORT_NAME }));
 
@@ -2527,7 +2969,9 @@ describe('RequestTable ordering', () => {
     await waitFor(() => {
       expect(renderedUrls()).toEqual(reordered.map((group) => group.url));
     });
-    expect(countHeader()?.getAttribute('aria-sort')).toBe('descending');
+    expect(countHeader().getAttribute('aria-sort')).toBe('descending');
+    expect(sortHeader(DURATION_SORT_NAME).getAttribute('aria-sort')).toBe('none');
+    expect(sortSelect().value).toBe(MOST_OCCURRENCES_FIRST);
 
     // The host is told, so it can remember the reader's choice. It is a report
     // of a selection in the component's own vocabulary and carries no query
@@ -2541,23 +2985,44 @@ describe('RequestTable ordering', () => {
     expect(spies.onExpand).not.toHaveBeenCalled();
   });
 
-  it('does not re-query when the activated column already holds the applied order', async () => {
-    const stub = resolvingProvider(PROVIDER_ORDER);
+  it('reverses the applied service order as a view order, without re-querying', async () => {
+    // Most occurrences first, as the node asks — deliberately returned with the
+    // larger group first so a reversal is visible.
+    const byCount: readonly RequestGroup[] = [REPEATED_GROUP, SINGLE_GROUP];
+    const stub = resolvingProvider(byCount);
     const spies = makeActions();
     const user = userEvent.setup();
 
-    // The node already asks for `count_desc`, and the contract offers one
-    // direction per ordering, so a second activation has nothing to request —
-    // and above all must not re-rank the page locally instead.
     renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
 
     await screen.findByRole('grid');
-    expect(countHeader()?.getAttribute('aria-sort')).toBe('descending');
+    expect(countHeader().getAttribute('aria-sort')).toBe('descending');
 
+    // The grid proposes the flip. The contract has no "fewest first", so the
+    // loaded groups are arranged here instead, and nothing is asked again.
     await user.click(screen.getByRole('button', { name: COUNT_SORT_NAME }));
 
     expect(stub.resolve).toHaveBeenCalledTimes(1);
-    expect(renderedUrls()).toEqual([...PROVIDER_ORDER_URLS]);
+    expect(renderedUrls()).toEqual([SINGLE_GROUP.url, REPEATED_GROUP.url]);
+    expect(countHeader().getAttribute('aria-sort')).toBe('ascending');
+    expect(selectedOptionText()).toBe('Occurrences: fewest first (loaded groups)');
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, {
+      sort: 'count_asc',
+      duplicatesOnly: 'false',
+    });
+
+    // Activating it again asks for the service order the groups arrived in:
+    // the view order is cleared, still without a re-query.
+    await user.click(screen.getByRole('button', { name: COUNT_SORT_NAME }));
+
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+    expect(renderedUrls()).toEqual(byCount.map((group) => group.url));
+    expect(countHeader().getAttribute('aria-sort')).toBe('descending');
+    expect(sortSelect().value).toBe(MOST_OCCURRENCES_FIRST);
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, {
+      sort: MOST_OCCURRENCES_FIRST,
+      duplicatesOnly: 'false',
+    });
   });
 
   it('names its ordering control for what it orders, and re-queries from it', async () => {
@@ -2580,6 +3045,502 @@ describe('RequestTable ordering', () => {
     expect(stub.resolve).toHaveBeenCalledTimes(2);
     expect(queryOfCall(stub, 2).sort).toBe(LONGEST_FIRST);
   });
+});
+
+/**
+ * A third group with a measured transfer size smaller than the repeated
+ * group's, so an order by size has a measured group on either side of the
+ * unmeasured one.
+ */
+const SMALL_TRANSFER_GROUP = makeRequestGroup({
+  id: 'request-group-example-0003',
+  requestKey: 'request-key-example-0003',
+  url: `${COLLECTION_PATH}/item`,
+  path: `${COLLECTION_PATH}/item`,
+  count: 2,
+  totalDurationMs: 60,
+  averageDurationMs: 30,
+  maxDurationMs: 35,
+  minDurationMs: 25,
+  initiators: [INITIATOR_SHELL],
+  occurrences: [
+    makeOccurrence({ eventId: eventIdFor(20), spanId: spanIdFor(20), initiator: INITIATOR_SHELL }),
+  ],
+  transferredBytes: 512,
+});
+
+describe('RequestTable view orders', () => {
+  it('arranges the loaded groups by a figure the service cannot order by, and says so', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+    expect(renderedUrls()).toEqual([...PROVIDER_ORDER_URLS]);
+
+    // Every figure column reports its ordering state, not only the one the
+    // service ranks by; the request, status and caller columns hold no single
+    // figure and report none.
+    for (const name of [DURATION_SORT_NAME, TRANSFERRED_SORT_NAME]) {
+      expect(sortHeader(name).getAttribute('aria-sort')).toBe('none');
+    }
+    for (const header of screen.getAllByRole('columnheader')) {
+      if (['Request', 'Status', 'Initiated by'].includes(header.textContent ?? '')) {
+        expect(header.hasAttribute('aria-sort')).toBe(false);
+      }
+    }
+
+    await user.click(screen.getByRole('button', { name: TRANSFERRED_SORT_NAME }));
+
+    // Largest transfer first — the measured group before the one with no
+    // exposed size — arranged here, with no request made for it.
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+    expect(renderedUrls()).toEqual([REPEATED_GROUP.url, SINGLE_GROUP.url]);
+    expect(sortHeader(TRANSFERRED_SORT_NAME).getAttribute('aria-sort')).toBe('descending');
+    expect(countHeader().getAttribute('aria-sort')).toBe('none');
+
+    // The select names the same order as the header, scoped to what it covers.
+    expect(sortSelect().value).toBe(VIEW_ORDER_VALUE);
+    expect(selectedOptionText()).toBe('Transferred: largest first (loaded groups)');
+
+    // No total was reported, so the loaded groups may not be the whole result
+    // and the footer says the order covers only them.
+    expect(footerNote()).toContain('This order covers only the 2 request groups loaded;');
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, {
+      sort: 'transferred_desc',
+      duplicatesOnly: 'false',
+    });
+
+    // Choosing the service order the groups arrived in restores it at once,
+    // without a re-query, and the caveat goes with the view order.
+    await user.selectOptions(sortSelect(), MOST_OCCURRENCES_FIRST);
+
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+    expect(renderedUrls()).toEqual([...PROVIDER_ORDER_URLS]);
+    expect(sortSelect().value).toBe(MOST_OCCURRENCES_FIRST);
+    expect(countHeader().getAttribute('aria-sort')).toBe('descending');
+    expect(sortHeader(TRANSFERRED_SORT_NAME).getAttribute('aria-sort')).toBe('none');
+    expect(footerNote()).not.toContain('This order covers only');
+  });
+
+  it('offers the view-order option disabled until a header arranges the groups', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // Four choices in every state, so the list never reorders under the reader:
+    // the three service orderings and the view-order option, unavailable while
+    // no header has arranged anything.
+    const options = Array.from(sortSelect().options);
+
+    expect(options.map((option) => option.value)).toEqual([...DATA_QUERY_SORTS, VIEW_ORDER_VALUE]);
+    expect(options.map((option) => option.disabled)).toEqual([false, false, false, true]);
+    expect(options[DATA_QUERY_SORTS.indexOf(LONGEST_FIRST)]?.textContent).toBe(
+      'Longest total duration first',
+    );
+  });
+
+  it('places a group with no exposed size after every measured one, in both directions', async () => {
+    const stub = resolvingProvider([SINGLE_GROUP, REPEATED_GROUP, SMALL_TRANSFER_GROUP]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    await user.click(screen.getByRole('button', { name: TRANSFERRED_SORT_NAME }));
+
+    expect(renderedUrls()).toEqual([
+      REPEATED_GROUP.url,
+      SMALL_TRANSFER_GROUP.url,
+      SINGLE_GROUP.url,
+    ]);
+    expect(sortHeader(TRANSFERRED_SORT_NAME).getAttribute('aria-sort')).toBe('descending');
+
+    await user.click(screen.getByRole('button', { name: TRANSFERRED_SORT_NAME }));
+
+    // Reversed for the measured sizes only: the unmeasured group stays last, so
+    // a reversal never ranks "no size" as the smallest.
+    expect(renderedUrls()).toEqual([
+      SMALL_TRANSFER_GROUP.url,
+      REPEATED_GROUP.url,
+      SINGLE_GROUP.url,
+    ]);
+    expect(sortHeader(TRANSFERRED_SORT_NAME).getAttribute('aria-sort')).toBe('ascending');
+    expect(selectedOptionText()).toBe('Transferred: smallest first (loaded groups)');
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('adds no scope caveat once every group of the result is loaded', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER, { total: PROVIDER_ORDER.length });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: TRANSFERRED_SORT_NAME }));
+
+    expect(renderedUrls()).toEqual([REPEATED_GROUP.url, SINGLE_GROUP.url]);
+    expect(footerNote()).toBe(`Groups loaded: ${formatCount(2)} of ${formatCount(2)}.`);
+  });
+
+  it('keeps the select and the headers naming the same order across a re-query', async () => {
+    const stub = pagingProvider([
+      { data: PROVIDER_ORDER },
+      { data: [REPEATED_GROUP, SINGLE_GROUP] },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // The select's service ordering moves the header's indicator with it.
+    await user.selectOptions(sortSelect(), LONGEST_FIRST);
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).sort).toBe(LONGEST_FIRST);
+    await waitFor(() => {
+      expect(renderedUrls()).toEqual([REPEATED_GROUP.url, SINGLE_GROUP.url]);
+    });
+    expect(sortHeader(DURATION_SORT_NAME).getAttribute('aria-sort')).toBe('descending');
+    expect(countHeader().getAttribute('aria-sort')).toBe('none');
+
+    // The flip of the service's Duration ordering is a view order, and the select
+    // names it; the duplicates filter keeps reporting the order in force.
+    await user.click(screen.getByRole('button', { name: DURATION_SORT_NAME }));
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(renderedUrls()).toEqual([SINGLE_GROUP.url, REPEATED_GROUP.url]);
+    expect(sortHeader(DURATION_SORT_NAME).getAttribute('aria-sort')).toBe('ascending');
+    expect(selectedOptionText()).toBe('Duration: shortest total first (loaded groups)');
+
+    // A header on another column that names the service's other ordering
+    // re-queries, and the select follows it back into the vocabulary.
+    await user.click(screen.getByRole('button', { name: COUNT_SORT_NAME }));
+
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3).sort).toBe(MOST_OCCURRENCES_FIRST);
+    await waitFor(() => {
+      expect(sortSelect().value).toBe(MOST_OCCURRENCES_FIRST);
+    });
+    expect(countHeader().getAttribute('aria-sort')).toBe('descending');
+  });
+});
+
+describe('RequestTable focus through a re-query', () => {
+  it('keeps the activated header control, and the grid around it, while the re-query is in flight', async () => {
+    const stub = heldSecondPageProvider({ data: PROVIDER_ORDER });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    const total = screen.getByRole('button', { name: DURATION_SORT_NAME });
+
+    await user.click(total);
+
+    // The service's duration ordering was asked for, and while it is in flight
+    // the loaded groups are gone — they belong to another order — but the grid,
+    // its header and the control the reader pressed are the same elements.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).sort).toBe(LONGEST_FIRST);
+    expect(dataRows()).toHaveLength(0);
+    expect(screen.getByRole('status', { busy: true })).toBeDefined();
+    expect(screen.getByRole('grid')).toBe(grid);
+    expect(total.isConnected).toBe(true);
+    expect(document.activeElement).toBe(total);
+    expect(sortHeader(DURATION_SORT_NAME).getAttribute('aria-sort')).toBe('descending');
+
+    act(() => {
+      stub.releaseSecondPage({ data: [REPEATED_GROUP, SINGLE_GROUP] });
+    });
+
+    await waitFor(() => {
+      expect(renderedUrls()).toEqual([REPEATED_GROUP.url, SINGLE_GROUP.url]);
+    });
+    expect(document.activeElement).toBe(total);
+  });
+
+  it('keeps the ordering select focused while the ordering it chose is fetched', async () => {
+    const stub = heldSecondPageProvider({ data: PROVIDER_ORDER });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    const select = sortSelect();
+
+    act(() => {
+      select.focus();
+    });
+    await user.selectOptions(select, LONGEST_FIRST);
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(sortSelect()).toBe(select);
+    expect(document.activeElement).toBe(select);
+
+    act(() => {
+      stub.releaseSecondPage({ data: PROVIDER_ORDER });
+    });
+
+    await screen.findAllByRole('row');
+    await waitFor(() => {
+      expect(dataRows()).toHaveLength(PROVIDER_ORDER.length);
+    });
+    expect(document.activeElement).toBe(select);
+  });
+});
+
+/** The note an opened group with no occurrence list shows. */
+const NO_OCCURRENCES_NOTE = 'No individual occurrences were returned for this group.';
+
+describe('RequestTable row selection', () => {
+  it('selects the representative occurrence when a row is activated, and marks the row', async () => {
+    const stub = resolvingProvider([REPEATED_GROUP, SINGLE_GROUP]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+
+    // Rows are selectable, so every row reports its state from the start.
+    expect(dataRows().map((row) => row.getAttribute('aria-selected'))).toEqual(['false', 'false']);
+
+    const [repeatedRow] = dataRows();
+
+    if (repeatedRow === undefined) {
+      throw new Error('the repeated group drew no row');
+    }
+
+    // A click on the row itself, not on a control inside it.
+    await user.click(cellsOf(repeatedRow).count);
+
+    // The group's canonically earliest occurrence, with its own coordinates.
+    const [first] = REPEATED_GROUP.occurrences;
+
+    expect(spies.onSelectEvent.mock.calls.map(([ref]) => ref)).toEqual([
+      { eventId: first?.eventId, spanId: first?.spanId, traceId: first?.traceId },
+    ]);
+    expect(dataRows().map((row) => row.getAttribute('aria-selected'))).toEqual(['true', 'false']);
+    expect(dataRows()[0]?.classList.contains('dg-is-selected')).toBe(true);
+
+    // Enter on a focused row activates it the same way.
+    const singleRow = dataRows()[1];
+
+    if (singleRow === undefined) {
+      throw new Error('the single group drew no row');
+    }
+
+    act(() => {
+      singleRow.focus();
+    });
+    await user.keyboard('{Enter}');
+
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: eventIdFor(9),
+      spanId: spanIdFor(9),
+      traceId: TRACE_ID,
+    });
+    expect(dataRows().map((row) => row.getAttribute('aria-selected'))).toEqual(['false', 'true']);
+    expect(dataRows()[1]?.classList.contains('dg-is-selected')).toBe(true);
+    expect(spies.onExpand).not.toHaveBeenCalled();
+  });
+
+  it('marks the group that holds an occurrence selected in any view', async () => {
+    const stub = resolvingProvider([SINGLE_GROUP, REPEATED_GROUP]);
+    const spies = makeActions();
+
+    /**
+     * The view, under a host whose shared selection is `selection`.
+     *
+     * @param selection The panel's current selection.
+     * @returns The element tree.
+     */
+    const tree = (selection: PanelSelection | undefined) => (
+      <DataProviderContext.Provider value={stub.provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <PanelActionsContext.Provider value={spies.actions}>
+            <PanelSelectionContext.Provider value={{ selection }}>
+              <RequestTable node={makeNode()} />
+            </PanelSelectionContext.Provider>
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>
+    );
+
+    // The third occurrence of the repeated group — not its representative —
+    // still marks the group that holds it.
+    const { rerender } = render(tree({ eventId: eventIdFor(3) }));
+
+    await screen.findByRole('grid');
+    expect(dataRows().map((row) => row.getAttribute('aria-selected'))).toEqual(['false', 'true']);
+
+    // The same span named under another record's id is the same occurrence.
+    rerender(tree({ eventId: 'event-example-other', traceId: TRACE_ID, spanId: spanIdFor(9) }));
+    expect(dataRows().map((row) => row.getAttribute('aria-selected'))).toEqual(['true', 'false']);
+
+    // An event no loaded group carries marks nothing.
+    rerender(tree({ eventId: 'event-example-elsewhere' }));
+    expect(dataRows().map((row) => row.getAttribute('aria-selected'))).toEqual(['false', 'false']);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('opens the detail of a group that carries no occurrence, since there is nothing to select', async () => {
+    const bare = makeRequestGroup({ id: 'request-group-example-0009', occurrences: [] });
+    const stub = resolvingProvider([bare]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+
+    const [row] = dataRows();
+
+    if (row === undefined) {
+      throw new Error('the bare group drew no row');
+    }
+
+    await user.click(cellsOf(row).count);
+
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, bare.id, true);
+    expect(await screen.findByText(NO_OCCURRENCES_NOTE)).toBeDefined();
+    expect(dataRows()[0]?.getAttribute('aria-selected')).toBe('false');
+  });
+});
+
+/**
+ * Every element in the document that carries the retry focus key, in document
+ * order: the frame hands a retry's focus to the first of them.
+ *
+ * @returns The keyed elements.
+ */
+function retryKeyed(): HTMLElement[] {
+  return Array.from(
+    document.querySelectorAll<HTMLElement>(`[${FOCUS_KEY_ATTRIBUTE}="${RETRY_FOCUS_KEY}"]`),
+  );
+}
+
+describe('RequestTable retry successor', () => {
+  it('keys the first recovered group once a retried first page succeeds, and nothing before', async () => {
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.reject(new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel is closed.'))
+        : Promise.resolve<DataQueryResponse>({ source: 'requests', data: PROVIDER_ORDER }),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // While the failure is on screen its Retry is the one keyed control.
+    const retry = await screen.findByRole('button', { name: RETRY_NAME });
+    expect(retryKeyed()).toEqual([retry]);
+
+    await user.click(retry);
+    await screen.findByRole('grid');
+
+    // Recovered: the first group's disclosure toggle is the successor, and the
+    // only keyed element — named for the request it opens.
+    await waitFor(() => {
+      expect(retryKeyed()).toEqual([
+        screen.getByRole('button', { name: disclosureName(SINGLE_GROUP, false) }),
+      ]);
+    });
+    expect(retryKeyed()[0]?.getAttribute('tabindex')).toBe('-1');
+  });
+
+  it('keys the first group of a retried further page, never the groups read before it', async () => {
+    const stub = recordingProvider((_query, call) => {
+      if (call === 2) {
+        return Promise.reject(
+          new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel is closed.'),
+        );
+      }
+
+      return Promise.resolve<DataQueryResponse>(
+        call === 1
+          ? { source: 'requests', data: [SINGLE_GROUP], total: 2, nextOffset: 1 }
+          : { source: 'requests', data: [REPEATED_GROUP], total: 2 },
+      );
+    });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The page failed below the group already read: its Retry is the only key.
+    const retry = await screen.findByRole('button', { name: RETRY_NAME });
+    expect(retryKeyed()).toEqual([retry]);
+
+    await user.click(retry);
+
+    await waitFor(() => {
+      expect(renderedUrls()).toEqual([SINGLE_GROUP.url, REPEATED_GROUP.url]);
+    });
+    expect(retryKeyed()).toEqual([
+      screen.getByRole('button', { name: disclosureName(REPEATED_GROUP, false) }),
+    ]);
+  });
+
+  it.each([
+    { title: 'Retried requests', case: 'a titled node' },
+    { title: undefined, case: 'a node without a heading' },
+  ])(
+    'hands keyboard focus from Retry to the recovered rows under the panel host, for $case',
+    async ({ title }) => {
+      const stub = recordingProvider((_query, call) =>
+        call === 1
+          ? Promise.reject(new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel is closed.'))
+          : Promise.resolve<DataQueryResponse>({ source: 'requests', data: PROVIDER_ORDER }),
+      );
+      const user = userEvent.setup();
+      const node = makeNode(title === undefined ? {} : { title });
+
+      render(
+        <PanelHost
+          spec={{
+            version: PANEL_SPEC_VERSION,
+            id: 'panel-under-test',
+            sessionId: PANEL_SESSION_ID,
+            panelVersion: 1,
+            title: 'Panel under test',
+            summary: { observed: [], likelyCauses: [] },
+            layout: [node],
+          }}
+          dataProvider={stub.provider}
+          actions={makeActions().actions}
+        />,
+      );
+
+      const retry = await screen.findByRole('button', { name: RETRY_NAME });
+
+      act(() => {
+        retry.focus();
+      });
+      await user.keyboard('{Enter}');
+
+      // The pressed Retry left the document with its error state; once the
+      // groups are back, focus is on the first group's disclosure toggle — a
+      // named control inside the grid's first row — rather than on the node's
+      // heading or its bare frame.
+      await screen.findByRole('grid');
+      await waitFor(() => {
+        expect(document.activeElement).toBe(
+          screen.getByRole('button', { name: disclosureName(SINGLE_GROUP, false) }),
+        );
+      });
+      expect(dataRows()[0]?.contains(document.activeElement)).toBe(true);
+    },
+  );
 });
 
 /**
@@ -3322,6 +4283,331 @@ function expectPendingBadge(badge: HTMLElement): void {
   }
 }
 
+/**
+ * The stylesheet modifier each response class carries here, the half of a
+ * status chip's appearance that is this table's own. The tone is the shared
+ * half, read from `../utils/color` by the waterfall and the timeline as well.
+ */
+const STATUS_MODIFIER_BY_CODE: Readonly<Record<number, string | undefined>> = {
+  101: undefined,
+  200: 'dg-request-table__status--ok',
+  301: 'dg-request-table__status--redirect',
+  404: 'dg-request-table__status--client-error',
+  500: 'dg-request-table__status--server-error',
+};
+
+/**
+ * Assert that a status chip draws `code` in the shared tone and in this
+ * table's modifier for its class.
+ *
+ * @param chip The chip found by its visible code.
+ * @param code The code it prints.
+ * @param tone The tone the product reads that class in.
+ */
+function expectStatusChip(chip: HTMLElement, code: number, tone: string): void {
+  expect(chip.classList.contains('dg-request-table__status'), `${String(code)} chip`).toBe(true);
+  expect(httpStatusTone(code)).toBe(tone);
+  expect(chip.classList.contains(`dg-badge--${tone}`), `${String(code)} tone`).toBe(true);
+  const modifier = STATUS_MODIFIER_BY_CODE[code];
+  const modifiers = Array.from(chip.classList).filter((name) =>
+    name.startsWith('dg-request-table__status--'),
+  );
+  expect(modifiers, `${String(code)} modifier`).toEqual(modifier === undefined ? [] : [modifier]);
+}
+
+describe('RequestTable status colours', () => {
+  it('reads every response class in the shared tone, at group and at occurrence level', async () => {
+    const user = userEvent.setup();
+    const occurrences = [
+      makeOccurrence({ eventId: eventIdFor(61), spanId: spanIdFor(61), statusCode: 301 }),
+      makeOccurrence({
+        eventId: eventIdFor(62),
+        spanId: spanIdFor(62),
+        startTime: BASE_START_MS + 5,
+        statusCode: 404,
+      }),
+      makeOccurrence({
+        eventId: eventIdFor(63),
+        spanId: spanIdFor(63),
+        startTime: BASE_START_MS + 10,
+        statusCode: 500,
+      }),
+      withoutStatusCode(
+        makeOccurrence({
+          eventId: eventIdFor(64),
+          spanId: spanIdFor(64),
+          startTime: BASE_START_MS + 15,
+          status: 'error',
+        }),
+      ),
+    ];
+    const group = makeRequestGroup({
+      id: 'request-group-example-0091',
+      requestKey: 'request-key-example-0091',
+      count: occurrences.length,
+      statusCodes: [301, 404, 500],
+      errorCount: 3,
+      occurrences,
+    });
+    const row = await renderSoleGroup(group);
+    const cell = cellsOf(row).status;
+
+    // A redirect is informational, a client error a warning, a server error a
+    // danger: the waterfall's chips read the same table, so a 404 is never a
+    // warning here and a failure one view over.
+    expectStatusChip(within(cell).getByText('301'), 301, 'info');
+    expectStatusChip(within(cell).getByText('404'), 404, 'warning');
+    expectStatusChip(within(cell).getByText('500'), 500, 'danger');
+
+    await user.click(screen.getByRole('button', { name: disclosureName(group, false) }));
+    const [detail] = detailRows();
+    if (detail === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+    const statusSlots = Array.from(
+      detail.querySelectorAll<HTMLElement>('.dg-request-table__occurrence-row'),
+    ).map((occurrenceRow) => stackItemsOf(occurrenceRow)[2]);
+    const [moved, missing, broken, unanswered] = statusSlots;
+    if (
+      moved === undefined ||
+      missing === undefined ||
+      broken === undefined ||
+      unanswered === undefined
+    ) {
+      throw new Error('an occurrence rendered no status slot');
+    }
+    expectStatusChip(moved, 301, 'info');
+    expectStatusChip(missing, 404, 'warning');
+    expectStatusChip(broken, 500, 'danger');
+
+    // A settled occurrence without a code keeps its span status, in the shared
+    // span-status tone the timeline's detail chip uses.
+    expect(unanswered.textContent).toBe(formatStatusLabel('error'));
+    expect(unanswered.classList.contains(`dg-badge--${statusTone('error')}`)).toBe(true);
+  });
+
+  it('draws a success in the success tone and an informational code with no modifier', async () => {
+    const row = await renderSoleGroup(
+      makeRequestGroup({
+        id: 'request-group-example-0092',
+        requestKey: 'request-key-example-0092',
+        count: 2,
+        statusCodes: [101, 200],
+      }),
+    );
+    const cell = cellsOf(row).status;
+
+    expectStatusChip(within(cell).getByText('200'), 200, 'success');
+    expectStatusChip(within(cell).getByText('101'), 101, 'neutral');
+  });
+});
+
+/**
+ * The visible words of the "No status" badge, as the component spells them.
+ */
+const NO_STATUS_TEXT = 'No status';
+
+/**
+ * A group that reports `noStatusCodeCount`, built on {@link makeRequestGroup}
+ * the way {@link pendingGroup} adds its own count.
+ *
+ * @param overrides Fields to replace.
+ * @param noStatusCodeCount The settled occurrences without a code to report.
+ * @returns A fresh group.
+ */
+function noStatusGroup(overrides: GroupOverrides, noStatusCodeCount: number): RequestGroup {
+  return { ...makeRequestGroup(overrides), noStatusCodeCount };
+}
+
+/** The reported shape: two answered with 200, two aborted without a code. */
+const ABORTED_PAIR_GROUP = noStatusGroup(
+  {
+    id: 'request-group-example-0121',
+    requestKey: 'request-key-example-0121',
+    count: 4,
+    statusCodes: [200],
+    errorCount: 2,
+    occurrences: [
+      makeOccurrence({ eventId: eventIdFor(61), spanId: spanIdFor(61), statusCode: 200 }),
+      makeOccurrence({
+        eventId: eventIdFor(62),
+        spanId: spanIdFor(62),
+        startTime: BASE_START_MS + 4,
+        statusCode: 200,
+      }),
+      withoutStatusCode(
+        makeOccurrence({
+          eventId: eventIdFor(63),
+          spanId: spanIdFor(63),
+          startTime: BASE_START_MS + 8,
+          status: 'error',
+        }),
+      ),
+      withoutStatusCode(
+        makeOccurrence({
+          eventId: eventIdFor(64),
+          spanId: spanIdFor(64),
+          startTime: BASE_START_MS + 12,
+          status: 'error',
+        }),
+      ),
+    ],
+  },
+  2,
+);
+
+describe('RequestTable status reconciliation', () => {
+  it('shows the occurrences that settled without a code beside the codes and failures', async () => {
+    const row = await renderSoleGroup(ABORTED_PAIR_GROUP);
+    const cell = cellsOf(row).status;
+
+    // The list of codes holds only the success, the failure count says two
+    // occurrences failed, and the badge between them names the two that
+    // reported no code — so the codes and the count no longer disagree.
+    // Three items: the one code, the "No status" badge and the failure count.
+    expect(stackItemsOf(cell)).toHaveLength(3);
+    expectStatusChip(within(cell).getByText('200'), 200, httpStatusTone(200));
+    const badge = within(cell).getByText(`${NO_STATUS_TEXT} ${formatCount(2)}`);
+    expect(badge.classList.contains('dg-badge')).toBe(true);
+    expect(badge.classList.contains('dg-request-table__status')).toBe(true);
+    expect(badge.classList.contains('dg-badge--neutral')).toBe(true);
+    expect(badge.classList.contains('dg-badge--outline')).toBe(true);
+    expect(badge.querySelector('.dg-badge__icon')).not.toBeNull();
+    expect(within(cell).getByText(formatCount(2), { selector: '.dg-badge--danger' })).toBeDefined();
+    // No unavailable label: the codes are there, and the rest are accounted for.
+    expect(within(cell).queryByText(NOT_AVAILABLE_LABEL)).toBeNull();
+
+    // Its description states the count against the total, why a settled
+    // request has no code, and that the failures among them are counted beside it.
+    expectKeyboardDisclosure(
+      badge,
+      `Settled without a status code: ${formatCount(2)} of ${formatCount(4)} occurrences.`,
+    );
+    const [description = ''] = tooltipTexts(badge.parentElement ?? cell);
+    expect(description).toContain('aborted request, a network error');
+    expect(description).toContain('failures shown beside this badge');
+  });
+
+  it('names a lone code-less occurrence without a count, in place of the unavailable label', async () => {
+    const lone = noStatusGroup(
+      {
+        id: 'request-group-example-0122',
+        requestKey: 'request-key-example-0122',
+        statusCodes: [],
+        errorCount: 1,
+        occurrences: [
+          withoutStatusCode(makeOccurrence({ eventId: eventIdFor(65), status: 'error' })),
+        ],
+      },
+      1,
+    );
+    const row = await renderSoleGroup(lone);
+    const cell = cellsOf(row).status;
+
+    const badge = within(cell).getByText(NO_STATUS_TEXT);
+    expect(badge.classList.contains('dg-request-table__status')).toBe(true);
+    expect(within(cell).queryByText(NOT_AVAILABLE_LABEL)).toBeNull();
+    const [description = ''] = tooltipTexts(badge.parentElement ?? cell);
+    expect(description).toContain('This request settled without a status code');
+    expect(description).toContain('It failed, and it is the failure shown beside this badge.');
+  });
+
+  it('says nothing about failures when none of the occurrences failed', async () => {
+    const opaque = noStatusGroup(
+      {
+        id: 'request-group-example-0123',
+        requestKey: 'request-key-example-0123',
+        count: 2,
+        statusCodes: [],
+        errorCount: 0,
+        occurrences: [withoutStatusCode(makeOccurrence({ eventId: eventIdFor(66) }))],
+      },
+      2,
+    );
+    const row = await renderSoleGroup(opaque);
+    const cell = cellsOf(row).status;
+
+    const badge = within(cell).getByText(`${NO_STATUS_TEXT} ${formatCount(2)}`);
+    expect(cell.querySelector('.dg-badge--danger')).toBeNull();
+    const [description = ''] = tooltipTexts(badge.parentElement ?? cell);
+    expect(description).not.toMatch(/failure/u);
+  });
+
+  it('drops the unavailable label when Pending and No status account for every occurrence', async () => {
+    const group = {
+      ...noStatusGroup(
+        {
+          id: 'request-group-example-0124',
+          requestKey: 'request-key-example-0124',
+          count: 3,
+          statusCodes: [],
+        },
+        2,
+      ),
+      pendingCount: 1,
+    };
+    const row = await renderSoleGroup(group);
+    const cell = cellsOf(row).status;
+
+    expect(within(cell).queryByText(NOT_AVAILABLE_LABEL)).toBeNull();
+    expectPendingBadge(within(cell).getByText(`${PENDING_TEXT} ${formatCount(1)}`));
+    expect(within(cell).getByText(`${NO_STATUS_TEXT} ${formatCount(2)}`)).toBeDefined();
+  });
+
+  it('reads a count the aggregate could not have produced as none', async () => {
+    // Zero, a fraction and a count larger than the group are all read as no
+    // code-less occurrence: no badge, and the unavailable label keeps its place.
+    for (const [ordinal, value] of [0, 1.5, 3].entries()) {
+      const row = await renderSoleGroup(
+        noStatusGroup(
+          {
+            id: `request-group-example-013${String(ordinal)}`,
+            requestKey: `request-key-example-013${String(ordinal)}`,
+            count: 2,
+            statusCodes: [],
+          },
+          value,
+        ),
+      );
+      const cell = cellsOf(row).status;
+
+      expect(within(cell).queryByText(new RegExp(`^${NO_STATUS_TEXT}`, 'u'))).toBeNull();
+      expect(within(cell).getByText(NOT_AVAILABLE_LABEL)).toBeDefined();
+      cleanup();
+    }
+  });
+
+  it('keeps each occurrence without a code on its own span status', async () => {
+    const user = userEvent.setup();
+
+    await renderSoleGroup(ABORTED_PAIR_GROUP);
+    await user.click(
+      screen.getByRole('button', { name: disclosureName(ABORTED_PAIR_GROUP, false) }),
+    );
+
+    const [detail] = detailRows();
+    if (detail === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+    const rows = Array.from(
+      detail.querySelectorAll<HTMLElement>('.dg-request-table__occurrence-row'),
+    );
+    expect(rows).toHaveLength(4);
+    // The two answered occurrences show their code; the two that reported none
+    // show the span status they settled with, in its tone.
+    const statusSlots = rows.map((occurrenceRow) => stackItemsOf(occurrenceRow)[2]);
+    expect(statusSlots.map((slot) => slot?.textContent)).toStrictEqual([
+      '200',
+      '200',
+      formatStatusLabel('error'),
+      formatStatusLabel('error'),
+    ]);
+    for (const slot of statusSlots.slice(2)) {
+      expect(slot?.classList.contains(`dg-badge--${statusTone('error')}`)).toBe(true);
+    }
+  });
+});
+
 describe('RequestTable pending requests', () => {
   it('badges a group whose every occurrence was in flight, with no unavailable code', async () => {
     const group = pendingGroup(
@@ -3755,7 +5041,7 @@ const GROUP_TRIGGERS: readonly TriggerCase[] = [
   },
   {
     name: 'duplicate badge',
-    find: (row) => within(cellsOf(row).duplicates).getByText(formatCount(2)),
+    find: (row) => within(cellsOf(row).count).getByText(formatCount(2)),
     expected: `Redundant occurrences: ${formatCount(2)} of ${formatCount(5)}.`,
   },
   {
@@ -3918,7 +5204,7 @@ describe('RequestTable keyboard access to tooltip descriptions', () => {
       throw new Error('the grid rendered fewer than two data rows');
     }
 
-    const trigger = within(cellsOf(first).duplicates).getByText(formatCount(2));
+    const trigger = within(cellsOf(first).count).getByText(formatCount(2));
 
     act(() => {
       trigger.focus();
@@ -4041,7 +5327,7 @@ function tabStopsIn(grid: HTMLElement): HTMLElement[] {
 }
 
 describe('RequestTable one Tab stop per grid', () => {
-  it('is entered on its active row by one Tab and left by the next, whatever it holds', async () => {
+  it("is entered on its active row by one Tab, walks only that row's controls, and then leaves", async () => {
     // Every group open, so the toggles, the tooltip triggers, the caller chips
     // and each occurrence's selection button and chip are all in the document,
     // and a next page, so a control follows the grid in the Tab order.
@@ -4099,8 +5385,10 @@ describe('RequestTable one Tab stop per grid', () => {
     expect(tabStopsIn(grid)).toEqual([lastRow]);
     expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
 
-    // One Tab from the control before the grid enters on that row; the next
-    // leaves the grid for the control after it; Shift+Tab comes back.
+    // One Tab from the control before the grid enters on that row. The Tabs
+    // after it walk THAT row's controls - its cells, then its open detail - and
+    // never another row's; the Tab after the last one leaves the grid for the
+    // control after it, and Shift+Tab from there comes back to the row.
     act(() => {
       screen.getByRole('button', { name: DUPLICATES_ONLY_NAME }).focus();
     });
@@ -4108,7 +5396,44 @@ describe('RequestTable one Tab stop per grid', () => {
     await user.tab();
     expect(document.activeElement).toBe(lastRow);
 
-    await user.tab();
+    const lastDetail = detailRows()[2];
+
+    if (lastRow === undefined || lastDetail === undefined) {
+      throw new Error('Expected the last group to be rendered, open.');
+    }
+
+    const walked: Element[] = [];
+    const bound = controls.length + 1;
+
+    for (let press = 0; press < bound; press += 1) {
+      await user.tab();
+
+      const focused = document.activeElement;
+
+      if (focused === null || !grid.contains(focused)) {
+        break;
+      }
+
+      walked.push(focused);
+    }
+
+    expect(walked.length).toBeGreaterThan(0);
+    expect(new Set(walked).size).toBe(walked.length);
+
+    for (const element of walked) {
+      expect(lastRow.contains(element) || lastDetail.contains(element)).toBe(true);
+    }
+
+    expect(walked).toContain(
+      within(lastRow).getByRole('button', { name: DISCLOSURE_NAME_PATTERN }),
+    );
+
+    for (const selection of within(lastDetail).getAllByRole('button', {
+      name: /^Select the occurrence at /,
+    })) {
+      expect(walked).toContain(selection);
+    }
+
     expect(document.activeElement).toBe(screen.getByRole('button', { name: LOAD_MORE_NAME }));
     expect(grid.contains(document.activeElement)).toBe(false);
 
@@ -4139,12 +5464,9 @@ const COLUMN_WIDTHS: readonly DataTableColumnWidth[] = [
   'text',
   'status',
   'count',
-  'count',
   'quantity',
   'quantity',
-  'quantity',
-  'quantity',
-  'name',
+  'label',
 ];
 
 /**
@@ -4242,6 +5564,55 @@ const SLOT_GROUP = makeRequestGroup({
   occurrences: SLOT_OCCURRENCES,
 });
 
+/**
+ * The component stylesheet, read from disk with the `import.meta.url`
+ * convention `../tokens/tokens.test.ts` documents, so the working directory is
+ * irrelevant. The path is joined with `node:path` rather than resolved with
+ * `new URL(…)`: under happy-dom the global `URL` is the DOM's, which Node's
+ * `fileURLToPath` rejects.
+ */
+const COMPONENT_STYLESHEET = readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'styles', 'components.css'),
+  'utf8',
+);
+
+/**
+ * The declaration bodies of every rule whose selector list names `selector`,
+ * compared with its whitespace collapsed so a selector the formatter broke
+ * over several lines still matches. The stylesheet has no at-rule blocks (its
+ * header states it), so each rule is one `selectors { declarations }` pair.
+ *
+ * @param selector One selector of a selector list, spaced as it reads on one line.
+ * @returns The bodies, in source order.
+ */
+function rulesSelecting(selector: string): string[] {
+  const uncommented = COMPONENT_STYLESHEET.replace(/\/\*[\s\S]*?\*\//gu, '');
+  return Array.from(uncommented.matchAll(/([^{}]+)\{([^{}]*)\}/gu))
+    .filter(([, selectors = '']) =>
+      selectors.split(',').some((listed) => listed.trim().replace(/\s+/gu, ' ') === selector),
+    )
+    .map(([, , body = '']) => body);
+}
+
+/**
+ * The value one rule body declares for a property, failing when it declares none.
+ *
+ * @param body A rule body.
+ * @param property The property name.
+ * @returns The declared value, trimmed.
+ */
+function declaredValue(body: string, property: string): string {
+  const match = new RegExp(`(?:^|;)\\s*${property}:\\s*([^;]+);`, 'u').exec(body);
+  if (match?.[1] === undefined) {
+    throw new Error(`the rule declares no ${property}`);
+  }
+  return match[1].trim();
+}
+
+/** The selector of the URL's slot in the identity cell. */
+const URL_SLOT_SELECTOR =
+  '.dg-request-table__group-row > .dg-stack__items > :has(> .dg-tooltip__trigger > .dg-request-table__url)';
+
 describe('RequestTable layout contracts', () => {
   it('gives every column a track with a readable minimum, so a narrow panel scrolls', async () => {
     const stub = resolvingProvider(PROVIDER_ORDER);
@@ -4288,6 +5659,107 @@ describe('RequestTable layout contracts', () => {
       `calc(${COLUMN_WIDTHS.map((width) => DATA_TABLE_COLUMN_TRACKS[width].floor).join(' + ')})`,
     );
     expect(grid.style.getPropertyValue('--dgc-column-count')).toBe(String(COLUMN_HEADERS.length));
+  });
+
+  it('keeps the caller column at its readable floor, beside the count, in a narrow panel', async () => {
+    const stub = resolvingProvider([MIXED_INITIATOR_GROUP]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    const callers = DATA_TABLE_COLUMN_TRACKS[COLUMN_WIDTHS[COLUMN_WIDTHS.length - 1] ?? 'standard'];
+    const request = DATA_TABLE_COLUMN_TRACKS[COLUMN_WIDTHS[0] ?? 'standard'];
+
+    // The first caller shares its cell with the `+N` count, which keeps its own
+    // width, so a caller column that yielded left the caller a character or
+    // two beside it. The column holds its whole floor instead - its minimum IS
+    // its floor - and the request is the one column that narrows to fit, so a
+    // panel too narrow for that scrolls with the caller readable.
+    expect(callers.yields).toBe(false);
+    expect(callers.minimum).toBe(callers.floor);
+    expect(request.yields).toBe(true);
+    expect(grid.style.getPropertyValue('--dgc-yield-count')).toBe('1');
+
+    // Still one line of two items: the caller and the count of the others.
+    const [row] = dataRows();
+
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    expect(stackItemsOf(cellsOf(row).initiators)).toHaveLength(2);
+    expect(cellsOf(row).initiators.querySelector('.dg-stack--wrap')).toBeNull();
+  });
+
+  it('folds the duplicate count and the three durations into cells, so six columns fit a split pane', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // Six columns: no column of its own per duration or for the duplicates,
+    // whose figures are drawn inside the occurrences and duration cells.
+    const headers = screen.getAllByRole('columnheader').map((cell) => cell.textContent);
+    expect(headers).toHaveLength(6);
+    for (const folded of ['Duplicates', 'Average', 'Slowest', 'Total']) {
+      expect(headers).not.toContain(folded);
+    }
+
+    // The sum of the readable floors is what a panel must hold before any
+    // column narrows. Folded, it is the sum over six roles, with one compact
+    // floor per figure column rather than one per figure; in every theme it
+    // stays below the sum the nine separate columns had.
+    const nineColumns: readonly DataTableColumnWidth[] = [
+      'text',
+      'status',
+      'count',
+      'count',
+      'quantity',
+      'quantity',
+      'quantity',
+      'quantity',
+      'label',
+    ];
+    for (const theme of THEMES) {
+      const sum = (widths: readonly DataTableColumnWidth[]): number =>
+        widths.reduce((total, width) => total + (floorChOf(width, theme) ?? 0), 0);
+      expect(sum(COLUMN_WIDTHS)).toBeLessThan(sum(nineColumns));
+    }
+  });
+
+  it('gives the URL priority over the grouping chip in the identity cell', () => {
+    const [slot, ...others] = rulesSelecting(URL_SLOT_SELECTOR);
+    expect(others).toHaveLength(0);
+    const body = slot ?? '';
+
+    // A readable run of the URL is the slot's basis — the run a `text` column
+    // guarantees even when it yields — measured in the URL's own glyphs, so a
+    // line breaks before the chip could cut the URL to a few characters, and
+    // the chip moves under it instead. The run is clamped to the URL's own
+    // width, so a short URL claims no more than itself, and a slot moved onto
+    // a line of its own still shrinks rather than overflows, to one glyph square.
+    expect(declaredValue(body, 'flex-basis')).toBe(
+      `calc(${cssVar('columnMinText')} * ${cssVar('columnYield')})`,
+    );
+    expect(declaredValue(body, 'font')).toBe(cssVar('monoMd'));
+    expect(declaredValue(body, 'max-inline-size')).toBe('max-content');
+    expect(declaredValue(body, 'min-inline-size')).toBe(cssVar('iconSize'));
+    expect(declaredValue(body, 'flex')).toBe('auto');
+
+    // The items wrap, and the chip keeps its width on whichever line it lands.
+    const [items] = rulesSelecting('.dg-request-table__group-row > .dg-stack__items');
+    expect(declaredValue(items ?? '', 'flex-wrap')).toBe('wrap');
+    const [chip] = rulesSelecting('.dg-request-table__group-row > .dg-stack__items > :last-child');
+    expect(declaredValue(chip ?? '', 'flex')).toBe('none');
+
+    // The URL declares the font the slot's run is measured in (in its own
+    // rule; the shared single-line rule that also selects it sets no font).
+    const fonts = rulesSelecting('.dg-request-table__url').filter((rule) =>
+      /(?:^|;)\s*font:/u.test(rule),
+    );
+    expect(fonts).toHaveLength(1);
+    expect(declaredValue(fonts[0] ?? '', 'font')).toBe(cssVar('monoMd'));
   });
 
   it('lays each occurrence out as exactly four slots, in column order', async () => {

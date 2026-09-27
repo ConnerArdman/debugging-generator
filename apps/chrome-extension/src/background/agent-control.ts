@@ -46,7 +46,10 @@
  *   *disabled*, not idled. The service's own all-false `agent.config` is
  *   forwarded as it arrives; a local disarm derives the dormant set
  *   mechanically from the last received configuration's own hook keys, so no
- *   hook name is ever spelled in this file.
+ *   hook name is ever spelled in this file. A worker that lost its
+ *   configurations to an eviction disarms from the ended binding instead (see
+ *   {@link DisarmFallback}), reading the key set from the protocol's own
+ *   `agent.config` schema — still no hook name spelled here.
  * - **Navigation** ({@link AgentControl.handleNavigationDecision}).
  *   `tab-registry.ts` classifies a committed navigation; this module acts on
  *   the verdict — re-arm on the same origin, forget the tab on another.
@@ -81,6 +84,7 @@
  */
 
 import type { AgentConfigPayload, AgentHookConfig, AgentReadyPayload } from '@debuggen/protocol';
+import { agentConfigPayloadSchema, parseAgentConfigPayload } from '@debuggen/protocol';
 import type { CaptureId, Logger, SessionId } from '@debuggen/shared';
 import { noopLogger, nowEpochMs } from '@debuggen/shared';
 
@@ -339,10 +343,32 @@ export type ReloadOutcome =
  */
 export type DisarmReason = 'unbound' | 'session-ended' | 'displaced' | 'service-lost' | 'requested';
 
+/**
+ * The binding a caller has just ended, for {@link AgentControl.disarm} to fall
+ * back on when this controller holds no configuration for the tab.
+ *
+ * A projection of `TabBindingRecord`, so the record the tab registry reports
+ * as a removal's `previous` satisfies it as it is. The registry persists its
+ * records — `captureId` included — in `chrome.storage.session`; this
+ * controller's configurations live only in the worker's memory. An MV3 worker
+ * evicted while a capture runs therefore comes back knowing from the registry
+ * that the tab's page agent was armed for a capture, but holding no
+ * configuration to derive the dormant one from. A binding ended on that
+ * revived worker — a re-announced bind the service refuses because its session
+ * is over, most of all — would otherwise leave the page armed with nothing
+ * left that could disarm it (AAP §0.5.1: runtime hooks are disabled, not
+ * merely idled). `origin` keeps the dormant configuration off a document of any
+ * other origin, exactly as a routed configuration's binding does.
+ */
+export type DisarmFallback = Pick<TabBindingRecord, 'sessionId' | 'origin' | 'captureId'>;
+
 /** The answer to {@link AgentControl.disarm}. */
 export type DisarmOutcome =
   | {
-      /** No configuration was ever received for the tab: nothing to disarm. */
+      /**
+       * No configuration was ever received for the tab, and no fallback binding
+       * named a capture: nothing to disarm.
+       */
       readonly kind: 'not-armed';
       readonly tabId: TabId;
     }
@@ -576,10 +602,15 @@ export interface AgentControl {
 
   /**
    * Return a tab's agent to dormant with an all-false configuration derived
-   * from the last received configuration's own hook keys. A tab that never
-   * received one is left alone.
+   * from the last received configuration's own hook keys.
+   *
+   * A tab this controller holds no configuration for is disarmed from
+   * `fallback` — the binding the caller just ended — when that binding names a
+   * capture: the page may still be armed by a configuration a previous
+   * incarnation of this worker delivered (see {@link DisarmFallback}). With no
+   * configuration and no capture to name, the tab is left alone.
    */
-  disarm(tabId: TabId, reason?: DisarmReason): DisarmOutcome;
+  disarm(tabId: TabId, reason?: DisarmReason, fallback?: DisarmFallback): DisarmOutcome;
 
   /**
    * Relay a tab's last `agent.ready` upward again — for instance after the tab
@@ -724,6 +755,36 @@ function dormantConfigFrom(config: AgentConfigPayload): AgentConfigPayload {
     }
   }
   return { sessionId: config.sessionId, captureId: config.captureId, hooks };
+}
+
+/**
+ * The dormant configuration for an ended binding this worker holds no
+ * configuration for: the binding's session and capture, and every hook key of
+ * the protocol's own `agent.config` schema mapped to `false`.
+ *
+ * Mechanical for the same reason as {@link dormantConfigFrom}: the key set is
+ * read from the schema `@debuggen/protocol` validates the frame against, never
+ * from a local list, and the result is validated against that schema before it
+ * is used, so a frame the bridge or the page agent would reject is never built.
+ * `undefined` when the binding names no capture — the payload requires one — or
+ * when the built payload does not validate.
+ *
+ * @param binding The ended binding's session, origin and capture.
+ */
+function dormantConfigForBinding(binding: DisarmFallback): AgentConfigPayload | undefined {
+  if (binding.captureId === undefined) {
+    return undefined;
+  }
+  const hooks: Record<string, boolean> = {};
+  for (const key of Object.keys(agentConfigPayloadSchema.shape.hooks.shape)) {
+    hooks[key] = false;
+  }
+  const parsed = parseAgentConfigPayload({
+    sessionId: binding.sessionId,
+    captureId: binding.captureId,
+    hooks,
+  });
+  return parsed.ok ? parsed.value : undefined;
 }
 
 /**
@@ -1535,14 +1596,40 @@ export function createAgentControl(deps: AgentControlDeps): AgentControl {
     }
   }
 
-  function disarm(tabId: TabId, reason: DisarmReason = 'requested'): DisarmOutcome {
+  function disarm(
+    tabId: TabId,
+    reason: DisarmReason = 'requested',
+    fallback?: DisarmFallback,
+  ): DisarmOutcome {
     const state = tabs.get(tabId);
     const desired = state?.desired;
-    if (state === undefined || desired === undefined) {
-      log.debug('disarm: no configuration was received for the tab', { tabId, reason });
+    if (state !== undefined && desired !== undefined) {
+      return disarmTab(tabId, state, desired, reason);
+    }
+    // No configuration is held: this worker never received one for the tab, or
+    // an eviction took it while the page stayed armed. The ended binding is the
+    // only record left of what armed the page; disarm from it when it names a
+    // capture, since an armed page with nothing left to disarm it is the one
+    // outcome §0.5.1 forbids and a dormant frame to a dormant page changes
+    // nothing.
+    const fromBinding = fallback === undefined ? undefined : dormantConfigForBinding(fallback);
+    if (fallback === undefined || fromBinding === undefined) {
+      log.debug('disarm: no configuration was received for the tab', {
+        tabId,
+        reason,
+        fallback: fallback !== undefined,
+      });
       return { kind: 'not-armed', tabId };
     }
-    return disarmTab(tabId, state, desired, reason);
+    const target = state ?? stateFor(tabId);
+    target.boundOrigin ??= fallback.origin;
+    log.info('disarm: no configuration is held for the tab; disarming from its ended binding', {
+      tabId,
+      sessionId: fromBinding.sessionId,
+      captureId: fromBinding.captureId,
+      reason,
+    });
+    return disarmTab(tabId, target, fromBinding, reason);
   }
 
   function reannounce(tabId: TabId): boolean {

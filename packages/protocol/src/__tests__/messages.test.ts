@@ -188,6 +188,7 @@ import {
   EDITOR_OPEN_URI,
   HTTP_ONLY_PAYLOAD_NAMES,
   HTTP_ONLY_PAYLOAD_SCHEMAS,
+  MAX_TAIL_CAPTURE_TALLIES,
   MESSAGE_PAYLOAD_SCHEMAS,
   MESSAGE_TYPE,
   MESSAGE_TYPES,
@@ -240,6 +241,7 @@ import {
   targetRequestPayloadSchema,
   targetSelectedPayloadSchema,
   telemetryEventPayloadSchema,
+  telemetryTailCaptureTallySchema,
   telemetryTailPayloadSchema,
   unavailableSignalSchema,
 } from '../messages/index.js';
@@ -3357,6 +3359,108 @@ describe('telemetry.tail — the persisted schema, which is the mirror image', (
         events: [{ ...validPersistedEvent(), seq: 0 }],
       }).success,
     ).toBe(true);
+  });
+});
+
+describe('telemetry.tail — per-capture tallies count the store, not the stream', () => {
+  const OTHER_CAPTURE_ID = 'cap_2b8n5r0t4w6y1u3i';
+
+  it('carries each capture’s stored and skipped counts alongside its events', () => {
+    const payload = {
+      ...VALID_PAYLOADS['telemetry.tail'],
+      captures: [{ captureId: CAPTURE_ID, storedEvents: 93_430, skippedEvents: 81_830 }],
+    };
+
+    // The panel's one capture counter reads `storedEvents`, which a paced,
+    // bounded tail can never reach by counting the events it streamed.
+    expect(telemetryTailPayloadSchema.parse(payload)).toEqual(payload);
+    // Optional, so a frame from a service that does not count still parses.
+    expect(telemetryTailPayloadSchema.safeParse(VALID_PAYLOADS['telemetry.tail']).success).toBe(
+      true,
+    );
+  });
+
+  it('accepts a tally for each capture a boundary-straddling frame spans', () => {
+    const events = [
+      validPersistedEvent(),
+      { ...validPersistedEvent(), id: 'evt_second', captureId: OTHER_CAPTURE_ID },
+    ];
+    const captures = [
+      { captureId: CAPTURE_ID, storedEvents: 12, skippedEvents: 0 },
+      { captureId: OTHER_CAPTURE_ID, storedEvents: 1, skippedEvents: 0 },
+    ];
+
+    expect(
+      telemetryTailPayloadSchema.safeParse({ sessionId: SESSION_ID, events, captures }).success,
+    ).toBe(true);
+  });
+
+  it('refuses a tally for a capture none of the frame’s events belong to, or one named twice', () => {
+    const payload = VALID_PAYLOADS['telemetry.tail'];
+    const tally = { captureId: CAPTURE_ID, storedEvents: 4, skippedEvents: 0 };
+
+    for (const captures of [[{ ...tally, captureId: OTHER_CAPTURE_ID }], [tally, tally]]) {
+      const refused = telemetryTailPayloadSchema.safeParse({ ...payload, captures });
+
+      expect(refused.success).toBe(false);
+      if (refused.success) {
+        return;
+      }
+      expect(issuePaths(refused.error)).toEqual(['captures']);
+      // A rejection never echoes what it received.
+      expect(JSON.stringify(refused.error.issues)).not.toContain(OTHER_CAPTURE_ID);
+    }
+  });
+
+  it('refuses counts that are not whole, non-negative, safe numbers, and extra keys', () => {
+    const payload = VALID_PAYLOADS['telemetry.tail'];
+    const tally = { captureId: CAPTURE_ID, storedEvents: 4, skippedEvents: 0 };
+
+    for (const bad of [-1, 1.5, '4', Number.MAX_SAFE_INTEGER + 1, Number.NaN]) {
+      for (const key of ['storedEvents', 'skippedEvents']) {
+        expect(
+          telemetryTailPayloadSchema.safeParse({ ...payload, captures: [{ ...tally, [key]: bad }] })
+            .success,
+        ).toBe(false);
+      }
+    }
+    expect(
+      telemetryTailPayloadSchema.safeParse({
+        ...payload,
+        captures: [{ ...tally, eventName: 'click' }],
+      }).success,
+    ).toBe(false);
+    expect(telemetryTailPayloadSchema.safeParse({ ...payload, captures: [] }).success).toBe(false);
+  });
+
+  it('bounds the tallies one frame may carry', () => {
+    const captureIds = Array.from(
+      { length: MAX_TAIL_CAPTURE_TALLIES + 1 },
+      (_, index) => `cap_bound${String(index).padStart(8, '0')}`,
+    );
+    const events = captureIds.map((captureId, index) => ({
+      ...validPersistedEvent(),
+      id: `evt_bound${String(index)}`,
+      captureId,
+    }));
+    const tallies = captureIds.map((captureId) => ({
+      captureId,
+      storedEvents: 1,
+      skippedEvents: 0,
+    }));
+
+    expect(
+      telemetryTailPayloadSchema.safeParse({
+        sessionId: SESSION_ID,
+        events,
+        captures: tallies.slice(0, MAX_TAIL_CAPTURE_TALLIES),
+      }).success,
+    ).toBe(true);
+    expect(
+      telemetryTailPayloadSchema.safeParse({ sessionId: SESSION_ID, events, captures: tallies })
+        .success,
+    ).toBe(false);
+    expect(telemetryTailCaptureTallySchema.shape.captureId).toBeDefined();
   });
 });
 

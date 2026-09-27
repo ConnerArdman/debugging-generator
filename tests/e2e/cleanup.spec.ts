@@ -75,7 +75,12 @@ import type { Page } from '@playwright/test';
 
 import type { INSTRUMENTATION_MARKERS } from '@debuggen/instrumentation';
 
-import { DEMO_LAUNCH_TIMEOUT_MS, diffSnapshots, waitForStreamedContent } from './helpers/demo-app';
+import {
+  DEMO_LAUNCH_TIMEOUT_MS,
+  diffSnapshots,
+  waitForOrderableCheckout,
+  waitForStreamedContent,
+} from './helpers/demo-app';
 import type { MarkerFinding } from './helpers/demo-app';
 import {
   DEFAULT_SESSION_TIMEOUTS,
@@ -91,6 +96,7 @@ import type {
   ModificationRecord,
   ServiceHandle,
   SessionInteraction,
+  SessionPreparation,
   SessionRecord,
   TrackedFileSnapshot,
 } from './helpers/fixtures';
@@ -414,8 +420,11 @@ async function firstOrderableProductId(page: Page, baseUrl: string): Promise<str
 /**
  * Put one orderable unit in the tab's cart through the storefront's own route
  * (the same browser context, so the same cart), then open the checkout and
- * prove the target control is the form's only submit button, labelled and
- * enabled. Setup only: nothing here runs inside the capture.
+ * prove the target control is the form's only submit button, labelled, and
+ * that the form would place the order: the cart read, the freight quote
+ * settled with a service chosen, and nothing outstanding
+ * ({@link waitForOrderableCheckout}). Setup only: nothing here runs inside the
+ * capture.
  */
 async function prepareCheckout(page: Page, baseUrl: string): Promise<void> {
   const productId = await firstOrderableProductId(page, baseUrl);
@@ -442,15 +451,29 @@ async function prepareCheckout(page: Page, baseUrl: string): Promise<void> {
     placeOrder,
     'Place order must be enabled: a cart holding an item and the prefilled checkout details',
   ).toBeEnabled({ timeout: E2E_TIMEOUTS.pageReady });
+  await waitForOrderableCheckout(page, E2E_TIMEOUTS.pageReady);
 }
+
+/**
+ * The pause between "Ready to capture" and Start capture: the session's
+ * patches make the dev server rebuild under the open checkout page, which can
+ * have it ask for its freight quote again, so the form is waited on until it
+ * would place the order — the moment a developer presses — before the capture
+ * opens.
+ */
+const awaitOrderableCheckout: SessionPreparation = ({ appPage }) =>
+  waitForOrderableCheckout(appPage, E2E_TIMEOUTS.pageReady);
 
 /**
  * The reproduction the capture records: press "Place order", require the
  * checkout route's `200`, and wait for the confirmation address the form
  * pushes once React has committed the placed order — so the capture closes
- * after the whole click → request → response → render sequence.
+ * after the whole click → request → response → render sequence. The press is
+ * made only once the form would send the order (a press before the freight
+ * quote settles is refused by the form's validation pass and sends nothing).
  */
 const placeOrder: SessionInteraction = async ({ appPage }) => {
+  await waitForOrderableCheckout(appPage, E2E_TIMEOUTS.pageReady);
   const [response] = await Promise.all([
     appPage.waitForResponse(
       (candidate) =>
@@ -533,6 +556,7 @@ test.describe('cleanup — ending a session leaves the demo exactly as it was', 
         panel,
         appPage,
         target: { selector: PLACE_ORDER_SELECTOR },
+        beforeCapture: awaitOrderableCheckout,
         interact: placeOrder,
         tracker: sessions,
       });

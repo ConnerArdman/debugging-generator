@@ -94,6 +94,16 @@
  * reason, so the hook and the provider can never disagree about which two
  * queries are the same request.
  *
+ * The one provider in this library that shares more is the panel-bound wrapper,
+ * `bindPanelIdentity` in `./DataProvider`: a panel-bound read addresses the
+ * capture that panel was generated from, which no longer grows, so the wrapper
+ * also keeps each identical query's settled *successful* answer for as long as
+ * it lives — a node that mounts after its sibling resolved the same trace, or a
+ * remount, reads it without a second round trip. A failure and an abort are
+ * never kept there, so {@link UseQueryResult.retry} always asks again, and a
+ * live read (no panel identity) is never shared at all. This hook is unchanged
+ * by it: it still resolves the current request once, through the provider.
+ *
  * ## Why the query is keyed by value
  *
  * A query-backed component rebuilds its query on every render: the node's own
@@ -170,154 +180,20 @@ import type { ErrorStateProps } from '../primitives/ErrorState';
 import {
   checkDataQueryResponse,
   isAddressableSessionId,
+  stableQueryKey,
   useDataProvider,
   usePanelSessionId,
 } from './DataProvider';
 import type { DataProvider, DataQueryResponse, DataResultFor } from './DataProvider';
 
 /*
- * ---------------------------------------------------------------------------
- * Stable query keys
- *
- * One exported function and its module-private recursive helper. It is the one
- * definition of "the same request" in the panel-data contract: this hook keys
- * its effect on it, and a host surface's provider that coalesces identical
- * in-flight requests keys its registry on it (the DevTools panel's
- * `apps/chrome-extension/src/panel/data-provider.ts` does). It lives here, next
- * to its first consumer, rather than in `src/utils/**` — which is shared
- * presentation code with no serialisation vocabulary this belongs in — and is
- * re-exported from the package entry beside `useQuery`.
- * ---------------------------------------------------------------------------
+ * `stableQueryKey` — the one definition of "the same request" — is defined in
+ * `./DataProvider`, beside the interface and the panel-bound read sharing
+ * (`bindPanelIdentity`) that keys on it, and is re-exported here so that this
+ * hook and every existing importer keep reading it from the module that keys
+ * its effect on it. See its own documentation there.
  */
-
-/**
- * The deterministic identity of a query's contents — the one definition of
- * "the same request" shared by {@link useQuery} and by any provider that
- * coalesces identical requests in flight.
- *
- * Two queries that would resolve to the same page produce the same key, and two
- * that would not produce different keys. Three properties make that true:
- *
- * - **object keys are sorted**, so a query assembled field by field in one order
- *   matches one assembled in another;
- * - **array order is preserved**, because the order of a list inside a filter is
- *   part of what it asks for, not incidental;
- * - **members holding `undefined` are omitted**, so an explicitly absent field
- *   is the same request as an omitted one — which matters because the schema
- *   infers every optional field as `?: T | undefined`, and a component spreading
- *   local state into a query routinely produces the explicit form.
- *
- * Written for the JSON values a schema-valid `DataQuery` holds: strings, finite
- * numbers, booleans, `null`, arrays and plain objects. A value outside that set —
- * a function, a symbol, a non-finite number — cannot appear on a query that
- * passed validation, and is folded to `null` rather than throwing: this runs
- * during render, where an exception would take the whole panel down over a
- * malformed query that the error state could otherwise report.
- *
- * Cost is bounded and small. A `DataQuery` has at most four fields beside its
- * source and a filter of at most five, so this is a handful of string
- * concatenations per render — cheaper than the `useMemo` that would be needed to
- * avoid it, which would itself need a stable key to memoize on.
- *
- * The key is for comparison only: it is never parsed, and no consumer may depend
- * on its exact spelling. A consumer that coalesces requests across sessions
- * combines it with the session itself, because the key describes the query's
- * contents and nothing else.
- *
- * @example A provider coalescing identical in-flight requests:
- * ```ts
- * const key = `${sessionId}\n${stableQueryKey(normalizedQuery)}`;
- * const shared = inFlight.get(key) ?? dispatch(key, sessionId, normalizedQuery);
- * ```
- *
- * @param query The query whose contents identify the request.
- * @returns A string that is equal for equal query contents.
- */
-export function stableQueryKey(query: DataQuery): string {
-  return serializeStably(query);
-}
-
-/**
- * Serialise one JSON-shaped value into the canonical form described on
- * {@link stableQueryKey}.
- *
- * The output is JSON-like but is never parsed: it exists only to be compared, so
- * no consumer may depend on its exact spelling.
- *
- * @param value Any value reachable inside a query.
- * @returns Its canonical serialisation.
- */
-function serializeStably(value: unknown): string {
-  if (value === null) {
-    return 'null';
-  }
-
-  if (typeof value === 'object') {
-    if (isUnknownArray(value)) {
-      // Order-preserving, and holes and `undefined` members serialise as `null`
-      // exactly as `JSON.stringify` renders them — an array position cannot be
-      // omitted without shifting every position after it.
-      return `[${value.map(serializeStably).join(',')}]`;
-    }
-
-    // The one type assertion in this module, and it is sound: `typeof value`
-    // is `"object"`, `value` is not `null` and it is not an array, so indexing
-    // it by string key is exactly what it supports. The assertion buys back the
-    // string index signature that the `object` type does not carry; every value
-    // read through it stays `unknown` and is serialised by the same recursion.
-    const record = value as Readonly<Record<string, unknown>>;
-
-    // `Array.prototype.sort` with no comparator orders by UTF-16 code unit,
-    // which is a total order over the key set and therefore deterministic. The
-    // keys of a query are ASCII schema field names, so no locale, normalisation
-    // or collation question arises.
-    const members = Object.keys(record)
-      .sort()
-      .filter((name) => record[name] !== undefined)
-      .map((name) => `${JSON.stringify(name)}:${serializeStably(record[name])}`);
-
-    return `{${members.join(',')}}`;
-  }
-
-  switch (typeof value) {
-    case 'string':
-      // Quoted and escaped, so a value containing a brace, a comma or a colon
-      // cannot imitate the structure around it.
-      return JSON.stringify(value);
-    case 'number':
-      // `NaN` and the infinities have no JSON form and cannot survive schema
-      // validation; folding them together is safe because a query can hold
-      // neither.
-      return Number.isFinite(value) ? String(value) : 'null';
-    case 'boolean':
-      return value ? 'true' : 'false';
-    case 'bigint':
-      // Not reachable through a validated query, but distinguishing two bigints
-      // costs one line and prevents a key collision that would suppress a
-      // refetch.
-      return `${value.toString()}n`;
-    default:
-      // `undefined`, `function` and `symbol`. None can appear on a validated
-      // query, and none has a JSON form.
-      return 'null';
-  }
-}
-
-/**
- * Whether an object is an array, narrowing it to a readonly list of `unknown`.
- *
- * `Array.isArray` on its own narrows to `any[]`, which would leak `any` into the
- * recursion above and through the template literal that consumes it. This
- * predicate keeps the narrowing at `readonly unknown[]`, so every element stays
- * a value the recursion has to inspect rather than one the compiler stops
- * checking.
- *
- * @param value A non-null object.
- * @returns `true` when `value` is an array.
- */
-function isUnknownArray(value: object): value is readonly unknown[] {
-  return Array.isArray(value);
-}
+export { stableQueryKey };
 
 /*
  * ---------------------------------------------------------------------------

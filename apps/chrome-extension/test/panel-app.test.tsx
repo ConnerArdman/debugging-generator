@@ -44,6 +44,8 @@ import { PANEL_SPEC_VERSION } from '@debuggen/panel-schema';
 import type { PanelSpec } from '@debuggen/panel-schema';
 import type { ErrorPayload, SessionRecord, TelemetryEvent } from '@debuggen/protocol';
 import { createEnvelope, parseSessionRecord } from '@debuggen/protocol';
+import { DebuggenError } from '@debuggen/shared';
+import { computeCaptureSummary } from '@debuggen/telemetry';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -54,11 +56,13 @@ import { App } from '../src/panel/App';
 import { EVENT_RESOLUTION_PAGE_BUDGET } from '../src/panel/data-provider';
 import type * as ConnectionModule from '../src/panel/state/connection';
 import {
+  CAPTURE_STOP_CONFIRM_GRACE_MS,
   applyRelayedMessage,
   applySessionSnapshot,
   getPanelSnapshot,
   resetPanelStore,
   selectEvent,
+  setBindingState,
   setConnectionStatus,
   setLastError,
 } from '../src/panel/state/session-store';
@@ -525,7 +529,14 @@ describe('App — the failure notice', () => {
     expect(screen.getByText(NOTICE_TITLE)).toBeTruthy();
     expect(screen.getByText(FAILURE.message)).toBeTruthy();
     expect(screen.getByText(RETRY_HINT)).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy();
+    // Both controls belong to the notice they act on: one action row inside its card.
+    const dismiss = screen.getByRole('button', { name: 'Dismiss' });
+    const actionRow = dismiss.closest('.dg-error-state__action');
+    expect(actionRow).not.toBeNull();
+    expect(actionRow?.closest('.dg-error-state')).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Retry' }).closest('.dg-error-state__action')).toBe(
+      actionRow,
+    );
 
     await user.click(screen.getByRole('button', { name: 'Retry' }));
 
@@ -564,6 +575,54 @@ describe('App — the failure notice', () => {
     expect(getPanelSnapshot().lastError).toBeUndefined();
     expect(harness.resync).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(requireElement(container, 'main'));
+  });
+});
+
+describe('App — the drawer floats beside the body', () => {
+  it('opens the drawer as the floating last pane of a drawer division, focused without scrolling', async () => {
+    answerPanelData((offset) => Promise.resolve(eventsPage([LEAF_EVENT], offset, 1)));
+    act(() => {
+      applySessionSnapshot({
+        session: SESSION,
+        connection: { status: 'connected', serviceUrl: 'http://127.0.0.1:43117' },
+        binding: { kind: 'bound', sessionId: SESSION_ID, tabId: 7, url: 'http://127.0.0.1:3100/' },
+      });
+    });
+    const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+
+    const { container } = render(<App theme="dark" />);
+
+    // Closed: the body is the division's only pane, so nothing floats.
+    const division = requireElement(container, '.dg-split.dg-split--drawer');
+    const main = requireElement(container, 'main');
+    expect(main.parentElement?.classList.contains('dg-split__pane')).toBe(true);
+    expect(division.querySelectorAll(':scope > .dg-split__panes > .dg-split__pane')).toHaveLength(
+      1,
+    );
+
+    act(() => {
+      selectEvent({ eventId: LEAF_EVENT.id, traceId: TRACE_ID, spanId: LEAF_SPAN });
+    });
+
+    // Open: the drawer is the second, last pane of the same division — the one
+    // the stylesheet floats — and the body keeps the first.
+    const drawer = requireElement(container, 'aside[aria-label="Selected event"]');
+    const panes = division.querySelectorAll(':scope > .dg-split__panes > .dg-split__pane');
+    expect(panes).toHaveLength(2);
+    expect(panes[0]?.contains(main)).toBe(true);
+    expect(panes[1]?.contains(drawer)).toBe(true);
+
+    // Focus moves into the drawer without scrolling the document away from the
+    // row that raised the selection.
+    expect(document.activeElement).toBe(drawer);
+    const drawerFocus = focus.mock.contexts.findIndex((context) => context === drawer);
+    expect(drawerFocus).toBeGreaterThanOrEqual(0);
+    expect(focus.mock.calls[drawerFocus]).toEqual([{ preventScroll: true }]);
+    // The drawer resolves the selection through the panel-data provider.
+    await waitFor(() => {
+      expect(panelDataRequests().length).toBeGreaterThan(0);
+    });
+    expect(await within(drawer).findAllByText(LEAF_EVENT.name)).not.toHaveLength(0);
   });
 });
 
@@ -902,5 +961,154 @@ describe('App — the drawer reads the rendered panel’s evidence', () => {
         query: { source: 'events', filter: { traceId: TRACE_ID }, panelId: PANEL_ID },
       });
     }
+  });
+});
+
+describe('App — a stop the request could not confirm', () => {
+  const STOP_CAPTURE_LABEL = 'Stop capture';
+  const LAST_ERROR_TITLE = 'A Debug Generator request did not complete';
+  const STOP_TIMED_OUT = 'The capture.stop request timed out after 20000 ms';
+  const RUNNING_CAPTURE = 'capture-app-0002';
+
+  /** Show `SESSION` capturing {@link RUNNING_CAPTURE}, bound and connected. */
+  function showCapturing(): void {
+    applySessionSnapshot({
+      session: {
+        ...SESSION,
+        status: 'capturing',
+        captures: [{ id: RUNNING_CAPTURE, planVersion: 1, startedAt: 1_700_000_000_000 }],
+      },
+      connection: { status: 'connected', serviceUrl: 'http://127.0.0.1:43117' },
+      binding: { kind: 'bound', sessionId: SESSION_ID, tabId: 7, url: 'http://127.0.0.1:3100/' },
+    });
+  }
+
+  /** The service's `capture.stopped` announcement of {@link RUNNING_CAPTURE}. */
+  function relayStopped(): void {
+    const summary = computeCaptureSummary([], {
+      captureId: RUNNING_CAPTURE,
+      sessionId: SESSION_ID,
+    });
+    applyRelayedMessage(
+      createEnvelope(
+        'capture.stopped',
+        { sessionId: SESSION_ID, captureId: RUNNING_CAPTURE, summary },
+        { ts: 1_700_000_060_000 },
+      ),
+    );
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('shows no failure when the capture is seen stopped after the request timed out', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    harness.handler = (kind) =>
+      Promise.reject(
+        kind === 'capture.stop'
+          ? new DebuggenError('TRANSPORT_DISCONNECTED', STOP_TIMED_OUT)
+          : new Error(`This suite does not answer ${kind}.`),
+      );
+    showCapturing();
+    const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+
+    render(<App theme="dark" />);
+    await user.click(screen.getByRole('button', { name: STOP_CAPTURE_LABEL }));
+    await waitFor(() => {
+      expect(harness.requests.map((request) => request.kind)).toEqual(['capture.stop']);
+    });
+
+    // The request has failed, but the stop is still unconfirmed: the control keeps its cue.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CAPTURE_STOP_CONFIRM_GRACE_MS / 2);
+    });
+    expect(screen.queryByText(LAST_ERROR_TITLE)).toBeNull();
+    expect(screen.getByRole('button', { name: /Stopping capture/u })).toBeTruthy();
+
+    act(() => {
+      relayStopped();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CAPTURE_STOP_CONFIRM_GRACE_MS);
+    });
+
+    expect(screen.queryByText(LAST_ERROR_TITLE)).toBeNull();
+    expect(getPanelSnapshot().lastError).toBeUndefined();
+    expect(getPanelSnapshot().capture.active).toBe(false);
+  });
+
+  it('reports the failure once the grace period passes with the capture still running', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    harness.handler = (kind) =>
+      Promise.reject(
+        kind === 'capture.stop'
+          ? new DebuggenError('TRANSPORT_DISCONNECTED', STOP_TIMED_OUT)
+          : new Error(`This suite does not answer ${kind}.`),
+      );
+    showCapturing();
+    const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+
+    render(<App theme="dark" />);
+    await user.click(screen.getByRole('button', { name: STOP_CAPTURE_LABEL }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CAPTURE_STOP_CONFIRM_GRACE_MS + 1_000);
+    });
+
+    expect(screen.getByText(LAST_ERROR_TITLE)).toBeTruthy();
+    expect(getPanelSnapshot().lastError?.message).toContain(STOP_TIMED_OUT);
+    expect(getPanelSnapshot().capture.stopFailure?.code).toBe('TRANSPORT_DISCONNECTED');
+  });
+});
+
+describe('App — an ended session', () => {
+  /** The sentence `EmptyPanel` opens with. */
+  const EMPTY_STATE = /^No session yet/;
+
+  it('stays on screen with its Ended status, cleanup outcome and ended reason once its tab is unbound', () => {
+    const connection = { status: 'connected', serviceUrl: DEFAULT_SERVICE_BASE_URL } as const;
+    applySessionSnapshot({
+      session: SESSION,
+      panel: PANEL,
+      connection,
+      binding: { kind: 'bound', sessionId: SESSION_ID, tabId: 7, url: 'http://127.0.0.1:3100/' },
+    });
+    // The session end as the panel receives it: the cleanup outcome, the ended
+    // record, then the unbinding — which `./state/connection.ts` follows with
+    // the default reset of the session scope.
+    applyRelayedMessage(
+      createEnvelope('cleanup.completed', {
+        sessionId: SESSION_ID,
+        status: 'clean',
+        conflicts: [],
+      }),
+    );
+    applyRelayedMessage(
+      createEnvelope('session.updated', {
+        session: {
+          ...SESSION,
+          status: 'ended',
+          updatedAt: SESSION.updatedAt + 1_000,
+          cleanup: { status: 'clean', completedAt: SESSION.updatedAt + 1_000, conflicts: [] },
+        },
+      }),
+    );
+    setBindingState({ kind: 'unbound' });
+    resetPanelStore();
+
+    render(<App theme="dark" />);
+
+    expect(screen.queryByText(EMPTY_STATE)).toBeNull();
+    // The panel chrome's header comes first; the rendered panel has its own.
+    const [chrome] = screen.getAllByRole('banner');
+    if (chrome === undefined) {
+      throw new Error('The panel rendered no header.');
+    }
+    expect(within(chrome).getAllByText('Ended').length).toBeGreaterThan(0);
+    expect(screen.getByText('Clean')).toBeTruthy();
+    expect(document.body.textContent).toContain(
+      'This session has ended. Start a new session in VS Code to capture again.',
+    );
+    expect(screen.getAllByText(PANEL.title).length).toBeGreaterThan(0);
   });
 });

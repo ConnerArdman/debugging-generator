@@ -79,9 +79,12 @@
  *     for nothing again — which a position-derived key cannot do.
  *   - **The outline is stated once and stepped once.** The title is an `h2`,
  *     the top-level nodes `h3`, and each titled container puts its children
- *     exactly one level deeper; an untitled container adds no level. Without a
- *     selection handler, the head's citations are inert text rather than
- *     focusable controls that do nothing.
+ *     exactly one level deeper; an untitled container adds no level. Every view
+ *     of captured evidence is a named region in that outline: an untitled one is
+ *     headed by its node type's catalogue label at the level it was given, while
+ *     an untitled source link and an untitled container draw no heading at all.
+ *     Without a selection handler, the head's citations are inert text rather
+ *     than focusable controls that do nothing.
  *
  * The last block pins the failure contract every query-backed node renders
  * through, because the host tier is where its three halves meet: the query
@@ -98,11 +101,12 @@
  * The final block pins the other half of that focus key: the node frame
  * `NodeRenderer` draws around every node keeps keyboard focus inside the node
  * while a retry remounts its view. A retry that fails again lands on the new
- * Retry, one that succeeds leaves focus on the node's heading (or, untitled, on
- * its frame) with a `tabindex` borrowed only while it is focused, focus stays
- * in the node while the retry is in flight, and nothing that settles later
- * pulls back focus the reader moved elsewhere. The unrenderable-node failure
- * names its block for what it holds — the node's definition, not a query.
+ * Retry, one that succeeds leaves focus on the node's heading (for an untitled
+ * view, the heading its catalogue label draws, never its container's) with a
+ * `tabindex` borrowed only while it is focused, focus stays in the node while
+ * the retry is in flight, and nothing that settles later pulls back focus the
+ * reader moved elsewhere. The unrenderable-node failure names its block for
+ * what it holds — the node's definition, not a query.
  *
  * ## What this suite deliberately does not do
  *
@@ -3488,6 +3492,65 @@ function headingLevels(): number[] {
   return screen.getAllByRole('heading').map((heading) => Number(heading.tagName.slice(1)));
 }
 
+/**
+ * The level and text of every heading inside one part of the panel, in
+ * document order: the outline a layout draws, without the panel head above it.
+ *
+ * Exact on purpose. A heading drawn where none belongs — over a source chip, or
+ * for an untitled container — is as wrong as one missing, and only a complete
+ * list shows both.
+ *
+ * @param scope The region, or node frame, whose outline is wanted.
+ * @returns One `[level, text]` pair per heading.
+ */
+function outlineWithin(scope: HTMLElement): (readonly [number, string])[] {
+  return within(scope)
+    .queryAllByRole('heading')
+    .map((heading) => [Number(heading.tagName.slice(1)), heading.textContent ?? ''] as const);
+}
+
+/**
+ * The node frame a rendered element belongs to: its nearest `data-node-path`
+ * wrapper.
+ *
+ * @param element An element a node drew.
+ * @returns That node's frame.
+ */
+function frameOf(element: HTMLElement): HTMLElement {
+  const frame = element.closest<HTMLElement>('[data-node-path]');
+  if (frame === null) {
+    throw new Error('the element is drawn outside any node frame');
+  }
+
+  return frame;
+}
+
+/** The title a panel author gives the view of {@link metricView}, in the case that keeps it. */
+const AUTHORED_VIEW_TITLE = 'Authored view title';
+
+/** The supporting line a panel author gives an otherwise untitled view. */
+const AUTHORED_VIEW_DESCRIPTION = 'An authored line saying how to read this view.';
+
+/**
+ * A query-backed metric view carrying only the labels a case gives it.
+ *
+ * @param id The node's id, which is also its document path.
+ * @param labels The title and description to author, if any.
+ * @returns The node.
+ */
+function metricView(
+  id: string,
+  labels: { readonly title?: string; readonly description?: string } = {},
+): PanelNode {
+  return {
+    type: 'metricCards',
+    id,
+    query: { source: 'metrics' },
+    metrics: [NODE_METRIC_ID],
+    ...labels,
+  };
+}
+
 describe('PanelHost document outline', () => {
   it('draws the title at level 2 and steps one level per titled container', async () => {
     await renderPanel(makeSpec());
@@ -3511,11 +3574,127 @@ describe('PanelHost document outline', () => {
     });
   });
 
+  it('heads an untitled view with its catalogue label one level below the container that titled it', async () => {
+    await renderPanel(makeSpec());
+
+    // The metric view at the bottom of the nested layout carries no title, so
+    // its type's catalogue label heads it, one level below the stack; the
+    // source link beside it draws no heading at all.
+    expect(outlineWithin(screen.getByRole('region', { name: SECTION_TITLE }))).toEqual([
+      [3, SECTION_TITLE],
+      [4, SPLIT_TITLE],
+      [5, STACK_TITLE],
+      [6, METRIC_VIEW_NAME],
+    ]);
+  });
+
+  it("names an untitled view's region with its catalogue label, at the layout's level", async () => {
+    await renderPanel(makeSpec({ layout: makeSiblingLayout() }));
+
+    // A top-level view sits directly below the panel title, as a titled one would.
+    const heading = screen.getByRole('heading', { level: 3, name: METRIC_VIEW_NAME });
+    const region = screen.getByRole('region', { name: METRIC_VIEW_NAME });
+
+    // A real region, named by that heading and holding the view itself, so a
+    // reader who lands on the heading or the landmark is at the evidence.
+    expect(region.tagName).toBe('SECTION');
+    expect(region.getAttribute('aria-labelledby')).toBe(heading.id);
+    expect(region.contains(heading)).toBe(true);
+    expect(within(region).getAllByRole('list', { name: METRIC_VIEW_NAME })).toHaveLength(1);
+
+    // The `Section` primitive's own heading, which is also what the node's
+    // focus keeper parks on.
+    expect(heading.classList.contains('dg-section__title')).toBe(true);
+    expect(outlineWithin(frameOf(region))).toEqual([[3, METRIC_VIEW_NAME]]);
+  });
+
+  it('draws no heading and no region for an untitled source link', async () => {
+    await renderPanel(makeSpec({ layout: makeSiblingLayout() }));
+
+    // One chip, whose own accessible name says where it leads: a heading over
+    // it would name a control rather than a region.
+    const frame = frameOf(screen.getByRole('button', { name: chipName(NODE_LOCATION) }));
+
+    expect(outlineWithin(frame)).toEqual([]);
+    expect(within(frame).queryAllByRole('region')).toEqual([]);
+  });
+
   it('adds no level under a container that draws no heading', async () => {
     await renderPanel(makeSpec({ layout: makeUntitledMiddleLayout() }));
 
     screen.getByRole('heading', { level: 3, name: OUTER_TITLE });
     screen.getByRole('heading', { level: 4, name: INNER_TITLE });
+
+    // Exactly the two titled containers: the untitled stack between them and
+    // the two source links inside the split draw none.
+    expect(outlineWithin(screen.getByRole('region', { name: OUTER_TITLE }))).toEqual([
+      [3, OUTER_TITLE],
+      [4, INNER_TITLE],
+    ]);
+  });
+
+  it("heads an untitled view inside an untitled container at the container's own level", async () => {
+    const { container } = await renderPanel(
+      makeSpec({
+        layout: [
+          {
+            type: 'stack',
+            id: 'layout.0',
+            children: [
+              metricView('layout.0.children.0'),
+              { type: 'sourceLink', id: 'layout.0.children.1', location: { ...NODE_LOCATION } },
+            ],
+          },
+        ],
+      }),
+    );
+
+    // The stack draws no heading and so adds no level: the view it groups is
+    // headed at the layout's own level, and is the only region the stack holds.
+    const stack = container.querySelector<HTMLElement>('[data-node-path="layout.0"]');
+    if (stack === null) {
+      throw new Error('the untitled stack drew no node frame');
+    }
+
+    expect(outlineWithin(stack)).toEqual([[3, METRIC_VIEW_NAME]]);
+    expect(
+      within(stack)
+        .getAllByRole('region')
+        .map((region) => region.getAttribute('aria-labelledby')),
+    ).toEqual([within(stack).getByRole('heading', { name: METRIC_VIEW_NAME }).id]);
+  });
+
+  it('keeps a title the panel wrote instead of the catalogue label', async () => {
+    await renderPanel(
+      makeSpec({ layout: [metricView('layout.0', { title: AUTHORED_VIEW_TITLE })] }),
+    );
+
+    screen.getByRole('region', { name: AUTHORED_VIEW_TITLE });
+    screen.getByRole('heading', { level: 3, name: AUTHORED_VIEW_TITLE });
+    expect(screen.queryByRole('heading', { name: METRIC_VIEW_NAME })).toBeNull();
+  });
+
+  it('reads a blank title as none, and heads the view with its catalogue label', async () => {
+    await renderPanel(makeSpec({ layout: [metricView('layout.0', { title: '   ' })] }));
+
+    screen.getByRole('region', { name: METRIC_VIEW_NAME });
+    screen.getByRole('heading', { level: 3, name: METRIC_VIEW_NAME });
+  });
+
+  it('renders a description on an untitled view under its catalogue label', async () => {
+    await renderPanel(
+      makeSpec({ layout: [metricView('layout.0', { description: AUTHORED_VIEW_DESCRIPTION })] }),
+    );
+
+    const region = screen.getByRole('region', { name: METRIC_VIEW_NAME });
+    const heading = within(region).getByRole('heading', { level: 3, name: METRIC_VIEW_NAME });
+    const description = within(region).getByText(AUTHORED_VIEW_DESCRIPTION);
+
+    // Prose under the heading, never the region's name.
+    expect(heading.compareDocumentPosition(description) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(outlineWithin(region)).toEqual([[3, METRIC_VIEW_NAME]]);
   });
 });
 
@@ -5209,9 +5388,11 @@ describe('PanelHost focus after a retry', () => {
   /**
    * A titled query-backed leaf followed by a standalone source chip.
    *
-   * The leaf is titled so the node frame has a heading of its own to park focus
-   * on; the chip is a control in *another* node, which is where a reader who
-   * moves on while a retry is in flight goes.
+   * The leaf is titled so the heading its frame parks focus on carries a name
+   * this suite chose (an untitled one would be headed by its catalogue label,
+   * which the untitled-leaf case below covers); the chip is a control in
+   * *another* node, which is where a reader who moves on while a retry is in
+   * flight goes.
    *
    * @returns The two nodes, as fresh objects.
    */
@@ -5437,33 +5618,43 @@ describe('PanelHost focus after a retry', () => {
     },
   );
 
-  it('parks focus on the frame of a node without a heading, never on its container', async () => {
+  it('parks focus on the heading an untitled view draws from its catalogue label, never on its container', async () => {
     const { provider, container } = renderControlled(makeNestedLayout());
     const stack = screen.getByRole('region', { name: STACK_TITLE });
+    const stackHeading = within(stack).getByRole('heading', { name: STACK_TITLE });
     const frame = frameAt(container, UNTITLED_LEAF_PATH);
     const user = userEvent.setup();
+
+    // The untitled leaf is headed by its catalogue label inside its own frame,
+    // and that heading is present in every state the view passes through.
+    const heading = within(frame).getByRole('heading', { name: METRIC_VIEW_NAME });
 
     const retry = await failNext(provider, stack);
     expect(frame.contains(retry)).toBe(true);
     retry.focus();
     await user.keyboard('{Enter}');
 
-    // The leaf draws no heading; the stack's heading belongs to the stack's own
-    // frame, so focus waits on the leaf's frame instead.
-    expect(document.activeElement).toBe(frame);
-    expect(frame.getAttribute('tabindex')).toBe('-1');
+    // The stack's heading belongs to the stack's own frame, so focus waits on
+    // the leaf's own heading — never on its container's, and never on the
+    // leaf's frame while the leaf has a heading to offer.
+    expect(document.activeElement).toBe(heading);
+    expect(document.activeElement).not.toBe(stackHeading);
+    expect(heading.getAttribute('tabindex')).toBe('-1');
+    expect(frame.hasAttribute('tabindex')).toBe(false);
 
     provider.takeNext().answer(metricsResponse());
     await within(frame).findByRole('list', { name: METRIC_VIEW_NAME });
 
     await waitFor(() => {
-      expect(document.activeElement).toBe(frame);
+      expect(document.activeElement).toBe(heading);
     });
 
     await user.tab();
 
-    expect(document.activeElement).not.toBe(frame);
-    expect(frame.hasAttribute('tabindex')).toBe(false);
+    expect(document.activeElement).not.toBe(heading);
+    expect(document.activeElement).not.toBe(document.body);
+    expect(heading.hasAttribute('tabindex')).toBe(false);
+    expect(stackHeading.hasAttribute('tabindex')).toBe(false);
   });
 
   it('moves no focus for a node the reader was not in', async () => {

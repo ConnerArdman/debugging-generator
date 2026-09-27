@@ -135,7 +135,8 @@ import {
 } from 'node:fs';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { createServer as createTcpServer } from 'node:net';
+import type { AddressInfo, Server as NetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -175,13 +176,16 @@ import { openStore } from '../store/db.js';
 import { LOG_FAILURE_NOTICE_MESSAGE } from '../logging.js';
 import {
   FRAMEWORK_DEV_CLIS,
+  acceptDevServerConnection,
   buildRelaunchHint,
   detectDevServer,
   formatRelaunchCommand,
   packageManagerRunArgs,
+  probeDevServer,
 } from './detect.js';
 import type {
   DevScriptSelection,
+  DevServerAcceptResult,
   DevServerDetection,
   DevServerFramework,
   DevServerProbeResult,
@@ -195,6 +199,7 @@ import {
   DEFAULT_CLI_CREDENTIAL_LEASE_MS,
   DEFAULT_LISTENER_LOOKUP_TIMEOUT_MS,
   DEFAULT_MANAGED_CREDENTIAL_LEASE_MS,
+  DEFAULT_READY_ACCEPT_HOLD_MS,
   DEFAULT_READY_PROBE_TIMEOUT_MS,
   DEV_SERVER_ARGUMENT_ALLOWLIST,
   DEV_SERVER_COMMAND_ENV_ALLOWLIST,
@@ -204,6 +209,8 @@ import {
   DEV_SERVER_OUTPUT_DIAGNOSTICS,
   LAUNCH_NODE_OPTIONS_ALLOWLIST,
   LEASE_RENEWALS_PER_LEASE,
+  MAX_OUTPUT_TAIL_LINES,
+  MAX_OUTPUT_TAIL_LINE_LENGTH,
   MAX_READY_CANDIDATES,
   PRELOAD_BUILD_COMMAND,
   PRELOAD_BUNDLED_RELATIVE_URL,
@@ -229,7 +236,9 @@ import {
   isTrustedDevCliFile,
   isTrustedNodePathDirectory,
   parseLaunchCommand,
+  prependSearchPath,
   preloadPathCandidates,
+  projectBinDirectories,
   resolveIngestUrl,
   resolvePreloadPath,
   resolveWindowsComSpec,
@@ -3661,7 +3670,10 @@ describe('DevServerLauncher.launch: a NODE_PATH the service does not trust', () 
     const harness = createHarness({ deps: { isTrustedDevDirectory: trusting } });
     await launchReady(harness, { command: `NODE_PATH=${entry} next dev` });
 
-    expect(trusting).toHaveBeenCalledExactlyOnceWith(entry);
+    // The NODE_PATH entry is judged once; the same check then decides which
+    // `node_modules/.bin` directories the `next dev` child's PATH gets.
+    expect(trusting.mock.calls.filter(([path]) => path === entry)).toHaveLength(1);
+    expect(trusting).toHaveBeenCalledWith(join(harness.projectRoot, 'node_modules', '.bin'));
     expect(harness.spawner.call(0).options.env['NODE_PATH']).toBe(entry);
   });
 });
@@ -5956,7 +5968,7 @@ describe('DevServerLauncher.launch: readiness', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('reports an early exit with an output digest — counts and diagnostic ids, no line — and revokes the credential', async () => {
+  it('reports an early exit with an output digest in the error, logs the redacted tail, and revokes the credential', async () => {
     const harness = createHarness();
     const pending = harness.launcher.launch({ projectRoot: harness.projectRoot });
     const child = await spawnedChild(harness, pending);
@@ -5977,10 +5989,12 @@ describe('DevServerLauncher.launch: readiness', () => {
       signal: null,
       output: { stdoutLines: 1, stderrLines: 2, diagnostics: ['port-in-use'] },
     });
+    // The error never quotes the output; the credential is in no record at all.
     for (const fragment of ['worker echoed', 'EADDRINUSE', 'compiling', ':::4173', token]) {
       expect(errorSurfaces(error)).not.toContain(fragment);
-      expect(serializedRecords(harness.records)).not.toContain(fragment);
     }
+    expect(token.length).toBeGreaterThan(0);
+    expect(serializedRecords(harness.records)).not.toContain(token);
 
     const exitRecord = harness.records.find(
       (record) => record.message === 'The launched dev server exited before it was ready',
@@ -5991,6 +6005,14 @@ describe('DevServerLauncher.launch: readiness', () => {
       truncatedLines: 0,
       diagnostics: ['port-in-use'],
     });
+    // The failure's own warning carries why, in order, stderr tagged and the
+    // echoed credential removed.
+    expect(exitRecord?.fields['outputTail']).toStrictEqual([
+      '  compiling the application…',
+      '[stderr] worker echoed credential [redacted] before failing',
+      '[stderr] Error: listen EADDRINUSE: address already in use :::4173',
+    ]);
+    expect(error.details).not.toHaveProperty('outputTail');
 
     expect(harness.issuer.revoke).toHaveBeenCalledTimes(1);
     expect(harness.issuer.revoke.mock.calls[0]?.[0]).toStrictEqual({
@@ -6396,10 +6418,17 @@ describe('DevServerLauncher.launch: readiness verification (listener ownership)'
     await vi.advanceTimersByTimeAsync(1_000);
     const error = expectErr(await pending, 'DEV_SERVER_UNAVAILABLE', 'ready-timeout');
 
-    expect(error.hint).toContain('It never announced a local address that answered.');
+    // Addresses were announced and probed; none accepted — said as such.
+    expect(error.message).toBe(
+      "The dev server's address did not accept a connection within 1 s of starting, so it was stopped.",
+    );
+    expect(error.hint).toContain(
+      'Nothing accepted a connection at the local address it announced or the session named.',
+    );
     expect(error.details).toStrictEqual({
       reason: 'ready-timeout',
       timeoutMs: 1_000,
+      probed: true,
       lastSeenUrl: DEV_URL,
       output: { stdoutLines: 2, stderrLines: 0, diagnostics: [] },
     });
@@ -6444,7 +6473,7 @@ describe('DevServerLauncher.launch: readiness verification (listener ownership)'
       "The dev server's announced address answered within 1 s, but the process listening there is not the dev server this launch started, so the launched dev server was stopped.",
     );
     expect(error.hint).toBe(
-      'Another process answers at that address. Stop it, or change the port the dev server listens on, then launch the dev server again. Run the dev script in a terminal to read its full output.',
+      'Another process answers at that address. Stop it, or change the port the dev server listens on, then launch the dev server again. The last lines it printed, redacted, are in the Debug Generator service log (the "Debug Generator Service" output in VS Code). Run the dev script in a terminal to read its full output.',
     );
     expect(error.details).toStrictEqual({
       reason: 'ready-unverified',
@@ -6464,6 +6493,11 @@ describe('DevServerLauncher.launch: readiness verification (listener ownership)'
       candidates: [DEV_URL],
       ownership: 'other-process',
       output: { stdoutLines: 4, stderrLines: 2, truncatedLines: 0, diagnostics: [] },
+      outputTail: [
+        ...REDACTED_SENTINEL_STDOUT,
+        `  - Local:   ${DEV_ORIGIN}`,
+        ...REDACTED_SENTINEL_STDERR,
+      ],
     });
     expect(
       harness.records.find((entry) => entry.message === 'Stopped a launched dev server')?.fields[
@@ -6500,7 +6534,7 @@ describe('DevServerLauncher.launch: readiness verification (listener ownership)'
       "The dev server's announced address answered within 1 s, but the service could not determine which process listens there, so the launched dev server was stopped.",
     );
     expect(error.hint).toBe(
-      'The service could not determine which process listens at that address. Start the dev server yourself with the Debug Generator preload, then set debuggen.devServerUrl to its local address. Run the dev script in a terminal to read its full output.',
+      'The service could not determine which process listens at that address. Start the dev server yourself with the Debug Generator preload, then set debuggen.devServerUrl to its local address. The last lines it printed, redacted, are in the Debug Generator service log (the "Debug Generator Service" output in VS Code). Run the dev script in a terminal to read its full output.',
     );
     expect(error.details).toStrictEqual({
       reason: 'ready-unverified',
@@ -6844,7 +6878,8 @@ describe('DevServerLauncher.launch: readiness verification (listener ownership)'
 });
 
 // ---------------------------------------------------------------------------
-// Child output privacy (CWE-532): digested, never logged, kept or returned
+// Child output privacy (CWE-532): digested, a redacted tail for a failed
+// start only, never returned
 // ---------------------------------------------------------------------------
 
 /**
@@ -6876,7 +6911,27 @@ function sentinelOutput(token: string): {
   };
 }
 
-/** Every fragment is absent from every log record and from every surface of `error`. */
+/**
+ * The {@link sentinelOutput} lines as a failed start's `outputTail` logs them,
+ * in print order: the codeframe reduced to the marker, the SQL literals
+ * parameterised, the query value masked, the address and the credential gone,
+ * stderr tagged.
+ */
+const REDACTED_SENTINEL_STDOUT: readonly string[] = Object.freeze([
+  '[redacted]',
+  'prisma:query SELECT "id" FROM "Invoice" WHERE "memo" = ? LIMIT ?',
+  'GET https://statements.example.test/v1/export?account=? 200 in 41ms',
+]);
+const REDACTED_SENTINEL_STDERR: readonly string[] = Object.freeze([
+  '[stderr] notify: sent receipt to [redacted]',
+  '[stderr] DEBUGGEN_TOKEN=[redacted]',
+]);
+
+/**
+ * Every fragment is absent from every log record and from every surface of
+ * `error`; no record relays output line by line, and the error neither
+ * carries nor quotes the tail its failure's warning logged.
+ */
 function expectNoOutputLeak(
   harness: Harness,
   error: DebuggenError,
@@ -6894,6 +6949,11 @@ function expectNoOutputLeak(
   expect(harness.records.some((record) => Object.hasOwn(record.fields, 'line'))).toBe(false);
   expect(error.details).not.toHaveProperty('outputTail');
   expect(error.hint).not.toContain('Last output');
+}
+
+/** The `outputTail` field of the first record with `message`. */
+function loggedTail(harness: Harness, message: string): unknown {
+  return harness.records.find((record) => record.message === message)?.fields['outputTail'];
 }
 
 /** The `output` field of the first record with `message`. */
@@ -6920,7 +6980,11 @@ describe('DevServerLauncher.launch: child output privacy (CWE-532)', () => {
       diagnostics: [],
     });
     expect(error.hint).toBe(
-      'Fix the problem that stopped it (a missing dependency, a port in use, a build error), then launch the dev server again. Run the dev script in a terminal to read its full output.',
+      'Fix the problem that stopped it (a missing dependency, a port in use, a build error), then launch the dev server again. The last lines it printed, redacted, are in the Debug Generator service log (the "Debug Generator Service" output in VS Code). Run the dev script in a terminal to read its full output.',
+    );
+    // Why it exited is readable in the failure's own warning — redacted.
+    expect(loggedTail(harness, 'The launched dev server exited before it was ready')).toStrictEqual(
+      [...REDACTED_SENTINEL_STDOUT, ...REDACTED_SENTINEL_STDERR],
     );
   });
 
@@ -6938,15 +7002,34 @@ describe('DevServerLauncher.launch: child output privacy (CWE-532)', () => {
     const error = expectErr(await pending, 'DEV_SERVER_UNAVAILABLE', 'ready-timeout');
 
     expectNoOutputLeak(harness, error, sentinels.fragments);
+    // It never printed a serving address and the session named none: nothing
+    // was probed, and the error says so rather than blaming an answer.
+    expect(error.message).toBe(
+      'The dev server did not announce a local address within 1 s of starting, so it was stopped.',
+    );
+    expect(error.hint).toContain(
+      'It printed no local serving address (such as "Local: http://localhost:3000"), and the session named none.',
+    );
     expect(error.details).toStrictEqual({
       reason: 'ready-timeout',
       timeoutMs: 1_000,
+      probed: false,
       output: { stdoutLines: 4, stderrLines: 2, diagnostics: [] },
     });
     expect(error.hint).toContain('Run the dev script in a terminal to read its full output.');
-    expect(
-      loggedOutput(harness, 'The launched dev server did not become ready in time; it was stopped'),
-    ).toStrictEqual({ stdoutLines: 4, stderrLines: 2, truncatedLines: 1, diagnostics: [] });
+    const timeoutRecord = 'The launched dev server did not become ready in time; it was stopped';
+    expect(loggedOutput(harness, timeoutRecord)).toStrictEqual({
+      stdoutLines: 4,
+      stderrLines: 2,
+      truncatedLines: 1,
+      diagnostics: [],
+    });
+    // The overlong line is cut to the logged bound, with an ellipsis.
+    expect(loggedTail(harness, timeoutRecord)).toStrictEqual([
+      ...REDACTED_SENTINEL_STDOUT,
+      ...REDACTED_SENTINEL_STDERR,
+      `${'x'.repeat(MAX_OUTPUT_TAIL_LINE_LENGTH - 1)}\u2026`,
+    ]);
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -6961,7 +7044,8 @@ describe('DevServerLauncher.launch: child output privacy (CWE-532)', () => {
     child.failToSpawn('ENOENT');
     const error = expectErr(await pending, 'DEV_SERVER_LAUNCH_FAILED', 'spawn-failed');
 
-    expectNoOutputLeak(harness, error, [...sentinels.fragments, 'sh: 1: next']);
+    expectNoOutputLeak(harness, error, sentinels.fragments);
+    expect(errorSurfaces(error)).not.toContain('sh: 1: next');
     expect(error.details).toStrictEqual({
       reason: 'spawn-failed',
       errorCode: 'ENOENT',
@@ -6975,6 +7059,44 @@ describe('DevServerLauncher.launch: child output privacy (CWE-532)', () => {
       truncatedLines: 0,
       diagnostics: ['command-not-found'],
     });
+    expect(loggedTail(harness, 'The dev-server command could not be started')).toStrictEqual([
+      ...REDACTED_SENTINEL_STDERR,
+      '[stderr] sh: 1: next: command not found',
+    ]);
+  });
+
+  it('keeps only the last lines, masks an echoed environment, and drops the tail once logged', async () => {
+    const harness = createHarness();
+    const pending = harness.launcher.launch({ projectRoot: harness.projectRoot });
+    const child = await spawnedChild(harness, pending);
+    const password = ['pw', 'sentinel', '5521'].join('-');
+    const connection = `postgresql://127.0.0.1:5432/${['ledger', 'sentinel'].join('_')}`;
+
+    for (let line = 1; line <= MAX_OUTPUT_TAIL_LINES + 5; line += 1) {
+      child.print(`build step ${String(line)} of ${String(MAX_OUTPUT_TAIL_LINES + 5)}\n`);
+    }
+    child.print(`DATABASE_URL=${connection}\n`, 'stderr');
+    child.print(`db password: ${password}\n`, 'stderr');
+    child.finish(1, null);
+    expectErr(await pending, 'DEV_SERVER_LAUNCH_FAILED', 'exited-before-ready');
+
+    const tail = loggedTail(harness, 'The launched dev server exited before it was ready');
+    expect(tail).toHaveLength(MAX_OUTPUT_TAIL_LINES);
+    expect(tail).toStrictEqual([
+      ...Array.from(
+        { length: MAX_OUTPUT_TAIL_LINES - 2 },
+        (_, index) => `build step ${String(index + 8)} of ${String(MAX_OUTPUT_TAIL_LINES + 5)}`,
+      ),
+      '[stderr] DATABASE_URL=[redacted]',
+      '[stderr] db password: [redacted]',
+    ]);
+    const logged = serializedRecords(harness.records);
+    expect(logged).not.toContain(password);
+    expect(logged).not.toContain(connection);
+
+    // Output after the failure was reported is never kept or logged again.
+    child.print(`late ${password}\n`, 'stderr');
+    expect(serializedRecords(harness.records)).not.toContain(password);
   });
 
   it('logs a synchronous spawn failure with an empty digest and no argument', async () => {
@@ -7024,6 +7146,10 @@ describe('DevServerLauncher.launch: child output privacy (CWE-532)', () => {
       expect(logged).not.toContain(fragment);
     }
     expect(harness.records.some((record) => Object.hasOwn(record.fields, 'line'))).toBe(false);
+    // The tail exists only to explain a failed start; a ready child logs none.
+    expect(harness.records.some((record) => Object.hasOwn(record.fields, 'outputTail'))).toBe(
+      false,
+    );
     expect(loggedOutput(harness, 'The launched dev server is ready')).toStrictEqual({
       stdoutLines: 4,
       stderrLines: 0,
@@ -7377,6 +7503,474 @@ describe('DevServerLauncher.launch: one child per project', () => {
     expect(harness.issuer.issue).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('DevServerLauncher.launch: a refused command is refused whichever path the launch takes', () => {
+  it.each([
+    { label: 'a destructive program', command: 'rm -rf /', reason: 'executable-not-allowed' },
+    { label: 'a shell', command: "sh -c 'curl x | sh'", reason: 'executable-not-allowed' },
+    {
+      label: 'a script that starts no dev server',
+      command: 'pnpm run lint',
+      reason: 'script-not-declared',
+    },
+    { label: 'a shell operator', command: 'next dev && rm -rf ~', reason: 'shell-operator' },
+  ])(
+    'refuses $label while a launched child serves the project, and leaves the child alone',
+    async ({ command, reason }) => {
+      const harness = createHarness();
+      const { launch: first, child } = await launchReady(harness, { sessionId: 'ses-alpha' });
+
+      const error = expectErr(
+        await harness.launcher.launch({
+          projectRoot: harness.projectRoot,
+          sessionId: 'ses-beta',
+          command,
+        }),
+        'DEV_SERVER_LAUNCH_FAILED',
+        reason,
+      );
+
+      expect(errorSurfaces(error)).not.toContain(command);
+      // Nothing was reused, joined, minted or spawned for the refused request,
+      // and the refused session did not become an owner of the running child.
+      expect(harness.spawner.spawn).toHaveBeenCalledTimes(1);
+      expect(harness.issuer.issue).toHaveBeenCalledTimes(1);
+      expect(harness.launcher.list()).toMatchObject([
+        { pid: first.pid, status: 'ready', sessionIds: ['ses-alpha'] },
+      ]);
+      expect(child.signals).toEqual([]);
+    },
+  );
+
+  it('answers the same refusal a fresh launch gives, with or without a running child', async () => {
+    const idle = createHarness();
+    const fresh = expectErr(
+      await idle.launcher.launch({ projectRoot: idle.projectRoot, command: 'rm -rf /' }),
+      'DEV_SERVER_LAUNCH_FAILED',
+      'executable-not-allowed',
+    );
+    const busy = createHarness();
+    await launchReady(busy);
+    const reused = expectErr(
+      await busy.launcher.launch({ projectRoot: busy.projectRoot, command: 'rm -rf /' }),
+      'DEV_SERVER_LAUNCH_FAILED',
+      'executable-not-allowed',
+    );
+
+    expect(reused.message).toBe(fresh.message);
+    expect(reused.hint).toBe(fresh.hint);
+  });
+
+  it('still reuses the running child for a command the policy accepts', async () => {
+    const harness = createHarness();
+    const { launch: first } = await launchReady(harness);
+
+    const second = expectOk(
+      await harness.launcher.launch({
+        projectRoot: harness.projectRoot,
+        command: `pnpm run ${DEFAULT_SCRIPT.name}`,
+      }),
+    );
+
+    expect(second).toStrictEqual({
+      managed: true,
+      alreadyRunning: true,
+      devServerUrl: DEV_URL,
+      pid: first.pid,
+    });
+    expect(harness.spawner.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a refused command that joins a launch in flight, while the launch it joined succeeds', async () => {
+    const harness = createHarness();
+    const firstPending = harness.launcher.launch({
+      projectRoot: harness.projectRoot,
+      sessionId: 'ses-first',
+    });
+    const refusedPending = harness.launcher.launch({
+      projectRoot: harness.projectRoot,
+      sessionId: 'ses-joiner',
+      command: 'rm -rf /',
+    });
+    const child = await spawnedChild(harness, firstPending);
+
+    child.print(`   - Local:        ${DEV_ORIGIN}\n`);
+    const [first, refused] = await Promise.all([firstPending, refusedPending]);
+
+    expect(expectOk(first)).toMatchObject({ managed: true, alreadyRunning: false, pid: FIRST_PID });
+    expectErr(refused, 'DEV_SERVER_LAUNCH_FAILED', 'executable-not-allowed');
+    expect(harness.spawner.spawn).toHaveBeenCalledTimes(1);
+    // The refused joiner's session never became an owner of the child.
+    expect(harness.launcher.list()).toMatchObject([{ sessionIds: ['ses-first'] }]);
+  });
+
+  it('refuses a refused command beside a dev server detection found running with the preload', async () => {
+    const harness = createHarness({
+      detection: { running: true, preloadAttached: true, devServerUrl: DEV_URL },
+    });
+
+    expectErr(
+      await harness.launcher.launch({ projectRoot: harness.projectRoot, command: 'rm -rf /' }),
+      'DEV_SERVER_LAUNCH_FAILED',
+      'executable-not-allowed',
+    );
+    const external = expectOk(await harness.launcher.launch({ projectRoot: harness.projectRoot }));
+
+    expect(external).toMatchObject({ managed: false, alreadyRunning: true, devServerUrl: DEV_URL });
+    expect(harness.spawner.spawn).not.toHaveBeenCalled();
+    expect(harness.issuer.issue).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `next dev` resolves through the project's node_modules/.bin
+// ---------------------------------------------------------------------------
+
+describe('projectBinDirectories', () => {
+  it('lists the project root and every trusted ancestor, nearest first', () => {
+    const trusted = new Set([
+      '/home/dev/shop/apps/web/node_modules/.bin',
+      '/home/dev/shop/node_modules/.bin',
+    ]);
+    const isTrustedDirectory = vi.fn((path: string) => trusted.has(path));
+
+    expect(
+      projectBinDirectories('/home/dev/shop/apps/web', { platform: POSIX, isTrustedDirectory }),
+    ).toEqual(['/home/dev/shop/apps/web/node_modules/.bin', '/home/dev/shop/node_modules/.bin']);
+    // Every directory up to the root was judged; untrusted ones are left out.
+    expect(isTrustedDirectory.mock.calls.map(([path]) => path)).toEqual([
+      '/home/dev/shop/apps/web/node_modules/.bin',
+      '/home/dev/shop/apps/node_modules/.bin',
+      '/home/dev/shop/node_modules/.bin',
+      '/home/dev/node_modules/.bin',
+      '/home/node_modules/.bin',
+      '/node_modules/.bin',
+    ]);
+  });
+
+  it('lists nothing for a relative root, and treats a trust check that throws as untrusted', () => {
+    const throwing = (): boolean => {
+      throw new Error('stat failed');
+    };
+
+    expect(
+      projectBinDirectories('apps/web', { platform: POSIX, isTrustedDirectory: () => true }),
+    ).toEqual([]);
+    expect(
+      projectBinDirectories('/home/dev/shop', { platform: POSIX, isTrustedDirectory: throwing }),
+    ).toEqual([]);
+  });
+
+  it('walks a Windows root in its own grammar', () => {
+    expect(
+      projectBinDirectories('C:\\work\\shop', {
+        platform: WINDOWS,
+        isTrustedDirectory: (path) => path === 'C:\\work\\shop\\node_modules\\.bin',
+      }),
+    ).toEqual(['C:\\work\\shop\\node_modules\\.bin']);
+  });
+
+  it('lists a real, service-owned node_modules/.bin by default', () => {
+    const projectRoot = makeProject('bin-default');
+    const bin = join(projectRoot, 'node_modules', '.bin');
+    mkdirSync(bin, { recursive: true });
+    chmodSync(bin, 0o755);
+
+    expect(projectBinDirectories(projectRoot)[0]).toBe(bin);
+  });
+});
+
+describe('prependSearchPath', () => {
+  it('puts the directories first, once each, without mutating the environment', () => {
+    const env = Object.freeze({ PATH: '/opt/b:/usr/bin:/opt/a', HOME: '/home/dev' });
+
+    expect(prependSearchPath(env, ['/opt/a', '/opt/b', '/opt/a'], POSIX)).toStrictEqual({
+      PATH: '/opt/a:/opt/b:/usr/bin',
+      HOME: '/home/dev',
+    });
+    expect(env.PATH).toBe('/opt/b:/usr/bin:/opt/a');
+  });
+
+  it('keeps the Windows spelling of the variable, folding case and using ";"', () => {
+    expect(
+      prependSearchPath({ Path: 'C:\\Windows;c:\\work\\bin' }, ['C:\\work\\bin'], WINDOWS),
+    ).toStrictEqual({ Path: 'C:\\work\\bin;C:\\Windows' });
+  });
+
+  it('creates PATH when there is none, and copies the environment for no directories', () => {
+    expect(prependSearchPath({ HOME: '/home/dev' }, ['/opt/a'], POSIX)).toStrictEqual({
+      HOME: '/home/dev',
+      PATH: '/opt/a',
+    });
+    const env = { PATH: '/usr/bin' };
+    const copy = prependSearchPath(env, [], POSIX);
+    expect(copy).toStrictEqual(env);
+    expect(copy).not.toBe(env);
+  });
+});
+
+describe('DevServerLauncher.launch: next dev finds the project’s own next', () => {
+  it('puts the trusted node_modules/.bin directories in front of the PATH of a `next dev` child', async () => {
+    const projectRoot = makeProject('bin-path');
+    const projectBin = join(projectRoot, 'node_modules', '.bin');
+    const harness = createHarness({
+      projectRoot,
+      deps: { isTrustedDevDirectory: (path) => path === projectBin },
+    });
+
+    await launchReady(harness, { command: 'next dev --port 4173 --hostname 127.0.0.1' });
+
+    const call = harness.spawner.call(0);
+    expect(call.command).toBe('next');
+    expect(call.options.env['PATH']).toBe(`${projectBin}:${PARENT_ENV.PATH ?? ''}`);
+    expect(
+      harness.records.find(
+        (record) => record.message === 'Spawned a dev server with the telemetry preload attached',
+      )?.fields['binDirectories'],
+    ).toBe(1);
+  });
+
+  it('leaves the PATH of a package-manager run as the service passes it — the runner adds its own', async () => {
+    const isTrustedDevDirectory = vi.fn(() => true);
+    const scripted = createHarness({ deps: { isTrustedDevDirectory } });
+    await launchReady(scripted, { command: `pnpm run ${DEFAULT_SCRIPT.name}` });
+
+    expect(scripted.spawner.call(0).options.env['PATH']).toBe(PARENT_ENV.PATH);
+    expect(isTrustedDevDirectory).not.toHaveBeenCalled();
+  });
+
+  it('keeps the service PATH alone when no node_modules/.bin is trusted, so the spawn failure names the command', async () => {
+    const harness = createHarness({
+      children: [{ pid: null }],
+      deps: { isTrustedDevDirectory: () => false },
+    });
+    const pending = harness.launcher.launch({
+      projectRoot: harness.projectRoot,
+      command: 'next dev',
+    });
+    const child = await spawnedChild(harness, pending);
+
+    child.failToSpawn('ENOENT');
+    const error = expectErr(await pending, 'DEV_SERVER_LAUNCH_FAILED', 'spawn-failed');
+
+    expect(harness.spawner.call(0).options.env['PATH']).toBe(PARENT_ENV.PATH);
+    expect(error.hint).toContain('"next" was not found on the PATH');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Readiness by an accepted connection
+// ---------------------------------------------------------------------------
+
+type AcceptFn = NonNullable<DevServerLauncherDeps['acceptProbe']>;
+
+/** An accept probe double: accepted exactly at `origins`, refused (ECONNREFUSED) elsewhere. */
+function acceptingAt(origins: readonly string[]): Mock<AcceptFn> {
+  return vi.fn<AcceptFn>((url) => {
+    const parsed = new URL(url);
+    const answer: DevServerAcceptResult = origins.includes(parsed.origin)
+      ? { url: `${parsed.origin}${parsed.pathname}`, accepted: true, durationMs: 1 }
+      : {
+          url: `${parsed.origin}${parsed.pathname}`,
+          accepted: false,
+          durationMs: 1,
+          error: {
+            code: 'ECONNREFUSED',
+            message: 'Connection refused: nothing is listening at this address.',
+          },
+        };
+    return Promise.resolve(ok(answer));
+  });
+}
+
+/** A readiness probe that never gets an HTTP response: a dev server still compiling its first route. */
+const compilingProbe: ProbeFn = () => new Promise(() => undefined);
+
+/** HTTP servers a test opened; closed, with their hanging requests, after it. */
+const compilingServers: Server[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    compilingServers.splice(0).map(
+      (server) =>
+        new Promise<void>((resolve) => {
+          server.closeAllConnections();
+          server.close(() => {
+            resolve();
+          });
+        }),
+    ),
+  );
+});
+
+/** A loopback HTTP server that accepts connections and never answers a request, and its origin. */
+async function compilingServer(): Promise<string> {
+  const server = createServer(() => undefined);
+  compilingServers.push(server);
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve();
+    });
+  });
+  return `http://127.0.0.1:${String((server.address() as AddressInfo).port)}`;
+}
+
+describe('DevServerLauncher.launch: readiness by an accepted connection', () => {
+  it('is ready once the announced address accepts a connection, without waiting for the HTTP answer', async () => {
+    const acceptProbe = acceptingAt([DEV_ORIGIN]);
+    const harness = createHarness({ probe: compilingProbe, deps: { acceptProbe } });
+
+    const { launch } = await launchReady(harness);
+
+    expect(launch).toMatchObject({ managed: true, alreadyRunning: false, devServerUrl: DEV_URL });
+    // The connect is bounded by the probe timeout, and the accepted
+    // connection must then stay open through the hold.
+    expect(acceptProbe).toHaveBeenCalledWith(
+      DEV_URL,
+      expect.objectContaining({
+        timeoutMs: DEFAULT_READY_PROBE_TIMEOUT_MS,
+        holdMs: DEFAULT_READY_ACCEPT_HOLD_MS,
+      }),
+    );
+    // An accepted connection is only an answer: ownership still decided it.
+    expect(harness.ownership).toHaveBeenCalledWith(FIRST_PID, portOf(DEV_ORIGIN));
+    const ready = harness.records.find(
+      (record) => record.message === 'The launched dev server is ready',
+    );
+    expect(ready?.fields['answeredBy']).toBe('accept');
+    expect(ready?.fields).not.toHaveProperty('framework');
+  });
+
+  it('records an HTTP answer that arrives first, with its framework signature', async () => {
+    const acceptProbe = vi.fn<AcceptFn>(() => new Promise(() => undefined));
+    const harness = createHarness({ deps: { acceptProbe } });
+
+    await launchReady(harness);
+
+    const ready = harness.records.find(
+      (record) => record.message === 'The launched dev server is ready',
+    );
+    expect(ready?.fields).toMatchObject({ answeredBy: 'http', framework: 'next' });
+  });
+
+  it('never counts an accepted connection held by another process as ready', async () => {
+    vi.useFakeTimers();
+    const harness = createHarness({
+      probe: compilingProbe,
+      ownership: () => Promise.resolve(false),
+      deps: { acceptProbe: acceptingAt([DEV_ORIGIN]), readyTimeoutMs: 1_000 },
+    });
+    const pending = harness.launcher.launch({ projectRoot: harness.projectRoot });
+    const child = await spawnedChild(harness, pending);
+
+    child.print(`  - Local:   ${DEV_ORIGIN}\n`);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const error = expectErr(await pending, 'DEV_SERVER_UNAVAILABLE', 'ready-unverified');
+
+    expect(error.details).toMatchObject({ ownership: 'other-process', candidates: [DEV_URL] });
+    expect(child.signals).toEqual(['SIGTERM']);
+  });
+
+  it('is ready at a real listener that accepts but is still compiling, which the HTTP probe alone never reached', async () => {
+    const origin = await compilingServer();
+    const ownership = ownershipByPort({ [portOf(origin)]: true });
+    const withAccept = createHarness({
+      probe: probeDevServer,
+      ownership,
+      deps: {
+        acceptProbe: acceptDevServerConnection,
+        readyProbeTimeoutMs: 200,
+        readyAcceptHoldMs: 100,
+        readyTimeoutMs: 3_000,
+      },
+    });
+
+    const { launch } = await launchReady(withAccept, {}, 0, origin);
+
+    expect(launch.devServerUrl).toBe(`${origin}/`);
+    expect(
+      withAccept.records.find((record) => record.message === 'The launched dev server is ready')
+        ?.fields['answeredBy'],
+    ).toBe('accept');
+
+    // The same listener with the HTTP probe alone: every GET waits on the
+    // compile, so the start times out although the address accepted.
+    const httpOnly = createHarness({
+      probe: probeDevServer,
+      ownership,
+      deps: { readyProbeTimeoutMs: 200, readyTimeoutMs: 700 },
+    });
+    const pending = httpOnly.launcher.launch({ projectRoot: httpOnly.projectRoot });
+    const child = await spawnedChild(httpOnly, pending);
+    child.print(`   - Local:        ${origin}\n`);
+
+    const error = expectErr(await pending, 'DEV_SERVER_UNAVAILABLE', 'ready-timeout');
+    expect(error.details).toMatchObject({ probed: true });
+  });
+
+  it('never counts a listener that drops the connections it accepts — a server failing to load its config — as ready', async () => {
+    // Next.js 16 binds its port and prints "Ready" before it reads
+    // next.config; a config that throws exits the child, closing every
+    // connection it had accepted. Accepted-then-dropped is no answer, so the
+    // exit is reported as what it is.
+    const origin = await droppingServer();
+    const harness = createHarness({
+      probe: compilingProbe,
+      ownership: ownershipByPort({ [portOf(origin)]: true }),
+      deps: {
+        acceptProbe: acceptDevServerConnection,
+        readyAcceptHoldMs: 100,
+        readyTimeoutMs: 5_000,
+      },
+    });
+    const pending = harness.launcher.launch({ projectRoot: harness.projectRoot });
+    const child = await spawnedChild(harness, pending);
+
+    child.print(`   - Local:        ${origin}\n`);
+    // Long past the hold: a connection held open this long would have counted.
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    child.print('Failed to load next.config.ts\n', 'stderr');
+    child.finish(1, null);
+
+    const error = expectErr(await pending, 'DEV_SERVER_LAUNCH_FAILED', 'exited-before-ready');
+    expect(error.details).toMatchObject({ exitCode: 1 });
+    expect(
+      harness.records.some((record) => record.message === 'The launched dev server is ready'),
+    ).toBe(false);
+  });
+});
+
+/** TCP servers a test opened that drop what they accept; closed after it. */
+const droppingServers: NetServer[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    droppingServers.splice(0).map(
+      (server) =>
+        new Promise<void>((resolve) => {
+          server.close(() => {
+            resolve();
+          });
+        }),
+    ),
+  );
+});
+
+/** A loopback TCP listener that accepts each connection and closes it 20 ms later, and its origin. */
+async function droppingServer(): Promise<string> {
+  const server = createTcpServer((socket) => {
+    setTimeout(() => {
+      socket.destroy();
+    }, 20);
+  });
+  droppingServers.push(server);
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve();
+    });
+  });
+  return `http://127.0.0.1:${String((server.address() as AddressInfo).port)}`;
+}
 
 // ---------------------------------------------------------------------------
 // stop, session coupling and shutdown

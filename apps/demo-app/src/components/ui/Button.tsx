@@ -17,13 +17,27 @@
  * submission the shopper meant to make. So the attribute is always emitted, always explicitly, and
  * a submit button is the caller stating `type="submit"`.
  *
- * THE BUSY STATE IS TRUTHFUL, AND IT IS NOT A LAYOUT EVENT
- * `busy` says that the request this control started has not finished. It holds the native
- * `disabled` attribute for the duration, so a second press cannot start a second request; it sets
- * `aria-busy="true"`, so the state a reader sees and the state a screen reader can observe are the
- * same fact; and it puts one `Spinner` before the label. The label stays mounted throughout -
- * swapping it for the indicator would collapse the control to the indicator's width mid-press, and
- * the text the reader was about to re-read would vanish at exactly the moment they are watching it.
+ * THE BUSY STATE IS TRUTHFUL, IT KEEPS FOCUS, AND IT IS NOT A LAYOUT EVENT
+ * `busy` says that the request this control started has not finished. It refuses every activation
+ * for the duration - a press, Enter, Space, and the implicit submission a form performs through
+ * its submit button - so a second press cannot start a second request; it sets
+ * `aria-disabled="true"` and `aria-busy="true"`, so the state a reader sees and the state a screen
+ * reader can observe are the same fact; and it puts one `Spinner` before the label.
+ *
+ * What it deliberately does NOT do is write the native `disabled` attribute. The control going
+ * busy is almost always the control the reader has just pressed, so it is the element holding
+ * keyboard focus at that moment, and a `disabled` element cannot hold focus: the browser blurs it
+ * and focus falls to `<body>`, outside any dialog the control sits in, so the next Tab starts from
+ * the top of the document (WCAG 2.4.3). `aria-disabled` states the same unavailability to
+ * assistive technology while the element stays focusable, and the refusal is made in the click
+ * handler instead - `preventDefault()` and nothing else, so neither the caller's `onClick` nor a
+ * form submission runs. Native `disabled` is written only when the caller passes `disabled`, which
+ * means "not actionable at all" rather than "working", and is a state a reader does not arrive in
+ * by pressing the control.
+ *
+ * The label stays mounted throughout - swapping it for the indicator would collapse the control to
+ * the indicator's width mid-press, and the text the reader was about to re-read would vanish at
+ * exactly the moment they are watching it.
  * Geometry is otherwise the stylesheet's, which declares padding and type size once per size and
  * never restates either in a state rule, so nothing here can change a control's height: a measured
  * toggle is 33px tall idle and busy alike. The indicator does add its own width - the ring plus the
@@ -32,11 +46,12 @@
  * shrinking. Growing is the safe direction: the label stays whole and legible either way.
  *
  * The indicator is decorative by contract (`Spinner` renders `aria-hidden`), which means the busy
- * state is carried to assistive technology by `aria-busy` and by nothing else in here. A surface
- * that wants the wait *announced* - naming what is in flight - adds its own hidden status text
- * beside the button, because only the caller knows what the request is and how often it repeats.
- * Colour is never the sole carrier of meaning: the disabled dimming always accompanies a real
- * `disabled` attribute, and the busy cursor always accompanies it too.
+ * state is carried to assistive technology by `aria-busy` - and the refusal by `aria-disabled` -
+ * and by nothing else in here. A surface that wants the wait *announced* - naming what is in
+ * flight - adds its own hidden status text beside the button, because only the caller knows what
+ * the request is and how often it repeats. Colour is never the sole carrier of meaning: the dimming
+ * always accompanies a real `disabled` attribute or a real `aria-disabled="true"`, which the
+ * stylesheet paints alike, and a busy control always carries the indicator as well.
  *
  * APPEARANCE IS THREE DATA ATTRIBUTES, NOT A LOOKUP MAP
  * `Button.module.css` exports two classes - `.root` for the control, `.label` for the text that is
@@ -57,11 +72,14 @@
  *
  * No `'use client'` directive: the component holds no state and subscribes to nothing, so a server
  * component renders it as happily as a client one, and a caller that passes `onClick` already
- * carries its own client boundary. Nothing is read from `window`, `Date.now()` or `Math.random()`
+ * carries its own client boundary. The busy refusal is the one handler this file attaches of its
+ * own, and it is attached only while `busy` is true - a flag that describes a request in flight,
+ * which only a client component can have - so an idle control rendered by a server component
+ * carries no function prop at all. Nothing is read from `window`, `Date.now()` or `Math.random()`
  * while rendering, so the markup the server sends and the markup the browser first produces agree.
  */
 import clsx from 'clsx';
-import type { ComponentPropsWithRef } from 'react';
+import type { ComponentPropsWithRef, MouseEvent } from 'react';
 
 import styles from './Button.module.css';
 import { Spinner } from './Spinner';
@@ -106,11 +124,13 @@ interface Props extends Omit<ComponentPropsWithRef<'button'>, 'className'> {
   /**
    * The action this control started is still in flight.
    *
-   * Drives three things from one prop, so they cannot drift apart: the native `disabled` attribute
-   * for the duration, `aria-busy="true"`, and the indicator before the label. It is deliberately
-   * separate from `disabled` - a busy control is temporarily working, an unavailable one is not
-   * actionable at all, and the stylesheet paints them differently (a progress cursor against a
-   * not-allowed one).
+   * Drives four things from one prop, so they cannot drift apart: every activation refused for the
+   * duration (the caller's `onClick` is not called and a submit button does not submit),
+   * `aria-disabled="true"`, `aria-busy="true"`, and the indicator before the label. The control
+   * stays focusable throughout - see the header for why it never becomes natively `disabled` - so
+   * the reader who pressed it is still standing on it when the request settles. It is deliberately
+   * separate from `disabled`: a busy control is temporarily working, an unavailable one is not
+   * actionable at all and is the only one that leaves the tab order.
    *
    * @default false
    */
@@ -121,11 +141,27 @@ interface Props extends Omit<ComponentPropsWithRef<'button'>, 'className'> {
 }
 
 /**
+ * Refuses an activation that reaches a busy control.
+ *
+ * Module-level, so every busy control shares one function and no closure is created per render.
+ * `preventDefault()` on the click is what cancels a submit button's form submission - including the
+ * implicit one a browser performs by clicking a form's default button when Enter is pressed in one
+ * of its fields - and not calling the caller's `onClick` is what stops every other kind of action.
+ * Propagation is left alone: an ancestor listening for clicks still sees a click happen, exactly as
+ * it would for any other control the reader pressed.
+ */
+function refuseBusyActivation(event: MouseEvent<HTMLButtonElement>): void {
+  event.preventDefault();
+}
+
+/**
  * Renders the control.
  *
- * `variant` and `size` become data attributes; `busy` becomes `aria-busy` and `data-busy`, using
- * `undefined` rather than `'false'` so an idle control leaves no attribute behind at all and the
- * rendered markup reads the same way as the stylesheet's `[data-busy='true']` selectors.
+ * `variant` and `size` become data attributes; `busy` becomes `aria-disabled`, `aria-busy` and
+ * `data-busy`, using `undefined` rather than `'false'` so an idle control leaves no attribute behind
+ * at all and the rendered markup reads the same way as the stylesheet's `[aria-disabled='true']`
+ * and `[data-busy='true']` selectors. While busy, the click handler is {@link refuseBusyActivation}
+ * in place of the caller's; idle, it is the caller's own, untouched - including no handler at all.
  *
  * `styles.root` and `styles.label` are typed `string | undefined` under `noUncheckedIndexedAccess`,
  * which `clsx` drops where a template string would interpolate the word "undefined" into the
@@ -155,24 +191,30 @@ export function Button({
   busy = false,
   type = 'button',
   disabled,
+  onClick,
   className,
   children,
   ...rest
 }: Props) {
-  // Ordering: `type`, `disabled`, `className` and `children` are destructured above, so `{...rest}`
-  // cannot contain them and spreading it last cannot defeat the explicit `type`, the busy lock or
-  // the class composition. What it can still override is a derived `aria-*` or `data-*` attribute,
-  // which is the intended escape hatch - a control that needs finer ARIA than a boolean can state
-  // it and have it survive.
+  // Ordering: `type`, `disabled`, `onClick`, `className` and `children` are destructured above, so
+  // `{...rest}` cannot contain them and spreading it last cannot defeat the explicit `type`, the
+  // busy refusal or the class composition. What it can still override is a derived `aria-*` or
+  // `data-*` attribute, which is the intended escape hatch - a control that needs finer ARIA than a
+  // boolean can state it and have it survive.
+  //
+  // `disabled` is the caller's alone: `busy` never writes it, because the busy control is the one
+  // holding focus and a natively disabled element drops it to `<body>` (see the header).
   return (
     <button
       type={type}
-      disabled={disabled === true || busy}
+      disabled={disabled === true}
+      aria-disabled={busy ? 'true' : undefined}
       aria-busy={busy ? 'true' : undefined}
       data-variant={variant}
       data-size={size}
       data-busy={busy ? 'true' : undefined}
       className={clsx(styles.root, className)}
+      onClick={busy ? refuseBusyActivation : onClick}
       {...rest}
     >
       {busy ? <Spinner size={size === 'lg' ? 'md' : 'sm'} /> : null}

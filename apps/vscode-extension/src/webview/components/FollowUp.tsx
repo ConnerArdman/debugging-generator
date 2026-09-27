@@ -15,7 +15,19 @@
  * snapshot; the only content kept here is the draft, with the bookkeeping of the last submission
  * outcome applied to it. The component posts nothing, fetches nothing and opens no socket
  * (AAP 0.4.2), and the gate is a prop: whether a result exists is `App.tsx`'s decision from the
- * host's snapshot, never an inference made here by looking at an analysis object.
+ * host's snapshot, never an inference made here by looking at an analysis object. So is the
+ * reason the gate is closed (`unavailableReason`), which only selects the sentence that explains
+ * it.
+ *
+ * ## What was asked stays on screen
+ *
+ * The follow-ups already asked in the session (`asked`, the record's `followUps`) are listed
+ * above the entry, oldest first, in every state — so the question a regenerated analysis answers
+ * is never missing from the view, and the busy, error or closed entry below it never hides what
+ * was asked. Each question is rendered verbatim with its outcome as a badge whose text names it
+ * (answered, needs a new capture, answering from the stored capture, awaiting an answer), so the
+ * outcome is never carried by colour alone. The outcome is read from the record's outcome links
+ * (`analysisId`, `needsNewCapture`) by presence, never from the question's wording.
  *
  * ## The draft is kept until the follow-up is accepted
  *
@@ -27,6 +39,16 @@
  * applied `seq` is state, compared during render — so no effect sets state and a re-render that
  * passes the same outcome again changes nothing. An outcome already present when the component
  * mounts belongs to a submission this instance never made, and is not applied.
+ *
+ * ## Length and blank drafts
+ *
+ * The field's native `maxLength` is `MAX_WEBVIEW_QUESTION_LENGTH` from `../../webview-messages` —
+ * the protocol's own question limit, which the host and the service enforce too — so the browser
+ * stops typing there and truncates a longer paste. A counter under the field (`1,234 / 2,000
+ * characters`) describes it through `aria-describedby` rather than a live region, so it is heard
+ * with the field and never once per keystroke, and turns to the `warning` tone with a sentence
+ * saying longer text is cut off once the draft is full. The submit chord pressed on a blank draft
+ * marks the field invalid with a short message, cleared as soon as the draft holds text.
  *
  * ## Focus
  *
@@ -43,9 +65,13 @@
  *             supplied.
  *   pending   `LoadingState`, which owns `role="status"` and `aria-busy`, while the follow-up is
  *             being processed - so a second submission cannot be raised in the meantime.
- *   disabled  `EmptyState` explaining that follow-ups open once a result exists (`enabled` is
- *             false). An enabled-looking field that could not do anything is never rendered.
+ *   disabled  `EmptyState` explaining why no follow-up can be asked now (`enabled` is false),
+ *             in the sentence `unavailableReason` selects: no result yet, the latest question
+ *             still being answered, the session ended or failed, or the local service not
+ *             running. An enabled-looking field that could not do anything is never rendered.
  *   ready     the labelled multi-line field and its submit control.
+ *
+ * The asked list, when there is one, sits above whichever state is shown.
  *
  * ## The question is data, never a decision (AAP 0.5.4, 0.5.2)
  *
@@ -62,20 +88,42 @@
  * style appears. There is no `<form>` element at all: `Button` renders `type="button"` by
  * default, so nothing here can submit and navigate the webview document. Layout comes from the
  * `dgv-followup` block of `../styles.css`, whose declarations resolve to `--dg-*` tokens only; the
- * retry hint is a `Text` in the design system's `warning` tone and adds no class.
+ * retry hint is a `Text` in the design system's `warning` tone and adds no class. The asked list
+ * is the one raw list in the file — an `<ol>`, so its length and order are announced — styled by
+ * the shared `dgv-asked-list` / `dgv-asked__text` rules of the same stylesheet.
  */
 import {
+  Badge,
   Button,
   EmptyState,
   ErrorState,
   Input,
   LoadingState,
+  Stack,
   Text,
 } from '@debuggen/panel-renderer';
+import type { BadgeTone } from '@debuggen/panel-renderer';
+import type { FollowUpRecord } from '@debuggen/protocol';
+import { assertNever } from '@debuggen/shared';
 import { useEffect, useId, useRef, useState } from 'react';
 import type { KeyboardEvent, ReactElement } from 'react';
 
+import { MAX_WEBVIEW_QUESTION_LENGTH } from '../../webview-messages';
 import type { SubmissionOutcome } from '../pending-actions';
+
+/**
+ * Why the follow-up entry is closed, as `App.tsx` reads it from the session. It selects the
+ * sentence of the disabled state and nothing else; it never opens the gate, which `enabled` owns.
+ *
+ * - `awaitingResult` — the session has not produced its first result yet.
+ * - `working` — a result exists, but the session is working on its latest question (a follow-up
+ *   being re-analysed or re-captured), so another one waits for that answer.
+ * - `ended` — the session has ended and takes no further question.
+ * - `failed` — the session stopped at a failed stage.
+ * - `serviceUnavailable` — the local service is not reachable, so nothing could be sent.
+ */
+export type FollowUpUnavailableReason =
+  'awaitingResult' | 'working' | 'ended' | 'failed' | 'serviceUnavailable';
 
 /**
  * Props of {@link FollowUp}.
@@ -108,6 +156,21 @@ export interface FollowUpProps {
    */
   enabled: boolean;
 
+  /**
+   * Why the entry is closed while `enabled` is `false`, which selects the sentence the disabled
+   * state shows. Ignored while `enabled` is `true`.
+   *
+   * @default 'awaitingResult'
+   */
+  unavailableReason?: FollowUpUnavailableReason | undefined;
+
+  /**
+   * The follow-ups already asked in the session, oldest first — the session record's
+   * `followUps`, as the host sent it. Listed above the entry in every state when non-empty, each
+   * question verbatim with its outcome in words; an absent or empty ladder renders no list.
+   */
+  asked?: readonly FollowUpRecord[] | undefined;
+
   /** A follow-up is being processed. Replaces the field with a busy placeholder. */
   pending?: boolean | undefined;
 
@@ -139,8 +202,33 @@ const FIELD_ROWS = 3;
 /** The submit control's label, which is also its accessible name. */
 const SUBMIT_LABEL = 'Ask follow-up';
 
-/** The copy of the disabled state - generic product vocabulary only (AAP 0.5.4). */
-const UNAVAILABLE_MESSAGE = 'Ask a follow-up once the first result is ready.';
+/**
+ * The copy of the disabled state, one sentence per {@link FollowUpUnavailableReason} — generic
+ * product vocabulary only (AAP 0.5.4). Each says why the entry is closed and what reopens it.
+ */
+const AWAITING_RESULT_MESSAGE = 'Ask a follow-up once the first result is ready.';
+const WORKING_MESSAGE =
+  'The session is working on its latest question. Ask another follow-up once that result is ready.';
+const ENDED_MESSAGE =
+  'This session has ended, so it takes no more follow-ups. Ask a new question above to start another session.';
+const FAILED_MESSAGE =
+  'This session stopped at a failed stage, so it takes no follow-ups. Retry the stage, or ask a new question above.';
+const SERVICE_UNAVAILABLE_MESSAGE = 'Start the local Debug Generator service to ask a follow-up.';
+
+/** The visible label of the asked list, which also names the `<ol>` through `aria-labelledby`. */
+const ASKED_LABEL = 'Asked in this session';
+
+/** The outcome badge of each state a recorded follow-up can be in, named in words. */
+const ANSWERED_LABEL = 'Answered';
+const NEEDS_CAPTURE_LABEL = 'Needs a new capture';
+const STORED_CAPTURE_LABEL = 'Answering from the stored capture';
+const AWAITING_ANSWER_LABEL = 'Awaiting an answer';
+
+/** How one recorded follow-up's outcome is presented: its badge tone and the words it carries. */
+interface OutcomePresentation {
+  readonly tone: BadgeTone;
+  readonly label: string;
+}
 
 /** Announced, not painted, while a follow-up is processed; `LoadingState` appends the `…`. */
 const PENDING_LABEL = 'Processing the follow-up question';
@@ -154,6 +242,51 @@ const ERROR_TITLE = 'The follow-up question could not be processed';
  * vocabulary only (AAP 0.5.4).
  */
 const RETRY_HINT = `Your follow-up question was not confirmed, so it is kept here. Press “${SUBMIT_LABEL}” to try again.`;
+
+/**
+ * Formats the character counter: the locale's digit grouping and no fraction, the same format
+ * `App.tsx` uses when it states the limit in a notice.
+ */
+const COUNT_FORMAT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+
+/** The question limit as the counter prints it, e.g. `2,000`. */
+const LIMIT_TEXT = COUNT_FORMAT.format(MAX_WEBVIEW_QUESTION_LENGTH);
+
+/**
+ * Appended to the counter once the draft holds {@link MAX_WEBVIEW_QUESTION_LENGTH} characters:
+ * the field's native `maxLength` stops typing there and cuts a longer paste off, and this is what
+ * tells the developer why.
+ */
+const LIMIT_REACHED_TEXT = 'Limit reached: longer text is cut off.';
+
+/**
+ * Appended to the counter when the draft holds more than {@link MAX_WEBVIEW_QUESTION_LENGTH}
+ * characters. `maxLength` constrains only the developer's own edits, so this is a value written
+ * into the field some other way; nothing was cut off, and `App.tsx` will not send it until it is
+ * shortened.
+ */
+const OVER_LIMIT_TEXT = 'Over the limit: shorten it to ask.';
+
+/**
+ * Inline validation shown when the Ctrl/⌘+Enter chord is pressed on a blank draft, until the
+ * draft holds text again. Generic product vocabulary only (AAP 0.5.4).
+ */
+const BLANK_DRAFT_MESSAGE = 'Type a follow-up question before asking.';
+
+/**
+ * The counter line under the field, e.g. `1,234 / 2,000 characters`, with the limit-reached
+ * sentence once the draft is full and the over-limit sentence past it.
+ *
+ * @param length The draft's length in UTF-16 code units, the unit `maxLength` counts.
+ * @returns The counter text.
+ */
+function counterText(length: number): string {
+  const count = `${COUNT_FORMAT.format(length)} / ${LIMIT_TEXT} characters`;
+  if (length > MAX_WEBVIEW_QUESTION_LENGTH) {
+    return `${count}. ${OVER_LIMIT_TEXT}`;
+  }
+  return length === MAX_WEBVIEW_QUESTION_LENGTH ? `${count}. ${LIMIT_REACHED_TEXT}` : count;
+}
 
 /**
  * Compose the root class list without `clsx`, which is not a dependency of this workspace.
@@ -199,13 +332,131 @@ function focusWasLost(active: Element | null): boolean {
 }
 
 /**
- * Renders the follow-up entry in whichever of its four states the props select.
+ * The sentence of the disabled state for one reason. Closed by `assertNever`, so a reason added to
+ * {@link FollowUpUnavailableReason} is a compile error here until it has its own sentence.
+ *
+ * @param reason Why the entry is closed.
+ * @returns The generic sentence explaining it.
+ */
+function unavailableMessage(reason: FollowUpUnavailableReason): string {
+  switch (reason) {
+    case 'awaitingResult':
+      return AWAITING_RESULT_MESSAGE;
+    case 'working':
+      return WORKING_MESSAGE;
+    case 'ended':
+      return ENDED_MESSAGE;
+    case 'failed':
+      return FAILED_MESSAGE;
+    case 'serviceUnavailable':
+      return SERVICE_UNAVAILABLE_MESSAGE;
+    default:
+      return assertNever(reason, 'Unhandled follow-up unavailable reason');
+  }
+}
+
+/**
+ * The outcome of one recorded follow-up, read from its outcome links by presence — never from its
+ * question. An analysis produced for it means it was answered; otherwise the follow-up stage's
+ * decision says which path is answering it; with neither, it has not been decided yet.
+ *
+ * @param followUp One entry of the session's follow-up ladder.
+ * @returns The badge tone and the words that name the outcome.
+ */
+function describeOutcome(followUp: FollowUpRecord): OutcomePresentation {
+  if (followUp.analysisId !== undefined) {
+    return { tone: 'success', label: ANSWERED_LABEL };
+  }
+  if (followUp.needsNewCapture === true) {
+    return { tone: 'info', label: NEEDS_CAPTURE_LABEL };
+  }
+  if (followUp.needsNewCapture === false) {
+    return { tone: 'info', label: STORED_CAPTURE_LABEL };
+  }
+  return { tone: 'neutral', label: AWAITING_ANSWER_LABEL };
+}
+
+/**
+ * The key of one asked follow-up: its attempt identity when the record carries one (unique within
+ * a session's ladder), otherwise its position and time, which a ladder never repeats.
+ *
+ * @param followUp The entry.
+ * @param index Its position in the ladder.
+ * @returns A key stable across snapshots of the same ladder.
+ */
+function askedKey(followUp: FollowUpRecord, index: number): string {
+  return followUp.attemptId ?? `${String(index)}:${String(followUp.askedAt)}`;
+}
+
+/** Props of {@link AskedFollowUps}. */
+interface AskedFollowUpsProps {
+  /** The non-empty ladder, oldest first. */
+  readonly asked: readonly FollowUpRecord[];
+}
+
+/**
+ * The follow-ups asked so far: a muted label naming an ordered list, one item per follow-up with
+ * its question verbatim — line breaks kept by `dgv-asked__text` — over its outcome badge. A
+ * component of its own so its `useId` call is unconditional.
+ *
+ * @param props See {@link AskedFollowUpsProps}.
+ * @returns The labelled list.
+ */
+function AskedFollowUps(props: AskedFollowUpsProps): ReactElement {
+  const { asked } = props;
+  const askedHeadingId = useId();
+  return (
+    <Stack gap={1}>
+      <Text as="p" size="xs" tone="muted" id={askedHeadingId}>
+        {ASKED_LABEL}
+      </Text>
+      <ol className="dgv-asked-list" aria-labelledby={askedHeadingId}>
+        {asked.map((followUp, index) => {
+          const outcome = describeOutcome(followUp);
+          return (
+            <li key={askedKey(followUp, index)} className="dgv-asked-list__item">
+              <Text as="p" size="sm" className="dgv-asked__text">
+                {followUp.question}
+              </Text>
+              <Badge tone={outcome.tone}>{outcome.label}</Badge>
+            </li>
+          );
+        })}
+      </ol>
+    </Stack>
+  );
+}
+
+/**
+ * Renders the follow-ups asked so far, then the follow-up entry in whichever of its four states
+ * the props select.
  *
  * @param props See {@link FollowUpProps}.
- * @returns The `dgv-followup` block holding the error, busy, unavailable or ready state.
+ * @returns The `dgv-followup` block holding the asked list, when there is one, and the error,
+ *   busy, unavailable or ready state.
+ *
+ * @example
+ * <FollowUp
+ *   onSubmit={askFollowUp}
+ *   submission={pendingActions.outcomes.askFollowUp}
+ *   enabled={phase.acceptsFollowUp && !serviceUnavailable}
+ *   unavailableReason={session.status === 'ended' ? 'ended' : 'awaitingResult'}
+ *   asked={session.followUps}
+ *   pending={followUpPending}
+ * />
  */
 export function FollowUp(props: FollowUpProps): ReactElement {
-  const { onSubmit, submission, enabled, pending = false, error, onRetry, className } = props;
+  const {
+    onSubmit,
+    submission,
+    enabled,
+    unavailableReason = 'awaitingResult',
+    asked,
+    pending = false,
+    error,
+    onRetry,
+    className,
+  } = props;
 
   // The draft, kept until an accepted outcome clears it. Declared before any branch, as a hook
   // must be, so the draft survives the component switching between states.
@@ -215,6 +466,8 @@ export function FollowUp(props: FollowUpProps): ReactElement {
   const [appliedSeq, setAppliedSeq] = useState<number | undefined>(submission?.seq);
   // Whether the last applied outcome was a failure the next submit clears.
   const [retryHintShown, setRetryHintShown] = useState<boolean>(false);
+  // Whether the submit chord was pressed on a blank draft; cleared once the draft holds text.
+  const [blankAttempted, setBlankAttempted] = useState<boolean>(false);
   // The outcome whose focus consequence has been handled; read and written by the effect only.
   const focusHandledSeq = useRef<number | undefined>(appliedSeq);
 
@@ -222,6 +475,7 @@ export function FollowUp(props: FollowUpProps): ReactElement {
   // supplied is the focus route that primitive documents; see the focus effect below.
   const fieldId = useId();
   const retryHintId = useId();
+  const counterId = useId();
 
   // React's "adjust state while rendering" pattern: a new outcome is applied here, once per
   // `seq`, and React re-renders before committing, so neither a stale draft nor a second
@@ -251,9 +505,14 @@ export function FollowUp(props: FollowUpProps): ReactElement {
 
   const rootClassName = composeRootClassName(className);
 
+  // First in every state, so what was asked is never replaced by the entry's busy, error or
+  // closed state, and in the same position, so switching states never remounts it.
+  const history = asked !== undefined && asked.length > 0 ? <AskedFollowUps asked={asked} /> : null;
+
   if (error !== undefined && error.trim().length > 0) {
     return (
       <div className={rootClassName}>
+        {history}
         <ErrorState title={ERROR_TITLE} message={error} onRetry={onRetry} />
       </div>
     );
@@ -262,6 +521,7 @@ export function FollowUp(props: FollowUpProps): ReactElement {
   if (pending) {
     return (
       <div className={rootClassName}>
+        {history}
         <LoadingState variant="block" label={PENDING_LABEL} />
       </div>
     );
@@ -270,18 +530,38 @@ export function FollowUp(props: FollowUpProps): ReactElement {
   if (!enabled) {
     return (
       <div className={rootClassName}>
-        <EmptyState message={UNAVAILABLE_MESSAGE} />
+        {history}
+        <EmptyState message={unavailableMessage(unavailableReason)} />
       </div>
     );
   }
 
   const trimmedDraft = draft.trim();
   const isBlank = trimmedDraft.length === 0;
+  // Lengths only (AAP 0.5.4). `maxLength` keeps the draft within the limit, so reaching it is the
+  // one state the counter warns about.
+  const atLimit = draft.length >= MAX_WEBVIEW_QUESTION_LENGTH;
+  const blankShown = blankAttempted && isBlank;
+
+  /**
+   * Replace the draft with what the field now holds, and retire the blank-draft message as soon as
+   * the draft holds text again. The flag is cleared only when it is set, for the reason
+   * `submitDraft` gives about no-op updates.
+   *
+   * @param next The field's full next value.
+   */
+  const changeDraft = (next: string): void => {
+    setDraft(next);
+    if (blankAttempted && next.trim().length > 0) {
+      setBlankAttempted(false);
+    }
+  };
 
   /**
    * Hand the trimmed draft up, keeping it until `submission` reports it accepted, and retire the
-   * previous attempt's retry hint. A blank draft is refused silently: the submit control is
-   * already disabled for it, and the chord simply does nothing.
+   * previous attempt's retry hint. A blank draft is refused: the submit control is already
+   * disabled for it, and the chord shows an inline validation message on the field until the
+   * draft holds text again.
    *
    * Focus stays where it is: the kept draft keeps the submit control enabled. The hint is retired
    * only when it is showing — a no-op `setState` from an event stays queued in React and is
@@ -290,6 +570,9 @@ export function FollowUp(props: FollowUpProps): ReactElement {
    */
   const submitDraft = (): void => {
     if (isBlank) {
+      if (!blankAttempted) {
+        setBlankAttempted(true);
+      }
       return;
     }
     onSubmit(trimmedDraft);
@@ -309,6 +592,7 @@ export function FollowUp(props: FollowUpProps): ReactElement {
 
   return (
     <div className={rootClassName}>
+      {history}
       <Input
         id={fieldId}
         multiline
@@ -316,11 +600,18 @@ export function FollowUp(props: FollowUpProps): ReactElement {
         rows={FIELD_ROWS}
         label={FIELD_LABEL}
         hint={FIELD_HINT}
+        maxLength={MAX_WEBVIEW_QUESTION_LENGTH}
         value={draft}
-        onValueChange={setDraft}
+        onValueChange={changeDraft}
         onKeyDown={handleKeyDown}
-        aria-describedby={retryHintShown ? retryHintId : undefined}
+        invalid={blankShown}
+        errorMessage={BLANK_DRAFT_MESSAGE}
+        aria-describedby={retryHintShown ? `${counterId} ${retryHintId}` : counterId}
       />
+      {/* Described by the field, not live: announced with it, never once per keystroke. */}
+      <Text as="p" size="xs" tone={atLimit ? 'warning' : 'muted'} numeric id={counterId}>
+        {counterText(draft.length)}
+      </Text>
       {retryHintShown ? (
         <Text as="p" size="xs" tone="warning" id={retryHintId}>
           {RETRY_HINT}

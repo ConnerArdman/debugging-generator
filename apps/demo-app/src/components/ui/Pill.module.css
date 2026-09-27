@@ -23,12 +23,12 @@
  * card below it - on each click. Selection changes three colours and nothing else; the box is
  * fixed by `.root`.
  *
- * Cascade order matters three times in this file and is the reason the blocks are in the order they
+ * Cascade order matters four times in this file and is the reason the blocks are in the order they
  * are: the selected rule is written after the tone rules because the two have equal specificity,
- * the selected hover rule carries a longer selector than the plain hover rule so a selected chip
- * stays inverted while the pointer is over it, and the two pressed rules are written after both
- * hover rules - the selected one longer again - so a press wins over a hover on the chip under the
- * pointer.
+ * the neutral hover rule is written after the plain hover rule it ties with, the selected hover
+ * rule carries a longer selector than both so a selected chip stays inverted while the pointer is
+ * over it, and the two pressed rules are written after every hover rule - the selected one longer
+ * again - so a press wins over a hover on the chip under the pointer.
  *
  * Every value is `var(--ls-TOKEN, <fallback>)` against the tokens declared in
  * `app/globals.css`; the fallbacks mirror them so this module also renders sensibly on its own.
@@ -53,7 +53,7 @@
   min-height: var(--ls-control-sm, 32px);
   padding-block: var(--ls-space-1, 4px);
   padding-inline: var(--ls-space-3, 12px);
-  border: 1px solid var(--ls-border, #cbd5e1);
+  border: 1px solid var(--ls-border, #8190a5);
   border-radius: var(--ls-radius-lg, 12px);
   background-color: var(--ls-surface, #ffffff);
   color: var(--ls-text, #0f172a);
@@ -83,7 +83,7 @@ button.root {
  * `Pill.tsx` and `.root` above already produce it - and keeps the hairline border rather than a
  * slate one, which is what stops a dozen quiet chips from reading as a dozen outlines. */
 .root[data-tone='neutral'] {
-  border-color: var(--ls-border, #cbd5e1);
+  border-color: var(--ls-border, #8190a5);
   color: var(--ls-text-muted, #475569);
 }
 
@@ -162,17 +162,40 @@ button.root {
 /* Hover, excluded while disabled so an unavailable chip stays inert - `:hover` still matches a
  * disabled button, so the guard is what keeps the fill from implying it can be pressed.
  *
+ * The cue is the one the secondary Button gives, and for the same reason: swapping the white
+ * surface for the recessed one alone is a 1.05:1 step, which a reader cannot tell from a chip at
+ * rest. Every chip therefore darkens its border as well as its fill, so the
+ * chip under the pointer is plainly the one that will answer a press. Only colours change; the
+ * border width, padding and height floor are `.root`'s, so the wrapping row cannot reflow.
+ *
+ * The rules are declared in three steps, each yielding to the next:
+ *
+ *   - Every tone: the border is the chip's own foreground mixed towards the ink colour, the way the
+ *     press rule below mixes it, so a success chip deepens its teal rather than losing it to a
+ *     neutral hairline. The fill stays the recessed surface: an ink-tinted fill would take the
+ *     warning tone's text under the 4.5:1 text minimum (about 4.25:1).
+ *   - Neutral, the default and the tone of every catalog filter chip: the ink-mixed fill and
+ *     border of the secondary Button. Slate text on that fill measures 6.4:1, and the border
+ *     measures 4.8:1 on white against the resting hairline's 3.25:1. `:where()` keeps the tone test
+ *     out of the specificity, so this rule ties with the one above and wins by coming after it -
+ *     and still loses, as that one does, to the selected hover rule and to both pressed rules.
+ *   - Selected: repeated at higher specificity rather than left to the rules above, because an
+ *     inverted chip lightens to the slate step of the palette instead of taking a near-white fill
+ *     that would drop its white label onto it. White on slate measures 7.6:1.
+ *
  * Deliberately not wrapped in a `(hover: hover)` capability query. That query is the usual guard
  * against a chip staying in its hover appearance after a tap, but a browser that reports
- * `hover: none` would then never show the state, and the hover step here is only a 3% luminance
- * shift on a pointer-and-keyboard view. The rule is therefore declared plainly.
- *
- * The selected rule is repeated at higher specificity rather than left to the base rule above:
- * an inverted chip lightens to the slate step of the palette instead of falling back to the
- * recessed surface, which would drop white text onto a near-white fill. White on slate measures
- * 7.6:1, and only the two colours change, so the row's geometry is untouched. */
+ * `hover: none` would then never show the state at all, and a hover left behind by a tap is a
+ * grey step that cannot be mistaken for the ink inversion of a selected chip. The rules are
+ * therefore declared plainly. */
 .root:hover:not(:disabled) {
+  border-color: color-mix(in srgb, currentColor 85%, var(--ls-ink, #0f172a));
   background-color: var(--ls-surface-sunken, #f8fafc);
+}
+
+.root:where([data-tone='neutral']):hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--ls-ink, #0f172a) 24%, var(--ls-border, #8190a5));
+  background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 8%, var(--ls-surface, #ffffff));
 }
 
 .root[data-selected='true']:hover:not(:disabled) {

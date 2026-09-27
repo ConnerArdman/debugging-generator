@@ -159,8 +159,11 @@ model Cart {
 
   /// The session's open-cart pointer: this cart holds it for as long as it is
   /// the cart the session shops with, and `NULL` once the cart has become an
-  /// order. Unique, so "at most one open cart per session" is a fact the
-  /// database keeps rather than a race two requests can both win.
+  /// order - or once a checkout that ended without settling its payment has
+  /// set it aside, leaving the cart `ABANDONED` under its `checkoutKey` while
+  /// the session shops on with the next one. Unique, so "at most one open cart
+  /// per session" is a fact the database keeps rather than a race two requests
+  /// can both win.
   openToken String? @unique @map("open_token")
 
   /// The attempt that claimed this cart, by the name its checkout submission

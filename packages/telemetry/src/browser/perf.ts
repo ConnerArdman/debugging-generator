@@ -52,17 +52,29 @@
  *
  * Which of those four observers replays the buffer is a separate decision, and
  * {@link BUFFERED_ENTRY_TYPES} is the whole of it. `navigation` and `paint`
- * are replayed because their entries exist **once** per document and were
- * produced long before the developer asked a question: without the flag, a
- * capture armed after page load could never see them, and "did this capture
- * span a reload?" would be unanswerable. `resource` and `longtask` are
- * **not** replayed, because their buffers hold the page's whole history —
- * every image, script and stylesheet the document ever loaded, and every task
- * that ever blocked the thread — and replaying them would open a capture with
- * up to {@link MAX_ENTRIES_PER_TYPE} entries that predate the question, in one
- * immediate batch, spending the per-type bound on evidence about a moment
- * nobody is investigating. The two streams a developer arms this hook for are
- * the ones the capture window itself produces.
+ * are replayed because their entries exist **once** per document and are
+ * already in the buffer by the time this hook runs: when a capture spans a
+ * reload, the agent is re-armed in the new document only after it has loaded,
+ * so without the flag the capture could never see that document's own
+ * navigation and paints, and "did this capture span a reload?" would be
+ * unanswerable. The same replay also hands over the entries of a document
+ * that loaded **before** Start, and this module keeps them on purpose: its
+ * own capture instant is taken when it is armed, which after a reload is
+ * later than the fresh navigation it replays for, so a filter here would
+ * discard the one entry the flag exists to deliver. Only the service knows
+ * when the capture opened, so it discards the lifecycle entries that ended
+ * before that instant at attribution — the `pre-capture` drop of
+ * `apps/local-service/src/telemetry/attribute.ts` — and keeps every other
+ * one, a reload's included.
+ *
+ * `resource` and `longtask` are **not** replayed, because their buffers hold
+ * the page's whole history — every image, script and stylesheet the document
+ * ever loaded, and every task that ever blocked the thread — and replaying
+ * them would open a capture with up to {@link MAX_ENTRIES_PER_TYPE} entries
+ * that predate the question, in one immediate batch, spending the per-type
+ * bound on evidence about a moment nobody is investigating. The two streams a
+ * developer arms this hook for are the ones the capture window itself
+ * produces.
  *
  * Buffering is not the only guard: every entry of a non-replayed type is also
  * measured against {@link getCaptureStartTime}, the instant {@link attachPerf}
@@ -70,8 +82,9 @@
  * in {@link PerfStats.preCapture}. An entry still in flight when the capture
  * armed is kept — a resource that was loading, or a task that was blocking,
  * when the developer pressed Capture is part of what they are looking at — and
- * the two lifecycle types are exempt by construction, since being older than
- * the capture is precisely why they are replayed.
+ * the two lifecycle types are exempt here by construction, since being older
+ * than this hook's instant is precisely why they are replayed; their window
+ * test is the service's, against the capture's own start (above).
  *
  * **Replayed entries become roots of their own traces, deliberately.** Every
  * event asks `./interaction.js` which trace it belongs to, and that module
@@ -233,21 +246,28 @@ export const OBSERVED_ENTRY_TYPES = ['longtask', 'resource', 'navigation', 'pain
 
 /**
  * The entry types observed with `buffered: true`, and therefore the only ones
- * whose pre-capture entries are allowed into a capture.
+ * this hook emits even when they predate its own attachment.
  *
  * A subset of {@link OBSERVED_ENTRY_TYPES}, and the module's whole buffering
  * policy — see the header for the reasoning. `navigation` and `paint` describe
  * the document's lifecycle, occur once, and are gone from the timeline's
- * delivery path by the time a capture is armed, so replaying them is the only
- * way to have them at all. `resource` and `longtask` are continuous streams
- * whose buffers hold the page's entire history; replaying those would open
- * every capture with a batch of evidence about a moment nobody asked about,
- * and would spend {@link MAX_ENTRIES_PER_TYPE} before the developer had
- * interacted with anything.
+ * delivery path by the time the agent is armed — after a reload during a
+ * capture, only once the new document has loaded — so replaying them is the
+ * only way a capture sees a reload's fresh lifecycle entries at all.
+ * `resource` and `longtask` are continuous streams whose buffers hold the
+ * page's entire history; replaying those would open every capture with a batch
+ * of evidence about a moment nobody asked about, and would spend
+ * {@link MAX_ENTRIES_PER_TYPE} before the developer had interacted with
+ * anything.
  *
  * Membership also selects the capture-start filter: a type in this list is
  * exempt from it (an older entry is exactly what it was replayed for), and a
- * type outside it is measured against {@link getCaptureStartTime}.
+ * type outside it is measured against {@link getCaptureStartTime}. The replay
+ * therefore also delivers the lifecycle entries of a document that loaded
+ * before the capture started; those are discarded by the service at
+ * attribution, not here — `apps/local-service/src/telemetry/attribute.ts`
+ * drops a replayed entry as `pre-capture` when it ended before the capture's
+ * recorded start, and keeps one that reaches into the window.
  */
 export const BUFFERED_ENTRY_TYPES = ['navigation', 'paint'] as const;
 

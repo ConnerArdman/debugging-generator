@@ -32,9 +32,16 @@
  *                    credential stops the command before anything is spawned —
  *                    without one the preload stays inert and records nothing
  *                    (`packages/telemetry/src/node/config.ts`), so starting the
- *                    server anyway would only look instrumented. Once the
- *                    dev server has exited — on its own, through a forwarded
- *                    Ctrl-C or SIGTERM, or because it could not be started —
+ *                    server anyway would only look instrumented. The dev
+ *                    server leads a process group of its own, and SIGINT
+ *                    (Ctrl-C), SIGTERM, SIGHUP and SIGQUIT sent to this
+ *                    command are forwarded to that whole group — the package
+ *                    manager in front of the dev server relays none itself —
+ *                    with SIGKILL after a grace period, a line once it has
+ *                    stopped and a warning naming whatever could not be
+ *                    stopped (`runDevServer`). Once the dev server has
+ *                    exited — on its own, through a forwarded signal, or
+ *                    because it could not be started —
  *                    this command releases the credential
  *                    (`POST /credentials/release`); the service supervises it
  *                    as a lease as well, and revokes it shortly after the dev
@@ -359,8 +366,34 @@ export const SERVICE_ROUTES = Object.freeze([
 /** Timeout for the liveness pre-flight: 2 s, after which the service counts as not answering. */
 export const HEALTH_TIMEOUT_MS = 2_000;
 
-/** Timeout for the launch, stop, credential and release requests. */
+/**
+ * Timeout for a request the service answers from its own state: the
+ * credential and release requests. The launch and the stop also wait on the
+ * dev server itself, and take {@link LAUNCH_TIMEOUT_MS} and
+ * {@link STOP_TIMEOUT_MS}.
+ */
 export const REQUEST_TIMEOUT_MS = 5_000;
+
+/**
+ * Timeout for the launch request: 65 s. The service's launcher answers
+ * `POST /dev-server/launch` only once the dev server it spawned is ready, and
+ * waits up to 60 s for that (`DEFAULT_READY_TIMEOUT_MS` in
+ * `apps/local-service/src/dev-server/launcher.ts`); a cold `next dev`
+ * routinely needs longer than {@link REQUEST_TIMEOUT_MS}. The bound is that
+ * readiness wait plus one ordinary request timeout, so the launcher's own
+ * answer — the launch, or its typed readiness failure — always arrives before
+ * this command gives up on it and leaves a dev server running unreported.
+ */
+export const LAUNCH_TIMEOUT_MS = 60_000 + REQUEST_TIMEOUT_MS;
+
+/**
+ * Timeout for the stop request: 12 s. The launcher answers
+ * `POST /dev-server/stop` once its termination ladder has run — `SIGTERM`,
+ * up to 5 s of grace, `SIGKILL`, up to 2 s for the exit to be seen
+ * (`DEFAULT_STOP_GRACE_MS` and `KILL_CONFIRM_MS` there) — so the bound is that
+ * ladder plus one ordinary request timeout.
+ */
+export const STOP_TIMEOUT_MS = 5_000 + 2_000 + REQUEST_TIMEOUT_MS;
 
 /**
  * The longest the closing release of `--spawn-local` can take: the identity
@@ -612,7 +645,20 @@ What it does (--spawn-local)
      variables of this terminal (see "What the child inherits"), the --env
      variables, the preload on NODE_OPTIONS, and DEBUGGEN_INGEST_URL,
      DEBUGGEN_PROJECT_ROOT and DEBUGGEN_TOKEN
-  6. forwards SIGINT/SIGTERM to that child and waits for it to exit
+  6. runs that child as the leader of a process group of its own and waits
+     for it. SIGINT (Ctrl-C), SIGTERM, SIGHUP (the terminal closing) and
+     SIGQUIT sent to this command are forwarded to that whole group, because
+     the package manager in front of the dev server relays no signal itself,
+     and one line says so. A dev server still running ${String(STOP_GRACE_MS / 1000)} seconds later is
+     sent SIGKILL. What it leaves in its group after exiting gets the rest of
+     that grace period, then SIGKILL (SIGTERM first when it exited on its
+     own), but only while this command can prove those processes are the dev
+     server's (on Linux; elsewhere they are only reported). One line says when
+     the dev server has stopped. A warning names the process group and the
+     kill -TERM / kill -KILL commands for anything still running, and a dev
+     server not gone ${String(KILL_CONFIRM_MS / 1000)} seconds after SIGKILL ends this command with 137
+     rather than a wait. Windows has no process groups: a tree still running
+     after the grace period is ended with taskkill /T /F.
   7. once the child has exited — on its own, through a forwarded signal, or
      because it could not be started — has the service prove itself again as
      in step 3, then releases the credential: POST {service}${RELEASE_PATH}
@@ -679,7 +725,10 @@ Options
                     the dev server disconnects; otherwise it lapses within 5
                     minutes. This command releases it through
                     POST ${RELEASE_PATH} once the dev server has exited.
-                    Signals and the exit code are forwarded.
+                    SIGINT, SIGTERM, SIGHUP and SIGQUIT are forwarded to the
+                    dev server's whole process group, with SIGKILL ${String(STOP_GRACE_MS / 1000)} seconds
+                    later if it is still running, and its exit code is this
+                    command's.
   --env NAME[=value]
                     give the --spawn-local child one more variable: NAME alone
                     forwards this terminal's value (exit 2 when it is unset),
@@ -759,6 +808,8 @@ Exit codes
       spawned.
   n   whatever the --spawn-local child exited with; 128 + signal number when it
       was signalled
+  137 also when the --spawn-local dev server had not exited ${String(KILL_CONFIRM_MS / 1000)} seconds after
+      SIGKILL; a warning names the command that stops it
 
   The closing release of --spawn-local never changes the exit code: one that
   fails, or is skipped because the service did not prove itself again, is a
@@ -1150,6 +1201,11 @@ export function resolveDebuggenHome(env = process.env) {
  * The recovery hint for "the local service is not running yet". The address
  * paragraph is included only when there is an address worth naming.
  *
+ * The VS Code command is named as the Command Palette shows it — the
+ * `category` and `title` that `apps/vscode-extension/package.json` contributes
+ * for `debuggen.startService` — so a developer can type what this prints;
+ * `scripts/dev-instrumented.test.mjs` derives that name from the manifest.
+ *
  * @param {string} [base] service base URL this run expected
  * @returns {string}
  */
@@ -1157,7 +1213,7 @@ function serviceStartHint(base) {
   const lines = [
     'Start the local coordination service first, then re-run this command:',
     '',
-    '  - from VS Code: run the "Debug Generator: Start Service" command',
+    '  - from VS Code: run the "Debug Generator: Start Local Service" command',
     '    (debuggen.startService), which also writes the editor credential; or',
     '  - from a terminal: pnpm --filter @debuggen/local-service dev',
   ];
@@ -1820,12 +1876,17 @@ function oversizedAnswer(url, status, consequence) {
  * @param {string} request.editorToken editor credential
  * @param {unknown} request.body JSON body
  * @param {string} [request.consequence] what the request may already have
- *   done when its answer has to be discarded, for the refusal's hint
+ *   done when its answer has to be discarded — because it was over the cap,
+ *   never arrived in time, or was cut off — for the failure's hint
+ * @param {number} [request.timeoutMs] how long to wait for the whole answer
+ *   (default {@link REQUEST_TIMEOUT_MS})
  * @returns {Promise<{ status: number, statusText: string, json: unknown, text: string }>}
  * @throws {DevInstrumentedError} on a transport failure or timeout, and on an
  *   answer over {@link RESPONSE_MAX_BYTES}
  */
-async function postJson({ url, editorToken, body, consequence }) {
+async function postJson({ url, editorToken, body, consequence, timeoutMs = REQUEST_TIMEOUT_MS }) {
+  /** @type {{ hint?: string }} */
+  const discarded = consequence === undefined ? {} : { hint: consequence };
   /** @type {Response} */
   let response;
   try {
@@ -1844,12 +1905,12 @@ async function postJson({ url, editorToken, body, consequence }) {
       // misconfiguration or a hostile listener, and either way the answer is to
       // stop rather than to follow.
       redirect: 'error',
-      signal: globalThis.AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: globalThis.AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
     const timedOut = error instanceof Error && error.name === 'TimeoutError';
-    const reason = timedOut ? `no answer within ${REQUEST_TIMEOUT_MS} ms` : describeCause(error);
-    throw new DevInstrumentedError(`request to ${url} failed: ${reason}`);
+    const reason = timedOut ? `no answer within ${String(timeoutMs)} ms` : describeCause(error);
+    throw new DevInstrumentedError(`request to ${url} failed: ${reason}`, discarded);
   }
 
   // A declared length over the cap is refused before a byte of the body is
@@ -1871,9 +1932,10 @@ async function postJson({ url, editorToken, body, consequence }) {
     text = await readBoundedText(response, RESPONSE_MAX_BYTES);
   } catch (error) {
     const timedOut = error instanceof Error && error.name === 'TimeoutError';
-    const reason = timedOut ? `no answer within ${REQUEST_TIMEOUT_MS} ms` : describeCause(error);
+    const reason = timedOut ? `no answer within ${String(timeoutMs)} ms` : describeCause(error);
     throw new DevInstrumentedError(
       `request to ${url} failed while reading its ${String(response.status)} answer: ${reason}`,
+      discarded,
     );
   }
   if (text === undefined) throw oversizedAnswer(url, response.status, consequence);
@@ -2076,6 +2138,8 @@ export async function launchDevServer({ base, editorToken, projectRoot }) {
     url,
     editorToken,
     body: { projectRoot },
+    // The launcher answers once the dev server is ready, not at the spawn.
+    timeoutMs: LAUNCH_TIMEOUT_MS,
     consequence: [
       'The service may have started a dev server before it answered. Stop it with:',
       '',
@@ -2167,6 +2231,8 @@ export async function stopDevServer({ base, editorToken, projectRoot }) {
     url,
     editorToken,
     body: { projectRoot },
+    // The launcher answers once its termination ladder has run.
+    timeoutMs: STOP_TIMEOUT_MS,
     consequence: [
       'The dev server may still be running under the service. Retry with',
       '--stop, or end the session in VS Code, which stops the process it owns.',
@@ -3646,20 +3712,441 @@ export function childExitCode(code, signal) {
 }
 
 /**
- * Spawn the dev server and wait for it, forwarding `SIGINT` and `SIGTERM`.
+ * The signals `--spawn-local` forwards to its dev server's process group (see
+ * {@link runDevServer}). The dev server runs in a session of its own, so the
+ * signals a terminal raises itself — Ctrl-C's `SIGINT`, Ctrl-\'s `SIGQUIT`
+ * and the `SIGHUP` of a terminal that closes — reach this command alone, and
+ * this command passes each of them on. `SIGTERM` is what `kill <pid>` sends.
  *
- * With `stdio: 'inherit'` a terminal already delivers Ctrl-C to the whole
- * foreground group, so forwarding is what makes a programmatic
- * `kill <this pid>` behave the same way. Registering the handlers also stops
- * this process from dying first and orphaning the dev server — it waits for
- * the child, then reports the child's status as its own.
+ * @type {readonly NodeJS.Signals[]}
+ */
+const FORWARDED_SIGNALS = Object.freeze(['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']);
+
+/**
+ * How long a forwarded stop waits for the dev server to exit before it sends
+ * `SIGKILL`: 5 seconds, the service launcher's `DEFAULT_STOP_GRACE_MS`
+ * (`apps/local-service/src/dev-server/launcher.ts`), so a dev server stopped
+ * from this terminal has as long to shut down as one the service stops. What
+ * a dev server that exited on its own leaves in its process group gets the
+ * same time between `SIGTERM` and `SIGKILL`.
+ */
+export const STOP_GRACE_MS = 5_000;
+
+/**
+ * How long this command waits after `SIGKILL` to see the dev server go: 2
+ * seconds, the launcher's `KILL_CONFIRM_MS`. `SIGKILL` cannot be caught or
+ * ignored, so a process still there by then is one this command could not
+ * end — it may not signal it, or the process is stuck in the kernel — and it
+ * is reported with the command that stops it rather than waited for.
+ */
+export const KILL_CONFIRM_MS = 2_000;
+
+/** How often a stop re-reads the dev server's process group while it waits for it to empty: 100 ms, as the launcher does. */
+const GROUP_POLL_INTERVAL_MS = 100;
+
+/**
+ * This command's exit status when the dev server had not exited
+ * {@link KILL_CONFIRM_MS} after `SIGKILL`: 137, the status of a process
+ * `SIGKILL` ended (128 + 9), which is what the dev server reports once the
+ * kill takes effect, so a caller reads "killed" either way. A warning names
+ * the process and the command that stops it.
+ */
+const EXIT_NOT_STOPPED = 137;
+
+/** The line a stop prints once nothing of the dev server is left running. */
+const DEV_SERVER_STOPPED = 'dev-instrumented: the dev server stopped';
+
+/** The Linux process filesystem, read to prove which processes are the dev server's (see {@link trackProcessGroup}). */
+const PROC_ROOT = '/proc';
+
+/**
+ * Indexes of the `/proc/<pid>/stat` fields read here, counted after the `)`
+ * that closes the command name — which may itself hold spaces and `)`, so the
+ * line is split after its *last* `)`: the state (field 3 of the whole line),
+ * the process group (5), the session (6) and the start time in clock ticks
+ * since boot (22). The same split as the launcher's inspector.
+ */
+const STAT_FIELDS = Object.freeze({ state: 0, pgrp: 2, session: 3, starttime: 19 });
+
+/** A decimal number as `/proc` writes it: an entry's pid, a group, a start time. */
+const DECIMAL = /^\d+$/u;
+
+/**
+ * @typedef {object} ProcessStat
+ * @property {string} state the one-letter process state; `Z` (zombie) and
+ *   `X` (dead) are processes that have already exited
+ * @property {number} pgrp its process group id
+ * @property {number} session its session id
+ * @property {string} starttime when it started, in clock ticks since boot.
+ *   With the pid it identifies one process across time: a recycled pid
+ *   belongs to a process that started later.
+ */
+
+/**
+ * Read one process's `/proc/<pid>/stat`, synchronously (Linux).
+ *
+ * @param {number} pid
+ * @returns {ProcessStat | null | undefined} `null` when there is no such
+ *   process (any more); `undefined` when the entry could not be read, or is
+ *   not in the shape the kernel writes
+ */
+function readProcessStat(pid) {
+  /** @type {string} */
+  let text;
+  try {
+    text = fs.readFileSync(`${PROC_ROOT}/${String(pid)}/stat`, 'utf8');
+  } catch (error) {
+    return isErrnoCode(error, 'ENOENT') || isErrnoCode(error, 'ESRCH') ? null : undefined;
+  }
+  const close = text.lastIndexOf(')');
+  if (close === -1) return undefined;
+  const fields = text
+    .slice(close + 1)
+    .trim()
+    .split(/\s+/u);
+  const state = fields[STAT_FIELDS.state];
+  const pgrp = fields[STAT_FIELDS.pgrp];
+  const session = fields[STAT_FIELDS.session];
+  const starttime = fields[STAT_FIELDS.starttime];
+  if (
+    state === undefined ||
+    pgrp === undefined ||
+    session === undefined ||
+    starttime === undefined ||
+    ![pgrp, session, starttime].every((value) => DECIMAL.test(value))
+  ) {
+    return undefined;
+  }
+  return { state, pgrp: Number(pgrp), session: Number(session), starttime };
+}
+
+/**
+ * Whether a process is a live member of the process group the dev server
+ * leads: still running (not a zombie or dead), in group `pgid`, and in
+ * session `pgid` — the session the dev server's own `setsid()` created, which
+ * no member of its group can be outside of.
+ *
+ * @param {ProcessStat} stat
+ * @param {number} pgid
+ * @returns {boolean}
+ */
+function isLiveGroupMember(stat, pgid) {
+  return stat.state !== 'Z' && stat.state !== 'X' && stat.pgrp === pgid && stat.session === pgid;
+}
+
+/**
+ * The live members of process group `pgid`, from every `/proc/<pid>/stat`,
+ * read synchronously (Linux). An entry that vanishes while the directory is
+ * read, or cannot be read, is skipped: nothing this command could prove to be
+ * the dev server's, so nothing it would signal.
+ *
+ * @param {number} pgid
+ * @returns {Map<number, string> | undefined} pid → start time of each member;
+ *   `undefined` when `/proc` cannot be listed
+ */
+function listProcessGroup(pgid) {
+  /** @type {string[]} */
+  let names;
+  try {
+    names = fs.readdirSync(PROC_ROOT);
+  } catch {
+    return undefined;
+  }
+  /** @type {Map<number, string>} */
+  const members = new Map();
+  for (const name of names) {
+    if (!DECIMAL.test(name)) continue;
+    const pid = Number(name);
+    const stat = readProcessStat(pid);
+    if (stat !== null && stat !== undefined && isLiveGroupMember(stat, pgid)) {
+      members.set(pid, stat.starttime);
+    }
+  }
+  return members;
+}
+
+/**
+ * What a reading of the dev server's process group found once its leader
+ * had exited:
+ *   - `'gone'` — no process has the group id;
+ *   - `'verified'` — processes do, and one of them is a process pinned in the
+ *     group while it was provably the dev server's, so all of them are;
+ *   - `'unverified'` — processes do, or may (only a probe answered), and none
+ *     can be proved the dev server's, so none is signalled.
+ *
+ * @typedef {'gone' | 'verified' | 'unverified'} GroupVerdict
+ */
+
+/**
+ * @typedef {object} GroupReading
+ * @property {GroupVerdict} verdict
+ * @property {number} count how many processes the reading listed; 0 when
+ *   only a probe could answer
+ */
+
+/**
+ * @typedef {object} ProcessGroupTracker
+ * @property {() => void} pin record the group's current members. Sound only
+ *   while the group id is provably the dev server's: while its leader is
+ *   unreaped, or in the `'exit'` listener that runs in the same step as the
+ *   reap. A no-op without `/proc`.
+ * @property {() => GroupReading} read list the group after the leader's exit
+ *   and decide whose it is; a verified reading pins every member it listed,
+ *   so a process the dev server started since the last pin stays provable
+ * @property {(signal: NodeJS.Signals) => boolean} signalExited signal the
+ *   group after the leader's exit, only once a pinned member is confirmed —
+ *   in the same synchronous step as the `kill` — to be that very process,
+ *   still in that very group; whether the signal was sent
+ */
+
+/**
+ * Track the process group a `--spawn-local` dev server leads, so that it can
+ * be signalled after its leader has exited without ever signalling a
+ * stranger.
+ *
+ * While the leader is unreaped its pid — and with it the group id — is
+ * nobody else's, so a group signal is safe then, and {@link runDevServer}
+ * sends that one directly. Once the leader is reaped, a bare group id proves
+ * nothing: the kernel may hand the number to a new process. It does not do so
+ * while any process still has the number as its process-group or session id
+ * (Linux keeps a pid out of reuse while anything references it), so a group
+ * that still holds a process seen in it earlier is still the dev server's.
+ * Members are therefore *pinned* — pid and `/proc` start time — while the
+ * group is provably the dev server's: synchronously before each forwarded
+ * signal, while the leader is unreaped, and in the `'exit'` listener. Node
+ * emits `'exit'` from the very callback that reaped the child, before any
+ * other JavaScript runs, and a group that still has a member cannot have
+ * lost its id since; a group that has none lists as empty. A signal after the
+ * exit is sent only when a pinned member is confirmed still in the group in
+ * the same synchronous step as the `kill`.
+ *
+ * What remains is the width of that step: were the confirmed member to exit,
+ * with every other member, and the number to become another group's id
+ * between the read and the `kill` system call, that group would be signalled.
+ * Node exposes no pidfd, so no pid-based signal closes that two-syscall
+ * window; sequential pid allocation, which must wrap the whole pid space
+ * before it hands the number out again, makes it unreachable in practice.
+ *
+ * Without `/proc` (macOS and the other POSIX systems) nothing is pinned and
+ * nothing is signalled after the exit: {@link ProcessGroupTracker.read}
+ * only probes `kill(-pgid, 0)`, and a group that still answers is reported,
+ * never signalled.
+ *
+ * @param {object} request
+ * @param {number} request.pgid the dev server's pid, which is its process
+ *   group id
+ * @param {boolean} request.inspect whether `/proc` may be read to pin members
+ * @param {(pid: number, signal: NodeJS.Signals | 0) => void} request.signalProcess
+ *   sends a signal, or a probe (`0`), to a process group given as a negative
+ *   pid, throwing an errno-coded error as `process.kill` does
+ * @returns {ProcessGroupTracker}
+ */
+function trackProcessGroup({ pgid, inspect, signalProcess }) {
+  /**
+   * pid → start time of every process seen in the group while it was provably
+   * the dev server's.
+   *
+   * @type {Map<number, string>}
+   */
+  const pins = new Map();
+
+  /** @returns {GroupVerdict} */
+  const probe = () => {
+    try {
+      signalProcess(-pgid, 0);
+      return 'unverified';
+    } catch (error) {
+      // ESRCH: no process has the group id. EPERM, or anything else: some
+      // process may have it, and this command cannot tell whose it is.
+      return isErrnoCode(error, 'ESRCH') ? 'gone' : 'unverified';
+    }
+  };
+
+  return {
+    pin() {
+      if (!inspect) return;
+      const members = listProcessGroup(pgid);
+      if (members === undefined) return;
+      for (const [pid, starttime] of members) pins.set(pid, starttime);
+    },
+
+    read() {
+      const members = inspect ? listProcessGroup(pgid) : undefined;
+      if (members === undefined) return { verdict: probe(), count: 0 };
+      if (members.size === 0) return { verdict: 'gone', count: 0 };
+      const holdsPin = [...members].some(([pid, starttime]) => pins.get(pid) === starttime);
+      if (!holdsPin) return { verdict: 'unverified', count: members.size };
+      for (const [pid, starttime] of members) pins.set(pid, starttime);
+      return { verdict: 'verified', count: members.size };
+    },
+
+    signalExited(signal) {
+      if (!inspect) return false;
+      for (const [pid, starttime] of pins) {
+        const stat = readProcessStat(pid);
+        if (stat === null) {
+          pins.delete(pid);
+          continue;
+        }
+        if (stat === undefined || !isLiveGroupMember(stat, pgid) || stat.starttime !== starttime) {
+          continue;
+        }
+        // Confirmed, and nothing runs between that read and this signal.
+        try {
+          signalProcess(-pgid, signal);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    },
+  };
+}
+
+/**
+ * A duration setting, or its default when the setting is not a finite,
+ * non-negative number.
+ *
+ * @param {unknown} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+function durationOr(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+/**
+ * "1 process" or "3 processes".
+ *
+ * @param {number} count
+ * @returns {string}
+ */
+function processCount(count) {
+  return `${String(count)} ${count === 1 ? 'process' : 'processes'}`;
+}
+
+/**
+ * A duration in seconds, for messages: 5000 → "5 s", 300 → "0.3 s".
+ *
+ * @param {number} ms
+ * @returns {string}
+ */
+function inSeconds(ms) {
+  return `${String(ms / 1000)} s`;
+}
+
+/**
+ * @typedef {object} DevServerStopOptions
+ * How `--spawn-local` stops its dev server. Every field is optional and
+ * defaults to the production value; {@link main} passes them through from
+ * {@link MainContext}, where they exist for `scripts/dev-instrumented.test.mjs`.
+ * @property {number} [stopGraceMs] how long a forwarded stop waits before
+ *   `SIGKILL` (default {@link STOP_GRACE_MS})
+ * @property {number} [killConfirmMs] how long to wait after `SIGKILL` for the
+ *   dev server to go (default {@link KILL_CONFIRM_MS})
+ * @property {(pid: number, signal: NodeJS.Signals | 0) => void} [signalProcess]
+ *   sends a signal to a process group (a negative pid), or probes one (`0`),
+ *   throwing an errno-coded error as `process.kill` does — which is the
+ *   default. The suite injects one that withholds `SIGKILL`, to reach the
+ *   warnings for a dev server that could not be stopped.
+ * @property {boolean} [inspectProcesses] whether members of the dev server's
+ *   process group are pinned through `/proc` (default: on Linux and Android);
+ *   `false` leaves only the probe, as on the other POSIX systems
+ */
+
+/**
+ * @typedef {DevServerStopOptions & {
+ *   stdout?: import('node:stream').Writable,
+ *   stderr?: import('node:stream').Writable,
+ * }} RunDevServerOptions
+ * The stop settings, plus the streams the stop's lines (stdout) and warnings
+ * (stderr) are written to — `main`'s own, `process.stdout` and
+ * `process.stderr` by default.
+ */
+
+/**
+ * Spawn the dev server, wait for it, and stop all of it when this command is
+ * asked to stop.
+ *
+ * WHY A PROCESS GROUP: what `--spawn-local` spawns is a package manager, and
+ * the pnpm this repository pins through corepack is a Node shim that runs the
+ * real pnpm below itself and relays no signal to it. A signal to that direct
+ * child alone stops nothing, and the dev server keeps serving with a live
+ * credential. On POSIX the child is therefore spawned `detached`, which makes
+ * it call `setsid()`: it leads a process group whose id is its pid, and
+ * everything it starts — pnpm, the shell running the script, `next dev`,
+ * `next-server` — is in that group unless it moves itself out. A signal to
+ * the group (`kill(-pid)`) reaches all of them at once, the way a terminal's
+ * Ctrl-C reaches a foreground job.
+ *
+ * `setsid()` also gives the child a session of its own, without a
+ * controlling terminal. It still inherits this terminal as its stdin, stdout
+ * and stderr (`stdio: 'inherit'`), so its output, colours and TTY detection
+ * are unchanged, and it can still read keys: the kernel's job-control checks
+ * (`SIGTTIN`, `SIGTTOU`) apply only to a reader whose controlling terminal it
+ * is, which this one no longer is. What changes is that the terminal's own
+ * signals — Ctrl-C, Ctrl-\, the hangup when it closes — go to this command's
+ * job alone. That is why this command forwards them itself
+ * ({@link FORWARDED_SIGNALS}), why Ctrl-C now reaches the dev server once
+ * rather than twice, and why Ctrl-Z suspends this command but not the dev
+ * server, which keeps serving until the command is resumed and stopped.
+ *
+ * THE STOP: on the first forwarded signal this command signals the group and
+ * prints one line, then waits {@link STOP_GRACE_MS}. A dev server still
+ * running then is sent `SIGKILL`; one whose exit is still not seen
+ * {@link KILL_CONFIRM_MS} later is reported with the command that ends it,
+ * and this command returns {@link EXIT_NOT_STOPPED} rather than hang. A later
+ * signal is forwarded as well, and changes no deadline.
+ *
+ * AFTER THE LEADER EXITS, processes can remain in its group: a worker that
+ * ignores the signal, or one a crashed script left behind. The group id is
+ * then signalled only as {@link trackProcessGroup} proves it — never as a
+ * bare `kill(-pid)`. On Linux, members proved the dev server's are waited for
+ * until the grace period ends and then sent `SIGKILL`; when the dev server
+ * exited on its own, with no stop asked for, what it left is sent `SIGTERM`
+ * first and given a grace period of its own. Elsewhere on POSIX nothing is
+ * signalled after the exit; the group is only probed. Once nothing is left
+ * after a stop, one line says the dev server stopped; anything still running,
+ * or that could not be verified, is named in one warning on stderr with its
+ * process group and the `kill` commands that end it. Every wait is bounded.
+ *
+ * WINDOWS has no process groups. Its console delivers Ctrl-C and the close
+ * event to every process attached to it, the dev server's tree included, so
+ * the forwarded signal only ends the `cmd.exe` wrapper, as `child.kill` does
+ * there (it would otherwise stop at its "Terminate batch job" prompt). A
+ * wrapper still running when the grace period ends is ended with its whole
+ * tree by `taskkill /pid <pid> /T /F`, then `child.kill('SIGKILL')` — only
+ * while it is unreaped, because `taskkill` of a reaped child's id could end a
+ * process that reused it.
+ *
+ * Every listener is removed before this returns, so the credential release
+ * that follows in {@link main} holds signals on its own terms
+ * ({@link holdShutdownSignals}).
  *
  * @param {LaunchCommand} command
  * @param {NodeJS.ProcessEnv} childEnv
- * @returns {Promise<number>} exit code to use for this process
+ * @param {RunDevServerOptions} [options] output streams and stop settings
+ * @returns {Promise<number>} exit code to use for this process: the dev
+ *   server's own status ({@link childExitCode}), or {@link EXIT_NOT_STOPPED}
+ *   when it had not exited even after `SIGKILL`
  * @throws {DevInstrumentedError} exit 2 when the command cannot be executed
  */
-export async function runDevServer(command, childEnv) {
+export async function runDevServer(command, childEnv, options = {}) {
+  const stdout = options.stdout ?? process.stdout;
+  const stderr = options.stderr ?? process.stderr;
+  const stopGraceMs = durationOr(options.stopGraceMs, STOP_GRACE_MS);
+  const killConfirmMs = durationOr(options.killConfirmMs, KILL_CONFIRM_MS);
+  const signalProcess =
+    options.signalProcess ??
+    ((pid, signal) => {
+      process.kill(pid, signal);
+    });
+  const windows = process.platform === 'win32';
+  const inspect =
+    !windows &&
+    (options.inspectProcesses ?? (process.platform === 'linux' || process.platform === 'android'));
+
   const child = spawn(command.file, command.args, {
     cwd: command.cwd,
     env: childEnv,
@@ -3669,35 +4156,262 @@ export async function runDevServer(command, childEnv) {
     // A `cmd.exe` line from `wrapForPlatform` is already quoted and escaped;
     // letting Node re-quote it would break that escaping. Ignored off Windows.
     windowsVerbatimArguments: command.windowsVerbatimArguments === true,
+    // POSIX: `setsid()`, so the dev server leads a process group of its own
+    // (see above). Windows has no process groups, and a detached child there
+    // would be given a console of its own instead of this one.
+    detached: !windows,
   });
 
-  /** @type {NodeJS.Signals[]} */
-  const forwarded = ['SIGINT', 'SIGTERM'];
-  /** @type {Array<[NodeJS.Signals, () => void]>} */
-  const handlers = [];
+  /** The dev server's pid — on POSIX also its process group id — or `undefined` when the spawn failed. */
+  const pid = child.pid;
+  const group =
+    !windows && pid !== undefined
+      ? trackProcessGroup({ pgid: pid, inspect, signalProcess })
+      : undefined;
+  const pidText = String(pid);
+  const target = windows ? `pid ${pidText}` : `process group ${pidText}`;
 
-  for (const signal of forwarded) {
-    /** @returns {void} */
-    const handler = () => {
-      if (child.exitCode !== null || child.signalCode !== null) return;
+  /**
+   * Whether the dev server is still unreaped, so its pid — and with it its
+   * group id — is still its own. Node reaps a child and records its exit in
+   * one step, so the answer holds for the present moment.
+   *
+   * @returns {boolean}
+   */
+  const unreaped = () => pid !== undefined && child.exitCode === null && child.signalCode === null;
+
+  /** Signals that could not be delivered, for the warnings. */
+  let undelivered = 0;
+  /** @type {{ signal: NodeJS.Signals, at: number } | undefined} the first forwarded signal */
+  let stop;
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let graceTimer;
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let confirmTimer;
+  /** Ends the wait for the dev server's exit when {@link KILL_CONFIRM_MS} has passed after `SIGKILL`. */
+  let abandonWait = () => undefined;
+
+  /**
+   * Signal the dev server alone, through its `ChildProcess`. Windows can send
+   * `SIGINT`, `SIGTERM` and `SIGKILL` only — each as `TerminateProcess` — so a
+   * `SIGHUP` or `SIGQUIT` is sent as the default there.
+   *
+   * @param {NodeJS.Signals} signal
+   * @returns {void}
+   */
+  const signalLeaderOnly = (signal) => {
+    const sendable = windows && (signal === 'SIGHUP' || signal === 'SIGQUIT') ? 'SIGTERM' : signal;
+    try {
+      if (!child.kill(sendable)) undelivered += 1;
+    } catch {
+      undelivered += 1;
+    }
+  };
+
+  /**
+   * Signal the dev server while it is unreaped: its whole process group,
+   * pinned first — safe exactly now, because an unreaped leader keeps its
+   * pid — or, on Windows or when the group cannot be signalled, the dev
+   * server alone.
+   *
+   * @param {NodeJS.Signals} signal
+   * @returns {void}
+   */
+  const signalUnreaped = (signal) => {
+    if (group !== undefined && pid !== undefined) {
+      group.pin();
       try {
-        child.kill(signal);
+        signalProcess(-pid, signal);
+        return;
       } catch {
-        // The child is already gone; its 'exit' event settles the promise.
+        // The group could not be signalled: the dev server alone, below.
       }
+    }
+    signalLeaderOnly(signal);
+  };
+
+  /**
+   * Windows: end the dev server's whole tree with `taskkill /T /F` while its
+   * wrapper is unreaped, then the wrapper itself. `taskkill` finds the tree
+   * through the wrapper, so the wrapper is killed only once `taskkill` is done
+   * (or could not start).
+   *
+   * @returns {void}
+   */
+  const killWindowsTree = () => {
+    let wrapperKilled = false;
+    const killWrapper = () => {
+      if (wrapperKilled) return;
+      wrapperKilled = true;
+      if (unreaped()) signalLeaderOnly('SIGKILL');
     };
-    handlers.push([signal, handler]);
-    process.on(signal, handler);
-  }
+    try {
+      const killer = spawn('taskkill', ['/pid', pidText, '/T', '/F'], {
+        stdio: 'ignore',
+        shell: false,
+        windowsHide: true,
+      });
+      killer.once('exit', killWrapper);
+      killer.once('error', () => {
+        undelivered += 1;
+        killWrapper();
+      });
+    } catch {
+      undelivered += 1;
+      killWrapper();
+    }
+  };
+
+  /**
+   * The end of the grace period: `SIGKILL` for a dev server still unreaped,
+   * then a bounded wait to see it go.
+   *
+   * @returns {void}
+   */
+  const escalate = () => {
+    graceTimer = undefined;
+    if (!unreaped()) return;
+    writeLine(
+      stdout,
+      `dev-instrumented: the dev server is still running ${inSeconds(stopGraceMs)} after ${stop?.signal ?? 'the signal'}; sending SIGKILL (${target})`,
+    );
+    if (windows) killWindowsTree();
+    else signalUnreaped('SIGKILL');
+    confirmTimer = setTimeout(() => {
+      confirmTimer = undefined;
+      if (unreaped()) abandonWait();
+    }, killConfirmMs);
+  };
+
+  /**
+   * A forwarded signal: to the group while the leader is unreaped, to a
+   * verified group after that; the first one also prints the stop line and
+   * starts the grace period.
+   *
+   * @param {NodeJS.Signals} signal
+   * @returns {void}
+   */
+  const onSignal = (signal) => {
+    // The spawn failed: its 'error' ends the run, and there is nothing to stop.
+    if (pid === undefined) return;
+    if (unreaped()) signalUnreaped(signal);
+    else group?.signalExited(signal);
+    if (stop !== undefined) return;
+    stop = { signal, at: Date.now() };
+    writeLine(stdout, `dev-instrumented: ${signal} received; stopping the dev server (${target})`);
+    if (unreaped()) graceTimer = setTimeout(escalate, stopGraceMs);
+  };
 
   /** @returns {void} */
-  const removeHandlers = () => {
-    for (const [signal, handler] of handlers) process.off(signal, handler);
+  const clearTimers = () => {
+    clearTimeout(graceTimer);
+    clearTimeout(confirmTimer);
+    graceTimer = undefined;
+    confirmTimer = undefined;
+  };
+
+  /** @type {Array<[NodeJS.Signals, () => void]>} */
+  const handlers = FORWARDED_SIGNALS.map((signal) => [signal, () => onSignal(signal)]);
+  for (const [signal, handler] of handlers) process.on(signal, handler);
+
+  /** @returns {string} */
+  const undeliveredNote = () =>
+    undelivered === 0
+      ? ''
+      : ` (${String(undelivered)} ${undelivered === 1 ? 'signal' : 'signals'} could not be delivered)`;
+
+  /**
+   * Wait until the group holds nothing, or `deadline` passes; the last
+   * reading either way.
+   *
+   * @param {ProcessGroupTracker} tracker
+   * @param {number} deadline epoch milliseconds
+   * @returns {Promise<GroupReading>}
+   */
+  const awaitEmptyGroup = async (tracker, deadline) => {
+    let reading = tracker.read();
+    while (reading.verdict !== 'gone' && Date.now() < deadline) {
+      const wait = Math.max(1, Math.min(GROUP_POLL_INTERVAL_MS, deadline - Date.now()));
+      await new Promise((resolve) => setTimeout(resolve, wait));
+      reading = tracker.read();
+    }
+    return reading;
+  };
+
+  /**
+   * After the leader's exit: wait for what it left in its group, or end it,
+   * then say how the stop ended.
+   *
+   * @param {ProcessGroupTracker} tracker
+   * @param {number} pgid
+   * @returns {Promise<void>}
+   */
+  const settleGroup = async (tracker, pgid) => {
+    const groupId = String(pgid);
+    let reading = tracker.read();
+    let leftovers = false;
+    if (reading.verdict !== 'gone') {
+      let deadline = stop === undefined ? Date.now() + stopGraceMs : stop.at + stopGraceMs;
+      if (stop === undefined && reading.verdict === 'verified') {
+        // The dev server exited on its own, and left processes behind.
+        leftovers = true;
+        writeLine(
+          stdout,
+          `dev-instrumented: the dev server exited and left ${processCount(reading.count)} running in its process group ${groupId}; sending SIGTERM`,
+        );
+        if (!tracker.signalExited('SIGTERM')) undelivered += 1;
+        deadline = Date.now() + stopGraceMs;
+      }
+      reading = await awaitEmptyGroup(tracker, deadline);
+      if (reading.verdict === 'verified') {
+        writeLine(
+          stdout,
+          `dev-instrumented: ${processCount(reading.count)} of the dev server still running ${inSeconds(stopGraceMs)} after the signal; sending SIGKILL (process group ${groupId})`,
+        );
+        if (!tracker.signalExited('SIGKILL')) undelivered += 1;
+        reading = await awaitEmptyGroup(tracker, Date.now() + killConfirmMs);
+      }
+    }
+
+    const them = reading.count === 1 ? 'it' : 'them';
+    const stopCommands = [
+      `  Stop ${them} with: kill -TERM -${groupId}`,
+      `  and, if ${reading.count === 1 ? 'it does' : 'they do'} not exit, with: kill -KILL -${groupId}`,
+    ];
+    if (reading.verdict === 'gone') {
+      // A signal may also have arrived while this ran: `stop` is read now.
+      if (leftovers || stop !== undefined) writeLine(stdout, DEV_SERVER_STOPPED);
+    } else if (reading.verdict === 'verified') {
+      writeLine(
+        stderr,
+        [
+          `dev-instrumented: warning: ${processCount(reading.count)} of the dev server ${reading.count === 1 ? 'is' : 'are'} still running in its process group ${groupId} after SIGKILL${undeliveredNote()}.`,
+          ...stopCommands,
+        ].join('\n'),
+      );
+    } else {
+      writeLine(
+        stderr,
+        [
+          `dev-instrumented: warning: the dev server exited, but its process group ${groupId} still has ${reading.count === 0 ? 'processes' : processCount(reading.count)} running that this command could not verify as the dev server's, so it did not signal them.`,
+          `  List them with: ps -eo pid,pgid,args | awk '$2 == ${groupId}'`,
+          ...stopCommands,
+        ].join('\n'),
+      );
+    }
   };
 
   try {
-    return await new Promise((resolve, reject) => {
-      child.once('error', (error) => {
+    /** @type {{ code: number | null, signal: NodeJS.Signals | null } | undefined} */
+    const exit = await new Promise((resolve, reject) => {
+      child.on('error', (error) => {
+        if (pid !== undefined) {
+          // Once the child exists, only a signal can fail this way
+          // (`child.kill` reports EPERM as an 'error'): counted, and the
+          // ladder goes on.
+          undelivered += 1;
+          return;
+        }
         const missing = isErrnoCode(error, 'ENOENT');
         reject(
           new DevInstrumentedError(
@@ -3711,11 +4425,39 @@ export async function runDevServer(command, childEnv) {
         );
       });
       child.once('exit', (code, signal) => {
-        resolve(childExitCode(code, signal));
+        // The step that reaped the leader: its group id is still provably
+        // the dev server's (see trackProcessGroup), so what is left in it now
+        // is pinned before anything else runs.
+        group?.pin();
+        resolve({ code, signal });
       });
+      abandonWait = () => resolve(undefined);
     });
+    clearTimers();
+
+    if (exit === undefined) {
+      // Not even SIGKILL ended it. Unreferenced, so the credential release
+      // and this command's own exit do not wait for a process that may never
+      // go.
+      child.unref();
+      writeLine(
+        stderr,
+        [
+          `dev-instrumented: warning: the dev server (pid ${pidText}) had not exited ${inSeconds(killConfirmMs)} after SIGKILL and may still be running${undeliveredNote()}.`,
+          windows
+            ? `  Stop it with: taskkill /pid ${pidText} /T /F`
+            : `  Stop it with: kill -KILL -${pidText}`,
+        ].join('\n'),
+      );
+      return EXIT_NOT_STOPPED;
+    }
+
+    if (group !== undefined && pid !== undefined) await settleGroup(group, pid);
+    else if (stop !== undefined) writeLine(stdout, DEV_SERVER_STOPPED);
+    return childExitCode(exit.code, exit.signal);
   } finally {
-    removeHandlers();
+    clearTimers();
+    for (const [signal, handler] of handlers) process.off(signal, handler);
   }
 }
 
@@ -4047,10 +4789,15 @@ function reportFailure(error, stderr = process.stderr) {
  * @property {NodeJS.ProcessEnv} [env] environment to read and to inherit into a
  *   `--spawn-local` child
  * @property {import('node:stream').Writable} [stdout] stream the banner, the
- *   launch report, the usage text and a credential release's outcome line are
+ *   launch report, the usage text, a credential release's outcome line and
+ *   the `--spawn-local` stop lines are written to
+ * @property {import('node:stream').Writable} [stderr] stream failures, hints,
+ *   a credential release's warning and a `--spawn-local` stop's warning are
  *   written to
- * @property {import('node:stream').Writable} [stderr] stream failures, hints
- *   and a credential release's warning are written to
+ * @property {DevServerStopOptions} [devServerStop] how `--spawn-local` stops
+ *   its dev server — grace period, kill confirmation, the signal sender and
+ *   whether `/proc` is read ({@link runDevServer}); production values by
+ *   default
  */
 
 /**
@@ -4141,10 +4888,11 @@ export async function main(argv = process.argv.slice(2), context = {}) {
         });
 
       // From here on the credential exists, so every way out of this block —
-      // the child's own exit, an exit a forwarded SIGINT/SIGTERM caused, a
-      // spawn that failed (ENOENT) — releases it before this command returns.
-      // The release never changes what is returned or thrown: the child's
-      // status stays the exit code, and a spawn failure is still reported.
+      // the child's own exit, an exit a signal forwarded to its process group
+      // caused, a dev server not even SIGKILL ended, a spawn that failed
+      // (ENOENT) — releases it before this command returns. The release never
+      // changes what is returned or thrown: the child's status stays the exit
+      // code, and a spawn failure is still reported.
       try {
         writeLine(
           stdout,
@@ -4160,7 +4908,11 @@ export async function main(argv = process.argv.slice(2), context = {}) {
           }),
         );
 
-        return await runDevServer(command, childEnv);
+        return await runDevServer(command, childEnv, {
+          ...context.devServerStop,
+          stdout,
+          stderr,
+        });
       } finally {
         await releaseAfterUse({ base: serviceBase, editorToken, token, stdout, stderr });
       }

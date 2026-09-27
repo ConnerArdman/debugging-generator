@@ -15,9 +15,13 @@
  *
  * 1. **The query is derived once, in one memoised place.** It starts as the
  *    node's own {@link DataQuery}, takes the reader's sort when they have
- *    expressed one, and has its page size clamped to the bounds the schema
- *    publishes ({@link DATA_QUERY_DEFAULT_LIMIT}, {@link DATA_QUERY_MAX_LIMIT},
- *    {@link DATA_QUERY_DEFAULT_OFFSET}). Nothing else constructs a query.
+ *    expressed one — and, where neither the reader nor the node names one,
+ *    this table's own opening order ({@link OPENING_SORT}, longest first),
+ *    requested explicitly so the order on screen is the one the query asked
+ *    for and the header can say so — and has its page size clamped to the
+ *    bounds the schema publishes ({@link DATA_QUERY_DEFAULT_LIMIT},
+ *    {@link DATA_QUERY_MAX_LIMIT}, {@link DATA_QUERY_DEFAULT_OFFSET}). Nothing
+ *    else constructs a query.
  * 2. **An order the service can apply is a re-query, never an array
  *    operation.** The service applied `filter`, `sort`, `limit` and `offset`
  *    before these rows existed (`docs/ARCHITECTURE.md`, "Panel data"), so
@@ -99,7 +103,9 @@
  *   `../styles/components.css` already implements for this block:
  *
  *     dg-span-table                the block — a column that may shrink
- *     dg-span-table__name-cell     the identity text: monospace, truncating
+ *     dg-span-table__name-cell     the identity text: monospace, truncating,
+ *                                  and the trigger of the tooltip that holds
+ *                                  the whole name
  *     dg-span-table__kind-cell     the kind chip box
  *     dg-span-table__tier-cell     the tier chip box
  *     dg-span-table__duration-cell tabular figures on the duration
@@ -127,12 +133,14 @@
  *   its own — the primitive's measurement fallback is what makes these rows
  *   render in a test environment that measures nothing.
  * - **No Tab stop inside a row.** The grid is one Tab stop, its active row;
- *   ArrowRight (or F2) moves into that row's controls and ArrowLeft or Escape
- *   returns, while ArrowUp/Down, Home/End and PageUp/PageDown move between
- *   rows and Enter or Space selects one. The one obligation that model places
- *   on a caller is met here: the only focusable control a cell renders — the
- *   source chip — carries `tabIndex={-1}`, so it is reached by those keys and
- *   by the pointer, never by Tab.
+ *   ArrowRight (or F2, or Tab) moves into that row's controls and ArrowLeft or
+ *   Escape returns, while ArrowUp/Down, Home/End and PageUp/PageDown move
+ *   between rows and Enter or Space selects one. The one obligation that model
+ *   places on a caller is met here: the two focusable elements a cell renders
+ *   — the operation name, whose focus opens the tooltip holding the whole of
+ *   an ellipsized name, and the source chip — carry `tabIndex={-1}`, so they
+ *   are reached by the grid's keys and by the pointer, never as Tab stops of
+ *   the document.
  *
  * ## Which fields it may read
  *
@@ -181,6 +189,7 @@ import { EmptyState } from '../primitives/EmptyState';
 import { ErrorState } from '../primitives/ErrorState';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
+import { Tooltip } from '../primitives/Tooltip';
 import { kindColorVar, tierColorVar } from '../utils/color';
 import {
   ELLIPSIS,
@@ -504,18 +513,35 @@ function sortReportFor(order: SpanOrder): string {
 }
 
 /**
+ * The order this table opens in when neither the node nor the reader names
+ * one: longest duration first, the ranking a "Slowest Operations" view exists
+ * to present.
+ *
+ * Requested explicitly rather than left to the service's per-source default,
+ * for two reasons. The order on screen is then guaranteed by the query this
+ * table sent, not by a default it would have to mirror (and could silently
+ * disagree with — the `events` source defaults to start order). And the header
+ * can state it: the Duration header reports `aria-sort="descending"` from the
+ * first paint, so the first activation of that header flips to shortest first
+ * instead of announcing an order that was already on screen.
+ */
+const OPENING_SORT: DataQuerySort = 'duration_desc';
+
+/**
  * The ordering a data query can actually be given, rendered as the table's own
  * sort state so the header shows the order that was applied rather than one the
  * service was never asked for.
  *
  * `count_desc` is a grouped-source ordering: a span list has no count, so a node
  * carrying it is drawn in the order the service returned and no column claims an
- * ordering. Same for a query with no `sort` at all.
+ * ordering. A query this table builds always carries a sort — the node's, the
+ * reader's, or {@link OPENING_SORT} — so no column is left unsorted merely
+ * because nothing was authored.
  *
- * @param sort The ordering the effective query carries, if any.
+ * @param sort The ordering the effective query carries.
  * @returns The column and direction to show as sorted, or `null` for none.
  */
-function displaySortFor(sort: DataQuerySort | undefined): SpanOrder | null {
+function displaySortFor(sort: DataQuerySort): SpanOrder | null {
   if (sort === 'duration_desc') {
     return { key: DURATION_COLUMN_KEY, direction: 'desc' };
   }
@@ -695,7 +721,12 @@ const DURATION_HEADER = 'Duration';
 /** Names the sort control of a column whose values are relative, not absolute. */
 const START_HEADER_LABEL = 'Start, relative to the earliest listed operation';
 
-const EMPTY_MESSAGE = 'No spans matched this query.';
+/**
+ * The empty capture's sentence, in the words every other view's empty capture
+ * uses ("… were captured for this interaction"), so the panel names what is
+ * absent the same way wherever it is absent.
+ */
+const EMPTY_MESSAGE = 'No spans were captured for this interaction.';
 const EMPTY_TITLE = 'No spans';
 const COUNT_ONLY_TITLE = 'Count only';
 const COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE =
@@ -831,9 +862,18 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
       defaultSortDirection: 'asc',
       cell: (event) => (
         <>
-          <Text as="span" size="sm" truncate className="dg-span-table__name-cell">
-            {event.name}
-          </Text>
+          {/* The name ellipsizes inside its column, so the whole of it is a
+              tooltip away for a pointer and for the keyboard alike: the text is
+              the trigger and takes focus as `tabIndex={-1}` - reached by the
+              grid's own keys, never a Tab stop of the document - and focus
+              opens the bubble. The bubble repeats the text the trigger already
+              reads out, so it describes nothing (`describesTrigger={false}`)
+              and a screen reader hears the name once. */}
+          <Tooltip content={event.name} describesTrigger={false}>
+            <Text as="span" size="sm" truncate className="dg-span-table__name-cell" tabIndex={-1}>
+              {event.name}
+            </Text>
+          </Tooltip>
           {showStatus && event.status === 'error' ? (
             <Badge tone="danger" variant="soft">
               {formatStatusLabel(event.status)}
@@ -1092,7 +1132,7 @@ const NOTHING_CAPTURED_COPY: EmptyPageCopy = Object.freeze({
  *    "Load more" control that reaches it.
  * 3. **Nothing matched** — the total is zero, or no total was reported for a
  *    page starting at the first item. The only case that reads as an empty
- *    capture, and the product's original sentence.
+ *    capture, in the panel's shared empty-capture sentence ({@link EMPTY_MESSAGE}).
  * 4. **Past the end** — the page starts at or beyond the total.
  * 5. **Matched, not on this page** — the total counts rows at or after this
  *    page's position, none arrived, and the service named no further page. The
@@ -1343,7 +1383,8 @@ export function SpanTable(props: SpanTableProps): ReactElement {
   const { selection, markSelected } = useViewSelection();
 
   // The ordering the reader asked for, which overrides the node's own. Undefined
-  // until they ask, so a panel's authored ordering is what they first see.
+  // until they ask, so a panel's authored ordering — or, where it names none,
+  // this table's opening order — is what they first see.
   const [sortOverride, setSortOverride] = useState<DataQuerySort | undefined>(undefined);
   // The order the reader asked for that the service cannot apply, arranged over
   // the loaded rows here; `null` while the rows are shown in the service's
@@ -1355,7 +1396,9 @@ export function SpanTable(props: SpanTableProps): ReactElement {
   const identity = nodeId ?? node.id;
   const source = spanSourceOf(node.query.source);
   const filter = node.query.filter;
-  const appliedSort = sortOverride ?? node.query.sort;
+  // Always an ordering: the reader's, the node's, or the table's opening one,
+  // so the query states the order the rows arrive in and the header reports it.
+  const appliedSort: DataQuerySort = sortOverride ?? node.query.sort ?? OPENING_SORT;
   const limit = clampLimit(node.query.limit);
   const baseOffset = clampOffset(node.query.offset);
 
@@ -1391,9 +1434,10 @@ export function SpanTable(props: SpanTableProps): ReactElement {
   const offset = activePages?.offset ?? baseOffset;
 
   // The one place a query is constructed. `exactOptionalPropertyTypes` is in
-  // force, so an absent filter or ordering is an absent member rather than a
-  // member set to `undefined` - which also keeps the serialised identity above
-  // and the hook's own request key in agreement.
+  // force, so an absent filter is an absent member rather than a member set to
+  // `undefined` - which also keeps the serialised identity above and the hook's
+  // own request key in agreement. The ordering is never absent (see
+  // `appliedSort`).
   const query = useMemo<SpanQuery | undefined>(() => {
     if (source === undefined) {
       return undefined;
@@ -1404,7 +1448,7 @@ export function SpanTable(props: SpanTableProps): ReactElement {
       limit,
       offset,
       ...(filter === undefined ? {} : { filter }),
-      ...(appliedSort === undefined ? {} : { sort: appliedSort }),
+      sort: appliedSort,
     };
   }, [source, limit, offset, filter, appliedSort]);
 

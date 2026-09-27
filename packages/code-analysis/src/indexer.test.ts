@@ -22,10 +22,13 @@
  *
  * A hit must return the index a build would have produced and must cost no
  * program: that is asserted through the public cache interface rather than by
- * inspecting entry files. A changed file must miss. An entry an earlier
- * indexer or an earlier vocabulary wrote must be ignored. A cache that cannot
- * be written to must not fail an index, because failing to cache an index is
- * not failing to build one.
+ * inspecting entry contents. A file whose bytes changed must miss; a file whose
+ * metadata moved while its bytes did not — the product's own patch followed by
+ * its byte-for-byte restore — must still hit. A project keeps one entry file
+ * however many states it passes through. An entry an earlier indexer or an
+ * earlier vocabulary wrote must be ignored. A cache that cannot be written to
+ * must not fail an index, because failing to cache an index is not failing to
+ * build one.
  *
  * ## 3. Degradation — a partial graph beats a failed stage
  *
@@ -82,9 +85,14 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   unlinkSync,
+  utimesSync,
+  writeFileSync,
 } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -100,7 +108,8 @@ import {
 } from '@debuggen/shared';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { computeIndexCacheKey, createIndexCache } from './cache.js';
+import { createIndexCache } from './cache.js';
+import type { IndexCacheKeyInput } from './cache.js';
 import { CodeGraph } from './graph/graph.js';
 import { CODE_INDEX_SCHEMA_VERSION } from './graph/types.js';
 import {
@@ -291,24 +300,29 @@ function canonicalJson(index: CodeIndex): string {
 }
 
 /**
- * The cache key `indexProject` will compute for a project indexed with the
- * default extractors.
+ * The cache key input `indexProject` will look up for a project indexed with
+ * the default extractors.
  *
  * Derived through the same public functions the module uses — the project's own
  * normalised root and configuration, {@link INDEXER_VERSION}, the extractor
  * identities in run order and {@link computeFileFingerprints} — so a case can
  * plant an entry the module will actually look for. Every cache case that
- * plants one also proves the key agreed, by indexing once more and expecting
+ * plants one also proves the input agreed, by indexing once more and expecting
  * the hit.
  */
-async function cacheKeyFor(loaded: LoadedProject): Promise<string> {
-  return computeIndexCacheKey({
+async function cacheKeyInputFor(loaded: LoadedProject): Promise<IndexCacheKeyInput> {
+  return {
     projectRoot: loaded.projectRoot,
     tsConfigFilePath: loaded.tsConfigFilePath,
     indexerVersion: INDEXER_VERSION,
     extractors: DEFAULT_EXTRACTORS.map((extractor) => extractor.id),
     files: await computeFileFingerprints(loaded),
-  });
+  };
+}
+
+/** The entry files in a cache directory: what "one entry per project" is asserted against. */
+function entryFilesIn(cacheDir: string): readonly string[] {
+  return readdirSync(cacheDir).filter((name) => name.endsWith('.json'));
 }
 
 /** The diagnostics of one code, in the order they were reported. */
@@ -1192,14 +1206,15 @@ describe('the cache contract', () => {
     async () => {
       const sandbox = makeSandbox('debuggen-indexer-invalidate-');
       const root = copyCorpusInto(sandbox, 'project');
-      const cache = createIndexCache({ cacheDir: join(sandbox, 'index') });
+      const cacheDir = join(sandbox, 'index');
+      const cache = createIndexCache({ cacheDir });
 
       expect((await indexOrThrow({ projectRoot: root, cache })).fromCache).toBe(false);
       expect((await indexOrThrow({ projectRoot: root, cache })).fromCache).toBe(true);
 
-      // One file's size and modification time change, so its fingerprint
-      // changes, so the key changes: a single edited file is a full rebuild, by
-      // design rather than by omission.
+      // One file's bytes change — and with them its size and modification
+      // time — so the recorded digest no longer describes it: a single edited
+      // file is a full rebuild, by design rather than by omission.
       await appendFile(
         join(root, SERVICE_MODULE),
         '\nexport async function countBasinGauges(): Promise<number> {\n  return 0;\n}\n',
@@ -1211,8 +1226,93 @@ describe('the cache contract', () => {
         'countBasinGauges',
       );
 
-      // And the rebuilt index is what the next run is served.
+      // And the rebuilt index is what the next run is served — from the same
+      // entry file, which the rebuild overwrote rather than joined.
       expect((await indexOrThrow({ projectRoot: root, cache })).fromCache).toBe(true);
+      expect(entryFilesIn(cacheDir)).toHaveLength(1);
+    },
+    INDEX_TIMEOUT_MS,
+  );
+
+  it(
+    'serves a project whose file was patched and then restored byte for byte',
+    async () => {
+      // The product's own reversible edit, end to end at the indexer's level:
+      // a session indexes the project, instrumentation rewrites a file, cleanup
+      // restores the original bytes — under a new modification time and a new
+      // change time, because the restore is a write. The next session must be
+      // served from the cache instead of paying for a full rebuild.
+      const sandbox = makeSandbox('debuggen-indexer-restore-');
+      const root = copyCorpusInto(sandbox, 'project');
+      const cacheDir = join(sandbox, 'index');
+      const cache = createIndexCache({ cacheDir });
+      const target = join(root, SERVICE_MODULE);
+      const original = readFileSync(target);
+
+      const built = await indexOrThrow({ projectRoot: root, cache });
+      expect(built.fromCache).toBe(false);
+      const before = statSync(target);
+
+      // Patch, then restore. Both writes happen while nothing indexes the
+      // tree, which is the order a session follows: the index is loaded when
+      // the session starts, before any file is patched.
+      writeFileSync(target, `${original.toString('utf8')}\n// instrumented\n`);
+      writeFileSync(target, original);
+      // Pinned a whole second later, so the restored file's metadata provably
+      // differs from what the entry recorded whatever the filesystem's
+      // timestamp granularity.
+      const restoredAt = Math.ceil(before.mtimeMs / 1000) + 1;
+      utimesSync(target, restoredAt, restoredAt);
+      const after = statSync(target);
+      expect(after.mtimeMs).not.toBe(before.mtimeMs);
+      expect(readFileSync(target).equals(original)).toBe(true);
+
+      const served = await indexOrThrow({ projectRoot: root, cache });
+      expect(served.fromCache).toBe(true);
+      expect(served.stats.extractorDurations).toEqual({});
+      // The same graph as the build — and the fingerprints of the tree as it
+      // is now, which is what a rebuild of it would have recorded.
+      expect(served.graph.size).toEqual(built.graph.size);
+      expect(served.index.nodes).toEqual(built.index.nodes);
+      expect(served.index.edges).toEqual(built.index.edges);
+      const restored = served.index.files.find((file) => file.file === SERVICE_MODULE);
+      expect(restored?.mtimeMs).toBe(after.mtimeMs);
+
+      // The entry was refreshed, so the run after that is a hit on the
+      // stat-only path, and the project still has exactly one entry file.
+      const again = await indexOrThrow({ projectRoot: root, cache });
+      expect(again.fromCache).toBe(true);
+      expect(again.index.files).toEqual(served.index.files);
+      expect(entryFilesIn(cacheDir)).toHaveLength(1);
+    },
+    INDEX_TIMEOUT_MS,
+  );
+
+  it(
+    'keeps one entry file when the patched tree is indexed in between',
+    async () => {
+      // The less common order: something indexes the project while a patch is
+      // in place. That state differs in content, so it is a rebuild, and so is
+      // the restored state after it — but each rebuild overwrites the
+      // project's one entry, so the directory never grows.
+      const sandbox = makeSandbox('debuggen-indexer-overwrite-');
+      const root = copyCorpusInto(sandbox, 'project');
+      const cacheDir = join(sandbox, 'index');
+      const cache = createIndexCache({ cacheDir });
+      const target = join(root, SERVICE_MODULE);
+      const original = readFileSync(target);
+
+      expect((await indexOrThrow({ projectRoot: root, cache })).fromCache).toBe(false);
+      expect(entryFilesIn(cacheDir)).toHaveLength(1);
+
+      writeFileSync(target, `${original.toString('utf8')}\n// instrumented\n`);
+      expect((await indexOrThrow({ projectRoot: root, cache })).fromCache).toBe(false);
+      expect(entryFilesIn(cacheDir)).toHaveLength(1);
+
+      writeFileSync(target, original);
+      expect((await indexOrThrow({ projectRoot: root, cache })).fromCache).toBe(false);
+      expect((await indexOrThrow({ projectRoot: root, cache })).fromCache).toBe(true);
+      expect(entryFilesIn(cacheDir)).toHaveLength(1);
     },
     INDEX_TIMEOUT_MS,
   );
@@ -1271,9 +1371,9 @@ describe('the cache contract', () => {
       const cacheDir = join(makeSandbox('debuggen-indexer-stale-version-'), 'index');
       const cache = createIndexCache({ cacheDir });
       const loaded = openOrThrow(FIXTURE_ROOT);
-      const key = await cacheKeyFor(loaded);
+      const keyInput = await cacheKeyInputFor(loaded);
 
-      const planted = await cache.save(key, {
+      const planted = await cache.save(keyInput, {
         ...baseline().index,
         indexerVersion: 'indexer/0.0.0-earlier',
       });
@@ -1283,9 +1383,9 @@ describe('the cache contract', () => {
       expect(run.fromCache).toBe(false);
       expect(run.index.indexerVersion).toBe(INDEXER_VERSION);
 
-      // The entry really was under the key the module looks for: the rebuild
-      // wrote its own index there, and the next run is served from it. Without
-      // this step the case would also pass against a key that never matched.
+      // The entry really was the one the module looks for: the rebuild wrote
+      // its own index over it, and the next run is served from it. Without this
+      // step the case would also pass against an input that never matched.
       expect((await indexOrThrow({ projectRoot: FIXTURE_ROOT, cache })).fromCache).toBe(true);
     },
     INDEX_TIMEOUT_MS,
@@ -1297,9 +1397,9 @@ describe('the cache contract', () => {
       const cacheDir = join(makeSandbox('debuggen-indexer-stale-schema-'), 'index');
       const cache = createIndexCache({ cacheDir });
       const loaded = openOrThrow(FIXTURE_ROOT);
-      const key = await cacheKeyFor(loaded);
+      const keyInput = await cacheKeyInputFor(loaded);
 
-      const planted = await cache.save(key, {
+      const planted = await cache.save(keyInput, {
         ...baseline().index,
         schemaVersion: CODE_INDEX_SCHEMA_VERSION + 1,
       });

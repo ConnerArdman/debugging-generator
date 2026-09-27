@@ -85,6 +85,7 @@ import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
   DATA_QUERY_MAX_LIMIT,
+  PANEL_SPEC_VERSION,
 } from '@debuggen/panel-schema';
 import type { DataQuery, DataQuerySort, QueryTableNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
@@ -100,6 +101,7 @@ import { DataProviderContext, PanelSessionContext, createDataProvider } from '..
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { PanelHost } from '../host/PanelHost';
 import { DATA_TABLE_COLUMN_TRACKS } from '../primitives/DataTable';
 import type { DataTableColumnWidth } from '../primitives/DataTable';
 import { FOCUS_KEY_ATTRIBUTE } from '../primitives/ErrorState';
@@ -2191,6 +2193,280 @@ describe('QueryTable ordering', () => {
   });
 });
 
+/**
+ * A provider that answers the first call with `first` and holds every later
+ * call until the test releases it with the page to answer.
+ */
+interface HeldReorderProvider extends StubProvider {
+  /** Settles every held call with this page. */
+  readonly release: (page: QueryPage) => void;
+}
+
+/**
+ * Builds a {@link HeldReorderProvider}: the re-query an ordering causes stays in
+ * flight for as long as the test needs to look at the view while it is.
+ *
+ * @param first The page the first call resolves with.
+ * @returns The stub, with its release.
+ */
+function heldReorderProvider(first: QueryPage): HeldReorderProvider {
+  let settle: ((page: QueryPage) => void) | undefined;
+  const held = new Promise<QueryPage>((resolve) => {
+    settle = resolve;
+  });
+
+  const stub = recordingProvider((_query, call) =>
+    (call === 1 ? Promise.resolve(first) : held).then((page): DataQueryResponse => ({
+      source: 'queries',
+      data: page.data,
+      ...(page.total === undefined ? {} : { total: page.total }),
+      ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+    })),
+  );
+
+  return {
+    ...stub,
+    release: (page) => {
+      if (settle === undefined) {
+        throw new Error('the held page promise was never constructed');
+      }
+
+      settle(page);
+    },
+  };
+}
+
+describe('QueryTable focus through a re-query', () => {
+  it('keeps the Order by select, and the grid, the same focused elements while the chosen order is fetched', async () => {
+    const stub = heldReorderProvider({ data: PROVIDER_ORDER });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    const toolbar = screen.getByRole('group', { name: TOOLBAR_NAME });
+    const order = screen.getByRole('combobox', { name: ORDER_CONTROL_NAME });
+
+    act(() => {
+      order.focus();
+    });
+    await user.selectOptions(order, MOST_EXECUTIONS_FIRST);
+
+    // The ordering was asked for, and while it is in flight the rows of the old
+    // one are gone - they answer another question - but the toolbar, the select
+    // the reader used and the grid are the same elements, focus has not moved,
+    // and the loading state is drawn where the rows were.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).sort).toBe(MOST_EXECUTIONS_FIRST);
+    expect(dataRows()).toHaveLength(0);
+    expect(screen.getByRole('status', { busy: true }).textContent).toContain(LOADING_LABEL);
+    expect(screen.getByRole('group', { name: TOOLBAR_NAME })).toBe(toolbar);
+    expect(screen.getByRole('combobox', { name: ORDER_CONTROL_NAME })).toBe(order);
+    expect(screen.getByRole('grid')).toBe(grid);
+    expect(document.activeElement).toBe(order);
+    expect((order as HTMLSelectElement).value).toBe(MOST_EXECUTIONS_FIRST);
+    expect(ariaSortOf(EXECUTIONS_SORT_NAME)).toBe('descending');
+
+    act(() => {
+      stub.release({ data: [SECOND_GROUP, FIRST_GROUP] });
+    });
+
+    await waitFor(() => {
+      expect(collapsedStatements()).toEqual([
+        oneLinePreview(SECOND_GROUP.statement),
+        oneLinePreview(FIRST_GROUP.statement),
+      ]);
+    });
+    expect(document.activeElement).toBe(order);
+    expect(screen.getByRole('combobox', { name: ORDER_CONTROL_NAME })).toBe(order);
+  });
+
+  it('keeps an activated sortable header focused, and reporting its order, through the re-query', async () => {
+    const stub = heldReorderProvider({ data: PROVIDER_ORDER });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    const executions = screen.getByRole('button', { name: EXECUTIONS_SORT_NAME });
+
+    await user.click(executions);
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(dataRows()).toHaveLength(0);
+    expect(screen.getByRole('grid')).toBe(grid);
+    expect(executions.isConnected).toBe(true);
+    expect(document.activeElement).toBe(executions);
+    expect(ariaSortOf(EXECUTIONS_SORT_NAME)).toBe('descending');
+    expect(ariaSortOf(TOTAL_TIME_SORT_NAME)).toBe('none');
+
+    act(() => {
+      stub.release({ data: [SECOND_GROUP, FIRST_GROUP] });
+    });
+
+    await waitFor(() => {
+      expect(dataRows()).toHaveLength(2);
+    });
+    expect(document.activeElement).toBe(executions);
+  });
+
+  it('draws a failed re-query in the kept grid, with the select still in place', async () => {
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({ source: 'queries', data: PROVIDER_ORDER })
+        : Promise.reject(new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel is closed.')),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    const order = screen.getByRole('combobox', { name: ORDER_CONTROL_NAME });
+
+    await user.selectOptions(order, EARLIEST_FIRST);
+
+    // The view-scope failure contract, drawn where the rows were: the grid and
+    // the select the reader used stay, so choosing another order is still one
+    // step away, and the failure's Retry is the one keyed control.
+    const alert = await screen.findByRole('alert');
+
+    expect(within(alert).getByText(VIEW_FAILURE_TITLE)).toBeDefined();
+    expect(screen.getByRole('grid')).toBe(grid);
+    expect(screen.getByRole('combobox', { name: ORDER_CONTROL_NAME })).toBe(order);
+    expect(retryKeyed()).toEqual([within(alert).getByRole('button', { name: RETRY_NAME })]);
+  });
+});
+
+/**
+ * Every element in the document carrying the error state's retry focus key:
+ * the failure's own Retry while one is shown, and the control that takes over
+ * from it once a retry has succeeded.
+ *
+ * @returns The keyed elements, in document order.
+ */
+function retryKeyed(): HTMLElement[] {
+  return Array.from(
+    document.querySelectorAll<HTMLElement>(`[${FOCUS_KEY_ATTRIBUTE}="${RETRY_FOCUS_KEY}"]`),
+  );
+}
+
+describe('QueryTable retry successor', () => {
+  it('keys the first recovered row once a retried first page succeeds, and nothing before', async () => {
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.reject(new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel is closed.'))
+        : Promise.resolve<DataQueryResponse>({ source: 'queries', data: PROVIDER_ORDER }),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const alert = await screen.findByRole('alert');
+    const retry = within(alert).getByRole('button', { name: RETRY_NAME });
+
+    // While the view has failed, its Retry is the only keyed control.
+    expect(retryKeyed()).toEqual([retry]);
+
+    await user.click(retry);
+    await screen.findByRole('grid');
+
+    // Once it succeeded, the first recovered row's disclosure toggle carries the
+    // key - a named control, drawing the focus ring, outside the Tab order like
+    // every in-cell control - and nothing else does.
+    const toggle = within(dataRow(0)).getByRole('button', { name: EXPAND_ROW_NAME });
+
+    expect(retryKeyed()).toEqual([toggle]);
+    expect(toggle.getAttribute('tabindex')).toBe('-1');
+  });
+
+  it('keys the first row of a retried further page, never a row read before it', async () => {
+    const stub = recordingProvider((_query, call) => {
+      if (call === 2) {
+        return Promise.reject(
+          new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel is closed.'),
+        );
+      }
+
+      return Promise.resolve<DataQueryResponse>(
+        call === 1
+          ? { source: 'queries', data: [FIRST_GROUP], total: 2, nextOffset: 1 }
+          : { source: 'queries', data: [SECOND_GROUP], total: 2 },
+      );
+    });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The page failed below the row already read: only its own Retry is keyed,
+    // and the row above it carries nothing.
+    const pageRetry = await screen.findByRole('button', { name: RETRY_PAGE_NAME });
+
+    expect(retryKeyed()).toEqual([pageRetry]);
+
+    await user.click(pageRetry);
+
+    await waitFor(() => {
+      expect(dataRows()).toHaveLength(2);
+    });
+
+    // The row the retry brought takes over, not the first row of the table.
+    expect(retryKeyed()).toEqual([
+      within(dataRow(1)).getByRole('button', { name: expandRowName(SECOND_STATEMENT) }),
+    ]);
+  });
+
+  it.each([
+    { case: 'a titled node', title: 'Retried queries' },
+    { case: 'an untitled node', title: undefined },
+  ])(
+    'hands keyboard focus from Retry to the recovered rows under the panel host, for $case',
+    async ({ title }) => {
+      const stub = recordingProvider((_query, call) =>
+        call === 1
+          ? Promise.reject(new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel is closed.'))
+          : Promise.resolve<DataQueryResponse>({ source: 'queries', data: PROVIDER_ORDER }),
+      );
+      const user = userEvent.setup();
+      const node = makeNode(title === undefined ? {} : { title });
+
+      render(
+        <PanelHost
+          spec={{
+            version: PANEL_SPEC_VERSION,
+            id: 'panel-under-test',
+            sessionId: PANEL_SESSION_ID,
+            panelVersion: 1,
+            title: 'Panel under test',
+            summary: { observed: [], likelyCauses: [] },
+            layout: [node],
+          }}
+          dataProvider={stub.provider}
+          actions={makeActions().actions}
+        />,
+      );
+
+      const retry = await screen.findByRole('button', { name: RETRY_NAME });
+
+      act(() => {
+        retry.focus();
+      });
+      await user.keyboard('{Enter}');
+
+      // The Retry that held focus is gone; the node frame hands focus to the
+      // control that carries its key - the first recovered row's toggle -
+      // rather than parking it on the node's heading or its wrapper.
+      await waitFor(() => {
+        expect(document.activeElement).toBe(
+          within(dataRow(0)).getByRole('button', { name: EXPAND_ROW_NAME }),
+        );
+      });
+    },
+  );
+});
+
 describe('QueryTable paging', () => {
   it('says how much of the result is on screen and appends the next page', async () => {
     // `nextOffset` deliberately differs from the length of the page: the
@@ -3231,6 +3507,52 @@ function expectSingleTabStop(grid: HTMLElement, active: HTMLElement): void {
 }
 
 /**
+ * Presses Tab from the focused active row until focus leaves the grid, and
+ * asserts the path the grid's keyboard model gives it: every stop on the way is
+ * a distinct control of `row` itself - never of another row - and at least one
+ * is. Bounded by the number of focusable elements in the grid, so a model that
+ * cycled would fail here rather than hang.
+ *
+ * @param user The user-event instance driving the keyboard.
+ * @param grid The grid element.
+ * @param row The data row focus entered on.
+ * @returns The controls walked, in order.
+ */
+async function tabAcrossRow(
+  user: ReturnType<typeof userEvent.setup>,
+  grid: HTMLElement,
+  row: HTMLElement,
+): Promise<Element[]> {
+  expect(document.activeElement).toBe(row);
+
+  const walked: Element[] = [];
+  const bound = grid.querySelectorAll(FOCUSABLE_SELECTOR).length + 1;
+
+  for (let press = 0; press < bound; press += 1) {
+    await user.tab();
+
+    const focused = document.activeElement;
+
+    if (focused === null || !grid.contains(focused)) {
+      break;
+    }
+
+    walked.push(focused);
+  }
+
+  expect(walked.length).toBeGreaterThan(0);
+  expect(new Set(walked).size).toBe(walked.length);
+
+  for (const element of walked) {
+    expect(row.contains(element)).toBe(true);
+  }
+
+  expect(grid.contains(document.activeElement)).toBe(false);
+
+  return walked;
+}
+
+/**
  * A group whose one carried execution resolved to source, so an open row also
  * renders that execution's own chip beside its selector and row-count trigger.
  */
@@ -3279,31 +3601,32 @@ describe('QueryTable grid keyboard model and names', () => {
     expectSingleTabStop(grid, dataRow(1));
   });
 
-  it('enters the grid on the active row with Tab and leaves it with the next Tab', async () => {
+  it("enters the grid on the active row with Tab, walks only that row's controls, and leaves", async () => {
     const stub = resolvingProvider(PROVIDER_ORDER, { total: 9, nextOffset: 2 });
     const user = userEvent.setup();
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    await screen.findByRole('grid');
+    const grid = await screen.findByRole('grid');
 
     const order = screen.getByRole('combobox', { name: ORDER_CONTROL_NAME });
     const loadMore = screen.getByRole('button', { name: LOAD_MORE_NAME });
 
-    // From the control before the grid, one Tab lands on the active row, and the
-    // next leaves for the control after it: no chip, count or toggle in between.
+    // From the control before the grid, one Tab lands on the active row; the
+    // Tabs after it walk that row's own controls, its disclosure toggle among
+    // them, and the Tab after the last leaves for the control after the grid.
     act(() => {
       order.focus();
     });
     await user.tab();
 
-    expect(document.activeElement).toBe(dataRow(0));
+    const firstWalk = await tabAcrossRow(user, grid, dataRow(0));
 
-    await user.tab();
-
+    expect(firstWalk).toContain(within(dataRow(0)).getByRole('button', { name: EXPAND_ROW_NAME }));
     expect(document.activeElement).toBe(loadMore);
 
-    // Shift+Tab walks the same single stop back.
+    // Shift+Tab from after the grid comes back to the row, the grid's one
+    // stop, and the next leaves the grid backwards.
     await user.tab({ shift: true });
 
     expect(document.activeElement).toBe(dataRow(0));
@@ -3312,13 +3635,15 @@ describe('QueryTable grid keyboard model and names', () => {
 
     expect(document.activeElement).toBe(order);
 
-    // The stop is where the reader left it: after moving down a row and leaving,
-    // Tab returns to that row rather than to the first.
+    // The stop is where the reader left it: after moving down a row, Tab walks
+    // THAT row's controls, and Shift+Tab from after the grid returns to it
+    // rather than to the first.
     act(() => {
       dataRow(0).focus();
     });
     await user.keyboard('{ArrowDown}');
-    await user.tab();
+
+    await tabAcrossRow(user, grid, dataRow(1));
 
     expect(document.activeElement).toBe(loadMore);
 

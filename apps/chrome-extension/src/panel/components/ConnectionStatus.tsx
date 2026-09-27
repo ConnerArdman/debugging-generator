@@ -21,6 +21,12 @@
  *                        then, when `onRequestAddressChange` is supplied, the same "Change
  *                        service address…" control.
  *
+ * Before any of those has been observed — the panel has just opened, and neither the worker nor a
+ * lost port has said anything yet — the composition root passes `pending`, and the pill reads a
+ * neutral "Connecting…" with no control beside it. The store's initial status is an assumption at
+ * that point, and rendering it would flash "Reconnecting…" (a connection that dropped) at a
+ * developer whose worker is about to report "Not paired" or "Connected".
+ *
  * The address control asks the composition root to open `PairDialog` in its address mode, so a
  * paired developer whose service moved to another port points the extension at it without
  * pairing again. It is offered only in the two states where the worker cannot reach the service:
@@ -175,6 +181,17 @@ const PAIR_COMMAND_TITLE = '“Pair Chrome DevTools Panel”';
  */
 const ADDRESS_CHANGE_HINT = `If the service now listens at another address, choose ${ADDRESS_ACTION_LABEL} to enter it; this panel keeps its pairing.`;
 
+/**
+ * The pill's label before the connection state has been observed. Not one of
+ * `PANEL_CONNECTION_LABELS`: it names no state of the worker's vocabulary, only
+ * that the panel is still waiting to hear which one holds, so it cannot be
+ * mistaken for "Reconnecting…" — a connection that was up and dropped.
+ */
+const PENDING_LABEL = 'Connecting…';
+
+/** The pending pill's tone: neutral, because nothing is known to be right or wrong yet. */
+const PENDING_TONE: BadgeTone = 'neutral';
+
 /** The message of the render-time guard for a status outside the imported vocabulary. */
 const UNHANDLED_STATUS_MESSAGE = 'Unhandled panel connection status';
 
@@ -213,6 +230,16 @@ const STATUS_TONE: Readonly<Record<PanelConnectionStatus, BadgeTone>> = Object.f
 export interface ConnectionStatusProps {
   /** The pill's state, as `../state/connection.ts` stored it from the worker's pushes. */
   status: PanelConnectionStatus;
+
+  /**
+   * Whether the connection state has not been observed yet
+   * (`!usePanelConnectionObserved()`): the panel has just opened and neither
+   * the worker nor a lost port has said anything. The pill then reads a
+   * neutral "Connecting…" and offers no control, whatever `status` holds —
+   * the store's initial status is an assumption until something reports it.
+   * Omitted or `false`, `status` is rendered.
+   */
+  pending?: boolean | undefined;
 
   /**
    * The inspected tab's binding. Only a `tab-left` binding renders anything — the
@@ -351,6 +378,18 @@ function describeStatus(
   }
 }
 
+/**
+ * The tooltip hint while the connection state has not been observed: what the
+ * panel is waiting for, and that nothing needs doing yet.
+ *
+ * @param serviceUrl The service base URL, when known and non-blank.
+ * @returns One plain sentence.
+ */
+function describePending(serviceUrl: string | undefined): string {
+  const service = serviceUrl === undefined ? SERVICE_NAME : `${SERVICE_NAME} at ${serviceUrl}`;
+  return `This panel is waiting for the extension to report its connection to ${service}; no action is needed.`;
+}
+
 /** `text` with its first character upper-cased, for a phrase that opens a sentence. */
 function capitalize(text: string): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
@@ -484,6 +523,7 @@ function renderAddressAction(
 export function ConnectionStatus(props: ConnectionStatusProps): ReactElement {
   const {
     status,
+    pending = false,
     binding,
     onRequestPairing,
     pairingDialogOpen,
@@ -501,15 +541,17 @@ export function ConnectionStatus(props: ConnectionStatusProps): ReactElement {
   const notice = bindingNotice(binding);
   const startCommand = visibleText(serviceStartCommand);
   const addressChange =
-    onRequestAddressChange !== undefined && offersAddressChange(status)
+    !pending && onRequestAddressChange !== undefined && offersAddressChange(status)
       ? onRequestAddressChange
       : undefined;
-  const hint = describeStatus(
-    status,
-    visibleText(serviceUrl),
-    startCommand !== undefined,
-    addressChange !== undefined,
-  );
+  const hint = pending
+    ? describePending(visibleText(serviceUrl))
+    : describeStatus(
+        status,
+        visibleText(serviceUrl),
+        startCommand !== undefined,
+        addressChange !== undefined,
+      );
 
   return (
     <Stack direction="horizontal" gap={2} align="center" wrap className={className}>
@@ -522,8 +564,12 @@ export function ConnectionStatus(props: ConnectionStatusProps): ReactElement {
           tabIndex={0}
         >
           <Stack direction="horizontal" gap={2} align="center" wrap>
-            <Badge id={pillLabelId} tone={STATUS_TONE[status]} variant="soft">
-              {PANEL_CONNECTION_LABELS[status]}
+            <Badge
+              id={pillLabelId}
+              tone={pending ? PENDING_TONE : STATUS_TONE[status]}
+              variant="soft"
+            >
+              {pending ? PENDING_LABEL : PANEL_CONNECTION_LABELS[status]}
             </Badge>
             {notice === undefined ? null : (
               <Text id={noticeId} size="sm" tone="warning">
@@ -533,7 +579,9 @@ export function ConnectionStatus(props: ConnectionStatusProps): ReactElement {
           </Stack>
         </div>
       </Tooltip>
-      {renderRecoveryAction(status, onRequestPairing, pairingDialogOpen, startCommand)}
+      {pending
+        ? null
+        : renderRecoveryAction(status, onRequestPairing, pairingDialogOpen, startCommand)}
       {/* Its own slot, after the recovery line whatever that renders, so the control keeps its
           place in the tree — and its focus — across "Reconnecting…" and "Service not running". */}
       {addressChange === undefined ? null : renderAddressAction(addressChange, addressDialogOpen)}

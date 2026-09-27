@@ -476,6 +476,43 @@ const RICH_EVENTS: readonly TelemetryEvent[] = Object.freeze([
   RICH_SHORT_INTERACTION,
 ]);
 
+const repeatEvent = eventFactory(2_000);
+
+/**
+ * The rich capture's request repeated on the short trace: the same request key,
+ * issued outside the interaction that the primary trace holds — the shape of
+ * requests an effect re-issues after renders rather than one interaction.
+ */
+const REPEAT_OUTSIDE_PRIMARY = repeatEvent({
+  kind: 'fetch',
+  traceId: TRACE_SHORT,
+  name: 'GET',
+  startOffsetMs: 605,
+  durationMs: 10,
+  attributes: requestAttributes('/v1/items?page=?', 'rk-items'),
+});
+
+/** A commit of the page after that repeat. */
+const REPEAT_COMMIT = repeatEvent({
+  kind: 'commit',
+  traceId: TRACE_SHORT,
+  name: 'commit',
+  startOffsetMs: 612,
+  durationMs: 2,
+});
+
+/** The rich capture plus a repeat of its request that the primary trace does not hold. */
+const REPEATED_EVENTS: readonly TelemetryEvent[] = Object.freeze([
+  ...RICH_EVENTS,
+  REPEAT_OUTSIDE_PRIMARY,
+  REPEAT_COMMIT,
+]);
+
+/** The rich capture with its duplicate request removed: no request group repeats. */
+const UNREPEATED_EVENTS: readonly TelemetryEvent[] = Object.freeze(
+  RICH_EVENTS.filter((event) => event !== RICH_REQUEST_B),
+);
+
 const leakEvent = eventFactory(1_000);
 
 /** The leak capture: every row that can carry captured text carries a sentinel. */
@@ -523,10 +560,10 @@ const LEAK_EVENTS: readonly TelemetryEvent[] = Object.freeze([
 
 /** Every event id and trace id the stub evidence port confirms. */
 const PLANTED_EVENT_IDS: ReadonlySet<string> = new Set(
-  [...RICH_EVENTS, ...LEAK_EVENTS].map((event) => event.id),
+  [...REPEATED_EVENTS, ...LEAK_EVENTS].map((event) => event.id),
 );
 const PLANTED_TRACE_IDS: ReadonlySet<string> = new Set(
-  [...RICH_EVENTS, ...LEAK_EVENTS].map((event) => event.traceId),
+  [...REPEATED_EVENTS, ...LEAK_EVENTS].map((event) => event.traceId),
 );
 
 /* -------------------------------------------------------------------------------------------------
@@ -1250,14 +1287,85 @@ describe('evidence-gated node selection', () => {
     expect(isTraceId(traceId)).toBe(true);
     expect(RICH_SUMMARY.traceIds).toContain(traceId);
 
-    const placeholder: CaptureSummary = { ...RICH_SUMMARY, primaryTraceId: '...' };
-    for (const summary of [withoutPrimaryTrace(RICH_SUMMARY), placeholder, EMPTY_SUMMARY]) {
+    // Without a real primary trace, no view is filtered to a trace. A capture
+    // that repeats no request then draws no timeline at all …
+    const unrepeated = makeCaptureSummary({ events: UNREPEATED_EVENTS });
+    expect(unrepeated.topRequests.some((group) => group.hasDuplicates)).toBe(false);
+    const placeholder: CaptureSummary = { ...unrepeated, primaryTraceId: '...' };
+    for (const summary of [withoutPrimaryTrace(unrepeated), placeholder, EMPTY_SUMMARY]) {
       const untraced = await built({ summary });
       expect(viewTypesOf(untraced)).not.toContain('timeline');
       for (const node of allNodes(untraced)) {
         expect(queryOf(node)?.filter?.traceId).toBeUndefined();
       }
     }
+    // … and one that repeats a request draws the flat requests-against-renders
+    // axis, since no trace can be shown to hold the repetition.
+    const repeatedPlaceholder: CaptureSummary = { ...RICH_SUMMARY, primaryTraceId: '...' };
+    for (const summary of [withoutPrimaryTrace(RICH_SUMMARY), repeatedPlaceholder]) {
+      const untraced = await built({ summary });
+      const flat = viewOfType(untraced, 'timeline');
+      expect(queryOf(flat)?.source).toBe('spans');
+      expect(queryOf(flat)?.sort).toBe('start_asc');
+      for (const node of allNodes(untraced)) {
+        expect(queryOf(node)?.filter?.traceId).toBeUndefined();
+      }
+    }
+  });
+
+  it('keeps the trace timeline when the primary trace holds every repeat of a request', () => {
+    // Both occurrences of the rich capture's duplicate ran inside the primary trace.
+    const group = RICH_SUMMARY.topRequests.find((candidate) => candidate.hasDuplicates);
+    expect(group?.occurrences.map((occurrence) => occurrence.traceId)).toEqual([
+      TRACE_MAIN,
+      TRACE_MAIN,
+    ]);
+    const timeline = selectFallbackNodes(RICH_SUMMARY).nodes.find(
+      (choice) => choice.type === 'timeline',
+    );
+    expect(timeline?.section).toBe('trace');
+    expect(timeline?.query).toEqual({ source: 'trace', filter: { traceId: TRACE_MAIN } });
+  });
+
+  it('plots repeated requests the primary trace does not hold against the renders, across the whole capture', async () => {
+    const summary = makeCaptureSummary({ events: REPEATED_EVENTS });
+    expect(summary.primaryTraceId).toBe(TRACE_MAIN);
+    const group = summary.topRequests.find((candidate) => candidate.hasDuplicates);
+    expect(group?.occurrences.map((occurrence) => occurrence.traceId)).toContain(TRACE_SHORT);
+
+    const selection = selectFallbackNodes(summary);
+    const timelines = selection.nodes.filter((choice) => choice.type === 'timeline');
+    expect(timelines).toHaveLength(1);
+    const timeline = nth(timelines, 0);
+    expect(timeline.section).toBe('requestTimeline');
+    // The request and commit kinds the capture holds, in start order, over
+    // every trace: no trace filter, and no kind the capture never recorded.
+    expect(timeline.query).toEqual({
+      source: 'spans',
+      filter: { kinds: ['fetch', 'commit'] },
+      sort: 'start_asc',
+    });
+
+    const spec = await built({ summary });
+    expect(validatePanelSpec(spec).ok).toBe(true);
+    expectCatalogConformance(spec);
+    const section = sectionsOf(spec).find((candidate) =>
+      candidate.children.some((child) => child.type === 'timeline'),
+    );
+    expect(section?.title).toBe(FALLBACK_SECTION_TITLES.requestTimeline);
+    expect(section?.title).toBe('Requests against renders');
+    const flat = viewOfType(spec, 'timeline');
+    expect(queryOf(flat)?.filter?.traceId).toBeUndefined();
+    expect(queryOf(flat)?.filter?.kinds).toEqual(['fetch', 'commit']);
+
+    // Without the commit, only the request kind remains on the axis.
+    const requestsOnly = makeCaptureSummary({
+      events: REPEATED_EVENTS.filter((event) => event !== REPEAT_COMMIT),
+    });
+    const requestsOnlyTimeline = selectFallbackNodes(requestsOnly).nodes.find(
+      (choice) => choice.type === 'timeline',
+    );
+    expect(requestsOnlyTimeline?.query.filter?.kinds).toEqual(['fetch']);
   });
 
   it('gives an empty capture a valid, non-blank layout: the overview alone', async () => {

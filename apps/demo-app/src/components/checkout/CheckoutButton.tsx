@@ -28,13 +28,15 @@
  *
  * ONE SOURCE FOR "IN FLIGHT"
  * `pending` arrives as a prop and is never derived here, so what the control shows and what the
- * form is actually doing cannot drift apart. It reaches the primitive as `busy`, which is what
- * holds the native `disabled` attribute for the duration, sets `aria-busy="true"` and places the
- * indicator before the label - so this module restates neither of those and renders no indicator
- * of its own, and a second press cannot start a second submission. `disabled` is the separate,
- * independent reason a caller may have for the action being unavailable - an empty cart, a
- * shipping option still to be chosen - and the two are combined into the attribute here rather
- * than left to the primitive, so the lock is legible where the control is composed.
+ * form is actually doing cannot drift apart. It reaches the primitive as `busy` and only as `busy`,
+ * which refuses every press and the form's implicit submission for the duration, sets
+ * `aria-disabled` and `aria-busy="true"` and places the indicator before the label - so this module
+ * restates none of those and renders no indicator of its own, and a second press cannot start a
+ * second submission. It is deliberately NOT folded into the native `disabled` attribute: this is
+ * the control the buyer has just pressed, and a natively disabled control cannot keep focus, so
+ * the buyer would be dropped onto `<body>` for the length of the request. `disabled` is the
+ * separate, independent reason a caller may have for the action being unavailable - an empty cart,
+ * a cart that could not be read - and it alone writes the attribute.
  *
  * THE CAPTION IS A LIVE REGION, AND IT IS ALWAYS IN THE DOCUMENT
  * The indicator inside the primitive is decorative by contract, so on its own it tells assistive
@@ -86,8 +88,8 @@ interface Props {
    *
    * Required rather than defaulted: the state belongs to whoever sent the order, and a control
    * that quietly assumed `false` would show an idle button over a request that is still running.
-   * It drives all three of the busy treatments - the held `disabled` attribute, `aria-busy` and
-   * the indicator - plus the caption underneath.
+   * It drives all of the busy treatments - the refused press, `aria-disabled`, `aria-busy` and the
+   * indicator - plus the caption underneath, and it leaves the control focusable throughout.
    */
   pending: boolean;
 
@@ -174,7 +176,7 @@ export function CheckoutButton({
         variant="primary"
         size="lg"
         busy={pending}
-        disabled={disabled === true || pending}
+        disabled={disabled === true}
         onClick={onPlaceOrderClick}
         className={clsx(styles.action, pending && styles.pending)}
       >

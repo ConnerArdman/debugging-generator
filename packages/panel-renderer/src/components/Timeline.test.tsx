@@ -34,13 +34,22 @@
  *     that, with the refine route, instead of implying completeness.
  *   - **The drawn-row budget is absolute.** A walk longer than
  *     `MAX_DRAWN_ROWS` is drawn one window at a time: the canvas never holds
- *     more bars than the budget however often "Next spans" is pressed, every
- *     walked span is drawn in exactly one window, the footer states which rows
+ *     more rows than the budget however often "Next spans" is pressed, every
+ *     walked span is drawn — as a bar, or counted by a "+N" mark — in exactly
+ *     one window, the footer states which rows
  *     are drawn and how many precede and follow them, no connector is drawn to
  *     a parent outside the window, focus passes to the other paging control at
  *     either end, a span result's further pages lengthen the walk without
  *     growing the window, a span selected elsewhere in the panel pages the
  *     window to it once, and a changed query starts again at its first row.
+ *   - **Overlapping spans are stacked, never hidden.** Spans of one depth that
+ *     overlap once drawn are packed into sub-rows, so no bar is painted over
+ *     another, spans that only touch share a sub-row, and connectors still
+ *     join each child to its parent's bar. A depth crowded past its sub-row cap
+ *     keeps its longest spans as bars and gathers the rest into "+N" marks on
+ *     one row beneath it, which the canvas's text alternative and the footer
+ *     state and the table lists span by span; a selected span is never
+ *     gathered, and selecting a drawn bar moves nothing.
  *   - **Paging follows the service.** Each further page is requested at the
  *     `nextOffset` the previous response named, at the same page size, and
  *     appended with each record once; the loaded rows stay on screen while a
@@ -84,13 +93,16 @@
  *     symbol belonging to no application, demonstration or otherwise — in the
  *     fixtures and in the comments alike.
  *   - **Layout is not stubbed.** No `getBoundingClientRect` override, no
- *     `ResizeObserver` polyfill and no size getter anywhere: the component reads
- *     no layout, so none is needed. The canvas is a fixed logical coordinate
- *     space — a `viewBox` `CHART_VIEWBOX_WIDTH` units wide, `width="100%"`,
- *     `preserveAspectRatio="xMinYMin meet"` — and its labels are fitted with
- *     the deterministic advance estimate of `../utils/format`, so the drawing
- *     is a pure function of the data, which is what every case asserts against
- *     under happy-dom's zero layout.
+ *     `ResizeObserver` polyfill and no size getter anywhere. The component lays
+ *     its canvas out at the width it measures, and under happy-dom — whose
+ *     boxes are all zero and whose `ResizeObserver` observes nothing — no width
+ *     is ever measured, so every case here draws in the fallback frame: a
+ *     `viewBox` `CHART_VIEWBOX_WIDTH` units wide, `width="100%"`,
+ *     `preserveAspectRatio="xMinYMin meet"`, with labels fitted by the
+ *     deterministic advance estimate of `../utils/format`. The drawing is then
+ *     a pure function of the data, which is what every case asserts against.
+ *     `./Timeline.scale.test.tsx` stubs the measurement and covers the drawing
+ *     at a measured width.
  *   - **Queries by role and accessible name.** The canvas, the grid, its rows, the
  *     chips, the tooltips and the footer control are all reached that way; a class
  *     is read only off an element already obtained semantically, since no
@@ -891,14 +903,15 @@ function renderComponent(
 /**
  * The canvas, once the query has settled.
  *
- * Obtained by its role: the SVG is `role="img"` with a text alternative, which
- * keeps its bars out of the accessibility tree and is therefore sound only
- * alongside the keyboard-reachable equivalent every case below also asserts.
+ * Obtained by its role: the SVG is a `role="figure"` with a text alternative,
+ * each of whose bars is a named `role="img"`. The bars are not focusable, so
+ * the figure is sound only alongside the keyboard-reachable equivalent every
+ * case below also asserts.
  *
  * @returns The `svg` element.
  */
 async function findCanvas(): Promise<HTMLElement> {
-  return screen.findByRole('img');
+  return screen.findByRole('figure');
 }
 
 /** The lane labels drawn on the canvas, top to bottom. */
@@ -952,6 +965,46 @@ function barTitled(canvas: HTMLElement, name: string): Element {
 /** The parent → child connectors drawn on the canvas. */
 function edgesOf(canvas: HTMLElement): Element[] {
   return Array.from(canvas.querySelectorAll('path.dg-timeline__edge'));
+}
+
+/** The "+N" marks drawn on the canvas, lane by lane and left to right. */
+function overflowMarksOf(canvas: HTMLElement): Element[] {
+  return Array.from(canvas.querySelectorAll('rect.dg-timeline__overflow'));
+}
+
+/** How many spans a "+N" mark gathers: the count its title opens with. */
+function gatheredCountOf(mark: Element): number {
+  const title = mark.querySelector('title')?.textContent ?? '';
+  const count = /^\+([\d,]+):/u.exec(title)?.[1];
+  if (count === undefined) {
+    throw new Error(`a "+N" mark's title states no count: "${title}"`);
+  }
+
+  return Number(count.replaceAll(',', ''));
+}
+
+/**
+ * How many rows the canvas accounts for: every bar, and every span a crowded
+ * depth gathered into a "+N" mark instead.
+ */
+function rowsOnCanvas(canvas: HTMLElement): number {
+  return overflowMarksOf(canvas).reduce(
+    (total, mark) => total + gatheredCountOf(mark),
+    barsOf(canvas).length,
+  );
+}
+
+/**
+ * The footer, found by the statement it opens with — which rows it holds —
+ * whatever it goes on to say about spans gathered into "+N" marks.
+ */
+function footerStartingWith(statement: string): HTMLElement {
+  return screen.getByText((content) => content.startsWith(statement));
+}
+
+/** {@link footerStartingWith}, awaited until the footer says it. */
+async function findFooterStartingWith(statement: string): Promise<HTMLElement> {
+  return screen.findByText((content) => content.startsWith(statement));
 }
 
 /**
@@ -1097,7 +1150,7 @@ describe('Timeline states', () => {
 
     // Nothing is drawn yet: no canvas, no equivalent table, and above all no
     // empty state — an unsettled query is not an answer.
-    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('figure')).toBeNull();
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
 
@@ -1125,7 +1178,7 @@ describe('Timeline states', () => {
 
     // An empty trace is a success, so it is drawn as an absence and not as a
     // failure — and there is nothing to place on an axis.
-    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('figure')).toBeNull();
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByRole('status', { busy: true })).toBeNull();
@@ -1146,7 +1199,7 @@ describe('Timeline states', () => {
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByRole('button', { name: RETRY_NAME })).toBeNull();
     expect(screen.queryByRole('status', { busy: true })).toBeNull();
-    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('figure')).toBeNull();
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
     expect(stub.resolve).toHaveBeenCalledTimes(1);
@@ -1186,7 +1239,7 @@ describe('Timeline states', () => {
     expect(queryOfCall(stub, 2)).toEqual(queryOfCall(stub, 1));
 
     // No canvas and no rows were invented behind the failure.
-    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('figure')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
   });
 
@@ -1289,7 +1342,7 @@ describe('Timeline states', () => {
 
     // Nothing was asked of the provider, and nothing was drawn as if it had been.
     expect(stub.resolve).not.toHaveBeenCalled();
-    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('figure')).toBeNull();
   });
 });
 
@@ -1328,15 +1381,23 @@ describe('Timeline cross-tier chain', () => {
     // than as the raw millisecond number the capture carried.
     expect(within(rowNamed(INTERACTION_EVENT.name)).getByText('1.175 s')).toBeDefined();
 
-    // Each bar's own label is that same name with a compact duration beside it,
-    // whole wherever it fits. Every bar of the chain has room for its label: the
-    // three that run almost to the window's end hold theirs inside the bar, and
-    // the query, which ends well before the window does, has it after the bar,
-    // on the lane surface.
+    // Each bar's own label is that same name with the same precise duration
+    // beside it — the text its table row prints — whole wherever it fits. Every
+    // bar of the chain has room for its label: the three that run almost to the
+    // window's end hold theirs inside the bar, and the query, which ends well
+    // before the window does, has it after the bar, on the lane surface.
     expect(barLabelsOf(canvas)).toEqual(
-      CHAIN_EVENTS.map((event) => `${event.name} · ${formatDurationCompact(event.duration)}`),
+      CHAIN_EVENTS.map((event) => `${event.name} · ${formatDuration(event.duration)}`),
     );
     expect(barLabelPlacementsOf(canvas)).toEqual(['inside', 'inside', 'inside', 'beside']);
+
+    // One precision across the view: the duration a bar's label carries is the
+    // very text that span's table row prints, never a rounder "1.2 s" beside a
+    // row that reads "1.175 s".
+    for (const event of CHAIN_EVENTS) {
+      const cell = rowNamed(event.name).querySelector('.dg-duration-cell');
+      expect(barLabelsOf(canvas)).toContain(`${event.name} · ${cell?.textContent ?? ''}`);
+    }
 
     // The summary strip states the shape of what was drawn.
     const summary = screen.getByRole('group', { name: 'Timeline summary' });
@@ -1396,6 +1457,32 @@ describe('Timeline cross-tier chain', () => {
     for (const element of styled) {
       expect(element.getAttribute('style') ?? '').not.toMatch(/#[0-9a-f]{3}|rgba?\(|hsla?\(/iu);
     }
+  });
+
+  it('reads every count of a one-span trace in the singular', async () => {
+    // One span on one tier: the summary pills, the footer and the canvas's
+    // text alternative each agree their noun with the count of one.
+    const stub = resolvingTrace(makeTree([makeTraceNode(INTERACTION_EVENT, { depth: 0 })]));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+    const summary = screen.getByRole('group', { name: 'Timeline summary' });
+    expect(within(summary).getByText(`${formatCount(1)} span`)).toBeDefined();
+    expect(within(summary).getByText(`${formatCount(1)} tier`)).toBeDefined();
+    expect(screen.getByText(`${formatCount(1)} span shown.`)).toBeDefined();
+
+    const alternative = canvas.getAttribute('aria-label') ?? '';
+    expect(alternative).toContain(
+      `${formatCount(1)} span in ${formatCount(1)} tier lane over ${formatDuration(
+        INTERACTION_EVENT.duration,
+      )}.`,
+    );
+
+    // No plural is left beside a count of one anywhere the reader reads it.
+    const plural = /\b1 (?:spans|tiers|tier lanes)\b/u;
+    expect(document.body.textContent ?? '').not.toMatch(plural);
+    expect(alternative).not.toMatch(plural);
   });
 
   it('draws a flat span page through the same component, with no correlated tree', async () => {
@@ -1635,7 +1722,7 @@ describe('Timeline paging', () => {
     // While that page is in flight the loaded chart and table stay on screen,
     // the footer keeps its total, and the control reports the page it awaits.
     expect(renderedNames()).toEqual([INTERACTION_EVENT.name, FETCH_EVENT.name]);
-    expect(barsOf(screen.getByRole('img'))).toHaveLength(2);
+    expect(barsOf(screen.getByRole('figure'))).toHaveLength(2);
     expect(document.querySelector('.dg-timeline__loading')).toBeNull();
     expect(screen.getByText(`Showing ${formatCount(2)} of ${formatCount(4)} spans.`)).toBeDefined();
 
@@ -1649,7 +1736,7 @@ describe('Timeline paging', () => {
     // Appended after the rows already drawn, and the repeated record drawn once.
     await screen.findByText(`Showing ${formatCount(3)} of ${formatCount(4)} spans.`);
     expect(renderedNames()).toEqual([INTERACTION_EVENT.name, FETCH_EVENT.name, SERVER_EVENT.name]);
-    expect(barsOf(screen.getByRole('img'))).toHaveLength(3);
+    expect(barsOf(screen.getByRole('figure'))).toHaveLength(3);
 
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
 
@@ -1696,7 +1783,7 @@ describe('Timeline paging', () => {
     expect(message.textContent).toContain(PAGE_FAILURE.message);
     expect(alert.textContent).toContain(PAGE_FAILURE.code);
     expect(renderedNames()).toEqual([INTERACTION_EVENT.name, FETCH_EVENT.name]);
-    expect(barsOf(screen.getByRole('img'))).toHaveLength(2);
+    expect(barsOf(screen.getByRole('figure'))).toHaveLength(2);
     expect(screen.getByText(`Showing ${formatCount(2)} of ${formatCount(4)} spans.`)).toBeDefined();
 
     // The query shown is the page that failed, not the node's first page.
@@ -1882,7 +1969,8 @@ describe('Timeline paging', () => {
 
     stub.release(3);
 
-    await screen.findByText(`Showing ${formatCount(1)} of ${formatCount(1)} spans.`);
+    // One span of one: every count on screen takes the singular.
+    await screen.findByText(`Showing ${formatCount(1)} of ${formatCount(1)} span.`);
     expect(renderedNames()).toEqual([QUERY_EVENT.name]);
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
     expect(stub.resolve).toHaveBeenCalledTimes(3);
@@ -1972,7 +2060,7 @@ describe('Timeline paging', () => {
 
     later.release(1);
 
-    await screen.findByText(`Showing ${formatCount(1)} of ${formatCount(1)} spans.`);
+    await screen.findByText(`Showing ${formatCount(1)} of ${formatCount(1)} span.`);
     expect(renderedNames()).toEqual([QUERY_EVENT.name]);
     expect(earlier.resolve).toHaveBeenCalledTimes(2);
   });
@@ -2028,7 +2116,7 @@ async function expectEmptyState(title: string, message: string): Promise<void> {
 
   // An empty state is a success drawn as an absence: no canvas, no table, no
   // failure and no loading indicator.
-  expect(screen.queryByRole('img')).toBeNull();
+  expect(screen.queryByRole('figure')).toBeNull();
   expect(screen.queryByRole('grid')).toBeNull();
   expect(screen.queryByRole('alert')).toBeNull();
   expect(screen.queryByRole('status', { busy: true })).toBeNull();
@@ -2435,7 +2523,8 @@ describe('Timeline partial results', () => {
 /**
  * The footer's statement of a partial window, spelled out as the reader reads
  * it: the 1-based range drawn, the walk it was cut from, and how many rows lie
- * before and after it undrawn.
+ * before and after it undrawn. A window of one row names its one position in
+ * the singular ("Span 2,001 of 2,001 is drawn; 2,000 before it are not.").
  *
  * @param first The first drawn row, 1-based.
  * @param last The last drawn row, 1-based.
@@ -2450,14 +2539,17 @@ function windowFooter(
   before: number,
   after: number,
 ): string {
+  const single = first === last;
+  const pronoun = single ? 'it' : 'them';
   const undrawn = [
-    ...(before > 0 ? [`${formatCount(before)} before them`] : []),
-    ...(after > 0 ? [`${formatCount(after)} after them`] : []),
+    ...(before > 0 ? [`${formatCount(before)} before ${pronoun}`] : []),
+    ...(after > 0 ? [`${formatCount(after)} after ${pronoun}`] : []),
   ];
+  const drawn = single
+    ? `Span ${formatCount(first)} of ${formatCount(total)} is drawn`
+    : `Spans ${formatCount(first)}–${formatCount(last)} of ${formatCount(total)} are drawn`;
 
-  return `Spans ${formatCount(first)}–${formatCount(last)} of ${formatCount(
-    total,
-  )} are drawn; ${undrawn.join(' and ')} ${before + after === 1 ? 'is' : 'are'} not.`;
+  return `${drawn}; ${undrawn.join(' and ')} ${before + after === 1 ? 'is' : 'are'} not.`;
 }
 
 /** A flat span record of a long result: a root of its own, 1 ms after the one before it. */
@@ -2495,7 +2587,7 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
 
     // The first window: which rows it draws and how many follow it undrawn,
     // in the footer and in the picture's own text alternative.
-    const footer = screen.getByText(
+    const footer = footerStartingWith(
       windowFooter(1, DRAWN_ROW_BUDGET, LONG_TRACE_ROWS, 0, LONG_TRACE_ROWS - DRAWN_ROW_BUDGET),
     );
     expect(footer.getAttribute('aria-live')).toBe('polite');
@@ -2504,10 +2596,16 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
         1,
       )}–${formatCount(DRAWN_ROW_BUDGET)})`,
     );
-    expect(barsOf(canvas)).toHaveLength(DRAWN_ROW_BUDGET);
+    // Two thousand back-to-back 1 ms children, each widened to the minimum
+    // visible width, overlap once drawn far more deeply than one depth draws
+    // sub-rows for: the window's every row is on the canvas, as a bar or
+    // counted by a "+N" mark, and never as more than the budget.
+    const firstBars = barsOf(canvas);
+    expect(rowsOnCanvas(canvas)).toBe(DRAWN_ROW_BUDGET);
+    expect(overflowMarksOf(canvas).length).toBeGreaterThan(0);
     expect(barTitled(canvas, LONG_ROOT_NAME)).toBeDefined();
     // The root is drawn in this window, so every child drawn with it is joined to it.
-    expect(edgesOf(canvas)).toHaveLength(DRAWN_ROW_BUDGET - 1);
+    expect(edgesOf(canvas)).toHaveLength(firstBars.length - 1);
     expect(within(summaryStrip()).getByText('Partial result')).toBeDefined();
     // The table is the same window, and its name says so rather than "every span".
     expect(
@@ -2516,7 +2614,7 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
           name.includes(
             `spans ${formatCount(1)}–${formatCount(DRAWN_ROW_BUDGET)} of the ${formatCount(
               LONG_TRACE_ROWS,
-            )} captured spans`,
+            )} spans correlated into this trace`,
           ),
       }),
     ).toBeDefined();
@@ -2525,7 +2623,7 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
 
     // The walk is in memory whole, so moving the window asks the provider nothing.
     await user.click(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
-    await screen.findByText(
+    await findFooterStartingWith(
       windowFooter(
         DRAWN_ROW_BUDGET + 1,
         DRAWN_ROW_BUDGET * 2,
@@ -2537,12 +2635,12 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
     expect(stub.resolve).toHaveBeenCalledTimes(1);
 
     // The second window starts at walk row 2,000 — the child at index 1,999 —
-    // and holds no more bars than the first. Its rows' parent, the root, is not
+    // and holds no more rows than the first. Its rows' parent, the root, is not
     // drawn here, so no connector is invented to another row, and each row's
     // description says where its parent is.
     const second = await findCanvas();
     const secondBars = barsOf(second);
-    expect(secondBars).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(rowsOnCanvas(second)).toBe(DRAWN_ROW_BUDGET);
     expect(
       secondBars[0]?.querySelector('title')?.textContent?.startsWith(longChildName(1999)),
     ).toBe(true);
@@ -2574,17 +2672,62 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
     // The last window is short, and the control that reached it goes away:
     // focus moves to the control that pages back, not to the document.
     await user.click(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
-    await screen.findByText(windowFooter(DRAWN_ROW_BUDGET + 1, rows, rows, DRAWN_ROW_BUDGET, 0));
-    expect(barsOf(await findCanvas())).toHaveLength(rows - DRAWN_ROW_BUDGET);
+    await findFooterStartingWith(
+      windowFooter(DRAWN_ROW_BUDGET + 1, rows, rows, DRAWN_ROW_BUDGET, 0),
+    );
+    expect(rowsOnCanvas(await findCanvas())).toBe(rows - DRAWN_ROW_BUDGET);
     expect(screen.queryByRole('button', { name: NEXT_SPANS_NAME })).toBeNull();
     expect(document.activeElement).toBe(screen.getByRole('button', { name: PREVIOUS_SPANS_NAME }));
 
     // Back at the first window, focus moves the other way.
     await user.click(screen.getByRole('button', { name: PREVIOUS_SPANS_NAME }));
-    await screen.findByText(windowFooter(1, DRAWN_ROW_BUDGET, rows, 0, rows - DRAWN_ROW_BUDGET));
-    expect(barsOf(await findCanvas())).toHaveLength(DRAWN_ROW_BUDGET);
+    await findFooterStartingWith(
+      windowFooter(1, DRAWN_ROW_BUDGET, rows, 0, rows - DRAWN_ROW_BUDGET),
+    );
+    expect(rowsOnCanvas(await findCanvas())).toBe(DRAWN_ROW_BUDGET);
     expect(screen.queryByRole('button', { name: PREVIOUS_SPANS_NAME })).toBeNull();
     expect(document.activeElement).toBe(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('names a last window of one span in the singular, by its position rather than a range', async () => {
+    // One full window and a single span after it: 2,001 rows.
+    const rows = DRAWN_ROW_BUDGET + 1;
+    const stub = resolvingTrace(wideTrace(DRAWN_ROW_BUDGET));
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await findCanvas();
+
+    await user.click(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
+    const footer = await screen.findByText(windowFooter(rows, rows, rows, DRAWN_ROW_BUDGET, 0));
+    expect(footer.textContent).toBe(
+      `Span ${formatCount(rows)} of ${formatCount(rows)} is drawn; ${formatCount(
+        DRAWN_ROW_BUDGET,
+      )} before it are not.`,
+    );
+
+    // The picture, its table and the summary all speak of one span.
+    const canvas = await findCanvas();
+    expect(barsOf(canvas)).toHaveLength(1);
+    const alternative = canvas.getAttribute('aria-label') ?? '';
+    expect(alternative).toContain(
+      `${formatCount(1)} of ${formatCount(rows)} spans (span ${formatCount(rows)})`,
+    );
+    expect(alternative).toContain(
+      'The table below lists the same span with its kind, tier, offset and duration.',
+    );
+    expect(
+      screen.getByRole('grid', {
+        name: (name) =>
+          name.includes(
+            `span ${formatCount(rows)} of the ${formatCount(
+              rows,
+            )} spans correlated into this trace, with its kind`,
+          ),
+      }),
+    ).toBeDefined();
+    expect(within(summaryStrip()).getByText(`${formatCount(1)} span`)).toBeDefined();
     expect(stub.resolve).toHaveBeenCalledTimes(1);
   });
 
@@ -2596,13 +2739,18 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
     await findCanvas();
 
+    // A span is drawn either as a bar, named by its title, or counted by the
+    // "+N" mark of the crowded depth that gathered it.
     const drawnEvents = new Map<string, number>();
     let windows = 0;
+    let accounted = 0;
     const record = (canvas: HTMLElement): void => {
       const bars = barsOf(canvas);
+      const onCanvas = rowsOnCanvas(canvas);
       expect(bars.length).toBeGreaterThan(0);
-      expect(bars.length).toBeLessThanOrEqual(DRAWN_ROW_BUDGET);
+      expect(onCanvas).toBeLessThanOrEqual(DRAWN_ROW_BUDGET);
       windows += 1;
+      accounted += onCanvas;
       for (const bar of bars) {
         const title = bar.querySelector('title')?.textContent ?? '';
         drawnEvents.set(title, (drawnEvents.get(title) ?? 0) + 1);
@@ -2631,9 +2779,11 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
     }
 
     // Three windows for 4,501 rows, and every row of the walk drawn once: the
-    // window moved over the walk, it never grew and never skipped a row.
+    // window moved over the walk, it never grew and never skipped a row — the
+    // windows account for exactly the walk's rows, and no bar is drawn twice.
     expect(windows).toBe(Math.ceil(LONG_TRACE_ROWS / DRAWN_ROW_BUDGET));
-    expect(drawnEvents.size).toBe(LONG_TRACE_ROWS);
+    expect(accounted).toBe(LONG_TRACE_ROWS);
+    expect(drawnEvents.size).toBeGreaterThan(0);
     expect([...drawnEvents.values()].every((count) => count === 1)).toBe(true);
     expect(stub.resolve).toHaveBeenCalledTimes(1);
   });
@@ -2655,7 +2805,7 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
     const view = render(withHost(makeNode()));
     await findCanvas();
     await user.click(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
-    await screen.findByText(
+    await findFooterStartingWith(
       windowFooter(
         DRAWN_ROW_BUDGET + 1,
         DRAWN_ROW_BUDGET * 2,
@@ -2673,7 +2823,7 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
       ),
     );
 
-    await screen.findByText(
+    await findFooterStartingWith(
       windowFooter(1, DRAWN_ROW_BUDGET, LONG_TRACE_ROWS, 0, LONG_TRACE_ROWS - DRAWN_ROW_BUDGET),
     );
     expect(barTitled(await findCanvas(), LONG_ROOT_NAME)).toBeDefined();
@@ -2694,7 +2844,7 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
 
     // The window holding the selected span is drawn, and the span is marked
     // on the canvas and in the table.
-    await screen.findByText(
+    await findFooterStartingWith(
       windowFooter(
         DRAWN_ROW_BUDGET * 2 + 1,
         LONG_TRACE_ROWS,
@@ -2712,7 +2862,7 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
     // back to the selection, and the selection it no longer draws is marked
     // nowhere — no stale mark on a bar or a row of another window.
     await user.click(screen.getByRole('button', { name: PREVIOUS_SPANS_NAME }));
-    await screen.findByText(
+    await findFooterStartingWith(
       windowFooter(
         DRAWN_ROW_BUDGET + 1,
         DRAWN_ROW_BUDGET * 2,
@@ -2735,7 +2885,7 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
         },
       }),
     );
-    await screen.findByText(
+    await findFooterStartingWith(
       windowFooter(1, DRAWN_ROW_BUDGET, LONG_TRACE_ROWS, 0, LONG_TRACE_ROWS - DRAWN_ROW_BUDGET),
     );
     expect(
@@ -2764,15 +2914,17 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
     );
 
     // One page fits one window: every loaded row is drawn and nothing is paged.
-    await screen.findByText(`Showing ${formatCount(pageSize)} of ${formatCount(total)} spans.`);
-    expect(barsOf(await findCanvas())).toHaveLength(pageSize);
+    await findFooterStartingWith(
+      `Showing ${formatCount(pageSize)} of ${formatCount(total)} spans.`,
+    );
+    expect(rowsOnCanvas(await findCanvas())).toBe(pageSize);
     expect(screen.queryByRole('button', { name: NEXT_SPANS_NAME })).toBeNull();
 
     // The second page makes the loaded walk longer than one window: the
     // canvas still draws the budget, and the footer states the total, what is
     // loaded and which of the loaded rows are drawn.
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
-    await screen.findByText(
+    await findFooterStartingWith(
       `Showing ${formatCount(total)} of ${formatCount(total)} spans. ${windowFooter(
         1,
         DRAWN_ROW_BUDGET,
@@ -2781,13 +2933,13 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
         total - DRAWN_ROW_BUDGET,
       )}`,
     );
-    expect(barsOf(await findCanvas())).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(rowsOnCanvas(await findCanvas())).toBe(DRAWN_ROW_BUDGET);
     expect(within(summaryStrip()).getByText('Partial result')).toBeDefined();
 
     // The rest of the loaded rows are one window on, and the provider is not
     // asked again for rows it has already sent.
     await user.click(screen.getByRole('button', { name: NEXT_SPANS_NAME }));
-    await screen.findByText(
+    await findFooterStartingWith(
       `Showing ${formatCount(total)} of ${formatCount(total)} spans. ${windowFooter(
         DRAWN_ROW_BUDGET + 1,
         total,
@@ -2796,7 +2948,7 @@ describe('Timeline drawn-row window', { timeout: WINDOW_CASE_TIMEOUT_MS }, () =>
         0,
       )}`,
     );
-    expect(barsOf(await findCanvas())).toHaveLength(total - DRAWN_ROW_BUDGET);
+    expect(rowsOnCanvas(await findCanvas())).toBe(total - DRAWN_ROW_BUDGET);
     expect(stub.resolve).toHaveBeenCalledTimes(2);
   });
 });
@@ -3180,7 +3332,7 @@ describe('Timeline span order', () => {
     expect(description).not.toContain(REATTACHED_FLAG);
 
     // Not an orphan in the drawing either: that state belongs to the correlator.
-    const canvas = screen.getByRole('img');
+    const canvas = screen.getByRole('figure');
     for (const bar of barsOf(canvas)) {
       expect(bar.classList.contains('dg-is-orphan')).toBe(false);
       expect(bar.classList.contains('dg-is-orphaned')).toBe(false);
@@ -3197,7 +3349,7 @@ describe('Timeline span order', () => {
     await screen.findByText(`Showing ${formatCount(4)} of ${formatCount(4)} spans.`);
     expect(renderedNames()).toEqual([...CHAIN_NAMES]);
     expect(screen.queryAllByText(PARENT_NOT_LOADED_FLAG)).toHaveLength(0);
-    expect(edgesOf(screen.getByRole('img'))).toHaveLength(CHAIN_EVENTS.length - 1);
+    expect(edgesOf(screen.getByRole('figure'))).toHaveLength(CHAIN_EVENTS.length - 1);
   });
 
   it('expands a duplicated span id under its first record, and joins the child to that record', async () => {
@@ -3312,7 +3464,7 @@ describe('Timeline span order', () => {
     expect(within(child).getByText(PARENT_NOT_LOADED_FLAG)).toBeDefined();
     expect(await descriptionOf(child)).toContain(spanIdFor(0x71));
     expect(within(rowNamed(collidingRoot.name)).queryByText(PARENT_NOT_LOADED_FLAG)).toBeNull();
-    expect(edgesOf(screen.getByRole('img'))).toHaveLength(0);
+    expect(edgesOf(screen.getByRole('figure'))).toHaveLength(0);
 
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
 
@@ -3327,7 +3479,7 @@ describe('Timeline span order', () => {
     expect(screen.queryAllByText(PARENT_NOT_LOADED_FLAG)).toHaveLength(0);
     expect(stub.queries.map((query) => query.offset)).toEqual([0, 2]);
 
-    const canvas = screen.getByRole('img');
+    const canvas = screen.getByRole('figure');
     const edges = edgesOf(canvas);
     expect(edges).toHaveLength(1);
 
@@ -3779,7 +3931,7 @@ describe('Timeline keyboard-reachable descriptions', () => {
     expect(bubble.textContent).toContain(AMBIGUOUS_CANDIDATE_SPAN_ID);
   });
 
-  it("keeps a row's source chip out of the Tab order, reached by the table's arrow keys", async () => {
+  it("keeps a row's source chip out of the Tab order, reached from its row by Tab and the arrow keys", async () => {
     const stub = resolvingTrace(crossTierTree());
     const spies = makeActions();
     const user = userEvent.setup();
@@ -3797,8 +3949,12 @@ describe('Timeline keyboard-reachable descriptions', () => {
     expect(chip.getAttribute('tabindex')).toBe('-1');
     expectOpen(openBubbleIn(nameCell));
 
-    // Tab leaves the table from its one stop rather than landing on the chip,
-    // and Shift+Tab comes back to the row.
+    // The chip never becomes a Tab stop of its own, but Tab from its active row
+    // walks onto it (`primitives/DataTable`'s keyboard model), the next Tab
+    // leaves the table, and Shift+Tab comes back to the row.
+    await user.tab();
+    expect(document.activeElement).toBe(chip);
+    expect(chip.getAttribute('tabindex')).toBe('-1');
     await user.tab();
     expect(row.contains(document.activeElement)).toBe(false);
     await user.tab({ shift: true });
@@ -3826,6 +3982,47 @@ describe('Timeline keyboard-reachable descriptions', () => {
 });
 
 describe('Timeline accessibility', () => {
+  it('names the table for the spans a span query loaded, and a lone span in the singular', async () => {
+    const stub = resolvingSpans([INTERACTION_EVENT, FETCH_EVENT]);
+
+    renderComponent(makeNode({ query: { source: 'spans', filter: { traceId: TRACE_ID } } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    // A span query lists what its filter selected, as far as its pages have
+    // been loaded — never "every captured span", and not a correlated trace.
+    await findCanvas();
+    expect(
+      screen.getByRole('grid', {
+        name: (name) =>
+          name.endsWith(
+            `: the ${formatCount(2)} captured spans loaded for this view's query, with their kind, tier, offset and duration.`,
+          ),
+      }),
+    ).toBeDefined();
+    expect(
+      screen.queryByRole('grid', { name: /every captured span|correlated into this trace/u }),
+    ).toBeNull();
+    cleanup();
+
+    // One span is named as one.
+    const single = resolvingSpans([FETCH_EVENT]);
+    renderComponent(makeNode({ query: { source: 'spans', filter: { traceId: TRACE_ID } } }), {
+      provider: single.provider,
+      actions: makeActions().actions,
+    });
+    await findCanvas();
+    expect(
+      screen.getByRole('grid', {
+        name: (name) =>
+          name.endsWith(
+            `: the ${formatCount(1)} captured span loaded for this view's query, with its kind, tier, offset and duration.`,
+          ),
+      }),
+    ).toBeDefined();
+  });
+
   it('pairs the canvas with a keyboard-operable equivalent of every row', async () => {
     const stub = resolvingTrace(crossTierTree());
     const spies = makeActions();
@@ -3847,8 +4044,15 @@ describe('Timeline accessibility', () => {
     expect(alternative).toContain(formatDuration(CHAIN_WINDOW_MS));
     expect(alternative).toContain('table below');
 
-    // The equivalent is a named grid and it lists every span, not a sample.
-    const grid = screen.getByRole('grid', { name: /every captured span of this interaction/i });
+    // The equivalent is a named grid and it lists every span, not a sample —
+    // named for what it holds: the spans correlated into this trace, never
+    // every span the interaction captured.
+    const grid = screen.getByRole('grid', {
+      name: (name) =>
+        name.endsWith(
+          `: the ${formatCount(CHAIN_EVENTS.length)} spans correlated into this trace, with their kind, tier, offset and duration.`,
+        ) && !name.includes('every captured span'),
+    });
     expect(grid.closest('.dg-timeline__equivalent')).not.toBeNull();
     expect(dataRows()).toHaveLength(CHAIN_EVENTS.length);
     expect(renderedNames()).toEqual([...CHAIN_NAMES]);
@@ -4115,7 +4319,7 @@ function blockOf(className: string): HTMLElement {
 
 /** The timeline's canvas, read inside its own block so a second chart's canvas is never taken. */
 function timelineCanvas(): HTMLElement {
-  return within(blockOf('dg-timeline')).getByRole('img');
+  return within(blockOf('dg-timeline')).getByRole('figure');
 }
 
 /** The timeline bars carrying the selected state. */
@@ -4140,7 +4344,7 @@ function flameRowNamed(name: string): HTMLElement {
 function selectedFlameFrames(): string[] {
   return Array.from(
     within(blockOf('dg-flame'))
-      .getByRole('img')
+      .getByRole('figure')
       .querySelectorAll('rect.dg-flame__frame.dg-is-selected'),
   ).map((frame) => (frame.querySelector('title')?.textContent ?? '').split('\n')[0] ?? '');
 }
@@ -4224,7 +4428,7 @@ describe('Timeline shared selection', () => {
       </SelectionHost>,
     );
 
-    expect(await screen.findAllByRole('img')).toHaveLength(2);
+    expect(await screen.findAllByRole('figure')).toHaveLength(2);
     await screen.findByRole('tree');
 
     // Nothing is selected in either chart yet.
@@ -4926,16 +5130,17 @@ describe('Timeline canvas geometry', () => {
     );
   });
 
-  it('lays the canvas out in a fixed logical viewBox that CSS sizes to its container, reading no layout', async () => {
+  it('lays an unmeasured canvas out in the fixed fallback viewBox that CSS sizes to its container', async () => {
     const stub = resolvingTrace(nestedTree());
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     const canvas = await findCanvas();
 
-    // The fixed logical coordinate space: a viewBox the scale module's chart
-    // width wide and the drawing's own height tall, declared 100% wide so CSS
-    // sizes it, and scaled uniformly from its top-left corner.
+    // Nothing is laid out here, so no width is measured and the drawing is in
+    // the fallback frame: a viewBox the scale module's chart width wide and
+    // the drawing's own height tall, declared 100% wide so CSS sizes it, and
+    // scaled uniformly from its top-left corner.
     const [minX, minY, viewWidth, viewHeight] = viewBoxOf(canvas);
     expect([minX, minY]).toEqual([0, 0]);
     expect(viewWidth).toBe(CHART_VIEWBOX_WIDTH);
@@ -4990,7 +5195,7 @@ describe('Timeline canvas geometry', () => {
       if (label === undefined) {
         continue;
       }
-      const whole = `${event.name} · ${formatDurationCompact(event.duration)}`;
+      const whole = `${event.name} · ${formatDuration(event.duration)}`;
       if (label.text !== whole) {
         const [namePart = ''] = label.text.split(' · ');
         expect(namePart.endsWith(ELLIPSIS) || namePart === event.name).toBe(true);
@@ -5022,7 +5227,7 @@ describe('Timeline canvas geometry', () => {
     // The request's own label is drawn inside it, clear of the commit.
     expect(request.label?.inside).toBe(true);
     expect(request.label?.text).toBe(
-      `${NESTED_REQUEST.name} · ${formatDurationCompact(NESTED_REQUEST.duration)}`,
+      `${NESTED_REQUEST.name} · ${formatDuration(NESTED_REQUEST.duration)}`,
     );
 
     // A late span alone on its row has room before its bar, and its label is
@@ -5030,7 +5235,7 @@ describe('Timeline canvas geometry', () => {
     const render = drawnRowNamed(rows, NESTED_RENDER.name);
     expect(render.label?.inside).toBe(false);
     expect(render.label?.text).toBe(
-      `${NESTED_RENDER.name} · ${formatDurationCompact(NESTED_RENDER.duration)}`,
+      `${NESTED_RENDER.name} · ${formatDuration(NESTED_RENDER.duration)}`,
     );
     expect(render.label?.end).toBeLessThanOrEqual(render.x);
   });
@@ -5103,7 +5308,7 @@ describe('Timeline canvas geometry', () => {
     if (requestLabel === undefined) {
       throw new Error('the request was left unlabelled');
     }
-    const requestSuffix = ` · ${formatDurationCompact(request.duration)}`;
+    const requestSuffix = ` · ${formatDuration(request.duration)}`;
     const inset = requestLabel.start - requestRow.x;
     const insideRoom = requestRow.end - inset - requestLabel.start;
     expect(requestLabel.inside).toBe(true);
@@ -5127,7 +5332,7 @@ describe('Timeline canvas geometry', () => {
     if (commitLabel === undefined) {
       throw new Error('the commit was left unlabelled');
     }
-    const commitSuffix = ` · ${formatDurationCompact(commit.duration)}`;
+    const commitSuffix = ` · ${formatDuration(commit.duration)}`;
     const gap = commitRow.x - commitLabel.end;
     const beforeRoom = commitLabel.end - (requestRow.end + gap);
     expect(commitLabel.text).toBe(commit.name);
@@ -5160,7 +5365,7 @@ describe('Timeline canvas geometry', () => {
 
     // The widest room is inside the long bar: the name is cut there, the
     // duration kept after the ellipsis, and the whole text fits the bar.
-    const suffix = ` · ${formatDurationCompact(HOSTILE_QUERY.duration)}`;
+    const suffix = ` · ${formatDuration(HOSTILE_QUERY.duration)}`;
     expect(label.inside).toBe(true);
     expect(label.text.endsWith(`${ELLIPSIS}${suffix}`)).toBe(true);
     expect(label.end).toBeLessThanOrEqual(query.end);
@@ -5180,5 +5385,631 @@ describe('Timeline canvas geometry', () => {
     // The whole name is still what the table and the bar's description carry.
     expect(renderedNames()).toContain(HOSTILE_NAME);
     expect(query.title.startsWith(`${HOSTILE_NAME} `)).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Overlapping spans
+ *
+ * Two shapes. The first is an interaction whose four requests all run at
+ * once, the way parallel calls from one handler do, with a fifth that starts
+ * exactly as the first ends and a query under each of the first two: every
+ * bar must stay visible beside the others, and a span that only touches
+ * another shares its sub-row. The second is a crowded depth — ten renders of
+ * one commit, all running over one stretch of the window — deeper than a
+ * depth draws sub-rows for, so its shortest spans must be gathered into a
+ * "+N" mark rather than painted over one another or allowed to grow the lane
+ * without bound.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The interaction the overlapping requests belong to. */
+const STACK_ROOT = makeEvent({
+  id: 'event-example-0701',
+  spanId: spanIdFor(0x70),
+  kind: 'interaction',
+  name: 'example.stacked.click',
+  tier: 'browser',
+  startTime: BASE_START_MS,
+  duration: 1000,
+  producerId: BROWSER_PRODUCER_ID,
+  seq: 0,
+  ingestSeq: 1,
+});
+
+/** Four requests in flight together, each started 15 ms after the one before. */
+const STACK_REQUESTS = [0, 1, 2, 3].map((index) =>
+  makeEvent({
+    id: `event-example-071${String(index)}`,
+    spanId: spanIdFor(0x71 + index),
+    parentSpanId: STACK_ROOT.spanId,
+    kind: 'fetch',
+    name: `GET /example/stacked/${String(index)}`,
+    tier: 'browser',
+    startTime: BASE_START_MS + index * 15,
+    duration: 800 - index * 100,
+    producerId: BROWSER_PRODUCER_ID,
+    seq: index + 1,
+    ingestSeq: index + 2,
+  }),
+);
+
+/** A request that starts at the very instant the first one ends. */
+const STACK_TOUCHING = makeEvent({
+  id: 'event-example-0715',
+  spanId: spanIdFor(0x75),
+  parentSpanId: STACK_ROOT.spanId,
+  kind: 'fetch',
+  name: 'GET /example/stacked/after',
+  tier: 'browser',
+  startTime: BASE_START_MS + 800,
+  duration: 150,
+  producerId: BROWSER_PRODUCER_ID,
+  seq: 5,
+  ingestSeq: 6,
+});
+
+/** The query each of the first two requests waited on; the two overlap. */
+const STACK_QUERIES = [0, 1].map((index) =>
+  makeEvent({
+    id: `event-example-072${String(index)}`,
+    spanId: spanIdFor(0x7a + index),
+    parentSpanId: spanIdFor(0x71 + index),
+    kind: 'db.query',
+    name: `example.stacked.query.${String(index)}`,
+    tier: 'db',
+    startTime: BASE_START_MS + 5 + index * 15,
+    duration: 300,
+    producerId: SERVER_PRODUCER_ID,
+    seq: index,
+    ingestSeq: index + 7,
+  }),
+);
+
+/** The overlapping requests as a trace: the root, five requests and two queries. */
+function stackedTree(): TraceTree {
+  return makeTree([
+    makeTraceNode(STACK_ROOT, {
+      depth: 0,
+      children: [
+        ...STACK_REQUESTS.map((request, index) => {
+          const query = STACK_QUERIES[index];
+          return makeTraceNode(request, {
+            depth: 1,
+            children: query === undefined ? [] : [makeTraceNode(query, { depth: 2 })],
+          });
+        }),
+        makeTraceNode(STACK_TOUCHING, { depth: 1 }),
+      ],
+    }),
+  ]);
+}
+
+/** The interaction whose commit rendered one crowded depth. */
+const CROWD_ROOT = makeEvent({
+  id: 'event-example-0801',
+  spanId: spanIdFor(0x80),
+  kind: 'interaction',
+  name: 'example.crowded.click',
+  tier: 'browser',
+  startTime: BASE_START_MS,
+  duration: 1000,
+  producerId: BROWSER_PRODUCER_ID,
+  seq: 0,
+  ingestSeq: 1,
+});
+
+/** How many renders the crowded depth holds: more than it draws sub-rows for. */
+const CROWD_SIZE = 10;
+
+/** The sub-rows one depth draws before it gathers the rest: the component's own cap. */
+const SUB_ROW_CAP = 6;
+
+/**
+ * Ten renders started 1 ms apart, render `i` lasting `100 + 50·i` ms, so every
+ * one of them overlaps every other: the six longest are drawn as bars and the
+ * four shortest are gathered into one "+4" mark.
+ */
+const CROWD_RENDERS = Array.from({ length: CROWD_SIZE }, (_unused, index) =>
+  makeEvent({
+    id: `event-example-08${String(10 + index)}`,
+    spanId: spanIdFor(0x81 + index),
+    parentSpanId: CROWD_ROOT.spanId,
+    kind: 'render',
+    name: `render ExampleCrowded${String(index)}`,
+    tier: 'browser',
+    startTime: BASE_START_MS + 100 + index,
+    duration: 100 + 50 * index,
+    producerId: BROWSER_PRODUCER_ID,
+    seq: index + 1,
+    ingestSeq: index + 2,
+  }),
+);
+
+/** The renders a crowded depth keeps as bars: the six longest. */
+const CROWD_DRAWN = CROWD_RENDERS.slice(CROWD_SIZE - SUB_ROW_CAP);
+
+/** The renders it gathers into its "+N" mark: the four shortest. */
+const CROWD_GATHERED = CROWD_RENDERS.slice(0, CROWD_SIZE - SUB_ROW_CAP);
+
+/** The crowded depth as a trace: the root and its ten renders. */
+function crowdedTree(): TraceTree {
+  return makeTree([
+    makeTraceNode(CROWD_ROOT, {
+      depth: 0,
+      children: CROWD_RENDERS.map((render) => makeTraceNode(render, { depth: 1 })),
+    }),
+  ]);
+}
+
+/** The sentence the canvas and the footer state for the crowded depth's one mark. */
+const CROWD_GATHERED_STATEMENT = `${formatCount(
+  CROWD_GATHERED.length,
+)} spans are gathered into 1 “+N” mark where more spans overlap than a lane draws rows for; the table below lists each of them.`;
+
+/** Every pair of bars on one row, asserted not to overlap beyond a shared edge. */
+function expectNoBarOverlap(rows: readonly DrawnRow[]): void {
+  for (const [index, row] of rows.entries()) {
+    for (const other of rows.slice(index + 1)) {
+      if (other.y !== row.y) {
+        continue;
+      }
+      const overlap = Math.min(row.end, other.end) - Math.max(row.x, other.x);
+      expect(overlap, `"${row.title}" and "${other.title}" overlap on one row`).toBeLessThanOrEqual(
+        1e-6,
+      );
+    }
+  }
+}
+
+/** The connector path that joins a child's bar to its parent's, as the canvas writes it. */
+function connectorBetween(parent: DrawnRow, child: DrawnRow): string {
+  const parentCenter = parent.y + parent.height / 2;
+  const childCenter = child.y + child.height / 2;
+
+  return `M ${String(alignHairline(parent.x))} ${String(alignHairline(parentCenter))} V ${String(
+    alignHairline(childCenter),
+  )} H ${String(alignHairline(child.x))}`;
+}
+
+/** Each bar's position, keyed by its description. */
+function barPositions(canvas: HTMLElement): Map<string, string> {
+  return new Map(
+    drawnRowsOf(canvas).map((row) => [row.title, `${String(row.x)},${String(row.y)}`]),
+  );
+}
+
+describe('Timeline overlapping spans', () => {
+  it('stacks overlapping spans of one depth into sub-rows, lets touching spans share one, and joins each to its parent', async () => {
+    const tree = stackedTree();
+    const stub = resolvingTrace(tree);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+    const rows = drawnRowsOf(canvas);
+
+    // Every span is a bar, and none is painted over another.
+    expect(rows).toHaveLength(tree.nodeCount);
+    expect(overflowMarksOf(canvas)).toHaveLength(0);
+    expectNoBarOverlap(rows);
+
+    // The four requests in flight together take four sub-rows under the root;
+    // the two overlapping queries take two in the database lane.
+    const bands = laneBandsOf(canvas);
+    expect(bands.map((band) => numericAttribute(band, 'height'))).toEqual([
+      layoutHeight(1 + STACK_REQUESTS.length),
+      layoutHeight(STACK_QUERIES.length),
+    ]);
+    const requestRows = STACK_REQUESTS.map((request) => drawnRowNamed(rows, request.name));
+    expect(new Set(requestRows.map((row) => row.y)).size).toBe(STACK_REQUESTS.length);
+
+    // A request that starts exactly as the first ends only touches it, and
+    // shares its sub-row.
+    const [first] = requestRows;
+    expect(drawnRowNamed(rows, STACK_TOUCHING.name).y).toBe(first?.y);
+
+    // Every connector still joins the child's bar to its own parent's, on the
+    // sub-rows both were packed into.
+    const paths = edgesOf(canvas).map((edge) => edge.getAttribute('d'));
+    const root = drawnRowNamed(rows, STACK_ROOT.name);
+    for (const request of [...STACK_REQUESTS, STACK_TOUCHING]) {
+      expect(paths).toContain(connectorBetween(root, drawnRowNamed(rows, request.name)));
+    }
+    for (const [index, query] of STACK_QUERIES.entries()) {
+      const parent = requestRows[index];
+      if (parent === undefined) {
+        throw new Error(`no request drawn for query ${String(index)}`);
+      }
+      expect(paths).toContain(connectorBetween(parent, drawnRowNamed(rows, query.name)));
+    }
+    expect(paths).toHaveLength(tree.nodeCount - 1);
+
+    // Nothing is gathered, so neither the canvas nor the footer mentions marks.
+    expect(canvas.getAttribute('aria-label')).not.toContain('“+N”');
+  });
+
+  it('keeps the longest spans of a crowded depth as bars and gathers the rest into a "+N" mark the canvas, the footer and the table account for', async () => {
+    const tree = crowdedTree();
+    const stub = resolvingTrace(tree);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+    const rows = drawnRowsOf(canvas);
+
+    // The six longest renders and the root are bars; the four shortest are not.
+    expect(rows).toHaveLength(tree.nodeCount - CROWD_GATHERED.length);
+    for (const render of CROWD_DRAWN) {
+      expect(drawnRowNamed(rows, render.name)).toBeDefined();
+    }
+    for (const render of CROWD_GATHERED) {
+      expect(() => drawnRowNamed(rows, render.name)).toThrow();
+    }
+    expectNoBarOverlap(rows);
+
+    // One mark gathers the four, on one row beneath the depth's six sub-rows,
+    // so the lane is the root's row, six sub-rows and the overflow row: bounded,
+    // however many renders the commit held.
+    const marks = overflowMarksOf(canvas);
+    expect(marks).toHaveLength(1);
+    const [mark] = marks;
+    if (mark === undefined) {
+      throw new Error('the crowded depth drew no "+N" mark');
+    }
+    expect(gatheredCountOf(mark)).toBe(CROWD_GATHERED.length);
+    const [band] = laneBandsOf(canvas);
+    if (band === undefined) {
+      throw new Error('the canvas drew no browser lane');
+    }
+    expect(numericAttribute(band, 'height')).toBe(layoutHeight(1 + SUB_ROW_CAP + 1));
+    const markTop = numericAttribute(mark, 'y');
+    for (const render of CROWD_DRAWN) {
+      expect(markTop).toBeGreaterThan(drawnRowNamed(rows, render.name).y);
+    }
+    expect(markTop + numericAttribute(mark, 'height')).toBeLessThanOrEqual(
+      numericAttribute(band, 'y') + numericAttribute(band, 'height'),
+    );
+
+    // The mark spans exactly what it gathers, and says what it holds, when,
+    // and where each of them is instead.
+    const [earliest] = CROWD_GATHERED;
+    const latest = CROWD_GATHERED.at(-1);
+    if (earliest === undefined || latest === undefined) {
+      throw new Error('the crowded fixture gathers nothing');
+    }
+    expect(mark.querySelector('title')?.textContent).toBe(
+      `+${formatCount(CROWD_GATHERED.length)}: ${formatCount(
+        CROWD_GATHERED.length,
+      )} overlapping spans from ${formatOffset(earliest.startTime, BASE_START_MS)} to ${formatOffset(
+        latest.startTime + latest.duration,
+        BASE_START_MS,
+      )} are not drawn as bars. A lane draws at most ${formatCount(
+        SUB_ROW_CAP,
+      )} rows of bars for one depth and keeps the longest spans as bars. Every span is listed in the table below.`,
+    );
+    expect(
+      Array.from(canvas.querySelectorAll('text.dg-timeline__overflow-label')).map(
+        (label) => label.textContent,
+      ),
+    ).toEqual([`+${formatCount(CROWD_GATHERED.length)}`]);
+
+    // The canvas's text alternative and the footer state it too.
+    expect(canvas.getAttribute('aria-label')).toContain(CROWD_GATHERED_STATEMENT);
+    const footer = footerStartingWith(`${formatCount(tree.nodeCount)} spans shown.`);
+    expect(footer.textContent).toContain(CROWD_GATHERED_STATEMENT);
+
+    // And the table lists every span, the gathered four included.
+    expect(renderedNames()).toEqual(
+      expect.arrayContaining([CROWD_ROOT.name, ...CROWD_RENDERS.map((render) => render.name)]),
+    );
+    expect(renderedNames()).toHaveLength(tree.nodeCount);
+  });
+
+  it('draws a selected span its crowded depth would gather as a bar, and moves no bar when a drawn one is selected', async () => {
+    const stub = resolvingTrace(crowdedTree());
+    const spies = makeActions();
+    const [shortest] = CROWD_GATHERED;
+    const longest = CROWD_DRAWN.at(-1);
+    if (shortest === undefined || longest === undefined) {
+      throw new Error('the crowded fixture is empty');
+    }
+
+    // Nothing selected: the unpinned layout.
+    const { rerender } = render(
+      hostedTree(<Timeline node={makeNode()} />, stub.provider, spies.actions, {
+        selection: undefined,
+      }),
+    );
+    await findCanvas();
+    const unpinned = barPositions(timelineCanvas());
+    expect(() => barTitled(timelineCanvas(), shortest.name)).toThrow();
+
+    // A drawn bar selected: marked where it is, and no bar moves.
+    rerender(
+      hostedTree(<Timeline node={makeNode()} />, stub.provider, spies.actions, {
+        selection: { eventId: longest.id },
+      }),
+    );
+    await waitFor(() => {
+      expect(selectedBars()).toHaveLength(1);
+    });
+    expect(barTitled(timelineCanvas(), longest.name).classList.contains('dg-is-selected')).toBe(
+      true,
+    );
+    expect(barPositions(timelineCanvas())).toEqual(unpinned);
+
+    // The shortest render, which the depth gathers, selected elsewhere in the
+    // panel: it is drawn as a bar and marked, and the depth still accounts for
+    // every one of its renders.
+    rerender(
+      hostedTree(<Timeline node={makeNode()} />, stub.provider, spies.actions, {
+        selection: { eventId: shortest.id },
+      }),
+    );
+    await waitFor(() => {
+      expect(barTitled(timelineCanvas(), shortest.name).classList.contains('dg-is-selected')).toBe(
+        true,
+      );
+    });
+    expect(selectedBars()).toHaveLength(1);
+    expect(rowsOnCanvas(timelineCanvas())).toBe(CROWD_SIZE + 1);
+    expectNoBarOverlap(drawnRowsOf(timelineCanvas()));
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Durations that are not measurements
+ *
+ * A malformed record can carry a duration no clock produced: a negative value,
+ * or `null` where the schema promises a number. Its bar is still drawn — at
+ * the minimum width, where the call began — but every place the view prints a
+ * duration states it as unavailable: the bar's title, its label, the detail
+ * strip and the table. Printing the clamped geometry value would report a
+ * corrupt measurement as the fastest span of the capture.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A duration as a malformed record delivers it: `null` where a number belongs. */
+const UNMEASURED_NULL = null as unknown as number;
+
+/** The separator between a bar label's name and its duration. */
+const LABEL_SEPARATOR = ' · ';
+
+const UNMEASURED_ROOT = makeEvent({
+  id: 'event-unmeasured-root',
+  spanId: spanIdFor(0xe0),
+  kind: 'interaction',
+  name: 'example.unmeasured-root',
+  duration: 2000,
+});
+
+/** A fetch whose duration is negative, at 1.2 s: the last span, with room after it for a label. */
+const NEGATIVE_FETCH = makeEvent({
+  id: 'event-unmeasured-negative',
+  spanId: spanIdFor(0xe1),
+  parentSpanId: UNMEASURED_ROOT.spanId,
+  kind: 'fetch',
+  name: 'example.negative-fetch',
+  startTime: BASE_START_MS + 1200,
+  duration: -5,
+  seq: 1,
+  ingestSeq: 2,
+});
+
+/** A fetch whose duration is `null`, at 400 ms. */
+const NULL_FETCH = makeEvent({
+  id: 'event-unmeasured-null',
+  spanId: spanIdFor(0xe2),
+  parentSpanId: UNMEASURED_ROOT.spanId,
+  kind: 'fetch',
+  name: 'example.null-fetch',
+  startTime: BASE_START_MS + 400,
+  duration: UNMEASURED_NULL,
+  seq: 2,
+  ingestSeq: 3,
+});
+
+/** A fetch below zero only by floating-point noise, at 700 ms: the zero it is. */
+const NOISE_FETCH = makeEvent({
+  id: 'event-unmeasured-noise',
+  spanId: spanIdFor(0xe3),
+  parentSpanId: UNMEASURED_ROOT.spanId,
+  kind: 'fetch',
+  name: 'example.noise-fetch',
+  startTime: BASE_START_MS + 700,
+  duration: -0.0004,
+  seq: 3,
+  ingestSeq: 4,
+});
+
+/** A measured fetch, at 30 ms. */
+const MEASURED_FETCH = makeEvent({
+  id: 'event-unmeasured-measured',
+  spanId: spanIdFor(0xe4),
+  parentSpanId: UNMEASURED_ROOT.spanId,
+  kind: 'fetch',
+  name: 'example.measured-fetch',
+  startTime: BASE_START_MS + 30,
+  duration: 250,
+  seq: 4,
+  ingestSeq: 5,
+});
+
+/** The span list the cases draw, in canonical order. */
+const UNMEASURED_SPANS: readonly TelemetryEvent[] = [
+  UNMEASURED_ROOT,
+  NEGATIVE_FETCH,
+  MEASURED_FETCH,
+  NULL_FETCH,
+  NOISE_FETCH,
+];
+
+/** The duration phrase a bar's title carries: "… tier, <duration> at <offset>." */
+function titleDurationOf(canvas: HTMLElement, name: string): string {
+  const title = barTitled(canvas, name).querySelector('title')?.textContent ?? '';
+  const phrase = / tier, (.+?) at /u.exec(title)?.[1];
+  if (phrase === undefined) {
+    throw new Error(`the bar of "${name}" states no duration: "${title}"`);
+  }
+
+  return phrase;
+}
+
+/** The duration cell inside `scope`. */
+function durationCellIn(scope: Element): HTMLElement {
+  const cell = scope.querySelector<HTMLElement>('.dg-duration-cell');
+  if (cell === null) {
+    throw new Error('no duration cell was drawn there');
+  }
+
+  return cell;
+}
+
+describe('Timeline durations that are not measurements', () => {
+  it('states a negative or null duration as n/a on its bar, its label and its table row, and still draws the bar', async () => {
+    const stub = resolvingSpans(UNMEASURED_SPANS);
+
+    renderComponent(makeNode({ query: { source: 'spans' } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    const canvas = await findCanvas();
+
+    for (const event of [NEGATIVE_FETCH, NULL_FETCH]) {
+      // Drawn — the bar marks where the call began — but never as measured.
+      expect(titleDurationOf(canvas, event.name)).toBe(NOT_AVAILABLE_LABEL);
+      const cell = durationCellIn(rowNamed(event.name));
+      expect(cell.textContent).toBe(NOT_AVAILABLE_LABEL);
+      expect(cell.classList.contains('dg-is-unavailable')).toBe(true);
+    }
+
+    expect(titleDurationOf(canvas, NOISE_FETCH.name)).toBe(formatDuration(0));
+    expect(titleDurationOf(canvas, MEASURED_FETCH.name)).toBe(formatDuration(250));
+
+    // A label that states a duration states the one the title does: no label of
+    // an unmeasured bar reads as a measured zero.
+    const labels = barLabelsOf(canvas);
+    for (const event of [NEGATIVE_FETCH, NULL_FETCH]) {
+      for (const label of labels.filter((text) => text.startsWith(event.name))) {
+        expect(label.endsWith(`${LABEL_SEPARATOR}${formatDuration(0)}`)).toBe(false);
+        expect(label.endsWith(`${LABEL_SEPARATOR}${formatDurationCompact(0)}`)).toBe(false);
+      }
+    }
+    expect(labels).toContain(`${NEGATIVE_FETCH.name}${LABEL_SEPARATOR}${NOT_AVAILABLE_LABEL}`);
+  });
+
+  it('states an unmeasured duration as n/a in the detail strip of the span selected', async () => {
+    const stub = resolvingSpans(UNMEASURED_SPANS);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode({ query: { source: 'spans' } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await findCanvas();
+
+    await user.click(rowNamed(NEGATIVE_FETCH.name));
+    expect(detailTrigger().textContent).toBe(NEGATIVE_FETCH.name);
+    const cell = durationCellIn(detailStrip());
+    expect(cell.textContent).toBe(NOT_AVAILABLE_LABEL);
+    expect(cell.classList.contains('dg-is-unavailable')).toBe(true);
+
+    // And the row's own description — the keyboard path — says the same.
+    expect(await descriptionOf(rowNamed(NEGATIVE_FETCH.name))).toContain(
+      `tier, ${NOT_AVAILABLE_LABEL} at`,
+    );
+  });
+});
+
+describe('Timeline chart accessible names', () => {
+  it('names the canvas as a figure and every bar as an image carrying its full description', async () => {
+    const tree = stackedTree();
+    renderComponent(makeNode(), {
+      provider: resolvingTrace(tree).provider,
+      actions: makeActions().actions,
+    });
+
+    const canvas = await findCanvas();
+    expect(canvas.tagName.toLowerCase()).toBe('svg');
+    expect(canvas.getAttribute('role')).toBe('figure');
+    expect(canvas.getAttribute('aria-label')).toMatch(/^Timeline: /);
+
+    // One named image per span: the bar's accessible name is the sentence its
+    // native tooltip shows, so the hover information is in the tree as well.
+    const bars = barsOf(canvas);
+    expect(bars).toHaveLength(tree.nodeCount);
+    const images = within(canvas).getAllByRole('img');
+    expect(images).toHaveLength(bars.length);
+    for (const bar of bars) {
+      const name = bar.getAttribute('aria-label');
+      expect(bar.getAttribute('role')).toBe('img');
+      expect(name).not.toBeNull();
+      expect(name).toBe(bar.querySelector('title')?.textContent);
+    }
+    for (const event of [STACK_ROOT, ...STACK_REQUESTS]) {
+      expect(
+        within(canvas).getByRole('img', {
+          name: (accessibleName) => accessibleName.startsWith(`${event.name} — `),
+        }),
+      ).toBeDefined();
+    }
+
+    // What repeats those names is hidden from assistive technology: the lanes,
+    // the axis, the connectors and every visible label.
+    for (const selector of ['.dg-timeline__lanes', '.dg-timeline__axis']) {
+      expect(canvas.querySelector(selector)?.getAttribute('aria-hidden')).toBe('true');
+    }
+    const edges = edgesOf(canvas);
+    expect(edges.length).toBeGreaterThan(0);
+    for (const edge of edges) {
+      expect(edge.closest('[aria-hidden="true"]')).not.toBeNull();
+    }
+    const labels = Array.from(canvas.querySelectorAll('text.dg-timeline__bar-label'));
+    expect(labels.length).toBeGreaterThan(0);
+    for (const label of labels) {
+      expect(label.getAttribute('aria-hidden')).toBe('true');
+    }
+  });
+
+  it('names every "+N" mark as an image stating what it gathers', async () => {
+    renderComponent(makeNode(), {
+      provider: resolvingTrace(crowdedTree()).provider,
+      actions: makeActions().actions,
+    });
+
+    const canvas = await findCanvas();
+    const marks = overflowMarksOf(canvas);
+    expect(marks.length).toBeGreaterThan(0);
+    for (const mark of marks) {
+      expect(mark.getAttribute('role')).toBe('img');
+      expect(mark.getAttribute('aria-label')).toBe(mark.querySelector('title')?.textContent);
+      expect(mark.getAttribute('aria-label')).toMatch(/Every span is listed in the table below\.$/);
+    }
+    for (const label of Array.from(canvas.querySelectorAll('text.dg-timeline__overflow-label'))) {
+      expect(label.getAttribute('aria-hidden')).toBe('true');
+    }
+    expect(within(canvas).getAllByRole('img')).toHaveLength(barsOf(canvas).length + marks.length);
+  });
+
+  it('names a bar whose duration is not a measurement with n/a, never a measured zero', async () => {
+    renderComponent(makeNode({ query: { source: 'spans' } }), {
+      provider: resolvingSpans(UNMEASURED_SPANS).provider,
+      actions: makeActions().actions,
+    });
+
+    const canvas = await findCanvas();
+    for (const event of [NEGATIVE_FETCH, NULL_FETCH]) {
+      const bar = within(canvas).getByRole('img', {
+        name: (accessibleName) => accessibleName.startsWith(`${event.name} — `),
+      });
+      expect(bar.getAttribute('aria-label')).toContain(`tier, ${NOT_AVAILABLE_LABEL} at`);
+      expect(bar.getAttribute('aria-label')).not.toContain(`tier, ${formatDuration(0)} at`);
+    }
   });
 });

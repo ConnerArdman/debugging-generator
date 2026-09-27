@@ -117,8 +117,8 @@ import type {
   Result,
   SessionId,
 } from '@debuggen/shared';
-import { DEFAULT_TOP_N, METRIC_IDS } from '@debuggen/telemetry';
-import type { CaptureSummary, MetricId } from '@debuggen/telemetry';
+import { DEFAULT_TOP_N, METRIC_IDS, REQUEST_KINDS } from '@debuggen/telemetry';
+import type { CaptureSummary, MetricId, TelemetryKind } from '@debuggen/telemetry';
 
 import type { AnalysisSummarizer } from '../analysis/summarize.js';
 import { sessionLogger, subsystemLogger } from '../logging.js';
@@ -191,6 +191,7 @@ export function isFallbackReason(value: unknown): value is FallbackReason {
 export const FALLBACK_SECTION_TITLES = Object.freeze({
   overview: 'Capture overview',
   trace: 'Longest trace',
+  requestTimeline: 'Requests against renders',
   operations: 'Slowest operations',
   renders: 'Component renders',
   requests: 'Network requests',
@@ -298,6 +299,74 @@ type QueryRefinement = Omit<DataQuery, 'source'>;
 /** The sort of the generic "slowest operations" ranking. */
 const SLOWEST_FIRST: DataQuerySort = 'duration_desc';
 
+/** The sort of a flat time axis: records in the order they started. */
+const START_ORDER: DataQuerySort = 'start_asc';
+
+/**
+ * The event kinds of the requests-against-renders timeline: every request
+ * kind of the catalog's request views, and the commit — one record per render
+ * pass, where the component renders of that pass would crowd the requests off
+ * a bounded page.
+ */
+const REQUEST_TIMELINE_KINDS: readonly TelemetryKind[] = Object.freeze([
+  ...REQUEST_KINDS,
+  'commit',
+]);
+
+/**
+ * Whether the capture repeated a request that the primary trace does not
+ * show: a request group of the summary reports duplicates, and at least one of
+ * its occurrences ran outside `primaryTraceId` — or the summary names no
+ * primary trace, or the group's occurrence list is truncated, so containment
+ * cannot be shown. Repeated requests are rarely caused by one interaction, so
+ * a trace timeline would then plot whichever trace ran longest instead of the
+ * repetition.
+ */
+function hasDuplicatesOutsidePrimaryTrace(
+  summary: CaptureSummary,
+  primaryTraceId: string | undefined,
+): boolean {
+  return listOf(summary.topRequests).some((group) => {
+    if (!group.hasDuplicates && positiveCount(group.duplicateCount) === 0) {
+      return false;
+    }
+    const occurrences = listOf(group.occurrences);
+    if (primaryTraceId === undefined || group.occurrencesTruncated || occurrences.length === 0) {
+      return true;
+    }
+    return occurrences.some((occurrence) => occurrence.traceId !== primaryTraceId);
+  });
+}
+
+/** Whether a value is an array; `Array.isArray` alone narrows a readonly list to `any[]`. */
+function isUnknownArray(value: unknown): value is readonly unknown[] {
+  return Array.isArray(value);
+}
+
+/** A summary section read defensively: a stored summary is typed, not trusted. */
+function listOf<T>(items: readonly T[] | undefined): readonly T[] {
+  return isUnknownArray(items) ? items : [];
+}
+
+/**
+ * The timeline of a capture that repeated requests: the requests and the
+ * page's commits across the whole capture, in start order — the requests
+ * plotted against the renders that issued them — narrowed to the kinds the
+ * capture actually holds. `undefined` when it holds none of them.
+ */
+function requestTimelineChoice(summary: CaptureSummary): FallbackNodeChoice | undefined {
+  const kinds = REQUEST_TIMELINE_KINDS.filter(
+    (kind) => positiveCount(summary.kindCounts[kind]) > 0,
+  );
+  if (kinds.length === 0) {
+    return undefined;
+  }
+  return choiceFor('timeline', 'requestTimeline', {
+    preferredSource: 'spans',
+    refine: { filter: { kinds: [...kinds] }, sort: START_ORDER },
+  });
+}
+
 /**
  * The source a fallback node reads: the preferred one when the node type's
  * catalog entry allows it, otherwise the entry's implied default, otherwise the
@@ -381,8 +450,12 @@ function hasEvidence(
  * - for an **empty capture** (no events) nothing else, so the panel is a single
  *   valid section rather than a blank layout — AAP 0.5.5 handles "no telemetry
  *   was captured" on its own path before any panel is generated;
- * - a `timeline` only when the summary names a real trace (`primaryTraceId`),
- *   filtered to that trace — never to a placeholder;
+ * - a `timeline` of the requests and commits across the whole capture, in
+ *   start order, when a request group reports duplicates the primary trace
+ *   does not hold — repeated requests then span many traces, so no single one
+ *   shows them;
+ * - otherwise a `timeline` only when the summary names a real trace
+ *   (`primaryTraceId`), filtered to that trace — never to a placeholder;
  * - a `table` over spans, slowest first and bounded to the summary's top-N:
  *   the generic "slowest operations" ranking;
  * - a `renderTable`, `requestTable` or `queryTable` only when renders, requests
@@ -406,8 +479,17 @@ export function selectFallbackNodes(summary: CaptureSummary): FallbackSelection 
   add(choiceFor('metricCards', 'overview'));
 
   if (!empty) {
-    const traceId = summary.primaryTraceId;
-    if (traceId !== undefined && isTraceId(traceId)) {
+    const primary = summary.primaryTraceId;
+    const traceId = primary !== undefined && isTraceId(primary) ? primary : undefined;
+    // Repeated requests the primary trace does not hold span many traces, so
+    // their timeline is the flat axis of requests and commits rather than
+    // whichever trace ran longest.
+    const requestTimeline = hasDuplicatesOutsidePrimaryTrace(summary, traceId)
+      ? requestTimelineChoice(summary)
+      : undefined;
+    if (requestTimeline !== undefined) {
+      add(requestTimeline);
+    } else if (traceId !== undefined) {
       add(
         choiceFor('timeline', 'trace', {
           preferredSource: 'trace',

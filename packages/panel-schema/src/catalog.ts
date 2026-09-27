@@ -1056,9 +1056,11 @@ export const PANEL_NODE_CATALOG: Readonly<Record<PanelNodeType, PanelNodeCatalog
       // required. It reads the component, phase, trigger and changed props that
       // the row's columns and histograms show, the producer's running render
       // count each occurrence carries, and the reported render time as the
-      // fallback for an unusable duration. The owner chain feeds only the
-      // component tree, the self time and the commit's root name feed nothing
-      // in this result, and a commit is not a render, so none is read here.
+      // fallback for an unusable duration, and the names of the changed
+      // contexts that make a context trigger attributable. The owner chain
+      // feeds only the component tree, the self time and the commit's root
+      // name feed nothing in this result, and a commit is not a render, so
+      // none is read here.
       ...declareReads({
         requiredFields: [...EVENT_IDENTITY_FIELDS, 'kind', ...EVENT_TIMING_FIELDS],
         optionalFields: EVENT_LINK_FIELDS,
@@ -1070,6 +1072,7 @@ export const PANEL_NODE_CATALOG: Readonly<Record<PanelNodeType, PanelNodeCatalog
             'changedProps',
             'trigger',
             'actualDuration',
+            'changedContexts',
           ]),
         ],
       }),
@@ -1139,8 +1142,11 @@ export const PANEL_NODE_CATALOG: Readonly<Record<PanelNodeType, PanelNodeCatalog
       // a response that never reported one — so no attribute is required. It
       // groups by the service-assigned key, reads the method, URL, status code,
       // initiator and in-flight marker the columns and the pending badge show,
-      // and resolves bytes from the request's own reading or from the
-      // resource-timing entry it is joined to, which is cross-kind provenance.
+      // labels each caller by the component that started the request and its
+      // owners when the renderer reported them (absent in most captures, so
+      // optional like every other read here), and resolves bytes from the
+      // request's own reading or from the resource-timing entry it is joined
+      // to, which is cross-kind provenance.
       // The same-origin and trace-header flags are not read by anything behind
       // this view.
       ...declareReads({
@@ -1157,6 +1163,8 @@ export const PANEL_NODE_CATALOG: Readonly<Record<PanelNodeType, PanelNodeCatalog
             'url',
             'http.status_code',
             'initiator',
+            'initiatorComponent',
+            'initiatorOwners',
             'request_key',
             'transferSize',
             'resourceTimingUrl',

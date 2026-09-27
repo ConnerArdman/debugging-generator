@@ -58,7 +58,7 @@ pnpm demo:db
 docker compose ps postgres
 ```
 
-`pnpm demo:db` is `docker compose up -d postgres`: it starts the single Compose service `postgres` (image `postgres:18.6-alpine`, container `debuggen-postgres`, database `lumen_supply`, port 5432) in the background, with its data in a named volume so nothing appears in your working tree.
+`pnpm demo:db` is `docker compose up -d postgres`: it starts the single Compose service `postgres` (image `postgres:18.6-alpine`, container `<project>-postgres-1`, database `lumen_supply`, port 5432) in the background, with its data in the named volume `<project>_postgres-data` so nothing appears in your working tree. `<project>` is the Compose project name: the checkout directory's name unless `COMPOSE_PROJECT_NAME` is set, so every checkout or worktree gets its own container and volume; a second one running side by side needs only its own `POSTGRES_PORT` (see [README.md](../README.md#local-postgresql-container)).
 
 You should see: within a few seconds, `docker compose ps postgres` reports the container as `(healthy)` — that is its `pg_isready` healthcheck passing.
 
@@ -70,9 +70,14 @@ pnpm demo:migrate
 pnpm demo:seed
 ```
 
-`demo:generate` writes the Prisma client (already done by `pnpm build`; repeating it is harmless). `demo:migrate` first checks that the committed migration matches `prisma/schema.prisma`, then applies `prisma/migrations/0001_init`. `demo:seed` resets every table and loads the data set.
+`demo:generate` writes the Prisma client (already done by `pnpm build`; repeating it is harmless). `demo:migrate` first runs `check:migration`, which replays the committed migrations in order and requires them to reproduce `prisma/schema.prisma` exactly, then applies both of them with `prisma migrate deploy`:
 
-You should see: `All migrations have been successfully applied.`, then seed progress lines prefixed `lumen-supply seed:` and, at the end, this table (the seed uses a fixed random seed, so the counts are exact):
+- `prisma/migrations/0001_init` — the baseline: the twelve tables, their keys and their indexes.
+- `prisma/migrations/0002_cart_checkout_key` — adds `carts.checkout_key`, the name of the checkout attempt that claimed the cart (the checkout submission's `idempotencyKey`). It is written when a checkout claims the cart, kept when the cart becomes an order, and cleared when a checkout that did not finish puts the cart back. The column is unique, so one attempt name holds at most one cart, and a repeated submission with the same key is answered with that attempt's own outcome — the order it placed or the cart it holds — instead of placing a second order, by any process, after any restart.
+
+The history is incremental: an applied migration is never edited, and a later schema change arrives as a new migration. `demo:seed` resets every table and loads the data set.
+
+You should see: `check-migrations: 2 migrations reproduce prisma/schema.prisma (149 schema objects)`, then Prisma applying `0001_init` and `0002_cart_checkout_key` and reporting `All migrations have been successfully applied.` (on a database that already has both, `No pending migrations to apply.`), then seed progress lines prefixed `lumen-supply seed:` and, at the end, this table (the seed uses a fixed random seed, so the counts are exact):
 
 ```text
 lumen-supply seed: row counts
@@ -109,7 +114,7 @@ curl -s http://127.0.0.1:43117/health
 
 You should see: a JSON log line `the Debug Generator service is listening` with its URL, and the health route answer with the service `version`, `protocolVersion` (`"1.0.0"`) and whether `pairingAvailable` is true. The service creates `$DEBUGGEN_HOME` (default `~/.debuggen`, mode `0700`) with the session database, the backup directory and the index cache, and on first start writes the editor credential that the VS Code extension and `pnpm demo:instrumented` authenticate with to `auth.json` (mode `0600`) in the same directory. Nothing prints it, and you never need to copy it anywhere.
 
-Alternatively, let VS Code run it: the command **Debug Generator: Start Local Service** (`debuggen.startService`) starts the service bundled with the extension, and with `debuggen.autoStartService` enabled (the default) the extension starts it by itself whenever its health check fails. When VS Code starts the service it forwards the `debuggen.provider` setting as `DEBUGGEN_PROVIDER`; that setting defaults to `anthropic`, so set it to `deterministic` for a key-less run.
+Alternatively, let VS Code run it: the command **Debug Generator: Start Local Service** (`debuggen.startService`) starts the service bundled with the extension, and with `debuggen.autoStartService` enabled (the default) the extension starts it by itself whenever its health check fails. When VS Code starts the service it forwards the `debuggen.provider` setting as `DEBUGGEN_PROVIDER` and a non-empty `debuggen.model` as `DEBUGGEN_MODEL`; the provider defaults to `deterministic`, so a key-less run needs no setting. For `anthropic`, set `debuggen.model` and start VS Code from an environment that has `ANTHROPIC_API_KEY`, which is never read from settings.
 
 ### Step 4 — Load the two extensions
 
@@ -319,7 +324,7 @@ Paths below are relative to `apps/demo-app/`.
 
 **Mechanism:** `CheckoutButton` is a plain submit button, and `POST /api/checkout` only validates the request and calls `placeOrder`. The checkout attempt then awaits, strictly in sequence:
 
-1. `reserveStock` (`inventory.service.ts`) — for **each cart line**, a raw `pool.query` whose five CTEs aggregate `inventory_movements` for that product (over the last 540 days, and the last 30 for holds and shipments). The table is indexed only on `warehouse_id`: the initial migration deliberately has **no index on `(product_id, created_at)`**, so each of those aggregates scans the whole 200 000-row ledger.
+1. `reserveStock` (`inventory.service.ts`) — for **each cart line**, a raw `pool.query` whose five CTEs aggregate `inventory_movements` for that product (over the last 540 days, and the last 30 for holds and shipments). The table is indexed only on `warehouse_id`: the initial migration deliberately has **no index on `(product_id, created_at)`**, and the later `0002_cart_checkout_key` migration does not add one either (it only touches `carts`), so each of those aggregates scans the whole 200 000-row ledger.
 2. `applyPromotions` (`pricing.service.ts`) — a separate `prisma.priceRule.findMany` **per cart line**: an N+1.
 3. `quote` (`shipping.service.ts`) — an HTTP call to the simulated carrier at `POST /api/mock/carrier`, which takes about 430 ms, awaited after the stock and pricing work although it depends on neither.
 4. `authorize` — the simulated payment processor at `POST /api/mock/payment`, about 120 ms.

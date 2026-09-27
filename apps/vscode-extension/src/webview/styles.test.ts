@@ -24,6 +24,10 @@
  *   4. no colour is written as a literal;
  *   5. no border or outline width is written as a keyword.
  *
+ * Beside them, the progress list's four marker tones (running, done, failed
+ * and warning) are each held to one colour of their own through a token, so a
+ * warning can never be painted as the success check beside it.
+ *
  * ## How the stylesheet is read
  *
  * This project type-checks against DOM libraries only (`tsconfig.webview.json`
@@ -217,6 +221,38 @@ describe('webview stylesheet', () => {
       ).map(describeDeclaration),
       'an edge weight is var(--dg-border-width-hairline) or var(--dg-border-width-marker)',
     ).toEqual([]);
+  });
+});
+
+describe('progress status markers', () => {
+  // `components/ProgressSteps.tsx` draws four marker tones, each a glyph, a
+  // spoken word and a colour. The colour must exist for every tone and differ
+  // between them, or a notice would be painted like the success beside it.
+  const MARKER_TONES = ['running', 'done', 'failed', 'warning'] as const;
+
+  /** The colour values the rule for one tone's modifier declares. */
+  function markerColours(tone: (typeof MARKER_TONES)[number]): string[] {
+    return DECLARATIONS.filter(
+      ({ selector, property }) =>
+        selector === `.dgv-progress__marker--${tone}` && property === 'color',
+    ).map(({ value }) => value);
+  }
+
+  for (const tone of MARKER_TONES) {
+    it(`colours the ${tone} marker through exactly one design token`, () => {
+      const colours = markerColours(tone);
+      expect(colours).toHaveLength(1);
+      expect(colours[0]).toMatch(/^var\(--dg-[\w-]+\)$/u);
+    });
+  }
+
+  it('gives every tone a colour of its own', () => {
+    const colours = MARKER_TONES.flatMap((tone) => markerColours(tone));
+    expect(new Set(colours).size).toBe(MARKER_TONES.length);
+  });
+
+  it('paints a warning with the warning status token', () => {
+    expect(markerColours('warning')).toEqual(['var(--dg-warning)']);
   });
 });
 

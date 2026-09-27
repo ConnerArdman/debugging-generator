@@ -136,6 +136,7 @@ import type {
   PanelSelection,
   PanelEventCoordinates,
 } from '../host/PanelActions';
+import { renderTriggerAppearance } from '../utils/color';
 import { formatCount, formatDurationCompact, formatRenderTriggerLabel } from '../utils/format';
 import { ComponentTree } from './ComponentTree';
 
@@ -277,7 +278,7 @@ const THRESHOLD_FIELD_NAME = 'Mark at renders ≥';
  * and live region — completed with the derived default that applies meanwhile.
  */
 function thresholdRejectedText(derived: number): string {
-  return `Enter a whole number of at least ${formatCount(1)}. The default of ${formatCount(
+  return `Enter a whole number of ${formatCount(0)} or more. The default of ${formatCount(
     derived,
   )} applies until then.`;
 }
@@ -2281,6 +2282,48 @@ describe('ComponentTree counts', () => {
     expect(within(row).getByText('example-key-1').textContent).toContain('Instance key:');
   });
 
+  it('draws a trigger chip exactly as the render table does: its hue, and a dashed unknown', async () => {
+    const stub = resolvingProvider(
+      makeSnapshot({
+        roots: [
+          makeTreeNode({
+            id: `${COMPONENT_TREE_NODE_ID_PREFIX}0`,
+            component: 'ExampleRoot',
+            renderCount: 4,
+            totalDurationMs: 8,
+            lastTrigger: 'state',
+          }),
+          makeTreeNode({
+            id: `${COMPONENT_TREE_NODE_ID_PREFIX}1`,
+            component: 'ExampleSibling',
+            renderCount: 2,
+            totalDurationMs: 3,
+            lastTrigger: 'unknown',
+          }),
+        ],
+        nodeCount: 2,
+      }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree');
+
+    const stateChip = within(rowNamed('ExampleRoot')).getByText(formatRenderTriggerLabel('state'));
+    const expectedState = renderTriggerAppearance('state');
+    expect(stateChip.style.getPropertyValue('--dgc-badge-color')).toBe(expectedState.colorVar);
+    expect(stateChip.classList.contains(`dg-badge--${expectedState.tone}`)).toBe(true);
+    expect(stateChip.classList.contains('dg-trigger-chip')).toBe(true);
+    expect(stateChip.classList.contains('dg-trigger-chip--dashed')).toBe(false);
+
+    const unknownChip = within(rowNamed('ExampleSibling')).getByText(
+      formatRenderTriggerLabel('unknown'),
+    );
+    expect(unknownChip.classList.contains('dg-trigger-chip--dashed')).toBe(true);
+    expect(unknownChip.style.getPropertyValue('--dgc-badge-color')).toBe(
+      renderTriggerAppearance('unknown').colorVar,
+    );
+  });
+
   it('answers n/a where a count or a duration was not measured', async () => {
     const stub = resolvingProvider(makeSnapshot({ roots: [UNMEASURED_NODE], nodeCount: 1 }));
 
@@ -2441,7 +2484,7 @@ describe('ComponentTree threshold', () => {
     expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '' });
   });
 
-  it('bounds the field to whole renders, from one up to the highest count captured', async () => {
+  it('bounds the field to whole renders, from zero up to the highest count captured', async () => {
     const stub = resolvingProvider(makeSnapshot({ roots: UNEVEN_STRUCTURE }));
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -2450,7 +2493,7 @@ describe('ComponentTree threshold', () => {
     // The highest count in the capture is forty: past it nothing more can be
     // marked, so that is where the spin buttons stop.
     const field = screen.getByRole('spinbutton', { name: THRESHOLD_FIELD_NAME });
-    expect(field.getAttribute('min')).toBe('1');
+    expect(field.getAttribute('min')).toBe('0');
     expect(field.getAttribute('step')).toBe('1');
     expect(field.getAttribute('max')).toBe('40');
 
@@ -2485,12 +2528,8 @@ describe('ComponentTree threshold', () => {
     expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '3' });
     expect(field.getAttribute('aria-invalid')).toBeNull();
 
-    // Zero is below the bound, so it names no threshold: the derived default
-    // is in force — one mark — and the host hears "", its spelling of that.
-    // The text stays so it can be corrected, but the field is marked invalid,
-    // the toolbar shows which default applies — a short pill beside the
-    // controls, not an error line that would widen the field's column — and
-    // the full reason describes the field and is announced by a live region.
+    // The rejection's live region: always mounted, empty while the value is
+    // accepted, and never part of the field's description until it speaks.
     const toolbar = screen.getByRole('group', { name: TOOLBAR_NAME });
     const liveRegion = toolbar.querySelector<HTMLElement>('[aria-live="polite"]');
 
@@ -2505,13 +2544,36 @@ describe('ComponentTree threshold', () => {
     expect(liveRegion.textContent).toBe('');
     expect(field.getAttribute('aria-describedby') ?? '').not.toContain(liveRegion.id);
 
+    // Zero is a threshold: every node with a measured count reaches it, so all
+    // four are marked, and the host hears "0" — the threshold in force, not
+    // the default. Nothing about it is invalid.
     await user.clear(field);
     await user.type(field, '0');
 
     await waitFor(() => {
-      expect(screen.getByText(markedStatus(1))).toBeDefined();
+      expect(screen.getByText(markedStatus(4))).toBeDefined();
     });
     expect(screen.getByDisplayValue('0')).toBe(field);
+    expect(screen.getAllByText(AT_OR_ABOVE_THRESHOLD_TEXT)).toHaveLength(4);
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '0' });
+    expect(field.getAttribute('aria-invalid')).toBeNull();
+    expect(screen.queryByText(defaultInForceText(6))).toBeNull();
+    expect(liveRegion.textContent).toBe('');
+
+    // A negative number is below the bound, so it names no threshold: the
+    // derived default is in force — one mark — and the host hears "", its
+    // spelling of that. The text stays so it can be corrected, but the field
+    // is marked invalid, the toolbar shows which default applies — a short
+    // pill beside the controls, not an error line that would widen the
+    // field's column — and the full reason describes the field and is
+    // announced by a live region.
+    await user.clear(field);
+    await user.type(field, '-1');
+
+    await waitFor(() => {
+      expect(screen.getByText(markedStatus(1))).toBeDefined();
+    });
+    expect(screen.getByDisplayValue('-1')).toBe(field);
     expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '' });
     expect(field.getAttribute('aria-invalid')).toBe('true');
     const pill = within(screen.getByRole('group', { name: TOOLBAR_NAME })).getByText(
@@ -2559,8 +2621,80 @@ describe('ComponentTree threshold', () => {
     // Every report was a canonical decimal integer or "", never raw text.
     for (const [nodeId, filter] of spies.onFilterChange.mock.calls) {
       expect(nodeId).toBe(NODE_ID);
-      expect(filter.renderThreshold).toMatch(/^(?:[1-9]\d*)?$/);
+      expect(filter.renderThreshold).toMatch(/^(?:0|[1-9]\d*)?$/);
     }
+  });
+
+  it('honours an entered zero: marks every measured node and opens every branch above one', async () => {
+    // The uniform structure — one root — with a node whose count was never
+    // measured beside the aside. The derived default of six marks nothing, so
+    // only the root is open and the branch below it is closed.
+    const unmeasured = {
+      id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/2`,
+      component: 'ExampleUnmeasured',
+      depth: 1,
+      children: [],
+    } as unknown as ComponentTreeNode;
+    const stub = resolvingProvider(
+      makeSnapshot({ roots: [{ ...ROOT_NODE, children: [BRANCH_NODE, ASIDE_NODE, unmeasured] }] }),
+    );
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('tree');
+
+    // One snapshot root is one root row.
+    expect(rows().filter((row) => row.getAttribute('aria-level') === '1')).toHaveLength(1);
+    expect(rowNames()).toEqual([
+      'ExampleRoot',
+      'ExampleBranch',
+      'ExampleAside',
+      'ExampleUnmeasured',
+    ]);
+    expect(screen.getByText(markedStatus(0))).toBeDefined();
+
+    const field = screen.getByRole('spinbutton', { name: THRESHOLD_FIELD_NAME });
+    await user.clear(field);
+    await user.type(field, '0');
+
+    // Every node with a measured count reaches zero — all five — and every
+    // ancestor of a marked node opens, so the branch that was closed now
+    // shows its children. The unmeasured node reaches no threshold at all.
+    await waitFor(() => {
+      expect(screen.getByText(markedStatus(5))).toBeDefined();
+    });
+    expect(rowNames()).toEqual([...EXPANDED_ROW_NAMES, 'ExampleUnmeasured']);
+    for (const name of EXPANDED_ROW_NAMES) {
+      expect(rowNamed(name).classList.contains(HIGHLIGHTED_CLASS)).toBe(true);
+    }
+    expect(rowNamed('ExampleUnmeasured').classList.contains(HIGHLIGHTED_CLASS)).toBe(false);
+    expect(screen.queryByText(/hidden at or above threshold/)).toBeNull();
+
+    // Reported as the threshold in force, and accepted as valid.
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '0' });
+    expect(field.getAttribute('aria-invalid')).toBeNull();
+
+    // Leading zeros are spelling here too: "00" is zero, reported as "0".
+    await user.clear(field);
+    await user.type(field, '00');
+    await waitFor(() => {
+      expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '0' });
+    });
+    expect(screen.getByText(markedStatus(5))).toBeDefined();
+
+    // Clearing restores the derived default and the default expansion with it.
+    await user.clear(field);
+    await waitFor(() => {
+      expect(screen.getByText(markedStatus(0))).toBeDefined();
+    });
+    expect(rowNames()).toEqual([
+      'ExampleRoot',
+      'ExampleBranch',
+      'ExampleAside',
+      'ExampleUnmeasured',
+    ]);
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '' });
   });
 
   it('states on a collapsed branch how many marks it hides, and announces the count', async () => {

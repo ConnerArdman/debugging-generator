@@ -50,6 +50,15 @@
  * from the bridge frame (`armedCaptureId`, `droppedCount`), and why the
  * envelope, not the payload, carries routing.
  *
+ * ## What the tail frame counts
+ *
+ * The live tail is paced and bounded (`apps/local-service/src/telemetry/live-tail.ts`),
+ * so the events one panel receives are a view of the capture, not its size.
+ * Each tail frame therefore carries the running totals of its captures —
+ * {@link telemetryTailCaptureTallySchema}: the events the store holds and the
+ * events the tail skipped — and the panel's single capture counter reads those
+ * totals rather than counting what it was sent.
+ *
  * ## What this module does not own
  *
  * So that nobody adds it here:
@@ -352,6 +361,107 @@ function nonEmptyEventBatchSchema<S extends z.ZodType>(element: S): z.ZodArray<S
 }
 
 /**
+ * The most capture tallies one `telemetry.tail` frame may carry.
+ *
+ * A frame carries one tally per distinct capture among its events, and a
+ * session has at most one open capture at a time, so a frame spans one capture
+ * or — across a stop and the next start — two. Sixteen is a ceiling on a
+ * malformed frame, never a limit the service approaches.
+ */
+export const MAX_TAIL_CAPTURE_TALLIES = 16;
+
+/** The failure message of a malformed tally count. */
+const TALLY_COUNT_EXPECTATION =
+  'expected a whole number of events from 0 within the safe-integer range';
+
+/** What a frame whose tallies repeat a capture, or name one it holds no event of, is refused with. */
+const TALLY_CAPTURE_EXPECTATION =
+  'expected at most one tally per capture, each naming a capture at least one event of the frame belongs to';
+
+/** The label a frame whose tallies do not describe its own events is refused under. */
+const TALLY_CAPTURE_LABEL = 'tally-per-frame-capture';
+
+/** A tally count: a whole number of events, bounded so the panel can compare counts exactly. */
+function tallyCountSchema(): z.ZodInt {
+  return z
+    .int({ error: TALLY_COUNT_EXPECTATION })
+    .min(0, { error: TALLY_COUNT_EXPECTATION })
+    .max(Number.MAX_SAFE_INTEGER, { error: TALLY_COUNT_EXPECTATION });
+}
+
+/**
+ * One capture's running totals, as the service knows them when it builds a
+ * `telemetry.tail` frame (AAP §0.4.2, §0.7.3).
+ *
+ * The tail is a paced, bounded view — at most a few hundred events a second,
+ * with the oldest dropped from a full buffer — so the events a panel receives
+ * are never a count of what the capture recorded. This tally is: `storedEvents`
+ * is the capture's authoritative size, the number of events the store has
+ * committed for it, and `skippedEvents` is how many of them the live tail did
+ * not stream, so the panel can show one counter that agrees with the store and
+ * say plainly that the view skipped events.
+ *
+ * Counts only: no event, name or attribute value, so the tally carries nothing
+ * the redaction layer has not already seen.
+ */
+export const telemetryTailCaptureTallySchema = z.strictObject({
+  /** The capture these totals describe; at least one event of the frame belongs to it. */
+  captureId: identifierSchema(),
+
+  /** Events the store has committed for the capture so far: the capture's size. */
+  storedEvents: tallyCountSchema(),
+
+  /**
+   * Events of the capture the live tail did not stream — dropped from a full
+   * buffer, released after an outage, or discarded in an unsendable frame.
+   * Every one of them is still in the store.
+   */
+  skippedEvents: tallyCountSchema(),
+});
+
+/** One capture's running totals on a `telemetry.tail` frame. */
+export type TelemetryTailCaptureTally = z.infer<typeof telemetryTailCaptureTallySchema>;
+
+/**
+ * Refuses tallies that do not describe the frame's own events: a capture named
+ * twice, or a capture no event of the frame belongs to.
+ *
+ * A check on the object for the reason {@link requireLossReportForEmptyBatch}
+ * is one — the rule relates two fields — and it keeps the `ZodObject` and its
+ * `.shape`. It runs only on an otherwise valid payload, and the issue carries
+ * no received value.
+ *
+ * @param parsed The frame's parse state, whose `value` is the parsed frame.
+ */
+function requireTalliesForFrameCaptures(
+  parsed: z.core.ParsePayload<{
+    readonly events: readonly { readonly captureId: string }[];
+    readonly captures?: readonly { readonly captureId: string }[] | undefined;
+  }>,
+): void {
+  if (parsed.issues.length > 0 || parsed.value.captures === undefined) {
+    return;
+  }
+
+  const present = new Set(parsed.value.events.map((event) => event.captureId));
+  const named = new Set<string>();
+  for (const tally of parsed.value.captures) {
+    if (named.has(tally.captureId) || !present.has(tally.captureId)) {
+      parsed.issues.push({
+        code: 'custom',
+        path: ['captures'],
+        message: TALLY_CAPTURE_EXPECTATION,
+        params: { label: TALLY_CAPTURE_LABEL },
+        // Left empty on purpose: a rejection never carries what was received.
+        input: undefined,
+      });
+      return;
+    }
+    named.add(tally.captureId);
+  }
+}
+
+/**
  * Refuses an empty `telemetry.event` batch unless it reports a loss.
  *
  * Whether `events` may be empty depends on `droppedCount`, so this is a check on
@@ -517,23 +627,41 @@ export type TelemetryEventPayload = z.infer<typeof telemetryEventPayloadSchema>;
  * reason it is absent above: the service is the sender, the panel may hold more
  * than one session in view across a rebind, and a tail frame has to say which
  * session it belongs to without the receiver inspecting its elements.
+ *
+ * `captures` carries each of the frame's captures' running totals
+ * ({@link telemetryTailCaptureTallySchema}): the store's count and how many the
+ * tail skipped. The tail is paced and bounded, so the panel's capture counter
+ * reads the store's count from here rather than counting the events it was
+ * sent. Optional so a frame without totals stays valid; when present it names
+ * each capture of the frame at most once, and only captures the frame's events
+ * belong to.
  */
-export const telemetryTailPayloadSchema = z.strictObject({
-  /** The session whose capture these events belong to. */
-  sessionId: identifierSchema(),
+export const telemetryTailPayloadSchema = z
+  .strictObject({
+    /** The session whose capture these events belong to. */
+    sessionId: identifierSchema(),
 
-  /**
-   * The events, each validated against the **persisted** schema: already
-   * redacted, already attributed, already stamped with `ingestSeq`.
-   */
-  events: nonEmptyEventBatchSchema(telemetryEventSchema),
-});
+    /**
+     * The events, each validated against the **persisted** schema: already
+     * redacted, already attributed, already stamped with `ingestSeq`.
+     */
+    events: nonEmptyEventBatchSchema(telemetryEventSchema),
+
+    /** The running totals of each capture the events belong to. */
+    captures: z
+      .array(telemetryTailCaptureTallySchema)
+      .min(1)
+      .max(MAX_TAIL_CAPTURE_TALLIES)
+      .optional(),
+  })
+  .check(requireTalliesForFrameCaptures);
 
 /**
  * A redacted live-tail frame as it crosses the WebSocket boundary outbound.
  *
  * `events` is exactly `TelemetryEvent[]` — the store's shape, which is what the
- * panel's event log, detail drawer and source links are written against.
+ * panel's event log, detail drawer and source links are written against — and
+ * `captures`, when present, the per-capture totals the panel's counter reads.
  */
 export type TelemetryTailPayload = z.infer<typeof telemetryTailPayloadSchema>;
 
@@ -564,10 +692,12 @@ const EVENT_HINT =
 
 /** The hint offered when an outbound live-tail frame fails validation. */
 const TAIL_HINT =
-  'A telemetry.tail payload is { sessionId, events }: an identifier and between 1 and ' +
+  'A telemetry.tail payload is { sessionId, events, captures? }: an identifier and between 1 and ' +
   `${String(MAX_EVENTS_PER_BATCH)} persisted events, each carrying every field a producer sends ` +
-  'plus the attribution the service assigns — sessionId, captureId and a one-based ingestSeq. An ' +
-  'event that has not been through ingest belongs in a telemetry.event payload instead.';
+  'plus the attribution the service assigns — sessionId, captureId and a one-based ingestSeq — and ' +
+  `optionally up to ${String(MAX_TAIL_CAPTURE_TALLIES)} capture tallies { captureId, storedEvents, ` +
+  'skippedEvents }, one per capture the events belong to. An event that has not been through ' +
+  'ingest belongs in a telemetry.event payload instead.';
 
 /**
  * Validates an unknown value as a {@link TelemetryEventPayload}, without

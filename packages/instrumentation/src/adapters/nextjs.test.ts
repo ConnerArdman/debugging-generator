@@ -23,9 +23,13 @@
  * 3. **With no preload attached, not one byte is written.** A file
  *    modification that cannot produce a span is pure risk to a developer's
  *    working tree, so the install applies nothing, journals nothing, and
- *    reports the gap with the exact relaunch command — naming the project root
- *    once, inside the command, whenever it fits the hint bound, and never cut
- *    short however deep the root is. The cases that assert this run against a
+ *    reports the gap with a relaunch hint a developer can actually follow: by
+ *    default the "Debug Generator: Launch Dev Server" editor command alone —
+ *    never the unresolvable published specifier on a hand-typed
+ *    `NODE_OPTIONS` line — and, with an injected descriptor, the exact
+ *    credential-aware command as well. Either way the project root is named
+ *    once whenever it fits the hint bound, and the hint is never cut short
+ *    however deep the root is. The cases that assert this run against a
  *    *copy* of the corpus with a real backup store, so a violation is
  *    detectable rather than merely improbable.
  * 4. **With a preload attached, the real patcher does the writing.** The
@@ -1291,7 +1295,53 @@ function expectRootNamed(hint: string, projectRoot: string, label: string): void
   }
 }
 
-/** What a relaunch hint must carry, as a case knows it. */
+/**
+ * The editor command every relaunch hint names, spelled as the VS Code command
+ * palette shows `debuggen.launchDevServer`: its contributed category and title
+ * (`apps/vscode-extension/package.json`). Restated rather than imported
+ * because a hint quoting any other spelling cannot be typed into the palette.
+ */
+const LAUNCH_DEV_SERVER_PALETTE_LABEL = 'Debug Generator: Launch Dev Server';
+
+/**
+ * Asserts that a hint carries no hand-typed preload command at all.
+ *
+ * The published specifier cannot be resolved from a target project — it
+ * declares no `@debuggen/*` dependency — and a bare `NODE_OPTIONS` line sets
+ * none of the ingest variables, so a default hint quoting either would be a
+ * command that fails, or runs and reports nothing (QA INT-F05).
+ *
+ * @param hint The hint.
+ * @param label What the hint is, for the failure message.
+ */
+function expectNoHandTypedCommand(hint: string, label: string): void {
+  expect(hint, `${label} must not quote the unresolvable published specifier`).not.toContain(
+    DEBUGGEN_NODE_PRELOAD_SPECIFIER,
+  );
+  expect(hint, `${label} must carry no hand-typed preload command`).not.toContain('NODE_OPTIONS');
+  expect(hint, `${label} must carry no hand-typed preload command`).not.toContain('--import');
+}
+
+/**
+ * Asserts everything the default relaunch hint must carry, for a root of any
+ * length: one whole line within the hint bound, the editor command exactly as
+ * the palette labels it, no hand-typed command, and the project root named at
+ * most once — exactly once whenever it fits.
+ *
+ * @param hint The hint.
+ * @param projectRoot The root of the project the hint is about.
+ * @param label What the hint is, for the failure message.
+ */
+function expectEditorRelaunchHint(hint: string, projectRoot: string, label: string): void {
+  expectWholeHint(hint, label);
+  expect(hint, `${label} must name the editor command as the palette labels it`).toContain(
+    `"${LAUNCH_DEV_SERVER_PALETTE_LABEL}"`,
+  );
+  expectNoHandTypedCommand(hint, label);
+  expectRootNamed(hint, projectRoot, label);
+}
+
+/** What an injected-descriptor relaunch hint must carry, as a case knows it. */
 interface RelaunchExpectation {
   /** The module specifier the hint must preload. */
   readonly specifier: string;
@@ -1299,15 +1349,31 @@ interface RelaunchExpectation {
   /** The exact dev command, when the case knows which one the hint composes. */
   readonly devCommand?: string | undefined;
 
-  /** The environment variable names the hint must mention. */
+  /** The environment variable names the command must hand the preload. */
   readonly envVarNames?: readonly string[] | undefined;
 }
 
 /**
- * Asserts everything a relaunch hint must carry, for a root of any length: one
- * whole line within the hint bound, the preload assignment and the exact
- * command, every environment variable name, and the project root named at most
- * once — as the directory of that command whenever it is named.
+ * The assignments an injected command must put in front of the dev command:
+ * one `NAME="$NAME"` reference per variable, sorted, then the preload.
+ *
+ * @param expected What the hint must carry.
+ * @returns The assignments, space-separated.
+ */
+function expectedAssignments(expected: RelaunchExpectation): string {
+  return [
+    ...[...new Set(expected.envVarNames ?? [])].sort().map((name) => `${name}="$${name}"`),
+    `NODE_OPTIONS="--import ${expected.specifier}"`,
+  ].join(' ');
+}
+
+/**
+ * Asserts everything an injected-descriptor relaunch hint must carry, for a
+ * root of any length: one whole line within the hint bound, the editor command
+ * first, the credential-aware command — every variable as a `NAME="$NAME"`
+ * reference in front of the preload assignment and the exact dev command, and
+ * the instruction to export them — and the project root named at most once, as
+ * the directory of that command whenever it is named.
  *
  * @param hint The hint.
  * @param projectRoot The root of the project the hint is about.
@@ -1320,29 +1386,46 @@ function expectRelaunchHint(
   expected: RelaunchExpectation,
   label: string,
 ): void {
-  const preload = `NODE_OPTIONS="--import ${expected.specifier}"`;
+  const assignments = expectedAssignments(expected);
+  const names = expected.envVarNames ?? [];
 
   expectWholeHint(hint, label);
-  // One copy-pasteable instruction rather than a paragraph of advice.
-  expect(hint, `${label} must carry the preload assignment`).toContain(preload);
+  expect(hint, `${label} must lead with the editor command`).toMatch(
+    new RegExp(`^${escapeRegExp(`Run "${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code`)}`, 'u'),
+  );
+  // One copy-pasteable instruction rather than a paragraph of advice, and one
+  // that hands the preload its ingest variables rather than leaving it inert.
+  expect(hint, `${label} must carry every assignment the preload needs`).toContain(assignments);
 
   if (expected.devCommand !== undefined) {
-    expect(hint, `${label} must carry the exact command`).toContain(
-      `${preload} ${expected.devCommand}`,
+    expect(hint, `${label} must end with the exact command`).toMatch(
+      new RegExp(`${escapeRegExp(`${assignments} ${expected.devCommand}`)}$`, 'u'),
     );
   }
 
-  for (const name of expected.envVarNames ?? []) {
-    expect(hint, `${label} must name ${name}`).toContain(name);
+  if (names.length > 0) {
+    expect(hint, `${label} must say to export the variables first`).toContain(
+      `with ${[...names].sort().join(', ')} exported`,
+    );
   }
 
   expectRootNamed(hint, projectRoot, label);
 
   if (expected.devCommand !== undefined && hint.includes(projectRoot)) {
     expect(hint, `${label} must name the root as the command's directory`).toContain(
-      `cd ${projectRoot} && ${preload} ${expected.devCommand}`,
+      `cd ${projectRoot} && ${assignments} ${expected.devCommand}`,
     );
   }
+}
+
+/**
+ * Escapes every character a regular expression gives a meaning to.
+ *
+ * @param text Literal text.
+ * @returns A pattern matching exactly that text.
+ */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
 /**
@@ -2172,15 +2255,17 @@ describe('install with no preload attached', () => {
     for (const gap of result.unavailable) {
       expectGapShape(gap);
       expect(gap.reason.toLowerCase()).toContain('preload');
-      // The published preload entry and the project root, whatever TMPDIR
-      // made that root's length: named once, as the command's directory,
-      // whenever it fits, and never at the command's expense.
-      expectRelaunchHint(
-        gap.hint,
-        world.projectRoot,
-        { specifier: DEBUGGEN_NODE_PRELOAD_SPECIFIER },
-        `the hint for ${gap.signal}`,
-      );
+      // With nothing injected — how the registry builds this adapter — the
+      // one exact instruction is the editor command, which launches with the
+      // service's own preload path and a fresh credential. It names the
+      // project root once whenever it fits, whatever TMPDIR made its length.
+      expectEditorRelaunchHint(gap.hint, world.projectRoot, `the hint for ${gap.signal}`);
+
+      if (world.projectRoot.length <= READINESS_HINT_MAX_LENGTH / 2) {
+        expect(gap.hint).toBe(
+          `Run "${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code for ${world.projectRoot}, which starts this project's dev server with the preload and a fresh ingest credential.`,
+        );
+      }
     }
 
     // The patched-span signal says so explicitly, because its gap is the one
@@ -2248,7 +2333,8 @@ describe('install with no preload attached', () => {
       // Names only, never values: the ingest URL and the per-launch
       // credential are minted by the launcher (docs/SECURITY.md, "The launched
       // dev server"), and a hint that quoted one would be a credential in a
-      // user interface.
+      // user interface. Each name appears as a shell reference, so the
+      // command hands the preload what the developer exported.
       expectRelaunchHint(
         gap.hint,
         world.projectRoot,
@@ -2301,6 +2387,10 @@ describe('install with no preload attached', () => {
       expect(gap.reason).not.toBe(sameSignal?.reason);
       expect(gap.hint).not.toBe(sameSignal?.hint);
       expectRootNamed(gap.hint, world.projectRoot, `the silent hint for ${gap.signal}`);
+      // The restart goes through the same editor command, named as the
+      // palette labels it so it can be typed there verbatim.
+      expect(gap.hint).toContain(`"${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code`);
+      expectNoHandTypedCommand(gap.hint, `the silent hint for ${gap.signal}`);
     }
   });
 });
@@ -3292,10 +3382,13 @@ describe('relaunch hints at any project-root depth', () => {
       expect(occurrencesOf(hint, root), `${label} must name the root exactly once`).toBe(1);
     }
 
-    // The published entry and the corpus's own package manager, too.
+    // With nothing injected, the editor command names the root instead.
     for (const [label, hint] of await noPreloadHints(undefined, context, actions)) {
-      expectRelaunchHint(hint, root, { specifier: DEBUGGEN_NODE_PRELOAD_SPECIFIER }, label);
+      expectEditorRelaunchHint(hint, root, label);
       expect(occurrencesOf(hint, root), `${label} must name the root exactly once`).toBe(1);
+      expect(hint, `${label} must name the root after the editor command`).toContain(
+        `"${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code for ${root},`,
+      );
     }
   });
 
@@ -3319,12 +3412,7 @@ describe('relaunch hints at any project-root depth', () => {
     }
 
     for (const [label, hint] of await noPreloadHints(undefined, context, actions)) {
-      expectRelaunchHint(
-        hint,
-        world.projectRoot,
-        { specifier: DEBUGGEN_NODE_PRELOAD_SPECIFIER },
-        label,
-      );
+      expectEditorRelaunchHint(hint, world.projectRoot, label);
       expect(hint, `${label} must drop a root that cannot fit`).not.toContain(world.projectRoot);
     }
 
@@ -3347,17 +3435,54 @@ describe('relaunch hints at any project-root depth', () => {
       expect(hint, `${label} must drop a root that cannot fit`).not.toContain(root);
     }
 
-    // With no dev command known, the hint is the one fragment to add to
-    // whatever command the developer uses — and it degrades the same way.
+    // With no dev command known, the hint is the one set of assignments to put
+    // in front of whatever command the developer uses — and it degrades the
+    // same way.
     const unknownManager: ProjectSummary = { ...fixture.projectSummary, packageManager: 'unknown' };
     const shortRoot = syntheticRoot(64);
+    const withoutDevCommand: NextJsAdapterRelaunchDescriptor = {
+      preloadSpecifier: INJECTED_RELAUNCH.preloadSpecifier,
+      envVarNames: INJECTED_RELAUNCH.envVarNames,
+    };
+    const fragment = `${expectedAssignments(INJECTED_EXPECTATION)} in front of its command.`;
 
+    for (const [label, hint] of await noPreloadHints(
+      withoutDevCommand,
+      contextAtRoot(shortRoot, preloadPresets(shortRoot).notConnected, unknownManager),
+      actions,
+    )) {
+      expectRelaunchHint(
+        hint,
+        shortRoot,
+        { ...INJECTED_EXPECTATION, devCommand: undefined },
+        label,
+      );
+      expect(hint, `${label} must name the assignments to add`).toContain(
+        `start the dev server from ${shortRoot} with ${fragment}`,
+      );
+      expect(occurrencesOf(hint, shortRoot), `${label} must name the root exactly once`).toBe(1);
+    }
+
+    for (const [label, hint] of await noPreloadHints(
+      withoutDevCommand,
+      contextAtRoot(root, preloadPresets(root).notConnected, unknownManager),
+      actions,
+    )) {
+      expectRelaunchHint(hint, root, { ...INJECTED_EXPECTATION, devCommand: undefined }, label);
+      expect(hint, `${label} must name the assignments to add`).toContain(
+        `start the dev server from the project root with ${fragment}`,
+      );
+      expect(hint, `${label} must drop a root that cannot fit`).not.toContain(root);
+    }
+
+    // And with nothing injected, an unknown package manager changes nothing:
+    // the editor command needs no dev command to be exact.
     for (const [label, hint] of await noPreloadHints(
       undefined,
       contextAtRoot(shortRoot, preloadPresets(shortRoot).notConnected, unknownManager),
       actions,
     )) {
-      expectRelaunchHint(hint, shortRoot, { specifier: DEBUGGEN_NODE_PRELOAD_SPECIFIER }, label);
+      expectEditorRelaunchHint(hint, shortRoot, label);
       expect(occurrencesOf(hint, shortRoot), `${label} must name the root exactly once`).toBe(1);
     }
 
@@ -3366,7 +3491,7 @@ describe('relaunch hints at any project-root depth', () => {
       contextAtRoot(root, preloadPresets(root).notConnected, unknownManager),
       actions,
     )) {
-      expectRelaunchHint(hint, root, { specifier: DEBUGGEN_NODE_PRELOAD_SPECIFIER }, label);
+      expectEditorRelaunchHint(hint, root, label);
       expect(hint, `${label} must drop a root that cannot fit`).not.toContain(root);
     }
   });
@@ -3392,6 +3517,9 @@ describe('relaunch hints at any project-root depth', () => {
 
       expectWholeHint(row.hint ?? '', label);
       expect(occurrencesOf(row.hint ?? '', shortRoot), `${label} must name the root`).toBe(1);
+      expect(row.hint).toBe(
+        `Restart the dev server for ${shortRoot} with "${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code so its preload reconnects.`,
+      );
     }
 
     for (const row of long.signals) {
@@ -3399,13 +3527,17 @@ describe('relaunch hints at any project-root depth', () => {
 
       expectWholeHint(row.hint ?? '', label);
       expect(row.hint, `${label} must drop the root`).not.toContain(longRoot);
+      expect(row.hint).toBe(
+        `Restart this project's dev server with "${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code so its preload reconnects.`,
+      );
     }
   });
 
-  it('drops the variable names before the command when they alone would crowd it out', async () => {
+  it('sends the developer to the editor command rather than a command missing a variable', async () => {
     const root = syntheticRoot(64);
     // Longer together than the whole hint bound, so no spelling carrying both
-    // them and the command can fit.
+    // them and the command can fit — and a command without them would start a
+    // preload with no ingest URL or credential, which reports nothing.
     const envVarNames = Array.from(
       { length: 64 },
       (_, index) => `INJECTED_VARIABLE_NUMBER_${String(index).padStart(2, '0')}`,
@@ -3418,12 +3550,7 @@ describe('relaunch hints at any project-root depth', () => {
       contextAtRoot(root, preloadPresets(root).notConnected),
       await smallPlan(fixture),
     )) {
-      expectRelaunchHint(
-        hint,
-        root,
-        { specifier: INJECTED_RELAUNCH.preloadSpecifier, devCommand: INJECTED_RELAUNCH.devCommand },
-        label,
-      );
+      expectEditorRelaunchHint(hint, root, label);
       expect(occurrencesOf(hint, root), `${label} must still name the root`).toBe(1);
 
       for (const name of envVarNames) {
@@ -3446,9 +3573,8 @@ describe('relaunch hints at any project-root depth', () => {
       context,
       actions,
     )) {
-      expectWholeHint(hint, label);
-      expect(hint, `${label} must carry no partial command`).not.toContain('NODE_OPTIONS');
-      expect(hint, `${label} must carry no partial command`).not.toContain('--import');
+      expectEditorRelaunchHint(hint, root, label);
+      expect(hint, `${label} must carry no partial command`).not.toContain('/opt/sss');
 
       for (const name of INJECTED_RELAUNCH.envVarNames) {
         expect(hint, `${label} must still name ${name}`).toContain(name);
@@ -3463,9 +3589,83 @@ describe('relaunch hints at any project-root depth', () => {
       context,
       actions,
     )) {
-      expectWholeHint(hint, label);
-      expect(hint, `${label} must carry no partial command`).not.toContain('NODE_OPTIONS');
+      expectEditorRelaunchHint(hint, root, label);
       expect(hint, `${label} must carry no partial variable list`).not.toContain('INJECTED_');
+    }
+  });
+
+  it('composes no command from a specifier or variable name the shell would change', async () => {
+    const root = syntheticRoot(64);
+    const context = contextAtRoot(root, preloadPresets(root).notConnected);
+    const actions = await smallPlan(fixture);
+    // Each would be a different command once typed: `NODE_OPTIONS` splits on
+    // the space, the shell expands the `$` inside the double quotes, and a
+    // hyphen cannot start a `NAME="$NAME"` assignment.
+    const untypeable: readonly (readonly [string, NextJsAdapterRelaunchDescriptor])[] = [
+      [
+        'a specifier with a space',
+        { ...INJECTED_RELAUNCH, preloadSpecifier: '/opt/my tools/r.mjs' },
+      ],
+      ['a specifier with a dollar', { ...INJECTED_RELAUNCH, preloadSpecifier: '/opt/$HOME/r.mjs' }],
+      ['a blank specifier', { ...INJECTED_RELAUNCH, preloadSpecifier: '   ' }],
+      ['a variable that is no shell name', { ...INJECTED_RELAUNCH, envVarNames: ['NOT-A-NAME'] }],
+    ];
+
+    for (const [what, relaunch] of untypeable) {
+      for (const [label, hint] of await noPreloadHints(relaunch, context, actions)) {
+        expectEditorRelaunchHint(hint, root, `${label}, given ${what}`);
+        expect(occurrencesOf(hint, root), `${label} must name the root exactly once`).toBe(1);
+      }
+    }
+  });
+
+  it('quotes a project root the shell would split, so cd receives it whole', async () => {
+    const root = '/work/two words/shop';
+    const context = contextAtRoot(root, preloadPresets(root).notConnected);
+
+    for (const [label, hint] of await noPreloadHints(
+      INJECTED_RELAUNCH,
+      context,
+      await smallPlan(fixture),
+    )) {
+      expectWholeHint(hint, label);
+      expect(hint, `${label} must quote the root as one shell word`).toMatch(
+        new RegExp(
+          `${escapeRegExp(`cd '${root}' && ${expectedAssignments(INJECTED_EXPECTATION)} ${INJECTED_RELAUNCH.devCommand}`)}$`,
+          'u',
+        ),
+      );
+    }
+  });
+
+  it('keeps a control character in the root out of every hint by dropping the root', async () => {
+    // A bell is not whitespace, so collapsing whitespace would keep it — and
+    // the readiness schema refuses a hint that carries one.
+    const root = '/work/bell\u0007shop';
+    const actions = await smallPlan(fixture);
+
+    for (const relaunch of [undefined, INJECTED_RELAUNCH]) {
+      for (const [label, hint] of await noPreloadHints(
+        relaunch,
+        contextAtRoot(root, preloadPresets(root).notConnected),
+        actions,
+      )) {
+        expectWholeHint(hint, label);
+        expect(hint, `${label} must carry no control character`).not.toMatch(/\p{Cc}/u);
+        expect(hint, `${label} must still name the editor command`).toContain(
+          `"${LAUNCH_DEV_SERVER_PALETTE_LABEL}"`,
+        );
+      }
+    }
+
+    const silent = await createNextJsAdapter().readiness(
+      contextAtRoot(root, preloadPresets(root).stale),
+    );
+
+    expect(readinessSchema.parse(silent)).toEqual(silent);
+
+    for (const row of silent.signals) {
+      expect(row.hint, `the silent hint for ${row.signal}`).not.toMatch(/\p{Cc}/u);
     }
   });
 });

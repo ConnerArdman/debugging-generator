@@ -22,7 +22,8 @@
  *   ├─ debuggen.session webview · debuggen.sessions tree
  *   ├─ registerCommands (all twelve ids)
  *   ├─ registerDebuggenUriHandler
- *   ├─ inbound subscription table · transport · configuration · project root
+ *   ├─ inbound subscription table · capture context keys · transport ·
+ *   │  configuration · project root
  *   └─ void startup()                                   (never awaited)
  *
  * deactivate()                                 (asynchronous, ≤ DEACTIVATE_BUDGET_MS)
@@ -100,6 +101,7 @@ import type { LogFields, LogRecord, Logger } from '@debuggen/shared';
 
 import { registerCommands } from './commands';
 import type { CommandId, DestructiveConfirmation } from './commands';
+import { bindCaptureContextKeys } from './commands/capture-availability';
 import { DEFAULT_SHUTDOWN_TIMEOUTS, endSessionsForShutdown } from './commands/end-session';
 import type { ShutdownReport } from './commands/end-session';
 import {
@@ -131,7 +133,7 @@ import {
   sourceResultFor,
 } from './source/open-location';
 import type { ForwardedSourceOpenOutcome } from './source/open-location';
-import { ExtensionState } from './state';
+import { DEGRADATION_SENTENCE_LEAD, ExtensionState } from './state';
 import { registerDebuggenUriHandler } from './uri-handler';
 import {
   SESSION_VIEW_ID,
@@ -263,9 +265,28 @@ const CREDENTIAL_REFUSED_MESSAGE = 'The Debug Generator service refused this edi
 /** The command that starts the embedded service by the developer's request. */
 const START_SERVICE_COMMAND = 'debuggen.startService' satisfies CommandId;
 
+/**
+ * VS Code's built-in command that sets a context key, read by the capture
+ * commands' `enablement` clauses in `package.json`
+ * (`./commands/capture-availability`).
+ */
+const SET_CONTEXT_COMMAND = 'setContext';
+
 /** The fallback-panel banner copy of AAP §0.5.5. */
 const FALLBACK_PANEL_NOTICE =
   'Generated panel failed validation; showing a fallback view built from captured data.';
+
+/**
+ * The most panels one activation remembers having announced; see
+ * {@link announcePanel}.
+ *
+ * A session generates one panel for its question and at most one per
+ * follow-up (the protocol allows 50), and a window works through a handful of
+ * sessions, so the bound is not reached in practice. It keeps the memory
+ * bounded however long the window lives; past it the oldest announcement is
+ * forgotten first, and forgetting one can at worst repeat that panel's notice.
+ */
+const MAX_ANNOUNCED_PANELS = 256;
 
 /** A run of whitespace, collapsed to one space for display. */
 const WHITESPACE_RUN = /\s+/g;
@@ -331,6 +352,12 @@ interface ExtensionRuntime {
   disposed: boolean;
   /** The socket state last reported, to detect a lost connection. */
   connection: ConnectionState;
+  /**
+   * The panels already announced, each as its `[sessionId, panelId]` key, in
+   * the order announced and at most {@link MAX_ANNOUNCED_PANELS}; see
+   * {@link announcePanel}.
+   */
+  readonly announcedPanels: Set<string>;
 }
 
 /** The runtime of the current activation; `undefined` before `activate` and after `deactivate`. */
@@ -753,6 +780,7 @@ export function activate(context: vscode.ExtensionContext): void {
       sessionsTree,
       disposed: false,
       connection: client.state,
+      announcedPanels: new Set<string>(),
     };
 
     // 9. Commands: the barrel owns the id → handler table.
@@ -773,6 +801,17 @@ export function activate(context: vscode.ExtensionContext): void {
     for (const unsubscribe of subscribeInbound(rt)) {
       ownUnsubscribe(unsubscribe);
     }
+    // The `enablement` context keys of the view-title capture actions: greyed
+    // unless the active session can start or stop a capture now. A key is
+    // written only when its value changes, and disposal resets it to false.
+    const captureContextKeys = bindCaptureContextKeys(
+      state,
+      (key, value) => vscode.commands.executeCommand(SET_CONTEXT_COMMAND, key, value),
+      logger.child({ component: 'capture-context' }),
+    );
+    ownUnsubscribe(() => {
+      captureContextKeys.dispose();
+    });
     for (const disposable of wireTransport(rt)) {
       own(disposable);
     }
@@ -831,7 +870,7 @@ export function activate(context: vscode.ExtensionContext): void {
  * | ----------------------- | ------------------------------------------------- |
  * | `session.created`       | `applySessionRecord(payload.session)`             |
  * | `session.updated`       | `applySessionRecord(payload.session)`, the selected target included |
- * | `session.progress`      | `applyProgress(payload)`                          |
+ * | `session.progress`      | `applyProgress(payload, ts)` + `applyProgressFailure(payload)` |
  * | `session.bound`         | logged; the record's `boundTab` arrives on `session.updated` |
  * | `target.selected`       | not subscribed: DevTools → service only           |
  * | `instrumentation.plan`  | `applyInstrumentationPlan(payload)`               |
@@ -840,7 +879,7 @@ export function activate(context: vscode.ExtensionContext): void {
  * | `capture.started`       | `applyCaptureStarted(payload)`                    |
  * | `capture.stopped`       | `applyCaptureStopped(payload)`                    |
  * | `analysis.completed`    | `applyAnalysis(payload.analysis)`                 |
- * | `panel.generated`       | `applyPanelGenerated(payload)` + fallback banner  |
+ * | `panel.generated`       | `applyPanelGenerated(payload)` + one notice per live panel |
  * | `cleanup.completed`     | `applyCleanupCompleted(payload)`                  |
  * | `source.open`           | `openSourceLocation(payload.location, session root + payload.pinned)`, answered with `source.result` (`ref` = the frame's `id`); a frame without `pinned` is refused unopened |
  * | `error`                 | logged at `warn` + one notice                     |
@@ -870,7 +909,13 @@ function subscribeInbound(rt: ExtensionRuntime): Array<() => void> {
       state.applySessionRecord(message.payload.session);
     }),
     client.on(MESSAGE_TYPE.SESSION_PROGRESS, (message) => {
-      state.applyProgress(message.payload);
+      // The envelope's `ts` is when the service first sent the row; a replay of
+      // stored history re-sends it unchanged, which is how the store applies
+      // each row once however often the history is replayed.
+      state.applyProgress(message.payload, message.ts);
+      // A stage failure reaches the editor only as its `failed` row (AAP
+      // §0.5.5); the store also records it as the session's failing stage.
+      state.applyProgressFailure(message.payload);
     }),
     client.on(MESSAGE_TYPE.SESSION_BOUND, (message) => {
       logger.debug('Tab binding changed', {
@@ -928,8 +973,14 @@ function concernsActiveSession(rt: ExtensionRuntime, sessionId: string | undefin
 /**
  * `instrumentation.ready` with unavailable signals: the AAP §0.5.5 sentence,
  * "Could not enable ‹signal›: ‹reason›. Continuing with: ‹enabled list›.",
- * built from the payload alone — the signals and reasons the installer
- * reported and the runtime hooks and patched files it actually enabled.
+ * built from the signals, reasons and runtime hooks the payload reports and
+ * from the files the session holds patched. `applied` lists only the records
+ * this install wrote — for a follow-up, the delta — so the patched files are
+ * counted from the session's merged journal, which `applyInstrumentationReady`
+ * has already folded the payload into; a follow-up that patched nothing still
+ * continues with every file an earlier plan version patched. The sentence
+ * opens with the store's {@link DEGRADATION_SENTENCE_LEAD}, the one wording
+ * the progress rows are matched by.
  */
 function announceDegradedSignals(
   rt: ExtensionRuntime,
@@ -940,11 +991,16 @@ function announceDegradedSignals(
   }
   const missing = payload.unavailable
     .map(
-      (entry) => `Could not enable ${toDisplayText(entry.signal)}: ${toDisplayText(entry.reason)}.`,
+      (entry) =>
+        `${DEGRADATION_SENTENCE_LEAD} ${toDisplayText(entry.signal)}: ${toDisplayText(entry.reason)}.`,
     )
     .join(' ');
   const enabled = payload.runtimeHooks.map(toDisplayText).filter((hook) => hook !== '');
-  const patchedFiles = new Set(payload.applied.map((record) => record.file)).size;
+  const patchedFiles = new Set(
+    rt.state.modifications
+      .filter((record) => record.status === 'applied')
+      .map((record) => record.file),
+  ).size;
   if (patchedFiles > 0) {
     enabled.push(`function timing in ${patchedFiles} file${patchedFiles === 1 ? '' : 's'}`);
   }
@@ -999,6 +1055,20 @@ function announceInstrumentationFailure(
  * `panel.generated`: the panel is rendered in Chrome DevTools, so the editor
  * says where to look. A fallback panel is announced as exactly that — never
  * as a clean result (AAP §0.5.5).
+ *
+ * Each panel is announced once. The service re-sends a session's latest
+ * `panel.generated` whenever the session is read again (`GET /sessions/:id`:
+ * a reopen, a resync after a reconnect, an end's detail read), so a panel is
+ * remembered by its session and id in {@link ExtensionRuntime.announcedPanels}
+ * and a replay of it stays silent; a follow-up's new panel has a new id and is
+ * announced as always.
+ *
+ * Nothing is announced for a session the store has acknowledged as ended
+ * (`ExtensionState.hasAcknowledgedEnd`): an ended session is unbound and the
+ * service refuses to bind it again, so its panel is not "ready" in any
+ * DevTools tab, and a stored panel replayed on reopen is history rather than
+ * news. The view still shows the panel's summary, which the store takes from
+ * the same frame.
  */
 function announcePanel(
   rt: ExtensionRuntime,
@@ -1007,6 +1077,22 @@ function announcePanel(
   if (!concernsActiveSession(rt, payload.sessionId)) {
     return;
   }
+  if (rt.state.hasAcknowledgedEnd(payload.sessionId)) {
+    rt.logger.debug('Panel of an ended session not announced', {
+      sessionId: payload.sessionId,
+      panelId: payload.panelId,
+    });
+    return;
+  }
+  const key = JSON.stringify([payload.sessionId, payload.panelId]);
+  if (rt.announcedPanels.has(key)) {
+    rt.logger.debug('Panel already announced', {
+      sessionId: payload.sessionId,
+      panelId: payload.panelId,
+    });
+    return;
+  }
+  rememberAnnouncedPanel(rt, key);
   const fallback = payload.panel.meta?.fallback === true;
   rt.logger.info('Panel generated', {
     sessionId: payload.sessionId,
@@ -1025,6 +1111,22 @@ function announcePanel(
           ),
         },
   );
+}
+
+/**
+ * Remembers that the panel `key` names has been announced, forgetting the
+ * oldest announcement first once {@link MAX_ANNOUNCED_PANELS} are held. A
+ * `Set` iterates in insertion order, so its first member is the oldest.
+ */
+function rememberAnnouncedPanel(rt: ExtensionRuntime, key: string): void {
+  const announced = rt.announcedPanels;
+  announced.add(key);
+  if (announced.size > MAX_ANNOUNCED_PANELS) {
+    const oldest = announced.values().next();
+    if (oldest.done !== true) {
+      announced.delete(oldest.value);
+    }
+  }
 }
 
 /**

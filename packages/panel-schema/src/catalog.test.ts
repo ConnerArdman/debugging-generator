@@ -434,11 +434,20 @@ const ESTABLISHED_ATTRIBUTE_READS: Readonly<
   // The span table's columns are all event fields.
   table: { required: [], optional: [] },
   // The render aggregate keys a row by component and phase and reads the
-  // render count, changed props, trigger and actual duration; an unnamed
-  // component becomes a fallback label rather than a dropped row.
+  // render count, changed props, trigger, actual duration and the providers of
+  // the changed contexts (which context a `context` trigger refers to); an
+  // unnamed component becomes a fallback label rather than a dropped row.
   renderTable: {
     required: [],
-    optional: ['component', 'phase', 'renderCount', 'changedProps', 'trigger', 'actualDuration'],
+    optional: [
+      'component',
+      'phase',
+      'renderCount',
+      'changedProps',
+      'trigger',
+      'actualDuration',
+      'changedContexts',
+    ],
   },
   // The tree joins render records by component and owner chain and parses the
   // snapshot text and its truncation flag, which travel on a `log` event.
@@ -454,9 +463,9 @@ const ESTABLISHED_ATTRIBUTE_READS: Readonly<
     ],
   },
   // Every request record forms a group, so no key is required; the group
-  // reads method, url, status, initiator, grouping key, size, resource-timing
-  // url and in-flight state, and joins resource-timing entries for size and
-  // initiator provenance.
+  // reads method, url, status, initiator (with the component and owners that
+  // label it), grouping key, size, resource-timing url and in-flight state,
+  // and joins resource-timing entries for size and initiator provenance.
   requestTable: {
     required: [],
     optional: [
@@ -464,6 +473,8 @@ const ESTABLISHED_ATTRIBUTE_READS: Readonly<
       'url',
       'http.status_code',
       'initiator',
+      'initiatorComponent',
+      'initiatorOwners',
       'request_key',
       'transferSize',
       'resourceTimingUrl',
@@ -1573,6 +1584,13 @@ describe('the reads mappings AAP §0.6.2 states', () => {
       missingFrom(reads, ['http.method', 'url', 'http.status_code', 'duration', 'initiator']),
     ).toEqual([]);
     expect(optionalReads).toContain('inFlight');
+
+    // The component that started a request and its owners label the caller —
+    // the only evidence that tells two mounts of one component apart — and a
+    // production renderer never reports them, so they may only be optional.
+    expect(missingFrom(optionalReads, ['initiatorComponent', 'initiatorOwners'])).toEqual([]);
+    expect(entryFor('requestTable').requiredReads).not.toContain('initiatorComponent');
+    expect(entryFor('requestTable').requiredReads).not.toContain('initiatorOwners');
 
     // The plan's "duplicate count" is an aggregate's output rather than a
     // captured field, so what the entry must declare is the *event* field the

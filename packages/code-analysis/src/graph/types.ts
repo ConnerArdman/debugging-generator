@@ -1247,11 +1247,15 @@ export interface CodeEdge {
  * What an indexed file looked like when it was read.
  *
  * The unit of cache invalidation. `../cache.ts` folds the whole list of these
- * into its cache key — order-insensitively, so a re-ordered file list is not a
- * different project — and compares `mtimeMs` and `size` per file to decide
- * whether a stored index still describes the tree on disk. Those two fields are
- * therefore the ones that matter: they are cheap to collect for every file in a
- * project, and together they catch the edits a developer actually makes.
+ * into the state key of a project's entry — order-insensitively, so a
+ * re-ordered file list is not a different project — and compares `mtimeMs` and
+ * `size` per file as the fast path for deciding whether a stored index still
+ * describes the tree on disk: they are cheap to collect for every file in a
+ * project, and together they catch the edits a developer actually makes. A
+ * file whose metadata moved is then settled by comparing its content hash with
+ * the one the entry recorded, so a file rewritten with identical bytes — a
+ * reversible patch that has been restored, a checkout that only touched the
+ * modification time — keeps the stored index instead of forcing a rebuild.
  */
 export interface FileFingerprint {
   /**

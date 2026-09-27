@@ -40,8 +40,8 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { isMessageOfType } from '@debuggen/protocol';
-import type { ClientKind, ProtocolMessage } from '@debuggen/protocol';
+import { MAX_TAIL_CAPTURE_TALLIES, isMessageOfType } from '@debuggen/protocol';
+import type { ClientKind, ProtocolMessage, TelemetryTailCaptureTally } from '@debuggen/protocol';
 import {
   DebuggenError,
   createConsoleLogger,
@@ -66,11 +66,13 @@ import type { TelemetryEvent, TelemetryKind } from '@debuggen/telemetry';
 import {
   TAIL_CLIENT_KINDS,
   TAIL_FLUSH_INTERVAL_MS,
+  TAIL_MAX_TRACKED_CAPTURES,
   TAIL_RETRY_MAX_DELAY_MS,
   TAIL_UNDELIVERED_RETENTION_MS,
   createLiveTail,
 } from './live-tail.js';
 import type {
+  CaptureArrivals,
   LiveTail,
   LiveTailDeps,
   TailBroadcaster,
@@ -355,6 +357,59 @@ function tailedIds(messages: readonly ProtocolMessage[]): string[] {
   return idsOf(tailedEvents(messages));
 }
 
+/** The capture tallies each frame of a list carried, in order (`undefined` for a frame without). */
+function tailedTallies(
+  messages: readonly ProtocolMessage[],
+): (readonly TelemetryTailCaptureTally[] | undefined)[] {
+  return messages.flatMap((message) =>
+    isMessageOfType(message, 'telemetry.tail') ? [message.payload.captures] : [],
+  );
+}
+
+/**
+ * A {@link CaptureArrivals} double: the store's committed count per capture,
+ * set by the case, with every read recorded.
+ */
+interface ScriptedArrivals {
+  readonly arrivals: CaptureArrivals;
+  /** Sets what the store reports for a capture of {@link SESSION}. */
+  readonly commit: (captureId: CaptureId, eventCount: number) => void;
+  /** Makes every later read refuse (`'refuse'`), throw (`'throw'`) or answer (`'answer'`). */
+  readonly mode: (next: 'answer' | 'refuse' | 'throw') => void;
+  /** Every read, as `session/capture`. */
+  readonly reads: string[];
+}
+
+function createScriptedArrivals(): ScriptedArrivals {
+  const counts = new Map<string, number>();
+  const reads: string[] = [];
+  let mode: 'answer' | 'refuse' | 'throw' = 'answer';
+  return {
+    arrivals: {
+      captureWatermark(sessionId, captureId) {
+        reads.push(`${sessionId}/${captureId}`);
+        if (mode === 'throw') {
+          throw new Error('the store is unavailable');
+        }
+        if (mode === 'refuse') {
+          return {
+            ok: false,
+            error: new DebuggenError('STORE_ERROR', 'the tracker could not be read'),
+          };
+        }
+        return { ok: true, value: { eventCount: counts.get(`${sessionId}/${captureId}`) ?? 0 } };
+      },
+    },
+    commit: (captureId, eventCount) => {
+      counts.set(`${SESSION}/${captureId}`, eventCount);
+    },
+    mode: (next) => {
+      mode = next;
+    },
+    reads,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The harness
 // ---------------------------------------------------------------------------
@@ -371,7 +426,7 @@ interface Harness {
 
 type HarnessOptions = Pick<
   LiveTailDeps,
-  'flushIntervalMs' | 'maxEventsPerFrame' | 'maxBufferedEvents'
+  'flushIntervalMs' | 'maxEventsPerFrame' | 'maxBufferedEvents' | 'arrivals'
 >;
 
 function createHarness(options: HarnessOptions = {}): Harness {
@@ -934,5 +989,305 @@ describe('lifecycle', () => {
 
     expect(timers.pending()).toHaveLength(0);
     expect(tail.stats()).toMatchObject({ buffered: 0, sessions: 0, eventsExpired: 0 });
+  });
+});
+
+describe('what a frame counts: per-capture tallies', () => {
+  /** A persisted event of {@link SESSION} attributed to another capture. */
+  function eventOf(captureId: CaptureId): TelemetryEvent {
+    return { ...makeEvent(), captureId };
+  }
+
+  /** Fires every pending timer, bounded, so a whole backlog drains. */
+  function drainAll(timers: ManualScheduler): void {
+    let fired = 0;
+    while (timers.pending().length > 0) {
+      expect(fired, 'the drain must end').toBeLessThan(200);
+      timers.fireNext();
+      fired += 1;
+    }
+  }
+
+  it('reports the store’s committed count, not the number of events it streamed', () => {
+    const store = createScriptedArrivals();
+    const { tail, timers, transport } = createHarness({ arrivals: store.arrivals });
+    const events = makeEvents(3);
+    // The store has committed more than this tail was handed: the tally reads the store.
+    store.commit(CAPTURE, 9_000);
+
+    expectOk(tail.push(SESSION, events));
+    timers.fireNext();
+
+    expect(tailedTallies(transport.delivered)).toEqual([
+      [{ captureId: CAPTURE, storedEvents: 9_000, skippedEvents: 0 }],
+    ]);
+    expect(store.reads).toEqual([`${SESSION}/${CAPTURE}`]);
+  });
+
+  it('counts every event the bounded buffer evicted, so streamed plus skipped equals stored', () => {
+    const store = createScriptedArrivals();
+    const { tail, timers, transport } = createHarness({
+      arrivals: store.arrivals,
+      maxBufferedEvents: 10,
+      maxEventsPerFrame: 4,
+    });
+    const flood = makeEvents(25);
+    store.commit(CAPTURE, flood.length);
+
+    expectOk(tail.push(SESSION, flood));
+    drainAll(timers);
+
+    const streamed = tailedEvents(transport.delivered).length;
+    const last = tailedTallies(transport.delivered).at(-1);
+    expect(streamed).toBe(10);
+    expect(last).toEqual([{ captureId: CAPTURE, storedEvents: 25, skippedEvents: 15 }]);
+    expect(streamed + (last?.[0]?.skippedEvents ?? 0)).toBe(last?.[0]?.storedEvents);
+    // Every frame of the drain already said so, not only the last one.
+    for (const tallies of tailedTallies(transport.delivered)) {
+      expect(tallies?.[0]).toMatchObject({ storedEvents: 25, skippedEvents: 15 });
+    }
+  });
+
+  it('keeps failures through an overflow, evicting the oldest other events instead', () => {
+    const store = createScriptedArrivals();
+    const { tail, timers, transport } = createHarness({
+      arrivals: store.arrivals,
+      maxBufferedEvents: 4,
+      maxEventsPerFrame: 4,
+    });
+    const failedOperation: TelemetryEvent = { ...makeEvent(), status: 'error' };
+    const failure: TelemetryEvent = { ...makeEvent(), kind: 'error', tier: tierFor('error') };
+    const burst = makeEvents(6);
+    const pushed = [failedOperation, failure, ...burst];
+    store.commit(CAPTURE, pushed.length);
+
+    expectOk(tail.push(SESSION, pushed));
+    drainAll(timers);
+
+    // The two failures were the oldest, yet they are streamed; the burst's oldest four are not.
+    expect(idsOf(tailedEvents(transport.delivered))).toEqual(
+      idsOf([failedOperation, failure, ...burst.slice(4)]),
+    );
+    expect(tailedTallies(transport.delivered).at(-1)).toEqual([
+      { captureId: CAPTURE, storedEvents: 8, skippedEvents: 4 },
+    ]);
+  });
+
+  it('evicts failures too, oldest first, once they alone overflow the buffer', () => {
+    const { tail, timers, transport } = createHarness({
+      maxBufferedEvents: 2,
+      maxEventsPerFrame: 4,
+    });
+    const failures = Array.from({ length: 3 }, (): TelemetryEvent => ({
+      ...makeEvent(),
+      status: 'error',
+    }));
+    const other = makeEvent();
+
+    expectOk(tail.push(SESSION, [...failures, other]));
+    drainAll(timers);
+
+    expect(idsOf(tailedEvents(transport.delivered))).toEqual(idsOf(failures.slice(1)));
+    expect(tailedTallies(transport.delivered).at(-1)).toEqual([
+      { captureId: CAPTURE, storedEvents: 4, skippedEvents: 2 },
+    ]);
+  });
+
+  it('never lowers a count once the store stops tracking a closed capture', () => {
+    const store = createScriptedArrivals();
+    const { tail, timers, transport } = createHarness({ arrivals: store.arrivals });
+    store.commit(CAPTURE, 7);
+    expectOk(tail.push(SESSION, makeEvents(7)));
+    timers.fireNext();
+
+    // The capture closed and its watermark was released: the store answers 0.
+    store.commit(CAPTURE, 0);
+    expectOk(tail.push(SESSION, makeEvents(1)));
+    timers.fireNext();
+
+    const counts = tailedTallies(transport.delivered).map((tallies) => tallies?.[0]?.storedEvents);
+    expect(counts).toEqual([7, 8]);
+  });
+
+  it('without the port, counts the events it admitted, never a duplicate twice', () => {
+    const { tail, timers, transport } = createHarness();
+    const first = makeEvents(3);
+
+    expectOk(tail.push(SESSION, first));
+    timers.fireNext();
+    // A replayed batch comes back from insertMany as the same stored rows.
+    expectOk(tail.push(SESSION, [...first, ...makeEvents(2)]));
+    timers.fireNext();
+
+    expect(tailedTallies(transport.delivered).map((tallies) => tallies?.[0])).toEqual([
+      { captureId: CAPTURE, storedEvents: 3, skippedEvents: 0 },
+      { captureId: CAPTURE, storedEvents: 5, skippedEvents: 0 },
+    ]);
+  });
+
+  it('falls back to its own count when the store read refuses or throws, logging the code only', () => {
+    const store = createScriptedArrivals();
+    const { tail, timers, transport, logged } = createHarness({ arrivals: store.arrivals });
+    store.commit(CAPTURE, 40);
+
+    store.mode('refuse');
+    expectOk(tail.push(SESSION, makeEvents(2)));
+    timers.fireNext();
+    store.mode('throw');
+    expectOk(tail.push(SESSION, makeEvents(1)));
+    timers.fireNext();
+    store.mode('answer');
+    expectOk(tail.push(SESSION, makeEvents(1)));
+    timers.fireNext();
+
+    expect(tailedTallies(transport.delivered).map((tallies) => tallies?.[0]?.storedEvents)).toEqual(
+      [2, 3, 40],
+    );
+    const failures = logged(/stored-event count/, 'debug');
+    expect(failures.length).toBeGreaterThanOrEqual(1);
+    expect(failures[0]?.fields).toMatchObject({ code: 'STORE_ERROR' });
+  });
+
+  it('does not count as skipped the events of a frame a re-entrant push evicted, when that frame was delivered', () => {
+    const { tail, timers, transport } = createHarness({
+      maxBufferedEvents: 4,
+      maxEventsPerFrame: 4,
+    });
+    const first = makeEvents(4);
+    const second = makeEvents(3);
+    expectOk(tail.push(SESSION, first));
+    // The push overflows the bound while the first frame is inside the broadcaster.
+    transport.duringNextSend(() => {
+      expectOk(tail.push(SESSION, second));
+    });
+    drainAll(timers);
+
+    expect(tailedIds(transport.delivered)).toEqual(idsOf([...first, ...second]));
+    expect(tailedTallies(transport.delivered).at(-1)).toEqual([
+      { captureId: CAPTURE, storedEvents: 7, skippedEvents: 0 },
+    ]);
+  });
+
+  it('counts them as skipped when that frame reached nobody', () => {
+    const { tail, timers, transport } = createHarness({
+      maxBufferedEvents: 4,
+      maxEventsPerFrame: 4,
+    });
+    const first = makeEvents(4);
+    const second = makeEvents(3);
+    expectOk(tail.push(SESSION, first));
+    transport.answer('nobody');
+    transport.duringNextSend(() => {
+      expectOk(tail.push(SESSION, second));
+    });
+    timers.fireNext();
+    transport.answer('deliver');
+    drainAll(timers);
+
+    const streamed = tailedEvents(transport.delivered).length;
+    expect(streamed).toBe(4);
+    expect(tailedTallies(transport.delivered).at(-1)).toEqual([
+      { captureId: CAPTURE, storedEvents: 7, skippedEvents: 3 },
+    ]);
+  });
+
+  it('counts an undelivered backlog released after its retention window as skipped', () => {
+    const { tail, timers, transport } = createHarness();
+    transport.answer('nobody');
+    expectOk(tail.push(SESSION, makeEvents(4)));
+    drainAll(timers);
+    expect(tail.stats().eventsExpired).toBe(4);
+
+    transport.answer('deliver');
+    expectOk(tail.push(SESSION, makeEvents(1)));
+    timers.fireNext();
+
+    expect(tailedTallies(transport.delivered).at(-1)).toEqual([
+      { captureId: CAPTURE, storedEvents: 5, skippedEvents: 4 },
+    ]);
+  });
+
+  it('counts the events of a discarded invalid frame as skipped', async () => {
+    const { tail, transport } = createHarness({ maxEventsPerFrame: 3 });
+    tailValidation.refuseNext = 1;
+
+    expectOk(tail.push(SESSION, makeEvents(5)));
+    expectErr(await tail.flush(SESSION));
+
+    expect(tailedTallies(transport.delivered)).toEqual([
+      [{ captureId: CAPTURE, storedEvents: 5, skippedEvents: 3 }],
+    ]);
+  });
+
+  it('keeps a capture’s tally across forget(), counting what was still buffered as skipped', () => {
+    const { tail, timers, transport } = createHarness();
+    expectOk(tail.push(SESSION, makeEvents(3)));
+
+    tail.forget(SESSION);
+    expectOk(tail.push(SESSION, makeEvents(2)));
+    timers.fireNext();
+
+    expect(tailedTallies(transport.delivered)).toEqual([
+      [{ captureId: CAPTURE, storedEvents: 5, skippedEvents: 3 }],
+    ]);
+  });
+
+  it('tallies every capture a frame spans, apart per session', () => {
+    const { tail, timers, transport } = createHarness();
+    const next = newCaptureId();
+
+    expectOk(tail.push(SESSION, [makeEvent(), makeEvent(), eventOf(next)]));
+    expectOk(tail.push(OTHER_SESSION, makeEvents(1, OTHER_SESSION)));
+    timers.fireNext();
+    timers.fireNext();
+
+    const bySession = new Map(
+      transport.delivered.map((message) => [
+        isMessageOfType(message, 'telemetry.tail') ? message.payload.sessionId : '',
+        isMessageOfType(message, 'telemetry.tail') ? message.payload.captures : undefined,
+      ]),
+    );
+    expect(bySession.get(SESSION)).toEqual([
+      { captureId: CAPTURE, storedEvents: 2, skippedEvents: 0 },
+      { captureId: next, storedEvents: 1, skippedEvents: 0 },
+    ]);
+    expect(bySession.get(OTHER_SESSION)).toEqual([
+      { captureId: CAPTURE, storedEvents: 1, skippedEvents: 0 },
+    ]);
+  });
+
+  it('carries at most the protocol’s bound of tallies, the most recent captures, and still delivers the frame', () => {
+    const { tail, timers, transport } = createHarness();
+    const captures = Array.from({ length: MAX_TAIL_CAPTURE_TALLIES + 2 }, () => newCaptureId());
+    const events = captures.map((captureId) => eventOf(captureId));
+
+    expectOk(tail.push(SESSION, events));
+    timers.fireNext();
+
+    expect(tailedIds(transport.delivered)).toEqual(idsOf(events));
+    const [tallies] = tailedTallies(transport.delivered);
+    expect(tallies?.map((tally) => tally.captureId)).toEqual(
+      captures.slice(-MAX_TAIL_CAPTURE_TALLIES),
+    );
+    expect(tail.stats().framesFailed).toBe(0);
+  });
+
+  it('holds at most TAIL_MAX_TRACKED_CAPTURES tallies, forgetting the least recently used', () => {
+    const { tail, timers, transport } = createHarness();
+    const first = newCaptureId();
+    expectOk(tail.push(SESSION, [eventOf(first), eventOf(first)]));
+    timers.fireNext();
+
+    for (let index = 0; index < TAIL_MAX_TRACKED_CAPTURES; index += 1) {
+      expectOk(tail.push(SESSION, [eventOf(newCaptureId())]));
+    }
+    drainAll(timers);
+    expectOk(tail.push(SESSION, [eventOf(first)]));
+    timers.fireNext();
+
+    // The first capture's tally was evicted by the bound, so its count restarts.
+    expect(tailedTallies(transport.delivered).at(-1)).toEqual([
+      { captureId: first, storedEvents: 1, skippedEvents: 0 },
+    ]);
   });
 });

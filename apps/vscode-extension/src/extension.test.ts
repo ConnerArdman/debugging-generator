@@ -34,6 +34,13 @@
  * - a window deactivated while the prompt is open acts on no answer;
  * - no notification carries the token read back or a private setting.
  *
+ * The final block delivers `panel.generated` frames to the handlers the real
+ * `activate()` registered and pins the notice they raise: a live session's
+ * panel — ready notice or fallback banner — is announced once however often
+ * the service replays it, a follow-up's new panel is announced, and nothing
+ * is announced for a session the store holds as ended, reopened or ended in
+ * view, while the store still records the panel for the view.
+ *
  * ## What is real and what is substituted
  *
  * Real: `./extension` itself, `./service/client` (whose refusal of a private
@@ -65,7 +72,13 @@
 import * as vscode from 'vscode';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { WsUnauthorizedDetail } from '@debuggen/protocol';
+import { parseSessionRecord } from '@debuggen/protocol';
+import type {
+  MessageByType,
+  SessionRecord,
+  SessionStatus,
+  WsUnauthorizedDetail,
+} from '@debuggen/protocol';
 import { DebuggenError } from '@debuggen/shared';
 import type { Logger } from '@debuggen/shared';
 
@@ -155,6 +168,12 @@ interface HostState {
 
   /** The host store activation handed to `registerCommands`. */
   commandState: ExtensionState | undefined;
+
+  /**
+   * Every inbound-frame handler activation registered on the client, by frame
+   * type, so a case can deliver a frame exactly as the socket would.
+   */
+  readonly inboundHandlers: Map<string, Array<(message: unknown) => void>>;
 }
 
 /** One `show*Message` call the substitute editor received. */
@@ -185,6 +204,7 @@ const host = vi.hoisted((): HostState => ({
   connectCalls: 0,
   unauthorizedListeners: [],
   commandState: undefined,
+  inboundHandlers: new Map(),
 }));
 
 vi.mock('vscode', () => {
@@ -318,8 +338,8 @@ vi.mock('./commands', () => ({
 /**
  * The real client, behind a proxy that binds every member to the real
  * instance (its private fields need it), records each refused-credential
- * listener while still registering it, and replaces `connect()` with a
- * counter, so no socket is ever opened.
+ * listener and each inbound-frame handler while still registering them, and
+ * replaces `connect()` with a counter, so no socket is ever opened.
  */
 vi.mock('./service/client', async (importOriginal) => {
   const actual = await importOriginal<typeof ServiceClientModule>();
@@ -339,6 +359,17 @@ vi.mock('./service/client', async (importOriginal) => {
             return (listener: (detail: WsUnauthorizedDetail) => void): (() => void) => {
               host.unauthorizedListeners.push(listener);
               return target.onUnauthorized(listener);
+            };
+          }
+          if (property === 'on') {
+            return (
+              ...onArgs: Parameters<ServiceClientModule.ServiceClient['on']>
+            ): (() => void) => {
+              const [type, handler] = onArgs;
+              const handlers = host.inboundHandlers.get(type) ?? [];
+              handlers.push(handler as (message: unknown) => void);
+              host.inboundHandlers.set(type, handlers);
+              return target.on(...onArgs);
             };
           }
           const value: unknown = Reflect.get(target, property, target);
@@ -583,6 +614,7 @@ beforeEach(() => {
   host.connectCalls = 0;
   host.unauthorizedListeners.length = 0;
   host.commandState = undefined;
+  host.inboundHandlers.clear();
   host.settings.clear();
   host.settings.set('serviceUrl', PRIVATE_SERVICE_URL);
   host.settings.set('provider', PRIVATE_PROVIDER);
@@ -1044,5 +1076,203 @@ describe('the refused-credential prompt', () => {
     expect(host.refreshCalls).toBe(0);
     expect(host.connectCalls).toBe(0);
     expect(host.notifications).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The panel.generated notice
+// ---------------------------------------------------------------------------
+
+/** The owning endpoint every adopted session in these cases is recorded under. */
+const SESSION_ENDPOINT = 'http://127.0.0.1:43117';
+
+/** The session the panel cases adopt. */
+const PANEL_SESSION_ID = 'ses_panel_notice_0001';
+
+/** A panel title, as the generated specification states it. */
+const PANEL_TITLE = 'Interaction latency';
+
+/** Numbers each built frame, so every delivery carries its own envelope id. */
+let panelFrameSerial = 0;
+
+/**
+ * A stored session record, validated by the protocol's own schema.
+ *
+ * @param status The session's status.
+ * @param updatedAt When the service last changed it.
+ * @returns The record.
+ */
+function panelSessionRecord(status: SessionStatus, updatedAt = 1_760_000_000_000): SessionRecord {
+  const parsed = parseSessionRecord({
+    id: PANEL_SESSION_ID,
+    projectRoot: '/workspace/sample-project',
+    projectName: 'sample-project',
+    devServerUrl: 'http://127.0.0.1:3000/',
+    createdAt: 1_760_000_000_000,
+    updatedAt,
+    status,
+    question: 'Why is this interaction slow?',
+    followUps: [],
+    relevantFiles: [],
+    plans: [],
+    modifications: [],
+    captures: [],
+    panelIds: [],
+    analyses: [],
+    cleanup: { status: 'pending', conflicts: [] },
+    promptVersions: {},
+    provider: { id: 'deterministic' },
+  });
+  if (!parsed.ok) {
+    throw parsed.error;
+  }
+  return parsed.value;
+}
+
+/**
+ * A `panel.generated` envelope carrying the members the host reads — the
+ * session, the panel id, its title, version and fallback flag — delivered
+ * under a fresh envelope id, as every replay of the service is.
+ *
+ * @param panelId The generated panel's id.
+ * @param options Its version and whether it is a deterministic fallback.
+ * @returns The frame.
+ */
+function panelFrame(
+  panelId: string,
+  options: { readonly panelVersion?: number; readonly fallback?: boolean } = {},
+): MessageByType<'panel.generated'> {
+  panelFrameSerial += 1;
+  return {
+    id: `msg_panel_frame_${String(panelFrameSerial)}`,
+    type: 'panel.generated',
+    sessionId: PANEL_SESSION_ID,
+    ts: 1_760_000_000_000 + panelFrameSerial,
+    payload: {
+      sessionId: PANEL_SESSION_ID,
+      panelId,
+      panel: {
+        id: panelId,
+        title: PANEL_TITLE,
+        panelVersion: options.panelVersion ?? 1,
+        ...(options.fallback === true ? { meta: { fallback: true } } : {}),
+      },
+    },
+  } as unknown as MessageByType<'panel.generated'>;
+}
+
+/**
+ * Delivers one inbound frame to every handler activation registered for its
+ * type, as the client does when the frame arrives on the socket.
+ *
+ * @param frame The frame.
+ */
+function deliver(frame: MessageByType<'panel.generated'>): void {
+  const handlers = host.inboundHandlers.get(frame.type) ?? [];
+  expect(handlers.length).toBeGreaterThan(0);
+  for (const handler of handlers) {
+    handler(frame);
+  }
+}
+
+/** The notices naming a generated panel: its ready notice or the fallback banner. */
+function panelNotices(): Array<Pick<ShownMessage, 'level' | 'text'>> {
+  return host.notifications
+    .filter(
+      (shown) => shown.text.includes('Chrome DevTools') || shown.text.includes('fallback view'),
+    )
+    .map(({ level, text }) => ({ level, text }));
+}
+
+/** The ready notice of {@link PANEL_TITLE}, as the developer reads it. */
+const READY_NOTICE = {
+  level: 'info',
+  text: `Panel "${PANEL_TITLE}" is ready in the Debug Generator panel of Chrome DevTools.`,
+} as const;
+
+/** The fallback banner of AAP §0.5.5, as the developer reads it. */
+const FALLBACK_NOTICE = {
+  level: 'warning',
+  text: 'Generated panel failed validation; showing a fallback view built from captured data.',
+} as const;
+
+describe('the panel.generated notice', () => {
+  /** Activates, lets start-up settle, and returns the host store. */
+  async function activatedState(): Promise<ExtensionState> {
+    activateExtension();
+    await settle();
+    const state = host.commandState;
+    if (state === undefined) {
+      throw new Error('activation handed no store to the commands');
+    }
+    return state;
+  }
+
+  it("announces a live session's panel once, however often the service replays it", async () => {
+    const state = await activatedState();
+    state.adoptSession(panelSessionRecord('generated'), SESSION_ENDPOINT);
+
+    // The live frame, then the replays of three re-reads of the session.
+    for (let delivery = 0; delivery < 4; delivery += 1) {
+      deliver(panelFrame('pnl_notice_0001'));
+    }
+    await settle();
+    expect(panelNotices()).toEqual([READY_NOTICE]);
+    expect(state.latestPanel?.id).toBe('pnl_notice_0001');
+
+    // A follow-up's new panel is news, and is announced once too.
+    deliver(panelFrame('pnl_notice_0002', { panelVersion: 2 }));
+    deliver(panelFrame('pnl_notice_0002', { panelVersion: 2 }));
+    await settle();
+    expect(panelNotices()).toEqual([READY_NOTICE, READY_NOTICE]);
+    expect(recordsOf('Panel generated')).toHaveLength(2);
+    expect(recordsOf('Panel already announced')).toHaveLength(4);
+
+    // Ended before deactivation, so shutdown has no live session to end.
+    state.applySessionEnded(PANEL_SESSION_ID, { cleanup: 'clean' });
+  });
+
+  it("announces a live session's fallback panel once, as the fallback banner", async () => {
+    const state = await activatedState();
+    state.adoptSession(panelSessionRecord('generated'), SESSION_ENDPOINT);
+
+    deliver(panelFrame('pnl_notice_fallback', { fallback: true }));
+    deliver(panelFrame('pnl_notice_fallback', { fallback: true }));
+    await settle();
+
+    expect(panelNotices()).toEqual([FALLBACK_NOTICE]);
+    expect(state.latestPanel?.fallback).toBe(true);
+    state.applySessionEnded(PANEL_SESSION_ID, { cleanup: 'clean' });
+  });
+
+  it('announces nothing for a reopened ended session, while the view still gets its panel', async () => {
+    const state = await activatedState();
+    // Reopened from the Sessions tree: the stored record is ended.
+    state.adoptSession(panelSessionRecord('ended', 1_760_000_000_500), SESSION_ENDPOINT);
+
+    deliver(panelFrame('pnl_notice_0001'));
+    deliver(panelFrame('pnl_notice_0001'));
+    deliver(panelFrame('pnl_notice_fallback', { panelVersion: 2, fallback: true }));
+    await settle();
+
+    expect(panelNotices()).toEqual([]);
+    expect(state.latestPanel?.id).toBe('pnl_notice_fallback');
+    expect(recordsOf('Panel of an ended session not announced')).toHaveLength(3);
+  });
+
+  it('stops announcing once the session in view has ended', async () => {
+    const state = await activatedState();
+    state.adoptSession(panelSessionRecord('generated'), SESSION_ENDPOINT);
+    deliver(panelFrame('pnl_notice_0001'));
+    await settle();
+    expect(panelNotices()).toEqual([READY_NOTICE]);
+
+    state.applySessionEnded(PANEL_SESSION_ID, { cleanup: 'clean' });
+    // The end's detail read replays the panel; a panel id never announced is silent too.
+    deliver(panelFrame('pnl_notice_0001'));
+    deliver(panelFrame('pnl_notice_0003', { panelVersion: 3 }));
+    await settle();
+
+    expect(panelNotices()).toEqual([READY_NOTICE]);
   });
 });

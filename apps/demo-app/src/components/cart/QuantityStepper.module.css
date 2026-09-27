@@ -2,7 +2,7 @@
  * QuantityStepper - the cart's quantity control.
  *
  * Four classes, and deliberately no more: `.root` (the inline group), `.label` (the control's
- * visually-hidden label), `.field` (the numeric input) and `.status` (the small hint beside it).
+ * visually-hidden label), `.field` (the numeric input) and `.status` (the small hint under it).
  * QuantityStepper.tsx reads exactly those four off this module, so a name here is a contract, not
  * a detail.
  *
@@ -41,12 +41,17 @@
  * monospace digits inside the padding Input.module.css applies and still reads as a compact
  * stepper next to the line item's price. It is declared here, on the group, so the field inherits
  * it and a cart row that needs a wider stepper can override one property instead of restyling
- * the field. */
+ * the field.
+ *
+ * `position: relative` makes the group the containing block of `.status`, which is placed out of
+ * flow beneath it (see that rule): the group's box is then exactly the three controls, whether or
+ * not the hint is showing. It declares no `z-index`, so it opens no stacking context. */
 .root {
   --qty-field-width: calc(var(--ls-space-6, 32px) * 2);
   --qty-busy-opacity: 0.6;
   --qty-busy-transition: opacity 150ms ease-out;
 
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: var(--ls-space-1, 4px);
@@ -119,14 +124,28 @@
   appearance: none;
 }
 
-/* The hint beside the control - the visible echo of the committed quantity, or the reason a value
- * was rejected. The screen-reader announcement is a separate visually-hidden node the component
- * renders, so this line is free to be quiet. Tabular numerals here too: the hint sits in the same
- * row and would otherwise re-measure it as the number changes. */
+/* The hint under the control - the reason an entry was refused, and what the cart still holds. The
+ * screen-reader echo of the committed quantity is a visually-hidden node inside the same element,
+ * so this box paints nothing until an entry is out of range.
+ *
+ * Out of flow, beneath the group and aligned with its leading edge. As an in-flow flex item the
+ * hint widened the group the moment it appeared, which pushed the field, the + control, the line
+ * total and the whole row sideways by the width of its text; positioned here, showing it moves
+ * none of them. `nowrap` keeps it one line - it is wider than the group, and wrapping inside a box
+ * the group's width would stack it into the row below - and the line height is stated so the
+ * room it occupies under the group is a known quantity: one spacing step of air plus one 12px
+ * line at 1.4, about 21px. `CartLineRow.module.css` reserves that room in the row's narrow
+ * arrangement, where the stepper sits on the row's last line; in the wide one the details column
+ * beside it is already deeper than the stepper and its hint together. */
 .status {
+  position: absolute;
+  inset-block-start: calc(100% + var(--ls-space-1, 4px));
+  inset-inline-start: 0;
   color: var(--ls-text-muted, #475569);
   font-size: var(--ls-text-xs, 12px);
   font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  white-space: nowrap;
 }
 
 /* Out-of-range value. `Input` already renders the field's invalid appearance from its own

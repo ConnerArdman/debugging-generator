@@ -10,9 +10,10 @@
  * empty, or the lines themselves.
  *
  * It is mounted twice in the storefront and the arrangement is the only difference between the two
- * placings: `variant="drawer"` inside the cart panel, where this is the one region that scrolls,
- * and `variant="page"` on `/cart`, where the document scrolls and the region does not. Both read
- * the same cart at the same moment, because both read it the same way.
+ * placings: `variant="drawer"` inside the cart panel, whose body row is the one region that
+ * scrolls it, and `variant="page"` on `/cart`, where the document scrolls. Neither arrangement
+ * scrolls the list itself. Both read the same cart at the same moment, because both read it the
+ * same way.
  *
  * THE CART IS READ HERE, NEVER FETCHED
  * `@/hooks/useCart` is the only cart this file knows about. The lines, the two counts and the
@@ -60,26 +61,47 @@
  * the list as it starts.
  *
  * The rows are a real `<ul>` of `<li>`s, which is what lets a screen reader say how many lines
- * there are, and nothing here adds a list role, a table role or a tab stop of its own: the scroll
- * region is reachable and every control inside a row is focusable in DOM order, with the focus ring
- * the storefront draws in `../ui/Button` and the stepper.
+ * there are, and nothing here adds a list role, a table role or a tab stop of its own: every
+ * control inside a row is focusable in DOM order, with the focus ring the storefront draws in
+ * `../ui/Button` and the stepper, and focusing one scrolls the surface's own scroll container to
+ * it.
  *
  * APPEARANCE AND NAMES
  * `./CartLineList.module.css` owns every value - the column, the two `data-variant` arrangements,
- * the scroll cap in the drawer, the hairline between rows and the placeholder geometry. All eight
- * of the classes it declares are used below and nothing else is: a CSS Module lookup yields
- * `undefined` for a name that does not exist rather than failing to compile, so the two files are
- * kept in step by hand. Nothing is set through an inline style, and the empty state's illustration
- * is named to `../ui/BlankSlate` by its `art` key rather than referenced as a file, so no asset
- * path appears here at all.
+ * the row container the lines collapse against, the hairline between rows and the placeholder
+ * geometry. All eight of the classes it declares are used below and nothing else is: a CSS Module
+ * lookup yields `undefined` for a name that does not exist rather than failing to compile, so the
+ * two files are kept in step by hand. Nothing is set through an inline style, and the empty
+ * state's illustration is named to `../ui/BlankSlate` by its `art` key rather than referenced as a
+ * file, so no asset path appears here at all.
  *
- * Nothing in this file reads a clock, a random source, `window` or `document`, and nothing
- * schedules a timer, so the markup the server renders and the markup the browser first produces
- * agree and the cart raises no hydration warning to explain away.
+ * WHERE FOCUS GOES WHEN THE CONTROL IT WAS ON LEAVES THE LIST
+ * Two presses inside this collection take the pressed control out of the document, and a control
+ * removed while it holds focus leaves focus on `<body>`, where a keyboard shopper's next Tab starts
+ * from the top of the page (WCAG 2.4.3). The root is therefore a landing place of its own: a group
+ * named "Cart items", focusable only programmatically (`tabIndex={-1}`, so it is never a stop in
+ * the tab order), marked `data-cart-lines` so `./CartLineRow.tsx` can find it, and rendered in
+ * every one of the four states, so it is still there whatever the cart turns out to hold.
+ *
+ *   - Removing the last line: the row moves focus here when it has no neighbouring row to move to
+ *     and no dialog around it - the `/cart` page and the checkout review, where the emptied list
+ *     leaves no control behind.
+ *   - The notice's retry: `refreshCart()` clears the failure the moment the read starts, so the
+ *     notice - and the control that was pressed - unmounts before the answer arrives. Focus is
+ *     moved here first, while the control is still in the document; if the read fails again the
+ *     new notice's retry takes it back, so pressing Enter again is all it takes to retry again,
+ *     and if the read succeeds it stays here, on the lines that arrived.
+ *
+ * Nothing in this file reads a clock, a random source or `window`, and nothing schedules a timer.
+ * `document` is read in exactly two places - the retry handler and the effect that settles the
+ * retry's focus - both after mount and never while rendering, so the markup the server renders and
+ * the markup the browser first produces agree and the cart raises no hydration warning to explain
+ * away.
  */
 
 import clsx from 'clsx';
 
+import { useEffect, useRef } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import { Alert } from '@/components/ui/Alert';
@@ -108,6 +130,14 @@ const ERROR_TITLE = 'Your cart could not be read';
 
 /** The retry control's label. */
 const RETRY_LABEL = 'Try again';
+
+/**
+ * The accessible name of the collection's root, which is where focus lands when the control it was
+ * on leaves the list (see the header). A name rather than a heading: the surfaces placing this list
+ * already title it - the drawer's dialog, the cart page's `h1`, the checkout review's heading - and
+ * the group only has to say which part of that surface a reader has been moved to.
+ */
+const CART_LINES_LABEL = 'Cart items';
 
 /** What the live region says while the cart is being read for the first time. */
 const LOADING_ANNOUNCEMENT = 'Loading your cart\u2026';
@@ -164,8 +194,8 @@ const SKELETON_ROW_KEYS: readonly string[] = Array.from(
 interface Props {
   /**
    * Which of the two arrangements `./CartLineList.module.css` declares to use. `drawer` is the
-   * compact rhythm, and the one that caps the list's height and scrolls it; `page` is a step looser
-   * and lets the document do the scrolling.
+   * compact rhythm, for a panel whose own body row scrolls the list; `page` is a step looser and
+   * lets the document do the scrolling. Neither makes the list a scroll container of its own.
    *
    * @default 'drawer'
    */
@@ -198,6 +228,16 @@ interface Props {
 export function CartLineList({ variant = 'drawer', emptySlot, className }: Props): ReactElement {
   const { lines, syncStatus, cartError, cartErrorTitle, refreshCart } = useCart();
 
+  // The collection's root, which is the landing place for focus described in the header, and the
+  // notice's retry control while a notice is on screen (React sets it back to `null` when the
+  // notice unmounts). Both are read only from the retry handler and the effect below.
+  const cartLinesRegion = useRef<HTMLDivElement | null>(null);
+  const cartRetryControl = useRef<HTMLButtonElement | null>(null);
+
+  // Set when a press of the retry control moved focus onto the root, and cleared once the read it
+  // started has settled. A ref: nothing renders from it, and the effect below is its only reader.
+  const cartRetryFocusPending = useRef(false);
+
   /*
    * Ask the provider to read the cart again.
    *
@@ -207,10 +247,50 @@ export function CartLineList({ variant = 'drawer', emptySlot, className }: Props
    * `no-floating-promises` catches. Nothing is lost by discarding it - the provider publishes the
    * cart it read and clears or replaces `cartError` on its own, so the outcome of this click
    * arrives as a new render of this component rather than as a value here.
+   *
+   * Focus is moved onto the root before the read is asked for, and only when it is on the control
+   * being pressed: the provider clears the failure as the read starts, which unmounts the notice in
+   * the very next commit, and a control removed while focused leaves focus on `<body>`. A press
+   * made with focus elsewhere - a pointer press on a control that does not take focus - leaves it
+   * where it is.
    */
   const handleRetry = (): void => {
+    const region = cartLinesRegion.current;
+
+    if (region !== null && document.activeElement === cartRetryControl.current) {
+      region.focus();
+      cartRetryFocusPending.current = true;
+    }
+
     void refreshCart();
   };
+
+  /*
+   * Settle where the retry left focus, once the read it started has answered.
+   *
+   * It runs after the commit that publishes the outcome, so the DOM already shows it: a read that
+   * failed again has mounted a new notice, and its retry control takes focus back from the root so
+   * the next Enter retries again; a read that succeeded leaves focus on the root, around the lines
+   * it returned. Nothing is moved unless focus is still on the root where the handler put it - a
+   * shopper who has gone on to another control while the read was in flight keeps it. The pending
+   * mark is cleared either way, so a later failure published for an unrelated reason never pulls
+   * focus onto its notice. `'loading'` is the read still in flight, so it is skipped.
+   *
+   * Keyed on `syncStatus` alone: every read passes through `'loading'` and out again, and the
+   * notice's presence is a function of the state it settles on. No state is written here, so the
+   * effect adds no render of its own.
+   */
+  useEffect(() => {
+    if (!cartRetryFocusPending.current || syncStatus === 'loading') {
+      return;
+    }
+
+    cartRetryFocusPending.current = false;
+
+    if (document.activeElement === cartLinesRegion.current) {
+      cartRetryControl.current?.focus();
+    }
+  }, [syncStatus]);
 
   /*
    * The one sentence the live region carries, and `null` in the states that have nothing to say.
@@ -225,9 +305,20 @@ export function CartLineList({ variant = 'drawer', emptySlot, className }: Props
         : null;
 
   return (
+    /*
+      The landing place for focus described in the header: a named group, focusable only
+      programmatically, and marked for `./CartLineRow.tsx`'s removal fallback. `data-cart-lines`
+      carries no value because its presence is the whole of what that file's selector asks about;
+      the two spellings are kept in step by hand, like this file's class contract.
+    */
     <div
+      ref={cartLinesRegion}
       className={clsx(styles.root, className)}
       data-variant={variant}
+      data-cart-lines=""
+      role="group"
+      aria-label={CART_LINES_LABEL}
+      tabIndex={-1}
       aria-busy={syncStatus === 'saving'}
     >
       {/*
@@ -251,7 +342,7 @@ export function CartLineList({ variant = 'drawer', emptySlot, className }: Props
             tone="danger"
             title={cartErrorTitle ?? ERROR_TITLE}
             actions={
-              <Button variant="secondary" size="sm" onClick={handleRetry}>
+              <Button ref={cartRetryControl} variant="secondary" size="sm" onClick={handleRetry}>
                 {RETRY_LABEL}
               </Button>
             }

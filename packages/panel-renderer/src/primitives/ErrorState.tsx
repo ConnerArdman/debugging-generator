@@ -256,6 +256,12 @@ const DEFAULT_TITLE = 'Could not load this view';
 const DEFAULT_RETRY_LABEL = 'Retry';
 
 /**
+ * The label an unqualified dismiss control carries (see
+ * {@link ErrorStateProps.onDismiss}): one generic word, like the retry's.
+ */
+const DEFAULT_DISMISS_LABEL = 'Dismiss';
+
+/**
  * The attribute that marks a control as recognisable again after a remount.
  *
  * A retry replaces this component's subtree: the query returns to loading, the
@@ -295,9 +301,51 @@ export const ERROR_STATE_RETRY_FOCUS_KEY = 'error-state-retry';
  * once and the attribute name is the exported constant rather than a second
  * copy of its spelling.
  */
-const RETRY_FOCUS_ATTRIBUTES = {
+const RETRY_FOCUS_ATTRIBUTES = Object.freeze({
   [FOCUS_KEY_ATTRIBUTE]: ERROR_STATE_RETRY_FOCUS_KEY,
-} as const;
+} as const);
+
+/**
+ * The attributes a view spreads onto the ONE control that takes over from a
+ * retry that succeeded: the same key as the retry itself, so the host's node
+ * frame, which hands focus lost from a keyed control to the first focusable
+ * element carrying the same key, moves the reader from the retry they pressed
+ * onto the content that replaced the failure — instead of leaving focus parked
+ * on the node's heading, or on its bare frame when the node has no heading.
+ *
+ * ## The successor's side of the contract
+ *
+ * This component cannot mark its successor: it is pure, and the successor is
+ * whatever the view draws once the query settles. So the view does, under
+ * three rules that keep the key meaning "where a retry's focus belongs now":
+ *
+ *   1. **One element, and a meaningful one.** The first control of the
+ *      recovered content — the first control of a grid row, say — which is
+ *      focusable in its own right (a `tabIndex={-1}` control qualifies),
+ *      carries a name and draws the global `:focus-visible` ring. Never a
+ *      wrapper: a frame focuses the element that carries the key.
+ *   2. **Never beside a live error state.** While this component is rendered
+ *      for the same node the successor carries nothing, because the frame takes
+ *      the FIRST keyed element in document order: a retry that fails again must
+ *      hand focus to the new Retry, not to content that precedes it.
+ *   3. **Only on what the retry brought.** The successor is the first item of
+ *      the result the settled request returned: the view's first row after a
+ *      failed first page, the first row of the new page after a failed further
+ *      page. Content that stayed on screen throughout carries nothing, so a
+ *      reader who retried a page below it is not moved back up to it.
+ *
+ * Focus moves only when the frame itself parked it after the loss; a reader
+ * who moved on while the retry was in flight is never pulled back. Between
+ * retries the key moves nothing: the frame acts only on a loss, and a marked
+ * control that the reader focuses and the view then replaces hands focus to
+ * whichever control carries the key next, as any keyed control does.
+ *
+ * @example
+ * // On the first control of the first row the settled page brought, and only
+ * // while that page is a success:
+ * <Button {...(isSuccessor ? RETRY_SUCCESSOR_FOCUS_ATTRIBUTES : NO_ATTRIBUTES)} … />
+ */
+export const RETRY_SUCCESSOR_FOCUS_ATTRIBUTES = RETRY_FOCUS_ATTRIBUTES;
 
 /**
  * The accessible name of the query block when the caller names it nothing
@@ -596,7 +644,9 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    * The control carries {@link FOCUS_KEY_ATTRIBUTE} set to
    * {@link ERROR_STATE_RETRY_FOCUS_KEY}, so that when the retry replaces this
    * subtree the host's node frame can recognise the equivalent control in what
-   * replaces it and keep keyboard focus inside the node.
+   * replaces it and keep keyboard focus inside the node: the new Retry of a
+   * retry that failed again, or — once the query succeeds — the control the
+   * view marked with {@link RETRY_SUCCESSOR_FOCUS_ATTRIBUTES}.
    */
   onRetry?: (() => void) | undefined;
 
@@ -610,6 +660,31 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    * Ignored when `onRetry` is omitted, because no control is rendered then.
    */
   retryLabel?: string | undefined;
+
+  /**
+   * What to do when the reader closes a failure notice that is theirs to
+   * close — a non-blocking notice raised above a view that keeps working, as
+   * opposed to the failure of the view itself.
+   *
+   * The dismiss control is rendered **only** when this callback is supplied,
+   * for the reason `onRetry` gives, and it sits in the same action row, after
+   * the retry control: every control of an error state is part of the box it
+   * acts on, so a reader can tell which failure a control closes. A node's
+   * query failure omits it — its error state is the view, and removing it
+   * would leave nothing in its place.
+   *
+   * Like `onRetry`, it is raised and nothing more: removing the notice, and
+   * where keyboard focus goes once the control that held it is gone, belong
+   * to the caller that owns the notice.
+   */
+  onDismiss?: (() => void) | undefined;
+
+  /**
+   * The dismiss control's label, its accessible name as well as its visible
+   * text. Defaults to a generic one-word action, and a blank value falls back
+   * to it. Ignored when `onDismiss` is omitted.
+   */
+  dismissLabel?: string | undefined;
 
   /**
    * A decorative glyph above the copy. Omitted (`undefined`), the default
@@ -650,8 +725,8 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
  * Renders the error state of a node: a glyph (the default one unless the
  * caller replaces or suppresses it), the title, the required message, an
  * optional hint, an optional failure code, the optional failing query, an
- * optional closed technical-details disclosure and an optional retry control,
- * in that order.
+ * optional closed technical-details disclosure and the optional retry and
+ * dismiss controls, in that order.
  *
  * Presentational and pure — no state, no effects, no hooks, no timers, nothing
  * read from the document while rendering, and no memoization. It re-renders
@@ -703,6 +778,8 @@ export function ErrorState(props: ErrorStateProps): ReactElement {
     announce = DEFAULT_ANNOUNCE,
     onRetry,
     retryLabel,
+    onDismiss,
+    dismissLabel,
     icon,
     className,
     ...rest
@@ -712,6 +789,7 @@ export function ErrorState(props: ErrorStateProps): ReactElement {
   // back to the default rather than reaching `Button` as empty children. The
   // query block's name follows the same rule for the same reason.
   const retryText = hasText(retryLabel) ? retryLabel : DEFAULT_RETRY_LABEL;
+  const dismissText = hasText(dismissLabel) ? dismissLabel : DEFAULT_DISMISS_LABEL;
   const queryName = hasText(queryLabel) ? queryLabel : DEFAULT_QUERY_ACCESSIBLE_NAME;
 
   // Only an omitted glyph is defaulted: an explicit `null`, `false` or `''` is a
@@ -778,11 +856,18 @@ export function ErrorState(props: ErrorStateProps): ReactElement {
           </Code>
         </details>
       ) : null}
-      {onRetry === undefined ? null : (
+      {onRetry === undefined && onDismiss === undefined ? null : (
         <div className="dg-error-state__action">
-          <Button variant="secondary" size="sm" onClick={onRetry} {...RETRY_FOCUS_ATTRIBUTES}>
-            {retryText}
-          </Button>
+          {onRetry === undefined ? null : (
+            <Button variant="secondary" size="sm" onClick={onRetry} {...RETRY_FOCUS_ATTRIBUTES}>
+              {retryText}
+            </Button>
+          )}
+          {onDismiss === undefined ? null : (
+            <Button variant="secondary" size="sm" onClick={onDismiss}>
+              {dismissText}
+            </Button>
+          )}
         </div>
       )}
     </div>

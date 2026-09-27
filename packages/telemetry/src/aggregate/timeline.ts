@@ -62,10 +62,20 @@
  * trace + code graph". Only the first half happens here: this package sits below
  * `@debuggen/code-analysis` in the acyclic package graph (AAP 0.2.2) and must
  * not import it, so {@link buildDependencyGraph} derives participants and edges
- * from span parentage and nothing else.
+ * from span parentage plus the producer's render ancestry, and nothing else.
  *
- * Two facts of that parentage travel with the graph, so that no consumer has to
- * re-derive them from raw events or guess at them:
+ * The render ancestry is what turns a React commit from a star into a cascade.
+ * Every `render` span's parent is the commit that performed it, so parentage
+ * alone would hang every component off that commit; `../browser/react.ts` also
+ * records each render's nearest composite ancestor (`parentFiberId`,
+ * `ownerChain`) and `../browser/fiber-diff.ts` why it rendered (`trigger`). A
+ * render therefore joins the component that rendered above it in the same
+ * commit, which is the "trigger → provider → consumers" structure AAP 0.6.5
+ * asks the render panel's graph to show. Nothing is read from a component's
+ * name beyond matching it against the names the producer recorded.
+ *
+ * Four facts of that derivation travel with the graph, so that no consumer has
+ * to re-derive them from raw events or guess at them:
  *
  * - **The event a participant stands for.** A participant that collapsed
  *   exactly one record carries that record's `eventId` and `traceId` — the
@@ -73,12 +83,18 @@
  *   for no single event, so it carries neither, and no consumer is handed a
  *   span id to pass off as one.
  * - **How an edge was known.** `inferredCount` says how many of an edge's
- *   callee spans joined their caller through a lineage attribution — AAP
- *   0.4.2's asynchronous continuation — rather than by being nested inside it,
- *   and `ambiguousCount` how many of those attributions had more than one
- *   candidate. Both are read through `lineageOf`, the package's only reader of
- *   the lineage keys, and both are omitted when zero, so a measured edge is
- *   byte-for-byte the shape it always was.
+ *   callee spans joined their caller through an attribution rather than by
+ *   being nested inside it — a lineage attribution (AAP 0.4.2's asynchronous
+ *   continuation, read through `lineageOf`, the package's only reader of the
+ *   lineage keys) or a provider attribution (a context consumer whose recorded
+ *   ancestry reached no ancestor that rendered) — and `ambiguousCount` how many
+ *   of those attributions had more than one candidate. Both are omitted when
+ *   zero, so a measured edge is byte-for-byte the shape it always was.
+ * - **Why a component rendered.** An edge whose callee is a render tallies the
+ *   producer's triggers (`renderTriggers`) and names the contexts the callee's
+ *   hook transitions recorded as changed (`contexts`).
+ * - **The role a component played.** A participant whose renders started,
+ *   supplied or consumed a context change carries `roles`.
  *
  * The shapes are deliberately **additive** for the other half:
  * `apps/local-service`, which owns the code graph, attaches a `source` to a node
@@ -125,6 +141,7 @@ import type { TraceNode, TraceNodeLineage, TraceTree } from '../correlation/tree
 import {
   ATTRIBUTE_VALUE_TYPES,
   MAX_PREVIEW_LENGTH,
+  RENDER_TRIGGERS,
   TRANSITION_SOURCES,
 } from '../schema/attributes.js';
 // Type-only: these key tuples are consulted by the *compiler*, which checks the
@@ -135,12 +152,15 @@ import type {
   FUNCTION_ATTRIBUTE_KEYS,
   HTTP_SERVER_ATTRIBUTE_KEYS,
   INTERACTION_ATTRIBUTE_KEYS,
+  RENDER_ATTRIBUTE_KEYS,
   ROUTE_HANDLER_ATTRIBUTE_KEYS,
   STATE_ATTRIBUTE_KEYS,
 } from '../schema/attributes.js';
 import type {
   AttributeValueSummary,
   AttributeValueType,
+  RenderPhase,
+  RenderTrigger,
   TransitionSource,
 } from '../schema/attributes.js';
 import type { TelemetryEvent } from '../schema/event.js';
@@ -1949,11 +1969,19 @@ export function aggregateStateTransitions(
  * Frozen: a read-only vocabulary.
  */
 export const DEPENDENCY_NODE_KINDS = Object.freeze([
-  /** Something the user did, and the page's own response to it. */
+  /** Something the user did, React's commit that answered it, and a page error. */
   'ui-event',
-  /** A named application function, on either tier. */
+  /**
+   * Application code executing, on either tier: a named function, a React
+   * component rendering (with its hook transitions), a log record, and a long
+   * task — script that blocked the main thread.
+   */
   'function',
-  /** A request boundary: the call the page made and the request that answered it. */
+  /**
+   * A request boundary: the call the page made and the request that answered
+   * it, plus the page's own transfers — its document navigation and the
+   * performance entries that time its resources.
+   */
   'api',
   /** Server-side work behind that boundary. */
   'service',
@@ -1975,38 +2003,58 @@ export type DependencyNodeKind = (typeof DEPENDENCY_NODE_KINDS)[number];
  * unclassified kind would otherwise fall into whatever branch happened to be
  * last. The rules it encodes:
  *
- * - Everything the page observes about itself is a `ui-event`: the interaction,
- *   the renders and commits that followed, the hook transitions, the document's
- *   navigation, the performance entries, and a page error. They are one
- *   participant class because they are all the page acting, and their *kind*
- *   stays on the node for a renderer that wants to distinguish them.
+ * - What the user did and the page's reaction to it as a whole is a
+ *   `ui-event`: the interaction, React's commit that applied the resulting
+ *   renders, and a page error.
+ * - Application code executing is a `function`, on either tier: a patched named
+ *   function, a React component rendering — a component is a named function of
+ *   the application, and the trigger → provider → consumer structure of a render
+ *   cascade (AAP 0.6.5) is a structure *between components* — the hook
+ *   transitions observed inside a render, a log record (it names the code that
+ *   emitted it rather than a participant of its own) and a long task, which is
+ *   script that blocked the main thread.
  * - A request boundary is an `api`: the browser's `fetch`/`xhr` and the server's
- *   incoming request span. They stay separate nodes — their identities differ
- *   (a span name versus a matched route) and their tiers differ — which is
- *   precisely the client-to-server edge a reader is looking for.
+ *   incoming request span, plus the page's own transfers — the document
+ *   navigation and the performance entries, which are dominated by resource
+ *   timings. The browser and server ends stay separate nodes — their
+ *   identities differ (a span name versus a matched route) and their tiers
+ *   differ — which is precisely the client-to-server edge a reader is looking
+ *   for.
  * - Server-side work behind that boundary is a `service`: the route handler, and
  *   an exception raised while handling a request, charged to the participant
  *   that failed rather than given a class of its own.
- * - A patched named function is a `function` on either tier, and an explicit log
- *   record joins it: a log names the code that emitted it rather than a
- *   participant of its own.
  * - `db.query` is the `database`; an outgoing server-side request is `external`,
  *   which is the only class that means "not this application".
+ *
+ * ## Why the classes follow the renderer's colour families
+ *
+ * The graph draws a participant in the colour its spans have in every other
+ * view when its kinds agree on one, and in its class colour otherwise, and the
+ * six classes own six distinct colours. A kind classed into one participant
+ * class while its span colour is *another* class's colour would put two
+ * meanings on one colour in the legend — a navigation drawn in the request
+ * colour under the page-event class, a long task drawn in the code colour under
+ * the page-event class. So every kind whose span-colour family is a class
+ * colour is classed into that class (navigation and performance entries into
+ * `api`, a long task into `function`), and the remaining kinds — renders,
+ * commits and hook transitions, the server's incoming request, failures —
+ * belong to span-colour families no class owns. No legend can then show one
+ * colour twice.
  *
  * Frozen: a read-only lookup table.
  */
 export const KIND_TO_DEPENDENCY_NODE_KIND: Readonly<Record<TelemetryKind, DependencyNodeKind>> =
   Object.freeze({
     interaction: 'ui-event',
-    render: 'ui-event',
+    render: 'function',
     commit: 'ui-event',
     fetch: 'api',
     xhr: 'api',
-    navigation: 'ui-event',
-    'perf.longtask': 'ui-event',
-    'perf.entry': 'ui-event',
+    navigation: 'api',
+    'perf.longtask': 'function',
+    'perf.entry': 'api',
     error: 'ui-event',
-    state: 'ui-event',
+    state: 'function',
     'http.server': 'api',
     'route.handler': 'service',
     function: 'function',
@@ -2027,6 +2075,56 @@ export const KIND_TO_DEPENDENCY_NODE_KIND: Readonly<Record<TelemetryKind, Depend
  * presented as a fact. The span still appears, with its own kind on the node.
  */
 const UNCLASSIFIED_DEPENDENCY_NODE_KIND: DependencyNodeKind = 'external';
+
+/**
+ * The roles a component participant can play in a render cascade — the
+ * "trigger → provider → consumers" structure of AAP 0.6.5.
+ *
+ * - `trigger` — at least one of its renders was classified `state`: its own
+ *   hook state changed, so it started a render pass.
+ * - `provider` — at least one other component's `context`-triggered render was
+ *   attributed to it: it re-rendered above that consumer in the same commit,
+ *   so it is where the changed context value came from.
+ * - `consumer` — at least one of its renders was classified `context`: a
+ *   context value it reads changed.
+ *
+ * Roles are read off render triggers the producer classified
+ * (`../browser/fiber-diff.ts`) and the ancestry it recorded; none is guessed
+ * from a name. A component re-rendered only because its parent did (`props`,
+ * `unchanged`) has no role: it is simply downstream, and its incoming edge's
+ * {@link DependencyGraphEdge.renderTriggers} says why it rendered.
+ *
+ * Listed in this order on a node (a closed vocabulary, frozen).
+ */
+export const DEPENDENCY_NODE_ROLES = Object.freeze(['trigger', 'provider', 'consumer'] as const);
+
+/** One member of the closed render-cascade role vocabulary. */
+export type DependencyNodeRole = (typeof DEPENDENCY_NODE_ROLES)[number];
+
+/**
+ * Why a callee render ran, as an edge tallies it: the producer's render trigger
+ * (`RENDER_TRIGGERS`, in that order) for an update, and `mount` for a first
+ * render, which carries no trigger because there was no previous render to
+ * compare against.
+ *
+ * A render whose phase and trigger are both unreadable is tallied `unknown`,
+ * the producer's own word for an unevaluable classification — never `mount`
+ * and never `unchanged`, for the reason `RENDER_TRIGGERS` gives.
+ *
+ * Frozen: a read-only vocabulary.
+ */
+export const DEPENDENCY_RENDER_REASONS = Object.freeze([...RENDER_TRIGGERS, 'mount'] as const);
+
+/** One member of the render-reason vocabulary an edge tallies. */
+export type DependencyRenderReason = RenderTrigger | 'mount';
+
+/**
+ * The most context labels one edge carries in
+ * {@link DependencyGraphEdge.contexts}: 8. A consumer rarely reads more than a
+ * handful of contexts, and the bound keeps a pathological capture from
+ * growing an edge without limit.
+ */
+export const MAX_CONTEXT_LABELS_PER_DEPENDENCY_EDGE = 8;
 
 /** Prefix of every {@link DependencyGraphNode.id}. */
 export const DEPENDENCY_NODE_ID_PREFIX = 'dep:';
@@ -2127,6 +2225,85 @@ export const DEFAULT_MAX_DEPENDENCY_EDGES = 400;
  */
 export const MAX_SPAN_IDS_PER_DEPENDENCY_NODE = 50;
 
+/*
+ * Render-cascade vocabulary bindings.
+ *
+ * Bound here rather than with the module's other key bindings because only the
+ * dependency graph reads them, and by the same two mechanisms: a catalogued key
+ * is annotated with its kind's member type, and a vocabulary member with the
+ * vocabulary's type, so a rename upstream fails to compile here.
+ */
+
+/** One member of the declared `render` attribute key set. */
+type RenderAttributeKey = (typeof RENDER_ATTRIBUTE_KEYS)[number];
+
+/** The rendered component's display name: a render participant's identity. */
+const RENDER_COMPONENT_KEY: RenderAttributeKey = 'component';
+
+/** `mount` or `update`: whether the render had a previous render to compare against. */
+const RENDER_PHASE_KEY: RenderAttributeKey = 'phase';
+
+/** Why the fiber rendered, a member of `RENDER_TRIGGERS`; written on an update only. */
+const RENDER_TRIGGER_KEY: RenderAttributeKey = 'trigger';
+
+/** The render's composite ancestors' names, nearest first. */
+const RENDER_OWNER_CHAIN_KEY: RenderAttributeKey = 'ownerChain';
+
+/**
+ * The rendered fiber's identity within its document.
+ *
+ * An addition `../browser/react.ts` writes beside the catalogued render keys,
+ * spelled exactly as the catalogued `state` key so that the two producers
+ * describe one component instance identically. It is bound to that key rather
+ * than spelled again, which keeps the two spellings one.
+ */
+const RENDER_FIBER_ID_KEY = STATE_FIBER_ID_KEY;
+
+/**
+ * The fiber id of the render's nearest composite ancestor.
+ *
+ * Also an addition of `../browser/react.ts` beside the catalogued render keys,
+ * and the one key this section spells itself: the catalog declares no group it
+ * belongs to, so there is no member type to annotate it with. It is the
+ * render's ancestry by *identity* — `ownerChain` is the same ancestry by name —
+ * and the only way to tell a component's own parent from another instance of
+ * the same component.
+ */
+const RENDER_PARENT_FIBER_ID_KEY = 'parentFiberId';
+
+/** The phase of a first render, which carries no trigger. */
+const MOUNT_RENDER_PHASE: RenderPhase = 'mount';
+
+/** The trigger of a render whose own hook state changed: where a cascade starts. */
+const STATE_RENDER_TRIGGER: RenderTrigger = 'state';
+
+/** The trigger of a render a consumed context value changed. */
+const CONTEXT_RENDER_TRIGGER: RenderTrigger = 'context';
+
+/** The producer's word for a classification it could not evaluate. */
+const UNKNOWN_RENDER_TRIGGER: RenderTrigger = 'unknown';
+
+/** The reason an edge tallies a first render under. */
+const MOUNT_RENDER_REASON: DependencyRenderReason = 'mount';
+
+/** The transition source of a consumed context value changing. */
+const CONTEXT_TRANSITION_SOURCE: TransitionSource = 'context';
+
+/** The kind a render cascade is resolved over. */
+const RENDER_KIND: TelemetryKind = 'render';
+
+/**
+ * Hostile-input bound on the owner-chain entries one render is matched by: 64.
+ *
+ * `../browser/react.ts` records at most eight, so a real chain is never cut.
+ * The bound only keeps a malformed chain from costing more than a fixed number
+ * of lookups per render, which is what keeps the cascade resolution linear.
+ */
+const MAX_OWNER_CHAIN_LOOKUPS = 64;
+
+/** The owner chain of a render that recorded none. */
+const NO_OWNER_CHAIN: readonly string[] = Object.freeze([]);
+
 /** The empty identity-key list of a kind whose span name is its identity. */
 const NO_IDENTITY_KEYS: readonly string[] = Object.freeze([]);
 
@@ -2138,9 +2315,13 @@ const IDENTITY_SEPARATOR = ' ';
  * joined.
  *
  * Collapsing spans into participants needs an identity, and for most kinds the
- * producer's span name *is* it. Four kinds have something better, and it is
+ * producer's span name *is* it. Six kinds have something better, and it is
  * always a key the catalog already declares:
  *
+ * - A component's renders and its hook transitions are identified by the
+ *   **component**, so a transition lands in the participant of the component it
+ *   happened in, and the graph's participants are the components the render
+ *   table and the component tree name.
  * - An interaction is identified by what happened and to what, so two clicks on
  *   the same element are one participant while clicks on two elements are two.
  * - An incoming request and a route handler are identified by the **matched
@@ -2164,7 +2345,7 @@ const IDENTITY_SEPARATOR = ' ';
 const KIND_IDENTITY_ATTRIBUTE_KEYS: Readonly<Record<TelemetryKind, readonly string[]>> =
   Object.freeze({
     interaction: Object.freeze([INTERACTION_EVENT_TYPE_KEY, INTERACTION_TARGET_SELECTOR_KEY]),
-    render: NO_IDENTITY_KEYS,
+    render: Object.freeze([RENDER_COMPONENT_KEY]),
     commit: NO_IDENTITY_KEYS,
     fetch: NO_IDENTITY_KEYS,
     xhr: NO_IDENTITY_KEYS,
@@ -2172,7 +2353,7 @@ const KIND_IDENTITY_ATTRIBUTE_KEYS: Readonly<Record<TelemetryKind, readonly stri
     'perf.longtask': NO_IDENTITY_KEYS,
     'perf.entry': NO_IDENTITY_KEYS,
     error: NO_IDENTITY_KEYS,
-    state: NO_IDENTITY_KEYS,
+    state: Object.freeze([STATE_COMPONENT_KEY]),
     'http.server': Object.freeze([HTTP_SERVER_ROUTE_KEY]),
     'route.handler': Object.freeze([ROUTE_HANDLER_ROUTE_KEY]),
     function: Object.freeze([FUNCTION_MODULE_KEY, FUNCTION_SYMBOL_KEY]),
@@ -2181,6 +2362,44 @@ const KIND_IDENTITY_ATTRIBUTE_KEYS: Readonly<Record<TelemetryKind, readonly stri
     'server.error': NO_IDENTITY_KEYS,
     log: NO_IDENTITY_KEYS,
   });
+
+/**
+ * The words that qualify a participant's identity into its label, per kind.
+ *
+ * For most kinds the identity reads as what the participant is: a component, a
+ * route, a request's span name. A long task's does not. Its span name is the
+ * entry's attribution — `self`, `same-origin-descendant`, … — which says where
+ * the blocking script ran, not that the main thread was blocked, and a node
+ * labelled `self` reads as nothing. So a long task is labelled
+ * `Long task (self)`. The qualifier is part of the identity, so the node id
+ * says the same thing its label does.
+ *
+ * Total by construction, for the same reason as the tables above; `undefined`
+ * means the identity is the label as it stands.
+ *
+ * Frozen: a read-only lookup table.
+ */
+const KIND_IDENTITY_QUALIFIERS: Readonly<Record<TelemetryKind, string | undefined>> = Object.freeze(
+  {
+    interaction: undefined,
+    render: undefined,
+    commit: undefined,
+    fetch: undefined,
+    xhr: undefined,
+    navigation: undefined,
+    'perf.longtask': 'Long task',
+    'perf.entry': undefined,
+    error: undefined,
+    state: undefined,
+    'http.server': undefined,
+    'route.handler': undefined,
+    function: undefined,
+    'db.query': undefined,
+    'http.client': undefined,
+    'server.error': undefined,
+    log: undefined,
+  },
+);
 
 /**
  * One participant of the captured work.
@@ -2195,6 +2414,15 @@ const KIND_IDENTITY_ATTRIBUTE_KEYS: Readonly<Record<TelemetryKind, readonly stri
  * questions — how long the capture, the interaction or a tier actually took —
  * are answered by the interval unions at the top of this module, which is why
  * both live here and neither is used for the other's job.
+ *
+ * A component's hook transitions are the one record that is **folded** rather
+ * than collapsed. A `state` event is an observation made inside a render, not
+ * work of its own — its duration is zero and its render already counted the
+ * time — so it joins the participant of its component by adding `state` to
+ * `spanKinds` and nothing else: not to `count`, the durations or `spanIds`. A
+ * transition whose component has no rendered record in the slice has nothing
+ * to fold into, and its component's participant is then built from the
+ * transitions themselves, each counted as usual.
  *
  * ## It stands for one event only when it collapsed one record
  *
@@ -2233,8 +2461,9 @@ export interface DependencyGraphNode {
    * of `TELEMETRY_KINDS`.
    *
    * The participant class above is coarser than the kind vocabulary — a
-   * `ui-event` node may collapse renders, commits or a navigation, and an `api`
-   * node is either the browser's request or the server's — so the class alone
+   * `function` node may be a patched function, a component's renders or a long
+   * task, and an `api` node is the browser's request, the server's, or the
+   * document's navigation — so the class alone
    * cannot tell a renderer what the node actually is. This list keeps the
    * kinds on the node, which is what lets a graph colour a participant with
    * the same span-kind colour the timeline and flame views give its spans.
@@ -2284,6 +2513,16 @@ export interface DependencyGraphNode {
    * Present exactly when `eventId` is, and taken from the same record.
    */
   readonly traceId?: TraceId;
+  /**
+   * The roles this component played in a render cascade, in the order of
+   * {@link DEPENDENCY_NODE_ROLES}; see that vocabulary for what each means.
+   *
+   * Set only on a participant that collapsed `render` records, and only when
+   * it played at least one role: the key is absent — not an empty list — for
+   * every other participant, so a graph with no render cascade keeps exactly
+   * the shape it always had.
+   */
+  readonly roles?: readonly DependencyNodeRole[];
 }
 
 /**
@@ -2293,16 +2532,32 @@ export interface DependencyGraphNode {
  *
  * Most callee spans join their caller by being **nested** inside it: the
  * parent link is the context the runtime carried, and the edge is measured.
- * Some join through a **lineage attribution** instead — AAP 0.4.2's
- * asynchronous continuation, which gives a commit that followed a settled
- * response that response's span as its parent — and an attribution is an
- * inference, sometimes one chosen from several open candidates. A reader must
- * be able to tell the three apart, so an edge says how many of its `count`
- * callee spans were attributed (`inferredCount`) and how many of those
- * attributions were ambiguous (`ambiguousCount`). Both are read through
- * `lineageOf` in `../correlation/tree.ts`, never from the attribute keys, and
- * both keys are omitted when their value is `0`: an edge built entirely from
- * nesting carries neither.
+ * Some join through an **attribution** instead, and an attribution is an
+ * inference, sometimes one chosen from several open candidates. There are two:
+ *
+ * - a **lineage attribution** — AAP 0.4.2's asynchronous continuation, which
+ *   gives a commit that followed a settled response that response's span as
+ *   its parent — read through `lineageOf` in `../correlation/tree.ts`, never
+ *   from the attribute keys;
+ * - a **provider attribution** — a `context`-triggered render whose recorded
+ *   ancestry (`ownerChain` is bounded) ends before any ancestor that rendered
+ *   in the same commit, charged to the provider that rendered before it in
+ *   that commit.
+ *
+ * A reader must be able to tell the three apart, so an edge says how many of
+ * its `count` callee spans were attributed (`inferredCount`) and how many of
+ * those attributions were ambiguous (`ambiguousCount`). Both keys are omitted
+ * when their value is `0`: an edge built entirely from nesting carries neither.
+ *
+ * ## Render edges say why the callee rendered
+ *
+ * A component's render joins the component that rendered above it in the same
+ * commit — its nearest rendered ancestor — rather than the commit it sat in,
+ * so a render cascade reads as the trigger → provider → consumers structure of
+ * AAP 0.6.5 instead of a star around the commit. An edge whose callee is a
+ * render therefore tallies why each of those renders ran
+ * (`renderTriggers`), and names the contexts whose change the callee's hook
+ * transitions recorded (`contexts`).
  */
 export interface DependencyGraphEdge {
   /**
@@ -2321,7 +2576,7 @@ export interface DependencyGraphEdge {
   readonly totalDurationMs: number;
   /**
    * How many of the `count` callee spans joined their caller through a lineage
-   * attribution rather than by being nested inside it.
+   * or provider attribution rather than by being nested inside it.
    *
    * Between `1` and `count` when present; the key is omitted when no callee
    * span was attributed, so `inferredCount === count` means the whole
@@ -2330,12 +2585,35 @@ export interface DependencyGraphEdge {
   readonly inferredCount?: number;
   /**
    * How many of those attributed spans had more than one candidate caller open
-   * when they were attributed, so the caller shown is the most recently settled
-   * candidate rather than a certainty.
+   * when they were attributed, so the caller shown is the most recent candidate
+   * — the most recently settled request, or the provider that rendered last
+   * before the consumer — rather than a certainty.
    *
    * Between `1` and `inferredCount` when present; omitted when `0`.
    */
   readonly ambiguousCount?: number;
+  /**
+   * Why the callee renders of this edge ran: how many of them each
+   * {@link DependencyRenderReason} accounts for.
+   *
+   * Present only when at least one callee span is a `render`, and then holding
+   * only the reasons that occurred — every value a whole number of at least
+   * `1`, keys in the order of {@link DEPENDENCY_RENDER_REASONS} — so the values
+   * sum to the number of callee renders. Absent on an edge none of whose
+   * callees rendered.
+   */
+  readonly renderTriggers?: Readonly<Partial<Record<DependencyRenderReason, number>>>;
+  /**
+   * The contexts whose value change the callee's hook transitions recorded
+   * (`state` events with `transitionSource: "context"`, by their `hookLabel`),
+   * sorted and de-duplicated, at most
+   * {@link MAX_CONTEXT_LABELS_PER_DEPENDENCY_EDGE}.
+   *
+   * A context label is a producer-assigned name — the context's display name,
+   * or the category of its value — never a value. Absent when no transition
+   * named one, which is the case whenever state tracking was not armed.
+   */
+  readonly contexts?: readonly string[];
 }
 
 /**
@@ -2392,6 +2670,14 @@ interface ParticipantAccumulator {
   readonly firstEventId: EventId;
   /** The trace of that same record; see {@link DependencyGraphNode.traceId}. */
   readonly firstTraceId: TraceId;
+  /**
+   * Whether the participant was created from a record of work rather than from
+   * a hook transition: only such a participant folds transitions in without
+   * counting them (see {@link DependencyGraphNode}).
+   */
+  readonly collapsedWork: boolean;
+  /** The render-cascade roles claimed so far; published in vocabulary order. */
+  readonly roles: Set<DependencyNodeRole>;
   count: number;
   totalDurationMs: number;
   maxDurationMs: number;
@@ -2405,10 +2691,88 @@ interface EdgeAccumulator {
   readonly to: string;
   count: number;
   totalDurationMs: number;
-  /** Callee spans attributed through lineage; see {@link DependencyGraphEdge.inferredCount}. */
+  /**
+   * Callee spans attributed through lineage or to a provider; see
+   * {@link DependencyGraphEdge.inferredCount}.
+   */
   inferredCount: number;
   /** Of those, the ambiguous ones; see {@link DependencyGraphEdge.ambiguousCount}. */
   ambiguousCount: number;
+  /** Callee renders per reason; see {@link DependencyGraphEdge.renderTriggers}. */
+  readonly renderTriggers: Map<DependencyRenderReason, number>;
+  /** Every context label the callee renders recorded; see {@link DependencyGraphEdge.contexts}. */
+  readonly contexts: Set<string>;
+}
+
+/**
+ * How a render came to hang from the render charged as its cause.
+ *
+ * - `nested` — the cause is the render's recorded ancestor: its nearest
+ *   composite parent by fiber identity, or the nearest ancestor its owner chain
+ *   names that rendered earlier in the same commit.
+ * - `inferred` — a context consumer whose recorded ancestry reached no rendered
+ *   ancestor, charged to the one provider candidate that rendered before it.
+ * - `ambiguous` — the same, chosen as the last of several candidates.
+ */
+type RenderAttribution = 'nested' | 'inferred' | 'ambiguous';
+
+/** What one attribution adds to an edge's `inferredCount` and `ambiguousCount`. */
+interface AttributionTally {
+  readonly inferred: number;
+  readonly ambiguous: number;
+}
+
+/**
+ * The edge tallies of each way a callee span can have joined its caller: a
+ * nested span is measured structure, an inferred one is one inference, and an
+ * ambiguous one is an inference that had to choose. The same three describe a
+ * render charged to its cause and a span joined through lineage. Total by
+ * construction over {@link RenderAttribution}.
+ *
+ * Frozen: a read-only lookup table.
+ */
+const ATTRIBUTION_TALLIES: Readonly<Record<RenderAttribution, AttributionTally>> = Object.freeze({
+  nested: Object.freeze({ inferred: 0, ambiguous: 0 }),
+  inferred: Object.freeze({ inferred: 1, ambiguous: 0 }),
+  ambiguous: Object.freeze({ inferred: 1, ambiguous: 1 }),
+});
+
+/**
+ * What a span joined to its span parent adds to an edge's attribution counts:
+ * an inference when `lineageOf` finds a lineage attribution, an ambiguous one
+ * when that attribution chose among several candidates, and nothing when the
+ * span was nested. Read through the one reader of the lineage keys, so the edge
+ * and the timeline row built from the same event can never disagree about it.
+ */
+function lineageTallyOf(event: TelemetryEvent): AttributionTally {
+  const lineage = lineageOf(event);
+  if (lineage === undefined) {
+    return ATTRIBUTION_TALLIES.nested;
+  }
+  return lineage.ambiguous === true ? ATTRIBUTION_TALLIES.ambiguous : ATTRIBUTION_TALLIES.inferred;
+}
+
+/** One `render` event, read once for the cascade resolution and the edges. */
+interface RenderReading {
+  readonly event: TelemetryEvent;
+  /** The event's position in canonical order: the last emission-order tie-break. */
+  readonly rank: number;
+  /** The component name ancestors are matched by: `component`, else the span name. */
+  readonly name: string | undefined;
+  readonly fiberId: number | undefined;
+  readonly parentFiberId: number | undefined;
+  /** Ancestor names, nearest first, at most {@link MAX_OWNER_CHAIN_LOOKUPS}. */
+  readonly ownerChain: readonly string[];
+  /** The producer's trigger, strictly a member of `RENDER_TRIGGERS`, else absent. */
+  readonly trigger: RenderTrigger | undefined;
+  /** What an edge tallies this render under; see {@link DEPENDENCY_RENDER_REASONS}. */
+  readonly reason: DependencyRenderReason;
+}
+
+/** The render one render is charged to, and how that was established. */
+interface RenderCause {
+  readonly cause: RenderReading;
+  readonly attribution: RenderAttribution;
 }
 
 /** @see MutableRowSeed */
@@ -2426,6 +2790,7 @@ interface MutableDependencyGraphNode {
   layer?: number;
   eventId?: EventId;
   traceId?: TraceId;
+  roles?: readonly DependencyNodeRole[];
 }
 
 /** @see MutableRowSeed */
@@ -2437,6 +2802,8 @@ interface MutableDependencyGraphEdge {
   totalDurationMs: number;
   inferredCount?: number;
   ambiguousCount?: number;
+  renderTriggers?: Readonly<Partial<Record<DependencyRenderReason, number>>>;
+  contexts?: readonly string[];
 }
 
 /**
@@ -2527,11 +2894,11 @@ function preferSource(
 }
 
 /**
- * The identity a span collapses by: its kind's identity attributes when they
- * are readable, otherwise the producer's span name, otherwise
- * {@link UNKNOWN_PARTICIPANT_LABEL}.
+ * The identity a span's attributes and name give it, before any kind
+ * qualifier: its kind's identity attributes when they are readable, otherwise
+ * the producer's span name, otherwise {@link UNKNOWN_PARTICIPANT_LABEL}.
  */
-function participantIdentityOf(event: TelemetryEvent): string {
+function unqualifiedIdentityOf(event: TelemetryEvent): string {
   const keys = KIND_IDENTITY_ATTRIBUTE_KEYS[event.kind] ?? NO_IDENTITY_KEYS;
 
   if (keys.length > 0) {
@@ -2554,37 +2921,73 @@ function participantIdentityOf(event: TelemetryEvent): string {
 }
 
 /**
- * Folds one event into its participant, creating the participant on first
- * sight.
+ * The identity a span collapses by, which is also its participant's label: the
+ * unqualified identity, wrapped in its kind's qualifier when the kind has one
+ * ({@link KIND_IDENTITY_QUALIFIERS}).
  *
- * @returns The participant's node id, so the caller can map the span onto it.
+ * An unreadable identity is replaced by the qualifier alone — `Long task`, not
+ * `Long task ((unknown participant))` — because the qualifier already says what
+ * the participant is.
+ */
+function participantIdentityOf(event: TelemetryEvent): string {
+  const identity = unqualifiedIdentityOf(event);
+  const qualifier = KIND_IDENTITY_QUALIFIERS[event.kind];
+
+  if (qualifier === undefined) {
+    return identity;
+  }
+  return identity === UNKNOWN_PARTICIPANT_LABEL ? qualifier : `${qualifier} (${identity})`;
+}
+
+/** Where one event lands: its participant's id, class and identity. */
+interface ParticipantKey {
+  readonly id: string;
+  readonly kind: DependencyNodeKind;
+  readonly identity: string;
+}
+
+/**
+ * The participant one event belongs to.
+ *
+ * A pure function of the event, so a span, the render charged as its cause and
+ * the role it claims all name one participant however often it is asked.
+ */
+function participantKeyOf(event: TelemetryEvent): ParticipantKey {
+  const kind = KIND_TO_DEPENDENCY_NODE_KIND[event.kind] ?? UNCLASSIFIED_DEPENDENCY_NODE_KIND;
+  const identity = participantIdentityOf(event);
+  return { id: `${DEPENDENCY_NODE_ID_PREFIX}${kind}:${event.tier}:${identity}`, kind, identity };
+}
+
+/**
+ * Collapses one event into its participant, creating the participant on first
+ * sight.
  */
 function accumulateParticipant(
   participants: Map<string, ParticipantAccumulator>,
   event: TelemetryEvent,
-): string {
-  const kind = KIND_TO_DEPENDENCY_NODE_KIND[event.kind] ?? UNCLASSIFIED_DEPENDENCY_NODE_KIND;
-  const identity = participantIdentityOf(event);
-  const id = `${DEPENDENCY_NODE_ID_PREFIX}${kind}:${event.tier}:${identity}`;
+  key: ParticipantKey,
+): void {
   const durationMs = clampNonNegative(finiteOrZero(event.duration));
 
-  const existing = participants.get(id);
+  const existing = participants.get(key.id);
   if (existing === undefined) {
-    participants.set(id, {
-      id,
-      kind,
-      label: identity,
+    participants.set(key.id, {
+      id: key.id,
+      kind: key.kind,
+      label: key.identity,
       tier: event.tier,
       spanKinds: new Set([event.kind]),
       spanIds: [event.spanId],
       firstEventId: event.id,
       firstTraceId: event.traceId,
+      collapsedWork: !STATE_KIND_SET.has(event.kind),
+      roles: new Set(),
       count: 1,
       totalDurationMs: durationMs,
       maxDurationMs: durationMs,
       source: event.source,
     });
-    return id;
+    return;
   }
 
   existing.count += 1;
@@ -2597,8 +3000,364 @@ function accumulateParticipant(
     existing.spanIds.push(event.spanId);
   }
   existing.source = preferSource(existing.source, event.source);
+}
 
-  return id;
+/**
+ * Folds one hook transition into its component's participant.
+ *
+ * Into a participant built from records of work, the transition adds its kind
+ * — so the node says its component's state was observed changing — and a
+ * source location when it carries a more confident one, since a location is a
+ * fact about the component rather than about work. It adds nothing to `count`,
+ * the durations or the span sample: it is evidence about a render, and
+ * counting it would make one render of a component with three changed hooks
+ * read as four spans. With no such participant — the component's renders are
+ * outside the slice — the transitions build their own participant and are
+ * counted as usual, because they are then all the participant is.
+ */
+function foldTransition(
+  participants: Map<string, ParticipantAccumulator>,
+  event: TelemetryEvent,
+  key: ParticipantKey,
+): void {
+  const existing = participants.get(key.id);
+  if (existing === undefined || !existing.collapsedWork) {
+    accumulateParticipant(participants, event, key);
+    return;
+  }
+
+  existing.spanKinds.add(event.kind);
+  existing.source = preferSource(existing.source, event.source);
+}
+
+/** A member of the closed render-trigger vocabulary, or `undefined`. */
+function asRenderTrigger(value: unknown): RenderTrigger | undefined {
+  const reported = asNonEmptyString(value);
+  if (reported === undefined) {
+    return undefined;
+  }
+  return RENDER_TRIGGERS.find((trigger) => trigger === reported);
+}
+
+/**
+ * A render's recorded ancestor names, nearest first.
+ *
+ * Entries that are not non-empty strings are skipped, and at most
+ * {@link MAX_OWNER_CHAIN_LOOKUPS} entries are read. An element accessor that
+ * throws part-way costs the rest of the chain and nothing else.
+ */
+function readOwnerChain(attributes: AttributeBag): readonly string[] {
+  const value = readAttribute(attributes, RENDER_OWNER_CHAIN_KEY);
+  if (!Array.isArray(value)) {
+    return NO_OWNER_CHAIN;
+  }
+
+  // `Array.isArray` narrows to `any[]`; the assertion tightens every element
+  // back to `unknown`, so each one is still validated below.
+  const entries = value as readonly unknown[];
+  const names: string[] = [];
+
+  try {
+    const limit = Math.min(entries.length, MAX_OWNER_CHAIN_LOOKUPS);
+    for (let index = 0; index < limit; index += 1) {
+      const name = asNonEmptyString(entries[index]);
+      if (name !== undefined) {
+        names.push(name);
+      }
+    }
+  } catch {
+    return names;
+  }
+
+  return names;
+}
+
+/**
+ * Reads one `render` event for the cascade resolution.
+ *
+ * The reason an edge tallies is the producer's trigger when it named one; a
+ * first render carries none and is tallied `mount`; a render whose trigger and
+ * phase are both unreadable is `unknown`, never a guess at either.
+ */
+function readRender(event: TelemetryEvent, rank: number): RenderReading {
+  const attributes = attributeBagOf(event);
+  const trigger = asRenderTrigger(readAttribute(attributes, RENDER_TRIGGER_KEY));
+  const isMount = readAttribute(attributes, RENDER_PHASE_KEY) === MOUNT_RENDER_PHASE;
+
+  return {
+    event,
+    rank,
+    name:
+      asNonEmptyString(readAttribute(attributes, RENDER_COMPONENT_KEY)) ??
+      asNonEmptyString(event.name),
+    fiberId: asNonNegativeInteger(readAttribute(attributes, RENDER_FIBER_ID_KEY)),
+    parentFiberId: asNonNegativeInteger(readAttribute(attributes, RENDER_PARENT_FIBER_ID_KEY)),
+    ownerChain: readOwnerChain(attributes),
+    trigger,
+    reason: trigger ?? (isMount ? MOUNT_RENDER_REASON : UNKNOWN_RENDER_TRIGGER),
+  };
+}
+
+/**
+ * A render's per-producer sequence number as an ordering key.
+ *
+ * The schema makes `seq` a non-negative integer; a value that is not finite
+ * sorts after every usable one of its producer, so the order stays total.
+ */
+function emissionSeqOf(event: TelemetryEvent): number {
+  return Number.isFinite(event.seq) ? event.seq : Number.MAX_VALUE;
+}
+
+/**
+ * Orders the renders of one commit as their producer emitted them.
+ *
+ * `../browser/react.ts` walks a commit parent-before-child and emits its
+ * renders in that order, so emission order is tree order: an ancestor that
+ * rendered always precedes its descendants. Canonical order cannot stand in for
+ * it, because it sorts on `startTime` first and a render's start is React's
+ * profiler timestamp. Emission order is `seq` within one producer; the
+ * producer id and then the canonical rank settle every remaining tie, so the
+ * order is total and independent of input order.
+ */
+function compareEmissionOrder(left: RenderReading, right: RenderReading): number {
+  if (left.event.producerId !== right.event.producerId) {
+    return compareStrings(left.event.producerId, right.event.producerId);
+  }
+  const leftSeq = emissionSeqOf(left.event);
+  const rightSeq = emissionSeqOf(right.event);
+  if (leftSeq !== rightSeq) {
+    return leftSeq < rightSeq ? -1 : 1;
+  }
+  return left.rank - right.rank;
+}
+
+/**
+ * The position of the render a commit's render hangs from by its recorded
+ * ancestry, or `undefined` when no recorded ancestor rendered before it.
+ *
+ * The nearest composite ancestor is matched by **fiber identity** first, which
+ * is exact. When the producer named that ancestor's fiber and it did not render
+ * in this commit, the owner chain's first entry — the same ancestor, by name —
+ * is skipped, since it could only match another instance of that component.
+ * The rest of the chain is matched by name, nearest first, against the first
+ * render of that name, which must precede this one: an ancestor that rendered
+ * was emitted before its descendants, so a later render of the name is not
+ * this render's ancestor.
+ */
+function renderedAncestorOf(
+  reading: RenderReading,
+  position: number,
+  byFiber: ReadonlyMap<number, number>,
+  byName: ReadonlyMap<string, number>,
+): number | undefined {
+  let firstNameIndex = 0;
+
+  if (reading.parentFiberId !== undefined) {
+    const parent = byFiber.get(reading.parentFiberId);
+    if (parent !== undefined && parent !== position) {
+      return parent;
+    }
+    firstNameIndex = 1;
+  }
+
+  for (let index = firstNameIndex; index < reading.ownerChain.length; index += 1) {
+    const name = reading.ownerChain[index];
+    const candidate = name === undefined ? undefined : byName.get(name);
+    if (candidate !== undefined && candidate < position) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Resolves the causes of one commit's renders, in emission order.
+ *
+ * **Pass 1 — ancestry.** A `state`-triggered render starts the cascade: it has
+ * no cause, keeps hanging from its commit, and is a fallback provider
+ * candidate. Every other render is charged to its nearest recorded ancestor
+ * that rendered ({@link renderedAncestorOf}); a `context`-triggered render
+ * charged that way makes its ancestor one of the commit's providers, and one
+ * whose ancestry reached no rendered ancestor waits for pass 2. Any other
+ * render with no rendered ancestor keeps hanging from its span parent.
+ *
+ * **Pass 2 — provider attribution.** A waiting context consumer is charged to
+ * the last provider emitted before it — or, when no provider was, the last
+ * `state`-triggered render emitted before it — as `inferred` when that was the
+ * only candidate and `ambiguous` when there were several. With no candidate it
+ * has no cause. The candidates are the ones pass 1 established from recorded
+ * ancestry: an attribution made here never narrows a later consumer's
+ * candidates, so one guess cannot make the next look certain.
+ *
+ * Linear in the commit's renders after the sort: each render is indexed once,
+ * matched through at most {@link MAX_OWNER_CHAIN_LOOKUPS} lookups, and pass 2
+ * walks the candidate lists with cursors rather than rescanning them.
+ */
+function resolveCommitCascade(
+  renders: readonly RenderReading[],
+  causes: Map<TelemetryEvent, RenderCause>,
+): void {
+  const byFiber = new Map<number, number>();
+  const byName = new Map<string, number>();
+
+  renders.forEach((reading, position) => {
+    if (reading.fiberId !== undefined && !byFiber.has(reading.fiberId)) {
+      byFiber.set(reading.fiberId, position);
+    }
+    if (reading.name !== undefined && !byName.has(reading.name)) {
+      byName.set(reading.name, position);
+    }
+  });
+
+  const providerPositions = new Set<number>();
+  const statePositions: number[] = [];
+  const waiting: number[] = [];
+
+  renders.forEach((reading, position) => {
+    if (reading.trigger === STATE_RENDER_TRIGGER) {
+      statePositions.push(position);
+      return;
+    }
+
+    const ancestor = renderedAncestorOf(reading, position, byFiber, byName);
+    const cause = ancestor === undefined ? undefined : renders[ancestor];
+    if (cause !== undefined) {
+      causes.set(reading.event, { cause, attribution: 'nested' });
+      if (reading.trigger === CONTEXT_RENDER_TRIGGER && ancestor !== undefined) {
+        providerPositions.add(ancestor);
+      }
+      return;
+    }
+
+    if (reading.trigger === CONTEXT_RENDER_TRIGGER) {
+      waiting.push(position);
+    }
+  });
+
+  if (waiting.length === 0) {
+    return;
+  }
+
+  const providers = [...providerPositions].sort((left, right) => left - right);
+  let providersBefore = 0;
+  let statesBefore = 0;
+
+  // `waiting` is in ascending position order, so each cursor only moves forward.
+  for (const position of waiting) {
+    while ((providers[providersBefore] ?? position) < position) {
+      providersBefore += 1;
+    }
+    while ((statePositions[statesBefore] ?? position) < position) {
+      statesBefore += 1;
+    }
+
+    const useProviders = providersBefore > 0;
+    const candidateCount = useProviders ? providersBefore : statesBefore;
+    const lastCandidate = useProviders
+      ? providers[providersBefore - 1]
+      : statePositions[statesBefore - 1];
+    const reading = renders[position];
+    const cause = lastCandidate === undefined ? undefined : renders[lastCandidate];
+    if (candidateCount === 0 || reading === undefined || cause === undefined) {
+      continue;
+    }
+
+    causes.set(reading.event, {
+      cause,
+      attribution: candidateCount === 1 ? 'inferred' : 'ambiguous',
+    });
+  }
+}
+
+/**
+ * The cause each render of the slice is charged to, for the renders that have
+ * one; see {@link resolveCommitCascade}.
+ *
+ * Renders are grouped by their span parent — the commit that performed them —
+ * because a render cascade is a structure *within* one commit: an ancestor that
+ * rendered in another commit did not cause this render. A render with no span
+ * parent belongs to no commit and has no cause.
+ *
+ * @param renders Every render of the slice, in canonical order, once each.
+ */
+function resolveRenderCauses(
+  renders: readonly RenderReading[],
+): ReadonlyMap<TelemetryEvent, RenderCause> {
+  const commits = new Map<SpanId, RenderReading[]>();
+
+  for (const reading of renders) {
+    const { parentSpanId } = reading.event;
+    if (parentSpanId === undefined) {
+      continue;
+    }
+    const group = commits.get(parentSpanId);
+    if (group === undefined) {
+      commits.set(parentSpanId, [reading]);
+    } else {
+      group.push(reading);
+    }
+  }
+
+  const causes = new Map<TelemetryEvent, RenderCause>();
+  for (const group of commits.values()) {
+    resolveCommitCascade(group.sort(compareEmissionOrder), causes);
+  }
+  return causes;
+}
+
+/**
+ * The context labels a hook transition recorded as changed, keyed by the render
+ * span it was observed inside.
+ *
+ * Only `state` events whose `transitionSource` is `context` contribute, by
+ * their `hookLabel` — the context's producer-assigned name, never a value. The
+ * render span is the producer's `renderSpanId`, else the event's span parent,
+ * which `../browser/state.ts` sets to the same render.
+ */
+function indexContextLabels(
+  events: readonly TelemetryEvent[],
+): ReadonlyMap<string, ReadonlySet<string>> {
+  const labels = new Map<string, Set<string>>();
+
+  for (const event of events) {
+    if (!STATE_KIND_SET.has(event.kind)) {
+      continue;
+    }
+    const attributes = attributeBagOf(event);
+    if (
+      asTransitionSource(readAttribute(attributes, STATE_TRANSITION_SOURCE_KEY)) !==
+      CONTEXT_TRANSITION_SOURCE
+    ) {
+      continue;
+    }
+    const label = asNonEmptyString(readAttribute(attributes, STATE_HOOK_LABEL_KEY));
+    const renderSpanId =
+      asNonEmptyString(readAttribute(attributes, STATE_RENDER_SPAN_ID_KEY)) ?? event.parentSpanId;
+    if (label === undefined || renderSpanId === undefined) {
+      continue;
+    }
+
+    const known = labels.get(renderSpanId);
+    if (known === undefined) {
+      labels.set(renderSpanId, new Set([label]));
+    } else {
+      known.add(label);
+    }
+  }
+
+  return labels;
+}
+
+/** Adds a role to a participant, when the participant is known. */
+function claimRole(
+  participants: ReadonlyMap<string, ParticipantAccumulator>,
+  participantId: string | undefined,
+  role: DependencyNodeRole,
+): void {
+  if (participantId !== undefined) {
+    participants.get(participantId)?.roles.add(role);
+  }
 }
 
 /** Descending by total duration, then by count, then ascending by id. */
@@ -2790,6 +3549,13 @@ function toDependencyNode(accumulator: ParticipantAccumulator, layer: number): D
     node.traceId = accumulator.firstTraceId;
   }
 
+  // In vocabulary order, and absent rather than empty, so a participant that
+  // played no role keeps exactly the shape it had before roles were reported.
+  const roles = DEPENDENCY_NODE_ROLES.filter((role) => accumulator.roles.has(role));
+  if (roles.length > 0) {
+    node.roles = roles;
+  }
+
   return node;
 }
 
@@ -2812,6 +3578,28 @@ function toDependencyEdge(accumulator: EdgeAccumulator): DependencyGraphEdge {
     edge.ambiguousCount = accumulator.ambiguousCount;
   }
 
+  // Every callee render was tallied under exactly one reason, so a non-empty
+  // tally is exactly "at least one callee rendered". Keys are written in the
+  // vocabulary's order and only for reasons that occurred.
+  if (accumulator.renderTriggers.size > 0) {
+    const renderTriggers: Partial<Record<DependencyRenderReason, number>> = {};
+    for (const reason of DEPENDENCY_RENDER_REASONS) {
+      const tally = accumulator.renderTriggers.get(reason);
+      if (tally !== undefined && tally > 0) {
+        renderTriggers[reason] = tally;
+      }
+    }
+    edge.renderTriggers = renderTriggers;
+  }
+
+  // Sorted before the bound applies, so the labels kept are a function of the
+  // set of labels rather than of the order the transitions arrived in.
+  if (accumulator.contexts.size > 0) {
+    edge.contexts = [...accumulator.contexts]
+      .sort(compareStrings)
+      .slice(0, MAX_CONTEXT_LABELS_PER_DEPENDENCY_EDGE);
+  }
+
   return edge;
 }
 
@@ -2820,18 +3608,36 @@ function toDependencyEdge(accumulator: EdgeAccumulator): DependencyGraphEdge {
  * them.
  *
  * Spans collapse into participants by class, tier and identity
- * ({@link KIND_IDENTITY_ATTRIBUTE_KEYS}); an edge is one participant's span
- * hanging from another's. Two relationships are deliberately not edges: a span
- * whose parent is outside the slice contributes none (there is nothing to point
- * at), and a span whose parent collapsed into the **same** participant
- * contributes none either — a self-edge is not drawable in a layered layout, and
- * the recursion it describes is already visible in that node's `count`.
+ * ({@link KIND_IDENTITY_ATTRIBUTE_KEYS}, {@link KIND_IDENTITY_QUALIFIERS}), and a
+ * component's hook transitions fold into its participant without being counted
+ * ({@link DependencyGraphNode}). An edge is one participant's span hanging from
+ * another's: from its span parent, except for a render, which hangs from the
+ * render charged as its cause when one is — its nearest recorded ancestor that
+ * rendered in the same commit, or for a context consumer whose ancestry reached
+ * none, the provider that rendered before it (see `resolveCommitCascade`). A
+ * render cascade therefore reads commit → trigger → provider → consumers →
+ * their children, the structure AAP 0.6.5 asks for, rather than a star around
+ * the commit; a render with no cause keeps hanging from its commit.
+ *
+ * Two relationships are deliberately not edges: a span whose parent is outside
+ * the slice contributes none (there is nothing to point at), and a span whose
+ * parent collapsed into the **same** participant contributes none either — a
+ * self-edge is not drawable in a layered layout, and the recursion it describes
+ * is already visible in that node's `count`.
  *
  * A participant that collapsed exactly one record carries that record's
- * `eventId` and `traceId` ({@link DependencyGraphNode}), and an edge counts how
- * many of its callee spans were attributed through lineage rather than nested,
- * and how many of those ambiguously ({@link DependencyGraphEdge}). Both are
- * read off the events; neither is guessed.
+ * `eventId` and `traceId`, and a component its cascade `roles`
+ * ({@link DependencyGraphNode}). An edge counts how many of its callee spans
+ * were attributed — through lineage, or to a provider — rather than nested, and
+ * how many of those ambiguously; an edge with callee renders tallies why they
+ * rendered and names the contexts their transitions recorded
+ * ({@link DependencyGraphEdge}). All of it is read off the events: triggers,
+ * ancestry and context labels are the producer's, and a name is only ever
+ * matched against the names the producer recorded.
+ *
+ * Linear in the events after the canonical sort, and after sorting each
+ * commit's renders into emission order: every other step visits each event a
+ * bounded number of times.
  *
  * Both bounds drop the least significant items rather than an arbitrary tail:
  * participants by descending total duration, edges by descending count. Keeping
@@ -2857,26 +3663,73 @@ export function buildDependencyGraph(
 
   const participants = new Map<string, ParticipantAccumulator>();
   const participantIdBySpanId = new Map<SpanId, string>();
+  const transitions: { readonly event: TelemetryEvent; readonly key: ParticipantKey }[] = [];
+  const readings = new Map<TelemetryEvent, RenderReading>();
 
-  for (const event of ordered) {
-    const id = accumulateParticipant(participants, event);
+  ordered.forEach((event, rank) => {
+    const key = participantKeyOf(event);
     // First occurrence of a span id wins, as everywhere else in this module: a
     // repeated span id is a replayed batch the correlator reports rather than
     // something to reconcile here.
     if (!participantIdBySpanId.has(event.spanId)) {
-      participantIdBySpanId.set(event.spanId, id);
+      participantIdBySpanId.set(event.spanId, key.id);
     }
+
+    if (STATE_KIND_SET.has(event.kind)) {
+      transitions.push({ event, key });
+      return;
+    }
+
+    accumulateParticipant(participants, event, key);
+    if (event.kind === RENDER_KIND && !readings.has(event)) {
+      readings.set(event, readRender(event, rank));
+    }
+  });
+
+  // Transitions fold in only after every record of work has been collapsed, so
+  // whether one is folded or counted never depends on whether its render
+  // happened to sort before it.
+  for (const { event, key } of transitions) {
+    foldTransition(participants, event, key);
   }
 
-  const edgeAccumulators = new Map<string, EdgeAccumulator>();
+  const causes = resolveRenderCauses([...readings.values()]);
 
-  for (const event of ordered) {
-    const { parentSpanId } = event;
-    if (parentSpanId === undefined) {
+  for (const reading of readings.values()) {
+    const own = participantIdBySpanId.get(reading.event.spanId);
+    if (reading.trigger === STATE_RENDER_TRIGGER) {
+      claimRole(participants, own, 'trigger');
+      continue;
+    }
+    if (reading.trigger !== CONTEXT_RENDER_TRIGGER) {
       continue;
     }
 
-    const from = participantIdBySpanId.get(parentSpanId);
+    claimRole(participants, own, 'consumer');
+    const cause = causes.get(reading.event);
+    const provider =
+      cause === undefined ? undefined : participantIdBySpanId.get(cause.cause.event.spanId);
+    // A component that re-rendered below another instance of itself supplied
+    // nothing to itself: the consumer role already says what happened.
+    if (provider !== own) {
+      claimRole(participants, provider, 'provider');
+    }
+  }
+
+  const contextLabels = indexContextLabels(ordered);
+  const edgeAccumulators = new Map<string, EdgeAccumulator>();
+
+  for (const event of ordered) {
+    const reading = event.kind === RENDER_KIND ? readings.get(event) : undefined;
+    const cause = reading === undefined ? undefined : causes.get(event);
+    const { parentSpanId } = event;
+
+    const from =
+      cause !== undefined
+        ? participantIdBySpanId.get(cause.cause.event.spanId)
+        : parentSpanId === undefined
+          ? undefined
+          : participantIdBySpanId.get(parentSpanId);
     const to = participantIdBySpanId.get(event.spanId);
     if (from === undefined || to === undefined || from === to) {
       continue;
@@ -2884,32 +3737,41 @@ export function buildDependencyGraph(
 
     const id = dependencyEdgeId(from, to);
     const durationMs = clampNonNegative(finiteOrZero(event.duration));
-    // How this callee span came to hang from its caller: through a lineage
-    // attribution when `lineageOf` finds one, by nesting otherwise. Read
-    // through the one reader of the lineage keys, so the edge and the timeline
-    // row built from the same event can never disagree about it.
-    const lineage = lineageOf(event);
-    const inferred = lineage === undefined ? 0 : 1;
-    const ambiguous = lineage?.ambiguous === true ? 1 : 0;
+    // How this callee span came to hang from its caller. A render charged to a
+    // cause is tallied by how the cause was established, and never through
+    // `lineageOf`: a render copies its commit's lineage attributes, which
+    // describe how the *commit* joined its parent, not how this render joined
+    // its cause. Every other span is tallied by `lineageOf`.
+    const tally =
+      cause === undefined ? lineageTallyOf(event) : ATTRIBUTION_TALLIES[cause.attribution];
 
-    const existing = edgeAccumulators.get(id);
-    if (existing === undefined) {
-      edgeAccumulators.set(id, {
+    let edge = edgeAccumulators.get(id);
+    if (edge === undefined) {
+      edge = {
         id,
         from,
         to,
-        count: 1,
-        totalDurationMs: durationMs,
-        inferredCount: inferred,
-        ambiguousCount: ambiguous,
-      });
-      continue;
+        count: 0,
+        totalDurationMs: 0,
+        inferredCount: 0,
+        ambiguousCount: 0,
+        renderTriggers: new Map(),
+        contexts: new Set(),
+      };
+      edgeAccumulators.set(id, edge);
     }
 
-    existing.count += 1;
-    existing.totalDurationMs += durationMs;
-    existing.inferredCount += inferred;
-    existing.ambiguousCount += ambiguous;
+    edge.count += 1;
+    edge.totalDurationMs += durationMs;
+    edge.inferredCount += tally.inferred;
+    edge.ambiguousCount += tally.ambiguous;
+
+    if (reading !== undefined) {
+      edge.renderTriggers.set(reading.reason, (edge.renderTriggers.get(reading.reason) ?? 0) + 1);
+      for (const label of contextLabels.get(event.spanId) ?? []) {
+        edge.contexts.add(label);
+      }
+    }
   }
 
   const allParticipants = [...participants.values()];

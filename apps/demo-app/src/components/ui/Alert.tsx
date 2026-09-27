@@ -3,11 +3,12 @@
  *
  * This is the primitive every surface of the application reaches for when it has something to say
  * about the state of the page itself: an order that could not be placed above the checkout form, a
- * cart that failed to synchronise, a low-stock notice on the inventory dashboard, a free-freight
- * threshold on the cart summary. It renders where it is placed, in the document flow, and it stays
- * there: nothing here dismisses itself, fixes itself to the viewport or claims a stacking tier.
- * Notices that fly in, stack and time out are the toast provider's business, and that separation is
- * what lets this component stay a plain function with no state, no effects and no timers.
+ * cart that failed to synchronise, a low-stock notice on the inventory dashboard, a freight quote
+ * that could not be fetched for a destination at checkout. It renders where it is placed, in the
+ * document flow, and it stays there: nothing here dismisses itself, fixes itself to the viewport
+ * or claims a stacking tier. Notices that fly in, stack and time out are the toast provider's
+ * business, and that separation is what lets this component stay a plain function with no state,
+ * no effects and no timers.
  *
  * Three decisions make up its whole contract, and each is deliberate:
  *
@@ -29,7 +30,10 @@
  * paragraph by default, a heading level when the notice is the page rather than a message inside
  * one. That choice belongs to whoever knows the document around the box, and it is deliberately
  * kept apart from decision 1: the element carries no role, no live-region politeness and no
- * urgency, so choosing a heading changes the outline and nothing about the announcement.
+ * urgency, so choosing a heading changes the outline and nothing about the announcement. What it
+ * does change is how an `h1` looks: a title rendered as the page's `<h1>` is painted in the
+ * storefront's page-title role, the size every other route's title wears, while a paragraph, an
+ * `h2` and an `h3` keep the box's own compact headline.
  *
  * Presentation belongs entirely to `Alert.module.css`, which selects each tone through the
  * `data-tone` attribute set below. That is why this component performs no class lookup and never
@@ -39,7 +43,7 @@
  * Usage:
  *
  * ```tsx
- * <Alert>Orders over 500 units ship free this week.</Alert>
+ * <Alert>Freight is quoted for the destination and service you choose at checkout.</Alert>
  *
  * <Alert tone="danger" title="Order failed" actions={<Button onClick={retry}>Try again</Button>}>
  *   The payment service did not respond. No charge was made and your cart is unchanged.
@@ -89,10 +93,11 @@ interface Props {
    * heading level chosen by this component would land at whatever depth the caller happened to
    * place the box.
    *
-   * A notice that IS the page is the exception - the storefront's error boundary is one - and
-   * there the failure headline is the route's own title, so it is passed `'h1'` and becomes a real
-   * heading a reader can navigate back to once the announcement has passed. The level stays the
-   * caller's decision, because only the caller knows what the page around the box declares.
+   * A notice that IS the page is the exception - the storefront's error boundary is one, and a
+   * product page whose read failed is another - and there the failure headline is the route's own
+   * title, so it is passed `'h1'`, becomes a real heading a reader can navigate back to once the
+   * announcement has passed, and is painted at the page-title size. The level stays the caller's
+   * decision, because only the caller knows what the page around the box declares.
    */
   titleAs?: 'p' | 'h1' | 'h2' | 'h3';
 
@@ -131,7 +136,7 @@ interface Props {
  * a heading level. It changes nothing about the announcement: the role and politeness above are
  * still derived from the tone alone, so a page-level error that renders its headline as an `h1`
  * still produces exactly one assertive announcement and gains a heading a reader can navigate to
- * afterwards.
+ * afterwards - and, being the page's title, that headline is painted at the page-title size.
  */
 export function Alert({
   children,
@@ -149,8 +154,10 @@ export function Alert({
     Whichever element it is, it carries the one `title` class, and `Alert.module.css` states that
     class's margin reset, tone colour, size, weight and line height outright - every property
     app/globals.css sets on a heading level, and a CSS-module class outranks those element rules.
-    So the headline is painted identically in either form: choosing a heading changes the document
-    outline and nothing a reader sees.
+    So a paragraph, an `h2` and an `h3` are painted identically and differ only in the outline. An
+    `h1` is the one level that also changes what a reader sees: it is the page's title, and the
+    stylesheet paints it with the size, weight and leading of `.ls-page-title`, keeping the tone
+    colour.
   */
   const Title = titleAs;
 

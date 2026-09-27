@@ -105,6 +105,16 @@
  * and a retry of exactly that request — below the footer, with the earlier rows
  * still on screen.
  *
+ * Once the reader has chosen an ordering — from the "Order by" select or a
+ * sortable header — the toolbar and the grid stay mounted through the re-query
+ * that follows, and its loading, error or empty state is drawn in the grid's
+ * empty slot, so the control the reader used keeps its element and their focus.
+ *
+ * A retry that succeeds hands keyboard focus to the recovered rows: the expand
+ * toggle of the first row the settled page brought carries the error state's
+ * successor focus key (`RETRY_SUCCESSOR_FOCUS_ATTRIBUTES`), which the host's
+ * node frame moves focus to from the Retry that left the document.
+ *
  * @see packages/panel-schema/src/catalog.ts — the `queryTable` catalog entry
  * @see packages/telemetry/src/aggregate/queries.ts — the `queries` result shape
  * @see docs/SECURITY.md — "Redaction": the SQL placeholder and row-count treatment
@@ -142,7 +152,7 @@ import type {
 } from '../primitives/DataTable';
 import { DurationCell } from '../primitives/DurationCell';
 import { EmptyState } from '../primitives/EmptyState';
-import { ErrorState } from '../primitives/ErrorState';
+import { ErrorState, RETRY_SUCCESSOR_FOCUS_ATTRIBUTES } from '../primitives/ErrorState';
 import { LoadingState } from '../primitives/LoadingState';
 import type { SelectOption } from '../primitives/Select';
 import { Text } from '../primitives/Text';
@@ -609,6 +619,12 @@ const LOADING_SKELETON_ROWS = 6;
 /** The empty page, allocated once so an unpaged render keeps a stable identity. */
 const NO_GROUPS: readonly QueryGroup[] = Object.freeze([]);
 
+/**
+ * What a toggle that is not the retry successor spreads in place of
+ * `RETRY_SUCCESSOR_FOCUS_ATTRIBUTES`: nothing, allocated once.
+ */
+const NO_FOCUS_ATTRIBUTES: Readonly<Record<string, never>> = Object.freeze({});
+
 /*
  * ---------------------------------------------------------------------------
  * Props and paging state
@@ -883,6 +899,27 @@ function freshPaging(identity: string, baseOffset: number): PagingState {
 }
 
 /**
+ * The row whose expand toggle takes over keyboard focus from a retry that
+ * succeeded: the first group of the page the settled request returned.
+ *
+ * That is the error state's successor contract
+ * (`RETRY_SUCCESSOR_FOCUS_ATTRIBUTES` in `../primitives/ErrorState`), applied to
+ * both scopes this view retries in. After a failed first page the settled page
+ * is the whole table, so focus lands on its first row; after a failed further
+ * page it is the page appended below the rows already read, so focus lands on
+ * the first row that arrived rather than jumping back to the top. Only a page
+ * that succeeded names one: while a page is loading or has failed there is
+ * nothing recovered to hand focus to, and a failure's own Retry must be the
+ * only keyed control in the node.
+ *
+ * @param page The page that settled successfully, or `undefined` while none has.
+ * @returns The id of that page's first group, or `undefined` for none.
+ */
+function retrySuccessorKeyOf(page: readonly QueryGroup[] | undefined): string | undefined {
+  return page?.[0]?.id;
+}
+
+/**
  * Whether a string carries something to render.
  *
  * @param value The candidate.
@@ -961,16 +998,25 @@ function occurrenceOffsetText(startTime: number, originEpochMs: number): string 
  * one case rendered as prose rather than as code: it is the data layer's word
  * for an absence, and dressing it as a statement would invent one.
  *
+ * The toggle of the first row the settled page brought also carries the error
+ * state's successor focus key (see {@link retrySuccessorKeyOf}): it is the
+ * row's first control, named by the statement it opens, so a reader whose
+ * retry succeeded lands on the recovered rows rather than on the node's
+ * heading or its bare frame.
+ *
  * @param group The row.
  * @param meta The row's expansion state and the id of its detail row, as
  * `DataTable` hands it to every cell of the row.
  * @param onToggle Called with the row when the affordance is activated.
+ * @param retrySuccessor Whether this row's toggle is where a successful retry's
+ * focus belongs.
  * @returns The cell's content.
  */
 function renderStatementCell(
   group: QueryGroup,
   meta: DataTableCellMeta,
   onToggle: (group: QueryGroup) => void,
+  retrySuccessor: boolean,
 ): ReactNode {
   const { expanded, detailRowId } = meta;
   const unknown = group.statement === UNKNOWN_STATEMENT;
@@ -1019,6 +1065,7 @@ function renderStatementCell(
         onClick={() => {
           onToggle(group);
         }}
+        {...(retrySuccessor ? RETRY_SUCCESSOR_FOCUS_ATTRIBUTES : NO_FOCUS_ATTRIBUTES)}
       />
       {abbreviated ? <Tooltip content={group.statement}>{statement}</Tooltip> : statement}
     </Stack>
@@ -1418,10 +1465,14 @@ function renderDetail(
  * table rendered.
  *
  * @param onToggle Called with a row when its expand affordance is activated.
+ * @param retrySuccessorKey The id of the row whose toggle takes over focus from
+ * a successful retry, or `undefined` while no row may (see
+ * {@link retrySuccessorKeyOf}).
  * @returns The column definitions.
  */
 function buildColumns(
   onToggle: (group: QueryGroup) => void,
+  retrySuccessorKey: string | undefined,
 ): readonly DataTableColumn<QueryGroup>[] {
   return [
     {
@@ -1429,7 +1480,8 @@ function buildColumns(
       header: HEADER.statement,
       width: COLUMN_WIDTH.statement,
       rowHeader: true,
-      cell: (group, _rowIndex, meta) => renderStatementCell(group, meta, onToggle),
+      cell: (group, _rowIndex, meta) =>
+        renderStatementCell(group, meta, onToggle, group.id === retrySuccessorKey),
     },
     {
       key: COLUMN_KEY.system,
@@ -1685,9 +1737,14 @@ export function QueryTable(props: QueryTableProps): ReactElement {
     setPaging({ identity, offset: nextOffset, frozen: [...position.frozen, ...page] });
   }, [identity, nextOffset, page, pageLimit, position.frozen, position.offset, status]);
 
+  // The row a successful retry hands focus to: the first of the page that
+  // settled. Recomputed per page, so the key is never on a row of an earlier
+  // page and never present while a page is in flight or failed.
+  const retrySuccessorKey = retrySuccessorKeyOf(page);
+
   const columns = useMemo<readonly DataTableColumn<QueryGroup>[]>(
-    () => buildColumns(handleToggle),
-    [handleToggle],
+    () => buildColumns(handleToggle, retrySuccessorKey),
+    [handleToggle, retrySuccessorKey],
   );
 
   const renderExpandedRow = useCallback(
@@ -1724,56 +1781,73 @@ export function QueryTable(props: QueryTableProps): ReactElement {
     );
   }
 
-  // The three states, in precedence, while nothing has been loaded yet. Once a
+  // The three states, in precedence, while nothing has been loaded yet; once a
   // page is frozen the table below stays on screen and the footer carries the
-  // incremental states instead.
+  // incremental states instead. Built once and placed below, so the same state
+  // can stand alone or sit inside a grid that is kept on screen.
+  let inPlaceOfRows: ReactElement | undefined;
+
   if (rows.length === 0) {
     if (status === 'loading') {
-      return shell(
+      inPlaceOfRows = (
         <LoadingState
           className={LOADING_CLASS}
           variant="rows"
           rows={LOADING_SKELETON_ROWS}
           label={LOADING_LABEL}
-        />,
+        />
       );
-    }
-
-    if (status === 'error') {
+    } else if (status === 'error') {
       // The package's one failure contract — the single error-state design every
       // failed node renders — in its view scope: nothing is on screen, so the
       // whole view is what failed.
-      return shell(
+      inPlaceOfRows = (
         <ErrorState
           className={ERROR_CLASS}
           {...queryFailureProps({ error, announcement, retry }, query)}
-        />,
+        />
+      );
+    } else {
+      // A successful request with no rows on screen. What that means depends on
+      // what was asked and what the provider counted — a count-only query, an
+      // empty capture, a page past the end of a positive total — and only the
+      // empty capture may say that nothing was captured. A page the provider
+      // says is followed by another keeps its Load More, so an empty page is
+      // never a dead end the service did not declare.
+      const emptyCopy = describeEmptyPage({
+        pageLimit,
+        baseOffset,
+        pageOffset: position.offset,
+        total,
+        hasNextPage,
+      });
+
+      inPlaceOfRows = (
+        <EmptyState
+          className={EMPTY_CLASS}
+          title={emptyCopy.title}
+          message={emptyCopy.message}
+          icon={emptyCopy === NOTHING_CAPTURED_COPY ? <Database className="dg-icon" /> : undefined}
+          action={hasNextPage ? loadMoreControl : undefined}
+        />
       );
     }
+  }
 
-    // A successful request with no rows on screen. What that means depends on
-    // what was asked and what the provider counted — a count-only query, an
-    // empty capture, a page past the end of a positive total — and only the
-    // empty capture may say that nothing was captured. A page the provider says
-    // is followed by another keeps its Load More, so an empty page is never a
-    // dead end the service did not declare.
-    const emptyCopy = describeEmptyPage({
-      pageLimit,
-      baseOffset,
-      pageOffset: position.offset,
-      total,
-      hasNextPage,
-    });
+  // Where that state is drawn. Before the reader has chosen an ordering it
+  // stands alone, as on first load: there are no controls yet worth keeping.
+  // Once they have, a re-query empties the rows on screen — the pages of the
+  // old ordering belong to a different result — and replacing the toolbar and
+  // the grid then would unmount the very control they just used, the "Order
+  // by" select or a sortable header, and drop their focus out of the view. So
+  // from then on both stay mounted, as the same elements in the same place, and
+  // the state is drawn in the grid's own empty slot — outside its rows, where
+  // `DataTable` places it — with the new ordering already reported by the
+  // select and the header's `aria-sort`.
+  const holdGrid = sortOverride !== undefined;
 
-    return shell(
-      <EmptyState
-        className={EMPTY_CLASS}
-        title={emptyCopy.title}
-        message={emptyCopy.message}
-        icon={emptyCopy === NOTHING_CAPTURED_COPY ? <Database className="dg-icon" /> : undefined}
-        action={hasNextPage ? loadMoreControl : undefined}
-      />,
-    );
+  if (inPlaceOfRows !== undefined && !holdGrid) {
+    return shell(inPlaceOfRows);
   }
 
   return shell(
@@ -1803,35 +1877,40 @@ export function QueryTable(props: QueryTableProps): ReactElement {
         onRowToggle={handleToggle}
         onRowActivate={handleToggle}
         renderExpandedRow={renderExpandedRow}
+        empty={inPlaceOfRows}
       />
 
-      <Stack
-        direction="horizontal"
-        gap={2}
-        align="center"
-        justify="between"
-        wrap
-        className={clsx('dg-data-table__footer', FOOTER_CLASS)}
-      >
-        {/* A polite live region: a further page appending rows, or a re-query
-            under a new ordering, changes this sentence, and a reader who asked
-            for either is told how much of the result is now on screen without
-            moving focus off the control they used. Atomic, so the whole
-            sentence is read rather than only the figure that changed. It is a
-            live region and not `role="status"`, which is reserved for the
-            first page's loading state. */}
-        <Text size="xs" tone="muted" aria-live="polite" aria-atomic="true">
-          {loadedText(rows.length, total)}
-        </Text>
-
-        {status === 'loading' ? (
-          <Text size="xs" tone="muted">
-            {LOADING_MORE_MESSAGE}
+      {/* Drawn while rows are on screen: with none, the state in the grid's
+          empty slot is what speaks for the view, and a count of nothing
+          beside a loading skeleton would say less than that state does. */}
+      {rows.length > 0 ? (
+        <Stack
+          direction="horizontal"
+          gap={2}
+          align="center"
+          justify="between"
+          wrap
+          className={clsx('dg-data-table__footer', FOOTER_CLASS)}
+        >
+          {/* A polite live region: a further page appending rows changes this
+              sentence, and a reader who asked for it is told how much of the
+              result is now on screen without moving focus off the control they
+              used. Atomic, so the whole sentence is read rather than only the
+              figure that changed. It is a live region and not `role="status"`,
+              which is reserved for the first page's loading state. */}
+          <Text size="xs" tone="muted" aria-live="polite" aria-atomic="true">
+            {loadedText(rows.length, total)}
           </Text>
-        ) : null}
 
-        {hasNextPage ? loadMoreControl : null}
-      </Stack>
+          {status === 'loading' ? (
+            <Text size="xs" tone="muted">
+              {LOADING_MORE_MESSAGE}
+            </Text>
+          ) : null}
+
+          {hasNextPage ? loadMoreControl : null}
+        </Stack>
+      ) : null}
 
       {/*
        * A further page that failed gets the same error contract as a first page
@@ -1840,9 +1919,10 @@ export function QueryTable(props: QueryTableProps): ReactElement {
        * its `offset` is the page that failed — and a retry that re-issues
        * exactly that request, labelled for the page. It sits below the footer
        * rather than in place of the grid, so the statements already read stay
-       * on screen and the reader keeps their place.
+       * on screen and the reader keeps their place. With no rows on screen the
+       * failure is the view's own and is drawn in the grid's empty slot above.
        */}
-      {status === 'error' ? (
+      {status === 'error' && rows.length > 0 ? (
         <ErrorState
           className={ERROR_CLASS}
           {...queryFailureProps({ error, announcement, retry }, query, { scope: 'page' })}

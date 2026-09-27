@@ -65,7 +65,11 @@
  *    writes `process.env`, opens a directory or needs a temporary one. Every
  *    path fixture is a plausible absolute path that does not exist, which is
  *    itself the evidence that the module is pure: a reader that stat'ed,
- *    created or read anything would fail on them.
+ *    created or read anything would fail on them. The module's two explicit
+ *    filesystem reads, `canonicalizePath` and `verifyPromptsDirectory`, are
+ *    the exception by design. Their cases run in a fresh `mkdtemp` sandbox
+ *    removed after each test, and the prompt-directory cases also read the
+ *    checkout's own `apps/local-service/prompts`, never writing to it.
  * 2. **The vocabularies are imported, never restated.** `PROVIDER_IDS`,
  *    `DEFAULT_PROVIDER_ID`, `LOG_LEVELS`, `LOG_LEVEL_SETTINGS` and
  *    `DEBUGGEN_ERROR_CODES` come from the modules that own them, and the
@@ -111,9 +115,23 @@ import {
   type LogLevelSetting,
   type Result,
 } from '@debuggen/shared';
-import { DEFAULT_PROVIDER_ID, PROVIDER_IDS, type ProviderId } from '@debuggen/model-provider';
+import {
+  DEFAULT_PROVIDER_ID,
+  PROVIDER_IDS,
+  createPromptLoader,
+  type ProviderId,
+} from '@debuggen/model-provider';
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -134,6 +152,7 @@ import {
   PROJECT_ROOT_UNRESOLVABLE_MESSAGE,
   PROJECT_ROOT_UNRESOLVABLE_REASON,
   PROMPTS_DIRECTORY_NAME,
+  PROMPTS_MANIFEST_FILE_NAME,
   PROVIDER_REQUIREMENTS,
   SERVICE_ENV_KEYS,
   SESSIONS_DATABASE_FILE_NAME,
@@ -152,6 +171,9 @@ import {
   serviceConfigSchema,
   serviceEnvSchema,
   toModelProviderOverrides,
+  verifyPromptsDirectory,
+  type PromptsEntryStat,
+  type PromptsEntryStats,
   type ProviderRequirementKey,
   type ServiceConfig,
   type ServiceConfigOverrides,
@@ -2517,5 +2539,385 @@ describe('requireProjectOutsideStateHome', () => {
     expect(normalizePosix(config.databasePath)).toBe(
       `/work/shop/debuggen-state/${SESSIONS_DATABASE_FILE_NAME}`,
     );
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The prompt directory is present before anything touches disk
+ * ---------------------------------------------------------------------------
+ */
+
+/** Sandboxes the prompt-directory suite created, removed after each test. */
+const promptSandboxes: string[] = [];
+
+afterEach(() => {
+  for (const sandbox of promptSandboxes.splice(0)) {
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+});
+
+/** A fresh, canonical temporary directory for one prompt-directory case. */
+function promptSandbox(): string {
+  const sandbox = toPosix(realpathSync(mkdtempSync(join(tmpdir(), 'debuggen-config-prompts-'))));
+  promptSandboxes.push(sandbox);
+  return sandbox;
+}
+
+/** Creates a directory holding a manifest file, the minimum the check accepts. */
+function promptTree(path: string): string {
+  const root = directory(path);
+  writeFileSync(join(root, PROMPTS_MANIFEST_FILE_NAME), '{}\n', 'utf8');
+  return root;
+}
+
+/** Every entry below `root`, sorted: the evidence that a check created nothing. */
+function treeListing(root: string): readonly string[] {
+  return readdirSync(root, { recursive: true, encoding: 'utf8' }).sort();
+}
+
+/** Fails the test unless `result` is an `Err`, and returns its error. */
+function promptRefusalOf(result: Result<void, DebuggenError>): DebuggenError {
+  if (!isErr(result)) {
+    return expect.unreachable('expected the prompt directory to be refused');
+  }
+  return result.error;
+}
+
+/** The message a refusal must read, in loadServiceConfig's own per-key format. */
+function promptsDirectoryMessage(reason: string): string {
+  return `The local service configuration is invalid: DEBUGGEN_PROMPTS_DIR (${reason}).`;
+}
+
+/**
+ * The remedy {@link loadServiceConfig} gives for `DEBUGGEN_PROMPTS_DIR`, read
+ * from a real rejection of that key rather than restated, so the two failures
+ * are proven to answer with one remedy.
+ */
+const PROMPTS_DIR_REMEDY = loadErr({ DEBUGGEN_PROMPTS_DIR: 'service/prompts' }).hint;
+
+/** A stats object of one kind, for an injected stat. */
+function statsOf(kind: 'directory' | 'file' | 'other'): PromptsEntryStats {
+  return { isDirectory: () => kind === 'directory', isFile: () => kind === 'file' };
+}
+
+/** A thrown filesystem error carrying `code` and a message that must not travel. */
+function errnoError(code: string): Error {
+  return Object.assign(new Error(`${code}: THE-THROWN-MESSAGE-MUST-NOT-TRAVEL`), { code });
+}
+
+/** An injected stat that records every path it is asked about. */
+function recordingStat(answer: PromptsEntryStat): {
+  readonly stat: PromptsEntryStat;
+  readonly calls: string[];
+} {
+  const calls: string[] = [];
+  return {
+    calls,
+    stat: (path: string) => {
+      calls.push(path);
+      return answer(path);
+    },
+  };
+}
+
+describe('verifyPromptsDirectory', () => {
+  it('accepts the prompt directory this service ships, as loadServiceConfig derives it', () => {
+    const config = loadOk({});
+    const before = treeListing(config.promptsDir);
+
+    expect(config.promptsDir).toBe(EXPECTED_DEFAULT_PROMPTS_DIR);
+    expect(verifyPromptsDirectory(config)).toStrictEqual({ ok: true, value: undefined });
+    expect(verifyPromptsDirectory({ promptsDir: EXPECTED_DEFAULT_PROMPTS_DIR })).toStrictEqual({
+      ok: true,
+      value: undefined,
+    });
+    // Read-only against the checkout itself: the shipped tree is unchanged.
+    expect(treeListing(config.promptsDir)).toStrictEqual(before);
+  });
+
+  it('looks for the manifest under the name the prompt loader reads', () => {
+    const loader = createPromptLoader({ promptsDir: EXPECTED_DEFAULT_PROMPTS_DIR, env: {} });
+
+    expect(PROMPTS_MANIFEST_FILE_NAME).toBe('manifest.json');
+    expect(toPosix(loader.manifestPath)).toBe(
+      joinPosix(EXPECTED_DEFAULT_PROMPTS_DIR, PROMPTS_MANIFEST_FILE_NAME),
+    );
+  });
+
+  it('refuses a directory that does not exist, naming the key, and creates nothing', () => {
+    const sandbox = promptSandbox();
+    const absent = `${sandbox}/absent/prompts`;
+
+    const error = promptRefusalOf(verifyPromptsDirectory({ promptsDir: absent }));
+
+    const reason = `the directory '${absent}' does not exist`;
+    expect(error.code).toBe(CONFIG_CODE);
+    expect(error.message).toBe(promptsDirectoryMessage(reason));
+    expect(error.hint).toBe(PROMPTS_DIR_REMEDY);
+    expect(error.hint).toContain('DEBUGGEN_PROMPTS_DIR');
+    expect(error.details).toStrictEqual({
+      subsystem: 'config',
+      keys: ['DEBUGGEN_PROMPTS_DIR'],
+      issues: [{ key: 'DEBUGGEN_PROMPTS_DIR', reason }],
+    });
+    expect(existsSync(absent)).toBe(false);
+    expect(treeListing(sandbox)).toStrictEqual([]);
+  });
+
+  it('refuses a file where the directory should be', () => {
+    const sandbox = promptSandbox();
+    const file = `${sandbox}/prompts`;
+    writeFileSync(file, 'not a directory\n', 'utf8');
+
+    const error = promptRefusalOf(verifyPromptsDirectory({ promptsDir: file }));
+
+    expect(error.code).toBe(CONFIG_CODE);
+    expect(error.message).toBe(promptsDirectoryMessage(`the path '${file}' is not a directory`));
+    expect(error.hint).toBe(PROMPTS_DIR_REMEDY);
+    // The file's contents are not what the failure is about, and do not travel.
+    expect(surfacesOf(error)).not.toContain('not a directory\n');
+  });
+
+  it('refuses a directory that holds no manifest.json, and creates nothing', () => {
+    const sandbox = promptSandbox();
+    const promptsDir = directory(`${sandbox}/prompts`);
+    directory(`${promptsDir}/plan`);
+    const before = treeListing(sandbox);
+
+    const error = promptRefusalOf(verifyPromptsDirectory({ promptsDir }));
+
+    expect(error.code).toBe(CONFIG_CODE);
+    expect(error.message).toBe(
+      promptsDirectoryMessage(`the directory '${promptsDir}' has no manifest.json`),
+    );
+    expect(error.hint).toBe(PROMPTS_DIR_REMEDY);
+    expect(treeListing(sandbox)).toStrictEqual(before);
+  });
+
+  it('refuses a manifest.json that is not a regular file', () => {
+    const promptsDir = directory(`${promptSandbox()}/prompts`);
+    directory(`${promptsDir}/${PROMPTS_MANIFEST_FILE_NAME}`);
+
+    const error = promptRefusalOf(verifyPromptsDirectory({ promptsDir }));
+
+    expect(error.message).toBe(
+      promptsDirectoryMessage(`the manifest.json in '${promptsDir}' is not a regular file`),
+    );
+  });
+
+  it('accepts a prompt directory reached through a symbolic link', () => {
+    const sandbox = promptSandbox();
+    const real = promptTree(`${sandbox}/real-prompts`);
+    symlinkSync(real, `${sandbox}/prompts`);
+
+    expect(verifyPromptsDirectory({ promptsDir: `${sandbox}/prompts` })).toStrictEqual({
+      ok: true,
+      value: undefined,
+    });
+  });
+
+  it('reports a dangling link as a directory that does not exist', () => {
+    const sandbox = promptSandbox();
+    symlinkSync(`${sandbox}/gone`, `${sandbox}/prompts`);
+
+    const error = promptRefusalOf(verifyPromptsDirectory({ promptsDir: `${sandbox}/prompts` }));
+
+    expect(error.message).toBe(
+      promptsDirectoryMessage(`the directory '${sandbox}/prompts' does not exist`),
+    );
+  });
+
+  it('reports a stat failure other than absence by its errno, never its thrown message', () => {
+    const denied = recordingStat(() => {
+      throw errnoError('EACCES');
+    });
+
+    const error = promptRefusalOf(
+      verifyPromptsDirectory({ promptsDir: '/opt/prompts' }, { stat: denied.stat }),
+    );
+
+    expect(error.code).toBe(CONFIG_CODE);
+    expect(error.message).toBe(
+      promptsDirectoryMessage("the directory '/opt/prompts' could not be inspected (EACCES)"),
+    );
+    expect(surfacesOf(error)).not.toContain('THE-THROWN-MESSAGE-MUST-NOT-TRAVEL');
+    expect(denied.calls).toStrictEqual(['/opt/prompts']);
+  });
+
+  it('reports a manifest that cannot be inspected, after the directory itself passed', () => {
+    const manifestDenied = recordingStat((path) => {
+      if (path.endsWith(`/${PROMPTS_MANIFEST_FILE_NAME}`)) {
+        throw errnoError('EIO');
+      }
+      return statsOf('directory');
+    });
+
+    const error = promptRefusalOf(
+      verifyPromptsDirectory({ promptsDir: '/opt/prompts' }, { stat: manifestDenied.stat }),
+    );
+
+    expect(error.message).toBe(
+      promptsDirectoryMessage("the manifest.json in '/opt/prompts' could not be inspected (EIO)"),
+    );
+    expect(manifestDenied.calls).toStrictEqual(['/opt/prompts', '/opt/prompts/manifest.json']);
+  });
+
+  it('omits an errno the thrown value does not carry in the expected shape', () => {
+    const error = promptRefusalOf(
+      verifyPromptsDirectory(
+        { promptsDir: '/opt/prompts' },
+        {
+          stat: () => {
+            throw new Error('no code at all');
+          },
+        },
+      ),
+    );
+
+    expect(error.message).toBe(
+      promptsDirectoryMessage("the directory '/opt/prompts' could not be inspected"),
+    );
+  });
+
+  it('returns a refusal, never a throw, when the entry cannot say what kind it is', () => {
+    const unreadable: PromptsEntryStats = {
+      isDirectory: () => {
+        throw errnoError('EIO');
+      },
+      isFile: () => false,
+    };
+
+    const error = promptRefusalOf(
+      verifyPromptsDirectory({ promptsDir: '/opt/prompts' }, { stat: () => unreadable }),
+    );
+
+    expect(error.message).toBe(
+      promptsDirectoryMessage("the directory '/opt/prompts' could not be inspected (EIO)"),
+    );
+  });
+
+  it.each(['ENOENT', 'ENOTDIR'])(
+    'treats a thrown %s as absence rather than as a failure to inspect',
+    (code: string) => {
+      const error = promptRefusalOf(
+        verifyPromptsDirectory(
+          { promptsDir: '/opt/prompts' },
+          {
+            stat: () => {
+              throw errnoError(code);
+            },
+          },
+        ),
+      );
+
+      expect(error.message).toBe(
+        promptsDirectoryMessage("the directory '/opt/prompts' does not exist"),
+      );
+    },
+  );
+
+  it('accepts a directory and a regular manifest as an injected stat reports them', () => {
+    const answers = recordingStat((path) =>
+      path.endsWith(`/${PROMPTS_MANIFEST_FILE_NAME}`) ? statsOf('file') : statsOf('directory'),
+    );
+
+    expect(
+      verifyPromptsDirectory({ promptsDir: '/opt/prompts' }, { stat: answers.stat }),
+    ).toStrictEqual({ ok: true, value: undefined });
+    expect(answers.calls).toStrictEqual(['/opt/prompts', '/opt/prompts/manifest.json']);
+  });
+
+  it.each([
+    { label: 'a relative path', promptsDir: 'service/prompts' },
+    { label: 'an unnormalised path', promptsDir: '/opt/service/../prompts/' },
+    { label: 'a path with a NUL character', promptsDir: '/opt/prompts\u0000' },
+    { label: 'the empty string', promptsDir: '' },
+  ])(
+    'refuses $label with the resolved-path rule, before any stat',
+    ({ promptsDir }: { readonly promptsDir: string }) => {
+      const never = recordingStat(() => statsOf('directory'));
+
+      const error = promptRefusalOf(verifyPromptsDirectory({ promptsDir }, { stat: never.stat }));
+
+      expect(error.message).toBe(
+        promptsDirectoryMessage('the resolved path is not an absolute, normalised path'),
+      );
+      expect(error.hint).toBe(PROMPTS_DIR_REMEDY);
+      expect(never.calls).toStrictEqual([]);
+    },
+  );
+
+  it('refuses a promptsDir that is not a string at all, before any stat', () => {
+    const never = recordingStat(() => statsOf('directory'));
+    const untyped = { promptsDir: 42 } as unknown as Pick<ServiceConfig, 'promptsDir'>;
+
+    const error = promptRefusalOf(verifyPromptsDirectory(untyped, { stat: never.stat }));
+
+    expect(error.message).toBe(promptsDirectoryMessage('the value is not a string'));
+    expect(never.calls).toStrictEqual([]);
+  });
+
+  it('quotes the path with control characters replaced and its length bounded', () => {
+    const escape = '/opt/pro\u001b[31mmpts\u0085';
+    const escaped = promptRefusalOf(
+      verifyPromptsDirectory({ promptsDir: escape }, { stat: () => undefined }),
+    );
+
+    expect(escaped.message).toBe(
+      promptsDirectoryMessage("the directory '/opt/pro\uFFFD[31mmpts\uFFFD' does not exist"),
+    );
+    expect(surfacesOf(escaped)).not.toContain('\u001b');
+
+    const long = `/${'a'.repeat(300)}/\u{1F4C1}-prompts-leaf`;
+    const bounded = promptRefusalOf(
+      verifyPromptsDirectory({ promptsDir: long }, { stat: () => undefined }),
+    );
+    const quoted = /'([^']*)'/.exec(bounded.message)?.[1] ?? '';
+
+    expect(Array.from(quoted)).toHaveLength(160);
+    expect(quoted.startsWith('/aaaa')).toBe(true);
+    // The tail is kept, astral character and all, because the directory's own
+    // name is at the end of the path.
+    expect(quoted.endsWith('/\u{1F4C1}-prompts-leaf')).toBe(true);
+    expect(quoted).toContain('\u2026');
+  });
+
+  it('never names an internal function in any refusal a developer reads', () => {
+    const sandbox = promptSandbox();
+    const file = `${sandbox}/file`;
+    writeFileSync(file, '', 'utf8');
+    const noManifest = directory(`${sandbox}/no-manifest`);
+
+    const refusals = [
+      verifyPromptsDirectory({ promptsDir: `${sandbox}/absent` }),
+      verifyPromptsDirectory({ promptsDir: file }),
+      verifyPromptsDirectory({ promptsDir: noManifest }),
+      verifyPromptsDirectory({ promptsDir: 'relative' }),
+      verifyPromptsDirectory(
+        { promptsDir: '/opt/prompts' },
+        {
+          stat: () => {
+            throw errnoError('EACCES');
+          },
+        },
+      ),
+    ].map(promptRefusalOf);
+
+    for (const error of refusals) {
+      expect(error.code).toBe(CONFIG_CODE);
+      expect(keysOf(error)).toStrictEqual(['DEBUGGEN_PROMPTS_DIR']);
+      expect(surfacesOf(error)).not.toContain('createPromptLoader');
+      expect(`${error.message}\n${error.hint ?? ''}`).not.toMatch(/[A-Za-z_$][\w$]*\(\)/);
+    }
+  });
+
+  it('leaves loadServiceConfig pure: a prompt directory that does not exist still resolves', () => {
+    // The dev-server launcher and every suite in this file resolve fictitious
+    // prompt paths; only the explicit check consults the disk.
+    expect(loadOk({ DEBUGGEN_PROMPTS_DIR: EXPLICIT_PROMPTS_DIR }).promptsDir).toBe(
+      EXPLICIT_PROMPTS_DIR,
+    );
+    expect(existsSync(EXPLICIT_PROMPTS_DIR)).toBe(false);
   });
 });

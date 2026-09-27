@@ -409,20 +409,33 @@ const sharedExclude: string[] = [
  * at all); `coverage.include` is the option that does this, and `coverageExclude`
  * below is applied on top of it.
  *
- * The trees are exactly the code the Vitest projects own and hold suites for:
- * the packages' sources, the service's sources, the VS Code extension's host
- * sources (the `vscode-extension-host` project), and the repository guard
- * scripts of AAP 0.3.4 and 0.5.4. Deliberately NOT widened to
- * `apps/chrome-extension` or to `apps/vscode-extension/src/webview/**` (kept
- * out through `coverageExclude`): their projects hold no suite at this
- * position, so including them would bury the real gaps under whole unmeasured
- * applications. `apps/demo-app` stays out for the reason stated under
- * `coverageExclude` - it is Playwright's subject, not Vitest's.
+ * The trees are exactly the source code of every Vitest project that holds
+ * suites, so the report lists each unmeasured module of those trees at 0%:
+ *   * `packages/*` - the eight library packages, `.tsx` included for the
+ *     React components of `panel-renderer`.
+ *   * `apps/local-service/src` - the `local-service` and
+ *     `local-service-integration` projects.
+ *   * `apps/chrome-extension/src` - the `chrome-extension` project. Its suites
+ *     live in `apps/chrome-extension/test/**` while the code they exercise -
+ *     background service worker, content bridge, DevTools page and the React
+ *     panel - lives here, which is why the tree is named explicitly rather
+ *     than inferred from where the suites sit.
+ *   * `apps/vscode-extension/src` - one tree, two projects: the host logic
+ *     (`.ts`, the `vscode-extension-host` project) and the React webview under
+ *     `src/webview/**` (`.tsx` components and their `.ts` helpers, the
+ *     `vscode-extension-webview` project). The `{ts,tsx}` brace is what admits
+ *     the webview's components; a `.ts`-only glob would silently drop them.
+ *   * `scripts/*.mjs` - the repository guard scripts of AAP 0.3.4 and 0.5.4
+ *     (the `tooling` project).
+ * `apps/demo-app` stays out for the reason stated under `coverageExclude` - it
+ * is Playwright's subject, not Vitest's. `apps/vscode-extension/test/suite/**`
+ * runs in a real extension host under `pnpm test:vscode`, outside this report.
  */
 const coverageInclude: string[] = [
   'packages/*/src/**/*.{ts,tsx}',
   'apps/local-service/src/**/*.ts',
-  'apps/vscode-extension/src/**/*.ts',
+  'apps/chrome-extension/src/**/*.{ts,tsx}',
+  'apps/vscode-extension/src/**/*.{ts,tsx}',
   'scripts/*.mjs',
 ];
 
@@ -432,20 +445,29 @@ const coverageInclude: string[] = [
  * Applied AFTER `coverageInclude` above (Vitest 5.0.1: "Files are first checked
  * against `coverage.include`"), so this list is what trims the tests themselves,
  * config and build tooling, the declaration output of `tsc -b`, the guard
- * scripts' own suites, the demo application - which is exercised end to end
- * through Playwright (AAP 0.8.3) rather than by any Vitest project - and the VS
- * Code webview, whose project holds no suite yet, back out of the source trees
- * the include globs sweep in.
+ * scripts' own suites, ambient declaration files, and the demo application -
+ * which is exercised end to end through Playwright (AAP 0.8.3) rather than by
+ * any Vitest project - back out of the source trees the include globs sweep
+ * in. `**\/test/**` is what keeps `apps/chrome-extension/test/**`, that
+ * project's suites, out of the report while its `src/` stays in; `**\/*.test.*`
+ * does the same for the colocated suites of the service and of both VS Code
+ * extension projects.
  *
- * No `*.d.ts` exclusion is needed: the `include` trees hold no hand-written
- * declaration file, and generated declarations live in `dist/` and `.tsbuild/`,
- * both excluded here.
+ * `**\/*.d.ts` is excluded because the include trees hold hand-written ambient
+ * declarations that carry types and no runtime statement - today the asset
+ * module declarations `apps/chrome-extension/src/panel/assets.d.ts` and
+ * `apps/vscode-extension/src/webview/assets.d.ts`. A declaration file compiles
+ * to nothing v8 can execute, so its entry would be a row no test can ever
+ * change, listed among the modules that genuinely lack a suite.
+ * Generated declarations live in `dist/` and `.tsbuild/`, which their own
+ * entries already exclude.
  */
 const coverageExclude: string[] = [
   '**/node_modules/**',
   '**/dist/**',
   '**/.tsbuild/**',
   '**/*.config.{ts,js,mjs}',
+  '**/*.d.ts',
   '**/test/**',
   '**/__tests__/**',
   '**/*.test.*',
@@ -453,7 +475,6 @@ const coverageExclude: string[] = [
   '**/test/fixtures/**',
   'scripts/*.test.mjs',
   'apps/demo-app/**',
-  'apps/vscode-extension/src/webview/**',
 ];
 
 /**
@@ -602,12 +623,36 @@ export function localServiceProjects(options: {
      * The colocated unit suites of the service: config parsing and defaults,
      * the session state-machine transition table, telemetry attribution,
      * redaction wiring, the auth token and Origin rules, source-path
-     * containment, panel fallback assembly and retention. They must stay fast
-     * and hermetic - no socket opened, no dev server launched, nothing under
-     * `$DEBUGGEN_HOME` touched - so they need none of the execution policy the
-     * integration project below carries and run with Vitest's defaults.
-     * `retry: 0` restates the default on the record: a flaky unit test must
-     * fail, never be masked by a second attempt.
+     * containment, panel fallback assembly and retention.
+     *
+     * Not all of them are pure functions over in-memory values. `main.test.ts`
+     * boots the composed service through `startService` - HTTP plus a
+     * WebSocket upgrade on an ephemeral port, a `node:sqlite` store under a
+     * fresh `mkdtemp` state root - and stops it again, and spawns child
+     * processes; `server/http*.test.ts` listen on ephemeral ports; and
+     * `dev-server/launcher.test.ts` spawns real `node` listener processes for
+     * its listener-ownership suite. They bind only ephemeral ports and write
+     * only under fresh temporary directories, never the developer's
+     * `$DEBUGGEN_HOME`, so the files still run in parallel and need none of
+     * the serialisation the integration project below carries. What they do
+     * need is time:
+     *
+     *   * `testTimeout` / `hookTimeout` of 20 s replace the 5 s / 10 s
+     *     defaults. Measured with this project at three workers on a shared
+     *     12-CPU host, the heaviest tests here - `panels/data.test.ts`,
+     *     `store/*.test.ts`, `dev-server/launcher.test.ts` - take 3-6.3 s, and
+     *     `releaseParts`' credential test about 1.1-1.3 s; at a load average
+     *     of 7-9 that same test took 5.25 s and failed the 5 s default, and
+     *     with it `pnpm verify`, whose CI job has no retry. Starved of CPU on
+     *     purpose it took 15.4 s and still passed. `hookTimeout` matches
+     *     because `main.test.ts`'s `afterEach` closes real `ServiceHandle`s,
+     *     each of whose stops may spend up to `SHUTDOWN_BUDGET.totalMs`
+     *     (8 s). Bounded, not unbounded: a genuinely hung start or stop still
+     *     fails the run, and the budget stays below the integration project's
+     *     30 s. A suite whose own worst case exceeds it states its timeout
+     *     itself, next to the reason.
+     *   * `retry: 0` restates the default on the record: a flaky unit test
+     *     must fail, never be masked by a second attempt.
      */
     defineProject({
       test: {
@@ -617,6 +662,8 @@ export function localServiceProjects(options: {
         include: at('src/**/*.test.ts'),
         exclude,
         env: { ...hermeticEnv },
+        testTimeout: 20_000,
+        hookTimeout: 20_000,
         retry: 0,
       },
     }),

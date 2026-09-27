@@ -1,7 +1,8 @@
 /**
- * The unified diff of one instrumentation modification, as the "Debug
- * Generator" view shows it under `ModificationsList`'s "View diff" control
- * ("Open diff" on a conflict row) (AAP 0.7.3, 0.5.5).
+ * A unified diff of one instrumented file, as the "Debug Generator" view shows
+ * it under a `ModificationsList` item: the change Debug Generator made ("View
+ * diff", AAP 0.7.3) or, for a conflict, the developer's edit on top of it
+ * ("Open diff", AAP 0.5.5). `subject` names which one is on screen.
  *
  * This is the on-screen half of a product guarantee: every file the tool edits
  * is recorded, and the record - including the unified diff the patcher journaled
@@ -67,7 +68,8 @@
  * (`alert`, `status` with `aria-busy`, `status`), so none is added here. The
  * empty-state copy is owned by this component and is deliberately generic:
  * every string that describes a specific change comes from `props.diff` or
- * `props.fileLabel`, never from this file (AAP 0.5.4).
+ * `props.fileLabel`, never from this file, and `props.subject` is the owner's
+ * own generic vocabulary (AAP 0.5.4).
  *
  * ## Styling and accessibility
  *
@@ -76,9 +78,12 @@
  * column is what keeps colour from being the only carrier of meaning: `+` and
  * `-` stay visible beside the success/danger text.
  *
- * The lines sit in a `<pre>`, the element for preformatted text whose
- * whitespace is significant, exposed as a named `region` ("Diff of ‹file›")
- * and focusable so a keyboard user can scroll a wide line into view. Each row
+ * The header strip names the file — wrapped, never clipped, in the narrowest
+ * view — and, with `subject`, what the diff compares. The lines sit in a
+ * `<pre>`, the element for preformatted text whose whitespace is significant,
+ * exposed as a named `region` ("Diff of ‹file›", followed by the subject in
+ * parentheses when there is one) and focusable so a keyboard user can scroll a
+ * wide line into view with the arrow keys. Each row
  * is a `span` - phrasing content, as a `<pre>` requires - and a line break
  * text node separates consecutive rows, so the region's text is the diff's
  * lines exactly. The `<pre>` and the window controls are Tab stops by
@@ -88,7 +93,9 @@
  * in document order, so an owner that walks its controls with the arrow keys
  * reaches them before the horizontally scrolling region keeps those keys. The
  * line list carries no table roles, and no heading is emitted - the
- * surrounding outline belongs to `ModificationsList`.
+ * surrounding outline belongs to `ModificationsList`, which lays each diff
+ * out at its item's full width in the page's own flow: the one vertical
+ * scroller is the webview's `PanelShell`, and only a wide line scrolls here.
  *
  * ## Privacy
  *
@@ -141,6 +148,15 @@ export interface DiffViewProps {
   fileLabel?: string | undefined;
 
   /**
+   * What this diff compares — "Change made by Debug Generator", "Your edit
+   * since instrumentation" — shown under the file label and appended to the
+   * region's name, so an owner that can show more than one diff of a file
+   * never leaves the reader guessing which one is open. Generic product copy
+   * supplied by the owner; a blank value shows nothing.
+   */
+  subject?: string | undefined;
+
+  /**
    * `true` while the owner is still resolving the diff. Outranked only by
    * `error`.
    */
@@ -156,12 +172,11 @@ export interface DiffViewProps {
    * The `tabIndex` of every focusable element this component renders: the
    * diff's scroll region and, for a diff longer than {@link DIFF_LINE_BATCH}
    * lines, the controls that move its window. Defaults to `0`, a Tab
-   * stop each. An owner that renders the diff inside a composite widget which
-   * manages focus itself passes `-1`: `ModificationsList` does, because its
-   * `DataTable` requires every control in a detail row to be `tabIndex={-1}` -
-   * the grid is a single Tab stop whose arrow keys reach each of them from the
-   * row, so both stay keyboard-reachable under the table's own navigation
-   * model.
+   * stop each - what `ModificationsList` uses, since it lays each diff out in
+   * the page's own flow, so a keyboard user can Tab onto the lines and scroll a
+   * wide one. An owner that renders the diff inside a composite widget which
+   * manages focus itself (a grid whose arrow keys reach every control it
+   * holds) passes `-1` instead.
    */
   innerTabIndex?: 0 | -1 | undefined;
 
@@ -350,6 +365,65 @@ function hasText(value: string | undefined): value is string {
 }
 
 /**
+ * The scroll region's accessible name: "Diff of ‹file›", or "Diff" without a
+ * label, followed by the subject in parentheses when there is one.
+ *
+ * @param label The file label, already checked for content.
+ * @param subject What the diff compares, already checked for content.
+ * @returns The name.
+ */
+function regionName(label: string | undefined, subject: string | undefined): string {
+  const base = label === undefined ? REGION_NAME : `Diff of ${label}`;
+  return subject === undefined ? base : `${base} (${subject})`;
+}
+
+/**
+ * The header strip above the lines, or above the state that stands in for
+ * them: the file label, the subject beneath it, and - for a long diff - the
+ * window notice with its controls. Nothing at all when there is none of the
+ * three.
+ *
+ * The label renders through `Code wrap`, so a long path breaks across lines in
+ * a narrow view instead of widening the strip or being clipped by it; the
+ * strip's rule in `../styles.css` insets it to the lines' own padding.
+ */
+function DiffHeader(props: {
+  readonly label: string | undefined;
+  readonly subject: string | undefined;
+  readonly notice?: ReactElement | null | undefined;
+}): ReactElement | null {
+  const { label, subject, notice = null } = props;
+  if (label === undefined && subject === undefined && notice === null) {
+    return null;
+  }
+
+  const labelElement =
+    label === undefined ? null : (
+      <Code size="sm" wrap>
+        {label}
+      </Code>
+    );
+
+  return (
+    <Text as="div" size="sm" tone="secondary" className={HEADER_CLASS}>
+      {subject === undefined && notice === null ? (
+        labelElement
+      ) : (
+        <Stack gap={1} align="start">
+          {labelElement}
+          {subject === undefined ? null : (
+            <Text size="xs" tone="secondary" className="dgv-diff__subject">
+              {subject}
+            </Text>
+          )}
+          {notice}
+        </Stack>
+      )}
+    </Text>
+  );
+}
+
+/**
  * Splits a line whose kind is known into its marker column and remainder.
  *
  * Only a genuine diff marker moves into the marker column: the `+` of an added
@@ -491,9 +565,9 @@ const DiffLine = memo(function DiffLine(props: { readonly row: DiffRow }): React
  *   so the mounted count never grows past one batch however far the reader
  *   pages. The notice names the window's first and last line and the total.
  * - The notice and its controls come BEFORE the `<pre>` in document order. The
- *   region scrolls horizontally, and a composite owner such as `DataTable`
- *   leaves a horizontally scrolling element its ArrowLeft/ArrowRight/Home/End,
- *   so a control placed after it could not be reached by those keys. The
+ *   region scrolls horizontally, and a composite owner such as a grid leaves a
+ *   horizontally scrolling element its ArrowLeft/ArrowRight/Home/End, so a
+ *   control placed after it could not be reached by those keys. The
  *   region is described by the notice, so assistive technology announces
  *   which lines it holds, and the notice is a polite live region, so a move
  *   of the window is announced while focus stays on the control.
@@ -506,10 +580,11 @@ const DiffLine = memo(function DiffLine(props: { readonly row: DiffRow }): React
 function DiffLines(props: {
   readonly diff: string;
   readonly label: string | undefined;
+  readonly subject: string | undefined;
   readonly name: string;
   readonly tabIndex: 0 | -1;
 }): ReactElement {
-  const { diff, label, name, tabIndex } = props;
+  const { diff, label, subject, name, tabIndex } = props;
 
   // Hooks before any branch, as they must be. Parsing is a pass over up to
   // 2 MiB of text, so it runs once per diff, not once per render.
@@ -579,21 +654,11 @@ function DiffLines(props: {
 
   return (
     <>
-      {label === undefined && notice === null ? null : (
-        // The header strip above the lines: the file label, and for a long diff
-        // the notice with its window controls beneath it, inset to the lines'
-        // own padding and ruled off from them by the strip's subtle border.
-        <Text as="div" size="sm" tone="secondary" className={HEADER_CLASS}>
-          {notice === null ? (
-            <Code size="sm">{label}</Code>
-          ) : (
-            <Stack gap={1} align="start">
-              {label === undefined ? null : <Code size="sm">{label}</Code>}
-              {notice}
-            </Stack>
-          )}
-        </Text>
-      )}
+      {/* The header strip above the lines: the file label and subject, and for
+          a long diff the notice with its window controls beneath them, inset
+          to the lines' own padding and ruled off from them by the strip's
+          subtle border. */}
+      <DiffHeader label={label} subject={subject} notice={notice} />
       <pre
         ref={regionRef}
         className="dgv-diff__scroll"
@@ -632,8 +697,17 @@ function DiffLines(props: {
  *   long-diff notice when there is one, and the diff's lines.
  */
 export function DiffView(props: DiffViewProps): ReactElement {
-  const { diff, fileLabel, pending = false, error, innerTabIndex = 0, className } = props;
+  const {
+    diff,
+    fileLabel,
+    subject: subjectProp,
+    pending = false,
+    error,
+    innerTabIndex = 0,
+    className,
+  } = props;
   const label = hasText(fileLabel) ? fileLabel : undefined;
+  const subject = hasText(subjectProp) ? subjectProp : undefined;
   const failed = hasText(error);
 
   const rootClass = ['dgv-diff', failed ? 'dgv-diff--error' : '', className ?? '']
@@ -663,7 +737,8 @@ export function DiffView(props: DiffViewProps): ReactElement {
         <DiffLines
           diff={diff}
           label={label}
-          name={label === undefined ? REGION_NAME : `Diff of ${label}`}
+          subject={subject}
+          name={regionName(label, subject)}
           tabIndex={innerTabIndex}
         />
       </div>
@@ -672,11 +747,7 @@ export function DiffView(props: DiffViewProps): ReactElement {
 
   return (
     <div className={rootClass}>
-      {label === undefined ? null : (
-        <Text as="div" size="sm" tone="secondary" className={HEADER_CLASS}>
-          <Code size="sm">{label}</Code>
-        </Text>
-      )}
+      <DiffHeader label={label} subject={subject} />
       {pending ? (
         <LoadingState variant="rows" label={LOADING_LABEL} />
       ) : (

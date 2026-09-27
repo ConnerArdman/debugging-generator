@@ -3769,7 +3769,7 @@ describe('StateTransitionViewer keyboard model', () => {
     };
   }
 
-  it('keeps the grid one Tab stop: Tab enters on the row and the next Tab leaves', async () => {
+  it('keeps the grid one Tab stop: Tab enters on the row, walks that row alone and leaves', async () => {
     const user = userEvent.setup();
     const { grid, first, second, firstTriggers, secondTriggers } = await renderExplainedRows();
 
@@ -3788,15 +3788,25 @@ describe('StateTransitionViewer keyboard model', () => {
       expect(controls).toContain(trigger);
     }
 
-    // One pass of Tab through the whole document stops inside the grid once,
-    // on the row, and then leaves it: nothing in a row adds a stop.
-    const stops = await tabSequence(user);
-    expect(stops.filter((stop) => grid.contains(stop))).toEqual([first]);
+    // The active row's own controls, in document order: the ones Tab walks
+    // after the row (`primitives/DataTable`'s keyboard model). The second row's
+    // controls are never among them.
+    const firstRowControls = controls.filter((control) => first.contains(control));
+    expect(firstRowControls.length).toBeGreaterThan(0);
+    for (const trigger of firstTriggers) {
+      expect(firstRowControls).toContain(trigger);
+    }
 
-    const rowPosition = stops.indexOf(first);
-    const afterRow = stops[rowPosition + 1];
-    if (afterRow !== undefined) {
-      expect(grid.contains(afterRow)).toBe(false);
+    // One pass of Tab through the whole document stops inside the grid on the
+    // active row, then on that row's controls, and then leaves it: no other row
+    // adds a stop.
+    const stops = await tabSequence(user);
+    expect(stops.filter((stop) => grid.contains(stop))).toEqual([first, ...firstRowControls]);
+
+    const lastInGrid = stops.indexOf(firstRowControls.at(-1) ?? first);
+    const afterGrid = stops[lastInGrid + 1];
+    if (afterGrid !== undefined) {
+      expect(grid.contains(afterGrid)).toBe(false);
     }
 
     // Tab back in lands on the row again, and focus there leaves the grid
@@ -3804,8 +3814,9 @@ describe('StateTransitionViewer keyboard model', () => {
     await tabUntil(user, first);
     expect(tabStopsIn(grid)).toEqual([first]);
 
+    // The next Tab walks into the row, and Shift+Tab walks back to it.
     await user.tab();
-    expect(grid.contains(document.activeElement)).toBe(false);
+    expect(document.activeElement).toBe(firstRowControls[0]);
 
     await user.tab({ shift: true });
     expect(document.activeElement).toBe(first);

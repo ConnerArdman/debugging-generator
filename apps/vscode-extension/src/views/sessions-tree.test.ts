@@ -24,7 +24,12 @@
  *   renders the empty state;
  * - the cleanup wording reads the row's `conflictCount`;
  * - a `session.updated` record of a listed session reaches the tree as its
- *   list row, never as the whole record.
+ *   list row, never as the whole record;
+ * - a session row's description is `‹status› · ‹local time of day›`, so rows
+ *   that share a question differ without hovering: seconds are added exactly
+ *   for the rows of one day row that share a displayed label and a minute,
+ *   and a creation time that is not a representable instant renders the
+ *   status alone.
  *
  * ## The `vscode` substitute
  *
@@ -59,6 +64,8 @@ import {
   SESSION_LIST_PAGE_CAP,
   SessionsTreeProvider,
   describeSession,
+  formatSessionDescription,
+  type DateNode,
   type MessageNode,
   type ProjectNode,
   type SessionNode,
@@ -192,6 +199,30 @@ const OTHER_PROJECT_ROOT = '/home/example/workspace/admin';
 
 /** One hour, in milliseconds: numbered sessions are created an hour apart. */
 const HOUR_MS = 3_600_000;
+
+/**
+ * A session row's time of day as the harness's provider formats it: the
+ * provider's locale (`en-US`) with the provider's own options, so expectations
+ * hold in any host time zone.
+ */
+const SHORT_TIME = new Intl.DateTimeFormat('en-US', { timeStyle: 'short' });
+
+/** {@link SHORT_TIME} with seconds, for rows that would otherwise read identically. */
+const PRECISE_TIME = new Intl.DateTimeFormat('en-US', { timeStyle: 'medium' });
+
+/** An `en-US` description with hours and minutes only, e.g. `2:41 PM · ended`. */
+const SHORT_DESCRIPTION = /^\d{1,2}:\d{2}\s?[AP]M · [a-z]+$/u;
+
+/** An `en-US` description with seconds, e.g. `2:41:07 PM · ended`. */
+const PRECISE_DESCRIPTION = /^\d{1,2}:\d{2}:\d{2}\s?[AP]M · [a-z]+$/u;
+
+/**
+ * Epoch milliseconds of a local wall-clock time on Fri, Sep 25, 2026, so every
+ * session a case creates this way falls on one local day in any time zone.
+ */
+function localTime(hours: number, minutes: number, seconds = 0): number {
+  return new Date(2026, 8, 25, hours, minutes, seconds).getTime();
+}
 
 /**
  * Stored session number `index` of a large listing, as `GET /sessions` sends
@@ -817,11 +848,265 @@ describe('SessionsTreeProvider — a pushed record reaches the tree as its row',
     expect(session?.session).not.toHaveProperty('plans');
     expect(session?.session).not.toHaveProperty('modifications');
     const item = provider.getTreeItem(session as SessionNode);
-    expect(item.description).toBe('capturing');
+    expect(item.description).toBe(`${SHORT_TIME.format(record.createdAt)} · capturing`);
+    expect(item.description).toMatch(/^\d{1,2}:\d{2}\s?[AP]M · capturing$/u);
     expect(item.command).toEqual({
       command: 'debuggen.reopenSession',
       title: 'Reopen Session',
       arguments: [sessionId('a')],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session row descriptions
+// ---------------------------------------------------------------------------
+
+/** The question several sessions of one day share, as in the Sessions view the finding shows. */
+const SHARED_QUESTION = 'Why is this button slow?';
+
+/** An `ended` row of session `letter` asking {@link SHARED_QUESTION}, created at `createdAt`. */
+function askedAt(
+  letter: string,
+  createdAt: number,
+  overrides: Partial<SessionListItem> = {},
+): SessionListItem {
+  return row(letter, {
+    status: 'ended',
+    question: SHARED_QUESTION,
+    createdAt,
+    updatedAt: createdAt + 60_000,
+    cleanup: { status: 'clean', completedAt: createdAt + 59_000, conflictCount: 0 },
+    ...overrides,
+  });
+}
+
+/** A session row as the provider renders it. */
+interface RenderedSessionRow {
+  readonly node: SessionNode;
+  readonly item: LabelledItem;
+}
+
+/** Every session row of the tree, rendered, by session id. */
+async function renderSessionRows(
+  provider: SessionsTreeProvider,
+): Promise<ReadonlyMap<string, RenderedSessionRow>> {
+  const rendered = new Map<string, RenderedSessionRow>();
+  for (const node of await sessionRows(provider, await provider.getChildren())) {
+    rendered.set(node.sessionId, { node, item: provider.getTreeItem(node) as LabelledItem });
+  }
+  return rendered;
+}
+
+/** The rendered row of session `letter`; a case whose fixture lacks it fails loudly. */
+function renderedRow(
+  rendered: ReadonlyMap<string, RenderedSessionRow>,
+  letter: string,
+): RenderedSessionRow {
+  const found = rendered.get(sessionId(letter));
+  if (found === undefined) {
+    throw new Error(`the tree renders no row for session ${letter}`);
+  }
+  return found;
+}
+
+describe('SessionsTreeProvider — session rows are told apart by their time of day', () => {
+  it('gives three same-label sessions created minutes apart three distinct descriptions', async () => {
+    const first = localTime(14, 41);
+    const second = localTime(14, 43);
+    const third = localTime(15, 2);
+    const { provider } = harness([askedAt('c', third), askedAt('b', second), askedAt('a', first)]);
+
+    const rendered = await renderSessionRows(provider);
+
+    expect(rendered.size).toBe(3);
+    const rows = [...rendered.values()];
+    expect(new Set(rows.map(({ item }) => item.label))).toEqual(new Set([SHARED_QUESTION]));
+    expect(renderedRow(rendered, 'a').item.description).toBe(`${SHORT_TIME.format(first)} · ended`);
+    expect(renderedRow(rendered, 'b').item.description).toBe(
+      `${SHORT_TIME.format(second)} · ended`,
+    );
+    expect(renderedRow(rendered, 'c').item.description).toBe(`${SHORT_TIME.format(third)} · ended`);
+    expect(new Set(rows.map(({ item }) => item.description)).size).toBe(3);
+    for (const { node, item } of rows) {
+      expect(item.description).toMatch(SHORT_DESCRIPTION);
+      expect(node.preciseTime).toBe(false);
+    }
+  });
+
+  it('adds seconds to same-label sessions created in the same minute, and to those alone', async () => {
+    const first = localTime(14, 41, 7);
+    const second = localTime(14, 41, 38);
+    const later = localTime(15, 2);
+    const asked = askedAt('a', first);
+    const { provider } = harness([askedAt('c', later), askedAt('b', second), asked]);
+
+    const rendered = await renderSessionRows(provider);
+
+    // At minute precision the two would read `2:41 PM · ended` twice.
+    expect(SHORT_TIME.format(first)).toBe(SHORT_TIME.format(second));
+    const a = renderedRow(rendered, 'a');
+    const b = renderedRow(rendered, 'b');
+    const c = renderedRow(rendered, 'c');
+    expect(a.item.description).toBe(`${PRECISE_TIME.format(first)} · ended`);
+    expect(b.item.description).toBe(`${PRECISE_TIME.format(second)} · ended`);
+    expect(a.item.description).toMatch(PRECISE_DESCRIPTION);
+    expect(b.item.description).toMatch(PRECISE_DESCRIPTION);
+    expect(a.item.description).not.toBe(b.item.description);
+    expect([a.node.preciseTime, b.node.preciseTime]).toEqual([true, true]);
+    // The third shares the label but not the minute, so it keeps the short time.
+    expect(c.item.description).toBe(`${SHORT_TIME.format(later)} · ended`);
+    expect(c.node.preciseTime).toBe(false);
+
+    // Only the description changes: label, id, tooltip, icon, context value and
+    // the reopen command are the row's as before.
+    expect(a.item.label).toBe(SHARED_QUESTION);
+    expect(a.item.id).toBe(`session:${sessionId('a')}`);
+    expect(a.item.tooltip).toBe(
+      `${SHARED_QUESTION}\n\n${describeSession(asked, { locale: 'en-US' })}`,
+    );
+    expect(a.item.iconPath).toEqual({ id: 'history' });
+    expect(a.item.contextValue).toBe('debuggen.session');
+    expect(a.item.command).toEqual({
+      command: 'debuggen.reopenSession',
+      title: 'Reopen Session',
+      arguments: [sessionId('a')],
+    });
+  });
+
+  it('keeps the short time for different labels created in the same minute', async () => {
+    const first = localTime(14, 41, 7);
+    const second = localTime(14, 41, 38);
+    const { provider } = harness([
+      askedAt('b', second, { question: 'Why does the list flicker?' }),
+      askedAt('a', first),
+    ]);
+
+    const rendered = await renderSessionRows(provider);
+
+    const a = renderedRow(rendered, 'a');
+    const b = renderedRow(rendered, 'b');
+    expect(a.item.label).not.toBe(b.item.label);
+    expect(a.item.description).toBe(`${SHORT_TIME.format(first)} · ended`);
+    expect(b.item.description).toBe(`${SHORT_TIME.format(second)} · ended`);
+    expect([a.node.preciseTime, b.node.preciseTime]).toEqual([false, false]);
+  });
+
+  it('compares the labels the rows display, so questions differing only in spacing collide', async () => {
+    const first = localTime(9, 5, 12);
+    const second = localTime(9, 5, 48);
+    const { provider } = harness([
+      askedAt('b', second, { question: 'Why is this\n  button slow?' }),
+      askedAt('a', first, { question: '  Why is this button   slow?' }),
+    ]);
+
+    const rendered = await renderSessionRows(provider);
+
+    const a = renderedRow(rendered, 'a');
+    const b = renderedRow(rendered, 'b');
+    expect([a.item.label, b.item.label]).toEqual([SHARED_QUESTION, SHARED_QUESTION]);
+    expect(a.item.description).toBe(`${PRECISE_TIME.format(first)} · ended`);
+    expect(b.item.description).toBe(`${PRECISE_TIME.format(second)} · ended`);
+  });
+
+  it('decides per day row: the same label and minute in another project keeps the short time', async () => {
+    const first = localTime(14, 41, 7);
+    const second = localTime(14, 41, 38);
+    const { provider } = harness([
+      askedAt('b', second, { projectRoot: OTHER_PROJECT_ROOT, projectName: 'admin' }),
+      askedAt('a', first),
+    ]);
+
+    const rendered = await renderSessionRows(provider);
+
+    expect(renderedRow(rendered, 'a').item.description).toBe(`${SHORT_TIME.format(first)} · ended`);
+    expect(renderedRow(rendered, 'b').item.description).toBe(
+      `${SHORT_TIME.format(second)} · ended`,
+    );
+  });
+
+  it('renders the status alone, under "Unknown date", when the creation time is not an instant', async () => {
+    const { provider } = harness((window) =>
+      Promise.resolve(
+        ok({
+          sessions: [askedAt('b', Number.NaN), askedAt('a', Number.NaN)],
+          total: 2,
+          limit: window?.limit ?? SESSION_LIST_MAX_LIMIT,
+          offset: 0,
+          nextOffset: null,
+        }),
+      ),
+    );
+
+    const roots = await provider.getChildren();
+    const project = roots.find((node): node is ProjectNode => node.kind === 'project');
+    if (project === undefined) {
+      throw new Error('the tree renders no project row');
+    }
+    const days = (await provider.getChildren(project)).filter(
+      (node): node is DateNode => node.kind === 'date',
+    );
+    expect(days.map((day) => (provider.getTreeItem(day) as LabelledItem).label)).toEqual([
+      'Unknown date',
+    ]);
+    const rendered = await renderSessionRows(provider);
+
+    expect(rendered.size).toBe(2);
+    for (const { node, item } of rendered.values()) {
+      expect(item.label).toBe(SHARED_QUESTION);
+      expect(item.description).toBe('ended');
+      expect(node.preciseTime).toBe(false);
+    }
+  });
+});
+
+describe('formatSessionDescription', () => {
+  const createdAt = localTime(14, 41, 7);
+
+  it('states the short local time of day, then the status', () => {
+    expect(formatSessionDescription({ status: 'generated', createdAt }, { locale: 'en-US' })).toBe(
+      `${SHORT_TIME.format(createdAt)} · generated`,
+    );
+  });
+
+  it('adds seconds when asked to', () => {
+    expect(
+      formatSessionDescription({ status: 'ended', createdAt }, { locale: 'en-US', precise: true }),
+    ).toBe(`${PRECISE_TIME.format(createdAt)} · ended`);
+  });
+
+  it("formats in the locale's own clock", () => {
+    const expected = new Intl.DateTimeFormat('de-DE', { timeStyle: 'short' }).format(createdAt);
+
+    expect(formatSessionDescription({ status: 'ended', createdAt }, { locale: 'de-DE' })).toBe(
+      `${expected} · ended`,
+    );
+    expect(expected).toMatch(/^\d{2}:\d{2}$/u);
+  });
+
+  it('falls back to the default locale for a malformed tag instead of throwing', () => {
+    const expected = new Intl.DateTimeFormat(undefined, { timeStyle: 'short' }).format(createdAt);
+
+    expect(
+      formatSessionDescription({ status: 'ended', createdAt }, { locale: 'not a locale!!' }),
+    ).toBe(`${expected} · ended`);
+  });
+
+  it('renders the status alone for a time that is not a representable instant', () => {
+    for (const unrepresentable of [
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      8.64e15 + 1,
+    ]) {
+      for (const precise of [false, true]) {
+        expect(
+          formatSessionDescription(
+            { status: 'failed', createdAt: unrepresentable },
+            { locale: 'en-US', precise },
+          ),
+        ).toBe('failed');
+      }
+    }
   });
 });

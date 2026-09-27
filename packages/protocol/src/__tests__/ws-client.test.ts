@@ -40,6 +40,10 @@
  *   transport reports it.
  * - **The queue is bounded and ordered.** FIFO, oldest dropped first, the drop
  *   reported by type and depth, `0` meaning "never queue".
+ * - **`bufferedAmount` belongs to the socket's owner.** `WebSocketLike` declares
+ *   it optional so the Chrome worker's heartbeat can read it off the socket it
+ *   injected; a transport without it still satisfies the type, and the client
+ *   itself never reads it.
  * - **Only loopback receives a credential.** The hello frame carries the bearer
  *   credential and the project root, so a configured URL naming any other host
  *   — or carrying userinfo, a stray path, a query or a fragment — must leave the
@@ -2443,6 +2447,85 @@ describe('restart: the owner retires a socket it found dead', () => {
     refused.client.restart(RESTART_REASON);
     expect(refused.client.state).toBe('closed');
     expect(refused.timers.pending()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bufferedAmount
+// ---------------------------------------------------------------------------
+
+/** The outbound backlog the metered socket below reports, in bytes. */
+const REPORTED_BUFFERED_BYTES = 65_536;
+
+describe('bufferedAmount: a reading for the socket’s owner, never for the client', () => {
+  /**
+   * A transport whose sockets report {@link REPORTED_BUFFERED_BYTES} and count
+   * every read of it, as the platform `WebSocket` and `ws` both expose it.
+   */
+  function createMeteredTransport(): {
+    readonly webSocketConstructor: WebSocketConstructorLike;
+    readonly sockets: FakeWebSocket[];
+    readonly reads: () => number;
+  } {
+    const sockets: FakeWebSocket[] = [];
+    let reads = 0;
+
+    class MeteredWebSocket extends FakeWebSocket {
+      constructor(...args: ConstructorParameters<WebSocketConstructorLike>) {
+        super(args[0], args[1], args.length);
+        sockets.push(this);
+      }
+
+      get bufferedAmount(): number {
+        reads += 1;
+        return REPORTED_BUFFERED_BYTES;
+      }
+    }
+
+    return { webSocketConstructor: MeteredWebSocket, sockets, reads: () => reads };
+  }
+
+  it('is readable through WebSocketLike when the transport reports it, and absent when it does not', () => {
+    const metered = createMeteredTransport();
+    const reporting: WebSocketLike = new metered.webSocketConstructor(SOCKET_URL);
+    const silent: WebSocketLike = new FakeWebSocket(SOCKET_URL, undefined, 1);
+
+    expect(reporting.bufferedAmount).toBe(REPORTED_BUFFERED_BYTES);
+    expect(metered.reads()).toBe(1);
+    // A transport without the member still satisfies the interface; its owner
+    // reads the reading as unknown.
+    expect(silent.bufferedAmount).toBeUndefined();
+    expect('bufferedAmount' in silent).toBe(false);
+  });
+
+  it('is never read by the client across the handshake, direct and queued sends, inbound frames, a restart and close', () => {
+    const metered = createMeteredTransport();
+    const timers = new FakeTimers();
+    const client = new ReconnectingWsClient({
+      url: SERVICE_URL,
+      webSocketConstructor: metered.webSocketConstructor,
+      identity: DEVTOOLS_IDENTITY,
+      token: TOKEN,
+      timers,
+      random: () => 1,
+    });
+
+    client.connect();
+    expect(client.send('session.unbind', { tabId: 1 })).toEqual({ ok: true, value: 'queued' });
+    const first = metered.sockets.at(-1);
+    first?.open();
+    expect(client.send('session.unbind', { tabId: 2 })).toEqual({ ok: true, value: 'sent' });
+    first?.receive(progressFrame());
+    client.restart(RESTART_REASON);
+    timers.fire(timers.onlyPending());
+    const second = metered.sockets.at(-1);
+    second?.open();
+    client.close();
+
+    expect(metered.sockets).toHaveLength(2);
+    expect(first === undefined ? [] : sentUnbindTabIds(first)).toEqual([1, 2]);
+    expect(client.state).toBe('closed');
+    expect(metered.reads()).toBe(0);
   });
 });
 

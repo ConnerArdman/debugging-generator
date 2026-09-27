@@ -186,7 +186,7 @@ import { Kbd } from '../primitives/Kbd';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
-import { renderTriggerColorVar } from '../utils/color';
+import { renderTriggerAppearance } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
   formatCount,
@@ -280,11 +280,15 @@ const THRESHOLD_LABEL = 'Mark at renders ≥';
 
 /**
  * The threshold field's rejection, first half: what the field accepts.
- * Completed with the default that applies meanwhile, so a rejected value never
- * reads as the one in force. Announced with the field and through its live
- * region; the toolbar shows the short form below.
+ * Completed with the lowest value it accepts and the default that applies
+ * meanwhile, so a rejected value never reads as the one in force. Announced
+ * with the field and through its live region; the toolbar shows the short form
+ * below.
  */
-const THRESHOLD_REJECTED_PREFIX = 'Enter a whole number of at least';
+const THRESHOLD_REJECTED_PREFIX = 'Enter a whole number of';
+
+/** The threshold field's rejection, after the lowest accepted value. */
+const THRESHOLD_REJECTED_BOUND_SUFFIX = 'or more';
 
 /**
  * The visible short form of the rejection, a toolbar status pill completed
@@ -487,10 +491,13 @@ const MINIMUM_THRESHOLD = 2;
  *
  * Lower than {@link MINIMUM_THRESHOLD} on purpose: that floor keeps the
  * *derived* default from marking a uniform capture, while a developer who asks
- * to see every component that rendered at all is entitled to one. Zero is not a
- * threshold — every count reaches it — so it is below the bound.
+ * to see every component is entitled to see them. Zero is a threshold too:
+ * every measured count reaches it, so it marks — and opens the way to — every
+ * node the capture counted, which is exactly what typing it asks for. A node
+ * whose count was not measured is still not marked, because no count reached
+ * anything.
  */
-const MINIMUM_ENTERED_THRESHOLD = 1;
+const MINIMUM_ENTERED_THRESHOLD = 0;
 
 /** The field's native `step`: a render count is a whole number. */
 const THRESHOLD_STEP = 1;
@@ -878,11 +885,16 @@ function childrenOf(datum: ComponentTreeNode): readonly ComponentTreeNode[] {
   return isNodeArray(children) ? children : [];
 }
 
-/** Whether a node's count reaches the mark. A threshold of zero marks nothing. */
+/**
+ * Whether a node's count reaches the mark: a measured, finite count at or
+ * above the threshold. At a threshold of zero that is every node with a
+ * measured count; a node whose count is absent or unreadable reaches no
+ * threshold at all, since nothing was measured to compare.
+ */
 function isAboveThreshold(datum: ComponentTreeNode, threshold: number): boolean {
   const count = datum.renderCount;
 
-  return threshold > 0 && typeof count === 'number' && Number.isFinite(count) && count >= threshold;
+  return typeof count === 'number' && Number.isFinite(count) && count >= threshold;
 }
 
 /**
@@ -1069,7 +1081,10 @@ function prepareTree(
  * of a marked node opens so the finding is on screen. Nothing else does, so a
  * structure of thousands of nodes puts a bounded number of rows in the DOM on
  * first paint. This source answers with one object and no paging, so expansion
- * is the only bound available.
+ * is the only bound available. The derived default never lifts that bound —
+ * it marks only what stands out — whereas a threshold the developer enters
+ * does: at zero every counted node is marked, so every branch above one opens,
+ * which is what asking to see every component means.
  *
  * The result is a *default*, not the state: a developer's own toggles are held
  * separately and win, so re-deriving this set after a threshold change never
@@ -1269,10 +1284,11 @@ function deriveThreshold(counts: readonly number[]): number {
  *
  * The one rule every reading of the field goes through: once trimmed, the text
  * must be decimal digits ({@link WHOLE_NUMBER_PATTERN}) naming a safe integer
- * of at least {@link MINIMUM_ENTERED_THRESHOLD}. Anything else — an empty
- * field, zero, a fraction, a sign, an exponent, a number past the safe-integer
- * range, or text a number field could not hold — names no threshold. Leading
- * zeros and surrounding space are spelling, not meaning: " 03" names three.
+ * of at least {@link MINIMUM_ENTERED_THRESHOLD} — zero included. Anything else
+ * — an empty field, a negative number, a fraction, a sign, an exponent, a
+ * number past the safe-integer range, or text a number field could not hold —
+ * names no threshold. Leading zeros and surrounding space are spelling, not
+ * meaning: " 03" names three, and "00" names zero.
  *
  * There is no upper clamp. A value above the field's `max` is a whole number
  * of renders no component reached, so it is honoured and marks nothing — which
@@ -1919,6 +1935,8 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     const name = displayNameOf(datum);
     const instanceKey = instanceKeyOf(datum);
     const trigger = datum.lastTrigger;
+    // A single render's trigger, with no bucket count, so it is never idle.
+    const triggerAppearance = trigger === undefined ? undefined : renderTriggerAppearance(trigger);
     const location = datum.source;
     const hasChildren = hierarchical && item.children.length > 0;
     const isSelected = item.key === selectedKey;
@@ -2032,7 +2050,19 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
         </span>
 
         {trigger === undefined ? null : (
-          <Badge variant="outline" color={renderTriggerColorVar(trigger)}>
+          // Drawn by the render table's own rule (`renderTriggerAppearance`):
+          // the trigger's hue, its tone and — for `unknown` — the dashed
+          // hairline, so one trigger never looks different in the two views.
+          <Badge
+            variant="outline"
+            tone={triggerAppearance?.tone}
+            color={triggerAppearance?.colorVar}
+            className={clsx(
+              'dg-trigger-chip',
+              triggerAppearance?.dashed === true && 'dg-trigger-chip--dashed',
+            )}
+            data-trigger={trigger}
+          >
             <span className="dg-visually-hidden">{`${TRIGGER_PREFIX_LABEL} `}</span>
             {formatRenderTriggerLabel(trigger)}
           </Badge>
@@ -2236,8 +2266,8 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
       });
     }
 
-    // Text that names no threshold — zero, a sign, a fraction — is kept in the
-    // field so the developer can correct it, but the field is marked invalid
+    // Text that names no threshold — a sign, a fraction, an exponent — is kept
+    // in the field so the developer can correct it, but the field is marked invalid
     // and the toolbar says which default applies meanwhile, so a rejected value
     // never reads as the one in force. An empty field is not an error: clearing
     // it is the documented way back to the default.
@@ -2268,11 +2298,11 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     const thresholdRejection = thresholdRejected
       ? `${THRESHOLD_REJECTED_PREFIX} ${formatCount(
           MINIMUM_ENTERED_THRESHOLD,
-        )}. The default of ${formatCount(derivedThreshold)} applies until then.`
+        )} ${THRESHOLD_REJECTED_BOUND_SUFFIX}. The default of ${formatCount(derivedThreshold)} applies until then.`
       : '';
     const thresholdRejectionId = `${baseId}-threshold-rejection`;
 
-    const thresholdExplanation = `Marks every component whose cumulative render count reaches this value. The default of ${formatCount(derivedThreshold)} is ${String(THRESHOLD_MEDIAN_MULTIPLE)}× the median render count of the ${formatCount(counts.length)} ${nounForCount(COMPONENTS_LABEL, counts.length)} in this capture, so it follows the capture rather than a fixed number. Clear the field, or enter anything but a whole number of at least ${formatCount(MINIMUM_ENTERED_THRESHOLD)}, to restore it.`;
+    const thresholdExplanation = `Marks every component whose cumulative render count reaches this value; ${formatCount(MINIMUM_ENTERED_THRESHOLD)} marks every component with a measured count. The default of ${formatCount(derivedThreshold)} is ${String(THRESHOLD_MEDIAN_MULTIPLE)}× the median render count of the ${formatCount(counts.length)} ${nounForCount(COMPONENTS_LABEL, counts.length)} in this capture, so it follows the capture rather than a fixed number. Clear the field, or enter anything but a whole number of ${formatCount(MINIMUM_ENTERED_THRESHOLD)} ${THRESHOLD_REJECTED_BOUND_SUFFIX}, to restore it.`;
 
     const noteId = `${baseId}-note`;
 

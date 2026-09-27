@@ -129,6 +129,7 @@ import {
 } from './dom-target.js';
 import {
   INTERACTION_TAIL_MS,
+  MAX_INTERACTION_LIFETIME_MS,
   PERF_EVENT_DURATION_THRESHOLD_MS,
   attachInteractions,
   detachInteractions,
@@ -886,5 +887,162 @@ describe('the element picker gesture', () => {
     advanceTo(SYNC_DEADLINE_PERF_MS + INTERACTION_TAIL_MS);
     expect(emittedInteractions()).toHaveLength(0);
     expect(outcomes).toEqual([{ kind: 'cancelled', reason: 'request' }]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The interaction's target, described as the gesture found it
+ *
+ * The capture-phase listener describes the element before the page's own
+ * handlers run, and that timing is the contract these cases pin. It is what
+ * makes `target.text` the label the developer actually pressed — the demo's
+ * place-order control relabels itself to its pending text inside its own
+ * dispatch, and the slow-interaction flow finds the press by that label — and
+ * what keeps the owner chain when a handler removes its own element, whose
+ * fiber React detaches before the dispatch returns. PERF-F07 weighed moving
+ * the description off the dispatch and kept it here for exactly these two
+ * reasons: a change that describes the element later fails the first case,
+ * and one that also reads the owner chain later fails the third.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the interaction target', () => {
+  /** A named component, for the owner chain a planted fiber reports. */
+  function CartLineRow(): null {
+    return null;
+  }
+
+  /** The fields bippy requires of an object before it treats it as a fiber. */
+  interface PlantedFiber {
+    readonly tag: number;
+    readonly type: unknown;
+    readonly stateNode: unknown;
+    return: PlantedFiber | null;
+    readonly child: PlantedFiber | null;
+    readonly sibling: PlantedFiber | null;
+    readonly flags: number;
+  }
+
+  /**
+   * Plant a minimal fiber pair on `element`, the way React's DOM renderer
+   * links a host node to its fiber: an enumerable `__reactFiber$…` key holding
+   * a host fiber whose parent is a component fiber.
+   *
+   * @returns The host fiber, so a case can detach it as React does on delete.
+   */
+  function plantFiber(element: HTMLElement): PlantedFiber {
+    const componentFiber: PlantedFiber = {
+      tag: 0,
+      type: CartLineRow,
+      stateNode: null,
+      return: null,
+      child: null,
+      sibling: null,
+      flags: 0,
+    };
+    const hostFiber: PlantedFiber = {
+      tag: 5,
+      type: 'button',
+      stateNode: element,
+      return: componentFiber,
+      child: null,
+      sibling: null,
+      flags: 0,
+    };
+    Reflect.set(element, '__reactFiber$interactiontest', hostFiber);
+    return hostFiber;
+  }
+
+  it("describes the element before the page's handler relabels it", () => {
+    attachInteractions();
+    advanceTo(GESTURE_PERF_MS);
+
+    const button = appendButton();
+    button.textContent = 'Add to cart';
+    button.addEventListener('click', () => {
+      // The page's own handler relabels the button inside the dispatch, as a
+      // pending control does.
+      button.textContent = 'Adding…';
+    });
+
+    button.dispatchEvent(new Event('click', { bubbles: true }));
+    vi.advanceTimersByTime(0);
+    advanceTo(SYNC_DEADLINE_PERF_MS);
+
+    const draft = theOneInteraction();
+    expect(draft.name).toBe('click button');
+    expect(draft.attributes['target.tagName']).toBe('button');
+    expect(typeof draft.attributes['target.selector']).toBe('string');
+    // The label the developer pressed, not the one the handler put there.
+    expect(draft.attributes['target.text']).toBe('Add to cart');
+  });
+
+  it('offers the description to a diagnostic read inside the dispatch', () => {
+    attachInteractions();
+    advanceTo(GESTURE_PERF_MS);
+
+    const button = appendButton();
+    button.textContent = 'Checkout';
+    let insideHandler: ActiveInteraction | undefined;
+    button.addEventListener('click', () => {
+      insideHandler = getActiveInteraction();
+      button.textContent = 'Placing order';
+    });
+
+    button.dispatchEvent(new Event('click', { bubbles: true }));
+
+    expect(insideHandler?.target?.tagName).toBe('button');
+    expect(insideHandler?.target?.text).toBe('Checkout');
+
+    // The emitted event carries that same description, not a later reading.
+    vi.advanceTimersByTime(0);
+    advanceTo(SYNC_DEADLINE_PERF_MS);
+    expect(theOneInteraction().attributes['target.text']).toBe('Checkout');
+  });
+
+  it('keeps the owner chain read at dispatch when the handler removes its own element', () => {
+    attachInteractions();
+    advanceTo(GESTURE_PERF_MS);
+
+    const button = appendButton();
+    const hostFiber = plantFiber(button);
+    button.addEventListener('click', () => {
+      // What deleting the row does before the dispatch returns: React detaches
+      // the deleted host fiber and the node leaves the document.
+      hostFiber.return = null;
+      button.remove();
+    });
+
+    button.dispatchEvent(new Event('click', { bubbles: true }));
+    vi.advanceTimersByTime(0);
+    advanceTo(SYNC_DEADLINE_PERF_MS);
+
+    const draft = theOneInteraction();
+    expect(draft.attributes['component']).toBe('CartLineRow');
+    expect(draft.attributes['componentChain']).toEqual(['CartLineRow']);
+    expect(draft.attributes['target.tagName']).toBe('button');
+  });
+
+  it('still carries its target when the window is finalised before the probe runs', () => {
+    attachInteractions();
+    advanceTo(GESTURE_PERF_MS);
+
+    const button = appendButton();
+    button.textContent = 'Retry';
+    button.dispatchEvent(new Event('click', { bubbles: true }));
+
+    // A read far past the lifetime cap finalises the window on the read path —
+    // the safety valve — before the dispatch probe has had a chance to run.
+    resolveEventContext(Date.now() + MAX_INTERACTION_LIFETIME_MS + 60_000);
+
+    const draft = theOneInteraction();
+    expect(draft.attributes['target.tagName']).toBe('button');
+    expect(draft.attributes['target.text']).toBe('Retry');
+
+    // The probe that fires afterwards finds a finalised window: nothing more
+    // is emitted.
+    vi.advanceTimersByTime(0);
+    expect(emittedInteractions()).toHaveLength(1);
   });
 });

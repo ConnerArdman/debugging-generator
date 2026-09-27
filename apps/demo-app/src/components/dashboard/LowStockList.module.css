@@ -44,6 +44,16 @@
   gap: var(--ls-space-3, 12px);
 }
 
+/* The line under the heading that relates the rows shown to every line the filters matched, when
+ * the list holds only the most urgent of them. Muted and small like the rows' supporting text, and
+ * tabular so its figures keep one width as the counts change. */
+.summary {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+}
+
 /* The `<ul>`. Rows are separated by the hairline on `.item`, not by a gap, so the list reads as one
  * continuous ledger rather than a stack of cards. */
 .list {
@@ -127,12 +137,19 @@
 }
 
 /* The SKU, when the row carries one: rendered inside `.product` as its own element, so it reads as
- * a code beside the name rather than part of it. Monospace, muted, and back to normal weight. */
+ * a code beside the name rather than part of it. Monospace, muted, and back to normal weight.
+ *
+ * A code is one token and is never broken: `white-space: nowrap` holds "BRG-00007" together, so
+ * when the rest of the name's line cannot fit it the whole code moves to the next line instead of
+ * splitting at its hyphen or, under `.product`'s `overflow-wrap`, between any two characters. The
+ * space in front of it belongs to the name's own text, outside this element, so that is where the
+ * line breaks. */
 .sku {
   color: var(--ls-text-muted, #475569);
   font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: var(--ls-text-xs, 12px);
   font-weight: 400;
+  white-space: nowrap;
 }
 
 /* The warehouse, on its own line under the product name: which of the six sites is short. */

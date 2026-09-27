@@ -18,6 +18,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The one VS Code build both editor tiers test, within engines.vscode ^1.125.0: the
+# extension-host suites (apps/vscode-extension/.vscode-test.mjs, verify job) and the
+# e2e window (tests/e2e/helpers/editor-host.ts, e2e job) both read it, so a new stable
+# release cannot change the editor under test between two runs of one commit.
+env:
+  VSCODE_TEST_VERSION: "1.139.0"
+
 jobs:
   verify:
     name: Verify
@@ -63,13 +70,8 @@ jobs:
       - name: Aggregate quality gate
         run: pnpm verify
 
-      # Pinned to the VS Code build the extension-host suites are validated against
-      # (within engines.vscode ^1.125.0), so a new stable release cannot change the
-      # editor under test between two runs of one commit.
       - name: Extension-host tests
         run: xvfb-run -a pnpm test:vscode
-        env:
-          VSCODE_TEST_VERSION: "1.139.0"
 
   e2e:
     name: End-to-end

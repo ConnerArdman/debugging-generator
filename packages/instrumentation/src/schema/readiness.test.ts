@@ -1121,10 +1121,12 @@ describe('deriveServerAgentSignals', () => {
 
     expect(derived.http).toBe(true);
     expect(derived.routeHandlers).toBe(true);
+    // Outgoing calls are part of the spine: the external call a handler awaits
+    // is time inside the request, and leaving it out leaves a gap in the trace.
+    expect(derived.fetch).toBe(true);
     expect(derived.functions).toEqual(['handleRequest']);
     expect(derived.prisma).toBe(false);
     expect(derived.pg).toBe(false);
-    expect(derived.fetch).toBe(false);
   });
 
   it('enables both database flags for a query-tracking action', () => {
@@ -1152,20 +1154,25 @@ describe('deriveServerAgentSignals', () => {
     expect(derived.functions).toEqual(['timedStep']);
     expect(derived.http).toBe(true);
     expect(derived.routeHandlers).toBe(true);
+    expect(derived.fetch).toBe(true);
     expect(derived.prisma).toBe(false);
     expect(derived.pg).toBe(false);
-    expect(derived.fetch).toBe(false);
   });
 
-  it('enables outgoing request spans only when request tracing was planned', () => {
-    const withFetch = deriveServerAgentSignals([
+  it('enables outgoing request spans with the spine, whether or not page request tracing was planned', () => {
+    // A server trace whose external calls are missing has an unexplained gap
+    // where a third-party dependency spent its time (AAP §0.1.1: one tree
+    // spanning the route handler, the SQL and the external calls), so the
+    // server tier's `fetch` follows the tier rather than a page-side action.
+    const withPageRequests = deriveServerAgentSignals([
       action({ type: 'db-query-tracking' }),
       action({ type: 'fetch-tracking' }),
     ]);
-    expect(withFetch.fetch).toBe(true);
+    expect(withPageRequests.fetch).toBe(true);
 
-    const withoutFetch = deriveServerAgentSignals([action({ type: 'db-query-tracking' })]);
-    expect(withoutFetch.fetch).toBe(false);
+    const withoutPageRequests = deriveServerAgentSignals([action({ type: 'db-query-tracking' })]);
+    expect(withoutPageRequests.fetch).toBe(true);
+    expect(withoutPageRequests.http).toBe(true);
   });
 
   it('does not let a browser-only request plan arm the server tier', () => {

@@ -152,9 +152,13 @@ import {
  * - `unchanged-render-burst` — renders with shallow-equal props, unchanged own
  *   state and no changed consumed context.
  * - `dominant-render-trigger` — the input change behind most of a component's
- *   renders.
+ *   renders, naming the providers of the context when that change was one.
  * - `unknown-render-trigger` — renders whose trigger could not be determined,
  *   counted apart from unchanged renders and never folded into them.
+ *
+ * The four render kinds are drawn from the project's own components whenever
+ * the capture marks any as declared by the project, so a framework's
+ * internal components cannot take their places.
  * - `state-transition-burst` — one state hook changing value repeatedly.
  * - `long-task` — long tasks and total blocking time.
  * - `captured-error` — failures the capture recorded.
@@ -1344,7 +1348,44 @@ function requestInitiatorDrafts(view: EvidenceView, maxEvidence: number): Candid
   return drafts;
 }
 
-/** `repeated-query`: one parameterised statement shape executed repeatedly. */
+/**
+ * The caller that issued the most of a query group's time: summed duration,
+ * then executions (both descending), then name, so the choice is total.
+ */
+function dominantCaller(
+  callers: AnalysisQueryRow['callers'],
+): AnalysisQueryRow['callers'][number] | undefined {
+  let best: AnalysisQueryRow['callers'][number] | undefined;
+  for (const caller of callers) {
+    if (best === undefined) {
+      best = caller;
+      continue;
+    }
+    const ms = durationOf(caller.totalDurationMs);
+    const bestMs = durationOf(best.totalDurationMs);
+    const count = wholeCount(caller.executionCount);
+    const bestCount = wholeCount(best.executionCount);
+    if (
+      ms > bestMs ||
+      (ms === bestMs &&
+        (count > bestCount || (count === bestCount && compareStrings(caller.name, best.name) < 0)))
+    ) {
+      best = caller;
+    }
+  }
+  return best;
+}
+
+/**
+ * `repeated-query`: one parameterised statement shape executed repeatedly.
+ *
+ * Ranked by the time the shape took (`magnitude`), then by how often it ran
+ * (`secondary`): a statement run as often as another but costing a fraction of
+ * its time is the lesser finding, and a count-first order would let it crowd
+ * the costly one out of the `maxPerKind` cap. Located at the one call site its
+ * located executions share, else at its costliest caller, else at its first
+ * located execution.
+ */
 function repeatedQueryDrafts(view: EvidenceView, maxEvidence: number): CandidateDraft[] {
   const drafts: CandidateDraft[] = [];
   for (const row of view.queries) {
@@ -1353,6 +1394,7 @@ function repeatedQueryDrafts(view: EvidenceView, maxEvidence: number): Candidate
     if (executions < FACT_CANDIDATE_THRESHOLDS.minQueryExecutions || first === undefined) {
       continue;
     }
+    const occurrenceSources = row.occurrences.map((occurrence) => occurrence.source);
     const onlyCaller = row.callers.length === 1 ? row.callers[0] : undefined;
     let callerPart = '';
     if (onlyCaller !== undefined) {
@@ -1363,50 +1405,126 @@ function repeatedQueryDrafts(view: EvidenceView, maxEvidence: number): Candidate
     const shape = safeLabel(row.statement, 'an unnamed statement');
     drafts.push({
       kind: 'repeated-query',
-      magnitude: executions,
-      secondary: durationOf(row.totalDurationMs),
+      magnitude: durationOf(row.totalDurationMs),
+      secondary: executions,
       tieBreak: first.eventId,
       statement: `One statement shape ran ${String(executions)} times, taking ${formatMs(row.totalDurationMs)} ms in total (longest ${formatMs(row.maxDurationMs)} ms)${callerPart}: ${shape}`,
       evidence: sample(row.occurrences, maxEvidence).map((occurrence) => ({
         eventId: occurrence.eventId,
         traceId: occurrence.traceId,
         spanId: occurrence.spanId,
+        kind: 'db.query',
         label: `statement (${formatMs(occurrence.durationMs)} ms)`,
       })),
       value: executions,
       unit: 'executions',
       location:
-        onlyCaller?.source ?? firstLocation(row.occurrences.map((occurrence) => occurrence.source)),
+        sharedLocation(occurrenceSources) ??
+        dominantCaller(row.callers)?.source ??
+        firstLocation(occurrenceSources),
     });
   }
   return drafts;
 }
 
-/** Render occurrences as evidence seeds: those with `preferred` trigger first when any exist. */
+/**
+ * The render rows a render candidate may be about: the project's own
+ * components when any row is marked as declared by the project, every row
+ * otherwise.
+ *
+ * A framework or library component — often minified, placed only through the
+ * project component that rendered it — cannot be changed by the developer, and
+ * its count is usually the downstream echo of a project component's renders;
+ * offering it would crowd out the component the question is about. A capture
+ * whose rows carry no ownership (every row `false`, as a statistic persisted
+ * before the field existed reads) keeps every row.
+ */
+function candidateRenderRows(rows: readonly AnalysisRenderRow[]): readonly AnalysisRenderRow[] {
+  const declared = rows.filter((row) => row.declaredInProject);
+  return declared.length > 0 ? declared : rows;
+}
+
+/** Provider names a `dominant-render-trigger` statement lists for a context trigger. */
+const MAX_TRIGGER_PROVIDER_NAMES = 3;
+
+/** Characters kept of each provider name in a candidate statement. */
+const MAX_PROVIDER_LABEL_LENGTH = 60;
+
+/**
+ * The `dominant-render-trigger` statement of one row.
+ *
+ * For a context trigger with named providers, the trigger phrase is followed
+ * by the providers of the contexts that changed, most frequent first — "a
+ * changed consumed context value (provided by ‹a›, ‹b›)" — so the statement
+ * says which context changed, not only that one did. Providers are dropped
+ * from the end until the sentence fits the candidate statement bound, so a
+ * long list costs names rather than a cut sentence.
+ */
+function dominantTriggerStatement(
+  row: AnalysisRenderRow,
+  entry: (typeof INPUT_TRIGGER_PHRASES)[number],
+  dominantCount: number,
+): string {
+  const component = safeLabel(row.component, 'an unnamed component');
+  const sentence = (phrase: string): string =>
+    `${String(dominantCount)} of the ${plural(wholeCount(row.renderCount), 'render', 'renders')} of ${component} were triggered by ${phrase}.`;
+  if (entry.trigger !== 'context') {
+    return sentence(entry.phrase);
+  }
+  const providers = row.changedContexts
+    .slice(0, MAX_TRIGGER_PROVIDER_NAMES)
+    .map((context) => safeLabel(context.name, '', MAX_PROVIDER_LABEL_LENGTH))
+    .filter((label) => label.length > 0);
+  for (let kept = providers.length; kept > 0; kept -= 1) {
+    const named = sentence(`${entry.phrase} (provided by ${providers.slice(0, kept).join(', ')})`);
+    if (named.length <= FACT_CANDIDATE_LIMITS.maxStatementLength) {
+      return named;
+    }
+  }
+  return sentence(entry.phrase);
+}
+
+/**
+ * Render occurrences as evidence seeds.
+ *
+ * With no `trigger`, any of the row's renders substantiates a statement about
+ * how often the component rendered. With one, only renders **of that trigger**
+ * are cited: a sentence counting a component's unchanged-input (or unknown, or
+ * context-triggered) renders is never evidenced by renders that had another
+ * trigger. When the row carries none of that trigger the seeds are empty and
+ * the candidate is withheld rather than cited by contradicting renders; the
+ * analysis row's occurrence selection (`selectRenderOccurrences`) keeps one
+ * render of every trigger it can, so that only happens when the capture's
+ * carried renders include none.
+ */
 function renderSeeds(
   row: AnalysisRenderRow,
   maxEvidence: number,
-  preferred?: RenderTrigger,
+  trigger?: RenderTrigger,
 ): EvidenceSeed[] {
-  const matching =
-    preferred === undefined
-      ? []
-      : row.occurrences.filter((occurrence) => occurrence.trigger === preferred);
-  const chosen = matching.length > 0 ? matching : row.occurrences;
+  const chosen =
+    trigger === undefined
+      ? row.occurrences
+      : row.occurrences.filter((occurrence) => occurrence.trigger === trigger);
   const component = safeLabel(row.component, 'component', 60);
   return sample(chosen, maxEvidence).map((occurrence) => ({
     eventId: occurrence.eventId,
     traceId: occurrence.traceId,
     spanId: occurrence.spanId,
     kind: 'render',
-    label: `${component} render (${occurrence.trigger}, ${formatMs(occurrence.durationMs)} ms)`,
+    // A coalesced event stands for several renders in one commit and its
+    // duration is their total; the chip says so rather than reading as one.
+    label:
+      occurrence.instanceCount === undefined
+        ? `${component} render (${occurrence.trigger}, ${formatMs(occurrence.durationMs)} ms)`
+        : `${component} ×${String(occurrence.instanceCount)} renders in one commit (${occurrence.trigger}, ${formatMs(occurrence.durationMs)} ms total)`,
   }));
 }
 
 /** `render-outlier`: the components that rendered most often. */
 function renderOutlierDrafts(view: EvidenceView, maxEvidence: number): CandidateDraft[] {
   const drafts: CandidateDraft[] = [];
-  for (const row of view.renders) {
+  for (const row of candidateRenderRows(view.renders)) {
     const renders = wholeCount(row.renderCount);
     const first = row.occurrences[0];
     if (renders < FACT_CANDIDATE_THRESHOLDS.minRenders || first === undefined) {
@@ -1431,7 +1549,7 @@ function renderOutlierDrafts(view: EvidenceView, maxEvidence: number): Candidate
 /** `unchanged-render-burst`: renders with unchanged props, own state and consumed context. */
 function unchangedRenderDrafts(view: EvidenceView, maxEvidence: number): CandidateDraft[] {
   const drafts: CandidateDraft[] = [];
-  for (const row of view.renders) {
+  for (const row of candidateRenderRows(view.renders)) {
     const unchanged = wholeCount(row.unchangedRenderCount);
     const first = row.occurrences[0];
     if (unchanged < FACT_CANDIDATE_THRESHOLDS.minUnchangedRenders || first === undefined) {
@@ -1456,7 +1574,7 @@ function unchangedRenderDrafts(view: EvidenceView, maxEvidence: number): Candida
 /** `dominant-render-trigger`: the input change behind most of a component's renders. */
 function dominantTriggerDrafts(view: EvidenceView, maxEvidence: number): CandidateDraft[] {
   const drafts: CandidateDraft[] = [];
-  for (const row of view.renders) {
+  for (const row of candidateRenderRows(view.renders)) {
     const first = row.occurrences[0];
     if (first === undefined) {
       continue;
@@ -1473,13 +1591,12 @@ function dominantTriggerDrafts(view: EvidenceView, maxEvidence: number): Candida
     if (dominant === undefined || dominantCount < FACT_CANDIDATE_THRESHOLDS.minTriggerRenders) {
       continue;
     }
-    const component = safeLabel(row.component, 'an unnamed component');
     drafts.push({
       kind: 'dominant-render-trigger',
       magnitude: dominantCount,
       secondary: wholeCount(row.renderCount),
       tieBreak: first.eventId,
-      statement: `${String(dominantCount)} of the ${plural(wholeCount(row.renderCount), 'render', 'renders')} of ${component} were triggered by ${dominant.phrase}.`,
+      statement: dominantTriggerStatement(row, dominant, dominantCount),
       evidence: renderSeeds(row, maxEvidence, dominant.trigger),
       value: dominantCount,
       unit: 'renders',
@@ -1492,7 +1609,7 @@ function dominantTriggerDrafts(view: EvidenceView, maxEvidence: number): Candida
 /** `unknown-render-trigger`: renders whose trigger could not be determined. */
 function unknownTriggerDrafts(view: EvidenceView, maxEvidence: number): CandidateDraft[] {
   const drafts: CandidateDraft[] = [];
-  for (const row of view.renders) {
+  for (const row of candidateRenderRows(view.renders)) {
     const unknown = wholeCount(row.unknownTriggerCount);
     const first = row.occurrences[0];
     if (unknown < FACT_CANDIDATE_THRESHOLDS.minUnknownTriggerRenders || first === undefined) {

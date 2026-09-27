@@ -141,7 +141,7 @@ import {
 import { sha256OfFile } from '@debuggen/shared/node';
 import { Node } from 'ts-morph';
 
-import { computeIndexCacheKey } from './cache.js';
+import { computeIndexCacheEntryKey } from './cache.js';
 import { apiCallsExtractor } from './extractors/api-calls.js';
 import { apiRoutesExtractor } from './extractors/api-routes.js';
 import { dbCallsExtractor } from './extractors/db-calls.js';
@@ -157,7 +157,7 @@ import { buildRouteMap, routeMapFromIndex } from './route-map.js';
 
 import type { Logger, Result, SourceLocation } from '@debuggen/shared';
 import type { SourceFile } from 'ts-morph';
-import type { IndexCache } from './cache.js';
+import type { IndexCache, IndexCacheKeyInput } from './cache.js';
 import type {
   CodeEdge,
   CodeIndex,
@@ -189,10 +189,13 @@ import type { RouteMap } from './route-map.js';
  * index built by the previous version a *different answer* over the same
  * source, and every one of them requires a bump.
  *
- * `./cache.ts` folds this value into {@link computeIndexCacheKey}'s input, so a
- * bump makes every entry written by an earlier version unreachable rather than
+ * `./cache.ts` folds this value into the entry name it derives from the key
+ * input (`computeIndexCacheEntryKey`) as well as into the state key, so a bump
+ * makes every entry written by an earlier version unreachable rather than
  * merely rejected: the cheapest correct form of invalidation, and the reason
- * nothing else has to be done to retire a stale index. Forgetting the bump is
+ * nothing else has to be done to retire a stale index — the service's
+ * retention sweep removes the unreachable file once a newer entry of the same
+ * project supersedes it. Forgetting the bump is
  * the one mistake here that produces silently wrong results — a cached index
  * from yesterday's extractors served to today's queries — so a change to any
  * file under `./extractors/` should be read as a change to this line as well.
@@ -216,9 +219,12 @@ import type { RouteMap } from './route-map.js';
  * parameter or a destructured binding. Both change the answer over unchanged
  * source, so every index written by `indexer/1.0.0` has to become unreachable —
  * without the bump, a cached index would answer "this file declares no such
- * symbol" for a declaration the patcher can now wrap.
+ * symbol" for a declaration the patcher can now wrap. `indexer/1.2.0` is the
+ * bump for `./extractors/db-calls.ts` recognising the transaction client an
+ * interactive `$transaction` callback receives, which adds the call sites
+ * written on that client to the graph over unchanged source.
  */
-export const INDEXER_VERSION: string = 'indexer/1.1.0';
+export const INDEXER_VERSION: string = 'indexer/1.2.0';
 
 /**
  * The extractors an index is built from, in the fixed order they run in.
@@ -552,8 +558,9 @@ export interface IndexResult {
    *
    * `true` means no file was parsed and no extractor ran, which is worth
    * knowing when a result is surprising: a stale-looking index with
-   * `fromCache: true` and an unchanged fingerprint set is a correct answer
-   * about an unchanged project.
+   * `fromCache: true` is a correct answer about a project whose files are
+   * unchanged — by their stamps, or, where only their metadata moved, by the
+   * digest of their bytes.
    */
   readonly fromCache: boolean;
 
@@ -1462,16 +1469,19 @@ async function runPipeline(
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The cache key for one run: the single definition both of
+ * The cache key input for one run: the single definition both of
  * {@link indexProject}'s cache paths use.
  *
  * It exists as a function rather than as two call sites because the two paths
- * reach the key from different places — one from the discovered path set
- * before any file is parsed, the other from an already-opened project's
- * prepared file set — and a key computed two ways is a key that can drift, at
- * which point a save and the next run's lookup stop agreeing and the cache
- * never hits. Everything the key covers is passed here and nothing is decided
- * here, so the two paths differ only in the values they hold.
+ * reach it from different places — one from the discovered path set before any
+ * file is parsed, the other from an already-opened project's prepared file set
+ * — and an input assembled two ways is one that can drift, at which point a
+ * save and the next run's lookup stop agreeing and the cache never hits.
+ * Everything the keys cover is passed here and nothing is decided here, so the
+ * two paths differ only in the values they hold. `./cache.ts` derives both of
+ * its keys from this one value — the project's entry name from the identity
+ * half, the freshness key from all of it — so neither path can name one
+ * project's entry with another project's state.
  *
  * The extractor identities are contributed **in run order** and are not
  * sorted; `./cache.ts` explains why on `IndexCacheKeyInput.extractors`, and
@@ -1481,40 +1491,41 @@ async function runPipeline(
  * @param tsConfigFilePath The configuration in force, or `undefined`.
  * @param extractors The extractors this run will use, in order.
  * @param files The fingerprints of the file set the run covers.
- * @returns The key, 64 lowercase hexadecimal characters.
+ * @returns The input to hand to `IndexCache.load` and `IndexCache.save`.
  */
-function indexCacheKeyFor(
+function indexCacheKeyInputFor(
   projectRoot: string,
   tsConfigFilePath: string | undefined,
   extractors: readonly Extractor[],
   files: readonly FileFingerprint[],
-): string {
-  return computeIndexCacheKey({
+): IndexCacheKeyInput {
+  return {
     projectRoot,
     tsConfigFilePath,
     indexerVersion: INDEXER_VERSION,
     extractors: extractors.map((extractor) => extractor.id),
     files,
-  });
+  };
 }
 
 /**
  * Reads a cache entry, or `undefined` for anything that is not a usable hit.
  *
  * `./cache.ts` already treats an absent, unparsable, stale or unsafe entry as a
- * miss and removes it, so the work here is the defensive half: an entry is only
- * accepted when it describes *this* project and *this* indexer version. The key
- * covers both, so a mismatch means a key collision or a hand-edited file rather
- * than ordinary staleness — either way, indexing the project is the right
- * answer and is cheaper than reasoning about how the entry got there.
+ * miss and removes it — and serves an entry whose files were touched but whose
+ * bytes were not, which is what keeps the product's own patch-and-restore from
+ * costing a rebuild — so the work here is the defensive half: an entry is only
+ * accepted when it describes *this* project and *this* indexer version. The
+ * entry key covers both, so a mismatch means a key collision or a hand-edited
+ * file rather than ordinary staleness — either way, indexing the project is the
+ * right answer and is cheaper than reasoning about how the entry got there.
  *
- * Never rejects: `IndexCache.load` only rejects for a malformed key, which
- * cannot happen for a key this module computed, and the guard is here so that a
- * future cache implementation cannot turn a failed optimisation into a failed
- * index.
+ * Never rejects: `IndexCache.load` promises not to, and the guard is here so
+ * that a future cache implementation cannot turn a failed optimisation into a
+ * failed index.
  *
- * Log fields are counts, the key digest and booleans — never a project path,
- * for the reason `IndexCacheOptions.logger` gives.
+ * Log fields are counts, the entry key digest and booleans — never a project
+ * path, for the reason `IndexCacheOptions.logger` gives.
  *
  * The project is identified by its **root** rather than by an opened handle,
  * because the whole point of consulting the cache is to find out whether a
@@ -1523,21 +1534,22 @@ function indexCacheKeyFor(
  * that is the one field the check below ever needed.
  *
  * @param cache The cache to read.
- * @param key The key from {@link computeIndexCacheKey}.
+ * @param keyInput The input from {@link indexCacheKeyInputFor}.
  * @param projectRoot The normalised project root the entry must describe.
  * @param logger Where the hit and miss lines go.
  * @returns The cached index, or `undefined`.
  */
 async function loadFromCache(
   cache: IndexCache,
-  key: string,
+  keyInput: IndexCacheKeyInput,
   projectRoot: string,
   logger: Logger,
 ): Promise<CodeIndex | undefined> {
+  const key = computeIndexCacheEntryKey(keyInput);
   let entry: CodeIndex | undefined;
 
   try {
-    entry = await cache.load(key);
+    entry = await cache.load(keyInput);
   } catch (cause) {
     logger.warn('the code index cache could not be read; the project will be indexed', {
       reason: failureDetail(cause),
@@ -1644,26 +1656,32 @@ function cacheHitResult(
  * `IndexCache.save` returns a `Result` a caller may ignore deliberately rather
  * than throwing.
  *
+ * The write replaces the project's one entry: the entry is named by the
+ * project's identity, not by the state of its files, so re-indexing a project
+ * never adds a file to the cache directory.
+ *
  * @param cache The cache to write to.
- * @param key The key from {@link computeIndexCacheKey}.
+ * @param keyInput The input from {@link indexCacheKeyInputFor} the lookup was
+ * made with.
  * @param index The index to store.
  * @param truncated Whether the `maxFiles` bound excluded part of the project.
  * @param logger Where a failed write is reported.
  */
 async function saveToCache(
   cache: IndexCache,
-  key: string,
+  keyInput: IndexCacheKeyInput,
   index: CodeIndex,
   truncated: boolean,
   logger: Logger,
 ): Promise<void> {
+  const key = computeIndexCacheEntryKey(keyInput);
   if (truncated) {
     logger.debug('a truncated code index was not cached', { key });
     return;
   }
 
   try {
-    const saved = await cache.save(key, index);
+    const saved = await cache.save(keyInput, index);
     if (isErr(saved)) {
       logger.warn('the code index could not be cached; it will be rebuilt next time', {
         key,
@@ -1829,12 +1847,18 @@ export async function buildIndex(
  *
  * ## Re-indexing
  *
- * A single changed file changes that file's fingerprint, which changes the key,
- * which is a miss and therefore a **full rebuild**. Incremental per-file reuse
- * is deliberately out of scope for this version: it would require the graph to
- * know which nodes and edges came from which file and to re-run the joins after
- * a swap, and a half-built mechanism for that is worse than the honest full
- * rebuild — so there is none, rather than a partial one to be discovered later.
+ * A file whose metadata moved but whose bytes did not — a rewrite with
+ * identical content, a `touch`, the product's own reversible patch followed by
+ * its byte-for-byte restore — is still a **hit**: `./cache.ts` reads each such
+ * file once, finds the digest it recorded, serves the stored index with the
+ * current fingerprints and refreshes its entry so the next lookup is stat-only
+ * again. A file whose *bytes* changed, or a file added or removed, is a miss
+ * and therefore a **full rebuild**, which overwrites the project's one entry.
+ * Incremental per-file reuse is deliberately out of scope for this version: it
+ * would require the graph to know which nodes and edges came from which file
+ * and to re-run the joins after a swap, and a half-built mechanism for that is
+ * worse than the honest full rebuild — so there is none, rather than a partial
+ * one to be discovered later.
  *
  * @param options What to index and how; see {@link IndexProjectOptions}.
  * @returns `Ok` with the index, the graph, the route map and the run's
@@ -1889,14 +1913,14 @@ export async function indexProject(options: IndexProjectOptions): Promise<Result
       return fingerprinted;
     }
 
-    const key = indexCacheKeyFor(
+    const keyInput = indexCacheKeyInputFor(
       discovered.value.projectRoot,
       discovered.value.tsConfigFilePath,
       pipeline.extractors,
       fingerprinted.value.fingerprints,
     );
 
-    const entry = await loadFromCache(cache, key, discovered.value.projectRoot, logger);
+    const entry = await loadFromCache(cache, keyInput, discovered.value.projectRoot, logger);
     if (entry !== undefined) {
       // No `Project` has been constructed and no file has been parsed, which is
       // the whole point of this path.
@@ -1905,9 +1929,9 @@ export async function indexProject(options: IndexProjectOptions): Promise<Result
 
     // A miss: the program has to be built after all. The discovery already made
     // is handed to `openProject`, so the tree is walked once per run rather
-    // than once per stage, and the entry is written under the key computed
-    // above — the same key the next run's discovery will compute for an
-    // unchanged tree.
+    // than once per stage, and the entry is written from the input computed
+    // above — the project's one entry, recording the state the next run's
+    // discovery will compute for an unchanged tree.
     const opened = resolveProject(options, logger, discovered.value);
     if (isErr(opened)) {
       return opened;
@@ -1918,7 +1942,7 @@ export async function indexProject(options: IndexProjectOptions): Promise<Result
       return prepared;
     }
 
-    return buildAndReport(opened.value, prepared.value, pipeline, { cache, key }, startedAt);
+    return buildAndReport(opened.value, prepared.value, pipeline, { cache, keyInput }, startedAt);
   }
 
   // ── The program-first path ────────────────────────────────────────────────
@@ -1942,21 +1966,21 @@ export async function indexProject(options: IndexProjectOptions): Promise<Result
   }
 
   // The same key definition as the cache-first path, over the file set this
-  // path holds: `indexCacheKeyFor` is what keeps a save here reachable from a
-  // lookup there.
-  const key = indexCacheKeyFor(
+  // path holds: `indexCacheKeyInputFor` is what keeps a save here reachable
+  // from a lookup there.
+  const keyInput = indexCacheKeyInputFor(
     loaded.projectRoot,
     loaded.tsConfigFilePath,
     pipeline.extractors,
     prepared.value.fingerprints,
   );
 
-  const entry = await loadFromCache(cache, key, loaded.projectRoot, logger);
+  const entry = await loadFromCache(cache, keyInput, loaded.projectRoot, logger);
   if (entry !== undefined) {
     return ok(cacheHitResult(entry, prepared.value, startedAt, logger));
   }
 
-  return buildAndReport(loaded, prepared.value, pipeline, { cache, key }, startedAt);
+  return buildAndReport(loaded, prepared.value, pipeline, { cache, keyInput }, startedAt);
 }
 
 /** Where a completed build should be written, when it should be written at all. */
@@ -1964,8 +1988,12 @@ interface CacheWrite {
   /** The cache to write to. */
   readonly cache: IndexCache;
 
-  /** The key the entry belongs under — always one {@link indexCacheKeyFor} produced. */
-  readonly key: string;
+  /**
+   * The input the lookup before the build was made with — always one
+   * {@link indexCacheKeyInputFor} produced — from which the cache derives the
+   * project's entry name and the state the entry records.
+   */
+  readonly keyInput: IndexCacheKeyInput;
 }
 
 /**
@@ -2006,7 +2034,7 @@ async function buildAndReport(
   const routeMap = buildRouteMap(loaded, { logger });
 
   if (write !== undefined) {
-    await saveToCache(write.cache, write.key, index, prepared.truncated, logger);
+    await saveToCache(write.cache, write.keyInput, index, prepared.truncated, logger);
   }
 
   const stats: IndexStats = {

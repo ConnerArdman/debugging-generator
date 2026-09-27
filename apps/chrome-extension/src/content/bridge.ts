@@ -24,7 +24,7 @@
  *   agent   <--CustomEvent(PAGE_BRIDGE_FRAME_EVENT)--  bridge
  * bridge --chrome.runtime.connect({ name: PORT_CONTENT_BRIDGE })--> service worker
  *        upstream:   agent.ready · telemetry.batch · target.described · agent.error
- *        downstream: agent.config · agent.snapshot · target.request
+ *        downstream: bridge.pause · bridge.resume · agent.config · agent.snapshot · target.request
  * ```
  *
  * Both hops carry **raw** payloads. The bridge parses each agent frame's JSON,
@@ -45,8 +45,9 @@
  * Anything posted on the page's `window` is readable by every script on the
  * page, so a token carried on window frames stops being a secret the moment
  * the first frame is posted, and anyone holding it can post an all-false
- * `agent.config` that disarms a capture. Page channel version 3 therefore
- * carries **no token and nothing on `window` after the handshake**: the agent
+ * `agent.config` that disarms a capture. The page channel (since version 3;
+ * {@link PAGE_CHANNEL_VERSION} is the current one) therefore carries **no
+ * token and nothing on `window` after the handshake**: the agent
  * creates a node it never inserts into the document and hands it over once,
  * as the `relatedTarget` of its answer to this bridge's one request, while no
  * page script has yet run. The bridge keeps the first acceptable node — an
@@ -141,6 +142,20 @@
  * sent from the port's `onDisconnect`, `stop()` and termination, never
  * re-entrantly from inside the agent's own dispatch; the unacknowledged frame
  * is the agent's signal there.
+ *
+ * ## Flow control, relayed
+ *
+ * Custody passes at the port, so a claimed batch says nothing about whether
+ * the worker is keeping up. The worker says so itself: it posts
+ * `bridge.pause` down this port once its lane for the tab backs up and
+ * `bridge.resume` once it has drained, and the bridge relays each to the agent
+ * unchanged, like every downstream frame — only from the current port, so a
+ * superseded port's signal is never applied. The agent then holds its batches
+ * back in its own bounded buffer, and its eviction count reaches the service
+ * as `droppedCount`; the bridge keeps no pause state of its own. Every new
+ * port starts unpaused on both sides: the worker records a pause per bridge
+ * connection, and the `bridge.ready` this bridge dispatches on a new port
+ * clears the agent's.
  *
  * ## Recovery
  *
@@ -340,11 +355,14 @@ export const BRIDGE_EVENT_BUDGET_CAPACITY = 10_000;
  * The events one document may relay per second once its burst is spent: the
  * bucket's refill rate.
  *
- * The demo's worst genuine sustained rate is about 200 render events per
- * second — its 48 memoised product cards (the default catalog page) re-render
- * on every 250 ms dispatch tick — and even its largest page (96 cards) stays
- * under 400. 2 000 per second is ten times the default case, so a real
- * capture never meets the limit, while a page calling
+ * The agent coalesces the fibers of a component that rendered alike in one
+ * commit into one render event (`packages/telemetry/src/browser/react.ts`), so
+ * a render-heavy page emits per component group, not per fiber: the demo's
+ * default catalog page — 48 memoised product cards re-rendering on every
+ * 250 ms dispatch tick, about 2 000 fiber renders a second — relays under 100
+ * events a second, and uncoalesced it measured about 1 500. 2 000 per second
+ * is above even that uncoalesced rate, so a real capture never meets the
+ * limit, while a page calling
  * `globalThis.__DEBUGGEN__.span` in a tight loop is held to a bounded rate
  * and its loss is reported.
  */
@@ -1157,6 +1175,10 @@ const PAGE_FRAMING = {
  */
 function toPageFrame(message: BridgeDownstreamMessage): BridgeChannelMessage {
   switch (message.type) {
+    case 'bridge.pause':
+      return { ...PAGE_FRAMING, type: message.type, payload: message.payload };
+    case 'bridge.resume':
+      return { ...PAGE_FRAMING, type: message.type, payload: message.payload };
     case 'agent.config':
       return { ...PAGE_FRAMING, type: message.type, payload: message.payload };
     case 'agent.snapshot':

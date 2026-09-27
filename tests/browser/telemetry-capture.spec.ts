@@ -2014,8 +2014,10 @@ async function pickButtonAndExpectConsumed(input: {
 
   const target = await waitForSessionTarget(service, sessionId);
   await expectTargetIsButton(target, { page, button, contract, baseUrl });
+  // The header's one summary line for the target: clipped to fit, with the whole selector as its
+  // title. The same selector is repeated inside the collapsed "Target details" disclosure.
   await expect(
-    panel.header.getByText(target.selector, { exact: true }),
+    panel.header.getByTitle(target.selector, { exact: true }),
     "the panel shows the picked element's selector",
   ).toBeVisible({ timeout: DEFAULT_WAIT_TIMEOUT_MS });
   await expectPickerEnded(panel, page);

@@ -88,44 +88,26 @@
  * collapses its five-area grid to two lines through a single `@container` query, and an *unnamed*
  * container is what that plain query resolves against - so this container is deliberately left
  * unnamed, and naming it would silently disable the row's narrow arrangement. Inline-size
- * containment constrains the inline axis only, which is why the block axis below is still free to
- * cap and scroll. */
+ * containment constrains the inline axis only, so the region still grows with its rows. */
 .scroll {
   min-inline-size: 0;
   container-type: inline-size;
 }
 
-/* Drawer: the list is the only part of the panel that should grow unboundedly, so it caps itself
- * and scrolls. The cap is a file-local property built from the spacing scale - fourteen 32px steps,
- * 448px - deep enough to show several lines at once and shallow enough that the twelve-line cart
- * the demo seeds scrolls here rather than pushing the totals footer out of reach.
+/* Neither placing caps or scrolls the region; each surface owns the one scroll container it has.
  *
- * The `min()` is the part that earns its keep. The panel is a full-viewport-height sheet whose
- * middle row is what holds this list, so the room actually available is the viewport less the
- * panel's header, its totals footer and their padding - roughly 185px of chrome. A fixed 448px cap
- * is taller than that on a short window, and the cost is not a little clipping: the panel's own
- * body then becomes a second scroll container nested inside this one, the last row is cut through
- * the middle, and on a platform with classic (space-taking) scrollbars that nested scrollbar
- * appears and disappears with the item count, shifting every row sideways by its width - exactly
- * the shift `scrollbar-gutter: stable` is here to prevent. Half the viewport keeps the cap clear of
- * the chrome for any window taller than about 370px, and yields to the token value - which is the
- * design intent - on anything from a normal laptop upwards. `vh` rather than `dvh` deliberately:
- * the overlay this sits in is sized by the same reference frame.
+ * Page (`/cart`, and the checkout review): the document scrolls. A second scroll container on a
+ * full-page cart traps the wheel and hides rows below the fold.
  *
- * `overscroll-behavior: contain` stops a flick at the end of the list from chaining into the panel
- * behind it, and `scrollbar-gutter: stable` reserves the scrollbar's width whether or not it is
- * showing, so rows never shift sideways as items come and go. */
-.root[data-variant='drawer'] .scroll {
-  --list-max-height: calc(var(--ls-space-6, 32px) * 14);
-
-  max-block-size: min(var(--list-max-height), 50vh);
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  scrollbar-gutter: stable;
-}
-
-/* Page: the document scrolls, so the region does neither. A second scroll container on a full-page
- * cart traps the wheel and hides rows below the fold. */
+ * Drawer: the panel's `.body` row is the sheet's only scrolling region (`CartDrawer.module.css`),
+ * sized to exactly what the header and the totals footer leave of the viewport, and it carries the
+ * overscroll containment and the stable scrollbar gutter. A height cap here made this region a
+ * second scroll container nested inside that one: whenever the cap was taller than the room the
+ * body actually had - a 375x812 phone with a few lines, for instance - both scrolled, the last row
+ * was cut off at the body's edge behind the footer, and a wheel or a swipe scrolled whichever of
+ * the two it happened to land on. Uncapped, the list is the body's content and the body scrolls
+ * it, so every row, the last one included, scrolls fully into view above the footer. */
+.root[data-variant='drawer'] .scroll,
 .root[data-variant='page'] .scroll {
   max-block-size: none;
   overflow: visible;
@@ -158,10 +140,9 @@
  *
  * These rows are children of `.root`, so the rhythm between them is its `gap`; they carry no
  * hairline, because the 1px rules belong to the real list and a floating rule between spaced
- * placeholders reads as a defect rather than a separator. They also sit outside `.scroll`, so they
- * do not carry its reserved scrollbar gutter: on a platform with space-taking scrollbars the rows
- * that replace them are that gutter narrower. Only the inline axis is affected, and only in the
- * drawer, where the gutter is what keeps the loaded rows from shifting as items come and go. */
+ * placeholders reads as a defect rather than a separator. In the drawer they sit inside the same
+ * scrolling body as the loaded rows, and so inside the same reserved scrollbar gutter: the switch
+ * from placeholders to lines moves nothing sideways. */
 .skeletonRow {
   --skeleton-media-inline-size: calc(var(--ls-space-6, 32px) * 2);
   --skeleton-media-block-size: calc(var(--skeleton-media-inline-size) * 3 / 4);
@@ -181,11 +162,14 @@
  * the same height a quantity stepper occupies. Measured against a populated list, this closes the
  * jump from placeholders to data from tens of pixels per row to a couple: the remainder is the
  * stepper's own border and text metrics, which belong to its component and are not knowable here.
- * The page variant needs no second track - its rows keep the single-line arrangement. */
+ * The block-end padding follows the real row's two-line arrangement too, which reserves one extra
+ * spacing step under the stepper for its range hint. The page variant needs no second track - its
+ * rows keep the single-line arrangement. */
 .root[data-variant='drawer'] .skeletonRow {
   --skeleton-controls-block-size: calc(var(--ls-space-6, 32px) - var(--ls-space-1, 4px));
 
   grid-template-rows: var(--skeleton-line-block-size) var(--skeleton-controls-block-size);
+  padding-block-end: calc(var(--ls-space-3, 12px) + var(--ls-space-3, 12px));
 }
 
 /* The thumbnail placeholder: the row's 64px media box at the 4 / 3 ratio the catalog artwork is

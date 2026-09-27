@@ -51,6 +51,23 @@
  * arrived — the cap is upstream, so nothing here may imply the list is
  * complete.
  *
+ * ## A CONTEXT TRIGGER NAMES ITS PROVIDER
+ *
+ * A bare `context` count says that some consumed context changed, not which
+ * one — and "which one" is the question a reader acts on. The aggregate
+ * therefore carries, per row and per render, the names of the contexts that
+ * changed, each named by the component that **provides** it (the component a
+ * developer opens to see where the value comes from), or by the context's own
+ * display name when no provider could be read. This view states them in three
+ * places: a `Changed contexts` column beside `Changed props`, with a count per
+ * name; the `context` chip of the trigger histogram, whose description lists
+ * the providers whenever the row names any; and each individual render, whose
+ * trigger chip is followed by the names of the contexts that changed at that
+ * render. Names and counts only, on the same terms as prop names: a context
+ * value never reaches this component. A row or render built before the names
+ * were recorded simply has none, and reads as "no context changes reported" —
+ * never as "no context changed", which the trigger histogram alone may say.
+ *
  * ## DATA ARRIVES THROUGH THE NODE'S QUERY, INTERACTIONS LEAVE THROUGH ACTIONS
  *
  * The only data path is `../host/useQuery` resolving this node's own
@@ -116,7 +133,8 @@
  *
  * ## ORDERING BELONGS TO THE DATA LAYER
  *
- * Nothing here sorts, filters, slices or pages the array it received — the
+ * Nothing here sorts, slices or pages the array it received, and nothing
+ * filters it beyond the one presentation filter described below — the
  * service already did, and re-ordering a page locally would order that page
  * against a total it is only part of. A sort change is therefore a **re-query**
  * mapped onto the node's own `DataQuerySort` vocabulary, and the order the grid
@@ -124,6 +142,32 @@
  * vocabulary offers one direction per key, so the header of an already-sorted
  * column re-requests the same order rather than reversing into a sort that does
  * not exist, and no direction is ever displayed that the data does not have.
+ *
+ * One presentation filter exists, and it is bound by an honesty rule: the
+ * **component scope**. A capture of a real page is full of framework and
+ * library components — often minified to a letter or two — that render as
+ * often as the project's own, and a table led by them answers nobody's
+ * question. The aggregate marks every row with `declaredInProject`, and while
+ * the loaded rows hold both kinds, a toolbar control offers "Project
+ * components" (the default) and "All components", each with its count. The
+ * rule is what keeps that filter from becoming a second data layer:
+ *
+ *   - It hides, and never re-orders: the rows it keeps stay in provider order.
+ *   - It only ever hides a row the aggregate marked `declaredInProject: false`.
+ *     A row that does not say (a stored row from an older build) is shown, and
+ *     with no row of each kind loaded the control is not offered at all and
+ *     every row is shown.
+ *   - It works over the loaded pages only, and never re-queries: "load more",
+ *     the page sequence, the footer's paging counters and the provider's total
+ *     all keep counting every loaded row, and the footer states how many rows
+ *     the scope hides, so nothing is out of view without the reader being told.
+ *   - Under "All components" an outside row is drawn, marked beside its name
+ *     as being outside the project, so the two kinds are never confused.
+ *   - The outlier mark is measured against the rows in view — the median of
+ *     what the reader is comparing — so a hidden framework component can
+ *     neither raise nor lower the bar a project component is marked against.
+ *
+ * The chosen scope is reported through `onFilterChange` as `componentScope`.
  *
  * ## STATES: ALL THREE, IN PRECEDENCE
  *
@@ -165,9 +209,14 @@
  *                                      source link it is — truncating, mono
  *   `dg-render-table__count-cell`      a figure column, mono and tabular
  *   `dg-is-outlier`                    a count far above the loaded median
- *   `dg-render-table__trigger`         one histogram chip, with its five
- *   `dg-render-table__trigger--*`      per-trigger variants
- *   `dg-render-table__changed-props`   the wrapping key list
+ *   `dg-render-table__trigger`         one histogram chip, which also carries
+ *   `dg-trigger-chip`                  the chip rule it shares with the
+ *                                      component tree (hue from
+ *                                      `renderTriggerAppearance`), plus
+ *   `dg-trigger-chip--dashed`          the `unknown` hairline and
+ *   `dg-trigger-chip--idle`            the receded hairline of an empty bucket
+ *   `dg-render-table__changed-props`   the wrapping name list — of changed
+ *                                      props, and of changed contexts
  *   `dg-render-table__detail`          the per-render list of an expanded row
  *   `dg-render-table__occurrence`      one render in that list, with
  *                                      `dg-is-selected` while it is the
@@ -231,7 +280,6 @@ import { Stack } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
 import type { ToolbarSelect } from '../layout/Toolbar';
 import { Badge } from '../primitives/Badge';
-import type { BadgeTone } from '../primitives/Badge';
 import { Button } from '../primitives/Button';
 import { Code } from '../primitives/Code';
 import { DataTable } from '../primitives/DataTable';
@@ -248,8 +296,15 @@ import { LoadingState } from '../primitives/LoadingState';
 import type { SelectOption } from '../primitives/Select';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
-import { renderTriggerColorVar } from '../utils/color';
-import { formatCount, formatOffset, formatRenderTriggerLabel, truncate } from '../utils/format';
+import { renderTriggerAppearance } from '../utils/color';
+import {
+  formatCount,
+  formatCountOf,
+  formatDuration,
+  formatOffset,
+  formatRenderTriggerLabel,
+  truncate,
+} from '../utils/format';
 import { SourceLink } from './SourceLink';
 
 /*
@@ -329,8 +384,20 @@ const EMPTY_PAGE_TITLE = 'Nothing on this page';
 const OCCURRENCES_TRUNCATED_NOTE =
   'Not every render is listed: the per-render list is bounded by the producer.';
 
+/**
+ * The expanded row's heading for the component's whole name - the one place it
+ * is always shown in full, however narrow the Component column ellipsizes it.
+ */
+const COMPONENT_NAME_TITLE = 'Component';
+
 /** The expanded row's heading for the list of individual renders. */
 const OCCURRENCES_TITLE = 'Individual renders';
+
+/**
+ * Prefixes the instance count of a line that stands for several renders of the
+ * component in one commit (`×12`), matching {@link CHANGE_COUNT_PREFIX}.
+ */
+const INSTANCE_COUNT_PREFIX = '×';
 
 /** What the per-render offsets in an expanded row are measured from. */
 const OFFSET_NOTE = 'Offsets are measured from this component’s first observed render.';
@@ -352,6 +419,40 @@ const NO_CHANGED_PROPS_LABEL = 'No prop changes reported';
 
 /** Stated wherever prop names are shown, so no reader infers that values exist. */
 const PROP_VALUES_NOTE = 'Names and change counts only — prop values are never captured.';
+
+/** The expanded row's heading for the per-provider context change counts. */
+const CHANGED_CONTEXTS_TITLE = 'Changed contexts';
+
+/**
+ * What an empty changed-context list means: nothing was reported — which is
+ * not the claim that no context changed. A row from a build that did not
+ * record the names reads the same way, because it reported none either.
+ */
+const NO_CHANGED_CONTEXTS_LABEL = 'No context changes reported';
+
+/**
+ * What a changed-context name IS, stated wherever the names are listed: the
+ * component that provides the context, which is where its value comes from and
+ * so what a reader opens — never the consumer whose row it is.
+ */
+const CONTEXT_NAMES_NOTE =
+  'Each name is the component that provides a context whose value changed — or the context’s own name where no provider could be read. Names and change counts only — context values are never captured.';
+
+/**
+ * The lead of the `context` histogram chip's description, completed with the
+ * providers the row names and their counts. Worded as the contexts that
+ * changed rather than as the renders the chip counts: a render classified
+ * under another trigger may have seen a context change too, so the per-name
+ * counts are not a breakdown of the chip's figure.
+ */
+const CONTEXT_PROVIDERS_LEAD = 'Contexts that changed, by providing component:';
+
+/**
+ * The separator between an individual render's trigger chip and the names of
+ * the contexts that changed at that render. Decorative: hidden from assistive
+ * technology, which reads the names as their own phrase after the chip.
+ */
+const OCCURRENCE_CONTEXTS_SEPARATOR = '·';
 
 /**
  * The disclosure control's name while a row is collapsed — the stem
@@ -386,6 +487,43 @@ const SORT_LABEL = 'Order renders';
 /** The toolbar's own accessible name. */
 const TOOLBAR_LABEL = 'Render table order';
 
+/**
+ * The toolbar's accessible name while it also holds the component-scope
+ * control, so the group's name covers both of the controls inside it.
+ */
+const TOOLBAR_WITH_SCOPE_LABEL = 'Render table order and scope';
+
+/**
+ * The component-scope control's accessible name. Visually hidden like the
+ * order control's — each option states what it shows — and specific to this
+ * table for the same reason.
+ */
+const SCOPE_LABEL = 'Render table components';
+
+/**
+ * The stem of each scope option, completed with how many loaded rows it shows
+ * (see {@link scopeOptions}), so the reader sees what a choice costs before
+ * making it.
+ */
+const SCOPE_OPTION_STEMS: Readonly<Record<ComponentScope, string>> = Object.freeze({
+  project: 'Project components',
+  all: 'All components',
+});
+
+/** The mark beside the name of a row outside the project, under "All components". */
+const OUTSIDE_PROJECT_LABEL = 'Outside project';
+
+/**
+ * What that mark means. Worded as what the aggregate observed — the name is
+ * not among the project's own declarations — rather than as a verdict, since
+ * a row the resolver could not place at all carries the same mark.
+ */
+const OUTSIDE_PROJECT_DESCRIPTION =
+  'Not declared in this project’s source — typically a framework or library component that the project’s own code renders.';
+
+/** Key under which the component scope is reported to `PanelActions.onFilterChange`. */
+const SCOPE_FILTER_KEY = 'componentScope';
+
 /*
  * ---------------------------------------------------------------------------
  * Columns
@@ -409,6 +547,7 @@ const COLUMN_KEYS = Object.freeze({
   unchanged: 'unchangedRenderCount',
   unknown: 'unknownTriggerCount',
   changedProps: 'changedPropKeys',
+  changedContexts: 'changedContexts',
   phases: 'phaseCounts',
 });
 
@@ -423,6 +562,7 @@ const COLUMN_HEADERS = Object.freeze({
   unchanged: 'Stable inputs',
   unknown: 'Unclassified',
   changedProps: 'Changed props',
+  changedContexts: CHANGED_CONTEXTS_TITLE,
   phases: 'Phases',
 });
 
@@ -449,6 +589,7 @@ const COLUMN_TOOLTIPS = Object.freeze({
   unknown:
     'Renders where at least one of those three inputs could not be evaluated, so nothing is claimed about them. Counted separately and never as a stable-input render.',
   changedProps: `Names of the props observed to change, with a per-name count in the expanded row. ${PROP_VALUES_NOTE}`,
+  changedContexts: `The contexts observed to change at this component’s renders, most frequent first, each with the number of renders it changed at. ${CONTEXT_NAMES_NOTE}`,
   phases:
     'Renders by commit phase. A phase that was not recorded is in neither bucket, so these may total less than the render count.',
 });
@@ -481,18 +622,20 @@ const COLUMN_TOOLTIPS = Object.freeze({
  *                           so the two figure columns read as a pair
  *   changedProps  text      the changed-prop names, which wrap, so the list is
  *                           as tall as the histogram beside it
+ *   changedContexts text    the changed-context provider names with their
+ *                           counts, which wrap exactly like the prop list
  *   phases        label     one short phase chip per line
  *
  * Every role has a non-zero floor, and the primitive sums the columns' floors
  * and minimums into the grid's own width (`--dgc-readable-inline`,
  * `--dgc-min-inline`). A panel just too narrow for every floor narrows the
- * three `text` columns (the component name, the trigger histogram and the prop
- * list), never below the `--dg-column-yield` fraction of theirs, only as far
- * as the table needs to fit; a panel too narrow even for that keeps every
+ * four `text` columns (the component name, the trigger histogram and the two
+ * name lists), never below the `--dg-column-yield` fraction of theirs, only as
+ * far as the table needs to fit; a panel too narrow even for that keeps every
  * floor and scrolls the table horizontally with every column readable, instead
  * of squeezing a column to its padding and painting one cell's content over
  * the next. Once every floor is met, spare width goes mostly to the name, the
- * histogram and the prop list, and barely to a figure column. A token floor and
+ * histogram and the name lists, and barely to a figure column. A token floor and
  * a ratio resolve identically in the header row and in every data row, which is
  * what keeps each column under its own heading (see `../primitives/DataTable`
  * on why an intrinsic track does not).
@@ -507,6 +650,7 @@ const COLUMN_WIDTHS = Object.freeze({
   unchanged: 'count',
   unknown: 'count',
   changedProps: 'text',
+  changedContexts: 'text',
   phases: 'label',
 } satisfies Record<keyof typeof COLUMN_KEYS, DataTableColumnWidth>);
 
@@ -571,34 +715,12 @@ export type PhaseDisplayOrderIsTotal = AssertNever<
   Exclude<RenderPhase, (typeof PHASE_DISPLAY_ORDER)[number]>
 >;
 
-/**
- * The text tone of each bucket's chip, mirroring `RENDER_TRIGGER_TOKEN_KEYS` in
- * `../utils/color`: a changed input is informational, a stable-input render is
- * the actionable warning, and an unclassified render is neutral because it makes
- * no claim. The chip's hairline is taken from that module directly (see
- * {@link TriggerChip}), so the colour decision itself lives in one place and
- * this table only chooses the primitive's tone that matches it.
+/*
+ * A bucket's tone, hue and hairline are not decided here: `renderTriggerAppearance`
+ * in `../utils/color` answers all three for the chip, and the component tree
+ * asks the same function, so one trigger is drawn identically in both views.
+ * See {@link TriggerChip}.
  */
-const TRIGGER_TONES: Readonly<Record<RenderTrigger, BadgeTone>> = Object.freeze({
-  props: 'info',
-  state: 'info',
-  context: 'info',
-  unchanged: 'warning',
-  unknown: 'neutral',
-});
-
-/**
- * The per-bucket variant class. `--unknown` is the one that carries a second,
- * non-colour signal (a dashed hairline), because its distinction from
- * `--unchanged` has to survive a monochrome surface.
- */
-const TRIGGER_CLASSES: Readonly<Record<RenderTrigger, string>> = Object.freeze({
-  props: 'dg-render-table__trigger--props',
-  state: 'dg-render-table__trigger--state',
-  context: 'dg-render-table__trigger--context',
-  unchanged: 'dg-render-table__trigger--unchanged',
-  unknown: 'dg-render-table__trigger--unknown',
-});
 
 /*
  * ---------------------------------------------------------------------------
@@ -660,6 +782,47 @@ const DEFAULT_SORT: DataQuerySort = 'count_desc';
 
 /*
  * ---------------------------------------------------------------------------
+ * Component scope
+ *
+ * The one presentation filter this view applies, under the honesty rule the
+ * module documentation states ("ORDERING BELONGS TO THE DATA LAYER"): it hides
+ * only rows the aggregate marked as outside the project, over the loaded pages
+ * only, and says how many it hides.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The two scopes the control offers, in the order it offers them. */
+const COMPONENT_SCOPES = Object.freeze(['project', 'all'] as const);
+
+/** One member of {@link COMPONENT_SCOPES}. */
+type ComponentScope = (typeof COMPONENT_SCOPES)[number];
+
+/**
+ * The scope a table opens in whenever the control is offered: the project's
+ * own components, which are what a developer can change.
+ */
+const DEFAULT_COMPONENT_SCOPE: ComponentScope = 'project';
+
+/**
+ * The scope in force while the control is not offered: everything, because
+ * with no row of each kind loaded there is nothing a scope could honestly
+ * separate.
+ */
+const UNSCOPED: ComponentScope = 'all';
+
+/**
+ * Whether a control value names a scope — the guard behind the scope select,
+ * which rejects a value that never belonged to its options.
+ *
+ * @param value The control's value.
+ * @returns `true` for a member of {@link COMPONENT_SCOPES}.
+ */
+function isComponentScope(value: string): value is ComponentScope {
+  return COMPONENT_SCOPES.some((scope) => scope === value);
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Presentation bounds
  *
  * Counts, never lengths: nothing below reaches a class, a custom property or a
@@ -690,6 +853,24 @@ const MIN_ROWS_FOR_OUTLIERS = 4;
 
 /** How many prop names a cell shows before the rest are summarised as "+N more". */
 const MAX_PROP_KEYS_IN_CELL = 4;
+
+/**
+ * How many changed-context names a row's cell, and an individual render's
+ * line, show before the rest are summarised as "+N more". The same budget as
+ * the prop list beside it, so the two name columns read alike; the expanded
+ * row lists every name that arrived.
+ */
+const MAX_CONTEXT_NAMES_IN_CELL = 4;
+
+/**
+ * How many providers the `context` histogram chip's description names before
+ * the rest are summarised: the leading few are the ones a reader acts on, and
+ * the full list is one column to the right.
+ */
+const MAX_CONTEXT_PROVIDERS_IN_DESCRIPTION = 3;
+
+/** The name list of a row or render that reports none: stable, and shared. */
+const NO_NAMES: readonly string[] = Object.freeze([]);
 
 /** How many skeleton rows the loading silhouette draws. A count. */
 const LOADING_ROWS = 6;
@@ -947,6 +1128,124 @@ function appendPage(
 }
 
 /**
+ * Whether the aggregate marked a row as outside the project — a framework or
+ * library component, or one no route could place in the project's source.
+ *
+ * Only an explicit `false` counts. The field is read as `unknown` because a
+ * stored row from a build that predates it carries none, and a row that does
+ * not say is never treated as one that said "outside".
+ *
+ * @param stat The row.
+ * @returns `true` only when the row says it is not declared in the project.
+ */
+function isOutsideProject(stat: RenderStat): boolean {
+  const declared: unknown = stat.declaredInProject;
+
+  return declared === false;
+}
+
+/** What the loaded rows say about the component scope. */
+interface ScopeSummary {
+  /**
+   * Whether the scope control is offered: at least one loaded row is declared
+   * in the project and at least one is outside it. Otherwise a scope would
+   * either hide nothing or hide everything, and neither is a choice.
+   */
+  readonly offered: boolean;
+
+  /** How many loaded rows the project scope keeps — every row not marked outside. */
+  readonly projectCount: number;
+
+  /** How many loaded rows there are, which is what the "all" scope shows. */
+  readonly allCount: number;
+}
+
+/**
+ * Reads the component scope off every loaded row, in one pass.
+ *
+ * @param rows Every row loaded so far.
+ * @returns Whether a scope is offered and the count each scope would show.
+ */
+function summarizeScope(rows: readonly RenderStat[]): ScopeSummary {
+  let declared = 0;
+  let outside = 0;
+
+  for (const stat of rows) {
+    const flag: unknown = stat.declaredInProject;
+
+    if (flag === true) {
+      declared += 1;
+    } else if (flag === false) {
+      outside += 1;
+    }
+  }
+
+  return {
+    offered: declared > 0 && outside > 0,
+    projectCount: rows.length - outside,
+    allCount: rows.length,
+  };
+}
+
+/**
+ * The loaded rows a scope shows, in provider order.
+ *
+ * The project scope drops the rows marked outside the project and nothing
+ * else; the order of the rows it keeps is the order they arrived in, because
+ * this is a presentation filter over what was loaded and never a re-ranking.
+ * When nothing is dropped the loaded array itself is returned, so the grid
+ * receives the same stable value it would without a scope.
+ *
+ * @param rows Every row loaded so far.
+ * @param scope The scope in force.
+ * @returns The rows to draw.
+ */
+function rowsInScope(rows: readonly RenderStat[], scope: ComponentScope): readonly RenderStat[] {
+  if (scope === 'all') {
+    return rows;
+  }
+
+  const kept = rows.filter((stat) => !isOutsideProject(stat));
+
+  return kept.length === rows.length ? rows : kept;
+}
+
+/**
+ * The scope control's options, each stating how many loaded rows it shows.
+ *
+ * @param summary The loaded rows' {@link ScopeSummary}.
+ * @returns The options, in {@link COMPONENT_SCOPES} order.
+ *
+ * @example
+ * ```ts
+ * scopeOptions({ offered: true, projectCount: 18, allCount: 30 });
+ * // [{ value: 'project', label: 'Project components (18)' },
+ * //  { value: 'all', label: 'All components (30)' }]
+ * ```
+ */
+function scopeOptions(summary: ScopeSummary): readonly SelectOption[] {
+  return COMPONENT_SCOPES.map((scope) => ({
+    value: scope,
+    label: `${SCOPE_OPTION_STEMS[scope]} (${formatCount(
+      scope === 'project' ? summary.projectCount : summary.allCount,
+    )})`,
+  }));
+}
+
+/**
+ * The footer's disclosure of the rows the scope hides, or `undefined` when it
+ * hides none.
+ *
+ * @param hidden How many loaded rows are out of view.
+ * @returns The sentence, e.g. `12 components outside the project hidden.`
+ */
+function hiddenRowsText(hidden: number): string | undefined {
+  return hidden > 0
+    ? `${formatCount(hidden)} ${componentNoun(hidden)} outside the project hidden.`
+    : undefined;
+}
+
+/**
  * A stable identity for a query, field by field.
  *
  * Two uses, both of which need the *contents* rather than the object: it keys
@@ -1069,6 +1368,157 @@ function changedPropCount(
 }
 
 /**
+ * Whether a value is an array, with its elements read as `unknown`.
+ *
+ * A predicate rather than an inline `Array.isArray`, which narrows to `any[]`
+ * and would let an unchecked element reach the DOM.
+ *
+ * @param value Anything.
+ * @returns `true` when the value is an array.
+ */
+function isUnknownArray(value: unknown): value is readonly unknown[] {
+  return Array.isArray(value);
+}
+
+/**
+ * The changed-context names a list carries, in the order the aggregate gave
+ * them — most frequent first for a row, by name for one render — with every
+ * entry that is not a non-blank string skipped and a repeated name kept once.
+ *
+ * Total over anything, because the field is recent: a row or render stored by
+ * a build that predates it carries no list at all, and that reads as an empty
+ * one — "no context changes reported" — rather than taking the view down. A
+ * repeat is dropped because each name is a React key where it is drawn.
+ *
+ * @param value The `changedContexts` field as it arrived.
+ * @returns The names, possibly none; never re-ordered.
+ */
+function contextNamesOf(value: unknown): readonly string[] {
+  if (!isUnknownArray(value) || value.length === 0) {
+    return NO_NAMES;
+  }
+
+  const names: string[] = [];
+  const seen = new Set<string>();
+
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.trim().length === 0 || seen.has(entry)) {
+      continue;
+    }
+
+    seen.add(entry);
+    names.push(entry);
+  }
+
+  return names;
+}
+
+/**
+ * The providers of the contexts that changed at a row's renders, most frequent
+ * first. Read through {@link contextNamesOf}, so an absent field is no names.
+ *
+ * @param stat The row.
+ * @returns The names, possibly none.
+ */
+function rowContextNames(stat: RenderStat): readonly string[] {
+  const value: unknown = stat.changedContexts;
+
+  return contextNamesOf(value);
+}
+
+/**
+ * The providers of the contexts that changed at one render. Read through
+ * {@link contextNamesOf}, so an absent field is no names.
+ *
+ * @param occurrence The render.
+ * @returns The names, possibly none.
+ */
+function occurrenceContextNames(occurrence: RenderOccurrence): readonly string[] {
+  const value: unknown = occurrence.changedContexts;
+
+  return contextNamesOf(value);
+}
+
+/**
+ * How many of a row's renders one named context changed at.
+ *
+ * On the same terms as {@link changedPropCount}: `undefined` rather than `0`
+ * when the row reports no usable count for a name it lists, so the caller
+ * omits the figure instead of printing a zero beside a name that is listed
+ * because it changed. The map is read as `unknown` and by own property only,
+ * because it may be absent on a stored row, and because a provider named like
+ * a member of `Object.prototype` must not read that member.
+ *
+ * @param stat The row.
+ * @param name The provider name.
+ * @returns The count, or `undefined` when the row did not report one.
+ */
+function changedContextCount(stat: RenderStat, name: string): number | undefined {
+  const counts: unknown = stat.changedContextCounts;
+
+  if (typeof counts !== 'object' || counts === null || !Object.hasOwn(counts, name)) {
+    return undefined;
+  }
+
+  const value: unknown = Reflect.get(counts, name);
+
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(value, 0) : undefined;
+}
+
+/**
+ * A name as a name chip draws it: bounded by the shared truncation budget and
+ * followed by its count when one was reported, behind the prefix that stops
+ * `name ×4` being read as part of the name.
+ *
+ * @param name The name.
+ * @param count Its count, or `undefined` to draw the name alone.
+ * @returns The chip's text.
+ */
+function nameWithCount(name: string, count: number | undefined): string {
+  return count === undefined
+    ? truncate(name)
+    : `${truncate(name)} ${CHANGE_COUNT_PREFIX}${formatCount(count)}`;
+}
+
+/**
+ * The description the `context` chip of a row's trigger histogram carries:
+ * the leading providers the row names, in the aggregate's order, each with its
+ * count, and how many more there are.
+ *
+ * `undefined` when the row names no provider, so the chip stays the plain,
+ * unfocusable chip its column header explains — a description that could only
+ * say "unnamed" would be a control with nothing to add.
+ *
+ * @param stat The row.
+ * @param names The row's names, as {@link rowContextNames} read them.
+ * @returns The description, or `undefined` when there is none to give.
+ *
+ * @example
+ * ```ts
+ * contextProvidersDescription(stat, ['<ProviderA>', '<ProviderB>']);
+ * // 'Contexts that changed, by providing component: <ProviderA> ×12, <ProviderB> ×3.'
+ * ```
+ */
+function contextProvidersDescription(
+  stat: RenderStat,
+  names: readonly string[],
+): string | undefined {
+  if (names.length === 0) {
+    return undefined;
+  }
+
+  const shown = names.slice(0, MAX_CONTEXT_PROVIDERS_IN_DESCRIPTION);
+  const remaining = names.length - shown.length;
+  const listed = shown
+    .map((name) => nameWithCount(name, changedContextCount(stat, name)))
+    .join(', ');
+
+  return remaining > 0
+    ? `${CONTEXT_PROVIDERS_LEAD} ${listed}, +${formatCount(remaining)} more.`
+    : `${CONTEXT_PROVIDERS_LEAD} ${listed}.`;
+}
+
+/**
  * The median of a list of counts.
  *
  * @param values The counts, in any order; the input is not mutated.
@@ -1098,14 +1548,16 @@ function median(values: readonly number[]): number | undefined {
 
 /**
  * The render count above which a row is marked as standing out, derived from the
- * rows that are actually loaded.
+ * rows that are actually loaded and in view.
  *
  * `undefined` — no row is marked — whenever the heuristic would be meaningless:
  * too few rows to have a distribution, or a median of zero, where every non-zero
  * count would qualify and the mark would say nothing.
  *
- * @param stats Every row loaded so far — all accumulated pages, not only the
- *        latest one — so the mark describes what the reader has on screen.
+ * @param stats Every loaded row the component scope shows — all accumulated
+ *        pages, not only the latest one — so the mark describes what the
+ *        reader has on screen and is compared against, and a row the scope
+ *        hides can neither raise nor lower the bar.
  * @returns The threshold, or `undefined` when no row should be marked.
  */
 function outlierThreshold(stats: readonly RenderStat[]): number | undefined {
@@ -1224,6 +1676,56 @@ function selectOccurrenceLabel(component: string | undefined, offset: string): s
     : `${SELECT_OCCURRENCE_VERB} ${component} render at ${offset}`;
 }
 
+/**
+ * How many renders one listed occurrence stands for.
+ *
+ * The browser agent coalesces the fibers of a component that rendered alike in
+ * one commit into a single event, and the aggregate carries that group's size
+ * as `instanceCount` — present only when it is more than one. Anything else
+ * (absent, non-integer, below two) counts as the single render an uncoalesced
+ * event is, so a malformed weight can never inflate or erase a render.
+ *
+ * @param occurrence The listed render.
+ * @returns A whole number of at least one.
+ *
+ * @example
+ * ```ts
+ * occurrenceWeight({ ...occurrence, instanceCount: 12 }); // 12
+ * occurrenceWeight(occurrence); // 1
+ * ```
+ */
+function occurrenceWeight(occurrence: RenderOccurrence): number {
+  const count = occurrence.instanceCount;
+  return count !== undefined && Number.isInteger(count) && count > 1 ? count : 1;
+}
+
+/**
+ * The definition behind a grouped line's `×N` badge: how many renders it
+ * stands for, that its duration is their sum, and — when known — the slowest
+ * one, so a summed time is never read as the cost of one render.
+ *
+ * @param weight The group's size, at least two.
+ * @param maxInstanceDurationMs The slowest instance's time, when reported.
+ * @returns The sentence.
+ *
+ * @example
+ * ```ts
+ * groupedRenderDescription(12, 3.4);
+ * // '12 renders of this component in one commit, listed as one line. The time shown is their total; the slowest took 3.4 ms.'
+ * ```
+ */
+function groupedRenderDescription(
+  weight: number,
+  maxInstanceDurationMs: number | undefined,
+): string {
+  const lead = `${formatCountOf(weight, 'render')} of this component in one commit, listed as one line. The time shown is their total`;
+  return maxInstanceDurationMs === undefined ||
+    !Number.isFinite(maxInstanceDurationMs) ||
+    maxInstanceDurationMs < 0
+    ? `${lead}.`
+    : `${lead}; the slowest took ${formatDuration(maxInstanceDurationMs)}.`;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Parts
@@ -1264,10 +1766,15 @@ interface TriggerChipProps {
  * The word is the vocabulary member verbatim rather than a paraphrase, because
  * the five words are what the metric ids, the analysis and this table all use —
  * and because `unchanged` and `unknown` must read as two different answers at a
- * glance. Three signals carry that difference: the word itself, the tone (the
- * actionable warning against a neutral non-claim) and, for `unknown` alone, a
- * dashed hairline that survives a monochrome surface. The hairline colour comes
- * from `../utils/color`, so this file states no colour of its own.
+ * glance. Three signals carry that difference: the word itself, the colour (the
+ * actionable warning against a muted non-claim) and, for `unknown` alone, a
+ * dashed hairline that survives a monochrome surface. The three input triggers
+ * each take a hue of their own, so "driven by context" and "driven by props"
+ * read apart before their words are read, and a bucket whose count is zero is
+ * drawn idle in the muted colour, so an empty `unchanged` bucket never carries
+ * the warning colour. Every one of those decisions comes from
+ * `renderTriggerAppearance` in `../utils/color`, so this file states no colour
+ * of its own.
  *
  * A chip that carries a description is focusable, and never a Tab stop
  * (`tabIndex={-1}`). `Tooltip` opens on focus arriving inside it, so a chip
@@ -1276,23 +1783,33 @@ interface TriggerChipProps {
  * controls of a row and its open detail (`../primitives/DataTable`). An arrow
  * key landing on the chip opens its description exactly as a Tab would, and
  * the first Escape closes the bubble before the second returns to the row.
- * Only the single-render form inside an expanded row carries a description,
- * while the histogram form in every grid row is explained by its column header
- * and is not focusable at all.
+ * The single-render form inside an expanded row always carries a description.
+ * The histogram form in a grid row is explained by its column header and is
+ * not focusable, with one exception: the `context` chip of a row that names
+ * the providers of its changed contexts carries those names as its
+ * description, because the header can define the bucket but cannot say whose
+ * context it was.
  *
  * @param props See {@link TriggerChipProps}.
  * @returns The chip, wrapped in a tooltip when a description was supplied.
  */
 function TriggerChip(props: TriggerChipProps): ReactElement {
   const { trigger, count, description } = props;
+  const appearance = renderTriggerAppearance(trigger, count);
 
   const chip = (
     <Badge
-      tone={TRIGGER_TONES[trigger]}
+      tone={appearance.tone}
       variant="outline"
-      color={renderTriggerColorVar(trigger)}
-      className={clsx('dg-render-table__trigger', TRIGGER_CLASSES[trigger])}
+      color={appearance.colorVar}
+      className={clsx(
+        'dg-render-table__trigger',
+        'dg-trigger-chip',
+        appearance.dashed && 'dg-trigger-chip--dashed',
+        appearance.idle && 'dg-trigger-chip--idle',
+      )}
       data-trigger={trigger}
+      data-trigger-idle={appearance.idle ? 'true' : undefined}
       tabIndex={description === undefined ? undefined : -1}
     >
       {count === undefined ? trigger : `${trigger} ${formatCount(count)}`}
@@ -1391,6 +1908,11 @@ interface OccurrenceRowProps {
  * base and their text would be noise beside the renders it is being compared
  * with (`../utils/format` makes the same choice for every other view).
  *
+ * A line that stands for several renders of the component in one commit — the
+ * browser agent coalesces fibers that rendered alike into one event — carries a
+ * `×N` badge whose tooltip says the duration beside it is their total and how
+ * long the slowest took, so a summed time is never read as one render's cost.
+ *
  * This is the only item in this view that is one captured event, so it is the
  * only one that offers selection — the aggregate row above it stands for many.
  * The render that is the panel's selected event is marked with the design
@@ -1404,6 +1926,13 @@ interface OccurrenceRowProps {
  * one Tab stop, and its arrow keys walk the controls of a row and its open
  * detail in document order (`../primitives/DataTable`).
  *
+ * A render that saw contexts change names their providers right after its
+ * trigger chip — `context · <ProviderA>, <ProviderB>` — whatever trigger it was
+ * classified under, since the names are attribution rather than
+ * classification. The separator is decoration and hidden from assistive
+ * technology, which hears the names behind a visually hidden lead instead.
+ * Plain text, never a control, so the line's arrow-key walk is unchanged.
+ *
  * @param props See {@link OccurrenceRowProps}.
  * @returns The row.
  */
@@ -1411,6 +1940,10 @@ function OccurrenceRow(props: OccurrenceRowProps): ReactElement {
   const { occurrence, originEpochMs, component, onSelect, selected } = props;
 
   const offset = formatOffset(occurrence.startTime, originEpochMs);
+  const weight = occurrenceWeight(occurrence);
+  const contexts = occurrenceContextNames(occurrence);
+  const shownContexts = contexts.slice(0, MAX_CONTEXT_NAMES_IN_CELL);
+  const moreContexts = contexts.length - shownContexts.length;
 
   return (
     <Stack
@@ -1443,6 +1976,13 @@ function OccurrenceRow(props: OccurrenceRowProps): ReactElement {
         </Button>
       )}
       <DurationCell ms={occurrence.durationMs} severity="auto" size="sm" />
+      {weight > 1 ? (
+        <Tooltip content={groupedRenderDescription(weight, occurrence.maxInstanceDurationMs)}>
+          <Badge tone="neutral" variant="outline" data-instance-count={weight} tabIndex={-1}>
+            {`${INSTANCE_COUNT_PREFIX}${formatCount(weight)}`}
+          </Badge>
+        </Tooltip>
+      ) : null}
       {occurrence.phase === undefined ? null : (
         <Badge tone="neutral" variant="soft">
           {occurrence.phase}
@@ -1452,6 +1992,14 @@ function OccurrenceRow(props: OccurrenceRowProps): ReactElement {
         trigger={occurrence.trigger}
         description={formatRenderTriggerLabel(occurrence.trigger)}
       />
+      {shownContexts.length === 0 ? null : (
+        <Text as="span" size="xs" tone="secondary">
+          <span aria-hidden="true">{`${OCCURRENCE_CONTEXTS_SEPARATOR} `}</span>
+          <span className="dg-visually-hidden">{`${CHANGED_CONTEXTS_TITLE}: `}</span>
+          {shownContexts.map((name) => truncate(name)).join(', ')}
+          {moreContexts > 0 ? `, +${formatCount(moreContexts)} more` : null}
+        </Text>
+      )}
       {occurrence.source === undefined ? null : (
         <SourceLink location={occurrence.source} compact tabIndex={-1} />
       )}
@@ -1472,15 +2020,25 @@ interface RenderDetailProps {
 }
 
 /**
- * The detail of an expanded row: the individual renders behind the count, and
- * the per-name changed-prop counts behind the summary cell.
+ * The detail of an expanded row: the component's whole name, the individual
+ * renders behind the count, and the per-name changed-prop and changed-context
+ * counts behind the two summary cells.
  *
- * Both lists say what they are bounded by. The render list states how many of
+ * The name comes first and is shown whole and wrapping, exactly as captured: the
+ * Component column ellipsizes it to its width, and the row's chip, when the row
+ * resolved to a location, describes that location rather than the name, so the
+ * detail - opened by the row's toggle or by ArrowRight - is where the whole of a
+ * long name is always readable, by pointer and keyboard alike. A blank name
+ * shows no heading over nothing.
+ *
+ * Every list says what it is bounded by. The render list states how many of
  * the component's renders it holds and, when the producer said its list is
  * incomplete, says so outright — an expansion that silently showed a prefix
  * would invite the reader to count renders that are not there. The prop list
  * states that names and counts are all that exist, so its length is never read
- * as the width of a props object.
+ * as the width of a props object. The context list states what each name is —
+ * the providing component — and lists every name the row carries, which is
+ * where the cell's "+N more" leads.
  *
  * @param props See {@link RenderDetailProps}.
  * @returns The detail block.
@@ -1490,16 +2048,34 @@ function RenderDetail(props: RenderDetailProps): ReactElement {
 
   const occurrences = stat.occurrences;
   const keys = stat.changedPropKeys;
+  const contexts = rowContextNames(stat);
   const component = rowIdentity(stat);
+  // Counted in renders, not lines: a coalesced line stands for several, so a
+  // complete list must read "Listing 12 of 12" rather than look truncated.
+  const listedRenders = occurrences.reduce(
+    (total, occurrence) => total + occurrenceWeight(occurrence),
+    0,
+  );
 
   return (
     <Stack gap={3} className="dg-render-table__detail">
+      {component === undefined ? null : (
+        <Stack gap={1}>
+          <Text as="p" size="sm" weight="medium">
+            {COMPONENT_NAME_TITLE}
+          </Text>
+          <Code size="sm" wrap>
+            {stat.component}
+          </Code>
+        </Stack>
+      )}
+
       <Stack gap={1}>
         <Text as="p" size="sm" weight="medium">
           {OCCURRENCES_TITLE}
         </Text>
         <Text as="p" size="xs" tone="muted">
-          {`Listing ${formatCount(occurrences.length)} of ${formatCount(stat.renderCount)} renders. ${OFFSET_NOTE}`}
+          {`Listing ${formatCount(listedRenders)} of ${formatCount(stat.renderCount)} renders. ${OFFSET_NOTE}`}
         </Text>
         {stat.occurrencesTruncated ? (
           <Text as="p" size="xs" tone="warning">
@@ -1554,6 +2130,34 @@ function RenderDetail(props: RenderDetailProps): ReactElement {
                 </Code>
               );
             })}
+          </Stack>
+        )}
+      </Stack>
+
+      <Stack gap={1}>
+        <Text as="p" size="sm" weight="medium">
+          {CHANGED_CONTEXTS_TITLE}
+        </Text>
+        <Text as="p" size="xs" tone="muted">
+          {CONTEXT_NAMES_NOTE}
+        </Text>
+        {contexts.length === 0 ? (
+          <Text as="p" size="xs" tone="muted">
+            {NO_CHANGED_CONTEXTS_LABEL}
+          </Text>
+        ) : (
+          <Stack
+            direction="horizontal"
+            gap={1}
+            align="center"
+            wrap
+            className="dg-render-table__changed-props"
+          >
+            {contexts.map((name) => (
+              <Code key={name} size="sm">
+                {nameWithCount(name, changedContextCount(stat, name))}
+              </Code>
+            ))}
           </Stack>
         )}
       </Stack>
@@ -1698,6 +2302,15 @@ interface ColumnContext {
    */
   readonly hasRows: boolean;
 
+  /**
+   * Whether a row marked outside the project carries the "Outside project"
+   * mark beside its name: while the reader has chosen "All components" from an
+   * offered scope control, and only then. Without the control the loaded rows
+   * are not known to hold a single project component, so the mark would have
+   * nothing to be told apart from.
+   */
+  readonly markOutsideProject: boolean;
+
   /** Opens or closes a row's per-render list. */
   readonly onToggle: (stat: RenderStat) => void;
 }
@@ -1707,13 +2320,13 @@ interface ColumnContext {
  *
  * Every field read below is one the node catalog declares for this node type
  * (`catalogEntryFor('renderTable').reads`: span identity, timing and taxonomy
- * fields, `parentSpanId` and `source` when present, and six render attribute
- * keys — `component`, `phase`, `renderCount`, `changedProps`, `trigger` and
- * `actualDuration`), and the
+ * fields, `parentSpanId` and `source` when present, and seven render attribute
+ * keys — `component`, `phase`, `renderCount`, `changedProps`, `trigger`,
+ * `actualDuration` and `changedContexts`), and the
  * aggregate that answers the `renders` source is where those fields are already
  * folded into per-component rows.
  *
- * Two of the ten columns exist for one reason, and it is the reason this whole
+ * Two of the eleven columns exist for one reason, and it is the reason this whole
  * view is evidence rather than a chart: `Stable inputs` and `Unclassified` are
  * separate columns, with separate headers and separate definitions, because the
  * counts behind them mean opposite things. Nothing in this function combines
@@ -1732,15 +2345,17 @@ interface ColumnContext {
  * location, so there is one source control per row and the reader clicks the
  * name itself. A row that resolved to no location draws the name as text.
  * Either way the name ellipsizes inside its column rather than overprinting the
- * next one, and a tooltip keeps it readable: an unlinked name's tooltip is the
- * whole name, and a linked name's is the link's own — the declared symbol and
- * the full location.
+ * next one, and the whole of it stays reachable: an unlinked name's tooltip is
+ * the whole name as captured, a linked name's tooltip is the link's own — the
+ * declared symbol and the full location — and the row's expanded detail opens
+ * with the whole name in both cases ({@link RenderDetail}).
  *
  * Every description and every control is reachable from the keyboard, and
  * none of them adds a Tab stop: the grid is ONE stop, its active row, and
  * `../primitives/DataTable`'s arrow keys move focus onto everything else. So
  * every focusable element a cell renders — the disclosure toggle, the source
- * chip, the full name of a component with no location, a marked count figure —
+ * chip, the full name of a component with no location, the outside-project
+ * mark, a marked count figure, a `context` chip that names its providers —
  * is `tabIndex={-1}`, and so are the header's
  * definition triggers while rows exist ({@link DescribedHeader}), which
  * ArrowUp from the first row reaches as it does the grid's own sort buttons.
@@ -1753,7 +2368,7 @@ interface ColumnContext {
  * @returns The column definitions.
  */
 function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderStat>[] {
-  const { markAbove, hasRows, onToggle } = context;
+  const { markAbove, hasRows, markOutsideProject, onToggle } = context;
 
   // The header's definition triggers follow the grid's own rule for its sort
   // buttons: out of the Tab order while the body has a row to arrive through.
@@ -1804,11 +2419,14 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
             />
             {stat.source === undefined ? (
               // No location: the name is a label, and its tooltip is what makes
-              // an ellipsized name readable. The text is the tooltip's trigger,
-              // so it takes focus — as `tabIndex={-1}` in every row, never a Tab
-              // stop, exactly like the outlier figure: the grid's arrow keys
-              // land on it and open the tooltip.
-              <Tooltip content={name}>
+              // an ellipsized name readable — the WHOLE name as captured, not
+              // the budgeted caption, so a name past the preview budget is
+              // never cut in the one place a reader looks for the rest of it.
+              // The text is the tooltip's trigger, so it takes focus — as
+              // `tabIndex={-1}` in every row, never a Tab stop, exactly like
+              // the outlier figure: the grid's keys land on it and open the
+              // tooltip.
+              <Tooltip content={stat.component}>
                 <Text
                   as="span"
                   size="sm"
@@ -1821,20 +2439,34 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
               </Tooltip>
             ) : (
               // The name itself is the control. `stat.source` is handed over by
-              // reference, and the chip's own tooltip names the symbol and the
-              // full location whenever the caption stands in for them. Its
-              // accessible name leads with the name it shows and ends with the
-              // location it opens (`sourceLinkAccessibleName`), so the row
-              // header a screen reader announces for every cell carries the
-              // component without a second, hidden copy of it.
+              // reference, and the chip's own tooltip leads with the WHOLE name
+              // as captured (`labelDescription`), then the symbol and the full
+              // location, so a name past the preview budget stays readable here
+              // exactly as in the unlinked branch above. Its accessible name
+              // leads with the name it shows and ends with the location it
+              // opens (`sourceLinkAccessibleName`), so the row header a screen
+              // reader announces for every cell carries the component without a
+              // second, hidden copy of it.
               <SourceLink
                 location={stat.source}
                 label={name}
+                labelDescription={stat.component}
                 compact
                 tabIndex={-1}
                 className="dg-render-table__component-cell"
               />
             )}
+            {markOutsideProject && isOutsideProject(stat) ? (
+              // Beside the name, never inside it, so the name element still
+              // holds the name alone. Its explanation is a tooltip whose
+              // trigger takes focus as `tabIndex={-1}`, like every described
+              // element in the grid: the arrow keys reach it, Tab does not.
+              <Tooltip content={OUTSIDE_PROJECT_DESCRIPTION}>
+                <Badge tone="neutral" variant="soft" tabIndex={-1}>
+                  {OUTSIDE_PROJECT_LABEL}
+                </Badge>
+              </Tooltip>
+            ) : null}
           </Stack>
         );
       },
@@ -1877,7 +2509,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
           <Tooltip
             content={`More than ${formatCount(markAbove)} renders — over ${String(
               OUTLIER_MEDIAN_MULTIPLE,
-            )}× the median of the loaded rows.`}
+            )}× the median of the loaded rows in view.`}
           >
             {figure}
           </Tooltip>
@@ -1920,17 +2552,25 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       ),
       headerLabel: COLUMN_HEADERS.triggers,
       width: COLUMN_WIDTHS.triggers,
-      cell: (stat) => (
-        <Stack direction="horizontal" gap={1} align="center" wrap>
-          {TRIGGER_DISPLAY_ORDER.map((trigger) => (
-            <TriggerChip
-              key={trigger}
-              trigger={trigger}
-              count={triggerCount(stat.triggers, trigger)}
-            />
-          ))}
-        </Stack>
-      ),
+      cell: (stat) => {
+        // The header defines each bucket; only the row can say whose context
+        // changed. So the `context` chip alone carries a description, and only
+        // while the row names at least one provider.
+        const providers = contextProvidersDescription(stat, rowContextNames(stat));
+
+        return (
+          <Stack direction="horizontal" gap={1} align="center" wrap>
+            {TRIGGER_DISPLAY_ORDER.map((trigger) => (
+              <TriggerChip
+                key={trigger}
+                trigger={trigger}
+                count={triggerCount(stat.triggers, trigger)}
+                description={trigger === 'context' ? providers : undefined}
+              />
+            ))}
+          </Stack>
+        );
+      },
     },
     {
       key: COLUMN_KEYS.unchanged,
@@ -2007,6 +2647,58 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
             {shown.map((key) => (
               <Code key={key} size="sm">
                 {truncate(key)}
+              </Code>
+            ))}
+            {remaining > 0 ? (
+              <Badge tone="neutral" variant="soft">
+                {`+${formatCount(remaining)} more`}
+              </Badge>
+            ) : null}
+          </Stack>
+        );
+      },
+    },
+    {
+      key: COLUMN_KEYS.changedContexts,
+      header: (
+        <DescribedHeader
+          label={COLUMN_HEADERS.changedContexts}
+          description={COLUMN_TOOLTIPS.changedContexts}
+          tabIndex={headerTabIndex}
+        />
+      ),
+      headerLabel: COLUMN_HEADERS.changedContexts,
+      width: COLUMN_WIDTHS.changedContexts,
+      cell: (stat) => {
+        const names = rowContextNames(stat);
+
+        if (names.length === 0) {
+          return (
+            <Text as="span" size="xs" tone="muted">
+              {NO_CHANGED_CONTEXTS_LABEL}
+            </Text>
+          );
+        }
+
+        // The same cap as the prop list, over the names that ARRIVED and in
+        // the aggregate's order — most frequent first, so the provider behind
+        // most of this row's context renders is always the first chip. Each
+        // chip carries its count here, because which provider dominates is the
+        // point of the column; the expanded row lists every name.
+        const shown = names.slice(0, MAX_CONTEXT_NAMES_IN_CELL);
+        const remaining = names.length - shown.length;
+
+        return (
+          <Stack
+            direction="horizontal"
+            gap={1}
+            align="center"
+            wrap
+            className="dg-render-table__changed-props"
+          >
+            {shown.map((name) => (
+              <Code key={name} size="sm">
+                {nameWithCount(name, changedContextCount(stat, name))}
               </Code>
             ))}
             {remaining > 0 ? (
@@ -2223,6 +2915,15 @@ function useProviderGeneration(): number {
  * outer `key` does not take part: the reader's order is state of this instance,
  * never part of the node's query identity.
  *
+ * ## The component scope is a view over the loaded rows
+ *
+ * The reader's scope is state of this instance too, and it touches nothing
+ * the page sequence owns: choosing one neither re-queries nor releases a page,
+ * and the rows it hides are still in the accumulator "load more" freezes, in
+ * the footer's paging counters and behind every later page. It is offered
+ * from the toolbar only while the loaded rows hold both project and outside
+ * components, so a page that arrives later can bring the control into view.
+ *
  * @param props The same props as {@link RenderTable}.
  * @returns The block, in whichever of its four states applies.
  */
@@ -2242,6 +2943,8 @@ function RenderTableView(props: RenderTableProps): ReactElement {
   const [chosenSort, setChosenSort] = useState<DataQuerySort | undefined>(undefined);
   const [pages, setPages] = useState<PageAccumulator | undefined>(undefined);
   const [expandedKeys, setExpandedKeys] = useState<readonly string[]>(NO_EXPANDED_KEYS);
+  // `undefined` until the reader chooses, so the default follows the rows.
+  const [chosenScope, setChosenScope] = useState<ComponentScope | undefined>(undefined);
 
   // The size of every page in the sequence, and where its first page starts.
   // Neither moves while the reader pages: "load more" advances the offset only.
@@ -2290,6 +2993,18 @@ function RenderTableView(props: RenderTableProps): ReactElement {
   // grid's row key. Memoized so the grid receives one stable array per answer
   // rather than a fresh copy of every loaded row on every render.
   const rows = useMemo(() => appendPage(carriedRows, pageRows), [carriedRows, pageRows]);
+
+  // The component scope over every loaded row: offered only while the rows
+  // hold both kinds, defaulting to the project's own components, and a filter
+  // that keeps provider order. Everything that pages — the accumulator, the
+  // counters, "load more" — keeps reading `rows`; only the grid and the
+  // outlier mark read the rows in view.
+  const scopeSummary = useMemo(() => summarizeScope(rows), [rows]);
+  const appliedScope: ComponentScope = scopeSummary.offered
+    ? (chosenScope ?? DEFAULT_COMPONENT_SCOPE)
+    : UNSCOPED;
+  const visibleRows = useMemo(() => rowsInScope(rows, appliedScope), [rows, appliedScope]);
+  const hiddenText = hiddenRowsText(rows.length - visibleRows.length);
 
   // The provider's total, or the one it reported last while the next page is
   // in flight — so the footer never drops a total it was already told.
@@ -2357,6 +3072,21 @@ function RenderTableView(props: RenderTableProps): ReactElement {
     [actions, appliedSort, node.id],
   );
 
+  const handleScopeSelect = useCallback(
+    (value: string): void => {
+      // The same guard as the order control's: only a value the options named.
+      if (!isComponentScope(value)) {
+        return;
+      }
+
+      // A view over the rows already loaded, so no page is released and no
+      // query is issued — which is exactly what distinguishes it from an order.
+      setChosenScope(value);
+      actions?.onFilterChange?.(node.id, { [SCOPE_FILTER_KEY]: value });
+    },
+    [actions, node.id],
+  );
+
   const handleLoadMore = useCallback((): void => {
     // Only a resolved page with a provider-reported next offset can be advanced
     // from. The rows on screen — every earlier page plus this one — are frozen
@@ -2411,10 +3141,11 @@ function RenderTableView(props: RenderTableProps): ReactElement {
     [selection],
   );
 
-  // Over every accumulated row, so the mark describes what the reader has on
-  // screen; memoized because it sorts the counts, and the rows only change when
-  // a page arrives.
-  const markAbove = useMemo(() => outlierThreshold(rows), [rows]);
+  // Over every accumulated row the scope shows, so the mark describes what the
+  // reader has on screen and is comparing — a hidden framework component
+  // neither raises nor lowers the bar; memoized because it sorts the counts,
+  // and the rows in view only change when a page arrives or the scope changes.
+  const markAbove = useMemo(() => outlierThreshold(visibleRows), [visibleRows]);
 
   // Nothing is on screen: the page in flight is the first of its sequence, or
   // it failed, or it resolved with no rows. A next page in flight or failed
@@ -2469,9 +3200,12 @@ function RenderTableView(props: RenderTableProps): ReactElement {
     >
       {/* A polite live region, read whole: a page appended by "load more"
           changes the count, and a reader who pressed the control hears how
-          much of the result is now on screen without leaving it. */}
+          much of the result is now on screen without leaving it. The count is
+          of every loaded row — it is the paging counter — and the rows the
+          component scope keeps out of view are disclosed in the same line, so
+          the two figures are always heard together. */}
       <Text as="p" size="xs" tone="muted" aria-live="polite" aria-atomic="true">
-        {loadedText}
+        {hiddenText === undefined ? loadedText : `${loadedText} ${hiddenText}`}
       </Text>
       {showLoadMore ? (
         <Button variant="secondary" size="sm" disabled={appending} onClick={handleLoadMore}>
@@ -2496,30 +3230,46 @@ function RenderTableView(props: RenderTableProps): ReactElement {
 
   const columns = buildColumns({
     markAbove,
-    hasRows: rows.length > 0,
+    hasRows: visibleRows.length > 0,
+    markOutsideProject: scopeSummary.offered && appliedScope === 'all',
     onToggle: handleToggle,
   });
+
+  const sortSelect: ToolbarSelect = {
+    id: `${node.id}:sort`,
+    label: SORT_LABEL,
+    labelHidden: true,
+    value: appliedSort,
+    options: sortOptions(),
+    onValueChange: handleSortSelect,
+  };
+
+  // Offered only while the loaded rows hold both kinds; otherwise absent, not
+  // disabled, because there is no choice to make.
+  const scopeSelects: readonly ToolbarSelect[] = scopeSummary.offered
+    ? [
+        {
+          id: `${node.id}:scope`,
+          label: SCOPE_LABEL,
+          labelHidden: true,
+          value: appliedScope,
+          options: scopeOptions(scopeSummary),
+          onValueChange: handleScopeSelect,
+        },
+      ]
+    : [];
 
   return (
     <RenderTableShell className={className}>
       <Toolbar
-        label={TOOLBAR_LABEL}
+        label={scopeSummary.offered ? TOOLBAR_WITH_SCOPE_LABEL : TOOLBAR_LABEL}
         compact
         className="dg-render-table__toolbar"
-        selects={[
-          {
-            id: `${node.id}:sort`,
-            label: SORT_LABEL,
-            labelHidden: true,
-            value: appliedSort,
-            options: sortOptions(),
-            onValueChange: handleSortSelect,
-          } satisfies ToolbarSelect,
-        ]}
+        selects={[sortSelect, ...scopeSelects]}
       />
 
       <DataTable
-        rows={rows}
+        rows={visibleRows}
         columns={columns}
         rowKey={(stat) => stat.id}
         caption={TABLE_CAPTION}

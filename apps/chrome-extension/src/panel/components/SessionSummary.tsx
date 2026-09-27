@@ -24,12 +24,29 @@
  * ```text
  * Section (card, "Session", h2)
  * ├── identity           status Badge (tone + word) · project name · question · follow-ups
- * ├── Section "Progress"          (h3)  <ol> of service progress rows, first-arrival order
- * ├── Section "Instrumentation"   (h3)  plan objective · DataTable of modification records
- * │                                     └── conflict rows open a detail row with the explanation
- * ├── Section "Signals"           (h3)  enabled runtime hooks · unavailable signals with hints
- * └── Section "Cleanup"           (h3)  cleanup status Badge · count of files left untouched
+ * ├── disclosure         Button (aria-expanded + aria-controls) · counts while collapsed
+ * │                      — only when the composition root supplies `onToggleCollapsed`
+ * ├── collapsed:         the latest progress row, verbatim, with its status badge, and the
+ * │                      cleanup status Badge once there is a cleanup outcome
+ * └── expanded:          Stack (the details the disclosure controls)
+ *     ├── Section "Progress"          (h3)  <ol> of service progress rows, first-arrival order
+ *     ├── Section "Instrumentation"   (h3)  plan objective · DataTable of modification records
+ *     │                                     └── conflict rows open a detail row with the explanation
+ *     ├── Section "Signals"           (h3)  enabled runtime hooks · unavailable signals with hints
+ *     └── Section "Cleanup"           (h3)  cleanup status Badge · count of files left untouched
  * ```
+ *
+ * ## Collapsed, the summary is a digest
+ *
+ * Once a generated panel is on screen, the panel — not this summary — is the body of the DevTools
+ * panel (AAP 0.7.3), and a session's few dozen progress rows would push it below the fold. So the
+ * summary is collapsible, controlled by the composition root (`collapsed`, `onToggleCollapsed`),
+ * and collapsed it keeps exactly what identifies the session and where it stands: the region's
+ * name ("Session"), the status badge, the project name, the question, the latest progress row,
+ * the counts of steps, failed steps and modified files, and — once cleanup has an outcome — its
+ * status and the number of files it left untouched. The follow-up questions and the four
+ * blocks return when it is expanded. Without the two props the summary renders expanded with no
+ * disclosure control, as a caller that never collapses it expects.
  *
  * The heading outline continues the panel's: the header's wordmark is level 1 and the generated
  * panel's title inside `PanelHost` is level 2, so this summary is a level-2 region whose blocks
@@ -65,6 +82,10 @@
  *
  * - Status is never carried by colour alone: every badge has its word, and a progress row's word
  *   is part of the row's text, so a screen reader hears "Done understand Found …".
+ * - The disclosure control is the renderer's `Button` with `aria-expanded`, and `aria-controls`
+ *   naming the details while they are rendered; collapsed, the details are unmounted rather than
+ *   kept as an empty box, so the attribute is dropped with them and never names a missing element.
+ *   The region keeps its accessible name, "Session", in both states.
  * - The modification list is the renderer's `DataTable`: `role="grid"` with exact
  *   `aria-rowcount`/`aria-colcount`, the file as `rowheader`, one roving Tab stop and arrow-key
  *   navigation, all owned by the primitive. No column offers sorting — the rows come from the store
@@ -95,6 +116,7 @@
  */
 import {
   Badge,
+  Button,
   Code,
   DataTable,
   EmptyState,
@@ -116,7 +138,7 @@ import type {
   SessionStatus,
   SourceLocation,
 } from '@debuggen/protocol';
-import { useMemo } from 'react';
+import { useId, useMemo } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import type {
@@ -149,9 +171,10 @@ export interface SessionSummaryProps {
   session: SessionRecord | undefined;
 
   /**
-   * The progress rows, in first-arrival order, already deduplicated by stage and message and
-   * bounded by the store's `PANEL_PROGRESS_MAX_ENTRIES`. Rendered in exactly this order, all of
-   * them — this component adds no second bound.
+   * The progress rows, in first-arrival order, already deduplicated by stage and message, settled
+   * with their stage's header (a stage's failure in place of its running header) and bounded by the
+   * store's `PANEL_PROGRESS_MAX_ENTRIES`. Rendered in exactly this order, all of them — this
+   * component adds no second bound and re-derives no status.
    */
   progress: readonly PanelProgressEntry[];
 
@@ -191,6 +214,19 @@ export interface SessionSummaryProps {
    * see the module header for why no record rendered here carries a location to open.
    */
   onOpenSource?: ((location: SourceLocation) => void) | undefined;
+
+  /**
+   * Whether the summary shows only its digest — identity, the latest progress row and the counts —
+   * instead of its four blocks (see "Collapsed, the summary is a digest" in the module header).
+   * Controlled: the composition root decides, as it does for the live tail. Defaults to `false`.
+   */
+  collapsed?: boolean | undefined;
+
+  /**
+   * Raised by the disclosure control; the composition root flips `collapsed`. Omitted, no control
+   * is rendered.
+   */
+  onToggleCollapsed?: (() => void) | undefined;
 
   /** Extra classes for the outermost element, forwarded to the card `Section`. */
   className?: string | undefined;
@@ -348,6 +384,13 @@ const CLEANUP_TITLE = 'Cleanup';
 
 /** The label above the follow-up questions. */
 const FOLLOW_UPS_LABEL = 'Follow-up questions';
+
+/** The disclosure control's label in each state: it names what activating it does. */
+const SHOW_DETAILS_LABEL = 'Show session details';
+const HIDE_DETAILS_LABEL = 'Hide session details';
+
+/** The separator between the counts of the collapsed digest. */
+const COUNT_SEPARATOR = ' · ';
 
 /** The label above the enabled runtime hooks. */
 const ENABLED_SIGNALS_LABEL = 'Enabled';
@@ -630,12 +673,13 @@ function renderModifications(
 
 /**
  * The identity block: the status badge with its word, the project name, the question as typed and
- * any follow-up questions, oldest first.
+ * — unless the summary is collapsed — any follow-up questions, oldest first.
  *
  * @param session The bound session's record.
+ * @param showFollowUps Whether to list the follow-up questions.
  * @returns The block.
  */
-function renderIdentity(session: SessionRecord): ReactElement {
+function renderIdentity(session: SessionRecord, showFollowUps: boolean): ReactElement {
   const status = SESSION_STATUS_PRESENTATION[session.status];
 
   return (
@@ -649,7 +693,7 @@ function renderIdentity(session: SessionRecord): ReactElement {
       <Text as="p" size="md">
         {session.question}
       </Text>
-      {session.followUps.length > 0 ? (
+      {showFollowUps && session.followUps.length > 0 ? (
         <Stack gap={0}>
           <Text size="xs" tone="muted">
             {FOLLOW_UPS_LABEL}
@@ -695,8 +739,7 @@ function renderProgress(
         {progress.map((entry) => (
           // `(stage, message)` is the row's identity in the store, so it is unique here.
           <li key={`${entry.stage}\u0000${entry.message}`}>
-            {renderStatusBadge(PROGRESS_STATUS_PRESENTATION[entry.status])}{' '}
-            <Code size="sm">{entry.stage}</Code> <Text size="sm">{entry.message}</Text>
+            {renderProgressLine(entry)}
             {hasText(entry.detail) ? (
               <Text as="div" size="xs" tone="muted">
                 {entry.detail}
@@ -707,6 +750,64 @@ function renderProgress(
       </ol>
     </Text>
   );
+}
+
+/**
+ * One progress row's line: its status badge (word and glyph), the reporting stage and the
+ * service's message, verbatim. Shared by the list and the collapsed digest, so a row reads the
+ * same in both.
+ *
+ * @param entry The row.
+ * @returns The line's inline content.
+ */
+function renderProgressLine(entry: PanelProgressEntry): ReactElement {
+  return (
+    <>
+      {renderStatusBadge(PROGRESS_STATUS_PRESENTATION[entry.status])}{' '}
+      <Code size="sm">{entry.stage}</Code> <Text size="sm">{entry.message}</Text>
+    </>
+  );
+}
+
+/**
+ * The most recently reported progress row: the one with the newest service stamp, the later of
+ * two at the same stamp. By stamp rather than position, because a stage's failure takes the place
+ * of that stage's header instead of the end of the list.
+ *
+ * @param progress The store's progress rows.
+ * @returns The latest row, or `undefined` when there is none.
+ */
+function latestProgressEntry(
+  progress: readonly PanelProgressEntry[],
+): PanelProgressEntry | undefined {
+  let latest: PanelProgressEntry | undefined;
+  for (const entry of progress) {
+    if (latest === undefined || entry.ts >= latest.ts) {
+      latest = entry;
+    }
+  }
+  return latest;
+}
+
+/**
+ * The counts the collapsed digest states: every progress row, the failed ones when there are any,
+ * and the modification records — each with its noun.
+ *
+ * @param progress The store's progress rows.
+ * @param modifications The session's modification records.
+ * @returns For instance `"32 steps · 2 failed · 3 modified files"`.
+ */
+function digestCounts(
+  progress: readonly PanelProgressEntry[],
+  modifications: readonly ModificationRecord[],
+): string {
+  const failed = progress.filter((entry) => entry.status === 'failed').length;
+  const counts = [countOf(progress.length, 'step', 'steps')];
+  if (failed > 0) {
+    counts.push(`${String(failed)} failed`);
+  }
+  counts.push(countOf(modifications.length, 'modified file', 'modified files'));
+  return counts.join(COUNT_SEPARATOR);
 }
 
 /** What the signals block renders from. */
@@ -848,13 +949,13 @@ function renderCleanup(input: CleanupInput): ReactElement {
 
 /**
  * Renders the bound session's overview: identity, progress, instrumentation, signals and — once
- * there is an outcome — cleanup. Renders nothing without a session.
+ * there is an outcome — cleanup; or, collapsed, its digest. Renders nothing without a session.
  *
  * @param props The props documented on {@link SessionSummaryProps}.
  * @returns The summary region, or `null` when there is no session.
  *
  * @example
- * // The composition root, with the store's snapshot in hand:
+ * // The composition root, with the store's snapshot in hand and the disclosure it keeps:
  * <SessionSummary
  *   session={snapshot.session}
  *   progress={snapshot.progress}
@@ -864,6 +965,8 @@ function renderCleanup(input: CleanupInput): ReactElement {
  *   instrumentationFailure={snapshot.instrumentation.failure}
  *   cleanup={snapshot.cleanup}
  *   onOpenSource={actions.onOpenSource}
+ *   collapsed={summaryCollapsed}
+ *   onToggleCollapsed={toggleSummary}
  * />
  */
 export function SessionSummary(props: SessionSummaryProps): ReactElement | null {
@@ -875,8 +978,13 @@ export function SessionSummary(props: SessionSummaryProps): ReactElement | null 
     unavailable,
     instrumentationFailure,
     cleanup,
+    collapsed = false,
+    onToggleCollapsed,
     className,
   } = props;
+
+  // The id of the details the disclosure control names — called unconditionally, as a hook must be.
+  const detailsId = useId();
 
   // Every conflict report the service sent, keyed by the record it is about. The record's own
   // cleanup state comes first and the `cleanup.completed` push overlays it, so the newest report
@@ -928,58 +1036,118 @@ export function SessionSummary(props: SessionSummaryProps): ReactElement | null 
           (conflict) => !listedConflictIds.has(conflict.recordId),
         );
 
-  return (
-    <Section variant="card" title={SUMMARY_TITLE} headingLevel={2} gap={4} className={className}>
-      {renderIdentity(session)}
+  // The disclosure control, when the composition root lets the developer collapse the summary.
+  // `aria-controls` is written only while the details are rendered: collapsed, they are unmounted,
+  // so the attribute never names an element that is not in the document; `aria-expanded` carries
+  // the state either way.
+  const disclosure =
+    onToggleCollapsed === undefined ? null : (
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-expanded={!collapsed}
+        aria-controls={collapsed ? undefined : detailsId}
+        onClick={onToggleCollapsed}
+      >
+        {collapsed ? SHOW_DETAILS_LABEL : HIDE_DETAILS_LABEL}
+      </Button>
+    );
 
-      <Section title={PROGRESS_TITLE} headingLevel={3} gap={2}>
-        {renderProgress(progress, status.progressExpected)}
-      </Section>
-
-      <Section title={INSTRUMENTATION_TITLE} headingLevel={3} gap={2}>
-        {latestPlan === undefined ? null : (
+  if (collapsed) {
+    // The digest: identity, the counts beside the control, and the latest row — nothing else.
+    const latest = latestProgressEntry(progress);
+    return (
+      <Section variant="card" title={SUMMARY_TITLE} headingLevel={2} gap={3} className={className}>
+        {renderIdentity(session, false)}
+        <Stack direction="horizontal" gap={2} align="center" wrap>
+          {disclosure}
+          <Text size="sm" tone="secondary" numeric>
+            {digestCounts(progress, modifications)}
+          </Text>
+        </Stack>
+        {latest === undefined ? null : (
           <Text as="p" size="sm" tone="secondary">
-            {`Plan ${String(latestPlan.planVersion)}: ${latestPlan.objective}`}
+            {renderProgressLine(latest)}
           </Text>
         )}
-        {instrumentationFailure === undefined ? null : (
-          <ErrorState
-            title={INSTRUMENTATION_FAILED_TITLE}
-            message={instrumentationFailure.message}
-            hint={instrumentationFailure.hint}
-            code={instrumentationFailure.code}
-            announce="polite"
-          />
+        {effectiveCleanup === undefined ? null : (
+          // Once there is a cleanup outcome it is where the session stands, so
+          // the digest states it too: a partial or conflicting cleanup is never
+          // hidden behind a collapsed summary (AAP 0.5.5).
+          <Stack direction="horizontal" gap={2} align="center" wrap>
+            <Text size="sm" tone="secondary">
+              {CLEANUP_TITLE}
+            </Text>
+            {renderStatusBadge(CLEANUP_STATUS_PRESENTATION[effectiveCleanup.status])}
+            {effectiveCleanup.conflicts.length > 0 ? (
+              <Text size="sm">{`${countOf(effectiveCleanup.conflicts.length, 'file', 'files')} left untouched`}</Text>
+            ) : null}
+          </Stack>
         )}
-        {renderModifications(modifications, conflictRowKeys, conflictsByRecord, {
-          failed: instrumentationFailure !== undefined,
-          awaitingReport,
-        })}
       </Section>
+    );
+  }
 
-      <Section title={SIGNALS_TITLE} headingLevel={3} gap={2}>
-        {renderSignals({
-          runtimeHooks: enabledHooks,
-          unavailable,
-          appliedCount,
-          failed: instrumentationFailure !== undefined,
-          awaitingReport,
-        })}
-      </Section>
+  return (
+    <Section variant="card" title={SUMMARY_TITLE} headingLevel={2} gap={4} className={className}>
+      {renderIdentity(session, true)}
 
-      {effectiveCleanup === undefined ? null : (
-        <Section title={CLEANUP_TITLE} headingLevel={3} gap={2}>
-          {renderCleanup({
-            status: effectiveCleanup.status,
-            conflictCount: effectiveCleanup.conflicts.length,
-            completedAt:
-              effectiveCleanup.status === recordCleanup.status
-                ? recordCleanup.completedAt
-                : undefined,
-            unlistedConflicts,
+      {disclosure === null ? null : (
+        <Stack direction="horizontal" gap={2} align="center" wrap>
+          {disclosure}
+        </Stack>
+      )}
+
+      <Stack id={detailsId} gap={4}>
+        <Section title={PROGRESS_TITLE} headingLevel={3} gap={2}>
+          {renderProgress(progress, status.progressExpected)}
+        </Section>
+
+        <Section title={INSTRUMENTATION_TITLE} headingLevel={3} gap={2}>
+          {latestPlan === undefined ? null : (
+            <Text as="p" size="sm" tone="secondary">
+              {`Plan ${String(latestPlan.planVersion)}: ${latestPlan.objective}`}
+            </Text>
+          )}
+          {instrumentationFailure === undefined ? null : (
+            <ErrorState
+              title={INSTRUMENTATION_FAILED_TITLE}
+              message={instrumentationFailure.message}
+              hint={instrumentationFailure.hint}
+              code={instrumentationFailure.code}
+              announce="polite"
+            />
+          )}
+          {renderModifications(modifications, conflictRowKeys, conflictsByRecord, {
+            failed: instrumentationFailure !== undefined,
+            awaitingReport,
           })}
         </Section>
-      )}
+
+        <Section title={SIGNALS_TITLE} headingLevel={3} gap={2}>
+          {renderSignals({
+            runtimeHooks: enabledHooks,
+            unavailable,
+            appliedCount,
+            failed: instrumentationFailure !== undefined,
+            awaitingReport,
+          })}
+        </Section>
+
+        {effectiveCleanup === undefined ? null : (
+          <Section title={CLEANUP_TITLE} headingLevel={3} gap={2}>
+            {renderCleanup({
+              status: effectiveCleanup.status,
+              conflictCount: effectiveCleanup.conflicts.length,
+              completedAt:
+                effectiveCleanup.status === recordCleanup.status
+                  ? recordCleanup.completedAt
+                  : undefined,
+              unlistedConflicts,
+            })}
+          </Section>
+        )}
+      </Stack>
     </Section>
   );
 }

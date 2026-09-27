@@ -584,6 +584,18 @@ export interface PortHub {
   readonly pushToPanels: (tabId: TabId, push: PortPush) => number;
 
   /**
+   * Deliver a push to one panel connection — the one a request arrived on
+   * (`PortRequestContext.connectionId`), whether or not it is bound to a tab
+   * yet. For the state a request's own outcome changes, which the requesting
+   * panel must hold before it acts on the answer: the connection pill after
+   * pairing, for one.
+   *
+   * @returns `false` when no panel connection has that id (it closed, or is not
+   * a panel) or its port turned out dead.
+   */
+  readonly pushToPanel: (connectionId: WorkerConnectionId, push: PortPush) => boolean;
+
+  /**
    * Deliver a push to every connected panel, bound or not — for worker-wide
    * state such as the connection pill ("Reconnecting…", "Not paired",
    * "Service not running").
@@ -2132,6 +2144,9 @@ export function createPortHub(deps: PortHubDeps): PortHub {
     return panels === undefined ? 0 : deliverToAll(panels, push);
   };
 
+  const pushToPanel = (connectionId: WorkerConnectionId, push: PortPush): boolean =>
+    connections.get(connectionId)?.role === PORT_PANEL && postFrame(connectionId, push);
+
   const broadcastToPanels = (value: PortPush | WorkerStatusSnapshot): number =>
     deliverToAll(allPanelIds(), 'channel' in value ? value : connectionPushFromStatus(value));
 
@@ -2257,6 +2272,7 @@ export function createPortHub(deps: PortHubDeps): PortHub {
     handleConnect,
     bindPanelTab,
     pushToPanels,
+    pushToPanel,
     broadcastToPanels,
     relayPush,
     sendToBridge,

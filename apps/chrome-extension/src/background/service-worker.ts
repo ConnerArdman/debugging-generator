@@ -71,6 +71,7 @@
 
 import type {
   AnalysisResult,
+  CaptureStopResponse,
   ErrorPayload,
   MessagePayload,
   PanelSpec,
@@ -85,6 +86,7 @@ import {
   createEnvelope,
   DEFAULT_WS_BACKOFF,
   HttpClient,
+  isMessageOfType,
   isPlainRecord,
   MESSAGE_TYPE,
   parseErrorPayload,
@@ -468,8 +470,37 @@ const WORKER_REQUEST_TIMEOUT_MS = Math.max(
  * plus the flushes made while the cold start settles, and bounds what one tab
  * can make the worker hold. A batch beyond the bound is dropped and reported
  * — counted, logged and held for the service's ledger — never silently lost.
+ *
+ * It is the last resort: long before it, the lane asks the page to hold its
+ * telemetry back ({@link TELEMETRY_LANE_PAUSE_AT}).
  */
 const MAX_PENDING_TELEMETRY_BATCHES_PER_TAB = 64;
+
+/**
+ * The lane's high-water mark: once this many of a tab's batches wait, the
+ * worker relays `bridge.pause` to the tab's content bridge, and the page
+ * agent stops posting batches of its own accord and keeps buffering them —
+ * in its own bounded buffer, whose oldest events it evicts and reports as
+ * `droppedCount` on its next batch, the one place a loss under sustained
+ * overload is counted. A quarter of {@link MAX_PENDING_TELEMETRY_BATCHES_PER_TAB}:
+ * the batches the page had already handed over, and those it flushes at a
+ * capture change or on unload while paused, still fit in the lane.
+ *
+ * The lane backs up when the service acknowledges telemetry more slowly than
+ * the page produces it (`ws-bridge.ts`'s in-flight window), or while it
+ * waits for a route; either way the page's buffer holds the backlog instead
+ * of the lane dropping it.
+ */
+const TELEMETRY_LANE_PAUSE_AT = MAX_PENDING_TELEMETRY_BATCHES_PER_TAB / 4;
+
+/**
+ * The lane's low-water mark: once a paused tab's lane is back to this many
+ * waiting batches, the worker relays `bridge.resume`. Near empty rather than
+ * just below the high mark, so the page drains its backlog in one run rather
+ * than a pause and a resume per batch, while the lane still holds work for
+ * the socket as the page's first batches arrive.
+ */
+const TELEMETRY_LANE_RESUME_AT = 2;
 
 /**
  * The most capture contexts one tab may hold undelivered loss for: the
@@ -488,6 +519,45 @@ const MAX_PENDING_TELEMETRY_BATCHES_PER_TAB = 64;
  * of the page's batches cannot hold them back.
  */
 export const MAX_PENDING_LOSS_CONTEXTS_PER_TAB = 8;
+
+/**
+ * How many sessions the worker keeps a replay memory for (see
+ * `sessionReplays`), the least recently reported forgotten first. One browser
+ * debugs a handful of sessions at a time; the bound keeps a worker that
+ * outlives many of them from growing without end.
+ */
+export const MAX_REMEMBERED_SESSIONS = 32;
+
+/**
+ * How many progress rows one session's replay memory keeps, the oldest
+ * dropped first: the service's own replay bound (`MAX_REPLAYED_PROGRESS_ROWS`
+ * in the service's `sessions/reopen.ts`), which the panel's own list cap
+ * stays under.
+ */
+export const MAX_REMEMBERED_PROGRESS_ROWS = 500;
+
+/**
+ * What a panel attaching to a bound tab needs and its `session.snapshot` does
+ * not carry, as the service last sent it for one session:
+ *
+ * - `progress` — the `session.progress` frames, one per row, a row being
+ *   identified by its stage and message exactly as the panel identifies it:
+ *   a row reported again keeps its first position and takes the newer frame;
+ * - `ready` — the latest `instrumentation.ready`;
+ * - `failed` — the `instrumentation.failed` of an install after it that could
+ *   enable nothing. A newer `instrumentation.ready` supersedes it.
+ *
+ * These are the frames the service replays when a tab is bound, in the order
+ * it sends them.
+ */
+interface SessionReplayMemory {
+  readonly progress: readonly RelayedProtocolMessage[];
+  readonly ready?: RelayedProtocolMessage | undefined;
+  readonly failed?: RelayedProtocolMessage | undefined;
+}
+
+/** The empty replay memory a session starts from. */
+const EMPTY_REPLAY_MEMORY: SessionReplayMemory = Object.freeze({ progress: Object.freeze([]) });
 
 /**
  * How many times the lane hands one batch to the bridge: the send, and one
@@ -754,12 +824,38 @@ export interface NavigationMemo {
   readonly status: string | undefined;
 }
 
+/**
+ * A same-URL load held until the page agent proves it a reload (see
+ * {@link NavigationCommitKind}): worker-generation memory, never persisted.
+ */
+interface ReloadCandidate {
+  /** The URL the load committed at: the one `tab.navigated` reports. */
+  readonly url: string;
+  /** The page agent document the tab showed before the load. */
+  readonly previousDocumentId: string;
+}
+
+/**
+ * Why a `chrome.tabs.onUpdated` event reports a commit:
+ *
+ * - `url-change` — the tab's URL changed: a cross-document load, or a
+ *   same-document change through the history API. Committed for certain.
+ * - `reload-candidate` — a new `loading` cycle at the same URL. A reload looks
+ *   exactly like this, but so does a same-URL `history.replaceState` (Next.js
+ *   makes one after soft navigations and at hydration): Chrome reports both as
+ *   `{ status: 'loading' }` then `{ status: 'complete' }`. Only a new page
+ *   agent document tells them apart.
+ */
+export type NavigationCommitKind = 'url-change' | 'reload-candidate';
+
 /** What one `chrome.tabs.onUpdated` event means for a tab's committed navigations. */
 export interface NavigationStep {
   /** The memo to keep for the tab's next event. */
   readonly memo: NavigationMemo;
   /** The committed URL to report as `tab.navigated`, or `undefined` when the event reports none. */
   readonly url: string | undefined;
+  /** Why the event reports {@link url}; `undefined` exactly when it reports none. */
+  readonly kind: NavigationCommitKind | undefined;
 }
 
 /**
@@ -773,12 +869,15 @@ export interface NavigationStep {
  *
  * - A changed `url` that differs from the remembered one is a commit — a
  *   cross-document one, or a same-document one through the history API — and
- *   is reported with that URL.
- * - A new `loading` cycle without a URL change is a reload, which commits a
- *   new document at the same URL, and is reported with the committed URL
- *   (`tab.url`, else the remembered one) — unless `tab.pendingUrl` names a
- *   different URL. Then the load is bound for another URL: nothing has
- *   committed yet, and its commit arrives as a `url` change.
+ *   is reported with that URL, as a `url-change`.
+ * - A new `loading` cycle without a URL change may be a reload, which commits
+ *   a new document at the same URL, and is reported with the committed URL
+ *   (`tab.url`, else the remembered one) as a `reload-candidate` — unless
+ *   `tab.pendingUrl` names a different URL. Then the load is bound for another
+ *   URL: nothing has committed yet, and its commit arrives as a `url` change.
+ *   A candidate is not proof: a same-URL `history.replaceState` fires the very
+ *   same events, so the caller confirms it against the page agent's document
+ *   before it reports a reload (see `handleTabUpdated`).
  *
  * Chrome reports a URL-changing load in one of two orders, and each yields one
  * report: a single `{ status: 'loading', url }` event, reported by the `url`
@@ -795,6 +894,14 @@ export interface NavigationStep {
  * before it: a history-API change followed by a real reload is two
  * navigations, and both are reported.
  *
+ * Chrome decides that a tab's URL changed by its *visible* URL, yet reports
+ * the *committed* one, so a browser-initiated load started while another load
+ * is still `loading` can arrive as `{ status: 'loading', url }` naming the old,
+ * still-committed URL (`tab.pendingUrl` the destination), then commit with a
+ * bare `{ status: 'loading' }` whose `tab.url` is the new URL. So any event
+ * without a `url` whose committed `tab.url` differs from the remembered URL
+ * reports that commit — at most once, since the memo then holds it.
+ *
  * Pure: the caller keeps the returned memo for the tab's next event.
  *
  * @example
@@ -810,13 +917,13 @@ export interface NavigationStep {
  *   started.memo,
  *   { url: 'http://localhost:4400/b' },
  *   { url: 'http://localhost:4400/b' },
- * ); // committed.url === 'http://localhost:4400/b'
+ * ); // committed.url === 'http://localhost:4400/b', committed.kind === 'url-change'
  * ```
  *
  * @param previous The memo the tab's previous event left, or `undefined` for its first.
  * @param changeInfo The event's change info.
  * @param tab The tab as the event reports it.
- * @returns The memo to keep and the committed URL to report, if any.
+ * @returns The memo to keep, and the committed URL to report with why, if any.
  */
 export function nextCommittedNavigation(
   previous: NavigationMemo | undefined,
@@ -829,13 +936,25 @@ export function nextCommittedNavigation(
     status: changeInfo.status ?? previous?.status,
   };
   if (changeInfo.url !== undefined) {
-    return { memo, url: changeInfo.url === previous?.url ? undefined : changeInfo.url };
+    return changeInfo.url === previous?.url
+      ? { memo, url: undefined, kind: undefined }
+      : { memo, url: changeInfo.url, kind: 'url-change' };
+  }
+  // `tab.url` is the tab's last committed URL. Moved away from the remembered
+  // one with no `url` in the change, it is a commit Chrome reported without
+  // naming it: Chrome decides that the URL changed by the tab's visible URL but
+  // reports the committed one, so a browser-initiated load can carry a `url`
+  // (the old, still-committed URL) when it starts and none when it commits.
+  if (tab.url !== undefined && previous?.url !== undefined && tab.url !== previous.url) {
+    return { memo, url: tab.url, kind: 'url-change' };
   }
   if (changeInfo.status !== 'loading' || previous?.status === 'loading') {
-    return { memo, url: undefined };
+    return { memo, url: undefined, kind: undefined };
   }
   const boundElsewhere = tab.pendingUrl !== undefined && tab.pendingUrl !== committedUrl;
-  return { memo, url: boundElsewhere ? undefined : committedUrl };
+  return boundElsewhere || committedUrl === undefined
+    ? { memo, url: undefined, kind: undefined }
+    : { memo, url: committedUrl, kind: 'reload-candidate' };
 }
 
 /** The session's latest validated analysis: the last of `analyses`, oldest first. */
@@ -1130,6 +1249,56 @@ export function telemetryLossNotice(kind: TelemetryLossKind, events: number): Er
 }
 
 /**
+ * A refused `pair.complete`, as the pairing dialog shows it: the service's own
+ * sentence, without the lead the protocol client puts in front of every HTTP
+ * refusal.
+ *
+ * `HttpClient` reports a refusal as `The ‹operation› request failed (status
+ * ‹n›): ‹the service's message›` — right for a log line or an editor
+ * notification, where the operation and status identify which call failed, but
+ * a developer who just typed a code into the one dialog that pairs needs only
+ * the reason: "Too many failed pairing attempts; pairing is paused for up to 60
+ * seconds." The lead is rebuilt from the error's own `details.operation` and
+ * `details.status` and removed only when the message starts with exactly that;
+ * any other failure — a transport loss, the worker's own `STORE_ERROR`, a
+ * refusal whose body carried no message — is returned unchanged. Code, hint,
+ * details and cause are kept, so the answer stays a typed failure of the same
+ * kind. The service's message is constant text (no code, token or URL is ever
+ * interpolated into it), so nothing new reaches the panel.
+ *
+ * @example
+ * ```ts
+ * pairingRefusalForPanel(refusal).message;
+ * // 'The pair.complete request failed (status 429): Too many … seconds.'
+ * // → 'Too many … seconds.'
+ * ```
+ *
+ * @param error What the credential store answered a failed pairing with.
+ * @returns The failure to answer the panel with.
+ */
+export function pairingRefusalForPanel(error: DebuggenError): DebuggenError {
+  const details = error.details;
+  const operation = details?.operation;
+  const status = details?.status;
+  if (typeof operation !== 'string' || typeof status !== 'number') {
+    return error;
+  }
+  const lead = `The ${operation} request failed (status ${String(status)}): `;
+  if (!error.message.startsWith(lead)) {
+    return error;
+  }
+  const reported = error.message.slice(lead.length).trim();
+  if (reported === '') {
+    return error;
+  }
+  return new DebuggenError(error.code, reported, {
+    ...(details === undefined ? {} : { details }),
+    ...(error.hint === undefined ? {} : { hint: error.hint }),
+    ...(error.cause === undefined ? {} : { cause: error.cause }),
+  });
+}
+
+/**
  * The answer to a panel's `page.reload`, from the consented reload's outcome:
  * the reloaded document's readiness, or a failure in the shared error
  * vocabulary — `AGENT_NOT_READY` when no `agent.ready` arrived within the
@@ -1310,6 +1479,11 @@ interface TelemetryLane {
   /** Events of batches enqueued before start-up settled, not yet past it. */
   heldEvents: number;
   /**
+   * The content bridge connection the lane relayed `bridge.pause` to and has
+   * not yet resumed, while the lane is over its low-water mark.
+   */
+  pausedBridge: WorkerConnectionId | undefined;
+  /**
    * Jobs queued or being forwarded — the page's batches and the worker's
    * loss-only reports alike — per {@link telemetryLossKey} of their pinned
    * context: a confirmed route schedules a loss-only report only for a
@@ -1320,10 +1494,18 @@ interface TelemetryLane {
 
 /**
  * Where loss the service's ledger was not told of came from: the cold-start
- * hold, a full lane, a route not confirmed in time, a failed send, or a frame
- * the socket client queued and discarded. For the log line only.
+ * hold, a full lane, a route not confirmed in time, no room in the socket's
+ * telemetry window in time, a failed send, or a frame the socket client
+ * queued and discarded. For the log line only.
  */
-type PendingLossSource = 'cold-start-hold' | 'lane-full' | 'route' | 'send' | 'socket-queue';
+type PendingLossSource =
+  'cold-start-hold' | 'lane-full' | 'route' | 'capacity' | 'send' | 'socket-queue';
+
+/**
+ * Where a lane job that reached the transport failed: its tab's route, the
+ * wait for room in the socket's telemetry window, or the send.
+ */
+type TelemetryFailureStage = 'route' | 'capacity' | 'send';
 
 /**
  * One tab's loss under one context that the service's producer-loss ledger
@@ -1672,6 +1854,141 @@ export function createSourceOpenRelayFilter(
 }
 
 /**
+ * How many `session.bind` ids {@link BindRefLedger} keeps. A bind is answered
+ * within one round trip, and a confirmed one never draws a refusal, so the
+ * bound is reached only by that many binds sent while none was answered — far
+ * beyond the tabs one developer inspects. Past it the oldest id is forgotten,
+ * and a refusal of that bind, should it still arrive, is relayed as any other
+ * session-less frame is.
+ */
+export const BIND_REF_LEDGER_CAPACITY = 128;
+
+/**
+ * The codes a `session.bind` refusal carries when nothing is wrong: no session
+ * serves the tab, so the tab stays unbound and its panel's empty state ("No
+ * session yet — start one from the Debug Generator view in VS Code") already
+ * says everything the refusal says.
+ *
+ * The worker never names a session in its binds ({@link requestBindIfNeeded}
+ * sends the tab, its URL and its origin only), so `SESSION_NOT_FOUND` answers
+ * exactly one question: does an active session debug the application at this
+ * origin? "No" is the normal state before the developer starts one, after a
+ * service restart and after every reconnect, never a failed request.
+ */
+export const BIND_EMPTY_STATE_CODES: ReadonlySet<DebuggenErrorCode> = new Set<DebuggenErrorCode>([
+  'SESSION_NOT_FOUND',
+]);
+
+/**
+ * The envelope ids of the `session.bind` frames this worker sent, each with
+ * the tab it asked for. The service answers a refused bind with an `error`
+ * whose `ref` is the bind's id and which names no session, so without this
+ * ledger the port hub would broadcast it to every panel of every tab.
+ */
+export interface BindRefLedger {
+  /** Remember that the bind whose envelope id is `ref` asks for `tabId`. */
+  record(ref: string, tabId: TabId): void;
+  /**
+   * The tab the bind `ref` asked for, forgetting `ref`: the refusal is that
+   * bind's answer. `undefined` when `ref` names no bind this worker sent.
+   */
+  take(ref: string): TabId | undefined;
+  /** Forget `ref`: its frame was never sent. */
+  forget(ref: string): void;
+  /** How many ids are held. */
+  readonly size: number;
+}
+
+/**
+ * Build a {@link BindRefLedger} holding at most `capacity` ids, the oldest
+ * forgotten first (see {@link BIND_REF_LEDGER_CAPACITY}).
+ *
+ * @param capacity The number of ids kept; a value that is not a positive
+ * integer is replaced by {@link BIND_REF_LEDGER_CAPACITY}.
+ */
+export function createBindRefLedger(capacity: number = BIND_REF_LEDGER_CAPACITY): BindRefLedger {
+  const limit = Number.isInteger(capacity) && capacity > 0 ? capacity : BIND_REF_LEDGER_CAPACITY;
+  /** Insertion-ordered, so the first key is always the oldest bind. */
+  const refs = new Map<string, TabId>();
+  return Object.freeze({
+    record(ref: string, tabId: TabId): void {
+      refs.delete(ref);
+      refs.set(ref, tabId);
+      for (const oldest of refs.keys()) {
+        if (refs.size <= limit) {
+          break;
+        }
+        refs.delete(oldest);
+      }
+    },
+    take(ref: string): TabId | undefined {
+      const tabId = refs.get(ref);
+      refs.delete(ref);
+      return tabId;
+    },
+    forget(ref: string): void {
+      refs.delete(ref);
+    },
+    get size(): number {
+      return refs.size;
+    },
+  });
+}
+
+/**
+ * Wrap a relay sink so the service's `error` refusal of a `session.bind` this
+ * worker sent reaches only the panels it concerns:
+ *
+ * - a refusal carrying one of the {@link BIND_EMPTY_STATE_CODES} is withheld
+ *   from every panel. It reports that no session serves the tab, which leaves
+ *   the tab unbound — the state its panel already renders as the empty state —
+ *   so relaying it would present the normal "no session yet" state as a failed
+ *   request, and would do so again after every reconnect, since the worker
+ *   re-requests the binding of every announced tab whenever the socket opens;
+ * - any other refusal (a refused credential, a rate limit) is a real failure
+ *   of that tab's bind, relayed to that tab's panels only rather than to the
+ *   panels of every inspected tab.
+ *
+ * Either way the bind's id is forgotten: the refusal is its answer. Every
+ * other frame — an `error` answering anything else included — goes to
+ * `relay` unchanged, in order.
+ *
+ * @param refs The worker's ledger of sent `session.bind` ids.
+ * @param relay The sink every frame that is not withheld goes to.
+ * @param logger Where a withheld or redirected refusal is logged — its tab and
+ * code only.
+ * @returns A {@link RelayPush} for `createWsBridge`.
+ */
+export function createBindRefusalRelayFilter(
+  refs: BindRefLedger,
+  relay: RelayPush,
+  logger: Logger = noopLogger,
+): RelayPush {
+  return (message, tabId) => {
+    if (message.type === 'error' && message.payload.ref !== undefined) {
+      const { ref, code } = message.payload;
+      const askedFor = refs.take(ref);
+      if (askedFor !== undefined) {
+        if (BIND_EMPTY_STATE_CODES.has(code)) {
+          logger.debug('No session serves the tab; its panel shows the empty state.', {
+            tabId: askedFor,
+            errorCode: code,
+          });
+          return;
+        }
+        logger.debug('Relayed a bind refusal to the tab that asked for the binding.', {
+          tabId: askedFor,
+          errorCode: code,
+        });
+        relay(message, askedFor);
+        return;
+      }
+    }
+    relay(message, tabId);
+  };
+}
+
+/**
  * The `source.open` port answer: `ok({ forwarded })` or a typed failure.
  *
  * `forwarded: true` — the editor confirmed it opened the location.
@@ -1992,6 +2309,200 @@ export function forwardSourceOpen(
 
 /*
  * ===========================================================================
+ * Section C3 — confirming a capture stop
+ *
+ * The service's `POST /sessions/:id/capture/stop` answers only after the whole
+ * stop has run: the stop barrier, the summary over every stored event, the
+ * analysis and the panel. Closing the window is the first of those steps, and
+ * the service announces it at once with the `capture.stopped` broadcast — so a
+ * capture that stopped can be confirmed long before its HTTP answer arrives,
+ * and an HTTP call that timed out says nothing about whether the stop
+ * happened. Reporting that timeout as "Could not stop the capture" beside a
+ * capture that did stop, and a panel generated from it, is a failure presented
+ * where there was none (AAP §0.5.5).
+ * ===========================================================================
+ */
+
+/**
+ * The HTTP deadline of a `capture.stop` call, in milliseconds: the port hub's
+ * budget for one panel request ({@link WORKER_REQUEST_TIMEOUT_MS}) less
+ * {@link SERVICE_REQUEST_DEADLINE_MARGIN_MS} — twenty seconds. The margin is
+ * what the read-back of a call the transport lost runs in, so the panel hears
+ * this worker's verdict before the hub's generic timeout. Exported so a test
+ * can hold that inequality.
+ */
+export const CAPTURE_STOP_REQUEST_TIMEOUT_MS =
+  WORKER_REQUEST_TIMEOUT_MS - SERVICE_REQUEST_DEADLINE_MARGIN_MS;
+
+/**
+ * The deadline of that read-back (`GET /sessions/:id`), in milliseconds: the
+ * margin less one second for the answer to travel back through the hub.
+ */
+export const CAPTURE_STOP_READBACK_TIMEOUT_MS = SERVICE_REQUEST_DEADLINE_MARGIN_MS - 1_000;
+
+/** What {@link confirmCaptureStop} reaches the service through — the socket bridge's own members. */
+export interface CaptureStopConfirmDeps {
+  /** `POST /sessions/:id/capture/stop`. */
+  readonly stopCapture: WsBridge['stopCapture'];
+  /** `GET /sessions/:id`, the read-back of a call the transport lost. */
+  readonly getSession: WsBridge['getSession'];
+  /** The socket's frames, for the `capture.stopped` broadcast. */
+  readonly subscribe: ProtocolSubscribe;
+  /** Defaults to `noopLogger`. Records carry ids and codes only. */
+  readonly logger?: Logger | undefined;
+}
+
+/**
+ * The summary of a session record's latest capture once it has stopped, or
+ * `undefined` while it runs, when it collected nothing to summarise, or when
+ * the session has no capture.
+ */
+function stoppedCaptureSummary(record: SessionRecord): CaptureStopResponse['summary'] | undefined {
+  const latest = record.captures[record.captures.length - 1];
+  return latest?.stoppedAt === undefined ? undefined : latest.summary;
+}
+
+/**
+ * Stop a session's capture and answer as soon as the stop is known, whichever
+ * way it becomes known first:
+ *
+ * 1. the service's `capture.stopped` broadcast for the session — a session
+ *    holds at most one capture at a time, so a stop announced after this
+ *    request was issued is the stop of the capture it asked about. Its summary
+ *    is the answer, and the HTTP call, which the service keeps running to the
+ *    end whatever the client does, is released;
+ * 2. the HTTP answer — success, or the service's refusal, answered unchanged;
+ * 3. an HTTP call the transport lost or that outlived
+ *    {@link CAPTURE_STOP_REQUEST_TIMEOUT_MS} (`TRANSPORT_DISCONNECTED`): the
+ *    session is read back, and a latest capture that has stopped is the
+ *    answer. Otherwise the original failure is — the stop was not confirmed.
+ *
+ * Never rejects; a failure is an `err`. Aborting `signal` (the hub's timeout
+ * or the panel leaving) ends the wait with the call's cancellation.
+ *
+ * @param deps The socket bridge's stop, read and subscribe members.
+ * @param sessionId The session whose capture stops.
+ * @param tabId The inspected tab the request acts for.
+ * @param signal The panel request's signal.
+ */
+export function confirmCaptureStop(
+  deps: CaptureStopConfirmDeps,
+  sessionId: SessionId,
+  tabId: TabId,
+  signal: AbortSignal,
+): Promise<Result<CaptureStopResponse, DebuggenError>> {
+  const log = deps.logger ?? noopLogger;
+  const calls = new AbortController();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let unsubscribe: Unsubscribe | undefined;
+    const settle = (result: Result<CaptureStopResponse, DebuggenError>): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      unsubscribe?.();
+      signal.removeEventListener('abort', cancel);
+      // Releases a call whose answer is no longer needed; a settled one ignores it.
+      calls.abort();
+      resolve(result);
+    };
+    // The request's owner gave up (the hub's timeout, or the panel left): the wait ends now with
+    // the cancellation, whatever the calls do with the abort they are handed.
+    function cancel(): void {
+      const reason: unknown = signal.reason;
+      calls.abort(reason);
+      settle(
+        err(
+          DebuggenError.is(reason)
+            ? reason
+            : workerError(
+                'TRANSPORT_DISCONNECTED',
+                'The capture.stop request was cancelled before the stop was confirmed.',
+                { cause: reason },
+              ),
+        ),
+      );
+    }
+
+    if (signal.aborted) {
+      cancel();
+      return;
+    }
+    signal.addEventListener('abort', cancel, { once: true });
+
+    try {
+      unsubscribe = deps.subscribe(MESSAGE_TYPE.CAPTURE_STOPPED, (message) => {
+        if (message.payload.sessionId !== sessionId) {
+          return;
+        }
+        log.debug('capture.stop was confirmed by the capture.stopped broadcast.', {
+          sessionId,
+          captureId: message.payload.captureId,
+        });
+        settle(ok({ summary: message.payload.summary }));
+      });
+    } catch (cause: unknown) {
+      // Without the broadcast the HTTP answer and the read-back still decide.
+      log.warn('The capture.stopped broadcast could not be watched for a stop.', {
+        sessionId,
+        error: errorName(cause),
+      });
+    }
+
+    const run = async (): Promise<void> => {
+      const stopped = await deps.stopCapture(sessionId, {
+        signal: calls.signal,
+        tabId,
+        timeoutMs: CAPTURE_STOP_REQUEST_TIMEOUT_MS,
+      });
+      if (settled) {
+        return;
+      }
+      if (stopped.ok || stopped.error.code !== 'TRANSPORT_DISCONNECTED' || signal.aborted) {
+        settle(stopped);
+        return;
+      }
+      const read = await deps.getSession(sessionId, {
+        signal: calls.signal,
+        tabId,
+        timeoutMs: CAPTURE_STOP_READBACK_TIMEOUT_MS,
+      });
+      if (settled) {
+        return;
+      }
+      const summary = read.ok ? stoppedCaptureSummary(read.value) : undefined;
+      if (summary === undefined) {
+        log.info('A capture.stop the transport lost could not be confirmed.', {
+          sessionId,
+          errorCode: stopped.error.code,
+          readback: read.ok ? 'still-capturing' : read.error.code,
+        });
+        settle(stopped);
+        return;
+      }
+      log.info('A capture.stop the transport lost was confirmed by reading the session back.', {
+        sessionId,
+        errorCode: stopped.error.code,
+      });
+      settle(ok({ summary }));
+    };
+
+    run().catch((cause: unknown) => {
+      settle(
+        err(
+          DebuggenError.is(cause)
+            ? cause
+            : workerError('INTERNAL', 'The worker could not stop the capture.', { cause }),
+        ),
+      );
+    });
+  });
+}
+
+/*
+ * ===========================================================================
  * Section D — the composition
  * ===========================================================================
  */
@@ -2109,6 +2620,21 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   /** The last URL and load status seen per tab. */
   const navigationMemo = new Map<TabId, NavigationMemo>();
   /**
+   * Per tab: the same-URL load held until its page agent proves it a reload
+   * — the URL it committed at, and the document the tab showed before it. A
+   * same-URL `history.replaceState` fires the same `tabs.onUpdated` events as
+   * a reload, so the load is reported only when an `agent.ready` names another
+   * document; one that never does was not a reload, and reports nothing.
+   */
+  const reloadCandidates = new Map<TabId, ReloadCandidate>();
+  /**
+   * Per tab: its committed-navigation reports still in flight, chained so they
+   * leave in commit order, as one promise that never rejects. The tab's next
+   * `agent.ready` waits for it, so the service records the navigation before
+   * it reads the new document's report.
+   */
+  const navigationReports = new Map<TabId, Promise<void>>();
+  /**
    * Panel connections that asked for a `session.snapshot` without naming an
    * inspected tab and are still unassociated: the only panels a DevTools page
    * announced later may adopt ({@link adoptWaitingPanel}). A panel that has
@@ -2141,6 +2667,24 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * first opportunity rather than kept.
    */
   const pendingLoss = new Map<TabId, Map<string, PendingLoss>>();
+  /**
+   * Per session, its {@link SessionReplayMemory}, least recently reported
+   * first, at most {@link MAX_REMEMBERED_SESSIONS}.
+   *
+   * The service replays a session's progress and signal report when a tab is
+   * bound, but a DevTools page binds its tab before the panel page loads, and
+   * a panel reopened on a bound tab attaches after that replay: the frames
+   * reach no panel, and the `session.snapshot` a panel hydrates from carries
+   * neither. So they are pushed to a tab's panels once they are associated —
+   * after each snapshot answer and each background hydration — and the panel
+   * shows the pipeline's progress and the signals the capture will run with
+   * (AAP §0.5.5, §0.7.3), never "No pipeline progress has reached this panel"
+   * or "No signal report has reached this panel" for a session that has both.
+   * Worker-generation memory like the lanes: a revived worker re-learns it
+   * from the replay its socket's re-announced bindings trigger. Forgotten when
+   * the session ends.
+   */
+  const sessionReplays = new Map<SessionId, SessionReplayMemory>();
   /** Whether `ready` has settled; until then telemetry is held within a bound. */
   let coldStartSettled = false;
   /** Batches dropped since start because their tab's lane was full. */
@@ -2158,6 +2702,8 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   let lastPublishedStatus: WorkerStatusSnapshot['status'] | undefined;
   /** The `source.open` ids this generation sent whose answer can still arrive. */
   const sourceOpenRefs: SourceOpenRefLedger = createSourceOpenRefLedger();
+  /** The `session.bind` ids this generation sent, each with the tab it asked for. */
+  const bindRefs: BindRefLedger = createBindRefLedger();
   /**
    * The socket bridge, once constructed: read by the ledger's socket tracking,
    * which the bridge can call into while it is still being constructed.
@@ -3016,10 +3562,21 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       if (!scope.ok) {
         return scope;
       }
-      const stopped = await wsBridge.stopCapture(payload.sessionId, {
-        signal: context.signal,
-        tabId: scope.value,
-      });
+      // Answered as soon as the stop is known — the service's `capture.stopped`
+      // broadcast, the HTTP answer, or a read-back of a call the transport lost
+      // (see `confirmCaptureStop`) — never as a bare timeout of a stop that
+      // happened.
+      const stopped = await confirmCaptureStop(
+        {
+          stopCapture: wsBridge.stopCapture,
+          getSession: wsBridge.getSession,
+          subscribe: wsBridge.subscribe,
+          logger: log,
+        },
+        payload.sessionId,
+        scope.value,
+        context.signal,
+      );
       if (!stopped.ok) {
         log.info('capture.stop was refused.', {
           sessionId: payload.sessionId,
@@ -3084,7 +3641,7 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       return verdict.kind === 'accepted' ? ok({ accepted: true }) : err(verdict.error);
     },
 
-    'pair.complete': async (payload) => {
+    'pair.complete': async (payload, context) => {
       // The dialog saves the service address just before it submits the code,
       // so the code is redeemed at that address: read it now instead of
       // relying on the storage change event having been delivered already.
@@ -3104,9 +3661,14 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       }
       if (!paired.ok) {
         log.info('Pairing did not complete.', { errorCode: paired.error.code });
-        return paired;
+        return err(pairingRefusalForPanel(paired.error));
       }
       log.info('Paired with the local service.');
+      // The requesting panel holds the status pairing produced before it acts
+      // on the answer (its dialog closes and it re-reads its session), rather
+      // than whatever it was last told — every later change still reaches it
+      // through the status broadcast.
+      hub.pushToPanel(context.connectionId, connectionPushFromStatus(wsBridge.snapshot()));
       return ok({ paired: true });
     },
 
@@ -3144,6 +3706,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       // reset the notice the panel keeps.
       if (tabId !== undefined) {
         replayTelemetryLossAfterAnswer(tabId);
+        // The progress and signal report the bind replayed before this panel attached.
+        if (binding.kind === 'bound') {
+          pushSessionReplayAfterAnswer(tabId, binding.sessionId);
+        }
       }
       // `tabId` is re-tested only to narrow it: an unknown tab is `UNBOUND_STATE`.
       if (tabId === undefined || binding.kind !== 'bound' || !status.hasCredential) {
@@ -3165,7 +3731,12 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       // reads are tried again on the hydration retry schedule.
       if (!context.signal.aborted) {
         hub.pushToPanels(tabId, bindingPushFor(binding));
-        hub.pushToPanels(tabId, connectionPushFromStatus(status));
+        // The status as it is now, not as it was before the reads: the socket
+        // may have connected (or dropped) while they were in flight, and that
+        // change was already broadcast — repeating the earlier status here
+        // would overwrite it on this tab's panels, with nothing left to
+        // correct it until the status changes again.
+        hub.pushToPanels(tabId, connectionPushFromStatus(wsBridge.snapshot()));
         scheduleHydrationRetry(tabId, 0, failure);
       }
       return err(failure);
@@ -3430,6 +4001,7 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       pending: 0,
       reports: 0,
       heldEvents: 0,
+      pausedBridge: undefined,
       queued: new Map(),
     };
     telemetryLanes.set(tabId, created);
@@ -3840,6 +4412,105 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   }
 
   /**
+   * Record one frame of a session's {@link SessionReplayMemory}: a
+   * `session.progress` row is merged in by its stage and message (a newer
+   * frame of a row replaces it in place, an older one is ignored, a new row is
+   * appended, past {@link MAX_REMEMBERED_PROGRESS_ROWS} the oldest row is
+   * dropped); an `instrumentation.ready` replaces the signal report; an
+   * `instrumentation.failed` is kept after the `instrumentation.ready` it
+   * followed. The session becomes the most recently reported; past
+   * {@link MAX_REMEMBERED_SESSIONS} the least recently reported one is
+   * forgotten.
+   */
+  function rememberForReplay(sessionId: SessionId, frame: RelayedProtocolMessage): void {
+    const held = sessionReplays.get(sessionId) ?? EMPTY_REPLAY_MEMORY;
+    let next: SessionReplayMemory;
+    if (isMessageOfType(frame, MESSAGE_TYPE.SESSION_PROGRESS)) {
+      const { stage, message } = frame.payload;
+      const index = held.progress.findIndex(
+        (row) =>
+          isMessageOfType(row, MESSAGE_TYPE.SESSION_PROGRESS) &&
+          row.payload.stage === stage &&
+          row.payload.message === message,
+      );
+      const existing = index === -1 ? undefined : held.progress[index];
+      if (existing !== undefined && frame.ts < existing.ts) {
+        return;
+      }
+      const progress =
+        index === -1
+          ? [...held.progress, frame].slice(-MAX_REMEMBERED_PROGRESS_ROWS)
+          : held.progress.map((row, at) => (at === index ? frame : row));
+      next = { ...held, progress };
+    } else if (isMessageOfType(frame, MESSAGE_TYPE.INSTRUMENTATION_READY)) {
+      next = { progress: held.progress, ready: frame };
+    } else if (isMessageOfType(frame, MESSAGE_TYPE.INSTRUMENTATION_FAILED)) {
+      next = { ...held, failed: frame };
+    } else {
+      return;
+    }
+    sessionReplays.delete(sessionId);
+    sessionReplays.set(sessionId, next);
+    for (const oldest of sessionReplays.keys()) {
+      if (sessionReplays.size <= MAX_REMEMBERED_SESSIONS) {
+        break;
+      }
+      sessionReplays.delete(oldest);
+    }
+  }
+
+  /**
+   * Push a session's {@link SessionReplayMemory} to the tab's panels — its
+   * progress rows in order, then its `instrumentation.ready` and the
+   * `instrumentation.failed` that followed it — when the tab is still bound to
+   * that session. A panel applies a frame it already shows as no change.
+   */
+  async function pushSessionReplay(tabId: TabId, sessionId: SessionId): Promise<void> {
+    if (disposed || !sessionReplays.has(sessionId) || !hasPanels(tabId)) {
+      return;
+    }
+    const state = await registry.getPanelBindingState(tabId);
+    // Read after the await: the memory may have been updated or forgotten meanwhile.
+    const memory = sessionReplays.get(sessionId);
+    if (
+      disposed ||
+      memory === undefined ||
+      state.kind !== 'bound' ||
+      state.sessionId !== sessionId
+    ) {
+      return;
+    }
+    let panels = 0;
+    for (const frame of [...memory.progress, memory.ready, memory.failed]) {
+      if (frame !== undefined) {
+        panels = Math.max(panels, pushProtocol(tabId, frame));
+      }
+    }
+    log.debug("The session's progress and signal report were shown to the panels of its tab.", {
+      tabId,
+      sessionId,
+      progressRows: memory.progress.length,
+      signalReport: memory.ready !== undefined || memory.failed !== undefined,
+      panels,
+    });
+  }
+
+  /**
+   * {@link pushSessionReplay} once the answer being prepared for the panel
+   * has been posted — a zero-delay task, as for
+   * {@link replayTelemetryLossAfterAnswer} — so the frames follow the snapshot
+   * they complete.
+   */
+  function pushSessionReplayAfterAnswer(tabId: TabId, sessionId: SessionId): void {
+    if (!sessionReplays.has(sessionId)) {
+      return;
+    }
+    timers.setTimeout(() => {
+      background(pushSessionReplay(tabId, sessionId), 'session replay after snapshot');
+    }, 0);
+  }
+
+  /**
    * Push one loss notice ({@link telemetryLossNotice}) to the tab's panels as
    * a protocol `error`, under the tab's bound session when there is one. The
    * log line records how many panels it reached, so a notice issued while no
@@ -4027,7 +4698,7 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   function reportTelemetryLoss(
     job: PendingTelemetryBatch,
     sessionId: SessionId,
-    stage: 'route' | 'send',
+    stage: TelemetryFailureStage,
     code: DebuggenErrorCode,
     loss: number,
   ): void {
@@ -4072,7 +4743,7 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   function holdUndeliveredLoss(
     job: PendingTelemetryBatch,
     context: TelemetryBatchContext,
-    stage: 'route' | 'send',
+    stage: TelemetryFailureStage,
     code: DebuggenErrorCode,
     undelivered: { readonly eventsHandedOver: number; readonly loss: number },
   ): void {
@@ -4112,15 +4783,18 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    *    capture): a tab re-bound while the batch waited must not receive it —
    *    a batch produced under one session is never sent as another's.
    * 4. Take over the loss held for the batch's pinned context and for the
-   *    labels its frames carry ({@link claimPendingLoss}), then send, scoped
-   *    to the verified session, with the page's `droppedCount` and that held
-   *    loss on the first frame. A route lost between the confirmation and the
-   *    write is awaited once more within the same deadline; a second failure
-   *    drops the batch and reports it.
+   *    labels its frames carry ({@link claimPendingLoss}), wait for room in
+   *    the socket's telemetry window (`wsBridge.awaitTelemetryCapacity`,
+   *    within the same deadline — the service is still storing what went
+   *    before), then send at once, scoped to the verified session, with the
+   *    page's `droppedCount` and that held loss on the first frame. A route
+   *    lost between the confirmation and the write is awaited once more
+   *    within the same deadline; a second failure drops the batch and reports
+   *    it, as does a window that found no room before the deadline.
    *
    * What a dropped batch leaves undelivered is capture loss the service must
-   * still learn of: a failed route or send holds the events not handed over
-   * and the loss not handed over under the frames' labels
+   * still learn of: a failed route, capacity wait or send holds the events not
+   * handed over and the loss not handed over under the frames' labels
    * ({@link holdUndeliveredLoss}). A drop for the binding (step 1 or 3) names
    * no capture the service could account it to, and holds nothing.
    *
@@ -4225,6 +4899,20 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       // stays absent. A loss-only report (no events) is one event-less frame
       // carrying the count, so the loss reaches the service's ledger when no
       // later batch will carry it.
+      // The window's room is reserved for this send, which follows at once:
+      // nothing is awaited between the grant and the write.
+      const room = await wsBridge.awaitTelemetryCapacity(tabId, job.events.length, {
+        signal: job.deadline.signal,
+      });
+      if (disposed) {
+        return;
+      }
+      if (!room.ok) {
+        const left = undelivered();
+        reportTelemetryLoss(job, binding.sessionId, 'capacity', room.error.code, left.loss);
+        holdUndeliveredLoss(job, sendContext, 'capacity', room.error.code, left);
+        return;
+      }
       const sent = wsBridge.sendTelemetryBatch(tabId, job.events, binding.sessionId, {
         ...(job.context.captureId === undefined ? {} : { armedCaptureId: job.context.captureId }),
         ...(loss > 0 ? { droppedCount: loss } : {}),
@@ -4397,7 +5085,9 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * {@link MAX_PENDING_LOSS_CONTEXTS_PER_TAB} instead — and every job is
    * counted under its pinned context in {@link TelemetryLane.queued}. The
    * job's deadline is released however it settles; a job that throws is
-   * logged by name.
+   * logged by name. A bounded job that takes the lane to its high-water mark
+   * pauses the tab's page agent, and the one whose end takes it back to its
+   * low-water mark resumes it ({@link applyLaneBackpressure}).
    */
   function queueTelemetryJob(
     lane: TelemetryLane,
@@ -4408,6 +5098,7 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     const key = telemetryLossKey(job.context);
     if (bounded) {
       lane.pending += 1;
+      applyLaneBackpressure(job.tabId, lane);
     } else {
       lane.reports += 1;
     }
@@ -4427,6 +5118,7 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
           job.deadline.release();
           if (bounded) {
             lane.pending -= 1;
+            applyLaneBackpressure(job.tabId, lane);
           } else {
             lane.reports -= 1;
           }
@@ -4442,6 +5134,78 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     );
   }
 
+  /**
+   * Hold a tab's page agent back while its lane is backed up: relay
+   * `bridge.pause` to the tab's content bridge once the lane holds
+   * {@link TELEMETRY_LANE_PAUSE_AT} batches, and `bridge.resume` once it is
+   * back to {@link TELEMETRY_LANE_RESUME_AT}. Called whenever a batch joins
+   * or leaves the lane; never throws.
+   *
+   * The pause is recorded against the bridge connection it reached, since a
+   * reload or a new document brings a new bridge, and a new agent, that
+   * starts unpaused: a lane still over its high-water mark pauses the new
+   * bridge too, and the resume goes only to a bridge that was paused. A
+   * signal that reaches no bridge (none is attached) changes nothing, and is
+   * sent again on the lane's next change. The signals are hints — the lane's
+   * own bound and its loss reporting stay in force whatever the page does.
+   */
+  function applyLaneBackpressure(tabId: TabId, lane: TelemetryLane): void {
+    if (disposed) {
+      return;
+    }
+    const current = currentBridgeConnectionId(tabId);
+    if (lane.pending >= TELEMETRY_LANE_PAUSE_AT) {
+      if (current === undefined || lane.pausedBridge === current) {
+        return;
+      }
+      if (signalTelemetryFlow(tabId, 'bridge.pause')) {
+        lane.pausedBridge = current;
+        log.debug("A tab's telemetry lane backed up; its page agent was asked to hold back.", {
+          tabId,
+          pending: lane.pending,
+        });
+      }
+      return;
+    }
+    if (lane.pausedBridge === undefined || lane.pending > TELEMETRY_LANE_RESUME_AT) {
+      return;
+    }
+    const paused = lane.pausedBridge;
+    lane.pausedBridge = undefined;
+    if (paused !== current) {
+      // The paused bridge is gone; its successor was never paused.
+      return;
+    }
+    if (signalTelemetryFlow(tabId, 'bridge.resume')) {
+      log.debug("A tab's telemetry lane drained; its page agent was asked to resume.", {
+        tabId,
+        pending: lane.pending,
+      });
+    }
+  }
+
+  /** Post one flow-control signal to a tab's content bridge; whether a bridge took it. */
+  function signalTelemetryFlow(tabId: TabId, type: 'bridge.pause' | 'bridge.resume'): boolean {
+    return hub.sendToBridge(
+      tabId,
+      type === 'bridge.pause'
+        ? {
+            channel: EXTENSION_CHANNEL,
+            version: PORT_PROTOCOL_VERSION,
+            direction: 'downstream',
+            type: 'bridge.pause',
+            payload: {},
+          }
+        : {
+            channel: EXTENSION_CHANNEL,
+            version: PORT_PROTOCOL_VERSION,
+            direction: 'downstream',
+            type: 'bridge.resume',
+            payload: {},
+          },
+    );
+  }
+
   const bridgeHandlers: BridgeMessageHandlers = {
     'agent.ready': (payload, context) => {
       const { tabId } = context;
@@ -4454,8 +5218,26 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       // batches its document sends after it — and gives a newer bridge for the
       // tab time to supersede this one, which is why its attribution is
       // checked there.
-      const recorded = inTabOrder(tabId, 'agent.ready', () => {
+      const recorded = inTabOrder(tabId, 'agent.ready', async () => {
         if (disposed || isStaleBridgeFrame('agent.ready', context)) {
+          return;
+        }
+        // The service must hear of the navigation that brought this document
+        // before the document's own report: its readiness ledger distrusts a
+        // report a reload left behind by the navigation's time. So the tab's
+        // reports in flight land first, and a same-URL load held as a reload
+        // candidate is reported now if this is another document — it was a
+        // reload. The same document reporting again proves nothing either
+        // way, so the candidate stays held.
+        await navigationReports.get(tabId);
+        const candidate = reloadCandidates.get(tabId);
+        if (candidate !== undefined && payload.documentId !== candidate.previousDocumentId) {
+          reloadCandidates.delete(tabId);
+          log.debug('A new page agent document confirmed a reload.', { tabId });
+          background(reportCommittedNavigation(tabId, candidate.url), 'reload report');
+          await navigationReports.get(tabId);
+        }
+        if (disposed) {
           return;
         }
         // agent-control relays `agent.ready` upward with the tab filled in,
@@ -4618,17 +5400,86 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * Re-request a binding for every announced DevTools tab that has none —
    * after the socket opens (a bind sent while it was closed was refused) and
    * after a session is created (a new session may match a tab's origin).
+   *
+   * @param origin When given — the dev-server origin of the session just
+   *   created — only the announced tabs on that origin are re-announced: the
+   *   service binds a tab to a session of its own origin only, so a bind for
+   *   any other tab could only be refused.
    */
-  async function rebindAnnouncedTabs(trigger: string): Promise<void> {
+  async function rebindAnnouncedTabs(trigger: string, origin?: string): Promise<void> {
     await ready;
+    let requested = 0;
     for (const [tabId, target] of announcedTabs) {
       if (!hasDevtools(tabId)) {
         announcedTabs.delete(tabId);
         continue;
       }
+      if (origin !== undefined && target.origin !== origin) {
+        continue;
+      }
+      requested += 1;
       await requestBindIfNeeded(tabId, target);
     }
-    log.debug('Announced tabs re-checked for a binding.', { trigger, tabs: announcedTabs.size });
+    log.debug('Announced tabs re-checked for a binding.', {
+      trigger,
+      tabs: announcedTabs.size,
+      checked: requested,
+    });
+  }
+
+  /**
+   * Keep an inspected tab's announcement current across its committed
+   * navigations, so a later re-announcement — on connect, or when a session
+   * is created for its origin — names the document the tab shows now rather
+   * than the one its DevTools page opened on.
+   *
+   * @returns The tab's previous and current announcement, or `undefined` when
+   *   no DevTools page inspects the tab (whose browsing stays unreported).
+   */
+  async function refreshAnnouncement(
+    tabId: TabId,
+    committedUrl: string,
+  ): Promise<
+    | { readonly previous: BindTarget | undefined; readonly current: BindTarget | undefined }
+    | undefined
+  > {
+    if (!hasDevtools(tabId)) {
+      return undefined;
+    }
+    const previous = announcedTabs.get(tabId);
+    const current = await resolveBindTarget(tabId, committedUrl);
+    if (current === undefined) {
+      announcedTabs.delete(tabId);
+    } else {
+      announcedTabs.set(tabId, current);
+    }
+    return { previous, current };
+  }
+
+  /**
+   * An inspected tab with no binding committed a navigation: announce it
+   * again — exactly as its DevTools page announces it on opening — when it
+   * came back to the origin it left, or moved to an origin other than the one
+   * last announced. The service binds it to a session serving that origin, or
+   * records it as awaiting one. A navigation within the announced origin
+   * changes nothing the service decides on, so it sends nothing.
+   */
+  async function reannounceUnboundTab(tabId: TabId, committedUrl: string): Promise<void> {
+    const announcement = await refreshAnnouncement(tabId, committedUrl);
+    if (announcement === undefined) {
+      return;
+    }
+    const { previous, current } = announcement;
+    const returned = await registry.handleReturnedNavigation(tabId, current?.origin);
+    if (current === undefined || (!returned && previous?.origin === current.origin)) {
+      return;
+    }
+    log.debug('Unbound inspected tab re-announced after a navigation.', {
+      tabId,
+      returned,
+      origin: current.origin,
+    });
+    await requestBindIfNeeded(tabId, current);
   }
 
   const devtoolsHandlers: DevtoolsMessageHandlers = {
@@ -5150,6 +6001,7 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         }),
       );
     }
+    await pushSessionReplay(tabId, sessionId);
   }
 
   // -------------------------------------------------------------------------
@@ -5320,10 +6172,28 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * kept unchanged, and a payload that names no tab is sent as it is.
    * `wsBridge` is dereferenced only when a frame is sent, by which time it
    * exists.
+   *
+   * A `session.bind` also leaves with an envelope id recorded in `bindRefs`
+   * beside the tab it asks for — before the send, so a refusal the transport
+   * delivers synchronously is already recognised — which is how
+   * {@link createBindRefusalRelayFilter} tells the service's refusal of it
+   * from every other session-less `error`. An id whose frame was not sent is
+   * forgotten again.
    */
   const sendActingForPayloadTab: ProtocolSend = (type, payload, options) => {
-    const tabId = options?.tabId === undefined ? payloadTabId(payload) : undefined;
-    return wsBridge.send(type, payload, tabId === undefined ? options : { ...options, tabId });
+    const payloadTab = payloadTabId(payload);
+    const tabId = options?.tabId === undefined ? payloadTab : undefined;
+    const acting = tabId === undefined ? options : { ...options, tabId };
+    if (type !== MESSAGE_TYPE.SESSION_BIND || payloadTab === undefined) {
+      return wsBridge.send(type, payload, acting);
+    }
+    const id = acting?.id ?? newMessageId();
+    bindRefs.record(id, payloadTab);
+    const sent = wsBridge.send(type, payload, { ...acting, id });
+    if (!sent.ok) {
+      bindRefs.forget(id);
+    }
+    return sent;
   };
 
   const hub: PortHub = createPortHub({
@@ -5429,17 +6299,28 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
 
   /**
    * The socket bridge's relay sink: every relayed frame goes to the port hub,
-   * except the service's `error` refusal of a `source.open` this worker sent.
-   * That frame is session-less, so the hub would broadcast it to every panel,
-   * whose session store records its raw sentence as the panel's last failure;
-   * the request it refuses already settles on it and reaches the panel as a
-   * typed failure shown with fixed copy (`../panel/actions.ts`).
+   * except the service's `error` refusals of the requests this worker sent.
+   * Those frames are session-less, so the hub would broadcast them to every
+   * panel, whose session store records the raw sentence as the panel's last
+   * failure:
+   *
+   * - a `source.open` refusal is withheld, because the request it refuses
+   *   already settles on it and reaches the panel as a typed failure shown with
+   *   fixed copy (`../panel/actions.ts`);
+   * - a `session.bind` refusal saying no session serves the tab is withheld,
+   *   because the unbound tab's empty state already says so, and any other
+   *   bind refusal reaches the asking tab's panels only
+   *   ({@link createBindRefusalRelayFilter}).
    */
   const relayToPanels: RelayPush = createSourceOpenRelayFilter(
     sourceOpenRefs,
-    (message, tabId) => {
-      hub.relayPush(message, tabId);
-    },
+    createBindRefusalRelayFilter(
+      bindRefs,
+      (message, tabId) => {
+        hub.relayPush(message, tabId);
+      },
+      log,
+    ),
     log,
   );
 
@@ -5480,6 +6361,22 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         addLossCounts(frame.events, frame.droppedCount),
         'socket-queue',
       );
+    },
+    // A re-announced binding the service refused for good names a session
+    // that ended, failed or vanished while the socket was down: the
+    // `session.updated` and `cleanup.completed` that would have ended it never
+    // reached this worker, and the service cannot send them to a connection
+    // that binds none of the session's tabs. The refusal is therefore what
+    // ends the tab's binding (`session-ended`), and that binding change
+    // returns the page agent to its dormant configuration (AAP §0.5.1) — else
+    // it stays armed for a session that is over, across reloads and restarts.
+    onBindingRefused: (refusal) => {
+      log.info('The service refused a re-announced binding; its session is over.', {
+        tabId: refusal.tabId,
+        sessionId: refusal.sessionId,
+        code: refusal.code,
+      });
+      background(registry.handleSessionEnded(refusal.sessionId), 'end a refused binding');
     },
     logger: rootLogger,
   });
@@ -5645,7 +6542,9 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
           change.previous !== undefined &&
           change.previous.sessionId !== change.current?.sessionId
         ) {
-          agent.disarm(change.tabId, 'displaced');
+          // The displaced binding is the fallback: a worker revived after an
+          // eviction holds no configuration to derive the dormant one from.
+          agent.disarm(change.tabId, 'displaced', change.previous);
           // A pick armed for the displaced session must not select for the new one.
           cancelPickWithBinding(change.tabId);
         }
@@ -5661,7 +6560,11 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       case 'removed': {
         const reason = disarmReasonFor(change);
         if (reason !== undefined) {
-          agent.disarm(change.tabId, reason);
+          // The removed record is the fallback: its persisted `captureId`
+          // survives an eviction that took the configuration this worker
+          // armed the page with, so a binding ended on a revived worker — a
+          // re-announced bind the service refuses as over — still disarms it.
+          agent.disarm(change.tabId, reason, change.previous);
         }
         // Disarming does not end a pick in the page; the pick is cancelled there.
         cancelPickWithBinding(change.tabId);
@@ -5673,20 +6576,85 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   }
 
   /**
-   * The URL of a committed navigation this `tabs.onUpdated` event reports, or
-   * `undefined` when it reports none — {@link nextCommittedNavigation} over the
-   * tab's remembered URL and status, whose memo is kept for the tab's next
-   * event. A load Chrome reports in two events (the `loading` entry naming a
-   * `pendingUrl`, then the `url` at commit) therefore reports once.
+   * The committed navigation this `tabs.onUpdated` event reports, with why —
+   * {@link nextCommittedNavigation} over the tab's remembered URL and status,
+   * whose memo is kept for the tab's next event. A load Chrome reports in two
+   * events (the `loading` entry naming a `pendingUrl`, then the `url` at
+   * commit) therefore reports once.
    */
-  function committedNavigationUrl(
+  function committedNavigation(
     tabId: TabId,
     changeInfo: WorkerTabChange,
     tab: WorkerTab,
-  ): string | undefined {
+  ): NavigationStep {
     const step = nextCommittedNavigation(navigationMemo.get(tabId), changeInfo, tab);
     navigationMemo.set(tabId, step.memo);
-    return step.url;
+    return step;
+  }
+
+  /**
+   * Report the committed navigation a `tabs.onUpdated` event names, once per
+   * real commit.
+   *
+   * A URL change is reported at once, and forgets any same-URL load the tab
+   * still held. A same-URL `loading` cycle is only a reload candidate: a
+   * same-URL `history.replaceState` fires the very same events, and reporting
+   * it would tell the service of a reload that never happened — the service
+   * announces a reload during a capture as "Page reloaded during capture". So
+   * when the tab's page agent has reported a document, the load is held
+   * ({@link reloadCandidates}), keeping the document shown before the first
+   * of several such cycles, and the tab's next `agent.ready` reports it if
+   * it names another document (a reload), or never. A tab whose agent has
+   * reported no document — a page without one, or one the consented reload
+   * cleared — cannot be confirmed that way, and is reported at once, as
+   * before.
+   */
+  async function handleTabUpdated(
+    tabId: TabId,
+    changeInfo: WorkerTabChange,
+    tab: WorkerTab,
+  ): Promise<void> {
+    const step = committedNavigation(tabId, changeInfo, tab);
+    if (step.url === undefined) {
+      return;
+    }
+    if (step.kind === 'reload-candidate') {
+      const documentId = agent.getReadiness(tabId)?.documentId;
+      if (documentId !== undefined) {
+        const held = reloadCandidates.get(tabId);
+        reloadCandidates.set(tabId, {
+          url: step.url,
+          previousDocumentId: held?.previousDocumentId ?? documentId,
+        });
+        log.debug('A same-URL load waits for a new page agent document to prove a reload.', {
+          tabId,
+        });
+        return;
+      }
+    } else {
+      reloadCandidates.delete(tabId);
+    }
+    await reportCommittedNavigation(tabId, step.url);
+  }
+
+  /**
+   * Queue one committed navigation's report behind the tab's earlier ones and
+   * track it in {@link navigationReports}. The returned promise rejects when
+   * the report fails; the tracked one never does, so a tab's `agent.ready`
+   * that waits on it is never blocked by a failed report.
+   */
+  function reportCommittedNavigation(tabId: TabId, url: string): Promise<void> {
+    const report = (navigationReports.get(tabId) ?? Promise.resolve()).then(() =>
+      reportNavigationNow(tabId, url),
+    );
+    const tracked = report.then(undefined, () => undefined);
+    navigationReports.set(tabId, tracked);
+    void tracked.then(() => {
+      if (navigationReports.get(tabId) === tracked) {
+        navigationReports.delete(tabId);
+      }
+    });
+    return report;
   }
 
   /**
@@ -5694,7 +6662,11 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * `tab.navigated` and keeps or drops the binding by origin, and the agent
    * controller re-arms the new document (same origin) or clears the
    * configuration (different origin). Unbound tabs are not reported, to keep
-   * the service free of every other tab's browsing.
+   * the service free of every other tab's browsing — except a tab a DevTools
+   * page inspects, whose announcement follows the document it shows: moved to
+   * another origin, or back to the origin it left (withdrawing "Tab left
+   * ‹origin›"), it is announced again with `session.bind`, as when its DevTools
+   * opened ({@link reannounceUnboundTab}).
    *
    * A bound tab that commits a document with no URL form the service accepts
    * (`chrome://`, `about:blank`, `file:`, an extension page) has left the app
@@ -5704,17 +6676,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * shows the panel "Tab left ‹origin›", and the agent controller clears the
    * tab's configuration, exactly as for a reported cross-origin navigation.
    */
-  async function handleTabUpdated(
-    tabId: TabId,
-    changeInfo: WorkerTabChange,
-    tab: WorkerTab,
-  ): Promise<void> {
-    const url = committedNavigationUrl(tabId, changeInfo, tab);
-    if (url === undefined) {
-      return;
-    }
+  async function reportNavigationNow(tabId: TabId, url: string): Promise<void> {
     await ready;
     if ((await registry.getBinding(tabId)) === undefined) {
+      await reannounceUnboundTab(tabId, url);
       return;
     }
     const redacted = redactNavigationUrl(url);
@@ -5729,6 +6694,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         ? await registry.handleUnreportableNavigation(tabId)
         : await registry.handleNavigated({ tabId, url: reported });
     const outcome = agent.handleNavigationDecision(decision);
+    // The tab's announcement follows its document, so a session created later
+    // for the origin it moved to (which the service now awaits for it) binds
+    // the document it shows. The departure itself stays "Tab left ‹origin›".
+    await refreshAnnouncement(tabId, url);
     log.info('Committed navigation of a bound tab.', {
       tabId,
       reportable: reported !== undefined,
@@ -5787,16 +6756,40 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     }),
     wsBridge.subscribe(MESSAGE_TYPE.SESSION_UPDATED, (message) => {
       // An ended session unbinds its tab; the binding change disarms the agent.
+      if (message.payload.session.status === 'ended') {
+        sessionReplays.delete(message.payload.session.id);
+      }
       background(registry.handleSessionUpdated(message.payload), MESSAGE_TYPE.SESSION_UPDATED);
     }),
+    // Remembered for a panel that attaches after they were relayed (`sessionReplays`).
+    wsBridge.subscribe(MESSAGE_TYPE.SESSION_PROGRESS, (message) => {
+      rememberForReplay(message.payload.sessionId, message);
+    }),
+    wsBridge.subscribe(MESSAGE_TYPE.INSTRUMENTATION_READY, (message) => {
+      rememberForReplay(message.payload.sessionId, message);
+    }),
+    wsBridge.subscribe(MESSAGE_TYPE.INSTRUMENTATION_FAILED, (message) => {
+      rememberForReplay(message.payload.sessionId, message);
+    }),
     wsBridge.subscribe(MESSAGE_TYPE.CLEANUP_COMPLETED, (message) => {
+      sessionReplays.delete(message.payload.sessionId);
       background(
         registry.handleSessionEnded(message.payload.sessionId),
         MESSAGE_TYPE.CLEANUP_COMPLETED,
       );
     }),
-    wsBridge.subscribe(MESSAGE_TYPE.SESSION_CREATED, () => {
-      background(rebindAnnouncedTabs('session-created'), 'rebind after session.created');
+    wsBridge.subscribe(MESSAGE_TYPE.SESSION_CREATED, (message) => {
+      // The service sends a new session to this worker when one of its
+      // announced tabs awaits that session's dev-server origin — a panel opened
+      // before the question, or kept open after the previous session ended —
+      // so the tabs on that origin are announced again and bind to it.
+      background(
+        rebindAnnouncedTabs(
+          'session-created',
+          bindableOrigin(message.payload.session.devServerUrl),
+        ),
+        'rebind after session.created',
+      );
     }),
     wsBridge.subscribe(MESSAGE_TYPE.TARGET_REQUEST, (message) => {
       // The service asked the bound tab for a target (the editor's
@@ -5875,6 +6868,8 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
 
   listen(tabs.onRemoved, (tabId) => {
     navigationMemo.delete(tabId);
+    reloadCandidates.delete(tabId);
+    navigationReports.delete(tabId);
     announcedTabs.delete(tabId);
     cancelHydration(tabId, 'tab-closed');
     // Batches already queued still settle on their own lane (and find the tab
@@ -5988,6 +6983,8 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     // route is released by the bridge's close below, and each job clears its
     // own deadline timer as it settles.
     telemetryLanes.clear();
+    reloadCandidates.clear();
+    navigationReports.clear();
     background(wsBridge.close(), 'close');
     log.info('Worker disposed.');
   }

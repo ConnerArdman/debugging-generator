@@ -139,6 +139,10 @@ export function ProductGallery({ images, productName, className }: Props) {
           the optimiser passes SVG through untouched unless the project configures it to do
           otherwise, which this one deliberately does not. The intrinsic size travels as the
           width and height attributes so the ratio is known before the file arrives.
+
+          This picture is loaded eagerly, unlike the thumbnails below: it sits in the first
+          viewport and is the largest picture on the page, so deferring it would only delay what
+          the reader came to see.
         */}
         <img
           className={styles.image}
@@ -168,13 +172,19 @@ export function ProductGallery({ images, productName, className }: Props) {
                   setSelectedIndex(index);
                 }}
               >
-                {/* Described by the control's own hidden name, so the picture adds nothing. */}
+                {/*
+                  Described by the control's own hidden name, so the picture adds nothing. Loaded
+                  lazily and decoded asynchronously: the strip sits under the frame, usually below
+                  the fold, and its width and height already reserve each thumbnail's box.
+                */}
                 <img
                   className={styles.thumbImage}
                   src={source(image)}
                   width={FRAME_WIDTH}
                   height={FRAME_HEIGHT}
                   alt=""
+                  loading="lazy"
+                  decoding="async"
                 />
                 <VisuallyHidden>{`View image ${String(index + 1)} of ${String(total)}`}</VisuallyHidden>
               </Button>

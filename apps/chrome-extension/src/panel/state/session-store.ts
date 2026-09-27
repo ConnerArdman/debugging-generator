@@ -24,7 +24,8 @@
  *   picker-mode toggle) and {@link setLastError} (a non-blocking failure the
  *   panel chrome surfaces, such as a click-to-source request that could not be
  *   delivered).
- * - {@link resetPanelStore}, on unbind or session end and in unit suites.
+ * - {@link resetPanelStore}, when the inspected tab's binding is lost (session
+ *   end included) and in unit suites.
  *
  * ## What it deliberately does not do
  *
@@ -75,6 +76,14 @@
  * question (AAP §0.5.5: a failure, or foreign data, is never presented as this
  * session's result).
  *
+ * An ended session is the one exception to "a lost binding resets the scope".
+ * Ending a session unbinds its tab (AAP §0.2.3), yet what the developer asked
+ * for at that moment is the session's outcome: its "Ended" status, its cleanup
+ * result (`cleanup.completed` is addressed to DevTools, AAP §0.4.2) and the
+ * panel it generated. So the ended session stays on screen, read-only, until
+ * another session arrives; the arrival is a change of session identity, and
+ * resets the scope before the new session's data lands.
+ *
  * @example Reading a slice from a component (a `.tsx` file of this panel):
  * ```tsx
  * import { type PanelSnapshot, usePanelStoreSelector } from '../state/session-store';
@@ -110,7 +119,7 @@ import type {
   TelemetryEvent,
 } from '@debuggen/protocol';
 import { assertNever, nowEpochMs } from '@debuggen/shared';
-import type { CaptureId, MessageId, PanelId, SessionId } from '@debuggen/shared';
+import type { CaptureId, DebuggenErrorCode, MessageId, PanelId, SessionId } from '@debuggen/shared';
 
 import type {
   PanelBindingState,
@@ -229,18 +238,35 @@ export interface PanelConnectionSlice {
 /**
  * One row of the progress view — the ✓/spinner/✗ list of AAP §0.7.3, built from
  * real pipeline events whose wording the service composed.
+ *
+ * A stage's first row is its group header: the `running` row whose message is
+ * the stage's title (for instance "Understanding problem"). How the rows of a
+ * stage settle when that header finishes or fails is described on
+ * {@link mergeProgress}.
  */
 export interface PanelProgressEntry {
   /** The pipeline stage that reported. */
   readonly stage: ProgressStage;
   /** Whether that stage is working, finished or failed. */
   readonly status: ProgressStatus;
-  /** The service-composed line. Together with `stage`, the row's identity. */
+  /**
+   * The service-composed line. Together with `stage`, the row's identity (and,
+   * through {@link supersedes}, the identity of the header it replaced).
+   */
   readonly message: string;
   /** The optional second line; absent when the stage said nothing further. */
   readonly detail?: string;
   /** When the service stamped the frame, in epoch milliseconds. */
   readonly ts: number;
+  /**
+   * The message of the stage header this row replaced in place — present only
+   * on a stage's failure row (`‹stage title› failed: ‹summary›`) that arrived
+   * while the header was still `running`, so the failure takes the header's
+   * position instead of leaving a spinner above it. A replay of that header is
+   * recognised through this field and ignored; a newer header — the stage
+   * running again — takes the row back and drops the field.
+   */
+  readonly supersedes?: string;
 }
 
 /** The session's current generated panel — only the current one is kept. */
@@ -257,12 +283,32 @@ export interface PanelCaptureSlice {
   readonly active: boolean;
   /** The running or most recent capture; kept after it stops. */
   readonly captureId: CaptureId | undefined;
-  /** Events counted for this capture: the live counter beside Stop capture. */
+  /**
+   * Events the capture holds: the live counter beside Stop capture, and the panel's one running
+   * number (see "Counting a capture" in Section J). The service's count of the capture's stored
+   * events whenever it reported one — the `telemetry.tail` frame's tally for the capture, the
+   * stopped summary's `coverage.storedEvents`, the record's count — and never lowered for the
+   * same capture; the number of events tailed only when the service reported no count.
+   */
   readonly eventCount: number;
+  /**
+   * Events of this capture the service stored but did not stream to the live tail — its tail's
+   * bounded buffer evicted them during a burst, or held them past its retention window while no
+   * panel received frames — as the latest tally reported. The live tail states it, so a tail that
+   * is not the whole capture says so; the evidence is intact in the store either way.
+   */
+  readonly tailSkipped: number;
   /** When the capture started, in epoch milliseconds, when known. */
   readonly startedAt: number | undefined;
   /** What the capture added up to; present once it has stopped. */
   readonly summary: PanelCaptureSummary | undefined;
+  /**
+   * A failed "Stop capture" request reported through {@link reportCaptureStopFailure} while this
+   * capture still looked running — shown as `lastError` meanwhile. The request can fail although
+   * the stop happened (the service answers only after analysing the capture), so the failure is
+   * withdrawn from `lastError` as soon as this capture is seen stopped.
+   */
+  readonly stopFailure: ErrorPayload | undefined;
 }
 
 /**
@@ -372,7 +418,10 @@ export interface PanelSnapshot {
   readonly connection: PanelConnectionSlice;
   /** The bound session's record, exactly as the service last broadcast it. */
   readonly session: SessionRecord | undefined;
-  /** The progress rows, in first-arrival order, deduplicated by stage and message. */
+  /**
+   * The progress rows, in first-arrival order, deduplicated by stage and
+   * message; a stage's rows settle with its header (see {@link mergeProgress}).
+   */
   readonly progress: readonly PanelProgressEntry[];
   /** The session's current generated panel. */
   readonly panel: PanelCurrentPanel | undefined;
@@ -416,6 +465,16 @@ export interface ResetPanelStoreOptions {
    * that caused it. Unit suites pass `true` between cases.
    */
   readonly includeConnection?: boolean | undefined;
+  /**
+   * Also discard an ended session's final state. Defaults to `false`: ending a
+   * session unbinds its tab, and the reset that follows the lost binding must
+   * leave the ended session on screen — its "Ended" status, its cleanup outcome
+   * (`cleanup.completed` is addressed to DevTools, AAP §0.4.2) and the panel it
+   * generated — until another session arrives (see {@link resetPanelStore}).
+   * Ignored when `includeConnection` is `true`, which always yields the
+   * pristine snapshot.
+   */
+  readonly discardEndedSession?: boolean | undefined;
 }
 
 /*
@@ -515,8 +574,10 @@ const INITIAL_CAPTURE: PanelCaptureSlice = Object.freeze({
   active: false,
   captureId: undefined,
   eventCount: 0,
+  tailSkipped: 0,
   startedAt: undefined,
   summary: undefined,
+  stopFailure: undefined,
 });
 
 /** Nothing picked, nothing requested. */
@@ -552,6 +613,21 @@ const SESSION_SCOPED_INITIAL = Object.freeze({
   target: INITIAL_TARGET,
   instrumentation: INITIAL_INSTRUMENTATION,
   cleanup: undefined,
+  lastError: undefined,
+} satisfies SnapshotPatch);
+
+/**
+ * What losing the binding clears when the session on screen has ended: only
+ * the slices that act on a live binding — the selection, whose drawer reads
+ * evidence through the tab's binding, the pending pick with its picker request,
+ * and the last failure. Everything else stays as the session's final state: the
+ * record with its "Ended" status, the progress rows, the generated panel and
+ * its analysis, the capture and its live tail, the instrumentation outcome and
+ * the cleanup outcome.
+ */
+const ENDED_SESSION_RELEASE = Object.freeze({
+  selectedEvent: undefined,
+  target: INITIAL_TARGET,
   lastError: undefined,
 } satisfies SnapshotPatch);
 
@@ -692,6 +768,25 @@ export function getSessionId(): SessionId | undefined {
 }
 
 /**
+ * Whether `sessionId` is the ended session this panel keeps on screen after
+ * its end unbound the inspected tab (see {@link resetPanelStore}): the tab is
+ * not bound, the record on screen is `sessionId`'s, and that session has ended
+ * — its record says so, or its cleanup outcome has arrived ahead of the ended
+ * record. `../data-provider.ts` injects exactly this function as its
+ * `isSessionEnded`, so a read of such a session is refused before anything is
+ * sent. Read from the current snapshot at every call.
+ *
+ * @param sessionId The session a query is addressed to.
+ */
+export function isEndedSessionShown(sessionId: SessionId): boolean {
+  return (
+    state.connection.binding.kind !== 'bound' &&
+    state.session?.id === sessionId &&
+    showsEndedSession(state)
+  );
+}
+
+/**
  * Return the store to its initial state.
  *
  * By default every session-scoped slice is reset and the connection slice is
@@ -699,13 +794,26 @@ export function getSessionId(): SessionId | undefined {
  * the pristine reset unit suites use. Resetting a store that is already in that
  * state notifies nobody.
  *
+ * `./connection.ts` calls the default form whenever the inspected tab's
+ * binding is lost — the tab was unbound, left its session's origin, or had its
+ * binding taken. Ending a session unbinds its tab too, and that loss is not a
+ * reason to erase what the session found: when the session on screen has
+ * ended, only the slices that need a live binding are cleared (the selection,
+ * the pending pick, the last failure) and its final state stays until another
+ * session arrives — a binding to it, or its record — whose change of session
+ * identity resets the scope as it always does. Pass
+ * {@link ResetPanelStoreOptions.discardEndedSession} to discard that final
+ * state as well.
+ *
  * @param options What to reset.
  */
 export function resetPanelStore(options: ResetPanelStoreOptions = {}): void {
+  if (options.includeConnection === true) {
+    commit(withChanges(state, INITIAL_SNAPSHOT));
+    return;
+  }
   commit(
-    options.includeConnection === true
-      ? withChanges(state, INITIAL_SNAPSHOT)
-      : withChanges(state, SESSION_SCOPED_INITIAL),
+    options.discardEndedSession === true ? resetSessionScope(state) : releaseSessionScope(state),
   );
 }
 
@@ -747,6 +855,29 @@ function belongsToOtherSession(snapshot: PanelSnapshot, sessionId: SessionId | u
 /** `snapshot` with every session-scoped slice reset; the connection slice kept. */
 function resetSessionScope(snapshot: PanelSnapshot): PanelSnapshot {
   return withChanges(snapshot, SESSION_SCOPED_INITIAL);
+}
+
+/**
+ * Whether the session on screen has ended: its record says so, or its cleanup
+ * outcome has arrived. Cleanup runs only when a session ends, and the service
+ * reports it before it records the end, so a binding loss that overtakes the
+ * ended record still finds the session ending rather than live.
+ */
+function showsEndedSession(snapshot: PanelSnapshot): boolean {
+  const session = snapshot.session;
+  return session !== undefined && (session.status === 'ended' || snapshot.cleanup !== undefined);
+}
+
+/**
+ * `snapshot` once the inspected tab's binding is lost: every session-scoped
+ * slice reset — unless the session on screen has ended, whose final state
+ * stays with only {@link ENDED_SESSION_RELEASE} cleared (see
+ * {@link resetPanelStore}).
+ */
+function releaseSessionScope(snapshot: PanelSnapshot): PanelSnapshot {
+  return showsEndedSession(snapshot)
+    ? withChanges(snapshot, ENDED_SESSION_RELEASE)
+    : resetSessionScope(snapshot);
 }
 
 /*
@@ -835,8 +966,10 @@ function sameCapture(left: PanelCaptureSlice, right: PanelCaptureSlice): boolean
     left.active === right.active &&
     left.captureId === right.captureId &&
     left.eventCount === right.eventCount &&
+    left.tailSkipped === right.tailSkipped &&
     left.startedAt === right.startedAt &&
-    left.summary === right.summary
+    left.summary === right.summary &&
+    left.stopFailure === right.stopFailure
   );
 }
 
@@ -847,7 +980,58 @@ function sameProgressEntry(left: PanelProgressEntry, right: PanelProgressEntry):
     left.status === right.status &&
     left.message === right.message &&
     left.detail === right.detail &&
-    left.ts === right.ts
+    left.ts === right.ts &&
+    left.supersedes === right.supersedes
+  );
+}
+
+/**
+ * What joins a stage header's message to the summary in that stage's failure
+ * row: the service words every stage failure `‹stage title› failed: ‹summary›`
+ * (`apps/local-service/src/sessions/progress.ts`, `publicFailureCopy`), and the
+ * header's message is the same stage title.
+ */
+const STAGE_FAILURE_CONNECTIVE = ' failed: ';
+
+/**
+ * The closing of a stage failure row's detail: the service appends
+ * `(error code: ‹code›, ref: ‹ref›)` to every stage failure it files, and to
+ * no other row.
+ */
+const STAGE_FAILURE_DETAIL_SUFFIX = /\(error code: [^(),]+, ref: [^()]+\)$/u;
+
+/**
+ * Whether a progress row is the report of a failed pipeline stage — the row a
+ * failed session is explained by — rather than an ordinary ✗ line such as a
+ * signal that could not be enabled while the stage carried on.
+ *
+ * A stage failure is recognised by the shape the service gives it and by
+ * nothing the developer typed: a row that replaced its stage's running header
+ * ({@link PanelProgressEntry.supersedes}), or a `failed` row whose detail ends
+ * with the service's `(error code: ‹code›, ref: ‹ref›)` suffix.
+ *
+ * @param entry A row of {@link PanelSnapshot.progress}.
+ * @returns `true` for a stage failure row.
+ *
+ * @example
+ * ```ts
+ * isStageFailureEntry({
+ *   stage: 'understand',
+ *   status: 'failed',
+ *   message: 'Understanding problem failed: Model provider unavailable (MODEL_UNAVAILABLE).',
+ *   detail: 'Check ANTHROPIC_API_KEY or switch DEBUGGEN_PROVIDER. (error code: MODEL_UNAVAILABLE, ref: r-1)',
+ *   ts: 1,
+ * }); // true
+ * ```
+ */
+export function isStageFailureEntry(entry: PanelProgressEntry): boolean {
+  if (entry.supersedes !== undefined) {
+    return true;
+  }
+  return (
+    entry.status === 'failed' &&
+    entry.detail !== undefined &&
+    STAGE_FAILURE_DETAIL_SUFFIX.test(entry.detail.trimEnd())
   );
 }
 
@@ -906,13 +1090,23 @@ function nextConnection(
 }
 
 /**
+ * The refusal of a bind that found no session for the tab's origin — what the
+ * panel is answered when it opens before the question is asked.
+ */
+const NO_SESSION_FOR_ORIGIN: DebuggenErrorCode = 'SESSION_NOT_FOUND';
+
+/**
  * Move to a new binding. A binding to a different session is a change of
- * session identity, so the session-scoped slices are reset first.
+ * session identity, so the session-scoped slices are reset first. A tab that
+ * binds has found its session, so a refusal saying no session served its
+ * origin — the service later delivered the session to the open panel, which
+ * bound it — is answered and no longer shown.
  */
 function applyBinding(snapshot: PanelSnapshot, binding: PanelBindingState): PanelSnapshot {
   const nextSessionId = binding.kind === 'bound' ? binding.sessionId : undefined;
   const base = isSessionSwitch(snapshot, nextSessionId) ? resetSessionScope(snapshot) : snapshot;
   const connection = base.connection;
+  const answered = binding.kind === 'bound' && base.lastError?.code === NO_SESSION_FOR_ORIGIN;
   return withChanges(base, {
     connection: nextConnection(
       connection,
@@ -921,6 +1115,7 @@ function applyBinding(snapshot: PanelSnapshot, binding: PanelBindingState): Pane
       connection.serviceUrl,
       binding,
     ),
+    ...(answered ? { lastError: undefined } : {}),
   });
 }
 
@@ -996,14 +1191,198 @@ function bindingFromBound(
   }
 }
 
+/** A progress status that ends the step it reports. */
+type TerminalProgressStatus = Exclude<ProgressStatus, 'running'>;
+
+/**
+ * Whether `incoming` is older than the row it would replace — a replay, or a
+ * delivery overtaken by a newer one — and so must be ignored. Within the same
+ * millisecond a `running` report never reopens a finished row: a stage that
+ * settled in the millisecond it started is replayed header first, and that
+ * header must not bring the spinner back.
+ */
+function isStaleProgress(existing: PanelProgressEntry, incoming: PanelProgressEntry): boolean {
+  return (
+    incoming.ts < existing.ts ||
+    (incoming.ts === existing.ts && incoming.status === 'running' && existing.status !== 'running')
+  );
+}
+
+/** The index of the first row `stage` reported — the stage's group header — or `-1`. */
+function stageHeaderIndex(entries: readonly PanelProgressEntry[], stage: ProgressStage): number {
+  return entries.findIndex((candidate) => candidate.stage === stage);
+}
+
+/**
+ * The message a stage's header row answers to: the header's own, or — once a
+ * failure row replaced it — the header message that failure superseded.
+ */
+function headerMessageOf(header: PanelProgressEntry): string {
+  return header.supersedes ?? header.message;
+}
+
+/**
+ * Settle, in place in `rows` (a private copy), every other row of `stage`
+ * still `running` when the stage reached `status` at `ts`, keeping each row's
+ * position, message and detail. A row reported after `ts` is left alone: it
+ * started after the report that settles the others.
+ */
+function settleStageRows(
+  rows: PanelProgressEntry[],
+  stage: ProgressStage,
+  keep: number,
+  status: TerminalProgressStatus,
+  ts: number,
+): void {
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (
+      row !== undefined &&
+      index !== keep &&
+      row.stage === stage &&
+      row.status === 'running' &&
+      row.ts <= ts
+    ) {
+      rows[index] = Object.freeze({ ...row, status, ts });
+    }
+  }
+}
+
+/** `rows`, frozen, with the oldest dropped past {@link PANEL_PROGRESS_MAX_ENTRIES}. */
+function boundedProgress(rows: PanelProgressEntry[]): readonly PanelProgressEntry[] {
+  const overflow = rows.length - PANEL_PROGRESS_MAX_ENTRIES;
+  return Object.freeze(overflow > 0 ? rows.slice(overflow) : rows);
+}
+
+/**
+ * The rows with the row at `index` — the same `(stage, message)` as `entry` —
+ * taking `entry`'s values, unless `entry` is stale or changes nothing. A row
+ * that superseded a header keeps that record. When the updated row is its
+ * stage's header and `entry` finishes or fails it, the stage's other running
+ * rows settle with it.
+ */
+function updateProgressRow(
+  entries: readonly PanelProgressEntry[],
+  index: number,
+  entry: PanelProgressEntry,
+): readonly PanelProgressEntry[] {
+  const existing = entries[index];
+  if (existing === undefined || isStaleProgress(existing, entry)) {
+    return entries;
+  }
+  const next =
+    existing.supersedes === undefined
+      ? entry
+      : Object.freeze({ ...entry, supersedes: existing.supersedes });
+  if (sameProgressEntry(existing, next)) {
+    return entries;
+  }
+  const rows = entries.slice();
+  rows[index] = next;
+  if (next.status !== 'running' && index === stageHeaderIndex(entries, next.stage)) {
+    settleStageRows(rows, next.stage, index, next.status, next.ts);
+  }
+  return Object.freeze(rows);
+}
+
+/**
+ * The rows with a stage header reported again after a failure row replaced it
+ * (the failure at `index` records the header's message as its `supersedes`).
+ *
+ * No newer than that failure, the header is a replay of the one the failure
+ * closed, and nothing changes. Newer, the stage is running again — a follow-up
+ * re-ran it — so the header takes its row back and the failure's record goes
+ * with the row it lived in; a terminal header settles its stage as above.
+ */
+function reopenStageHeader(
+  entries: readonly PanelProgressEntry[],
+  index: number,
+  entry: PanelProgressEntry,
+): readonly PanelProgressEntry[] {
+  const existing = entries[index];
+  if (existing === undefined || entry.ts <= existing.ts) {
+    return entries;
+  }
+  const rows = entries.slice();
+  rows[index] = entry;
+  if (entry.status !== 'running' && index === stageHeaderIndex(entries, entry.stage)) {
+    settleStageRows(rows, entry.stage, index, entry.status, entry.ts);
+  }
+  return Object.freeze(rows);
+}
+
+/**
+ * The rows with an `entry` no row answers to yet.
+ *
+ * An ordinary row is appended. A stage's failure row — `failed`, and worded
+ * `‹header message› failed: ‹summary›` after its stage's header — ends the
+ * stage instead:
+ *
+ * - while the header still runs, the failure replaces it in place, recording
+ *   the header's message in `supersedes`, so no spinner stays above it;
+ * - once the header has settled (or an earlier failure already replaced it),
+ *   the failure is appended as a row of its own;
+ * - older than the header, it is the failure of an earlier run of the stage,
+ *   which that header already superseded, and it is ignored.
+ *
+ * Either way every other row of the stage still running settles to `failed`.
+ */
+function mergeNewProgressRow(
+  entries: readonly PanelProgressEntry[],
+  entry: PanelProgressEntry,
+): readonly PanelProgressEntry[] {
+  const headerIndex = stageHeaderIndex(entries, entry.stage);
+  const header = headerIndex === -1 ? undefined : entries[headerIndex];
+  if (
+    entry.status !== 'failed' ||
+    header === undefined ||
+    !entry.message.startsWith(`${headerMessageOf(header)}${STAGE_FAILURE_CONNECTIVE}`)
+  ) {
+    return boundedProgress([...entries, entry]);
+  }
+  if (entry.ts < header.ts) {
+    return entries;
+  }
+  const rows = entries.slice();
+  let failureIndex = headerIndex;
+  if (header.status === 'running' && header.supersedes === undefined) {
+    rows[headerIndex] = Object.freeze({ ...entry, supersedes: header.message });
+  } else {
+    failureIndex = rows.push(entry) - 1;
+  }
+  settleStageRows(rows, entry.stage, failureIndex, 'failed', entry.ts);
+  return boundedProgress(rows);
+}
+
 /**
  * The progress rows with `entry` merged in.
  *
  * Rows are identified by `(stage, message)`: a row reported again keeps its
  * first-arrival position and takes the newer `status`, `detail` and `ts`, so a
  * line moves from running to done in place instead of repeating. A report older
- * than the row it would replace is stale and ignored. Past
- * {@link PANEL_PROGRESS_MAX_ENTRIES} the oldest rows are dropped.
+ * than the row it would replace is stale and ignored — the case of every row
+ * replayed on bind, which arrives in stored order with its original stamp.
+ * Past {@link PANEL_PROGRESS_MAX_ENTRIES} the oldest rows are dropped.
+ *
+ * A stage's first row is its header, and the header decides for the stage, so
+ * no row is left spinning beside a stage that has ended (AAP §0.7.3):
+ *
+ * - **The header settles.** When the header moves to `done` or `failed`, every
+ *   other row of the stage still `running` takes the same status — the
+ *   instrumentation stage's "Reload the page…" request once "Ready to capture"
+ *   follows, for instance.
+ * - **The stage fails.** The service words a stage's failure differently from
+ *   its header (`‹title› failed: ‹summary›`), so the failure matches no row;
+ *   {@link mergeNewProgressRow} recognises it after its header, lets it replace
+ *   a running header in place and settles the stage's other running rows.
+ * - **The header returns.** A replay of a header a failure replaced is ignored;
+ *   a newer one takes the row back ({@link reopenStageHeader}).
+ *
+ * The only wording read here is the service's own row shape: the stage title
+ * a header carries and the ` failed: ` connective of its failure row.
+ * Identities stay unique — a replacement happens only when no row holds the
+ * incoming `(stage, message)` — so `SessionSummary` keys rows by them safely.
+ * A report that changes nothing returns `entries` itself.
  */
 function mergeProgress(
   entries: readonly PanelProgressEntry[],
@@ -1012,18 +1391,16 @@ function mergeProgress(
   const index = entries.findIndex(
     (candidate) => candidate.stage === entry.stage && candidate.message === entry.message,
   );
-  if (index === -1) {
-    const appended = [...entries, entry];
-    const overflow = appended.length - PANEL_PROGRESS_MAX_ENTRIES;
-    return Object.freeze(overflow > 0 ? appended.slice(overflow) : appended);
+  if (index !== -1) {
+    return updateProgressRow(entries, index, entry);
   }
-  const existing = entries[index];
-  if (existing === undefined || entry.ts < existing.ts || sameProgressEntry(existing, entry)) {
-    return entries;
+  const superseded = entries.findIndex(
+    (candidate) => candidate.stage === entry.stage && candidate.supersedes === entry.message,
+  );
+  if (superseded !== -1) {
+    return reopenStageHeader(entries, superseded, entry);
   }
-  const replaced = entries.slice();
-  replaced[index] = entry;
-  return Object.freeze(replaced);
+  return mergeNewProgressRow(entries, entry);
 }
 
 /**
@@ -1083,12 +1460,35 @@ function reconcileTarget(
 }
 
 /**
+ * How many events a stopped capture's summary says the store holds.
+ *
+ * `coverage.storedEvents` is the store's count when the window closed. The
+ * summary's own `eventCount` counts the events it was computed from, which the
+ * service caps for a large capture — so it is only the answer when the summary
+ * carries no coverage — and the larger of the two is taken, so a summary can
+ * never lower what it reports.
+ */
+function summaryStoredCount(summary: PanelCaptureSummary | undefined): number {
+  if (summary === undefined) {
+    return 0;
+  }
+  const stored = summary.coverage?.storedEvents;
+  return Math.max(
+    summary.eventCount,
+    stored !== undefined && Number.isSafeInteger(stored) && stored > 0 ? stored : 0,
+  );
+}
+
+/**
  * The capture slice a session record implies: its latest capture, in flight
  * while it has no `stoppedAt`.
  *
  * For the capture already on screen the local counter is kept when it is ahead
- * of the record's (the tail may have counted events the record has not caught
- * up with), and an immutable stopped-capture summary keeps its reference.
+ * of the record's (a tally may have reported events the record has not caught
+ * up with), the tail's skipped count and an unconfirmed stop failure are kept,
+ * and an immutable stopped-capture summary keeps its reference. The record's
+ * count is the larger of its `eventCount` and its summary's stored count (see
+ * {@link summaryStoredCount}).
  */
 function captureFromRecord(
   current: PanelCaptureSlice,
@@ -1100,8 +1500,10 @@ function captureFromRecord(
     return sameCapture(current, INITIAL_CAPTURE) ? current : INITIAL_CAPTURE;
   }
   const sameId = current.captureId === latest.id;
-  const recordCount = latest.eventCount ?? latest.summary?.eventCount ?? 0;
-  const stopped = latest.stoppedAt !== undefined;
+  const recordCount = Math.max(latest.eventCount ?? 0, summaryStoredCount(latest.summary));
+  // A capture never resumes — every window has its own id — so one already seen stopped stays
+  // stopped, whatever an older record read before the stop says.
+  const stopped = latest.stoppedAt !== undefined || (sameId && !current.active);
   const summary = !stopped
     ? undefined
     : sameId && current.summary !== undefined
@@ -1111,8 +1513,10 @@ function captureFromRecord(
     active: !stopped,
     captureId: latest.id,
     eventCount: sameId ? Math.max(current.eventCount, recordCount) : recordCount,
+    tailSkipped: sameId ? current.tailSkipped : 0,
     startedAt: latest.startedAt,
     summary,
+    stopFailure: sameId ? current.stopFailure : undefined,
   };
   return sameCapture(current, next) ? current : Object.freeze(next);
 }
@@ -1176,21 +1580,56 @@ function reduceSessionRecord(snapshot: PanelSnapshot, record: SessionRecord): Pa
     return snapshot;
   }
   const base = isSessionSwitch(snapshot, record.id) ? resetSessionScope(snapshot) : snapshot;
+  // The record reports the session's captures too, so the capture slice follows it exactly as a
+  // hydration does: a `capture.stopped` lost with the socket — the service announces the stop
+  // while the worker is reconnecting — is repaired by the record the reconnect replays, instead
+  // of leaving a stale running count beside a session that has moved on.
+  const capture = captureFromRecord(base.capture, record);
+  const captureChanged =
+    base.capture.captureId !== undefined &&
+    capture.captureId !== undefined &&
+    capture.captureId !== base.capture.captureId;
   return withChanges(base, {
     session: record,
     target: reconcileTarget(base.target, record, base.session),
+    capture,
+    ...(captureChanged
+      ? { liveTail: EMPTY_TAIL, liveTailDropped: 0, tailNotices: EMPTY_NOTICES }
+      : {}),
   });
 }
 
+/** The `telemetry.tail` payload, as the relayed envelope carries it. */
+type TelemetryTailFrame = Extract<
+  RelayedProtocolMessage,
+  { readonly type: 'telemetry.tail' }
+>['payload'];
+
 /**
- * Apply `telemetry.tail`: append the batch, count it, and keep only the newest
+ * Apply `telemetry.tail`: append the batch and keep only the newest
  * {@link LIVE_TAIL_MAX_EVENTS} events, adding the number dropped to
- * `liveTailDropped`. An empty batch changes nothing.
+ * `liveTailDropped`, and count the capture on screen. An empty batch changes
+ * nothing.
+ *
+ * ## Counting a capture
+ *
+ * The tail is not the capture: the service streams at most a bounded frame
+ * every flush interval and drops the oldest of a burst from its bounded buffer
+ * (the store keeps every event). So the counter never counts what was tailed
+ * when the frame says what was stored. Every frame carries a tally per capture
+ * it spans — the store's committed count and the events its tail skipped — and
+ * the tally for the capture on screen sets the counter (never lowering it) and
+ * the skipped count. A frame with tallies but none for the capture on screen
+ * leaves both alone. Only a frame without tallies — an older service — counts
+ * its events of the capture on screen, as the best available lower bound.
+ *
+ * Nothing is counted for a capture the panel does not know (its id arrives
+ * with `capture.started` or the record), and a stopped capture's count is the
+ * summary's stored count, which a late frame never moves: its skipped count
+ * still follows the tally, since the tail is what it describes.
  */
-function reduceTelemetryTail(
-  snapshot: PanelSnapshot,
-  events: readonly TelemetryEvent[],
-): PanelSnapshot {
+function reduceTelemetryTail(snapshot: PanelSnapshot, frame: TelemetryTailFrame): PanelSnapshot {
+  const events = frame.events;
   if (events.length === 0) {
     return snapshot;
   }
@@ -1199,11 +1638,48 @@ function reduceTelemetryTail(
   return withChanges(snapshot, {
     liveTail: Object.freeze(overflow > 0 ? combined.slice(overflow) : combined),
     liveTailDropped: snapshot.liveTailDropped + overflow,
-    capture: Object.freeze({
-      ...snapshot.capture,
-      eventCount: snapshot.capture.eventCount + events.length,
-    }),
+    capture: countTailFrame(snapshot.capture, frame),
   });
+}
+
+/**
+ * The capture slice after one `telemetry.tail` frame is counted (see "Counting
+ * a capture" above); the same reference when the frame changes nothing.
+ */
+function countTailFrame(capture: PanelCaptureSlice, frame: TelemetryTailFrame): PanelCaptureSlice {
+  const captureId = capture.captureId;
+  if (captureId === undefined) {
+    return capture;
+  }
+  const settled = !capture.active && capture.summary !== undefined;
+  const tallies = frame.captures;
+  let eventCount = capture.eventCount;
+  let tailSkipped = capture.tailSkipped;
+  if (tallies === undefined) {
+    if (!capture.active) {
+      return capture;
+    }
+    let tailed = 0;
+    for (const event of frame.events) {
+      if (event.captureId === captureId) {
+        tailed += 1;
+      }
+    }
+    eventCount = Math.min(Number.MAX_SAFE_INTEGER, eventCount + tailed);
+  } else {
+    const tally = tallies.find((candidate) => candidate.captureId === captureId);
+    if (tally === undefined) {
+      return capture;
+    }
+    if (!settled) {
+      eventCount = Math.max(eventCount, tally.storedEvents);
+    }
+    tailSkipped = Math.max(tailSkipped, tally.skippedEvents);
+  }
+  if (eventCount === capture.eventCount && tailSkipped === capture.tailSkipped) {
+    return capture;
+  }
+  return Object.freeze({ ...capture, eventCount, tailSkipped });
 }
 
 /** The relayed `session.bound` envelope. */
@@ -1303,8 +1779,10 @@ function reduceRelayedMessage(
           active: true,
           captureId: payload.captureId,
           eventCount: 0,
+          tailSkipped: 0,
           startedAt: message.ts,
           summary: undefined,
+          stopFailure: undefined,
         }),
         liveTail: EMPTY_TAIL,
         liveTailDropped: 0,
@@ -1328,14 +1806,17 @@ function reduceRelayedMessage(
       if (staleStop) {
         return snapshot;
       }
-      const summaryCount = payload.summary.eventCount;
+      // The store's count when the window closed, not the summary's capped `eventCount`.
+      const storedCount = summaryStoredCount(payload.summary);
       return withChanges(snapshot, {
         capture: Object.freeze({
           active: false,
           captureId: payload.captureId,
-          eventCount: sameId ? Math.max(capture.eventCount, summaryCount) : summaryCount,
+          eventCount: sameId ? Math.max(capture.eventCount, storedCount) : storedCount,
+          tailSkipped: sameId ? capture.tailSkipped : 0,
           startedAt: sameId ? capture.startedAt : undefined,
           summary: payload.summary,
+          stopFailure: sameId ? capture.stopFailure : undefined,
         }),
       });
     }
@@ -1390,7 +1871,7 @@ function reduceRelayedMessage(
       if (belongsToOtherSession(snapshot, payload.sessionId)) {
         return snapshot;
       }
-      return reduceTelemetryTail(snapshot, payload.events);
+      return reduceTelemetryTail(snapshot, payload);
     }
 
     case 'analysis.completed': {
@@ -1488,6 +1969,13 @@ function reduceRelayedMessage(
  *
  * A record that is not the bound session's, and a panel or an analysis that is
  * not the shown session's, is dropped rather than rendered.
+ *
+ * An answer for a tab that is not bound carries no session, because the worker
+ * holds none for it. When the panel shows an ended session — whose end
+ * unbound the tab — that absence says nothing new: the ended session's final
+ * state stays (see {@link resetPanelStore}) and only the connection slice is
+ * taken from the answer, so a reconnect after a worker suspension does not
+ * erase it either.
  */
 function reduceSessionSnapshot(
   snapshot: PanelSnapshot,
@@ -1502,6 +1990,20 @@ function reduceSessionSnapshot(
       ? undefined
       : answer.session;
   const sessionId = boundSessionId ?? record?.id;
+  const connectionState = answer.connection;
+
+  if (sessionId === undefined && showsEndedSession(snapshot)) {
+    return withChanges(snapshot, {
+      connection: nextConnection(
+        snapshot.connection,
+        connectionState.status,
+        connectionState.retryInMs,
+        connectionState.serviceUrl,
+        binding,
+      ),
+    });
+  }
+
   const base = isSessionSwitch(snapshot, sessionId) ? resetSessionScope(snapshot) : snapshot;
 
   const spec = answer.panel;
@@ -1525,7 +2027,6 @@ function reduceSessionSnapshot(
     capture.captureId !== undefined &&
     capture.captureId !== base.capture.captureId;
 
-  const connectionState = answer.connection;
   return withChanges(base, {
     connection: nextConnection(
       base.connection,
@@ -1563,7 +2064,37 @@ function reduceSessionSnapshot(
  */
 export function applyRelayedMessage(input: RelayedProtocolMessage | PortProtocolPush): void {
   const message = 'direction' in input ? input.message : input;
-  commit(reduceRelayedMessage(state, message));
+  commit(settleStopFailure(state, reduceRelayedMessage(state, message)));
+}
+
+/**
+ * `next` with an unconfirmed stop failure settled, once the capture it was reported for is seen
+ * stopped — or is no longer the capture on screen, which a new capture or another session
+ * implies.
+ *
+ * The failure is withdrawn from `lastError` only while `lastError` is still that failure: an
+ * error reported since, or a dismissal, is left as it is. Either way the capture no longer holds
+ * it, so a later stop never withdraws anything a second time.
+ *
+ * @param previous The snapshot the change was derived from.
+ * @param next The snapshot after the change.
+ */
+function settleStopFailure(previous: PanelSnapshot, next: PanelSnapshot): PanelSnapshot {
+  const failure = previous.capture.stopFailure;
+  if (failure === undefined) {
+    return next;
+  }
+  const capture = next.capture;
+  if (capture.active && capture.captureId === previous.capture.captureId) {
+    return next;
+  }
+  return withChanges(next, {
+    lastError: sameError(next.lastError, failure) ? undefined : next.lastError,
+    capture:
+      capture.stopFailure === undefined
+        ? capture
+        : Object.freeze({ ...capture, stopFailure: undefined }),
+  });
 }
 
 /**
@@ -1575,7 +2106,7 @@ export function applyRelayedMessage(input: RelayedProtocolMessage | PortProtocol
  * @param snapshot The worker's answer.
  */
 export function applySessionSnapshot(snapshot: PanelSessionSnapshot): void {
-  commit(reduceSessionSnapshot(state, snapshot));
+  commit(settleStopFailure(state, reduceSessionSnapshot(state, snapshot)));
 }
 
 /**
@@ -1706,4 +2237,107 @@ export function setLastError(error: ErrorPayload | undefined): void {
     return;
   }
   commit(withChanges(state, { lastError: error }));
+}
+
+/**
+ * Surface a failed "Stop capture" request — unless the capture is already known to have stopped.
+ *
+ * The service answers a stop only after it has analysed the capture and generated its panel, so
+ * the request can time out or lose its transport although the stop itself happened — and the
+ * service announced it with `capture.stopped`. A failure is therefore reported against the
+ * capture on screen:
+ *
+ * - the capture is already seen stopped: the request asked for what happened, and nothing is
+ *   shown — a stop that succeeded is never presented as one that failed (AAP §0.5.5);
+ * - it still looks running: the failure is shown as `lastError`, as {@link setLastError} does,
+ *   and held on the capture slice as `stopFailure`. It is withdrawn from `lastError` once the
+ *   capture is seen stopped — `capture.stopped`, a record or a hydration that reports the stop —
+ *   because it was not the capture's outcome after all; a failure that was real (the capture
+ *   keeps running) stays until dismissed.
+ *
+ *
+ * The failure belongs to the capture the stop was requested for (`captureId`, read when "Stop
+ * capture" was pressed): once another capture is on screen that one has plainly stopped, so its
+ * late failure is not shown against the capture now running.
+ *
+ * @param error The failure to surface; a `DebuggenError`'s payload, as for {@link setLastError}.
+ * @param captureId The capture on screen when the stop was requested; `undefined` when none was.
+ */
+export function reportCaptureStopFailure(
+  error: ErrorPayload,
+  captureId: CaptureId | undefined,
+): void {
+  commitCaptureStopFailure(error, captureId);
+}
+
+/**
+ * How long, in milliseconds, a "Stop capture" request that failed without an answer
+ * (`TRANSPORT_DISCONNECTED`: the transport lost it, or a deadline expired) waits for the store to
+ * see its capture stopped before the failure is reported — {@link awaitCaptureStopSettled}.
+ *
+ * The service closes the window first and announces it with `capture.stopped`, but only after it
+ * has drained the capture's in-flight events and summarised everything stored — tens of seconds
+ * for a large capture, beyond every request deadline between the panel and the service. A minute
+ * covers that work; the stop's own "Stopping capture…" cue stays up meanwhile, and a service that
+ * really is unreachable is shown by the connection status, not only by this failure.
+ */
+export const CAPTURE_STOP_CONFIRM_GRACE_MS = 60_000;
+
+/**
+ * Wait until the capture on screen is no longer `captureId` running — it was seen stopped
+ * (`capture.stopped`, or a record or hydration that reports the stop), another capture took its
+ * place, or the panel left the session — and resolve `true`; resolve `false` if it still runs
+ * after `timeoutMs`. The store is observed, never polled or written, so the answer is exactly
+ * what the panel shows.
+ *
+ * @param captureId The capture a stop was requested for.
+ * @param timeoutMs How long to wait; {@link CAPTURE_STOP_CONFIRM_GRACE_MS} by default.
+ */
+export function awaitCaptureStopSettled(
+  captureId: CaptureId,
+  timeoutMs: number = CAPTURE_STOP_CONFIRM_GRACE_MS,
+): Promise<boolean> {
+  const settled = (): boolean => !(state.capture.captureId === captureId && state.capture.active);
+  if (settled()) {
+    return Promise.resolve(true);
+  }
+  return new Promise((resolve) => {
+    // Both are assigned below before either can fire: a store change is a later commit and the
+    // timer a later task, so `finish` never reads them uninitialised.
+    const finish = (answer: boolean): void => {
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(answer);
+    };
+    const unsubscribe = subscribePanelStore(() => {
+      if (settled()) {
+        finish(true);
+      }
+    });
+    const timer = setTimeout(
+      () => {
+        finish(settled());
+      },
+      Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0,
+    );
+  });
+}
+
+/** {@link reportCaptureStopFailure}'s write, once its guards have passed. */
+function commitCaptureStopFailure(error: ErrorPayload, captureId: CaptureId | undefined): void {
+  const capture = state.capture;
+  if (captureId === undefined || capture.captureId === undefined) {
+    setLastError(error);
+    return;
+  }
+  if (capture.captureId !== captureId || !capture.active) {
+    return;
+  }
+  commit(
+    withChanges(state, {
+      lastError: error,
+      capture:
+        capture.stopFailure === error ? capture : Object.freeze({ ...capture, stopFailure: error }),
+    }),
+  );
 }

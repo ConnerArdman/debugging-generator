@@ -8,9 +8,9 @@ import { createPortal } from 'react-dom';
 import { Badge } from '@/components/ui/Badge';
 import { BlankSlate } from '@/components/ui/BlankSlate';
 import { Button } from '@/components/ui/Button';
+import buttonStyles from '@/components/ui/Button.module.css';
 import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
 import { useCartSummary } from '@/hooks/useCartSummary';
-import { formatQuantityLabel } from '@/lib/format';
 
 import { CartLineList } from './CartLineList';
 import { CartTotalsPanel } from './CartTotalsPanel';
@@ -35,7 +35,8 @@ import styles from './CartDrawer.module.css';
  *
  * WHAT IT READS
  * `@/hooks/useCartSummary` and nothing else: `contentsKnown` with `isCartEmpty`, to decide whether
- * there is a total worth footing the sheet with, and `lineCount` for the badge beside the heading.
+ * there is a total worth footing the sheet with, and `unitCount` with its `unitCountLabel` wording
+ * for the badge beside the heading - the same count the header's cart badge quotes.
  * The summary is read rather than the cart counted here because an empty set of lines is two
  * different statements - a cart the server answered with nothing in it, or a cart whose read is
  * still in flight or came back a failure - and that hook is where the storefront tells them apart
@@ -124,10 +125,18 @@ import styles from './CartDrawer.module.css';
  * cart returns the reader to the control they opened it with. Tab and Shift+Tab cycle inside the
  * sheet, Escape dismisses it, and a press on the scrim dismisses it.
  *
+ * The dialog carries a literal `id`, {@link CART_DIALOG_ID}, exported so the header's cart control
+ * can name the sheet it opens through `aria-controls`. A literal rather than a generated value: the
+ * header mounts this component once per document, so the id is unique without being generated, and
+ * the control and the dialog read it from one declaration. The control sets the reference only
+ * while it holds `open`, because this component renders nothing while closed and a reference to an
+ * element that is not in the document is broken rather than merely absent.
+ *
  * The sheet is the only element in the file that suppresses its focus outline, and
  * `CartDrawer.module.css` does it there for a container that is focused programmatically and is not
  * itself a control. Every control inside keeps the ring the application draws - the two footer
- * anchors from this module, the close control and the rows' own controls from their components.
+ * anchors from this module, the empty state's action from the button stylesheet it wears, the
+ * close control and the rows' own controls from their components.
  *
  * NO CLOCK
  * Nothing in this file reads a clock or schedules anything: no interval, no deferred callback and
@@ -141,20 +150,31 @@ import styles from './CartDrawer.module.css';
  * declarations this file writes are the document-level ones described above, on
  * `document.documentElement` and `document.body`, because neither element is in this tree for a
  * class to be put on. The empty state's illustration is named to `../ui/BlankSlate` by its `art` key
- * rather than imported as a file, so no asset path appears here at all.
+ * rather than imported as a file, so no asset path appears here at all. The empty state's one
+ * action is an anchor wearing `../ui/Button.module.css`'s own `.root` and `.label` with its
+ * `data-variant` and `data-size`, exactly as the cart page's actions do, so it reads as the
+ * storefront's primary control without a tenth class here restating that control's chrome.
  */
+
+/**
+ * The dialog's `id`, which the header's cart control names in `aria-controls` while the sheet is
+ * open. Exported for that one reader; see DIALOG SEMANTICS above for why it is a literal.
+ */
+export const CART_DIALOG_ID = 'site-cart-dialog';
 
 /** The dialog's visible heading, which is also its accessible name. */
 const DIALOG_TITLE = 'Your cart';
 
 /**
- * Screen-reader-only continuation of the count badge, so it is announced as "12 lines in your cart"
- * rather than as a bare number beside a heading. Two forms, because "1 lines" is not English; the
+ * Screen-reader-only continuation of the count badge, so it is announced as "12 items in your cart"
+ * rather than as a bare number beside a heading. The badge counts units - the figure the header's
+ * own cart badge and its "with 12 items" name quote - so one cart is one count wherever a reader
+ * meets it, and the noun is the header's too. Two forms, because "1 items" is not English; the
  * leading space is part of each string, since the number and this text are separate elements and
  * the announced name is their concatenation.
  */
-const COUNT_SUFFIX_ONE = ' line in your cart';
-const COUNT_SUFFIX_MANY = ' lines in your cart';
+const COUNT_SUFFIX_ONE = ' item in your cart';
+const COUNT_SUFFIX_MANY = ' items in your cart';
 
 /**
  * The close control: a glyph the eye reads as a dismissal, hidden from assistive technology, plus
@@ -172,6 +192,21 @@ const VIEW_CART_LABEL = 'View cart';
 const EMPTY_HEADING = 'Your cart is empty';
 const EMPTY_BODY = 'Browse the catalog to add items.';
 const EMPTY_ART_ALT = 'An empty shopping cart';
+
+/**
+ * The empty state's way on: the catalog, which is where every line in a cart comes from and what
+ * the sentence above already points at. Worded as that sentence's own verb and object, so the
+ * control a reader meets is the action they were just told to take.
+ */
+const EMPTY_ACTION_LABEL = 'Browse the catalog';
+const EMPTY_ACTION_HREF = '/';
+
+/**
+ * The size step of that action, from `../ui/Button.module.css`'s scale: `md`, the storefront's
+ * ordinary control height. The sheet is a narrow column, and the page-level `lg` step the cart
+ * page's own actions take would crowd the illustration and the sentence it follows.
+ */
+const EMPTY_ACTION_SIZE = 'md';
 
 /** The keys this dialog answers to, spelled as `KeyboardEvent.key` reports them. */
 const CLOSE_KEY = 'Escape';
@@ -367,13 +402,14 @@ export function CartDrawer(props: Props): ReactElement | null {
 
   // The published cart's totals, or the reason it has none: `@/hooks/useCartSummary` publishes a
   // reading discriminated by `contentsKnown`, which is what says whether the storefront has
-  // established what the cart holds at all. `lineCount` is the number of lines, which is what this
-  // sheet lists and what the badge beside the heading counts; the header's own badge quotes units.
+  // established what the cart holds at all. `unitCount` is the number of units across every line,
+  // which is what the badge beside the heading counts - the figure the header's own badge quotes,
+  // so the badge a reader pressed and the badge in the sheet it opened never disagree.
   //
   // Read from the summary rather than counted from the cart here, and for one reason: an empty
   // `lines` array is a cart the server answered with nothing in it *or* a cart whose read is still
   // in flight or failed, and the summary is where the storefront tells those apart once. A badge
-  // counting the array directly would print "0 lines in your cart" for contents nobody read.
+  // counting the array directly would print "0 items in your cart" for contents nobody read.
   const summary = useCartSummary();
 
   // Ties `aria-labelledby` on the sheet to the heading inside it. `useId` rather than a counter or a
@@ -619,6 +655,7 @@ export function CartDrawer(props: Props): ReactElement | null {
     >
       <div
         className={styles.panel}
+        id={CART_DIALOG_ID}
         role="dialog"
         aria-modal="true"
         aria-labelledby={labelId}
@@ -671,7 +708,8 @@ export function CartDrawer(props: Props): ReactElement | null {
             {DIALOG_TITLE}
           </h2>
 
-          {/* The count, formatted by the application's own number formatter rather than by an
+          {/* The unit count, the one the header's badge quotes, in the wording the summary
+              publishes - formatted by the application's own number formatter rather than by an
               `Intl` instance built here, so every figure in the storefront groups its digits the
               same way - and printed only where the cart's contents were established. A cart still
               being read, or one whose read failed, has no count to put in a chip: a zero here
@@ -680,9 +718,9 @@ export function CartDrawer(props: Props): ReactElement | null {
               is, in the one place a reader is looking. */}
           {summary.contentsKnown ? (
             <Badge size="sm">
-              {formatQuantityLabel(summary.lineCount)}
+              {summary.unitCountLabel}
               <VisuallyHidden>
-                {summary.lineCount === 1 ? COUNT_SUFFIX_ONE : COUNT_SUFFIX_MANY}
+                {summary.unitCount === 1 ? COUNT_SUFFIX_ONE : COUNT_SUFFIX_MANY}
               </VisuallyHidden>
             </Badge>
           ) : null}
@@ -703,12 +741,37 @@ export function CartDrawer(props: Props): ReactElement | null {
             failure a reader can act on, placeholders while the cart is first read, the empty block,
             or the lines - so none of those states is restated here. The empty block is the one
             thing this surface supplies, because the wording belongs to the surface a reader is
-            looking at. */}
+            looking at.
+
+            Its heading is an `<h3>`, one level under the dialog's own `<h2>`. It offers the one
+            way on an empty cart has - the catalog - because a sheet whose footer is withheld for
+            an empty cart would otherwise end in a sentence and a close control. The action is an
+            anchor, since it navigates, and it dismisses the dialog as it is followed, exactly as
+            the footer's links do, so the sheet is not left standing over the page it sent the
+            reader to; focus then returns to the control the sheet was opened from. It is a
+            `next/link` anchor inside the sheet, so the focus trap reaches it by Tab and Enter
+            follows it. */}
         <div className={styles.body}>
           <CartLineList
             variant="drawer"
             emptySlot={
-              <BlankSlate art="empty-cart" alt={EMPTY_ART_ALT} heading={EMPTY_HEADING}>
+              <BlankSlate
+                art="empty-cart"
+                alt={EMPTY_ART_ALT}
+                heading={EMPTY_HEADING}
+                headingAs="h3"
+                action={
+                  <Link
+                    href={EMPTY_ACTION_HREF}
+                    className={clsx(buttonStyles.root)}
+                    data-variant="primary"
+                    data-size={EMPTY_ACTION_SIZE}
+                    onClick={onClose}
+                  >
+                    <span className={clsx(buttonStyles.label)}>{EMPTY_ACTION_LABEL}</span>
+                  </Link>
+                }
+              >
                 {EMPTY_BODY}
               </BlankSlate>
             }

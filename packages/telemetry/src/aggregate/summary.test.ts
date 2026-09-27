@@ -75,6 +75,10 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
+import { clampNonNegative, roundMs } from '@debuggen/shared';
+
+import { correlateEvents } from '../correlation/correlator.js';
+import { selfTimeOf, walkTrace } from '../correlation/tree.js';
 import {
   COMMIT_ATTRIBUTE_KEYS,
   DB_QUERY_ATTRIBUTE_KEYS,
@@ -1167,12 +1171,15 @@ describe('computeMetrics', () => {
         duration: 2.346_49,
         traceId,
       }),
-      // The longest span in the fixture, so it is also what the capture window
-      // ends on.
+      // The longest span in the fixture, in a trace of its own: it holds no
+      // interaction, so it contributes its blocking time and nothing to the
+      // interaction-scoped durations.
       makeLongTaskEvent(LONG_TASK_BLOCKING_THRESHOLD_MS + 3.141_59),
     ]);
 
-    expect(valueOf(values, 'total_duration')).toBe(53.142);
+    // The interaction's trace spans [0, 12.34567]: its own span covers the
+    // server and database spans nested in it.
+    expect(valueOf(values, 'total_duration')).toBe(12.346);
     expect(valueOf(values, 'backend_duration')).toBe(4);
     expect(valueOf(values, 'database_duration')).toBe(2.346);
     expect(valueOf(values, 'blocking_time')).toBe(3.142);
@@ -1684,6 +1691,186 @@ describe('computeMetrics', () => {
     computeMetrics(events);
 
     expect(clone(events)).toEqual(before);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The duration scope
+ * ---------------------------------------------------------------------------
+ */
+
+/** The four duration metrics, by id, as one comparable object. */
+function durationsOf(values: readonly MetricValue[]): Readonly<Record<string, number>> {
+  return {
+    total_duration: valueOf(values, 'total_duration'),
+    frontend_duration: valueOf(values, 'frontend_duration'),
+    backend_duration: valueOf(values, 'backend_duration'),
+    database_duration: valueOf(values, 'database_duration'),
+  };
+}
+
+/** A render placed on the time axis, in a trace of its own unless one is named. */
+function makeRenderAt(at: number, traceId?: string): TelemetryEvent {
+  return makeSpanAt({
+    kind: RENDER_KIND,
+    at,
+    duration: 2,
+    ...(traceId !== undefined ? { traceId } : {}),
+    attributes: { [COMPONENT_ATTRIBUTE]: 'Ticker', [TRIGGER_ATTRIBUTE]: UNCHANGED_TRIGGER },
+  });
+}
+
+/**
+ * One slow click inside a capture that ran far longer than it.
+ *
+ * The click's trace spans [1000, 1354]: the interaction [1000, 1300], the
+ * request it issued [1010, 1260], the server span that answered [1020, 1220],
+ * one statement [1050, 1130], and a commit its continuation window attributed
+ * to the trace [1350, 1354] — past the interaction's own end, and inside the
+ * trace's extent. Around it, twenty background re-renders tick every 250 ms
+ * across [0, 4752], each in a trace of its own, and a background poll brings
+ * its own request, server span and statement at [2995, 3105].
+ */
+function slowClickAmidBackgroundWork(): {
+  readonly clickTrace: readonly TelemetryEvent[];
+  readonly events: readonly TelemetryEvent[];
+} {
+  const traceId = nextTraceId();
+  const server = makeServerSpan(1020, 200, traceId);
+  const clickTrace = [
+    makeSpanAt({ kind: INTERACTION_KIND, at: 1000, duration: 300, traceId }),
+    makeRequestEvent({ traceId, startTime: BASE_TIME + 1010, duration: 250 }),
+    server,
+    makeQueryEvent('select col_a from t1 where id = $1', {
+      at: 1050,
+      duration: 80,
+      traceId,
+      parentSpanId: server.spanId,
+    }),
+    makeSpanAt({ kind: COMMIT_KIND, at: 1350, duration: 4, traceId }),
+  ];
+
+  const pollTrace = nextTraceId();
+  const background = [
+    ...Array.from({ length: 20 }, (_, index) => makeRenderAt(index * 250)),
+    makeRequestEvent({ traceId: pollTrace, startTime: BASE_TIME + 2995, duration: 110 }),
+    makeServerSpan(3000, 100, pollTrace),
+    makeQueryEvent('select col_b from t2 where id = $1', {
+      at: 3010,
+      duration: 50,
+      traceId: pollTrace,
+    }),
+  ];
+
+  // Interleaved roughly by time, as a store reads a window back: the scope is
+  // decided by trace membership, never by position in the list.
+  return { clickTrace, events: [...background.slice(0, 7), ...clickTrace, ...background.slice(7)] };
+}
+
+describe('the duration scope', () => {
+  it('measures the four durations over the interaction trace, not the capture around it', () => {
+    const { clickTrace, events } = slowClickAmidBackgroundWork();
+
+    const values = computeMetrics(events);
+
+    // Browser [1000, 1300] ∪ [1350, 1354] = 304 ms, minus the 200 ms the
+    // server covered; the background poll's server and statement time is in no
+    // interaction's trace and in none of the four numbers.
+    expect(durationsOf(values)).toEqual({
+      total_duration: 354,
+      frontend_duration: 104,
+      backend_duration: 200,
+      database_duration: 80,
+    });
+    // The very numbers a panel filtered to the click's trace reads, so a card
+    // over the capture and a card over the trace agree.
+    expect(durationsOf(values)).toEqual(durationsOf(computeMetrics(clickTrace)));
+  });
+
+  it('keeps every count over every event in scope', () => {
+    const { events } = slowClickAmidBackgroundWork();
+
+    const values = computeMetrics(events);
+
+    // The background re-renders, the poll's request and its statement are
+    // still what the capture observed.
+    expect(valueOf(values, 'render_count')).toBe(20);
+    expect(valueOf(values, 'unchanged_render_count')).toBe(20);
+    expect(valueOf(values, 'request_count')).toBe(2);
+    expect(valueOf(values, 'query_count')).toBe(2);
+  });
+
+  it('unions the interaction traces, counting overlap once and the gap between them not at all', () => {
+    const first = nextTraceId();
+    const second = nextTraceId();
+    const third = nextTraceId();
+    const values = computeMetrics([
+      // [0, 100] and [60, 160] overlap: 160 ms of wall clock, not the 200 ms
+      // their durations add up to.
+      makeSpanAt({ kind: INTERACTION_KIND, at: 0, duration: 100, traceId: first }),
+      makeServerSpan(10, 40, first),
+      makeSpanAt({ kind: INTERACTION_KIND, at: 60, duration: 100, traceId: second }),
+      makeServerSpan(40, 50, second),
+      // [400, 450] stands apart: 50 ms more, not the 240 ms idle gap as well.
+      makeSpanAt({ kind: INTERACTION_KIND, at: 400, duration: 50, traceId: third }),
+      // Background work after the last interaction widens nothing.
+      makeRenderAt(1000),
+    ]);
+
+    // Server [10, 50] ∪ [40, 90] = 80 ms across the two traces; the front end
+    // is the 210 ms of interaction time the server did not cover.
+    expect(durationsOf(values)).toEqual({
+      total_duration: 210,
+      frontend_duration: 130,
+      backend_duration: 80,
+      database_duration: 0,
+    });
+  });
+
+  it('keeps the capture-wide durations when no interaction is in scope', () => {
+    const poll = nextTraceId();
+    const values = computeMetrics([
+      // An idle capture: re-renders at [0, 2] and [5000, 5002], and one poll
+      // answered by the server [100, 200] with a statement [120, 150] inside.
+      makeRenderAt(0),
+      makeServerSpan(100, 100, poll),
+      makeQueryEvent('select col_c from t3 where id = $1', {
+        at: 120,
+        duration: 30,
+        traceId: poll,
+      }),
+      makeRenderAt(5000),
+    ]);
+
+    expect(durationsOf(values)).toEqual({
+      total_duration: 5002,
+      frontend_duration: 4,
+      backend_duration: 100,
+      database_duration: 30,
+    });
+  });
+
+  it('publishes the same fourteen values from computeMetrics and computeCaptureSummary', () => {
+    const { events } = slowClickAmidBackgroundWork();
+
+    const summary = computeCaptureSummary(events, makeContext());
+
+    expect(summary.metrics).toEqual(computeMetrics(events));
+    expect(valueOf(summary.metrics, 'total_duration')).toBe(354);
+  });
+
+  it('keeps the summary window as the extent of every summarised event', () => {
+    const { events } = slowClickAmidBackgroundWork();
+
+    const summary = computeCaptureSummary(events, makeContext());
+
+    // The window describes the events handed in; the metric describes the
+    // interaction. Neither is clamped to the other.
+    expect(summary.startTime).toBe(BASE_TIME);
+    expect(summary.endTime).toBe(BASE_TIME + 4752);
+    expect(summary.durationMs).toBe(4752);
+    expect(valueOf(summary.metrics, 'total_duration')).toBeLessThan(summary.durationMs);
   });
 });
 
@@ -2290,6 +2477,274 @@ describe('computeCaptureSummary', () => {
 
     expect(summary.topSpans).toHaveLength(DEFAULT_TOP_N);
     expect(summary.truncated).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The top-span ranking against a reference
+ *
+ * `computeCaptureSummary` selects its top spans with a bounded heap and reads
+ * their self times from a correlation of their own traces only, because a full
+ * sort and a full correlation of a capture of hundreds of thousands of events
+ * cost seconds. Both are optimisations and nothing else: the published rows
+ * must be byte-identical to what a stable sort of every event by duration and
+ * id, and a correlation of every trace, would give. The reference below is
+ * that straightforward algorithm, and the randomized captures are built to hit
+ * what an optimisation gets wrong — ties at the published precision, shared
+ * ids, orphans, duplicate span ids and many traces.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A small seeded generator (mulberry32), so every randomized capture is
+ * reproducible from its seed and a failure names the seed that produced it.
+ */
+function seededRandom(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let mixed = state;
+    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
+
+/** One member of a non-empty list, chosen by `random`. */
+function pick<T>(random: () => number, list: readonly T[]): T {
+  const chosen = list[Math.floor(random() * list.length)];
+  if (chosen === undefined) {
+    throw new Error('pick requires a non-empty list');
+  }
+  return chosen;
+}
+
+/** The kinds a randomized capture draws from: every tier, and failures. */
+const RANDOMIZED_KINDS: readonly TelemetryKind[] = [
+  INTERACTION_KIND,
+  RENDER_KIND,
+  COMMIT_KIND,
+  FETCH_KIND,
+  HTTP_SERVER_KIND,
+  ROUTE_HANDLER_KIND,
+  FUNCTION_KIND,
+  DB_QUERY_KIND,
+  LONG_TASK_KIND,
+  ERROR_KIND,
+];
+
+/**
+ * The durations a randomized capture draws from. Repeats tie exactly;
+ * `2.500_4` and `2.499_6` tie with `2.5` only once rounded to the published
+ * three decimals, and `37.123_5` / `37.123_49` sit either side of a rounding
+ * boundary — the ties a ranking by raw duration would order differently.
+ */
+const RANDOMIZED_DURATIONS: readonly number[] = [
+  0, 1, 1, 2.5, 2.500_4, 2.499_6, 10, 10, 37.123_5, 37.123_49, 120,
+];
+
+/**
+ * A capture of one to six traces of one to twenty-four events each, shuffled.
+ *
+ * Within a trace an event is a root, the child of an earlier span, or an
+ * orphan whose parent never arrived; now and then it reuses an earlier span id
+ * of its trace, or an earlier event id of any trace. Start times land on a
+ * coarse grid, so equal starts are common too.
+ */
+function randomizedCapture(seed: number): TelemetryEvent[] {
+  const random = seededRandom(seed);
+  const events: TelemetryEvent[] = [];
+  const traceCount = 1 + Math.floor(random() * 6);
+
+  for (let trace = 0; trace < traceCount; trace += 1) {
+    const traceId = nextTraceId();
+    const spanIds: string[] = [];
+    const eventCount = 1 + Math.floor(random() * 24);
+
+    for (let index = 0; index < eventCount; index += 1) {
+      const kind = pick(random, RANDOMIZED_KINDS);
+      const placement = random();
+      const parentSpanId =
+        placement < 0.15
+          ? nextSpanId()
+          : placement < 0.35 || spanIds.length === 0
+            ? undefined
+            : pick(random, spanIds);
+      const spanId = random() < 0.05 && spanIds.length > 0 ? pick(random, spanIds) : nextSpanId();
+      const id = random() < 0.08 && events.length > 0 ? pick(random, events).id : undefined;
+      spanIds.push(spanId);
+
+      events.push(
+        makeEvent({
+          kind,
+          traceId,
+          spanId,
+          ...(parentSpanId !== undefined ? { parentSpanId } : {}),
+          ...(id !== undefined ? { id } : {}),
+          startTime: BASE_TIME + Math.floor(random() * 50) * 5,
+          duration: pick(random, RANDOMIZED_DURATIONS),
+          status: random() < 0.1 ? ERROR_STATUS : OK_STATUS,
+          ...(kind === RENDER_KIND
+            ? {
+                attributes: {
+                  [COMPONENT_ATTRIBUTE]: pick(random, ['Alpha', 'Beta', 'Gamma']),
+                  [TRIGGER_ATTRIBUTE]: pick(random, [UNCHANGED_TRIGGER, PROPS_TRIGGER]),
+                },
+              }
+            : {}),
+        }),
+      );
+    }
+  }
+
+  // Fisher–Yates with the same generator: the traces arrive interleaved, as
+  // a store returns a window.
+  for (let index = events.length - 1; index > 0; index -= 1) {
+    const other = Math.floor(random() * (index + 1));
+    const current = events[index];
+    const swapped = events[other];
+    if (current !== undefined && swapped !== undefined) {
+      events[index] = swapped;
+      events[other] = current;
+    }
+  }
+  return events;
+}
+
+/**
+ * The published top spans, computed the straightforward way: every event
+ * sorted by its published duration descending and then by id (a stable sort,
+ * so full ties keep input order), the first `topN` kept, and their self times
+ * read from one correlation of **every** event.
+ */
+function referenceTopSpans(events: readonly TelemetryEvent[], topN: number): SpanSummary[] {
+  const published = (event: TelemetryEvent): number =>
+    roundMs(clampNonNegative(Number.isFinite(event.duration) ? event.duration : 0));
+  const ranked = [...events]
+    .sort((left, right) => {
+      const leftDuration = published(left);
+      const rightDuration = published(right);
+      if (leftDuration !== rightDuration) {
+        return leftDuration < rightDuration ? 1 : -1;
+      }
+      if (left.id === right.id) {
+        return 0;
+      }
+      return left.id < right.id ? -1 : 1;
+    })
+    .slice(0, topN);
+
+  const targets = new Set(ranked.map((event) => event.id));
+  const selfTimes = new Map<string, number>();
+  if (targets.size > 0) {
+    for (const trace of correlateEvents(events).traces) {
+      walkTrace(trace, (node) => {
+        if (targets.has(node.event.id)) {
+          selfTimes.set(node.event.id, selfTimeOf(node));
+        }
+      });
+    }
+  }
+
+  return ranked.map((event) => {
+    const selfTimeMs = selfTimes.get(event.id);
+    return {
+      id: event.id,
+      spanId: event.spanId,
+      traceId: event.traceId,
+      kind: event.kind,
+      tier: event.tier,
+      name: event.name,
+      startTime: Number.isFinite(event.startTime) ? event.startTime : 0,
+      durationMs: published(event),
+      ...(selfTimeMs !== undefined ? { selfTimeMs } : {}),
+      status: event.status,
+      ...(event.source !== undefined ? { source: event.source } : {}),
+    };
+  });
+}
+
+/** How many randomized captures the equivalence is checked over. */
+const RANDOMIZED_CAPTURE_COUNT = 150;
+
+describe('the top-span ranking against a full sort and a full correlation', () => {
+  it('publishes byte-identical top spans for randomized captures at every bound', () => {
+    const exercised = {
+      tiesAtPublishedPrecision: false,
+      sharedEventIds: false,
+      orphans: false,
+      topSpansAcrossTraces: false,
+    };
+
+    for (let seed = 1; seed <= RANDOMIZED_CAPTURE_COUNT; seed += 1) {
+      const events = randomizedCapture(seed);
+      const bounds = [0, 1, 3, DEFAULT_TOP_N, events.length, events.length + 7];
+
+      for (const topN of bounds) {
+        const expected = referenceTopSpans(events, topN);
+        const summary = computeCaptureSummary(events, makeContext(), { topN });
+
+        expect(JSON.stringify(summary.topSpans), `seed ${String(seed)}, topN ${String(topN)}`).toBe(
+          JSON.stringify(expected),
+        );
+
+        const durations = expected.map((span) => span.durationMs);
+        exercised.tiesAtPublishedPrecision ||= new Set(durations).size < durations.length;
+        exercised.topSpansAcrossTraces ||= new Set(expected.map((span) => span.traceId)).size > 1;
+      }
+
+      exercised.sharedEventIds ||= new Set(events.map((event) => event.id)).size < events.length;
+      exercised.orphans ||= correlateEvents(events).orphanCount > 0;
+    }
+
+    // The fixtures really did reach every case the optimisations could get
+    // wrong; an equivalence over captures that never tie proves little.
+    expect(exercised).toEqual({
+      tiesAtPublishedPrecision: true,
+      sharedEventIds: true,
+      orphans: true,
+      topSpansAcrossTraces: true,
+    });
+  });
+
+  it('keeps full ties — equal published duration and equal id — in input order', () => {
+    const [first, second, third] = [nextTraceId(), nextTraceId(), nextTraceId()];
+    const shared = nextEventId();
+    const events = [
+      makeEvent({ id: shared, traceId: first, name: 'first', duration: 5 }),
+      // 5.000_4 publishes as 5: a tie at the published precision.
+      makeEvent({ id: shared, traceId: second, name: 'second', duration: 5.000_4 }),
+      makeEvent({ id: shared, traceId: third, name: 'third', duration: 5 }),
+      makeEvent({ name: 'shorter', duration: 4 }),
+    ];
+
+    const summary = computeCaptureSummary(events, makeContext(), { topN: 2 });
+
+    expect(summary.topSpans.map((span) => span.name)).toEqual(['first', 'second']);
+    expect(JSON.stringify(summary.topSpans)).toBe(JSON.stringify(referenceTopSpans(events, 2)));
+  });
+
+  it('reads a top span’s self time from its own trace among many others', () => {
+    const traceId = nextTraceId();
+    const server = makeServerSpan(0, 500, traceId);
+    const events = [
+      ...Array.from({ length: 200 }, (_, index) => makeRenderAt(index * 3)),
+      server,
+      makeQueryEvent('select col_a from t1 where id = $1', {
+        at: 100,
+        duration: 150,
+        traceId,
+        parentSpanId: server.spanId,
+      }),
+    ];
+
+    const summary = computeCaptureSummary(events, makeContext(), { topN: 2 });
+
+    expect(summary.topSpans.map((span) => span.id)).toEqual([server.id, events[201]?.id]);
+    // 500 ms inclusive, 150 ms of which the statement beneath it covered.
+    expect(summary.topSpans[0]?.selfTimeMs).toBe(350);
+    expect(summary.topSpans[1]?.selfTimeMs).toBe(150);
   });
 });
 

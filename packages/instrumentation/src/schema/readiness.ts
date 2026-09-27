@@ -1344,15 +1344,21 @@ function compareSymbolNames(left: string, right: string): number {
  *    `'server'`, or at least one patched function name.
  * 3. When nothing was requested, the disabled set is reported and nothing else
  *    is considered.
- * 4. Otherwise `http` and `routeHandlers` are **both** switched on regardless
+ * 4. Otherwise `http`, `routeHandlers` and `fetch` are switched on regardless
  *    of what was asked for, because they are the spine a server trace hangs
  *    off: the incoming-request span is where the browser's `traceparent` is
  *    extracted and the route-handler span is what parents the rest, so a
  *    database or function span collected without them arrives as a flagged
- *    orphan instead of a row in a tree. `prisma` and `pg` both follow
- *    `'db-query-tracking'`, and `fetch` follows `'fetch-tracking'` — the dev
- *    server's outgoing requests, which is how a call to an external service
- *    reaches the correlated trace's timeline.
+ *    orphan instead of a row in a tree. `fetch` — the dev server's outgoing
+ *    requests — belongs to the same spine: an external call a handler or a
+ *    service function awaits is part of that request's time (the correlated
+ *    trace of AAP §0.1.1 places it under the route handler, beside the SQL), so
+ *    a server trace without it has an unexplained gap exactly where a
+ *    third-party dependency spends its time. It is therefore not left to an
+ *    explicit `'fetch-tracking'` action, which the planner writes for the
+ *    *page's* requests and which, on its own, never arms this tier (a
+ *    browser-only plan stays disabled). `prisma` and `pg` both follow
+ *    `'db-query-tracking'`: reading a project's SQL is opt-in per plan.
  *
  * Why `prisma` and `pg` are not narrowed per driver: telling them apart would
  * mean knowing which adapter planned the action, and adapter ids live in
@@ -1379,7 +1385,6 @@ export function deriveServerAgentSignals(
   const functionSymbols = new Set<string>();
   let serverSpanRequested = false;
   let dbQueryRequested = false;
-  let fetchRequested = false;
   let serverTierSeen = false;
 
   for (const action of actions) {
@@ -1393,8 +1398,6 @@ export function deriveServerAgentSignals(
       serverSpanRequested = true;
     } else if (action.type === 'db-query-tracking') {
       dbQueryRequested = true;
-    } else if (action.type === 'fetch-tracking') {
-      fetchRequested = true;
     }
 
     if (
@@ -1420,7 +1423,8 @@ export function deriveServerAgentSignals(
   return {
     http: true,
     routeHandlers: true,
-    fetch: fetchRequested,
+    // Part of the spine (step 4): the outgoing calls a server request awaits.
+    fetch: true,
     prisma: dbQueryRequested,
     pg: dbQueryRequested,
     functions,

@@ -58,9 +58,14 @@ a guess.
   against that URL fails; turn it off to run the service yourself.
 - Setting `debuggen.devServerUrl` — the development server URL of the project you are debugging;
   leave it empty to let the service detect a running server for the workspace folder or launch one.
-- Setting `debuggen.provider` — the model provider the service reasons with: the hosted `anthropic`
-  provider, or `deterministic`, which is rules-based, runs offline and sends nothing off the
-  machine.
+- Setting `debuggen.provider` — the model provider the service reasons with: `deterministic`, the
+  default, which is rules-based, runs offline and sends nothing off the machine, or the hosted
+  `anthropic` provider.
+- Setting `debuggen.model` — the model id the `anthropic` provider calls, forwarded as
+  `DEBUGGEN_MODEL` when the extension starts the bundled service; empty by default, which keeps a
+  `DEBUGGEN_MODEL` inherited from the editor's environment. No model id is built in, and
+  `ANTHROPIC_API_KEY` is read only from the environment VS Code was started from, never from
+  settings.
 - Click-to-source: a source location opens the file at its line and column, places the selection
   there, reveals it in the editor and highlights the line briefly so you can see where you landed.
 - Click-to-source reports this editor's result back to the DevTools panel (`source.result`), so

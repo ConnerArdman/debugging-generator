@@ -32,6 +32,15 @@
  * extra sub-rows of that depth rather than painted over one another, and every
  * sub-row of a depth still sits above the next depth.
  *
+ * A depth takes at most `MAX_DEPTH_ROWS` (3) rows. A depth crowded past that —
+ * hundreds of near-simultaneous renders of one commit — keeps its longest
+ * operations as bars on `MAX_DEPTH_SUB_ROWS` (2) sub-rows and gathers the rest
+ * into outlined "+N" marks on ONE row beneath them, so a crowded browser side
+ * can never push the deeper levels (the request's server work, its queries)
+ * hundreds of rows out of the viewport. A note says how many operations were
+ * gathered, and every one of them is still a row of the tree beneath the
+ * chart.
+ *
  * ## A FIXED LOGICAL CANVAS, SIZED BY CSS
  *
  * The icicle is drawn in one fixed coordinate space: a `viewBox`
@@ -57,11 +66,15 @@
  * emoji is about two columns wide — and a budget that is wrong by one glyph
  * paints the ellipsis past the frame, where nobody sees it.
  *
- * ## THE CHART IS AN IMAGE; THE LIST IS THE INTERFACE
+ * ## THE CHART IS A FIGURE; THE LIST IS THE INTERFACE
  *
- * The `<svg>` is `role="img"` with a text alternative summarising the trace, so
- * assistive technology is told what the picture shows rather than being walked
- * through hundreds of `<rect>` elements. Beneath it, **every frame** is a row
+ * The `<svg>` is `role="figure"` with a text alternative summarising the trace,
+ * and each frame and "+N" mark in it is a `role="img"` named by its full
+ * description — the sentence its tree row is named by — so the information a
+ * pointer gets on hover is also in the accessibility tree for a screen reader
+ * browsing the picture. The axis and the visible labels, which repeat those
+ * names, are hidden from assistive technology. The frames are not focusable.
+ * Beneath the canvas, **every frame** is a row
  * of an indented `role="tree"`: its name on a real `Button`, its kind, its
  * tier, its measured duration, its own time, a source chip where the span
  * resolved to a place in the project, and a disclosure control where its
@@ -113,6 +126,31 @@
  * the first page again (or on the page of the tab stop a key or a selection
  * carried there).
  *
+ * ## EVERY PAGE SAYS WHERE IT SITS
+ *
+ * A window or a page of rows that opens below the root holds operations whose
+ * parents an earlier page shows, and on their own they read as rows with no
+ * place in the hierarchy. So every such page carries its CONTEXT — every
+ * ancestor of its first operation, which (the walk being pre-order) is every
+ * operation before the page that any of its operations hangs from — marked as
+ * context and never as page content:
+ *
+ *   - the icicle draws the drawn window's context as a band of its own at the
+ *     top of the canvas, one row per ancestor, outermost first, each bar
+ *     labelled "Context: …", titled as context and filled from outside the
+ *     span-kind scale (`data-flame-context` marks it); a polite statement
+ *     beside the window's controls and the canvas's text alternative name the
+ *     chain; activating a context bar selects it, which pages to the window
+ *     that draws it;
+ *   - the tree names the context of its page of rows in a captioned list
+ *     above its scroll container — outside the tree, so it is no row of the
+ *     page, holds no tab stop and changes no level or position the tree
+ *     states — laid out as tree rows are, indented by depth.
+ *
+ * The band holds at most one bar per level the layout draws, so the drawing
+ * stays bounded: at most `MAX_DRAWN_ROWS` window frames and `MAX_ICICLE_DEPTH`
+ * context bars.
+ *
  * Two reductions are PARTIAL RESULTS — part of the trace is not held here at
  * all — and share one notice with the "Partial result" badge the timeline
  * uses. A trace the correlator itself bounded says so and gives the refine
@@ -161,12 +199,18 @@
  *   `dg-flame__axis`              the time axis group
  *   `dg-flame__axis-tick`         one tick rule
  *   `dg-flame__axis-label`        one tick label
- *   `dg-flame__row`               one drawn row of the icicle: a depth, or one
- *                                 sub-row of a depth whose siblings overlap
+ *   `dg-flame__row`               one drawn row of the icicle: a depth, one
+ *                                 sub-row of a depth whose siblings overlap,
+ *                                 or the overflow row beneath a crowded depth
  *   `dg-flame__frame`             one frame, filled from `--dgc-frame-color`
  *   `dg-flame__frame-label`       the label drawn inside a frame, inked from
  *                                 `--dgc-frame-ink` (the ink paired with the
  *                                 frame's fill, so the label clears 4.5:1)
+ *   `dg-flame__overflow`          one "+N" mark on an overflow row: the
+ *                                 operations of a crowded depth its sub-rows
+ *                                 could not hold, gathered over their extent
+ *   `dg-flame__overflow-label`    the "+N" count drawn inside a mark, when it
+ *                                 fits whole
  *   `dg-flame__equivalent`        the text equivalent: a paged tree in the
  *                                 shared scroll viewport (`dg-virtual-viewport`,
  *                                 whose block size the stylesheet caps) and
@@ -181,6 +225,11 @@
  *   `dg-is-selected`              the selected frame and its row
  *   `dg-is-hovered`               the row of the frame under the pointer
  *   `dg-is-orphan`                a re-attached record (the canonical state name)
+ *
+ * The context band reuses `dg-flame__row`, `dg-flame__frame` and
+ * `dg-flame__frame-label` with the neutral fill and its paired ink through the
+ * same `--dgc-*` properties, and the tree's context rows reuse
+ * `dg-flame__equivalent-row` and `dg-flame__toggle`; neither adds a class.
  *
  * ## HOVER DETAIL IS AUTHOR-DRAWN AND DISMISSIBLE (WCAG 1.4.13)
  *
@@ -228,7 +277,7 @@ import type {
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
 import { ChevronDown, ChevronRight, Flame } from 'lucide-react';
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type {
   CSSProperties,
   FocusEvent as ReactFocusEvent,
@@ -251,10 +300,17 @@ import { Kbd } from '../primitives/Kbd';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
-import { kindColorVar, kindInkColorVar } from '../utils/color';
+import { cssVar } from '../tokens/tokens';
+import {
+  KIND_FILL_INK_TOKEN_KEYS,
+  UNCLASSIFIED_TOKEN_KEY,
+  kindColorVar,
+  kindInkColorVar,
+} from '../utils/color';
 import {
   DEFAULT_LABEL_FONT_SIZE,
   ELLIPSIS,
+  NOT_AVAILABLE_LABEL,
   countedNoun,
   createEstimateMeasure,
   fitTextToWidth,
@@ -262,6 +318,7 @@ import {
   formatCountOf,
   formatDuration,
   formatKindLabel,
+  formatOffset,
   formatStatusLabel,
   formatTierLabel,
   pluralize,
@@ -349,6 +406,56 @@ const MIN_LABEL_CHARS = 3;
  * never mistaken for a touch.
  */
 const TOUCH_TOLERANCE = 1e-6;
+
+/**
+ * The most sub-rows one crowded depth draws its overlapping frames on: 2. A
+ * depth whose frames need more rows than these and one more (see
+ * {@link MAX_DEPTH_ROWS}) keeps its most significant frames in these rows and
+ * gathers every other one into "+N" marks on one overflow row beneath them
+ * (see {@link packCrowdedDepth}), so a depth never takes more than three rows.
+ *
+ * ## Why a bound at all
+ *
+ * The packing is optimal — a depth takes as many sub-rows as bars stack over
+ * any one point — and that is only legible while the stack is shallow. One
+ * React commit re-renders hundreds of components inside a millisecond; widened
+ * to the minimum visible width, every one of those bars overlaps the others,
+ * and an unbounded packing gives that one depth hundreds of rows. The canvas
+ * scrolls inside a capped viewport (`--dg-scroll-cap-sm`, 336 px), so the
+ * levels beneath — the request's server work and its queries, usually what
+ * the reader came for — would sit thousands of pixels down, under a band of
+ * slivers.
+ *
+ * ## Why two
+ *
+ * - Two keeps the ordinary overlaps drawn exactly as the optimal packing draws
+ *   them: a request beside its own resource timing, a few parallel calls, a
+ *   record re-attached inside two overlapping siblings, or a run of short
+ *   operations widened into their neighbours stack at most three deep, which
+ *   {@link MAX_DEPTH_ROWS} rows hold without gathering anything. One would
+ *   start gathering at the first stack of three.
+ * - Two bounds a crowded depth at three rows. A slow submission — commits and
+ *   their renders crowding two browser depths above a five-level server chain
+ *   (request, route handler, handler function, service function, query) —
+ *   then draws in twelve rows, and every level of that chain starts inside the
+ *   first 336 px of a wide panel (a row pitch of about 27 px at 1 400 px).
+ *   Three sub-rows would push the last two levels, the service's call and its
+ *   query, below the viewport's edge.
+ */
+const MAX_DEPTH_SUB_ROWS = 2;
+
+/**
+ * The most rows one depth ever takes: its {@link MAX_DEPTH_SUB_ROWS} sub-rows
+ * and the overflow row beneath them.
+ *
+ * It is also the threshold for gathering at all. A depth whose optimal packing
+ * fits in this many rows is drawn exactly as that packing lays it out, every
+ * frame a bar: gathering its last row into marks would take the same number of
+ * rows and only hide the frames on it, such as a record re-attached inside two
+ * overlapping siblings. Only a depth that needs more is packed into the
+ * sub-rows and one row of marks.
+ */
+const MAX_DEPTH_ROWS = MAX_DEPTH_SUB_ROWS + 1;
 
 /**
  * The deepest row this layout draws: 32.
@@ -453,6 +560,38 @@ const PREVIOUS_WINDOW_LABEL = 'Previous operations';
 const NEXT_WINDOW_LABEL = 'Next operations';
 
 /**
+ * The word a context bar's label opens with and its title closes on, so a bar
+ * drawn only to show where a page sits never reads as one of the page's own
+ * operations — in text, not by its neutral fill alone (WCAG 1.4.1).
+ */
+const CONTEXT_WORD = 'Context';
+
+/** The last line of a context bar's title: what the bar is, and where it is drawn in full. */
+const CONTEXT_BAR_NOTE =
+  'Drawn for context: an operation this window’s operations are nested inside, listed with its own operations in an earlier window.';
+
+/**
+ * The caption above the tree's context rows, which is also their list's
+ * accessible name: which rows it describes, and that none of them is a row of
+ * this page.
+ */
+const TREE_CONTEXT_CAPTION =
+  'Context from an earlier page, not rows of this one: the rows below are nested inside';
+
+/**
+ * The fill a context bar is painted in: the muted text colour, deliberately
+ * outside the span-kind scale every operation of the page is filled from, so
+ * the context band reads apart from the page at a glance.
+ */
+const CONTEXT_FILL_VAR = cssVar(UNCLASSIFIED_TOKEN_KEY);
+
+/**
+ * The ink of a context bar's label: the ink `../utils/color` pairs with that
+ * fill, which the token test holds to 4.5:1 on it in every theme.
+ */
+const CONTEXT_INK_VAR = cssVar(KIND_FILL_INK_TOKEN_KEYS[UNCLASSIFIED_TOKEN_KEY] ?? 'surfaceBase');
+
+/**
  * The partial-result sentence for a trace the correlator itself bounded, with
  * the refine route: nothing more of it is in memory, so no control could show
  * more, and only a narrower query or a shorter capture reaches the rest.
@@ -540,10 +679,27 @@ interface FlameFrame {
   readonly parentFrameId: string | undefined;
   /** The operation's start, in epoch milliseconds. */
   readonly startTime: number;
-  /** The measured duration, in milliseconds. */
+  /**
+   * The duration as DRAWN, in milliseconds: never negative and never
+   * non-finite, with a duration that was not measured drawn as zero. Geometry
+   * and ordering only — every figure a reader is shown comes from
+   * {@link FlameFrame.measuredDurationMs}.
+   */
   readonly durationMs: number;
-  /** The duration minus the interval union of the children, in milliseconds. */
+  /** The duration minus the interval union of the children, in milliseconds, as drawn. */
   readonly selfTimeMs: number;
+  /**
+   * The duration as SHOWN, in milliseconds, or `undefined` when the record's
+   * duration is not a measurement (see {@link measuredDurationMs}), which every
+   * label, tooltip and cell then states as "n/a" rather than as a zero.
+   */
+  readonly measuredDurationMs: number | undefined;
+  /**
+   * The own time as SHOWN, or `undefined` when the frame's own duration is not
+   * a measurement: an own time computed from a duration nobody measured is not
+   * a measurement either.
+   */
+  readonly measuredSelfTimeMs: number | undefined;
   /** How many operations this one made directly. */
   readonly childCount: number;
   /** Whether the correlator had to re-attach this record. */
@@ -605,6 +761,53 @@ interface PlacedFrame {
   readonly height: number;
   /** The label to draw inside it, or `undefined` when none fits. */
   readonly label: string | undefined;
+}
+
+/**
+ * One "+N" mark: a run of a crowded depth's frames that none of its
+ * {@link MAX_DEPTH_SUB_ROWS} sub-rows could hold, gathered into one outlined
+ * band over the extent their bars cover together.
+ */
+interface OverflowMark {
+  /** The mark's identity: the id of the first frame it gathers, left to right. */
+  readonly key: string;
+  /** How many frames it gathers; at least one. */
+  readonly count: number;
+  /** The band's left edge, in user units: the leftmost gathered bar's. */
+  readonly x: number;
+  /** The band's width, in user units: to the rightmost gathered bar's right edge. */
+  readonly width: number;
+  /** The band's top edge, in user units: the overflow row's. */
+  readonly y: number;
+  /** The band's height, in user units. */
+  readonly height: number;
+  /** The "+N" count to draw inside it, or `undefined` when it does not fit whole. */
+  readonly label: string | undefined;
+  /** Its native tooltip: how many it gathers, and that each is listed in the tree. */
+  readonly title: string;
+}
+
+/**
+ * A frame an overflow mark gathered, with the bar it would be drawn as on the
+ * overflow row — drawn only while it is the panel's selection, so the shared
+ * selection is always marked on the canvas.
+ */
+interface GatheredFrame {
+  /** The frame's bar, at its own drawn extent on the overflow row. */
+  readonly bar: PlacedFrame;
+  /** The {@link OverflowMark.key} of the mark that gathered it. */
+  readonly markKey: string;
+}
+
+/**
+ * One drawn row of the icicle: a depth, a sub-row of a depth whose siblings
+ * overlap, or the overflow row of a crowded depth, which holds only marks.
+ */
+interface IcicleRow {
+  /** The frames drawn as bars on this row, left to right, never overlapping. */
+  readonly frames: readonly PlacedFrame[];
+  /** The "+N" marks on this row, left to right; empty except on an overflow row. */
+  readonly marks: readonly OverflowMark[];
 }
 
 /**
@@ -686,13 +889,36 @@ interface FlameModel extends TraceFacts {
   /** The drawn window's frames, in the traversal's order — the list's rows. */
   readonly frames: readonly FlameFrame[];
   /**
+   * The window's CONTEXT: every operation its frames are nested inside that an
+   * earlier window draws, outermost first — the ancestors of its first frame
+   * (see {@link contextIndexesOf}). Empty for a window that opens at a root.
+   * Never page content: these are not rows of the list, and they are not
+   * counted by the window.
+   */
+  readonly context: readonly FlameFrame[];
+  /**
+   * The context band: one bar per {@link context} operation, each on a row of
+   * its own at the top of the canvas, outermost first, above every row of the
+   * window itself.
+   */
+  readonly contextBars: readonly PlacedFrame[];
+  /**
    * The icicle's drawn rows, top to bottom, each holding frames that never
    * overlap one another. A depth whose frames overlap in time — or only once
    * the minimum visible width widened them — occupies several consecutive
-   * rows, and every row of depth `d` sits above every row of depth `d + 1`
-   * (see {@link packIcicleRows}).
+   * rows — at most {@link MAX_DEPTH_ROWS}, the last of a crowded depth's an
+   * overflow row of marks — and every row of depth `d` sits above every row of
+   * depth `d + 1` (see {@link packIcicleRows}). They start below the context
+   * band.
    */
-  readonly icicleRows: readonly (readonly PlacedFrame[])[];
+  readonly icicleRows: readonly IcicleRow[];
+  /**
+   * Every frame of the window an overflow mark gathered, by frame id — what
+   * lets the canvas draw a gathered frame when the panel selects it.
+   */
+  readonly gathered: ReadonlyMap<string, GatheredFrame>;
+  /** How many overflow marks the canvas draws; `0` when no depth was crowded. */
+  readonly overflowMarkCount: number;
   /** The canvas height the rows and the axis occupy, in user units. */
   readonly canvasHeight: number;
   /** The axis ticks, with their positions and labels. */
@@ -744,7 +970,11 @@ const EMPTY_WALK: FlameWalk = {
 const EMPTY_MODEL: FlameModel = {
   ...EMPTY_FACTS,
   frames: [],
+  context: [],
+  contextBars: [],
   icicleRows: [],
+  gathered: new Map(),
+  overflowMarkCount: 0,
   canvasHeight: AXIS_BAND_HEIGHT,
   ticks: [],
   shownDepth: 0,
@@ -873,6 +1103,14 @@ const LEVEL_NOUN: CountedNoun = countedNoun('level');
 const IS_VERB: CountedNoun = countedNoun('is', 'are');
 const WAS_VERB: CountedNoun = countedNoun('was', 'were');
 const OBJECT_PRONOUN: CountedNoun = countedNoun('it', 'them');
+const ROW_NOUN: CountedNoun = countedNoun('row');
+const MARK_NOUN: CountedNoun = countedNoun('mark');
+
+/**
+ * Where a gathered operation can still be read: "it is listed" for one,
+ * "every one is listed" for several.
+ */
+const LISTED_IN_TREE: CountedNoun = countedNoun('it is listed', 'every one is listed');
 
 /**
  * Why a re-attached operation was re-attached: its own parent never arrived —
@@ -942,17 +1180,17 @@ function provenanceOf(frame: FlameFrame): string | undefined {
  * A frame's whole detail as one block of plain text, for the native tooltip the
  * canvas shows on hover.
  *
- * The chart is `role="img"`, so this text is a convenience for a pointer user;
- * the same facts reach a keyboard or screen-reader user through the row's own
- * tooltip and cells in the text equivalent, which is the representation that
- * must be complete.
+ * This text is a convenience for a pointer user; the same facts reach a screen
+ * reader through the frame's accessible name ({@link frameDescription}), and a
+ * keyboard user through the row's own tooltip and cells in the text
+ * equivalent, which is the representation that must be complete.
  */
 function frameTooltipText(frame: FlameFrame): string {
   const lines: string[] = [frame.name];
 
   lines.push(`${formatKindLabel(frame.kind)} · ${formatTierLabel(frame.tier)}`);
-  lines.push(`Duration ${formatDuration(frame.durationMs)}`);
-  lines.push(`Own time ${formatDuration(frame.selfTimeMs)}`);
+  lines.push(`Duration ${formatShownDuration(frame.measuredDurationMs)}`);
+  lines.push(`Own time ${formatShownDuration(frame.measuredSelfTimeMs)}`);
   lines.push(pluralNestedCalls(frame.childCount));
 
   if (frame.status === 'error') {
@@ -971,11 +1209,122 @@ function frameTooltipText(frame: FlameFrame): string {
 }
 
 /**
+ * An overflow mark's native tooltip and accessible name: how many operations
+ * it gathers, the stretch of the trace they cover, why they are gathered, and
+ * where each of them can still be read — "8 operations from 0.00 ms to
+ * 90.00 ms gathered here, where this level overlaps more deeply than its 2
+ * rows can draw; every one is listed in the tree below."
+ *
+ * The stretch is what tells one mark from another: a crowded level of a large
+ * trace gathers into many marks, and a reader moving through the canvas's
+ * images by name hears where each one sits rather than a list of identical
+ * counts. It is measured from the chart's own origin — the axis's zero — and
+ * is omitted when either end is not a finite time, so a malformed record never
+ * prints a made-up offset.
+ *
+ * @param count How many operations the mark gathers.
+ * @param stretch Where the gathered operations start and end, as epoch
+ * milliseconds, and the origin the axis measures them from; omitted when
+ * unknown.
+ * @returns The tooltip text.
+ */
+function overflowMarkTitle(count: number, stretch?: MarkStretch): string {
+  const during =
+    stretch !== undefined &&
+    Number.isFinite(stretch.startTime) &&
+    Number.isFinite(stretch.endTime) &&
+    Number.isFinite(stretch.origin)
+      ? ` from ${formatOffset(stretch.startTime, stretch.origin)} to ${formatOffset(
+          stretch.endTime,
+          stretch.origin,
+        )}`
+      : '';
+
+  return `${pluralOperations(count)}${during} gathered here, where this level overlaps more deeply than its ${formatCountOf(
+    MAX_DEPTH_SUB_ROWS,
+    ROW_NOUN,
+  )} can draw; ${pluralize(count, LISTED_IN_TREE)} in the tree below.`;
+}
+
+/**
+ * The stretch of the trace one overflow mark covers: from the earliest start
+ * of the operations it gathers to the latest end, both as epoch milliseconds,
+ * with the origin the chart's axis measures offsets from.
+ */
+interface MarkStretch {
+  /** The earliest start of a gathered operation, in epoch milliseconds. */
+  readonly startTime: number;
+  /** The latest drawn end of a gathered operation, in epoch milliseconds. */
+  readonly endTime: number;
+  /** The axis's zero, in epoch milliseconds. */
+  readonly origin: number;
+}
+
+/**
+ * Where a run of gathered bars sits in the trace: the earliest start and the
+ * latest end of the frames it holds. The end reads each frame's DRAWN duration
+ * (a record whose duration is not a measurement contributes its start only),
+ * which is the extent the mark itself is drawn over.
+ *
+ * @param bars The run's bars; at least one.
+ * @param origin The axis's zero, in epoch milliseconds.
+ * @returns The run's stretch.
+ */
+function stretchOf(bars: readonly UnrowedFrame[], origin: number): MarkStretch {
+  let startTime = Number.POSITIVE_INFINITY;
+  let endTime = Number.NEGATIVE_INFINITY;
+
+  // A loop rather than a spread into Math.min/Math.max: one mark can gather
+  // every frame of a drawn window, and a spread of that many arguments is not
+  // a bound this view should depend on.
+  for (const bar of bars) {
+    const { startTime: start, durationMs } = bar.frame;
+    if (!Number.isFinite(start)) {
+      continue;
+    }
+    startTime = Math.min(startTime, start);
+    endTime = Math.max(endTime, start + durationMs);
+  }
+
+  return { startTime, endTime, origin };
+}
+
+/**
+ * What the row bound on a crowded depth did to the drawing, as the note above
+ * the canvas and its text alternative both state it — or `undefined` when no
+ * depth of the drawn window needed more than {@link MAX_DEPTH_ROWS} rows, so a
+ * trace the bound never touched carries no note about it.
+ *
+ * A statement about the drawn window, not the whole walk: it counts the
+ * operations this window gathered, so it is re-worded as the reader pages.
+ *
+ * @param model The drawn window.
+ * @returns The sentence, when anything was gathered.
+ */
+function compactionSentence(model: FlameModel): string | undefined {
+  const gathered = model.gathered.size;
+  if (gathered === 0) {
+    return undefined;
+  }
+
+  return `Where more operations of one level overlap than its ${formatCountOf(
+    MAX_DEPTH_SUB_ROWS,
+    ROW_NOUN,
+  )} can hold, those rows keep the longest, and the ${pluralOperations(
+    gathered,
+  )} that did not fit ${pluralize(gathered, IS_VERB)} gathered into ${formatCountOf(
+    model.overflowMarkCount,
+    MARK_NOUN,
+  )} on a row beneath them; ${pluralize(gathered, LISTED_IN_TREE)} in the tree below.`;
+}
+
+/**
  * The canvas's text alternative: what the picture shows, in one sentence.
  *
  * It describes recorded operations and measured durations, and it never
  * describes samples, stacks or a profile — see the note at the top of this
- * module.
+ * module. A drawing in which a crowded depth gathered operations into marks
+ * says so in the words of the note above it ({@link compactionSentence}).
  */
 function canvasTextAlternative(model: FlameModel, title: string | undefined): string {
   const heading = title === undefined ? CATALOG_ENTRY.label : title;
@@ -984,11 +1333,18 @@ function canvasTextAlternative(model: FlameModel, title: string | undefined): st
     levels,
     LEVEL_NOUN,
   )} deep, ${formatDuration(model.totalDurationMs)} from the first to the last.`;
+  const compaction = compactionSentence(model);
+  const described = compaction === undefined ? shape : `${shape} ${compaction}`;
 
-  // A partial picture says so in the same words the notices beside it use.
+  // A partial picture says so in the same words the notices beside it use,
+  // and a picture with a context band says which of its rows are context.
   const partial: string[] = [];
   if (isWindowed(model.window)) {
     partial.push(windowSentence(model.window));
+  }
+  const contextStatement = contextSentence(model.context);
+  if (contextStatement !== undefined) {
+    partial.push(contextStatement);
   }
   if (model.walkBounded) {
     partial.push(walkBoundSentence(model));
@@ -997,7 +1353,7 @@ function canvasTextAlternative(model: FlameModel, title: string | undefined): st
     partial.push('The trace itself arrived incomplete.');
   }
 
-  return partial.length === 0 ? shape : `${shape} ${partial.join(' ')}`;
+  return partial.length === 0 ? described : `${described} ${partial.join(' ')}`;
 }
 
 /*
@@ -1009,6 +1365,30 @@ function canvasTextAlternative(model: FlameModel, title: string | undefined): st
 /** A duration made usable: non-finite becomes `0`, negative becomes `0`. */
 function usableDurationMs(value: number): number {
   return clampNonNegative(Number.isFinite(value) ? value : 0);
+}
+
+/**
+ * A duration a reader may be shown as measured, or `undefined` when the
+ * record's value is not a measurement.
+ *
+ * The display twin of {@link usableDurationMs}, and the judgement
+ * `formatDuration` and `DurationCell` make: a duration cannot be negative, so a
+ * negative one — or a `null`, `NaN` or infinity arriving in a malformed record
+ * — is corrupt rather than fast. A value below zero only by floating-point
+ * noise, one that rounds to zero at the shared resolution, is the zero it is.
+ *
+ * @param value The record's duration, in milliseconds.
+ */
+function measuredDurationMs(value: number): number | undefined {
+  return Number.isFinite(value) && roundMs(value) >= 0 ? clampNonNegative(value) : undefined;
+}
+
+/**
+ * A shown duration as text: the formatter's text for a measured value, and the
+ * not-available label for one that was not measured.
+ */
+function formatShownDuration(ms: number | undefined): string {
+  return ms === undefined ? NOT_AVAILABLE_LABEL : formatDuration(ms);
 }
 
 /**
@@ -1135,6 +1515,30 @@ function frameLabelText(name: string, width: number): string | undefined {
   })?.text;
 }
 
+/**
+ * The "+N" count to draw inside an overflow mark `width` user units wide, or
+ * `undefined` when it does not fit whole.
+ *
+ * Fitted exactly as a frame's label is ({@link frameLabelText}): by the
+ * estimate of the label's type role, in the same logical units, between the
+ * insets, and never inside a mark narrower than {@link MIN_LABEL_WIDTH}. With
+ * one difference: a count is never cut. "+1…" of "+1,234" would state a number
+ * the mark does not hold, so a count that does not fit whole draws nothing,
+ * and the mark's title still carries it.
+ *
+ * @param count How many operations the mark gathers.
+ * @param width The mark's width, in the canvas's user units.
+ * @returns The text to draw, or `undefined` for no label.
+ */
+function overflowLabelText(count: number, width: number): string | undefined {
+  if (!(width >= MIN_LABEL_WIDTH)) {
+    return undefined;
+  }
+
+  const fit = fitTextToWidth(`+${formatCount(count)}`, width - LABEL_INSET * 2, LABEL_MEASURE);
+  return fit === undefined || fit.truncated ? undefined : fit.text;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Derivation
@@ -1195,6 +1599,189 @@ function packDepthBars(bars: readonly UnrowedFrame[]): readonly (readonly Unrowe
 }
 
 /**
+ * Orders a crowded depth's bars by how much the reader needs each one drawn:
+ * the longest measured duration first, then the earliest drawn start, then
+ * traversal order, so the order is total and the same trace always keeps the
+ * same bars.
+ *
+ * Duration first because a long operation is what a reader of a timing view
+ * came to see, and it is also the bar a mark would hide the most of; the drawn
+ * start follows the measured start (the scale only clamps it into the canvas),
+ * and traversal order settles bars that agree on both.
+ */
+function bySignificance(left: UnrowedFrame, right: UnrowedFrame): number {
+  return (
+    right.frame.durationMs - left.frame.durationMs || left.x - right.x || left.order - right.order
+  );
+}
+
+/**
+ * Where `bar` fits on a sub-row whose bars are disjoint and sorted by left
+ * edge: the index to insert it at to keep them so, or `-1` when it would
+ * overlap a bar already there.
+ *
+ * The row's bars are disjoint and sorted by left edge, so their right edges
+ * are sorted too, and only the two neighbours of the insertion point can
+ * overlap the new bar: the one before must end at or before its left edge, and
+ * the one after must begin at or after its right edge, each within
+ * {@link TOUCH_TOLERANCE} so bars that only touch share the row. A binary
+ * search finds the insertion point, so a row is never scanned end to end.
+ *
+ * @param lane One sub-row's bars, disjoint and sorted by left edge.
+ * @param bar The bar to place.
+ * @returns The insertion index, or `-1` when the bar does not fit.
+ */
+function laneInsertionIndex(lane: readonly UnrowedFrame[], bar: UnrowedFrame): number {
+  let low = 0;
+  let high = lane.length;
+
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = lane[middle];
+    if (candidate !== undefined && candidate.x <= bar.x) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+
+  const before = lane[low - 1];
+  if (before !== undefined && before.x + before.width - bar.x > TOUCH_TOLERANCE) {
+    return -1;
+  }
+  const after = lane[low];
+  if (after !== undefined && bar.x + bar.width - after.x > TOUCH_TOLERANCE) {
+    return -1;
+  }
+
+  return low;
+}
+
+/** A run of gathered bars whose drawn extents overlap, and the extent they cover together. */
+interface OverflowCluster {
+  /** The bars, left to right. */
+  readonly bars: readonly UnrowedFrame[];
+  /** The leftmost bar's left edge, in user units. */
+  readonly x: number;
+  /** The rightmost right edge among the bars, in user units. */
+  readonly end: number;
+}
+
+/** A crowded depth, packed: its bounded sub-rows and what they could not hold. */
+interface CrowdedDepth {
+  /** At most {@link MAX_DEPTH_SUB_ROWS} sub-rows, each with its bars left to right. */
+  readonly lanes: readonly (readonly UnrowedFrame[])[];
+  /** Every bar no sub-row could hold, gathered into runs left to right. */
+  readonly clusters: readonly OverflowCluster[];
+}
+
+/**
+ * Packs a depth that needs more than {@link MAX_DEPTH_ROWS} rows into
+ * {@link MAX_DEPTH_SUB_ROWS} sub-rows, and gathers the bars that fit in none of
+ * them.
+ *
+ * ## Which bars keep a row
+ *
+ * The bars are taken by significance ({@link bySignificance}: the longest
+ * measured duration, then the earliest start, then traversal order) and each
+ * goes into the first sub-row it overlaps nothing on ({@link laneInsertionIndex})
+ * — first fit, over the same DRAWN extents and with the same touch tolerance
+ * as the optimal packing, so no row ever paints one bar over another. The
+ * {@link MAX_DEPTH_SUB_ROWS} longest operations of the depth are therefore
+ * always bars — each finds fewer bars placed before it than there are
+ * sub-rows — and a shorter one keeps a row wherever the longer ones leave room
+ * for it. A bar is gathered only
+ * when every sub-row is already taken where it would be drawn, so every
+ * sub-row holds at least one bar.
+ *
+ * ## How the rest are gathered
+ *
+ * The gathered bars, left to right, are merged into runs wherever their drawn
+ * extents overlap (bars that only touch start a new run). Each run becomes one
+ * "+N" mark over the extent it covers, on the overflow row beneath the
+ * sub-rows, so the mark sits where the operations it stands for were drawn.
+ *
+ * @param bars One crowded depth's bars, in traversal order.
+ * @returns The bounded sub-rows and the runs of gathered bars.
+ */
+function packCrowdedDepth(bars: readonly UnrowedFrame[]): CrowdedDepth {
+  const lanes: UnrowedFrame[][] = Array.from({ length: MAX_DEPTH_SUB_ROWS }, () => []);
+  const overflow: UnrowedFrame[] = [];
+
+  for (const bar of [...bars].sort(bySignificance)) {
+    let placed = false;
+    for (const lane of lanes) {
+      const index = laneInsertionIndex(lane, bar);
+      if (index >= 0) {
+        lane.splice(index, 0, bar);
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) {
+      overflow.push(bar);
+    }
+  }
+
+  overflow.sort((left, right) => left.x - right.x || left.order - right.order);
+
+  const clusters: OverflowCluster[] = [];
+  let run: UnrowedFrame[] = [];
+  let clusterStart = 0;
+  let clusterEnd = 0;
+
+  for (const bar of overflow) {
+    const barEnd = bar.x + bar.width;
+    if (run.length > 0 && clusterEnd - bar.x > TOUCH_TOLERANCE) {
+      run.push(bar);
+      clusterEnd = Math.max(clusterEnd, barEnd);
+      continue;
+    }
+    if (run.length > 0) {
+      clusters.push({ bars: run, x: clusterStart, end: clusterEnd });
+    }
+    run = [bar];
+    clusterStart = bar.x;
+    clusterEnd = barEnd;
+  }
+  if (run.length > 0) {
+    clusters.push({ bars: run, x: clusterStart, end: clusterEnd });
+  }
+
+  // Every sub-row holds a bar whenever anything was gathered (see above), so
+  // the filter only guards a depth that was never crowded to begin with.
+  return { lanes: lanes.filter((lane) => lane.length > 0), clusters };
+}
+
+/**
+ * One sub-row's bars, placed at the row's top edge.
+ *
+ * @param lane The sub-row's bars, left to right.
+ * @param y The row's top edge, in user units.
+ * @returns The bars with their full geometry.
+ */
+function placeLane(lane: readonly UnrowedFrame[], y: number): PlacedFrame[] {
+  return lane.map((bar) => ({
+    frame: bar.frame,
+    x: bar.x,
+    width: bar.width,
+    y,
+    height: bar.height,
+    label: bar.label,
+  }));
+}
+
+/** The icicle's drawn rows and what its overflow rows gathered. */
+interface PackedIcicle {
+  /** The drawn rows, top to bottom. */
+  readonly rows: readonly IcicleRow[];
+  /** Every gathered frame, by frame id, with the bar it would be drawn as. */
+  readonly gathered: ReadonlyMap<string, GatheredFrame>;
+  /** How many "+N" marks the overflow rows hold in all. */
+  readonly markCount: number;
+}
+
+/**
  * Assigns every bar its drawn row: each depth packed into sub-rows, and the
  * sub-rows numbered in depth-major order.
  *
@@ -1204,34 +1791,81 @@ function packDepthBars(bars: readonly UnrowedFrame[]): readonly (readonly Unrowe
  * with no overlaps keeps exactly one row, so a trace whose siblings never
  * overlap draws precisely as a one-row-per-depth icicle would.
  *
+ * A depth whose optimal packing ({@link packDepthBars}) fits in
+ * {@link MAX_DEPTH_ROWS} rows is drawn exactly as that packing lays it out,
+ * every frame a bar. A crowded depth — one that needs more — is packed into
+ * {@link MAX_DEPTH_SUB_ROWS} sub-rows by {@link packCrowdedDepth}, and ONE
+ * overflow row directly beneath them carries a "+N" mark per run of the bars
+ * they could not hold. So a depth never takes more than `MAX_DEPTH_ROWS` rows,
+ * however many of its operations overlap, and the depths below it stay within
+ * reach of the top of the canvas.
+ *
  * The vertical rhythm is `../utils/scale`'s: row `n` of the result sits at
- * `rowY(n)` below the axis band.
+ * `rowY(firstRow + n)` below the axis band, so the rows open beneath the
+ * `firstRow` rows above them — the context band's.
  *
  * @param barsByDepth The shown bars grouped by depth, dense from the root.
- * @returns The drawn rows, top to bottom, each with its bars left to right.
+ * @param origin The axis's zero, in epoch milliseconds, which each mark's
+ * title measures the stretch it covers from.
+ * @param firstRow How many drawn rows sit above these on the canvas.
+ * @returns The drawn rows, top to bottom, each with its bars left to right,
+ * and every frame the overflow rows gathered.
  */
 function packIcicleRows(
   barsByDepth: readonly (readonly UnrowedFrame[])[],
-): readonly (readonly PlacedFrame[])[] {
-  const rows: PlacedFrame[][] = [];
+  origin: number,
+  firstRow: number,
+): PackedIcicle {
+  const rows: IcicleRow[] = [];
+  const gathered = new Map<string, GatheredFrame>();
+  let markCount = 0;
+
+  const pushLane = (lane: readonly UnrowedFrame[]): void => {
+    rows.push({
+      frames: placeLane(lane, AXIS_BAND_HEIGHT + rowY(firstRow + rows.length)),
+      marks: [],
+    });
+  };
 
   for (const bars of barsByDepth) {
-    for (const lane of packDepthBars(bars)) {
-      const y = AXIS_BAND_HEIGHT + rowY(rows.length);
-      rows.push(
-        lane.map((bar) => ({
-          frame: bar.frame,
-          x: bar.x,
-          width: bar.width,
-          y,
-          height: bar.height,
-          label: bar.label,
-        })),
-      );
+    const optimal = packDepthBars(bars);
+    if (optimal.length <= MAX_DEPTH_ROWS) {
+      optimal.forEach(pushLane);
+      continue;
     }
+
+    const crowded = packCrowdedDepth(bars);
+    crowded.lanes.forEach(pushLane);
+
+    const y = AXIS_BAND_HEIGHT + rowY(firstRow + rows.length);
+    const marks: OverflowMark[] = [];
+    for (const cluster of crowded.clusters) {
+      const [first] = cluster.bars;
+      if (first === undefined) {
+        continue;
+      }
+      const count = cluster.bars.length;
+      const width = cluster.end - cluster.x;
+      const key = first.frame.frameId;
+      marks.push({
+        key,
+        count,
+        x: cluster.x,
+        width,
+        y,
+        height: Math.max(...cluster.bars.map((bar) => bar.height)),
+        label: overflowLabelText(count, width),
+        title: overflowMarkTitle(count, stretchOf(cluster.bars, origin)),
+      });
+      for (const bar of placeLane(cluster.bars, y)) {
+        gathered.set(bar.frame.frameId, { bar, markKey: key });
+      }
+    }
+    markCount += marks.length;
+    rows.push({ frames: [], marks });
   }
 
-  return rows;
+  return { rows, gathered, markCount };
 }
 
 /**
@@ -1442,6 +2076,160 @@ function ancestryOf(shown: readonly ShownRow[], entry: ShownRow): readonly strin
 }
 
 /**
+ * The CONTEXT of a page that opens at the shown operation `firstIndex`: the
+ * shown indexes of every one of that operation's ancestors, outermost first.
+ *
+ * ## Why the first operation's ancestors are the whole context
+ *
+ * The walk is pre-order and a fold removes whole subtrees, so every operation's
+ * subtree is one contiguous run of the shown operations, starting at the
+ * operation itself. An operation of the page `[firstIndex, end)` whose parent
+ * lies BEFORE the page therefore has that parent's run covering `firstIndex`
+ * too — the parent is an ancestor of the page's first operation — and so is
+ * every ancestor of that parent. The ancestors of the first operation are
+ * thus exactly the operations before the page that any of its operations,
+ * top-level or nested, hangs from; each of them precedes the page, and none
+ * of them is page content.
+ *
+ * Bounded by the walk's depth bound ({@link MAX_ICICLE_DEPTH}), since every
+ * shown operation has one shown ancestor per level above it.
+ *
+ * @param shown The walk's shown operations.
+ * @param firstIndex The page's first operation among them.
+ * @returns The ancestors' shown indexes, outermost first; empty at a root.
+ */
+function contextIndexesOf(shown: readonly ShownRow[], firstIndex: number): readonly number[] {
+  const indexes: number[] = [];
+  let parentIndex = shown[firstIndex]?.parentShownIndex;
+
+  while (parentIndex !== undefined && indexes.length <= MAX_ICICLE_DEPTH) {
+    const ancestor = shown[parentIndex];
+    if (ancestor === undefined) {
+      break;
+    }
+    indexes.push(parentIndex);
+    parentIndex = ancestor.parentShownIndex;
+  }
+
+  return indexes.reverse();
+}
+
+/**
+ * The frame one shown operation of a walk is drawn and listed as — the single
+ * construction both the drawn window and its context use, so an operation
+ * reads the same whether it is drawn as page content or as context.
+ *
+ * @param walk The walk the operation belongs to.
+ * @param shownIndex Its index among the walk's shown operations.
+ * @returns Its frame, or `undefined` for an index the walk does not hold.
+ */
+function frameAt(walk: FlameWalk, shownIndex: number): FlameFrame | undefined {
+  const entry = walk.shown[shownIndex];
+  if (entry === undefined) {
+    return undefined;
+  }
+
+  const { row, parentShownIndex } = entry;
+  const { event } = row.node;
+  const ancestry = ancestryOf(walk.shown, entry);
+  const measured = measuredDurationMs(event.duration);
+
+  return {
+    frameId: entry.frameId,
+    shownIndex,
+    parentShownIndex,
+    posInSet: entry.posInSet,
+    setSize: walk.setSizes.get(parentShownIndex ?? ROOT_PARENT_KEY) ?? entry.posInSet,
+    eventId: event.id,
+    spanId: event.spanId,
+    traceId: event.traceId,
+    name: event.name,
+    kind: event.kind,
+    tier: event.tier,
+    status: event.status,
+    depth: row.depth,
+    parentFrameId:
+      parentShownIndex === undefined ? undefined : walk.shown[parentShownIndex]?.frameId,
+    startTime: event.startTime,
+    durationMs: usableDurationMs(event.duration),
+    selfTimeMs: selfTimeMsOf(row.node),
+    measuredDurationMs: measured,
+    measuredSelfTimeMs: measured === undefined ? undefined : selfTimeMsOf(row.node),
+    childCount: row.node.children.length,
+    orphaned: row.orphaned,
+    orphanReason: row.node.orphanReason,
+    lineage: row.lineage,
+    lineageAmbiguous: row.lineageAmbiguous,
+    source: event.source,
+    ancestry,
+    // A shown frame has one shown ancestor per level above it, so its depth
+    // is how many ancestors it has in all.
+    ancestryTruncated: row.depth > ancestry.length,
+    foldable: entry.foldable,
+    folded: entry.folded,
+    childrenBeyondDepth: row.childrenTruncated,
+  };
+}
+
+/**
+ * The frames of a page's context: {@link contextIndexesOf} made frames.
+ *
+ * @param walk The walk the page is cut from.
+ * @param firstIndex The page's first operation among the walk's shown ones.
+ * @returns The context frames, outermost first; empty at a root.
+ */
+function contextFramesOf(walk: FlameWalk, firstIndex: number): readonly FlameFrame[] {
+  return contextIndexesOf(walk.shown, firstIndex).flatMap((index) => {
+    const frame = frameAt(walk, index);
+    return frame === undefined ? [] : [frame];
+  });
+}
+
+/**
+ * The label a context bar carries: {@link CONTEXT_WORD} before the operation's
+ * name, fitted to the bar like any frame label — so what survives a narrow bar
+ * is the marker first.
+ *
+ * @param name The operation's recorded name.
+ * @param width The bar's drawn width, in user units.
+ * @returns The fitted label, or `undefined` when none fits.
+ */
+function contextLabelText(name: string, width: number): string | undefined {
+  return frameLabelText(`${CONTEXT_WORD}: ${name}`, width);
+}
+
+/**
+ * The native tooltip of a context bar: the frame's own detail, then what the
+ * bar is ({@link CONTEXT_BAR_NOTE}). The first line stays the operation's
+ * name, as on every bar.
+ *
+ * @param frame The context frame.
+ * @returns The tooltip text.
+ */
+function contextTooltipText(frame: FlameFrame): string {
+  return `${frameTooltipText(frame)}\n${CONTEXT_BAR_NOTE}`;
+}
+
+/**
+ * What the context band shows, as the canvas's text alternative and the
+ * statement beside the paging controls say it: which rows of the chart are
+ * context, and the chain they draw.
+ *
+ * @param context The window's context frames, outermost first.
+ * @returns The sentence, or `undefined` for a window with no context.
+ */
+function contextSentence(context: readonly FlameFrame[]): string | undefined {
+  if (context.length === 0) {
+    return undefined;
+  }
+
+  const chain = context.map((frame) => truncate(frame.name, ROW_NAME_BUDGET)).join(' › ');
+  return context.length === 1
+    ? `The top row of the chart is drawn for context: ${chain}, the operation the drawn operations are nested inside, from an earlier window.`
+    : `The top ${formatCount(context.length)} rows of the chart are drawn for context: ${chain}, the operations the drawn operations are nested inside, from an earlier window.`;
+}
+
+/**
  * Draws one window of a walk: at most {@link MAX_DRAWN_ROWS} of its shown
  * operations as frames, their bars packed into rows, and the axis.
  *
@@ -1465,11 +2253,25 @@ function ancestryOf(shown: readonly ShownRow[], entry: ShownRow): readonly strin
  *
  * Each depth's bars are packed into as many sub-rows as their drawn extents
  * need so that no two bars on one row overlap (see {@link packIcicleRows}); a
- * depth whose siblings are disjoint keeps a single row. The extents are read
- * in the same logical units, after the scale's minimum-width clamp, so the
- * packing answers for the bars as they are painted. A window that opens below
- * the root holds no frame at the shallower depths, and those depths draw no
- * row.
+ * depth whose siblings are disjoint keeps a single row, and a depth crowded
+ * past {@link MAX_DEPTH_ROWS} rows gathers what its sub-rows cannot hold into
+ * "+N" marks on one overflow row. The extents are read in the same logical
+ * units, after the scale's minimum-width clamp, so the packing answers for the
+ * bars as they are painted. A window that opens below the root holds no frame
+ * at the shallower depths, and those depths draw no row of the window's own.
+ *
+ * ## A window that opens below the root keeps its context
+ *
+ * Such a window's frames hang from operations an earlier window draws, and
+ * without them a reader would not know where those frames sit. So the window's
+ * context — every ancestor of its first frame, which is every operation before
+ * the window that any of its frames is nested inside ({@link contextIndexesOf})
+ * — is drawn as a band above the window's rows: one row per ancestor,
+ * outermost first, each bar at its own place on the time scale, labelled with
+ * {@link CONTEXT_WORD} and filled from outside the span-kind scale, so it
+ * reads as context and not as the window's content. The band is bounded by the
+ * depth bound, it is never counted by the window, and its frames are not rows
+ * of the list: the budget above still bounds what the window itself draws.
  *
  * @param walk The walk to draw a window of.
  * @param start The first shown operation to draw; sanitised by `windowRows`.
@@ -1491,49 +2293,43 @@ function drawWindow(walk: FlameWalk, start: number): FlameModel {
   const barsByDepth: UnrowedFrame[][] = [];
   let shownDepth = 0;
 
-  for (let shownIndex = window.start; shownIndex < window.end; shownIndex += 1) {
+  // The context band first: one row per operation the window's frames are
+  // nested inside that an earlier window draws, outermost at the top, each
+  // bar at its own place on the trace's time scale — which spans the window's
+  // frames, since an ancestor's interval contains its descendants'.
+  const contextIndexes = contextIndexesOf(walk.shown, window.start);
+  const context: FlameFrame[] = [];
+  const contextBars: PlacedFrame[] = [];
+
+  for (const shownIndex of contextIndexes) {
     const entry = walk.shown[shownIndex];
-    if (entry === undefined) {
+    const frame = frameAt(walk, shownIndex);
+    if (entry === undefined || frame === undefined) {
       continue;
     }
 
-    const { row, parentShownIndex } = entry;
-    const { event } = row.node;
-    const ancestry = ancestryOf(walk.shown, entry);
+    const { event } = entry.row.node;
+    const geometry = placeSpanDuration(event.startTime, event.duration, scale);
+    contextBars.push({
+      frame,
+      x: geometry.x,
+      width: geometry.width,
+      y: AXIS_BAND_HEIGHT + rowY(context.length),
+      height: entry.row.height,
+      label: contextLabelText(event.name, geometry.width),
+    });
+    context.push(frame);
+  }
 
-    const frame: FlameFrame = {
-      frameId: entry.frameId,
-      shownIndex,
-      parentShownIndex,
-      posInSet: entry.posInSet,
-      setSize: walk.setSizes.get(parentShownIndex ?? ROOT_PARENT_KEY) ?? entry.posInSet,
-      eventId: event.id,
-      spanId: event.spanId,
-      traceId: event.traceId,
-      name: event.name,
-      kind: event.kind,
-      tier: event.tier,
-      status: event.status,
-      depth: row.depth,
-      parentFrameId:
-        parentShownIndex === undefined ? undefined : walk.shown[parentShownIndex]?.frameId,
-      startTime: event.startTime,
-      durationMs: usableDurationMs(event.duration),
-      selfTimeMs: selfTimeMsOf(row.node),
-      childCount: row.node.children.length,
-      orphaned: row.orphaned,
-      orphanReason: row.node.orphanReason,
-      lineage: row.lineage,
-      lineageAmbiguous: row.lineageAmbiguous,
-      source: event.source,
-      ancestry,
-      // A shown frame has one shown ancestor per level above it, so its depth
-      // is how many ancestors it has in all.
-      ancestryTruncated: row.depth > ancestry.length,
-      foldable: entry.foldable,
-      folded: entry.folded,
-      childrenBeyondDepth: row.childrenTruncated,
-    };
+  for (let shownIndex = window.start; shownIndex < window.end; shownIndex += 1) {
+    const entry = walk.shown[shownIndex];
+    const frame = frameAt(walk, shownIndex);
+    if (entry === undefined || frame === undefined) {
+      continue;
+    }
+
+    const { row } = entry;
+    const { event } = row.node;
 
     const order = frames.length;
     frames.push(frame);
@@ -1566,15 +2362,19 @@ function drawWindow(walk: FlameWalk, start: number): FlameModel {
     { length: shownDepth + 1 },
     (_unused, depth) => barsByDepth[depth] ?? [],
   );
-  const icicleRows = packIcicleRows(depthBars);
+  const packed = packIcicleRows(depthBars, scale.domainStart, contextBars.length);
 
   return {
     ...factsOf(walk),
     frames,
-    icicleRows,
-    // Sized by the rows actually drawn, which is the depth count only when no
-    // depth needed a second row.
-    canvasHeight: AXIS_BAND_HEIGHT + layoutHeight(icicleRows.length),
+    context,
+    contextBars,
+    icicleRows: packed.rows,
+    gathered: packed.gathered,
+    overflowMarkCount: packed.markCount,
+    // Sized by the rows actually drawn — the context band's and the window's —
+    // which is the depth count only when no depth needed a second row.
+    canvasHeight: AXIS_BAND_HEIGHT + layoutHeight(contextBars.length + packed.rows.length),
     ticks: axis.ticks,
     shownDepth,
     window,
@@ -1596,6 +2396,12 @@ function notesFor(model: FlameModel): readonly string[] {
   // the depth bound is a note, because showing more rows does not lift it.
   if (model.depthClamped) {
     notes.push(DEPTH_BOUND_NOTE);
+  }
+  // The row bound on a crowded depth draws marks in place of bars, so it is
+  // stated whenever it gathered anything — and never otherwise.
+  const compaction = compactionSentence(model);
+  if (compaction !== undefined) {
+    notes.push(compaction);
   }
   if (model.foldCount > 0) {
     notes.push(
@@ -1962,8 +2768,8 @@ function frameDescription(frame: FlameFrame): string {
   const parts: string[] = [
     frame.name,
     `${formatKindLabel(frame.kind)}, ${formatTierLabel(frame.tier)}`,
-    `duration ${formatDuration(frame.durationMs)}`,
-    `own time ${formatDuration(frame.selfTimeMs)}`,
+    `duration ${formatShownDuration(frame.measuredDurationMs)}`,
+    `own time ${formatShownDuration(frame.measuredSelfTimeMs)}`,
     pluralNestedCalls(frame.childCount),
   ];
 
@@ -2169,11 +2975,11 @@ function frameDetail(frame: FlameFrame): ReactElement {
       <Text as="span" size="xs" tone="muted">
         duration
       </Text>{' '}
-      <DurationCell ms={frame.durationMs} size="sm" />{' '}
+      <DurationCell ms={frame.measuredDurationMs} size="sm" />{' '}
       <Text as="span" size="xs" tone="muted">
         own time
       </Text>{' '}
-      <DurationCell ms={frame.selfTimeMs} size="sm" />{' '}
+      <DurationCell ms={frame.measuredSelfTimeMs} size="sm" />{' '}
       <Text as="span" size="xs" tone="muted">
         {pluralNestedCalls(frame.childCount)}
       </Text>
@@ -2194,6 +3000,47 @@ function frameDetail(frame: FlameFrame): ReactElement {
         </>
       )}
     </>
+  );
+}
+
+/**
+ * One row of a page's context, above the tree: an operation the page's rows
+ * are nested inside, listed on an earlier page.
+ *
+ * A `listitem`, not a `treeitem`: it is not a row of this page, so it is kept
+ * out of the tree — its level, its position and the tree's one tab stop all
+ * belong to the page — and it holds no control. It is laid out as a tree row
+ * is, indented by its own depth with the toggle's empty box in front, so the
+ * chain reads as the path down to the page's first row; its name, kind, tier
+ * and duration are in the muted tone, and the caption above the list says
+ * what it is.
+ *
+ * @param frame The context frame.
+ * @returns The list item.
+ */
+function contextRow(frame: FlameFrame): ReactElement {
+  const depthStyle: CssVariableStyle = { '--dgc-depth': String(frame.depth) };
+
+  return (
+    <div
+      key={frame.frameId}
+      role="listitem"
+      className="dg-flame__equivalent-row"
+      style={depthStyle}
+    >
+      <span className="dg-flame__toggle" aria-hidden="true" />
+      <Text as="span" size="sm" tone="muted">
+        {truncate(frame.name, ROW_NAME_BUDGET)}
+      </Text>
+      <Badge color={kindColorVar(frame.kind)}>{formatKindLabel(frame.kind)}</Badge>
+      <Text as="span" size="xs" tone="muted">
+        {formatTierLabel(frame.tier)}
+      </Text>
+      <Text as="span" className="dg-visually-hidden">
+        duration
+      </Text>
+      <DurationCell ms={frame.durationMs} size="sm" />
+    </div>
   );
 }
 
@@ -2238,6 +3085,14 @@ interface FlameFrameTreeProps {
    */
   readonly onReach: (shownIndex: number) => TreeReach | undefined;
   /**
+   * The context of a page of rows that opens at the operation `shownIndex`
+   * among the walk's shown operations: every operation its rows are nested
+   * inside that an earlier page lists, outermost first
+   * ({@link contextFramesOf}). Stable for one walk, so the context of a page
+   * is computed once per page turn, not once per render.
+   */
+  readonly contextOf: (shownIndex: number) => readonly FlameFrame[];
+  /**
    * The frame under the pointer on the canvas, if any. Its row carries
    * `dg-is-hovered` whenever it is rendered; the tree is not scrolled to it.
    */
@@ -2272,9 +3127,13 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
     onToggle,
     onOpenSource,
     onReach,
+    contextOf,
   } = props;
 
   const viewportRef = useRef<HTMLDivElement>(null);
+
+  /** The id the context list's caption carries, which names the list. */
+  const contextCaptionId = useId();
 
   /** Set by a key that moved the active row; spent when that row takes focus. */
   const focusPendingRef = useRef(false);
@@ -2366,6 +3225,16 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
   // row controls turn it by moving the stop.
   const page = treePageOf(rowCount, activeIndex);
   const paged = isWindowed(page);
+
+  // Where this page sits: the operations its rows are nested inside that an
+  // earlier page lists — of this tree, or of an earlier drawn window. Read off
+  // the page's first row alone, which is enough (see `contextIndexesOf`), and
+  // recomputed only when the page opens at another operation.
+  const firstShownIndex = items[page.start]?.frame.shownIndex;
+  const pageContext = useMemo(
+    () => (firstShownIndex === undefined ? [] : contextOf(firstShownIndex)),
+    [contextOf, firstShownIndex],
+  );
 
   /**
    * Makes the operation at `target` — an index among the WALK's shown
@@ -2833,12 +3702,12 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
         <Text as="span" className="dg-visually-hidden">
           duration
         </Text>
-        <DurationCell ms={frame.durationMs} size="sm" />
+        <DurationCell ms={frame.measuredDurationMs} size="sm" />
 
         <Text as="span" size="xs" tone="muted">
           own
         </Text>
-        <DurationCell ms={frame.selfTimeMs} size="sm" />
+        <DurationCell ms={frame.measuredSelfTimeMs} size="sm" />
 
         {frame.childrenBeyondDepth ? (
           <Text as="span" size="xs" tone="muted">
@@ -2860,6 +3729,22 @@ function FlameFrameTree(props: FlameFrameTreeProps): ReactElement {
           order, so the tree stays the next stop after the operations
           controls above the canvas. */}
       <Stack direction="vertical" gap={1}>
+        {pageContext.length === 0 ? null : (
+          // The page's context, outside the tree and above its scroll
+          // container, so it stays in view while the page scrolls and no
+          // reader — pointer or assistive technology — takes it for a row of
+          // this page: a captioned list, named by its caption, of rows with
+          // no control and no tab stop.
+          <div>
+            <Text as="p" size="xs" tone="muted" id={contextCaptionId}>
+              {TREE_CONTEXT_CAPTION}
+            </Text>
+            <div role="list" aria-labelledby={contextCaptionId}>
+              {pageContext.map(contextRow)}
+            </div>
+          </div>
+        )}
+
         {/* The scroll container, deliberately role-less: the tree inside it
             owns the treeitems, and a role here would insert a foreign node
             between them. The stylesheet caps its height, so a page of rows
@@ -3100,6 +3985,14 @@ export function FlameChart(props: FlameChartProps): ReactElement {
     [pageTo, queryIdentity, rowWindow, walk],
   );
 
+  // The context of a page of the tree, read off the same walk the window is
+  // cut from, so a page of rows and the drawn window it belongs to name their
+  // context identically. Stable for one walk.
+  const contextOfPage = useCallback(
+    (shownIndex: number): readonly FlameFrame[] => contextFramesOf(walk, shownIndex),
+    [walk],
+  );
+
   useEffect(() => {
     const pagedFrom = pagedFromRef.current;
     if (pagedFrom === undefined) {
@@ -3267,9 +4160,83 @@ export function FlameChart(props: FlameChartProps): ReactElement {
   const notes = notesFor(model);
   const partialSentences = partialSentencesFor(model);
   const windowed = isWindowed(rowWindow);
+  const contextStatement = contextSentence(model.context);
   const listLabel = `${node.title ?? CATALOG_ENTRY.label}: ${pluralOperations(
     model.frames.length,
   )}, innermost last`;
+
+  // The selected frame when an overflow mark gathered it instead of a sub-row
+  // drawing it. Its bar is drawn on the overflow row, over its mark, so the
+  // panel's shared selection is marked in the picture wherever it lands; the
+  // rows themselves do not move, because the layout never depends on the
+  // selection.
+  const selectedGathered =
+    selectedFrameId === undefined ? undefined : model.gathered.get(selectedFrameId);
+
+  /** One frame's bar, its native tooltip and its label, as every row draws a frame. */
+  const renderFrame = (bar: PlacedFrame): ReactElement => {
+    const frameColor: CssVariableStyle = {
+      '--dgc-frame-color': kindColorVar(bar.frame.kind),
+    };
+    // The label is text on the frame's fill, so it takes the ink paired with
+    // that fill rather than one colour for every frame: no single ink clears
+    // 4.5:1 on the whole kind scale.
+    const frameInk: CssVariableStyle = {
+      '--dgc-frame-ink': kindInkColorVar(bar.frame.kind),
+    };
+    // A fragment rather than a group per frame: a large trace draws thousands
+    // of frames, and a wrapper element per bar would add as many nodes to the
+    // document while styling nothing.
+    return (
+      <Fragment key={bar.frame.frameId}>
+        <rect
+          className={clsx(
+            'dg-flame__frame',
+            bar.frame.frameId === selectedFrameId && 'dg-is-selected',
+            bar.frame.orphaned && 'dg-is-orphan',
+          )}
+          style={frameColor}
+          x={bar.x}
+          y={bar.y}
+          width={bar.width}
+          height={bar.height}
+          // A named picture of one operation: the sentence its tree row is
+          // named by, so a screen reader browsing the icicle hears what a
+          // pointer hovering it sees. Not focusable — the tree is the keyboard
+          // path.
+          role="img"
+          aria-label={frameDescription(bar.frame)}
+          onClick={() => {
+            handleSelect(bar.frame);
+          }}
+          onPointerEnter={() => {
+            handleFrameEnter(bar.frame.frameId);
+          }}
+          onPointerLeave={() => {
+            handleFrameLeave(bar.frame.frameId);
+          }}
+        >
+          {/* The user agent's own tooltip, kept for the pointer. The
+              author-drawn detail is the frame's tree row, which hovering the
+              frame marks and Escape dismisses, whose name opens the full
+              description on hover, and whose keyboard focus reveals it. */}
+          <title>{frameTooltipText(bar.frame)}</title>
+        </rect>
+        {bar.label === undefined ? null : (
+          <text
+            className="dg-flame__frame-label"
+            // The visible label repeats the start of the frame's name.
+            aria-hidden="true"
+            style={frameInk}
+            x={bar.x + LABEL_INSET}
+            y={bar.y + bar.height / 2}
+          >
+            {bar.label}
+          </text>
+        )}
+      </Fragment>
+    );
+  };
 
   return (
     <div ref={blockRef} className={clsx('dg-flame', className)}>
@@ -3325,11 +4292,31 @@ export function FlameChart(props: FlameChartProps): ReactElement {
         </Stack>
       ) : null}
 
+      {windowed ? (
+        // What the context band at the top of the chart is, beside the window
+        // it belongs to. Mounted for as long as the window is, and polite and
+        // live like the window's statement, so paging into a window that opens
+        // below the root announces the chain it sits in; empty — and visually
+        // hidden — on a window that opens at a root and so has none.
+        <Text
+          as="p"
+          size="xs"
+          tone="muted"
+          aria-live="polite"
+          className={contextStatement === undefined ? 'dg-visually-hidden' : undefined}
+        >
+          {contextStatement ?? ''}
+        </Text>
+      ) : null}
+
       <div className="dg-flame__viewport">
-        {/* A picture with a text alternative, deliberately: the rows beneath it
-            are the representation a keyboard and a screen reader use, so the
-            canvas announces what it shows instead of exposing one node per
-            bar.
+        {/* A figure with a text alternative, whose every frame and "+N" mark
+            is a named image: a screen reader browsing the picture hears each
+            operation's full description, the same sentence its tree row and
+            its native tooltip carry. The frames are not focusable — the tree
+            beneath is the keyboard path — and the axis and the visible labels,
+            which repeat what the names say, are hidden from assistive
+            technology.
 
             One fixed logical space, whatever the container: the `viewBox` is
             `CHART_VIEWBOX_WIDTH` units wide and exactly as tall as the drawn
@@ -3340,14 +4327,14 @@ export function FlameChart(props: FlameChartProps): ReactElement {
             the element's size; see the module note. */}
         <svg
           className="dg-flame__canvas"
-          role="img"
+          role="figure"
           aria-label={canvasTextAlternative(model, node.title)}
           viewBox={`0 0 ${String(CHART_VIEWBOX_WIDTH)} ${String(model.canvasHeight)}`}
           width="100%"
           height={model.canvasHeight}
           preserveAspectRatio="xMinYMin meet"
         >
-          <g className="dg-flame__axis">
+          <g className="dg-flame__axis" aria-hidden="true">
             {model.ticks.map((tick, index) => {
               const x = alignHairline(tick.offset);
               return (
@@ -3372,64 +4359,88 @@ export function FlameChart(props: FlameChartProps): ReactElement {
             })}
           </g>
 
-          {model.icicleRows.map((bars, rowIndex) => (
+          {model.contextBars.map((bar, contextIndex) => {
+            // The context band: the operations this window's frames are
+            // nested inside, one row each above the window's own rows. Filled
+            // from outside the span-kind scale, labelled "Context: …" and
+            // titled as context, and marked `data-flame-context` so the
+            // picture's one class contract stays unchanged. Activating one
+            // selects it, which pages the window to the one that draws it.
+            const contextColor: CssVariableStyle = { '--dgc-frame-color': CONTEXT_FILL_VAR };
+            const contextInk: CssVariableStyle = { '--dgc-frame-ink': CONTEXT_INK_VAR };
+            return (
+              <g className="dg-flame__row" key={`context-${String(contextIndex)}`}>
+                <rect
+                  className="dg-flame__frame"
+                  data-flame-context="true"
+                  style={contextColor}
+                  x={bar.x}
+                  y={bar.y}
+                  width={bar.width}
+                  height={bar.height}
+                  // A named picture like every frame of the window: the
+                  // frame's description, then that it is drawn for context.
+                  role="img"
+                  aria-label={`${frameDescription(bar.frame)} ${CONTEXT_BAR_NOTE}`}
+                  onClick={() => {
+                    handleSelect(bar.frame);
+                  }}
+                >
+                  <title>{contextTooltipText(bar.frame)}</title>
+                </rect>
+                {bar.label === undefined ? null : (
+                  <text
+                    className="dg-flame__frame-label"
+                    aria-hidden="true"
+                    style={contextInk}
+                    x={bar.x + LABEL_INSET}
+                    y={bar.y + bar.height / 2}
+                  >
+                    {bar.label}
+                  </text>
+                )}
+              </g>
+            );
+          })}
+
+          {model.icicleRows.map((row, rowIndex) => (
             // The drawn row's position is its identity, so it is also the
             // key: a fold changes which frames a row holds, and rows are
             // numbered top to bottom whatever they hold.
             <g className="dg-flame__row" key={rowIndex}>
-              {bars.map((bar) => {
-                const frameColor: CssVariableStyle = {
-                  '--dgc-frame-color': kindColorVar(bar.frame.kind),
-                };
-                // The label is text on the frame's fill, so it takes the ink
-                // paired with that fill rather than one colour for every frame:
-                // no single ink clears 4.5:1 on the whole kind scale.
-                const frameInk: CssVariableStyle = {
-                  '--dgc-frame-ink': kindInkColorVar(bar.frame.kind),
-                };
-                // A fragment rather than a group per frame: a large trace draws
-                // thousands of frames, and a wrapper element per bar would add
-                // as many nodes to the document while styling nothing.
+              {row.frames.map(renderFrame)}
+              {row.marks.map((mark) => {
+                // The selected frame, when this mark gathered it: drawn over
+                // the mark at its own extent, in place of the mark's count,
+                // which the two would otherwise both claim the band for.
+                const selectedHere =
+                  selectedGathered?.markKey === mark.key ? selectedGathered.bar : undefined;
                 return (
-                  <Fragment key={bar.frame.frameId}>
+                  <Fragment key={mark.key}>
                     <rect
-                      className={clsx(
-                        'dg-flame__frame',
-                        bar.frame.frameId === selectedFrameId && 'dg-is-selected',
-                        bar.frame.orphaned && 'dg-is-orphan',
-                      )}
-                      style={frameColor}
-                      x={bar.x}
-                      y={bar.y}
-                      width={bar.width}
-                      height={bar.height}
-                      onClick={() => {
-                        handleSelect(bar.frame);
-                      }}
-                      onPointerEnter={() => {
-                        handleFrameEnter(bar.frame.frameId);
-                      }}
-                      onPointerLeave={() => {
-                        handleFrameLeave(bar.frame.frameId);
-                      }}
+                      className="dg-flame__overflow"
+                      x={mark.x}
+                      y={mark.y}
+                      width={mark.width}
+                      height={mark.height}
+                      role="img"
+                      aria-label={mark.title}
                     >
-                      {/* The user agent's own tooltip, kept for the pointer.
-                          The author-drawn detail is the frame's tree row, which
-                          hovering the frame marks and Escape dismisses, whose
-                          name opens the full description on hover, and whose
-                          keyboard focus reveals it. */}
-                      <title>{frameTooltipText(bar.frame)}</title>
+                      {/* How many operations the band stands for, and where
+                          each of them is still listed one by one. */}
+                      <title>{mark.title}</title>
                     </rect>
-                    {bar.label === undefined ? null : (
+                    {mark.label === undefined || selectedHere !== undefined ? null : (
                       <text
-                        className="dg-flame__frame-label"
-                        style={frameInk}
-                        x={bar.x + LABEL_INSET}
-                        y={bar.y + bar.height / 2}
+                        className="dg-flame__overflow-label"
+                        aria-hidden="true"
+                        x={mark.x + LABEL_INSET}
+                        y={mark.y + mark.height / 2}
                       >
-                        {bar.label}
+                        {mark.label}
                       </text>
                     )}
+                    {selectedHere === undefined ? null : renderFrame(selectedHere)}
                   </Fragment>
                 );
               })}
@@ -3460,6 +4471,7 @@ export function FlameChart(props: FlameChartProps): ReactElement {
         onToggle={handleToggle}
         onOpenSource={actions?.onOpenSource}
         onReach={handleReach}
+        contextOf={contextOfPage}
       />
     </div>
   );

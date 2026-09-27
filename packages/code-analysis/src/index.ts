@@ -76,11 +76,15 @@
  * VS Code webview or `packages/panel-renderer`.
  *
  * Cached indexes live outside the developer's checkout: `createIndexCache`
- * writes one JSON entry per indexed tree under `$DEBUGGEN_HOME/index`
+ * writes one JSON entry per project under `$DEBUGGEN_HOME/index`
  * (`~/.debuggen/index` by default, resolved by {@link resolveIndexCacheDir}),
- * keyed by {@link computeIndexCacheKey} over the project's identity and a
- * fingerprint of every file that was read. A session therefore never shows up
- * in `git status`.
+ * named by {@link computeIndexCacheEntryKey} over the project's identity and
+ * overwritten on every save. Freshness is decided by the entry's state key —
+ * {@link computeIndexCacheKey} over the modification time and size of every
+ * file that was read — with a content-hash comparison for the files whose
+ * metadata moved, so a tree restored byte for byte (as session cleanup does)
+ * is served from the cache. A session therefore never shows up in
+ * `git status`.
  *
  * ## Dependency boundary
  *
@@ -306,12 +310,13 @@ export type {
 } from './graph/query.js';
 
 // ---------------------------------------------------------------------------
-// cache — one JSON entry per indexed tree under `$DEBUGGEN_HOME/index`, keyed
-// by project identity plus a fingerprint of every file that was read, so a
-// session never writes inside the developer's checkout
+// cache — one JSON entry per project under `$DEBUGGEN_HOME/index`, named by
+// project identity and kept fresh by file fingerprints plus content hashes, so
+// a session never writes inside the developer's checkout
 // ---------------------------------------------------------------------------
 export {
   INDEX_CACHE_SCHEMA_VERSION,
+  computeIndexCacheEntryKey,
   computeIndexCacheKey,
   createIndexCache,
   isCodeIndex,

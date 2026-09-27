@@ -19,9 +19,12 @@
  *   capture it claims to describe, before it may be stored, broadcast or drawn.
  *   By the time a node reaches this file, that has happened.
  * - **It does not mutate or repair.** No query field is defaulted, narrowed or
- *   reordered, no node is dropped and no label is invented. A panel on screen
- *   has to be the panel the coordination service validated and stored, so every
- *   field below is read and none is written.
+ *   reordered, no node is dropped and no label is invented. The one heading this
+ *   module supplies for a node that carries none — an untitled view's catalogue
+ *   label, see "Headings belong to the container" below — is the schema's own
+ *   vocabulary, drawn beside the node and never written onto it. A panel on
+ *   screen has to be the panel the coordination service validated and stored,
+ *   so every field below is read and none is written.
  * - **It reaches no transport.** The evidence behind a node arrives through that
  *   component's own `useQuery` against the ambient `DataProvider`, and an
  *   interaction leaves through the ambient `PanelActions`. There is no
@@ -71,10 +74,11 @@
  *   focus-key attribute is recognised again after a remount, so a retry that
  *   fails again puts focus on the *new* Retry.
  * - **Otherwise the node's own region.** Focus is parked on the node's heading
- *   (the `Section` heading of a titled node) or, for a node without one, on the
- *   frame itself — made programmatically focusable with `tabindex="-1"` only
- *   while it holds focus — and stays there once the node has settled on content
- *   with no equivalent control.
+ *   (the `Section` heading every view and every titled container draws) or,
+ *   for a node without one (a source link, an untitled container, a failure),
+ *   on the frame itself — made programmatically focusable with `tabindex="-1"`
+ *   only while it holds focus — and stays there once the node has settled on
+ *   content with no equivalent control.
  * - **Each frame answers for its own node only.** Frames nest (a container's
  *   frame holds its children's), so a frame treats as its own only the elements
  *   whose nearest frame it is.
@@ -114,6 +118,22 @@
  * *labelled leaf* is wrapped in `../layout/Section` here — once, for all of
  * them — while a *container's* own labels are forwarded by that container's
  * registry adapter, whose layout primitive already renders them.
+ *
+ * A *view* — one of the twelve leaf types that draw captured evidence, which
+ * the catalogue marks as `kind: 'visualization'` with `requiresQuery` — is a
+ * labelled leaf even when the panel gave it no title. Its heading is then the
+ * catalogue `label` of its type ("Timeline", "Event log", …), the name that
+ * field is documented to supply for "a section heading a panel did not title",
+ * so every view is a named region in the outline and the landmark list rather
+ * than a table or chart a reader can only reach by tabbing through it. The
+ * label is the schema's vocabulary, not wording this file chose. Two kinds of
+ * node draw a heading only for a title with text: the source-link leaf, a
+ * single chip whose own accessible name already says where it goes, so a
+ * heading per chip would only lengthen the outline; and the three containers,
+ * which group nodes without naming them and so add no level when untitled
+ * (below). A description on an untitled view renders under that label; on a
+ * source link it still renders on its own, in an unnamed container. See
+ * {@link leafHeadingFor}.
  *
  * The outline depth this module tracks is the depth of every heading a node
  * renders: {@link NodeRendererProps.headingLevel} is the level of the node's own
@@ -180,12 +200,12 @@
  *
  *   `dg-panel__node`        the wrapper this module emits around every node. It
  *                           owns no appearance — a `section` node renders its
- *                           own container inside it and a bare visualization
- *                           renders straight onto the panel surface — but it
- *                           does carry the column flow and the zero minimum
- *                           inline size that let a wide table or timeline
- *                           shrink inside a division instead of forcing it
- *                           open.
+ *                           own container inside it and a leaf renders onto the
+ *                           panel surface, its `Section` being the plain
+ *                           variant, which draws no surface — but it does
+ *                           carry the column flow and the zero minimum inline
+ *                           size that let a wide table or timeline shrink
+ *                           inside a division instead of forcing it open.
  *   `dg-panel__node-error`  added to that wrapper for the failure above. Its
  *                           minimum block size is what makes an unrenderable
  *                           node occupy the room its visualization would have,
@@ -319,8 +339,8 @@ function nextHeadingLevel(level: HeadingLevel): HeadingLevel {
  *
  * Absent, empty and whitespace-only are one case, which is the rule the three
  * layout primitives apply to the same two fields: a blank title must leave a
- * container unnamed rather than produce an empty heading, so a blank title must
- * not cause a leaf to be wrapped in a container either.
+ * container unnamed rather than produce an empty heading, and a leaf whose
+ * title is blank is read exactly as a leaf that has none.
  *
  * Module-private, as the identical predicate is in each layout primitive: it is
  * two comparisons over a string and nothing about it is design-system
@@ -331,6 +351,38 @@ function nextHeadingLevel(level: HeadingLevel): HeadingLevel {
  */
 function hasText(value: string | undefined): value is string {
   return value !== undefined && value.trim() !== '';
+}
+
+/**
+ * The heading a leaf's region is drawn under, or `undefined` for a leaf that
+ * draws none.
+ *
+ * The node's own title whenever it has text: what the panel author wrote always
+ * wins. Otherwise a view of captured evidence — a catalogue entry of
+ * `kind: 'visualization'` whose `requiresQuery` is set, which is exactly the
+ * twelve query-backed leaf types — is headed by its catalogue `label`, the
+ * field `@debuggen/panel-schema` documents as the name "for a section heading a
+ * panel did not title". Reading both facts from the catalogue, rather than
+ * naming types here, is what keeps a node type added to the vocabulary
+ * classified without an edit to this file, exactly as containment is.
+ *
+ * The source-link leaf is the one visualization this leaves unheaded: it reads
+ * no capture (`requiresQuery` is false) and draws a single chip whose own
+ * accessible name states where it leads, so a heading would name one control
+ * rather than a region and add an outline entry per chip. The containers never
+ * reach this function; their labels are their layout primitive's.
+ *
+ * @param node A leaf, already known to the registry.
+ * @returns The heading text, or `undefined` when the leaf draws no heading.
+ */
+function leafHeadingFor(node: PanelNode): string | undefined {
+  if (hasText(node.title)) {
+    return node.title;
+  }
+
+  const entry = catalogEntryFor(node.type);
+
+  return entry.kind === 'visualization' && entry.requiresQuery ? entry.label : undefined;
 }
 
 /**
@@ -483,10 +535,11 @@ const NODE_FRAME_SELECTOR = `.${NODE_CLASS}`;
  * `../layout/Section` renders a titled region as `<section aria-labelledby>`,
  * labelled by a `Heading` carrying this class: the region's own name and the
  * first thing announced inside it, which makes it the natural place for focus
- * to wait while the node reloads. A labelled leaf receives that `Section` from
- * this module and a `section` container from its layout primitive. Read here
- * as a selector only — the class is `Section`'s, styled by
- * `../styles/components.css`, and this file never emits it.
+ * to wait while the node reloads. A labelled leaf — every view, titled or
+ * headed by its catalogue label (see {@link leafHeadingFor}) — receives that
+ * `Section` from this module, and a `section` container from its layout
+ * primitive. Read here as a selector only — the class is `Section`'s, styled
+ * by `../styles/components.css`, and this file never emits it.
  */
 const NODE_HEADING_SELECTOR = '.dg-section__title';
 
@@ -1041,11 +1094,12 @@ export interface NodeRendererProps {
   /**
    * The outline level this node's own heading sits at, when it has one.
    *
-   * A labelled leaf's heading is the `Section` this module wraps it in; a
-   * container's heading is its layout primitive's, reached through the
-   * registry's uniform contract. Either way the heading renders at this level,
-   * and the children of a container whose title has text render one level
-   * deeper, so the outline never repeats or skips a level.
+   * A labelled leaf's heading is the `Section` this module wraps it in — for
+   * an untitled view, headed by its catalogue label; a container's heading is
+   * its layout primitive's, reached through the registry's uniform contract,
+   * and drawn only for a title with text. Either way the heading renders at
+   * this level, and the children of a container whose title has text render
+   * one level deeper, so the outline never repeats or skips a level.
    *
    * @default 2
    */
@@ -1080,9 +1134,10 @@ function sameNodeRendererProps(previous: NodeRendererProps, next: NodeRendererPr
  * The dispatch is a single lookup in `./registry`, so every node type is
  * treated identically here and the per-type differences stay in the adapters
  * the registry declares. A container's children are rendered through
- * {@link renderPanelNodes} and handed over as an array; a labelled leaf is
- * wrapped in `../layout/Section`; a type the registry has no component for
- * renders a visible failure rather than nothing.
+ * {@link renderPanelNodes} and handed over as an array; a labelled leaf —
+ * every view, and a source link with a title or description — is wrapped in
+ * `../layout/Section`; a type the registry has no component for renders a
+ * visible failure rather than nothing.
  *
  * Presentational: no state, no effect and no hook of its own. Every branch
  * draws its node inside a {@link NodeFrame}, whose one effect installs the
@@ -1155,16 +1210,20 @@ function NodeRendererView(props: NodeRendererProps): ReactElement {
   // it would be without them (the registry's adapters ignore the prop).
   const view = createElement(component, { node, nodeId: node.id });
 
-  // The heading a leaf's labels deserve, rendered once, here. The condition
-  // applies the same blank-label rule `Section` applies internally, so a node
-  // whose title is whitespace is not given an empty container to sit in. Only
-  // the two labels and the outline level are passed: the frame and the spacing
-  // stay at the container's own defaults, because a specification carries no
-  // field for either and this file may not invent one.
-  if (hasText(node.title) || hasText(node.description)) {
+  // The heading a leaf's labels deserve, rendered once, here: its title, or for
+  // an untitled view its catalogue label (see `leafHeadingFor`), at the level
+  // this node was given, so the view is a named region in the outline. The
+  // condition applies the same blank-label rule `Section` applies internally,
+  // so a source link whose title is whitespace is not given an empty container
+  // to sit in. Only the two labels and the outline level are passed: the frame
+  // and the spacing stay at the container's own defaults, because a
+  // specification carries no field for either and this file may not invent one.
+  const heading = leafHeadingFor(node);
+
+  if (heading !== undefined || hasText(node.description)) {
     return (
       <NodeFrame className={NODE_CLASS} diagnosticPath={diagnosticPath}>
-        <Section title={node.title} description={node.description} headingLevel={headingLevel}>
+        <Section title={heading} description={node.description} headingLevel={headingLevel}>
           {view}
         </Section>
       </NodeFrame>

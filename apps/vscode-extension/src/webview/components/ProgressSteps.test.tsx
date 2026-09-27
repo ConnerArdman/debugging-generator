@@ -20,6 +20,10 @@
  *   - **Status markers.** Each status yields exactly one marker modifier, a
  *     decorative glyph hidden from assistive technology and an announced word;
  *     a failed stage is always drawn as failed (AAP 0.5.5).
+ *   - **Notice rows.** A `done` row after the header of the capture or panel
+ *     stage — incomplete evidence, an empty capture, the fallback banner — is
+ *     drawn as a warning, never as a success check; headings and every other
+ *     stage's `done` rows stay checks.
  *   - **The call to action** appears only while a capture is armed, and reads
  *     "again" instead of "now" only for a capture a follow-up requested.
  *   - **The live window.** Sections older than the latest six collapse to
@@ -86,10 +90,10 @@ afterEach(() => {
 });
 
 /**
- * A fixed receive time. The component keys rows by stage, message and receipt
- * time plus an occurrence count, so fixtures sharing this time still get
- * distinct keys; cases about identity across host compaction use
- * {@link stamped} times instead.
+ * A fixed receive time. The component keys rows by stage and receipt time
+ * plus an occurrence count, so fixtures sharing this time still get distinct
+ * keys; cases about identity across host compaction use the distinct
+ * {@link stamped} times the host gives every row it holds instead.
  */
 const TS = 1_700_000_000_000;
 
@@ -698,8 +702,48 @@ describe('ProgressSteps reconciliation', () => {
     expect(row.querySelector('.dgv-progress__marker--running')).toBeNull();
   });
 
+  it('keeps a row mounted when the host settles it in place under a new message', () => {
+    const header = makeEntry({
+      stage: 'instrument',
+      status: 'running',
+      message: 'Preparing instrumentation',
+      ts: TS,
+    });
+    const signal = makeEntry({ stage: 'instrument', message: 'Browser performance', ts: TS + 1 });
+    const { container, rerender } = render(<ProgressSteps entries={[header, signal]} />);
+    const heading = required(container, '.dgv-progress__heading');
+    const row = required(container, '.dgv-progress__rows .dgv-progress__row');
+    expect(heading.querySelector('.dgv-progress__marker--running')).not.toBeNull();
+
+    // The host replaced the header in place: same stage and receipt time, the
+    // failed stage's own wording and status.
+    rerender(
+      <ProgressSteps
+        entries={[
+          {
+            ...header,
+            status: 'failed',
+            message:
+              'Preparing instrumentation failed: The planned instrumentation is not available here.',
+          },
+          signal,
+        ]}
+      />,
+    );
+
+    expect(required(container, '.dgv-progress__heading')).toBe(heading);
+    expect(required(container, '.dgv-progress__rows .dgv-progress__row')).toBe(row);
+    expect(heading.querySelector('.dgv-progress__marker--failed')).not.toBeNull();
+    expect(heading.querySelector('.dgv-progress__marker--running')).toBeNull();
+    expect(headings(container)).toEqual([
+      'Preparing instrumentation failed: The planned instrumentation is not available here.',
+    ]);
+    expect(rows(container)).toHaveLength(2);
+  });
+
   it('keeps the remaining rows mounted when the host drops the oldest ones', () => {
-    const entries = alternatingSections(3);
+    // Stamped as the host holds them: every row a distinct receipt time.
+    const entries = stamped(alternatingSections(3));
     const { container, rerender } = render(<ProgressSteps entries={entries} />);
     // The rows of the second and third sections: everything after the first section.
     const kept = rows(container).slice(2);
@@ -865,6 +909,7 @@ describe('ProgressSteps status markers', () => {
     'dgv-progress__marker--running',
     'dgv-progress__marker--done',
     'dgv-progress__marker--failed',
+    'dgv-progress__marker--warning',
   ] as const;
 
   it.each([
@@ -935,6 +980,157 @@ describe('ProgressSteps status markers', () => {
 
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.getByText('Could not summarise')).toBeDefined();
+  });
+});
+
+describe('ProgressSteps notice rows', () => {
+  /** The capture stage's header row, settled: the stage title. */
+  const CAPTURE_HEADER = 'Capturing runtime evidence';
+
+  /** The panel stage's header row, settled: the stage title. */
+  const PANEL_HEADER = 'Generating debugging panel';
+
+  /** The service's notice about incomplete evidence, sent as a `done` capture row. */
+  const INCOMPLETE_EVIDENCE = 'Capture evidence is incomplete. Some events were dropped.';
+
+  /** The empty-capture sentence, which closes the capture group in place of its title (AAP 0.5.5). */
+  const EMPTY_CAPTURE =
+    'No telemetry was captured. Interact with the page while capture is running, then Capture again.';
+
+  /** The fallback-panel banner, sent as a `done` panel row (AAP 0.5.5). */
+  const FALLBACK_BANNER =
+    'Generated panel failed validation; showing a fallback view built from captured data.';
+
+  /**
+   * The marker of the rendered row or heading whose text is `label`.
+   *
+   * @param container The render container.
+   * @param label The row's message.
+   * @returns The row's marker element.
+   */
+  function markerOf(container: ParentNode, label: string): Element {
+    const row = rows(container).find(
+      (candidate) =>
+        candidate.querySelector('.dgv-progress__label, .dgv-progress__group-title')?.textContent ===
+        label,
+    );
+    expect(row, `expected a row reading "${label}"`).toBeDefined();
+    if (row === undefined) {
+      throw new Error(`missing row "${label}"`);
+    }
+    return required(row, '.dgv-progress__marker');
+  }
+
+  /**
+   * The marker modifiers an element carries, of the four the component draws.
+   *
+   * @param marker A marker element.
+   * @returns Its modifiers.
+   */
+  function modifiersOf(marker: Element): string[] {
+    return Array.from(marker.classList).filter((name) => name.startsWith('dgv-progress__marker--'));
+  }
+
+  it('draws a done capture row after the header as a warning, with its own glyph and word', () => {
+    const { container } = render(
+      <ProgressSteps
+        entries={[
+          makeEntry({ stage: 'capture', message: CAPTURE_HEADER }),
+          makeEntry({ stage: 'capture', message: INCOMPLETE_EVIDENCE }),
+        ]}
+      />,
+    );
+
+    const marker = markerOf(container, INCOMPLETE_EVIDENCE);
+    expect(modifiersOf(marker)).toEqual(['dgv-progress__marker--warning']);
+    expect(required(marker, '[aria-hidden="true"]').textContent).toBe('!');
+    const spoken = required(marker, '.dg-visually-hidden');
+    expect(spoken.textContent).toBe('Warning');
+    expect(required(marker, '[aria-hidden="true"]').contains(spoken)).toBe(false);
+    // The notice is rendered verbatim, never re-worded.
+    expect(lines(container)).toEqual([CAPTURE_HEADER, INCOMPLETE_EVIDENCE]);
+  });
+
+  it('keeps the capture header row a done check', () => {
+    const { container } = render(
+      <ProgressSteps
+        entries={[
+          makeEntry({ stage: 'capture', message: CAPTURE_HEADER }),
+          makeEntry({ stage: 'capture', message: INCOMPLETE_EVIDENCE }),
+        ]}
+      />,
+    );
+
+    expect(modifiersOf(markerOf(container, CAPTURE_HEADER))).toEqual([
+      'dgv-progress__marker--done',
+    ]);
+  });
+
+  it('draws the empty-capture sentence that closes the group as a warning', () => {
+    const { container } = render(
+      <ProgressSteps
+        entries={[
+          makeEntry({ stage: 'capture', message: CAPTURE_HEADER }),
+          makeEntry({ stage: 'capture', message: EMPTY_CAPTURE }),
+        ]}
+      />,
+    );
+
+    expect(modifiersOf(markerOf(container, EMPTY_CAPTURE))).toEqual([
+      'dgv-progress__marker--warning',
+    ]);
+  });
+
+  it('draws the fallback-panel banner as a warning under a done panel header', () => {
+    const { container } = render(
+      <ProgressSteps
+        entries={[
+          makeEntry({ stage: 'generate-panel', message: PANEL_HEADER }),
+          makeEntry({ stage: 'generate-panel', message: FALLBACK_BANNER }),
+        ]}
+      />,
+    );
+
+    expect(modifiersOf(markerOf(container, FALLBACK_BANNER))).toEqual([
+      'dgv-progress__marker--warning',
+    ]);
+    expect(modifiersOf(markerOf(container, PANEL_HEADER))).toEqual(['dgv-progress__marker--done']);
+  });
+
+  it('keeps the done findings of every other stage done checks', () => {
+    const { container } = render(<ProgressSteps entries={[...STEP_EIGHT, ...FIRST_RUN_TAIL]} />);
+
+    expect(container.querySelector('.dgv-progress__marker--warning')).toBeNull();
+    expect(modifiersOf(markerOf(container, 'Found sample component'))).toEqual([
+      'dgv-progress__marker--done',
+    ]);
+    expect(modifiersOf(markerOf(container, 'Ready to capture'))).toEqual([
+      'dgv-progress__marker--done',
+    ]);
+  });
+
+  it('keeps failed and running rows of a notice stage failed and running', () => {
+    const { container } = render(
+      <ProgressSteps
+        entries={[
+          makeEntry({ stage: 'capture', status: 'running', message: CAPTURE_HEADER }),
+          makeEntry({ stage: 'capture', status: 'running', message: 'Listening for events' }),
+          makeEntry({ stage: 'capture', status: 'failed', message: 'Capture stopped early' }),
+          makeEntry({ stage: 'generate-panel', status: 'failed', message: 'Panel not stored' }),
+        ]}
+      />,
+    );
+
+    expect(modifiersOf(markerOf(container, 'Listening for events'))).toEqual([
+      'dgv-progress__marker--running',
+    ]);
+    expect(modifiersOf(markerOf(container, 'Capture stopped early'))).toEqual([
+      'dgv-progress__marker--failed',
+    ]);
+    expect(modifiersOf(markerOf(container, 'Panel not stored'))).toEqual([
+      'dgv-progress__marker--failed',
+    ]);
+    expect(container.querySelector('.dgv-progress__marker--warning')).toBeNull();
   });
 });
 

@@ -126,6 +126,7 @@ import {
   ANTHROPIC_DEFAULT_TIMEOUT_MS,
   ANTHROPIC_SUPPORTED_TEMPERATURE,
   createAnthropicProvider,
+  isProviderFailureText,
   resolveAnthropicTransportBudgets,
 } from './anthropic.js';
 import type {
@@ -2310,6 +2311,110 @@ describe('every failure is a coded DebuggenError, and nothing throws', () => {
     expect(ANTHROPIC_DEFAULT_TIMEOUT_MS).toBeGreaterThan(0);
     expect(Number.isInteger(ANTHROPIC_DEFAULT_MAX_RETRIES)).toBe(true);
     expect(ANTHROPIC_DEFAULT_MAX_RETRIES).toBeGreaterThanOrEqual(0);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The provenance proof for this provider's failure texts
+ *
+ * `isProviderFailureText` is what lets a host write a failure's own message and
+ * hint where free text may not go. Its value is in what it refuses as much as
+ * in what it accepts, so the texts are taken from failures the provider really
+ * raised — never pasted — and each refusal is a near miss of an accepted one.
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('isProviderFailureText proves a text is one this package wrote', () => {
+  it('recognises the hint and the sentence a rejected credential is reported with', async () => {
+    const { provider } = harness({
+      script: { create: rejects(new ScriptedTransportError(401, 'authentication failed')) },
+    });
+    const error = errorOf(await provider.generateText(makeRequest()));
+
+    expect(asObject(error.details ?? {}).condition).toBe('unauthorized');
+    expect(error.hint).toContain('The provider rejected the credential.');
+    expect(isProviderFailureText(error.hint)).toBe(true);
+    expect(isProviderFailureText(error.message)).toBe(true);
+    expect(isProviderFailureText(modelUnavailableMessage('MODEL_UNAVAILABLE'))).toBe(true);
+  });
+
+  it('recognises the hint of every transport failure, and the sentence of every code', async () => {
+    const thrown: readonly unknown[] = [
+      new ScriptedTransportError(403, 'not permitted'),
+      new ScriptedTransportError(429, 'rate limit exceeded'),
+      new ScriptedTransportError(502, 'bad gateway'),
+      new ScriptedTransportError(400, 'max_tokens is too large for this model'),
+      unreachableError(),
+      namedAbortError('AbortError'),
+    ];
+    for (const failure of thrown) {
+      const { provider } = harness({ script: { create: rejects(failure) } });
+      const error = errorOf(await provider.generateText(makeRequest()));
+      expect(isProviderFailureText(error.hint), String(error.hint)).toBe(true);
+      expect(isProviderFailureText(error.message)).toBe(true);
+    }
+
+    // The configuration refusals of both boundaries carry the same sentence.
+    const unconfigured = errorOf(createAnthropicProvider({ config: BASE_CONFIG }));
+    expect(isProviderFailureText(unconfigured.hint)).toBe(true);
+    expect(isProviderFailureText(unconfigured.message)).toBe(true);
+
+    for (const code of DEBUGGEN_ERROR_CODES) {
+      expect(isProviderFailureText(modelUnavailableMessage(code)), code).toBe(true);
+    }
+  });
+
+  it('recognises a fixed hint but not a message composed from the caller’s value', async () => {
+    const { provider } = harness({ script: { create: answers(textAnswer('unused')) } });
+    const error = errorOf(await provider.generateText(makeRequest({ maxTokens: 0 })));
+
+    expect(asObject(error.details ?? {}).condition).toBe('max-tokens-invalid');
+    expect(isProviderFailureText(error.hint)).toBe(true);
+    // The message quotes the value the call carried, so it is not a fixed text.
+    expect(isProviderFailureText(error.message)).toBe(false);
+  });
+
+  it('refuses padded, re-cased, truncated and extended copies, and a sentence for an unknown code', async () => {
+    const { provider } = harness({
+      script: { create: rejects(new ScriptedTransportError(401, 'authentication failed')) },
+    });
+    const hint = errorOf(await provider.generateText(makeRequest())).hint ?? '';
+    const sentence = modelUnavailableMessage('MODEL_UNAVAILABLE');
+    expect(hint.length).toBeGreaterThan(0);
+
+    for (const accepted of [hint, sentence]) {
+      const nearMisses = [
+        ` ${accepted}`,
+        `${accepted} `,
+        `${accepted}\n`,
+        accepted.toUpperCase(),
+        accepted.toLowerCase(),
+        accepted.slice(0, -1),
+        `${accepted} See /home/dev/project/config.json for details.`,
+      ];
+      for (const nearMiss of nearMisses) {
+        expect(isProviderFailureText(nearMiss), JSON.stringify(nearMiss)).toBe(false);
+      }
+    }
+    expect(isProviderFailureText(modelUnavailableMessage('NOT_A_CODE'))).toBe(false);
+  });
+
+  it('refuses arbitrary text and every value that is not a string', () => {
+    const refused: readonly unknown[] = [
+      '',
+      'The provider did not answer; retry the step.',
+      "SELECT * FROM accounts WHERE email = 'dev@example.test'",
+      'https://api.example.test/v1/items?email=dev%40example.test',
+      undefined,
+      null,
+      0,
+      true,
+      { toString: () => modelUnavailableMessage('MODEL_UNAVAILABLE') },
+      [modelUnavailableMessage('MODEL_UNAVAILABLE')],
+      new String(modelUnavailableMessage('MODEL_UNAVAILABLE')),
+    ];
+    for (const value of refused) {
+      expect(isProviderFailureText(value)).toBe(false);
+    }
   });
 });
 

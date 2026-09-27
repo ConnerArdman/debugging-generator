@@ -40,13 +40,29 @@
  *   once the delta install succeeds.
  * - **Maps the installer's result onto the wire without reshaping it**
  *   (AAP §0.4.2): `instrumentation.ready` carries `applied`, `runtimeHooks` and
- *   `unavailable` exactly as the installer returned them; `agent.config` and
+ *   `unavailable` exactly as the installer returned them — with one
+ *   substitution AAP §0.5.5 requires: when this install's dev-server detection
+ *   found the preload missing, every preload gap's `hint` is the exact
+ *   relaunch command that detection composed, never the adapter's generic text
+ *   ({@link withDetectedRelaunchHints}). `applied` lists exactly the records
+ *   *this* install wrote: every record of a first install, only plan version
+ *   *n + 1*'s records on a follow-up, and `[]` for a delta that installs
+ *   nothing — which runs no installer, so its `runtimeHooks` and `unavailable`
+ *   restate the session's current hooks and gaps. Records an earlier plan
+ *   version applied were announced by that version's install and are never
+ *   re-listed; the whole journal is the session record's `modifications`
+ *   (`GET /sessions/:id/modifications`). `agent.config` and
  *   `server-agent.config` carry the installer's hook configuration and signal
  *   set; `instrumentation.failed` carries the installer's error code, the
  *   stage's fixed public copy for that code and a diagnostic reference in
  *   place of the error's own message, and the error's hint only when it is
  *   proven product text — the dev-server detection's exact relaunch command
  *   standing in for an adapter's — else the code's default next step.
+ * - **Gives the detection the preload the launcher attaches**: when no
+ *   preload path is injected, each install resolves the telemetry preload
+ *   with the launcher's own `resolvePreloadPath`, so the relaunch command
+ *   imports that absolute `file:` URL rather than a variable the developer
+ *   would first have to export.
  * - **Arms and disarms the two producers at capture time, judged by
  *   receipts** ({@link InstrumentationService.armCapture},
  *   {@link InstrumentationService.disarmCapture}). `agent.config` requires a
@@ -80,15 +96,39 @@
  *   connects.
  * - **Reports degradation honestly** (AAP §0.5.5): every unavailable signal is
  *   one sentence — "Could not enable ‹signal›: ‹reason›. Continuing with:
- *   ‹enabled list›." — emitted as a `running` progress row, never as a failure.
- *   The only failure is the installer's own `Err`, which is what "nothing at all
- *   could be enabled" means.
+ *   ‹enabled list›.", composed by `../sessions/progress.ts`'s
+ *   `unavailableSignalMessage` — shown as exactly one terminal ✗ (`failed`)
+ *   progress row of the `instrument` stage: the checklist's row at install
+ *   time, and a row of the same shape for a server signal the capture lost
+ *   because the preload could not be reached. No `running` row precedes it, so
+ *   no client merging rows by stage and message is left with a spinner. A
+ *   degradation is never a session failure — no `stageFailed`, no
+ *   `instrumentation.failed`. The only failure is the installer's own `Err`,
+ *   which is what "nothing at all could be enabled" means.
+ *   When that failure includes a preload gap and the detection found the
+ *   preload missing, the failure's hint is the exact relaunch command
+ *   whichever signal the installer named, and each preload gap ("Could not
+ *   enable Server spans: ‹reason›.") is shown as a ✗ row with that command
+ *   before the failed row.
  * - **Checks a row only once readiness confirms it** (AAP §0.5.5, prompt §11
  *   Step 8): readiness is evaluated before any checklist row is sent; a signal
  *   is shown ✓ — and named after "Continuing with:" — only when the capture
  *   arms it *and* the verdict found a producer that will deliver it, every
  *   other planned signal is shown ✗ with the verdict's reason and hint, and
  *   "Ready to capture" closes the group last, only for a satisfied verdict.
+ * - **Keeps the signal report true to the page** (AAP §0.5.5, §0.7.1). The
+ *   install judges the page with the facts on file when it starts, and a
+ *   panel usually binds a moment before its page agent reports. So the share
+ *   of the report that runtime-only adapters produced — which writes no file
+ *   and can be asked again — is re-judged whenever the facts it was judged
+ *   against change: after the install's readiness verdict, when the bound
+ *   tab's next document reports, and on a tab (re)bind. A corrected
+ *   `instrumentation.ready` is sent only when the report actually changed,
+ *   with ✓ rows for the signals it newly confirms. A signal the verdict holds
+ *   back only because the bound page has not reported is left to the gate's
+ *   reload request and never shown as failed. The latest report — or the
+ *   latest failure — is replayed to a panel that binds
+ *   ({@link SignalReportPublisher.replaySignalReport}).
  *
  * ## What it never does
  *
@@ -140,11 +180,13 @@ import {
   CAPTURE_SIGNALS,
   DISABLED_SERVER_AGENT_SIGNALS,
   DORMANT_AGENT_HOOK_CONFIG,
+  PATCH_TARGET_HELD_REASON,
   READINESS_HINT_MAX_LENGTH,
   READINESS_REASON_MAX_LENGTH,
   SERVER_AGENT_SIGNAL_KEYS,
   actionIdentityKey,
   buildReadiness,
+  checkFeasibility,
   createAdapterRegistry,
   createBackupStore,
   deriveAgentHookConfig,
@@ -170,6 +212,7 @@ import {
   type UnavailableSignal,
 } from '@debuggen/instrumentation';
 import {
+  CLIENT_KINDS,
   createEnvelope,
   parseAgentConfigPayload,
   parseInstrumentationFailedPayload,
@@ -190,6 +233,7 @@ import {
   err,
   isAbsolutePosix,
   isErr,
+  isSafeRelativePath,
   isWindowsAbsolute,
   newMessageId,
   normalizePosix,
@@ -202,7 +246,12 @@ import {
 } from '@debuggen/shared';
 
 import { canonicalizePath, requireProjectOutsideStateHome, type ServiceConfig } from '../config.js';
-import { PRELOAD_DEPENDENT_SIGNALS } from '../dev-server/detect.js';
+import {
+  PRELOAD_DEPENDENT_SIGNALS,
+  buildPreloadUnavailableSignals,
+  type DevServerDetection,
+} from '../dev-server/detect.js';
+import { resolvePreloadPath } from '../dev-server/launcher.js';
 import {
   LOG_BINDING_KEYS,
   LOG_ERROR_FIELD_KEY,
@@ -216,6 +265,7 @@ import {
   authorProductText,
   isProductAuthoredText,
   publicFailureCopy,
+  unavailableSignalMessage,
   type InstalledSignals,
   type ProgressRow,
   type SessionProgress,
@@ -223,8 +273,10 @@ import {
 import type { SessionFailure } from '../sessions/state-machine.js';
 import type { ModificationsRepo } from '../store/modifications-repo.js';
 import {
+  MAX_RELOAD_WAIT_MS,
   collectReadinessEvidence,
   evaluateReadiness,
+  waitForNextAgentReady,
   type BrowserAgentRegistry,
   type CollectObservedReadinessDeps,
   type ReadinessEvidence,
@@ -266,7 +318,7 @@ const SERVER_AGENT_PRODUCER: ArmedProducer = 'server-agent';
 /**
  * The reason every server signal of a capture carries when the arm could not
  * reach the dev-server preload (AAP §0.5.5): one line, closed by the sentence
- * `buildDegradationNotice` builds around it.
+ * `unavailableSignalMessage` builds around it.
  */
 const PRELOAD_UNREACHABLE_REASON =
   'the dev-server preload is not connected, so this capture collects nothing on the server';
@@ -282,9 +334,6 @@ const PAGE_AGENT_UNREACHABLE_HINT =
 /** The mode of an action installed as a runtime hook rather than a file patch. */
 const RUNTIME_ACTION_MODE = 'runtime' as const satisfies InstrumentationAction['mode'];
 
-/** The protocol bound on a progress row's message (`session.progress`). */
-const MAX_PROGRESS_MESSAGE_LENGTH = 2000;
-
 /** The protocol bound on a progress row's detail (`session.progress`). */
 const MAX_PROGRESS_DETAIL_LENGTH = 4000;
 
@@ -293,12 +342,6 @@ const MAX_FAILURE_MESSAGE_LENGTH = 2000;
 
 /** The protocol bound on `instrumentation.failed`'s hint. */
 const MAX_FAILURE_HINT_LENGTH = 1000;
-
-/** The enabled-list wording of a degradation notice when no label is enabled. */
-const NOTHING_ELSE_ENABLED = 'the signals that remain available';
-
-/** Punctuation stripped from the end of a reason before the sentence closes it. */
-const TRAILING_PUNCTUATION_PATTERN = /[\s.!?;:,]+$/u;
 
 /** Any run of whitespace, collapsed to one space in display text. */
 const WHITESPACE_RUN_PATTERN = /\s+/gu;
@@ -450,7 +493,12 @@ export interface InstrumentationServiceDeps {
   readonly installer?: InstallPlanFn | undefined;
   /** The dev-server detection readiness runs; defaults to the real detector. */
   readonly detectDevServer?: CollectObservedReadinessDeps['detect'];
-  /** The detector's own ports (fetch, file reads), forwarded unchanged. */
+  /**
+   * The detector's own ports (fetch, file reads, the preload path), forwarded
+   * unchanged — except that, without a `preloadPath`, each install adds the
+   * one the launcher's `resolvePreloadPath` finds, so the relaunch command
+   * names the preload's absolute `file:` URL.
+   */
   readonly detectDeps?: CollectObservedReadinessDeps['detectDeps'];
   /** How long the readiness gate waits for a page reload, in milliseconds. */
   readonly reloadWaitMs?: number | undefined;
@@ -595,11 +643,26 @@ export interface InstrumentationOutcome {
   readonly planVersion: number;
   /** The plan version now active for the session — equal to {@link planVersion} on success. */
   readonly activePlanVersion: number;
-  /** The records this call applied, as the installer returned them. */
+  /**
+   * The records this call applied, as the installer returned them — the same
+   * list `instrumentation.ready` carries. On a follow-up that is only the
+   * delta's (plan version {@link planVersion}) records, and `[]` for a delta
+   * that installs nothing; records of earlier plan versions stay in the
+   * journal and are not repeated here.
+   */
   readonly applied: readonly ModificationRecord[];
-  /** The runtime hooks this call armed, as the installer returned them. */
+  /**
+   * The runtime hooks this call armed, as the installer returned them. For a
+   * delta that installs nothing — no installer runs — every hook the session's
+   * installed plan versions armed.
+   */
   readonly runtimeHooks: readonly string[];
-  /** The signals this call could not enable, as the installer returned them. */
+  /**
+   * The signals this call could not enable, as the installer returned them —
+   * each preload gap's hint the detection's exact relaunch command when the
+   * preload is missing ({@link withDetectedRelaunchHints}). For a delta that
+   * installs nothing, the gaps the previous install reported.
+   */
   readonly unavailable: readonly UnavailableSignal[];
   /**
    * The page-agent configuration the next capture arms. For a first install,
@@ -611,7 +674,10 @@ export interface InstrumentationOutcome {
   readonly serverSignals: ServerAgentSignals;
   /** The readiness gate's verdict for the installed plan version. */
   readonly readiness: ReadinessVerdict;
-  /** The degradation sentences emitted, one per unavailable signal. */
+  /**
+   * The degradation sentences, one per unavailable signal: byte for byte the
+   * messages of the checklist's ✗ rows for {@link unavailable}.
+   */
   readonly degradations: readonly string[];
 }
 
@@ -890,6 +956,14 @@ export type BoundSessionReconcileOutcome =
   | 'nothing-armed';
 
 /**
+ * What {@link ProducerReconciler.pageAgentReleased} did: `settled` (the
+ * session owed its page agent the dormant configuration, and that disarm is
+ * now settled) or `nothing-owed` (no page disarm was outstanding, so nothing
+ * changed).
+ */
+export type PageAgentReleaseOutcome = 'settled' | 'nothing-owed';
+
+/**
  * What {@link ProducerReconciler.releaseInterruptedCapture} is told about a
  * capture window a restart ended: the previous process had armed it, and the
  * session was failed, since no capture is continued across a restart.
@@ -955,6 +1029,34 @@ export interface ProducerReconciler {
   ): Result<DisarmCaptureOutcome, DebuggenError>;
 
   /**
+   * Settles the page disarm an ended session still owes, because the tab that
+   * held it has just been refused a re-bind to it.
+   *
+   * The disarm became owed when the session ended while the tab's DevTools
+   * connection was away — no connection took the dormant `agent.config` — and
+   * it can no longer be replayed the usual way:
+   * {@link ProducerReconciler.producerConnected} and
+   * {@link ProducerReconciler.reconcileBoundSession} reach a page agent
+   * through a live binding, and an ended session is never bound again. When
+   * that connection comes back it re-announces the tab's binding to the ended
+   * session; the binding route refuses it (`SESSION_INVALID_STATE`, or
+   * `SESSION_NOT_FOUND` for a session that vanished) and calls this.
+   *
+   * The contract that makes this a settlement rather than a guess: the refusal
+   * is delivered on the live connection that asked, and the DevTools service
+   * worker answers exactly that refusal by ending the tab's binding as
+   * `session-ended`, which returns the tab's page agent to its dormant
+   * configuration (AAP §0.5.1) — the one delivery this service could not make
+   * itself. Settling the owed disarm fires
+   * {@link ProducerReconciler.onDormancyConfirmed} when it empties the
+   * session's pending set, which upgrades a `partial` cleanup. The preload's
+   * owed disarm, if any, is untouched: only its own reconnect settles it.
+   *
+   * @returns Whether a page disarm was settled, or `Err` for an empty session id.
+   */
+  pageAgentReleased(sessionId: string): Result<PageAgentReleaseOutcome, DebuggenError>;
+
+  /**
    * The producers of one session still owed their dormant configuration,
    * `page-agent` first, then `server-agent`.
    */
@@ -971,12 +1073,71 @@ export interface ProducerReconciler {
   onDormancyConfirmed(listener: (sessionId: string) => void): () => void;
 }
 
+/** What {@link SignalReportPublisher.replaySignalReport} replays, and to whom. */
+export interface SignalReportReplayRequest {
+  /** The session whose latest signal report is replayed. */
+  readonly sessionId: string;
+  /**
+   * The tab the session is bound to now. Remembered as the page a later
+   * refresh of the report waits on; omitted, the tab this service last knew
+   * for the session is kept.
+   */
+  readonly boundTab?: BoundTab | undefined;
+  /** The client kinds the replay is sent to — for a bind, the DevTools panel alone. */
+  readonly kinds: readonly ClientKind[];
+}
+
+/**
+ * What a replay did: `replayed` (the latest report, the latest failure, or
+ * both, were sent) or `nothing-to-replay` (this process has installed nothing
+ * for the session, so it holds no report — after a restart, say).
+ */
+export type SignalReportReplayOutcome = 'replayed' | 'nothing-to-replay';
+
+/**
+ * The signal-report half of the driver: what keeps a panel's "Signals" list
+ * in step with the session's latest install, whenever the panel attaches.
+ *
+ * Kept apart from {@link InstrumentationService} on purpose: that surface is
+ * what the pipeline consumes and what a capture-readiness wrapper re-exposes
+ * member by member, and a replay is the binding layer's concern alone.
+ */
+export interface SignalReportPublisher {
+  /**
+   * Sends the session's latest signal report to `kinds`: the latest
+   * `instrumentation.ready` this service composed — installer fields,
+   * corrected by any later refresh — and, when the latest install failed, the
+   * `instrumentation.failed` it announced, after it. Synchronous: both frames
+   * are sent before it returns.
+   *
+   * It also records `boundTab` and, when the report still holds a gap a newer
+   * page report could clear, schedules a background refresh: the report is
+   * re-judged against the tab's facts now and after its next document
+   * reports, and a corrected `instrumentation.ready` — with ✓ rows for the
+   * signals it newly confirms — is sent to both user interfaces when it
+   * changed. The refresh never emits "Ready to capture": moving a session to
+   * `ready` is the orchestrator's. A replay that arrives while an install for
+   * the session runs sends what is held now; the install's own report reaches
+   * the bound panel through its broadcast, and is re-judged against `boundTab`
+   * as soon as that install is over.
+   *
+   * @returns `nothing-to-replay` when no report is held, `Err` for a malformed
+   * request, a disposed service, or a frame the client registry threw on.
+   */
+  replaySignalReport(
+    request: SignalReportReplayRequest,
+  ): Result<SignalReportReplayOutcome, DebuggenError>;
+}
+
 /**
  * The full driver {@link createInstrumentationService} returns: the service
- * surface every stage and route consumes, plus the producer reconciler that
- * the connection and binding layers drive.
+ * surface every stage and route consumes, the producer reconciler that the
+ * connection and binding layers drive, and the signal-report publisher the
+ * binding layer replays through.
  */
-export type InstrumentationDriver = InstrumentationService & ProducerReconciler;
+export type InstrumentationDriver = InstrumentationService &
+  ProducerReconciler &
+  SignalReportPublisher;
 
 // ---------------------------------------------------------------------------
 // Section D — pure helpers
@@ -1012,49 +1173,47 @@ function labelForSignal(signal: string): string {
  * enabled: "Could not enable ‹signal›: ‹reason›. Continuing with: ‹enabled
  * list›."
  *
+ * Each sentence is `../sessions/progress.ts`'s `unavailableSignalMessage`, the
+ * one composer the checklist's ✗ rows use too, so a sentence returned here is
+ * byte-identical to the row the progress view shows for the same entry and
+ * the same `enabledLabels`:
+ *
  * - **‹signal›** is the product's label from `CAPTURE_SIGNAL_LABELS` for one of
  *   the known capture signals, and the reported name for a signal a registered
  *   third-party adapter defined. No label is restated here.
- * - **‹reason›** is the adapter's reason verbatim, as one line, with trailing
- *   punctuation dropped so the sentence closes it once.
- * - **‹enabled list›** is `enabledLabels` joined in the order given.
+ * - **‹reason›** is the adapter's reason, as one bounded line, with trailing
+ *   whitespace and full stops dropped so the sentence closes it once.
+ * - **‹enabled list›** is `enabledLabels` in the order given, less the entry's
+ *   own label, bounded; "no confirmed signal" when nothing remains.
  *
  * One sentence per entry, in input order; byte-identical sentences collapse
- * onto the first. The entry's `hint` — for a server-tier gap, the exact
- * relaunch command — is not part of the sentence: it travels as the progress
- * row's detail and in `instrumentation.ready`, verbatim.
+ * onto the first, and an entry whose signal is blank yields none. The entry's
+ * `hint` — for a server-tier gap, the exact relaunch command — is not part of
+ * the sentence: it travels as the progress row's detail and in
+ * `instrumentation.ready`, verbatim.
  *
  * Pure: no clock, no logger, no I/O.
  *
  * @param unavailable The signals the installer could not enable.
- * @param enabledLabels The labels of the signals the capture proceeds with.
+ * @param enabledLabels The labels of the signals the capture proceeds with, in
+ * the progress view's ✓ order.
  * @returns The sentences, frozen.
  */
 export function buildDegradationNotice(
   unavailable: readonly UnavailableSignal[],
   enabledLabels: readonly string[],
 ): readonly string[] {
-  const enabled = enabledLabels.map(toDisplayLine).filter((label) => label.length > 0);
-  const continuing = enabled.length === 0 ? NOTHING_ELSE_ENABLED : enabled.join(', ');
   const sentences: string[] = [];
   const seen = new Set<string>();
 
   for (const entry of unavailable) {
-    const label = labelForSignal(entry.signal);
-
-    if (label.length === 0) {
-      continue;
-    }
-
-    const reason = toDisplayLine(entry.reason).replace(TRAILING_PUNCTUATION_PATTERN, '');
-    const opening =
-      reason.length === 0 ? `Could not enable ${label}.` : `Could not enable ${label}: ${reason}.`;
-    const sentence = clip(
-      `${opening} Continuing with: ${continuing}.`,
-      MAX_PROGRESS_MESSAGE_LENGTH,
+    const sentence = unavailableSignalMessage(
+      labelForSignal(entry.signal),
+      entry.reason,
+      enabledLabels,
     );
 
-    if (!seen.has(sentence)) {
+    if (sentence !== undefined && !seen.has(sentence)) {
       seen.add(sentence);
       sentences.push(sentence);
     }
@@ -1264,12 +1423,17 @@ function readinessRow(
  * to `READINESS_REASON_MAX_LENGTH` / `READINESS_HINT_MAX_LENGTH` and omitted
  * when blank, so every row satisfies `readinessSignalSchema`.
  *
+ * A signal in `awaitingPage` gets no row here: it is waiting for a tab to be
+ * bound or for the bound tab's page to report, which its waiting row says,
+ * and a ✗ row would present it as a failure (AAP §0.5.5).
+ *
  * Pure apart from reading `now` once.
  *
  * @param verdict The readiness verdict of the installed plan version.
  * @param confirmed The signals {@link confirmedSignals} kept.
  * @param unavailable The installer's unavailable signals.
  * @param now The clock `checkedAt` is read from.
+ * @param awaitingPage The signals held back only on the page gate; none by default.
  * @returns The report.
  */
 function buildConfirmedReadiness(
@@ -1277,9 +1441,13 @@ function buildConfirmedReadiness(
   confirmed: readonly CaptureSignal[],
   unavailable: readonly UnavailableSignal[],
   now: () => number,
+  awaitingPage: ReadonlySet<CaptureSignal> = new Set<CaptureSignal>(),
 ): Readiness {
   const kept = new Set<CaptureSignal>(confirmed);
-  const signals = verdict.plannedSignals.map((signal) => {
+  const reported = verdict.plannedSignals.filter(
+    (signal) => kept.has(signal) || !awaitingPage.has(signal),
+  );
+  const signals = reported.map((signal) => {
     if (kept.has(signal)) {
       const gap = gapFor(signal, [verdict.degraded]);
       return readinessRow(signal, gap === undefined ? AVAILABLE_STATUS : DEGRADED_STATUS, gap);
@@ -1391,6 +1559,168 @@ function preloadGaps(signals: ServerAgentSignals): readonly UnavailableSignal[] 
 /** Appends the entries of `extra` not already in `base`, keeping first occurrences. */
 function unionStrings(base: readonly string[], extra: readonly string[]): readonly string[] {
   return [...new Set([...base, ...extra])];
+}
+
+/** Whether a value is a non-null, non-array object whose keys can be read. */
+function isObjectRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Whether a value has the shape of an {@link UnavailableSignal}: three strings. */
+function isGapLike(value: unknown): value is UnavailableSignal {
+  return (
+    isObjectRecord(value) &&
+    typeof value['signal'] === 'string' &&
+    typeof value['reason'] === 'string' &&
+    typeof value['hint'] === 'string'
+  );
+}
+
+/** Whether two gaps say the same thing: the same signal, reason and hint. */
+function sameGap(first: UnavailableSignal, second: UnavailableSignal): boolean {
+  return (
+    first.signal === second.signal && first.reason === second.reason && first.hint === second.hint
+  );
+}
+
+/**
+ * `entries` with one occurrence of each gap in `removed` taken out, compared by
+ * value — a multiset difference, so a gap two sources reported identically is
+ * removed once per source. Order is kept. Returns `entries` itself when
+ * nothing was removed.
+ */
+function withoutGaps(
+  entries: readonly UnavailableSignal[],
+  removed: readonly UnavailableSignal[],
+): readonly UnavailableSignal[] {
+  if (removed.length === 0) {
+    return entries;
+  }
+
+  const remaining = [...removed];
+  const kept = entries.filter((entry) => {
+    const index = remaining.findIndex((candidate) => sameGap(candidate, entry));
+
+    if (index === -1) {
+      return true;
+    }
+
+    remaining.splice(index, 1);
+    return false;
+  });
+
+  return kept.length === entries.length ? entries : kept;
+}
+
+/** Whether two string lists hold the same entries in the same order. */
+function sameStrings(first: readonly string[], second: readonly string[]): boolean {
+  return first.length === second.length && first.every((entry, index) => entry === second[index]);
+}
+
+/** Whether two gap lists hold the same gaps in the same order. */
+function sameGaps(
+  first: readonly UnavailableSignal[],
+  second: readonly UnavailableSignal[],
+): boolean {
+  return (
+    first.length === second.length &&
+    first.every((entry, index) => {
+      const other = second[index];
+      return other !== undefined && sameGap(entry, other);
+    })
+  );
+}
+
+/**
+ * Whether the observed facts a runtime share depends on differ between two
+ * readings: whether a page agent is known and, for one that is, its document,
+ * its install timing and whether it found React; and whether a preload is
+ * connected. Receipt times and producer ids are not facts an adapter judges.
+ */
+function observedFactsDiffer(
+  first: ObservedReadinessInputs,
+  second: ObservedReadinessInputs,
+): boolean {
+  const before = first.browserAgent;
+  const after = second.browserAgent;
+
+  if ((before === undefined) !== (after === undefined)) {
+    return true;
+  }
+
+  if (
+    before !== undefined &&
+    after !== undefined &&
+    (before.documentId !== after.documentId ||
+      before.installedBeforeReact !== after.installedBeforeReact ||
+      before.reactDetected !== after.reactDetected)
+  ) {
+    return true;
+  }
+
+  return (first.serverAgent?.connected === true) !== (second.serverAgent?.connected === true);
+}
+
+/** The page-agent hooks a raw install result contributed, as additive flags. */
+function hookContributionOf(value: unknown): Partial<AgentHookConfig> {
+  const contribution: Partial<Record<(typeof AGENT_HOOK_KEYS)[number], boolean>> = {};
+
+  if (isObjectRecord(value)) {
+    for (const key of AGENT_HOOK_KEYS) {
+      if (value[key] === true) {
+        contribution[key] = true;
+      }
+    }
+  }
+
+  return contribution;
+}
+
+/** The preload signals a raw install result contributed, as a full additive set. */
+function serverContributionOf(value: unknown): ServerAgentSignals {
+  const functions =
+    isObjectRecord(value) && Array.isArray(value['functions'])
+      ? value['functions'].filter(isNonBlankString)
+      : [];
+  const merged: ServerAgentSignals = { ...DISABLED_SERVER_AGENT_SIGNALS, functions };
+
+  if (isObjectRecord(value)) {
+    for (const key of SERVER_AGENT_SIGNAL_KEYS) {
+      if (isServerAgentFlagKey(key) && value[key] === true) {
+        merged[key] = true;
+      }
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Widens a page-agent configuration with the hooks a set of actions derives and
+ * an adapter's own contribution — additive only — then re-closes the upstream
+ * prerequisite the installer closes: any hook on turns the interaction
+ * listener on, since it mints the trace root the other hooks hang off.
+ */
+function widenAgentHooks(
+  base: AgentHookConfig,
+  actions: readonly InstrumentationAction[],
+  contribution: Partial<AgentHookConfig>,
+): AgentHookConfig {
+  const merged: Record<(typeof AGENT_HOOK_KEYS)[number], boolean> = {
+    ...unionAgentHooks(base, deriveAgentHookConfig(actions)),
+  };
+
+  for (const key of AGENT_HOOK_KEYS) {
+    if (contribution[key] === true) {
+      merged[key] = true;
+    }
+  }
+
+  if (AGENT_HOOK_KEYS.some((key) => merged[key])) {
+    merged.interactions = true;
+  }
+
+  return merged;
 }
 
 /** Whether a value is a non-blank string. */
@@ -1539,6 +1869,118 @@ function withPlanVersions(
 }
 
 /**
+ * Whether an unavailable signal is a gap only the dev-server preload can close
+ * for this capture:
+ *
+ * - a signal only the preload supplies (`PRELOAD_DEPENDENT_SIGNALS`: incoming
+ *   requests, route handlers, database queries and function timing); or
+ * - a preload signal the page agent also collects (`fetch`), when `pageHooks`
+ *   arms the page's share. The page then delivers its half, so a gap still
+ *   reported for that signal can only be the server's. When the page does not
+ *   arm it, the gap may be the page's own — no tab bound, a hook withheld — and
+ *   is not claimed for the preload.
+ *
+ * Pure.
+ *
+ * @param signal The unavailable entry's signal.
+ * @param pageHooks The page-agent hooks the capture arms.
+ * @returns Whether relaunching the dev server with the preload closes the gap.
+ */
+function isPreloadGap(signal: string, pageHooks: AgentHookConfig): boolean {
+  return (
+    PRELOAD_DEPENDENT_SIGNALS.some((dependent) => dependent === signal) ||
+    (SERVER_AGENT_SIGNAL_KEYS.some((key) => key === signal) && pageCollects(pageHooks, signal))
+  );
+}
+
+/**
+ * The exact relaunch command this install's dev-server detection composed — its
+ * `relaunchHint` — when the detection found the preload missing and the hint is
+ * proven product text (`isProductAuthoredText`; `../dev-server/detect.ts`
+ * registers every hint it composes). `undefined` without a detection, with the
+ * preload attached, or for a hint this process did not compose, which is never
+ * shown in place of anything.
+ *
+ * @param devServer The detection readiness collected for the install, if it ran.
+ * @returns The proven relaunch hint, or `undefined`.
+ */
+function provenRelaunchHint(
+  devServer: Pick<DevServerDetection, 'preloadAttached' | 'relaunchHint'> | undefined,
+): string | undefined {
+  return devServer !== undefined &&
+    !devServer.preloadAttached &&
+    isProductAuthoredText(devServer.relaunchHint)
+    ? devServer.relaunchHint
+    : undefined;
+}
+
+/**
+ * Gives every preload gap of an install the exact relaunch command the
+ * install's own dev-server detection composed (AAP §0.5.5: "if the dev server
+ * was not started with the preload, the hint carries the exact relaunch
+ * command").
+ *
+ * An adapter speaks about a preload it cannot see: its hint can only name the
+ * preload by package specifier — which the target project need not resolve —
+ * and carries no ingest address or credential, so it does not start an
+ * instrumented dev server. The detection renders the command the launcher
+ * runs: the editor's token-free "Launch Dev Server" route first, then the
+ * manual line with the absolute `file:` URL of the preload this service
+ * resolved, the service's ingest URL, the project root and the
+ * `"$DEBUGGEN_TOKEN"` reference. So when the detection found the preload
+ * missing and its `relaunchHint` is proven product text, the `hint` of every
+ * entry that is a preload gap ({@link isPreloadGap}) becomes that
+ * `relaunchHint`; its `signal` and `reason` are kept. Every other entry — a
+ * page signal, a third-party signal, a shared signal the page does not arm —
+ * keeps its own hint, and with the preload attached nothing changes.
+ *
+ * Applied once per install, before the session's state is recorded, so
+ * `instrumentation.ready`, the degradation rows, the checklist's ✗ rows and
+ * the outcome all show the same command.
+ *
+ * Pure apart from refreshing the provenance registry's recency for the hint.
+ *
+ * @param unavailable The installer's unavailable signals.
+ * @param devServer The dev-server detection readiness collected for the install, if it ran.
+ * @param pageHooks The page-agent hooks the next capture arms ({@link captureAgentHooks}).
+ * @returns `unavailable` itself when no entry changes, otherwise a frozen copy.
+ *
+ * @example
+ * ```ts
+ * // detection.preloadAttached === false; detection.relaunchHint composed by detect.ts
+ * withDetectedRelaunchHints(
+ *   [{ signal: 'http', reason: 'no preload is attached', hint: adapterHint }],
+ *   detection,
+ *   pageHooks,
+ * ); // → [{ signal: 'http', reason: 'no preload is attached', hint: detection.relaunchHint }]
+ * ```
+ */
+export function withDetectedRelaunchHints(
+  unavailable: readonly UnavailableSignal[],
+  devServer: Pick<DevServerDetection, 'preloadAttached' | 'relaunchHint'> | undefined,
+  pageHooks: AgentHookConfig,
+): readonly UnavailableSignal[] {
+  const relaunchHint = provenRelaunchHint(devServer);
+
+  if (relaunchHint === undefined) {
+    return unavailable;
+  }
+
+  const replaces = (entry: UnavailableSignal): boolean =>
+    entry.hint !== relaunchHint && isPreloadGap(entry.signal, pageHooks);
+
+  if (!unavailable.some(replaces)) {
+    return unavailable;
+  }
+
+  return Object.freeze(
+    unavailable.map((entry) =>
+      replaces(entry) ? Object.freeze({ ...entry, hint: relaunchHint }) : entry,
+    ),
+  );
+}
+
+/**
  * Projects an install error onto `instrumentation.failed`'s error shape — the
  * frame both user interfaces display, so its text must be the product's, never
  * the failure's own (CWE-209):
@@ -1551,10 +1993,12 @@ function withPlanVersions(
  * - **hint** — which protocol requires on this frame — the error's own hint
  *   only when it is proven product text (`isProductAuthoredText`): the exact
  *   dev-server relaunch command `../dev-server/detect.ts` composed (see
- *   {@link withServiceRelaunchHint}), or any other recovery step a product
- *   builder registered. Otherwise the code's default next step: an installer
- *   error's hint can be an adapter's own text — its failure's hint, or the
- *   hint of the gap it reported — which may quote a path, a statement or a URL.
+ *   {@link withServiceRelaunchHint}), the session to end when another session
+ *   holds a target (see {@link withHeldTargetHint}), or any other recovery
+ *   step a product builder registered. Otherwise the code's default next
+ *   step: an installer error's hint can be an adapter's own text — its
+ *   failure's hint, or the hint of the gap it reported — which may quote a
+ *   path, a statement or a URL.
  *   A proven hint is registered again in its display form, so the failed row
  *   built from this frame proves it too.
  * - **ref** — the diagnostic reference, which the failure's local `warn` and
@@ -1588,52 +2032,335 @@ function toFailedError(error: DebuggenError, ref: string): InstrumentationFailed
 }
 
 /**
+ * The preload-dependent signals an installer failure names: its
+ * `details.blockedSignal` and the `signal` of every entry of its
+ * `details.unavailable` list (the installer's `{ signal, reason, hint }[]`), in
+ * `PRELOAD_DEPENDENT_SIGNALS` order, each once.
+ *
+ * The details are read structurally, because an injected installer's error is
+ * a caller's value: only a string signal of a record entry counts, and a
+ * missing, malformed or foreign list contributes nothing. A preload signal the
+ * page also collects (`fetch`) is not counted — a failed install armed no page
+ * hook, so that gap may be the page's own ({@link isPreloadGap}).
+ *
+ * Pure.
+ *
+ * @param error The installer's error.
+ * @returns The preload-dependent signals it reports, frozen.
+ */
+function preloadGapSignalsOf(error: DebuggenError): readonly CaptureSignal[] {
+  const named = new Set<unknown>([error.details?.['blockedSignal']]);
+  const listed: unknown = error.details?.['unavailable'];
+  const entries: readonly unknown[] = Array.isArray(listed) ? listed : [];
+
+  for (const entry of entries) {
+    if (typeof entry === 'object' && entry !== null && 'signal' in entry) {
+      named.add(entry.signal);
+    }
+  }
+
+  return Object.freeze(PRELOAD_DEPENDENT_SIGNALS.filter((signal) => named.has(signal)));
+}
+
+/** An installer failure as {@link failInstall} reports it. */
+interface ReportedInstallFailure {
+  /** The error to report: the installer's own, or its re-issue with the relaunch hint. */
+  readonly error: DebuggenError;
+  /**
+   * The instrument stage's ✗ rows owed ahead of the failed row: one entry per
+   * preload gap, each with the detection's product-authored reason and its
+   * relaunch hint. Empty when the relaunch hint does not apply.
+   */
+  readonly preloadGaps: readonly UnavailableSignal[];
+}
+
+/**
  * Re-issues an installer error with the relaunch hint this service's own
- * dev-server detection composed, when that is the recovery the developer needs
- * and the error's own hint is not proven product text (AAP §0.5.5: if the dev
- * server was not started with the preload, the hint carries the exact relaunch
- * command).
+ * dev-server detection composed, and names the preload gaps to report as ✗
+ * rows, whenever the preload is the recovery the developer needs (AAP §0.5.5:
+ * "Could not enable ‹signal›: ‹reason›." — or, if nothing could be enabled,
+ * `instrumentation.failed` whose hint, if the dev server was not started with
+ * the preload, carries the exact relaunch command).
  *
  * The installer's "nothing could be enabled" failure (`INSTRUMENTATION_UNAVAILABLE`)
- * names its most actionable blocked signal in `details.blockedSignal` and
- * carries that gap's hint, which for a preload-dependent signal is the
- * adapter's own relaunch text — never registered, so {@link toFailedError}
- * would replace it with fixed copy and the exact command would be lost. When
- * the blocked signal depends on the preload and the detection collected for
- * this install found the preload missing, the detection's `relaunchHint` —
- * registered by `../dev-server/detect.ts` when it composed it — takes its
- * place. The code, message and details are kept, and the original error is the
- * cause, so the local diagnostic still holds what the installer said.
+ * names one blocked signal in `details.blockedSignal` — the first reported gap
+ * with a hint, which on a plain dev server with no tab bound is a page signal
+ * — carries that gap's adapter hint, and lists every gap in
+ * `details.unavailable`. So when the detection collected for this install found
+ * the preload missing, its `relaunchHint` is proven product text (registered by
+ * `../dev-server/detect.ts` when it composed it), and the blocked signal **or
+ * any listed gap** depends on the preload ({@link preloadGapSignalsOf}):
  *
- * Returns `error` itself in every other case, including a hint that is
- * already proven and a detection whose hint this process did not compose.
+ * - the error is re-issued with that `relaunchHint` as its hint, whichever
+ *   signal the installer named and whatever hint it carried — the exact command
+ *   is the step AAP §0.5.5 requires; the code, message and details are kept,
+ *   and the original error is the cause, so the local diagnostic still holds
+ *   what the installer said;
+ * - the preload gaps are returned as `buildPreloadUnavailableSignals` words
+ *   them — product-authored reasons, the `relaunchHint` as every hint — for
+ *   {@link failInstall} to report as "Could not enable Server spans: …" and
+ *   the other preload rows before the failed row.
+ *
+ * In every other case — another code, no detection, an attached preload, a
+ * hint this process did not compose, no preload gap — the error is returned
+ * itself with no gap, and {@link toFailedError} decides its hint as before.
  *
  * @param error The installer's error.
  * @param devServer The dev-server detection readiness collected, if it ran.
- * @returns The error to report.
+ * @returns The error to report and the preload gaps to show ahead of it.
  */
 function withServiceRelaunchHint(
   error: DebuggenError,
   devServer: ReadinessEvidence['devServer'],
-): DebuggenError {
-  const blockedSignal = error.details?.['blockedSignal'];
+): ReportedInstallFailure {
+  const relaunchHint = provenRelaunchHint(devServer);
 
   if (
     error.code !== 'INSTRUMENTATION_UNAVAILABLE' ||
-    isProductAuthoredText(error.hint) ||
     devServer === undefined ||
-    devServer.preloadAttached ||
-    !isProductAuthoredText(devServer.relaunchHint) ||
-    !PRELOAD_DEPENDENT_SIGNALS.some((signal) => signal === blockedSignal)
+    relaunchHint === undefined
   ) {
+    return { error, preloadGaps: [] };
+  }
+
+  const signals = preloadGapSignalsOf(error);
+
+  if (signals.length === 0) {
+    return { error, preloadGaps: [] };
+  }
+
+  return {
+    error:
+      error.hint === relaunchHint
+        ? error
+        : new DebuggenError(error.code, error.message, {
+            hint: relaunchHint,
+            ...(error.details === undefined ? {} : { details: error.details }),
+            cause: error,
+          }),
+    preloadGaps: buildPreloadUnavailableSignals(devServer, signals),
+  };
+}
+
+/** The shape of a holding session id {@link withHeldTargetHint} will quote. */
+const HELD_TARGET_SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
+
+/** The longest held file path {@link withHeldTargetHint} will quote. */
+const HELD_TARGET_FILE_MAX_LENGTH = 512;
+
+/** A control character or a line or paragraph separator: never in a quoted fact. */
+const HELD_TARGET_LINE_BREAKER_PATTERN = /[\p{Cc}\u2028\u2029]/u;
+
+/**
+ * How many links of an error's `cause` chain {@link withHeldTargetHint}
+ * inspects: the installer wraps an adapter's refusal once, and a service
+ * re-issue wraps it once more, so a real chain is a few links long and a
+ * cyclic or adversarial one is cut off here.
+ */
+const HELD_TARGET_CAUSE_DEPTH = 8;
+
+/** The two facts the held-target hint is worded from, both validated. */
+interface HeldTargetFacts {
+  /** The held file, project-relative POSIX. */
+  readonly file: string;
+
+  /** The session whose instrumented bytes the file holds. */
+  readonly owningSessionId: string;
+}
+
+/**
+ * Reads the held-target facts off a structured value — an element of the
+ * installer's `details.heldTargets`, or a held refusal's `details` — or
+ * answers `undefined` when either fact is not safe to quote.
+ *
+ * `owningSessionId` must match {@link HELD_TARGET_SESSION_ID_PATTERN}, the
+ * shape of an id this service mints. `file` must be a project-relative path
+ * `isSafeRelativePath` accepts — no absolute path, no drive letter, no
+ * backslash, no escape above the root — on a single line and at most
+ * {@link HELD_TARGET_FILE_MAX_LENGTH} characters. Anything else is refused as
+ * a whole, because the hint is shown to the developer verbatim.
+ *
+ * @param value Any value.
+ * @returns The validated facts, or `undefined`.
+ */
+function heldTargetFactsOf(value: unknown): HeldTargetFacts | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const { file, owningSessionId } = value as { file?: unknown; owningSessionId?: unknown };
+
+  if (
+    typeof owningSessionId !== 'string' ||
+    !HELD_TARGET_SESSION_ID_PATTERN.test(owningSessionId)
+  ) {
+    return undefined;
+  }
+
+  if (
+    typeof file !== 'string' ||
+    file.length > HELD_TARGET_FILE_MAX_LENGTH ||
+    HELD_TARGET_LINE_BREAKER_PATTERN.test(file) ||
+    !isSafeRelativePath(file)
+  ) {
+    return undefined;
+  }
+
+  return { file, owningSessionId };
+}
+
+/**
+ * The target another session holds that an install error is about, or
+ * `undefined` when it is about something else.
+ *
+ * Two structured sources, in order, and never an error's message or hint:
+ *
+ * 1. The installer's nothing-enabled failure lists the holders of the targets
+ *    it set aside in `details.heldTargets`; its first entry is the one read.
+ * 2. Otherwise the error and its `cause` chain — at most
+ *    {@link HELD_TARGET_CAUSE_DEPTH} links, each a `DebuggenError` — are
+ *    searched for the patch layer's own refusal: `PATCH_UNSUPPORTED` whose
+ *    `details.reason` is `PATCH_TARGET_HELD_REASON`. That is how a held target
+ *    the installer had to treat as fatal (one met after the same adapter call
+ *    applied a record) still names its holder.
+ *
+ * @param error The install error.
+ * @returns The validated facts, or `undefined`.
+ */
+function findHeldTarget(error: DebuggenError): HeldTargetFacts | undefined {
+  const listed = error.details?.['heldTargets'];
+
+  if (Array.isArray(listed)) {
+    const first = heldTargetFactsOf(listed[0]);
+
+    if (first !== undefined) {
+      return first;
+    }
+  }
+
+  let link: unknown = error;
+
+  for (let depth = 0; depth < HELD_TARGET_CAUSE_DEPTH && DebuggenError.is(link); depth += 1) {
+    if (
+      link.code === 'PATCH_UNSUPPORTED' &&
+      link.details?.['reason'] === PATCH_TARGET_HELD_REASON
+    ) {
+      const facts = heldTargetFactsOf(link.details);
+
+      if (facts !== undefined) {
+        return facts;
+      }
+    }
+
+    link = link.cause;
+  }
+
+  return undefined;
+}
+
+/**
+ * Re-issues an installer error with a hint this service words itself when the
+ * install failed because a target is held by another session on the same
+ * project, so the developer is told which session to end (AAP §0.5.5: if
+ * nothing could be enabled, `instrumentation.failed` carries the hint).
+ *
+ * The installer's own hint for that case is the patch layer's sentence, which
+ * {@link toFailedError} must not show — it is not proven product text, and a
+ * gap's text may quote whatever an adapter wrote — so without this the
+ * developer would read the code's generic next step while the real cause sat
+ * in the debug log. The hint is instead composed here from two validated
+ * identifiers (see {@link findHeldTarget}) and registered with
+ * `authorProductText` at the point of composition, which is what lets
+ * `instrumentation.failed` and the instrument stage's failed row show it:
+ *
+ * > ‹file› is already instrumented by session ‹id›. End that session — its
+ * > cleanup restores the file — then ask again.
+ *
+ * The code, message and details are kept, and the original error is the
+ * cause, so the local diagnostic still holds what the installer said. The
+ * public message is unaffected: {@link toFailedError} replaces it with the
+ * code's fixed copy and a diagnostic reference whatever the hint (CWE-209).
+ *
+ * Returns `error` itself when its hint is already proven product text — the
+ * relaunch hint of {@link withServiceRelaunchHint}, which runs first — and
+ * when no held target with safely quotable facts is found.
+ *
+ * @param error The installer's error, after {@link withServiceRelaunchHint}.
+ * @returns The error to report.
+ *
+ * @example
+ * ```ts
+ * const reported = withHeldTargetHint(withServiceRelaunchHint(installed.error, devServer).error);
+ * // reported.hint === 'src/server/report.ts is already instrumented by session ses_abc. End that session — its cleanup restores the file — then ask again.'
+ * ```
+ */
+function withHeldTargetHint(error: DebuggenError): DebuggenError {
+  if (isProductAuthoredText(error.hint)) {
+    return error;
+  }
+
+  const held = findHeldTarget(error);
+
+  if (held === undefined) {
     return error;
   }
 
   return new DebuggenError(error.code, error.message, {
-    hint: devServer.relaunchHint,
+    hint: authorProductText(
+      `${held.file} is already instrumented by session ${held.owningSessionId}. End that session — its cleanup restores the file — then ask again.`,
+    ),
     ...(error.details === undefined ? {} : { details: error.details }),
     cause: error,
   });
+}
+
+/**
+ * The installer's `sessionOnAnotherProject` predicate for one install: `true`
+ * only for a session this service installed on a project other than
+ * `projectRoot`.
+ *
+ * `ModificationJournal.listOpen` answers every open record of every session on
+ * every project, and a record names only a project-relative file. The patch
+ * layer's hold check (`PATCH_TARGET_HELD_REASON`) matches another session's
+ * record by that file **and** by the digest of the bytes the file holds, which
+ * decides *whether* the file is held exactly. It cannot decide *by whom* when
+ * two copies of one project — two worktrees of a repository — were patched the
+ * same way: both copies then hold the same bytes under the same relative path,
+ * so the session it names could be the other copy's, and the developer would
+ * be told to end a session whose cleanup releases nothing here. With this
+ * predicate the installer lists the adapters no record of such a session.
+ *
+ * A session this service does not know answers `false`, so its records stay
+ * listed: leaving them out could let a second patch be layered over a file it
+ * holds, which is the corruption the hold check exists to prevent. In a
+ * running service every record that can hold a file (`applied`, `pending`,
+ * `failed`) belongs to a session installed by this process, because start-up
+ * reconciliation settles every record an earlier process left before a
+ * client is accepted.
+ *
+ * Only the install is given the predicate: start-up reconciliation and session
+ * cleanup keep the global listing their reconciliation requires, and the
+ * context's journal is handed to the installer unchanged.
+ *
+ * @param projectRoot The project being instrumented, as the install's request names it.
+ * @param projectOf The project a session was installed on, when this service knows it.
+ * @returns The predicate.
+ *
+ * @example
+ * ```ts
+ * const elsewhere = sessionOnAnotherProjectThan(projectRoot, (id) => sessions.get(id)?.projectRoot);
+ * await installer(plan, context, { adapters, sessionOnAnotherProject: elsewhere });
+ * ```
+ */
+export function sessionOnAnotherProjectThan(
+  projectRoot: string,
+  projectOf: (sessionId: string) => string | undefined,
+): (sessionId: string) => boolean {
+  return (sessionId) => {
+    const owner = projectOf(sessionId);
+
+    return owner !== undefined && owner !== projectRoot;
+  };
 }
 
 /**
@@ -1660,11 +2387,96 @@ interface ProducerConfig {
   readonly serverSignals: ServerAgentSignals;
 }
 
-/** The three `instrumentation.ready` fields of the latest install. */
+/**
+ * The three `instrumentation.ready` fields of the latest install, as that
+ * install sent them: `applied` holds only the records it wrote, never the
+ * session's whole journal.
+ */
 interface ReadyFields {
   readonly applied: readonly ModificationRecord[];
   readonly runtimeHooks: readonly string[];
   readonly unavailable: readonly UnavailableSignal[];
+}
+
+/** The two report fields a refresh can change: the armed hooks and the gaps. */
+interface ReportParts {
+  readonly runtimeHooks: readonly string[];
+  readonly unavailable: readonly UnavailableSignal[];
+}
+
+/**
+ * One refreshable adapter's share of a session's signal report: what it armed
+ * and could not arm the last time it was asked, and what it contributed to the
+ * producers' configurations when it armed anything.
+ *
+ * An adapter is refreshable when it is registered and every action the active
+ * plan gives it installs in `runtime` mode: asking it again writes no file, so
+ * its answer can be brought up to date with the page. An adapter with any
+ * `patch` action is never asked again — its share of the report stays as the
+ * installer returned it.
+ */
+interface RuntimeShare {
+  readonly adapterId: string;
+  readonly runtimeHooks: readonly string[];
+  readonly unavailable: readonly UnavailableSignal[];
+  /** The page-agent hooks it contributed; empty when it armed nothing. */
+  readonly agentHooks: Partial<AgentHookConfig>;
+  /** The preload signals it contributed; fully disabled when it armed nothing. */
+  readonly serverSignals: ServerAgentSignals;
+}
+
+/**
+ * What a session's signal report is composed from and re-judged with. Replaced,
+ * never mutated; a refresh that finds the session's report replaced while it
+ * worked drops its result, since a newer install or replay has superseded it.
+ */
+interface SignalReport {
+  /** The plan version the report describes, with its normalised plan. */
+  readonly plan: InstrumentationPlan;
+  /** The install's context, without its request's abort signal. */
+  readonly context: InstrumentationContext;
+  /** The install request's dev-server URL, for collecting the facts again. */
+  readonly devServerUrl?: string | undefined;
+  /** Whether the install skipped the feasibility gate, which a refresh then skips too. */
+  readonly skipFeasibility: boolean;
+  /** Whether a missing preload blocks readiness for this session. */
+  readonly requireServerAgent: boolean;
+  /** The observed facts the shares were last judged against. */
+  readonly judged: ObservedReadinessInputs;
+  /** The part of the report no refresh changes: every source but the shares. */
+  readonly fixed: ReportParts;
+  /** Each refreshable adapter's share, in registry order. */
+  readonly shares: readonly RuntimeShare[];
+  /**
+   * The signals the latest verdict held back only on the page gate: no tab
+   * bound yet, or the bound tab's page not (or not in time) reported.
+   */
+  readonly awaitingPage: readonly CaptureSignal[];
+  /** Every signal a ✓ row has been shown for, for this plan version. */
+  readonly confirmed: readonly CaptureSignal[];
+  /**
+   * The checklist rows shown as waiting for this plan version and not yet
+   * settled, with the detail each was last shown with: a ✓ row, or a ✗ row
+   * when the page answered with a gap, replaces each in place.
+   */
+  readonly waiting: readonly WaitingRow[];
+}
+
+/**
+ * A checklist row shown as waiting — `running`, "◌ ‹label›" — for a signal
+ * the page gate holds back (AAP §0.7.3: check/spinner/cross rows).
+ *
+ * Its message is the signal's checklist label, exactly the message the
+ * signal's ✓ row carries, so when the page reports and the signal is
+ * confirmed the ✓ row replaces the waiting row in place in both user
+ * interfaces — which identify a row by its stage and message — and the
+ * checklist keeps its order above "Ready to capture", whichever of the two
+ * arrives first. Its detail says what the signal is waiting for and what the
+ * developer can do, in the readiness gate's own words.
+ */
+interface WaitingRow {
+  readonly label: string;
+  readonly detail: string;
 }
 
 /**
@@ -1679,12 +2491,23 @@ interface SessionState {
   readonly actions: readonly InstrumentationAction[];
   /** The producer configuration per plan version, as installed (or recomputed). */
   readonly configs: ReadonlyMap<number, ProducerConfig>;
-  /** The latest install's `instrumentation.ready` fields. */
+  /**
+   * The latest install's `instrumentation.ready` fields. Its `unavailable` is
+   * the baseline a later capture's and an empty delta's gap reports build on;
+   * its `applied` is that install's records only — the journal, not this
+   * state, is the authority on every record the session holds.
+   */
   readonly ready: ReadyFields;
   /** Every runtime hook armed across the session's installed plan versions. */
   readonly runtimeHooks: readonly string[];
   /** The capture currently armed, when one is. */
   readonly armedCaptureId?: string | undefined;
+  /**
+   * The signal report of the active plan version, when this process installed
+   * it — never for arming state restored from a stored plan, which no install
+   * of this process judged.
+   */
+  readonly signals?: SignalReport | undefined;
 }
 
 /**
@@ -1788,6 +2611,358 @@ const EMPTY_READY: ReadyFields = Object.freeze({
   unavailable: Object.freeze([]),
 });
 
+/** The `warn` line a rejecting page-agent wait of the background refresh is logged with. */
+const SIGNAL_WAIT_FAILURE_MESSAGE =
+  'Waiting for the bound page to report for the signal report failed';
+
+/**
+ * One adapter's share of the signal report, read defensively off its raw
+ * install results — the adapter's own answers, as the installer kept them.
+ *
+ * `undefined` when any answer is not an ordinary runtime result: not an object,
+ * a fatal `failure`, a record applied, or a list missing. Such an adapter is
+ * not treated as a share at all, so its contribution stays in the report's
+ * fixed part exactly as the installer aggregated it.
+ *
+ * Hooks are de-duplicated with the first occurrence kept; a contribution to
+ * the producers' configurations is kept only from an answer that armed a
+ * hook, as the installer aggregates contributions only from enabled results.
+ */
+function readShare(adapterId: string, answers: readonly unknown[]): RuntimeShare | undefined {
+  const runtimeHooks: string[] = [];
+  const unavailable: UnavailableSignal[] = [];
+  let agentHooks: Partial<AgentHookConfig> = {};
+  let serverSignals: ServerAgentSignals = serverContributionOf(undefined);
+
+  for (const answer of answers) {
+    if (!isObjectRecord(answer) || answer['failure'] !== undefined) {
+      return undefined;
+    }
+
+    const applied = answer['applied'];
+    const hooks = answer['runtimeHooks'];
+    const gaps = answer['unavailable'];
+
+    if (
+      !Array.isArray(applied) ||
+      applied.length > 0 ||
+      !Array.isArray(hooks) ||
+      !Array.isArray(gaps)
+    ) {
+      return undefined;
+    }
+
+    const armed = hooks.filter(isNonBlankString);
+    runtimeHooks.push(...armed);
+    unavailable.push(...gaps.filter(isGapLike));
+
+    if (armed.length > 0) {
+      agentHooks = { ...agentHooks, ...hookContributionOf(answer['agentHooks']) };
+      serverSignals = unionServerSignals(
+        serverSignals,
+        serverContributionOf(answer['serverSignals']),
+      );
+    }
+  }
+
+  return {
+    adapterId,
+    runtimeHooks: unionStrings([], runtimeHooks),
+    unavailable,
+    agentHooks,
+    serverSignals,
+  };
+}
+
+/**
+ * The part of a report no refresh changes: `report` without what the shares
+ * put there. A gap is taken out once per share that reported it (a multiset
+ * difference, by value); a hook only when a share armed it and no other
+ * source did (`kept`), since a hook list holds each label once.
+ */
+function fixedPartOf(
+  report: ReportParts,
+  shares: readonly RuntimeShare[],
+  kept: ReadonlySet<string>,
+): ReportParts {
+  const shareHooks = new Set<string>(shares.flatMap((share) => share.runtimeHooks));
+
+  return {
+    runtimeHooks: report.runtimeHooks.filter((hook) => kept.has(hook) || !shareHooks.has(hook)),
+    unavailable: withoutGaps(
+      report.unavailable,
+      shares.flatMap((share) => share.unavailable),
+    ),
+  };
+}
+
+/**
+ * A report composed from its fixed part and its shares: the fixed hooks, then
+ * each share's, de-duplicated with the first occurrence kept; the fixed gaps,
+ * then each share's, in registry order.
+ */
+function composeParts(fixed: ReportParts, shares: readonly RuntimeShare[]): ReportParts {
+  return {
+    runtimeHooks: unionStrings(
+      fixed.runtimeHooks,
+      shares.flatMap((share) => share.runtimeHooks),
+    ),
+    unavailable: [...fixed.unavailable, ...shares.flatMap((share) => share.unavailable)],
+  };
+}
+
+/** Whether two share lists say the same thing: the same adapters, hooks and gaps, in order. */
+function sameShares(first: readonly RuntimeShare[], second: readonly RuntimeShare[]): boolean {
+  return (
+    first.length === second.length &&
+    first.every((share, index) => {
+      const other = second[index];
+
+      return (
+        other !== undefined &&
+        other.adapterId === share.adapterId &&
+        sameStrings(share.runtimeHooks, other.runtimeHooks) &&
+        sameGaps(share.unavailable, other.unavailable)
+      );
+    })
+  );
+}
+
+/** A plan's runtime actions that one adapter installs. */
+function runtimeActionsOf(
+  actions: readonly InstrumentationAction[],
+  adapterId: string,
+): readonly InstrumentationAction[] {
+  return actions.filter(
+    (action) => action.mode === RUNTIME_ACTION_MODE && action.adapter === adapterId,
+  );
+}
+
+/**
+ * Widens a plan version's producer configuration with every share that arms
+ * something, as the installer widens its derivation with each enabled
+ * adapter's contribution: the page hooks the share's actions derive plus its
+ * own page contribution, and its own preload contribution. The preload side is
+ * never derived from the actions here — which tier an action's signal is
+ * delivered on is the installer's judgement — so it widens only with what the
+ * adapter itself said it arms there.
+ */
+function widenConfig(
+  config: ProducerConfig,
+  actions: readonly InstrumentationAction[],
+  shares: readonly RuntimeShare[],
+): ProducerConfig {
+  let agentHooks = config.agentHooks;
+  let serverSignals = config.serverSignals;
+
+  for (const share of shares) {
+    if (share.runtimeHooks.length === 0) {
+      continue;
+    }
+
+    agentHooks = widenAgentHooks(
+      agentHooks,
+      runtimeActionsOf(actions, share.adapterId),
+      share.agentHooks,
+    );
+    serverSignals = unionServerSignals(serverSignals, share.serverSignals);
+  }
+
+  return { agentHooks, serverSignals };
+}
+
+/** What folding refreshed shares into a report produced. */
+interface FoldedShares {
+  readonly report: SignalReport;
+  readonly ready: ReadyFields;
+  readonly config: ProducerConfig;
+  readonly runtimeHooks: readonly string[];
+  /** Whether the composed `instrumentation.ready` fields differ from the ones given. */
+  readonly changed: boolean;
+}
+
+/**
+ * Folds refreshed shares into a report, and the report into the session's
+ * announced fields and producer configuration. Pure.
+ *
+ * Unchanged shares leave everything as it was — the fields keep the installer's
+ * own ordering — apart from recording the facts they were judged against.
+ * Changed shares recompose the report from its fixed part, widen the
+ * configuration with what they now arm, and add their hooks to the session's
+ * hook union.
+ */
+function foldShares(input: {
+  readonly report: SignalReport;
+  readonly shares: readonly RuntimeShare[];
+  readonly judged: ObservedReadinessInputs;
+  readonly ready: ReadyFields;
+  readonly config: ProducerConfig;
+  readonly runtimeHooks: readonly string[];
+}): FoldedShares {
+  const report: SignalReport = { ...input.report, shares: input.shares, judged: input.judged };
+
+  if (sameShares(input.report.shares, input.shares)) {
+    return {
+      report,
+      ready: input.ready,
+      config: input.config,
+      runtimeHooks: input.runtimeHooks,
+      changed: false,
+    };
+  }
+
+  const parts = composeParts(report.fixed, input.shares);
+  const changed =
+    !sameStrings(parts.runtimeHooks, input.ready.runtimeHooks) ||
+    !sameGaps(parts.unavailable, input.ready.unavailable);
+
+  return {
+    report,
+    ready: changed ? { applied: input.ready.applied, ...parts } : input.ready,
+    config: widenConfig(input.config, report.plan.instrumentationTargets, input.shares),
+    runtimeHooks: unionStrings(input.runtimeHooks, parts.runtimeHooks),
+    changed,
+  };
+}
+
+/**
+ * The gaps the progress rows are drawn from: `unavailable` without the gaps a
+ * share reported for a signal the verdict holds back only on the page gate.
+ * Such a signal is waiting, not failed — its {@link WaitingRow} says what for —
+ * and its gap still reaches `instrumentation.ready`. Returns `unavailable`
+ * itself when nothing waits.
+ */
+function rowGapsOf(
+  unavailable: readonly UnavailableSignal[],
+  shares: readonly RuntimeShare[],
+  awaitingPage: ReadonlySet<string>,
+): readonly UnavailableSignal[] {
+  if (awaitingPage.size === 0) {
+    return unavailable;
+  }
+
+  return withoutGaps(
+    unavailable,
+    shares.flatMap((share) => share.unavailable).filter((gap) => awaitingPage.has(gap.signal)),
+  );
+}
+
+/** Matches the closing punctuation and whitespace a reason fragment may end with. */
+const CLOSING_PUNCTUATION_PATTERN = /[\s.!?;:,]+$/u;
+
+/**
+ * What a waiting row's detail says: "Waiting: ‹reason›. ‹hint›", from the
+ * gate's gap for the signal — for a missing binding, that no tab is bound and
+ * how to open the panel; for a page that has not reported, that no page agent
+ * has and the reload request. Single-line and clipped to the progress schema's
+ * detail bound.
+ */
+function waitingDetail(gap: UnavailableSignal | undefined): string {
+  const reason = toDisplayLine(gap?.reason ?? '').replace(CLOSING_PUNCTUATION_PATTERN, '');
+  const hint = toDisplayLine(gap?.hint ?? '');
+  const sentence = reason.length === 0 ? 'Waiting for the page' : `Waiting: ${reason}`;
+
+  return clip(
+    hint.length === 0 ? `${sentence}.` : `${sentence}. ${hint}`,
+    MAX_PROGRESS_DETAIL_LENGTH,
+  );
+}
+
+/**
+ * The detail of a waiting row the page answered with a gap: each distinct gap
+ * of the label's signals as "‹reason›. ‹hint›", in order, single-line and
+ * clipped to the progress schema's detail bound; "Not enabled." when no gap
+ * names why.
+ */
+function settledDetail(gaps: readonly (UnavailableSignal | undefined)[]): string {
+  const sentences: string[] = [];
+
+  for (const gap of gaps) {
+    if (gap === undefined) {
+      continue;
+    }
+
+    // A reason is a fragment written to follow "Could not enable ‹signal›: ";
+    // standing alone, it opens its sentence.
+    const fragment = toDisplayLine(gap.reason).replace(CLOSING_PUNCTUATION_PATTERN, '');
+    const reason = `${fragment.charAt(0).toUpperCase()}${fragment.slice(1)}`;
+    const hint = toDisplayLine(gap.hint ?? '');
+    const sentence = [reason.length === 0 ? '' : `${reason}.`, hint]
+      .filter((part) => part.length > 0)
+      .join(' ');
+
+    if (sentence.length > 0 && !sentences.includes(sentence)) {
+      sentences.push(sentence);
+    }
+  }
+
+  const detail = sentences.join(' ');
+
+  return clip(detail.length === 0 ? 'Not enabled.' : detail, MAX_PROGRESS_DETAIL_LENGTH);
+}
+
+/**
+ * The waiting rows a verdict calls for: one per checklist label of a signal in
+ * `awaitingPage` that no ✓ row has been shown for (`shown`), ordered as the
+ * checklist orders its ✓ rows, each with the {@link waitingDetail} of the
+ * label's first such signal's blocking gap. Pure.
+ */
+function waitingRowsOf(
+  verdict: Pick<ReadinessVerdict, 'plannedSignals' | 'blocking'>,
+  awaitingPage: ReadonlySet<CaptureSignal>,
+  shown: ReadonlySet<string>,
+): readonly WaitingRow[] {
+  const details = new Map<string, string>();
+
+  for (const signal of verdict.plannedSignals) {
+    const label = CAPTURE_SIGNAL_LABELS[signal];
+
+    if (awaitingPage.has(signal) && !shown.has(label) && !details.has(label)) {
+      details.set(label, waitingDetail(gapFor(signal, [verdict.blocking])));
+    }
+  }
+
+  return INSTRUMENTATION_ROW_ORDER.flatMap((label) => {
+    const detail = details.get(label);
+
+    return detail === undefined ? [] : [{ label, detail }];
+  });
+}
+
+/** Whether a report holds a gap that a newer reading of the page could clear. */
+function hasRefreshableGap(report: SignalReport): boolean {
+  return (
+    report.awaitingPage.length > 0 || report.shares.some((share) => share.unavailable.length > 0)
+  );
+}
+
+/** Whether a value is a tab binding: a non-negative integer tab id and a non-blank URL. */
+function isBoundTab(value: unknown): value is BoundTab {
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+
+  const tabId = value['tabId'];
+
+  return (
+    typeof tabId === 'number' &&
+    Number.isSafeInteger(tabId) &&
+    tabId >= 0 &&
+    isNonBlankString(value['url'])
+  );
+}
+
+/** Whether a value is a non-empty list of known client kinds. */
+function isClientKindList(value: unknown): value is readonly ClientKind[] {
+  const known: readonly string[] = CLIENT_KINDS;
+
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((kind) => typeof kind === 'string' && known.includes(kind))
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Section F — the service
 // ---------------------------------------------------------------------------
@@ -1838,6 +3013,22 @@ export function createInstrumentationService(
   /** Per session: the disarms no producer connection has taken yet; outlives `stopSession`. */
   const pending = new Map<string, PendingDisarm>();
   const dormancyListeners = new Set<(sessionId: string) => void>();
+  /**
+   * Per session: the `instrumentation.failed` payload of the latest install,
+   * when that install failed — what a binding panel is replayed after the
+   * latest report. Cleared by a later successful install.
+   */
+  const failedReports = new Map<string, InstrumentationFailedPayload>();
+  /** Per session: the tab its latest install or bind named, which a refresh waits on. */
+  const knownTabs = new Map<string, BoundTab>();
+  /**
+   * The sessions a bind named a tab for while their install ran. That install
+   * judged the page without the tab, so the report it leaves is re-judged
+   * against the tab the moment the install is over (see `install`).
+   */
+  const boundDuringInstall = new Set<string>();
+  /** Per session: the one background refresh of its signal report, cancelled by its controller. */
+  const signalWaiters = new Map<string, AbortController>();
   let disposed = false;
 
   /**
@@ -2565,6 +3756,52 @@ export function createInstrumentationService(
   }
 
   /**
+   * The dev-server detection's collaborators for one install: the injected
+   * ones, plus — when none was injected — the absolute path of the telemetry
+   * preload, so the detection's relaunch command imports the very file the
+   * launcher attaches (`--import file:///…/register.mjs`) rather than a
+   * `"$DEBUGGEN_PRELOAD_URL"` reference the developer would first have to
+   * export (AAP §0.5.5: the hint carries the exact relaunch command).
+   *
+   * Resolved per install with the launcher's own `resolvePreloadPath`, over the
+   * candidates a launch uses, so the command and a launch agree on the file; a
+   * preload built or removed while the service runs is seen by the next
+   * install. It only checks that files exist. A miss — the telemetry package is
+   * not built — keeps the reference, since a path is never fabricated, and so
+   * does a throw: an install never fails for want of a more exact hint. Neither
+   * is logged with a path, only with its code or closed exception class.
+   */
+  function detectionDeps(log: Logger): CollectObservedReadinessDeps['detectDeps'] {
+    const supplied = deps.detectDeps;
+
+    if (supplied?.preloadPath !== undefined) {
+      return supplied;
+    }
+
+    let preload: Result<string, DebuggenError>;
+
+    try {
+      preload = resolvePreloadPath({ logger: log });
+    } catch (thrown) {
+      log.debug(
+        'Resolving the telemetry preload threw; the relaunch command keeps its preload reference',
+        exceptionFields(thrown),
+      );
+      return supplied;
+    }
+
+    if (isErr(preload)) {
+      log.debug(
+        'The telemetry preload was not found; the relaunch command keeps its preload reference',
+        { code: preload.error.code },
+      );
+      return supplied;
+    }
+
+    return { ...supplied, preloadPath: preload.value };
+  }
+
+  /**
    * The preparation half of an install: the root's first confirmation, the
    * state-root separation check, the readiness facts, the root's second
    * confirmation, the context, the delta, and — unless the delta is empty —
@@ -2580,12 +3817,18 @@ export function createInstrumentationService(
    * second answer as `canonicalProjectRoot`. A link retargeted while the
    * readiness facts were collected is therefore refused rather than written
    * through.
+   *
+   * An installer failure is reported through {@link withServiceRelaunchHint},
+   * with this install's detection: the error it answers is returned, and the
+   * preload gaps it names are appended to `failedPreloadGaps` — the caller's
+   * accumulator, as `failures` is — for {@link failInstall} to show as ✗ rows.
    */
   async function prepareInstall(
     request: InstallRequest,
     checked: CheckedInstall,
     prior: SessionState | undefined,
     log: Logger,
+    failedPreloadGaps: UnavailableSignal[],
   ): Promise<Result<PreparedInstall, DebuggenError>> {
     const { sessionId, projectRoot, plan } = checked;
     const beforeCheck = confirmInstallRoot(request, log, 'before-state-root-check');
@@ -2608,7 +3851,7 @@ export function createInstrumentationService(
         agents: deps.agents,
         devServers: deps.devServers,
         detect: deps.detectDevServer,
-        detectDeps: deps.detectDeps,
+        detectDeps: detectionDeps(log),
         config: { host: deps.config.host, port: deps.config.port },
         logger: log,
         now: clock,
@@ -2675,10 +3918,20 @@ export function createInstrumentationService(
       adapters,
       delta: resolved.value?.delta,
       skipFeasibility: request.skipFeasibility ?? false,
+      // The hold check of the patch layer names the session holding a target;
+      // a session this service installed on another project is never it.
+      sessionOnAnotherProject: sessionOnAnotherProjectThan(
+        projectRoot,
+        (holder) => sessions.get(holder)?.projectRoot,
+      ),
     });
 
     if (isErr(installed)) {
-      return err(withServiceRelaunchHint(installed.error, evidence.value.devServer));
+      // The relaunch command first, then — when that did not apply — the
+      // session holding a target this plan needed; each keeps a proven hint.
+      const reported = withServiceRelaunchHint(installed.error, evidence.value.devServer);
+      failedPreloadGaps.push(...reported.preloadGaps);
+      return err(withHeldTargetHint(reported.error));
     }
 
     return ok({
@@ -2763,26 +4016,38 @@ export function createInstrumentationService(
   }
 
   /**
-   * Emits one `running` row per degradation sentence, the signal's hint — the
-   * exact relaunch command, for a server-tier gap — as its detail, verbatim.
+   * Emits the capture-time ✗ rows of {@link reportPreloadGaps}: one terminal
+   * `failed` row of the `instrument` stage per gap, whose message is
+   * `unavailableSignalMessage`'s sentence — the wording and shape of the
+   * checklist's ✗ rows — and whose detail is the gap's hint verbatim, as one
+   * line. Byte-identical rows are emitted once.
+   *
+   * The row's `failed` status is the ✗ of a signal the capture proceeds
+   * without, never a session failure: nothing here calls `stageFailed` or
+   * sends `instrumentation.failed`. A progress collaborator that throws or
+   * refuses the row is logged and costs the arm nothing, because the capture
+   * is already armed with what it has.
    */
-  function emitDegradations(
-    failures: CollaboratorFailure[],
+  function emitPreloadGapRows(
     log: Logger,
     sessionId: string,
-    unavailable: readonly UnavailableSignal[],
+    gaps: readonly UnavailableSignal[],
     enabledLabels: readonly string[],
   ): void {
     const emitted = new Set<string>();
 
-    for (const entry of unavailable) {
-      const [message] = buildDegradationNotice([entry], enabledLabels);
+    for (const gap of gaps) {
+      const message = unavailableSignalMessage(
+        labelForSignal(gap.signal),
+        gap.reason,
+        enabledLabels,
+      );
 
       if (message === undefined) {
         continue;
       }
 
-      const detail = clip(toDisplayLine(entry.hint), MAX_PROGRESS_DETAIL_LENGTH);
+      const detail = clip(toDisplayLine(gap.hint), MAX_PROGRESS_DETAIL_LENGTH);
       const key = `${message}\n${detail}`;
 
       if (emitted.has(key)) {
@@ -2793,50 +4058,75 @@ export function createInstrumentationService(
 
       const row: ProgressRow = {
         stage: INSTRUMENT_STAGE,
-        status: 'running',
+        status: 'failed',
         message,
         ...(detail.length === 0 ? {} : { detail }),
       };
 
       noteProgress(
         log,
-        'degradation',
-        attempt(failures, log, 'progress', 'degradation', () => deps.progress.emit(sessionId, row)),
+        'preloadGap',
+        attempt([], log, 'progress', 'preloadGap', () => deps.progress.emit(sessionId, row)),
+      );
+    }
+  }
+
+  /**
+   * Emits one checklist row per entry, in order, under the instrument stage,
+   * with `status` — `running` for a {@link WaitingRow} being shown, `failed`
+   * for one the page answered with a gap. A throw or a schema refusal is
+   * recorded and logged; progress is advisory.
+   */
+  function emitChecklistRows(
+    failures: CollaboratorFailure[],
+    log: Logger,
+    sessionId: string,
+    rows: readonly WaitingRow[],
+    status: 'running' | 'failed',
+  ): void {
+    const step = status === 'running' ? 'waitingRow' : 'settledWaitingRow';
+
+    for (const entry of rows) {
+      const row: ProgressRow = {
+        stage: INSTRUMENT_STAGE,
+        status,
+        message: entry.label,
+        ...(entry.detail.length === 0 ? {} : { detail: entry.detail }),
+      };
+
+      noteProgress(
+        log,
+        step,
+        attempt(failures, log, 'progress', step, () => deps.progress.emit(sessionId, row)),
       );
     }
   }
 
   /**
    * The `instrumentation.ready` fields of an empty delta, which installs
-   * nothing: the session's current state — the records the journal holds as
-   * applied, and the hooks and gaps the previous install reported.
+   * nothing (AAP §0.4.2: "the installer applies only the delta").
+   *
+   * - `applied` is `[]`: this install wrote no record. The records earlier plan
+   *   versions applied were announced by their own installs and remain in the
+   *   journal — `SessionRecord.modifications`,
+   *   `GET /sessions/:id/modifications` — so re-listing them here would
+   *   misreport them as this plan version's edits.
+   * - `runtimeHooks` and `unavailable` report the session's current state,
+   *   because no installer ran to report a narrower one: every hook armed
+   *   across the installed plan versions, and the gaps the previous install
+   *   reported when this service holds that version as active.
+   *
+   * Pure: the journal is not read, so nothing here can fail.
    */
-  async function currentReady(
-    failures: CollaboratorFailure[],
-    log: Logger,
-    sessionId: string,
+  function emptyDeltaReady(
     prior: SessionState | undefined,
     previousPlanVersion: number,
-  ): Promise<ReadyFields> {
+  ): ReadyFields {
     const known = prior?.activePlanVersion === previousPlanVersion ? prior.ready : EMPTY_READY;
-    const runtimeHooks = prior?.runtimeHooks ?? known.runtimeHooks;
-    const listed = await attemptAsync(failures, log, 'modifications', 'listBySession', () =>
-      deps.modifications.listBySession(sessionId),
-    );
-
-    if (listed === undefined || isErr(listed)) {
-      if (listed !== undefined) {
-        log.warn('The journal could not be read; re-announcing the last known records', {
-          code: listed.error.code,
-        });
-      }
-
-      return { applied: known.applied, runtimeHooks, unavailable: known.unavailable };
-    }
 
     return {
-      applied: listed.value.filter((record) => record.status === 'applied'),
-      runtimeHooks,
+      applied: EMPTY_READY.applied,
+      runtimeHooks: prior?.runtimeHooks ?? known.runtimeHooks,
       unavailable: known.unavailable,
     };
   }
@@ -2863,11 +4153,736 @@ export function createInstrumentationService(
   }
 
   /**
+   * Validates and sends one `instrumentation.ready` frame to the session's
+   * editor and DevTools clients. A payload the ready schema refuses is logged
+   * with `rejectedMessage`, recorded as a failure and not sent.
+   */
+  function sendReady(
+    failures: CollaboratorFailure[],
+    log: Logger,
+    sessionId: string,
+    ready: ReadyFields,
+    rejectedMessage: string,
+  ): void {
+    const readyPayload = parseInstrumentationReadyPayload({
+      sessionId,
+      applied: ready.applied,
+      runtimeHooks: ready.runtimeHooks,
+      unavailable: ready.unavailable,
+    });
+
+    if (isErr(readyPayload)) {
+      failures.push({
+        collaborator: 'protocol',
+        step: 'instrumentation.ready',
+        ...describeException(readyPayload.error),
+      });
+      log.error(rejectedMessage, { code: readyPayload.error.code });
+      return;
+    }
+
+    const payload: InstrumentationReadyPayload = readyPayload.value;
+    sendToInterfaces(failures, log, sessionId, 'instrumentation.ready', () =>
+      createEnvelope('instrumentation.ready', payload, { ts: clock() }),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // The signal report — runtime shares, their refresh, and the bind replay
+  // -------------------------------------------------------------------------
+
+  /**
+   * The ids of the adapters whose share of a plan's report can be asked again:
+   * registered, given at least one of the plan's actions, and every one of
+   * those actions in `runtime` mode — so asking again writes no file. Read off
+   * the plan's own `adapter` fields and the registry, never off a list of ids.
+   */
+  function refreshableAdapterIds(actions: readonly InstrumentationAction[]): ReadonlySet<string> {
+    const runtimeOnly = new Map<string, boolean>();
+
+    for (const action of actions) {
+      runtimeOnly.set(
+        action.adapter,
+        (runtimeOnly.get(action.adapter) ?? true) && action.mode === RUNTIME_ACTION_MODE,
+      );
+    }
+
+    const ids = new Set<string>();
+
+    for (const [adapterId, onlyRuntime] of runtimeOnly) {
+      if (onlyRuntime && adapters.get(adapterId) !== undefined) {
+        ids.add(adapterId);
+      }
+    }
+
+    return ids;
+  }
+
+  /**
+   * Splits an installer result into the shares of its refreshable adapters, in
+   * registry order, and the fixed rest: the feasibility and grouping gaps, and
+   * every other adapter's hooks and gaps.
+   */
+  function splitReport(
+    result: AggregateInstallResult,
+    refreshable: ReadonlySet<string>,
+  ): { readonly fixed: ReportParts; readonly shares: readonly RuntimeShare[] } {
+    const answersByAdapter = new Map<string, unknown[]>();
+
+    for (const answer of result.perAdapter) {
+      const adapterId: unknown = answer.adapterId;
+
+      if (isNonBlankString(adapterId) && refreshable.has(adapterId)) {
+        const answers = answersByAdapter.get(adapterId) ?? [];
+        answers.push(answer);
+        answersByAdapter.set(adapterId, answers);
+      }
+    }
+
+    const shares: RuntimeShare[] = [];
+
+    for (const adapter of adapters.adapters()) {
+      const answers = answersByAdapter.get(adapter.id);
+      const share = answers === undefined ? undefined : readShare(adapter.id, answers);
+
+      if (share !== undefined) {
+        shares.push(share);
+      }
+    }
+
+    const shared = new Set<string>(shares.map((share) => share.adapterId));
+    const otherHooks = new Set<string>();
+
+    for (const answer of result.perAdapter) {
+      const adapterId: unknown = answer.adapterId;
+      const hooks: unknown = answer.runtimeHooks;
+
+      if (isNonBlankString(adapterId) && shared.has(adapterId)) {
+        continue;
+      }
+
+      if (Array.isArray(hooks)) {
+        for (const hook of hooks.filter(isNonBlankString)) {
+          otherHooks.add(hook);
+        }
+      }
+    }
+
+    return { fixed: fixedPartOf(result, shares, otherHooks), shares };
+  }
+
+  /**
+   * The signal report an install leaves: for an installed plan, split off the
+   * installer's result and judged against the facts the install's context
+   * carried; for an empty delta, the previous version's shares carried over —
+   * judged against the facts they were judged against — with the fixed part
+   * re-derived from the re-announced fields.
+   */
+  function signalReportOf(
+    request: InstallRequest,
+    prepared: PreparedInstall,
+    prior: SessionState | undefined,
+    ready: ReadyFields,
+    plan: InstrumentationPlan,
+  ): SignalReport {
+    const refreshable = refreshableAdapterIds(plan.instrumentationTargets);
+    let fixed: ReportParts;
+    let shares: readonly RuntimeShare[];
+    let judged: ObservedReadinessInputs;
+
+    if (prepared.kind === 'installed') {
+      ({ fixed, shares } = splitReport(prepared.result, refreshable));
+      judged = prepared.context.readiness;
+    } else {
+      const previous =
+        prior?.activePlanVersion === prepared.resolved.delta.previousPlanVersion
+          ? prior.signals
+          : undefined;
+      shares = (previous?.shares ?? []).filter((share) => refreshable.has(share.adapterId));
+      fixed = fixedPartOf(ready, shares, new Set<string>(previous?.fixed.runtimeHooks ?? []));
+      judged = previous?.judged ?? prepared.context.readiness;
+    }
+
+    return {
+      plan,
+      context: { ...prepared.context, signal: undefined },
+      devServerUrl: request.devServerUrl,
+      skipFeasibility: request.skipFeasibility ?? false,
+      requireServerAgent: request.requireServerAgent === true,
+      judged,
+      fixed,
+      shares,
+      awaitingPage: [],
+      confirmed: [],
+      waiting: [],
+    };
+  }
+
+  /**
+   * Asks every share's adapter again, against `readiness`, with the runtime
+   * actions of the report's plan it installs — those that still pass the
+   * feasibility gate, unless the install skipped it.
+   *
+   * Only refreshable adapters have shares, so nothing here can write a file. A
+   * throw, an abort or an answer that is not an ordinary runtime result keeps
+   * that adapter's previous share, as does a feasibility check that cannot be
+   * run; each is logged with the adapter id and the error's closed shape.
+   */
+  async function refreshShares(
+    report: SignalReport,
+    readiness: ObservedReadinessInputs,
+    signal: AbortSignal | undefined,
+    log: Logger,
+  ): Promise<readonly RuntimeShare[]> {
+    if (report.shares.length === 0) {
+      return report.shares;
+    }
+
+    const context: InstrumentationContext = { ...report.context, readiness, signal };
+    const actions = report.plan.instrumentationTargets;
+    const candidates = report.shares.flatMap((share) => runtimeActionsOf(actions, share.adapterId));
+    let feasible: ReadonlySet<string> | undefined;
+
+    if (!report.skipFeasibility) {
+      try {
+        feasible = new Set<string>(
+          checkFeasibility(candidates, context, { resolver: adapters }).feasible.map(
+            (action) => action.id,
+          ),
+        );
+      } catch (thrown) {
+        log.warn(
+          'The runtime actions could not be checked again; the signal report is kept',
+          exceptionFields(thrown),
+        );
+        return report.shares;
+      }
+    }
+
+    const shares: RuntimeShare[] = [];
+
+    for (const share of report.shares) {
+      const adapter = adapters.get(share.adapterId);
+      const shareActions = runtimeActionsOf(actions, share.adapterId).filter(
+        (action) => feasible === undefined || feasible.has(action.id),
+      );
+
+      if (adapter === undefined || shareActions.length === 0 || signal?.aborted === true) {
+        shares.push(share);
+        continue;
+      }
+
+      let answer: unknown;
+
+      try {
+        answer = await adapter.install(shareActions, context);
+      } catch (thrown) {
+        log.warn('A runtime adapter could not be asked again; its share of the report is kept', {
+          adapter: share.adapterId,
+          ...exceptionFields(thrown),
+        });
+        shares.push(share);
+        continue;
+      }
+
+      const refreshed = readShare(share.adapterId, [answer]);
+
+      if (refreshed === undefined) {
+        log.warn(
+          'A runtime adapter answered the refresh with no runtime result; its share is kept',
+          {
+            adapter: share.adapterId,
+          },
+        );
+        shares.push(share);
+        continue;
+      }
+
+      shares.push(refreshed);
+    }
+
+    return shares;
+  }
+
+  /** Cancels the session's background refresh of its signal report, when one runs. */
+  function stopSignalWaiter(sessionId: string): void {
+    const waiter = signalWaiters.get(sessionId);
+
+    if (waiter !== undefined) {
+      signalWaiters.delete(sessionId);
+      waiter.abort();
+    }
+  }
+
+  /**
+   * Starts the session's one background refresh of its signal report,
+   * replacing any that runs: with `immediate`, the report is re-judged at once;
+   * then, while the latest verdict still holds a signal back on the bound page,
+   * the tab's next document is awaited — at most {@link MAX_RELOAD_WAIT_MS} for
+   * each — and the report re-judged when one reports. A timeout ends it, as do
+   * `stopSession`, `dispose`, a newer install, replay or arm.
+   *
+   * Fire and forget: nothing it does is awaited by a caller, and nothing it
+   * meets escapes it.
+   */
+  function startSignalWaiter(sessionId: string, immediate: boolean): void {
+    stopSignalWaiter(sessionId);
+
+    if (disposed || sessions.get(sessionId)?.signals === undefined) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const log = sessionLog(sessionId);
+    signalWaiters.set(sessionId, controller);
+
+    void runSignalWaiter(sessionId, controller.signal, immediate, log)
+      .catch((thrown: unknown) => {
+        log.error('The background refresh of the signal report threw', exceptionFields(thrown));
+      })
+      .finally(() => {
+        if (signalWaiters.get(sessionId) === controller) {
+          signalWaiters.delete(sessionId);
+        }
+      });
+  }
+
+  /** The body of {@link startSignalWaiter}. */
+  async function runSignalWaiter(
+    sessionId: string,
+    signal: AbortSignal,
+    immediate: boolean,
+    log: Logger,
+  ): Promise<void> {
+    if (immediate) {
+      await refreshSignalReport(sessionId, signal, log);
+    }
+
+    let afterDocumentId = sessions.get(sessionId)?.signals?.judged.browserAgent?.documentId;
+
+    while (!signal.aborted && !disposed) {
+      const report = sessions.get(sessionId)?.signals;
+      const tab = knownTabs.get(sessionId);
+
+      if (report === undefined || tab === undefined || report.awaitingPage.length === 0) {
+        return;
+      }
+
+      const next = await waitForNextAgentReady(
+        deps.agents,
+        {
+          tabId: tab.tabId,
+          afterDocumentId,
+          timeoutMs: MAX_RELOAD_WAIT_MS,
+          signal,
+          failureMessage: SIGNAL_WAIT_FAILURE_MESSAGE,
+        },
+        log,
+      );
+
+      if (next === undefined || signal.aborted) {
+        log.debug('No new document reported on the bound tab; the signal report stays as it is', {
+          tabId: tab.tabId,
+        });
+        return;
+      }
+
+      // Waiting again needs a document other than this one, so a report that
+      // changes nothing cannot answer the next wait at once.
+      afterDocumentId = next.documentId;
+      await refreshSignalReport(sessionId, signal, log);
+    }
+  }
+
+  /**
+   * Re-judges one session's signal report against the page as it is now: the
+   * facts are collected again for the tab this service knows, the shares are
+   * asked again when those facts changed, and the readiness gate evaluates the
+   * report's plan — never asking for a reload, never announcing "Ready to
+   * capture" — then {@link publishRefresh} states what changed.
+   *
+   * Skipped while an install for the session runs, and dropped when the
+   * session's report was replaced meanwhile. Never throws.
+   */
+  async function refreshSignalReport(
+    sessionId: string,
+    signal: AbortSignal,
+    log: Logger,
+  ): Promise<void> {
+    const state = sessions.get(sessionId);
+    const report = state?.signals;
+
+    if (disposed || signal.aborted || inFlight.has(sessionId) || state === undefined) {
+      return;
+    }
+
+    if (report === undefined) {
+      return;
+    }
+
+    const current = (): boolean =>
+      !disposed &&
+      !signal.aborted &&
+      !inFlight.has(sessionId) &&
+      sessions.get(sessionId)?.signals === report;
+    const boundTab = knownTabs.get(sessionId);
+
+    try {
+      const evidence = await collectReadinessEvidence(
+        {
+          serverAgents: deps.serverAgents,
+          agents: deps.agents,
+          devServers: deps.devServers,
+          detect: deps.detectDevServer,
+          detectDeps: deps.detectDeps,
+          config: { host: deps.config.host, port: deps.config.port },
+          logger: log,
+          now: clock,
+        },
+        {
+          sessionId,
+          projectRoot: state.projectRoot,
+          boundTab,
+          plan: report.plan,
+          devServerUrl: report.devServerUrl,
+          signal,
+        },
+      );
+
+      if (isErr(evidence)) {
+        log.warn('The page facts could not be collected again; the signal report is kept', {
+          code: evidence.error.code,
+        });
+        return;
+      }
+
+      if (!current()) {
+        return;
+      }
+
+      let judged = evidence.value.observed;
+      let shares = observedFactsDiffer(report.judged, judged)
+        ? await refreshShares(report, judged, signal, log)
+        : report.shares;
+
+      const verdict = await evaluateReadiness(
+        { adapters, agents: deps.agents, logger: log, now: clock, reloadPrompts },
+        {
+          context: { ...report.context, readiness: judged, signal },
+          plan: report.plan,
+          boundTab,
+          devServer: evidence.value.devServer,
+          allowReloadPrompt: false,
+          requireServerAgent: report.requireServerAgent,
+          announceReady: false,
+          signal,
+        },
+      );
+
+      if (isErr(verdict)) {
+        log.warn('Readiness could not be evaluated again; the signal report is kept', {
+          code: verdict.error.code,
+        });
+        return;
+      }
+
+      // The gate may have settled on a report that arrived while it judged.
+      if (observedFactsDiffer(judged, verdict.value.observed)) {
+        judged = verdict.value.observed;
+        shares = await refreshShares({ ...report, shares }, judged, signal, log);
+      }
+
+      if (current()) {
+        publishRefresh(sessionId, report, shares, judged, verdict.value, log);
+      }
+    } catch (thrown) {
+      log.warn('Re-judging the signal report threw; the report is kept', exceptionFields(thrown));
+    }
+  }
+
+  /**
+   * States what a background refresh changed, in the order the progress view
+   * reads: the session's state first; then one corrected
+   * `instrumentation.ready` to both user interfaces when the composed report
+   * differs from the one announced; then each {@link WaitingRow} not shown
+   * yet, or shown with another detail (a tab was bound, its page has not
+   * reported yet); then each waiting row the page answered with a gap,
+   * settled as ✗ in place with that gap's words; then a ✓ row for each signal
+   * the checklist now confirms that no ✓ row has been shown for — replacing
+   * its waiting row in place — and the checklist's one terminal ✗ row, in AAP
+   * §0.5.5 words, for each gap that is not waiting for the page and was not
+   * announced before — or was, but only while its signal waited, so it was
+   * never shown as a failure. Nothing else — no "Ready to capture", which the
+   * orchestrator's own re-gate emits as it moves the session to `ready`, and
+   * which the checklist rows above it keep their places before.
+   */
+  function publishRefresh(
+    sessionId: string,
+    expected: SignalReport,
+    shares: readonly RuntimeShare[],
+    judged: ObservedReadinessInputs,
+    verdict: ReadinessVerdict,
+    log: Logger,
+  ): void {
+    const state = sessions.get(sessionId);
+    const planVersion = expected.plan.planVersion;
+    const config = state?.configs.get(planVersion);
+
+    if (state === undefined || config === undefined || state.activePlanVersion !== planVersion) {
+      return;
+    }
+
+    const folded = foldShares({
+      report: expected,
+      shares,
+      judged,
+      ready: state.ready,
+      config,
+      runtimeHooks: state.runtimeHooks,
+    });
+    const armed = armedCaptureSignals(
+      captureAgentHooks(folded.config.agentHooks, expected.plan.instrumentationTargets),
+      folded.config.serverSignals,
+      folded.runtimeHooks,
+    );
+    const confirmed = confirmedSignals(verdict, armed, folded.ready.unavailable);
+    const awaitingPage = new Set<CaptureSignal>(verdict.awaitingPageSignals ?? []);
+    const shownLabels = new Set<string>(labelsOfSignals(expected.confirmed));
+    const newlyConfirmed = confirmed.filter(
+      (signal) => !shownLabels.has(CAPTURE_SIGNAL_LABELS[signal]),
+    );
+    const checkedLabels = new Set<string>(labelsOfSignals([...expected.confirmed, ...confirmed]));
+    // A signal that was waiting was never shown as a failure, so a gap it now
+    // has is new to the developer even when the report already listed it.
+    const wasWaiting = new Set<string>(expected.awaitingPage);
+    const newGaps = rowGapsOf(folded.ready.unavailable, shares, awaitingPage).filter(
+      (gap) =>
+        wasWaiting.has(gap.signal) ||
+        !state.ready.unavailable.some((announced) => sameGap(announced, gap)),
+    );
+    // Waiting rows: shown anew, or again when what they wait for changed —
+    // a tab was bound, but its page has not reported yet — and settled as ✗
+    // when the page answered with a gap; a ✓ row settles the rest in place.
+    const waiting = waitingRowsOf(verdict, awaitingPage, checkedLabels);
+    const waitingNow = new Set<string>(waiting.map((row) => row.label));
+    const shownWaiting = waiting.filter(
+      (row) =>
+        !expected.waiting.some(
+          (previous) => previous.label === row.label && previous.detail === row.detail,
+        ),
+    );
+    const settledAsFailed: readonly WaitingRow[] = expected.waiting
+      .filter((previous) => !waitingNow.has(previous.label) && !checkedLabels.has(previous.label))
+      .map((previous) => ({
+        label: previous.label,
+        detail: settledDetail(
+          verdict.plannedSignals
+            .filter((signal) => CAPTURE_SIGNAL_LABELS[signal] === previous.label)
+            .map((signal) =>
+              gapFor(signal, [
+                newGaps,
+                verdict.blocking,
+                verdict.degraded,
+                folded.ready.unavailable,
+              ]),
+            ),
+        ),
+      }));
+    // A waiting row settled as ✗ closes its label's row in place; the
+    // checklist's ✗ row for the gap still states the failure in AAP §0.5.5
+    // words (`unavailableSignalMessage`), so every new gap is reported to it.
+    const checklistGaps = newGaps;
+    const configs = new Map<number, ProducerConfig>(state.configs);
+    configs.set(planVersion, folded.config);
+
+    sessions.set(sessionId, {
+      ...state,
+      configs,
+      ready: folded.ready,
+      runtimeHooks: folded.runtimeHooks,
+      signals: {
+        ...folded.report,
+        awaitingPage: [...awaitingPage],
+        confirmed: CAPTURE_SIGNALS.filter(
+          (signal) => expected.confirmed.includes(signal) || confirmed.includes(signal),
+        ),
+        waiting,
+      },
+    });
+
+    const failures: CollaboratorFailure[] = [];
+
+    if (folded.changed) {
+      sendReady(
+        failures,
+        log,
+        sessionId,
+        folded.ready,
+        'The refreshed signal report was rejected by the ready schema and not sent',
+      );
+    }
+
+    emitChecklistRows(failures, log, sessionId, shownWaiting, 'running');
+    emitChecklistRows(failures, log, sessionId, settledAsFailed, 'failed');
+
+    if (newlyConfirmed.length > 0 || checklistGaps.length > 0) {
+      const newlySet = new Set<CaptureSignal>(newlyConfirmed);
+      const rows = buildConfirmedReadiness(verdict, confirmed, checklistGaps, clock, awaitingPage);
+      const readiness = buildReadiness({
+        signals: rows.signals.filter(
+          (row) => isCaptureSignal(row.signal) && newlySet.has(row.signal),
+        ),
+        now: clock,
+      });
+
+      noteProgress(
+        log,
+        'reportInstrumentation',
+        attempt(failures, log, 'progress', 'reportInstrumentation', () =>
+          deps.progress.reportInstrumentation(sessionId, {
+            ...(newlyConfirmed.length === 0 ? {} : { signals: newlyConfirmed, readiness }),
+            ...(checklistGaps.length === 0 ? {} : { unavailable: checklistGaps }),
+          }),
+        ),
+      );
+    }
+
+    log.info('The signal report was brought up to date with the page', {
+      planVersion,
+      changed: folded.changed,
+      newlyConfirmedSignals: newlyConfirmed,
+      newGapSignals: newGaps.map((gap) => gap.signal),
+      unavailableSignals: folded.ready.unavailable.map((gap) => gap.signal),
+      awaitingPageSignals: [...awaitingPage],
+      waitingRows: waiting.map((row) => row.label),
+      settledWaitingRows: settledAsFailed.map((row) => row.label),
+      satisfied: verdict.satisfied,
+      collaboratorFailures: failures.length,
+    });
+  }
+
+  function replaySignalReport(
+    request: SignalReportReplayRequest,
+  ): Result<SignalReportReplayOutcome, DebuggenError> {
+    if (
+      !isObjectRecord(request) ||
+      !isNonBlankString(request.sessionId) ||
+      !isClientKindList(request.kinds) ||
+      (request.boundTab !== undefined && !isBoundTab(request.boundTab))
+    ) {
+      return err(
+        wiringError(
+          'A signal report was replayed without a session id, client kinds or a valid tab binding.',
+          'Pass the session id, the client kinds to replay to and the binding as the session record holds it.',
+          'request',
+        ),
+      );
+    }
+
+    if (disposed) {
+      return err(
+        new DebuggenError('INTERNAL', 'The instrumentation service has been shut down.', {
+          hint: 'Restart the Debug Generator service, then bind the tab again.',
+        }),
+      );
+    }
+
+    const { sessionId, kinds } = request;
+    const log = sessionLog(sessionId);
+
+    if (request.boundTab !== undefined) {
+      knownTabs.set(sessionId, request.boundTab);
+
+      // The running install built its verdict without this tab: the report it
+      // leaves is re-judged against the tab once it is over.
+      if (inFlight.has(sessionId)) {
+        boundDuringInstall.add(sessionId);
+      }
+    }
+
+    const state = sessions.get(sessionId);
+    const report = state?.signals;
+    const failed = failedReports.get(sessionId);
+
+    if ((state === undefined || report === undefined) && failed === undefined) {
+      log.debug('No signal report is held for the session; nothing was replayed');
+      return ok('nothing-to-replay');
+    }
+
+    const failures: CollaboratorFailure[] = [];
+
+    if (state !== undefined && report !== undefined) {
+      const payload = parseInstrumentationReadyPayload({
+        sessionId,
+        applied: state.ready.applied,
+        runtimeHooks: state.ready.runtimeHooks,
+        unavailable: state.ready.unavailable,
+      });
+
+      if (isErr(payload)) {
+        log.error('The held signal report was rejected by the ready schema and not replayed', {
+          code: payload.error.code,
+        });
+      } else {
+        const value: InstrumentationReadyPayload = payload.value;
+        attempt(failures, log, 'broadcaster', 'instrumentation.ready.replay', () => {
+          deps.broadcaster.broadcastToKinds(
+            sessionId,
+            kinds,
+            createEnvelope('instrumentation.ready', value, { ts: clock() }),
+          );
+        });
+      }
+    }
+
+    if (failed !== undefined) {
+      attempt(failures, log, 'broadcaster', 'instrumentation.failed.replay', () => {
+        deps.broadcaster.broadcastToKinds(
+          sessionId,
+          kinds,
+          createEnvelope('instrumentation.failed', failed, { ts: clock() }),
+        );
+      });
+    }
+
+    if (report !== undefined && hasRefreshableGap(report) && knownTabs.has(sessionId)) {
+      startSignalWaiter(sessionId, true);
+    }
+
+    log.info('The latest signal report was replayed', {
+      kinds: [...kinds],
+      ready: report !== undefined,
+      failed: failed !== undefined,
+      refreshing: signalWaiters.has(sessionId),
+    });
+
+    if (failures.length > 0) {
+      return err(
+        new DebuggenError(
+          'INTERNAL',
+          'The latest signal report could not be replayed to the session’s clients.',
+          {
+            hint: 'Check the service log for the failing collaborator, then bind the tab again.',
+            details: { failures: failures.map((failure) => ({ ...failure })) },
+          },
+        ),
+      );
+    }
+
+    return ok('replayed');
+  }
+
+  /**
    * The success branch, in the order the progress view must read (AAP §0.5.5,
    * prompt §11 Step 8):
    *
    * 1. Records the session's state and broadcasts `instrumentation.ready` with
-   *    the installer's three fields as they are.
+   *    the installer's three fields as they are — `applied` being only the
+   *    records this install wrote, so a follow-up announces its delta alone —
+   *    except that a preload gap's hint is the detection's exact relaunch
+   *    command when the preload is missing ({@link withDetectedRelaunchHints});
+   *    or, for a delta that installs nothing, {@link emptyDeltaReady}'s empty
+   *    `applied` beside the session's current hooks and gaps.
    * 2. Evaluates readiness **first**, with `announceReady: false`, so "Ready to
    *    capture" cannot precede the rows it closes. A reload request the gate
    *    emits is the only row that may come before the checklist.
@@ -2875,20 +4890,24 @@ export function createInstrumentationService(
    *    it ({@link captureAgentHooks}, {@link armedCaptureSignals}) and the
    *    verdict found it deliverable without blocking on it, minus the
    *    installer's unavailable signals ({@link confirmedSignals}).
-   * 4. Emits one degradation row per unavailable signal, naming only the
-   *    confirmed signals after "Continuing with:".
-   * 5. Reports the checklist as the confirmed signals, the installer's
+   * 4. Reports the checklist as the confirmed signals, the installer's
    *    unavailable entries and an aggregate readiness report
    *    ({@link buildConfirmedReadiness}) — never as the requested hook
    *    configuration, signal set or runtime hooks, whose label rule would
    *    re-add a ✓ for a signal readiness withdrew (a `Database tracing`
-   *    runtime hook with no connected preload).
+   *    runtime hook with no connected preload). The checklist is the one
+   *    report of each unavailable signal: its terminal ✗ row, worded
+   *    "Could not enable ‹signal›: ‹reason›. Continuing with: ‹confirmed
+   *    labels›." with the hint as detail. No other row is emitted for it.
+   * 5. Returns as `degradations` the same sentences
+   *    ({@link buildDegradationNotice} over the confirmed labels), byte for
+   *    byte the messages of those ✗ rows.
    * 6. Emits "Ready to capture" once, last, and only for a satisfied verdict.
    *
    * When readiness cannot be evaluated — a collaborator threw, or it answered
-   * `Err` — nothing is presented as enabled: the degradation rows name no
-   * signal, the checklist carries only the installer's ✗ rows, no ready row is
-   * emitted, and the error is returned.
+   * `Err` — nothing is presented as enabled: the checklist carries only the
+   * installer's ✗ rows, whose sentences continue with "no confirmed signal",
+   * no ready row is emitted, and the error is returned.
    */
   async function completeInstall(
     failures: CollaboratorFailure[],
@@ -2931,11 +4950,42 @@ export function createInstrumentationService(
       const previousPlanVersion = prepared.resolved.delta.previousPlanVersion;
       config =
         prior?.configs.get(previousPlanVersion) ?? deriveConfig(prepared.resolved.previousActions);
-      ready = await currentReady(failures, log, sessionId, prior, previousPlanVersion);
+      ready = emptyDeltaReady(prior, previousPlanVersion);
       runtimeHooks = ready.runtimeHooks;
     }
 
-    if (!disposed) {
+    // AAP §0.5.5: with the preload missing, every preload gap carries the exact
+    // relaunch command this install's detection composed. Substituted before
+    // the state is recorded, so the ready frame, the degradation rows, the
+    // checklist and the outcome all show the same command.
+    const pageHooks = captureAgentHooks(config.agentHooks, plan.instrumentationTargets);
+    ready = {
+      ...ready,
+      unavailable: withDetectedRelaunchHints(
+        ready.unavailable,
+        prepared.evidence.devServer,
+        pageHooks,
+      ),
+    };
+
+    let report = signalReportOf(request, prepared, prior, ready, plan);
+
+    /** Folds refreshed shares into the install's report, fields and configuration. */
+    const fold = (shares: readonly RuntimeShare[], judged: ObservedReadinessInputs): boolean => {
+      const folded = foldShares({ report, shares, judged, ready, config, runtimeHooks });
+      report = folded.report;
+      ready = folded.ready;
+      config = folded.config;
+      runtimeHooks = folded.runtimeHooks;
+      return folded.changed;
+    };
+
+    /** Records the session's state as the install now describes it. */
+    const writeState = (): void => {
+      if (disposed) {
+        return;
+      }
+
       const configs = new Map<number, ProducerConfig>(
         prior !== undefined && prior.projectRoot === projectRoot ? prior.configs : [],
       );
@@ -2948,32 +4998,43 @@ export function createInstrumentationService(
         configs,
         ready,
         runtimeHooks,
-        armedCaptureId: prior?.armedCaptureId,
+        // Written twice when the report is corrected: the second write keeps
+        // whatever capture was armed in between.
+        armedCaptureId: (sessions.get(sessionId) ?? prior)?.armedCaptureId,
+        signals: report,
       });
-    }
+    };
 
-    const readyPayload = parseInstrumentationReadyPayload({
-      sessionId,
-      applied: ready.applied,
-      runtimeHooks: ready.runtimeHooks,
-      unavailable: ready.unavailable,
-    });
-
-    if (isErr(readyPayload)) {
-      failures.push({
-        collaborator: 'protocol',
-        step: 'instrumentation.ready',
-        ...describeException(readyPayload.error),
-      });
-      log.error('The installer result was rejected by the ready schema and not sent', {
-        code: readyPayload.error.code,
-      });
-    } else {
-      const payload: InstrumentationReadyPayload = readyPayload.value;
-      sendToInterfaces(failures, log, sessionId, 'instrumentation.ready', () =>
-        createEnvelope('instrumentation.ready', payload, { ts: clock() }),
+    // An empty delta re-announces the previous version's report, which was
+    // judged against the page as it was then: brought up to date with the
+    // facts this install collected, it is never re-announced stale.
+    if (
+      prepared.kind === 'unchanged' &&
+      observedFactsDiffer(report.judged, prepared.context.readiness)
+    ) {
+      fold(
+        await refreshShares(report, prepared.context.readiness, request.signal, log),
+        prepared.context.readiness,
       );
     }
+
+    writeState();
+
+    if (!disposed) {
+      failedReports.delete(sessionId);
+
+      if (request.boundTab !== undefined) {
+        knownTabs.set(sessionId, request.boundTab);
+      }
+    }
+
+    sendReady(
+      failures,
+      log,
+      sessionId,
+      ready,
+      'The installer result was rejected by the ready schema and not sent',
+    );
 
     // Readiness is judged before a single checklist row is sent, and told not
     // to announce "Ready to capture" itself: that row closes the group below,
@@ -3015,7 +5076,6 @@ export function createInstrumentationService(
     if (verdict === undefined || isErr(verdict)) {
       // Without a verdict nothing is confirmed, so nothing is shown as
       // enabled: the installer's gaps are still reported, as ✗ rows only.
-      emitDegradations(failures, log, sessionId, ready.unavailable, []);
       reportChecklist({ unavailable: ready.unavailable });
 
       if (verdict === undefined) {
@@ -3029,21 +5089,61 @@ export function createInstrumentationService(
       return err(withPlanVersions(verdict.error, { planVersion, activePlanVersion: planVersion }));
     }
 
+    // The verdict judged the page as it is now — after the gate settled on a
+    // report that was in flight, or on the reloaded document. When that is not
+    // the page the runtime shares were judged against, they are asked again
+    // before anything is confirmed, and the corrected report is announced
+    // once, in place of the stale one.
+    if (observedFactsDiffer(report.judged, verdict.value.observed)) {
+      const changed = fold(
+        await refreshShares(report, verdict.value.observed, request.signal, log),
+        verdict.value.observed,
+      );
+
+      writeState();
+
+      if (changed) {
+        sendReady(
+          failures,
+          log,
+          sessionId,
+          ready,
+          'The corrected signal report was rejected by the ready schema and not sent',
+        );
+      }
+    }
+
     const armed = armedCaptureSignals(
       captureAgentHooks(config.agentHooks, plan.instrumentationTargets),
       config.serverSignals,
       runtimeHooks,
     );
     const confirmed = confirmedSignals(verdict.value, armed, ready.unavailable);
+    // A signal held back only on the page gate — no tab bound yet, or the
+    // bound tab's page not reported — is still listed in
+    // `instrumentation.ready`, but shown neither as a degradation nor as ✗:
+    // its checklist row waits, and turns ✓ in place once the page reports.
+    const awaitingPage = new Set<CaptureSignal>(verdict.value.awaitingPageSignals ?? []);
+    const rowGaps = rowGapsOf(ready.unavailable, report.shares, awaitingPage);
     const enabledLabels = labelsOfSignals(confirmed);
-    const degradations = buildDegradationNotice(ready.unavailable, enabledLabels);
+    // The checklist below derives its ✓ labels — and so every ✗ row's
+    // "Continuing with:" list — from `confirmed` alone (none of them is
+    // withdrawn: `confirmedSignals` removed the installer's gaps, and the
+    // aggregate readiness marks every confirmed signal available or degraded),
+    // so these sentences are byte for byte the messages of its ✗ rows for the
+    // gaps it shows.
+    const degradations = buildDegradationNotice(rowGaps, enabledLabels);
+    const waiting = waitingRowsOf(verdict.value, awaitingPage, new Set<string>(enabledLabels));
 
-    emitDegradations(failures, log, sessionId, ready.unavailable, enabledLabels);
+    emitChecklistRows(failures, log, sessionId, waiting, 'running');
     reportChecklist({
       signals: confirmed,
-      unavailable: ready.unavailable,
-      readiness: buildConfirmedReadiness(verdict.value, confirmed, ready.unavailable, clock),
+      unavailable: rowGaps,
+      readiness: buildConfirmedReadiness(verdict.value, confirmed, rowGaps, clock, awaitingPage),
     });
+
+    report = { ...report, awaitingPage: [...awaitingPage], confirmed, waiting };
+    writeState();
 
     if (verdict.value.satisfied) {
       noteProgress(
@@ -3053,6 +5153,12 @@ export function createInstrumentationService(
           deps.progress.readyToCapture(sessionId),
         ),
       );
+    }
+
+    // The page is still awaited: the report is corrected, and the newly
+    // confirmed signals checked, when the bound tab's next document reports.
+    if (awaitingPage.size > 0 && request.boundTab !== undefined) {
+      startSignalWaiter(sessionId, false);
     }
 
     if (failures.length > 0) {
@@ -3066,6 +5172,7 @@ export function createInstrumentationService(
       runtimeHooks: ready.runtimeHooks.length,
       unavailableSignals: ready.unavailable.map((entry) => entry.signal),
       confirmedSignals: confirmed,
+      awaitingPageSignals: [...awaitingPage],
       satisfied: verdict.value.satisfied,
     });
 
@@ -3096,6 +5203,15 @@ export function createInstrumentationService(
    * row's `SessionFailure` carries nothing the installer copied from an
    * adapter or an exception.
    *
+   * The preload gaps {@link withServiceRelaunchHint} named for this failure
+   * come first, once, as the stage's ✗ rows — "Could not enable Server spans:
+   * ‹reason›." and the other preload signals, each with the exact relaunch
+   * command as its detail — so a plain dev server is reported as missing its
+   * preload whichever signal the installer named (AAP §0.5.5). They are sent
+   * whether or not this call emits the failed row, since a caller that emits
+   * it does so after the install returns. Every text in them is product
+   * authored.
+   *
    * The error itself is kept for the local log only, under
    * {@link LOG_ERROR_FIELD_KEY} and the diagnostic reference the frame shows:
    * a `warn` record, written at the default levels, where the serializer emits
@@ -3109,6 +5225,7 @@ export function createInstrumentationService(
     checked: CheckedInstall,
     prior: SessionState | undefined,
     error: DebuggenError,
+    preloadGaps: readonly UnavailableSignal[],
   ): Result<never, DebuggenError> {
     const { sessionId, plan } = checked;
     const planVersion = plan.planVersion;
@@ -3117,6 +5234,16 @@ export function createInstrumentationService(
     const failed = toFailedError(error, ref);
     const payload = parseInstrumentationFailedPayload({ sessionId, error: failed });
 
+    if (preloadGaps.length > 0) {
+      noteProgress(
+        log,
+        'reportInstrumentation',
+        attempt(failures, log, 'progress', 'reportInstrumentation', () =>
+          deps.progress.reportInstrumentation(sessionId, { unavailable: preloadGaps }),
+        ),
+      );
+    }
+
     if (isErr(payload)) {
       log.error('The failure report was rejected and not sent', { code: payload.error.code });
     } else {
@@ -3124,6 +5251,11 @@ export function createInstrumentationService(
       sendToInterfaces(failures, log, sessionId, 'instrumentation.failed', () =>
         createEnvelope('instrumentation.failed', value, { ts: clock() }),
       );
+
+      // Kept so a panel that binds later is told the latest install failed.
+      if (!disposed) {
+        failedReports.set(sessionId, value);
+      }
     }
 
     if (request.reportStageFailure !== false) {
@@ -3149,6 +5281,7 @@ export function createInstrumentationService(
       planVersion,
       activePlanVersion,
       collaboratorFailures: failures.length,
+      preloadGapSignals: preloadGaps.map((gap) => gap.signal),
       [LOG_ERROR_FIELD_KEY]: error,
     });
     log.debug('The diagnostic of a failed instrumentation install', {
@@ -3168,6 +5301,8 @@ export function createInstrumentationService(
     const { sessionId, projectRoot, plan } = checked;
     const log = sessionLog(sessionId);
     const failures: CollaboratorFailure[] = [];
+    /** The preload gaps an installer failure owes ✗ rows for; filled by `prepareInstall`. */
+    const failedPreloadGaps: UnavailableSignal[] = [];
     const prior = sessions.get(sessionId);
 
     noteProgress(
@@ -3205,7 +5340,7 @@ export function createInstrumentationService(
       );
     } else {
       try {
-        prepared = await prepareInstall(request, checked, prior, log);
+        prepared = await prepareInstall(request, checked, prior, log, failedPreloadGaps);
       } catch (thrown) {
         const error = DebuggenError.from(thrown, 'INTERNAL');
         log.error('Preparing or running the install threw', {
@@ -3219,7 +5354,7 @@ export function createInstrumentationService(
     await settleWatcher(failures, log, sessionId, projectRoot);
 
     if (isErr(prepared)) {
-      return failInstall(failures, log, request, checked, prior, prepared.error);
+      return failInstall(failures, log, request, checked, prior, prepared.error, failedPreloadGaps);
     }
 
     return completeInstall(failures, log, request, checked, prior, prepared.value);
@@ -3259,6 +5394,8 @@ export function createInstrumentationService(
     }
 
     inFlight.add(sessionId);
+    // A newer install supersedes the background refresh of the previous report.
+    stopSignalWaiter(sessionId);
 
     try {
       return await runInstall(request, checked.value);
@@ -3271,6 +5408,26 @@ export function createInstrumentationService(
       return err(error);
     } finally {
       inFlight.delete(sessionId);
+      refreshAfterBindDuringInstall(sessionId);
+    }
+  }
+
+  /**
+   * Re-judges, at once, the report an install just left when a bind named the
+   * session's tab while that install ran: the install's verdict saw no tab (or
+   * the previous one), and the refresh skips a session whose install is in
+   * flight, so without this the report would wait for the next capture to be
+   * corrected. Runs only once the install is no longer in flight.
+   */
+  function refreshAfterBindDuringInstall(sessionId: string): void {
+    if (!boundDuringInstall.delete(sessionId) || disposed) {
+      return;
+    }
+
+    const signals = sessions.get(sessionId)?.signals;
+
+    if (signals !== undefined && hasRefreshableGap(signals) && knownTabs.has(sessionId)) {
+      startSignalWaiter(sessionId, true);
     }
   }
 
@@ -3326,11 +5483,14 @@ export function createInstrumentationService(
   }
 
   /**
-   * Emits the AAP §0.5.5 rows for the server signals a capture proceeds
-   * without because the preload could not be reached, skipping every signal
-   * the install already reported unavailable. The "Continuing with" list keeps
-   * a signal the page agent still collects (`fetch` is both a page hook and a
-   * preload signal), so it never claims the page's share is gone.
+   * Emits the AAP §0.5.5 ✗ rows for the server signals a capture proceeds
+   * without because the preload could not be reached — one terminal `failed`
+   * row per signal, once per capture, shaped as the checklist's ✗ rows
+   * ({@link emitPreloadGapRows}) — skipping every signal the install already
+   * reported unavailable. The "Continuing with" list keeps a signal the page
+   * agent still collects (`fetch` is both a page hook and a preload signal),
+   * so no other row claims the page's share is gone; like every such
+   * sentence, a row never lists its own signal's label.
    */
   function reportPreloadGaps(
     log: Logger,
@@ -3359,7 +5519,7 @@ export function createInstrumentationService(
       CAPTURE_SIGNALS.filter((signal) => armed.has(signal) && !gone.has(signal)),
     );
 
-    emitDegradations([], log, sessionId, fresh, enabledLabels);
+    emitPreloadGapRows(log, sessionId, fresh, enabledLabels);
   }
 
   function restoreArming(input: RestoreArmingInput): Result<ArmingSnapshot, DebuggenError> {
@@ -3649,6 +5809,15 @@ export function createInstrumentationService(
       serverAgent,
       unavailableSignals: unavailable.map((entry) => entry.signal),
     });
+
+    // The capture's own readiness gate has just judged the page. A report
+    // still holding a gap the page could clear is re-judged in the background,
+    // so the signals the capture arms are not left announced as unavailable.
+    const signals = sessions.get(sessionId)?.signals;
+
+    if (signals !== undefined && hasRefreshableGap(signals) && knownTabs.has(sessionId)) {
+      startSignalWaiter(sessionId, true);
+    }
 
     return ok({
       sessionId,
@@ -4179,6 +6348,33 @@ export function createInstrumentationService(
     return ok('dormant-unreachable');
   }
 
+  function pageAgentReleased(sessionId: string): Result<PageAgentReleaseOutcome, DebuggenError> {
+    if (!isNonBlankString(sessionId)) {
+      return err(
+        wiringError(
+          'A released page agent was reported without a session id.',
+          'Pass the id of the session whose tab was refused a re-bind.',
+          'sessionId',
+        ),
+      );
+    }
+
+    const owed = pending.get(sessionId);
+
+    if (owed?.pageCaptureId === undefined) {
+      return ok('nothing-owed');
+    }
+
+    // Recorded as delivered: the refused tab's service worker returns its
+    // page agent to dormant on the refusal (see the interface contract).
+    recordDormantPage(sessionId, owed.projectRoot, owed.pageCaptureId);
+    sessionLog(sessionId).info(
+      'The owed page disarm was settled: the tab re-announcing the ended session was refused, and its worker returns the page agent to dormant',
+      { [LOG_BINDING_KEYS.captureId]: owed.pageCaptureId },
+    );
+    return ok('settled');
+  }
+
   /**
    * Which producers a plan arms for a capture: the page agent when any page
    * hook is enabled (the installer's configuration widened by the plan's
@@ -4294,6 +6490,10 @@ export function createInstrumentationService(
 
     watched.delete(sessionId);
     sessions.delete(sessionId);
+    stopSignalWaiter(sessionId);
+    failedReports.delete(sessionId);
+    knownTabs.delete(sessionId);
+    boundDuringInstall.delete(sessionId);
 
     // What the producers still hold is not this session's plan state: an armed
     // producer and an owed disarm are kept, so a later disarm or reconnect
@@ -4337,6 +6537,15 @@ export function createInstrumentationService(
     serverArmedAt.clear();
     pending.clear();
     dormancyListeners.clear();
+    failedReports.clear();
+    knownTabs.clear();
+    boundDuringInstall.clear();
+
+    for (const waiter of signalWaiters.values()) {
+      waiter.abort();
+    }
+
+    signalWaiters.clear();
   }
 
   return {
@@ -4355,7 +6564,9 @@ export function createInstrumentationService(
     producerConnected,
     reconcileBoundSession,
     releaseInterruptedCapture,
+    pageAgentReleased,
     pendingDisarms: (sessionId) => producersOf(pending.get(sessionId)),
     onDormancyConfirmed,
+    replaySignalReport,
   };
 }

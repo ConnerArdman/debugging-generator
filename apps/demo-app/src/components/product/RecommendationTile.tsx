@@ -154,6 +154,12 @@ export function RecommendationTile({ item, variant = 'detail', className }: Prop
           paint. The stylesheet then fits the drawing inside that frame, and keeps the frame
           legible on its own when images are turned off.
 
+          The picture is loaded lazily and decoded asynchronously, in both variants alike: a
+          suggestion strip is secondary content that mostly sits below the fold, so its files wait
+          until the reader scrolls near them rather than competing with the product's own artwork
+          for the first paint, while a tile already on screen still loads at once. Because the
+          frame is reserved, a picture that arrives late moves nothing around it.
+
           `alt=""` because the thumbnail is decorative here: it is a product photograph, most often
           the shared placeholder drawing, inside a link that already prints the product's name and
           its price as text. Naming it after the product would put that name into the link's
@@ -162,7 +168,15 @@ export function RecommendationTile({ item, variant = 'detail', className }: Prop
           `ProductCard` and the cart's `CartLineRow` treat their thumbnails the same way, for the
           same reason.
         */}
-        <img className={styles.image} src={src} alt="" width={400} height={300} />
+        <img
+          className={styles.image}
+          src={src}
+          alt=""
+          width={400}
+          height={300}
+          loading="lazy"
+          decoding="async"
+        />
       </span>
       <span className={styles.body}>
         <span className={styles.name}>{item.name}</span>

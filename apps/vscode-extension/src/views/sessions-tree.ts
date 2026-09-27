@@ -12,12 +12,23 @@
  *
  * ```text
  * Sessions
- * ├─ web-client                        2 sessions
- * │  └─ Fri, Sep 25, 2026              2 sessions
- * │     ├─ ✓ ‹question, one line›      generated
- * │     └─ ● ‹question, one line›      capturing
+ * ├─ web-client                        4 sessions
+ * │  └─ Fri, Sep 25, 2026              4 sessions
+ * │     ├─ ● ‹question A, one line›    3:05 PM · capturing
+ * │     ├─ ✓ ‹question B, one line›    2:41:38 PM · generated
+ * │     ├─ ✓ ‹question B, one line›    2:41:07 PM · generated
+ * │     └─ ◷ ‹question B, one line›    11:12 AM · ended
  * └─ admin-portal                      1 session
  * ```
+ *
+ * A session row's description is the local time of day it was created, then
+ * its status; the day row above it already names the date. Two rows of one
+ * day row that would read identically — the same label and the same minute,
+ * as the two `2:41` rows above — show seconds instead, so rows that share a
+ * question stay distinguishable without hovering. The time leads because it
+ * is the part that tells such rows apart: a narrow sidebar truncates a
+ * description from its end, and the status it would cut is still shown by
+ * the row's icon (see {@link formatSessionDescription}).
  *
  * ## Fetch and project, nothing more
  *
@@ -50,7 +61,11 @@
  * - **Every label is data.** Labels, descriptions and tooltips are derived from
  *   list-row fields and the listing's `total`; nothing inspects what a
  *   question means, nothing is seeded or canned, and the question is only
- *   whitespace-collapsed and truncated for display (AAP §0.5.4).
+ *   whitespace-collapsed and truncated for display (AAP §0.5.4). The one
+ *   place two questions meet is display disambiguation: sibling rows whose
+ *   already-formatted labels are equal, and whose times read the same, show
+ *   seconds. That compares what the rows would display, never what a question
+ *   says, and it selects a time precision, never a result.
  *
  * ## When the tree fetches — and the loop it must never enter
  *
@@ -233,6 +248,24 @@ const DAY_FORMAT: Intl.DateTimeFormatOptions = Object.freeze({
   day: 'numeric',
 });
 
+/**
+ * How a session row states the time of day it was created — hours and
+ * minutes in the locale's own clock (`2:41 PM`, `14:41`). The day row above it
+ * names the date, so the row repeats none of it.
+ */
+const TIME_OF_DAY_FORMAT: Intl.DateTimeFormatOptions = Object.freeze({ timeStyle: 'short' });
+
+/**
+ * {@link TIME_OF_DAY_FORMAT} with seconds (`2:41:07 PM`), for the rows of one
+ * day row that would otherwise read identically.
+ */
+const PRECISE_TIME_OF_DAY_FORMAT: Intl.DateTimeFormatOptions = Object.freeze({
+  timeStyle: 'medium',
+});
+
+/** Separates a session row's time of day from its status, as the other one-line summaries do. */
+const DESCRIPTION_SEPARATOR = ' · ';
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -257,6 +290,16 @@ export interface SessionFormatOptions {
    * falls back to that default rather than throwing.
    */
   readonly locale?: string | undefined;
+}
+
+/** Options for {@link formatSessionDescription}. */
+export interface SessionDescriptionOptions extends SessionFormatOptions {
+  /**
+   * Whether the time of day carries seconds. The tree sets it for the rows of
+   * one day row that share a label and a minute ({@link SessionNode.preciseTime});
+   * omitted or `false` means hours and minutes.
+   */
+  readonly precise?: boolean | undefined;
 }
 
 /** Options for {@link groupSessions}. */
@@ -315,6 +358,13 @@ export interface SessionNode {
   readonly sessionId: string;
   /** The list row the tree item renders. */
   readonly session: SessionListItem;
+  /**
+   * Whether the row's description states its creation time to the second:
+   * true when another session of the same day row has the same displayed
+   * label and the same hours-and-minutes text, so the two rows would
+   * otherwise read identically. Omitted means `false`.
+   */
+  readonly preciseTime?: boolean | undefined;
 }
 
 /** Which non-data state a {@link MessageNode} renders. */
@@ -402,6 +452,53 @@ export interface SessionsTreeDeps {
 export function formatSessionLabel(question: string): string {
   const label = collapseText(question, MAX_SESSION_LABEL_LENGTH);
   return label.length === 0 ? UNTITLED_SESSION_LABEL : label;
+}
+
+/**
+ * A session row's description: the local time of day it was created, in the
+ * locale's own clock, then its status.
+ *
+ * The time of day is the part that tells apart the rows of one day row —
+ * sessions asked with the same question otherwise share a label and often a
+ * status. The day row above names the date, so only the time is added. With
+ * `precise`, the time carries seconds; the tree asks for that only for rows
+ * that would still read identically at minute precision
+ * ({@link SessionNode.preciseTime}).
+ *
+ * The time comes first because VS Code truncates a row's description from
+ * its end when the sidebar is too narrow for label and description: what
+ * survives is the distinguishing time, while the status it cuts is still
+ * shown by the row's status icon and spelled out in its tooltip.
+ *
+ * A `createdAt` that is not a representable instant (not finite, or outside
+ * the range `Date` accepts) renders the status alone. Such a session is
+ * already listed under the "Unknown date" day row, so an "unknown time"
+ * prefix would restate that row and distinguish nothing.
+ *
+ * @example
+ * ```ts
+ * formatSessionDescription(row, { locale: 'en-US' });                  // '2:41 PM · ended'
+ * formatSessionDescription(row, { locale: 'en-US', precise: true });   // '2:41:07 PM · ended'
+ * formatSessionDescription(row, { locale: 'de-DE' });                  // '14:41 · ended'
+ * formatSessionDescription({ ...row, createdAt: Number.NaN });         // 'ended'
+ * ```
+ *
+ * @param session The row's status and creation time, in epoch milliseconds.
+ * @param options The locale the time is formatted in, and whether it carries seconds.
+ * @returns The description, for example `2:41 PM · ended`.
+ */
+export function formatSessionDescription(
+  session: Pick<SessionListItem, 'status' | 'createdAt'>,
+  options: SessionDescriptionOptions = {},
+): string {
+  if (!isRepresentableInstant(session.createdAt)) {
+    return session.status;
+  }
+  const format = createDateTimeFormat(
+    options.locale,
+    options.precise === true ? PRECISE_TIME_OF_DAY_FORMAT : TIME_OF_DAY_FORMAT,
+  );
+  return `${format.format(session.createdAt)}${DESCRIPTION_SEPARATOR}${session.status}`;
 }
 
 /**
@@ -572,6 +669,65 @@ function groupByDay(projectRoot: string, ordered: readonly SessionListItem[]): r
 }
 
 /**
+ * The ids of a day row's sessions whose descriptions must carry seconds: each
+ * session that shares both its displayed label ({@link formatSessionLabel})
+ * and its hours-and-minutes text with another session of the same day row.
+ * Every other row keeps the shorter time.
+ *
+ * Decided per day row because that is what a developer compares: the rows
+ * listed together under one date. A session of another day or project is
+ * never mistaken for one of these, so it never lengthens their times.
+ *
+ * Display disambiguation only (AAP §0.5.4): the keys are the texts the rows
+ * would display, grouped for equality. Nothing reads what a question says,
+ * and the outcome is a time precision, never a different result. Two
+ * sessions created under one label within the same second still read alike:
+ * seconds are the finest unit a locale's clock names, and no finer unit is
+ * invented for two submissions that are, to the developer, one moment.
+ *
+ * @param sessions One day row's sessions.
+ * @param locale The locale the rows' times are formatted in, so the texts
+ *   compared are exactly the texts rendered.
+ * @returns The ids to render with seconds; empty when no two rows collide.
+ */
+function sessionsNeedingSeconds(
+  sessions: readonly SessionListItem[],
+  locale: string | undefined,
+): ReadonlySet<string> {
+  const precise = new Set<string>();
+  if (sessions.length < 2) {
+    return precise;
+  }
+  const format = createDateTimeFormat(locale, TIME_OF_DAY_FORMAT);
+  const idsByAppearance = new Map<string, string[]>();
+  for (const session of sessions) {
+    // A row without a representable time shows its status alone, and seconds
+    // would not change that.
+    if (!isRepresentableInstant(session.createdAt)) {
+      continue;
+    }
+    // `\n` cannot occur in either part — the label has every run of
+    // whitespace and control characters collapsed to one space, and a
+    // formatted time holds no line break — so the joined key is unambiguous.
+    const appearance = `${format.format(session.createdAt)}\n${formatSessionLabel(session.question)}`;
+    const ids = idsByAppearance.get(appearance);
+    if (ids === undefined) {
+      idsByAppearance.set(appearance, [session.id]);
+    } else {
+      ids.push(session.id);
+    }
+  }
+  for (const ids of idsByAppearance.values()) {
+    if (ids.length > 1) {
+      for (const id of ids) {
+        precise.add(id);
+      }
+    }
+  }
+  return precise;
+}
+
+/**
  * The root of the project holding the most recently updated session; the
  * first project in display order wins a tie.
  */
@@ -690,6 +846,16 @@ function formatCount(count: number, singular: string, plural: string): string {
 /** A timestamp in the given format, or `unknown` when it is not a finite number. */
 function formatTimestamp(epochMs: number, format: Intl.DateTimeFormat): string {
   return Number.isFinite(epochMs) ? format.format(epochMs) : 'unknown';
+}
+
+/**
+ * Whether an epoch-millisecond timestamp names an instant `Date` can hold:
+ * finite and within ±8.64e15 ms. `Intl.DateTimeFormat.format` throws
+ * `RangeError` for anything else, and a tree item must never throw; this is
+ * the same test {@link localDayOf} applies before it names a day.
+ */
+function isRepresentableInstant(epochMs: number): boolean {
+  return Number.isFinite(new Date(epochMs).getTime());
 }
 
 /** A day row's label: the weekday and date of its local midnight. */
@@ -1056,14 +1222,15 @@ export class SessionsTreeProvider
    * recovery affordance instead of VS Code's generic error.
    *
    * Only the root may fetch, and only when {@link fetchWarranted} says so;
-   * project and day rows derive their children from the node alone.
+   * project and day rows derive their children from the node alone (and the
+   * provider's locale, which decides which session rows need seconds).
    */
   async getChildren(element?: SessionsTreeNode): Promise<SessionsTreeNode[]> {
     try {
       if (this.disposed) {
         return [];
       }
-      return element === undefined ? await this.rootChildren() : childrenOf(element);
+      return element === undefined ? await this.rootChildren() : childrenOf(element, this.locale);
     } catch (error) {
       this.log.error('The Sessions view could not be built', { code: errorCode(error) });
       return [RENDER_FAILED_NODE];
@@ -1319,6 +1486,12 @@ export class SessionsTreeProvider
     return item;
   }
 
+  /**
+   * A session row: the question as its label, and `‹time of day› · ‹status›`
+   * as its description (`2:41 PM · ended`; `2:41:07 PM · ended` when
+   * {@link SessionNode.preciseTime} is set), so rows sharing a question differ
+   * without hovering, even where a narrow sidebar truncates the description.
+   */
   private sessionItem(node: SessionNode): vscode.TreeItem {
     const { session } = node;
     const item = new vscode.TreeItem(
@@ -1326,7 +1499,10 @@ export class SessionsTreeProvider
       vscode.TreeItemCollapsibleState.None,
     );
     item.id = `session:${node.sessionId}`;
-    item.description = session.status;
+    item.description = formatSessionDescription(session, {
+      locale: this.locale,
+      precise: node.preciseTime === true,
+    });
     const excerpt = collapseText(session.question, MAX_TOOLTIP_QUESTION_LENGTH);
     const details = describeSession(session, { locale: this.locale });
     item.tooltip = excerpt.length === 0 ? details : `${excerpt}\n\n${details}`;
@@ -1354,17 +1530,30 @@ function collapsible(expanded: boolean): vscode.TreeItemCollapsibleState {
     : vscode.TreeItemCollapsibleState.Collapsed;
 }
 
-/** The children a non-root node derives from itself; never fetches. */
-function childrenOf(element: SessionsTreeNode): SessionsTreeNode[] {
+/**
+ * The children a non-root node derives from itself; never fetches.
+ *
+ * A day row's session rows are built here because this is where every
+ * sibling a row could be mistaken for is at hand: each row is marked
+ * {@link SessionNode.preciseTime} when {@link sessionsNeedingSeconds} finds a
+ * sibling that would read identically.
+ *
+ * @param element The project, day, session or message row.
+ * @param locale The provider's formatting locale.
+ */
+function childrenOf(element: SessionsTreeNode, locale: string | undefined): SessionsTreeNode[] {
   switch (element.kind) {
     case 'project':
       return [...element.days];
-    case 'date':
+    case 'date': {
+      const precise = sessionsNeedingSeconds(element.sessions, locale);
       return element.sessions.map((session): SessionNode => ({
         kind: 'session',
         sessionId: session.id,
         session,
+        preciseTime: precise.has(session.id),
       }));
+    }
     case 'session':
     case 'message':
       return [];

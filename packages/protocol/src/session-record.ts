@@ -259,14 +259,30 @@ const MAX_REASON_LENGTH = 500;
 
 /**
  * The longest question accepted, for the session's question and for a
- * follow-up's: **2000** characters.
+ * follow-up's: **2000** characters (UTF-16 code units, as `String#length`
+ * counts them).
  *
  * A developer's own prose, and deliberately generous: a question may quote an
  * error message or paste a few lines of context, and a truncated question is a
  * worse pipeline input than a long one. It bounds a text area's content, not a
  * document.
+ *
+ * Exported because it is the product's **one** question limit, and every
+ * surface that accepts a question has to agree with it rather than restate it
+ * (AAP §0.2.3, "avoid duplicating"):
+ *
+ * - {@link questionSchema}, below, which applies it to the stored
+ *   `SessionRecord.question` and to every `followUps[].question`;
+ * - `./messages/session.ts`, whose `sessionCreateRequestSchema` and
+ *   `sessionQuestionRequestSchema` embed that schema, so `POST /sessions` and
+ *   `POST /sessions/:id/question` refuse exactly what the record would;
+ * - the VS Code webview, whose `MAX_WEBVIEW_QUESTION_LENGTH`
+ *   (`apps/vscode-extension/src/webview-messages.ts`) is this value: the host
+ *   refuses a longer `askQuestion`/`askFollowUp` frame, and the question and
+ *   follow-up text areas set it as their native `maxLength` and count against
+ *   it, so no question the service would refuse can be typed.
  */
-const MAX_QUESTION_LENGTH = 2000;
+export const MAX_QUESTION_LENGTH = 2000;
 
 /**
  * The longest model identifier recorded on {@link SessionProvider}: **128**
@@ -502,12 +518,34 @@ const urlSchema = z.url({ error: 'expected an absolute URL' }).max(MAX_URL_LENGT
 });
 
 /**
+ * The label {@link questionSchema}'s prose refinement declares, rendered by
+ * `describeZodIssues` as `question (custom label=non-blank-text-without-control-codes)`
+ * when a question is blank or carries a control character. A fixed schema name —
+ * it passes that function's field-name gate — so the refusal names the rule it
+ * broke without repeating any of the question.
+ */
+const QUESTION_PROSE_RULE = 'non-blank-text-without-control-codes';
+
+/**
  * A developer-authored question: non-empty, bounded prose.
  *
- * Plain text, and nothing in this package looks inside it (AAP §0.5.4). Used for
- * the session's question and for every follow-up's.
+ * Plain text, and nothing in this package looks inside it (AAP §0.5.4): it is
+ * at least one character long, at most {@link MAX_QUESTION_LENGTH} characters
+ * long, carries at least one non-whitespace character, and carries no control
+ * character other than tab, line feed or carriage return. No transform, default
+ * or catch — what was validated is exactly what is stored — and every refusal
+ * names the rule it broke, never the question itself (AAP §0.5.2).
+ *
+ * The single definition of a valid question, exported so each boundary applies
+ * the same rule:
+ *
+ * - this module's `SessionRecord.question` and `FollowUpRecord.question`;
+ * - `./messages/session.ts`'s `sessionCreateRequestSchema.question` and
+ *   `sessionQuestionRequestSchema.question`, so a blank or control-character
+ *   question is refused at the route with a precise 400 instead of being
+ *   accepted and failing later, when the record is written.
  */
-const questionSchema = z
+export const questionSchema = z
   .string()
   .min(1, { error: 'expected a non-empty question' })
   .max(MAX_QUESTION_LENGTH, {
@@ -515,6 +553,10 @@ const questionSchema = z
   })
   .refine(isProseText, {
     error: 'expected a question with at least one non-whitespace character and no control codes',
+    // Schema-declared, so `describeZodIssues` renders it (`question (custom
+    // label=…)`): a refused blank or control-character question then names the
+    // rule it broke, where a bare `custom` would not, and still echoes nothing.
+    params: { label: QUESTION_PROSE_RULE },
   });
 
 // ---------------------------------------------------------------------------

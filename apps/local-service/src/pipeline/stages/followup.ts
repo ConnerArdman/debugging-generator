@@ -54,7 +54,10 @@
  * path produces is held to the same deterministic steps Stage 3 uses —
  * `normalizePlan` → `instrumentationPlanSchema` → `checkPlanFeasibility` — and
  * a normalisation or internal-validation failure is a product defect logged
- * by its closed shape and its failing paths, and never re-prompted.
+ * by its closed shape and its failing paths, and never re-prompted. As in
+ * Stage 3, only feasible additions become part of plan version n + 1; an
+ * addition the gate refuses stays on the feasibility report, and a delta with
+ * no feasible addition is refused outright.
  *
  * ## What this stage owns, and what it hands on
  *
@@ -137,9 +140,13 @@
  *
  * The follow-up question is passed through to the context builder, the
  * analysis port and the panel port verbatim; it is never compared, searched or
- * switched on. No adapter id, route, file, symbol, component or application
- * name appears here, and no plan or panel is authored: every addition comes
- * from the validated decision, every resolution from the live registry.
+ * switched on. Its redacted text is handed to `./understand.js`'s generic
+ * tokenizer, and the identifier candidates the tokenizer returns are resolved
+ * through exact declaration lookups in the code graph: the decision reads
+ * names the graph holds, never the wording. No adapter id, route, file,
+ * symbol, component or application name appears here, and no plan or panel is
+ * authored: every addition comes from the validated decision, every resolution
+ * from the live registry.
  *
  * ## Privacy (AAP §0.5.2)
  *
@@ -157,6 +164,7 @@
  * @module
  */
 
+import type { CodeNodeKind } from '@debuggen/code-analysis';
 import {
   INSTRUMENTATION_ACTION_TYPES,
   INSTRUMENTATION_MODES,
@@ -227,8 +235,11 @@ import type { SessionFailure } from '../../sessions/state-machine.js';
 import type { ModificationsRepo } from '../../store/modifications-repo.js';
 import type { PanelsRepo } from '../../store/panels-repo.js';
 import type { SessionsRepo } from '../../store/sessions-repo.js';
+import { redactQuestionText } from '../context-builder.js';
 import type {
   ContextBuilder,
+  FollowUpDeclarationCandidate,
+  PipelineCodeHandles,
   PipelineStageContext,
   StagePlaceholder,
   StageRequestBuild,
@@ -236,6 +247,7 @@ import type {
 import type { AnalyzeStageInput, AnalyzeStageResult } from './analyze.js';
 import { authoredPlanShape, refusedFieldPath } from './plan.js';
 import { buildFollowUpDecisionSchema } from './reply-schemas.js';
+import { tokenizeQuestion } from './understand.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Vocabulary
@@ -1251,15 +1263,23 @@ export interface FollowUpExistingEvidenceResult extends FollowUpStageResultBase 
  */
 export interface FollowUpNewCaptureResult extends FollowUpStageResultBase {
   readonly path: 'new-capture';
-  /** Plan version n + 1 as recorded: the previous plan plus the delta. */
+  /** Plan version n + 1 as recorded: the previous plan plus the feasible delta. */
   readonly plan: InstrumentationPlan;
   /** Its version on the session's plan ladder. */
   readonly planVersion: number;
   /** The version it builds on — the one the delta was computed against. */
   readonly previousPlanVersion: number;
-  /** The delta's resolved actions, with the ids, adapters and modes normalisation assigned. */
+  /**
+   * The delta's feasible resolved actions, with the ids, adapters and modes
+   * normalisation assigned. An addition the feasibility gate refused is not
+   * among them; it stays on {@link FollowUpNewCaptureResult.feasibility}.
+   */
   readonly delta: readonly InstrumentationAction[];
-  /** The feasibility report of plan version n + 1 (installed actions re-checked, delta included). */
+  /**
+   * The feasibility report of the plan version as normalised, before the
+   * refused additions were left out (installed actions re-checked, the whole
+   * delta included).
+   */
   readonly feasibility: FeasibilityReport;
   /**
    * How many distinct files the delta's **feasible** patch-mode actions touch
@@ -1355,6 +1375,16 @@ const UNRECORDED_PLAN_LOG =
   'A follow-up delta was installed but recording its plan version failed.';
 
 /**
+ * Info record of a follow-up delta the feasibility gate narrowed: the refused
+ * additions were left out of plan version n + 1 and only the feasible ones go
+ * to the installer. Fields: stage, plan version, the omitted additions' counts
+ * by type and mode, the rejection codes and how many additions were kept.
+ * Never a path or a symbol — both name the developer's code.
+ */
+const DELTA_NARROWED_LOG =
+  'Left the follow-up additions the feasibility gate refused out of the next plan version; only the feasible ones are installed.';
+
+/**
  * Warn record of a plan version that the ladder and the session record both
  * hold although recording it reported a failure — a failure after the commit,
  * such as a broadcast — so the run completes with it. Fields: plan version,
@@ -1396,11 +1426,90 @@ const OUTCOME_UNRECORDED_LOG =
 const PROGRESS_FAILED_LOG =
   'A progress row of the follow-up stage could not be emitted; the stage continues.';
 
+/**
+ * Warn record of a code-graph lookup of the follow-up's names that failed. The
+ * decision then proceeds from the stored evidence alone, exactly as for a
+ * follow-up that names no declaration. Fields: stage, error code.
+ */
+const NAMES_UNRESOLVED_LOG =
+  'The declarations the follow-up names could not be resolved through the code graph; the decision proceeds from the stored evidence alone.';
+
 /** Which progress row a {@link PROGRESS_FAILED_LOG} record is about. */
 type ProgressRowKind = 'started' | 'completed' | 'failed';
 
 /** The most validation issues an internal-validation error lists (paths and codes only). */
 const MAX_REPORTED_ISSUES = 20;
+
+/* -------------------------------------------------------------------------------------------------
+ * Names the follow-up question carries — resolved through the code graph, never matched
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The code-graph node kinds that **declare** a name (`CodeSymbolMatch` of
+ * `@debuggen/code-analysis`): a binding site, a call site or a route entry only
+ * mentions one, and a timing can wrap nothing but a declaration.
+ */
+const DECLARATION_KINDS = Object.freeze([
+  'symbol',
+  'component',
+  'server-function',
+] as const satisfies readonly CodeNodeKind[]);
+
+/**
+ * The most declarations one follow-up's names resolve to — and so the most a
+ * follow-up context carries as `candidates`. The rules-based provider asks for
+ * at most six additional actions per decision, so a longer list could only
+ * cost payload.
+ */
+const MAX_NAMED_DECLARATIONS = 8;
+
+/**
+ * Resolves a follow-up's identifier candidates to the declarations the code
+ * graph holds for them.
+ *
+ * Each name is looked up exactly (`findByName` with `exact: true`, a
+ * constant-time index read), restricted to {@link DECLARATION_KINDS}; the
+ * matches are kept in name order then graph rank, de-duplicated by file and
+ * symbol, and capped at {@link MAX_NAMED_DECLARATIONS}. The names are the
+ * tokenizer's output — sorted, de-duplicated and capped — so two phrasings that
+ * name the same identifiers resolve to the same list. Nothing here reads the
+ * question itself.
+ *
+ * @param queries The run's read-only code-graph queries.
+ * @param names The identifier candidates, as the tokenizer ordered them.
+ * @returns The declarations, in resolution order.
+ */
+function resolveNamedDeclarations(
+  queries: PipelineCodeHandles['queries'],
+  names: readonly string[],
+): FollowUpDeclarationCandidate[] {
+  const declarations: FollowUpDeclarationCandidate[] = [];
+  const seen = new Set<string>();
+  for (const name of names) {
+    const matches = queries.findByName(name, {
+      exact: true,
+      kinds: DECLARATION_KINDS,
+      limit: MAX_NAMED_DECLARATIONS,
+    });
+    for (const match of matches) {
+      const identity = `${match.file}\u0000${match.name}`;
+      if (seen.has(identity)) {
+        continue;
+      }
+      seen.add(identity);
+      declarations.push({
+        file: match.file,
+        symbol: match.name,
+        kind: match.kind,
+        score: match.score ?? 1,
+      });
+      if (declarations.length >= MAX_NAMED_DECLARATIONS) {
+        return declarations;
+      }
+    }
+  }
+  return declarations;
+}
 
 /* -------------------------------------------------------------------------------------------------
  * Failures this stage raises itself — codes, enumerated reasons, counts and product-minted ids only
@@ -2353,7 +2462,7 @@ interface GatedPlan {
   readonly plan: InstrumentationPlan;
   readonly delta: readonly InstrumentationAction[];
   readonly feasibility: FeasibilityReport;
-  /** How many of the delta's actions the feasibility gate refused (reported, then installed as validated). */
+  /** How many of the delta's actions the feasibility gate refused (reported, and left out of `plan` and `delta`). */
   readonly refusedDelta: number;
   readonly chainedFiles: number;
 }
@@ -2648,6 +2757,23 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
     artifacts: StoredArtifacts,
     input: FollowUpStageInput,
   ): Promise<Result<DecidedFollowUp, DebuggenError>> => {
+    // The follow-up's words reach the structured input only as the generic
+    // tokenizer's identifier candidates, cut from the redacted text exactly as
+    // Stage 1 cuts its hints (the tokenizer bounds its own read), and as the
+    // declarations the code graph holds for them. A lookup that fails leaves the
+    // decision to the stored evidence alone.
+    const hints = tokenizeQuestion(
+      redactQuestionText(input.followUpQuestion, Number.POSITIVE_INFINITY).text,
+    );
+    const resolved = tryCatch(
+      () => resolveNamedDeclarations(stageContext.code.queries, hints.identifierCandidates),
+      'INTERNAL',
+    );
+    if (!resolved.ok) {
+      log.warn(NAMES_UNRESOLVED_LOG, { stage: FOLLOW_UP_STAGE, code: resolved.error.code });
+    }
+    const namedDeclarations = resolved.ok ? resolved.value : [];
+
     // The builder has already run the outbound guard: an `Err` here means the
     // payload must not leave the machine, so the provider is never called.
     const built = callSync(
@@ -2660,6 +2786,8 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
           captureSummary: artifacts.summary,
           analysis: artifacts.analysis,
           panel: artifacts.panel,
+          questionHints: { identifierCandidates: hints.identifierCandidates },
+          candidates: namedDeclarations,
           promptVersion: input.promptVersion ?? stageContext.promptVersions[FOLLOW_UP_STAGE],
           signal: stageContext.signal,
         }),
@@ -2711,6 +2839,8 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
       proposed: decision.additionalActions.length,
       accepted: delta.accepted.length,
       rejected: countsByReason(delta.rejected),
+      identifierCandidates: hints.identifierCandidates.length,
+      namedDeclarations: namedDeclarations.length,
       repairs,
       attempts,
       promptVersion,
@@ -3053,9 +3183,8 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
     }
     const delta = plan.instrumentationTargets.slice(previous.instrumentationTargets.length);
 
-    // Feasibility is a report: partially infeasible deltas are installed as validated and the
-    // installer reports every refusal as an unavailable signal (AAP §0.5.5). A delta none of whose
-    // additions can be installed would ask the developer to reproduce for nothing, so it is refused.
+    // Feasibility returns its refusals as data. A delta none of whose additions can be installed
+    // would ask the developer to reproduce for nothing, so it is refused outright.
     const checked = tryCatch(
       () => checkPlanFeasibility(plan, instrumentationContext, { resolver }),
       'INTERNAL',
@@ -3070,20 +3199,41 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
       return err(deltaInfeasibleError(feasibility, deltaIds));
     }
 
-    // Only a feasible patch-mode addition patches anything: the installer turns every refusal
-    // into an unavailable signal instead of a write.
+    // Only what can be installed becomes plan version n + 1, as in the first plan's gate
+    // (`gateInstrumentationPlan`): a refused addition stays on the feasibility report and is
+    // counted in `refusedDelta`, but it is left out of the recorded plan, so it is never handed to
+    // the installer and never surfaces as an unavailable signal. Only additions are narrowed — an
+    // installed action is never dropped, whatever its re-check says (AAP §0.4.2).
     const refusedIds: ReadonlySet<string> = new Set(refused.map((refusal) => refusal.action.id));
-    const chained = await countChainedFiles(
-      sessionId,
-      delta.filter((action) => !refusedIds.has(action.id)),
-    );
+    const feasibleDelta = delta.filter((action) => !refusedIds.has(action.id));
+    const recordable: InstrumentationPlan =
+      refusedIds.size === 0
+        ? plan
+        : {
+            ...plan,
+            instrumentationTargets: plan.instrumentationTargets.filter(
+              (action) => !refusedIds.has(action.id),
+            ),
+          };
+    if (refusedIds.size > 0) {
+      log.info(DELTA_NARROWED_LOG, {
+        stage: PLAN_STAGE,
+        planVersion,
+        omitted: countsByTypeAndMode(delta.filter((action) => refusedIds.has(action.id))),
+        rejectionCodes: [...new Set(refused.map((refusal) => refusal.code))].sort(),
+        kept: feasibleDelta.length,
+      });
+    }
+
+    // Only a feasible patch-mode addition patches anything.
+    const chained = await countChainedFiles(sessionId, feasibleDelta);
     if (!chained.ok) {
       return chained;
     }
 
     return ok({
-      plan,
-      delta,
+      plan: recordable,
+      delta: feasibleDelta,
       feasibility,
       refusedDelta: refused.length,
       chainedFiles: chained.value,

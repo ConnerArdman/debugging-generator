@@ -53,6 +53,7 @@ import {
 } from '../src/background/service-worker';
 import type {
   DebugGeneratorWorker,
+  NavigationCommitKind,
   NavigationMemo,
   WorkerEnvironment,
   WorkerEvent,
@@ -61,6 +62,12 @@ import type {
 } from '../src/background/service-worker';
 import { BINDING_STORAGE_KEY } from '../src/background/tab-registry';
 import type { NavigationDecisionKind, TabBindingChange } from '../src/background/tab-registry';
+import {
+  EXTENSION_CHANNEL,
+  PORT_CONTENT_BRIDGE,
+  PORT_PROTOCOL_VERSION,
+} from '../src/shared/messages';
+import type { BridgeUpstreamFrame } from '../src/shared/messages';
 
 /*
  * ===========================================================================
@@ -139,9 +146,33 @@ function loadCompleted(url: string): TabEvent {
   return { change: { status: 'complete' }, tab: { url } };
 }
 
-/** What a replayed sequence of events reported, and the memo it left. */
+/**
+ * A browser-initiated load bound for `pending` starting while the tab is
+ * still loading: Chrome names a `url` — the old, still-committed `committed`
+ * URL, because it compares the visible URL but reports the committed one.
+ */
+function loadingNamingCommitted(committed: string, pending: string): TabEvent {
+  return {
+    change: { status: 'loading', url: committed },
+    tab: { url: committed, pendingUrl: pending },
+  };
+}
+
+/** That load's commit, reported with no `url`: only `tab.url` names it. */
+function unnamedCommit(url: string): TabEvent {
+  return { change: { status: 'loading' }, tab: { url } };
+}
+
+/** A title or favicon change on a tab whose committed URL is `url`. */
+function propertyChanged(url: string): TabEvent {
+  return { change: {}, tab: { url } };
+}
+
+/** What a replayed sequence of events reported, why, and the memo it left. */
 interface Replay {
   readonly reported: readonly string[];
+  /** Why each of {@link reported} was reported, in the same order. */
+  readonly kinds: readonly NavigationCommitKind[];
   readonly memo: NavigationMemo | undefined;
 }
 
@@ -149,14 +180,18 @@ interface Replay {
 function replay(events: readonly TabEvent[], initial: NavigationMemo | undefined = LOADED): Replay {
   let memo = initial;
   const reported: string[] = [];
+  const kinds: NavigationCommitKind[] = [];
   for (const { change, tab } of events) {
     const step = nextCommittedNavigation(memo, change, tab);
     memo = step.memo;
-    if (step.url !== undefined) {
+    // A kind accompanies exactly the steps that report a URL.
+    expect(step.kind === undefined).toBe(step.url === undefined);
+    if (step.url !== undefined && step.kind !== undefined) {
       reported.push(step.url);
+      kinds.push(step.kind);
     }
   }
-  return { reported, memo };
+  return { reported, kinds, memo };
 }
 
 /*
@@ -304,6 +339,8 @@ interface Harness {
   readonly worker: DebugGeneratorWorker;
   /** `chrome.tabs.onUpdated`, for dispatching tab events. */
   readonly onUpdated: FakeEvent<[TabId, WorkerTabChange, WorkerTab]>;
+  /** `chrome.runtime.onConnect`, for connecting a page's content-script bridge. */
+  readonly onConnect: FakeEvent<[chrome.runtime.Port]>;
   /** Every binding change the registry announced after start-up, in order. */
   readonly changes: TabBindingChange[];
   readonly logger: RecordingLogger;
@@ -326,6 +363,7 @@ afterEach(() => {
  */
 async function startWorker(binding: TabBindingRecord): Promise<Harness> {
   const onUpdated = createEvent<[TabId, WorkerTabChange, WorkerTab]>();
+  const onConnect = createEvent<[chrome.runtime.Port]>();
   const logger = createRecordingLogger();
   const sockets = createSocketRecorder();
   // No case depends on a timer firing, so none ever does: a scheduled handler
@@ -345,7 +383,7 @@ async function startWorker(binding: TabBindingRecord): Promise<Harness> {
   const env: WorkerEnvironment = {
     runtime: {
       id: EXTENSION_ID,
-      onConnect: createEvent<[chrome.runtime.Port]>(),
+      onConnect,
       onInstalled: createEvent<[{ readonly reason: string }]>(),
       onStartup: createEvent<[]>(),
     },
@@ -380,7 +418,7 @@ async function startWorker(binding: TabBindingRecord): Promise<Harness> {
   worker.registry.onChange((change) => {
     changes.push(change);
   });
-  return { worker, onUpdated, changes, logger, socketCalls: sockets.calls };
+  return { worker, onUpdated, onConnect, changes, logger, socketCalls: sockets.calls };
 }
 
 /**
@@ -437,6 +475,133 @@ const CAPTURING_BINDING: TabBindingRecord = Object.freeze({
 
 /*
  * ===========================================================================
+ * The page agent — its content-script bridge and its document reports
+ * ===========================================================================
+ *
+ * The page agent's document ids have the canonical opaque shape (`doc_` and
+ * sixteen `[0-9a-z]`): the port hub refuses a bridge frame whose ids the
+ * agent could not have minted.
+ */
+
+/** The document {@link TAB_BOUND} shows before a case's loads. */
+const DOCUMENT_BEFORE = 'doc_beforeload000001';
+
+/** The document a real reload of {@link TAB_BOUND} brings. */
+const DOCUMENT_AFTER = 'doc_afterreload00001';
+
+/** The worker's debug line for each page agent report it handed on. */
+const AGENT_READY_HANDLED_LOG = 'agent.ready handled.';
+
+/** A `chrome.events.Event` the spec can fire; the worker never uses rules. */
+interface FakeChromeEvent<Args extends unknown[]> extends chrome.events.Event<
+  (...args: Args) => void
+> {
+  fire(...args: Args): void;
+}
+
+function createChromeEvent<Args extends unknown[]>(): FakeChromeEvent<Args> {
+  const listeners = new Set<(...args: Args) => void>();
+  return {
+    addListener: (callback: (...args: Args) => void): void => {
+      listeners.add(callback);
+    },
+    removeListener: (callback: (...args: Args) => void): void => {
+      listeners.delete(callback);
+    },
+    hasListener: (callback: (...args: Args) => void): boolean => listeners.has(callback),
+    hasListeners: (): boolean => listeners.size > 0,
+    getRules: (): void => undefined,
+    removeRules: (): void => undefined,
+    addRules: (): void => undefined,
+    fire: (...args: Args): void => {
+      for (const listener of [...listeners]) {
+        listener(...args);
+      }
+    },
+  };
+}
+
+/** A content-script bridge port the spec drives from the page side. */
+interface BridgePort extends chrome.runtime.Port {
+  readonly onMessage: FakeChromeEvent<[message: unknown, port: chrome.runtime.Port]>;
+  readonly onDisconnect: FakeChromeEvent<[port: chrome.runtime.Port]>;
+  /** Deliver a frame to the worker, as the content script would. */
+  send(message: unknown): void;
+}
+
+/** {@link TAB_BOUND} as Chrome describes a content script's sender tab. */
+const SENDER_TAB: chrome.tabs.Tab = Object.freeze({
+  id: TAB_BOUND,
+  index: 0,
+  windowId: 1,
+  url: URL_OVERVIEW,
+  pinned: false,
+  highlighted: true,
+  active: true,
+  frozen: false,
+  incognito: false,
+  selected: true,
+  discarded: false,
+  autoDiscardable: true,
+  groupId: -1,
+  lastAccessed: BOUND_AT_MS,
+});
+
+/** Connect a content-script bridge of {@link TAB_BOUND}, as a document load does. */
+function connectBridge(harness: Harness): BridgePort {
+  const onMessage = createChromeEvent<[message: unknown, port: chrome.runtime.Port]>();
+  const port: BridgePort = {
+    name: PORT_CONTENT_BRIDGE,
+    sender: { id: EXTENSION_ID, tab: SENDER_TAB, frameId: 0, url: URL_OVERVIEW, origin: ORIGIN },
+    onMessage,
+    onDisconnect: createChromeEvent<[port: chrome.runtime.Port]>(),
+    postMessage: (): void => undefined,
+    disconnect: (): void => undefined,
+    send: (message: unknown): void => {
+      onMessage.fire(message, port);
+    },
+  };
+  harness.onConnect.emit(port);
+  return port;
+}
+
+/** The page agent's `agent.ready` for one document of {@link TAB_BOUND}. */
+function agentReady(documentId: string): BridgeUpstreamFrame<'agent.ready'> {
+  return {
+    channel: EXTENSION_CHANNEL,
+    version: PORT_PROTOCOL_VERSION,
+    direction: 'upstream',
+    type: 'agent.ready',
+    payload: {
+      documentId,
+      producerId: documentId.replace(/^doc_/u, 'prd_'),
+      url: URL_OVERVIEW,
+      installedBeforeReact: true,
+      reactDetected: true,
+    },
+  };
+}
+
+/**
+ * Let the page agent of a newly loaded document of {@link TAB_BOUND} report
+ * `documentId` through a bridge of its own, and wait until the worker holds
+ * it as the tab's current document.
+ */
+async function announceDocument(harness: Harness, documentId: string): Promise<BridgePort> {
+  const bridge = connectBridge(harness);
+  bridge.send(agentReady(documentId));
+  await settle();
+  expect(harness.worker.agent.getReadiness(TAB_BOUND)?.documentId).toBe(documentId);
+  return bridge;
+}
+
+/** The index of the last log line with `message`, or `-1` when none was written. */
+function lastLogIndex(harness: Harness, message: string): number {
+  return harness.logger.entries.map((entry) => entry.message).lastIndexOf(message);
+}
+
+/*
+ * ===========================================================================
  * Module evaluation
  * ===========================================================================
  */
@@ -463,6 +628,7 @@ describe('nextCommittedNavigation', () => {
     ]);
 
     expect(result.reported).toEqual([URL_SETTINGS]);
+    expect(result.kinds).toEqual(['url-change']);
     expect(result.memo).toEqual({ url: URL_SETTINGS, status: 'complete' });
   });
 
@@ -486,14 +652,26 @@ describe('nextCommittedNavigation', () => {
     ['names the same URL', URL_OVERVIEW],
     ['is absent', undefined],
   ])(
-    'reports a same-URL reload whose pending URL %s once, with the committed URL',
+    'reports a same-URL reload whose pending URL %s once, with the committed URL, as a reload candidate',
     (_, pending) => {
       const result = replay([loadingStarted(URL_OVERVIEW, pending), loadCompleted(URL_OVERVIEW)]);
 
       expect(result.reported).toEqual([URL_OVERVIEW]);
+      expect(result.kinds).toEqual(['reload-candidate']);
       expect(result.memo).toEqual({ url: URL_OVERVIEW, status: 'complete' });
     },
   );
+
+  it('marks a same-URL loading cycle a reload candidate, whatever caused it, and a URL change a commit', () => {
+    // A same-URL `history.replaceState` and a reload fire the very same
+    // `loading` then `complete` events: the decision cannot tell them apart,
+    // so it names the cycle a candidate for the caller to confirm.
+    const replaced = replay([loadingStarted(URL_OVERVIEW), loadCompleted(URL_OVERVIEW)]);
+    const pushed = replay([loadingCommitted(URL_SETTINGS), loadCompleted(URL_SETTINGS)]);
+
+    expect(replaced.kinds).toEqual(['reload-candidate']);
+    expect(pushed.kinds).toEqual(['url-change']);
+  });
 
   it('reports nothing for a pending navigation that never commits, and still reports a later reload', () => {
     const aborted = replay([
@@ -530,6 +708,7 @@ describe('nextCommittedNavigation', () => {
     ]);
 
     expect(result.reported).toEqual([URL_SETTINGS, URL_SETTINGS]);
+    expect(result.kinds).toEqual(['url-change', 'reload-candidate']);
   });
 
   it('adds no report for repeated events of one split load', () => {
@@ -586,6 +765,7 @@ describe('nextCommittedNavigation', () => {
     ]);
 
     expect(result.reported).toEqual([URL_SETTINGS, URL_ARCHIVE, URL_ARCHIVE]);
+    expect(result.kinds).toEqual(['url-change', 'url-change', 'reload-candidate']);
   });
 
   it('answers the same for a tab it holds no memo of, as after a worker revival', () => {
@@ -615,8 +795,35 @@ describe('nextCommittedNavigation', () => {
       { url: URL_OVERVIEW },
     );
 
-    expect(titleOnly).toEqual({ memo: LOADED, url: undefined });
-    expect(completed).toEqual({ memo: LOADED, url: undefined });
+    expect(titleOnly).toStrictEqual({ memo: LOADED, url: undefined, kind: undefined });
+    expect(completed).toStrictEqual({ memo: LOADED, url: undefined, kind: undefined });
+  });
+
+  it('reports a commit Chrome sends without its url while another load is still loading, once', () => {
+    // A reload is still loading when a browser-initiated load to another
+    // origin starts: its start names the old committed URL, its commit none.
+    const result = replay([
+      loadingStarted(URL_OVERVIEW),
+      loadingNamingCommitted(URL_OVERVIEW, URL_ELSEWHERE),
+      unnamedCommit(URL_ELSEWHERE),
+      propertyChanged(URL_ELSEWHERE),
+      propertyChanged(URL_ELSEWHERE),
+      loadCompleted(URL_ELSEWHERE),
+    ]);
+
+    expect(result.reported).toEqual([URL_OVERVIEW, URL_ELSEWHERE]);
+    expect(result.memo).toEqual({ url: URL_ELSEWHERE, status: 'complete' });
+  });
+
+  it('reports a commit that a property change reveals before its url event, once', () => {
+    const result = replay([
+      propertyChanged(URL_SETTINGS),
+      urlCommitted(URL_SETTINGS),
+      loadCompleted(URL_SETTINGS),
+    ]);
+
+    expect(result.reported).toEqual([URL_SETTINGS]);
+    expect(result.memo).toEqual({ url: URL_SETTINGS, status: 'complete' });
   });
 });
 
@@ -644,7 +851,7 @@ describe('createWorker: one tab.navigated per committed load of a bound tab', ()
     expect(harness.socketCalls).toEqual([]);
   });
 
-  it('hands the registry one navigation for a reload during a capture', async () => {
+  it('hands the registry one navigation at once for a reload during a capture of a page whose agent reported no document', async () => {
     const harness = await startWorker(CAPTURING_BINDING);
 
     await dispatch(harness, TAB_BOUND, [
@@ -670,7 +877,7 @@ describe('createWorker: one tab.navigated per committed load of a bound tab', ()
     expect((await harness.worker.registry.getBinding(TAB_BOUND))?.url).toBe(URL_OVERVIEW);
   });
 
-  it('hands the registry both a history-API change and the reload after it', async () => {
+  it('hands the registry both a history-API change and the reload after it on a page whose agent reported no document', async () => {
     const harness = await startWorker(CAPTURING_BINDING);
 
     await dispatch(harness, TAB_BOUND, [
@@ -715,6 +922,22 @@ describe('createWorker: one tab.navigated per committed load of a bound tab', ()
     expect(await harness.worker.registry.getBinding(TAB_BOUND)).toBeUndefined();
   });
 
+  it('unbinds for a load to another origin whose commit Chrome reports without its url during a reload', async () => {
+    const harness = await startWorker(CAPTURING_BINDING);
+
+    await dispatch(harness, TAB_BOUND, [
+      loadingStarted(URL_OVERVIEW),
+      loadingNamingCommitted(URL_OVERVIEW, URL_ELSEWHERE),
+      unnamedCommit(URL_ELSEWHERE),
+      propertyChanged(URL_ELSEWHERE),
+      loadCompleted(URL_ELSEWHERE),
+    ]);
+
+    expect(committedNavigations(harness)).toEqual(['kept-same-origin', 'unbound-cross-origin']);
+    expect(harness.changes.map((change) => change.reason)).toContain('origin-changed');
+    expect(await harness.worker.registry.getBinding(TAB_BOUND)).toBeUndefined();
+  });
+
   it('hands the registry nothing for a tab that is not bound', async () => {
     const harness = await startWorker(CAPTURING_BINDING);
 
@@ -727,5 +950,77 @@ describe('createWorker: one tab.navigated per committed load of a bound tab', ()
 
     expect(committedNavigations(harness)).toEqual([]);
     expect(harness.changes).toEqual([]);
+  });
+});
+
+describe('createWorker: a same-URL load is reported only when a new page agent document proves a reload', () => {
+  it('reports nothing for a same-URL load the document survives — a same-URL history.replaceState', async () => {
+    const harness = await startWorker(CAPTURING_BINDING);
+    const bridge = await announceDocument(harness, DOCUMENT_BEFORE);
+
+    await dispatch(harness, TAB_BOUND, [loadingStarted(URL_OVERVIEW), loadCompleted(URL_OVERVIEW)]);
+    // The same document reporting again proves no reload either.
+    bridge.send(agentReady(DOCUMENT_BEFORE));
+    await settle();
+
+    expect(committedNavigations(harness)).toEqual([]);
+    expect(harness.changes).toEqual([]);
+    expect((await harness.worker.registry.getBinding(TAB_BOUND))?.captureId).toBe(CAPTURE);
+  });
+
+  it('reports a reload once, before handing on the new document’s report, and nothing for the replaceState after it', async () => {
+    const harness = await startWorker(CAPTURING_BINDING);
+    await announceDocument(harness, DOCUMENT_BEFORE);
+
+    await dispatch(harness, TAB_BOUND, [loadingStarted(URL_OVERVIEW), loadCompleted(URL_OVERVIEW)]);
+    expect(committedNavigations(harness)).toEqual([]);
+
+    await announceDocument(harness, DOCUMENT_AFTER);
+
+    expect(committedNavigations(harness)).toEqual(['kept-same-origin']);
+    expect(navigatedUrls(harness)).toEqual([URL_OVERVIEW]);
+    expect(lastLogIndex(harness, COMMITTED_NAVIGATION_LOG)).toBeLessThan(
+      lastLogIndex(harness, AGENT_READY_HANDLED_LOG),
+    );
+    expect((await harness.worker.registry.getBinding(TAB_BOUND))?.captureId).toBe(CAPTURE);
+
+    // The framework's same-URL replaceState at hydration is no second reload.
+    await dispatch(harness, TAB_BOUND, [loadingStarted(URL_OVERVIEW), loadCompleted(URL_OVERVIEW)]);
+    expect(committedNavigations(harness)).toEqual(['kept-same-origin']);
+  });
+
+  it('reports several same-URL cycles before the new document as one reload', async () => {
+    const harness = await startWorker(CAPTURING_BINDING);
+    await announceDocument(harness, DOCUMENT_BEFORE);
+
+    await dispatch(harness, TAB_BOUND, [
+      loadingStarted(URL_OVERVIEW),
+      loadCompleted(URL_OVERVIEW),
+      loadingStarted(URL_OVERVIEW, URL_OVERVIEW),
+      loadCompleted(URL_OVERVIEW),
+    ]);
+    await announceDocument(harness, DOCUMENT_AFTER);
+
+    expect(committedNavigations(harness)).toEqual(['kept-same-origin']);
+    expect(navigatedUrls(harness)).toEqual([URL_OVERVIEW]);
+  });
+
+  it('reports a history-API URL change at once, forgetting a same-URL load held before it', async () => {
+    const harness = await startWorker(CAPTURING_BINDING);
+    await announceDocument(harness, DOCUMENT_BEFORE);
+
+    await dispatch(harness, TAB_BOUND, [
+      loadingStarted(URL_OVERVIEW),
+      loadCompleted(URL_OVERVIEW),
+      loadingCommitted(URL_SETTINGS),
+      loadCompleted(URL_SETTINGS),
+    ]);
+
+    expect(committedNavigations(harness)).toEqual(['kept-same-origin']);
+    expect(navigatedUrls(harness)).toEqual([URL_SETTINGS]);
+
+    // A document that arrives later reports its own load, not the forgotten one.
+    await announceDocument(harness, DOCUMENT_AFTER);
+    expect(navigatedUrls(harness)).toEqual([URL_SETTINGS]);
   });
 });

@@ -36,6 +36,9 @@
  *   `scripts/check-no-residual-instrumentation.mjs` and call its own exports,
  *   so this suite and `pnpm check:no-residual-instrumentation` can never
  *   disagree.
+ * - **Page readiness** — {@link waitForStreamedContent} and
+ *   {@link waitForOrderableCheckout}: the moments a developer acts in on a
+ *   demo page, so a spec never races a Suspense reveal or a freight quote.
  * - **Runtime source lookup** — {@link sourceLineContaining} and
  *   {@link readDemoSource}, so a spec derives the expected line of a call site
  *   (the `pool.query` behind the slow checkout) at run time instead of
@@ -220,6 +223,106 @@ export async function waitForStreamedContent(
     undefined,
     { timeout: timeoutMs, polling: 100 },
   );
+}
+
+/** The checkout form, by the accessible name `CheckoutForm.tsx` gives it. */
+const CHECKOUT_FORM_SELECTOR = 'form[aria-label="Checkout details"]';
+
+/** How often {@link waitForOrderableCheckout} reads the checkout form. */
+const ORDERABLE_POLL_INTERVAL_MS = 100;
+
+/**
+ * What stands between the checkout form in the current document and a placed
+ * order, or `null` when a press of "Place order" would send the order now.
+ *
+ * Evaluated **in the page** (so it closes over nothing), from one DOM snapshot:
+ *
+ * 0. the document holds one checkout form — a second is the hidden copy of a
+ *    streamed Suspense segment not revealed yet ({@link waitForStreamedContent}),
+ *    which a reload of the page brings back;
+ * 1. the form holds one submit control, the place-order control, enabled and
+ *    not busy (`Button`'s `busy` sets `aria-disabled` instead of disabling);
+ * 2. its shipping-service group (`ShippingOptionPicker`, `role="radiogroup"`)
+ *    holds a checked, enabled radio — the settled freight quote's chosen
+ *    service; before a quote settles the group renders no rows at all;
+ * 3. the form states nothing outstanding: it renders its guidance line
+ *    ("Complete these before the order can be placed: …") as its own direct
+ *    `<p role="status">` child exactly while its validation pass would refuse
+ *    the order, and removes it once nothing would.
+ */
+function checkoutObstacle(formSelector: string): string | null {
+  const forms = document.querySelectorAll(formSelector);
+  if (forms.length > 1) {
+    return `the page holds ${String(forms.length)} copies of ${formSelector}: a streamed segment is not revealed yet`;
+  }
+  const form = forms.item(0);
+  if (form === null) {
+    return `the page has no ${formSelector}`;
+  }
+
+  const controls = form.querySelectorAll('button[type="submit"]');
+  const control = controls.item(0);
+  if (controls.length !== 1 || !(control instanceof HTMLButtonElement)) {
+    return `the form holds ${String(controls.length)} submit controls, not the one place-order control`;
+  }
+  if (control.disabled) {
+    return 'Place order is disabled: the cart is still being read, could not be read, or holds nothing';
+  }
+  if (control.getAttribute('aria-disabled') === 'true') {
+    return 'Place order is busy with a submission';
+  }
+
+  const group = form.querySelector('fieldset[role="radiogroup"]');
+  if (group === null) {
+    return 'the form has no shipping-service group';
+  }
+  if (group.querySelector('input[type="radio"]:checked:not(:disabled)') === null) {
+    const reads = (group.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    return `no shipping service is chosen yet, so the freight quote has not settled (the group reads "${reads}")`;
+  }
+
+  const outstanding = form.querySelector(':scope > p[role="status"]');
+  if (outstanding !== null) {
+    const says = (outstanding.textContent ?? '').replace(/\s+/g, ' ').trim();
+    return `the form still names what the order is waiting for: "${says}"`;
+  }
+
+  return null;
+}
+
+/**
+ * Wait until the demo's checkout page would place an order the moment "Place
+ * order" is pressed — the moment a developer reproducing an order presses it.
+ *
+ * "Enabled" is not that moment. The control is enabled as soon as the cart has
+ * been read and holds something, so that a press can run the form's
+ * validation pass and show what is missing; a press before the freight quote
+ * has settled is refused by that pass ("Shipping services are still being
+ * quoted for this destination."), and nothing is sent. A quote can be in
+ * flight long after the page loaded: the form asks again whenever the shipment
+ * it quotes changes or it is mounted afresh, and a session's patches make the
+ * dev server rebuild the application under the open page. So this waits, with
+ * {@link checkoutObstacle}, for what the form itself treats as orderable, and
+ * is meant to be called right before the press.
+ *
+ * @param timeoutMs How long the form may take to become orderable.
+ * @throws When the form is not orderable within `timeoutMs`; the message names
+ *   what it was still waiting for.
+ */
+export async function waitForOrderableCheckout(page: Page, timeoutMs: number): Promise<void> {
+  await expect
+    .poll(
+      () =>
+        page
+          .evaluate(checkoutObstacle, CHECKOUT_FORM_SELECTOR)
+          .catch((error: unknown) => `the checkout page could not be read (${messageOf(error)})`),
+      {
+        message: `the checkout form must be orderable before Place order is pressed (${page.url()})`,
+        timeout: timeoutMs,
+        intervals: [ORDERABLE_POLL_INTERVAL_MS],
+      },
+    )
+    .toBeNull();
 }
 
 /** The largest source file {@link sourceLineContaining} / {@link readDemoSource} will read. */

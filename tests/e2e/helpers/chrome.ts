@@ -3269,7 +3269,11 @@ export interface PanelLocators {
   pickerActive(): Promise<boolean>;
   /** The "No element selected" badge. */
   readonly noTargetBadge: Locator;
-  /** The session target's descriptor (tag, selector, text, component chain, page). */
+  /**
+   * The session target's one-line summary in the header: the "Target" label, the tag, the nearest
+   * component and the whole selector (clipped only when painted). The rest of the descriptor sits
+   * in the collapsed "Target details" region beneath it.
+   */
   readonly targetDescriptor: Locator;
 
   // --- pairing -------------------------------------------------------------
@@ -3466,9 +3470,10 @@ export function panelLocators(page: Page): PanelLocators {
       return (await pickElementButton.getAttribute('aria-pressed')) === 'true';
     },
     noTargetBadge: header.getByText(PANEL_STRINGS.noTarget, { exact: true }),
-    // The descriptor's own Stack is the innermost one holding the "Target"
-    // label (`components/TargetPicker.tsx` `TargetDescriptor`); outer stacks
-    // come earlier in document order, so the last match is the descriptor.
+    // The summary's own Stack is the innermost one holding the "Target" label
+    // (`components/TargetPicker.tsx` `TargetSummary`), and its text holds the
+    // whole selector; outer stacks come earlier in document order, and no
+    // stack of the details region holds that label, so the last match is it.
     targetDescriptor: header
       .locator('.dg-stack')
       .filter({ has: page.getByText(PANEL_STRINGS.targetLabel, { exact: true }) })

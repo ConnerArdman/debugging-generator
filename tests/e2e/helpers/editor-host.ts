@@ -30,7 +30,12 @@
  *   otherwise `@vscode/test-electron`'s `downloadAndUnzipVSCode` — resolved from
  *   `apps/vscode-extension/package.json`, whose devDependency it is — for
  *   `VSCODE_TEST_VERSION` (default `stable`) into that workspace's
- *   git-ignored, per-checkout `.vscode-test/`.
+ *   git-ignored, per-checkout `.vscode-test/`. These are the variables, the
+ *   default and the cache `apps/vscode-extension/.vscode-test.mjs` uses for the
+ *   extension-host tier, so both tiers resolve the same build. CI pins
+ *   `VSCODE_TEST_VERSION` once, workflow-wide, in `.github/workflows/ci.yml`:
+ *   its e2e and extension-host jobs run one pinned build, never a floating
+ *   `stable`.
  * - **Extension**: `--extensionDevelopmentPath=<repo>/apps/vscode-extension`;
  *   its manifest's `main` (`dist/extension.js`) must exist, which `pnpm build`
  *   produces. The extension id is read from that manifest
@@ -912,6 +917,13 @@ type DownloadAndUnzip = (options: {
  * `VSCODE_TEST_VERSION` (default `stable`) through `@vscode/test-electron`,
  * resolved from `apps/vscode-extension` because it is that workspace's
  * devDependency, cached in that workspace's git-ignored `.vscode-test/`.
+ *
+ * Variables, default and cache match `apps/vscode-extension/.vscode-test.mjs`,
+ * so an `X.Y.Z` build the extension-host tier already downloaded is reused
+ * here without a network request (`stable` is always looked up online). The
+ * `stable` default serves local runs only: CI sets `VSCODE_TEST_VERSION` once,
+ * workflow-wide, so the e2e and extension-host tiers resolve one pinned build
+ * and a new stable release cannot change the editor under test.
  *
  * @throws {EditorHostError} `prerequisites` for a wrong path or an unavailable
  *   downloader; `timeout` when the download outlasts its budget.

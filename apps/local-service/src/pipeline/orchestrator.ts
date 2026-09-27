@@ -93,8 +93,12 @@
  *
  * Log records carry ids, stage names, versions, counts and error codes only —
  * never the question, a prompt, a model output, a SQL statement, a URL, an
- * attribute value or a token (AAP §0.5.2). The follow-up question is passed to
- * the follow-up stage verbatim and is never inspected here (AAP §0.5.4).
+ * attribute value or a token (AAP §0.5.2). The one record that says more is a
+ * stage failure's: it carries the error under the error field, which the
+ * service's serializer reduces to its closed shape at the default level, and
+ * the error's message and hint only when each is proven product text. The
+ * follow-up question is passed to the follow-up stage verbatim and is never
+ * inspected here (AAP §0.5.4).
  *
  * @module
  */
@@ -115,7 +119,7 @@ import type {
   ModificationRecord,
   ObservedReadinessInputs,
 } from '@debuggen/instrumentation';
-import { PROMPT_STAGES } from '@debuggen/model-provider';
+import { PROMPT_STAGES, isProviderFailureText } from '@debuggen/model-provider';
 import type { ModelProvider, PromptLoader, PromptStage } from '@debuggen/model-provider';
 import type { PanelSpec } from '@debuggen/panel-schema';
 import { PROGRESS_STAGES, SESSION_STATUSES } from '@debuggen/protocol';
@@ -138,7 +142,7 @@ import {
   ok,
   toPosix,
 } from '@debuggen/shared';
-import type { Logger, Result } from '@debuggen/shared';
+import type { LogFields, Logger, Result } from '@debuggen/shared';
 import type { CaptureSummary } from '@debuggen/telemetry';
 
 import type { AnalysisFacts } from '../analysis/facts.js';
@@ -154,12 +158,17 @@ import type {
   InstrumentationOutcome,
   InstrumentationService,
 } from '../instrumentation/service.js';
-import { describeException, sessionLogger, subsystemLogger } from '../logging.js';
+import {
+  LOG_ERROR_FIELD_KEY,
+  describeException,
+  sessionLogger,
+  subsystemLogger,
+} from '../logging.js';
 import type { ExceptionDescription } from '../logging.js';
 import type { PanelGenerator } from '../panels/generate.js';
 import { placeFollowUpAttempt } from '../sessions/manager.js';
 import type { SessionBroadcaster, SessionManager, SessionPatch } from '../sessions/manager.js';
-import { PROGRESS_STAGE_TITLES } from '../sessions/progress.js';
+import { PROGRESS_STAGE_TITLES, isProductAuthoredText } from '../sessions/progress.js';
 import type { SessionProgress } from '../sessions/progress.js';
 import { isTerminalSessionStatus, statusForStage, transition } from '../sessions/state-machine.js';
 import type { SessionFailure, SessionTransitionContext } from '../sessions/state-machine.js';
@@ -1029,6 +1038,44 @@ function failureOf(stage: PipelineStageKey, error: DebuggenError): SessionFailur
 }
 
 /**
+ * Whether a failure's own words are proven product text, and so may be written
+ * at the service's default log level: exactly — no trimming, no case folding —
+ * a text the service registered as its own (`isProductAuthoredText`, the
+ * registry `../sessions/progress.ts` keeps) or one of the model boundary's
+ * fixed failure texts (`isProviderFailureText`). Anything else may be an
+ * exception's or an adapter's text quoting a path, a statement or a
+ * credential, and stays under the error field, where the service's serializer
+ * adds it only at `debug`/`trace` and redacted.
+ */
+function isProvenFailureText(text: unknown): text is string {
+  return isProductAuthoredText(text) || isProviderFailureText(text);
+}
+
+/**
+ * The fields of the {@link STAGE_FAILED_LOG} record for `error`, filed under
+ * `stage`.
+ *
+ * The error travels whole under `LOG_ERROR_FIELD_KEY`, where the service's
+ * serializer emits, at `error`, only its closed shape — type, code,
+ * closed-token details such as a provider's `condition` and `status` or a
+ * blocked signal, and its cause's type — and never its message, hint or stack,
+ * which it adds only at `debug`/`trace`. The error's message and hint are
+ * added beside it as `errorMessage` and `errorHint`, each on its own proof
+ * ({@link isProvenFailureText}); an unproven one is omitted rather than
+ * rewritten, so the default-level line says why the stage failed whenever the
+ * product itself wrote the reason, and quotes nothing it did not write.
+ */
+function stageFailedFields(stage: ProgressStage, error: DebuggenError): LogFields {
+  return {
+    stage,
+    code: error.code,
+    ...(isProvenFailureText(error.message) ? { errorMessage: error.message } : {}),
+    ...(isProvenFailureText(error.hint) ? { errorHint: error.hint } : {}),
+    [LOG_ERROR_FIELD_KEY]: error,
+  };
+}
+
+/**
  * Merges `incoming` records into `current` by id: a record already present is
  * replaced in place (its status may have moved), a new one is appended in
  * application order.
@@ -1117,7 +1164,8 @@ function settleSync<T>(call: () => Result<T, DebuggenError>): Result<T, Debuggen
 }
 
 /* -------------------------------------------------------------------------------------------------
- * Log records — fields are ids, stage names, versions, counts and codes; never content
+ * Log records — fields are ids, stage names, versions, counts and codes; never content the
+ * product did not write (a stage failure adds its error and its proven message and hint)
  * ---------------------------------------------------------------------------------------------- */
 
 /** Info record of a stage boundary. Fields: stage, capture id when known. */
@@ -1126,7 +1174,13 @@ const STAGE_STARTED_LOG = 'Pipeline stage started.';
 /** Info record of a stage that returned its validated artifact. Fields: stage, timing. */
 const STAGE_COMPLETED_LOG = 'Pipeline stage completed.';
 
-/** Error record of a stage failure. Fields: stage, error code. */
+/**
+ * Error record of a stage failure. Fields ({@link stageFailedFields}): stage,
+ * error code, the error itself under `err` (closed shape at the default
+ * level; message, hint and stack only at `debug`/`trace`), and `errorMessage`
+ * and `errorHint` — the error's message and hint, each present only when it
+ * is proven product text ({@link isProvenFailureText}).
+ */
 const STAGE_FAILED_LOG = 'Pipeline stage failed; the session is filed as failed at that stage.';
 
 /** Info record of a cancelled operation. Fields: stage, error code. */
@@ -1563,7 +1617,7 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     if (isCancellation(error)) {
       op.log.info(CANCELLED_LOG, { stage: failure.stage, code: error.code });
     } else {
-      op.log.error(STAGE_FAILED_LOG, { stage: failure.stage, code: error.code });
+      op.log.error(STAGE_FAILED_LOG, stageFailedFields(failure.stage, error));
     }
 
     const current = readSession(op.sessionId);
@@ -2523,8 +2577,14 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
         sendRow(op, GENERATE_PANEL_STAGE, () =>
           progress.stageStarted(sessionId, GENERATE_PANEL_STAGE),
         );
+        // The panel is generated from the summary of exactly the events the
+        // analysis aggregated (`AnalyzeStageResult.summary`), not the capture
+        // stage's stored summary: when a ceiling left the stored one partial,
+        // handing it on would give the panel's headline and lens other counts
+        // than the facts beneath them. The follow-up path does the same.
+        const analysedSummary = analysed.value.summary;
         const generated = await inStage(op, code.value, { captureId }, (context) =>
-          stages.generatePanel().run(context, { captureId, analysis, summary }),
+          stages.generatePanel().run(context, { captureId, analysis, summary: analysedSummary }),
         );
         if (!generated.ok) {
           return generated;

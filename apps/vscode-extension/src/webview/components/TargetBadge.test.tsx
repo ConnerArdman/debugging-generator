@@ -463,6 +463,124 @@ describe('TargetBadge error and pending states', () => {
 });
 
 // ---------------------------------------------------------------------------
+// When no pick can be requested
+// ---------------------------------------------------------------------------
+
+describe('TargetBadge when no pick can be requested', () => {
+  /** The reason each withheld availability states, with and without a target. */
+  const WITHHELD = [
+    [
+      'noSession',
+      /once a session is running, "pick element" puts the debug generator panel in chrome devtools into picker mode/i,
+      'Picking another element becomes possible once a session is running.',
+    ],
+    [
+      'serviceUnavailable',
+      /needs the local debug generator service; start it/i,
+      'Picking another element needs the local Debug Generator service; start it to pick again.',
+    ],
+    [
+      'ended',
+      /^no element was selected for this session, which has ended\.$/i,
+      'Selected for this session, which has ended.',
+    ],
+    [
+      'failed',
+      /stopped at a failed stage; ask a new question to start another session/i,
+      'Selected for this session, which stopped at a failed stage.',
+    ],
+  ] as const;
+
+  it.each(WITHHELD)(
+    'keeps "No target" with the %s reason and no pick control',
+    (availability, message) => {
+      const onRequestTarget = vi.fn<() => void>();
+      const { container } = render(
+        <TargetBadge onRequestTarget={onRequestTarget} pickAvailability={availability} />,
+      );
+
+      const status = screen.getByRole('status');
+      expect(rootOf(container)).toBe(status);
+      expect(status.className).toContain(ROOT_CLASS);
+      expect(within(status).queryByText('No target')).not.toBeNull();
+      expect(within(status).queryByText(message)).not.toBeNull();
+      // The default sentence invites a click on a control that is not there.
+      expect(screen.queryByText(/so questions are investigated from the current page/i)).toBeNull();
+      expect(screen.queryAllByRole('button')).toHaveLength(0);
+      expect(onRequestTarget).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(WITHHELD)(
+    'shows a %s target read-only, with its note in place of the re-pick control',
+    (availability, _message, note) => {
+      const target = makeTarget();
+      const { container } = render(
+        <TargetBadge target={target} onRequestTarget={vi.fn()} pickAvailability={availability} />,
+      );
+
+      // Every field of the descriptor still renders, verbatim.
+      expect(codeTexts(container)).toEqual([target.selector, ...CHAIN, target.url]);
+      expect(screen.queryByText(target.tagName)).not.toBeNull();
+      // No control of any kind, and the reason in words.
+      expect(screen.queryAllByRole('button')).toHaveLength(0);
+      expect(screen.queryByText(/pick another element$/i)).toBeNull();
+      const noteElement = screen.getByText(note);
+      expect(noteElement.tagName).toBe('P');
+      expect(rootOf(container).contains(noteElement)).toBe(true);
+    },
+  );
+
+  it.each(WITHHELD)('offers no retry from the %s error state', (availability) => {
+    const onRequestTarget = vi.fn<() => void>();
+    const { container } = render(
+      <TargetBadge
+        error="The pick was cancelled."
+        onRequestTarget={onRequestTarget}
+        pickAvailability={availability}
+      />,
+    );
+
+    const alert = screen.getByRole('alert');
+    expect(rootOf(container)).toBe(alert);
+    expect(within(alert).queryByText('The pick was cancelled.')).not.toBeNull();
+    expect(within(alert).queryAllByRole('button')).toHaveLength(0);
+    expect(onRequestTarget).not.toHaveBeenCalled();
+  });
+
+  it('offers the pick, re-pick and retry controls when explicitly available', async () => {
+    const user = userEvent.setup();
+    const onRequestTarget = vi.fn<() => void>();
+    const target = makeTarget();
+
+    const { rerender } = render(
+      <TargetBadge onRequestTarget={onRequestTarget} pickAvailability="available" />,
+    );
+    await user.click(screen.getByRole('button', { name: /^pick element$/i }));
+
+    rerender(
+      <TargetBadge
+        target={target}
+        onRequestTarget={onRequestTarget}
+        pickAvailability="available"
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /pick another element/i }));
+
+    rerender(
+      <TargetBadge
+        error="The pick failed."
+        onRequestTarget={onRequestTarget}
+        pickAvailability="available"
+      />,
+    );
+    await user.click(within(screen.getByRole('alert')).getByRole('button'));
+
+    expect(onRequestTarget.mock.calls).toEqual([[], [], []]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Privacy
 // ---------------------------------------------------------------------------
 

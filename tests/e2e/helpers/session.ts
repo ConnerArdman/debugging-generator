@@ -1390,12 +1390,16 @@ async function describePill(panel: PanelHandle): Promise<readonly string[]> {
  * Step 2 — bind the application's tab to the session through the product.
  *
  * The panel's DevTools page announced the tab when it opened — normally before
- * this session existed, so that bind found no session, or another one. When
- * the recording holds no binding of this session to the tab (or `mode` is
- * `always`), the tab is re-announced by reloading the DevTools page: the
- * worker sends `session.bind`, and the service binds the tab to the most
- * recently updated non-ended session on its origin. This module never sends
- * `session.bind` itself.
+ * this session existed, so that bind found no session, or another one. The
+ * service remembers such a tab and delivers the session created for its
+ * origin to the panel, whose worker then announces the tab again (AAP §0.2.3),
+ * so a tab the recording shows no binding for yet is simply waited for. The
+ * DevTools page is reloaded — the worker sends `session.bind`, and the service
+ * binds the tab to the most recently updated non-ended session on its origin —
+ * only to re-announce a tab whose binding was lost, one bound to another
+ * document, or any tab when `mode` is `always`; a reload while the product's
+ * own bind is landing would unbind the tab again as its DevTools closes. This
+ * module never sends `session.bind` itself.
  */
 async function bindTabStep(
   driver: WorkflowDriver,
@@ -1434,7 +1438,11 @@ async function bindTabStep(
   driver.recorder.drain();
   const current = driver.recorder.bindingState(tabId, scope);
   const announceMark = driver.client.snapshotIndex();
-  if (mode === 'always' || current.kind !== 'bound' || !sameDocument(appUrl, current.url)) {
+  const reannounce =
+    mode === 'always' ||
+    current.kind === 'lost' ||
+    (current.kind === 'bound' && !sameDocument(appUrl, current.url));
+  if (reannounce) {
     try {
       await panel.reload();
     } catch (error) {

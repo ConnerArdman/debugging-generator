@@ -94,9 +94,9 @@
  *   frames are being delivered is an ordinary burst, counted in
  *   `eventsDropped`; overflow while an undelivered backlog is waiting for its
  *   panel is **tail truncation for an unreachable panel**, counted in
- *   `eventsTruncatedWhileUndelivered` and logged under its own message. The
- *   tail payload has no field for either count, so they go to
- *   {@link LiveTail.stats} and to the log, never onto the wire.
+ *   `eventsTruncatedWhileUndelivered` and logged under its own message. Both
+ *   go to {@link LiveTail.stats} and the log, and — per capture — onto the
+ *   wire through each frame's capture tallies (see "What a frame counts").
  * - **Undelivered backlog:** events no connection received stay buffered, at
  *   most the per-session bound, for at most
  *   {@link TAIL_UNDELIVERED_RETENTION_MS} from the first undelivered attempt of
@@ -116,6 +116,30 @@
  * - **Sessions:** a session's state lives while it has buffered events or a
  *   pending timer; idle states beyond a small bound are released least recently
  *   used first, and {@link LiveTail.forget} releases one explicitly.
+ *
+ * ## What a frame counts
+ *
+ * The tail is a paced, bounded view, so the events a panel receives are never
+ * the size of the capture: a render flood outruns the frame budget and the
+ * buffer sheds its oldest events. Counting what arrived would put a number on
+ * screen that disagrees with the store. Every frame therefore carries, for each
+ * capture its events belong to, a tally (`telemetry.tail`'s `captures`):
+ *
+ * - `storedEvents` — the events the store has committed for the capture, read
+ *   when the frame is built from the injected {@link CaptureArrivals} (the
+ *   telemetry repository's ingest watermark, which `insertMany` advances before
+ *   ingest pushes the rows here, so the count already covers every event in the
+ *   frame). The highest reading is kept, so a watermark released once the
+ *   capture closed never lowers it. Without the port, the count of events this
+ *   tail admitted for the capture stands in.
+ * - `skippedEvents` — the events of the capture the tail removed without
+ *   delivering them: evicted from a full buffer, truncated or released during
+ *   an outage, discarded in an unsendable frame, or left buffered when the
+ *   session's tail state was released.
+ *
+ * Tallies are kept per session and capture, apart from the session's buffer
+ * state so they outlive an idle release, and bounded to the most recently used
+ * {@link TAIL_MAX_TRACKED_CAPTURES}. They are counts only.
  *
  * ## Delivery: only the bound tab
  *
@@ -186,11 +210,27 @@
  * @module
  */
 
-import { createEnvelope, parseTelemetryTailPayload } from '@debuggen/protocol';
-import type { ClientKind, ProtocolMessage, TelemetryTailPayload } from '@debuggen/protocol';
+import {
+  MAX_TAIL_CAPTURE_TALLIES,
+  createEnvelope,
+  parseTelemetryTailPayload,
+} from '@debuggen/protocol';
+import type {
+  ClientKind,
+  ProtocolMessage,
+  TelemetryTailCaptureTally,
+  TelemetryTailPayload,
+} from '@debuggen/protocol';
 import { DebuggenError, err, noopLogger, nowEpochMs, ok } from '@debuggen/shared';
-import type { DebuggenErrorCode, LogFields, Logger, Result, SessionId } from '@debuggen/shared';
-import { parseTelemetryEvent } from '@debuggen/telemetry';
+import type {
+  CaptureId,
+  DebuggenErrorCode,
+  LogFields,
+  Logger,
+  Result,
+  SessionId,
+} from '@debuggen/shared';
+import { ERROR_KINDS, parseTelemetryEvent } from '@debuggen/telemetry';
 import type { TelemetryEvent } from '@debuggen/telemetry';
 
 import { describeException, guardLogger, sessionLogger, subsystemLogger } from '../logging.js';
@@ -260,6 +300,16 @@ export const TAIL_RETRY_MAX_DELAY_MS = 2000;
  * lost — every event is in the store, where panel-data queries read it.
  */
 export const TAIL_UNDELIVERED_RETENTION_MS = 30_000;
+
+/**
+ * How many captures' tallies the tail keeps, least recently used released
+ * first (see "What a frame counts").
+ *
+ * A session has one open capture at a time and a panel shows one session, so
+ * the working set is a handful; the bound keeps a long-running service from
+ * accumulating one tally per capture it ever saw.
+ */
+export const TAIL_MAX_TRACKED_CAPTURES = 64;
 
 /**
  * The client kinds a tail frame is delivered to: the DevTools panel only.
@@ -364,6 +414,31 @@ export interface TailBroadcaster extends SessionBroadcaster {
 }
 
 /**
+ * The store's count of one capture's committed events, as the tail reads it
+ * when it builds a frame (see "What a frame counts").
+ *
+ * Satisfied in production by the telemetry repository's `captureWatermark`,
+ * the same instance ingest writes through, so `../main.ts` passes it unchanged
+ * and the compiler checks it there. The read is in-memory and constant-time,
+ * which is why it may run once per frame.
+ */
+export interface CaptureArrivals {
+  /**
+   * How many events the store has committed for a capture of a session.
+   *
+   * @param sessionId The session that owns the capture.
+   * @param captureId The capture window.
+   * @returns The count in `eventCount`, or a refusal; a capture the store no
+   * longer tracks answers `0`, which the tail never lets lower a count it
+   * already reported.
+   */
+  captureWatermark(
+    sessionId: SessionId,
+    captureId: CaptureId,
+  ): Result<{ readonly eventCount: number }, DebuggenError>;
+}
+
+/**
  * Everything {@link createLiveTail} is given; everything but the broadcaster is
  * optional and defaults to the production choice.
  */
@@ -375,6 +450,15 @@ export interface LiveTailDeps {
    * count decides whether a frame is dequeued.
    */
   readonly broadcaster: TailBroadcaster;
+
+  /**
+   * Where each frame's `storedEvents` comes from: the store's committed count
+   * per capture. Omitted, the tail counts the events it admitted for the
+   * capture instead — exact while every committed row reaches the tail once,
+   * which is how ingest calls it. A read that fails or throws falls back the
+   * same way for that frame and is logged by code.
+   */
+  readonly arrivals?: CaptureArrivals | undefined;
 
   /** The parent logger; records are bound to this subsystem and the session. Defaults to `noopLogger`. */
   readonly logger?: Logger | undefined;
@@ -610,7 +694,8 @@ type ReportKind =
   | 'broadcastFailed'
   | 'expired'
   | 'recovered'
-  | 'timerFailed';
+  | 'timerFailed'
+  | 'arrivalsFailed';
 
 /** The log levels this module writes at. */
 type ReportLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -675,6 +760,11 @@ const REPORTS: Readonly<
     level: 'error',
     message: 'Live tail could not schedule its flush timer',
   },
+  arrivalsFailed: {
+    level: 'debug',
+    message:
+      'Live tail could not read a capture’s stored-event count; the frame reports the events the tail admitted for it instead',
+  },
 });
 
 /** One throttled report kind's state for one session. */
@@ -737,8 +827,95 @@ interface SessionTail {
    * frame can never be delivered twice.
    */
   sending: boolean;
+  /**
+   * The frame inside the broadcaster, while {@link SessionTail.sending}: its
+   * events, and those of them a re-entrant `push`, `forget` or `close` removed
+   * from the buffer meanwhile. Whether those were delivered is decided by the
+   * attempt's receipt, so their `skippedEvents` booking waits for it.
+   */
+  inFlight: InFlightFrame | undefined;
   /** Per-kind throttle state. */
   readonly throttle: Map<ReportKind, ThrottleEntry>;
+}
+
+/** The frame a session has inside the broadcaster (see {@link SessionTail.inFlight}). */
+interface InFlightFrame {
+  readonly events: ReadonlySet<TelemetryEvent>;
+  /** Frame events removed from the buffer while the attempt was in progress. */
+  readonly removed: TelemetryEvent[];
+}
+
+/**
+ * One capture's running counts, held apart from its session's buffer state
+ * (see "What a frame counts").
+ */
+/**
+ * Whether the tail keeps `event` over its neighbours when its buffer overflows:
+ * an event whose subject is a failure (`ERROR_KINDS`) or an operation that
+ * failed (`status: 'error'`).
+ */
+function isFailureEvent(event: TelemetryEvent): boolean {
+  return event.status === 'error' || ERROR_KINDS.includes(event.kind);
+}
+
+/**
+ * Remove `excess` events from the front of an overflowing `buffer`, in place,
+ * and return them oldest first.
+ *
+ * The oldest events that are not failures (see {@link isFailureEvent}) go
+ * first; failures go only when the buffer holds fewer than `excess` other
+ * events, and then oldest first too. The events kept stay in arrival order, so
+ * a frame drained from the front still reads its survivors as a prefix. The
+ * common case — no failure among the oldest `excess` — is a single splice.
+ */
+function evictForBound(buffer: TelemetryEvent[], excess: number): TelemetryEvent[] {
+  if (excess <= 0) {
+    return [];
+  }
+  const count = Math.min(excess, buffer.length);
+  if (!buffer.slice(0, count).some(isFailureEvent)) {
+    return buffer.splice(0, count);
+  }
+  let others = 0;
+  for (const event of buffer) {
+    if (!isFailureEvent(event)) {
+      others += 1;
+    }
+  }
+  // Failures evicted only for the share the other events cannot cover.
+  let failuresToEvict = Math.max(0, count - others);
+  let othersToEvict = count - failuresToEvict;
+  const kept: TelemetryEvent[] = [];
+  const removed: TelemetryEvent[] = [];
+  for (const event of buffer) {
+    if (isFailureEvent(event)) {
+      if (failuresToEvict > 0) {
+        failuresToEvict -= 1;
+        removed.push(event);
+        continue;
+      }
+    } else if (othersToEvict > 0) {
+      othersToEvict -= 1;
+      removed.push(event);
+      continue;
+    }
+    kept.push(event);
+  }
+  buffer.length = 0;
+  for (const event of kept) {
+    buffer.push(event);
+  }
+  return removed;
+}
+
+interface CaptureTally {
+  readonly captureId: CaptureId;
+  /** Events of the capture this tail admitted: guarded, de-duplicated and buffered. */
+  admitted: number;
+  /** The highest `storedEvents` any frame has reported; never lowered. */
+  storedHigh: number;
+  /** Events of the capture removed from the tail without being delivered. */
+  skipped: number;
 }
 
 /** How one frame attempt ended. */
@@ -1038,6 +1215,13 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
 
   /** Every held session state, least recently pushed first. */
   const sessions = new Map<SessionId, SessionTail>();
+  /**
+   * Per session and capture, the counts each frame reports, least recently
+   * used first and bounded by {@link TAIL_MAX_TRACKED_CAPTURES}. Keyed by both
+   * ids so two sessions can never share a count.
+   */
+  const tallies = new Map<string, CaptureTally>();
+  const arrivals = deps.arrivals;
   const counters = {
     framesSent: 0,
     eventsSent: 0,
@@ -1152,6 +1336,138 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
     }
   }
 
+  /* ---- capture tallies ---- */
+
+  /**
+   * The tally of one capture of a session, created on first use and moved to
+   * most recently used; the least recently used past
+   * {@link TAIL_MAX_TRACKED_CAPTURES} are forgotten.
+   */
+  function tallyFor(sessionId: SessionId, captureId: CaptureId): CaptureTally {
+    const key = `${sessionId}\u0000${captureId}`;
+    const existing = tallies.get(key);
+    if (existing !== undefined) {
+      tallies.delete(key);
+      tallies.set(key, existing);
+      return existing;
+    }
+    const created: CaptureTally = { captureId, admitted: 0, storedHigh: 0, skipped: 0 };
+    tallies.set(key, created);
+    while (tallies.size > TAIL_MAX_TRACKED_CAPTURES) {
+      const oldest = tallies.keys().next();
+      if (oldest.done) {
+        break;
+      }
+      tallies.delete(oldest.value);
+    }
+    return created;
+  }
+
+  /**
+   * Books events the tail removed without delivering them against their
+   * captures' `skippedEvents`. Consecutive events of one capture — the common
+   * case — cost one tally lookup.
+   */
+  function noteSkipped(state: SessionTail, removed: readonly TelemetryEvent[]): void {
+    let tally: CaptureTally | undefined;
+    for (const event of removed) {
+      if (tally?.captureId !== event.captureId) {
+        tally = tallyFor(state.sessionId, event.captureId);
+      }
+      tally.skipped = Math.min(Number.MAX_SAFE_INTEGER, tally.skipped + 1);
+    }
+  }
+
+  /**
+   * Books events removed from the buffer without a frame of their own — by the
+   * bound, the retention window, `forget` or `close`. An event of the frame
+   * currently inside the broadcaster is set aside instead: that frame may still
+   * deliver it, and {@link settleInFlight} books it once the receipt is known.
+   */
+  function noteRemoved(state: SessionTail, removed: readonly TelemetryEvent[]): void {
+    const inFlight = state.inFlight;
+    if (inFlight === undefined) {
+      noteSkipped(state, removed);
+      return;
+    }
+    const lost: TelemetryEvent[] = [];
+    for (const event of removed) {
+      if (inFlight.events.has(event)) {
+        inFlight.removed.push(event);
+      } else {
+        lost.push(event);
+      }
+    }
+    noteSkipped(state, lost);
+  }
+
+  /**
+   * Closes the in-flight record of an attempt: frame events removed while it
+   * was in progress were delivered when the frame was sent, and skipped when it
+   * was not.
+   */
+  function settleInFlight(state: SessionTail, inFlight: InFlightFrame, sent: boolean): void {
+    if (state.inFlight === inFlight) {
+      state.inFlight = undefined;
+    }
+    if (!sent) {
+      noteSkipped(state, inFlight.removed);
+    }
+  }
+
+  /**
+   * The store's committed count for one capture, from the injected
+   * {@link CaptureArrivals}: `undefined` when there is no port, the read
+   * refuses or throws, or the store no longer tracks the capture (a zero).
+   */
+  function readStored(state: SessionTail, captureId: CaptureId): number | undefined {
+    if (arrivals === undefined) {
+      return undefined;
+    }
+    try {
+      const read = arrivals.captureWatermark(state.sessionId, captureId);
+      if (!read.ok) {
+        report(state, 'arrivalsFailed', 1, { code: read.error.code });
+        return undefined;
+      }
+      const count = read.value.eventCount;
+      return Number.isSafeInteger(count) && count > 0 ? count : undefined;
+    } catch (thrown) {
+      report(state, 'arrivalsFailed', 1, { code: codeOf(thrown, 'STORE_ERROR') });
+      return undefined;
+    }
+  }
+
+  /**
+   * The tallies one frame carries: one per capture its events belong to, read
+   * now. A frame spanning more than {@link MAX_TAIL_CAPTURE_TALLIES} captures —
+   * which the per-frame cap makes all but impossible — carries the most recent
+   * ones, the captures the panel is counting.
+   */
+  function talliesFor(
+    state: SessionTail,
+    batch: readonly TelemetryEvent[],
+  ): TelemetryTailCaptureTally[] {
+    const captureIds: CaptureId[] = [];
+    let previous: CaptureId | undefined;
+    for (const event of batch) {
+      if (event.captureId !== previous) {
+        previous = event.captureId;
+        const at = captureIds.indexOf(event.captureId);
+        if (at !== -1) {
+          captureIds.splice(at, 1);
+        }
+        captureIds.push(event.captureId);
+      }
+    }
+    return captureIds.slice(-MAX_TAIL_CAPTURE_TALLIES).map((captureId) => {
+      const tally = tallyFor(state.sessionId, captureId);
+      const reading = readStored(state, captureId) ?? tally.admitted;
+      tally.storedHigh = Math.max(tally.storedHigh, reading);
+      return { captureId, storedEvents: tally.storedHigh, skippedEvents: tally.skipped };
+    });
+  }
+
   /* ---- session state ---- */
 
   /** The session's state, created on first use and moved to most recently used. */
@@ -1170,6 +1486,7 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
       armed: undefined,
       outage: undefined,
       sending: false,
+      inFlight: undefined,
       throttle: new Map<ReportKind, ThrottleEntry>(),
     };
     sessions.set(sessionId, created);
@@ -1193,10 +1510,15 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
     }
   }
 
-  /** Cancels, empties and forgets one session's state, reporting throttled counts first. */
+  /**
+   * Cancels, empties and forgets one session's state, reporting throttled
+   * counts first. Events still buffered were never delivered, so they count as
+   * skipped for their captures, whose tallies outlive this state.
+   */
   function release(state: SessionTail): void {
     disarm(state);
     reportSuppressed(state);
+    noteRemoved(state, state.buffer);
     state.buffer.length = 0;
     state.seen.clear();
     state.outage = undefined;
@@ -1345,6 +1667,7 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
    */
   function expire(state: SessionTail, outage: TailOutage): number {
     const released = state.buffer.length;
+    noteRemoved(state, state.buffer);
     state.buffer.length = 0;
     state.outage = undefined;
     disarm(state);
@@ -1377,13 +1700,24 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
    * Validates a frame's payload against protocol's `telemetry.tail` schema,
    * without throwing. The error is protocol's own, which is built from issue
    * paths and codes and never from a received value.
+   *
+   * The frame carries its captures' tallies, read now. They are built from the
+   * frame's own admitted events — every one a schema-valid persisted event, so
+   * every one names a capture — and from counts held within the safe-integer
+   * range, so they satisfy the schema by construction and are validated with
+   * the rest of the frame, on the one invalid-frame path.
    */
   function validateFrame(
-    sessionId: SessionId,
+    state: SessionTail,
     events: readonly TelemetryEvent[],
   ): Result<TelemetryTailPayload, DebuggenError> {
     try {
-      return parseTelemetryTailPayload({ sessionId, events });
+      const captures = talliesFor(state, events);
+      return parseTelemetryTailPayload(
+        captures.length > 0
+          ? { sessionId: state.sessionId, events, captures }
+          : { sessionId: state.sessionId, events },
+      );
     } catch (thrown) {
       return err(
         new DebuggenError('PROTOCOL_INVALID_MESSAGE', 'A live-tail frame could not be validated', {
@@ -1420,7 +1754,7 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
    * Never mutates the buffer; `drain` decides what leaves it.
    */
   function sendFrame(state: SessionTail, batch: readonly TelemetryEvent[]): FrameOutcome {
-    const validated = validateFrame(state.sessionId, batch);
+    const validated = validateFrame(state, batch);
     if (!validated.ok) {
       return discardInvalid(state, batch, validated.error);
     }
@@ -1478,17 +1812,20 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
    * of the frame is still the buffer's prefix, in order, and events pushed
    * meanwhile sit behind it. Walking the frame against the front therefore
    * removes exactly the frame's surviving events and never one pushed after it.
+   *
+   * @returns The events removed — the frame's survivors, in order.
    */
-  function removeFront(state: SessionTail, batch: readonly TelemetryEvent[]): void {
+  function removeFront(
+    state: SessionTail,
+    batch: readonly TelemetryEvent[],
+  ): readonly TelemetryEvent[] {
     let matched = 0;
     for (const event of batch) {
       if (matched < state.buffer.length && state.buffer[matched] === event) {
         matched += 1;
       }
     }
-    if (matched > 0) {
-      state.buffer.splice(0, matched);
-    }
+    return matched > 0 ? state.buffer.splice(0, matched) : [];
   }
 
   /**
@@ -1519,12 +1856,15 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
     while (frames < maxFrames && state.buffer.length > 0 && isLive(state)) {
       frames += 1;
       const batch = state.buffer.slice(0, maxEventsPerFrame);
-      let outcome: FrameOutcome;
+      const inFlight: InFlightFrame = { events: new Set(batch), removed: [] };
+      let outcome: FrameOutcome | undefined;
       state.sending = true;
+      state.inFlight = inFlight;
       try {
         outcome = sendFrame(state, batch);
       } finally {
         state.sending = false;
+        settleInFlight(state, inFlight, outcome?.kind === 'sent');
       }
 
       if (outcome.kind === 'undelivered') {
@@ -1533,11 +1873,14 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
         expired += noteUndelivered(state);
         break;
       }
-      removeFront(state, batch);
+      const removed = removeFront(state, batch);
       if (outcome.kind === 'sent') {
         sent += batch.length;
         noteDelivered(state);
       } else {
+        // Discarded unsent: the frame's surviving events are skipped. Any that
+        // were removed while it was in flight were booked by settleInFlight.
+        noteSkipped(state, removed);
         failure ??= outcome.error;
       }
     }
@@ -1651,6 +1994,8 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
     let accepted = 0;
     let rejected = 0;
     let duplicates = 0;
+    /** The tally of the last admitted event's capture: a batch is usually one capture. */
+    let tally: CaptureTally | undefined;
 
     try {
       for (const candidate of candidates) {
@@ -1671,6 +2016,10 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
         state.buffer.push(event);
         remember(state, event.id);
         accepted += 1;
+        if (tally?.captureId !== event.captureId) {
+          tally = tallyFor(sessionId, event.captureId);
+        }
+        tally.admitted = Math.min(Number.MAX_SAFE_INTEGER, tally.admitted + 1);
       }
     } catch {
       // Only an array whose iteration itself throws (a hostile proxy) gets
@@ -1685,9 +2034,12 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
 
     const excess = state.buffer.length - maxBufferedEvents;
     if (excess > 0) {
-      // Oldest first: the tail is a live view, so the newest evidence is the
-      // useful evidence, and the dropped events are already in the store.
-      state.buffer.splice(0, excess);
+      // Oldest first, failures last: the tail is a live view, so the newest
+      // evidence is the useful evidence, but a failure is the event a
+      // developer is watching the tail for, and a burst of renders must not
+      // push it out unseen (see evictForBound). The dropped events are already
+      // in the store, and their captures' tallies say so on the next frame.
+      noteRemoved(state, evictForBound(state.buffer, excess));
       if (state.outage === undefined) {
         counters.eventsDropped += excess;
         report(state, 'dropped', excess, { bound: maxBufferedEvents });
@@ -1739,6 +2091,7 @@ export function createLiveTail(deps: LiveTailDeps): LiveTail {
       release(state);
     }
     sessions.clear();
+    tallies.clear();
   }
 
   return Object.freeze({

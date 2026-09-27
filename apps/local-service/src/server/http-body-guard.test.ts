@@ -22,6 +22,12 @@
  *    body is never re-read (its route validated it before serializing it),
  *    while framing and failure bodies still are, a failure body at most
  *    sixteen kibibytes deep; `full` mode re-parses success bodies.
+ * 6. **A body is read only as JSON.** A body whose `Content-Type` is not
+ *    `application/json` (charset, when named, `utf-8`) — or that has none — is
+ *    answered `415` at its first byte, with no side effect of the route; a
+ *    bodiless request is never judged, and a route's earlier refusal still
+ *    wins. No route module knows the reason, so the guard's replacement of the
+ *    route's answer is filed at `debug`, not `warn`.
  *
  * The application is built by `createHttpApp` over stub dependencies: only the
  * functions a request reaches before its body is read are real behaviour, and
@@ -38,9 +44,10 @@ import type { AddressInfo } from 'node:net';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { HTTP_ROUTES, buildPath } from '@debuggen/protocol';
+import { HTTP_ROUTES, buildPath, httpErrorResponseSchema } from '@debuggen/protocol';
 import type { HttpOperationId } from '@debuggen/protocol';
-import { isErr, noopLogger, ok } from '@debuggen/shared';
+import { createConsoleLogger, isErr, noopLogger, ok } from '@debuggen/shared';
+import type { LogRecord, Logger } from '@debuggen/shared';
 
 import { DEV_SERVER_CREDENTIAL_PATH } from '../dev-server/launcher.js';
 import type { PairingCompletionRequest, Principal } from './auth.js';
@@ -48,6 +55,7 @@ import {
   DEFAULT_REQUEST_BODY_LIMIT_BYTES,
   REQUEST_BODY_LIMIT_BYTES,
   REQUEST_BODY_REFUSAL_REASONS,
+  REQUEST_MEDIA_TYPE_REFUSAL_REASON,
   createHttpApp,
 } from './http.js';
 import type { HttpApp, HttpAppDeps, ResponseVerificationMode } from './http.js';
@@ -183,6 +191,8 @@ interface BuiltApp {
 interface BuildOptions {
   readonly verifyResponses?: ResponseVerificationMode | boolean;
   readonly requestBodyTimeoutMs?: number;
+  /** The service logger; the silent one unless a test reads the records. */
+  readonly logger?: Logger;
 }
 
 /**
@@ -208,7 +218,7 @@ function buildApp(options: BuildOptions = {}): BuiltApp {
       requireLiveCredential: () => ok(undefined),
     },
     config: { host: '127.0.0.1' },
-    logger: noopLogger,
+    logger: options.logger ?? noopLogger,
     sessions: { get: (id: string) => ok({ id, projectRoot: PROJECT_ROOT }) },
     bindings: { list: () => [], get: () => undefined },
     serviceVersion: '0.1.0',
@@ -312,13 +322,18 @@ function chunkedBody(text: string, parts: number): TestBody {
   return { stream, pulls: () => pulls, cancelled: () => cancelled };
 }
 
-/** A streamed (length-less) request to `path`. */
-function streamedRequest(method: string, path: string, body: TestBody): Request {
+/** A streamed (length-less) request to `path`, sent as JSON unless `contentType` says otherwise. */
+function streamedRequest(
+  method: string,
+  path: string,
+  body: TestBody,
+  contentType = 'application/json',
+): Request {
   return new Request(`${BASE_URL}${path}`, {
     method,
     body: body.stream,
     duplex: 'half',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': contentType },
   });
 }
 
@@ -582,6 +597,193 @@ describe('the request-body guard', () => {
       const health = await fetch(`http://127.0.0.1:${String(port)}${buildPath('health')}`);
       expect(health.status).toBe(200);
     });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The request media type
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The fixed message of the guard's `415` (see `./http.ts`). */
+const UNSUPPORTED_MEDIA_TYPE_MESSAGE = 'The request body must be sent as application/json.';
+
+/** The record the guard files when it answers a `415` in place of the route's answer. */
+const MEDIA_TYPE_REFUSED_LOG = 'Refused a request body sent under a media type other than JSON';
+
+/** The record the guard files when a route misreports one of the two ceilings it knows. */
+const MISREPORTED_REFUSAL_LOG =
+  'A route answered a refused request body at another status; answering the refusal';
+
+/** A valid `pair.complete` body, as text. */
+const PAIR_COMPLETE_BODY = JSON.stringify({ code: PAIRING_CODE });
+
+/**
+ * A `POST /pair/complete` carrying `body` under `contentType`. With no
+ * `contentType` the request carries no `Content-Type` only when `body` is a
+ * byte array or absent: the platform labels a string body `text/plain`.
+ */
+function pairCompleteRequest(body: string | Uint8Array | undefined, contentType?: string): Request {
+  return new Request(`${BASE_URL}${buildPath('pair.complete')}`, {
+    method: 'POST',
+    ...(body === undefined ? {} : { body }),
+    headers: contentType === undefined ? {} : { 'content-type': contentType },
+  });
+}
+
+/** A logger that keeps every record, at every level. */
+function recordingLogger(): { readonly logger: Logger; readonly records: LogRecord[] } {
+  const records: LogRecord[] = [];
+  const logger = createConsoleLogger({
+    level: 'trace',
+    sink: (record) => {
+      records.push(record);
+    },
+  });
+  return { logger, records };
+}
+
+describe('the request media type', () => {
+  it('keeps its refusal reason apart from the two every route module states', () => {
+    expect(REQUEST_MEDIA_TYPE_REFUSAL_REASON).toBe('unsupported-media-type');
+    expect(Object.values(REQUEST_BODY_REFUSAL_REASONS)).not.toContain(
+      REQUEST_MEDIA_TYPE_REFUSAL_REASON,
+    );
+  });
+
+  it.each([
+    ['text/plain', 'text/plain;charset=UTF-8'],
+    ['a form encoding', 'application/x-www-form-urlencoded'],
+    ['multipart form data', 'multipart/form-data; boundary=zz'],
+    ['a +json suffix type', 'application/merge-patch+json'],
+    ['a type that only begins like JSON', 'application/jsonp'],
+    ['JSON in a charset other than utf-8', 'application/json; charset=iso-8859-1'],
+    ['two joined Content-Type values', 'application/json, text/plain'],
+    ['a parameter with no value', 'application/json; charset'],
+  ])('answers a body sent as %s with 415 and redeems nothing', async (_label, contentType) => {
+    const { app, redeemed } = buildApp();
+
+    const response = await app.fetch(pairCompleteRequest(PAIR_COMPLETE_BODY, contentType));
+
+    expect(response.status).toBe(415);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const parsed = httpErrorResponseSchema.safeParse(await response.json());
+    expect(parsed.success).toBe(true);
+    expect(parsed.data).toMatchObject({
+      code: 'PROTOCOL_INVALID_MESSAGE',
+      message: UNSUPPORTED_MEDIA_TYPE_MESSAGE,
+    });
+    expect(redeemed).toEqual([]);
+  });
+
+  it('answers a body that carries no Content-Type at all with 415', async () => {
+    const { app, redeemed } = buildApp();
+    const request = pairCompleteRequest(new TextEncoder().encode(PAIR_COMPLETE_BODY));
+    expect(request.headers.get('content-type')).toBeNull();
+
+    const response = await app.fetch(request);
+
+    expect(response.status).toBe(415);
+    expect(await errorBody(response)).toMatchObject({ message: UNSUPPORTED_MEDIA_TYPE_MESSAGE });
+    expect(redeemed).toEqual([]);
+  });
+
+  it.each([
+    'application/json',
+    'application/json; charset=utf-8',
+    'Application/JSON; Charset="UTF-8"',
+    'application/json;',
+    'application/json; charset=utf-8; profile=debuggen',
+  ])('reads a body sent as %s', async (contentType) => {
+    const { app, redeemed } = buildApp();
+
+    const response = await app.fetch(pairCompleteRequest(PAIR_COMPLETE_BODY, contentType));
+
+    expect(response.status).toBe(200);
+    expect(redeemed).toEqual([PAIRING_CODE]);
+  });
+
+  it('never judges a request that carries no body byte, whatever its Content-Type', async () => {
+    const { app } = buildApp();
+
+    for (const request of [
+      pairCompleteRequest(undefined),
+      pairCompleteRequest(new Uint8Array(0)),
+      pairCompleteRequest(new Uint8Array(0), 'text/plain'),
+    ]) {
+      const response = await app.fetch(request);
+      // The route's own schema refusal of an empty body — not the guard's 415.
+      expect(response.status).toBe(400);
+      expect(await errorBody(response)).toMatchObject({ code: 'PROTOCOL_INVALID_MESSAGE' });
+    }
+  });
+
+  it('refuses a streamed body at its first byte, before its byte ceiling, and drops the rest within a bound', async () => {
+    const { app, redeemed } = buildApp();
+    const body = endlessBody();
+
+    const response = await app.fetch(
+      streamedRequest('POST', buildPath('pair.complete'), body, 'text/plain'),
+    );
+
+    expect(response.status).toBe(415);
+    expect(redeemed).toEqual([]);
+    await vi.waitFor(
+      () => {
+        expect(body.cancelled()).toBe(true);
+      },
+      { timeout: DISCARD_SETTLE_TIMEOUT_MS },
+    );
+  });
+
+  it("lets a route's refusal of the caller win: nothing of the body is read to judge it", async () => {
+    const { app, setPrincipal } = buildApp();
+    setPrincipal(DEVTOOLS);
+    const body = endlessBody();
+
+    const response = await app.fetch(
+      streamedRequest('POST', buildPath('session.create'), body, 'text/plain'),
+    );
+
+    expect(response.status).toBe(403);
+    expect(body.pulls()).toBe(0);
+  });
+
+  it.each(BODY_ROUTES)(
+    '$label answers a body that is not JSON with the guard’s 415',
+    async ({ method, path, principal }) => {
+      const { app, setPrincipal } = buildApp();
+      setPrincipal(principal);
+
+      const response = await app.fetch(
+        streamedRequest(method, path, chunkedBody('{}', 1), 'text/plain'),
+      );
+
+      expect(response.status).toBe(415);
+      expect(await errorBody(response)).toMatchObject({
+        code: 'PROTOCOL_INVALID_MESSAGE',
+        message: UNSUPPORTED_MEDIA_TYPE_MESSAGE,
+      });
+    },
+  );
+
+  it("files the replacement of the route's answer at debug, never as a route's mistake, and never the presented type", async () => {
+    const presented = 'text/zz-presented-media-type';
+    const { logger, records } = recordingLogger();
+    const { app } = buildApp({ logger });
+
+    const response = await app.fetch(pairCompleteRequest(PAIR_COMPLETE_BODY, presented));
+
+    expect(response.status).toBe(415);
+    const refused = records.filter((record) => record.message === MEDIA_TYPE_REFUSED_LOG);
+    expect(refused.map((record) => record.level)).toEqual(['debug']);
+    expect(refused[0]?.fields).toMatchObject({
+      operation: 'pair.complete',
+      reason: REQUEST_MEDIA_TYPE_REFUSAL_REASON,
+      status: 415,
+      routeStatus: 400,
+    });
+    expect(records.filter((record) => record.message === MISREPORTED_REFUSAL_LOG)).toEqual([]);
+    expect(JSON.stringify(records)).not.toContain(presented);
   });
 });
 

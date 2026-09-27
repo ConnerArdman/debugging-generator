@@ -493,6 +493,60 @@ describe('DiffView rendering', () => {
     expect(second.container.querySelector('.dgv-diff__file')).toBeNull();
   });
 
+  it('wraps the file label rather than letting a long path widen or overflow the strip', () => {
+    const { container } = render(<DiffView diff={SAMPLE_DIFF} fileLabel={FILE_LABEL} />);
+
+    const code = container.querySelector('.dgv-diff__file code');
+    expect(code?.textContent).toBe(FILE_LABEL);
+    expect(code?.classList.contains('dg-code--wrap')).toBe(true);
+  });
+
+  it('shows the subject under the file label and appends it to the region name', () => {
+    const subject = 'Change made by the tool';
+    const { container } = render(
+      <DiffView diff={SAMPLE_DIFF} fileLabel={FILE_LABEL} subject={subject} />,
+    );
+
+    const header = rootOf(container).querySelector('.dgv-diff__file');
+    expect(header?.querySelector('code')?.textContent).toBe(FILE_LABEL);
+    expect(header?.querySelector('.dgv-diff__subject')?.textContent).toBe(subject);
+    expect(header?.textContent).toBe(`${FILE_LABEL}${subject}`);
+
+    const region = screen.getByRole('region', { name: `Diff of ${FILE_LABEL} (${subject})` });
+    expect(region.tagName).toBe('PRE');
+  });
+
+  it('names the region after the subject alone when there is no file label', () => {
+    render(<DiffView diff={SAMPLE_DIFF} subject="Edit since the change" />);
+
+    expect(screen.getByRole('region', { name: 'Diff (Edit since the change)' })).not.toBeNull();
+  });
+
+  it('ignores a blank subject', () => {
+    const { container } = render(
+      <DiffView diff={SAMPLE_DIFF} fileLabel={FILE_LABEL} subject="  " />,
+    );
+
+    expect(container.querySelector('.dgv-diff__subject')).toBeNull();
+    expect(screen.getByRole('region', { name: `Diff of ${FILE_LABEL}` })).not.toBeNull();
+  });
+
+  it('keeps the subject in the header of the empty and pending states', () => {
+    const subject = 'Edit since the change';
+    const { container, rerender } = render(
+      <DiffView diff="" fileLabel={FILE_LABEL} subject={subject} />,
+    );
+
+    expect(container.querySelector('.dgv-diff__subject')?.textContent).toBe(subject);
+    expect(screen.getByRole('status').textContent).toContain(
+      'No diff is available for this modification.',
+    );
+
+    rerender(<DiffView diff="" fileLabel={FILE_LABEL} subject={subject} pending />);
+    expect(container.querySelector('.dgv-diff__subject')?.textContent).toBe(subject);
+    expect(screen.getByRole('status').getAttribute('aria-busy')).toBe('true');
+  });
+
   it('resolves header-looking content inside a hunk body from the hunk counts', () => {
     const lines = [
       'diff --git a/src/one.ts b/src/one.ts',

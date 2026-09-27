@@ -127,6 +127,7 @@ import { isErr, isOk, type Result } from '../result.js';
 import {
   SECURE_DIR_MODE,
   SECURE_FILE_MODE,
+  UNSAFE_PATH_REASONS,
   assertSecureDir,
   atomicCreateFileNoClobber,
   atomicReplaceFile,
@@ -139,8 +140,10 @@ import {
   pinPrivateFileWithinRoot,
   readFileNoFollow,
   readFileSnapshotNoFollow,
+  unsafePathReasonOf,
   writeSecureFileAtomic,
   type PrivateFileState,
+  type UnsafePathReason,
 } from './safe-fs.js';
 
 /*
@@ -613,14 +616,23 @@ function unsafePathErrorFrom(run: () => void): DebuggenError {
  * developer's next action is a `chmod` of exactly that directory — or a
  * different state directory — and a refusal that did not say which directory,
  * or what to run on it, would send them to `ls -l` to find out.
+ *
+ * The two renderings of a mode are checked apart on purpose. The message states
+ * the mode found and the mode required as a developer reads them (`0755`,
+ * `0700`); the details keep the three-digit form (`'755'`, `'700'`) that other
+ * workspaces compare against. A change that unified them in either direction
+ * would break one audience or the other.
  */
 function expectLooseDirectoryRefusal(error: DebuggenError, dirAbs: string, mode: number): void {
   expect(error.details?.reason).toBe('group-or-other-permissions');
+  expect(unsafePathReasonOf(error)).toBe('group-or-other-permissions');
   expect(error.details?.path).toBe(dirAbs);
   expect(error.details?.mode).toBe(octal(mode));
   expect(error.details?.expectedMode).toBe(octal(SECURE_DIR_MODE));
   expect(error.message).toContain(dirAbs);
-  expect(error.hint).toContain(`chmod ${octal(SECURE_DIR_MODE)} ${dirAbs}`);
+  expect(error.message).toContain(`has mode 0${octal(mode)}`);
+  expect(error.message).toContain(`it must be 0${octal(SECURE_DIR_MODE)}`);
+  expect(error.hint).toContain(`'chmod ${octal(SECURE_DIR_MODE)} ${dirAbs}'`);
 }
 
 /**
@@ -747,6 +759,166 @@ describe('the mode constants', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * The refusal vocabulary
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the refusal vocabulary', () => {
+  /** An `FS_UNSAFE_PATH` refusal built by hand, carrying exactly `details`. */
+  function refusalWith(details: Readonly<Record<string, unknown>>): DebuggenError {
+    return new DebuggenError('FS_UNSAFE_PATH', 'A refusal built by the test.', { details });
+  }
+
+  // The start-up report and every other consumer words its message per reason,
+  // so the list is the contract: six reasons, in the order the module
+  // documents them, and nobody else's to extend at runtime.
+  it('lists the six reasons in their documented order, frozen', () => {
+    expect(UNSAFE_PATH_REASONS).toEqual([
+      'symlink-component',
+      'not-a-directory',
+      'not-a-regular-file',
+      'foreign-owner',
+      'group-or-other-permissions',
+      'multiply-linked',
+    ]);
+    expect(Object.isFrozen(UNSAFE_PATH_REASONS)).toBe(true);
+  });
+
+  for (const reason of UNSAFE_PATH_REASONS) {
+    it(`recognises '${reason}' on an FS_UNSAFE_PATH refusal`, () => {
+      const recognised: UnsafePathReason | undefined = unsafePathReasonOf(
+        refusalWith({ path: '/state', reason }),
+      );
+
+      expect(recognised).toBe(reason);
+    });
+  }
+
+  it.skipIf(NO_POSIX_IDS)(
+    'recognises the reason of a real refusal of a 0755 directory (POSIX permission bits)',
+    () => {
+      const dir = makeDir(join(sandbox, 'state'), PROJECT_DIR_MODE);
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(dir);
+      });
+
+      expect(unsafePathReasonOf(error)).toBe('group-or-other-permissions');
+    },
+  );
+
+  it('recognises the reason of a real refusal of a file where a directory belongs', () => {
+    const file = makeFile(join(sandbox, 'state'), 'placed by the fixture\n');
+
+    const error = unsafePathErrorFrom(() => {
+      assertSecureDir(file);
+    });
+
+    expect(unsafePathReasonOf(error)).toBe('not-a-directory');
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'recognises the reason of a real refusal of a symbolic link (requires symbolic links)',
+    () => {
+      const target = makeDir(join(sandbox, 'target'), SECURE_DIR_MODE);
+      const link = join(sandbox, 'state');
+      symlinkSync(target, link);
+
+      const error = unsafePathErrorFrom(() => {
+        assertSecureDir(link);
+      });
+
+      expect(unsafePathReasonOf(error)).toBe('symlink-component');
+    },
+  );
+
+  it('answers undefined for a value that is not a DebuggenError', () => {
+    const errnoError = Object.assign(new Error('ELOOP: a link'), { code: 'ELOOP' });
+    // Everything a DebuggenError carries except the brand: shape alone is not
+    // a refusal.
+    const lookalike = {
+      name: 'DebuggenError',
+      code: 'FS_UNSAFE_PATH',
+      message: 'looks like a refusal',
+      details: { reason: 'group-or-other-permissions' },
+    };
+
+    for (const value of [
+      undefined,
+      null,
+      'group-or-other-permissions',
+      0o755,
+      errnoError,
+      lookalike,
+    ]) {
+      expect(unsafePathReasonOf(value)).toBeUndefined();
+    }
+  });
+
+  it('answers undefined for a DebuggenError with another code, whatever its reason', () => {
+    const internal = new DebuggenError('INTERNAL', 'Not a policy refusal.', {
+      details: { reason: 'group-or-other-permissions' },
+    });
+
+    expect(unsafePathReasonOf(internal)).toBeUndefined();
+
+    // The module's own INTERNAL error — two unrelated paths passed as a chain.
+    const boundaryError = debuggenErrorFrom(() => {
+      assertSecureDir(join(sandbox, 'state'), { upTo: join(sandbox, 'elsewhere') });
+    });
+    expect(boundaryError.code).toBe('INTERNAL');
+    expect(unsafePathReasonOf(boundaryError)).toBeUndefined();
+  });
+
+  it('answers undefined for an FS_UNSAFE_PATH error whose reason is outside the vocabulary', () => {
+    for (const details of [
+      { reason: 'cache-write-failed' },
+      { reason: 'GROUP-OR-OTHER-PERMISSIONS' },
+      { reason: 5 },
+      { reason: undefined },
+      { path: '/state' },
+    ]) {
+      expect(unsafePathReasonOf(refusalWith(details))).toBeUndefined();
+    }
+
+    expect(
+      unsafePathReasonOf(new DebuggenError('FS_UNSAFE_PATH', 'A refusal with no details.')),
+    ).toBeUndefined();
+  });
+
+  it('ignores a reason the details only inherit', () => {
+    const inherited: Readonly<Record<string, unknown>> = Object.create({
+      reason: 'foreign-owner',
+    }) as Readonly<Record<string, unknown>>;
+
+    expect(unsafePathReasonOf(refusalWith(inherited))).toBeUndefined();
+  });
+
+  it('never throws for a value whose traps or accessors throw', () => {
+    const fail = (): never => {
+      throw new Error('hostile value');
+    };
+    const hostileProxy = new Proxy(
+      {},
+      {
+        get: fail,
+        has: fail,
+        getOwnPropertyDescriptor: fail,
+        getPrototypeOf: fail,
+        ownKeys: fail,
+      },
+    );
+    const hostileDetails = refusalWith(
+      Object.defineProperty({}, 'reason', { enumerable: true, get: fail }),
+    );
+
+    expect(unsafePathReasonOf(hostileProxy)).toBeUndefined();
+    expect(unsafePathReasonOf(hostileDetails)).toBeUndefined();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * assertSecureDir
  * ---------------------------------------------------------------------------
  */
@@ -849,6 +1021,8 @@ describe('assertSecureDir', () => {
 
       expect(error.details?.path).toBe(link);
       expect(error.details?.reason).toBe('symlink-component');
+      // The fix is to replace that exact link, so the hint names it too.
+      expect(error.hint).toContain(`Replace the link '${link}' with a real directory`);
     },
   );
 
@@ -887,6 +1061,7 @@ describe('assertSecureDir', () => {
 
     expect(error.details?.path).toBe(file);
     expect(error.details?.reason).toBe('not-a-directory');
+    expect(error.hint).toContain(`Move or remove '${file}'`);
   });
 
   it('reports a boundary that does not contain the directory as a programmer error', () => {
@@ -972,6 +1147,8 @@ describe('assertSecureDir', () => {
       // to `ls -l`.
       expect(error.details?.owner).toBe(foreignUid);
       expect(error.details?.expectedOwner).toBe(ownUid());
+      // The fix names the refused path and the account its replacement needs.
+      expect(error.hint).toContain(`(uid ${String(ownUid())}) instead of '${dir}'`);
     },
   );
 
@@ -1187,6 +1364,36 @@ describe('ensureSecureDir', () => {
       expectLooseDirectoryRefusal(error, dir, PROJECT_DIR_MODE);
       expect(permissionsOf(dir)).toBe(PROJECT_DIR_MODE);
       expect(entriesIn(dir)).toEqual([]);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS)(
+    'words the refusal of a 0755 state root with the mode found, the mode required and the chmod to run (POSIX permission bits)',
+    () => {
+      // The shape `mkdir ~/.debuggen` leaves under the default umask 022, and
+      // the service's first call at start-up: the state root, no boundary.
+      const dir = makeDir(join(sandbox, 'state'), PROJECT_DIR_MODE);
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(dir);
+      });
+
+      // What a developer reads: both modes with the leading zero, the
+      // requirement stated rather than implied, and the exact command.
+      expect(error.message).toBe(
+        `'${dir}' has mode 0755, which grants access to group or other accounts; it must be 0700.`,
+      );
+      expect(error.hint).toBe(
+        `Check what it contains, then run 'chmod 700 ${dir}' (or point the tool at a directory only this account can reach).`,
+      );
+      // What other workspaces compare against: unchanged three-digit strings.
+      expect(error.details).toEqual({
+        path: dir,
+        reason: 'group-or-other-permissions',
+        mode: '755',
+        expectedMode: '700',
+      });
+      expect(permissionsOf(dir)).toBe(PROJECT_DIR_MODE);
     },
   );
 
@@ -3382,6 +3589,7 @@ describe('inspectPrivateFileNoFollow', () => {
 
       expect(error.details?.path).toBe(target);
       expect(error.details?.reason).toBe('symlink-component');
+      expect(error.hint).toContain(`Remove the link '${target}'`);
       expect(lstatSync(target).isSymbolicLink()).toBe(true);
       expectFileBytes(victim, 'another file\n');
     },
@@ -3432,6 +3640,7 @@ describe('inspectPrivateFileNoFollow', () => {
 
     expect(error.details?.path).toBe(target);
     expect(error.details?.reason).toBe('not-a-regular-file');
+    expect(error.hint).toContain(`Move or remove '${target}'`);
     expect(lstatSync(target).isDirectory()).toBe(true);
   });
 
@@ -3453,6 +3662,7 @@ describe('inspectPrivateFileNoFollow', () => {
         expect(error.details?.path).toBe(name);
         expect(error.details?.reason).toBe('multiply-linked');
         expect(error.details?.links).toBe(2);
+        expect(error.hint).toContain(`Remove the other hard links to '${name}'`);
       }
       expect(lstatSync(target).nlink).toBe(2);
 

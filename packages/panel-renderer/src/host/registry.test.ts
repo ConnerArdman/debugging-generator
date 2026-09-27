@@ -38,8 +38,11 @@
  * own interactions stays in `../components/*.test.tsx`; this file proves the
  * wiring exists. The third piece of wiring is the outline: each container
  * adapter draws its heading at the `headingLevel` it is handed rather than at
- * its layout primitive's default, and the node renderer hands a titled
- * container's children the next level down.
+ * its layout primitive's default, the node renderer hands a titled
+ * container's children the next level down, and every catalogued view drawn
+ * without a title is headed by its catalogue label at the level it is handed,
+ * as a named region — while the source-link leaf and an untitled container
+ * draw no heading at all.
  *
  * ## What the sixteen cases are driven by
  *
@@ -121,6 +124,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
 import { sourceLinkAccessibleName } from '../components/SourceLink';
+import type { HeadingLevel } from '../primitives/Heading';
 import { DataProviderContext, PanelSessionContext, createDataProvider } from './DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from './DataProvider';
 import { NodeRenderer } from './NodeRenderer';
@@ -227,6 +231,20 @@ const COMPONENT_SOURCE: SourceLocation = {
  * the name the dispatched chip actually carries.
  */
 const COMPONENT_SOURCE_CHIP_NAME = sourceLinkAccessibleName({ location: COMPONENT_SOURCE });
+
+/**
+ * A location resolved through the code graph, for the second component that
+ * rendered — so both recorded render rows are declared by the project and the
+ * table shows the whole recorded page rather than a project-scoped view of it.
+ */
+const SECOND_COMPONENT_SOURCE: SourceLocation = {
+  file: 'src/example/badge.tsx',
+  line: 18,
+  column: 5,
+  symbol: SECOND_COMPONENT,
+  resolvedBy: 'code-graph',
+  confidence: 0.85,
+};
 
 /** A location resolved through the code graph, for the statement's caller. */
 const CALLER_SOURCE: SourceLocation = {
@@ -488,6 +506,8 @@ const RECORDED_RENDERS: readonly RenderStat[] = [
     phaseCounts: { mount: 1, update: 2 },
     changedPropKeys: [CHANGED_PROP],
     changedPropCounts: { [CHANGED_PROP]: 2 },
+    changedContexts: [],
+    changedContextCounts: {},
     occurrences: [
       {
         id: RENDER_EVENT.id,
@@ -501,11 +521,13 @@ const RECORDED_RENDERS: readonly RenderStat[] = [
         trigger: 'props',
         renderCount: 3,
         changedPropKeys: [CHANGED_PROP],
+        changedContexts: [],
         source: COMPONENT_SOURCE,
       },
     ],
     occurrencesTruncated: false,
     source: COMPONENT_SOURCE,
+    declaredInProject: true,
   },
   {
     id: `render:${SECOND_COMPONENT}`,
@@ -522,8 +544,12 @@ const RECORDED_RENDERS: readonly RenderStat[] = [
     phaseCounts: { mount: 0, update: 1 },
     changedPropKeys: [],
     changedPropCounts: {},
+    changedContexts: [],
+    changedContextCounts: {},
     occurrences: [],
     occurrencesTruncated: false,
+    source: SECOND_COMPONENT_SOURCE,
+    declaredInProject: true,
   },
 ];
 
@@ -944,9 +970,16 @@ function makeHostActions(): HostActionSpies {
  * @param node The node to render.
  * @param provider The provider resolving its query.
  * @param actions The host the rendered component reports interactions to.
+ * @param headingLevel The outline level to hand the node renderer, or its
+ * default when omitted.
  * @returns The element tree to render.
  */
-function panelTree(node: PanelNode, provider: DataProvider, actions: PanelActions): ReactElement {
+function panelTree(
+  node: PanelNode,
+  provider: DataProvider,
+  actions: PanelActions,
+  headingLevel?: HeadingLevel,
+): ReactElement {
   return createElement(
     DataProviderContext.Provider,
     { value: provider },
@@ -956,7 +989,7 @@ function panelTree(node: PanelNode, provider: DataProvider, actions: PanelAction
       createElement(
         PanelActionsContext.Provider,
         { value: actions },
-        createElement(NodeRenderer, { node }),
+        createElement(NodeRenderer, { node, headingLevel }),
       ),
     ),
   );
@@ -1183,9 +1216,10 @@ const RENDER_CASES: Readonly<Record<PanelNodeType, RenderCase>> = {
   timeline: {
     node: { type: 'timeline', id: 'node:timeline', query: queryFor('timeline') },
     async expectSuccess(scope) {
-      // The canvas is the view's own text alternative; the rows below it are the
-      // keyboard-reachable representation of the same spans.
-      await within(scope).findByRole('img');
+      // The canvas is a figure named by the view's own text alternative; the
+      // rows below it are the keyboard-reachable representation of the same
+      // spans.
+      await within(scope).findByRole('figure');
       await findGridWithRows(scope);
     },
   },
@@ -1229,7 +1263,7 @@ const RENDER_CASES: Readonly<Record<PanelNodeType, RenderCase>> = {
   flame: {
     node: { type: 'flame', id: 'node:flame', query: queryFor('flame') },
     async expectSuccess(scope) {
-      await within(scope).findByRole('img');
+      await within(scope).findByRole('figure');
 
       // The equivalent tree is what a keyboard or screen-reader user reads the
       // hierarchy from, so a drawn icicle alone is not this view's success.
@@ -1726,6 +1760,9 @@ describe('the outline level a container is rendered at', () => {
 
     within(scope).getByRole('heading', { level: 4, name: OUTLINE_SECTION_TITLE });
     within(scope).getByRole('heading', { level: 5, name: OUTLINE_SPLIT_TITLE });
+
+    // Exactly the two containers': the untitled source links draw none.
+    expect(within(scope).getAllByRole('heading')).toHaveLength(2);
   });
 
   it('renders a container with no stated level at the renderer default of 2', () => {
@@ -1733,5 +1770,162 @@ describe('the outline level a container is rendered at', () => {
 
     within(scope).getByRole('heading', { level: 2, name: OUTLINE_SECTION_TITLE });
     within(scope).getByRole('heading', { level: 3, name: OUTLINE_SPLIT_TITLE });
+    expect(within(scope).getAllByRole('heading')).toHaveLength(2);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The heading a leaf is drawn under: its title, else its catalogue label
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The outline level the leaf-heading cases hand the node renderer.
+ *
+ * Not the renderer's default of 2, so a level that is not forwarded to the
+ * leaf's heading shows up as a wrong tag.
+ */
+const LEAF_HEADING_LEVEL: HeadingLevel = 4;
+
+/**
+ * Whether the catalogue calls a node type a view of captured evidence: a
+ * visualization that requires a query. Exactly the types whose untitled nodes
+ * must still be named regions.
+ *
+ * @param type A catalogued node type.
+ * @returns `true` for the query-backed visualizations.
+ */
+function isQueryBackedView(type: PanelNodeType): boolean {
+  const entry = PANEL_NODE_CATALOG[type];
+
+  return entry.kind === 'visualization' && entry.requiresQuery;
+}
+
+describe('the heading an untitled leaf is rendered under', () => {
+  it('classifies every leaf of the catalogue, with the source link the only unheaded one', () => {
+    const leaves = PANEL_NODE_TYPES.filter((type) => !PANEL_NODE_CATALOG[type].supportsChildren);
+
+    // Read off the catalogue, so a leaf type added to the vocabulary joins the
+    // cases below without an edit here.
+    expect(leaves.filter((type) => !isQueryBackedView(type))).toEqual(['sourceLink']);
+  });
+
+  for (const type of PANEL_NODE_TYPES) {
+    const entry = PANEL_NODE_CATALOG[type];
+
+    if (entry.supportsChildren) {
+      continue;
+    }
+
+    it(
+      isQueryBackedView(type)
+        ? `heads an untitled "${type}" view with its catalogue label, as a named region`
+        : `draws no heading and no region for an untitled "${type}" leaf`,
+      async () => {
+        const testCase = RENDER_CASES[type];
+        const stub = recordingProvider();
+        const spies = makeActions();
+
+        // The recorded case is untitled: the shape a generated panel's node
+        // arrives in when its author named nothing.
+        expect(testCase.node.title).toBeUndefined();
+
+        const scope = render(
+          panelTree(testCase.node, stub.provider, spies.actions, LEAF_HEADING_LEVEL),
+        ).container;
+
+        await testCase.expectSuccess(scope);
+
+        const frame = scope.querySelector<HTMLElement>('.dg-panel__node');
+
+        if (frame === null) {
+          throw new Error(`the "${type}" node drew no frame`);
+        }
+
+        if (isQueryBackedView(type)) {
+          // One heading, at the level the node was handed, reading the
+          // catalogue's label and carrying `Section`'s own heading class.
+          const heading = within(frame).getByRole('heading', {
+            level: LEAF_HEADING_LEVEL,
+            name: entry.label,
+          });
+          expect(within(frame).getAllByRole('heading')).toHaveLength(1);
+          expect(heading.classList.contains('dg-section__title')).toBe(true);
+
+          // One region, named by that heading, and it is the frame's content:
+          // the whole view sits inside it.
+          const region = within(frame).getByRole('region', { name: entry.label });
+          expect(within(frame).getAllByRole('region')).toHaveLength(1);
+          expect(region.getAttribute('aria-labelledby')).toBe(heading.id);
+          expect(frame.firstElementChild).toBe(region);
+          expect(frame.children).toHaveLength(1);
+        } else {
+          expect(within(frame).queryAllByRole('heading')).toEqual([]);
+          expect(within(frame).queryAllByRole('region')).toEqual([]);
+        }
+      },
+    );
+  }
+
+  it('adds no level for an untitled container: its untitled view is headed at the container level', async () => {
+    const view = RENDER_CASES.metricCards.node;
+    const untitledStack: PanelNode = {
+      type: 'stack',
+      id: 'node:untitled-stack',
+      children: [view, sourceLinkNode('node:untitled-stack.1', COMPONENT_SOURCE)],
+    };
+    const stub = recordingProvider();
+    const spies = makeActions();
+
+    const scope = render(
+      panelTree(untitledStack, stub.provider, spies.actions, LEAF_HEADING_LEVEL),
+    ).container;
+
+    await RENDER_CASES.metricCards.expectSuccess(scope);
+
+    // The stack draws no heading, so the view it groups is headed at the level
+    // the stack itself was handed, and it is the only region in the subtree.
+    const heading = within(scope).getByRole('heading', {
+      name: PANEL_NODE_CATALOG.metricCards.label,
+    });
+    expect(heading.tagName).toBe(`H${String(LEAF_HEADING_LEVEL)}`);
+    expect(within(scope).getAllByRole('heading')).toHaveLength(1);
+    expect(within(scope).getAllByRole('region')).toHaveLength(1);
+  });
+
+  it('heads a leaf with the title its author wrote rather than the catalogue label', async () => {
+    const authoredTitle = 'Authored view title';
+    const node: PanelNode = { ...RENDER_CASES.metricCards.node, title: authoredTitle };
+    const stub = recordingProvider();
+    const spies = makeActions();
+
+    const scope = render(
+      panelTree(node, stub.provider, spies.actions, LEAF_HEADING_LEVEL),
+    ).container;
+
+    await RENDER_CASES.metricCards.expectSuccess(scope);
+
+    within(scope).getByRole('region', { name: authoredTitle });
+    within(scope).getByRole('heading', { level: LEAF_HEADING_LEVEL, name: authoredTitle });
+    expect(within(scope).getAllByRole('heading')).toHaveLength(1);
+  });
+
+  it('renders a description on an untitled source link without inventing a heading for it', async () => {
+    const description = 'An authored line about the chip.';
+    const node: PanelNode = { ...RENDER_CASES.sourceLink.node, description };
+    const stub = recordingProvider();
+    const spies = makeActions();
+
+    const scope = render(
+      panelTree(node, stub.provider, spies.actions, LEAF_HEADING_LEVEL),
+    ).container;
+
+    await RENDER_CASES.sourceLink.expectSuccess(scope);
+
+    // The prose is drawn, in a grouping with neither a name nor a role.
+    within(scope).getByText(description);
+    expect(within(scope).queryAllByRole('heading')).toEqual([]);
+    expect(within(scope).queryAllByRole('region')).toEqual([]);
   });
 });

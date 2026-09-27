@@ -89,7 +89,16 @@
  * dispatch above this tier may group nodes without labelling them, and that is
  * the correct outcome rather than a gap: an unnamed landmark is an ARIA
  * anti-pattern, and a default name invented inside a library would be wording
- * the product never chose, which AAP 0.5.4 forbids this file to ship. The
+ * the product never chose, which AAP 0.5.4 forbids this file to ship.
+ *
+ * This component therefore never supplies a title of its own; what it names a
+ * region with is whatever its caller hands it. The one documented default in
+ * the product is the node catalogue's: `@debuggen/panel-schema`'s entry `label`
+ * is specified as the name "for a section heading a panel did not title", and
+ * the node dispatch (`../host/NodeRenderer`) passes it here as the title of an
+ * untitled view of captured evidence — so every generated view is a labelled
+ * region under the schema's own vocabulary ("Timeline", "Event log", …), while
+ * an untitled container and the source-link chip stay unnamed groupings. The
  * heading is rendered through the heading primitive and the supporting line
  * through the text primitive, never as a raw element, because AAP 0.6.4 puts
  * library primitives ahead of the raw elements they wrap.

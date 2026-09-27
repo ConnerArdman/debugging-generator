@@ -44,6 +44,11 @@
  * 8. **The log throttle (CWE-400).** Hundreds of malformed batches write one
  *    warning per key per interval, the next record carries the count held
  *    back, and a ceiling across keys holds however many sessions a flood spans.
+ * 9. **Sharing the event loop.** Every call — stored, refused or unreadable —
+ *    ends with one macrotask turn taken after the outcome is decided and
+ *    before its promise settles; a failing turn costs nothing but the turn;
+ *    and a chained backlog of batches that await no I/O lets a macrotask
+ *    queued beside it run after the first batch rather than after the last.
  *
  * ## The privacy layer is real, never stubbed
  *
@@ -67,7 +72,10 @@
  * Hermetic by contract: no database, socket, server, network, wall clock or
  * real timer — the ingest clock is injected, and every case that depends on
  * the locate budget's timers drives them with Vitest's fake timers (a locator
- * double that answers at once has them cleared before they could fire).
+ * double that answers at once has them cleared before they could fire). The
+ * end-of-call turn is the module's real `setImmediate` unless a case injects
+ * its own (`yieldTurn`): an immediate is not a timer, fires on the next loop
+ * iteration, and is untouched by the fake timers these cases install.
  * Identifiers come from
  * `@debuggen/shared`'s minting functions and kinds/tiers are typed against
  * `@debuggen/telemetry`'s vocabularies. Every name and URL is invented and
@@ -153,6 +161,7 @@ import {
   summaryFields,
   suppressionFields,
   toIngestResponse,
+  yieldMacrotask,
 } from './ingest.js';
 import type {
   AgentIngestInput,
@@ -869,6 +878,8 @@ interface HarnessOptions {
   readonly locateBudgetMs?: number;
   /** The ingest clock; defaults to {@link fixedClock}. Only the log-throttle cases move it. */
   readonly now?: () => number;
+  /** The end-of-call turn; the module's own `setImmediate` turn when absent. */
+  readonly yieldTurn?: () => Promise<unknown>;
 }
 
 /** One pipeline and every double it was built from. */
@@ -915,6 +926,7 @@ function harness(options: HarnessOptions = {}): Harness {
     privacy: privacy.primitives,
     sources: options.sources,
     locateBudgetMs: options.locateBudgetMs,
+    yieldTurn: options.yieldTurn,
   });
 
   return { ingest, log, repo, sessions, privacy, attributor, correlator, tail, logs: entries };
@@ -4171,5 +4183,257 @@ describe('the ingest log throttle', () => {
       ),
     ).toHaveLength(1);
     expect(h.repo.calls, 'every batch was still stored').toHaveLength(20);
+  });
+});
+
+/* =================================================================================================
+ * 9. Sharing the event loop: the end-of-call macrotask turn
+ * ============================================================================================== */
+
+/** The warning a failing end-of-call turn writes, once per throttle interval. */
+const YIELD_FAILED_WARNING =
+  'the end-of-batch event-loop turn failed; the batch report is unaffected';
+
+/** A turn a case releases by hand, recording what the pipeline had done when it was taken. */
+interface HeldTurn {
+  readonly yieldTurn: () => Promise<void>;
+  /** How many turns were taken. */
+  readonly taken: () => number;
+  /** A copy of the call-order log at the moment of each turn. */
+  readonly seen: CallTag[][];
+  /** Lets every turn taken so far end. */
+  release(): void;
+}
+
+function heldTurn(log: () => readonly CallTag[]): HeldTurn {
+  const seen: CallTag[][] = [];
+  const waiting: (() => void)[] = [];
+  return {
+    yieldTurn: () =>
+      new Promise<void>((resolve) => {
+        seen.push([...log()]);
+        waiting.push(resolve);
+      }),
+    taken: () => seen.length,
+    seen,
+    release(): void {
+      for (const resolve of waiting.splice(0)) {
+        resolve();
+      }
+    },
+  };
+}
+
+/** Lets every microtask already queued run — and nothing that needs a macrotask. */
+async function drainMicrotasks(): Promise<void> {
+  for (let index = 0; index < 50; index += 1) {
+    await Promise.resolve();
+  }
+}
+
+/** A promise's state after the microtasks queued so far have run. */
+async function settledYet(promise: Promise<unknown>): Promise<boolean> {
+  let settled = false;
+  void promise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await drainMicrotasks();
+  return settled;
+}
+
+describe('sharing the event loop: the end-of-call turn', () => {
+  it('takes the turn after step 11, and settles only once the turn has ended', async () => {
+    let calls: readonly CallTag[] = [];
+    const turn = heldTurn(() => calls);
+    const h = harness({ yieldTurn: turn.yieldTurn });
+    calls = h.log;
+
+    const pending = h.ingest.ingest(BROWSER_CONTEXT, [makeIngress(), makeRenderIngress()]);
+
+    expect(await settledYet(pending), 'the report waits for the turn').toBe(false);
+    expect(turn.taken()).toBe(1);
+    expect(turn.seen[0]?.slice(-3), 'store, correlate and tail are done first').toEqual([
+      'insert',
+      'correlate',
+      'tail',
+    ]);
+    const logsAtTurn = h.logs.length;
+
+    turn.release();
+    const report = expectReport(await pending);
+
+    expect(report).toMatchObject({ received: 2, persisted: 2 });
+    expect(h.log, 'nothing ran during or after the turn').toEqual(turn.seen[0]);
+    expect(h.logs, 'nothing was logged during or after the turn').toHaveLength(logsAtTurn);
+    expect(h.repo.calls).toHaveLength(1);
+  });
+
+  it('returns the report decided before the turn, identical to one taken with no turn at all', async () => {
+    const immediate = harness({ yieldTurn: () => Promise.resolve() });
+    const real = harness();
+    const batch = [makeIngress(), makeRequestIngress('/api/one?itemId=A'), makeRenderIngress()];
+
+    const withInstantTurn = expectReport(await immediate.ingest.ingest(BROWSER_CONTEXT, batch));
+    const withRealTurn = expectReport(await real.ingest.ingest(BROWSER_CONTEXT, batch));
+
+    expect(withRealTurn).toStrictEqual(withInstantTurn);
+    expect(withRealTurn).toMatchObject({ received: 3, persisted: 3, inserted: 3 });
+  });
+
+  it('takes the turn once on every refusal and typed error, and on both transports', async () => {
+    let turns = 0;
+    const counted = (): Promise<void> => {
+      turns += 1;
+      return Promise.resolve();
+    };
+    const h = harness({ yieldTurn: counted });
+    const refusedStore = harness({ repo: 'throw', yieldTurn: counted });
+
+    expect(expectError(await h.ingest.ingest(BROWSER_CONTEXT, 'events')).code).toBe(
+      'PROTOCOL_INVALID_MESSAGE',
+    );
+    expect(turns).toBe(1);
+
+    expectReport(await h.ingest.ingest(BROWSER_CONTEXT, [null]));
+    expect(turns, 'a batch that stored nothing').toBe(2);
+
+    expect(
+      expectError(await refusedStore.ingest.ingest(BROWSER_CONTEXT, [makeIngress()])).code,
+    ).toBe('STORE_ERROR');
+    expect(turns, 'a store failure').toBe(3);
+
+    expectReport(await h.ingest.ingestFromAgent({ tabId: TAB_ID, events: [makeIngress()] }));
+    expectReport(
+      await h.ingest.ingestFromServerAgent({
+        projectRoot: PROJECT_ONE,
+        scopedProjectRoot: PROJECT_ONE,
+        events: [makeServerIngress()],
+      }),
+    );
+    expect(turns, 'one turn per transport call').toBe(5);
+  });
+
+  it('takes the turn for an input whose fields cannot be read, before refusing it', async () => {
+    const turn = heldTurn(() => []);
+    const h = harness({ yieldTurn: turn.yieldTurn });
+    const revoked = (label: string): never => {
+      throw new Error(`the ${label} is revoked`);
+    };
+    const agentInput = Object.defineProperty({ events: [] }, 'tabId', {
+      enumerable: true,
+      get: () => revoked('relayed tab'),
+    }) as unknown as AgentIngestInput;
+    const serverInput = Object.defineProperty({ events: [] }, 'projectRoot', {
+      enumerable: true,
+      get: () => revoked('project root'),
+    }) as unknown as ServerAgentIngestInput;
+
+    const fromAgent = h.ingest.ingestFromAgent(agentInput);
+    const fromServer = h.ingest.ingestFromServerAgent(serverInput);
+
+    expect(await settledYet(fromAgent)).toBe(false);
+    expect(await settledYet(fromServer)).toBe(false);
+    expect(turn.taken()).toBe(2);
+
+    turn.release();
+    for (const result of [await fromAgent, await fromServer]) {
+      const error = expectError(result);
+      expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(error.details).toMatchObject({ problem: 'unreadable-input' });
+    }
+    expect(h.repo.calls).toEqual([]);
+  });
+
+  it.each([
+    [
+      'throws',
+      (): Promise<void> => {
+        throw new Error('the scheduler is gone');
+      },
+    ],
+    ['rejects', (): Promise<void> => Promise.reject(new Error('the scheduler is gone'))],
+  ])('keeps the report when the injected turn %s, and says so once', async (_label, failing) => {
+    const h = harness({ yieldTurn: failing });
+
+    for (let index = 0; index < 5; index += 1) {
+      const report = expectReport(await h.ingest.ingest(BROWSER_CONTEXT, [makeRenderIngress()]));
+      expect(report.persisted).toBe(1);
+    }
+
+    const warnings = recordsOf(h.logs, 'warn', YIELD_FAILED_WARNING);
+    expect(warnings, 'the throttle keeps the warning to one per interval').toHaveLength(1);
+    expect(warnings[0]?.fields).toMatchObject({ code: 'INTERNAL' });
+    expect(JSON.stringify(h.logs)).not.toContain('the scheduler is gone');
+    expectScalarFieldsOnly(h.logs);
+    expect(h.repo.calls).toHaveLength(5);
+  });
+
+  it('by default settles only after a macrotask queued beside the call has run', async () => {
+    const h = harness();
+    const order: string[] = [];
+
+    const pending = h.ingest.ingest(BROWSER_CONTEXT, [makeRenderIngress()]).then((result) => {
+      order.push('settled');
+      return result;
+    });
+    setImmediate(() => {
+      order.push('macrotask');
+    });
+
+    expect(expectReport(await pending).persisted).toBe(1);
+    expect(order, 'the store and the locator here answer in microtasks alone').toEqual([
+      'macrotask',
+      'settled',
+    ]);
+  });
+
+  it('lets a macrotask run between two batches of a chained backlog that awaits no I/O', async () => {
+    const h = harness();
+    const batches = 20;
+    let completed = 0;
+    let completedWhenMacrotaskRan: number | undefined;
+
+    // The WebSocket surface chains one connection's frames exactly like this.
+    let tail: Promise<void> = Promise.resolve();
+    for (let index = 0; index < batches; index += 1) {
+      tail = tail
+        .then(() => h.ingest.ingest(BROWSER_CONTEXT, [makeRenderIngress({ id: newEventId() })]))
+        .then((result) => {
+          expectReport(result);
+          completed += 1;
+        });
+    }
+    setImmediate(() => {
+      completedWhenMacrotaskRan = completed;
+    });
+
+    await tail;
+
+    expect(completed).toBe(batches);
+    expect(
+      completedWhenMacrotaskRan,
+      'at most one batch ran before the waiting macrotask',
+    ).toBeLessThanOrEqual(1);
+    expect(h.repo.calls).toHaveLength(batches);
+  });
+
+  it('exports its default turn as a genuine macrotask that never rejects', async () => {
+    const order: string[] = [];
+    setImmediate(() => {
+      order.push('queued first');
+    });
+    void Promise.resolve().then(() => {
+      order.push('microtask');
+    });
+
+    await expect(yieldMacrotask()).resolves.toBeUndefined();
+    order.push('turn ended');
+
+    expect(order).toEqual(['microtask', 'queued first', 'turn ended']);
   });
 });

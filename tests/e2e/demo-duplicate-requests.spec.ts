@@ -246,6 +246,18 @@ const TRACEPARENT_VALUE_PATTERN = /\b00-[0-9a-f]{32}-[0-9a-f]{16}-0[0-9a-f]\b/u;
  */
 const CONTENT_ATTRIBUTE_PATTERN = /body|payload|header|cookie|authorization/iu;
 
+/**
+ * The request attribute naming the components that created the initiating
+ * component, nearest first (`packages/telemetry/src/schema/attributes.ts`).
+ */
+const INITIATOR_OWNERS_KEY = 'initiatorOwners';
+
+/** The most owner names the agent records (`MAX_INITIATOR_OWNERS` in `browser/initiator-owner.ts`). */
+const MAX_OWNER_NAMES = 8;
+
+/** The longest owner name the agent records, in code points (`MAX_INITIATOR_NAME_LENGTH`). */
+const MAX_OWNER_NAME_LENGTH = 200;
+
 // ---------------------------------------------------------------------------
 // Budgets
 // ---------------------------------------------------------------------------
@@ -406,6 +418,21 @@ function required<T>(value: T | undefined, what: string): T {
 function stringAttribute(event: TelemetryEvent, key: string): string | undefined {
   const value: unknown = event.attributes[key];
   return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * Whether `value` is a bounded list of component names — the shape the agent
+ * gives `initiatorOwners` — rather than a captured structure.
+ */
+function isListOfNames(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.length <= MAX_OWNER_NAMES &&
+    value.every(
+      (name) =>
+        typeof name === 'string' && name.length > 0 && [...name].length <= MAX_OWNER_NAME_LENGTH,
+    )
+  );
 }
 
 /** A finite numeric attribute of an event, or `undefined`. */
@@ -863,10 +890,38 @@ async function settlePage(page: Page): Promise<void> {
       await delay(SETTLE_POLL_MS);
     }
     await page.waitForLoadState('load', { timeout: NAVIGATION_TIMEOUT_MS });
-    await waitForStreamedContent(page);
+    await waitForRevealedContent(page);
   } finally {
     page.off('framenavigated', onNavigated);
   }
+}
+
+/**
+ * Waits until `page` has revealed what it streamed, reloading it once when it
+ * does not.
+ *
+ * Instrumenting and restoring files makes the dev server recompile modules
+ * while the page may still be loading. When a patch or a restore lands during
+ * a reload of a freshly compiled route, the dev server's server render can fail
+ * for that one request — React reports "Switched to client rendering because
+ * the server rendering errored" — and that document never reveals its streamed
+ * segment. The next request renders against the recompiled modules, so a
+ * developer reloads, and so does this: once, before the capture starts. A
+ * document that still does not reveal its content after the reload is a real
+ * failure and is reported as one.
+ */
+async function waitForRevealedContent(page: Page): Promise<void> {
+  try {
+    await waitForStreamedContent(page);
+    return;
+  } catch (error) {
+    if (!(error instanceof Error) || error.name !== 'TimeoutError') {
+      throw error;
+    }
+  }
+  await reloadPage(page);
+  await page.waitForLoadState('load', { timeout: NAVIGATION_TIMEOUT_MS });
+  await waitForStreamedContent(page);
 }
 
 /** One recommendations request as the browser sent it, observed by Playwright. */
@@ -1028,7 +1083,8 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
           question: QUESTION,
         });
         active.register(selection.id);
-        await panel.reload();
+        // The panel is open on the tab, so the product binds the new session
+        // to it by itself; reloading the panel here would unbind it again.
         await waitForBound(editorClient, selection.id, {
           tabId: panel.tabId,
           url: appPage.url(),
@@ -1276,23 +1332,51 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
     });
 
     // Distinct initiators, as the aggregate exposes them: each carried by at
-    // least one of the group's own occurrences, and every one of them running
-    // through the rails' hook effect.
+    // least one of the group's own occurrences and labelled by the component
+    // whose effect issued the request, with the component that wrote that
+    // mount beside it — so the header's mini-rail and the detail body's rail
+    // are two initiators of one group, named apart.
     expect(
       group.initiators.length,
       [
-        `The duplicate group must be initiated from at least ${String(MIN_INITIATORS)} distinct call stacks.`,
+        `The duplicate group must be initiated by at least ${String(MIN_INITIATORS)} distinct initiators.`,
         '  observed initiators:',
         describeInitiators(group.initiators),
       ].join('\n'),
     ).toBeGreaterThanOrEqual(MIN_INITIATORS);
     expect(
-      group.initiators.filter((initiator) => !initiator.includes(RAIL_HOOK)),
+      group.initiators.filter((initiator) => !initiator.startsWith(RAIL_COMPONENT)),
       [
-        `Every initiator must run through ${RAIL_HOOK}, the hook both ${RAIL_COMPONENT} mounts call.`,
+        `Every initiator must name ${RAIL_COMPONENT}, the component whose effect issued the request.`,
         '  observed initiators:',
         describeInitiators(group.initiators),
       ].join('\n'),
+    ).toEqual([]);
+    const labelledMounts = {
+      header: group.initiators.filter((initiator) => initiator.includes(HEADER_COMPONENT)),
+      body: group.initiators.filter((initiator) => !initiator.includes(HEADER_COMPONENT)),
+    };
+    expect(
+      labelledMounts.header.length > 0 && labelledMounts.body.length > 0,
+      [
+        `The initiators must name both ${RAIL_COMPONENT} mounts: the one ${HEADER_COMPONENT} writes and the one the page body writes.`,
+        '  observed initiators:',
+        describeInitiators(group.initiators),
+      ].join('\n'),
+    ).toBe(true);
+
+    // The code behind every mount is the same: each occurrence's captured call
+    // stack runs through the rails' hook effect, which is why the stack alone
+    // cannot tell the mounts apart and the component label is what does.
+    expect(
+      group.occurrences
+        .filter(
+          (occurrence) =>
+            occurrence.initiatorStack !== undefined &&
+            !occurrence.initiatorStack.includes(RAIL_HOOK),
+        )
+        .map((occurrence) => occurrence.eventId),
+      `Every occurrence's captured stack must run through ${RAIL_HOOK}, the hook both ${RAIL_COMPONENT} mounts call.`,
     ).toEqual([]);
 
     // Two initiating components: the group's occurrences resolve to both
@@ -1513,11 +1597,15 @@ test.describe('demo defect 3 — duplicate recommendations requests', () => {
         Object.keys(event.attributes).filter((key) => CONTENT_ATTRIBUTE_PATTERN.test(key)),
         `${where}: attributes named for a body, a payload or a header`,
       ).toEqual([]);
+      // The one list a request carries is `initiatorOwners`: the names of the
+      // components that created the initiating component — an OpenTelemetry
+      // style array of strings, never a captured structure.
       expect(
         Object.entries(event.attributes)
           .filter(([, value]) => value !== null && typeof value === 'object')
+          .filter(([key, value]) => !(key === INITIATOR_OWNERS_KEY && isListOfNames(value)))
           .map(([key]) => key),
-        `${where}: structured attribute values (only scalars are captured for a request)`,
+        `${where}: structured attribute values (only scalars and the initiator's owner names are captured for a request)`,
       ).toEqual([]);
       const values = JSON.stringify(event.attributes);
       expect(

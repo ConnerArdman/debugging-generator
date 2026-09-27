@@ -497,7 +497,7 @@ describe('App — the pairing dialog is modal', () => {
     resetPanelStore({ includeConnection: true });
   });
 
-  it('makes the header, body, drawer and live tail inert while the dialog is open, and only then', async () => {
+  it('makes the header, body and live tail inert and withholds the floating drawer while the dialog is open, and only then', async () => {
     const user = userEvent.setup();
     act(() => {
       applySessionSnapshot({
@@ -518,13 +518,13 @@ describe('App — the pairing dialog is modal', () => {
     expect(dialog.closest('[inert]')).toBeNull();
     expect(document.activeElement).toBe(getField());
 
-    // An event selected behind the dialog opens an inert drawer, and the
-    // drawer's own attempt to take focus is pulled back into the dialog.
+    // An event selected behind the dialog opens no drawer yet: the drawer
+    // floats over the page, so it would cover the dialog, and focus stays in
+    // the dialog.
     act(() => {
       selectEvent({ eventId: 'event-synthetic-1' });
     });
-    const drawer = requireElement(container, 'aside');
-    expect(drawer.hasAttribute('inert')).toBe(true);
+    expect(container.querySelector('aside')).toBeNull();
     expect(dialog.contains(document.activeElement)).toBe(true);
 
     // A background control focused by script is pulled back as well.
@@ -534,7 +534,9 @@ describe('App — the pairing dialog is modal', () => {
     await user.click(within(dialog).getByRole('button', { name: CANCEL_NAME }));
 
     expect(screen.queryByRole('dialog')).toBeNull();
-    for (const region of [header, main, liveTail, requireElement(container, 'aside')]) {
+    // The selection made meanwhile opens its drawer once the dialog is gone.
+    const drawer = requireElement(container, 'aside[aria-label="Selected event"]');
+    for (const region of [header, main, liveTail, drawer]) {
       expect(region.hasAttribute('inert')).toBe(false);
     }
   });

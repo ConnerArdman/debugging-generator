@@ -50,9 +50,11 @@
  *    strength of a reply it never read.
  * 3. **A caller's mistake stays a caller's mistake.** The amount, the currency
  *    and the reference are checked here against the same rules the endpoint
- *    enforces, so a fractional amount or a blank reference is reported as the
- *    validation failure it is instead of returning as a bare rejection from a
- *    dependency. Nothing has been sent at that point, so nothing was taken.
+ *    enforces, so a fractional amount, an amount above the most the processor
+ *    authorizes in one payment ({@link MAX_PAYMENT_CENTS}) or a blank reference
+ *    is reported as the validation failure it is instead of returning as a bare
+ *    rejection from a dependency. Nothing has been sent at that point, so
+ *    nothing was taken.
  *
  * A declined authorization is not a failure of this module: it returns with
  * `authorized: false` and the wording to show for it, and the checkout decides
@@ -60,7 +62,8 @@
  * keeps no state and does no work at module scope.
  */
 
-import type { PaymentAuthorization } from '@/lib/types';
+import { formatPriceLabel } from '@/lib/format';
+import { MAX_PAYMENT_CENTS, type PaymentAuthorization } from '@/lib/types';
 import {
   StorefrontUpstreamError,
   StorefrontValidationError,
@@ -126,6 +129,19 @@ const DECLINED = 'The payment was declined by the processor.';
  * repeats no part of the address: it came from the request in the first place.
  */
 const MISADDRESSED = 'This request was not addressed to this store, so no payment was attempted.';
+
+/**
+ * What a caller is told when the amount is more than the processor authorizes
+ * in one payment.
+ *
+ * The processor would refuse it, and would say only that it refused; asked
+ * here first, the refusal names the figure and what to do about it - an order
+ * that size is not something trying again will change. Nothing is sent, so
+ * nothing is taken, and the sentence says both. The ceiling is worded by
+ * `@/lib/format`, the same formatter every price in the storefront is printed
+ * through.
+ */
+const OVERSIZED = `A single payment cannot be more than ${formatPriceLabel(MAX_PAYMENT_CENTS)}, so no payment was attempted and nothing was charged. Reduce the order, then place it again.`;
 
 /**
  * What to authorize: an amount, the currency it is counted in, and what the
@@ -243,9 +259,10 @@ function stamp(value: unknown): string | null {
  * refused before an amount is sent anywhere.
  *
  * @throws StorefrontValidationError when the amount is not a whole,
- * non-negative number of cents, the currency is not a three-letter code, no
- * reference was given, or the address handed over is not one this store may
- * reach itself at. Nothing has been sent at that point, so nothing was taken.
+ * non-negative number of cents or is more than {@link MAX_PAYMENT_CENTS}, the
+ * currency is not a three-letter code, no reference was given, or the address
+ * handed over is not one this store may reach itself at. Nothing has been sent
+ * at that point, so nothing was taken.
  * @throws StorefrontUpstreamError when the processor turned the request away:
  * a client-error status other than a timeout, which is the processor declining
  * to process the request rather than an answer about an amount. Nothing was
@@ -274,6 +291,14 @@ export async function authorize(
     throw new StorefrontValidationError(
       'A payment amount must be a whole number of cents and cannot be negative.',
     );
+  }
+
+  // The processor's own ceiling, asked before anything is sent: the stand-in
+  // processor refuses a larger amount with a client error, which would come back
+  // as a processor that turned the request away - true, but no help to a buyer
+  // whose order is simply larger than one payment can be.
+  if (amount > MAX_PAYMENT_CENTS) {
+    throw new StorefrontValidationError(OVERSIZED);
   }
 
   const currency = input.currency.trim().toUpperCase();

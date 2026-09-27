@@ -24,11 +24,17 @@
  *    records from every selection a view or evidence chip reports, or takes
  *    from the surface when the surface drives it.
  * 3. Renders the head (`../layout/SummaryHeader`), which is where the
- *    observed/inferred separation lives.
+ *    observed/inferred separation lives, handing it the document's generation
+ *    (`panelVersion`, and whether it `supersedes` a predecessor) so a
+ *    follow-up's answer is marked as the version it is.
  * 4. Renders the layout, node by node, through `./NodeRenderer`.
  *
  * A specification that arrived as the deterministic fallback is announced
- * above all of it, by the banner below.
+ * above all of it, by the banner below. A later generation replacing the panel
+ * in place is announced politely, by a visually hidden live region that stays
+ * mounted across the replacement, and keyboard focus that was inside the
+ * outgoing panel is carried into the new one (see "Focus survives a panel
+ * replacement" below).
  *
  * ## What this component does NOT do, on purpose
  *
@@ -62,8 +68,8 @@
  * its details drawer, a connection pill, a fresh `actions` object built from the
  * same callbacks — and a panel is a dozen tables and SVG views deep. So the
  * action context is rebuilt only when one of its callbacks changes identity,
- * the head only when the title, the summary, its two callbacks or the id of the
- * selected event change, and
+ * the head only when the title, the summary, the generation, its two callbacks
+ * or the id of the selected event change, and
  * the rendered layout only when `spec.layout` itself is a different value. The
  * data and session contexts carry values that are already stable (the injected
  * provider, and a string). A replaced specification still re-renders exactly
@@ -80,6 +86,37 @@
  * same panel keeps the key, and with it every mounted view (see
  * `panelIdentityKey` below).
  *
+ * ## Focus survives a panel replacement
+ *
+ * Remounting the column destroys the element that held keyboard focus, and a
+ * focused element that leaves the document hands focus to `<body>` — for a
+ * keyboard or screen-reader user, being thrown out of the panel at the moment a
+ * follow-up's answer arrives. `./NodeRenderer`'s focus keepers cannot help:
+ * they live in the node frames, which go with the column. So the host, whose
+ * instance outlives every column it renders, carries focus across:
+ *
+ * - **Tracking.** The column's `focus`/`blur` handlers record the element
+ *   holding focus inside it, and forget it when the reader moves focus out of
+ *   the column deliberately — to another element, or into empty space. A
+ *   focused element that is *removed* is not a departure, so the record
+ *   survives the remount.
+ * - **Restoring.** After a replaced column commits, the one effect in this
+ *   file checks the record. When focus was inside the outgoing column and has
+ *   fallen to `<body>`, it moves focus to the same node in the new panel — a
+ *   node of the same type, matched by id and then by its position among nodes
+ *   of that type, innermost node first, landing on that node's heading — and
+ *   otherwise to the panel title. A node heading
+ *   borrows `tabindex="-1"` only while it holds focus; the title is
+ *   programmatically focusable by `../layout/SummaryHeader`'s own contract.
+ *   Neither ever becomes a tab stop.
+ * - **Keeping it visible.** The new panel's views load after the column
+ *   commits, and each arrival grows the layout around the restored target. A
+ *   bounded watch reveals the target again whenever the column resizes, until
+ *   the reader moves focus, scrolls, points or types, or the panel settles —
+ *   so focus that was carried across is never left below the fold.
+ * - **Never stealing.** Nothing moves when focus was outside the panel before
+ *   the replacement, or has gone anywhere but `<body>` since.
+ *
  * ## Class names
  *
  * `dg-panel` is the block, with `dg-panel__banner`/`--fallback` for the notice,
@@ -95,10 +132,11 @@
  * @module
  */
 
-import type { PanelSpec } from '@debuggen/panel-schema';
+import { PANEL_CHILDREN_FIELD, PANEL_LAYOUT_PATH_ROOT } from '@debuggen/panel-schema';
+import type { PanelNode, PanelNodePath, PanelSpec } from '@debuggen/panel-schema';
 import { LayoutTemplate, TriangleAlert } from 'lucide-react';
-import { useCallback, useMemo, useState } from 'react';
-import type { ReactElement, ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { FocusEvent, ReactElement, ReactNode } from 'react';
 
 import { PanelShell } from '../layout/PanelShell';
 import { SummaryHeader } from '../layout/SummaryHeader';
@@ -182,6 +220,55 @@ const FALLBACK_BANNER_MESSAGE =
  * reaches a string in this package.
  */
 const EMPTY_LAYOUT_MESSAGE = 'This panel specifies no views, so the summary above is all of it.';
+
+/**
+ * The global visually hidden utility of `../styles/base.css`: removed from the
+ * visual surface, kept in the accessibility tree. The version announcement is
+ * read, never seen — the head already shows the version beside the title.
+ */
+const VISUALLY_HIDDEN_CLASS = 'dg-visually-hidden';
+
+/** The generation a panel starts at; see `PanelSpec.panelVersion`. */
+const FIRST_PANEL_VERSION = 1;
+
+/**
+ * What the live region says for a panel that names a predecessor but whose
+ * own number is the first generation, so no predecessor number exists to name.
+ */
+const UPDATED_PANEL_ANNOUNCEMENT = 'Showing an updated version of this panel.';
+
+/**
+ * The sentence the version live region carries for the panel on screen, or an
+ * empty string for a first version.
+ *
+ * Derived from the document alone, during render. The region itself stays
+ * mounted across a panel replacement (it sits outside the keyed column), so
+ * assistive technology announces exactly the changes of this text: a follow-up
+ * that replaces version 1 with version 2 in place is announced once, a
+ * re-delivery of the same version changes nothing and is not re-announced, and
+ * a first version says nothing at all. A panel that first mounts as a later
+ * version is not announced — a live region reports changes, not its initial
+ * content — and the head's version badge states it for every reader.
+ *
+ * Generic product wording; the predecessor of generation `n` is `n - 1`, as a
+ * follow-up stores its answer as the next generation (AAP 0.4.2). A number
+ * that is not a whole generation of at least one announces nothing.
+ *
+ * @param panelVersion The document's `panelVersion`.
+ * @param supersedes Whether the document names a panel it supersedes.
+ * @returns The announcement, possibly empty.
+ */
+function versionAnnouncement(panelVersion: number, supersedes: boolean): string {
+  if (!Number.isInteger(panelVersion) || panelVersion < FIRST_PANEL_VERSION) {
+    return '';
+  }
+
+  if (panelVersion > FIRST_PANEL_VERSION) {
+    return `Showing version ${String(panelVersion)} of this panel, which updates version ${String(panelVersion - 1)}.`;
+  }
+
+  return supersedes ? UPDATED_PANEL_ANNOUNCEMENT : '';
+}
 
 /*
  * ---------------------------------------------------------------------------
@@ -301,6 +388,427 @@ function renderFallbackBanner(): ReactElement {
  */
 function panelIdentityKey(spec: PanelSpec): string {
   return JSON.stringify([spec.sessionId, spec.id, spec.panelVersion]);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Focus across a panel replacement
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * `./NodeRenderer`'s node frame class, read as a selector: how the node a
+ * focused element sat in is found, and how a node of the new panel is found
+ * again. This file never emits the class.
+ */
+const NODE_FRAME_SELECTOR = '.dg-panel__node';
+
+/**
+ * The attribute `./NodeRenderer` writes each frame's document path to —
+ * `layout.0.children.1` — the spelling {@link nodePathKey} reproduces.
+ */
+const NODE_PATH_ATTRIBUTE = 'data-node-path';
+
+/**
+ * The heading of a titled node: `../layout/Section`'s title class, read as a
+ * selector only. It is the node's own name and the first thing announced
+ * inside it, which is what makes it the place focus lands in that node.
+ */
+const NODE_HEADING_SELECTOR = '.dg-section__title';
+
+/**
+ * The panel title inside this host's head. `../layout/SummaryHeader` renders
+ * its title programmatically focusable (`tabindex="-1"`) for exactly this use.
+ */
+const PANEL_TITLE_SELECTOR = `.${SUMMARY_CLASS} .dg-summary-header__title`;
+
+/** A subtree the browser will not focus into. */
+const UNFOCUSABLE_SUBTREE_SELECTOR = '[hidden], [inert]';
+
+/** The attribute a node heading borrows while it holds restored focus. */
+const TABINDEX_ATTRIBUTE = 'tabindex';
+
+/** The borrowed value: focusable by script, never a stop in the tab order. */
+const BORROWED_TABINDEX = '-1';
+
+/**
+ * Where keyboard focus was last seen inside the panel column, while the reader
+ * has not deliberately taken it elsewhere.
+ */
+interface ColumnFocus {
+  /** The column element the focus was inside — one mounted generation. */
+  readonly column: HTMLElement;
+
+  /**
+   * The element that held focus. Kept after it leaves the document: a detached
+   * subtree still answers `closest`, which is how the node it sat in is read
+   * once the column that held it is gone.
+   */
+  readonly element: Element;
+}
+
+/**
+ * A node path in `./NodeRenderer`'s diagnostic spelling: its segments joined
+ * with `.`, as written onto `data-node-path`.
+ *
+ * @param path The node's path within its specification.
+ * @returns The path as one string.
+ */
+function nodePathKey(path: PanelNodePath): string {
+  return path.join('.');
+}
+
+/**
+ * The children of a node, or none.
+ *
+ * Tolerant by design, unlike the schema package's own walk: the host renders
+ * specifications it never validates, and a node type outside the vocabulary —
+ * which `./NodeRenderer` draws as an error state — must not throw from focus
+ * bookkeeping. The three container types are the ones that hold children.
+ *
+ * @param node A node of the layout.
+ * @returns The node's children in document order, or an empty list.
+ */
+function childNodesOf(node: PanelNode): readonly PanelNode[] {
+  switch (node.type) {
+    case 'section':
+    case 'split':
+    case 'stack':
+      return node.children;
+
+    default:
+      return [];
+  }
+}
+
+/** One node of a layout with the path key `./NodeRenderer` writes for it. */
+interface PlacedNode {
+  /** The node itself, read and never written. */
+  readonly node: PanelNode;
+
+  /** Its path key, as `data-node-path` spells it. */
+  readonly pathKey: string;
+}
+
+/**
+ * Every node of a layout, depth first, in document order, each with its path
+ * key.
+ *
+ * The paths are the ones `./NodeRenderer` writes for the same layout: the
+ * layout root, then each index, with the children field between a container
+ * and its children.
+ *
+ * @param layout The nodes to walk.
+ * @returns The nodes in reading order.
+ */
+function placedNodesOf(layout: readonly PanelNode[]): readonly PlacedNode[] {
+  const placed: PlacedNode[] = [];
+  const stack: { readonly node: PanelNode; readonly path: PanelNodePath }[] = [];
+  const pushSiblings = (nodes: readonly PanelNode[], basePath: PanelNodePath): void => {
+    for (let index = nodes.length - 1; index >= 0; index -= 1) {
+      const node = nodes[index];
+      if (node !== undefined) {
+        stack.push({ node, path: [...basePath, index] });
+      }
+    }
+  };
+
+  pushSiblings(layout, PANEL_LAYOUT_PATH_ROOT);
+
+  for (let frame = stack.pop(); frame !== undefined; frame = stack.pop()) {
+    placed.push({ node: frame.node, pathKey: nodePathKey(frame.path) });
+    pushSiblings(childNodesOf(frame.node), [...frame.path, PANEL_CHILDREN_FIELD]);
+  }
+
+  return placed;
+}
+
+/**
+ * The path keys of the node frames enclosing `element`, innermost first.
+ *
+ * @param element The element that held focus, attached or not.
+ * @returns Every enclosing frame's path, possibly none.
+ */
+function enclosingNodePaths(element: Element): readonly string[] {
+  const paths: string[] = [];
+
+  for (
+    let frame = element.closest(NODE_FRAME_SELECTOR);
+    frame !== null;
+    frame = frame.parentElement?.closest(NODE_FRAME_SELECTOR) ?? null
+  ) {
+    const path = frame.getAttribute(NODE_PATH_ATTRIBUTE);
+    if (path !== null) {
+      paths.push(path);
+    }
+  }
+
+  return paths;
+}
+
+/**
+ * Where the node found at `path` in the outgoing layout sits in the incoming
+ * one, best candidate first.
+ *
+ * Only a node of the **same type** is the same node: the normaliser derives an
+ * unnamed node's id from its position, so after a follow-up that inserted a
+ * view, the same id — and the same path — can name a different kind of view,
+ * and landing there would tell the reader they are somewhere they are not. So:
+ *
+ * 1. the node of that type carrying the same id — an authored id survives any
+ *    reordering;
+ * 2. otherwise the node of that type at the same ordinal among nodes of its
+ *    type — the second table is still the second table after a view was
+ *    inserted before it.
+ *
+ * A path the outgoing layout does not hold (a column drawn from a
+ * specification this host could not walk) is tried as it stands.
+ *
+ * @param path A node's path key in the outgoing layout.
+ * @param outgoing The layout the focused column was drawn from.
+ * @param incoming The layout now on screen.
+ * @returns The candidate path keys in the incoming layout, best first.
+ */
+function incomingNodePaths(
+  path: string,
+  outgoing: readonly PanelNode[],
+  incoming: readonly PanelNode[],
+): readonly string[] {
+  const outgoingNodes = placedNodesOf(outgoing);
+  const focused = outgoingNodes.find((placed) => placed.pathKey === path);
+
+  if (focused === undefined) {
+    return [path];
+  }
+
+  const { type, id } = focused.node;
+  const ordinal = outgoingNodes
+    .filter((placed) => placed.node.type === type)
+    .findIndex((placed) => placed.pathKey === path);
+  const sameType = placedNodesOf(incoming).filter((placed) => placed.node.type === type);
+
+  const candidates: string[] = [];
+  for (const placed of [sameType.find((entry) => entry.node.id === id), sameType[ordinal]]) {
+    if (placed !== undefined && !candidates.includes(placed.pathKey)) {
+      candidates.push(placed.pathKey);
+    }
+  }
+
+  return candidates;
+}
+
+/**
+ * Whether an element can take focus: attached, and outside any hidden or
+ * inert subtree.
+ *
+ * @param element A candidate target.
+ * @returns `true` when the browser would focus it.
+ */
+function canTakeFocus(element: HTMLElement): boolean {
+  return element.isConnected && element.closest(UNFOCUSABLE_SUBTREE_SELECTOR) === null;
+}
+
+/**
+ * The heading of the node whose frame sits at `path` in `column`, when that
+ * node is on screen and titled.
+ *
+ * Only a heading whose nearest frame is that node's own counts, so a container
+ * never answers with one of its children's headings.
+ *
+ * @param column The newly mounted panel column.
+ * @param path A node path key.
+ * @returns The heading, or `null`.
+ */
+function nodeHeadingAt(column: HTMLElement, path: string): HTMLElement | null {
+  for (const frame of column.querySelectorAll<HTMLElement>(NODE_FRAME_SELECTOR)) {
+    if (frame.getAttribute(NODE_PATH_ATTRIBUTE) !== path) {
+      continue;
+    }
+
+    for (const heading of frame.querySelectorAll<HTMLElement>(NODE_HEADING_SELECTOR)) {
+      if (heading.closest(NODE_FRAME_SELECTOR) === frame && canTakeFocus(heading)) {
+        return heading;
+      }
+    }
+
+    return null;
+  }
+
+  return null;
+}
+
+/**
+ * Focuses `target`, borrowing `tabindex="-1"` when it has no tab index of its
+ * own and giving it back the moment focus leaves.
+ *
+ * Not `preventScroll`: the new panel's content is not the content the reader
+ * had scrolled to, and a focused element out of view is a focus indicator
+ * nobody can see.
+ *
+ * @param target The element to focus.
+ * @returns Whether it took focus.
+ */
+function focusRestoredTarget(target: HTMLElement): boolean {
+  const borrowed = !target.hasAttribute(TABINDEX_ATTRIBUTE);
+
+  if (borrowed) {
+    target.setAttribute(TABINDEX_ATTRIBUTE, BORROWED_TABINDEX);
+  }
+
+  target.focus();
+
+  if (target.ownerDocument.activeElement === target) {
+    if (borrowed) {
+      target.addEventListener(
+        'focusout',
+        () => {
+          target.removeAttribute(TABINDEX_ATTRIBUTE);
+        },
+        { once: true },
+      );
+    }
+    return true;
+  }
+
+  if (borrowed) {
+    target.removeAttribute(TABINDEX_ATTRIBUTE);
+  }
+  return false;
+}
+
+/**
+ * Moves focus into a newly mounted panel column for focus that was lost with
+ * the column before it.
+ *
+ * The node the lost element sat in comes first — the innermost enclosing node,
+ * then each container around it — each matched into the new layout by
+ * {@link incomingNodePaths}, and focused on its heading. When no such node is on screen, or
+ * none of them is titled, the panel title takes focus: it names the panel and
+ * sits immediately before the version it now shows.
+ *
+ * @param column The newly mounted column.
+ * @param lost The element that held focus in the outgoing column.
+ * @param outgoing The layout the outgoing column was drawn from.
+ * @param incoming The layout now on screen.
+ * @returns The element that took focus, or `null` when none could.
+ */
+function restoreColumnFocus(
+  column: HTMLElement,
+  lost: Element,
+  outgoing: readonly PanelNode[],
+  incoming: readonly PanelNode[],
+): HTMLElement | null {
+  for (const path of enclosingNodePaths(lost)) {
+    for (const candidate of incomingNodePaths(path, outgoing, incoming)) {
+      const heading = nodeHeadingAt(column, candidate);
+      if (heading !== null && focusRestoredTarget(heading)) {
+        return heading;
+      }
+    }
+  }
+
+  const title = column.querySelector<HTMLElement>(PANEL_TITLE_SELECTOR);
+  if (title !== null && canTakeFocus(title) && focusRestoredTarget(title)) {
+    return title;
+  }
+
+  return null;
+}
+
+/**
+ * How long, at most, a restored focus target is kept in view while the new
+ * panel settles, in milliseconds. The views of a replacement resolve their
+ * queries after the column commits — a large trace takes seconds — and each
+ * one that arrives grows the layout above or around the target; past this
+ * window the panel is taken to have settled and nothing is moved any more.
+ */
+const RESTORED_FOCUS_SETTLE_MS = 10_000;
+
+/**
+ * The reveal a restored focus target is given when the settling layout moves
+ * it. A restored target is always a heading — a view's or the panel's title —
+ * which names the region below it, so it is brought to the top of the scroll
+ * viewport (`block: 'start'`) where the region it names follows it on screen;
+ * aligned to the nearest edge instead, it would settle at the bottom with its
+ * own content below the fold. Horizontally it takes the least scroll.
+ */
+const RESTORED_FOCUS_REVEAL: ScrollIntoViewOptions = { block: 'start', inline: 'nearest' };
+
+/**
+ * The document events that mean the reader has taken over — scrolling,
+ * pointing or typing. Any one of them ends the watch, so the panel never pulls
+ * a reader back to a target they chose to scroll away from.
+ */
+const READER_INPUT_EVENTS = ['keydown', 'pointerdown', 'wheel', 'touchstart'] as const;
+
+/**
+ * Keeps the element focus was restored to on screen while the replacing
+ * panel's views load.
+ *
+ * Focus is restored the moment the new column commits, when its views are
+ * still loading. As each view's data arrives it grows the layout, which can
+ * push the focused heading out of the scroll viewport — focus in the right
+ * place that nobody can see. A `ResizeObserver` on the column reveals the
+ * target again ({@link RESTORED_FOCUS_REVEAL}) each time the column's size
+ * changes, for as long as the target still holds focus.
+ *
+ * The watch ends — and never moves anything again — at the first of: focus
+ * leaving the target, any reader input ({@link READER_INPUT_EVENTS}), the
+ * column leaving the document, {@link RESTORED_FOCUS_SETTLE_MS} elapsing, or
+ * the returned function being called (a later replacement, or the host
+ * unmounting). A DOM without `ResizeObserver` or `scrollIntoView` gets no
+ * watch, which leaves the focus exactly where it was restored.
+ *
+ * @param target The element focus was restored to.
+ * @param column The column it sits in.
+ * @returns A function that ends the watch; calling it again does nothing.
+ */
+function keepRestoredFocusInView(target: HTMLElement, column: HTMLElement): () => void {
+  const view = column.ownerDocument.defaultView;
+
+  if (
+    view === null ||
+    typeof view.ResizeObserver !== 'function' ||
+    typeof target.scrollIntoView !== 'function'
+  ) {
+    return () => undefined;
+  }
+
+  const doc = column.ownerDocument;
+  let active = true;
+
+  const stop = (): void => {
+    if (!active) {
+      return;
+    }
+    active = false;
+    observer.disconnect();
+    view.clearTimeout(timer);
+    target.removeEventListener('focusout', stop);
+    for (const type of READER_INPUT_EVENTS) {
+      doc.removeEventListener(type, stop, true);
+    }
+  };
+
+  const observer = new view.ResizeObserver(() => {
+    if (!active) {
+      return;
+    }
+    if (!column.isConnected || doc.activeElement !== target) {
+      stop();
+      return;
+    }
+    target.scrollIntoView(RESTORED_FOCUS_REVEAL);
+  });
+
+  const timer = view.setTimeout(stop, RESTORED_FOCUS_SETTLE_MS);
+  target.addEventListener('focusout', stop);
+  for (const type of READER_INPUT_EVENTS) {
+    doc.addEventListener(type, stop, { capture: true, passive: true });
+  }
+  observer.observe(column);
+
+  return stop;
 }
 
 /*
@@ -611,14 +1119,16 @@ export interface PanelHostProps {
  * Renders a validated panel specification.
  *
  * The theme root, the four ambient contracts, the fallback notice when the
- * document carries one, the head, and the layout — in that order and nothing
- * else. No effect and no write to the specification, and one piece of state:
- * the panel's shared selection. Its other hooks are the memos described in
- * this module's header, which keep an unrelated host render from reaching the
- * views, and the one key on the panel column, which keeps a view from
- * outliving its session or panel.
+ * document carries one, the head, the layout, and the version live region — in
+ * that order and nothing else. No write to the specification, one piece of
+ * state — the panel's shared selection — and one effect, which carries keyboard
+ * focus into a replaced panel (see "Focus survives a panel replacement" in this
+ * module's header) and writes no state. Its other hooks are the memos described
+ * in this module's header, which keep an unrelated host render from reaching
+ * the views, the refs that effect reads, and the one key on the panel column,
+ * which keeps a view from outliving its session or panel.
  *
- * Six details are decisions rather than mechanics:
+ * Seven details are decisions rather than mechanics:
  *
  * - **The panel has one selection, and the host owns it.** Every view that
  *   draws captured events reads it from the selection context and marks the
@@ -662,6 +1172,11 @@ export interface PanelHostProps {
  *   carry no views, so the body renders the library's empty state with a
  *   neutral sentence — never a blank area, and never an error, which is what a
  *   failed *validation* looks like and this is not.
+ * - **A replaced panel keeps the reader's place.** A later generation is
+ *   stated beside the unchanged title and announced once, politely, and focus
+ *   that was inside the outgoing panel lands on the same node's heading in the
+ *   new one, or on its title — never on `<body>`, and never taken from
+ *   anywhere outside the panel.
  *
  * @param props See {@link PanelHostProps}.
  * @returns The whole panel: theme root, contexts, notice, head and layout.
@@ -678,7 +1193,8 @@ export interface PanelHostProps {
  */
 export function PanelHost(props: PanelHostProps): ReactElement {
   const { spec, dataProvider, actions, selectedEventId, theme, className, id } = props;
-  const { sessionId, title, summary, layout } = spec;
+  const { sessionId, title, summary, layout, panelVersion } = spec;
+  const supersedesPrevious = spec.supersedes !== undefined;
   const panelKey = panelIdentityKey(spec);
 
   // The selection the views and the head reported, with the panel it was made
@@ -776,13 +1292,17 @@ export function PanelHost(props: PanelHostProps): ReactElement {
   // long as the supplied callbacks are. It marks the evidence chips that cite
   // the panel's shared selection, handed in as the bare id because the head
   // imports nothing from this folder; the id is a string, so the head
-  // re-renders when a different event is selected and not otherwise.
+  // re-renders when a different event is selected and not otherwise. The
+  // generation travels as the two primitives the document carries — its
+  // number and whether it names a predecessor — and the head decides whether
+  // to state it, so a first version renders exactly as before.
   const selectedId = selection?.eventId;
   const head = useMemo<ReactElement>(
     () => (
       <SummaryHeader
         title={title}
         summary={summary}
+        version={{ current: panelVersion, supersedes: supersedesPrevious }}
         headingLevel={PANEL_TITLE_HEADING_LEVEL}
         selectEvent={selectEvent}
         selectedEventId={selectedId}
@@ -790,7 +1310,7 @@ export function PanelHost(props: PanelHostProps): ReactElement {
         className={SUMMARY_CLASS}
       />
     ),
-    [title, summary, selectEvent, selectedId, openSource],
+    [title, summary, panelVersion, supersedesPrevious, selectEvent, selectedId, openSource],
   );
 
   // The layout, rendered once per `spec.layout` value. Handing React the very
@@ -811,6 +1331,112 @@ export function PanelHost(props: PanelHostProps): ReactElement {
     [layout],
   );
 
+  // Focus across a replacement (see "Focus survives a panel replacement" in
+  // this module's header). Refs, not state: none of this is rendered, and
+  // recording where focus sits must never re-render a panel.
+  //
+  // `columnRef` is the mounted column; `focusRef` is where focus was last seen
+  // inside a column, until the reader deliberately takes it elsewhere; and
+  // `drawnLayoutRef` is the layout the mounted column was drawn from, so the
+  // node a lost element sat in can be matched into the next layout by id.
+  const columnRef = useRef<HTMLDivElement>(null);
+  const focusRef = useRef<ColumnFocus | null>(null);
+  const drawnLayoutRef = useRef<readonly PanelNode[]>(layout);
+  // Ends the watch that keeps a restored focus target on screen while the new
+  // column's views load (see `keepRestoredFocusInView`); `null` when none runs.
+  const stopFocusWatchRef = useRef<(() => void) | null>(null);
+
+  // Focus arriving anywhere in the column — `onFocus` is React's `focusin` —
+  // is recorded against that column.
+  const recordColumnFocus = useCallback((event: FocusEvent<HTMLDivElement>): void => {
+    focusRef.current = { column: event.currentTarget, element: event.target };
+  }, []);
+
+  // Focus leaving an element of the column. Towards another element of the
+  // same column, that element's own focus event records it; towards anything
+  // else, the reader moved on. Towards nothing, the verdict waits one microtask
+  // for the DOM to settle: an element still attached that no longer holds focus
+  // was left on purpose (a click into empty space), while one that was removed
+  // — the column itself being replaced — is a loss the effect below answers.
+  const releaseColumnFocus = useCallback((event: FocusEvent<HTMLDivElement>): void => {
+    const { currentTarget, target, relatedTarget } = event;
+    const recorded = focusRef.current;
+
+    if (recorded === null || recorded.column !== currentTarget) {
+      return;
+    }
+
+    if (relatedTarget !== null) {
+      if (!currentTarget.contains(relatedTarget)) {
+        focusRef.current = null;
+      }
+      return;
+    }
+
+    queueMicrotask(() => {
+      const current = focusRef.current;
+      if (
+        current !== null &&
+        current.element === target &&
+        target.isConnected &&
+        target.ownerDocument.activeElement !== target
+      ) {
+        focusRef.current = null;
+      }
+    });
+  }, []);
+
+  // After a replaced column commits: focus that was inside the outgoing column,
+  // and has fallen to `<body>` with it, moves into the new panel. Declared
+  // before the layout bookkeeping below so it reads the outgoing layout, and a
+  // passive effect so the new nodes' own focus keepers are installed first and
+  // track the element focus lands on. Keyed on the identity and the layout: a
+  // re-delivery keeps the column, which the column check turns into a no-op.
+  useEffect(() => {
+    const recorded = focusRef.current;
+    const column = columnRef.current;
+
+    if (recorded === null || column === null || recorded.column === column) {
+      return;
+    }
+
+    // One answer per loss, whatever it turns out to be.
+    focusRef.current = null;
+
+    if (recorded.column.isConnected) {
+      return;
+    }
+
+    const { activeElement, body: documentBody } = column.ownerDocument;
+    const focusFellToBody =
+      activeElement === null || activeElement === documentBody || !activeElement.isConnected;
+
+    if (focusFellToBody) {
+      // A watch left by an earlier replacement belongs to a column that is gone.
+      stopFocusWatchRef.current?.();
+      stopFocusWatchRef.current = null;
+
+      const restored = restoreColumnFocus(column, recorded.element, drawnLayoutRef.current, layout);
+      if (restored !== null) {
+        stopFocusWatchRef.current = keepRestoredFocusInView(restored, column);
+      }
+    }
+  }, [panelKey, layout]);
+
+  // The layout the mounted column now shows, for the next replacement.
+  useEffect(() => {
+    drawnLayoutRef.current = layout;
+  }, [layout]);
+
+  // A host that unmounts ends any watch still keeping a restored target in view.
+  useEffect(
+    () => () => {
+      stopFocusWatchRef.current?.();
+      stopFocusWatchRef.current = null;
+    },
+    [],
+  );
+
   return (
     <PanelShell theme={theme} className={className} id={id}>
       {/* All four contracts wrap the head as well as the layout. The head is
@@ -829,8 +1455,17 @@ export function PanelHost(props: PanelHostProps): ReactElement {
                   `panelIdentityKey`): a panel for another session, or another
                   panel, remounts every view beneath, so no page, offset or
                   filter a view accumulated survives into a capture it was not
-                  drawn from. The shell and the four providers stay mounted. */}
-              <div key={panelKey} className={PANEL_CLASS}>
+                  drawn from. The shell and the four providers stay mounted.
+                  The focus handlers record where focus sits inside it, so the
+                  effect above can carry focus into the column that replaces
+                  it. */}
+              <div
+                key={panelKey}
+                ref={columnRef}
+                className={PANEL_CLASS}
+                onFocus={recordColumnFocus}
+                onBlur={releaseColumnFocus}
+              >
                 {/* Above the summary, so the provenance of what follows is read
                     first. The explicit `=== true` is the reading `PanelMeta`
                     prescribes: the flag is absent on an ordinary generated
@@ -841,6 +1476,22 @@ export function PanelHost(props: PanelHostProps): ReactElement {
 
                 <div className={BODY_CLASS}>{body}</div>
               </div>
+
+              {/* Outside the keyed column, so it is the same element before and
+                  after a replacement and its text change is what assistive
+                  technology announces. `aria-live` without `role="status"`: it
+                  is a notification channel, not a status the panel reports, and
+                  it adds no status to the ones the views and the fallback
+                  banner already expose. After the column, so the column stays
+                  the viewport's first child. */}
+              <Text
+                as="div"
+                className={VISUALLY_HIDDEN_CLASS}
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                {versionAnnouncement(panelVersion, supersedesPrevious)}
+              </Text>
             </PanelSelectionContext.Provider>
           </PanelActionsContext.Provider>
         </PanelSessionContext.Provider>

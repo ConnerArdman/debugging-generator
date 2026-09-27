@@ -568,12 +568,21 @@ export interface IssuedDevtoolsCredential extends IssuedCredential {
  * be checked, never authority: a route hands it to {@link requireBoundSession}
  * (directly or through {@link requireSessionAccess}), which refuses a DevTools
  * request whose acting tab is absent or is not the session's live bound tab.
+ *
+ * `requestRef` is the correlation reference `http.ts`'s request context minted
+ * for the request — the `ref` its error body and its `X-Debuggen-Ref` header
+ * carry. {@link createAuthMiddleware} hands it to the access boundary so a
+ * refusal's `warn` record names the same ref as the refusal's body. It is
+ * `undefined` only where no request context runs (a route composed on its own,
+ * as the unit suites do); a route may read it to log under the request's ref,
+ * and never treats it as input from the client — the service mints it.
  */
 export type ServerEnv = {
   Variables: {
     principal: Principal;
     operation: HttpOperationId;
     actingTabId: number | undefined;
+    requestRef: string | undefined;
   };
 };
 
@@ -712,6 +721,13 @@ export interface HttpAuthorizationRequest {
   readonly origin: string | undefined;
   /** The operation the route was registered for. */
   readonly operation: HttpOperationId;
+  /**
+   * The correlation reference the service minted for the request (the
+   * {@link ServerEnv} `requestRef`), which the refusal's body carries. A
+   * refusal's `warn` record is filed under it, so a developer holding the ref
+   * from a reply finds the record. Omitted where no request context minted one.
+   */
+  readonly ref?: string | undefined;
 }
 
 /** The input of {@link AuthService.authorizeHello}. */
@@ -971,7 +987,11 @@ export const AUTH_FAILURE_REASONS = Object.freeze({
   'pairing-locked': {
     code: 'RATE_LIMITED',
     status: 429,
-    message: 'Too many failed pairing attempts; pairing is paused.',
+    // The wait is part of the message because the message is what reaches the
+    // DevTools pairing dialog: the error payload carries no hint (AAP §0.4.2).
+    // "Up to", because a later attempt inside the lock has less of it left;
+    // the route's `Retry-After` states the same bound in seconds.
+    message: `Too many failed pairing attempts; pairing is paused for up to ${String(PAIRING_LOCKOUT_MS / 1000)} seconds.`,
     hint: `Wait ${String(PAIRING_LOCKOUT_MS / 1000)} seconds, then enter the current code again.`,
   },
 } as const satisfies Readonly<Record<string, AuthFailureDescriptor>>);
@@ -1211,6 +1231,193 @@ export function classifyOrigin(origin: string | undefined): OriginClass {
 export function isAllowedOrigin(origin: string | undefined): boolean {
   return classifyOrigin(origin).kind !== 'refused';
 }
+
+/* -------------------------------------------------------------------------------------------------
+ * Logging a refused origin
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The longest rendering {@link describeRefusedOrigin} returns, in characters. */
+export const MAX_DESCRIBED_ORIGIN_LENGTH = 128;
+
+/** What {@link describeRefusedOrigin} says for a request that carried no `Origin`. */
+export const ABSENT_ORIGIN_DESCRIPTION = '(absent)';
+
+/**
+ * What {@link describeRefusedOrigin} says for a value it will not render: one
+ * holding whitespace or a control character, or one that is not a URL.
+ */
+export const UNREADABLE_ORIGIN_DESCRIPTION = '(unreadable)';
+
+/** The literal `Origin` a browser sends from an opaque context (a sandboxed frame, `data:`, a redirect). */
+const OPAQUE_ORIGIN = 'null';
+
+/** Marks a rendering cut at {@link MAX_DESCRIBED_ORIGIN_LENGTH}. */
+const TRUNCATION_MARK = '…';
+
+/**
+ * A log-safe rendering of a refused `Origin`, so a refusal record says *which*
+ * page knocked without carrying anything else the header held.
+ *
+ * - An absent (or empty) header is {@link ABSENT_ORIGIN_DESCRIPTION}; the
+ *   opaque origin `null` stays `null`.
+ * - A value holding whitespace, a C0 control character or DEL — the one way a
+ *   header could forge a log line or smuggle a second value — or one `URL`
+ *   cannot parse is {@link UNREADABLE_ORIGIN_DESCRIPTION}: such a value is
+ *   never rendered at all.
+ * - Anything else is parsed and re-serialised as `scheme://host` — the host
+ *   keeps its port, and is the parser's normalised (punycode, lower-case)
+ *   form — or as the bare `scheme:` of a URL with no host (`data:`, `file:`).
+ *   Userinfo, path, query and fragment are never part of it: a crafted
+ *   `Origin` that names a user and a password before `evil.example`, a path
+ *   and a query is rendered `https://evil.example`.
+ * - The result is at most {@link MAX_DESCRIBED_ORIGIN_LENGTH} characters; a
+ *   longer host is cut and ends in `…`.
+ *
+ * Pure and total: it never throws, whatever it is handed.
+ *
+ * @param origin The raw `Origin` header value, or `undefined` when absent.
+ * @returns The rendering to log under an `origin` field.
+ *
+ * @example
+ * ```ts
+ * describeRefusedOrigin('http://evil.example');                    // 'http://evil.example'
+ * describeRefusedOrigin('https://evil.example:8443/a?b#c');         // 'https://evil.example:8443'
+ * describeRefusedOrigin('null');                                    // 'null'
+ * describeRefusedOrigin('data:text/html,<p>');                      // 'data:'
+ * describeRefusedOrigin('http://evil.example\r\nX-Forged: 1');      // '(unreadable)'
+ * ```
+ */
+export function describeRefusedOrigin(origin: string | undefined): string {
+  if (origin === undefined || origin === '') {
+    return ABSENT_ORIGIN_DESCRIPTION;
+  }
+  if (origin === OPAQUE_ORIGIN) {
+    return OPAQUE_ORIGIN;
+  }
+  if (hasForbiddenOriginCharacter(origin)) {
+    return UNREADABLE_ORIGIN_DESCRIPTION;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return UNREADABLE_ORIGIN_DESCRIPTION;
+  }
+  const rendered = parsed.host === '' ? parsed.protocol : `${parsed.protocol}//${parsed.host}`;
+  if (hasForbiddenOriginCharacter(rendered)) {
+    return UNREADABLE_ORIGIN_DESCRIPTION;
+  }
+  return rendered.length <= MAX_DESCRIBED_ORIGIN_LENGTH
+    ? rendered
+    : `${rendered.slice(0, MAX_DESCRIBED_ORIGIN_LENGTH - TRUNCATION_MARK.length)}${TRUNCATION_MARK}`;
+}
+
+/** How many refusals a {@link RefusalLogThrottle} files at `warn` per window, by default. */
+export const REFUSAL_LOG_BURST = 5;
+
+/** The window a {@link RefusalLogThrottle}'s burst is counted over, in milliseconds, by default. */
+export const REFUSAL_LOG_WINDOW_MS = 60_000;
+
+/**
+ * What a {@link RefusalLogThrottle} says about one refusal: file it at `warn`,
+ * with the number of refusals filed at `debug` since the previous `warn`, or
+ * file it at `debug`.
+ */
+export type RefusalLogVerdict =
+  { readonly level: 'warn'; readonly suppressed: number } | { readonly level: 'debug' };
+
+/**
+ * Decides, refusal by refusal, which ones reach the default log level.
+ *
+ * A web page can provoke refusals as fast as it can send requests, so writing
+ * every one at `warn` would let any page on the developer's machine flood the
+ * service log — and bury the one that matters. The throttle keeps the first
+ * few of every window visible and counts the rest, the same shape as the
+ * WebSocket admission quotas' refusal log in `./ws.ts`.
+ */
+export interface RefusalLogThrottle {
+  /** Records one refusal and returns the level to file it at. */
+  next(): RefusalLogVerdict;
+}
+
+/** How a {@link RefusalLogThrottle} is built; every member has a default. */
+export interface RefusalLogThrottleOptions {
+  /** Refusals filed at `warn` per window; a positive integer, else {@link REFUSAL_LOG_BURST}. */
+  readonly burst?: number | undefined;
+  /** The window in milliseconds; a positive finite number, else {@link REFUSAL_LOG_WINDOW_MS}. */
+  readonly windowMs?: number | undefined;
+  /** A monotonic clock in milliseconds; defaults to `performance.now`. */
+  readonly now?: (() => number) | undefined;
+}
+
+/**
+ * Builds a {@link RefusalLogThrottle}: the first `burst` refusals of each
+ * `windowMs` window are filed at `warn`, the rest at `debug`. A window opens
+ * at the first refusal after the previous one closed, and the first `warn` of
+ * a window reports, as `suppressed`, how many refusals went to `debug` since
+ * the last `warn` — so the count survives even when nothing was logged at the
+ * default level in between. Each owner holds its own instance; it keeps no
+ * global state and no timer.
+ *
+ * @param options The burst, the window and the clock.
+ * @returns The throttle.
+ *
+ * @example
+ * ```ts
+ * const throttle = createRefusalLogThrottle();
+ * const verdict = throttle.next();
+ * if (verdict.level === 'warn') {
+ *   log.warn('Refused a request from a web origin', { origin, suppressed: verdict.suppressed });
+ * } else {
+ *   log.debug('Refused a request from a web origin', { origin });
+ * }
+ * ```
+ */
+export function createRefusalLogThrottle(
+  options: RefusalLogThrottleOptions = {},
+): RefusalLogThrottle {
+  const burst =
+    options.burst !== undefined && Number.isInteger(options.burst) && options.burst > 0
+      ? options.burst
+      : REFUSAL_LOG_BURST;
+  const windowMs =
+    options.windowMs !== undefined && Number.isFinite(options.windowMs) && options.windowMs > 0
+      ? options.windowMs
+      : REFUSAL_LOG_WINDOW_MS;
+  const now = options.now ?? ((): number => performance.now());
+
+  let windowStartedAt: number | undefined;
+  let warnedInWindow = 0;
+  let suppressedSinceWarn = 0;
+
+  return Object.freeze({
+    next(): RefusalLogVerdict {
+      const at = now();
+      if (windowStartedAt === undefined || at - windowStartedAt >= windowMs) {
+        windowStartedAt = at;
+        warnedInWindow = 0;
+      }
+      if (warnedInWindow < burst) {
+        warnedInWindow += 1;
+        const suppressed = suppressedSinceWarn;
+        suppressedSinceWarn = 0;
+        return { level: 'warn', suppressed };
+      }
+      suppressedSinceWarn += 1;
+      return { level: 'debug' };
+    },
+  });
+}
+
+/**
+ * The refusal reasons decided by a request's `Origin` — the ones whose record
+ * names the origin ({@link describeRefusedOrigin}) when the request carried one.
+ */
+const ORIGIN_REFUSAL_REASONS: ReadonlySet<AuthFailureReason> = new Set<AuthFailureReason>([
+  'forbidden-origin',
+  'origin-not-permitted-for-role',
+  'pairing-origin-required',
+]);
 
 /**
  * How a credential is presented, which decides whether a DevTools credential
@@ -2570,12 +2777,36 @@ class CredentialAuthority implements AuthService {
     return ok(undefined);
   }
 
-  /** Logs a refusal by its reason; never by anything the client presented. */
-  #logRefusal(message: string, error: DebuggenError, fields: Record<string, unknown> = {}): void {
+  /**
+   * Logs a refusal by its reason; never by anything the client presented —
+   * with one bounded exception: a refusal decided by the request's `Origin`
+   * ({@link ORIGIN_REFUSAL_REASONS}) names that origin in its
+   * {@link describeRefusedOrigin} rendering (`scheme://host`, never a path,
+   * query or credential), because *which* page knocked is the one fact such a
+   * record exists to tell.
+   *
+   * @param message The record's constant message.
+   * @param error The refusal.
+   * @param fields Context the caller already holds (operation, ref, role).
+   * @param origin The request's raw `Origin`, when the caller has one.
+   */
+  #logRefusal(
+    message: string,
+    error: DebuggenError,
+    fields: Record<string, unknown> = {},
+    origin?: string,
+  ): void {
+    const reason = authFailureReasonOf(error);
+    const namesOrigin =
+      origin !== undefined &&
+      origin !== '' &&
+      reason !== undefined &&
+      ORIGIN_REFUSAL_REASONS.has(reason);
     this.#logger.warn(message, {
       ...fields,
-      reason: authFailureReasonOf(error) ?? 'not-a-refusal',
+      reason: reason ?? 'not-a-refusal',
       errorCode: error.code,
+      ...(namesOrigin ? { origin: describeRefusedOrigin(origin) } : {}),
     });
   }
 
@@ -3454,7 +3685,15 @@ class CredentialAuthority implements AuthService {
   authorizeHttpRequest(request: HttpAuthorizationRequest): Result<Principal | null, DebuggenError> {
     const decision = this.#decideHttpRequest(request);
     if (isErr(decision)) {
-      this.#logRefusal('refused an HTTP request', decision.error, { operation: request.operation });
+      this.#logRefusal(
+        'refused an HTTP request',
+        decision.error,
+        {
+          operation: request.operation,
+          ...(request.ref === undefined ? {} : { ref: request.ref }),
+        },
+        request.origin,
+      );
     }
     return decision;
   }
@@ -3534,7 +3773,7 @@ class CredentialAuthority implements AuthService {
   authorizeHello(request: HelloAuthorizationRequest): Result<Principal, DebuggenError> {
     const decision = this.#decideHello(request);
     if (isErr(decision)) {
-      this.#logRefusal('refused a client.hello', decision.error);
+      this.#logRefusal('refused a client.hello', decision.error, {}, request.origin);
     } else {
       this.#logger.debug('authenticated a client.hello', { role: decision.value.role });
     }
@@ -3802,7 +4041,7 @@ class CredentialAuthority implements AuthService {
   ): Result<IssuedDevtoolsCredential, DebuggenError> {
     const decision = this.#redeemPairingCode(request);
     if (isErr(decision)) {
-      this.#logRefusal('refused a pairing attempt', decision.error);
+      this.#logRefusal('refused a pairing attempt', decision.error, {}, request.origin);
     }
     return decision;
   }
@@ -4746,6 +4985,12 @@ export type AuthMiddlewareFactory = (operation: HttpOperationId) => MiddlewareHa
  * operation — `principal` on the context, and otherwise answers with the
  * protocol's error body at the refusal's status (400, 401, 403 or 429).
  *
+ * The refusal body carries the request's `requestRef` (see {@link ServerEnv})
+ * as its `ref`, and the same ref is handed to the access boundary, whose
+ * `warn` record of the refusal is filed under it — one ref for the reply and
+ * the record. Composed without `http.ts`'s request context, no ref is set and
+ * the body carries none.
+ *
  * ⚠️ It sets **no `Access-Control-Allow-Origin` header, deliberately**, and
  * nothing else may add one. Its absence is why a browser page cannot read any
  * response of this service, and together with the bearer requirement it is what
@@ -4768,22 +5013,27 @@ export function createAuthMiddleware(
   auth: Pick<AuthService, 'authorizeHttpRequest'>,
 ): AuthMiddlewareFactory {
   return (operation) => async (c, next) => {
+    const ref = c.get('requestRef');
+    /** The refusal reply: the boundary's status and body, under the request's ref. */
+    const refusal = (error: DebuggenError): Response => {
+      const { status, body } = authErrorResponse(error);
+      return c.json(ref === undefined ? body : { ...body, ref }, status);
+    };
     const decision = auth.authorizeHttpRequest({
       headers: c.req.raw.headers,
       origin: c.req.header(ORIGIN_HEADER),
       operation,
+      ref,
     });
     if (isErr(decision)) {
-      const { status, body } = authErrorResponse(decision.error);
-      return c.json(body, status);
+      return refusal(decision.error);
     }
     // The same pure rule the decision above enforced, over the same headers,
     // so this only extracts the value the access boundary already accepted;
     // should the two ever disagree the request is refused, never admitted.
     const actingTab = resolveActingTab(decision.value, c.req.header(ACTING_TAB_HEADER));
     if (isErr(actingTab)) {
-      const { status, body } = authErrorResponse(actingTab.error);
-      return c.json(body, status);
+      return refusal(actingTab.error);
     }
     c.set('operation', operation);
     c.set('actingTabId', actingTab.value);

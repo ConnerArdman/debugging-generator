@@ -36,10 +36,12 @@
  *      single request, and each is there because this component cannot promise to be here when the
  *      reply arrives: the request carries an `AbortSignal` this form aborts when it unmounts, the
  *      attempt - its name and the exact draft sent - is written to session storage before it goes
- *      out and replaced with the order's reference alone when it lands, and a placed order is given
- *      an address of its own with `history.pushState`. `POST /api/checkout` stops for none of it -
- *      a buyer who navigates away is still charged - so an abandoned attempt is treated as an
- *      outcome nobody established rather than as a cancelled order.
+ *      out, replaced with the order's reference alone when it lands and forgotten once that order's
+ *      receipt is on screen, and a placed order is given an address of its own with
+ *      `history.pushState`, which `app/checkout/page.tsx` answers with the same receipt on every
+ *      later visit. `POST /api/checkout` stops for none of it - a buyer who navigates away is still
+ *      charged - so an abandoned attempt is treated as an outcome nobody established rather than as
+ *      a cancelled order.
  *
  *   4. THE FORM SAYS WHAT IT KNOWS AND NOT WHAT IT WOULD PREFER. Two of the things a buyer
  *      reads here are statements about their money, and neither may be guessed. A failure is
@@ -78,8 +80,8 @@
  *      DESTINATION ARE CHECKED BEFORE IT IS ASKED FOR. A rate is a property of a destination, so
  *      this form starts with no services at all and offers none until the store has quoted the
  *      address in its fields: the service the order names is looked up in that quote, a service it
- *      omits is not something this order can be placed with, and the place-order control is
- *      unavailable until a quoted service is chosen. That is not this form second-guessing the
+ *      omits is not something this order can be placed with, and the order is not sent until a
+ *      quoted service is chosen. That is not this form second-guessing the
  *      endpoint - `POST /api/checkout` re-quotes and refuses an unoffered service outright - it is
  *      this form agreeing with it instead of showing a buyer a service that would be refused. Two
  *      things are settled before a request is made at all, for the same reason: freight is quoted
@@ -94,15 +96,15 @@
  *      fields on every render rather than stored when the order is submitted. Three things follow,
  *      and each of them was a defect while it did not. A message cannot outlive the value it was
  *      about, so a corrected field clears itself instead of standing accused until the next
- *      submission. The pass runs whether or not the order can be submitted, so the form can say
- *      what is missing in a state where the place-order control is unavailable - which is the state
- *      an incomplete address puts it in, and therefore the one state the messages most needed to be
- *      reachable in. And the control's availability *is* that pass: it is unavailable while the
- *      request would be refused, for a missing city exactly as for an unquoted shipment, with the
- *      line above it naming what is outstanding so an inert button is never the whole of the
- *      answer. When a message is shown is the one part that is about the buyer rather than the
- *      value: a field speaks once focus has left it, and a submission reveals all of them at once
- *      and moves the reader to the first.
+ *      submission. The pass runs on every render, so the form can say what is missing before
+ *      anything is pressed - the line above the place-order control names it. And whether the
+ *      order is sent *is* that pass: a request that would be refused is not made, for a missing
+ *      city exactly as for an unquoted shipment. The control itself stays available whenever there
+ *      is a cart to order, so that pressing it - or pressing Enter in a field - is answered rather
+ *      than ignored: the pass refuses the order, and the refusal is shown. When a message is shown
+ *      is the one part that is about the buyer rather than the value: a field speaks once focus has
+ *      left it, and a submission reveals all of them at once, lists them in an error summary at
+ *      the top of the form and moves the reader to it, each entry a link to its field.
  *
  * Validation is a mirror of the server's bounds, not a second opinion about them: the lengths and
  * shapes below are the ones `checkoutBodySchema` enforces - the email check is literally the
@@ -119,7 +121,14 @@
 import clsx from 'clsx';
 import Link from 'next/link';
 
-import { useEffect, useRef, useState, type FormEvent, type ReactElement } from 'react';
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactElement,
+} from 'react';
 
 import { z } from 'zod';
 
@@ -139,19 +148,24 @@ import {
   freightDestinationProblem,
   freightPostalCodeHint,
 } from '@/lib/destination';
-import { formatQuantityLabel } from '@/lib/format';
-import { MAX_SHIPMENT_UNITS } from '@/lib/types';
+import { formatPriceLabel, formatQuantityLabel } from '@/lib/format';
+import { MAX_PAYMENT_CENTS, MAX_SHIPMENT_UNITS } from '@/lib/types';
 import type {
   CheckoutDraft,
   CheckoutResult,
   CustomerContact,
+  OrderDetail,
   ShippingAddress,
   ShippingOption,
 } from '@/lib/types';
 import { useToastCenter } from '@/providers/ToastProvider';
 
 import { CheckoutButton } from './CheckoutButton';
-import { usePublishOrderPlaced, usePublishSelectedFreight } from './CheckoutCharges';
+import {
+  usePublishOrderPending,
+  usePublishOrderPlaced,
+  usePublishSelectedFreight,
+} from './CheckoutCharges';
 import { OrderConfirmation } from './OrderConfirmation';
 import { ShippingOptionPicker } from './ShippingOptionPicker';
 
@@ -176,6 +190,15 @@ const ADDRESS_REGION_ID = 'checkout-region';
 const ADDRESS_POSTAL_CODE_ID = 'checkout-postal-code';
 const ADDRESS_COUNTRY_ID = 'checkout-country';
 const DELIVERY_NOTES_ID = 'checkout-notes';
+
+/**
+ * The shipping group's body - the service picker and its message - which is the one "field" of this
+ * form that is not a single control. `./ShippingOptionPicker` mints its radios' ids from the
+ * services the store quoted, so there is no control id this form could name for it; the wrapper it
+ * renders into is given this id instead, and is focusable programmatically, so the error summary
+ * has somewhere to send a reader even when there are no services to choose between yet.
+ */
+const SHIPPING_GROUP_ID = 'checkout-shipping';
 
 /* ---------------------------------------------------------------------------
  * Bounds and shapes
@@ -370,18 +393,19 @@ type CheckoutFieldErrors = Partial<Record<CheckoutFieldKey, string>>;
  * Three things need exactly this and would otherwise each invent their own version of it. The line
  * beside the place-order control names what is still outstanding, and it has to name fields the way
  * the labels above them do - "State or region", not `region`. A submission that cannot proceed
- * moves the reader to the first field with something wrong, and "first" means first on screen
- * rather than first in an object's key order. And both of them have to cover every field: a key
- * this table omits would be a problem nobody is told about and a field nobody is sent to.
+ * shows an error summary listing every problem in on-screen order, each entry a link to the
+ * element named by `id`, and "order" means order on screen rather than an object's key order. And
+ * all of them have to cover every field: a key this table omits would be a problem nobody is told
+ * about and a field nobody is sent to.
  *
- * `id` is absent for exactly one entry. The shipping service is a group of radios drawn by
- * `./ShippingOptionPicker`, which mints their ids from the services the store quoted, so this form
- * has no id of its own to move focus to - the group's own message is what speaks for it, and the
- * entry is here for its label and its ordering.
+ * Every entry has an `id`. For ten of them it is the control's own; the shipping service is a group
+ * of radios drawn by `./ShippingOptionPicker`, which mints their ids from the services the store
+ * quoted, so its entry names the wrapper the group renders into ({@link SHIPPING_GROUP_ID}) and
+ * {@link focusCheckoutControl} finds the radio to land on inside it.
  */
 const FIELDS: readonly {
   readonly key: CheckoutFieldKey;
-  readonly id?: string;
+  readonly id: string;
   readonly label: string;
 }[] = [
   { key: 'name', id: CONTACT_NAME_ID, label: 'Contact name' },
@@ -393,7 +417,7 @@ const FIELDS: readonly {
   { key: 'region', id: ADDRESS_REGION_ID, label: 'State or region' },
   { key: 'postalCode', id: ADDRESS_POSTAL_CODE_ID, label: 'Postal code' },
   { key: 'country', id: ADDRESS_COUNTRY_ID, label: 'Country' },
-  { key: 'shippingOptionId', label: 'Shipping method' },
+  { key: 'shippingOptionId', id: SHIPPING_GROUP_ID, label: 'Shipping method' },
   { key: 'notes', id: DELIVERY_NOTES_ID, label: 'Notes for the warehouse' },
 ];
 
@@ -460,6 +484,24 @@ interface Props {
    * attempt, and counting it twice would count one sale twice.
    */
   onOrderPlaced?: (result: CheckoutResult) => void;
+
+  /**
+   * An order that has already been placed, to show as this form's receipt instead of its fields.
+   *
+   * `app/checkout/page.tsx` passes it when the page's address names an order and the store holds
+   * it - the address this form gives an order with `history.pushState`, reloaded, bookmarked or
+   * returned to - so a buyer arriving there reads the same receipt a submission shows, and the
+   * review column beside it is told the order is placed exactly as it is after a submission. The
+   * receipt arriving with the page is not something the buyer just did, so focus is left where the
+   * browser put it; it moves to the receipt only when the order arrives on a form already on
+   * screen, which is the one case where the control the buyer used has just left the document.
+   * An attempt record naming this order is forgotten once its receipt is on screen.
+   *
+   * A submission's own result takes precedence over it, since only that result carries the payment
+   * that settled the order. Spelled with `| undefined` because the workspace compiles with
+   * `exactOptionalPropertyTypes` and the page passes the value it holds, which may be absent.
+   */
+  placedOrder?: OrderDetail | undefined;
 
   /** An extra class from the surrounding layout, composed after the module's own root class. */
   className?: string;
@@ -924,13 +966,17 @@ function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
   }
 
   switch (cause.code) {
-    // Three things the buyer can act on reach this reason, and naming only the fields would send
+    // Four things the buyer can act on reach this reason, and naming only the fields would send
     // somebody to correct an address that was never the problem. The endpoint validates the
     // contact and the destination, and it also rates the freight for the units it reserved - so a
     // cart that grew past `MAX_SHIPMENT_UNITS` between this page's last reading of it and the
-    // submission is answered here too, which is the one case this form could not rule out in
-    // advance. The order is what the buyer checks first and the cart last, which is the order
-    // they are named in.
+    // submission is answered here too - and the payment service refuses, before anything is sent,
+    // a total above `MAX_PAYMENT_CENTS`, the most one payment can be. Neither the units nor the
+    // total can be ruled out in advance: the total is what the store prices when the order is
+    // placed, promotions and freight included, so no figure on this page is guaranteed to be it.
+    // The order is what the buyer checks first and the cart last, which is the order they are
+    // named in, and the sentence ends by saying what to do about a cart that is too large, since
+    // placing the same order again cannot change that answer.
     case 'VALIDATION_FAILED':
       return {
         kind: 'settled',
@@ -938,7 +984,8 @@ function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
         body:
           'Lumen Supply could not accept these details. Review the contact and address fields, ' +
           `and check that the cart holds no more than ${formatQuantityLabel(MAX_SHIPMENT_UNITS)} ` +
-          'units, then place the order again.',
+          `units and comes to no more than ${formatPriceLabel(MAX_PAYMENT_CENTS)}, the most one ` +
+          'payment can cover. Reduce the order if it is larger, then place it again.',
         action: RETRY_ORDER,
       };
     case 'NOT_FOUND':
@@ -1012,6 +1059,25 @@ function orderSizeLabel(itemCount: number, subtotalLabel: string): string {
   return `${formatQuantityLabel(itemCount)} ${unit} · ${subtotalLabel} subtotal`;
 }
 
+/**
+ * The error summary's heading. It names the situation rather than any one field, because the list
+ * under it does that, entry by entry, in the words each field's own message uses.
+ */
+const ERROR_SUMMARY_TITLE = 'There is a problem with this order';
+
+/**
+ * The sentence under the error summary's heading: how many problems stand between the buyer and
+ * the order, and that fixing them is what places it.
+ *
+ * The count is worded through `@/lib/format`, like every other figure in the storefront, and the
+ * singular is its own sentence so a single problem does not read "the 1 problems".
+ */
+function errorSummaryLead(problemCount: number): string {
+  return problemCount === 1
+    ? 'Fix the problem below to place the order.'
+    : `Fix the ${formatQuantityLabel(problemCount)} problems below to place the order.`;
+}
+
 /* ---------------------------------------------------------------------------
  * What outlives this render
  *
@@ -1045,10 +1111,11 @@ const CHECKOUT_PATH = '/checkout';
 /**
  * The query parameter that names a placed order in this page's address.
  *
- * `app/checkout/page.tsx` reads the same name to render the notice that makes the order durable,
- * and the two are stated separately on purpose: a route file's query vocabulary is its contract
- * with the browser, the same way `app/orders/page.tsx` declares its own, and a component importing
- * a route module would be the wrong direction of dependency. Change one and change the other.
+ * `app/checkout/page.tsx` reads the same name to read the order back and hand it to this form as
+ * its receipt, and the two are stated separately on purpose: a route file's query vocabulary is its
+ * contract with the browser, the same way `app/orders/page.tsx` declares its own, and a component
+ * importing a route module would be the wrong direction of dependency. Change one and change the
+ * other.
  */
 const ORDER_PARAM = 'order';
 
@@ -1071,7 +1138,9 @@ const ORDERS_PATH = '/orders';
  * submission it has already seen with the order that attempt placed. The instant is when the
  * request went out, which is what a diagnostic line needs to be worth reading. The order number is
  * `null` for exactly as long as the outcome is unknown: it is filled in when the store answers, so
- * a record that still holds `null` is an attempt nobody ever got an answer to.
+ * a record that still holds `null` is an attempt nobody ever got an answer to, and a record that
+ * holds one is an order whose receipt this tab has not yet shown - the record is forgotten the
+ * moment that receipt is on screen.
  *
  * And the draft is the exact body that was sent, written before it goes out, because resolving
  * the attempt means sending that body again. The endpoint checks a repeat as it checked the first
@@ -1243,7 +1312,9 @@ function readAttemptRecord(): CheckoutAttemptRecord | null {
  * exact draft being sent, and once when the store has answered with an order, with the order's
  * own reference and no draft. The second call is what turns "an order may exist" into "this order
  * exists", and it is the reference a buyer is shown if they come back to a form whose receipt they
- * never saw.
+ * never saw. It is written before the receipt is stored, not after, so a form that goes away in
+ * between still leaves that evidence behind; {@link forgetShownAttempt} takes it away once the
+ * receipt has actually rendered.
  *
  * A storage that refuses the write is logged and otherwise ignored. The submission continues: an
  * order the buyer can place is worth more than the note this page would have kept about it.
@@ -1260,15 +1331,17 @@ function rememberAttempt(record: CheckoutAttemptRecord): void {
 }
 
 /**
- * Drops the record, for an attempt that provably placed no order.
+ * Drops the record, once it has nothing left to report.
  *
- * Only an established outcome may do this: the store's own answer that no order was placed - a
- * failure it named, carrying a reason that means nothing was captured - or a failure of this page
- * raised before a fresh submission's request left it. A record removed on an unknown outcome is the
- * evidence of a possible charge thrown away, which is the whole thing this section exists to
- * prevent, so nothing else does it - no rejected request, whatever the browser says about its
- * connection. A record that cannot be read at all is the one other case, and
- * {@link readAttemptRecord} says why.
+ * Only an established outcome may do this, and there are two. One is an attempt that provably
+ * placed no order: the store's own answer that no order was placed - a failure it named, carrying
+ * a reason that means nothing was captured - or a failure of this page raised before a fresh
+ * submission's request left it. The other is an order whose receipt is on screen, which
+ * {@link forgetShownAttempt} establishes: the buyer is reading the order the record exists to tell
+ * them about. A record removed on an unknown outcome is the evidence of a possible charge thrown
+ * away, which is the whole thing this section exists to prevent, so nothing else does it - no
+ * rejected request, whatever the browser says about its connection. A record that cannot be read
+ * at all is the one other case, and {@link readAttemptRecord} says why.
  */
 function forgetAttempt(): void {
   try {
@@ -1278,6 +1351,30 @@ function forgetAttempt(): void {
       'Lumen Supply: this browser would not let the checkout clear its attempt record:',
       cause instanceof Error ? cause.name : typeof cause,
     );
+  }
+}
+
+/**
+ * Drops the record when it names `orderNumber`, whose receipt is now on screen.
+ *
+ * A record carrying an order number says "this tab placed an order it has not shown a receipt
+ * for", and the mount after next reads it that way and names the order in a notice. Once the
+ * receipt for that order has rendered - after the submission that placed it, or when the page at
+ * the order's own address hands it back - that sentence is no longer true, and a record left in
+ * place would be a false notice on the buyer's next visit to this page. So the record goes.
+ *
+ * Only a record naming this very order is dropped. One that names another order is still the
+ * evidence of a receipt that order never had, and one with no order number is an attempt whose
+ * outcome nobody established - neither is settled by a receipt for something else.
+ *
+ * Called from an effect, never while rendering, because an effect runs after the receipt has been
+ * committed to the screen.
+ *
+ * @param orderNumber The reference of the order whose receipt has just rendered.
+ */
+function forgetShownAttempt(orderNumber: string): void {
+  if (readAttemptRecord()?.orderNumber === orderNumber) {
+    forgetAttempt();
   }
 }
 
@@ -1298,7 +1395,7 @@ function orderAddress(orderNumber: string): string {
  * What it buys is everything a placed order was missing. Back returns to the checkout page instead
  * of leaving the storefront, Forward and reload arrive at an address that still names the order,
  * and the address bar holds something a buyer can copy or bookmark. The page at that address
- * reads the parameter and says whose order it is.
+ * reads the order back and hands it to this form, which renders the same receipt again.
  *
  * @param orderNumber The reference the store printed on the order.
  */
@@ -1310,13 +1407,65 @@ function pushOrderAddress(orderNumber: string): void {
  * Whether this page's current address already names `orderNumber`.
  *
  * Asked before the form raises a notice about an order it found in storage: when the address names
- * it, `app/checkout/page.tsx` has already said so at the top of the page, and a second notice
- * saying the same thing would be this component and that page both answering for one order.
+ * it, `app/checkout/page.tsx` has already answered for that order - with its receipt, which this
+ * form renders in place of the fields and which forgets the record, or with its own notice when
+ * the order could not be shown - and a second notice would be this component and that page both
+ * answering for one order.
  *
  * @param orderNumber The reference read back from the attempt record.
  */
 function addressNamesOrder(orderNumber: string): boolean {
   return new URLSearchParams(window.location.search).get(ORDER_PARAM) === orderNumber;
+}
+
+/* ---------------------------------------------------------------------------
+ * Where focus goes
+ *
+ * A keyboard or screen-reader buyer is always somewhere, and every step of this form either leaves
+ * them where they pressed or moves them to the thing that answers the press (WCAG 2.4.3): a
+ * validation pass that refuses the order lands them on the error summary, each of its links lands
+ * them on the field it names, a submission keeps them on the control that sent it while it is in
+ * flight, and its outcome lands them on the receipt or on the failure notice. The component owns
+ * the timing - the regions it focuses exist only after the render that shows them - and this
+ * section owns the one DOM walk that is not simply "focus this element". Like the section above,
+ * it is only ever called from a handler, never while rendering.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Move focus to the control an error-summary entry names, bringing it into view.
+ *
+ * `id` is one of {@link FIELDS}' ids. Ten of them are a control's own id and are focused directly.
+ * The eleventh is the shipping group's wrapper, whose radios are minted by `./ShippingOptionPicker`
+ * from the services the store quoted: the chosen service's radio is the one to land on, then the
+ * first service that can be chosen, and when no service has been quoted at all - the lookup is in
+ * flight, failed, or has no destination yet - the wrapper itself takes focus, so the reader lands
+ * on the group's own explanation of why there is nothing to choose. An id that is not in the
+ * document - a field the render in hand does not show - moves nothing.
+ *
+ * The browser's own focus scrolling brings the target into view, which is why nothing here scrolls.
+ */
+function focusCheckoutControl(id: string): void {
+  const target = document.getElementById(id);
+
+  if (target === null) {
+    return;
+  }
+
+  if (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLSelectElement ||
+    target instanceof HTMLTextAreaElement
+  ) {
+    target.focus();
+
+    return;
+  }
+
+  const choice =
+    target.querySelector<HTMLElement>('input[type="radio"]:checked:not(:disabled)') ??
+    target.querySelector<HTMLElement>('input[type="radio"]:not(:disabled)');
+
+  (choice ?? target).focus();
 }
 
 /* ---------------------------------------------------------------------------
@@ -1326,14 +1475,18 @@ function addressNamesOrder(orderNumber: string): boolean {
 /**
  * Render the checkout form, or the receipt for the order it placed.
  *
- * State is nine plain `useState` values and nothing else - the contact group, the destination
+ * State is ten plain `useState` values and nothing else - the contact group, the destination
  * group, the delivery note, the chosen service, whether a submission is in flight, the validation
- * messages, the failure notice, the placed order and the reference of an order an earlier attempt
- * from this tab turned out to have placed. There is no reducer, no transition and no derived copy
- * of the cart: the cart is read from the provider that owns it, and the two composite blocks below
- * own their own presentation. Five refs sit beside them, each holding something that must survive a
- * render without causing one: the attempt's name, the exact draft that attempt was sent with, the
- * controller of the submission in flight, and the two regions focus is moved to.
+ * messages, how many validation passes have refused the order in a row, the failure notice, the
+ * placed order and the reference of an order an earlier attempt from this tab turned out to have
+ * placed. There is no reducer, no transition and no derived copy of the cart: the cart is read from
+ * the provider that owns it, and the two composite blocks below own their own presentation. Ten
+ * refs sit beside them, each holding something that must survive a render without causing one: the
+ * attempt's name, the exact draft that attempt was sent with, the controller of the submission in
+ * flight, the four elements focus is moved to - the error summary, the failure notice, the receipt
+ * and the submit row - the cart notice's re-read control with the mark saying a press of it moved
+ * focus (see "Where focus goes" above), and the order the page handed over when the form first
+ * rendered.
  *
  * Two things are read from elsewhere and neither is state of this form's. The freight lookup for
  * the destination in the fields comes from `@/hooks/useShippingEta`, which owns the request and its
@@ -1349,21 +1502,32 @@ function addressNamesOrder(orderNumber: string): boolean {
  *
  * Once an order exists the fields are gone and the receipt takes their place, because there is
  * nothing left to edit: the order has an order number, the payment has resolved, and both are
- * printed by `./OrderConfirmation` from the result this form stored. Two things happen with it,
- * neither of them the receipt's own doing: focus moves to the region it is rendered in, since the
- * control that was pressed has left the document, and the page's address is rewritten to name the
- * order, so the receipt has somewhere to be returned to after it is gone.
+ * printed by `./OrderConfirmation` from the result this form stored. Three things happen with it,
+ * none of them the receipt's own doing: focus moves to the region it is rendered in, since the
+ * control that was pressed has left the document; the page's address is rewritten to name the
+ * order, so the receipt has somewhere to be returned to after it is gone; and, once the receipt is
+ * on screen, the attempt record naming it is forgotten, because it has nothing left to report.
+ *
+ * The same receipt is shown for an order the page hands over as `placedOrder` - the order the
+ * page's own address names, read back when a buyer reloads or returns to it. Everything but the
+ * focus is the same: the review column is told the order is placed, and the record naming it is
+ * forgotten. Focus is left alone when the order arrives with the page, since nothing the buyer
+ * pressed has gone, and moves to the receipt only when the order arrives on a form that was
+ * already on screen - a link followed from this form's own notice, whose control leaves the
+ * document with the fields.
  */
 export function CheckoutForm({
   initialAddress,
   initialContact,
   onOrderPlaced,
+  placedOrder,
   className,
 }: Props): ReactElement {
   const cart = useCart();
   const { showToast } = useToastCenter();
   const publishFreight = usePublishSelectedFreight();
   const publishPlacement = usePublishOrderPlaced();
+  const publishPending = usePublishOrderPending();
 
   const [contact, setContact] = useState<ContactFields>(() => ({
     name: initialContact?.name ?? '',
@@ -1389,6 +1553,18 @@ export function CheckoutForm({
   const [placed, setPlaced] = useState<CheckoutResult | null>(null);
 
   /*
+   * The receipt this form shows in place of its fields, or `null` while it shows the fields.
+   *
+   * A submission's own result comes first, because it is the one payload that carries the payment
+   * that settled the order; an order the page handed over from its address comes next. Either way
+   * the value is `./OrderConfirmation`'s own payload, so the one receipt renders both. The order
+   * number of the page's order is held on its own as well, as the primitive the effect below
+   * depends on - an object in a dependency array is a new identity on every render of the page.
+   */
+  const receipt: CheckoutResult | OrderDetail | null = placed ?? placedOrder ?? null;
+  const suppliedOrderNumber = placedOrder?.orderNumber ?? null;
+
+  /*
    * Which fields the buyer has finished with, and whether they have tried to place the order.
    *
    * These two are the whole of what this form stores about its validation, and storing this rather
@@ -1402,6 +1578,18 @@ export function CheckoutForm({
    */
   const [touched, setTouched] = useState<Partial<Record<CheckoutFieldKey, true>>>({});
   const [submitted, setSubmitted] = useState<boolean>(false);
+
+  /*
+   * How many submissions in a row the validation pass has refused, and `0` once one gets through.
+   *
+   * It is what the error summary is shown by and what focus follows to it, and it is a count
+   * rather than a flag because every refusal has to move focus, including the second press of a
+   * form that is still wrong: a flag already `true` would not change, and the effect that focuses
+   * the summary would not run. It is reset by a pass that sends the order, and by the render in
+   * which the summary's last entry is fixed, so a summary never reappears for a problem that arose
+   * after it was finished with - the message beside that field speaks for it until the next press.
+   */
+  const [refusedPasses, setRefusedPasses] = useState<number>(0);
 
   /*
    * An order this tab placed and then lost sight of, by its reference - and `null` in every other
@@ -1450,9 +1638,13 @@ export function CheckoutForm({
    * authoritative for the moment between the reply and the cart landing, and then replaced. So the
    * lookup waits for the cart, which is also what makes this page's one quote per shipment one
    * rather than two, and the service group shows no services until the answer arrives.
+   *
+   * It is withheld while a receipt is on screen as well. There is no service group to quote for
+   * then, and the page at an order's own address would otherwise rate whatever cart the session
+   * holds now for a form nobody can see.
    */
   const freight = useFreightQuote(
-    cart.itemCount > 0 ? destination : null,
+    cart.itemCount > 0 && receipt === null ? destination : null,
     destinationCountry,
     cart.itemCount,
   );
@@ -1474,9 +1666,9 @@ export function CheckoutForm({
    * `POST /api/checkout` would refuse, since that endpoint re-quotes and accepts only a service its
    * own quote lists. Before a quote has settled - no destination yet, a lookup in flight, a lookup
    * that failed - there is no offer to draw from and therefore nothing chosen: the group shows no
-   * services and says why, and the place-order control waits for the quote rather than committing
-   * the order to a figure nobody has been quoted. A quote that names no service at all leaves
-   * nothing chosen for the same reason, and the group says so.
+   * services and says why, and a press of the place-order control is refused by the validation pass
+   * rather than committing the order to a figure nobody has been quoted. A quote that names no
+   * service at all leaves nothing chosen for the same reason, and the group says so.
    *
    * Which is also why the amount comes from here: it is the quote's price for the chosen service,
    * which is both what the panel prints beside the checked row and what the order will be charged.
@@ -1519,6 +1711,24 @@ export function CheckoutForm({
 
   const failureRegion = useRef<HTMLDivElement | null>(null);
 
+  // The error summary's container, which takes focus each time a validation pass refuses the order.
+  const errorSummary = useRef<HTMLDivElement | null>(null);
+
+  /*
+   * The row holding the place-order control, and the cart notice's "Read the cart again" control
+   * while that notice is on screen (React sets it back to `null` when the notice unmounts).
+   *
+   * Pressing that control asks the cart to read itself again, and the cart clears its failure as the
+   * read starts, which unmounts the notice - and the control being pressed - before the answer
+   * arrives. The submit row is where focus waits in the meantime: it is always rendered, it sits
+   * directly below where the notice was, and it holds the control the buyer will want once the cart
+   * has been read. `cartRereadFocusPending` marks that a press moved focus there, so the effect that
+   * settles it runs for that press and for nothing else.
+   */
+  const submitRow = useRef<HTMLDivElement | null>(null);
+  const cartRereadControl = useRef<HTMLButtonElement | null>(null);
+  const cartRereadFocusPending = useRef(false);
+
   /*
    * The receipt's own container, which takes focus when the receipt replaces the fields.
    *
@@ -1528,6 +1738,19 @@ export function CheckoutForm({
    * thing inside it and a reader lands above the whole order rather than part-way into it.
    */
   const confirmationRegion = useRef<HTMLDivElement | null>(null);
+
+  /*
+   * The order the page handed over when this form first rendered, by its reference - `null` when
+   * it handed over none.
+   *
+   * It is what tells the two arrivals of a page's order apart. An order that came with the page is
+   * a receipt the buyer navigated to, and focus stays where the browser put it. An order that
+   * reaches a form already on screen - the App Router keeps this component mounted across a change
+   * of the query string alone, so following the link to an order's address from this form's own
+   * notice is one - replaces the fields the buyer was using, and focus follows the receipt as it
+   * does after a submission. The initial value is the only one ever held: nothing writes it.
+   */
+  const arrivedWith = useRef<string | null>(suppliedOrderNumber);
 
   // The name every submission of the order in front of the buyer travels under, drawn on the
   // first one and kept until an order exists. A ref rather than state because nothing renders it
@@ -1574,6 +1797,48 @@ export function CheckoutForm({
       failureRegion.current?.focus();
     }
   }, [failure]);
+
+  // A refused validation pass moves the reader to the error summary, which names every problem and
+  // links to each field - the pattern a keyboard or screen-reader user can act on without hunting
+  // for red text. Like the two regions either side of it, the summary is rendered by the state
+  // this follows, so focus is moved once it exists; the count changes on every refusal, which is
+  // what moves focus again on a second press of a form that is still wrong.
+  useEffect(() => {
+    if (refusedPasses > 0) {
+      errorSummary.current?.focus();
+    }
+  }, [refusedPasses]);
+
+  /*
+   * Settle where a press of "Read the cart again" left focus, once the read it started has
+   * answered.
+   *
+   * It runs after the commit that publishes the outcome. A read that failed again has mounted a new
+   * cart notice, and its control takes focus back from the submit row, so the next Enter reads the
+   * cart again; a read that succeeded has made the order placeable, and focus goes on to the
+   * place-order control in the row it was waiting in, when that control is available. Nothing moves
+   * unless focus is still on the row where the handler put it, and the mark is cleared either way,
+   * so a later failure published for an unrelated reason never pulls focus onto its notice.
+   * `'loading'` is the read still in flight, so it is skipped.
+   */
+  useEffect(() => {
+    if (!cartRereadFocusPending.current || cart.syncStatus === 'loading') {
+      return;
+    }
+
+    cartRereadFocusPending.current = false;
+
+    const row = submitRow.current;
+
+    if (row === null || document.activeElement !== row) {
+      return;
+    }
+
+    (
+      cartRereadControl.current ??
+      row.querySelector<HTMLButtonElement>('button[type="submit"]:not(:disabled)')
+    )?.focus();
+  }, [cart.syncStatus]);
 
   /*
    * Take down the connectivity notice once the connection is back, and nothing else with it.
@@ -1653,24 +1918,28 @@ export function CheckoutForm({
    * pressing the notice's control resends that same attempt exactly as it went out - which the
    * endpoint answers with the order it already holds, rather than placing a second one, however
    * empty the fields and the cart are by now. One WITH an order number is an order that exists and
-   * that this tab lost sight of, so its reference is put in front of the buyer; if the address
-   * already names it, the page has said so and this stays quiet.
+   * whose receipt this tab never showed - a record is forgotten once its receipt has rendered, so
+   * one still carrying an order number is exactly that - and its reference is put in front of the
+   * buyer, with a link to the order's own address, where the page renders that receipt and the
+   * record is forgotten in turn. If the address already names it, the page has answered for it -
+   * with that receipt, or with its own notice when the order could not be shown - and this stays
+   * quiet.
    *
    * Both kinds of record are logged where they report something, because a silent failure is the
    * hardest kind to find in production: the line names the attempt and when it went out, which is
    * what makes it worth reading in a bug report. An order the address already names is the
-   * exception and is logged by neither: the reference is on the page, so nothing was lost sight
-   * of, and a line saying a receipt was never shown would be untrue of the very page printing the
-   * order number.
+   * exception and is logged by neither: the page is answering for that order, so nothing was lost
+   * sight of, and a line saying a receipt was never shown would be untrue of the very page showing
+   * it.
    *
    * This is the one effect in the file that publishes state from its own body, and there is no
    * alternative to it: what it publishes comes from session storage, storage cannot be read while
    * rendering - the server has none, so the markup would not be the markup the server sent - and
    * there is nothing to subscribe to, because the record only ever changes as a consequence of
-   * this same component submitting. That is why this effect sets state, the pattern
-   * `react-hooks/set-state-in-effect` exists to question. The cost is one extra render per mount,
-   * on a page that has finished settling, and only for a buyer who has an unresolved attempt to be
-   * told about.
+   * this same component submitting or showing a receipt. That is why this effect sets state, the
+   * pattern `react-hooks/set-state-in-effect` exists to question. The cost is one extra render per
+   * mount, on a page that has finished settling, and only for a buyer who has an unresolved
+   * attempt to be told about.
    */
   useEffect(() => {
     const record = readAttemptRecord();
@@ -1715,11 +1984,84 @@ export function CheckoutForm({
   // programmatically - `tabIndex={-1}` keeps it out of the tab order - so it is a landing point and
   // never a stop on the way through the page. Like the notice's, this runs from an effect because
   // the element exists only after the render this state causes.
+  //
+  // The same moment ends the attempt record. It was rewritten with this order's reference before
+  // the receipt was stored, so a form that went away in between would still have left the
+  // evidence; now the receipt is on screen, the record has nothing left to report, and keeping it
+  // would raise a false "never showed a receipt" notice on the buyer's next visit to this page.
+  //
+  // Focus and scroll are separate steps on purpose. `focus()` alone lets the browser choose the
+  // scroll, and for a receipt taller than the viewport it centres the box or leaves it where the
+  // form was, so the heading the reader should land on ends up above the viewport or under the
+  // sticky header. Focusing without scrolling and then aligning the receipt's start edge puts the
+  // heading in view whatever the order's length; the alignment honours the document's scroll
+  // padding under the header and this wrapper's own scroll margin, and it follows the document's
+  // scroll behaviour, so a reader who asked for less motion gets an instant jump.
   useEffect(() => {
-    if (placed !== null) {
-      confirmationRegion.current?.focus();
+    if (placed === null) {
+      return;
     }
+
+    const region = confirmationRegion.current;
+
+    if (region !== null) {
+      region.focus({ preventScroll: true });
+      region.scrollIntoView({ block: 'start', inline: 'nearest' });
+    }
+
+    forgetShownAttempt(placed.order.orderNumber);
   }, [placed]);
+
+  /*
+   * Whether a receipt is on screen, published for the review column beside this form.
+   *
+   * A submission publishes it the moment its order lands - see `submitOrder` - and this states the
+   * same fact for every other way a receipt comes and goes. An order the page hands over from its
+   * address is a receipt on screen from the first render, and the column has to stop reviewing a
+   * cart this order was not placed from. And a receipt can go as well as come: the App Router keeps
+   * this form and that column mounted across a change of the query string alone, so a buyer who
+   * moves from an order's address to a plain `/checkout` is shown the fields again, and the column
+   * has to show the review again beside them rather than go on announcing an order the form no
+   * longer shows. Publishing the boolean itself, rather than `true` on arrival alone, is what
+   * covers both. The publisher ignores a value equal to the one it holds, so a render that changes
+   * neither writes no state.
+   */
+  const showingReceipt = receipt !== null;
+
+  useEffect(() => {
+    publishPlacement(showingReceipt);
+  }, [showingReceipt, publishPlacement]);
+
+  /*
+   * An order the page handed over from its address: a submission's receipt arrived by another
+   * route - a reload, a bookmark, Back and Forward, or the link in this form's notice about an
+   * order it lost sight of.
+   *
+   * Once its receipt is on screen the attempt record is forgotten when it names this order, for
+   * the reason given beside the effect that focuses a submission's receipt. Focus moves to the
+   * receipt only when the order reached a form that was already on screen, whose fields - and the
+   * link the buyer followed - have just left the document. An order that arrived with the page is
+   * where the buyer asked to be, and moving focus on page load would take the reader's place on the
+   * page from them for nothing they did.
+   *
+   * That focus does not scroll. The receipt takes the place of the fields, so its heading is where
+   * the link the buyer followed was - on screen - and letting the browser scroll a card taller than
+   * the viewport into view would align its top edge with the window's, under the sticky header.
+   *
+   * The one dependency is the order's reference, so this runs when the page's order changes and on
+   * no other render.
+   */
+  useEffect(() => {
+    if (suppliedOrderNumber === null) {
+      return;
+    }
+
+    forgetShownAttempt(suppliedOrderNumber);
+
+    if (arrivedWith.current !== suppliedOrderNumber) {
+      confirmationRegion.current?.focus({ preventScroll: true });
+    }
+  }, [suppliedOrderNumber]);
 
   // The chosen freight charge, published for the review column beside this form. The dependencies
   // are the four primitives the charge is made of and the publisher, which is stable for the life
@@ -1758,18 +2100,31 @@ export function CheckoutForm({
     publishFreight,
   ]);
 
+  // Whether the order is being placed, published for the review column beside this form, which
+  // holds its lines - their quantity and remove controls - for exactly as long as this form holds
+  // its own fields. A layout effect, so the review is held in the same frame the control turns
+  // busy rather than one frame after it, when a press on a line could still get through. The
+  // cleanup publishes `false`, so a form that goes away mid-request does not leave the review
+  // locked for a submission nobody is waiting on.
+  useLayoutEffect(() => {
+    publishPending(pending);
+
+    return () => {
+      publishPending(false);
+    };
+  }, [pending, publishPending]);
+
   /*
    * The order as the controls hold it, and everything wrong with it, recomputed on every render.
    *
    * This is where the form's validation lives, and it lives here rather than in the submit handler
    * for two reasons that were both defects while it did. A pass that runs only on submit cannot
-   * report anything about a form whose submit control is unavailable - which is exactly the state
-   * an incomplete address puts it in - so the one case the messages exist for was the one case they
-   * could not be shown. And a pass that stores its result leaves that result standing against
-   * values that have since been corrected: "A contact name is required." beside a name. Derived,
-   * neither is possible: there is nothing to go stale, and the messages, the counters, the
-   * outstanding line and the availability of the place-order control are all read off the same
-   * single pass over the same fields.
+   * report anything before the buyer presses, so the line above the place-order control could not
+   * say what was still missing. And a pass that stores its result leaves that result standing
+   * against values that have since been corrected: "A contact name is required." beside a name.
+   * Derived, neither is possible: there is nothing to go stale, and the messages, the counters, the
+   * outstanding line, the error summary and the decision to send the order are all read off the
+   * same single pass over the same fields.
    *
    * The freight message is merged in here for the same reason it was merged in there: it is the one
    * thing wrong with the order that is settled outside the fields, and the shipping field takes the
@@ -1866,10 +2221,11 @@ export function CheckoutForm({
    * running; name the attempt, once, and keep that name for every submission of this order; take
    * the draft - the one the attempt recorded when this press resolves it, the fields otherwise -
    * and, for the fields, reveal every message the validation pass above has already produced and
-   * stop there if anything is wrong, with the reader moved to the first field that is; hold the
-   * submission back if the browser has no connection; drop any notice a new order supersedes; then
-   * one request, whose two outcomes are a stored order and a receipt, or a notice above the submit
-   * row with every typed value still in place.
+   * stop there if anything is wrong, with the reader moved to the error summary that lists them;
+   * hold the submission back if the browser has no connection; drop any notice a new order
+   * supersedes; hand focus to the submitting control before the fields lock; then one request,
+   * whose two outcomes are a stored order and a receipt, or a notice above the submit row with
+   * every typed value still in place - and focus follows either one there.
    *
    * It validates nothing itself, and that is deliberate rather than an omission: the pass runs on
    * every render, so by the time this handler is reached its result is already the result for the
@@ -1926,6 +2282,15 @@ export function CheckoutForm({
       return;
     }
 
+    // The control that submitted the form: the place-order control or the failure notice's, and
+    // also the one an Enter in a field submits through, since a browser performs that implicit
+    // submission by clicking the form's default button. Read now, while the event is current, for
+    // the focus hand-off just before the request goes out. `SubmitEvent` is checked for rather than
+    // assumed, so an engine without it simply skips the hand-off.
+    const native = event.nativeEvent;
+    const submitter =
+      typeof SubmitEvent !== 'undefined' && native instanceof SubmitEvent ? native.submitter : null;
+
     // Drawn on the first submission and reused by every later one, so a buyer pressing the
     // control again after an unconfirmed outcome resolves that attempt instead of starting
     // another. An order that was placed ends the form, so a name is never reused for a second
@@ -1970,19 +2335,20 @@ export function CheckoutForm({
       setSubmitted(true);
 
       // Nothing is sent while anything is wrong, and the reader is put where the work is: the
-      // first field on screen with something wrong, whose message is now rendered beside it and
-      // announced. Without this the press moves nothing - the messages appear above the fold, the
-      // caret stays on the control that appeared to do nothing, and a reader using the keyboard is
-      // told nothing at all.
-      const first = FIELDS.find((field) => problems[field.key] !== undefined);
-
-      if (first !== undefined) {
-        if (first.id !== undefined) {
-          document.getElementById(first.id)?.focus();
-        }
+      // error summary at the top of the form, which the refusal count below renders and the effect
+      // above focuses. It names every problem, in on-screen order and in each field's own words,
+      // and each entry is a link that moves focus to its field - so the reader hears the whole of
+      // what is wrong once, and reaches any one of the fields from it in a single press. Without
+      // this the press moves nothing - the messages appear above the fold, the caret stays on the
+      // control that appeared to do nothing, and a reader using the keyboard is told nothing.
+      if (FIELDS.some((field) => problems[field.key] !== undefined)) {
+        setRefusedPasses((count) => count + 1);
 
         return;
       }
+
+      // The pass let the order through, so there is nothing left for a summary to list.
+      setRefusedPasses(0);
     }
 
     // Asked of the browser before anything is written down or sent, which is the only moment the
@@ -2010,6 +2376,15 @@ export function CheckoutForm({
     // only when the store answers.
     if (!resolving) {
       setFailure(null);
+    }
+
+    // The fields lock for the length of the request (the `<fieldset disabled>` below), and a field
+    // that is disabled while it holds focus drops that focus onto `<body>`. An order submitted by
+    // Enter in a field is exactly that case, so focus is handed to the control the form submitted
+    // through - which stays focusable while it is busy - before the lock is written. A press of the
+    // control itself already has focus there, and is left alone.
+    if (submitter !== null && document.activeElement !== submitter) {
+      submitter.focus();
     }
 
     setPending(true);
@@ -2091,7 +2466,9 @@ export function CheckoutForm({
     const abandoned = controller.signal.aborted;
 
     // The order's reference replaces the draft: the store holds the contact and the address now,
-    // and this tab has no further use for its own copy of them.
+    // and this tab has no further use for its own copy of them. It is written before the receipt
+    // is stored and forgotten only once the receipt has rendered - the effect that focuses the
+    // receipt does that - so a form that goes away in between still leaves it for the next mount.
     rememberAttempt({
       idempotencyKey: draft.idempotencyKey,
       startedAt: attemptStartedAt,
@@ -2142,16 +2519,22 @@ export function CheckoutForm({
     }
   }
 
-  if (placed !== null) {
+  // The receipt replaces the fields, whichever way it arrived. A submission's is headed for the
+  // moment it answers; an order the page read back from its address takes the receipt's default
+  // heading, which states that the order is placed without thanking the buyer for a submission
+  // they did not just make.
+  if (receipt !== null) {
     return (
       <div className={clsx(styles.root, className)}>
         <div className={styles.confirmation} ref={confirmationRegion} tabIndex={-1}>
           <OrderConfirmation
-            order={placed}
+            order={receipt}
             headline={
-              placed.outcome === 'already_placed'
-                ? 'This order was already placed'
-                : 'Thank you for your order'
+              placed === null
+                ? undefined
+                : placed.outcome === 'already_placed'
+                  ? 'This order was already placed'
+                  : 'Thank you for your order'
             }
           />
         </div>
@@ -2168,21 +2551,25 @@ export function CheckoutForm({
 
   // An order needs something to ship, a cart this form has read, and a request the endpoint would
   // accept. The third is the whole of the validation pass rather than a chosen subset of it, which
-  // is the difference between a control that says whether the order can be placed and one that
-  // says whether the freight has been quoted: an address with no city is an order
-  // `POST /api/checkout` refuses, so the control is unavailable for it exactly as it is for a
-  // shipment nobody has quoted. Both of the freight obstacles are part of that pass - a shipment
-  // too large to quote and a service the settled quote does not offer are what
+  // is the difference between an order that can be placed and one whose freight has merely been
+  // quoted: an address with no city is an order `POST /api/checkout` refuses, so it is not sent,
+  // exactly as a shipment nobody has quoted is not. Both of the freight obstacles are part of that
+  // pass - a shipment too large to quote and a service the settled quote does not offer are what
   // `freightSelectionProblem` reports - so neither is repeated here.
   //
-  // A cart that could not be read disables it too, on the strength of not knowing rather than of
-  // knowing the cart is empty.
+  // The first two decide whether the place-order control is available at all, because nothing a
+  // buyer can type fixes them: a cart that holds nothing, and a cart that could not be read -
+  // unavailable on the strength of not knowing rather than of knowing the cart is empty. The third
+  // does not, deliberately: the control stays available while the fields are incomplete, so that
+  // pressing it - or pressing Enter in a field, which submits through it - runs the pass, which
+  // refuses the order, reveals every message and moves the reader to the error summary. A control
+  // made unavailable by the pass would refuse the press instead, and the reader would be told
+  // nothing at the moment they asked.
   //
-  // Unavailable, never hidden, and never silent: `outstanding` below names what is missing beside
-  // the control, and every field with something wrong says so itself once the buyer has finished
-  // with it.
-  const readyToPlaceOrder =
-    !cartUnknown && cart.itemCount > 0 && Object.keys(problems).length === 0;
+  // Never hidden and never silent: `outstanding` below names what is missing beside the control,
+  // and every field with something wrong says so itself once the buyer has finished with it.
+  const cartOrderable = !cartUnknown && cart.itemCount > 0;
+  const readyToPlaceOrder = cartOrderable && Object.keys(problems).length === 0;
 
   // What the place-order control is waiting for, named the way the labels above the fields name it
   // and in the order they are read. A cart the storefront could not read is left out: its own
@@ -2197,8 +2584,31 @@ export function CheckoutForm({
     blocked =
       cart.itemCount === 0
         ? 'Place order becomes available once the cart holds something to ship.'
-        : `Place order becomes available once these are complete: ${listed(outstanding)}.`;
+        : `Complete these before the order can be placed: ${listed(outstanding)}.`;
   }
+
+  // The error summary's entries: every problem the buyer is being shown, in on-screen order, each
+  // with the id of the element its link moves focus to. Read off `revealed` rather than `problems`,
+  // so the summary lists exactly the messages printed beside the fields and an entry leaves the list
+  // the moment its field is corrected. The summary is shown only after a refused pass, and only
+  // while there is something left to list.
+  const summaryProblems = FIELDS.flatMap((field) => {
+    const message = revealed[field.key];
+
+    return message === undefined ? [] : [{ ...field, message }];
+  });
+
+  // A summary whose last entry has been fixed is finished with, so the refusal count goes back to
+  // zero and the summary is retired. Without this, a field emptied later - to retype an address,
+  // say - would bring the summary back while the buyer is typing, and `Alert`'s `danger` tone
+  // would announce it assertively; a new problem is left to the message beside its field until the
+  // next press. Adjusted while rendering, guarded by the state it writes, rather than from an
+  // effect: React re-runs this render with the new count before anything reaches the screen.
+  if (refusedPasses > 0 && summaryProblems.length === 0) {
+    setRefusedPasses(0);
+  }
+
+  const showErrorSummary = refusedPasses > 0 && summaryProblems.length > 0;
 
   return (
     <form
@@ -2214,24 +2624,79 @@ export function CheckoutForm({
           rest of it. `success` rather than `danger` - the order exists and nothing went wrong with
           it - which `Alert` announces politely, and the form below stays as it was, since the cart
           it would order is already an order. It appears only where the address does not name the
-          order itself; there `app/checkout/page.tsx` has already said so. */}
+          order itself; there `app/checkout/page.tsx` has already answered for it.
+
+          Two routes out, most specific first. The order's own address is where its receipt is:
+          the page reads the order back and this form renders it in place of the fields, which is
+          also what forgets the record behind this notice. Following that link takes the notice
+          down in the same click, because the App Router may keep this form mounted across the
+          change of query string, and a notice still up when the buyer comes back from the receipt
+          would be announcing a receipt they have now seen. The order history is the second route,
+          offered as somewhere to go rather than as a promise - see `ORDERS_PATH`. */}
       {recoveredOrder === null ? null : (
         <div className={styles.orderNotice}>
           <Alert
             tone="success"
             title={`Order ${recoveredOrder} is placed`}
             actions={
-              <Link className={styles.noticeLink} href={ORDERS_PATH}>
-                View your orders
-              </Link>
+              <>
+                <Link
+                  className={styles.noticeLink}
+                  href={orderAddress(recoveredOrder)}
+                  onClick={() => {
+                    setRecoveredOrder(null);
+                  }}
+                >
+                  View this order
+                </Link>
+                <Link className={styles.noticeLink} href={ORDERS_PATH}>
+                  View your orders
+                </Link>
+              </>
             }
           >
             {'This order was placed from this browser while the confirmation was not on screen, ' +
-              'so it is named here instead. Keep the order number for your records and quote it ' +
-              'to Lumen Supply about anything to do with this order.'}
+              'so it is named here instead. View it for the full receipt, and quote the order ' +
+              'number to Lumen Supply about anything to do with this order.'}
           </Alert>
         </div>
       )}
+
+      {/* The error summary: shown when a validation pass has refused the order, at the top of the
+          fields so it is the first thing a reader moved here meets, and focused by the effect that
+          follows `refusedPasses`. The wrapper is the focus target - programmatic only, so it is
+          never a tab stop - and `Alert`'s `danger` tone is the failure notice's own treatment, so
+          the storefront states one kind of problem one way. The heading is an `h2`, a sibling of
+          the field groups' headings, so the summary is reachable by heading as well.
+
+          Each entry is a real link to its field's id, so it reads and behaves as a link - and still
+          lands on the field with no scripting running - while the handler moves focus to the
+          control itself: a fragment navigation scrolls to an element without focusing it, and the
+          shipping group's entry needs {@link focusCheckoutControl} to find the radio to land on.
+          The link text is the field's label and its own message, the words printed beside it. */}
+      {showErrorSummary ? (
+        <div className={styles.errorSummary} ref={errorSummary} tabIndex={-1}>
+          <Alert tone="danger" title={ERROR_SUMMARY_TITLE} titleAs="h2">
+            <p className={styles.errorSummaryLead}>{errorSummaryLead(summaryProblems.length)}</p>
+            <ul className={styles.errorSummaryList}>
+              {summaryProblems.map((problem) => (
+                <li key={problem.key}>
+                  <a
+                    className={styles.noticeLink}
+                    href={`#${problem.id}`}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      focusCheckoutControl(problem.id);
+                    }}
+                  >
+                    {`${problem.label}: ${problem.message}`}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </Alert>
+        </div>
+      ) : null}
 
       {/* Every field of the order in one group that locks while the order is in flight.
           A submission carries the values the draft was assembled from, so an edit made after it
@@ -2241,7 +2706,9 @@ export function CheckoutForm({
           including the ones this form composes through `FormField`, and the primitives' own
           `:disabled` treatments give it its appearance without this module restating any of them.
           The freight group inside is also passed `pending` in its own right, so it reads as
-          unavailable whether it is read through this group or on its own.
+          unavailable whether it is read through this group or on its own. A disabled field cannot
+          keep focus, which is why `submitOrder` hands focus to the submitting control, outside this
+          group, before it sets `pending`.
 
           `styles.fields` is a reset: it removes the border, padding and min-width a fieldset
           arrives with, and lays the four groups below out as `.root`'s column does - same
@@ -2517,7 +2984,10 @@ export function CheckoutForm({
         <section className={styles.section}>
           <h2 className={styles.sectionTitle}>Delivery options</h2>
 
-          <div className={styles.shipping}>
+          {/* The error summary's target for the shipping entry (see `SHIPPING_GROUP_ID`). It is
+              focusable only programmatically, and takes focus itself only when no service has been
+              quoted to land on - the reader then arrives at the group's own explanation. */}
+          <div className={styles.shipping} id={SHIPPING_GROUP_ID} tabIndex={-1}>
             <ShippingOptionPicker
               selectedId={effectiveOptionId}
               postalCode={destination}
@@ -2580,10 +3050,12 @@ export function CheckoutForm({
             tone="danger"
             title={failure.title}
             actions={
-              // Unavailable while a submission is in flight, because an unresolved notice stays on
-              // screen while its attempt is being checked and pressing it again would only be
-              // refused by the handler.
-              <Button type="submit" variant="secondary" size="sm" disabled={pending}>
+              // Held while a submission is in flight, because an unresolved notice stays on screen
+              // while its attempt is being checked and pressing it again would only be refused by
+              // the handler. Held with `busy` rather than `disabled`: this is the control the buyer
+              // pressed to check the order, so it is holding focus, and a disabled control would
+              // drop that focus onto `<body>` for the length of the check.
+              <Button type="submit" variant="secondary" size="sm" busy={pending}>
                 {failure.action}
               </Button>
             }
@@ -2595,7 +3067,7 @@ export function CheckoutForm({
 
       {/* A cart larger than one shipment is stated here rather than discovered by the buyer when
           the order is refused: freight is quoted per shipment, so this cart has no quote and no
-          freight charge, and the place-order control is unavailable until it fits. This notice is
+          freight charge, and the validation pass refuses the order until it fits. This notice is
           the one that says what to do about it - the service group's own caption states the two
           figures beside the empty group, so neither surface repeats the other's sentence - and it
           appears as soon as the cart passes the ceiling, announced by `Alert`'s `danger` tone, and
@@ -2621,10 +3093,21 @@ export function CheckoutForm({
             tone="danger"
             title={cart.cartErrorTitle ?? CART_UNREAD_TITLE}
             actions={
+              // The read clears the cart's failure as it starts, which unmounts this notice and the
+              // control being pressed, so focus is moved to the submit row first - only when it is
+              // on this control - and settled by the effect that follows `cart.syncStatus`.
               <Button
+                ref={cartRereadControl}
                 variant="secondary"
                 size="sm"
                 onClick={() => {
+                  const row = submitRow.current;
+
+                  if (row !== null && document.activeElement === cartRereadControl.current) {
+                    row.focus();
+                    cartRereadFocusPending.current = true;
+                  }
+
                   void cart.refreshCart();
                 }}
               >
@@ -2638,20 +3121,25 @@ export function CheckoutForm({
         </div>
       ) : null}
 
-      {/* Why the place-order control is unavailable, in the words of the labels above the fields.
-          It answers the question a disabled button raises: the control is inert, so pressing it
-          reports nothing, and a buyer who cannot see what is missing has nowhere to go.
-          `role="status"` rather than an alert, because this is guidance and not a failure - and
-          because its text changes only when a field's validity changes, never on a keystroke, so
-          it announces once per thing settled. */}
+      {/* What still stands between the buyer and the order, in the words of the labels above the
+          fields, directly above the control: why it is unavailable while the cart holds nothing,
+          and what a press would be refused for while fields are incomplete - so the answer is on
+          screen before the press as well as in the error summary after it. `role="status"` rather
+          than an alert, because this is guidance and not a failure - and because its text changes
+          only when a field's validity changes, never on a keystroke, so it announces once per
+          thing settled. */}
       {blocked === null ? null : (
         <p className={styles.outstanding} role="status">
           {blocked}
         </p>
       )}
 
-      <div className={styles.submitRow}>
-        <CheckoutButton pending={pending} disabled={!readyToPlaceOrder} />
+      {/* `tabIndex={-1}` makes the row a programmatic landing place and never a tab stop: focus
+          waits here while the cart notice's "Read the cart again" is answered (see the refs). */}
+      <div className={styles.submitRow} ref={submitRow} tabIndex={-1}>
+        {/* Unavailable only for a cart there is nothing to order from; incomplete fields leave it
+            available so a press runs the validation pass (see `cartOrderable`). */}
+        <CheckoutButton pending={pending} disabled={!cartOrderable} />
 
         {/* The line beside the control quotes what is about to be ordered, so it appears only
             where there is a cart to quote: neither a cart still being read nor one that could not

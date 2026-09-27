@@ -1553,6 +1553,110 @@ describe('createAgentControl', () => {
       expect(changesOfKind(h, 'disarmed')).toEqual([]);
     });
 
+    it('disarms from the ended binding a tab it holds no configuration for — a worker revived after an eviction', () => {
+      // A revived worker: the page's bridge re-announced its document, but the
+      // configuration the previous incarnation armed the page with is gone.
+      h.attached.add(BOUND_TAB);
+      h.control.handleAgentReady(BOUND_TAB, readyPayload());
+      expect(h.control.getDesiredConfig(BOUND_TAB)).toBeUndefined();
+
+      const outcome = h.control.disarm(BOUND_TAB, 'session-ended', {
+        sessionId: SESSION_A,
+        origin: BOUND_ORIGIN,
+        captureId: CAPTURE_1,
+      });
+
+      expect(outcome).toEqual({
+        kind: 'disarmed',
+        tabId: BOUND_TAB,
+        sessionId: SESSION_A,
+        captureId: CAPTURE_1,
+        delivery: 'delivered',
+      });
+      // Every hook key the protocol's own schema declares, each false: the
+      // page agent's dormancy instruction, validated before it was sent.
+      expect(configsTo(h, BOUND_TAB)).toEqual([dormantConfig(SESSION_A, CAPTURE_1)]);
+      expect(changesOfKind(h, 'disarmed')).toEqual([
+        {
+          kind: 'disarmed',
+          tabId: BOUND_TAB,
+          sessionId: SESSION_A,
+          captureId: CAPTURE_1,
+          reason: 'session-ended',
+          delivery: 'delivered',
+        },
+      ]);
+      expect(logMessages(h, 'info')).toContain(
+        'disarm: no configuration is held for the tab; disarming from its ended binding',
+      );
+
+      // Dormant is now the tab's desired state, and it no longer holds the
+      // session's binding: a reload re-sends it dormant without a bound push.
+      h.pushStatus.mockClear();
+      h.control.handleAgentReady(BOUND_TAB, readyPayload({ documentId: 'doc-test-2' }));
+      expect(configsTo(h, BOUND_TAB).at(-1)).toEqual(dormantConfig(SESSION_A, CAPTURE_1));
+      expect(h.pushStatus).not.toHaveBeenCalled();
+    });
+
+    it('holds the ended binding’s dormant configuration until the page’s bridge returns', () => {
+      const outcome = h.control.disarm(BOUND_TAB, 'unbound', {
+        sessionId: SESSION_A,
+        origin: BOUND_ORIGIN,
+        captureId: CAPTURE_1,
+      });
+
+      expect(outcome).toMatchObject({ kind: 'disarmed', delivery: 'pending-bridge' });
+      expect(configsTo(h, BOUND_TAB)).toEqual([]);
+
+      h.attached.add(BOUND_TAB);
+      h.control.handleAgentReady(BOUND_TAB, readyPayload());
+      expect(configsTo(h, BOUND_TAB)).toEqual([dormantConfig(SESSION_A, CAPTURE_1)]);
+    });
+
+    it('never hands the ended binding’s dormant configuration to a document of another origin', () => {
+      h.attached.add(BOUND_TAB);
+      h.control.handleAgentReady(BOUND_TAB, readyPayload({ url: FOREIGN_URL }));
+
+      const outcome = h.control.disarm(BOUND_TAB, 'session-ended', {
+        sessionId: SESSION_A,
+        origin: BOUND_ORIGIN,
+        captureId: CAPTURE_1,
+      });
+
+      expect(outcome).toMatchObject({ kind: 'disarmed', delivery: 'pending-navigation' });
+      expect(bridgeAttemptsFor(h, BOUND_TAB)).toBe(0);
+    });
+
+    it('prefers the received configuration over the fallback binding', async () => {
+      h.attached.add(BOUND_TAB);
+      bind(h, SESSION_A, BOUND_TAB);
+      const received = armedConfig(SESSION_A, CAPTURE_1);
+      await h.control.applyConfig(received);
+
+      const outcome = h.control.disarm(BOUND_TAB, 'session-ended', {
+        sessionId: SESSION_B,
+        origin: BOUND_ORIGIN,
+        captureId: CAPTURE_2,
+      });
+
+      expect(outcome).toMatchObject({ sessionId: SESSION_A, captureId: CAPTURE_1 });
+      expectDormantFormOf(configsTo(h, BOUND_TAB).at(-1), received);
+    });
+
+    it('leaves a tab alone when the ended binding names no capture to disarm', () => {
+      h.attached.add(BOUND_TAB);
+      h.control.handleAgentReady(BOUND_TAB, readyPayload());
+
+      expect(
+        h.control.disarm(BOUND_TAB, 'session-ended', {
+          sessionId: SESSION_A,
+          origin: BOUND_ORIGIN,
+        }),
+      ).toEqual({ kind: 'not-armed', tabId: BOUND_TAB });
+      expect(h.sendToBridge).not.toHaveBeenCalled();
+      expect(changesOfKind(h, 'disarmed')).toEqual([]);
+    });
+
     it('forwards the service’s own all-false agent.config as it arrives, even after the binding is gone', async () => {
       h.attached.add(BOUND_TAB);
       bind(h, SESSION_A, BOUND_TAB);

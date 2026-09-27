@@ -218,6 +218,27 @@ function loaderFor(promptsDir: string, cache = true): PromptLoader {
   return createPromptLoader({ promptsDir, env: {}, cache });
 }
 
+/**
+ * The hint every failure about the prompts directory itself must carry,
+ * written out by hand.
+ *
+ * A second, independent copy of the module's text rather than an import of
+ * it, so a change to what developers are told is also a change a reviewer sees
+ * here. It names the one setting a developer controls and what the directory
+ * must contain, and no function or option of this package: the reader is
+ * looking at a log line or a panel, not at the host's source.
+ */
+const DIRECTORY_HINT_TEXT =
+  'Set DEBUGGEN_PROMPTS_DIR to the directory that holds the versioned prompt files and their ' +
+  'manifest.json.';
+
+/**
+ * A call written the way source code spells one — an identifier directly
+ * followed by `()` — which no text a developer reads may contain. It would
+ * name an internal API of the host process instead of a setting.
+ */
+const FUNCTION_CALL_SPELLING = /[A-Za-z_$][\w$]*\(\)/;
+
 /** A recording logger, so the debug diagnostics can be asserted. */
 interface RecordedLog {
   readonly level: string;
@@ -530,7 +551,7 @@ describe('createPromptLoader directory resolution', () => {
     expect(isOk(loader.load('followup'))).toBe(true);
   });
 
-  it('fails with a configuration error naming both channels when neither is set', () => {
+  it('fails with a configuration error naming the variable when neither channel is set', () => {
     const loader = createPromptLoader({ env: { DEBUGGEN_PROMPTS_DIR: '' } });
 
     const error = errorOf(loader.load('analyze'));
@@ -538,16 +559,19 @@ describe('createPromptLoader directory resolution', () => {
     expect(error.code).toBe('CONFIG_INVALID');
     expect(loader.promptsDir).toBe('');
     expect(loader.manifestPath).toBe('');
-    expect(error.hint).toContain('promptsDir');
-    expect(error.hint).toContain('DEBUGGEN_PROMPTS_DIR');
+    expect(error.hint).toBe(DIRECTORY_HINT_TEXT);
+    // The developer reading this sets a variable; the host's option and this
+    // module's factory are code they do not own and must not be sent to.
+    expect(error.hint).not.toContain('promptsDir');
+    expect(error.hint).not.toContain('createPromptLoader');
   });
 
   it('does not guess a directory when the variable is absent altogether', () => {
     // `env: {}` is the packaged case with nothing configured: no variable at
     // all, rather than a variable set to the empty string. A loader that fell
     // back to a `process.cwd()`-relative guess would answer something here —
-    // the assertions below are that it answers nothing, and says which two
-    // channels could have supplied a directory.
+    // the assertions below are that it answers nothing, and names the variable
+    // a developer sets to supply a directory.
     const loader = createPromptLoader({ env: {} });
 
     const error = errorOf(loader.load('investigate'));
@@ -556,8 +580,7 @@ describe('createPromptLoader directory resolution', () => {
     expect(loader.manifestPath).toBe('');
     expect(error.code).toBe('CONFIG_INVALID');
     expect(error.message).toContain('No prompts directory is configured');
-    expect(error.hint).toContain('promptsDir');
-    expect(error.hint).toContain('DEBUGGEN_PROMPTS_DIR');
+    expect(error.hint).toBe(DIRECTORY_HINT_TEXT);
     // Nothing on disk was consulted, so no path can appear in the report.
     expect(reportOf(error)).not.toContain(process.cwd());
   });
@@ -612,6 +635,89 @@ describe('createPromptLoader directory resolution', () => {
     createPromptLoader({ promptsDir: 'prompts-relative', env: {}, logger });
 
     expect(records.some((entry) => entry.level === 'debug')).toBe(true);
+  });
+
+  it('answers every failure about the directory itself with the same variable-only hint', () => {
+    const sandbox = createSandbox();
+    const notADirectory = join(sandbox, 'prompts-file');
+    writeFileSync(notADirectory, 'not a directory\n', 'utf8');
+
+    const failures = [
+      errorOf(createPromptLoader({ env: {} }).load('understand')),
+      errorOf(loaderFor(join(sandbox, 'absent')).load('understand')),
+      errorOf(loaderFor(notADirectory).load('understand')),
+      errorOf(loaderFor(`${sandbox}/prompts\u0000`).load('understand')),
+    ];
+
+    for (const error of failures) {
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.hint).toBe(DIRECTORY_HINT_TEXT);
+    }
+  });
+
+  it('names no internal function or option in any failure a developer reads', () => {
+    // Every rejection this module can produce without mocking the filesystem,
+    // one per distinct message-and-hint pair. The message and the hint are
+    // what a log line, a VS Code notification and the DevTools panel render;
+    // `details` is machine data and may legitimately carry a `promptsDir` key.
+    const sandbox = createSandbox();
+    const notADirectory = join(sandbox, 'prompts-file');
+    writeFileSync(notADirectory, 'not a directory\n', 'utf8');
+
+    const noManifest = join(sandbox, 'no-manifest');
+    writePrompt(noManifest, 'plan', 'v001');
+
+    const badJson = join(sandbox, 'bad-json');
+    mkdirSync(badJson, { recursive: true });
+    writeFileSync(join(badJson, 'manifest.json'), '{ "version": 1, ', 'utf8');
+
+    const badSchema = join(sandbox, 'bad-schema');
+    writeManifest(badSchema, { version: 1, stages: { plan: { current: 'v001' } } });
+
+    const missingFile = seedPromptTree(join(sandbox, 'missing-file'));
+    rmSync(join(missingFile, 'plan', 'v001.md'));
+
+    const emptyFile = seedPromptTree(join(sandbox, 'empty-file'));
+    writePrompt(emptyFile, 'plan', 'v001', '   \n');
+
+    const healthy = loaderFor(seedPromptTree(join(sandbox, 'healthy')));
+
+    const failures: DebuggenError[] = [
+      errorOf(createPromptLoader({ env: {} }).load('understand')),
+      errorOf(loaderFor(join(sandbox, 'absent')).load('understand')),
+      errorOf(loaderFor(notADirectory).load('understand')),
+      errorOf(loaderFor(`${sandbox}/prompts\u0000`).load('understand')),
+      errorOf(loaderFor(noManifest).load('plan')),
+      errorOf(loaderFor(badJson).load('plan')),
+      errorOf(loaderFor(badSchema).load('plan')),
+      errorOf(loaderFor(missingFile).load('plan')),
+      errorOf(loaderFor(emptyFile).load('plan')),
+      errorOf(healthy.load('../../etc' as unknown as PromptStage)),
+      errorOf(healthy.loadVersion('plan', 'v1')),
+      errorOf(renderPrompt('Return output matching {{schema}}.', {})),
+    ];
+
+    if (CAN_SYMLINK) {
+      const linked = seedPromptTree(join(sandbox, 'linked'));
+      const outside = join(sandbox, 'outside');
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(join(outside, 'v002.md'), '# not a prompt\n', 'utf8');
+      symlinkSync(join(outside, 'v002.md'), join(linked, 'plan', 'v002.md'));
+      failures.push(errorOf(loaderFor(linked).loadVersion('plan', 'v002')));
+    }
+
+    // Each case is a distinct failure: a table that collapsed to one repeated
+    // rejection would pass without exercising the other texts.
+    expect(new Set(failures.map((error) => `${error.message}\n${error.hint ?? ''}`)).size).toBe(
+      failures.length,
+    );
+
+    for (const error of failures) {
+      const readable = `${error.message}\n${error.hint ?? ''}`;
+      expect(readable).not.toContain('createPromptLoader(');
+      expect(readable).not.toContain('createPromptLoader');
+      expect(readable).not.toMatch(FUNCTION_CALL_SPELLING);
+    }
   });
 });
 

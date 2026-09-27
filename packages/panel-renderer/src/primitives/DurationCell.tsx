@@ -103,6 +103,7 @@
  * described above.
  */
 
+import { roundMs } from '@debuggen/shared';
 import clsx from 'clsx';
 import type { HTMLAttributes, ReactElement, Ref } from 'react';
 
@@ -170,18 +171,20 @@ const SIZE_CLASS: Readonly<Record<DurationCellSize, string>> = {
  *   against a timestamp that never arrived;
  * - `Infinity` and `-Infinity` — no finite measurement exists;
  * - a negative value — a duration cannot be negative, so a negative number is
- *   a corrupt measurement rather than a fast one. This is deliberately
- *   STRICTER than `formatDuration`, which clamps a negative input to zero for
- *   callers that need a printable value no matter what: a cell has the better
- *   option of saying "not measured", and reporting a corrupt measurement as the
+ *   a corrupt measurement rather than a fast one, and reporting it as the
  *   fastest possible one would be the single most misleading thing this
- *   component could do.
+ *   component could do. The test is the one `formatDuration` applies —
+ *   negative at the stored resolution, `roundMs(ms) < 0` — so a cell and every
+ *   other surface that formats the same value agree on which values are
+ *   measured.
  *
- * Zero passes: a real operation that completed inside the stored resolution is
- * measured, and the formatter renders it in the canonical unit.
+ * Zero passes, and so does a negative residue that rounds to zero at the stored
+ * resolution (`-0.0004`, the difference of two readings of one instant): a real
+ * operation that completed inside the stored resolution is measured, and the
+ * formatter renders it in the canonical unit.
  */
 function isMeasuredDuration(ms: number | null | undefined): ms is number {
-  return typeof ms === 'number' && Number.isFinite(ms) && ms >= 0;
+  return typeof ms === 'number' && Number.isFinite(ms) && roundMs(ms) >= 0;
 }
 
 /**

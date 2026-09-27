@@ -8,14 +8,18 @@
  * ## What this stage does, in this fixed order
  *
  * 1. **Build the input — by delegation.** `../../analysis/summarize.js` owns
- *    every read of the capture: it pages the persisted, already-redacted
- *    telemetry, correlates, aggregates, projects the metrics and fetches the
- *    bounded code excerpts, all under `ANALYSIS_INPUT_LIMITS` with a
- *    `truncated` report (AAP §0.5.2, §0.7.1 Group 2). `../../analysis/facts.js`
+ *    every read of the capture: it scans the persisted, already-redacted
+ *    telemetry — every event of the capture up to the bound the panel data
+ *    aggregates under — correlates, aggregates, projects the metrics and
+ *    fetches the bounded code excerpts, all under `ANALYSIS_INPUT_LIMITS` with
+ *    a `truncated` report (AAP §0.5.2, §0.7.1 Group 2). `../../analysis/facts.js`
  *    turns that input into the deterministic fact candidates the prompt
- *    requires the model to cite, and the summarizer places them into a second,
- *    identically bounded build. This file reads no telemetry row, computes no
- *    aggregate or metric and fetches no excerpt.
+ *    requires the model to cite, and the summarizer assembles them into a
+ *    second, identically bounded input from the same aggregates, in the same
+ *    call. The build also carries the capture summary its input was drawn
+ *    from; the metrics stored with the analysis are that summary's, so they
+ *    and every fact describe one event set. This file reads no telemetry row,
+ *    computes no aggregate or metric and fetches no excerpt.
  * 2. **Build the request — by delegation.** `../context-builder.js` renders the
  *    versioned prompt `prompts/analyze/vNNN.md`, derives its five placeholders
  *    ({@link AnalyzePromptPlaceholdersCovered}) from the same capped object that
@@ -184,8 +188,13 @@ export interface AnalyzeStageDeps {
   readonly contextBuilder: Pick<ContextBuilder, 'buildAnalyzeRequest'>;
   /** The configured model boundary; the only network this stage can reach. */
   readonly provider: ModelProvider;
-  /** The owner of the bounded, redacted analysis input (`../../analysis/summarize.js`). */
-  readonly summarizer: Pick<AnalysisSummarizer, 'loadCaptureSummary' | 'buildStageInput'>;
+  /**
+   * The owner of the bounded, redacted analysis input (`../../analysis/summarize.js`).
+   * Only `buildStageInput` is read: the build carries the capture summary its
+   * input was drawn from, so the stage never loads a second one that could
+   * describe a different set of events.
+   */
+  readonly summarizer: Pick<AnalysisSummarizer, 'buildStageInput'>;
   /** The owner of fact candidates, evidence verification and versioned persistence (`../../analysis/facts.js`). */
   readonly facts: Pick<
     AnalysisFacts,
@@ -291,7 +300,11 @@ export interface AnalyzeStageResult {
   readonly model: string;
   /** What checkpoint one checked: every cited id and location, and that all of them resolved. */
   readonly verification: FactVerificationReport;
-  /** The capture summary the analysis was drawn from; the metrics stored with it come from here. */
+  /**
+   * The capture summary the analysis was drawn from — the build's
+   * `AnalysisStageInputBuild.summary`, describing exactly the events the input
+   * aggregated. The metrics stored with the analysis come from here.
+   */
   readonly summary: CaptureSummary;
   /** Names of the input and request sections that were capped, trimmed or dropped — names only. */
   readonly truncated: readonly string[];
@@ -759,42 +772,32 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
   /**
    * The analysis input, entirely by delegation: the summarizer builds the
    * bounded, redacted input; the facts module derives the deterministic
-   * candidates from it; and, when there are any, the summarizer builds the
-   * input again carrying them, so they are projected, capped and held to the
-   * byte budget by the module that owns those rules. The candidates are
-   * evidence the prompt requires the model to cite — never observations.
+   * candidates from it and from the summary it was drawn from; and, when there
+   * are any, the summarizer assembles the input again carrying them, so they
+   * are projected, capped and held to the byte budget by the module that owns
+   * those rules. One build call does all three, so the capture is read and
+   * aggregated once. The candidates are evidence the prompt requires the model
+   * to cite — never observations.
    */
   const buildInput = async (
     context: PipelineStageContext,
     captureId: string,
-    summary: CaptureSummary,
   ): Promise<Result<BuiltAnalysisInput, DebuggenError>> => {
-    const request = {
+    const built = await deps.summarizer.buildStageInput({
       sessionId: context.sessionId,
       captureId,
       question: context.question,
       followUpQuestion: context.followUpQuestion,
       codeQueries: context.code.queries,
-    };
-    const first = await deps.summarizer.buildStageInput({
-      ...request,
-      options: { signal: context.signal },
+      options: {
+        signal: context.signal,
+        deriveFactCandidates: (evidence) => deps.facts.candidatesFor(evidence),
+      },
     });
-    if (!first.ok) {
-      return err(first.error);
+    if (!built.ok) {
+      return err(built.error);
     }
-    const candidates = deps.facts.candidatesFor({ input: first.value.input, summary });
-    if (candidates.length === 0) {
-      return ok({ build: first.value, factCandidates: 0 });
-    }
-    const second = await deps.summarizer.buildStageInput({
-      ...request,
-      options: { signal: context.signal, factCandidates: candidates },
-    });
-    if (!second.ok) {
-      return err(second.error);
-    }
-    return ok({ build: second.value, factCandidates: second.value.input.factCandidates.length });
+    return ok({ build: built.value, factCandidates: built.value.input.factCandidates.length });
   };
 
   /** One analysis run, in the fixed order of the module documentation. */
@@ -825,18 +828,18 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
       return fail(context, log, history.error, startedAt);
     }
 
-    // 3. The capture summary: the stored one first, recomputed from persisted events otherwise.
-    const summary = await deps.summarizer.loadCaptureSummary(context.sessionId, input.captureId);
-    if (!summary.ok) {
-      return fail(context, log, summary.error, startedAt);
-    }
-
-    // 4. The bounded, redacted stage input, carrying the deterministic fact candidates.
-    const built = await buildInput(context, input.captureId, summary.value);
+    // 3. The bounded, redacted stage input, carrying the deterministic fact candidates, and the
+    //    capture summary it was drawn from. That summary describes exactly the events the input
+    //    aggregated — every event of the capture up to the bound the panel data aggregates
+    //    under — so the metrics stored below, the fact candidates and the panel's own aggregates
+    //    share one event set. A stored summary covering fewer events (partial coverage) is not
+    //    cited: the summarizer replaces it with the summary of the aggregated events.
+    const built = await buildInput(context, input.captureId);
     if (!built.ok) {
       return fail(context, log, built.error, startedAt);
     }
     const { build, factCandidates } = built.value;
+    const { summary } = build;
     log.debug('Analysis input built.', {
       eventsConsidered: build.stats.eventsConsidered,
       eventsExcluded: build.stats.eventsExcluded,
@@ -849,7 +852,7 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
       factCandidates,
     });
 
-    // 5. The request: rendered from the versioned prompt, capped, and passed by the outbound guard.
+    // 4. The request: rendered from the versioned prompt, capped, and passed by the outbound guard.
     //    A refusal ends the stage here — the payload must not leave the machine.
     const requested = deps.contextBuilder.buildAnalyzeRequest({
       context,
@@ -863,7 +866,7 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
     }
     const { request, promptVersion } = requested.value;
 
-    // 6. The model-output gate: one validated call, bounded repairs, no normaliser, no fallback.
+    // 5. The model-output gate: one validated call, bounded repairs, no normaliser, no fallback.
     const answered = await fromPromise(
       generateStructuredWithRepair(deps.provider, analysisFindingsSchema, request, {
         maxRepairs,
@@ -880,12 +883,12 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
     }
     const { value: findings, repairs, attempts, providerId, model } = structured.value;
 
-    // 7. An abandoned run stores nothing, even when the model has already answered.
+    // 6. An abandoned run stores nothing, even when the model has already answered.
     if (isAborted(signal)) {
       return fail(context, log, cancelledError(scope), startedAt);
     }
 
-    // 8. Checkpoint one of AAP §0.8.4, owned by ../../analysis/facts.js: every cited id must
+    // 7. Checkpoint one of AAP §0.8.4, owned by ../../analysis/facts.js: every cited id must
     //    resolve in this capture and every suggested location must lie inside the project, or
     //    the whole analysis is rejected — propagated unchanged, never trimmed or downgraded.
     const verificationContext: FactVerificationContext = {
@@ -905,11 +908,11 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
       return fail(context, log, verificationInconsistentError(scope), startedAt);
     }
 
-    // 9. Assemble and store as the session's next version; the store supplies the version and
+    // 8. Assemble and store as the session's next version; the store supplies the version and
     //    the superseded id, and acceptFindings verifies once more immediately before writing.
     const acceptance: AcceptFindingsContext = {
       ...verificationContext,
-      metrics: summary.value.metrics,
+      metrics: summary.metrics,
     };
     const accepted = await deps.facts.acceptFindings(verified.value, acceptance);
     if (!accepted.ok) {
@@ -918,7 +921,7 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
     const analysis = accepted.value;
     const broadcast = announce(analysis, log);
 
-    // 10. Progress: count rows from the stored result, then the closing row.
+    // 9. Progress: count rows from the stored result, then the closing row.
     for (const row of analysisFindingRows(analysis, report.value)) {
       sendRow(log, 'finding', () =>
         deps.progress.finding(context.sessionId, ANALYZE_STAGE, row.message, row.detail),
@@ -959,7 +962,7 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
       providerId,
       model,
       verification: report.value,
-      summary: summary.value,
+      summary,
       truncated,
     });
   };

@@ -98,7 +98,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { SpanKind, SpanStatusCode, TraceFlags } from '@opentelemetry/api';
+import { ROOT_CONTEXT, SpanKind, SpanStatusCode, TraceFlags } from '@opentelemetry/api';
 import type { SpanContext } from '@opentelemetry/api';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 
@@ -2777,5 +2777,378 @@ describe('one capture per post, and the loss it reports', () => {
       lossReportBatches: 1,
     });
     expectLossAccounted(processor);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A span's relatives: skipped ancestors, the request's route, nested counts
+ *
+ * Spans end child-first, so these cases drive `onStart` parent-first and
+ * `onEnd` child-first, as the SDK does. The framework spans are built from the
+ * type table `./convert.ts` exports; a verbose-mode request is modelled on the
+ * chain `NEXT_OTEL_VERBOSE=1` actually produces — request-handler spans above
+ * the request span, render and response spans between it and the route
+ * handler — none of which `./convert.ts` emits.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The browser span a propagated `traceparent` names as the request's parent. */
+const REMOTE_PARENT_SPAN_ID = 'f'.repeat(SPAN_ID_WIDTH);
+
+/** A framework span type `./convert.ts` does not emit, as verbose mode delegates many. */
+const SKIPPED_FRAMEWORK_TYPE = 'BaseServer.render';
+
+/** A statement that belongs to no particular project. */
+const STATEMENT = 'SELECT "id" FROM "items" WHERE "active" = $1';
+
+/** What a relative-case span is built from. */
+interface RelativeSpanSpec {
+  /** The span's id. */
+  readonly spanId: string;
+  /** The id of the parent it recorded, or `undefined` for a trace root. */
+  readonly parentSpanId?: string | undefined;
+  /** The display name. */
+  readonly name: string;
+  /** The OpenTelemetry span kind. */
+  readonly kind: SpanKind;
+  /** The instrumentation scope that created it. */
+  readonly scope: string;
+  /** Its attributes. */
+  readonly attributes: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * A span for the relative cases: the same member set as {@link makeSpan}, with
+ * the identity, parent, scope and attributes a case names.
+ *
+ * @param spec What the span is.
+ * @returns The span, usable at both `onStart` and `onEnd`.
+ */
+function relativeSpan(spec: RelativeSpanSpec): ReadableSpan {
+  const spanContext: SpanContext = {
+    traceId: TRACE_ID,
+    spanId: spec.spanId,
+    traceFlags: TraceFlags.SAMPLED,
+  };
+  const span: Record<string, unknown> = {
+    name: spec.name,
+    kind: spec.kind,
+    spanContext: (): SpanContext => spanContext,
+    ...(spec.parentSpanId === undefined
+      ? {}
+      : {
+          parentSpanContext: {
+            traceId: TRACE_ID,
+            spanId: spec.parentSpanId,
+            traceFlags: TraceFlags.SAMPLED,
+          },
+        }),
+    startTime: SPAN_START,
+    endTime: SPAN_END,
+    duration: SPAN_DURATION,
+    status: { code: SpanStatusCode.UNSET },
+    attributes: { ...spec.attributes },
+    links: [],
+    events: [],
+    ended: true,
+    resource: { attributes: {} },
+    instrumentationScope: { name: spec.scope, version: '0.0.0' },
+    droppedAttributesCount: 0,
+    droppedEventsCount: 0,
+    droppedLinksCount: 0,
+  };
+  return span as unknown as ReadableSpan;
+}
+
+/** A framework span `./convert.ts` classifies as nothing, and so never emits. */
+function skippedFrameworkSpan(spanId: string, parentSpanId: string | undefined): ReadableSpan {
+  return relativeSpan({
+    spanId,
+    parentSpanId,
+    name: SKIPPED_FRAMEWORK_TYPE,
+    kind: SpanKind.INTERNAL,
+    scope: 'next.js',
+    attributes: { [NEXT_SPAN_TYPE_ATTRIBUTE]: SKIPPED_FRAMEWORK_TYPE },
+  });
+}
+
+/**
+ * The framework's request span as verbose mode leaves it: named after the
+ * method alone, with no route, because it is not the root of the request's work.
+ */
+function unlabelledRequestSpan(spanId: string, parentSpanId: string | undefined): ReadableSpan {
+  return relativeSpan({
+    spanId,
+    parentSpanId,
+    name: REQUEST_METHOD,
+    kind: SpanKind.SERVER,
+    scope: 'next.js',
+    attributes: {
+      [NEXT_SPAN_TYPE_ATTRIBUTE]: NEXT_SPAN_TYPES.request,
+      'http.method': REQUEST_METHOD,
+      'http.target': `${REQUEST_ROUTE}?page=2`,
+    },
+  });
+}
+
+/** The framework's route-handler span, which names the route it ran. */
+function routeHandlerSpan(spanId: string, parentSpanId: string): ReadableSpan {
+  return relativeSpan({
+    spanId,
+    parentSpanId,
+    name: `executing api route (app) ${REQUEST_ROUTE}`,
+    kind: SpanKind.INTERNAL,
+    scope: 'next.js',
+    attributes: {
+      [NEXT_SPAN_TYPE_ATTRIBUTE]: NEXT_SPAN_TYPES.appRouteHandler,
+      'next.route': REQUEST_ROUTE,
+    },
+  });
+}
+
+/** The driver's span of one statement execution, with the count it reported. */
+function driverStatementSpan(
+  spanId: string,
+  parentSpanId: string,
+  statement: string,
+  rowCount: number | undefined,
+): ReadableSpan {
+  return relativeSpan({
+    spanId,
+    parentSpanId,
+    name: 'pg.query:SELECT fixture',
+    kind: SpanKind.CLIENT,
+    scope: '@opentelemetry/instrumentation-pg',
+    attributes: {
+      'db.system': 'postgresql',
+      'db.statement': statement,
+      ...(rowCount === undefined ? {} : { 'db.response.returned_rows': rowCount }),
+    },
+  });
+}
+
+/** The ORM's span of the same execution, which observes no count of its own. */
+function ormStatementSpan(spanId: string, parentSpanId: string, statement: string): ReadableSpan {
+  return relativeSpan({
+    spanId,
+    parentSpanId,
+    name: 'prisma:client:db_query',
+    kind: SpanKind.CLIENT,
+    scope: 'prisma',
+    attributes: { 'db.system': 'postgresql', 'db.query.text': statement },
+  });
+}
+
+/**
+ * Start every span parent-first, then end them child-first, as the SDK does.
+ *
+ * @param processor The processor.
+ * @param spans The spans, outermost first.
+ */
+function runNested(processor: DebuggenSpanProcessor, spans: readonly ReadableSpan[]): void {
+  for (const span of spans) {
+    processor.onStart(
+      span as unknown as Parameters<DebuggenSpanProcessor['onStart']>[0],
+      ROOT_CONTEXT,
+    );
+  }
+  for (const span of [...spans].reverse()) {
+    processor.onEnd(span);
+  }
+}
+
+/** The posted event with this span id. */
+function postedEvent(rig: FetchRig, spanId: string): Readonly<Record<string, unknown>> {
+  const event = postedEventsOf(rig).find((candidate) => candidate.spanId === spanId);
+  if (event === undefined) {
+    throw new Error(`no event was posted for span ${spanId}`);
+  }
+  return event;
+}
+
+describe("a span's relatives", () => {
+  it('names the nearest emitted ancestor in place of framework spans it never emits', async () => {
+    const { processor, fetch: rig } = createHarness();
+    const handlerChain = skippedFrameworkSpan(spanIdFor(100), REMOTE_PARENT_SPAN_ID);
+    const request = unlabelledRequestSpan(spanIdFor(101), spanIdFor(100));
+    const render = skippedFrameworkSpan(spanIdFor(102), spanIdFor(101));
+    const response = skippedFrameworkSpan(spanIdFor(103), spanIdFor(102));
+    const handler = routeHandlerSpan(spanIdFor(104), spanIdFor(103));
+    const query = driverStatementSpan(spanIdFor(105), spanIdFor(104), STATEMENT, 3);
+
+    runNested(processor, [handlerChain, request, render, response, handler, query]);
+    await processor.forceFlush();
+
+    // Three events, the framework chain gone, and not one of them orphaned.
+    expect(postedEventsOf(rig).map((event) => event.kind)).toEqual([
+      'db.query',
+      'route.handler',
+      'http.server',
+    ]);
+    expect(postedEvent(rig, spanIdFor(105)).parentSpanId).toBe(spanIdFor(104));
+    expect(postedEvent(rig, spanIdFor(104)).parentSpanId).toBe(spanIdFor(101));
+    // Past both request-handler spans to the browser span that sent the request.
+    expect(postedEvent(rig, spanIdFor(101)).parentSpanId).toBe(REMOTE_PARENT_SPAN_ID);
+    expect(processor.stats().droppedUnconvertible).toBe(3);
+  });
+
+  it('makes a request span a trace root when every ancestor it had is one it never emits', async () => {
+    const { processor, fetch: rig } = createHarness();
+
+    runNested(processor, [
+      skippedFrameworkSpan(spanIdFor(110), undefined),
+      skippedFrameworkSpan(spanIdFor(111), spanIdFor(110)),
+      unlabelledRequestSpan(spanIdFor(112), spanIdFor(111)),
+    ]);
+    await processor.forceFlush();
+
+    const request = postedEvent(rig, spanIdFor(112));
+    expect(request.kind).toBe('http.server');
+    expect(Object.keys(request)).not.toContain('parentSpanId');
+  });
+
+  it('points past a span the capture refuses, just as past one it skips', async () => {
+    // The capture does not want outgoing requests, but the called route's
+    // request span — nested under the refused call by propagated context —
+    // still belongs under the handler that made the call.
+    const gate: CaptureGate = {
+      captureId: CAPTURE_ID,
+      isKindEnabled: (kind): boolean => kind !== 'http.client',
+    };
+    const { processor, fetch: rig } = createHarness({}, gate);
+    const handler = routeHandlerSpan(spanIdFor(120), spanIdFor(119));
+    const call = relativeSpan({
+      spanId: spanIdFor(121),
+      parentSpanId: spanIdFor(120),
+      name: 'fetch POST http://localhost:4000/downstream',
+      kind: SpanKind.CLIENT,
+      scope: 'next.js',
+      attributes: {
+        [NEXT_SPAN_TYPE_ATTRIBUTE]: NEXT_SPAN_TYPES.serverFetch,
+        'http.method': 'POST',
+        'http.url': 'http://localhost:4000/downstream',
+      },
+    });
+    const downstream = relativeSpan({
+      spanId: spanIdFor(122),
+      parentSpanId: spanIdFor(121),
+      name: 'POST /downstream',
+      kind: SpanKind.SERVER,
+      scope: 'next.js',
+      attributes: {
+        [NEXT_SPAN_TYPE_ATTRIBUTE]: NEXT_SPAN_TYPES.request,
+        'http.method': 'POST',
+        'http.route': '/downstream',
+      },
+    });
+
+    runNested(processor, [handler, call, downstream]);
+    await processor.forceFlush();
+
+    expect(postedEventsOf(rig).map((event) => event.kind)).toEqual([
+      'http.server',
+      'route.handler',
+    ]);
+    expect(postedEvent(rig, spanIdFor(122)).parentSpanId).toBe(spanIdFor(120));
+    expect(processor.stats().droppedByKind).toBe(1);
+  });
+
+  it('labels a request span that resolved no route with the route its handler reported', async () => {
+    const { processor, fetch: rig } = createHarness();
+
+    runNested(processor, [
+      unlabelledRequestSpan(spanIdFor(130), undefined),
+      skippedFrameworkSpan(spanIdFor(131), spanIdFor(130)),
+      routeHandlerSpan(spanIdFor(132), spanIdFor(131)),
+    ]);
+    await processor.forceFlush();
+
+    const request = postedEvent(rig, spanIdFor(130));
+    expect(request.name).toBe(`${REQUEST_METHOD} ${REQUEST_ROUTE}`);
+    const attributes = asRecord(request.attributes, 'the request attributes');
+    expect(attributes['http.route']).toBe(REQUEST_ROUTE);
+    expect(attributes['next.route']).toBe(REQUEST_ROUTE);
+  });
+
+  it('labels a request span with no route anywhere by its path, never its query', async () => {
+    const { processor, fetch: rig } = createHarness();
+
+    runNested(processor, [unlabelledRequestSpan(spanIdFor(140), undefined)]);
+    await processor.forceFlush();
+
+    expect(postedEvent(rig, spanIdFor(140)).name).toBe(`${REQUEST_METHOD} ${REQUEST_ROUTE}`);
+  });
+
+  it('records the driver row count, and carries it onto the ORM span of the same execution', async () => {
+    const { processor, fetch: rig } = createHarness();
+    const handler = routeHandlerSpan(spanIdFor(150), spanIdFor(149));
+
+    runNested(processor, [
+      handler,
+      ormStatementSpan(spanIdFor(151), spanIdFor(150), STATEMENT),
+      driverStatementSpan(spanIdFor(152), spanIdFor(151), STATEMENT, 7),
+    ]);
+    await processor.forceFlush();
+
+    const driver = asRecord(postedEvent(rig, spanIdFor(152)).attributes, 'the driver attributes');
+    const orm = asRecord(postedEvent(rig, spanIdFor(151)).attributes, 'the ORM attributes');
+    expect(driver['db.rowCount']).toBe(7);
+    expect(Object.keys(driver)).not.toContain('db.response.returned_rows');
+    expect(orm['db.rowCount']).toBe(7);
+  });
+
+  it('carries no count onto an outer span that ran a different statement', async () => {
+    const { processor, fetch: rig } = createHarness();
+
+    runNested(processor, [
+      ormStatementSpan(spanIdFor(160), spanIdFor(159), STATEMENT),
+      driverStatementSpan(spanIdFor(161), spanIdFor(160), 'SELECT 1', 1),
+    ]);
+    await processor.forceFlush();
+
+    const orm = asRecord(postedEvent(rig, spanIdFor(160)).attributes, 'the ORM attributes');
+    expect(Object.keys(orm)).not.toContain('db.rowCount');
+  });
+
+  it('carries the count even from a driver span the capture refuses', async () => {
+    // A prisma-only plan: the driver's span is dropped by source, but it is
+    // still the only observer of how many rows the ORM's statement returned.
+    const gate: CaptureGate = {
+      captureId: CAPTURE_ID,
+      isKindEnabled: (): boolean => true,
+      admitSpan: (candidate): 'admitted' | 'source-disabled' =>
+        candidate.source === 'pg' ? 'source-disabled' : 'admitted',
+    };
+    const { processor, fetch: rig } = createHarness({}, gate);
+
+    runNested(processor, [
+      ormStatementSpan(spanIdFor(170), spanIdFor(169), STATEMENT),
+      driverStatementSpan(spanIdFor(171), spanIdFor(170), STATEMENT, 4),
+    ]);
+    await processor.forceFlush();
+
+    expect(postedEventsOf(rig)).toHaveLength(1);
+    const orm = asRecord(postedEvent(rig, spanIdFor(170)).attributes, 'the ORM attributes');
+    expect(orm['db.rowCount']).toBe(4);
+    expect(processor.stats().droppedBySource).toBe(1);
+  });
+
+  it('leaves a span nesting directly under emitted spans exactly as it recorded', async () => {
+    const { processor, fetch: rig } = createHarness();
+    const request = makeSpan(180);
+
+    runNested(processor, [
+      request,
+      routeHandlerSpan(spanIdFor(181), spanIdFor(180)),
+      driverStatementSpan(spanIdFor(182), spanIdFor(181), STATEMENT, undefined),
+    ]);
+    await processor.forceFlush();
+
+    expect(postedEvent(rig, spanIdFor(181)).parentSpanId).toBe(spanIdFor(180));
+    expect(postedEvent(rig, spanIdFor(182)).parentSpanId).toBe(spanIdFor(181));
+    expect(postedEvent(rig, spanIdFor(180)).name).toBe(`${REQUEST_METHOD} ${REQUEST_ROUTE}`);
+    const query = asRecord(postedEvent(rig, spanIdFor(182)).attributes, 'the query attributes');
+    expect(Object.keys(query)).not.toContain('db.rowCount');
   });
 });

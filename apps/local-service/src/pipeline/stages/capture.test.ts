@@ -13,13 +13,15 @@
  *    (`quiescent`, `deadline`, `unverified`, `not-applicable`) and the
  *    cancellation are driven here with an injected sleeper and monotonic
  *    clock, never with real time.
- * 2. **The bounded summary.** The capture's events are read in small pages,
- *    yielding between them, and summarised up to an event ceiling and a
- *    stored-size ceiling; past either, the emptiness rule reads exact per-kind
- *    counts and the coverage reports stored versus summarised events.
+ * 2. **The bounded summary.** The capture's events are read in pages,
+ *    yielding between them, and summarised up to an event ceiling — the
+ *    panel-data resolver's own aggregate ceiling — and a stored-size ceiling;
+ *    past either, the emptiness rule reads exact per-kind counts and the
+ *    coverage reports stored versus summarised events.
  * 3. **The empty-capture rule** (AAP §0.5.5): zero events, or zero browser
  *    interactions for an interaction question — whether or not the
- *    interaction hook was armed.
+ *    interaction hook was armed — unless the question's category is answered
+ *    by evidence the page records on its own and the capture holds it.
  * 4. **Coverage.** The summary handed to the session manager — the one it
  *    persists and broadcasts in `capture.stopped` — says whether it covers
  *    everything the producers observed, and an incomplete capture reaches both
@@ -45,10 +47,13 @@ import {
   TARGETLESS_FILE,
   TARGETLESS_SYMBOL,
   instrumentationPlanSchema,
+  isCaptureSignal,
   problemUnderstandingSchema,
+  telemetryKindsForSignal,
 } from '@debuggen/instrumentation';
 import type {
   AgentHookConfig,
+  CaptureSignal,
   InstrumentationPlan,
   ProblemUnderstanding,
 } from '@debuggen/instrumentation';
@@ -77,7 +82,9 @@ import type { CaptureSummary, TelemetryEvent, TelemetryKind } from '@debuggen/te
 
 import type { ReadinessVerdict } from '../../instrumentation/readiness.js';
 import type { ArmingSnapshot, DisarmCaptureOutcome } from '../../instrumentation/service.js';
+import { MAX_AGGREGATE_INPUT_EVENTS } from '../../panels/data.js';
 import type { StopCaptureOptions } from '../../sessions/manager.js';
+import { TELEMETRY_QUERY_MAX_LIMIT } from '../../store/telemetry-repo.js';
 import type {
   CaptureIngestWatermark,
   CaptureSummaryPage,
@@ -90,7 +97,10 @@ import {
   INTERACTION_HOOK_OFF_MESSAGE,
   MAX_SUMMARY_BYTES,
   MAX_SUMMARY_EVENTS,
+  PASSIVE_EVIDENCE_SIGNALS,
+  SUMMARY_PAGE_CHARS,
   SUMMARY_PAGE_SIZE,
+  SUMMARY_PROBE_PAGE_SIZE,
   classifyCaptureEmptiness,
   createCaptureStage,
   understandingNeedsInteraction,
@@ -589,6 +599,35 @@ function stoppedSummary(h: Harness): CaptureSummary {
   return stop.summary;
 }
 
+/** A count as the finding rows print it. */
+function counted(count: number): string {
+  return count.toLocaleString('en-US');
+}
+
+/**
+ * The stored size of one pathological event, in characters: a 32 KiB
+ * attribute payload, so the byte ceiling binds after a few pages — long
+ * before the event ceiling. The double only reports the size; no such string
+ * is ever built.
+ */
+const RICH_EVENT_CHARS = 32 * 1024;
+
+/** How many rich events reach {@link MAX_SUMMARY_BYTES}. */
+const RICH_EVENTS_TO_BUDGET = Math.ceil(MAX_SUMMARY_BYTES / RICH_EVENT_CHARS);
+
+/**
+ * How many rich events the walk reads: after its first page it sizes every
+ * page by the stored size per row it has measured, so over rows of one size it
+ * lands exactly on the byte ceiling.
+ */
+const RICH_EVENTS_READ = RICH_EVENTS_TO_BUDGET;
+
+/** The most rich events one page after the first may ask for: one page's stored size. */
+const RICH_ROWS_PER_PAGE = Math.floor(SUMMARY_PAGE_CHARS / RICH_EVENT_CHARS);
+
+/** The finding row's clause naming the byte ceiling, as the stage words it. */
+const BYTE_CEILING_TEXT = 'one summary covers at most 256 MiB of stored event data';
+
 /* -------------------------------------------------------------------------------------------------
  * 1. The stop barrier
  * ---------------------------------------------------------------------------------------------- */
@@ -914,42 +953,92 @@ describe('the bounded summary', () => {
     return h.progress.filter((call) => call.method === 'finding').map((call) => call.message);
   }
 
-  /** Stored events large enough that the byte ceiling binds long before the event ceiling. */
-  const RICH_EVENT_CHARS = 10_000;
-
-  /** How many rich events reach {@link MAX_SUMMARY_BYTES}. */
-  const RICH_EVENTS_TO_BUDGET = Math.ceil(MAX_SUMMARY_BYTES / RICH_EVENT_CHARS);
-
-  /** How many rich events the walk reads: whole pages, up to the first that reaches the budget. */
-  const RICH_EVENTS_READ = Math.ceil(RICH_EVENTS_TO_BUDGET / SUMMARY_PAGE_SIZE) * SUMMARY_PAGE_SIZE;
-
   it('pins its two ceilings and its page size', () => {
-    expect(MAX_SUMMARY_EVENTS).toBe(10_000);
-    expect(MAX_SUMMARY_BYTES).toBe(16 * 1024 * 1024);
-    expect(SUMMARY_PAGE_SIZE).toBe(250);
-    expect(MAX_SUMMARY_EVENTS % SUMMARY_PAGE_SIZE).toBe(0);
+    // One bound for the stored summary, the analysis input and the panel's
+    // aggregates, imported from the panel-data resolver rather than restated.
+    expect(MAX_SUMMARY_EVENTS).toBe(MAX_AGGREGATE_INPUT_EVENTS);
+    expect(MAX_SUMMARY_EVENTS).toBe(250_000);
+    expect(MAX_SUMMARY_BYTES).toBe(256 * 1024 * 1024);
+    // The largest page the store serves, then a small first page and a size
+    // bound per page.
+    expect(SUMMARY_PAGE_SIZE).toBe(TELEMETRY_QUERY_MAX_LIMIT);
+    expect(SUMMARY_PAGE_SIZE).toBe(5_000);
+    expect(SUMMARY_PROBE_PAGE_SIZE).toBe(250);
+    expect(SUMMARY_PAGE_CHARS).toBe(8 * 1024 * 1024);
+    // Events of up to 1 KiB stored each — every realistic mix — reach the
+    // event ceiling first, reading whole pages; the byte ceiling only stops
+    // pathological attributes.
+    expect(MAX_SUMMARY_EVENTS * 1_024).toBeLessThanOrEqual(MAX_SUMMARY_BYTES);
+    expect(SUMMARY_PAGE_SIZE * 1_024).toBeLessThanOrEqual(SUMMARY_PAGE_CHARS);
+    expect(RICH_EVENTS_READ).toBeLessThan(MAX_SUMMARY_EVENTS);
   });
 
-  it('summarises a capture within both ceilings in full, one small page at a time', async () => {
-    const h = harness({ stored: 1_100 });
+  it('summarises a capture within both ceilings in full: a small first page, then whole pages', async () => {
+    const stored = SUMMARY_PROBE_PAGE_SIZE + 3 * SUMMARY_PAGE_SIZE + 100;
+    const h = harness({ stored });
 
     const completed = await createCaptureStage(h.deps).complete(h.context);
 
     expect(completed.ok).toBe(true);
     expect(pagesAsked(h)).toEqual([
-      { limit: SUMMARY_PAGE_SIZE, offset: 0 },
-      { limit: SUMMARY_PAGE_SIZE, offset: 250 },
-      { limit: SUMMARY_PAGE_SIZE, offset: 500 },
-      { limit: SUMMARY_PAGE_SIZE, offset: 750 },
-      { limit: SUMMARY_PAGE_SIZE, offset: 1_000 },
+      { limit: SUMMARY_PROBE_PAGE_SIZE, offset: 0 },
+      ...Array.from({ length: 4 }, (_, page) => ({
+        limit: SUMMARY_PAGE_SIZE,
+        offset: SUMMARY_PROBE_PAGE_SIZE + page * SUMMARY_PAGE_SIZE,
+      })),
     ]);
-    expect(stoppedSummary(h).eventCount).toBe(1_100);
-    expect(stoppedSummary(h).coverage).toMatchObject({ storedEvents: 1_100, complete: true });
+    expect(stoppedSummary(h).eventCount).toBe(stored);
+    expect(stoppedSummary(h).coverage).toMatchObject({ storedEvents: stored, complete: true });
     expect(h.telemetry.countByKind).not.toHaveBeenCalled();
   });
 
+  it(
+    'summarises a noisy capture past the former 10 000-event ceiling in full, reproduction included',
+    { timeout: 60_000 },
+    async () => {
+      // A page re-rendering in the background, and the reproduction at the end
+      // of the window: a summary of the first 10 000 events held none of it.
+      const stored = 42_704;
+      const reproducedFrom = stored - 704;
+      const h = harness({
+        stored,
+        kindAt: (index) => (index >= reproducedFrom ? 'interaction' : 'render'),
+        watermarks: [watermark(stored)],
+      });
+
+      const completed = await createCaptureStage(h.deps).complete(h.context);
+
+      expect(completed.ok).toBe(true);
+      const summary = stoppedSummary(h);
+      expect(summary.eventCount).toBe(stored);
+      expect(summary.kindCounts.interaction).toBe(stored - reproducedFrom);
+      expect(summary.kindCounts.render).toBe(reproducedFrom);
+      expect(summary.coverage).toEqual({
+        storedEvents: stored,
+        summarizedEvents: stored,
+        producerDroppedEvents: 0,
+        drain: 'quiescent',
+        complete: true,
+      });
+      expect(pagesAsked(h)).toHaveLength(
+        1 + Math.ceil((stored - SUMMARY_PROBE_PAGE_SIZE) / SUMMARY_PAGE_SIZE),
+      );
+      expect(h.telemetry.countByKind).not.toHaveBeenCalled();
+      expect(findingRows(h)).toEqual([]);
+      if (completed.ok) {
+        expect(completed.value.emptiness).toMatchObject({
+          empty: false,
+          eventCount: stored,
+          interactionCount: stored - reproducedFrom,
+        });
+      }
+    },
+  );
+
   it('yields to the event loop between pages', async () => {
-    const h = harness({ stored: 900 });
+    const h = harness({
+      stored: SUMMARY_PROBE_PAGE_SIZE + 2 * SUMMARY_PAGE_SIZE + SUMMARY_PAGE_SIZE / 2,
+    });
     let ticks = 0;
     let running = true;
     const tick = (): void => {
@@ -981,25 +1070,42 @@ describe('the bounded summary', () => {
   });
 
   it(
-    'stops at the event ceiling and judges emptiness from the exact per-kind counts',
-    { timeout: 60_000 },
+    'stops at the event ceiling, reports its coverage and judges emptiness from the exact per-kind counts',
+    { timeout: 180_000 },
     async () => {
       // Every interaction lies past the ceiling: a judgement read off the capped
       // summary alone would call this interaction question's capture empty.
       const beyond = 7;
+      const stored = MAX_SUMMARY_EVENTS + beyond;
       const h = harness({
-        stored: MAX_SUMMARY_EVENTS + beyond,
+        stored,
         kindAt: (index) => (index >= MAX_SUMMARY_EVENTS ? 'interaction' : 'fetch'),
-        watermarks: [watermark(MAX_SUMMARY_EVENTS + beyond)],
+        watermarks: [watermark(stored)],
       });
 
       const completed = await createCaptureStage(h.deps).complete(h.context);
 
       expect(completed.ok).toBe(true);
+      // A small first page, whole pages, and a last one asking for exactly the
+      // rows the ceiling leaves: the walk meets it without reading past it.
       const pages = pagesAsked(h);
-      expect(pages).toHaveLength(MAX_SUMMARY_EVENTS / SUMMARY_PAGE_SIZE);
-      expect(pages.every((page) => page.limit === SUMMARY_PAGE_SIZE)).toBe(true);
+      expect(pages).toHaveLength(
+        1 + Math.ceil((MAX_SUMMARY_EVENTS - SUMMARY_PROBE_PAGE_SIZE) / SUMMARY_PAGE_SIZE),
+      );
+      expect(pages[0]?.limit).toBe(SUMMARY_PROBE_PAGE_SIZE);
+      expect(pages.every((page) => page.limit <= SUMMARY_PAGE_SIZE)).toBe(true);
+      expect(pages.reduce((total, page) => total + page.limit, 0)).toBe(MAX_SUMMARY_EVENTS);
       expect(stoppedSummary(h).eventCount).toBe(MAX_SUMMARY_EVENTS);
+      expect(stoppedSummary(h).coverage).toEqual({
+        storedEvents: stored,
+        summarizedEvents: MAX_SUMMARY_EVENTS,
+        producerDroppedEvents: 0,
+        drain: 'quiescent',
+        complete: false,
+      });
+      expect(findingRows(h)).toEqual([
+        `Capture evidence is incomplete. The summary covers the first ${counted(MAX_SUMMARY_EVENTS)} of ${counted(stored)} captured events; one summary covers at most ${counted(MAX_SUMMARY_EVENTS)} events.`,
+      ]);
       expect(h.telemetry.countByKind).toHaveBeenCalledTimes(1);
       if (completed.ok) {
         expect(completed.value.emptiness).toMatchObject({
@@ -1024,21 +1130,26 @@ describe('the bounded summary', () => {
   it('stops rich events at the byte ceiling long before the event ceiling', async () => {
     // Every interaction lies past the byte ceiling, which binds after a few
     // pages: only the exact per-kind counts find them.
-    const stored = 3_000;
+    const interactions = 1_000;
+    const stored = RICH_EVENTS_READ + SUMMARY_PAGE_SIZE + interactions;
     const h = harness({
       stored,
       storedCharsAt: () => RICH_EVENT_CHARS,
-      kindAt: (index) => (index >= 2_000 ? 'interaction' : 'fetch'),
+      kindAt: (index) => (index >= stored - interactions ? 'interaction' : 'fetch'),
       watermarks: [watermark(stored)],
     });
 
     const completed = await createCaptureStage(h.deps).complete(h.context);
 
     expect(completed.ok).toBe(true);
-    expect(RICH_EVENTS_READ).toBeLessThan(MAX_SUMMARY_EVENTS);
-    expect(pagesAsked(h)).toHaveLength(RICH_EVENTS_READ / SUMMARY_PAGE_SIZE);
-    // The ceiling is checked between pages: the walk passes it by less than one page.
-    expect(RICH_EVENTS_READ - RICH_EVENTS_TO_BUDGET).toBeLessThan(SUMMARY_PAGE_SIZE);
+    // The first page measures the rows' size; every later one asks for no
+    // more rows than one page's stored size holds, and the last for exactly
+    // the rows that reach the ceiling.
+    const pages = pagesAsked(h);
+    expect(pages[0]).toEqual({ limit: SUMMARY_PROBE_PAGE_SIZE, offset: 0 });
+    expect(pages.length).toBeGreaterThan(2);
+    expect(pages.slice(1).every((page) => page.limit <= RICH_ROWS_PER_PAGE)).toBe(true);
+    expect(pages.reduce((total, page) => total + page.limit, 0)).toBe(RICH_EVENTS_READ);
     expect(stoppedSummary(h).eventCount).toBe(RICH_EVENTS_READ);
     expect(stoppedSummary(h).coverage).toEqual({
       storedEvents: stored,
@@ -1052,12 +1163,12 @@ describe('the bounded summary', () => {
       expect(completed.value.emptiness).toMatchObject({
         empty: false,
         eventCount: stored,
-        interactionCount: 1_000,
+        interactionCount: interactions,
       });
       expect(completed.value.next).toBe('analyzing');
     }
     expect(findingRows(h)).toEqual([
-      `Capture evidence is incomplete. The summary covers the first 1,750 of 3,000 captured events; one summary covers at most 16 MiB of stored event data.`,
+      `Capture evidence is incomplete. The summary covers the first ${counted(RICH_EVENTS_READ)} of ${counted(stored)} captured events; ${BYTE_CEILING_TEXT}.`,
     ]);
     expect(
       h.records.some(
@@ -1073,11 +1184,13 @@ describe('the bounded summary', () => {
     // The preload's events lie past the byte ceiling: the capped summary shows
     // none, the exact per-kind counts do, and the unreachable preload's flush
     // therefore stays unconfirmed.
-    const stored = 2_000;
+    const preloadEvents = 100;
+    const stored = RICH_EVENTS_READ + SUMMARY_PAGE_SIZE;
     const h = harness({
       stored,
       storedCharsAt: () => RICH_EVENT_CHARS,
-      kindAt: (index) => (index >= 1_900 ? 'http.server' : index === 0 ? 'interaction' : 'fetch'),
+      kindAt: (index) =>
+        index >= stored - preloadEvents ? 'http.server' : index === 0 ? 'interaction' : 'fetch',
       watermarks: [watermark(stored)],
       disarm: { ...DISARMED, serverAgent: 'unreachable' },
     });
@@ -1092,19 +1205,25 @@ describe('the bounded summary', () => {
       complete: false,
     });
     expect(findingRows(h)).toEqual([
-      'Capture evidence is incomplete. The summary covers the first 1,750 of 2,000 captured events; one summary covers at most 16 MiB of stored event data. Whether every event in flight when the capture stopped arrived could not be confirmed.',
+      `Capture evidence is incomplete. The summary covers the first ${counted(RICH_EVENTS_READ)} of ${counted(stored)} captured events; ${BYTE_CEILING_TEXT}. Whether every event in flight when the capture stopped arrived could not be confirmed.`,
     ]);
   });
 
   it('reports a walk that stopped at a ceiling exactly where the capture ended as complete', async () => {
-    const h = harness({ stored: MAX_SUMMARY_EVENTS, watermarks: [watermark(MAX_SUMMARY_EVENTS)] });
+    // The last full page both ends the capture and reaches the byte ceiling:
+    // the exact count proves nothing lies beyond it.
+    const h = harness({
+      stored: RICH_EVENTS_READ,
+      storedCharsAt: () => RICH_EVENT_CHARS,
+      watermarks: [watermark(RICH_EVENTS_READ)],
+    });
 
     await createCaptureStage(h.deps).complete(h.context);
 
     expect(h.telemetry.countByKind).toHaveBeenCalledTimes(1);
     expect(stoppedSummary(h).coverage).toEqual({
-      storedEvents: MAX_SUMMARY_EVENTS,
-      summarizedEvents: MAX_SUMMARY_EVENTS,
+      storedEvents: RICH_EVENTS_READ,
+      summarizedEvents: RICH_EVENTS_READ,
       producerDroppedEvents: 0,
       drain: 'quiescent',
       complete: true,
@@ -1113,10 +1232,12 @@ describe('the bounded summary', () => {
   });
 
   it('falls back to the summary counts when the exact count of a capped capture fails', async () => {
+    const stored = RICH_EVENTS_READ + 3;
     const h = harness({
-      stored: MAX_SUMMARY_EVENTS + 3,
-      kindAt: (index) => (index >= MAX_SUMMARY_EVENTS ? 'interaction' : 'fetch'),
-      watermarks: [watermark(MAX_SUMMARY_EVENTS + 3)],
+      stored,
+      storedCharsAt: () => RICH_EVENT_CHARS,
+      kindAt: (index) => (index >= RICH_EVENTS_READ ? 'interaction' : 'fetch'),
+      watermarks: [watermark(stored)],
       countByKindFails: true,
     });
 
@@ -1127,26 +1248,26 @@ describe('the bounded summary', () => {
       expect(completed.value.emptiness).toMatchObject({
         empty: true,
         reason: 'no-interaction',
-        eventCount: MAX_SUMMARY_EVENTS,
+        eventCount: RICH_EVENTS_READ,
       });
       expect(completed.value.next).toBe('ready');
     }
     // The capture's size is unknown past the rows read, and the summary is
     // still not whole: the coverage says so rather than claiming it covers all.
     expect(stoppedSummary(h).coverage).toMatchObject({
-      storedEvents: MAX_SUMMARY_EVENTS,
-      summarizedEvents: MAX_SUMMARY_EVENTS,
+      storedEvents: RICH_EVENTS_READ,
+      summarizedEvents: RICH_EVENTS_READ,
       complete: false,
     });
     expect(findingRows(h)).toEqual([
-      'Capture evidence is incomplete. The summary covers the first 10,000 captured events; the capture may hold more, and one summary covers at most 10,000 events.',
+      `Capture evidence is incomplete. The summary covers the first ${counted(RICH_EVENTS_READ)} captured events; the capture may hold more, and ${BYTE_CEILING_TEXT}.`,
     ]);
     expect(
       h.records.some(
         (record) =>
           record.level === 'warn' &&
           record.fields['code'] === 'STORE_ERROR' &&
-          record.fields['ceiling'] === 'events',
+          record.fields['ceiling'] === 'bytes',
       ),
     ).toBe(true);
   });
@@ -1264,6 +1385,210 @@ describe('the empty-capture rule', () => {
     expect(classifyCaptureEmptiness(countsOf({}), unclassified)).toMatchObject({
       empty: true,
       reason: 'no-events',
+    });
+  });
+
+  describe('the category matrix of an interaction question', () => {
+    /**
+     * A classified understanding of the given category that lists the
+     * interaction signal among the signals it needs, as the rules-based
+     * provider does for any selected element.
+     */
+    function interactionQuestionOf(
+      category: ProblemUnderstanding['category'],
+    ): ProblemUnderstanding {
+      return problemUnderstandingSchema.parse({
+        ...INTERACTION_QUESTION,
+        category,
+        signalsNeeded: ['interactions', 'react', 'fetch'],
+      });
+    }
+
+    /** Counts holding `count` events of each telemetry kind a capture signal produces. */
+    function signalCounts(
+      signal: CaptureSignal,
+      count: number,
+    ): Partial<Record<TelemetryKind, number>> {
+      return Object.fromEntries(telemetryKindsForSignal(signal).map((kind) => [kind, count]));
+    }
+
+    it('names the passive evidence of rendering and network questions only, by signal', () => {
+      expect(PASSIVE_EVIDENCE_SIGNALS).toEqual({ rendering: 'react', network: 'fetch' });
+      expect(Object.isFrozen(PASSIVE_EVIDENCE_SIGNALS)).toBe(true);
+      for (const [category, signal] of Object.entries(PASSIVE_EVIDENCE_SIGNALS)) {
+        expect(PROBLEM_CATEGORIES).toContain(category);
+        expect(isCaptureSignal(signal)).toBe(true);
+      }
+    });
+
+    it('keeps the unclassified exemption for an idle capture of background renders', () => {
+      const unclassified = interactionQuestionOf('other');
+      expect(unclassified.category).toBe('other');
+      expect(
+        classifyCaptureEmptiness(countsOf(signalCounts('react', 3_920)), unclassified),
+      ).toMatchObject({ empty: false, interactionCount: 0, interactionRequired: false });
+    });
+
+    it('empties a performance question whose idle capture holds only background renders', () => {
+      // The slow-button question of OBS-F10, once classified: 3 920 renders of
+      // a ticker nobody touched are not a reproduction of the click.
+      const performance = interactionQuestionOf('performance');
+      const renders = countsOf({ ...signalCounts('react', 1_960), ...signalCounts('perf', 6) });
+
+      expect(understandingNeedsInteraction(performance)).toBe(true);
+      expect(
+        classifyCaptureEmptiness(renders, performance, { agentHooks: INTERACTION_HOOKS }),
+      ).toEqual({
+        empty: true,
+        reason: 'no-interaction',
+        message: CAPTURE_EMPTY_MESSAGE,
+        eventCount: renders.eventCount,
+        interactionCount: 0,
+        interactionRequired: true,
+        interactionHookArmed: true,
+      });
+      // Its requests are not passive evidence for it either.
+      expect(
+        classifyCaptureEmptiness(countsOf(signalCounts('fetch', 5)), performance),
+      ).toMatchObject({ empty: true, reason: 'no-interaction' });
+    });
+
+    it('analyses a rendering question whose idle capture holds renders or commits', () => {
+      const rendering = interactionQuestionOf('rendering');
+      expect(understandingNeedsInteraction(rendering)).toBe(true);
+
+      for (const kind of telemetryKindsForSignal('react')) {
+        expect(
+          classifyCaptureEmptiness(countsOf({ [kind]: 40 }), rendering, {
+            agentHooks: INTERACTION_HOOKS,
+          }),
+        ).toEqual({
+          empty: false,
+          eventCount: 40,
+          interactionCount: 0,
+          interactionRequired: false,
+          interactionHookArmed: true,
+        });
+      }
+    });
+
+    it('empties a rendering question whose idle capture holds no render, only requests', () => {
+      expect(
+        classifyCaptureEmptiness(
+          countsOf(signalCounts('fetch', 7)),
+          interactionQuestionOf('rendering'),
+        ),
+      ).toMatchObject({
+        empty: true,
+        reason: 'no-interaction',
+        interactionCount: 0,
+        interactionRequired: true,
+      });
+    });
+
+    it('analyses a network question whose idle capture holds requests of any browser kind', () => {
+      const network = interactionQuestionOf('network');
+
+      for (const kind of telemetryKindsForSignal('fetch')) {
+        expect(classifyCaptureEmptiness(countsOf({ [kind]: 2 }), network)).toMatchObject({
+          empty: false,
+          interactionCount: 0,
+          interactionRequired: false,
+        });
+      }
+      // Renders are not a network question's evidence.
+      expect(classifyCaptureEmptiness(countsOf(signalCounts('react', 30)), network)).toMatchObject({
+        empty: true,
+        reason: 'no-interaction',
+        interactionRequired: true,
+      });
+    });
+
+    it('keeps the interaction condition for every category without passive evidence', () => {
+      const everything = countsOf({
+        ...signalCounts('react', 3),
+        ...signalCounts('fetch', 3),
+        ...signalCounts('perf', 3),
+        ...signalCounts('http', 3),
+      });
+      const passive: readonly string[] = Object.keys(PASSIVE_EVIDENCE_SIGNALS);
+
+      for (const category of PROBLEM_CATEGORIES) {
+        const question = interactionQuestionOf(category);
+        const emptiness = classifyCaptureEmptiness(everything, question);
+        if (category === 'other' || passive.includes(category)) {
+          expect(emptiness, category).toMatchObject({ empty: false });
+        } else {
+          expect(emptiness, category).toMatchObject({ empty: true, reason: 'no-interaction' });
+        }
+        // A recorded interaction always makes evidence of an interaction question.
+        expect(
+          classifyCaptureEmptiness(
+            countsOf({ ...signalCounts('react', 3), interaction: 1 }),
+            question,
+          ),
+          category,
+        ).toMatchObject({ empty: false });
+      }
+    });
+
+    it('calls a capture with no event empty whatever the category', () => {
+      for (const category of PROBLEM_CATEGORIES) {
+        expect(
+          classifyCaptureEmptiness(countsOf({}), interactionQuestionOf(category)),
+          category,
+        ).toMatchObject({ empty: true, reason: 'no-events', message: CAPTURE_EMPTY_MESSAGE });
+      }
+    });
+
+    it('sends a performance question captured over background renders back to ready with the empty-capture sentence', async () => {
+      const h = harness({
+        stored: 12,
+        agentHooks: INTERACTION_HOOKS,
+        understanding: interactionQuestionOf('performance'),
+        kindAt: () => 'render',
+      });
+
+      const completed = await createCaptureStage(h.deps).complete(h.context);
+
+      expect(completed.ok).toBe(true);
+      if (completed.ok) {
+        expect(completed.value.emptiness).toMatchObject({
+          empty: true,
+          reason: 'no-interaction',
+          eventCount: 12,
+        });
+        expect(completed.value.next).toBe('ready');
+      }
+      expect(h.stops.map((stop) => stop.next)).toEqual(['ready']);
+      expect(h.progress).toEqual([
+        { method: 'stageCompleted', stage: 'capture', message: CAPTURE_EMPTY_MESSAGE },
+      ]);
+    });
+
+    it('sends a rendering question captured over background renders on to analysis', async () => {
+      const h = harness({
+        stored: 12,
+        agentHooks: INTERACTION_HOOKS,
+        understanding: interactionQuestionOf('rendering'),
+        kindAt: (index) => (index % 3 === 0 ? 'commit' : 'render'),
+      });
+
+      const completed = await createCaptureStage(h.deps).complete(h.context);
+
+      expect(completed.ok).toBe(true);
+      if (completed.ok) {
+        expect(completed.value.emptiness).toMatchObject({
+          empty: false,
+          interactionCount: 0,
+          interactionRequired: false,
+        });
+        expect(completed.value.next).toBe('analyzing');
+      }
+      expect(h.stops.map((stop) => stop.next)).toEqual(['analyzing']);
+      expect(h.progress).toEqual([
+        { method: 'stageCompleted', stage: 'capture', message: undefined },
+      ]);
     });
   });
 
@@ -1578,22 +1903,27 @@ describe('coverage', () => {
   });
 
   it('reports a capped summary as covering part of the capture, adding coverage and nothing else', async () => {
-    const stored = MAX_SUMMARY_EVENTS + 7;
-    const h = harness({ stored, kindAt: () => 'interaction', watermarks: [watermark(stored)] });
+    const stored = RICH_EVENTS_READ + 7;
+    const h = harness({
+      stored,
+      storedCharsAt: () => RICH_EVENT_CHARS,
+      kindAt: () => 'interaction',
+      watermarks: [watermark(stored)],
+    });
 
     await createCaptureStage(h.deps).complete(h.context);
 
     const summary = stoppedSummary(h);
     expect(summary.coverage).toEqual({
       storedEvents: stored,
-      summarizedEvents: MAX_SUMMARY_EVENTS,
+      summarizedEvents: RICH_EVENTS_READ,
       producerDroppedEvents: 0,
       drain: 'quiescent',
       complete: false,
     });
     // The coverage is the only addition: every other field — `truncated`
     // included — is exactly the upstream summary of the events read.
-    const events = Array.from({ length: MAX_SUMMARY_EVENTS }, (_, index) =>
+    const events = Array.from({ length: RICH_EVENTS_READ }, (_, index) =>
       eventAt(index, 'interaction'),
     );
     expect(summary).toEqual({
@@ -1601,7 +1931,7 @@ describe('coverage', () => {
       coverage: summary.coverage,
     });
     expect(findings(h)).toEqual([
-      'Capture evidence is incomplete. The summary covers the first 10,000 of 10,007 captured events; one summary covers at most 10,000 events.',
+      `Capture evidence is incomplete. The summary covers the first ${counted(RICH_EVENTS_READ)} of ${counted(stored)} captured events; ${BYTE_CEILING_TEXT}.`,
     ]);
   });
 

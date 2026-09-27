@@ -2083,10 +2083,10 @@ describe('skip paths', () => {
       }),
     ]);
 
-    // Explained once, at `debug`: an unresolvable frame is normal operation,
-    // and anything louder would fill a session's log with the design working.
-    expect(recording.records.some((record) => record.level === 'debug')).toBe(true);
-    expect(recording.records.every((record) => record.level === 'debug')).toBe(true);
+    // Explained once, at `trace`: a dependency frame is the design working —
+    // every resolved stack carries several — so it stays out of the debug log.
+    expect(recording.records.some((record) => record.level === 'trace')).toBe(true);
+    expect(recording.records.every((record) => record.level === 'trace')).toBe(true);
   });
 
   it('skips every frame of a chunk that carries no directive, after one request', async () => {

@@ -31,8 +31,12 @@ import type {
   ToolCallsResponse,
 } from '@debuggen/model-provider';
 import type { PanelSpec } from '@debuggen/panel-schema';
-import { ANALYSIS_VERSION_START, createAnalysisResult } from '@debuggen/protocol';
-import type { AnalysisResult } from '@debuggen/protocol';
+import {
+  ANALYSIS_VERSION_START,
+  createAnalysisResult,
+  parseSessionRecord,
+} from '@debuggen/protocol';
+import type { AnalysisResult, SessionRecord } from '@debuggen/protocol';
 import {
   DebuggenError,
   ID_PREFIXES,
@@ -54,7 +58,9 @@ import {
   PANEL_PROMPT_STAGE,
   buildPanelStageContext,
   createPanelGenerator,
+  panelFramingOf,
   type PanelGenerator,
+  type PanelSessionPort,
   type PanelStorePort,
 } from './generate.js';
 import { createPanelValidator } from './validate.js';
@@ -181,6 +187,61 @@ function sensitiveQuestions(): readonly SensitiveQuestion[] {
   ];
 }
 
+/** The selected element's owner chain, nearest first: invented, generic component names. */
+const TARGET_CHAIN: readonly string[] = ['TallyTile', 'TallyBoard'];
+
+/** Page text on the selected element: it must never reach the panel's structured context. */
+const TARGET_TEXT = `Tile ${PLANTED}`;
+
+/**
+ * A stored session whose understanding settled on `category` and whose
+ * developer selected an element, validated by the protocol's own schema.
+ */
+function sessionRecordWith(category: string): SessionRecord {
+  const parsed = parseSessionRecord({
+    id: SESSION,
+    projectRoot: '/work/sample-project',
+    projectName: 'sample-project',
+    devServerUrl: 'http://127.0.0.1:3000/',
+    createdAt: BASE_TIME,
+    updatedAt: BASE_TIME,
+    status: 'analyzing',
+    question: PLAIN_QUESTION,
+    followUps: [],
+    target: {
+      selector: 'main .tile',
+      tagName: 'div',
+      text: TARGET_TEXT,
+      componentChain: [...TARGET_CHAIN],
+      url: `http://127.0.0.1:3000/items?page=${PLANTED}`,
+    },
+    understanding: {
+      category,
+      signalsNeeded: ['react', 'componentTree', 'state'],
+      entities: [{ kind: 'component', name: 'TallyTile' }],
+      searchHints: ['TallyTile'],
+    },
+    relevantFiles: [],
+    plans: [],
+    modifications: [],
+    captures: [],
+    panelIds: [],
+    analyses: [],
+    cleanup: { status: 'pending', conflicts: [] },
+    promptVersions: {},
+    provider: { id: 'deterministic' },
+  });
+  if (!parsed.ok) {
+    throw parsed.error;
+  }
+  return parsed.value;
+}
+
+/** A session port answering every read with `record`. */
+function sessionsHolding(record: SessionRecord | undefined): PanelSessionPort {
+  return { get: () => ok(record) };
+}
+
 /* -------------------------------------------------------------------------------------------------
  * Doubles and the harness
  * ---------------------------------------------------------------------------------------------- */
@@ -237,7 +298,7 @@ interface Harness {
   readonly sideEffects: string[];
 }
 
-function harness(latest: PanelSpec | undefined): Harness {
+function harness(latest: PanelSpec | undefined, sessions?: PanelSessionPort): Harness {
   const provider = new RecordingProvider();
   const records: LogRecord[] = [];
   const sideEffects: string[] = [];
@@ -260,6 +321,7 @@ function harness(latest: PanelSpec | undefined): Harness {
       },
     },
     panels,
+    sessions,
     logger: createConsoleLogger({ level: 'trace', sink: (record) => records.push(record) }),
     newId: () => PANEL_ID,
   });
@@ -385,4 +447,112 @@ describe('the generate-panel request', () => {
       }
     },
   );
+});
+
+describe('the panel framing: what the session settled, as structured data only', () => {
+  it('reads the understanding’s category and signals and the target’s chain and tag, nothing else', () => {
+    const framing = panelFramingOf(sessionRecordWith('rendering'));
+    expect(framing).toEqual({
+      category: 'rendering',
+      signalsNeeded: ['react', 'componentTree', 'state'],
+      componentChain: [...TARGET_CHAIN],
+      tagName: 'div',
+    });
+    // The target's text, selector and URL carry page content and stay behind.
+    expect(JSON.stringify(framing)).not.toContain(PLANTED);
+    expect(panelFramingOf(undefined)).toEqual({});
+  });
+
+  it('adds the framing to the structured input and to no rendered text', () => {
+    const framed = buildPanelStageContext(
+      ANALYSIS,
+      SUMMARY,
+      panelFramingOf(sessionRecordWith('network')),
+    );
+    const bare = buildPanelStageContext(ANALYSIS, SUMMARY);
+
+    expect(framed.input['understanding']).toEqual({
+      category: 'network',
+      signalsNeeded: ['react', 'componentTree', 'state'],
+    });
+    expect(framed.input['target']).toEqual({ componentChain: [...TARGET_CHAIN], tagName: 'div' });
+    expect(Object.hasOwn(bare.input, 'understanding')).toBe(false);
+    expect(Object.hasOwn(bare.input, 'target')).toBe(false);
+    // The rendered sections are those of the unframed context, byte for byte.
+    expect(framed.analysisText).toBe(bare.analysisText);
+    expect(framed.captureOverviewText).toBe(bare.captureOverviewText);
+  });
+
+  it('frames the request the generator sends with the session it answers, on both paths', async () => {
+    const created = harness(undefined, sessionsHolding(sessionRecordWith('rendering')));
+    const first = sentRequest(
+      created,
+      await created.generator.generate({
+        sessionId: SESSION,
+        captureId: CAPTURE,
+        question: PLAIN_QUESTION,
+        analysis: ANALYSIS,
+        summary: SUMMARY,
+      }),
+    );
+    const followed = harness(
+      await previousPanel(),
+      sessionsHolding(sessionRecordWith('rendering')),
+    );
+    const followUp = sentRequest(
+      followed,
+      await followed.generator.regenerate({
+        sessionId: SESSION,
+        captureId: CAPTURE,
+        question: PLAIN_QUESTION,
+        followUpQuestion: 'Which tile renders most?',
+        analysis: ANALYSIS,
+        summary: SUMMARY,
+      }),
+    );
+
+    for (const request of [first, followUp]) {
+      expect(request.input).toMatchObject({
+        understanding: { category: 'rendering' },
+        target: { componentChain: [...TARGET_CHAIN] },
+      });
+      expect(request.prompt).not.toContain('componentChain');
+      expect(JSON.stringify(request.input)).not.toContain(PLANTED);
+    }
+  });
+
+  it('composes from the capture alone when the session is absent or cannot be read', async () => {
+    const failing: PanelSessionPort = {
+      get: () => err(new DebuggenError('STORE_ERROR', 'The store double is closed.')),
+    };
+    const throwing: PanelSessionPort = {
+      get: () => {
+        throw new Error('The store double threw.');
+      },
+    };
+    for (const [sessions, warns] of [
+      [undefined, false],
+      [sessionsHolding(undefined), false],
+      [failing, true],
+      [throwing, true],
+    ] as const) {
+      const fixture = harness(undefined, sessions);
+      const request = sentRequest(
+        fixture,
+        await fixture.generator.generate({
+          sessionId: SESSION,
+          captureId: CAPTURE,
+          question: PLAIN_QUESTION,
+          analysis: ANALYSIS,
+          summary: SUMMARY,
+        }),
+      );
+      expect(Object.hasOwn(request.input, 'understanding')).toBe(false);
+      expect(Object.hasOwn(request.input, 'target')).toBe(false);
+      const warnings = fixture.records.filter(
+        (record) => record.level === 'warn' && record.message.includes('could not be read'),
+      );
+      expect(warnings).toHaveLength(warns ? 1 : 0);
+    }
+  });
 });

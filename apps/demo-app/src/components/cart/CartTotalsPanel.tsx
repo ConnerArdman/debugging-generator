@@ -9,18 +9,17 @@
  * units in the cart, the merchandise subtotal, one row per charge the placing surface knows about,
  * the closing figure those charges add up to, and the dispatch line carrying the warehouse's
  * cut-off - because a shopper who opens the drawer and then the page must not be quoted two
- * different carts. Two statements are not printed everywhere: the store's free-freight offer,
- * which belongs to a surface quoting a cart rather than one quoting an order, and an arrival
- * estimate, which belongs to a surface quoting an order rather than one quoting a cart; the last
- * two of the decisions below say why.
+ * different carts. Freight is stated only where an order is being quoted: a surface quoting a cart
+ * names no freight figure and no freight allowance, and says instead that freight and delivery
+ * time are quoted at checkout; the last two of the decisions below say why.
  *
  * IT PRINTS NO FIGURE UNTIL THERE IS A CART BEHIND ONE
  * `@/hooks/useCartSummary` publishes either the cart's totals or the reason it has none, and this
  * block renders whichever of the two it is handed. Where the contents are not established - the
  * first read still in flight, or a read that came back a failure - the rows are not rendered at
- * all: a zero in the units row, a subtotal of nothing and an offer read against a threshold would
- * each be a claim about a cart the storefront never saw, and the charge rows and closing figure
- * would be a total assembled on a subtotal nobody read. What is printed instead is the state, in
+ * all: a zero in the units row and a subtotal of nothing would each be a claim about a cart the
+ * storefront never saw, and the charge rows and closing figure would be a total assembled on a
+ * subtotal nobody read. What is printed instead is the state, in
  * words, with placeholder bars holding the rows' space while a read is still in flight; the block
  * keeps its heading, its surface and the dispatch line either way, so the column it sits in
  * neither collapses nor jumps when the figures arrive. The notice a buyer can act on, and the
@@ -29,14 +28,14 @@
  *
  * AND IT PRINTS NONE FOR A CART THAT HOLDS NOTHING
  * The same holds one step further on, where the contents *were* established and there are none:
- * "Items 0", a subtotal of nothing and the free-freight offer measured against an empty cart are
- * three figures about an order nobody is placing. So a cart-quoting surface prints the state in
- * words there too, and keeps only the dispatch line beside it. This is the answer the
- * cart drawer already gives by dropping its footer - totals and both destinations together - for
- * the same state, and one cart must not be answered two ways by the two surfaces quoting it; on
- * the cart's own page the row of actions withholds checkout for exactly the same reading. A
- * surface quoting an order's charges is the exception: it has rows of its own and its own reading
- * of an empty cart, so the figures there stay as that caller assembled them.
+ * "Items 0" and a subtotal of nothing are two figures about an order nobody is placing. So a
+ * cart-quoting surface prints the state in words there too, and keeps only the dispatch line
+ * beside it. This is the answer the cart drawer already gives by dropping its footer - totals and
+ * both destinations together - for the same state, and one cart must not be answered two ways by
+ * the two surfaces quoting it; on the cart's own page the row of actions withholds checkout for
+ * exactly the same reading. A surface quoting an order's charges is the exception: it has rows of
+ * its own and its own reading of an empty cart, so the figures there stay as that caller
+ * assembled them.
  *
  * A failure that arrives *after* a cart has been read is the other case, and it keeps its figures:
  * the provider leaves the contents it last published in place when it refuses a change, so the
@@ -45,15 +44,14 @@
  *
  * EVERY FIGURE ARRIVES ALREADY DERIVED
  * `@/hooks/useCartSummary` is the one place the cart's totals are worked out, and this component
- * reads its `CartSummary` and prints it. Nothing here multiplies, compares against a threshold or
- * divides cents: `freeFreightRemainingCents`, `freeFreightThresholdCents` and
- * `qualifiesForFreeFreight` are read as published, so the free-freight sentence can never
- * disagree with the state the badge beside it shows. The one piece of arithmetic in the file is
- * the closing row, which adds the charges a caller passed to the merchandise subtotal in integer
- * cents - a total of figures its caller derived, never a figure derived here. Money goes through
- * `../ui/Price`, which takes integer cents and is the application's only monetary formatter, and
- * the two bare counts go through `formatQuantityLabel`. There is deliberately no `Intl` instance
- * in this file.
+ * reads its `CartSummary` and prints it. Nothing here multiplies, compares or divides cents:
+ * `subtotalCents`, `unitCountLabel` and `lineCount` are read as published, so no figure on screen
+ * can disagree with the one the header badge and the checkout summary print for the same cart.
+ * The one piece of arithmetic in the file is the closing row, which adds the charges a caller
+ * passed to the merchandise subtotal in integer cents - a total of figures its caller derived,
+ * never a figure derived here. Money goes through `../ui/Price`, which takes integer cents and is
+ * the application's only monetary formatter, and the two bare counts go through
+ * `formatQuantityLabel`. There is deliberately no `Intl` instance in this file.
  *
  * THE PROP IS AN OVERRIDE, NOT AN ALTERNATIVE
  * The hook is called unconditionally and a `summary` prop, when one is given, replaces its result.
@@ -67,9 +65,9 @@
  * before its first reading - so the markup the server produced and the first markup the browser
  * renders always agree and the cart raises no hydration warning. Before that first reading the
  * dispatch line simply carries no countdown - a surface quoting charges prints the delivery
- * estimate its caller supplied, and a surface quoting a cart prints that delivery time is quoted
- * at checkout - which is why nothing here suppresses a hydration warning either. The countdown is
- * folded down to whole minutes as well, so the sentence changes at most once a minute.
+ * estimate its caller supplied, and a surface quoting a cart prints that freight and delivery time
+ * are quoted at checkout - which is why nothing here suppresses a hydration warning either. The
+ * countdown is folded down to whole minutes as well, so the sentence changes at most once a minute.
  *
  * MARKUP AND APPEARANCE
  * The rows are label-and-value pairs, so they are a `<dl>` with a `<div>` group per row, exactly
@@ -78,9 +76,9 @@
  * padding rhythm and optional head slot belong to `../ui/Card`, which this component renders
  * inside and to which a caller's `className` is passed, because a caller's class is placement -
  * the cart drawer's footer and the checkout column both use it that way. Every length, colour and
- * type size lives in `./CartTotalsPanel.module.css`, whose eleven classes are all used below;
- * there is no `style` prop. Variants are `data-variant` and the free-freight state is `data-qualifies`,
- * both read by attribute selectors in that file rather than by looking a class name up.
+ * type size lives in `./CartTotalsPanel.module.css`, whose ten classes are all used below; there
+ * is no `style` prop. Variants are `data-variant`, read by attribute selectors in that file rather
+ * than by looking a class name up.
  *
  * The presentation decisions worth recording, because each looks arbitrary otherwise:
  *
@@ -100,33 +98,33 @@
  *     "Estimated total" while any of them is still to be confirmed. Nothing is ever invented to
  *     fill a row: a charge whose amount is not yet established says so in words, because a zero or
  *     a dash in a money column reads as a figure somebody computed.
- *   - THE FREE-FREIGHT OFFER IS A STATEMENT ABOUT A CART, SO IT IS PRINTED ONLY WHERE A CART IS
- *     BEING QUOTED. It is measured against the merchandise subtotal, and the checkout request
- *     charges the freight it quotes whatever that subtotal is - it applies no allowance. On a
- *     surface quoting charges, therefore, every reading of the offer would be a claim about this
- *     order's freight that no server stands behind: "ships at no freight charge" contradicts the
- *     freight row above it, and "add $120.00 more for free freight" promises a reduction the order
- *     will not receive. So the line is printed on the merchandise-only surfaces, where nothing
- *     contradicts it and no order total is asserted, and omitted where charges are quoted - there,
- *     what is true of freight is the freight row and the caption the placing surface prints under
- *     these figures.
+ *   - FREIGHT IS A STATEMENT ABOUT AN ORDER, SO A SURFACE QUOTING A CART STATES NONE. What an
+ *     order is charged for carriage is the carrier's quote for the destination and the service a
+ *     buyer chooses at checkout, and the checkout request charges exactly that quote whatever the
+ *     merchandise subtotal comes to - no allowance, threshold or discount on freight is applied
+ *     anywhere. A cart has neither a destination nor a service, so any freight figure or freight
+ *     promise printed beside it would be a claim no server stands behind: a line in the drawer
+ *     promising carriage at no charge is contradicted by the freight the order is charged. So the
+ *     merchandise-only surfaces name no freight figure and no allowance, and their dispatch line
+ *     says that freight is quoted at checkout; where charges are quoted, what is true of freight
+ *     is the freight row the caller passes and the caption the placing surface prints under these
+ *     figures.
  *   - AN ARRIVAL ESTIMATE IS A STATEMENT ABOUT A SHIPPING SERVICE, SO IT IS PRINTED ONLY WHERE
  *     CHARGES ARE QUOTED. How long an order takes to arrive depends on the service that carries it
  *     and the destination it is carried to, and a cart has neither: the transit figure its own
  *     reading carries belongs to no service a buyer can choose, and the services quoted for one
  *     destination differ by days. Printed on a surface quoting a cart, that figure contradicts the
  *     service the buyer goes on to pick - "Arrives in 2 days" in the drawer beside a chosen
- *     seven-day freight service. So the merchandise-only surfaces say that the delivery time is
- *     quoted at checkout, and the surface quoting charges prints the estimate its caller supplies
- *     through `summary` for the service those charges are quoted for. The dispatch cut-off is
- *     printed on every surface in both readings: it is when the warehouse ships, which no choice
- *     of service changes.
+ *     seven-day freight service. So the merchandise-only surfaces say that freight and delivery
+ *     time are quoted at checkout, and the surface quoting charges prints the estimate its caller
+ *     supplies through `summary` for the service those charges are quoted for. The dispatch
+ *     cut-off is printed on every surface in both readings: it is when the warehouse ships, which
+ *     no choice of service changes.
  */
 
 import clsx from 'clsx';
 import type { ReactElement, ReactNode } from 'react';
 
-import { Badge } from '@/components/ui/Badge';
 import { Card } from '@/components/ui/Card';
 import { Price } from '@/components/ui/Price';
 import { Skeleton } from '@/components/ui/Skeleton';
@@ -187,22 +185,16 @@ const PENDING_CHARGE_NOTE = 'Confirmed on the order';
 const DELIVERY_READING = 'Delivery estimate:';
 
 /**
- * Opens the dispatch line on a surface quoting a cart, in place of an arrival estimate.
+ * Opens the dispatch line on a surface quoting a cart, in place of a freight figure and an arrival
+ * estimate.
  *
- * A cart has no destination and no shipping service, so no arrival it could state would hold for
- * the service a buyer goes on to choose; this says where that estimate is given instead. It names
+ * A cart has no destination and no shipping service, so no freight charge and no arrival it could
+ * state would hold for the service a buyer goes on to choose: checkout charges the carrier's quote
+ * for that service and destination, whatever the merchandise comes to. This says where both are
+ * given instead, and it is the only thing a cart-quoting surface says about freight. It names
  * itself, so unlike {@link DELIVERY_READING} it carries no hidden prefix.
  */
-const DELIVERY_QUOTED_NOTE = 'Delivery time quoted at checkout';
-
-/** The qualifying state, as the label that carries it rather than as a colour alone. */
-const FREE_FREIGHT_BADGE = 'Free freight';
-
-/**
- * Confirms the qualifying state in words beside that label, on the surfaces that print it: see the
- * header for why the whole free-freight line belongs to a surface quoting merchandise only.
- */
-const FREIGHT_EARNED_NOTE = 'This order ships at no freight charge.';
+const DELIVERY_QUOTED_NOTE = 'Freight and delivery time quoted at checkout';
 
 /** Introduces the line count under the units row; see {@link PRODUCT_NOUN}. */
 const ACROSS_PREFIX = 'Across';
@@ -214,10 +206,9 @@ const PRODUCT_NOUN_PLURAL = 'products';
 /**
  * What the block says in place of its figures while the cart is still being read.
  *
- * A cart nobody has read yet has no units, no subtotal and no free-freight standing, and a zero
- * printed for any of them would read as a figure somebody established. So the rows are not
- * rendered at all and this sentence stands where they would be, alongside the placeholder bars
- * that hold their space.
+ * A cart nobody has read yet has no units and no subtotal, and a zero printed for either of them
+ * would read as a figure somebody established. So the rows are not rendered at all and this
+ * sentence stands where they would be, alongside the placeholder bars that hold their space.
  */
 const CART_PENDING_NOTE = 'Your cart is being read. Its totals appear here once it has been.';
 
@@ -236,11 +227,11 @@ const CART_UNAVAILABLE_NOTE =
 /**
  * What it says for a cart that was read and holds nothing.
  *
- * A cart with no lines has no units to count, nothing to subtotal and no standing against the
- * free-freight threshold, so those rows are not printed for it either: "Items 0", "$0.00" and the
- * offer read against an empty cart are three figures about an order nobody is placing, and the
- * slide-over quoting this same cart prints none of them - it drops its whole footer. So this
- * surface says what the state is, in one sentence, and points at the thing that would change it.
+ * A cart with no lines has no units to count and nothing to subtotal, so those rows are not
+ * printed for it either: "Items 0" and "$0.00" are two figures about an order nobody is placing,
+ * and the slide-over quoting this same cart prints neither of them - it drops its whole footer. So
+ * this surface says what the state is, in one sentence, and points at the thing that would change
+ * it.
  */
 const CART_EMPTY_NOTE = 'Your cart is empty. Its totals appear here once you add a product.';
 
@@ -360,9 +351,10 @@ interface Props {
    *
    * Omitted - the cart drawer and the `/cart` page, neither of which knows a destination or a
    * service - the block prints the merchandise subtotal as its single, closing money row, asserts
-   * no order total and states no arrival estimate. Given, each entry prints a row and the closing
-   * row becomes their sum over that subtotal: see {@link CartCharge} for what an unestablished
-   * amount means, and the header for why the two arrangements are labelled differently.
+   * no order total and states no freight figure or arrival estimate. Given, each entry prints a
+   * row and the closing row becomes their sum over that subtotal: see {@link CartCharge} for what
+   * an unestablished amount means, and the header for why the two arrangements are labelled
+   * differently.
    *
    * A caller that quotes charges also supplies, through `summary`, the delivery estimate for the
    * service those charges are quoted for: the dispatch line prints `estimatedDeliveryLabel` only
@@ -398,7 +390,8 @@ interface Props {
  * Renders the cart's totals.
  *
  * @example The drawer's footer and the `/cart` page's summary column: merchandise only, so the
- * subtotal is the closing figure, no order total is claimed and delivery time is left to checkout.
+ * subtotal is the closing figure, no order total is claimed, and freight and delivery time are
+ * left to checkout.
  * ```tsx
  * <CartTotalsPanel variant="drawer" />
  * <CartTotalsPanel variant="page" className={styles.totals} />
@@ -462,10 +455,10 @@ export function CartTotalsPanel({
    *
    * It has two readings, and `hasCharges` chooses between them. A surface quoting charges opens it
    * with the delivery estimate its `summary` carries, which that caller states for the service the
-   * charges are quoted for. A surface quoting a cart has no service to state an arrival for, so it
-   * opens it with {@link DELIVERY_QUOTED_NOTE} instead; see the header. Both close with the
-   * dispatch provider's cut-off, which is the warehouse's and holds whatever service carries the
-   * order.
+   * charges are quoted for. A surface quoting a cart has no service to state a freight charge or an
+   * arrival for, so it opens it with {@link DELIVERY_QUOTED_NOTE} instead; see the header. Both
+   * close with the dispatch provider's cut-off, which is the warehouse's and holds whatever service
+   * carries the order.
    *
    * The space after the hidden prefix is load-bearing: without it the accessible reading runs the
    * two together, and the clipped span is out of flow, so the character collapses away as leading
@@ -490,10 +483,10 @@ export function CartTotalsPanel({
    * `@/hooks/useCartSummary` publishes either the cart's totals or the reason it has none, and
    * this is the second of those: the first read is still in flight, or it came back a failure, so
    * what the cart holds was never established. Every row below this point would be an invention -
-   * "0 items", a subtotal of nothing, and an offer read against a threshold, which together would
-   * tell a buyer their cart is empty when the truth is that the storefront cannot see it. The
-   * charge rows and the closing figure are equally impossible, because a total assembled on a
-   * subtotal nobody read is not a total of anything.
+   * "0 items" and a subtotal of nothing, which together would tell a buyer their cart is empty
+   * when the truth is that the storefront cannot see it. The charge rows and the closing figure
+   * are equally impossible, because a total assembled on a subtotal nobody read is not a total of
+   * anything.
    *
    * So the rows are withheld and the state is stated instead, with the block keeping its heading,
    * its surface and the dispatch line so the column it sits in neither collapses nor jumps when
@@ -530,12 +523,12 @@ export function CartTotalsPanel({
    *
    * The contents are established here - this is not the case above - and what they establish is
    * that there are none. Every row below would then be a figure about an order nobody is placing:
-   * a unit count of nought, a subtotal of nothing under a label that says what it comes before,
-   * and the free-freight offer read against a cart it cannot apply to. The cart drawer answers
-   * this same state by dropping its footer entirely, totals and both destinations together, and
-   * one cart quoted two ways by two surfaces is the thing this component exists to prevent. So the
-   * rows are withheld and the state is stated instead, with the block keeping its heading, its
-   * surface and the dispatch line so the column neither collapses nor jumps when a line is added.
+   * a unit count of nought and a subtotal of nothing under a label that says what it comes
+   * before. The cart drawer answers this same state by dropping its footer entirely, totals and
+   * both destinations together, and one cart quoted two ways by two surfaces is the thing this
+   * component exists to prevent. So the rows are withheld and the state is stated instead, with
+   * the block keeping its heading, its surface and the dispatch line so the column neither
+   * collapses nor jumps when a line is added.
    * No placeholder bars: nothing is in flight, and a bar standing where a figure will never arrive
    * would read as a cart still being counted.
    *
@@ -566,43 +559,6 @@ export function CartTotalsPanel({
     (running, charge) => running + (charge.amountCents ?? 0),
     totals.subtotalCents,
   );
-
-  /*
-   * The free-freight line has two readings, both of them the published state: qualifying, which
-   * the badge carries in words rather than in its colour, and the shortfall, which names both the
-   * amount left and the threshold it is measured against. There is deliberately no third reading
-   * for an empty cart - the branch above returns before this point, because an offer measured
-   * against a cart holding nothing is a statement about an order nobody is placing, and the
-   * slide-over prints nothing for that state either.
-   *
-   * Both are the store's offer about a cart, and the offer is only printed on a surface that is
-   * quoting a cart. Where charges are being quoted - the checkout review, where one of the rows
-   * is the freight this order is actually being charged - the line is not printed at all, because
-   * every reading of it would be a claim about that charge which no server stands behind: the
-   * offer is measured against the merchandise subtotal and the checkout request charges the quoted
-   * freight regardless, so "ships at no freight charge" would contradict the row above it and "add
-   * $120.00 more for free freight" would promise a reduction that request never applies. What is
-   * true of freight there is on the freight row and in the caption the placing surface prints
-   * beneath these figures.
-   */
-  let freight: ReactNode;
-  if (totals.qualifiesForFreeFreight) {
-    freight = (
-      <>
-        <Badge tone="success" size="sm">
-          {FREE_FREIGHT_BADGE}
-        </Badge>{' '}
-        <span className={styles.rowLabel}>{FREIGHT_EARNED_NOTE}</span>
-      </>
-    );
-  } else {
-    freight = (
-      <span className={styles.rowLabel}>
-        Add <Price cents={totals.freeFreightRemainingCents} size="sm" /> more for free freight on
-        orders from <Price cents={totals.freeFreightThresholdCents} size="sm" />.
-      </span>
-    );
-  }
 
   return (
     <Card className={className} pad={variant === 'page' ? 'lg' : 'md'} head={head}>
@@ -695,28 +651,11 @@ export function CartTotalsPanel({
           </p>
         )}
 
-        {/* `role="paragraph"` restores what the layout takes away, and is not a duplicate of the
-            element's own semantics: this line is laid out as a flex container so the qualifying
-            label can sit beside its sentence, and Chromium maps role `paragraph` onto block-flow
-            boxes only. The explicit role keeps it exposed as a paragraph like the note and
-            dispatch lines around it, so a reader navigating by paragraph reaches the one line
-            that carries the freight state. */}
-        {/* Printed only where the surface quotes merchandise alone; a surface quoting charges
-            says what is true of this order's freight on the freight row itself. See the reasoning
-            beside `freight` above. */}
-        {hasCharges ? null : (
-          <p
-            className={styles.freight}
-            role="paragraph"
-            data-qualifies={totals.qualifiesForFreeFreight ? 'true' : 'false'}
-          >
-            {freight}
-          </p>
-        )}
-
         {/* The same line the no-figures arrangements above print, assembled once beside the
             countdown it reads: its reading turns on whether charges are quoted, never on what a
-            buyer has collected. */}
+            buyer has collected. On a surface quoting merchandise alone it is also the only thing
+            said about freight - that it is quoted at checkout - because no freight figure or
+            allowance printed for a cart would hold for the order checkout goes on to charge. */}
         {dispatch}
       </div>
     </Card>

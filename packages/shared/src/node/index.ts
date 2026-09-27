@@ -37,7 +37,11 @@
  *   `0600` files for the product's own state directory, ownership and
  *   permission checks on every parent, a refusal to follow a symlink planted at
  *   a path it was asked to create, and atomic mode-preserving replacement of a
- *   file inside a developer's project.
+ *   file inside a developer's project. Its refusals share one code,
+ *   `FS_UNSAFE_PATH`, and it also exports their vocabulary —
+ *   `UNSAFE_PATH_REASONS`, the `UnsafePathReason` type and
+ *   `unsafePathReasonOf(caught)` — so a caller reporting a refusal can word it
+ *   per `details.reason` without matching message text.
  *
  * ## The rule for consumers
  *

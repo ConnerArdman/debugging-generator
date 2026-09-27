@@ -22,7 +22,12 @@
  *   shutdown is confirmed and removed after, or kept for good when it ends
  *   without one;
  * - one real `startHarness` round trip whose client close is forced to reject,
- *   and one start refused at configuration.
+ *   and one start refused at configuration;
+ * - the stand-in dev CLI's lifecycle across real harnesses: it lives exactly
+ *   as long as some harness does — removed by the release of the last one,
+ *   after the dev servers it ran have stopped, never by a process `'exit'`
+ *   handler that a `SIGTERM`-ended fork never runs — and a later harness gets
+ *   a fresh one.
  *
  * Failures are injected through the functions' parameters — fakes for the
  * clients, sockets and service — never by patching a module.
@@ -33,12 +38,12 @@ import { access, mkdtemp, rm } from 'node:fs/promises';
 import { connect as connectTcp, createServer } from 'node:net';
 import type { Server } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket as NodeWebSocket } from 'ws';
 
-import { DebuggenError, err, ok } from '@debuggen/shared';
+import { DebuggenError, err, isErr, ok } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 
 import {
@@ -46,6 +51,7 @@ import {
   releaseAfterLateStart,
   releaseHarnessResources,
   settleLateStart,
+  standInDevServerCommand,
   startHarness,
 } from './harness.js';
 import type {
@@ -289,6 +295,54 @@ function connectionRefused(host: string, port: number): Promise<boolean> {
       finish(true);
     });
   });
+}
+
+/** The CLI's path below a stand-in directory, as the launcher accepts a framework CLI. */
+const STAND_IN_CLI_SUFFIX = join('node_modules', 'next', 'dist', 'bin', 'next');
+
+/** The prefix the harness gives a stand-in directory. */
+const STAND_IN_ROOT_PREFIX = 'debuggen-stand-in-dev-cli-';
+
+/**
+ * The private directory of the stand-in dev CLI that `command` runs, read back
+ * from the command line itself — `'<node>' '<dir>/node_modules/next/dist/bin/next' dev` —
+ * so the suite observes what a launch would execute rather than harness internals.
+ * Every directory read is also handed to the `afterEach` above, so a failed
+ * assertion cannot leak one.
+ */
+function standInRootOf(command: string): string {
+  const cli = /^'[^']+' '([^']+)' dev$/u.exec(command)?.[1];
+  if (cli === undefined || !cli.endsWith(`${sep}${STAND_IN_CLI_SUFFIX}`)) {
+    throw new Error(`Not a stand-in dev-server command: ${command}`);
+  }
+  const root = cli.slice(0, -(STAND_IN_CLI_SUFFIX.length + sep.length));
+  if (
+    !basename(root).startsWith(STAND_IN_ROOT_PREFIX) ||
+    dirname(root) !== realpathSync(tmpdir())
+  ) {
+    throw new Error(`The stand-in CLI does not live in a private temporary directory: ${cli}`);
+  }
+  created.push(root);
+  return root;
+}
+
+/** How `startHarness` words a start refused at configuration. */
+const CONFIG_REFUSAL = /^The harness configuration was refused \(CONFIG_INVALID\): /u;
+
+/**
+ * Starts a harness refused at configuration — it takes a lease and returns it
+ * in the release after its failed start — and returns the refusal's message. A
+ * start that unexpectedly succeeds is stopped, so it cannot hold a lease, and
+ * yields `undefined`.
+ */
+function refusedStartMessage(): Promise<string | undefined> {
+  return startHarness({ fixtureProject: false, env: { DEBUGGEN_PORT: 'not-a-port' } }).then(
+    async (unexpected) => {
+      await unexpected.stop();
+      return undefined;
+    },
+    (cause: unknown) => (cause instanceof Error ? cause.message : 'a non-error value was thrown'),
+  );
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -698,5 +752,87 @@ describe('startHarness', () => {
     const message = outcome instanceof Error ? outcome.message : '';
     expect(message).toMatch(/^The harness configuration was refused \(CONFIG_INVALID\): /u);
     expect(message).not.toContain('Releasing what the failed start had acquired reported');
+  });
+
+  it('removes the stand-in dev CLI with the release of the last live harness, after the dev server it ran has stopped', async () => {
+    const harness = await startHarness();
+    try {
+      const command = standInDevServerCommand();
+      const root = standInRootOf(command);
+      expect(await exists(join(root, STAND_IN_CLI_SUFFIX))).toBe(true);
+      // One CLI for as long as a harness is live.
+      expect(standInDevServerCommand()).toBe(command);
+
+      const launched = await harness.launchDevServer(harness.requireProject().root);
+      if (isErr(launched)) {
+        throw new Error(
+          `devServer.launch was refused (${launched.error.code}): ${launched.error.message}`,
+        );
+      }
+      const devServer = new URL(launched.value.devServerUrl);
+      const devServerPort = Number(devServer.port);
+      expect(await connectionRefused(devServer.hostname, devServerPort)).toBe(false);
+
+      expect(await harness.stop()).toEqual({ clean: true, problems: [] });
+
+      // The service stopped its stand-in dev server before the CLI went away.
+      expect(await connectionRefused(devServer.hostname, devServerPort)).toBe(true);
+      expect(await exists(root)).toBe(false);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it('keeps the stand-in dev CLI while any harness is live, and a start refused meanwhile returns its own lease', async () => {
+    const first = await startHarness({ fixtureProject: false });
+    const second = await startHarness({ fixtureProject: false }).catch(async (cause: unknown) => {
+      await first.stop();
+      throw cause;
+    });
+    try {
+      const root = standInRootOf(standInDevServerCommand());
+
+      expect(await refusedStartMessage()).toMatch(CONFIG_REFUSAL);
+      expect(await exists(root)).toBe(true);
+
+      expect(await first.stop()).toEqual({ clean: true, problems: [] });
+      expect(await exists(root)).toBe(true);
+      expect(standInRootOf(standInDevServerCommand())).toBe(root);
+
+      expect(await second.stop()).toEqual({ clean: true, problems: [] });
+      expect(await exists(root)).toBe(false);
+    } finally {
+      await Promise.all([first.stop(), second.stop()]);
+    }
+  });
+
+  it('writes a fresh stand-in dev CLI for a harness started after the last one was released, and removes one written while none was live', async () => {
+    const earlier = await startHarness({ fixtureProject: false });
+    let earlierRoot: string;
+    try {
+      earlierRoot = standInRootOf(standInDevServerCommand());
+      expect(await earlier.stop()).toEqual({ clean: true, problems: [] });
+    } finally {
+      await earlier.stop();
+    }
+    expect(await exists(earlierRoot)).toBe(false);
+
+    const later = await startHarness({ fixtureProject: false });
+    try {
+      const laterRoot = standInRootOf(standInDevServerCommand());
+      expect(laterRoot).not.toBe(earlierRoot);
+      expect(await exists(join(laterRoot, STAND_IN_CLI_SUFFIX))).toBe(true);
+      expect(await later.stop()).toEqual({ clean: true, problems: [] });
+      expect(await exists(laterRoot)).toBe(false);
+    } finally {
+      await later.stop();
+    }
+
+    // Written while no harness is live, it is removed by the next release of a
+    // last lease — here the one after a start refused at configuration.
+    const unleasedRoot = standInRootOf(standInDevServerCommand());
+    expect(await exists(unleasedRoot)).toBe(true);
+    expect(await refusedStartMessage()).toMatch(CONFIG_REFUSAL);
+    expect(await exists(unleasedRoot)).toBe(false);
   });
 });

@@ -6,10 +6,16 @@
  *   - the gate: follow-ups exist only once the session has produced a result. The gate is the
  *     `enabled` prop that `App.tsx` computes, never an inference from an analysis object, and
  *     while it is closed the component explains itself with a generic empty state instead of
- *     rendering a field that could not do anything (AAP 0.4.2, 0.5.5);
+ *     rendering a field that could not do anything (AAP 0.4.2, 0.5.5), in the sentence the
+ *     `unavailableReason` prop selects;
+ *   - the asked list: every follow-up already asked is listed above the entry, in every state,
+ *     oldest first, its question verbatim and its outcome named in words;
  *   - the exact payload: `onSubmit` receives the trimmed draft, once and alone, and the draft is
  *     KEPT until a `submission` outcome reports it accepted; blank drafts are refused by the button
- *     and by the keyboard chord;
+ *     and by the keyboard chord, the chord marking the field invalid with a short message that
+ *     clears once the draft holds text;
+ *   - the protocol's question limit on the field: native `maxLength`, a paste cut off at it, and a
+ *     counter that describes the field (not a live region) and warns once the limit is reached;
  *   - the submission outcome: `accepted` clears the draft, `failed` keeps it and shows a retry hint
  *     describing the field until the next submit, each `seq` is applied exactly once, an outcome
  *     present at mount is not applied, and focus lost while the field was replaced or its submit
@@ -34,9 +40,50 @@ import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock, MockInstance } from 'vitest';
 
+import type { FollowUpRecord } from '@debuggen/protocol';
+
+import { MAX_WEBVIEW_QUESTION_LENGTH } from '../../webview-messages';
 import type { SubmissionOutcome } from '../pending-actions';
 
 import { FollowUp } from './FollowUp';
+import type { FollowUpUnavailableReason } from './FollowUp';
+
+/** The inline validation of a blank draft submitted by the chord. */
+const BLANK_DRAFT_TEXT = 'Type a follow-up question before asking.';
+
+/** Appended to the counter once the draft is full. */
+const LIMIT_REACHED_TEXT = 'Limit reached: longer text is cut off.';
+
+/** Appended to the counter when a value written past `maxLength` exceeds the limit. */
+const OVER_LIMIT_TEXT = 'Over the limit: shorten it to ask.';
+
+/** Formats a count as the counter does, in the test run's own locale. */
+const COUNT_FORMAT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+
+/**
+ * The counter's text for a draft below the limit.
+ *
+ * @param length The draft's length.
+ * @returns `‹length› / ‹limit› characters`.
+ */
+function counterFor(length: number): string {
+  return `${COUNT_FORMAT.format(length)} / ${COUNT_FORMAT.format(MAX_WEBVIEW_QUESTION_LENGTH)} characters`;
+}
+
+/**
+ * The element the field names first in `aria-describedby`: the counter.
+ *
+ * @param field The follow-up field.
+ * @returns The counter element.
+ */
+function getCounter(field: HTMLElement): HTMLElement {
+  const [firstId] = (field.getAttribute('aria-describedby') ?? '').split(' ');
+  const counter = firstId === undefined ? null : document.getElementById(firstId);
+  if (counter === null) {
+    throw new Error('expected the follow-up field to be described by its counter');
+  }
+  return counter;
+}
 
 /** The field's visible label, which `Input` renders as a real `<label htmlFor>`. */
 const FIELD_LABEL = 'Follow-up question';
@@ -345,6 +392,105 @@ describe('FollowUp — submission', () => {
 
     expect(onSubmit).not.toHaveBeenCalled();
     expect(getField().value).toBe('A composed question');
+  });
+});
+
+describe('FollowUp — the question limit', () => {
+  it('bounds the field natively by the protocol question limit', () => {
+    render(<FollowUp onSubmit={submitSpy()} enabled />);
+
+    expect(MAX_WEBVIEW_QUESTION_LENGTH).toBe(2000);
+    expect(getField().maxLength).toBe(MAX_WEBVIEW_QUESTION_LENGTH);
+  });
+
+  it('counts the draft in a counter that describes the field and is not a live region', () => {
+    render(<FollowUp onSubmit={submitSpy()} enabled />);
+
+    const counter = getCounter(getField());
+    expect(counter.textContent).toBe(counterFor(0));
+    expect(counter.getAttribute('aria-live')).toBeNull();
+    expect(counter.getAttribute('role')).toBeNull();
+    // The keyboard hint still describes the field beside the counter.
+    const describedBy = (getField().getAttribute('aria-describedby') ?? '').split(' ');
+    const descriptions = describedBy.map((id) => document.getElementById(id)?.textContent ?? '');
+    expect(descriptions.some((text) => text.includes('Ctrl+Enter'))).toBe(true);
+
+    fireEvent.change(getField(), { target: { value: 'f'.repeat(1234) } });
+    expect(getCounter(getField()).textContent).toBe(counterFor(1234));
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('warns once the draft reaches the limit, without refusing it', () => {
+    const onSubmit = submitSpy();
+    render(<FollowUp onSubmit={onSubmit} enabled />);
+
+    fireEvent.change(getField(), { target: { value: 'f'.repeat(MAX_WEBVIEW_QUESTION_LENGTH) } });
+
+    const counter = getCounter(getField());
+    expect(counter.textContent).toBe(
+      `${counterFor(MAX_WEBVIEW_QUESTION_LENGTH)}. ${LIMIT_REACHED_TEXT}`,
+    );
+    expect(counter.classList.contains('dg-text--warning')).toBe(true);
+    expect(getField().getAttribute('aria-invalid')).toBeNull();
+    fireEvent.click(getSubmit());
+    expect(onSubmit.mock.calls).toEqual([['f'.repeat(MAX_WEBVIEW_QUESTION_LENGTH)]]);
+  });
+
+  it('cuts a longer paste off at the limit and says why', async () => {
+    const user = userEvent.setup();
+    render(<FollowUp onSubmit={submitSpy()} enabled />);
+
+    await user.click(getField());
+    await user.paste('f'.repeat(20_000));
+
+    expect(getField().value).toHaveLength(MAX_WEBVIEW_QUESTION_LENGTH);
+    expect(getCounter(getField()).textContent).toContain(LIMIT_REACHED_TEXT);
+  });
+
+  it('says a draft written past the limit is over it, not cut off', () => {
+    render(<FollowUp onSubmit={submitSpy()} enabled />);
+
+    // `maxLength` constrains only the developer's own edits; a value set some other way can
+    // exceed it, and the counter must not claim the text was cut off.
+    fireEvent.change(getField(), {
+      target: { value: 'f'.repeat(MAX_WEBVIEW_QUESTION_LENGTH + 10) },
+    });
+
+    const counter = getCounter(getField());
+    expect(counter.textContent).toBe(
+      `${counterFor(MAX_WEBVIEW_QUESTION_LENGTH + 10)}. ${OVER_LIMIT_TEXT}`,
+    );
+    expect(counter.textContent).not.toContain(LIMIT_REACHED_TEXT);
+    expect(counter.classList.contains('dg-text--warning')).toBe(true);
+  });
+});
+
+describe('FollowUp — blank drafts', () => {
+  it('marks a blank draft submitted by the chord invalid, and clears the mark once it holds text', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    render(<FollowUp onSubmit={onSubmit} enabled />);
+    expect(screen.queryByText(BLANK_DRAFT_TEXT)).toBeNull();
+
+    await user.click(getField());
+    await user.keyboard('{Control>}{Enter}{/Control}');
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    const message = screen.queryByText(BLANK_DRAFT_TEXT);
+    expect(message).not.toBeNull();
+    expect(getField().getAttribute('aria-invalid')).toBe('true');
+    const describedBy = (getField().getAttribute('aria-describedby') ?? '').split(' ');
+    expect(describedBy).toContain(message?.id);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(document.activeElement).toBe(getField());
+
+    await user.keyboard('Why?');
+    expect(screen.queryByText(BLANK_DRAFT_TEXT)).toBeNull();
+    expect(getField().getAttribute('aria-invalid')).toBeNull();
+
+    await user.keyboard('{Control>}{Enter}{/Control}');
+    expect(onSubmit.mock.calls).toEqual([['Why?']]);
+    expect(screen.queryByText(BLANK_DRAFT_TEXT)).toBeNull();
   });
 });
 
@@ -695,6 +841,154 @@ describe('FollowUp — state precedence', () => {
     expect(screen.queryByText(UNAVAILABLE_MESSAGE)).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
     expectNoEntryControls(container);
+  });
+});
+
+describe('FollowUp — the closed entry says why', () => {
+  const MESSAGES: Readonly<Record<FollowUpUnavailableReason, string>> = {
+    awaitingResult: UNAVAILABLE_MESSAGE,
+    working:
+      'The session is working on its latest question. Ask another follow-up once that result is ready.',
+    ended:
+      'This session has ended, so it takes no more follow-ups. Ask a new question above to start another session.',
+    failed:
+      'This session stopped at a failed stage, so it takes no follow-ups. Retry the stage, or ask a new question above.',
+    serviceUnavailable: 'Start the local Debug Generator service to ask a follow-up.',
+  };
+  const REASONS = Object.keys(MESSAGES) as FollowUpUnavailableReason[];
+
+  it.each(REASONS)('shows the %s sentence, and no other, while the gate is closed', (reason) => {
+    const { container } = render(
+      <FollowUp onSubmit={submitSpy()} enabled={false} unavailableReason={reason} />,
+    );
+
+    const status = screen.getByRole('status');
+    expect(status.getAttribute('aria-busy')).toBeNull();
+    expect(status.textContent).toBe(MESSAGES[reason]);
+    for (const other of REASONS.filter((candidate) => candidate !== reason)) {
+      expect(container.textContent).not.toContain(MESSAGES[other]);
+    }
+    expectNoEntryControls(container);
+  });
+
+  it('defaults to the first-result sentence', () => {
+    render(<FollowUp onSubmit={submitSpy()} enabled={false} />);
+
+    expect(screen.getByRole('status').textContent).toBe(UNAVAILABLE_MESSAGE);
+  });
+
+  it('ignores the reason while the gate is open', () => {
+    render(<FollowUp onSubmit={submitSpy()} enabled unavailableReason="ended" />);
+
+    expect(getField().disabled).toBe(false);
+    expect(screen.queryByText(MESSAGES.ended)).toBeNull();
+  });
+});
+
+describe('FollowUp — what was asked', () => {
+  const ANSWERED: FollowUpRecord = {
+    question: 'Why did the first step run twice?',
+    askedAt: 1_758_000_040_000,
+    attemptId: 'fua_first',
+    attempt: 1,
+    needsNewCapture: false,
+    captureId: 'cap_stored',
+    analysisId: 'ana_second',
+    panelId: 'pnl_second',
+  };
+  const STORED: FollowUpRecord = {
+    question: 'Which step waits on the other?\nAnd for how long?',
+    askedAt: 1_758_000_050_000,
+    attemptId: 'fua_second',
+    attempt: 1,
+    needsNewCapture: false,
+  };
+  const NEW_CAPTURE: FollowUpRecord = {
+    question: 'What starts the second request?',
+    askedAt: 1_758_000_060_000,
+    needsNewCapture: true,
+    planVersion: 2,
+  };
+  const UNDECIDED: FollowUpRecord = {
+    question: 'Does the later step reuse the earlier result?',
+    askedAt: 1_758_000_070_000,
+  };
+  const LADDER: readonly FollowUpRecord[] = [ANSWERED, STORED, NEW_CAPTURE, UNDECIDED];
+  const OUTCOMES = [
+    'Answered',
+    'Answering from the stored capture',
+    'Needs a new capture',
+    'Awaiting an answer',
+  ];
+
+  /** The asked list, found by the label that names it. */
+  function askedList(): HTMLElement {
+    return screen.getByRole('list', { name: 'Asked in this session' });
+  }
+
+  it('lists every asked follow-up oldest first, verbatim, each with its outcome in words', () => {
+    render(<FollowUp onSubmit={submitSpy()} enabled asked={LADDER} />);
+
+    const list = askedList();
+    expect(list.tagName).toBe('OL');
+    const items = Array.from(list.querySelectorAll('li'));
+    expect(items).toHaveLength(LADDER.length);
+    // Byte for byte, line breaks included: the text node is the record's question.
+    expect(items.map((item) => item.querySelector('.dgv-asked__text')?.textContent)).toEqual(
+      LADDER.map((followUp) => followUp.question),
+    );
+    expect(items.map((item) => item.querySelector('.dg-badge')?.textContent)).toEqual(OUTCOMES);
+    for (const item of items) {
+      expect(item.classList.contains('dgv-asked-list__item')).toBe(true);
+    }
+  });
+
+  it.each([
+    ['the ready entry', { enabled: true }],
+    ['the closed entry', { enabled: false, unavailableReason: 'ended' as const }],
+    ['the busy entry', { enabled: true, pending: true }],
+    ['the failed entry', { enabled: true, error: 'The stage failed.' }],
+  ])('keeps the list above %s', (_label, props) => {
+    const { container } = render(<FollowUp onSubmit={submitSpy()} asked={LADDER} {...props} />);
+
+    const root = container.firstElementChild;
+    expect(root?.classList.contains(ROOT_CLASS)).toBe(true);
+    const list = askedList();
+    // The list sits in the root's first child, ahead of whichever state follows it.
+    expect(root?.firstElementChild?.contains(list)).toBe(true);
+    expect(list.querySelectorAll('li')).toHaveLength(LADDER.length);
+  });
+
+  it('renders no list, and no label, for an absent or empty ladder', () => {
+    const { rerender, container } = render(<FollowUp onSubmit={submitSpy()} enabled />);
+    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryByText('Asked in this session')).toBeNull();
+
+    rerender(<FollowUp onSubmit={submitSpy()} enabled asked={[]} />);
+    expect(screen.queryByRole('list')).toBeNull();
+    expect(container.querySelector('.dgv-asked-list')).toBeNull();
+  });
+
+  it('keeps an unsent draft when a follow-up is added to the list', async () => {
+    const user = userEvent.setup();
+    const onSubmit = submitSpy();
+    const { rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
+
+    await user.type(getField(), 'A draft written before the list grew');
+    rerender(<FollowUp onSubmit={onSubmit} enabled asked={[ANSWERED]} />);
+
+    expect(getField().value).toBe('A draft written before the list grew');
+    expect(askedList().querySelectorAll('li')).toHaveLength(1);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('adds no control: the list is text and badges only', () => {
+    const { container } = render(
+      <FollowUp onSubmit={submitSpy()} enabled={false} asked={LADDER} />,
+    );
+
+    expect(allButtons(container)).toEqual([]);
+    expect(askedList().querySelector('a, button, input, textarea')).toBeNull();
   });
 });
 

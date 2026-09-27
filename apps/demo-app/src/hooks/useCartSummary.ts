@@ -4,9 +4,9 @@
  * Lumen Supply - the cart's totals, as the storefront prints them.
  *
  * Four surfaces quote the same cart at once: the header badge counts the units in it, the cart
- * drawer and the `/cart` page print the subtotal with how much more buys free freight, and the
- * checkout summary repeats both beside the order being placed. The figures are worked out here,
- * in one place, so none of those surfaces can arrive at a different answer from the others.
+ * drawer and the `/cart` page print the units and the merchandise subtotal, and the checkout
+ * summary repeats both beside the order being placed. The figures are worked out here, in one
+ * place, so none of those surfaces can arrive at a different answer from the others.
  *
  * A FIGURE IS PUBLISHED ONLY WHERE THERE IS A CART BEHIND IT
  * The cart's lines come from a read of the server, so an empty array is two different statements:
@@ -24,16 +24,16 @@
  *
  * EVERY FIGURE PUBLISHED HERE IS MERCHANDISE ONLY, AND NONE OF THEM IS AN ORDER TOTAL
  * The lines the cart holds are all this module can see. It therefore publishes what those lines
- * come to and what that qualifies for - a subtotal, a unit count, a line count, the free-freight
- * threshold and the shortfall against it - and it publishes no freight charge, no discount, no tax
- * and no order total, because none of those is a property of a cart: they belong to the order the
- * checkout request creates, and the storefront's own free-freight offer is measured against the
- * subtotal below rather than applied to an order by the checkout service. So a surface printing
- * `subtotalCents` must label it as the merchandise subtotal it is, and a surface that has to state
- * what an order comes to must add the charges it knows about to this figure and say which of them
- * are still unsettled - which is exactly what the checkout review column does with
- * `@/components/cart/CartTotalsPanel`. A figure from here printed under the word "Total" would
- * quote a buyer less than the order they are about to place.
+ * come to - a subtotal, a unit count and a line count - and it publishes no freight charge, no
+ * freight allowance, no discount, no tax and no order total, because none of those is a property
+ * of a cart: they belong to the order the checkout request creates, which charges the freight the
+ * carrier quotes for the destination and service a buyer chooses there. A cart has neither, so
+ * nothing here predicts what freight an order will attract or promises a reduction of it that the
+ * checkout would not apply. So a surface printing `subtotalCents` must label it as the merchandise
+ * subtotal it is, and a surface that has to state what an order comes to must add the charges it
+ * knows about to this figure and say which of them are still unsettled - which is exactly what the
+ * checkout review column does with `@/components/cart/CartTotalsPanel`. A figure from here printed
+ * under the word "Total" would quote a buyer less than the order they are about to place.
  *
  * Every figure is summed from the lines the cart published, and every string beside it comes from
  * `@/lib/format`. Money and counts are deliberately not formatted in this module: that one pins
@@ -50,14 +50,6 @@ import { useMemo } from 'react';
 
 import { useCart, type CartContextValue } from '@/hooks/useCart';
 import { formatPriceLabel, formatQuantityLabel } from '@/lib/format';
-
-/**
- * What an order has to reach, in cents, for Lumen Supply to carry it at no charge.
- *
- * It is the merchandise subtotal that is measured against it, never the order total, so the
- * freight and the tax an order attracts are not part of what earns a buyer their free carriage.
- */
-const FREE_FREIGHT_THRESHOLD_CENTS = 75_000;
 
 /**
  * Why the cart's contents are not established, for a surface that has to say so.
@@ -120,14 +112,6 @@ export interface CartSummaryKnown extends CartSummaryBase {
   readonly subtotalLabel: string;
   /** Wording for {@link CartSummaryKnown.unitCount}, grouped for readability, for example `'1,024'`. */
   readonly unitCountLabel: string;
-  /** What a subtotal has to reach to be carried at no charge, in cents. */
-  readonly freeFreightThresholdCents: number;
-  /** How much more merchandise earns free carriage, in cents; `0` once the cart qualifies. */
-  readonly freeFreightRemainingCents: number;
-  /** Wording for {@link CartSummaryKnown.freeFreightRemainingCents}, for example `'$120.00'`. */
-  readonly freeFreightRemainingLabel: string;
-  /** True once the subtotal has reached {@link CartSummaryKnown.freeFreightThresholdCents}. */
-  readonly qualifiesForFreeFreight: boolean;
 }
 
 /**
@@ -225,10 +209,6 @@ function buildCartSummary(cart: CartContextValue): CartSummary {
     subtotalCents += line.lineTotalCents;
   }
 
-  // A cart already over the threshold needs nothing further, so the shortfall floors at zero
-  // rather than becoming a negative amount the freight line would print as money owed.
-  const freeFreightRemainingCents = Math.max(0, FREE_FREIGHT_THRESHOLD_CENTS - subtotalCents);
-
   return {
     contentsKnown: true,
     lineCount: cart.lines.length,
@@ -237,10 +217,6 @@ function buildCartSummary(cart: CartContextValue): CartSummary {
     subtotalCents,
     subtotalLabel: formatPriceLabel(subtotalCents),
     unitCountLabel: formatQuantityLabel(units),
-    freeFreightThresholdCents: FREE_FREIGHT_THRESHOLD_CENTS,
-    freeFreightRemainingCents,
-    freeFreightRemainingLabel: formatPriceLabel(freeFreightRemainingCents),
-    qualifiesForFreeFreight: freeFreightRemainingCents === 0,
     estimatedDeliveryLabel: cart.estimatedDeliveryLabel,
     dispatchCountdownMs: cart.dispatchCountdownMs,
   };
@@ -255,10 +231,10 @@ function buildCartSummary(cart: CartContextValue): CartSummary {
  * instead of inventing one. `true` carries the totals, and a consumer renders straight from them:
  * `lineCount` and `unitCount` with their wording for the two counts a cart is quoted by,
  * `subtotalCents` and `subtotalLabel` for the money - which is the merchandise subtotal and
- * nothing more, so a consumer labels it as one - `freeFreightRemainingLabel` with
- * `qualifiesForFreeFreight` for the free-carriage line, and `estimatedDeliveryLabel` with
- * `dispatchCountdownMs` for the delivery promise printed beside them. `isCartEmpty` is what a
- * surface shows its blank slate for, and it is a claim only this branch is entitled to make.
+ * nothing more, so a consumer labels it as one and states no freight figure beside it - and
+ * `estimatedDeliveryLabel` with `dispatchCountdownMs` for the delivery promise printed beside
+ * them. `isCartEmpty` is what a surface shows its blank slate for, and it is a claim only this
+ * branch is entitled to make.
  *
  * The cart's standing with the server is deliberately not repeated here, because it is a different
  * question from what the cart holds: a surface that has to say a change is being saved, or show a

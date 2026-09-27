@@ -5,7 +5,7 @@
  *
  *   .overlay            the fixed scrim; a click on it, and only on it, closes the dialog
  *     .panel            role="dialog" aria-modal="true" aria-labelledby=... tabIndex={-1}
- *       .head           <h2 class="title">, the line-count Badge, .close (a ghost Button)
+ *       .head           <h2 class="title">, the unit-count Badge, .close (a ghost Button)
  *       .body           <CartLineList variant="drawer" />  <- the only scrolling region
  *       .foot           <CartTotalsPanel variant="drawer" />, .checkoutLink, .cartLink
  *
@@ -148,16 +148,27 @@
   margin-inline-start: auto;
 }
 
-/* The middle grid row. `min-height: 0` is what makes a `1fr` row scroll instead of growing past
- * the panel and pushing the footer out of view; `overscroll-behavior: contain` keeps the gesture
- * inside the list once it bottoms out. This row owns its width and its vertical scroll and stops
- * there: how a long product code or SKU inside a line row wraps or breaks is the list row's own
- * module to decide, and clipping it from here would only hide it. */
+/* The middle grid row, and the sheet's one scroll container. `min-height: 0` is what makes a `1fr`
+ * row scroll instead of growing past the panel and pushing the footer out of view;
+ * `overscroll-behavior: contain` keeps the gesture inside the list once it bottoms out, and the
+ * block-end padding is the room the last row scrolls up into above the footer.
+ *
+ * Nothing inside it scrolls on its own: `CartLineList.module.css` declares no height cap and no
+ * overflow for its drawer arrangement, so the list is this row's content and a gesture anywhere
+ * over it moves this row and nothing else. A nested scroller would cut the last line at this
+ * row's edge and split one gesture between two regions.
+ *
+ * `scrollbar-gutter: stable` reserves the scrollbar's width whether or not the list is long enough
+ * to need one, so on a platform with space-taking scrollbars the rows do not shift sideways as
+ * lines come and go. This row owns its width and its vertical scroll and stops there: how a long
+ * product code or SKU inside a line row wraps or breaks is the list row's own module to decide,
+ * and clipping it from here would only hide it. */
 .body {
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding-block: var(--ls-space-3, 12px);
   padding-inline: var(--ls-space-4, 16px);
 }

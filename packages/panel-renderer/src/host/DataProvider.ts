@@ -86,13 +86,30 @@
  *
  * ## What it deliberately does not do
  *
- * No caching, no request de-duplication, no retry policy, no ordering and no
- * paging arithmetic live in this interface. Ordering, filtering and paging are
- * applied by the service, which holds the whole capture; a client that re-sorted
- * a page would silently disagree with the `total` and `nextOffset` it was handed.
- * Single-page resolution, abort handling and the loading/error/empty state
- * machine belong to `./useQuery`, the one caller of this interface inside the
- * library.
+ * No caching, no retry policy, no ordering and no paging arithmetic live in
+ * this interface, and a provider built by either factory de-duplicates nothing.
+ * Ordering, filtering and paging are applied by the service, which holds the
+ * whole capture; a client that re-sorted a page would silently disagree with
+ * the `total` and `nextOffset` it was handed. Single-page resolution, abort
+ * handling and the loading/error/empty state machine belong to `./useQuery`,
+ * the one caller of this interface inside the library.
+ *
+ * ## The one place identical reads are shared
+ *
+ * {@link bindPanelIdentity} is the exception, because it is the one wrapper
+ * that knows a read is **panel-bound**: it addresses the capture its panel was
+ * generated from, which no longer grows, so the same query always has the same
+ * answer for as long as that panel is on screen. The wrapper therefore sends
+ * each identical panel-bound query — same session, same panel, same
+ * {@link stableQueryKey} once an omitted `limit` or `offset` is read as the
+ * default the service applies — at most once while it is in flight, and keeps its
+ * settled successful answer for its own lifetime, within a bound: two nodes of
+ * one panel that draw the same trace fetch it once, and so does a node that
+ * mounts, remounts or retries after a sibling already resolved it. Failures and
+ * aborts are never kept, every caller's signal cancels that caller alone, and a
+ * live read — one with no panel identity — never passes through it, so nothing
+ * that can still grow is ever answered from memory. See
+ * {@link bindPanelIdentity} for the full contract.
  *
  * ## What is exported here
  *
@@ -118,7 +135,12 @@
 
 import { createContext, useContext } from 'react';
 
-import { DATA_QUERY_MAX_LIMIT, isDataQuerySource } from '@debuggen/panel-schema';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+  isDataQuerySource,
+} from '@debuggen/panel-schema';
 import type { DataQuery, DataQuerySource } from '@debuggen/panel-schema';
 import { DebuggenError, err, ok } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
@@ -649,6 +671,136 @@ export type DataQueryResolver = (
  */
 export function isAddressableSessionId(sessionId: unknown): sessionId is string {
   return typeof sessionId === 'string' && sessionId.trim() !== '';
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Stable query keys
+ *
+ * One exported function and its module-private recursive helper. It is the one
+ * definition of "the same request" in the panel-data contract: `./useQuery`
+ * keys its effect on it, {@link bindPanelIdentity} keys the reads it shares on
+ * it, and a host surface's provider that coalesces identical in-flight requests
+ * keys its registry on it (the DevTools panel's
+ * `apps/chrome-extension/src/panel/data-provider.ts` does). It lives here,
+ * beside the interface every one of those consumers is written against, so the
+ * wrapper below can use it without an import cycle; `./useQuery` re-exports it
+ * and the package entry exports it beside `useQuery`, as before.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The deterministic identity of a query's contents — the one definition of
+ * "the same request" shared by `./useQuery`, by {@link bindPanelIdentity} and
+ * by any provider that coalesces identical requests in flight.
+ *
+ * Two queries that would resolve to the same page produce the same key, and two
+ * that would not produce different keys. Three properties make that true:
+ *
+ * - **object keys are sorted**, so a query assembled field by field in one order
+ *   matches one assembled in another;
+ * - **array order is preserved**, because the order of a list inside a filter is
+ *   part of what it asks for, not incidental;
+ * - **members holding `undefined` are omitted**, so an explicitly absent field
+ *   is the same request as an omitted one — which matters because the schema
+ *   infers every optional field as `?: T | undefined`, and a component spreading
+ *   local state into a query routinely produces the explicit form.
+ *
+ * Written for the JSON values a schema-valid `DataQuery` holds: strings, finite
+ * numbers, booleans, `null`, arrays and plain objects. A value outside that set —
+ * a function, a symbol, a non-finite number — cannot appear on a query that
+ * passed validation, and is folded to `null` rather than throwing: this runs
+ * during render, where an exception would take the whole panel down over a
+ * malformed query that the error state could otherwise report.
+ *
+ * Cost is bounded and small. A `DataQuery` has at most four fields beside its
+ * source and a filter of at most five, so this is a handful of string
+ * concatenations per render — cheaper than the `useMemo` that would be needed to
+ * avoid it, which would itself need a stable key to memoize on.
+ *
+ * The key is for comparison only: it is never parsed, and no consumer may depend
+ * on its exact spelling. A consumer that coalesces requests across sessions
+ * combines it with the session itself, because the key describes the query's
+ * contents and nothing else.
+ *
+ * @example A provider coalescing identical in-flight requests:
+ * ```ts
+ * const key = `${sessionId}\n${stableQueryKey(normalizedQuery)}`;
+ * const shared = inFlight.get(key) ?? dispatch(key, sessionId, normalizedQuery);
+ * ```
+ *
+ * @param query The query whose contents identify the request.
+ * @returns A string that is equal for equal query contents.
+ */
+export function stableQueryKey(query: DataQuery): string {
+  return serializeStably(query);
+}
+
+/**
+ * Serialise one JSON-shaped value into the canonical form described on
+ * {@link stableQueryKey}.
+ *
+ * The output is JSON-like but is never parsed: it exists only to be compared, so
+ * no consumer may depend on its exact spelling.
+ *
+ * @param value Any value reachable inside a query.
+ * @returns Its canonical serialisation.
+ */
+function serializeStably(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+
+  if (typeof value === 'object') {
+    if (isUnknownList(value)) {
+      // Order-preserving, and holes and `undefined` members serialise as `null`
+      // exactly as `JSON.stringify` renders them — an array position cannot be
+      // omitted without shifting every position after it.
+      return `[${value.map(serializeStably).join(',')}]`;
+    }
+
+    // The one type assertion of the serialisation, and it is sound: `typeof
+    // value` is `"object"`, `value` is not `null` and it is not an array, so
+    // indexing it by string key is exactly what it supports. The assertion
+    // buys back the string index signature that the `object` type does not
+    // carry; every value read through it stays `unknown` and is serialised by
+    // the same recursion.
+    const record = value as Readonly<Record<string, unknown>>;
+
+    // `Array.prototype.sort` with no comparator orders by UTF-16 code unit,
+    // which is a total order over the key set and therefore deterministic. The
+    // keys of a query are ASCII schema field names, so no locale, normalisation
+    // or collation question arises.
+    const members = Object.keys(record)
+      .sort()
+      .filter((name) => record[name] !== undefined)
+      .map((name) => `${JSON.stringify(name)}:${serializeStably(record[name])}`);
+
+    return `{${members.join(',')}}`;
+  }
+
+  switch (typeof value) {
+    case 'string':
+      // Quoted and escaped, so a value containing a brace, a comma or a colon
+      // cannot imitate the structure around it.
+      return JSON.stringify(value);
+    case 'number':
+      // `NaN` and the infinities have no JSON form and cannot survive schema
+      // validation; folding them together is safe because a query can hold
+      // neither.
+      return Number.isFinite(value) ? String(value) : 'null';
+    case 'boolean':
+      return value ? 'true' : 'false';
+    case 'bigint':
+      // Not reachable through a validated query, but distinguishing two bigints
+      // costs one line and prevents a key collision that would suppress a
+      // refetch.
+      return `${value.toString()}n`;
+    default:
+      // `undefined`, `function` and `symbol`. None can appear on a validated
+      // query, and none has a JSON form.
+      return 'null';
+  }
 }
 
 /*
@@ -1682,24 +1834,154 @@ export function createPanelDataProvider(resolve: PanelDataResolver): DataProvide
   };
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Panel-bound read sharing
+ *
+ * What one {@link bindPanelIdentity} wrapper keeps: the identical panel-bound
+ * reads it has in flight and the successful answers they settled with, both
+ * keyed by {@link panelReadKey}. Module-private; the contract is stated on the
+ * wrapper itself.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The most settled answers one panel-bound wrapper keeps: 32.
+ *
+ * A panel draws a dozen or so query-backed nodes, and a reader who sorts or
+ * pages a table adds one answer per distinct page, so 32 holds every answer a
+ * panel draws at once with room for the pages a reader moves between. The
+ * bound is a count because the renderer cannot size an answer without
+ * serialising it; each answer is one page of at most `DATA_QUERY_MAX_LIMIT`
+ * items or one trace, which the view it answers already holds in memory. The
+ * least recently read answer is evicted first, so the ones on screen stay.
+ */
+const PANEL_READ_CACHE_MAX_ENTRIES = 32;
+
+/** What a caller that cancelled a panel-bound read is rejected with, absent a reason of its own. */
+const CANCELLED_READ_MESSAGE = "The request for this view's data was cancelled.";
+
+/**
+ * One panel-bound read in flight: the single underlying request, shared by
+ * every identical call made while it was outstanding.
+ */
+interface SharedPanelRead {
+  /**
+   * Aborts the underlying request, and only once no caller is waiting on it
+   * any more; its signal is the one the wrapped provider was handed.
+   */
+  readonly controller: AbortController;
+  /** The underlying request's outcome, exactly as every waiting caller receives it. */
+  readonly outcome: Promise<DataQueryResponse>;
+  /** How many callers are waiting on it right now. Never negative. */
+  waiting: number;
+}
+
+/**
+ * The identity of one panel-bound read: the session it is addressed to, the
+ * panel whose capture answers it and the {@link stableQueryKey} of the query
+ * as the service reads it.
+ *
+ * All three, because each changes the answer: the same query of another panel
+ * reads another capture, and the same panel id under another session is
+ * another panel. The session and the panel are JSON-quoted, so no value of one
+ * can imitate the separator before the next.
+ *
+ * "As the service reads it" means one thing only: an omitted `limit` or
+ * `offset` is keyed as {@link DATA_QUERY_DEFAULT_LIMIT} or
+ * {@link DATA_QUERY_DEFAULT_OFFSET}, the values the service fills in for an
+ * omitted one — so a span table asking `{ source: 'spans', limit: 200 }` and a
+ * waterfall asking `{ source: 'spans' }` are the one page they are. A value
+ * that is present is keyed exactly as it stands, so a query the service would
+ * clamp or refuse never shares an answer with a valid one. Only the key is
+ * normalised: the query forwarded to the wrapped provider is the caller's own.
+ *
+ * @param sessionId The session the call names.
+ * @param panelId The effective, already checked panel id.
+ * @param query The call's query.
+ * @returns The key the wrapper's two registries are indexed by.
+ */
+function panelReadKey(sessionId: string, panelId: string, query: DataQuery): string {
+  const asRead: DataQuery = {
+    ...query,
+    limit: query.limit === undefined ? DATA_QUERY_DEFAULT_LIMIT : query.limit,
+    offset: query.offset === undefined ? DATA_QUERY_DEFAULT_OFFSET : query.offset,
+  };
+  return `${JSON.stringify(sessionId)}\n${JSON.stringify(panelId)}\n${stableQueryKey(asRead)}`;
+}
+
+/**
+ * The abort-shaped error a cancelled caller is rejected with: its signal's own
+ * reason when that is an error — `AbortController.abort()` supplies a
+ * `DOMException` named `AbortError` when given none — and otherwise a fresh
+ * `DOMException` of that name, as obligation 4 on {@link DataProvider} asks.
+ *
+ * @param signal The caller's aborted signal.
+ * @returns The error to reject that caller with.
+ */
+function cancelledReadError(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  return reason instanceof Error ? reason : new DOMException(CANCELLED_READ_MESSAGE, 'AbortError');
+}
+
 /**
  * Bind a {@link DataProvider} to the panel specification being rendered, so
- * every query made through it names that panel's identity.
+ * every query made through it names that panel's identity — and so identical
+ * queries of that panel are sent once.
  *
  * The returned provider delegates each call to `provider` with the same session,
- * the same query and the same options — `signal` included — and with
- * `options.panelId` set: the call's own `panelId` when it names one, otherwise
- * the bound `panelId`. That is what makes every node of a rendered panel read
- * the capture that panel was generated from rather than live evidence, without
- * any node, `./useQuery` or `PanelHost` having to know the panel's id: the
- * surface that renders the specification wraps its long-lived provider once
- * per panel and hands the wrapper to `PanelHost`.
+ * the same query and the same options, and with `options.panelId` set: the
+ * call's own `panelId` when it names one, otherwise the bound `panelId`. That
+ * is what makes every node of a rendered panel read the capture that panel was
+ * generated from rather than live evidence, without any node, `./useQuery` or
+ * `PanelHost` having to know the panel's id: the surface that renders the
+ * specification wraps its long-lived provider once per panel and hands the
+ * wrapper to `PanelHost`.
  *
  * The input provider is not touched, so the same long-lived provider keeps
  * serving live reads elsewhere on the surface. The wrapper is a new object:
  * memoize it on the provider and the panel id (obligation 7 on
  * {@link DataProvider}), which also means a newly rendered panel version gets a
  * new wrapper and its views resolve again against their own capture.
+ *
+ * ## Identical panel-bound reads are shared
+ *
+ * Every call through the wrapper is panel-bound, and a panel-bound read
+ * addresses the capture its panel was generated from — a capture that is no
+ * longer growing — so one query of one panel always has one answer. Two nodes
+ * of a panel often ask the same question: a timeline and a flame chart of one
+ * trace, a waterfall and a span table of one set of spans. The wrapper
+ * therefore identifies each read by the session, the effective panel id and
+ * the query's {@link stableQueryKey} — an omitted `limit` or `offset` read as
+ * the default the service fills in (see {@link panelReadKey}) — and:
+ *
+ * - **shares one request while it is in flight** — an identical call made
+ *   before the first settles joins it instead of sending another;
+ * - **keeps the settled successful answer** for the wrapper's own lifetime, so
+ *   a node that mounts later, a remount, or a retry after a sibling already
+ *   succeeded is answered without a round trip. At most
+ *   {@link PANEL_READ_CACHE_MAX_ENTRIES} answers are kept, the least recently
+ *   read evicted first, and they go with the wrapper: a new panel version, or
+ *   a surface that stops rendering this panel, drops them;
+ * - **never keeps a failure or an abort** — a rejected read leaves no trace, so
+ *   the retry a node's error state offers asks the provider again;
+ * - **cancels per caller** — each call's own `signal` rejects that call alone,
+ *   with an abort-shaped error, while the request goes on for everyone still
+ *   waiting. The wrapped provider is handed a signal of the wrapper's own, which
+ *   aborts only once every caller waiting on the request has left — deferred by
+ *   one microtask, so a caller that leaves and an identical caller that asks in
+ *   the same turn (React's development double-invoke of effects, a node
+ *   remounted by a key change) keep the one request — and a request aborted
+ *   that way is forgotten: its answer, should the provider still deliver one,
+ *   is never kept. A call whose signal is already aborted is rejected at once
+ *   and neither sends nor reads anything;
+ * - hands every caller **the same response object**, which the readonly result
+ *   types and the renderer's no-mutation rule already make safe to share.
+ *
+ * A live read — a call on the long-lived provider itself, with no panel
+ * identity — never passes through here, so it is never shared or kept: its
+ * capture may still be growing, and only a panel-bound read may be answered
+ * from memory.
  *
  * Binding never throws, so a render cannot crash on it. A bound or per-call
  * `panelId` that cannot name a panel — not a string, or blank — is refused at
@@ -1718,9 +2000,162 @@ export function createPanelDataProvider(resolve: PanelDataResolver): DataProvide
  * @param provider The provider to delegate to. Not modified.
  * @param panelId The id of the panel specification the provider's queries
  * belong to: the rendered `PanelSpec`'s own `id`.
- * @returns A provider that forwards every query to `provider` with `panelId` set.
+ * @returns A provider that forwards every distinct query to `provider` with
+ * `panelId` set, sharing identical ones as described above.
  */
 export function bindPanelIdentity(provider: DataProvider, panelId: string): DataProvider {
+  /** The identical panel-bound reads in flight, by {@link panelReadKey}. */
+  const inFlight = new Map<string, SharedPanelRead>();
+
+  /**
+   * The settled successful answers, by {@link panelReadKey}, in the Map's own
+   * insertion order: least recently read first, which is the eviction order.
+   */
+  const settled = new Map<string, DataQueryResponse>();
+
+  /** The kept answer for `key`, if any, marked as the most recently read. */
+  const recall = (key: string): DataQueryResponse | undefined => {
+    const response = settled.get(key);
+    if (response !== undefined) {
+      settled.delete(key);
+      settled.set(key, response);
+    }
+    return response;
+  };
+
+  /** Keeps a successful answer, evicting the least recently read past the bound. */
+  const remember = (key: string, response: DataQueryResponse): void => {
+    settled.delete(key);
+    settled.set(key, response);
+    // Deleting the entry being visited is safe during Map iteration.
+    for (const oldest of settled.keys()) {
+      if (settled.size <= PANEL_READ_CACHE_MAX_ENTRIES) {
+        break;
+      }
+      settled.delete(oldest);
+    }
+  };
+
+  /**
+   * Sends the one underlying request for `key` and registers it as in flight.
+   *
+   * Invoked through an `async` arrow so a wrapped provider that throws
+   * synchronously still yields a rejected outcome (obligation 8 on
+   * {@link DataProvider}). The request leaves the in-flight registry the
+   * moment it settles; a success is kept unless the request was abandoned
+   * first, and a failure is never kept.
+   */
+  const open = (
+    key: string,
+    sessionId: string,
+    query: DataQuery,
+    options: DataQueryOptions | undefined,
+    effective: string,
+  ): SharedPanelRead => {
+    const controller = new AbortController();
+    const forwarded: DataQueryOptions = {
+      ...options,
+      signal: controller.signal,
+      panelId: effective,
+    };
+
+    const forget = (): void => {
+      if (inFlight.get(key)?.controller === controller) {
+        inFlight.delete(key);
+      }
+    };
+
+    const outcome = (async (): Promise<DataQueryResponse> =>
+      provider.query(sessionId, query, forwarded))().then(
+      (response) => {
+        forget();
+        if (!controller.signal.aborted) {
+          remember(key, response);
+        }
+        return response;
+      },
+      (cause: unknown) => {
+        forget();
+        throw cause;
+      },
+    );
+
+    const shared: SharedPanelRead = { controller, outcome, waiting: 0 };
+    inFlight.set(key, shared);
+    return shared;
+  };
+
+  /**
+   * Aborts and forgets a shared read that no caller is waiting on any more —
+   * one microtask later, and only if no identical caller joined it meanwhile
+   * and it has not settled.
+   */
+  const abandonIfUnwanted = (key: string, shared: SharedPanelRead, reason: Error): void => {
+    if (shared.waiting > 0) {
+      return;
+    }
+
+    queueMicrotask(() => {
+      if (shared.waiting > 0 || inFlight.get(key) !== shared) {
+        return;
+      }
+      inFlight.delete(key);
+      shared.controller.abort(reason);
+    });
+  };
+
+  /**
+   * Waits, as one caller, on a shared read: settles with its outcome, or
+   * rejects on this caller's own abort without touching anyone else's wait.
+   *
+   * The caller's promise is resolved with the shared outcome itself, so a
+   * success reaches it as the same response and a failure as the very same
+   * rejection the wrapped provider produced — a typed `DebuggenError` keeps
+   * its code and hint.
+   */
+  const join = <Source extends DataQuerySource>(
+    key: string,
+    shared: SharedPanelRead,
+    signal: AbortSignal | undefined,
+  ): Promise<DataQueryResponse<Source>> =>
+    new Promise<DataQueryResponse<Source>>((resolve, reject) => {
+      shared.waiting += 1;
+      let waiting = true;
+
+      const onAbort = (): void => {
+        if (!stopWaiting() || signal === undefined) {
+          return;
+        }
+        const reason = cancelledReadError(signal);
+        reject(reason);
+        abandonIfUnwanted(key, shared, reason);
+      };
+
+      /** Ends this caller's wait exactly once; `false` when it had already ended. */
+      const stopWaiting = (): boolean => {
+        if (!waiting) {
+          return false;
+        }
+        waiting = false;
+        shared.waiting -= 1;
+        signal?.removeEventListener('abort', onAbort);
+        return true;
+      };
+
+      signal?.addEventListener('abort', onAbort, { once: true });
+
+      const settle = (): void => {
+        if (stopWaiting()) {
+          // Sound for the same reason as the factories' one assertion: the
+          // key includes the query's source, so a shared read only ever
+          // answers calls for that source, and its answer is a response for
+          // it. What the compiler cannot see is that correlation.
+          resolve(shared.outcome as Promise<DataQueryResponse<Source>>);
+        }
+      };
+      void shared.outcome.then(settle, settle);
+    });
+
   return {
     async query<Source extends DataQuerySource>(
       sessionId: string,
@@ -1736,7 +2171,23 @@ export function bindPanelIdentity(provider: DataProvider, panelId: string): Data
         throw unusablePanelIdError(query.source, effective);
       }
 
-      return provider.query(sessionId, query, { ...options, panelId: effective });
+      // An aborted call is never resolved — not even from a kept answer — and
+      // never joins or opens a request.
+      const signal = options?.signal;
+      if (signal?.aborted === true) {
+        throw cancelledReadError(signal);
+      }
+
+      const key = panelReadKey(sessionId, effective, query);
+
+      const kept = recall(key);
+      if (kept !== undefined) {
+        // Sound as in `join`: the key includes the source.
+        return kept as DataQueryResponse<Source>;
+      }
+
+      const shared = inFlight.get(key) ?? open(key, sessionId, query, options, effective);
+      return join<Source>(key, shared, signal);
     },
   };
 }

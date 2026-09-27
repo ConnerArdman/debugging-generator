@@ -43,14 +43,19 @@
  *    location) is already stamped `route-map`.
  * 3. **`code-graph`** — render/state/error spans by component display name,
  *    `db.query` spans by the database call site reachable from their
- *    enclosing function or route handler, and unpatched `function` spans by
- *    symbol. `createCodeQueries` already mints these locations stamped
- *    `code-graph`.
+ *    enclosing function or route handler (for a statement an ORM issued, the
+ *    ORM call its recorded `model` and `method` name, never a driver call
+ *    site, inside the transaction whose body holds the operations recorded
+ *    under it), and unpatched `function` spans by symbol. `createCodeQueries`
+ *    already mints these locations stamped `code-graph`.
  * 4. **`source-map`** — `fetch`/`xhr` initiator stacks (and browser error
  *    stacks), mapped from generated chunks back to TypeScript by
  *    `resolveStack`, which already stamps `source-map`, discards dependency
  *    and bundler frames, talks only to the loopback dev server through
- *    `fetchSourceMap` and never throws.
+ *    `fetchSourceMap` and never throws. A request is located at the frame
+ *    that started it — the nearest component, event handler or hook — rather
+ *    than at the shared helper that called `fetch`; an error, at its
+ *    innermost frame.
  * 5. **`react-owner`** — a selected element, or an event carrying a
  *    component/owner chain, resolved by walking the chain nearest-first
  *    through the code graph. This is the **only** route whose stamp is minted
@@ -73,7 +78,10 @@
  * chooses between them, narrows ambiguous candidates with runtime evidence,
  * and validates the result. The one byte-level read is
  * {@link createSourceMapScopes}': it digests the chunk `fetchSourceMap`
- * requests, to know whether a map it kept still describes that chunk.
+ * requests, to know whether a map it kept still describes that chunk. The one
+ * graph search is a query owner's reachable call sites, made once per owner
+ * over the injected graph's edges because an ambiguity check needs the
+ * complete set, which a bounded pair query cannot prove (see `ownerReach`).
  *
  * ## An unresolvable item yields no location rather than a guess
  *
@@ -139,9 +147,9 @@ import {
 import type {
   CodeGraph,
   CodeMatch,
+  CodeNode,
   CodeNodeKind,
   CodeNodeOf,
-  CodePathEndpoint,
   CodeQueries,
   DbDriver,
   FetchSourceMapOptions,
@@ -247,6 +255,10 @@ const ATTRIBUTE = Object.freeze({
   dbSystem: 'db.system' satisfies KeyOf<typeof DB_QUERY_ATTRIBUTE_KEYS>,
   /** The operation a query span performed. */
   dbOperation: 'db.operation' satisfies KeyOf<typeof DB_QUERY_ATTRIBUTE_KEYS>,
+  /** The ORM model an ORM operation span names (the generated client's delegate). */
+  ormModel: 'model' satisfies KeyOf<typeof DB_QUERY_ATTRIBUTE_KEYS>,
+  /** The ORM method an ORM operation or transaction span names. */
+  ormMethod: 'method' satisfies KeyOf<typeof DB_QUERY_ATTRIBUTE_KEYS>,
 });
 
 /**
@@ -361,6 +373,32 @@ const FUNCTION_NODE_TIERS: readonly (readonly CodeNodeKind[])[] = Object.freeze(
 const DB_CALL_NODE_KIND = 'db-call' satisfies CodeNodeKind;
 
 /**
+ * How many ORM operations above a `db.query` span are read, nearest first: the
+ * operation that issued the statement and the one that encloses it (a
+ * transaction). A deeper level never narrows further — the enclosing one
+ * already bounds where the operation can have been written.
+ */
+const MAX_ORM_OPERATION_LEVELS = 2;
+
+/**
+ * Code-graph node kinds whose declaration makes a stack frame part of the
+ * code that initiated a request: a React component and an event handler.
+ */
+const INITIATING_NODE_KINDS: readonly CodeNodeKind[] = Object.freeze([
+  'component',
+  'handler',
+] as const);
+
+/** Code-graph node kinds that declare a function, and so may declare a hook. */
+const FUNCTION_DECLARATION_KINDS: readonly CodeNodeKind[] = Object.freeze([
+  'symbol',
+  'server-function',
+] as const);
+
+/** React's hook naming rule: `use` followed by an upper-case letter or a digit. */
+const HOOK_NAME = /^use[A-Z0-9]/;
+
+/**
  * How many times a wrapped display name (`Wrapper(Inner)`) is unwrapped
  * before its inner name is looked up.
  */
@@ -447,6 +485,14 @@ export interface SourceResolveLimits {
    */
   readonly maxDbCandidates: number;
 
+  /**
+   * Code-graph nodes expanded while computing what one enclosing function or
+   * route handler reaches. The search is made once per owner per call or
+   * batch; a search this budget cuts short is marked incomplete, and an
+   * incomplete search never proves that a call site is out of reach.
+   */
+  readonly maxReachableNodes: number;
+
   /** Route patterns and paths tried for one request span. */
   readonly maxRouteCandidates: number;
 
@@ -483,6 +529,7 @@ export const SOURCE_RESOLVE_LIMITS: SourceResolveLimits = Object.freeze({
   maxSourceMaps: DEFAULT_MAX_MAPS,
   maxParentHops: MAX_CALLER_LOOKUP_HOPS,
   maxDbCandidates: 64,
+  maxReachableNodes: 4_096,
   maxRouteCandidates: 8,
   maxBatchEvents: 5_000,
   maxConcurrentEvents: 4,
@@ -925,6 +972,65 @@ interface QueryOwner {
   readonly symbol?: string | undefined;
 }
 
+/**
+ * One ORM operation read off a query span or one of its query ancestors: the
+ * `method` the ORM's tracing recorded, and the `model` when the method was a
+ * model delegate's (a client-level method such as a transaction has none).
+ * Both are as the runtime spelled them; matching against the code graph is
+ * case-insensitive, because the ORM reports the model's declared name while
+ * the source spells the delegate property.
+ */
+interface OrmOperation {
+  readonly method: string;
+  readonly model?: string | undefined;
+  /**
+   * The span that recorded the operation, when it was read off a span of the
+   * query's lineage: what {@link observedInside} reads the operations run
+   * inside it from.
+   */
+  readonly spanId?: string | undefined;
+}
+
+/**
+ * What the spans between a query and its owner say about the client that
+ * issued it.
+ *
+ * A driver span underneath an ORM operation was issued by the ORM: the
+ * driver's own call sites are not where a developer wrote that query, so they
+ * must not answer for it.
+ */
+interface OrmEvidence {
+  /**
+   * The client of the outermost query span below the owner — the one the
+   * application called — when a span named one the code graph knows.
+   */
+  readonly issuer: DbDriver | undefined;
+  /** Whether that client differs from the query span's own client. */
+  readonly delegated: boolean;
+  /** The ORM operations above (and on) the query span, nearest first. */
+  readonly operations: readonly OrmOperation[];
+}
+
+/** A query span's enclosing application code and the ORM evidence met on the way to it. */
+interface QueryLineage {
+  readonly owner: QueryOwner | undefined;
+  readonly evidence: OrmEvidence;
+}
+
+/**
+ * The database call sites one owner reaches through the code graph, by node
+ * id, each with the length of its shortest path.
+ */
+interface OwnerReach {
+  readonly depths: ReadonlyMap<string, number>;
+  /**
+   * Whether the search saw everything within `maxPathDepth` hops. `false` when
+   * the node budget stopped it first: a call site absent from {@link depths}
+   * is then unknown rather than out of reach.
+   */
+  readonly complete: boolean;
+}
+
 /** A matched route and the location to open for it. */
 interface RouteHit {
   readonly entry: RouteEntry;
@@ -973,8 +1079,19 @@ interface ResolveScope {
   >;
   /** The batch's own events by `(sessionId, spanId)`, consulted before the store. */
   readonly batchEvents: ReadonlyMap<string, ResolvableEvent>;
+  /**
+   * The batch's own events by `(sessionId, parentSpanId)`: the children of a
+   * span that arrived with it, which is what {@link observedInside} reads.
+   */
+  readonly batchChildren: ReadonlyMap<string, readonly ResolvableEvent[]>;
   /** Parent spans already read from the store; `null` records a span that never arrived. */
   readonly parentCache: Map<string, ResolvableEvent | null>;
+  /**
+   * What each query owner reaches, by {@link ownerKey}: computed the first
+   * time one of the call's (or batch's) queries names that owner, so every
+   * later query of the same request reuses one graph search.
+   */
+  readonly reachByOwner: Map<string, OwnerReach>;
   /** Every signal that cancels this call: an abort is an `Err`. */
   readonly cancellation: readonly AbortSignal[];
   /** The call's time budget: an abort leaves the remaining items `budget-expired`. */
@@ -1262,6 +1379,7 @@ function mergeLimits(overrides: Partial<SourceResolveLimits> | undefined): Sourc
     maxSourceMaps: lowered('maxSourceMaps', 1),
     maxParentHops: lowered('maxParentHops', 1),
     maxDbCandidates: lowered('maxDbCandidates', 1),
+    maxReachableNodes: lowered('maxReachableNodes', 1),
     maxRouteCandidates: lowered('maxRouteCandidates', 1),
     maxBatchEvents: lowered('maxBatchEvents', 1),
     maxConcurrentEvents: lowered('maxConcurrentEvents', 1),
@@ -2072,11 +2190,36 @@ function ownerOf(
   return { file, symbol };
 }
 
+/** A usable ORM name: non-empty and within the code queries' name bound. */
+function ormName(event: ResolvableEvent, key: string): string | undefined {
+  const value = stringAttribute(event, key);
+  return value !== undefined && value.length <= CODE_QUERY_LIMITS.maxNameLength ? value : undefined;
+}
+
+/**
+ * The ORM operation a query span's tracing recorded on it, when it recorded
+ * one: a `method`, and the `model` it was called on when there was one. A
+ * span whose `model` is present but unusable is no evidence at all — reading
+ * it as a model-less (client-level) method would match the wrong call sites.
+ */
+function ormOperationOf(event: ResolvableEvent): OrmOperation | undefined {
+  const method = ormName(event, ATTRIBUTE.ormMethod);
+  if (method === undefined) {
+    return undefined;
+  }
+  if (event.attributes[ATTRIBUTE.ormModel] === undefined) {
+    return { method };
+  }
+  const model = ormName(event, ATTRIBUTE.ormModel);
+  return model === undefined ? undefined : { method, model };
+}
+
 /**
  * Walks up from a `db.query` span to the first enclosing function, route
  * handler or request span that identifies application code, at most
  * `maxParentHops` hops, stopping at a missing parent, a cycle or a parent in
- * another trace.
+ * another trace — and reads the ORM evidence of the query spans it passes on
+ * the way.
  *
  * An owner that names its module but no symbol is provisional. Next.js's
  * route-handler span (`AppRouteRouteHandlers.runHandler`) carries the route
@@ -2086,13 +2229,47 @@ function ownerOf(
  * site through the graph, so the walk continues to an ancestor in the same
  * module that names the handler, and falls back to the provisional owner only
  * when none does.
+ *
+ * The evidence is read from the query span itself and from every query-kind
+ * span below the owner. An ORM that runs over a driver emits its own spans
+ * (the operation, with the ORM's `model` and `method`; its transaction, with
+ * a `method` and no model) above the driver's statement spans, so the
+ * outermost query span names the client the application actually called, and
+ * the method-bearing spans, nearest first, name the operation and what
+ * encloses it. It costs no extra hop: the walk passes these spans on its way to
+ * the owner anyway.
  */
-async function findQueryOwner(
+async function findQueryLineage(
   env: ResolverEnv,
   scope: ResolveScope,
   queries: CodeQueries,
   event: ResolvableEvent,
-): Promise<Result<QueryOwner | undefined, DebuggenError>> {
+): Promise<Result<QueryLineage, DebuggenError>> {
+  const ownDriver = driverHint(event);
+  let issuer = ownDriver;
+  const operations: OrmOperation[] = [];
+  const readEvidence = (span: ResolvableEvent): void => {
+    if (!QUERY_KINDS.includes(span.kind)) {
+      return;
+    }
+    issuer = driverHint(span) ?? issuer;
+    if (operations.length < MAX_ORM_OPERATION_LEVELS) {
+      const operation = ormOperationOf(span);
+      if (operation !== undefined) {
+        operations.push({ ...operation, spanId: span.spanId });
+      }
+    }
+  };
+  const lineage = (owner: QueryOwner | undefined): QueryLineage => ({
+    owner,
+    evidence: {
+      issuer,
+      delegated: issuer !== undefined && issuer !== ownDriver,
+      operations,
+    },
+  });
+
+  readEvidence(event);
   const visited = new Set<string>([event.spanId]);
   let current = event;
   let provisional: QueryOwner | undefined;
@@ -2111,13 +2288,16 @@ async function findQueryOwner(
     if (parent.value === undefined || parent.value.traceId !== event.traceId) {
       break;
     }
+    if (provisional === undefined) {
+      readEvidence(parent.value);
+    }
     if (QUERY_OWNER_KINDS.includes(parent.value.kind)) {
       const owner = ownerOf(env, queries, parent.value);
       if (owner !== undefined) {
         if (owner.symbol === undefined) {
           provisional ??= owner;
         } else if (provisional === undefined || provisional.file === owner.file) {
-          return ok(owner);
+          return ok(lineage(owner));
         } else {
           break;
         }
@@ -2125,7 +2305,7 @@ async function findQueryOwner(
     }
     current = parent.value;
   }
-  return ok(provisional);
+  return ok(lineage(provisional));
 }
 
 /**
@@ -2140,6 +2320,91 @@ function prefer<T>(nodes: readonly T[], accepts: ((node: T) => boolean) | undefi
   return preferred.length > 0 ? preferred : nodes;
 }
 
+/** An owner's identity for {@link ResolveScope.reachByOwner}: its file and symbol. */
+function ownerKey(owner: QueryOwner): string {
+  return `${owner.file}\u0000${owner.symbol ?? ''}`;
+}
+
+/**
+ * Every database call site `owner` reaches through the code graph within
+ * `CODE_QUERY_LIMITS.maxPathDepth` hops, with its shortest distance.
+ *
+ * One breadth-first search per owner, over the same neighbourhood
+ * `CodeQueries.pathBetween` searches — outgoing edges of every kind, seeded
+ * from every node of the owner's file that bears its symbol (the declaration
+ * itself, and the route node a route module's handler edges leave from, whose
+ * `symbol` is the method's name), or from every node of the file for a
+ * provisional, symbol-less owner. It is made here rather than asked of
+ * `pathBetween` candidate by candidate for two reasons. A pair query answers
+ * one target within its own small expansion budget, so a call site it misses
+ * is not thereby out of reach — and an ambiguity check needs exactly that
+ * negative: the one candidate reached must be the only one reachable. And a
+ * request's queries share their owner, so one search serves all of them where
+ * a per-candidate probe repeated the whole search for every query span.
+ *
+ * Remembered in the scope; the node budget is {@link SourceResolveLimits.maxReachableNodes}.
+ */
+function ownerReach(
+  env: ResolverEnv,
+  scope: ResolveScope,
+  graph: CodeGraph,
+  owner: QueryOwner,
+): OwnerReach {
+  const key = ownerKey(owner);
+  const known = scope.reachByOwner.get(key);
+  if (known !== undefined) {
+    return known;
+  }
+
+  const maxDepth = CODE_QUERY_LIMITS.maxPathDepth;
+  const depthOf = new Map<string, number>();
+  const frontier: string[] = [];
+  for (const seed of graph.nodesByFile(owner.file)) {
+    const bearsSymbol =
+      owner.symbol === undefined || seed.name === owner.symbol || seed.symbol === owner.symbol;
+    if (bearsSymbol && !depthOf.has(seed.id)) {
+      depthOf.set(seed.id, 0);
+      frontier.push(seed.id);
+    }
+  }
+
+  let expanded = 0;
+  let complete = true;
+  for (let head = 0; head < frontier.length; head += 1) {
+    const id = frontier[head];
+    const depth = id === undefined ? undefined : depthOf.get(id);
+    if (id === undefined || depth === undefined || depth >= maxDepth) {
+      continue;
+    }
+    if (expanded >= env.limits.maxReachableNodes) {
+      complete = false;
+      break;
+    }
+    expanded += 1;
+    for (const edge of graph.outgoing(id)) {
+      if (!depthOf.has(edge.to)) {
+        depthOf.set(edge.to, depth + 1);
+        frontier.push(edge.to);
+      }
+    }
+  }
+
+  const depths = new Map<string, number>();
+  for (const [id, depth] of depthOf) {
+    if (graph.nodeById(id)?.kind === DB_CALL_NODE_KIND) {
+      depths.set(id, depth);
+    }
+  }
+  const reach: OwnerReach = { depths, complete };
+  scope.reachByOwner.set(key, reach);
+  env.logger.trace('computed the database call sites a query owner reaches', {
+    expanded,
+    reachable: depths.size,
+    complete,
+  });
+  return reach;
+}
+
 /**
  * The database call sites reachable from `owner` through the code graph,
  * nearest first: only those at the shortest path length are kept. `undefined`
@@ -2148,38 +2413,208 @@ function prefer<T>(nodes: readonly T[], accepts: ((node: T) => boolean) | undefi
  */
 function reachableCalls(
   env: ResolverEnv,
-  queries: CodeQueries,
+  scope: ResolveScope,
+  graph: CodeGraph,
   owner: QueryOwner,
   candidates: readonly CodeNodeOf<'db-call'>[],
 ): readonly CodeNodeOf<'db-call'>[] | undefined {
   if (candidates.length > env.limits.maxDbCandidates) {
     return undefined;
   }
-  // `symbol` rather than `name`: a selector's `symbol` matches a node's
-  // `symbol` or its `name`, which seeds the search from every node that stands
-  // for the declaration — the declaration itself, and the route node a route
-  // module's handler edges leave from (its `symbol` is the method's name).
-  const from: CodePathEndpoint =
-    owner.symbol === undefined ? { file: owner.file } : { file: owner.file, symbol: owner.symbol };
+  const reach = ownerReach(env, scope, graph, owner);
 
   let bestDepth = Number.POSITIVE_INFINITY;
   let nearest: CodeNodeOf<'db-call'>[] = [];
   for (const candidate of candidates) {
-    const path = queries.pathBetween(from, candidate.id, {
-      direction: 'out',
-      ...(Number.isFinite(bestDepth) ? { maxDepth: bestDepth } : {}),
-    });
-    if (path === undefined) {
+    const depth = reach.depths.get(candidate.id);
+    if (depth === undefined) {
       continue;
     }
-    if (path.depth < bestDepth) {
-      bestDepth = path.depth;
+    if (depth < bestDepth) {
+      bestDepth = depth;
       nearest = [candidate];
-    } else if (path.depth === bestDepth) {
+    } else if (depth === bestDepth) {
       nearest.push(candidate);
     }
   }
   return nearest;
+}
+
+/** Whether `node` is a call site of the ORM operation `operation` names. */
+function isCallOf(node: CodeNodeOf<'db-call'>, operation: OrmOperation): boolean {
+  if (node.data.operation?.toLowerCase() !== operation.method.toLowerCase()) {
+    return false;
+  }
+  const model = node.data.model;
+  return operation.model === undefined
+    ? model === undefined
+    : model?.toLowerCase() === operation.model.toLowerCase();
+}
+
+/** Whether call site `outer`'s source range contains call site `inner`. */
+function encloses(outer: CodeNodeOf<'db-call'>, inner: CodeNodeOf<'db-call'>): boolean {
+  if (outer.id === inner.id || outer.file !== inner.file) {
+    return false;
+  }
+  const end = outer.endLine ?? outer.line;
+  return inner.line >= outer.line && inner.line <= end;
+}
+
+/**
+ * The ORM operations recorded on the children of `operation`'s span that
+ * arrived in the same batch — for a transaction, the operations its callback
+ * ran — without duplicates. Empty when the operation was not read off a span,
+ * or none of its children arrived with the batch.
+ */
+function observedInside(
+  scope: ResolveScope,
+  sessionId: string,
+  operation: OrmOperation,
+): readonly OrmOperation[] {
+  if (operation.spanId === undefined) {
+    return [];
+  }
+  const children = scope.batchChildren.get(spanKey(sessionId, operation.spanId)) ?? [];
+  const seen = new Set<string>();
+  const observed: OrmOperation[] = [];
+  for (const child of children) {
+    if (!QUERY_KINDS.includes(child.kind)) {
+      continue;
+    }
+    const inner = ormOperationOf(child);
+    if (inner === undefined) {
+      continue;
+    }
+    const key = `${inner.model?.toLowerCase() ?? ''}\u0000${inner.method.toLowerCase()}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      observed.push(inner);
+    }
+  }
+  return observed;
+}
+
+/**
+ * `sites` narrowed to those whose source range holds a call of every
+ * operation in `observed` — when at least one does.
+ *
+ * An operation that encloses others (a transaction) ran exactly the operations
+ * recorded under its span, and its callback is where they were written, so a
+ * candidate site whose body holds no call of one of them is not the one that
+ * ran. Any subset of the operations that ran supports that elimination, which
+ * is why a batch holding only some of a transaction's children is still
+ * evidence. When no site holds them all — the callback delegated to a helper
+ * outside its range — the evidence says nothing about the sites and they are
+ * kept, so the answer is then the unique site or `ambiguous`, as before.
+ */
+function fittingBodies(
+  issued: readonly CodeNodeOf<'db-call'>[],
+  sites: readonly CodeNodeOf<'db-call'>[],
+  observed: readonly OrmOperation[],
+): readonly CodeNodeOf<'db-call'>[] {
+  if (sites.length < 2 || observed.length === 0) {
+    return sites;
+  }
+  const fitting = sites.filter((site) =>
+    observed.every((operation) =>
+      issued.some((node) => isCallOf(node, operation) && encloses(site, node)),
+    ),
+  );
+  return fitting.length > 0 ? fitting : sites;
+}
+
+/**
+ * `candidates` narrowed to the ones `reach` proves the owner reaches — when a
+ * complete search reached at least one. A search the budget cut short proves
+ * nothing about the rest, and a complete one that reached none says only
+ * that the graph did not link the owner to the site (a callback, a dynamic
+ * dispatch), which the ORM evidence itself outweighs; both keep the whole set,
+ * so the answer is then a project-wide unique match or `ambiguous`.
+ */
+function narrowByReach(
+  candidates: readonly CodeNodeOf<'db-call'>[],
+  reach: OwnerReach | undefined,
+): readonly CodeNodeOf<'db-call'>[] {
+  if (reach === undefined || !reach.complete) {
+    return candidates;
+  }
+  const reached = candidates.filter((node) => reach.depths.has(node.id));
+  return reached.length > 0 ? reached : candidates;
+}
+
+/**
+ * A query issued through an ORM, located at the ORM call that issued it.
+ *
+ * Only the issuing client's call sites are candidates — strictly, never as a
+ * soft preference: a driver statement the ORM ran was not written at any of
+ * the driver's own call sites, so falling back to one would name a wrong line
+ * with full confidence. The nearest ORM operation then selects the call sites
+ * of that `model` and `method`, narrowed to those the owner reaches. When the
+ * operation ran inside an enclosing one (a transaction), the enclosing
+ * operation's call sites are found the same way first, and the operation's own
+ * call sites count only inside their source range: an operation made through
+ * the transaction's own client is not a call site the index can hold, and a
+ * same-named call elsewhere is not the one that ran. With none inside, the
+ * enclosing call site is the answer — the transaction whose callback issued
+ * the statement. Where several sites of the enclosing operation (or of the
+ * operation itself, for a transaction's own statements) remain, the
+ * operations recorded under its span narrow them to the sites whose body
+ * holds a call of each ({@link fittingBodies}). Several sites at any step are
+ * `ambiguous`; no depth or order breaks the tie.
+ */
+function resolveOrmCallSite(
+  env: ResolverEnv,
+  scope: ResolveScope,
+  queries: CodeQueries,
+  graph: CodeGraph,
+  lineage: QueryLineage,
+  sessionId: string,
+): RouteStep {
+  const { owner, evidence } = lineage;
+  const issued = graph
+    .nodesByKind(DB_CALL_NODE_KIND)
+    .filter((node) => node.data.driver === evidence.issuer);
+  const reach = owner === undefined ? undefined : ownerReach(env, scope, graph, owner);
+  const [operation, enclosing] = evidence.operations;
+
+  let pool: readonly CodeNodeOf<'db-call'>[];
+  if (operation === undefined) {
+    pool = narrowByReach(issued, reach);
+  } else if (enclosing === undefined) {
+    pool = fittingBodies(
+      issued,
+      narrowByReach(
+        issued.filter((node) => isCallOf(node, operation)),
+        reach,
+      ),
+      observedInside(scope, sessionId, operation),
+    );
+  } else {
+    const outer = fittingBodies(
+      issued,
+      narrowByReach(
+        issued.filter((node) => isCallOf(node, enclosing)),
+        reach,
+      ),
+      observedInside(scope, sessionId, enclosing),
+    );
+    const inside = issued.filter(
+      (node) => isCallOf(node, operation) && outer.some((site) => encloses(site, node)),
+    );
+    pool = inside.length > 0 ? inside : outer;
+  }
+
+  if (pool.length === 0) {
+    return miss('symbol-not-found');
+  }
+  if (pool.length > env.limits.maxDbCandidates) {
+    return miss('ambiguous');
+  }
+  return choose(
+    env,
+    pool.map((node) => callSiteCandidate(queries, node)),
+    'code-graph',
+  );
 }
 
 /**
@@ -2213,11 +2648,14 @@ function callSiteCandidate(queries: CodeQueries, node: CodeNodeOf<'db-call'>): L
  * issued it.
  *
  * Narrowed before it is chosen: the enclosing function or route handler is
- * found by walking parent spans; the call sites that function issues directly
- * are preferred, then those reachable from it at the shortest path length;
- * among those, the span's driver (`db.client`, or `db.system` when it names a
- * driver) and operation break ties softly. Exactly one site is a hit; several
- * indistinguishable ones are `ambiguous`.
+ * found by walking parent spans. A query the walk shows was issued through an
+ * ORM — an ORM operation recorded on it or above it, or a query span of
+ * another client above it — is located by {@link resolveOrmCallSite}. Any
+ * other query prefers the call sites its owner issues directly, then those
+ * reachable from it at the shortest path length; among those, the span's
+ * driver (`db.client`, or `db.system` when it names a driver) and operation
+ * break ties softly. Exactly one site is a hit; several indistinguishable ones
+ * are `ambiguous`.
  */
 async function resolveQueryCallSite(
   env: ResolverEnv,
@@ -2226,10 +2664,15 @@ async function resolveQueryCallSite(
   graph: CodeGraph,
   event: ResolvableEvent,
 ): Promise<Result<RouteStep, DebuggenError>> {
-  const owner = await findQueryOwner(env, scope, queries, event);
-  if (isErr(owner)) {
-    return owner;
+  const lineage = await findQueryLineage(env, scope, queries, event);
+  if (isErr(lineage)) {
+    return lineage;
   }
+  const { evidence } = lineage.value;
+  if (evidence.issuer !== undefined && (evidence.delegated || evidence.operations.length > 0)) {
+    return ok(resolveOrmCallSite(env, scope, queries, graph, lineage.value, event.sessionId));
+  }
+  const owner = lineage.value.owner;
 
   const driver = driverHint(event);
   const operation = stringAttribute(event, ATTRIBUTE.dbOperation)?.toLowerCase();
@@ -2243,8 +2686,8 @@ async function resolveQueryCallSite(
 
   const all = graph.nodesByKind(DB_CALL_NODE_KIND);
   let pool: readonly CodeNodeOf<'db-call'>[] = all;
-  if (owner.value !== undefined) {
-    const enclosing = owner.value;
+  if (owner !== undefined) {
+    const enclosing = owner;
     const direct = all.filter(
       (node) =>
         enclosing.symbol !== undefined &&
@@ -2258,7 +2701,7 @@ async function resolveQueryCallSite(
       // project has more call sites than the reachability budget, where the
       // evidence is applied first to bring the search inside it.
       const searched = all.length > env.limits.maxDbCandidates ? byEvidence(all) : all;
-      const reachable = reachableCalls(env, queries, enclosing, searched);
+      const reachable = reachableCalls(env, scope, graph, enclosing, searched);
       if (reachable === undefined) {
         return ok(miss('ambiguous'));
       }
@@ -2356,14 +2799,126 @@ function stackOf(event: ResolvableEvent): { readonly applies: boolean; readonly 
 }
 
 /**
+ * The innermost declaration the code graph places `frame`'s line inside that is
+ * a React component, an event handler or a hook — code that starts work on the
+ * user's or the UI's behalf, as opposed to a shared helper it calls. A hook is
+ * recognised by React's own naming rule (`use` followed by an upper-case letter
+ * or a digit), the convention React's tooling enforces, and nothing
+ * project-specific. Innermost means the shortest line range, so a handler
+ * declared inside a component names the handler.
+ */
+function initiatingDeclaration(graph: CodeGraph, frame: SourceLocation): CodeNode | undefined {
+  let innermost: CodeNode | undefined;
+  for (const node of graph.nodesByFile(frame.file)) {
+    const endLine = node.endLine ?? node.line;
+    if (frame.line < node.line || frame.line > endLine) {
+      continue;
+    }
+    const initiating =
+      INITIATING_NODE_KINDS.includes(node.kind) ||
+      (FUNCTION_DECLARATION_KINDS.includes(node.kind) && HOOK_NAME.test(node.name));
+    if (
+      initiating &&
+      (innermost === undefined ||
+        endLine - node.line < (innermost.endLine ?? innermost.line) - innermost.line)
+    ) {
+      innermost = node;
+    }
+  }
+  return innermost;
+}
+
+/**
+ * The frame of a request's initiator stack that says who started the request.
+ *
+ * `frames` are the stack's vetted locations, innermost first. The innermost is
+ * where `fetch` was called, which in most applications is one shared request
+ * helper — so every request of the page would name the same line. Chosen
+ * instead, in order:
+ *
+ * 1. the nearest frame the code graph declares inside a component, an event
+ *    handler or a hook ({@link initiatingDeclaration}), with that
+ *    declaration's name as the location's `symbol` — the source map's name at
+ *    a call position is the callee (the request helper, or a word of its
+ *    arguments), while the reader wants the code that made the call;
+ * 2. otherwise the nearest frame outside the module that called `fetch` —
+ *    past the helper module's own layers, whatever they are named;
+ * 3. otherwise the innermost frame, which is all the stack offers.
+ *
+ * An error stack is not passed here: where an error was thrown is its
+ * innermost frame.
+ */
+function initiatingFrame(
+  graph: CodeGraph | undefined,
+  frames: readonly SourceLocation[],
+): SourceLocation | undefined {
+  const [innermost] = frames;
+  if (innermost === undefined) {
+    return undefined;
+  }
+  if (graph !== undefined) {
+    for (const frame of frames) {
+      const declaration = initiatingDeclaration(graph, frame);
+      if (declaration !== undefined) {
+        const name = declaration.name.trim();
+        return name.length === 0 ? frame : { ...frame, symbol: name };
+      }
+    }
+  }
+  return frames.find((frame) => frame.file !== innermost.file) ?? innermost;
+}
+
+/**
+ * The project files this session's patches had rewritten when `event` ran —
+ * every file of a modification record in force at that time
+ * ({@link inForceAt}), as a safe, normalised project-relative path.
+ *
+ * These are the modules the dev server re-evaluated in a hot update, which is
+ * what `resolveStack` needs to tell the module a hot-updated frame ran in from
+ * another project module of the same chunk (its `reevaluatedFiles`). It asks
+ * only when a frame is ambiguous, so the journal read — the batch's shared one
+ * ({@link modificationsFor}) — is made only then. A journal that cannot be
+ * read gives no hint rather than failing the route: the hint only breaks ties.
+ */
+async function reevaluatedFilesAt(
+  env: ResolverEnv,
+  scope: ResolveScope,
+  event: ResolvableEvent,
+): Promise<readonly string[]> {
+  const records = await modificationsFor(env, scope, event.sessionId);
+  if (isErr(records)) {
+    env.logger.debug(
+      'The modification journal could not be read; hot-updated frames get no tie-breaker',
+      { code: records.error.code },
+    );
+    return [];
+  }
+  const files = new Set<string>();
+  for (const record of records.value) {
+    if (inForceAt(record, event) && isSafeRelativePath(record.file)) {
+      files.add(normalizePosix(record.file));
+    }
+  }
+  return [...files];
+}
+
+/**
  * Route 4: a browser item whose call site is known only as a stack of
  * generated-chunk frames (confidence 0.75).
  *
  * Entirely delegated to `resolveStack`: it fetches maps only from the
  * session's loopback dev-server origin, discards dependency and bundler
- * frames, normalises bundler source paths and never throws. The first
- * returned location that passes {@link vet} — the nearest application frame —
- * is the answer. Without a dev-server origin nothing is fetched at all.
+ * frames, normalises bundler source paths and never throws. Every returned
+ * location is passed through {@link vet}. For a browser error the first one
+ * that passes — the innermost application frame, where it was thrown — is the
+ * answer; for a request initiator, {@link initiatingFrame} chooses among all
+ * that pass, because the innermost is the shared helper that called `fetch`.
+ * Without a dev-server origin nothing is fetched at all.
+ *
+ * A frame of a module the dev server re-evaluated after a patch rewrote it is
+ * module-relative; `resolveStack` maps it within the chunk's module sections
+ * and, when several match, prefers the one of a file this session's patches
+ * had rewritten ({@link reevaluatedFilesAt}).
  */
 const sourceMapRoute: RouteImpl = async (env, scope, subject) => {
   const steps: RouteStep[] = [];
@@ -2392,6 +2947,7 @@ const sourceMapRoute: RouteImpl = async (env, scope, subject) => {
   }
 
   const stack = captured.stack;
+  const event = subject.event;
   const signal = combinedSignal(scope.signals);
   const located = await fromPromise(
     Promise.resolve().then(() =>
@@ -2405,6 +2961,7 @@ const sourceMapRoute: RouteImpl = async (env, scope, subject) => {
         ...(env.sourceMapLookup === undefined ? {} : { fetchSourceMapImpl: env.sourceMapLookup }),
         maxFrames: env.limits.maxStackFrames,
         maxMaps: env.limits.maxSourceMaps,
+        reevaluatedFiles: () => reevaluatedFilesAt(env, scope, event),
         signal,
         logger: env.logger,
       }),
@@ -2415,12 +2972,23 @@ const sourceMapRoute: RouteImpl = async (env, scope, subject) => {
     return located;
   }
 
+  const initiator = INITIATOR_KINDS.includes(subject.event.kind);
+  const accepted: SourceLocation[] = [];
   for (const location of located.value.slice(0, env.limits.maxStackFrames)) {
-    const step = stepFor(vet(env, location, 'source-map'));
-    steps.push(step);
-    if (step.outcome === 'hit') {
+    const vetted = vet(env, location, 'source-map');
+    if (!vetted.accepted) {
+      steps.push(rejected(vetted.reason));
+    } else if (initiator) {
+      accepted.push(vetted.location);
+    } else {
+      steps.push(hit(vetted.location));
       return ok(steps);
     }
+  }
+  const chosen = initiatingFrame(env.graph, accepted);
+  if (chosen !== undefined) {
+    steps.push(hit(chosen));
+    return ok(steps);
   }
   if (located.value.length === 0) {
     steps.push(miss('unmapped-frame'));
@@ -2599,6 +3167,29 @@ async function resolveSubject(
   });
 }
 
+/**
+ * The longest a {@link SourceResolver.resolveEvents} batch runs before it
+ * yields the event loop, in milliseconds.
+ *
+ * Most routes answer from memory, and `node:sqlite` — behind the parent-span
+ * and journal ports — is synchronous, so a batch's `await`s settle as
+ * microtasks and a CPU-bound batch would otherwise never let a macrotask run:
+ * not ingest's budget timer, whose abort is how the batch learns to stop, and
+ * not any other request or socket the service is serving. Yielding with
+ * `setImmediate` once this much time has passed lets those run, and the budget
+ * is checked right after, so a batch overruns its budget by at most about one
+ * slice plus the item in progress. Short enough to keep that overrun and the
+ * service's latency small, long enough that the yields cost nothing measurable.
+ */
+export const RESOLVE_YIELD_SLICE_MS = 5;
+
+/** Yields to the event loop for one macrotask turn. */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
 /** What {@link resolveBatch} made of a batch's items. */
 interface BatchOutcome {
   /** Each item's location by its position in the batch, `undefined` where none was found. */
@@ -2628,6 +3219,11 @@ interface BatchOutcome {
  * `aborted` answer met while only the budget — not a cancelling signal — has
  * fired is the budget cutting that item short, and is counted as such rather
  * than failing the batch.
+ *
+ * Before taking an item, a worker yields the event loop once the workers
+ * together have run for {@link RESOLVE_YIELD_SLICE_MS} since the last yield,
+ * and only then checks the budget — which is what lets the budget's timer fire
+ * during a batch whose routes never wait on anything.
  */
 async function resolveBatch(
   env: ResolverEnv,
@@ -2639,13 +3235,25 @@ async function resolveBatch(
   let unresolved = 0;
   let budgetExpired = 0;
   let failure: DebuggenError | undefined;
+  let sliceStartedAt = performance.now();
 
   const budgetOnly = (): boolean =>
     scope.budget?.aborted === true && !isAborted(scope.cancellation);
 
+  const yieldIfDue = async (): Promise<void> => {
+    if (performance.now() - sliceStartedAt < RESOLVE_YIELD_SLICE_MS) {
+      return;
+    }
+    await yieldToEventLoop();
+    sliceStartedAt = performance.now();
+  };
+
   const work = async (): Promise<void> => {
     while (failure === undefined && next < items.length) {
-      if (budgetOnly()) {
+      await yieldIfDue();
+      // Re-read after the yield: another worker may have taken the last item
+      // or met a fault, and the budget may have fired, while this one waited.
+      if (failure !== undefined || next >= items.length || budgetOnly()) {
         return;
       }
       const index = next;
@@ -3507,12 +4115,27 @@ export function createSourceResolver(deps: SourceResolverDeps): SourceResolver {
   ): ResolveScope => {
     const cancellation = signalsFor(deps, options);
     const budget = options?.budget;
+    const batchChildren = new Map<string, ResolvableEvent[]>();
+    for (const event of batchEvents.values()) {
+      if (event.parentSpanId === undefined) {
+        continue;
+      }
+      const key = spanKey(event.sessionId, event.parentSpanId);
+      const siblings = batchChildren.get(key);
+      if (siblings === undefined) {
+        batchChildren.set(key, [event]);
+      } else {
+        siblings.push(event);
+      }
+    }
     return {
       sourceMapCache: deps.sourceMapCache ?? createSourceMapCache(),
       modificationsBySession: new Map(),
       patchEvidence: new Map(),
       batchEvents,
+      batchChildren,
       parentCache: new Map(),
+      reachByOwner: new Map(),
       cancellation,
       budget,
       signals: budget === undefined ? cancellation : [...cancellation, budget],

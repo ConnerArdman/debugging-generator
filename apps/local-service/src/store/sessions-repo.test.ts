@@ -48,6 +48,19 @@
  * without one, and refuses a blank id; deleting the session removes the row
  * through `ON DELETE CASCADE`; and no log line or error carries the path.
  *
+ * **`SessionRecord.modifications` says what the journal says.** The member is
+ * a mirror written at install time, while the conflict watcher, cleanup and
+ * start-up reconciliation move the journal alone; the record must still report
+ * each file's true status in `GET /sessions/:id`, in `session.updated` and on
+ * reopen. The suite journals real records through the real
+ * `createModificationsRepo`, mirrors them, moves them `applied → conflict` and
+ * `applied → reverted` through that repository, and proves that `get`,
+ * `update` and `setStatus` return — and store — the journal's records; that a
+ * mirrored entry the journal does not hold (or holds under another session)
+ * is left as it was and a journal record the mirror does not list is never
+ * added; that a record mirroring nothing reads no journal; and that a journal
+ * that cannot be read is logged by code, never by content, and fails nothing.
+ *
  * The store is the real one: `openStore` against a file in an `mkdtemp`
  * sandbox — never `:memory:` — so the real DDL, the migration ladder and the
  * `foreign_keys` pragma (which is what performs the `SET NULL`) are exercised.
@@ -68,6 +81,12 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { createModificationRecord } from '@debuggen/instrumentation';
+import type {
+  InstrumentationPlan,
+  ModificationRecord,
+  ModificationStatus,
+} from '@debuggen/instrumentation';
 import type { PanelSpec } from '@debuggen/panel-schema';
 import { FOLLOW_UP_ATTEMPT_ID_PREFIX, parseSessionRecord } from '@debuggen/protocol';
 import type { FollowUpRecord, SessionRecord } from '@debuggen/protocol';
@@ -79,6 +98,7 @@ import {
   newPanelId,
   newSessionId,
   noopLogger,
+  ok,
   unwrap,
 } from '@debuggen/shared';
 import type {
@@ -95,6 +115,8 @@ import type {
 import { openStore } from './db.js';
 import type { Store } from './db.js';
 import { STORE_MIGRATIONS, STORE_SCHEMA_VERSION } from './migrations.js';
+import { createModificationsRepo } from './modifications-repo.js';
+import type { ModificationsRepo } from './modifications-repo.js';
 import { createPanelsRepo } from './panels-repo.js';
 import type { PanelsRepo } from './panels-repo.js';
 import { createSessionsRepo } from './sessions-repo.js';
@@ -1079,5 +1101,298 @@ describe('insert with canonicalRoot and getRootIdentity', () => {
     expect(queryPlan(sql)).toMatch(
       /SEARCH session_root_identities USING PRIMARY KEY \(session_id=\?\)/u,
     );
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * modifications[] — the mirror kept current from the journal
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('the modifications mirror is kept current from the journal', () => {
+  /** The real journal the transitions are written through. */
+  let journal: ModificationsRepo;
+
+  /** How many synthetic digests have been minted in this test. */
+  let minted: number;
+
+  /** A distinct, obviously synthetic 64-character lowercase hex digest. */
+  function nextDigest(): string {
+    minted += 1;
+
+    return `${'b'.repeat(56)}${minted.toString(16).padStart(8, '0')}`;
+  }
+
+  /** A `pending` record for `file`, built through the upstream constructor. */
+  function makeModification(sessionId: SessionId, file: string): ModificationRecord {
+    const originalHash = nextDigest();
+
+    return unwrap(
+      createModificationRecord(
+        {
+          sessionId,
+          planVersion: 1,
+          file,
+          originalHash,
+          backupPath: join(directory, 'backups', sessionId, originalHash),
+          instrumentedHash: nextDigest(),
+          diff: `--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n-export const one = 1;\n+export const one = 1; // timed\n`,
+        },
+        { now: () => CLOCK_START },
+      ),
+    );
+  }
+
+  /** Journals a record for `file` and moves it to `applied`, as an install does. */
+  async function journalApplied(sessionId: SessionId, file: string): Promise<ModificationRecord> {
+    const appended = unwrap(await journal.append(makeModification(sessionId, file)));
+
+    return unwrap(await journal.updateStatus(appended.id, 'applied'));
+  }
+
+  /** Moves a journalled record to `status`, as the watcher or cleanup does. */
+  async function moveTo(record: ModificationRecord, status: ModificationStatus): Promise<void> {
+    unwrap(await journal.updateStatus(record.id, status));
+  }
+
+  /** Writes `records` onto the session's `modifications`, as the orchestrator's mirror does. */
+  function mirror(sessionId: SessionId, records: readonly ModificationRecord[]): SessionRecord {
+    const stored = unwrap(sessions.get(sessionId));
+
+    if (stored === undefined) {
+      throw new Error('The mirror target session is not stored.');
+    }
+
+    return unwrap(sessions.update({ ...stored, modifications: [...records] }));
+  }
+
+  /** The `[id, status]` pairs of a record's mirror, in its order. */
+  function statusesOf(record: SessionRecord | undefined): (readonly [string, string])[] {
+    return (record?.modifications ?? []).map((entry) => [entry.id, entry.status] as const);
+  }
+
+  /** The `[id, status]` pairs of the document the store holds, read with raw SQL. */
+  function storedStatuses(sessionId: SessionId): (readonly [string, string])[] {
+    const row = store.statement('SELECT record FROM sessions WHERE id = ?').get(sessionId);
+
+    if (row === undefined || typeof row['record'] !== 'string') {
+      throw new Error('The session row holds no document.');
+    }
+
+    return statusesOf(unwrap(parseSessionRecord(JSON.parse(row['record']))));
+  }
+
+  /** The journal's current record of `id`. */
+  async function journalled(id: string): Promise<ModificationRecord> {
+    const record = unwrap(await journal.get(id));
+
+    if (record === undefined) {
+      throw new Error('The journal holds no such record.');
+    }
+
+    return record;
+  }
+
+  beforeEach(() => {
+    minted = 0;
+    journal = createModificationsRepo({ store, now: () => CLOCK_START });
+  });
+
+  it('get answers the journal’s statuses after a conflict and a restore the mirror never saw', async () => {
+    const edited = await journalApplied(sessionA, 'src/moduleOne.ts');
+    const restored = await journalApplied(sessionA, 'src/moduleTwo.ts');
+    const untouched = await journalApplied(sessionA, 'src/moduleThree.ts');
+    mirror(sessionA, [edited, restored, untouched]);
+
+    await moveTo(edited, 'conflict');
+    await moveTo(restored, 'reverted');
+
+    const read = unwrap(sessions.get(sessionA));
+
+    expect(statusesOf(read)).toEqual([
+      [edited.id, 'conflict'],
+      [restored.id, 'reverted'],
+      [untouched.id, 'applied'],
+    ]);
+    // Each refreshed entry is the journal's whole record, not a status patch.
+    expect(read?.modifications[0]).toEqual(await journalled(edited.id));
+    expect(read?.modifications[1]).toEqual(await journalled(restored.id));
+    // The read changed nothing on disk: the document still holds the mirror.
+    expect(storedStatuses(sessionA)).toEqual([
+      [edited.id, 'applied'],
+      [restored.id, 'applied'],
+      [untouched.id, 'applied'],
+    ]);
+  });
+
+  it('update stores and returns the journal’s statuses when handed a record read before them', async () => {
+    const edited = await journalApplied(sessionA, 'src/moduleOne.ts');
+    const restored = await journalApplied(sessionA, 'src/moduleTwo.ts');
+    const stale = mirror(sessionA, [edited, restored]);
+
+    await moveTo(edited, 'conflict');
+    await moveTo(restored, 'reverted');
+
+    // A caller writing back what it read before cleanup, as a cleanup outcome
+    // written onto an in-memory record would.
+    const written = unwrap(
+      sessions.update({
+        ...stale,
+        cleanup: { status: 'conflict', completedAt: CLOCK_START + 5, conflicts: [] },
+      }),
+    );
+    const expected = [
+      [edited.id, 'conflict'],
+      [restored.id, 'reverted'],
+    ];
+
+    expect(statusesOf(written)).toEqual(expected);
+    expect(storedStatuses(sessionA)).toEqual(expected);
+    expect(statusesOf(unwrap(sessions.get(sessionA)))).toEqual(expected);
+    expect(written.cleanup.status).toBe('conflict');
+  });
+
+  it('setStatus stores and returns the journal’s statuses with the new session status', async () => {
+    const restoredOne = await journalApplied(sessionA, 'src/moduleOne.ts');
+    const restoredTwo = await journalApplied(sessionA, 'src/moduleTwo.ts');
+    mirror(sessionA, [restoredOne, restoredTwo]);
+
+    await moveTo(restoredOne, 'reverted');
+    await moveTo(restoredTwo, 'reverted');
+
+    const ended = unwrap(sessions.setStatus(sessionA, 'ended'));
+    const expected = [
+      [restoredOne.id, 'reverted'],
+      [restoredTwo.id, 'reverted'],
+    ];
+
+    expect(ended.status).toBe('ended');
+    expect(statusesOf(ended)).toEqual(expected);
+    expect(storedStatuses(sessionA)).toEqual(expected);
+  });
+
+  it('insertPlanWithRecord stores the mirror current, through update', async () => {
+    const restored = await journalApplied(sessionA, 'src/moduleOne.ts');
+    const stale = mirror(sessionA, [restored]);
+
+    await moveTo(restored, 'reverted');
+
+    const plan: InstrumentationPlan = {
+      version: 1,
+      planVersion: 1,
+      sessionId: sessionA,
+      objective: 'Measure where handlerAlpha spends its time',
+      hypotheses: [],
+      capture: ['fetch calls'],
+      instrumentationTargets: [],
+    };
+    // The mirror callback hands back the record read before the restore, as a
+    // caller holding it in memory would.
+    const planned = unwrap(
+      sessions.insertPlanWithRecord(plan, (storedPlan) =>
+        ok({ ...stale, plans: [...stale.plans, storedPlan] }),
+      ),
+    );
+
+    expect(statusesOf(planned.session)).toEqual([[restored.id, 'reverted']]);
+    expect(storedStatuses(sessionA)).toEqual([[restored.id, 'reverted']]);
+  });
+
+  it('keeps an entry the journal does not hold, and never adds one the mirror does not list', async () => {
+    const mirrored = await journalApplied(sessionA, 'src/moduleOne.ts');
+    const unmirrored = await journalApplied(sessionA, 'src/moduleTwo.ts');
+    const neverJournalled = {
+      ...makeModification(sessionA, 'src/moduleFour.ts'),
+      status: 'applied' as const,
+    };
+    mirror(sessionA, [neverJournalled, mirrored]);
+
+    await moveTo(mirrored, 'reverted');
+    await moveTo(unmirrored, 'reverted');
+
+    const read = unwrap(sessions.get(sessionA));
+    const written = unwrap(sessions.setStatus(sessionA, 'analyzing'));
+
+    for (const record of [read, written]) {
+      expect(statusesOf(record)).toEqual([
+        [neverJournalled.id, 'applied'],
+        [mirrored.id, 'reverted'],
+      ]);
+      expect(record?.modifications[0]).toEqual(neverJournalled);
+    }
+    expect(storedStatuses(sessionA)).toEqual([
+      [neverJournalled.id, 'applied'],
+      [mirrored.id, 'reverted'],
+    ]);
+  });
+
+  it('overlays only from the session’s own journal', async () => {
+    const other = await journalApplied(sessionA, 'src/moduleOne.ts');
+    // Session B's document names session A's record; A's journal moves it.
+    mirror(sessionB, [other]);
+    await moveTo(other, 'reverted');
+
+    expect(statusesOf(unwrap(sessions.get(sessionB)))).toEqual([[other.id, 'applied']]);
+  });
+
+  it('hands back the very record when the mirror is already current', async () => {
+    const applied = await journalApplied(sessionA, 'src/moduleOne.ts');
+    const stored = mirror(sessionA, [applied]);
+
+    const read = unwrap(sessions.get(sessionA));
+
+    expect(read).toEqual(stored);
+    expect(logs.some((entry) => entry.message.includes('refreshed from the journal'))).toBe(false);
+  });
+
+  it('reads no journal for a record that mirrors no modification', () => {
+    const texts: string[] = [];
+    const read = unwrap(createSessionsRepo({ store: recordingStore(store, texts) }).get(sessionA));
+
+    expect(read?.modifications).toEqual([]);
+    expect(texts.some((sql) => sql.includes('FROM modifications'))).toBe(false);
+  });
+
+  it('keeps the stored entries and logs by code when the journal cannot be read', async () => {
+    const restored = await journalApplied(sessionA, 'src/moduleOne.ts');
+    mirror(sessionA, [restored]);
+    await moveTo(restored, 'reverted');
+    store
+      .statement(
+        `INSERT INTO modifications (
+           id, session_id, plan_version, file, original_hash, backup_path,
+           instrumented_hash, applied_at, updated_at, status, diff, previous_record_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+      )
+      .run(
+        'mod_corruptjournalrow',
+        sessionA,
+        1,
+        'src/corrupt.ts',
+        'NOT-A-SHA256-DIGEST',
+        join(directory, 'backups', sessionA, 'original'),
+        'ALSO-NOT-A-SHA256-DIGEST',
+        CLOCK_START,
+        CLOCK_START,
+        'applied',
+        `+// ${SENTINEL}\n`,
+      );
+    logs.length = 0;
+
+    const read = unwrap(sessions.get(sessionA));
+    const written = unwrap(sessions.setStatus(sessionA, 'analyzing'));
+
+    expect(statusesOf(read)).toEqual([[restored.id, 'applied']]);
+    expect(statusesOf(written)).toEqual([[restored.id, 'applied']]);
+
+    const warnings = logs.filter(
+      (entry) => entry.level === 'warn' && entry.message.includes('modification journal'),
+    );
+
+    expect(warnings.map((entry) => entry.fields['operation'])).toEqual(['get', 'setStatus']);
+    for (const warning of warnings) {
+      expect(warning.fields['sessionId']).toBe(sessionA);
+      expect(warning.fields['code']).toBe('STORE_ERROR');
+    }
+    expect(JSON.stringify(logs)).not.toContain(SENTINEL);
   });
 });

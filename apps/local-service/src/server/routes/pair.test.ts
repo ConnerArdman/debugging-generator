@@ -30,7 +30,7 @@ import { HTTP_ROUTES, buildPath } from '@debuggen/protocol';
 import { DebuggenError, err, ok } from '@debuggen/shared';
 import type { LogFields, Logger } from '@debuggen/shared';
 
-import { AUTH_FAILURE_REASONS } from '../auth.js';
+import { AUTH_FAILURE_REASONS, PAIRING_LOCKOUT_MS } from '../auth.js';
 import type { AuthFailureReason, AuthService, EditorPrincipal, ServerEnv } from '../auth.js';
 
 import { createPairRoutes } from './pair.js';
@@ -363,4 +363,55 @@ describe('POST /pair/complete — outside the fence', () => {
     });
     expect(h.startPairing).not.toHaveBeenCalled();
   });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * POST /pair/complete — the lockout says how long to wait
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('POST /pair/complete — a lockout refusal', () => {
+  /** A `pair.complete` request from the extension origin, carrying {@link PAIRING_CODE}. */
+  function completeRequest(): Request {
+    return new Request(PAIR_COMPLETE_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: EXTENSION_ORIGIN },
+      body: JSON.stringify({ code: PAIRING_CODE }),
+    });
+  }
+
+  it('answers 429 with Retry-After in whole seconds and a message that states the wait', async () => {
+    const h = harness();
+    h.completePairing.mockReturnValueOnce(err(fenceRefusal('pairing-locked')));
+
+    const response = await pairApp(h.routes, editorPrincipal()).fetch(completeRequest());
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(response.headers.get('retry-after')).toBe(String(PAIRING_LOCKOUT_MS / 1000));
+    const payload = (await response.json()) as ErrorPayload;
+    expect(payload).toEqual({
+      code: 'RATE_LIMITED',
+      message: AUTH_FAILURE_REASONS['pairing-locked'].message,
+    });
+    // The developer reads the wait in the words the dialog shows, not only in a header.
+    expect(payload.message).toContain(`${String(PAIRING_LOCKOUT_MS / 1000)} seconds`);
+  });
+
+  it.each([
+    'pairing-invalid',
+    'pairing-used',
+    'pairing-expired',
+    'pairing-origin-required',
+  ] as const)(
+    'sets no Retry-After on a refusal that waiting does not change (%s)',
+    async (reason) => {
+      const h = harness();
+      h.completePairing.mockReturnValueOnce(err(fenceRefusal(reason)));
+
+      const response = await pairApp(h.routes, editorPrincipal()).fetch(completeRequest());
+
+      expect(response.status).toBe(AUTH_FAILURE_REASONS[reason].status);
+      expect(response.headers.get('retry-after')).toBeNull();
+    },
+  );
 });

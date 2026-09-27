@@ -182,8 +182,8 @@
  *
  * Recorded here so the next reader does not have to rediscover any of it. The
  * first and the last were verified in Chrome against a fixture of eight
- * participants across six layers; the second follows from the geometry below
- * and holds for every payload by construction:
+ * participants across six layers; the three between them follow from the
+ * geometry below and hold for every payload by construction:
  *
  *   - **Direction is carried by the layout and by the grid, not by arrowheads.**
  *     The stylesheet declares no marker for this block and the geometry helper
@@ -210,6 +210,26 @@
  *     widest relationship count drawn inside a gap (see {@link columnGapOf}).
  *     The participants grid is the complete reading of a graph too large to
  *     take in at a glance, which is the other reason it is never virtualized.
+ *   - **A tall column is bounded, and no box is ever cut by the viewport.** The
+ *     viewport's block size is capped by the stylesheet, so a column of every
+ *     participant a capture produced — fifteen components re-rendered by one
+ *     commit is ordinary — would be cut through a box at the cap. The scale
+ *     module's row bound (`DEFAULT_GRAPH_MAX_ROWS`, sized to that cap) draws a
+ *     taller column's costliest participants in boxes of their own and gathers
+ *     the rest into one overflow box in its last row: `+N more`, their summed
+ *     time, their names in its title. Every relationship to or from a gathered
+ *     participant is drawn to that box, merged with the others between the
+ *     same two boxes into one curve; the grid still lists every participant
+ *     and every relationship on its own, and the text alternative says how
+ *     many were gathered.
+ *   - **Counts are placed where they fit, never piled.** A connector that
+ *     stands for several records carries its count at the first of three
+ *     places that collides with no box and no other count: the middle of its
+ *     gap, just before the box it meets or just after the box it leaves — the
+ *     box side first when one participant fans out to, or in from, several
+ *     (`../utils/scale`'s `placeEdgeLabels`). A count that fits nowhere is not
+ *     drawn, and a note under the grid says how many were left off; every
+ *     count is in the grid.
  *   - **The relationship curves carry no information of their own.** The
  *     stroke is the design system's edge treatment in
  *     `../styles/components.css`, whose contrast is owned and tested with the
@@ -228,11 +248,35 @@
  * draw (`sources`), which the source guard reports against, and the view's own
  * name (`label`), which the canvas's text alternative and the grid's caption are
  * composed from. The participant fields drawn here — label, class, tier, record
- * count, total and slowest duration, source location, layer and event
- * coordinate — and the relationship fields — its endpoints, its count and its
- * inferred and ambiguous shares — are what the aggregate derives from the
- * telemetry fields that same entry declares in `reads`; this component reads
- * prepared participants and never a raw record.
+ * count, total and slowest duration, source location, layer, event coordinate
+ * and render-cascade roles — and the relationship fields — its endpoints, its
+ * count, its inferred and ambiguous shares, why its callee rendered and the
+ * contexts that changed — are what the aggregate derives from the telemetry
+ * fields that same entry declares in `reads`; this component reads prepared
+ * participants and never a raw record.
+ *
+ * ## TRIGGER → PROVIDER → CONSUMERS, IN WORDS
+ *
+ * The excessive-render panel reads this graph for the structure of a render
+ * cascade. The aggregate declares it and this component only states it: a
+ * participant's `roles` become chips after its class chip in the grid, the
+ * first of them by precedence (provider, trigger, consumer) prefixes its canvas
+ * box's metrics line, and all of them are named in its shape's title; a
+ * relationship's `renderTriggers` and `contexts` are appended to its chip as
+ * why the callee rendered and which contexts changed. A note under the grid
+ * defines the three roles whenever one is shown. Each declaration is validated
+ * against the aggregate's rules first, and one that breaks them is not shown
+ * and is counted under the grid, as a broken lineage is.
+ *
+ * ## A PARTICIPANT'S TIME IS A SUM
+ *
+ * A participant's time is its records' durations added up, so work that
+ * overlapped is counted once per record. The metric cards beside this view
+ * report each tier's wall-clock duration, with overlapping work counted once,
+ * and the two measures differ whenever records overlap. So the time is named
+ * as a sum everywhere it appears: `Σ` in a canvas box, "Summed" in the grid's
+ * detail line and column header, and one note under the grid that defines it
+ * and says why it can exceed a metric card.
  *
  * ## APPEARANCE IS A CLASS CONTRACT
  *
@@ -249,12 +293,15 @@
  *   dg-dependency-graph__viewport    the scroll container around the canvas
  *   dg-dependency-graph__canvas      the SVG
  *   dg-dependency-graph__column      one layer's group of shapes
- *   dg-dependency-graph__node        a participant's box
+ *   dg-dependency-graph__node        a participant's box, and alone — with no
+ *                                    class modifier and no colour — a tall
+ *                                    column's overflow box
  *   dg-dependency-graph__node--*     its participant class
  *   dg-dependency-graph__node-label  the label inside the box
  *   dg-dependency-graph__node-meta   the metrics line inside the box
- *   dg-dependency-graph__edge        a relationship's curve on the canvas
- *   dg-dependency-graph__edge-label  a repeated relationship's count
+ *   dg-dependency-graph__edge        a connector's curve on the canvas
+ *   dg-dependency-graph__edge-label  a repeated connector's count, where it
+ *                                    fits
  *   dg-dependency-graph__relationship
  *                                    a relationship's chip in the grid, which
  *                                    wraps inside its cell
@@ -291,6 +338,8 @@ import type {
   DependencyGraphData,
   DependencyGraphEdge,
   DependencyGraphNode,
+  DependencyNodeRole,
+  DependencyRenderReason,
   TelemetryKind,
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
@@ -322,6 +371,7 @@ import {
   NOT_AVAILABLE_LABEL,
   countedNoun,
   createEstimateMeasure,
+  fitTextToWidth,
   formatCount,
   formatCountOf,
   formatDurationCompact,
@@ -334,11 +384,21 @@ import type { CountedNoun, TextMeasure } from '../utils/format';
 import {
   DEFAULT_GRAPH_COLUMN_GAP,
   edgePathData,
-  interpolate,
   layoutDependencyGraph,
+  placeEdgeLabels,
+  planGraphRows,
   resolveGraphLayering,
 } from '../utils/scale';
-import type { DependencyGraphLayout, GraphLayering, GraphNodeBox } from '../utils/scale';
+import type {
+  DependencyGraphLayout,
+  EdgeLabelLayout,
+  EdgeLabelMetrics,
+  GraphLayering,
+  GraphNodeBox,
+  GraphRowPlan,
+  PositionedGraphConnector,
+  PositionedGraphOverflow,
+} from '../utils/scale';
 import { SourceLink } from './SourceLink';
 
 /**
@@ -439,6 +499,86 @@ const KIND_LEGEND_ORDER: readonly DependencyGraphNode['kind'][] = Object.freeze(
 
 /*
  * ---------------------------------------------------------------------------
+ * The render-cascade vocabulary
+ *
+ * The aggregate marks the part a component played in a render cascade — the
+ * trigger → provider → consumers structure of the excessive-render panel — on
+ * the participant (`roles`), and tallies on a relationship why its callee
+ * rendered (`renderTriggers`). `@debuggen/telemetry` is a type-only dependency
+ * of this package, so its runtime vocabularies cannot be imported: each table
+ * below is keyed by the contract's own union type, which makes the compiler
+ * reject a table that misses a member, and each ordered list is checked
+ * against the same union with `satisfies`. A member added upstream fails to
+ * compile here rather than rendering unnamed.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The word each render-cascade role is named by, on the class-column chip, in
+ * a shape's title and in the canvas box's metrics line. Generic product
+ * vocabulary: a role names what a component did, never which component.
+ */
+const ROLE_LABEL: Readonly<Record<DependencyNodeRole, string>> = Object.freeze({
+  trigger: 'trigger',
+  provider: 'provider',
+  consumer: 'consumer',
+});
+
+/**
+ * The order a participant's roles are listed in: the contract's own order,
+ * which is the order the cascade runs in — the trigger that started it, the
+ * provider the changed value came from, the consumer that read it.
+ */
+const ROLE_ORDER = Object.freeze([
+  'trigger',
+  'provider',
+  'consumer',
+] as const) satisfies readonly DependencyNodeRole[];
+
+/**
+ * The precedence that picks the one role a canvas box has room to name.
+ *
+ * A provider comes first: it is the participant a render-cascade panel is
+ * read for ("likely causes: the provider or callback identity"), and a
+ * component that both provided a value and started a pass is most usefully
+ * read as the source of the change. A trigger comes next, a consumer last.
+ */
+const PRIMARY_ROLE_ORDER = Object.freeze([
+  'provider',
+  'trigger',
+  'consumer',
+] as const) satisfies readonly DependencyNodeRole[];
+
+/**
+ * The word each render reason is named by on a relationship chip: the
+ * producer's render trigger for an update, and `mount` for a first render.
+ * The same words the render table uses for the same triggers.
+ */
+const RENDER_REASON_LABEL: Readonly<Record<DependencyRenderReason, string>> = Object.freeze({
+  props: 'props',
+  state: 'state',
+  context: 'context',
+  unchanged: 'unchanged',
+  unknown: 'unknown',
+  mount: 'mount',
+});
+
+/**
+ * The order a relationship's render reasons are listed in: the contract's own
+ * order (the producer's triggers, then `mount`), so two chips that share
+ * reasons list them the same way.
+ */
+const RENDER_REASON_ORDER = Object.freeze([
+  'props',
+  'state',
+  'context',
+  'unchanged',
+  'unknown',
+  'mount',
+] as const) satisfies readonly DependencyRenderReason[];
+
+/*
+ * ---------------------------------------------------------------------------
  * Geometry
  *
  * Every coordinate below is either a value `../utils/scale` returned or plain
@@ -486,9 +626,6 @@ const LABEL_CHARACTER_WIDTH = 8;
 /** The shortest label a box will show before the ellipsis, however narrow it is. */
 const MIN_LABEL_CHARACTERS = 6;
 
-/** The fraction along an edge its count label sits at: the midpoint. */
-const EDGE_LABEL_POSITION = 0.5;
-
 /**
  * The advance of a relationship's count label, as {@link columnGapOf} sizes a
  * column gap for it: `../utils/format`'s deterministic estimate at
@@ -510,6 +647,35 @@ const EDGE_LABEL_MEASURE: TextMeasure = createEstimateMeasure(DEFAULT_LABEL_FONT
  */
 const EDGE_LABEL_CLEARANCE = 4;
 
+/**
+ * The metrics line of a box is set in the same 11-unit `monoSm` role as a
+ * relationship's count label (`components.css`,
+ * `dg-dependency-graph__node-meta`), so the same deterministic estimate fits
+ * it to its box.
+ */
+const BOX_META_MEASURE: TextMeasure = EDGE_LABEL_MEASURE;
+
+/**
+ * The room kept clear on each side of a box's metrics line, in SVG user units:
+ * the half of the outline stroke drawn inside the box plus a small margin, so
+ * a line fitted to the box never touches its outline.
+ */
+const BOX_TEXT_INSET = 4;
+
+/**
+ * The type size and the spacing the canvas places its count labels with
+ * (`../utils/scale`'s `placeEdgeLabels`): the 11-unit `monoSm` role the labels
+ * are drawn in, {@link EDGE_LABEL_CLEARANCE} between a label and anything
+ * else, and the outline's reach ({@link OUTLINE_INSET}) outside each box — the
+ * same three numbers the column gap is sized with, so a label that the gap was
+ * widened for always fits beside a box.
+ */
+const EDGE_LABEL_METRICS: EdgeLabelMetrics = Object.freeze({
+  fontSize: DEFAULT_LABEL_FONT_SIZE,
+  clearance: EDGE_LABEL_CLEARANCE,
+  outlineInset: OUTLINE_INSET,
+});
+
 /** Where a participant's label baseline sits inside its box. */
 function labelY(box: GraphNodeBox): number {
   return box.y + box.height / BOX_TEXT_BANDS;
@@ -523,6 +689,17 @@ function metaY(box: GraphNodeBox): number {
 /** How many code points of a label a box of this width can show. */
 function labelBudget(width: number): number {
   return Math.max(MIN_LABEL_CHARACTERS, Math.floor(width / LABEL_CHARACTER_WIDTH));
+}
+
+/**
+ * A box's metrics line as it fits the box: the whole line when it fits
+ * between the text insets, otherwise its longest prefix with an ellipsis, by
+ * the deterministic estimate of its type role. The full line is always in the
+ * shape's title and in the participant's grid row, so a shortened one hides
+ * nothing.
+ */
+function fitBoxMeta(text: string, box: GraphNodeBox): string {
+  return fitTextToWidth(text, box.width - 2 * BOX_TEXT_INSET, BOX_META_MEASURE)?.text ?? '';
 }
 
 /** A repeated relationship's count, as the canvas labels its curve: `×3`. */
@@ -555,36 +732,54 @@ function canvasViewBox(layout: DependencyGraphLayout): string {
   return `${String(-OUTLINE_INSET)} ${String(-OUTLINE_INSET)} ${String(width)} ${String(height)}`;
 }
 
+/** Whether a drawn connector carries a count label: it stands for more than one record. */
+function isLabelledConnector(connector: { readonly count: number }): boolean {
+  return connector.count > 1;
+}
+
 /**
- * The distinct count labels the canvas draws inside a column gap.
+ * The distinct count labels the canvas may draw inside a column gap.
  *
- * A repeated relationship's count sits at the midpoint of its anchors
- * ({@link EDGE_LABEL_POSITION}). For a relationship from one column to the
- * next, that midpoint is the centre of the gap between the two columns, so
- * the gap is all the room its label has; those are the labels the column gap
- * is widened for. A relationship that skips columns, runs backwards or stays
- * in one column labels a point outside any single gap, and one naming a
- * participant the graph does not contain is not drawn, so neither constrains
- * the gap.
+ * Every connector that stands for more than one record carries its count, and
+ * `../utils/scale`'s `placeEdgeLabels` puts it at the first of three places
+ * that collides with nothing: the midpoint of the gap it crosses, just before
+ * the box it meets, or just after the box it leaves. Each of those lies inside
+ * one column gap — for a connector that skips columns, the gap beside its
+ * target or its source — so each labelled connector between two different
+ * columns constrains the gap, not only one between neighbours. A connector
+ * within one column labels a point between two rows rather than in a gap, and
+ * a relationship naming a participant the graph does not contain is not drawn,
+ * so neither constrains it.
  *
- * @param edges The payload's relationships.
- * @param layers The column of every participant, from the resolved layering.
+ * @param plan The payload's planned rows and merged connectors.
  */
-function gapCountLabelsOf(
-  edges: readonly DependencyGraphEdge[],
-  layers: ReadonlyMap<string, number>,
-): readonly string[] {
+function gapCountLabelsOf(plan: GraphRowPlan): readonly string[] {
   const labels = new Set<string>();
-  for (const edge of edges) {
-    if (edge.count <= 1) {
-      continue;
-    }
-    const from = layers.get(edge.from);
-    if (from !== undefined && layers.get(edge.to) === from + 1) {
-      labels.add(edgeCountText(edge.count));
+  for (const connector of plan.connectors) {
+    if (isLabelledConnector(connector) && connector.from.layer !== connector.to.layer) {
+      labels.add(edgeCountText(connector.count));
     }
   }
   return [...labels];
+}
+
+/**
+ * The advance of every labelled connector's count, by connector key — the
+ * widths `placeEdgeLabels` places the labels with, by the same deterministic
+ * estimate the column gap was sized with.
+ *
+ * An estimate that answers a non-finite or negative advance is read as `0`, as
+ * {@link minimumColumnGap} reads it.
+ */
+function edgeLabelWidthsOf(layout: DependencyGraphLayout): ReadonlyMap<string, number> {
+  const widths = new Map<string, number>();
+  for (const connector of layout.connectors) {
+    if (isLabelledConnector(connector)) {
+      const advance = EDGE_LABEL_MEASURE(edgeCountText(connector.count));
+      widths.set(connector.key, Number.isFinite(advance) && advance > 0 ? advance : 0);
+    }
+  }
+  return widths;
 }
 
 /**
@@ -764,25 +959,36 @@ interface GraphArrangement {
   readonly graph: DependencyGraphData;
   /** The layering resolved for it, which both the order and the geometry use. */
   readonly layering: GraphLayering;
+  /**
+   * Its rows, planned under the scale module's default row bound: which
+   * participants each column draws, which it gathers into an overflow box,
+   * and the connectors the relationships merge into.
+   */
+  readonly plan: GraphRowPlan;
   /** The column gap its count labels require; see {@link columnGapOf}. */
   readonly columnGap: number;
 }
 
 /**
  * Everything a payload's layout is built from: one layering, the canonical
- * order built from that same object, and the column gap its count labels
- * require.
+ * order built from that same object, the rows planned from both, and the
+ * column gap the planned connectors' count labels require.
  *
- * A pure function of the payload, computed once per payload, so the layering
- * never runs twice for one payload and the geometry built from this
- * arrangement is the same for identical data wherever it is drawn.
+ * A pure function of the payload, computed once per payload, so neither the
+ * layering nor the row plan runs twice for one payload, and the geometry built
+ * from this arrangement is the same for identical data wherever it is drawn.
+ * The rows are planned from the canonical order, which is what makes the
+ * participants a tall column draws in boxes of their own its costliest ones.
  */
 function arrangeGraph(data: DependencyGraphData): GraphArrangement {
   const layering = resolveGraphLayering(data.nodes, data.edges);
+  const graph = canonicalGraph(data, layering.layers);
+  const plan = planGraphRows(graph, undefined, layering);
   return {
-    graph: canonicalGraph(data, layering.layers),
+    graph,
     layering,
-    columnGap: columnGapOf(gapCountLabelsOf(data.edges, layering.layers)),
+    plan,
+    columnGap: columnGapOf(gapCountLabelsOf(plan)),
   };
 }
 
@@ -914,6 +1120,129 @@ function usableLineageOf(edge: DependencyGraphEdge): LineageTally | undefined {
 }
 
 /**
+ * The roles a participant declares, in {@link ROLE_ORDER}, each once.
+ *
+ * A role the closed vocabulary does not name has no word to be shown by, so
+ * it is not listed; the key being absent — every participant that played no
+ * part in a render cascade — is the empty list.
+ */
+function participantRolesOf(node: DependencyGraphNode): readonly DependencyNodeRole[] {
+  const declared: unknown = node.roles;
+  const listed: readonly unknown[] = Array.isArray(declared) ? declared : [];
+  return ROLE_ORDER.filter((role) => listed.includes(role));
+}
+
+/**
+ * The one role a participant's canvas box names: the first of its roles in
+ * {@link PRIMARY_ROLE_ORDER}, or `undefined` for a participant with none.
+ */
+function primaryRoleOf(roles: readonly DependencyNodeRole[]): DependencyNodeRole | undefined {
+  return PRIMARY_ROLE_ORDER.find((role) => roles.includes(role));
+}
+
+/** How many of a relationship's callee renders one reason accounts for. */
+interface RenderReasonTally {
+  /** The reason. */
+  readonly reason: DependencyRenderReason;
+  /** How many callee renders ran for it: a whole number of at least one. */
+  readonly count: number;
+}
+
+/** Why a relationship's callee rendered, and the contexts its transitions named. */
+interface RenderCause {
+  /** The reasons that occurred, in {@link RENDER_REASON_ORDER}; empty when none were declared. */
+  readonly reasons: readonly RenderReasonTally[];
+  /** The context labels, in the payload's (sorted) order; empty when none were declared. */
+  readonly contexts: readonly string[];
+}
+
+/** No render cause: a relationship none of whose callees rendered. */
+const NO_RENDER_CAUSE: RenderCause = Object.freeze({
+  reasons: Object.freeze([]),
+  contexts: Object.freeze([]),
+});
+
+/** Whether a value is a plain record: a non-null, non-array object. */
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Whether a set of keys names only render reasons of the closed vocabulary. */
+function namesOnlyRenderReasons(keys: readonly string[]): boolean {
+  const known: readonly string[] = RENDER_REASON_ORDER;
+  return keys.every((key) => known.includes(key));
+}
+
+/**
+ * Why a relationship's callee rendered, validated against the rules the
+ * aggregate declares for `renderTriggers` and `contexts`.
+ *
+ * Absent when the relationship declares neither — every relationship whose
+ * callee is not a render. Valid when every declared reason belongs to the
+ * closed vocabulary with a whole count of at least one, the reasons are not
+ * empty and together account for no more renders than the relationship's own
+ * `count`, and every context is a non-blank label. Anything else is
+ * inconsistent: nothing of it is shown, and it is counted and reported under
+ * the grid rather than repaired into a reason the capture never recorded.
+ */
+function renderCauseOf(edge: DependencyGraphEdge): Declaration<RenderCause> {
+  // Read as `unknown`: the payload crossed a shallow protocol guard, so the
+  // declared shapes are what is being checked rather than what is assumed.
+  const triggers: unknown = edge.renderTriggers;
+  const contexts: unknown = edge.contexts;
+  if (triggers === undefined && contexts === undefined) {
+    return ABSENT;
+  }
+
+  const reasons: RenderReasonTally[] = [];
+  if (triggers !== undefined) {
+    if (!isRecord(triggers) || !namesOnlyRenderReasons(Object.keys(triggers))) {
+      return INVALID;
+    }
+
+    let accounted = 0;
+    for (const reason of RENDER_REASON_ORDER) {
+      const count = triggers[reason];
+      if (count === undefined) {
+        continue;
+      }
+      if (!isWholeCount(count) || count < 1) {
+        return INVALID;
+      }
+      reasons.push({ reason, count });
+      accounted += count;
+    }
+
+    if (reasons.length === 0 || !isWholeCount(edge.count) || accounted > edge.count) {
+      return INVALID;
+    }
+  }
+
+  const labels: string[] = [];
+  if (contexts !== undefined) {
+    if (!Array.isArray(contexts)) {
+      return INVALID;
+    }
+    for (const label of contexts as readonly unknown[]) {
+      if (typeof label !== 'string' || label.trim() === '') {
+        return INVALID;
+      }
+      if (!labels.includes(label)) {
+        labels.push(label);
+      }
+    }
+  }
+
+  return { state: 'valid', value: { reasons, contexts: labels } };
+}
+
+/** A relationship's usable render cause, or {@link NO_RENDER_CAUSE}. */
+function usableRenderCauseOf(edge: DependencyGraphEdge): RenderCause {
+  const cause = renderCauseOf(edge);
+  return cause.state === 'valid' ? cause.value : NO_RENDER_CAUSE;
+}
+
+/**
  * How a relationship was known, as the one state both of its marks — the curve
  * on the canvas and the chip in the grid — are drawn from.
  *
@@ -967,18 +1296,52 @@ const LINEAGE_TONE: Readonly<Record<LineageState, BadgeTone>> = Object.freeze({
   ambiguous: 'warning',
 });
 
+/**
+ * How uncertain each lineage state is, least first: what decides the state of
+ * a connector that stands for several relationships.
+ */
+const LINEAGE_STATE_RANK: Readonly<Record<LineageState, number>> = Object.freeze({
+  measured: 0,
+  inferred: 1,
+  ambiguous: 2,
+});
+
+/**
+ * How a drawn connector was known: the least certain state among the
+ * relationships it stands for.
+ *
+ * A connector is one relationship unless it anchors on an overflow box, where
+ * every relationship between the same two drawn boxes is drawn as one curve.
+ * Marking that curve with its least certain member means an inferred or
+ * ambiguous relationship is never hidden inside a solid, measured-looking
+ * stroke; the grid still names each relationship's own state in words.
+ */
+function connectorLineageStateOf(connector: PositionedGraphConnector): LineageState {
+  let state: LineageState = 'measured';
+  for (const edge of connector.edges) {
+    const candidate = lineageStateOf(usableLineageOf(edge));
+    if (LINEAGE_STATE_RANK[candidate] > LINEAGE_STATE_RANK[state]) {
+      state = candidate;
+    }
+  }
+  return state;
+}
+
 /** How many declarations of a payload were present but inconsistent. */
 interface InconsistentDeclarations {
   /** Participants whose event coordinate broke its rules. */
   readonly coordinates: number;
   /** Drawn relationships whose lineage shares broke theirs. */
   readonly lineages: number;
+  /** Drawn relationships whose render reasons or contexts broke theirs. */
+  readonly renderCauses: number;
 }
 
 /** No inconsistent declaration: the count of an unresolved query, shared. */
 const NO_INCONSISTENT_DECLARATIONS: InconsistentDeclarations = Object.freeze({
   coordinates: 0,
   lineages: 0,
+  renderCauses: 0,
 });
 
 /*
@@ -1005,14 +1368,32 @@ interface ParticipantRelationship {
   readonly lineage: LineageTally | undefined;
   /** How it was known — measured, inferred or ambiguous; see {@link lineageStateOf}. */
   readonly state: LineageState;
+  /**
+   * Why its callee rendered and the contexts that changed, when it declares a
+   * valid render cause; {@link NO_RENDER_CAUSE} otherwise. See
+   * {@link renderCauseOf}.
+   */
+  readonly cause: RenderCause;
 }
 
 /** One participant: its datum, its box, what it calls and what it stands for. */
 interface ParticipantRow {
   /** The participant, borrowed read-only from the payload. */
   readonly node: DependencyGraphNode;
-  /** Its box in the layered layout. */
+  /**
+   * Its box in the layered layout: its own, or — when {@link collapsed} — the
+   * overflow box of its column, which it shares with every participant
+   * gathered there. Either way `layer` is the participant's own column.
+   */
   readonly box: GraphNodeBox;
+  /**
+   * Whether its column is taller than the row bound and gathered it into the
+   * column's overflow box, so the canvas draws no box of its own for it. The
+   * grid lists it all the same.
+   */
+  readonly collapsed: boolean;
+  /** The render-cascade roles it declares, in {@link ROLE_ORDER}; empty for none. */
+  readonly roles: readonly DependencyNodeRole[];
   /** Its outgoing relationships, in the payload's order. */
   readonly outgoing: readonly ParticipantRelationship[];
   /**
@@ -1022,12 +1403,20 @@ interface ParticipantRow {
   readonly eventRef: PanelEventRef | undefined;
 }
 
-/** One column of the layout: a layer and the participants placed in it. */
+/** One column of the layout: a layer and what the canvas draws in it. */
 interface ParticipantColumn {
   /** The column index, counting from `0`. */
   readonly layer: number;
-  /** Its participants, in layout order. */
+  /**
+   * The participants drawn in boxes of their own, in layout order — every
+   * participant of the column unless it is taller than the row bound.
+   */
   readonly rows: readonly ParticipantRow[];
+  /**
+   * The box standing for the participants the column gathered, when it is
+   * taller than the row bound; see `../utils/scale`'s `planGraphRows`.
+   */
+  readonly overflow: PositionedGraphOverflow | undefined;
 }
 
 /** The empty row list, shared so an unresolved query keeps a stable reference. */
@@ -1035,6 +1424,15 @@ const NO_ROWS: readonly ParticipantRow[] = Object.freeze([]);
 
 /** The empty relationship list, shared for every participant that calls nothing. */
 const NO_RELATIONSHIPS: readonly ParticipantRelationship[] = Object.freeze([]);
+
+/** No count label placed or left off: the labels of an unresolved query, shared. */
+const NO_EDGE_LABELS: EdgeLabelLayout = Object.freeze({
+  placed: Object.freeze([]),
+  suppressed: Object.freeze([]),
+});
+
+/** The empty column list, shared so an unresolved query keeps a stable reference. */
+const NO_COLUMNS: readonly ParticipantColumn[] = Object.freeze([]);
 
 /** A participant's identity in the grid. */
 function participantRowKey(row: ParticipantRow): string {
@@ -1060,6 +1458,7 @@ function buildRows(layout: DependencyGraphLayout): readonly ParticipantRow[] {
       targetLabel: labels.get(edge.to) ?? edge.to,
       lineage,
       state: lineageStateOf(lineage),
+      cause: usableRenderCauseOf(edge),
     });
     outgoing.set(edge.from, relationships);
   }
@@ -1069,6 +1468,8 @@ function buildRows(layout: DependencyGraphLayout): readonly ParticipantRow[] {
     return {
       node: positioned.node,
       box: positioned.box,
+      collapsed: positioned.collapsed,
+      roles: participantRolesOf(positioned.node),
       outgoing: outgoing.get(positioned.node.id) ?? NO_RELATIONSHIPS,
       eventRef: coordinate.state === 'valid' ? coordinate.value : undefined,
     };
@@ -1138,35 +1539,51 @@ function inconsistentDeclarationsOf(layout: DependencyGraphLayout): Inconsistent
   }
 
   let lineages = 0;
+  let renderCauses = 0;
   for (const positioned of layout.edges) {
     if (edgeLineageOf(positioned.edge).state === 'invalid') {
       lineages += 1;
     }
+    if (renderCauseOf(positioned.edge).state === 'invalid') {
+      renderCauses += 1;
+    }
   }
 
-  return { coordinates, lineages };
+  return { coordinates, lineages, renderCauses };
 }
 
 /**
- * Groups the rows into columns for the canvas.
+ * Groups the rows into columns for the canvas, each with the overflow box it
+ * draws below its own boxes when it is taller than the row bound.
  *
  * The rows are already ordered by layer, so this is one pass that starts a new
  * column whenever the layer changes — no sorting, and therefore no second
- * ordering rule that could disagree with the first.
+ * ordering rule that could disagree with the first. A gathered participant
+ * starts or joins its column like any other, so a column is never lost, but
+ * it is drawn only through its column's overflow box.
+ *
+ * @param rows The participants, in the grid's canonical order.
+ * @param overflow The layout's overflow boxes, one per bounded column.
  */
-function buildColumns(rows: readonly ParticipantRow[]): readonly ParticipantColumn[] {
+function buildColumns(
+  rows: readonly ParticipantRow[],
+  overflow: readonly PositionedGraphOverflow[],
+): readonly ParticipantColumn[] {
   const columns: { layer: number; rows: ParticipantRow[] }[] = [];
 
   for (const row of rows) {
-    const current = columns.at(-1);
+    let current = columns.at(-1);
     if (current === undefined || current.layer !== row.box.layer) {
-      columns.push({ layer: row.box.layer, rows: [row] });
-      continue;
+      current = { layer: row.box.layer, rows: [] };
+      columns.push(current);
     }
-    current.rows.push(row);
+    if (!row.collapsed) {
+      current.rows.push(row);
+    }
   }
 
-  return columns;
+  const overflowByLayer = new Map(overflow.map((box) => [box.layer, box]));
+  return columns.map((column) => ({ ...column, overflow: overflowByLayer.get(column.layer) }));
 }
 
 /*
@@ -1234,6 +1651,22 @@ function truncatedNotice(drawn: number): string {
   return `Showing the ${formatCount(drawn)} most significant participants: some participants or relationships were left out at this graph's size bound. Narrow the query to one trace or interaction to see more.`;
 }
 
+/**
+ * The sign a box's metrics line marks its time with: the time is a sum of
+ * records, which {@link SUMMED_TIME_NOTE} defines under the grid.
+ */
+const SUM_SIGN = 'Σ';
+
+/**
+ * What a participant's time is, stated under every graph. A participant's
+ * total is the sum of its records' durations (`totalDurationMs` in the
+ * aggregate), while the metric cards of the same panel report each tier's
+ * wall-clock time with overlapping work counted once — so one database
+ * participant can show more time than the database duration card, and without
+ * this sentence the two read as a contradiction.
+ */
+const SUMMED_TIME_NOTE = `A participant's time (${SUM_SIGN}, "Summed") is the sum of its records' durations, so records that overlapped are each counted in full and a participant's time can exceed the wall-clock tier durations the metric cards report.`;
+
 /** Said when the layering was computed here because the payload carried none. */
 const COMPUTED_LAYERS_NOTE =
   'The columns were computed from the relationships, because the captured participants carried no layer of their own.';
@@ -1250,6 +1683,77 @@ const LAYER_NOUN: CountedNoun = countedNoun('layer');
 const IS_VERB: CountedNoun = countedNoun('is', 'are');
 const POSSESSIVE_PRONOUN: CountedNoun = countedNoun('its', 'their');
 const OBJECT_PRONOUN: CountedNoun = countedNoun('it', 'them');
+const SUBJECT_PRONOUN: CountedNoun = countedNoun('it', 'they');
+const RELATIONSHIP_COUNT_NOUN: CountedNoun = countedNoun('relationship count');
+const HOLD_VERB: CountedNoun = countedNoun('holds', 'hold');
+const OVERFLOW_PLACE: CountedNoun = countedNoun('its foot', 'the foot of each');
+
+/**
+ * Said when some count labels fit nowhere on the picture: `placeEdgeLabels`
+ * leaves a label off rather than draw it over a box or another label, and
+ * this says how many and where every count can still be read.
+ */
+function suppressedEdgeLabelsNote(count: number): string {
+  return `${formatCountOf(count, RELATIONSHIP_COUNT_NOUN)} ${pluralize(count, IS_VERB)} not drawn on the picture where ${pluralize(count, SUBJECT_PRONOUN)} would overlap; the table lists every count.`;
+}
+
+/**
+ * How many participants an overflow box's title names before it counts the
+ * rest: enough to recognise what was gathered, bounded so a title stays one
+ * readable line however tall the column is. The grid lists every one.
+ */
+const OVERFLOW_TITLE_LABELS = 5;
+
+/** A finite duration of zero or more, or `0`: what a summed total adds. */
+function summableDuration(durationMs: number): number {
+  return Number.isFinite(durationMs) && durationMs > 0 ? durationMs : 0;
+}
+
+/**
+ * The summed time of the participants an overflow box gathers: each one's own
+ * total, added, so it reads on the same terms as a participant's box.
+ */
+function overflowTotalMs(overflow: PositionedGraphOverflow): number {
+  return overflow.nodes.reduce((sum, node) => sum + summableDuration(node.totalDurationMs), 0);
+}
+
+/** An overflow box's label: how many participants it stands for, `+7 more`. */
+function overflowLabel(overflow: PositionedGraphOverflow): string {
+  return `+${formatCount(overflow.nodes.length)} more`;
+}
+
+/** An overflow box's metrics line: the summed time it stands for, `Σ 1.2 s`. */
+function overflowMetaText(overflow: PositionedGraphOverflow): string {
+  return `${SUM_SIGN} ${formatDurationCompact(overflowTotalMs(overflow))}`;
+}
+
+/**
+ * The pointer title of an overflow box: how many participants it gathers, the
+ * first {@link OVERFLOW_TITLE_LABELS} of them by name, their summed time, and
+ * where each is listed in full.
+ */
+function overflowTitle(overflow: PositionedGraphOverflow): string {
+  const { nodes } = overflow;
+  const named = nodes.slice(0, OVERFLOW_TITLE_LABELS).map((node) => node.label);
+  const rest =
+    nodes.length > named.length ? ` and ${formatCount(nodes.length - named.length)} more` : '';
+  return `${formatCountOf(nodes.length, PARTICIPANT_NOUN)} gathered here: ${named.join(', ')}${rest} · Summed time ${formatDurationCompact(overflowTotalMs(overflow))}. Each is listed in the table below.`;
+}
+
+/**
+ * The text alternative's account of the row bound, or nothing when no column
+ * reached it: which participants of a tall column the picture draws, and how
+ * many it gathers into overflow boxes.
+ */
+function gatheredParticipantsSentence(layout: DependencyGraphLayout): string {
+  const gathered = layout.gatheredCount;
+  const bounded = layout.overflow.length;
+  if (gathered === 0 || bounded === 0) {
+    return '';
+  }
+  const bound = layout.maxRowsPerLayer;
+  return `In ${formatCountOf(bounded, LAYER_NOUN)} that ${pluralize(bounded, HOLD_VERB)} more than ${formatCount(bound)} participants, the ${formatCount(bound - 1)} that took the most time are drawn in boxes of their own and the other ${formatCountOf(gathered, PARTICIPANT_NOUN)} ${pluralize(gathered, IS_VERB)} gathered into one summary box at ${pluralize(bounded, OVERFLOW_PLACE)}.`;
+}
 
 /** Said when a relationship named a participant the payload does not contain. */
 function droppedRelationshipsNote(count: number): string {
@@ -1272,6 +1776,29 @@ function inconsistentLineagesNote(count: number): string {
 }
 
 /**
+ * Said when relationships declared render reasons or contexts that break the
+ * rules {@link renderCauseOf} checks. As with the lineage note, the
+ * relationship is still drawn and what is withheld is the declaration, so the
+ * relative clause stays plural.
+ */
+function inconsistentRenderCausesNote(count: number): string {
+  return `${formatCountOf(count, RELATIONSHIP_NOUN)} declared render reasons or contexts that do not match ${pluralize(count, POSSESSIVE_PRONOUN)} records, which are not shown.`;
+}
+
+/**
+ * What the three render-cascade roles mean, one sentence each, shown under the
+ * grid only when some participant carries a role — the words on the class
+ * chips and in the canvas boxes are otherwise defined nowhere a reader sees.
+ * The definitions are the aggregate's: a role is read off the render triggers
+ * the producer classified and the ancestry it recorded, never off a name.
+ */
+const ROLE_NOTE = [
+  `A ${ROLE_LABEL.trigger} is a component whose own state changed, which started a render pass.`,
+  `A ${ROLE_LABEL.provider} is a component that re-rendered above a context consumer in the same commit, which is where the changed context value came from.`,
+  `A ${ROLE_LABEL.consumer} is a component that re-rendered because a context value it reads changed.`,
+].join(' ');
+
+/**
  * The canvas's text alternative: what the picture holds, and where its
  * keyboard-reachable equivalent is.
  */
@@ -1280,23 +1807,92 @@ function textAlternative(layout: DependencyGraphLayout, truncated: boolean): str
   const equivalent =
     'The participants table below carries the same participants, their outgoing relationships and their source locations.';
 
-  return truncated
-    ? `${shape} ${truncatedNotice(layout.nodes.length)} ${equivalent}`
-    : `${shape} ${equivalent}`;
+  return [
+    shape,
+    gatheredParticipantsSentence(layout),
+    truncated ? truncatedNotice(layout.nodes.length) : '',
+    equivalent,
+  ]
+    .filter((sentence) => sentence !== '')
+    .join(' ');
 }
 
-/** A participant's metrics, as one line of text. */
+/**
+ * A participant's metrics, as one line of text.
+ *
+ * Its time is named "Summed" because it is one: the aggregate adds up the
+ * durations of every record the participant collapsed, so records that
+ * overlapped are each counted in full. The metric cards' tier durations are
+ * wall-clock spans with overlaps counted once, and the word keeps the two from
+ * reading as the same measure; {@link SUMMED_TIME_NOTE} says so in full.
+ */
 function participantMetricsText(node: DependencyGraphNode): string {
   const records = formatCount(node.count);
   const total = formatDurationCompact(node.totalDurationMs);
   const slowest = formatDurationCompact(node.maxDurationMs);
-  return `Records ${records} · Total ${total} · Slowest ${slowest}`;
+  return `Records ${records} · Summed ${total} · Slowest ${slowest}`;
 }
 
-/** The metrics line drawn inside a participant's box: its time, and its weight. */
+/**
+ * The metrics line drawn inside a participant's box: its summed time, marked
+ * `Σ` as a sum (see {@link participantMetricsText}), and its weight.
+ */
 function participantMetaText(node: DependencyGraphNode): string {
-  const total = formatDurationCompact(node.totalDurationMs);
+  const total = `${SUM_SIGN} ${formatDurationCompact(node.totalDurationMs)}`;
   return node.count > 1 ? `${total} · ×${formatCount(node.count)}` : total;
+}
+
+/**
+ * Whether a line fits a box whole, with no ellipsis, by the same deterministic
+ * estimate {@link fitBoxMeta} cuts by.
+ */
+function fitsBoxWhole(text: string, box: GraphNodeBox): boolean {
+  return (
+    fitTextToWidth(text, box.width - 2 * BOX_TEXT_INSET, BOX_META_MEASURE)?.truncated === false
+  );
+}
+
+/**
+ * The line a participant's canvas box draws under its label: the one role the
+ * box has room to name ({@link primaryRoleOf}) ahead of its metrics, fitted to
+ * the box. Every role, in full, is on the participant's class-column chips and
+ * in the shape's title.
+ *
+ * A role, its summed time and its weight do not always fit one box together,
+ * and cutting the joined line with an ellipsis would cut its **end** — the
+ * weight, which for a participant with a role is the figure its question is
+ * about: roles are only ever cascade roles of re-rendered components, and how
+ * many times a consumer rendered is what a render question asks. So the line
+ * gives up whole parts before it cuts one, in a fixed order: the full line;
+ * then the role and the weight, dropping the summed time the grid and the
+ * title still state; then the metrics alone, dropping the role the class
+ * column and the title still state; and only when none of those fits whole,
+ * the full line cut to the box.
+ */
+function boxMetaText(row: ParticipantRow): string {
+  const primary = primaryRoleOf(row.roles);
+  const metrics = participantMetaText(row.node);
+  if (primary === undefined) {
+    return fitBoxMeta(metrics, row.box);
+  }
+
+  const role = ROLE_LABEL[primary];
+  const full = `${role} · ${metrics}`;
+  const candidates =
+    row.node.count > 1
+      ? [full, `${role} · ×${formatCount(row.node.count)}`, metrics]
+      : [full, metrics];
+  const whole = candidates.find((candidate) => fitsBoxWhole(candidate, row.box));
+  return whole ?? fitBoxMeta(full, row.box);
+}
+
+/** A participant's roles, as its shape's title names them; empty for none. */
+function rolesText(roles: readonly DependencyNodeRole[]): string {
+  if (roles.length === 0) {
+    return '';
+  }
+  const noun = roles.length === 1 ? 'Role' : 'Roles';
+  return `${noun}: ${roles.map((role) => ROLE_LABEL[role]).join(', ')}`;
 }
 
 /**
@@ -1309,15 +1905,24 @@ function openSourceHint(file: string): string {
 }
 
 /**
- * The pointer title of a participant's shape on the canvas: what it is, how
- * long it took and — for a participant with a location, in a surface that can
- * open one — that a click opens it in the editor.
+ * The pointer title of a participant's shape on the canvas: what it is, the
+ * render-cascade roles it played, how long it took and — for a participant
+ * with a location, in a surface that can open one — that a click opens it in
+ * the editor.
  *
- * @param node The participant.
+ * @param row The participant's row: its datum and its validated roles.
  * @param canOpenSource Whether the host supplied the action a click would raise.
  */
-function participantTitle(node: DependencyGraphNode, canOpenSource: boolean): string {
-  const identity = `${node.label} · ${KIND_LABEL[node.kind]} · ${participantMetricsText(node)}`;
+function participantTitle(row: ParticipantRow, canOpenSource: boolean): string {
+  const { node } = row;
+  const identity = [
+    node.label,
+    KIND_LABEL[node.kind],
+    rolesText(row.roles),
+    participantMetricsText(node),
+  ]
+    .filter((part) => part !== '')
+    .join(' · ');
 
   // The click's second effect is named only where it exists: a participant
   // with a location, drawn in a surface whose host can open one. Promising a
@@ -1354,17 +1959,59 @@ function lineageSuffix(lineage: LineageTally | undefined): string {
 }
 
 /**
- * A relationship chip's text: what is called, how often, and how it was known.
+ * Why a relationship's callee rendered, as the suffix of its chip.
+ *
+ * Nothing for a relationship none of whose callees rendered. One reason reads
+ * as the word alone — ` (context)` — when it accounts for every record the
+ * relationship stands for, and with its count — ` (context 3)` — when it
+ * accounts for only some of them (a participant that collapsed renders with
+ * other records), so the word never claims more than was recorded. Several
+ * reasons read as their counts, in the contract's order:
+ * ` (props 240 · unchanged 240)`.
+ */
+function renderReasonSuffix(reasons: readonly RenderReasonTally[], recordCount: number): string {
+  const [only, ...others] = reasons;
+  if (only === undefined) {
+    return '';
+  }
+  if (others.length === 0 && only.count === recordCount) {
+    return ` (${RENDER_REASON_LABEL[only.reason]})`;
+  }
+
+  const tallies = reasons.map(
+    (tally) => `${RENDER_REASON_LABEL[tally.reason]} ${formatCount(tally.count)}`,
+  );
+  return ` (${tallies.join(' · ')})`;
+}
+
+/**
+ * The contexts whose change the callee's hook transitions recorded, as the
+ * suffix of its chip: ` (context: ‹labels›)`. A context label is a
+ * producer-assigned name, never a value, and is shown as given.
+ */
+function contextSuffix(contexts: readonly string[]): string {
+  return contexts.length === 0 ? '' : ` (context: ${contexts.join(', ')})`;
+}
+
+/**
+ * A relationship chip's text: what is called, how often, why the callee
+ * rendered, which contexts changed, and how the relationship was known.
  *
  * The called participant is named in full. The chip wraps inside its cell
  * (`dg-dependency-graph__relationship`), so a long module path or route costs
  * a line rather than its identity — a shortened name here would be the only
  * place a relationship's target could not be read, since the chip is the
  * relationship's sole text form in the grid.
+ *
+ * @example A render edge whose callee rendered 240 times for new props and 240
+ * times with unchanged inputs, through an inferred provider attribution:
+ * `→ Consumer ×480 (props 240 · unchanged 240) (inferred)`.
  */
 function relationshipChipText(relationship: ParticipantRelationship): string {
-  const repeats = relationship.edge.count > 1 ? ` ×${formatCount(relationship.edge.count)}` : '';
-  return `${RELATIONSHIP_ARROW} ${relationship.targetLabel}${repeats}${lineageSuffix(relationship.lineage)}`;
+  const { edge, cause } = relationship;
+  const repeats = edge.count > 1 ? ` ×${formatCount(edge.count)}` : '';
+  const why = renderReasonSuffix(cause.reasons, edge.count);
+  return `${RELATIONSHIP_ARROW} ${relationship.targetLabel}${repeats}${why}${contextSuffix(cause.contexts)}${lineageSuffix(relationship.lineage)}`;
 }
 
 /*
@@ -1380,14 +2027,36 @@ function relationshipChipText(relationship: ParticipantRelationship): string {
  * ---------------------------------------------------------------------------
  */
 
-/** The participant's class, as a chip carrying the class colour. */
+/**
+ * The participant's class, as a chip carrying the class colour, followed by
+ * one chip per render-cascade role it played.
+ *
+ * The role chips carry no colour of their own — the neutral soft chip — so no
+ * role could be read as a participant class or a span kind: their word is the
+ * whole of their meaning, and the note under the grid defines each word. A
+ * participant with no role keeps the class chip alone, exactly as before.
+ */
 function ClassCell({ row }: { readonly row: ParticipantRow }): ReactElement {
   const { kind } = row.node;
-
-  return (
+  const classChip = (
     <Badge tone="neutral" variant="outline" color={dependencyNodeColorVar(kind)} data-kind={kind}>
       {KIND_LABEL[kind]}
     </Badge>
+  );
+
+  if (row.roles.length === 0) {
+    return classChip;
+  }
+
+  return (
+    <Stack direction="horizontal" gap={1} align="center" wrap>
+      {classChip}
+      {row.roles.map((role) => (
+        <Badge key={role} tone="neutral" variant="soft" data-role={role}>
+          {ROLE_LABEL[role]}
+        </Badge>
+      ))}
+    </Stack>
   );
 }
 
@@ -1582,7 +2251,9 @@ const PARTICIPANT_COLUMNS: readonly DataTableColumn<ParticipantRow>[] = Object.f
   },
   {
     key: 'total-time',
-    header: 'Total time',
+    // A sum of the participant's records, not a wall-clock span; see
+    // `SUMMED_TIME_NOTE`, which the note under the grid states.
+    header: 'Summed time',
     align: 'end',
     width: 'quantity',
     cell: (row: ParticipantRow) => <DurationCell ms={row.node.totalDurationMs} size="sm" />,
@@ -1600,6 +2271,84 @@ const PARTICIPANT_COLUMNS: readonly DataTableColumn<ParticipantRow>[] = Object.f
     cell: (row: ParticipantRow) => <SourceCell row={row} />,
   },
 ]);
+
+/*
+ * ---------------------------------------------------------------------------
+ * The overflow box
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The overflow box's inline style: the pointer it hovers with is the platform's
+ * own rather than the participant box's hand.
+ *
+ * The participant box's class gives every box the hand cursor that says "this
+ * selects something", and the overflow box shares that class for its fill and
+ * neutral stroke, but it selects nothing. `auto` — one of the literals the
+ * design system allows outside a token (AAP 0.6.4) — hands the choice back to
+ * the browser, which draws its ordinary arrow over a shape. It is inline, and
+ * so outranks the class rule, because it is a property of this one box rather
+ * than of the class; it sets no colour, so the box still takes no class's
+ * stroke.
+ */
+const OVERFLOW_BOX_STYLE: CSSProperties = Object.freeze({ cursor: 'auto' });
+
+/**
+ * The box a column taller than the row bound draws in its last row, standing
+ * for every participant it gathered: how many (`+7 more`), their summed time
+ * (`Σ 1.2 s`), and — in its pointer title — the first of them by name.
+ *
+ * It is drawn with the participant box's base class alone: it stands for no
+ * one class, so it carries no class modifier and no `--dgc-node-color`, and
+ * the stylesheet strokes it in its neutral fallback, a colour no participant
+ * class or span kind uses. It is not a control — there is no one participant a
+ * click could select or whose source it could open — so it takes no handler
+ * and does not look like one ({@link OVERFLOW_BOX_STYLE}); each gathered
+ * participant is a row of the grid, where selecting it marks this box as the
+ * one it is drawn in.
+ *
+ * Its label and metrics line use the same classes and positions as a
+ * participant's, so every box on the canvas has exactly one of each and the
+ * shapes and their labels stay index-aligned in document order.
+ */
+function OverflowBox({
+  overflow,
+  selected,
+}: {
+  readonly overflow: PositionedGraphOverflow;
+  readonly selected: boolean;
+}): ReactElement {
+  const { box } = overflow;
+  return (
+    <g data-overflow={overflow.nodes.length}>
+      <title>{overflowTitle(overflow)}</title>
+      <rect
+        className={clsx('dg-dependency-graph__node', selected && 'dg-is-selected')}
+        style={OVERFLOW_BOX_STYLE}
+        x={box.x}
+        y={box.y}
+        width={box.width}
+        height={box.height}
+      />
+      <text
+        className="dg-dependency-graph__node-label"
+        x={box.centerX}
+        y={labelY(box)}
+        textAnchor="middle"
+      >
+        {truncate(overflowLabel(overflow), labelBudget(box.width))}
+      </text>
+      <text
+        className="dg-dependency-graph__node-meta"
+        x={box.centerX}
+        y={metaY(box)}
+        textAnchor="middle"
+      >
+        {fitBoxMeta(overflowMetaText(overflow), box)}
+      </text>
+    </g>
+  );
+}
 
 /**
  * The props of {@link DependencyGraph}.
@@ -1656,8 +2405,9 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
   // The layout, as a pure function of the payload and nothing else: no element
   // is observed and no size is read, so one payload always draws the same
   // picture. The arrangement (one layering, the canonical ordering built from
-  // that same object, and the column gap its count labels require) is
-  // resolved exactly once per payload, and the geometry is built from it.
+  // that same object, the rows planned from both, and the column gap their
+  // count labels require) is resolved exactly once per payload, and the
+  // geometry is built from it.
   const arrangement = useMemo(() => (data === undefined ? undefined : arrangeGraph(data)), [data]);
   const layout = useMemo(
     () =>
@@ -1667,12 +2417,29 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
             arrangement.graph,
             { columnGap: arrangement.columnGap },
             arrangement.layering,
+            arrangement.plan,
           ),
     [arrangement],
   );
   const rows = useMemo(() => (layout === undefined ? NO_ROWS : buildRows(layout)), [layout]);
   const colourKey = useMemo(() => spanColourKey(rows), [rows]);
-  const columns = useMemo(() => buildColumns(rows), [rows]);
+  const columns = useMemo(
+    () => (layout === undefined ? NO_COLUMNS : buildColumns(rows, layout.overflow)),
+    [layout, rows],
+  );
+  // Where each count label goes, or that it fits nowhere: a pure function of
+  // the layout and the labels' estimated widths, like the rest of the drawing.
+  const edgeLabels = useMemo<EdgeLabelLayout>(
+    () =>
+      layout === undefined
+        ? NO_EDGE_LABELS
+        : placeEdgeLabels(layout, edgeLabelWidthsOf(layout), EDGE_LABEL_METRICS),
+    [layout],
+  );
+  const placedLabels = useMemo(
+    () => new Map(edgeLabels.placed.map((placement) => [placement.key, placement])),
+    [edgeLabels],
+  );
   const inconsistent = useMemo(
     () =>
       layout === undefined ? NO_INCONSISTENT_DECLARATIONS : inconsistentDeclarationsOf(layout),
@@ -1680,6 +2447,7 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
   );
 
   const selectedId = selectedParticipantIdOf(rows, selection, localHighlight);
+  const hasRoles = rows.some((row) => row.roles.length > 0);
 
   // Selecting a participant: what a row activation in the grid does (a click on
   // the row, Enter or Space), and the first half of a click on its shape. It
@@ -1907,35 +2675,40 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
            * marked here — solid in the info tone, or dashed in the warning
            * tone — by the state class the stylesheet implements.
            */}
+          {/*
+           * One curve per connector: a relationship, or — where a column
+           * gathers participants into its overflow box — every relationship
+           * between the same two drawn boxes, merged, with their counts summed.
+           * A count label is drawn where `placeEdgeLabels` placed it and left
+           * off where it fits nowhere; the note under the grid says how many.
+           */}
           <g className="dg-dependency-graph__edges">
-            {layout.edges.map((positioned) => (
-              <Fragment key={positioned.edge.id}>
-                <path
-                  className={clsx(
-                    'dg-dependency-graph__edge',
-                    LINEAGE_STATE_CLASS[lineageStateOf(usableLineageOf(positioned.edge))],
+            {layout.connectors.map((connector) => {
+              const placement = placedLabels.get(connector.key);
+              return (
+                <Fragment key={connector.key}>
+                  <path
+                    className={clsx(
+                      'dg-dependency-graph__edge',
+                      LINEAGE_STATE_CLASS[connectorLineageStateOf(connector)],
+                    )}
+                    d={edgePathData(connector.curve)}
+                    data-connector={connector.key}
+                  />
+                  {placement === undefined ? null : (
+                    <text
+                      className="dg-dependency-graph__edge-label"
+                      x={placement.x}
+                      y={placement.y}
+                      data-connector={connector.key}
+                      data-placement={placement.position}
+                    >
+                      {edgeCountText(connector.count)}
+                    </text>
                   )}
-                  d={edgePathData(positioned.curve)}
-                />
-                {positioned.edge.count > 1 ? (
-                  <text
-                    className="dg-dependency-graph__edge-label"
-                    x={interpolate(
-                      EDGE_LABEL_POSITION,
-                      positioned.anchors.source.x,
-                      positioned.anchors.target.x,
-                    )}
-                    y={interpolate(
-                      EDGE_LABEL_POSITION,
-                      positioned.anchors.source.y,
-                      positioned.anchors.target.y,
-                    )}
-                  >
-                    {edgeCountText(positioned.edge.count)}
-                  </text>
-                ) : null}
-              </Fragment>
-            ))}
+                </Fragment>
+              );
+            })}
           </g>
 
           {columns.map((column) => (
@@ -1962,7 +2735,7 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
                    * by hover alone. Where a click also opens the participant's
                    * source, the title says so.
                    */}
-                  <title>{participantTitle(row.node, actions !== undefined)}</title>
+                  <title>{participantTitle(row, actions !== undefined)}</title>
                   <rect
                     className={clsx(
                       'dg-dependency-graph__node',
@@ -1990,10 +2763,16 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
                     y={metaY(row.box)}
                     textAnchor="middle"
                   >
-                    {participantMetaText(row.node)}
+                    {boxMetaText(row)}
                   </text>
                 </g>
               ))}
+              {column.overflow === undefined ? null : (
+                <OverflowBox
+                  overflow={column.overflow}
+                  selected={column.overflow.nodes.some((gathered) => gathered.id === selectedId)}
+                />
+              )}
             </g>
           ))}
         </svg>
@@ -2021,6 +2800,9 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
         <Text as="p" size="xs" tone="muted">
           {STATIC_LAYOUT_NOTE}
         </Text>
+        <Text as="p" size="xs" tone="muted">
+          {SUMMED_TIME_NOTE}
+        </Text>
         {layout.droppedEdgeCount > 0 ? (
           <Text as="p" size="xs" tone="warning">
             {droppedRelationshipsNote(layout.droppedEdgeCount)}
@@ -2034,6 +2816,21 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
         {inconsistent.lineages > 0 ? (
           <Text as="p" size="xs" tone="warning">
             {inconsistentLineagesNote(inconsistent.lineages)}
+          </Text>
+        ) : null}
+        {edgeLabels.suppressed.length > 0 ? (
+          <Text as="p" size="xs" tone="muted">
+            {suppressedEdgeLabelsNote(edgeLabels.suppressed.length)}
+          </Text>
+        ) : null}
+        {inconsistent.renderCauses > 0 ? (
+          <Text as="p" size="xs" tone="warning">
+            {inconsistentRenderCausesNote(inconsistent.renderCauses)}
+          </Text>
+        ) : null}
+        {hasRoles ? (
+          <Text as="p" size="xs" tone="muted">
+            {ROLE_NOTE}
           </Text>
         ) : null}
         {layout.layersComputed ? (

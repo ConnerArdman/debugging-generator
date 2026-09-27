@@ -18,6 +18,16 @@
  * per character would put five of them on the wire for "12" - four of them for quantities the
  * shopper never asked the cart to hold.
  *
+ * AN OUT-OF-RANGE ENTRY IS REFUSED, NEVER REWRITTEN
+ * Enter and blur commit only an entry inside the permitted range. An entry outside it - 0, or 999
+ * against a ceiling of 99 - commits nothing: the cart keeps the quantity it holds, and the field
+ * keeps the number the shopper typed, marked `aria-invalid` and described by a visible hint that
+ * names the range and the quantity the cart still holds. Committing the nearest permitted value
+ * instead would put a quantity in the cart that nobody typed and say nothing about it. The entry
+ * stays flagged until the shopper corrects it - a permitted number committed with Enter or blur -
+ * or abandons it with Escape, which restores the cart's own quantity. The two buttons are
+ * unaffected: pressing one is itself the request, for one unit either way.
+ *
  * WHO OWNS THE VALUE
  * The `quantity` prop is authoritative; the string in the field is a draft of the shopper's next
  * decision. The two are reconciled in two directions:
@@ -34,7 +44,9 @@
  *     mutation is accepted, the new `quantity` arrives and the adjustment above shows it; if it is
  *     rejected - out of stock, a failed request, a cart the server trimmed - the field shows the
  *     quantity that is really in the cart rather than the number the shopper typed. A control that
- *     kept the typed text would be quietly lying about the cart's contents.
+ *     kept the typed text would be quietly lying about the cart's contents. An out-of-range entry
+ *     is not a commit (see above), so it is the one draft that outlives Enter and blur - and it is
+ *     never presented as the cart's contents, because the hint under it says what the cart holds.
  *
  * WHAT IT HOLDS
  * Local `useState`, twice over - the draft the field displays, and the `quantity` the
@@ -60,6 +72,22 @@
  * control in the storefront is. The accessible names are real text through `../ui/VisuallyHidden`
  * rather than `aria-label` strings, so they are translatable markup, and the glyphs the buttons
  * paint are `aria-hidden` - a screen reader hears "Decrease quantity of <product>", never "minus".
+ *
+ * FOCUS NEVER LEAVES THE STEPPER BECAUSE THE STEPPER CHANGED STATE
+ * Every commit makes something here unavailable at the very moment the shopper is standing on it:
+ * the line goes `busy` while its mutation is in flight, and a press that reaches 1 or `max` leaves
+ * the pressed button with nothing more to do. A natively `disabled` element cannot hold focus, so
+ * writing that attribute on the focused control blurs it and drops a keyboard shopper onto
+ * `<body>` - outside the drawer's `aria-modal` dialog, with their next Tab starting from the top of
+ * the document (WCAG 2.4.3). Neither state therefore writes it. A held button carries
+ * `aria-disabled="true"`, which `../ui/Button`'s stylesheet dims exactly as it dims `:disabled` and
+ * which removes pointer presses, and the field is `readOnly` with `aria-disabled` while the line is
+ * busy; all three stay focusable, and assistive technology is told the same unavailability. A
+ * keyboard press that still reaches a held control does nothing, because `commit` refuses every
+ * commit while the line is held and a press at a bound clamps to the quantity already held. So a
+ * press of either button, an Enter in the field and a blur that commits a typed value all leave
+ * focus exactly where the shopper put it. Native `disabled` is written only from the `disabled`
+ * prop - a line that cannot be edited at all, which is not a state a shopper reaches by using it.
  */
 
 import clsx from 'clsx';
@@ -86,8 +114,27 @@ const MIN_LINE_QUANTITY = 1;
 const DEFAULT_MAX_LINE_QUANTITY = 99;
 
 /**
+ * The key that abandons an entry in progress and puts the cart's own quantity back in the field.
+ */
+const ABANDON_ENTRY_KEY = 'Escape';
+
+/**
+ * The two parts of the hint an out-of-range entry is described by, joined as
+ * "Enter 1–99 · cart still holds 5": the range a commit accepts, and what the cart still holds
+ * because nothing was committed. The second part is what tells a shopper the typed number did not
+ * reach the cart, which the invalid styling alone could not.
+ */
+const RANGE_HINT_PREFIX = 'Enter ';
+const RANGE_HINT_SEPARATOR = '\u2013';
+const HELD_HINT_PREFIX = ' \u00b7 cart still holds ';
+
+/**
  * Bring any number a shopper can produce into the line's permitted range, as a whole number of
  * units.
+ *
+ * Only the buttons reach it with a number outside that range - a decrement over a ceiling that has
+ * fallen below the quantity held - because the field's own commit points refuse an out-of-range
+ * entry before asking (see the header).
  *
  * Pure and module-level, so it is the same function for every row and can be reasoned about
  * without a component in hand. Non-finite input - an empty field, letters, `Infinity` - answers
@@ -160,9 +207,11 @@ interface Props {
   disabled?: boolean;
 
   /**
-   * A quantity mutation for this line is in flight. Dims the group, holds both buttons and the
-   * field, and is announced through `aria-busy`; it is deliberately separate from `disabled`,
-   * which means "not editable" rather than "working".
+   * A quantity mutation for this line is in flight. Dims the group, holds both buttons
+   * (`aria-disabled`) and the field (`readOnly` with `aria-disabled`) while keeping all three
+   * focusable, refuses every commit, and is announced through `aria-busy`; it is deliberately
+   * separate from `disabled`, which means "not editable" rather than "working" and is the only
+   * state that writes the native attribute.
    */
   busy?: boolean;
 
@@ -240,7 +289,7 @@ export function QuantityStepper({
   const quantityHintId = `${quantityFieldId}-status`;
 
   // `Number.parseInt` is the same reading the commit path takes, so what the field reports as
-  // invalid and what a commit would clamp cannot disagree.
+  // invalid and what Enter or blur refuses to commit cannot disagree.
   //
   // Two entries are deliberately NOT invalid. An empty or unparseable box is unfinished, not
   // wrong, and flagging it while the shopper is still clearing it would be noise. And an entry
@@ -254,20 +303,40 @@ export function QuantityStepper({
   const enteredOutOfRange =
     edited && Number.isFinite(entered) && (entered < MIN_LINE_QUANTITY || entered > max);
 
+  // Held: the line cannot take a commit right now - it is not editable at all, or its mutation is in
+  // flight. Only the first of the two writes the native attribute; see the header for why `busy`
+  // must not.
   const locked = disabled || busy;
 
+  // Whether each button has anything left to do. At a bound the button is held with
+  // `aria-disabled` rather than `disabled`, because the press that reached the bound is the press
+  // of that very button, which is holding focus as the new quantity arrives (see the header).
+  // `>=` rather than `===` for the ceiling: a `max` that has fallen below the held quantity leaves
+  // the increment with nothing to do either.
+  const quantityAtFloor = quantity <= MIN_LINE_QUANTITY;
+  const quantityAtCeiling = quantity >= max;
+
   /**
-   * Route every commit through one place: restore the field, reject what is not a number, and ask
-   * the caller only for a change it does not already have.
+   * Route every commit through one place: refuse it while the line is held, restore the field,
+   * reject what is not a number, and ask the caller only for a change it does not already have.
    *
    * The field's own two commit points additionally require `edited`, so an untouched entry cannot
    * mutate anything. In ordinary use that is already true of this function - a clamped quantity
    * equals itself - but it is not true when `max` has fallen below the quantity the cart holds:
    * without that guard, tabbing through such a line would clamp it down to the new ceiling and
    * trim the cart on the way past, which is a mutation nobody asked for. The buttons are exempt
-   * because pressing one IS the request.
+   * because pressing one IS the request - unless it sits at its bound, which its own handler
+   * checks for the same reason.
+   *
+   * The refusal comes first because the controls stay focusable while held: a keyboard press of a
+   * held button still reaches its handler, and it must ask for nothing. The field cannot have been
+   * edited while held - it is `readOnly` - so there is no draft for the refusal to leave stale.
    */
   function commit(next: number): void {
+    if (locked) {
+      return;
+    }
+
     // Unconditional, and first: whatever the shopper typed, the field goes back to showing the
     // cart's own quantity. An accepted mutation arrives as a new prop and replaces it in the same
     // React batch, so there is no intermediate frame; a rejected one leaves the truth on screen.
@@ -286,6 +355,28 @@ export function QuantityStepper({
     }
   }
 
+  /**
+   * The field's own decision point, shared by Enter and blur.
+   *
+   * An entry nobody changed commits nothing (see `commit`). An entry outside the permitted range
+   * commits nothing either, and is deliberately left in the field: it stays `aria-invalid`, the
+   * hint keeps naming the range and what the cart still holds, and the shopper corrects it or
+   * abandons it with Escape. Anything else - a permitted number, or a cleared box - goes through
+   * `commit`, which restores the field and asks the caller only for a real change.
+   */
+  function commitEntry(): void {
+    if (!edited || enteredOutOfRange) {
+      return;
+    }
+
+    commit(entered);
+  }
+
+  // The hint an out-of-range entry is described by; see the constants at the top of the file.
+  const rangeHint =
+    `${RANGE_HINT_PREFIX}${formatQuantityLabel(MIN_LINE_QUANTITY)}${RANGE_HINT_SEPARATOR}` +
+    `${formatQuantityLabel(max)}${HELD_HINT_PREFIX}${formatQuantityLabel(quantity)}`;
+
   return (
     <div
       className={clsx(styles.root, className)}
@@ -299,12 +390,20 @@ export function QuantityStepper({
         <VisuallyHidden>{`Quantity for ${itemLabel}`}</VisuallyHidden>
       </label>
 
+      {/* Held with `aria-disabled` while the line is busy and at the floor, never with `disabled`,
+          so the button keeps focus through the press that got it there; `disabled` is the prop's
+          alone. `Button` spreads `aria-*` through as its documented escape hatch, and draws no
+          indicator here because the group's own `data-busy` dimming already says the line is
+          working. */}
       <Button
         variant="secondary"
         size="sm"
-        disabled={locked || quantity <= MIN_LINE_QUANTITY}
+        disabled={disabled}
+        aria-disabled={busy || quantityAtFloor ? 'true' : undefined}
         onClick={() => {
-          commit(quantity - 1);
+          if (!quantityAtFloor) {
+            commit(quantity - 1);
+          }
         }}
       >
         <span aria-hidden="true">&minus;</span>
@@ -326,7 +425,11 @@ export function QuantityStepper({
         step={1}
         autoComplete="off"
         value={draft}
-        disabled={locked}
+        // Busy holds the field without taking focus from it: an Enter that commits leaves the
+        // shopper in the field they pressed it in, read-only until the line settles.
+        disabled={disabled}
+        readOnly={busy}
+        aria-disabled={busy ? 'true' : undefined}
         invalid={enteredOutOfRange}
         aria-describedby={enteredOutOfRange ? quantityHintId : undefined}
         onChange={(event) => {
@@ -339,26 +442,34 @@ export function QuantityStepper({
             // not, and a cart drawer inside a checkout form would do exactly that.
             event.preventDefault();
 
-            if (edited) {
-              commit(Number.parseInt(draft, 10));
-            }
+            commitEntry();
+          } else if (event.key === ABANDON_ENTRY_KEY && edited) {
+            // Escape abandons the entry: the field shows the cart's own quantity again and the
+            // flag and the hint go with it. Only an entry in progress consumes the key, so the
+            // first Escape in a dialog clears what was typed and the next one reaches the dialog;
+            // on an untouched field Escape passes straight through.
+            event.preventDefault();
+            event.stopPropagation();
+            setDraft(String(quantity));
           }
         }}
         onBlur={() => {
-          // Only an entry the shopper actually changed is worth a commit: focus passing through
-          // a row is not a decision about it (see `commit`).
-          if (edited) {
-            commit(Number.parseInt(draft, 10));
-          }
+          // Only an entry the shopper actually changed, and one inside the range, is worth a
+          // commit: focus passing through a row is not a decision about it (see `commitEntry`).
+          commitEntry();
         }}
       />
 
+      {/* Held on the same terms as the decrement, at the ceiling instead of the floor. */}
       <Button
         variant="secondary"
         size="sm"
-        disabled={locked || quantity >= max}
+        disabled={disabled}
+        aria-disabled={busy || quantityAtCeiling ? 'true' : undefined}
         onClick={() => {
-          commit(quantity + 1);
+          if (!quantityAtCeiling) {
+            commit(quantity + 1);
+          }
         }}
       >
         <span aria-hidden="true">+</span>
@@ -369,11 +480,13 @@ export function QuantityStepper({
           region appearing. It carries the committed quantity - read from the prop, never from the
           draft, so nothing is announced until the cart has actually changed - and turns into a
           visible range hint while the entry is out of range, which is the state `.status` is
-          coloured for and the reason the field points `aria-describedby` here. The wording carries
-          the meaning; the colour only emphasises it. */}
+          coloured for and the reason the field points `aria-describedby` here. The hint names the
+          quantity the cart still holds, so a refused entry is never mistaken for a committed one.
+          The wording carries the meaning; the colour only emphasises it. `.status` is out of the
+          group's flow, so the hint appearing moves nothing in the row. */}
       <span id={quantityHintId} role="status" aria-live="polite" className={styles.status}>
         {enteredOutOfRange ? (
-          `Enter ${formatQuantityLabel(MIN_LINE_QUANTITY)}\u2013${formatQuantityLabel(max)}`
+          rangeHint
         ) : (
           <VisuallyHidden>{formatQuantityLabel(quantity)}</VisuallyHidden>
         )}

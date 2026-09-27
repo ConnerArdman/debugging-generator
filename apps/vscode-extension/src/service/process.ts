@@ -113,6 +113,15 @@
  * of secret-named environment variables, bearer and key-value credentials,
  * provider-key and JWT shapes and long mixed-case base64url runs are replaced.
  *
+ * The model credential is never a setting. `ANTHROPIC_API_KEY` reaches the
+ * service only from the environment the editor was started from: a key in
+ * `settings.json` would sit in plaintext in a file settings sync uploads and a
+ * repository may commit. What the settings do supply is the provider
+ * (`debuggen.provider` → `DEBUGGEN_PROVIDER`, see
+ * {@link resolveProviderSetting}) and the model id (`debuggen.model` →
+ * `DEBUGGEN_MODEL`, see {@link resolveModelSetting}); no model id is built
+ * into this module, and the configured one is never logged.
+ *
  * The lifecycle records sent to the injected logger — which `src/extension.ts`
  * prints, unredacted, into the "Debug Generator" output — are held to a
  * stricter rule than the child's scrubbed output: they carry closed
@@ -271,13 +280,19 @@ const CONFIGURATION_SECTION = 'debuggen';
 const WATCHED_SETTINGS = Object.freeze([
   `${CONFIGURATION_SECTION}.serviceUrl`,
   `${CONFIGURATION_SECTION}.provider`,
+  `${CONFIGURATION_SECTION}.model`,
   `${CONFIGURATION_SECTION}.autoStartService`,
 ]);
 
-/** Settings whose change needs a restart of a running embedded service to take effect. */
+/**
+ * Settings whose change needs a restart of a running embedded service to take
+ * effect: the address it listens on and the provider and model it was started
+ * with, all read by the service once, at start-up.
+ */
 const RESTART_SETTINGS = Object.freeze([
   `${CONFIGURATION_SECTION}.serviceUrl`,
   `${CONFIGURATION_SECTION}.provider`,
+  `${CONFIGURATION_SECTION}.model`,
 ]);
 
 /**
@@ -460,8 +475,8 @@ export interface ServiceStatus {
   readonly restartAttempts: number;
 
   /**
-   * Whether a setting the running child was started with (`debuggen.serviceUrl`
-   * or `debuggen.provider`) changed since; a restart applies it.
+   * Whether a setting the running child was started with (`debuggen.serviceUrl`,
+   * `debuggen.provider` or `debuggen.model`) changed since; a restart applies it.
    */
   readonly settingsChanged: boolean;
 
@@ -642,6 +657,14 @@ export interface ServiceProcessSettings {
 
   /** The manifest default of `debuggen.provider`. */
   readonly providerDefault: unknown;
+
+  /**
+   * `debuggen.model`, trimmed, or `undefined` when it is empty, unset or not a
+   * string — the model id forwarded as `DEBUGGEN_MODEL` (see
+   * {@link resolveModelSetting}). Optional, so a reader that knows nothing of
+   * the setting keeps an inherited `DEBUGGEN_MODEL` in force. Never logged.
+   */
+  readonly model?: string | undefined;
 }
 
 /** One-shot scheduling: runs `callback` after `delayMs` and returns its cancellation. */
@@ -1219,7 +1242,7 @@ function unusableConfiguredRuntime(reason: string): DebuggenError {
 }
 
 // ---------------------------------------------------------------------------
-// The service address, provider and environment (pure)
+// The service address, provider, model and environment (pure)
 // ---------------------------------------------------------------------------
 
 /** Where the embedded service is told to listen: `DEBUGGEN_HOST` and `DEBUGGEN_PORT`. */
@@ -1381,6 +1404,69 @@ export function resolveProviderSetting(
   return ok(isProviderId(settings.providerDefault) ? settings.providerDefault : undefined);
 }
 
+/**
+ * A character a model id can never contain and an environment value must not
+ * carry: a C0 or C1 control (NUL makes `spawn` throw; a line feed or carriage
+ * return would split the value across lines of any record that prints it) or a
+ * Unicode line or paragraph separator.
+ */
+const MODEL_CONTROL_CHARACTER = /[\p{Cc}\p{Zl}\p{Zp}]/u;
+
+/** The developer's fix for a `debuggen.model` value the service cannot be handed. */
+const MODEL_SETTING_HINT =
+  'Set debuggen.model to the id of the model the anthropic provider should call, or clear it to use DEBUGGEN_MODEL from the environment VS Code was started from.';
+
+/**
+ * The `DEBUGGEN_MODEL` value to hand the child, from `debuggen.model`:
+ *
+ * - a non-empty value (trimmed) is forwarded, whatever the provider — the
+ *   service accepts a model beside `deterministic` and ignores it there, and
+ *   forwarding it unconditionally keeps the rule independent of whether the
+ *   provider came from a setting or from the editor's environment (where this
+ *   module does not read it back);
+ * - an empty, whitespace-only or unset value yields `undefined`, which leaves a
+ *   `DEBUGGEN_MODEL` inherited from the editor's environment as it is — the
+ *   manifest default is the empty string, so no model id is ever supplied by
+ *   this extension on its own (AAP §0.5.3: the model id comes from
+ *   `DEBUGGEN_MODEL` and is never hardcoded);
+ * - a value holding a {@link MODEL_CONTROL_CHARACTER} is refused. The failure
+ *   names the setting and never the value, which is the developer's own text.
+ *
+ * Whether a model is *required* is the service's decision, not this module's:
+ * with `anthropic` selected and no model from either source, the service
+ * refuses to start with a `CONFIG_INVALID` failure naming `DEBUGGEN_MODEL`,
+ * which reaches the developer through the child's start-up report.
+ *
+ * @example
+ * ```ts
+ * resolveModelSetting({ model: '  model-under-test ' }); // ok('model-under-test')
+ * resolveModelSetting({ model: '' });                    // ok(undefined): keep the inherited one
+ * resolveModelSetting({ model: 'a\nb' });                // err(CONFIG_INVALID, reason 'model')
+ * ```
+ *
+ * @param settings The settings snapshot.
+ * @returns The value to set, `undefined` to keep the inherited one, or a
+ * `CONFIG_INVALID` failure with `details.reason` `model`.
+ */
+export function resolveModelSetting(
+  settings: Pick<ServiceProcessSettings, 'model'>,
+): Result<string | undefined, DebuggenError> {
+  const model = settings.model?.trim();
+  if (model === undefined || model === '') {
+    return ok(undefined);
+  }
+  if (MODEL_CONTROL_CHARACTER.test(model)) {
+    return err(
+      new DebuggenError(
+        'CONFIG_INVALID',
+        'debuggen.model contains a control character or line break, so it cannot be passed to the Debug Generator service as DEBUGGEN_MODEL.',
+        { hint: MODEL_SETTING_HINT, details: { reason: 'model' } },
+      ),
+    );
+  }
+  return ok(model);
+}
+
 /** The inputs of {@link buildServiceEnvironment}. */
 export interface ServiceEnvironmentInput {
   /** The parent environment; copied, never mutated. */
@@ -1393,6 +1479,11 @@ export interface ServiceEnvironmentInput {
   readonly promptsDir?: string | undefined;
   /** `DEBUGGEN_PROVIDER`, when it is to be set rather than inherited. */
   readonly provider?: ProviderId | undefined;
+  /**
+   * `DEBUGGEN_MODEL`, when it is to be set rather than inherited — a value
+   * {@link resolveModelSetting} accepted, so it carries no control character.
+   */
+  readonly model?: string | undefined;
   /** Whether the runtime is Electron run as Node. */
   readonly runAsNode: boolean;
   /** The host platform; environment names are case-insensitive on Windows. */
@@ -1403,9 +1494,13 @@ export interface ServiceEnvironmentInput {
  * Assembles the child's environment: a copy of the parent's, with only the
  * variables the service reads (`apps/local-service/src/config.ts`) applied —
  * `DEBUGGEN_HOME`, `DEBUGGEN_HOST`, `DEBUGGEN_PORT`, `DEBUGGEN_PROMPTS_DIR`,
- * `DEBUGGEN_PROVIDER` — plus `ELECTRON_RUN_AS_NODE` for an Electron runtime
- * (removed for a real Node, so it does not leak into the processes the service
- * launches). `DEBUGGEN_TOKEN`, `DEBUGGEN_INGEST_URL` and `DEBUGGEN_PROJECT_ROOT`
+ * `DEBUGGEN_PROVIDER`, `DEBUGGEN_MODEL` — plus `ELECTRON_RUN_AS_NODE` for an
+ * Electron runtime (removed for a real Node, so it does not leak into the
+ * processes the service launches). An applied variable replaces an inherited
+ * copy; `DEBUGGEN_PROMPTS_DIR`, `DEBUGGEN_PROVIDER` and `DEBUGGEN_MODEL` are
+ * applied only when given, so without one an inherited copy stays in force.
+ * `ANTHROPIC_API_KEY` is never applied: it is only ever inherited.
+ * `DEBUGGEN_TOKEN`, `DEBUGGEN_INGEST_URL` and `DEBUGGEN_PROJECT_ROOT`
  * are removed: they are minted by the service's own launcher for a target
  * project's dev server and are never the service's to hold.
  *
@@ -1436,6 +1531,9 @@ export function buildServiceEnvironment(input: ServiceEnvironmentInput): Record<
   }
   if (input.provider !== undefined) {
     applied.set('DEBUGGEN_PROVIDER', input.provider);
+  }
+  if (input.model !== undefined) {
+    applied.set('DEBUGGEN_MODEL', input.model);
   }
   if (input.runAsNode) {
     applied.set(ELECTRON_RUN_AS_NODE, '1');
@@ -1866,7 +1964,8 @@ function spawnWithNode(
 }
 
 /**
- * Reads the three settings this module needs through
+ * Reads the four settings this module needs — `debuggen.autoStartService`,
+ * `debuggen.serviceUrl`, `debuggen.provider` and `debuggen.model` — through
  * `workspace.getConfiguration("debuggen")`, on every call, so a changed
  * setting takes effect without a reload.
  */
@@ -1875,6 +1974,7 @@ function readWorkspaceSettings(): ServiceProcessSettings {
   const autoStart = configuration.get<unknown>('autoStartService');
   const serviceUrl = configuration.get<unknown>('serviceUrl');
   const provider = configuration.inspect<unknown>('provider');
+  const model = configuration.get<unknown>('model');
   return {
     // The manifest default is `true`; a value that is not a boolean is read as
     // "off", because an ambiguous wish is never a licence to spawn.
@@ -1886,6 +1986,10 @@ function readWorkspaceSettings(): ServiceProcessSettings {
     providerExplicit:
       provider?.workspaceFolderValue ?? provider?.workspaceValue ?? provider?.globalValue,
     providerDefault: provider?.defaultValue,
+    // The manifest default is the empty string: no model id is supplied unless
+    // the developer configured one. A value that is not a string is read as
+    // unset, which keeps an inherited `DEBUGGEN_MODEL` in force.
+    model: typeof model === 'string' && model.trim() !== '' ? model.trim() : undefined,
   };
 }
 
@@ -1903,6 +2007,7 @@ export const SERVICE_FAILURE_REASONS = Object.freeze([
   'node-runtime',
   'service-url',
   'provider',
+  'model',
   'bundle-incomplete',
   'spawn-failed',
   'exited',
@@ -3016,10 +3121,10 @@ class EmbeddedServiceProcess implements ServiceProcess {
 
   /**
    * Everything a spawn needs, in the order that makes each failure precise:
-   * the entry, the address, the provider, the state directory, the runtime —
-   * then the editor credential, which is the only step with a side effect
-   * (creating `auth.json`), so it runs last and only for a spawn that will
-   * happen.
+   * the entry, the address, the provider, the model, the state directory, the
+   * runtime — then the editor credential, which is the only step with a side
+   * effect (creating `auth.json`), so it runs last and only for a spawn that
+   * will happen.
    */
   async #prepareLaunch(
     settings: ServiceProcessSettings,
@@ -3040,6 +3145,10 @@ class EmbeddedServiceProcess implements ServiceProcess {
     );
     if (isErr(provider)) {
       return provider;
+    }
+    const model = resolveModelSetting(settings);
+    if (isErr(model)) {
+      return model;
     }
     const home = this.#credential.paths();
     if (isErr(home)) {
@@ -3099,6 +3208,7 @@ class EmbeddedServiceProcess implements ServiceProcess {
       address: address.value,
       promptsDir: entry.value.promptsDir,
       provider: provider.value,
+      model: model.value,
       runAsNode: nodeRuntime.value.runAsNode,
       platform: this.#platform,
     });
@@ -3853,6 +3963,7 @@ class EmbeddedServiceProcess implements ServiceProcess {
         serviceUrl: DEFAULT_SERVICE_URL,
         providerExplicit: undefined,
         providerDefault: undefined,
+        model: undefined,
       };
     }
   }
@@ -3860,9 +3971,9 @@ class EmbeddedServiceProcess implements ServiceProcess {
   /**
    * A relevant setting changed: a latched failure may have been fixed, so the
    * next automatic `ensureRunning` may try again; a running child started
-   * with the old service URL or provider is flagged, because applying the new
-   * value takes a restart the developer chooses — an automatic restart could
-   * cut a session's cleanup short.
+   * with the old service URL, provider or model is flagged, because applying
+   * the new value takes a restart the developer chooses — an automatic restart
+   * could cut a session's cleanup short.
    */
   #onConfigurationChanged(event: ConfigurationChangeLike): void {
     if (this.#disposed) {

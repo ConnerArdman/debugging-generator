@@ -21,6 +21,12 @@
  *   regressing a status, and its counted `total` is kept for the active
  *   session beside a list later pushes may extend, until another session
  *   becomes active.
+ * - **A record's modifications.** A session record merges its
+ *   `modifications` under the same rule: a record sent before cleanup never
+ *   shows a file the journal already reported restored (or in conflict) as
+ *   applied again, a record further along moves each file forward, and a
+ *   reopened ended session renders its restored files as reverted beside its
+ *   clean cleanup.
  *
  * ## The `vscode` substitute
  *
@@ -1106,6 +1112,171 @@ describe('applyModificationJournal', () => {
     state.resetSession();
     expect(state.modificationsTotal).toBeUndefined();
     expect(Object.hasOwn(state.toWebviewState(), 'modificationsTotal')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A session record's modifications
+// ---------------------------------------------------------------------------
+
+describe("a session record's modifications", () => {
+  /** The `[id, status]` pairs the view renders, from the webview snapshot. */
+  function renderedStatuses(): (readonly [string, string])[] {
+    return state
+      .toWebviewState()
+      .modifications.map((record) => [record.id, record.status] as const);
+  }
+
+  it('a stale record after the post-cleanup journal never shows a restored file as applied again', () => {
+    const patches = [appliedPatch('S1', 'S1-mod-1'), appliedPatch('S1', 'S1-mod-2')];
+    state.adoptSession(
+      sessionRecord('S1', { status: 'capturing', modifications: patches }),
+      ENDPOINT,
+    );
+
+    // The end command's journal read, answered after cleanup restored both files.
+    state.applyModificationJournal(
+      'S1',
+      patches.map((patch) => ({ ...patch, status: 'reverted' as const })),
+      2,
+    );
+    // Then the ended record, its cleanup clean, carrying a mirror written before cleanup.
+    state.applySessionRecord(
+      sessionRecord('S1', {
+        status: 'ended',
+        updatedAt: T0 + 20,
+        modifications: patches,
+        cleanup: { status: 'clean', completedAt: T0 + 20, conflicts: [] },
+      }),
+    );
+
+    expect(state.cleanup.status).toBe('clean');
+    expect(state.modifications.map((record) => [record.id, record.status])).toEqual([
+      ['S1-mod-1', 'reverted'],
+      ['S1-mod-2', 'reverted'],
+    ]);
+    expect(renderedStatuses()).toEqual([
+      ['S1-mod-1', 'reverted'],
+      ['S1-mod-2', 'reverted'],
+    ]);
+  });
+
+  it('a newer record never moves a conflict back to applied, and a later record resolves it', () => {
+    state.adoptSession(
+      sessionRecord('S1', {
+        status: 'capturing',
+        modifications: [{ ...appliedPatch('S1'), status: 'conflict' }],
+      }),
+      ENDPOINT,
+    );
+
+    state.applySessionRecord(
+      sessionRecord('S1', {
+        status: 'capturing',
+        updatedAt: T0 + 5,
+        modifications: [appliedPatch('S1')],
+      }),
+    );
+    expect(renderedStatuses()).toEqual([['S1-mod-1', 'conflict']]);
+
+    state.applySessionRecord(
+      sessionRecord('S1', {
+        status: 'capturing',
+        updatedAt: T0 + 6,
+        modifications: [{ ...appliedPatch('S1'), status: 'reverted' }],
+      }),
+    );
+    expect(renderedStatuses()).toEqual([['S1-mod-1', 'reverted']]);
+  });
+
+  it('a fresh record moves each file forward, and takes a record at the same rank', () => {
+    state.adoptSession(
+      sessionRecord('S1', {
+        status: 'capturing',
+        modifications: [
+          appliedPatch('S1', 'S1-mod-1'),
+          appliedPatch('S1', 'S1-mod-2'),
+          { ...appliedPatch('S1', 'S1-mod-3'), status: 'conflict' },
+        ],
+      }),
+      ENDPOINT,
+    );
+
+    state.applySessionRecord(
+      sessionRecord('S1', {
+        status: 'ended',
+        updatedAt: T0 + 10,
+        modifications: [
+          { ...appliedPatch('S1', 'S1-mod-1'), status: 'reverted' },
+          { ...appliedPatch('S1', 'S1-mod-2'), status: 'conflict' },
+          { ...appliedPatch('S1', 'S1-mod-3'), status: 'failed' },
+        ],
+        cleanup: { status: 'conflict', completedAt: T0 + 10, conflicts: [] },
+      }),
+    );
+
+    expect(renderedStatuses()).toEqual([
+      ['S1-mod-1', 'reverted'],
+      ['S1-mod-2', 'conflict'],
+      ['S1-mod-3', 'failed'],
+    ]);
+  });
+
+  it('keeps the record’s own order and the held records it does not list yet', () => {
+    state.adoptSession(sessionRecord('S1', { status: 'capturing' }), ENDPOINT);
+    state.applyInstrumentationReady({
+      sessionId: 'S1',
+      applied: [appliedPatch('S1', 'S1-mod-9')],
+      runtimeHooks: [],
+      unavailable: [],
+    });
+    state.applyModificationJournal('S1', [
+      { ...appliedPatch('S1', 'S1-mod-2'), status: 'reverted' },
+    ]);
+
+    state.applySessionRecord(
+      sessionRecord('S1', {
+        status: 'capturing',
+        updatedAt: T0 + 3,
+        modifications: [appliedPatch('S1', 'S1-mod-1'), appliedPatch('S1', 'S1-mod-2')],
+      }),
+    );
+
+    expect(renderedStatuses()).toEqual([
+      ['S1-mod-1', 'applied'],
+      ['S1-mod-2', 'reverted'],
+      ['S1-mod-9', 'applied'],
+    ]);
+  });
+
+  it('reopening an ended session renders every restored file as reverted beside a clean cleanup', () => {
+    // Another session is in view; the Sessions tree reopens S1, whose record is fresh.
+    state.adoptSession(
+      sessionRecord('S2', { status: 'capturing', modifications: [appliedPatch('S2')] }),
+      ENDPOINT,
+    );
+
+    state.adoptSession(
+      sessionRecord('S1', {
+        status: 'ended',
+        updatedAt: T0 + 30,
+        modifications: [
+          { ...appliedPatch('S1', 'S1-mod-1'), status: 'reverted' },
+          { ...appliedPatch('S1', 'S1-mod-2'), status: 'reverted' },
+        ],
+        cleanup: { status: 'clean', completedAt: T0 + 30, conflicts: [] },
+      }),
+      ENDPOINT,
+    );
+
+    const snapshot = state.toWebviewState();
+    expect(snapshot.cleanup.status).toBe('clean');
+    expect(renderedStatuses()).toEqual([
+      ['S1-mod-1', 'reverted'],
+      ['S1-mod-2', 'reverted'],
+    ]);
+    // Nothing of the session it replaced is carried over, its applied patch included.
+    expect(state.modifications.every((record) => record.sessionId === 'S1')).toBe(true);
   });
 });
 

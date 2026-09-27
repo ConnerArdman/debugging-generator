@@ -59,10 +59,12 @@
  *   sources in development, `./store/schema.sql` beside the bundled entry
  *   point. Keeping the read out of here is what lets the installable bundle be
  *   self-contained.
- * - **No connection pragmas.** `journal_mode`, `foreign_keys`, `busy_timeout`
- *   and `synchronous` are per-connection settings owned by `./db.ts`. In
- *   particular `PRAGMA journal_mode` cannot run inside a transaction, and every
- *   write here happens inside one.
+ * - **No connection pragmas.** `auto_vacuum`, `journal_mode`, `foreign_keys`,
+ *   `busy_timeout` and `synchronous` are per-connection settings owned by
+ *   `./db.ts`. In particular `PRAGMA journal_mode` cannot run inside a
+ *   transaction, and every write here happens inside one; `auto_vacuum` must
+ *   reach a new file before its first write, which is earlier than any step
+ *   here runs.
  * - **No `node:sqlite` runtime dependency.** The binding is imported for its
  *   type only; the live database handle is passed in, which is what lets a test
  *   drive the whole ladder against an in-memory database with an injected

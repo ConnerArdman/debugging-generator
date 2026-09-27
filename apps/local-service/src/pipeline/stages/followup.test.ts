@@ -2288,6 +2288,117 @@ describe('createFollowUpStage — the existing-evidence path', () => {
     expect(request?.metadata?.promptVersion).toBe(RECORDED_PROMPT_VERSIONS.followup);
   });
 
+  /** One `findByName` call the stage made, as the fake graph received it. */
+  interface NameLookup {
+    readonly name: string;
+    readonly options: unknown;
+  }
+
+  /**
+   * Code handles whose graph declares `declarations` by name, recording every
+   * `findByName` lookup; `throwing` makes every lookup throw instead.
+   */
+  function codeDeclaring(
+    declarations: ReadonlyMap<string, readonly { file: string; kind: string }[]>,
+    lookups: NameLookup[],
+    throwing = false,
+  ): PipelineCodeHandles {
+    const base = fakeCode();
+    const queries = {
+      hasSymbol: (file: string, symbol: string): boolean => INDEX.get(file) === symbol,
+      findByName: (name: string, options?: unknown): readonly unknown[] => {
+        lookups.push({ name, options });
+        if (throwing) {
+          throw new Error(`The fake graph was told to throw ${SENTINEL}.`);
+        }
+        return (declarations.get(name) ?? []).map(({ file, kind }, index) => ({
+          nodeId: `node-${name}-${String(index)}`,
+          kind,
+          name,
+          file,
+          location: { file, line: 1, column: 1, resolvedBy: 'code-graph', confidence: 1 },
+          score: 1,
+        }));
+      },
+    };
+    return { ...base, queries: queries as unknown as PipelineCodeHandles['queries'] };
+  }
+
+  it('hands the builder the redacted follow-up’s identifier candidates and the declarations they resolve to', async () => {
+    const lookups: NameLookup[] = [];
+    const declarations = new Map([
+      [
+        'ledgerTotals',
+        [
+          { file: INDEXED_FILE, kind: 'server-function' },
+          // The same declaration reached twice is carried once.
+          { file: INDEXED_FILE, kind: 'server-function' },
+        ],
+      ],
+      ['formatLedgerRows', [{ file: OTHER_FILE, kind: 'symbol' }]],
+    ]);
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    const context: PipelineStageContext = {
+      ...h.context,
+      code: codeDeclaring(declarations, lookups),
+    };
+    // A camel-cased query value is masked before the tokenizer reads the text,
+    // so it never becomes a name the graph is asked about.
+    const question =
+      'Does ledgerTotals call formatLedgerRows twice after /ledger?view=hiddenLedgerView loads? ledgerTotals!';
+
+    expectOk(await h.stage.run(context, followUpInput({ followUpQuestion: question })));
+
+    const [call] = h.builder.calls;
+    expect(call?.questionHints).toStrictEqual({
+      identifierCandidates: ['formatLedgerRows', 'ledgerTotals'],
+    });
+    expect(call?.candidates).toStrictEqual([
+      { file: OTHER_FILE, symbol: 'formatLedgerRows', kind: 'symbol', score: 1 },
+      { file: INDEXED_FILE, symbol: 'ledgerTotals', kind: 'server-function', score: 1 },
+    ]);
+    // Exact, declaration-only, bounded lookups — one per name, in the tokenizer's order.
+    const lookupOptions = {
+      exact: true,
+      kinds: ['symbol', 'component', 'server-function'],
+      limit: 8,
+    };
+    expect(lookups).toStrictEqual([
+      { name: 'formatLedgerRows', options: lookupOptions },
+      { name: 'ledgerTotals', options: lookupOptions },
+    ]);
+    expect(recordsWith(h.log.records, 'Follow-up decided.')[0]?.fields).toMatchObject({
+      identifierCandidates: 2,
+      namedDeclarations: 2,
+    });
+  });
+
+  it('decides from the stored evidence alone when the graph lookup of the follow-up’s names fails', async () => {
+    const lookups: NameLookup[] = [];
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    const context: PipelineStageContext = {
+      ...h.context,
+      code: codeDeclaring(new Map(), lookups, true),
+    };
+
+    const value = expectOk(
+      await h.stage.run(context, followUpInput({ followUpQuestion: 'Is ledgerTotals slow?' })),
+    );
+
+    expect(value.path).toBe('existing-evidence');
+    expect(lookups.map((lookup) => lookup.name)).toStrictEqual(['ledgerTotals']);
+    const [call] = h.builder.calls;
+    expect(call?.questionHints).toStrictEqual({ identifierCandidates: ['ledgerTotals'] });
+    expect(call?.candidates).toStrictEqual([]);
+    const [warned, ...more] = recordsWith(
+      h.log.records,
+      'The declarations the follow-up names could not be resolved through the code graph; the decision proceeds from the stored evidence alone.',
+    );
+    expect(more).toStrictEqual([]);
+    expect(warned?.fields).toMatchObject({ stage: FOLLOW_UP_STAGE, code: 'INTERNAL' });
+    expect(h.log.records.map(serializeRecord).join('\n')).not.toContain(SENTINEL);
+  });
+
   it('carries the run’s cancellation signal to the request builder and the install', async () => {
     const controller = new AbortController();
     const h = harness({ outcomes: [answer(FETCH_DECISION)] });
@@ -2970,7 +3081,7 @@ describe('createFollowUpStage — the new-capture path', () => {
     expect(h.progress.trail.at(-1)).toBe(`stageFailed:${PLAN}`);
   });
 
-  it('installs a partially infeasible delta as validated, and counts no chain for a refused patch', async () => {
+  it('narrows a partially infeasible delta to its feasible additions, and counts no chain for a refused patch', async () => {
     const h = harness({
       outcomes: [
         answer({ needsNewCapture: true, additionalActions: [ADD_SPAN_ON_TIMED_FILE, ADD_FETCH] }),
@@ -2981,13 +3092,51 @@ describe('createFollowUpStage — the new-capture path', () => {
       expectOk(await h.stage.run(h.context, followUpInput())),
       'new-capture',
     );
-    expect(value.delta).toHaveLength(2);
-    const refusedIds = value.feasibility.rejected.map((refusal) => refusal.action.id);
-    expect(refusedIds).toContain(value.delta[0]?.id);
-    expect(refusedIds).not.toContain(value.delta[1]?.id);
+
+    // The report keeps the refusals the real gate made: the patch-mode span the delta proposed,
+    // and — re-checked — the installed patch-mode timing, which is never dropped.
+    const installedIds = new Set(PLAN_V1.instrumentationTargets.map((action) => action.id));
+    const refusedActions = value.feasibility.rejected.map((refusal) => refusal.action);
+    expect(refusedActions.some((action) => action.id === INSTALLED_TIMING.id)).toBe(true);
+    const refused = refusedActions.filter((action) => !installedIds.has(action.id));
+    expect(refused).toHaveLength(1);
+    const [refusedAction] = refused;
+    expect(refusedAction).toMatchObject({ file: INDEXED_FILE, type: ADD_SPAN_ON_TIMED_FILE.type });
+
+    // Only the feasible addition is the delta, and plan version n + 1 is the previous plan plus it
+    // alone: the refused one is neither recorded nor handed to the installer.
+    expect(value.delta).toHaveLength(1);
+    expect(value.delta[0]).toMatchObject({ type: ADD_FETCH.type });
+    expect(value.delta.map((action) => action.id)).not.toContain(refusedAction?.id);
+    expect(value.plan.instrumentationTargets).toStrictEqual([
+      ...PLAN_V1.instrumentationTargets,
+      ...value.delta,
+    ]);
+    expect(h.install).toHaveBeenCalledTimes(1);
+    const request = installRequestOf(h);
+    expect(request.plan).toStrictEqual(value.plan);
+    expect(request.plan.instrumentationTargets.map((action) => action.id)).not.toContain(
+      refusedAction?.id,
+    );
+    expect(h.recordPlan.mock.calls[0]?.[1]).toStrictEqual(value.plan);
+
+    // The narrowing is logged by count and code, never by path or symbol.
+    const [narrowed, ...more] = recordsWith(
+      h.log.records,
+      'Left the follow-up additions the feasibility gate refused out of the next plan version; only the feasible ones are installed.',
+    );
+    expect(more).toStrictEqual([]);
+    expect(narrowed?.fields).toMatchObject({
+      stage: PLAN,
+      planVersion: value.planVersion,
+      rejectionCodes: [AST_UNAVAILABLE],
+      kept: 1,
+    });
+    expect(JSON.stringify(narrowed?.fields)).not.toContain(INDEXED_FILE);
+    expect(JSON.stringify(narrowed?.fields)).not.toContain(INDEXED_SYMBOL);
+
     expect(value.chainedFiles).toBe(0);
     expect(h.latestRecordForFile).not.toHaveBeenCalled();
-    expect(h.install).toHaveBeenCalledTimes(1);
   });
 
   it('leaves the session at its previous plan version when the delta install fails and its own unwind left nothing open', async () => {

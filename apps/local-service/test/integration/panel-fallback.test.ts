@@ -641,6 +641,17 @@ async function runScenario(spec: ScenarioSpec): Promise<ScenarioRun> {
     throw new Error(`${spec.label}: agent.ready was refused.`);
   }
 
+  // `instrumenting` is entered before the install runs, so the session may still be installing
+  // when the report arrives: the capture opens only once the readiness gate has admitted `ready`,
+  // exactly as a client would wait for "Ready to capture" before starting one.
+  const armed = await harness.waitForSession(
+    created.id,
+    (record) => record.status === 'ready' || record.status === 'failed',
+  );
+  if (armed.status === 'failed') {
+    throw new Error(`${spec.label}: the session failed before it was ready to capture.`);
+  }
+
   const { captureId } = unwrap(
     await harness.startCapture(created.id),
     `${spec.label}: capture.start`,

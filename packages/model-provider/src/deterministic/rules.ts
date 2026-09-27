@@ -112,15 +112,21 @@ import {
 } from '../types.js';
 
 import {
+  CONTEXT_PROVIDER_LIST_MAX_ITEMS,
   EMPTY_CAPTURE_NOTICE,
+  LABEL_MAX_LENGTH,
   METRIC_COUNT_NOUNS,
+  UNNAMED_OPERATION_LABEL,
   captureSignalLabel,
   codeSymbolKindLabel,
+  contextChangeRenderCause,
+  contextTriggeredRenderFact,
   dominantSpanCause,
   duplicateRequestCause,
   duplicateRequestFact,
   errorCountFact,
   flowPathLabel,
+  formatDurationMs,
   codeRelevanceReason,
   instrumentationActionRationale,
   instrumentationActionTypeLabel,
@@ -363,6 +369,24 @@ const ERROR_MIN_COUNT = 1;
 const DOMINANT_SPAN_MIN_SHARE = 0.5;
 
 /**
+ * Share of its tier's measured time a repeated statement shape's summed time
+ * must reach before its repetition can be stated above `low` confidence.
+ *
+ * Repetition alone is not a cause of slowness: twelve executions that took nine
+ * milliseconds between them, beside a statement that took half a second, are a
+ * pattern, but not the pattern the developer is looking for. The yardstick is
+ * the database tier's measured time ({@link DATABASE_DURATION_METRIC}), because
+ * a statement shape is database work and a capture window's idle time cannot
+ * inflate that tier's total; only a capture that states no database time is
+ * weighed against the interaction's total instead. A shape below this share
+ * keeps its count-based strength for ranking against other shapes, and its
+ * confidence is capped at `low` ({@link IMMATERIAL_MAX_STEPS}). A shape whose
+ * summed time or whose yardstick is unknown is not capped, because nothing
+ * measured says it is immaterial.
+ */
+const REPEATED_QUERY_MATERIAL_SHARE = 0.1;
+
+/**
  * Items a data source must report before a panel node reading it is emitted.
  *
  * The default: one item is enough for most sources, because a table with one
@@ -452,6 +476,23 @@ const CONFIDENCE_LEVEL_THRESHOLDS: readonly (readonly [ConfidenceLevel, number])
   ['medium', 2],
   ['low', 0],
 ];
+
+/**
+ * The most whole steps of evidence strength that still read as `low`: one
+ * below the smallest threshold of any stronger level.
+ *
+ * Derived from {@link CONFIDENCE_LEVEL_THRESHOLDS} rather than written out, so
+ * retuning a threshold cannot leave a capped detection reading as `medium`. A
+ * detection judged immaterial ({@link REPEATED_QUERY_MATERIAL_SHARE}) has its
+ * steps capped here.
+ */
+const IMMATERIAL_MAX_STEPS = Math.max(
+  0,
+  CONFIDENCE_LEVEL_THRESHOLDS.reduce(
+    (lowest, [level, threshold]) => (level === 'low' ? lowest : Math.min(lowest, threshold)),
+    CONFIDENCE_MAX_STEPS + 1,
+  ) - 1,
+);
 
 /**
  * Multiplier turning a dominance share into whole steps of evidence strength.
@@ -1060,7 +1101,9 @@ const EVIDENCE_MEMBER_FIELDS: readonly string[] = ['eventId', 'id'];
 const EVIDENCE_OCCURRENCE_FIELDS: readonly string[] = ['occurrences'];
 
 /**
- * The key of the one spelling an emitted evidence reference has: `{ eventId }`.
+ * The key of the one spelling an emitted evidence reference has: `{ eventId }`,
+ * followed by `kind` and `label` when the context describes the event
+ * ({@link EvidenceDescriptor}).
  *
  * The context may spell its own references either way — a request group lists
  * bare `eventIds`, a fact candidate carries `{ eventId }` records — and both are
@@ -1070,10 +1113,59 @@ const EVIDENCE_OCCURRENCE_FIELDS: readonly string[] = ['occurrences'];
  */
 const EVIDENCE_OBJECT_KEY = 'eventId';
 
+/**
+ * The telemetry kinds an emitted evidence reference may name.
+ *
+ * Restated from `@debuggen/telemetry`'s `TELEMETRY_KINDS`, which this package
+ * sits below and cannot import — the precedent is {@link CONFIDENCE_LEVELS}.
+ * The restatement is load-bearing: `@debuggen/panel-schema`'s `EventRef`
+ * validates `kind` as an enumeration over that vocabulary and protocol's strict
+ * findings schema rejects the whole analysis for one unknown kind, so a kind is
+ * emitted only when it is a member here, and a kind the telemetry package adds
+ * later is simply left off the reference rather than failing the stage.
+ */
+const EVIDENCE_REF_KINDS: ReadonlySet<string> = new Set([
+  'interaction',
+  'render',
+  'commit',
+  'fetch',
+  'xhr',
+  'navigation',
+  'perf.longtask',
+  'perf.entry',
+  'error',
+  'state',
+  'http.server',
+  'route.handler',
+  'function',
+  'db.query',
+  'http.client',
+  'server.error',
+  'log',
+]);
+
+/**
+ * The display sugar an emitted reference carries: what kind of event it cites
+ * and a short caption for its chip. Both optional; a reference without either
+ * renders as its id.
+ */
+interface EvidenceDescriptor {
+  /** A member of {@link EVIDENCE_REF_KINDS}. */
+  readonly kind?: string;
+  /** A caption of at most {@link LABEL_MAX_LENGTH} characters, never blank. */
+  readonly label?: string;
+}
+
 /** The reference set of one structured context. */
 interface EvidenceIndex {
   /** Every reference the context carries, within {@link MAX_EVIDENCE_IDS}. */
   readonly available: ReadonlySet<string>;
+  /**
+   * The kind and caption of each reference whose event the context describes
+   * with a record of its own ({@link describeEvidence}); a reference known only
+   * from a bare list is absent here.
+   */
+  readonly descriptors: ReadonlyMap<string, EvidenceDescriptor>;
 }
 
 /**
@@ -1176,9 +1268,14 @@ function singleEvidenceOf(record: JsonObject): string | undefined {
  * same references.
  *
  * @param bags Objects whose nested structures may carry references.
- * @returns The available references.
+ * @param described The capture-aggregate bag whose event records describe the
+ * events they are ({@link describeEvidence}); omitted, no reference is described.
+ * @returns The available references and their descriptors.
  */
-function indexEvidence(bags: readonly (JsonObject | undefined)[]): EvidenceIndex {
+function indexEvidence(
+  bags: readonly (JsonObject | undefined)[],
+  described?: JsonObject,
+): EvidenceIndex {
   const available = new Set<string>();
 
   for (const bag of bags) {
@@ -1197,16 +1294,245 @@ function indexEvidence(bags: readonly (JsonObject | undefined)[]): EvidenceIndex
     }
   }
 
-  return { available };
+  return {
+    available,
+    descriptors:
+      described === undefined ? new Map<string, EvidenceDescriptor>() : describeEvidence(described),
+  };
 }
 
 /**
- * The citable subset of a candidate's references, as `{ eventId }` records.
+ * The capture sections whose rows are events, keyed by their own `eventId`:
+ * the flat operation lists and the trace sections (every node of a trace walk
+ * is a span).
+ */
+const DESCRIBED_ROW_FIELDS: readonly string[] = [
+  'spans',
+  'topSpans',
+  'slowestSpans',
+  'trace',
+  'traces',
+  'traceTree',
+  'traceTrees',
+];
+
+/**
+ * The capture sections whose rows are **aggregates** of events, each listing
+ * the events it was computed from as `occurrences[]` keyed by their own
+ * `eventId`, with what an occurrence of that section is.
+ *
+ * `kind` is what an occurrence is when its row does not say: every execution
+ * of a query group is a database query and every occurrence of a render
+ * statistic is a render, while a request group's occurrences may be `fetch`,
+ * `xhr` or `http.client` events and so name no kind here. `noun` names the
+ * occurrence in its caption when the occurrence names no operation of its own,
+ * `issuerFields` name the occurrence's own fields that say whose occurrence it
+ * is — a render's component — and `subject` reads the same from the aggregate
+ * when the occurrence does not say, so the caption tells the chip's reader
+ * which statement, component or endpoint the event belongs to.
+ *
+ * A query occurrence is named by its statement's leading keyword rather than
+ * by its `callerName`: that name is the span the execution ran inside, which is
+ * as often the enclosing route handler as the function that issued the
+ * statement, and under a fact about one statement shape a chip reading as the
+ * route says nothing about which statement it cites.
+ */
+const DESCRIBED_OCCURRENCE_SECTIONS: readonly {
+  readonly fields: readonly string[];
+  readonly kind?: string;
+  readonly noun: string;
+  readonly issuerFields: readonly string[];
+  readonly subject: (row: JsonObject) => string | undefined;
+}[] = [
+  {
+    fields: ['queries', 'queryGroups'],
+    kind: 'db.query',
+    noun: 'query',
+    issuerFields: [],
+    subject: (row) =>
+      statementKeyword(asString(readField(row, 'statement', 'db.statement', 'sql', 'text'))),
+  },
+  {
+    fields: ['renders', 'renderStats'],
+    kind: 'render',
+    noun: 'render',
+    issuerFields: ['component'],
+    subject: (row) => asString(readField(row, 'component', 'displayName', 'name')),
+  },
+  {
+    fields: ['requests', 'requestGroups', 'duplicateRequests'],
+    noun: 'request',
+    issuerFields: ['callerName', 'component'],
+    subject: (row) => {
+      const method = asString(readField(row, 'method', 'http.method'));
+      const path = asString(readField(row, 'path', 'endpoint', 'url'));
+      if (path === undefined) {
+        return undefined;
+      }
+      return method === undefined ? path : `${method} ${path}`;
+    },
+  },
+];
+
+/** Characters of a statement's leading keyword kept in a caption. */
+const MAX_STATEMENT_KEYWORD_LENGTH = 16;
+
+/**
+ * The leading SQL keyword of a parameterised statement, upper-cased —
+ * `SELECT`, `UPDATE`, `WITH`, `BEGIN` — for a caption that has to say which
+ * statement shape an execution belongs to without repeating the statement.
+ *
+ * @param statement The statement text, when the aggregate carried one.
+ * @returns The keyword, or `undefined` when the text does not begin with one.
+ */
+function statementKeyword(statement: string | undefined): string | undefined {
+  const match = /^[A-Za-z]+/.exec((statement ?? '').trimStart());
+  const keyword = match?.[0];
+  return keyword === undefined
+    ? undefined
+    : keyword.slice(0, MAX_STATEMENT_KEYWORD_LENGTH).toUpperCase();
+}
+
+/**
+ * The kind and caption of every event the capture describes with a record of
+ * its own.
+ *
+ * Only a record keyed by the event's **own** `eventId` describes it: an
+ * operation row, a trace node, an occurrence of an aggregate. A reference
+ * known only from a bare evidence list, or from a representative id on some
+ * other aggregate (a graph participant, a tree node), carries no description
+ * of the event it names, so it is emitted as its id alone. The first record
+ * that describes an event wins, in the fixed order operation rows, trace
+ * sections, then occurrence sections, each in the order the context carried
+ * its rows, so two runs describe an event identically.
+ *
+ * @param aggregates The capture-aggregate bag.
+ * @returns The descriptor of each described event, within {@link MAX_EVIDENCE_IDS}.
+ */
+function describeEvidence(aggregates: JsonObject): ReadonlyMap<string, EvidenceDescriptor> {
+  const descriptors = new Map<string, EvidenceDescriptor>();
+  const describeRecord = (record: JsonObject, context: OccurrenceContext | undefined): void => {
+    const eventId = singleEvidenceOf(record);
+    if (eventId === undefined || descriptors.has(eventId) || descriptors.size >= MAX_EVIDENCE_IDS) {
+      return;
+    }
+    descriptors.set(eventId, eventDescriptor(record, context));
+  };
+
+  for (const field of DESCRIBED_ROW_FIELDS) {
+    for (const node of flattenNodes(aggregates[field])) {
+      describeRecord(node, undefined);
+    }
+  }
+  for (const section of DESCRIBED_OCCURRENCE_SECTIONS) {
+    for (const field of section.fields) {
+      for (const row of asObjectArray(aggregates[field]) ?? []) {
+        const context: OccurrenceContext = {
+          ...(section.kind !== undefined ? { kind: section.kind } : {}),
+          noun: section.noun,
+          issuerFields: section.issuerFields,
+          ...optionalSubject(section.subject(row)),
+        };
+        for (const occurrence of asObjectArray(row['occurrences']) ?? []) {
+          describeRecord(occurrence, context);
+        }
+      }
+    }
+  }
+  return descriptors;
+}
+
+/**
+ * What an occurrence's aggregate says about it: the section's kind and noun,
+ * which of the occurrence's own fields name its issuer, and whose occurrence
+ * the aggregate says it is.
+ */
+interface OccurrenceContext {
+  /** What an occurrence of the section is, when fixed. */
+  readonly kind?: string;
+  /** What the section calls one occurrence. */
+  readonly noun: string;
+  /** The occurrence fields that name whose occurrence it is. */
+  readonly issuerFields: readonly string[];
+  /** Whose occurrence the aggregate says it is. */
+  readonly subject?: string;
+}
+
+/**
+ * A subject as an optional property, so an absent one is omitted rather than
+ * written as `undefined` under `exactOptionalPropertyTypes`.
+ *
+ * @param subject The subject, when the aggregate stated one.
+ * @returns `{ subject }`, or an empty object.
+ */
+function optionalSubject(subject: string | undefined): { readonly subject?: string } {
+  return subject === undefined ? {} : { subject };
+}
+
+/**
+ * The descriptor of one event record.
+ *
+ * The kind is the record's own when it is one of {@link EVIDENCE_REF_KINDS},
+ * else the section's. The caption names the operation — the record's own name;
+ * failing that, for an occurrence, its issuer (the occurrence fields its
+ * section names) or else its aggregate's subject, followed by the section's
+ * noun — and appends the record's duration when it has one:
+ * `‹operation› (‹n› ms)`. The operation part is cut first, so the duration
+ * survives any truncation, and the whole stays within {@link LABEL_MAX_LENGTH}.
+ *
+ * @param record An event record keyed by its own `eventId`.
+ * @param context What the record's aggregate says about it, for an occurrence;
+ * `undefined` for an operation row or a trace node, which describe themselves.
+ * @returns The descriptor; empty when the record says nothing displayable.
+ */
+function eventDescriptor(
+  record: JsonObject,
+  context: OccurrenceContext | undefined,
+): EvidenceDescriptor {
+  const ownKind = asString(record['kind']);
+  const kind = ownKind !== undefined && EVIDENCE_REF_KINDS.has(ownKind) ? ownKind : context?.kind;
+
+  let operation = asString(readField(record, 'name', 'operation', 'label'));
+  if (operation === undefined) {
+    if (context === undefined) {
+      operation = asString(readField(record, 'callerName', 'component'));
+    } else {
+      const issuer = asString(readField(record, ...context.issuerFields)) ?? context.subject;
+      operation = issuer === undefined ? context.noun : `${issuer} ${context.noun}`;
+    }
+  }
+  if (operation === undefined) {
+    return kind === undefined ? {} : { kind };
+  }
+
+  const durationMs = asDurationMs(readField(record, 'durationMs', 'duration', 'elapsedMs'));
+  // The canonical duration text carries its own unit (`formatDurationMs`).
+  const suffix = durationMs === undefined ? '' : ` (${formatDurationMs(durationMs)})`;
+  const name = truncateLabel(
+    sanitizeLabel(operation, UNNAMED_OPERATION_LABEL),
+    LABEL_MAX_LENGTH - suffix.length,
+  );
+  return {
+    ...(kind !== undefined ? { kind } : {}),
+    label: `${name}${suffix}`,
+  };
+}
+
+/**
+ * The citable subset of a candidate's references, as `{ eventId }` records,
+ * each with the `kind` and `label` its {@link EvidenceDescriptor} supplies.
  *
  * Filtered against the harvested set, de-duplicated, ordered, and capped. An
  * empty result is the caller's signal to **drop the candidate entirely**: a
  * fact carries at least one reference, and one that cannot cite anything is one
- * this module has no business asserting.
+ * this module has no business asserting. Keys are emitted in the fixed order
+ * `eventId`, `kind`, `label`.
+ *
+ * Described references are cited first, each group in id order: a candidate
+ * with more references than {@link MAX_EVIDENCE_PER_FACT} — a duplicate window
+ * of nine requests whose aggregate lists five occurrences, say — then cites the
+ * events a reader can recognise by their caption rather than by a raw id,
+ * while a candidate at or under the cap cites every reference it has.
  *
  * @param references The candidate's raw references.
  * @param index The context's reference set.
@@ -1219,8 +1545,21 @@ function citeEvidence(references: readonly string[], index: EvidenceIndex): Json
       citable.add(reference);
     }
   }
-  const ordered = sortStrings([...citable]).slice(0, MAX_EVIDENCE_PER_FACT);
-  return ordered.map((reference) => ({ [EVIDENCE_OBJECT_KEY]: reference }));
+  const sorted = sortStrings([...citable]);
+  const captioned = (reference: string): boolean =>
+    index.descriptors.get(reference)?.label !== undefined;
+  const ordered = [
+    ...sorted.filter((reference) => captioned(reference)),
+    ...sorted.filter((reference) => !captioned(reference)),
+  ].slice(0, MAX_EVIDENCE_PER_FACT);
+  return ordered.map((reference) => {
+    const descriptor = index.descriptors.get(reference);
+    return {
+      [EVIDENCE_OBJECT_KEY]: reference,
+      ...(descriptor?.kind !== undefined ? { kind: descriptor.kind } : {}),
+      ...(descriptor?.label !== undefined ? { label: descriptor.label } : {}),
+    };
+  });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1334,18 +1673,14 @@ function defaultConfidenceFor(resolvedBy: string): number | undefined {
 }
 
 /**
- * A `file:line:column` label for an aggregate's location, for the frames that
- * name a call site.
+ * A `file:line:column` label for a location an aggregate was read with, for
+ * the frames that name a call site.
  *
- * @param source An aggregate that may carry a location.
+ * @param location The validated location, when the aggregate had one.
  * @returns The label, or the empty string so the frame applies its own
  * documented fallback wording.
  */
-function callSiteLabel(source: JsonObject | undefined): string {
-  if (source === undefined) {
-    return '';
-  }
-  const location = readSourceLocation(source);
+function callSiteLabel(location: SourceLocation | undefined): string {
   return location === undefined ? '' : formatSourceLocation(location);
 }
 
@@ -1596,6 +1931,13 @@ const TIER_DURATION_METRICS: Readonly<Record<string, ComputedMetricId>> = Object
   server: 'backend_duration',
   db: 'database_duration',
 });
+
+/**
+ * The metric measuring the database tier's time: the yardstick a repeated
+ * statement shape's summed time is weighed against
+ * ({@link REPEATED_QUERY_MATERIAL_SHARE}).
+ */
+const DATABASE_DURATION_METRIC: ComputedMetricId = 'database_duration';
 
 /* -------------------------------------------------------------------------------------------------
  * structured-context readers
@@ -1930,6 +2272,8 @@ interface SpanView {
   readonly duration: number;
   /** The tier it was recorded in, when the capture attributed one. */
   readonly tier?: string;
+  /** The telemetry kind of the event it is, when the capture states one. */
+  readonly kind?: string;
 }
 
 /** One component's render statistics for a capture. */
@@ -1948,6 +2292,29 @@ interface RenderView {
   readonly stateTriggered: number;
   /** Renders triggered by a change of a context value the component consumes. */
   readonly contextTriggered: number;
+  /**
+   * Whether the project declares the component: `true` or `false` as the
+   * context reports it, `undefined` when the context carries no such field —
+   * unknown, which is not the same as "not declared".
+   */
+  readonly declared: boolean | undefined;
+  /**
+   * The components providing the contexts whose changes re-rendered this one,
+   * most frequent first. Names only, as the capture attributed them.
+   */
+  readonly changedContexts: readonly string[];
+  /** The component's individual renders the context carries, in carried order. */
+  readonly occurrences: readonly RenderOccurrenceView[];
+}
+
+/** One individual render of a component, as the context carried it. */
+interface RenderOccurrenceView {
+  /** The event the render is, citable when the context carries it. */
+  readonly reference: string;
+  /** Its trigger classification, when the context reports one. */
+  readonly trigger: string | undefined;
+  /** The providers of the contexts that changed at this render. */
+  readonly contexts: readonly string[];
 }
 
 /**
@@ -1980,6 +2347,10 @@ interface QueryGroupView {
   readonly count: number;
   /** The parameterised statement text, or the empty string. */
   readonly statement: string;
+  /** The summed time of those executions, in milliseconds, when the capture reported it. */
+  readonly totalMs?: number;
+  /** Where the executions were issued from, when the capture located them. */
+  readonly location?: SourceLocation;
 }
 
 /**
@@ -2008,7 +2379,14 @@ function readSpans(aggregates: JsonObject): readonly SpanView[] {
     }
     const name = asString(readField(node, 'name', 'operation', 'label')) ?? '';
     const tier = asString(node.tier);
-    spans.push({ node, name, duration, ...(tier !== undefined ? { tier } : {}) });
+    const kind = asString(node.kind);
+    spans.push({
+      node,
+      name,
+      duration,
+      ...(tier !== undefined ? { tier } : {}),
+      ...(kind !== undefined ? { kind } : {}),
+    });
   }
   return spans;
 }
@@ -2023,6 +2401,11 @@ function readSpans(aggregates: JsonObject): readonly SpanView[] {
  * are read too, when the context carries one, because they are what tells a
  * component that changed its own state apart from the consumers that merely
  * re-rendered with it; a statistic without a histogram reads as zero for both.
+ *
+ * Context attribution is read alongside: which providers' contexts changed
+ * ({@link readChangedContexts}), whether the project declares the component,
+ * and the individual renders with their own triggers, so a context-triggered
+ * render can be cited as exactly that.
  *
  * @param aggregates The capture-aggregate bag.
  * @returns The statistics, in the order the context carried them.
@@ -2048,9 +2431,88 @@ function readRenders(aggregates: JsonObject): readonly RenderView[] {
         ) ?? 0,
       stateTriggered: asCount(triggers?.['state']) ?? 0,
       contextTriggered: asCount(triggers?.['context']) ?? 0,
+      declared: asBoolean(readField(node, 'declaredInProject', 'declared')),
+      changedContexts: readChangedContexts(node),
+      occurrences: readRenderOccurrences(node),
     });
   }
   return renders;
+}
+
+/** Provider names read from one render statistic's context attribution. */
+const MAX_CHANGED_CONTEXTS_READ = 16;
+
+/**
+ * The providers of the contexts whose changes re-rendered one component, most
+ * frequent first.
+ *
+ * Accepts both carriers a stage may use: `[{ name, count }]` records (the
+ * service's analysis input) and a plain list of names with an optional
+ * `changedContextCounts` map beside it (the upstream aggregate). Names are
+ * de-duplicated; a list with counts is ordered by count, descending, and a
+ * tie — or a name with no count — keeps its carried position, which is
+ * already most-frequent-first with ties by name in both carriers. The order
+ * is therefore total and independent of how the counts were spelled.
+ *
+ * @param node One render statistic.
+ * @returns The provider names, bounded by {@link MAX_CHANGED_CONTEXTS_READ}.
+ */
+function readChangedContexts(node: JsonObject): readonly string[] {
+  const list = asArray(readField(node, 'changedContexts', 'contexts'));
+  if (list === undefined) {
+    return [];
+  }
+  const counts = readObjectField(node, 'changedContextCounts', 'contextCounts');
+  const entries: { readonly name: string; readonly count: number; readonly index: number }[] = [];
+  const seen = new Set<string>();
+  for (const [index, member] of list.entries()) {
+    const record = asObject(member);
+    const name =
+      record === undefined
+        ? asString(member)
+        : asString(readField(record, 'name', 'provider', 'component'));
+    if (name === undefined || seen.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    const listed = record === undefined ? undefined : asCount(record.count);
+    const mapped =
+      counts !== undefined && Object.hasOwn(counts, name) ? asCount(counts[name]) : undefined;
+    // An unknown count sorts after every known one without reordering the unknowns.
+    entries.push({ name, count: listed ?? mapped ?? -1, index });
+  }
+  return entries
+    .sort((left, right) =>
+      left.count === right.count ? left.index - right.index : right.count - left.count,
+    )
+    .slice(0, MAX_CHANGED_CONTEXTS_READ)
+    .map((entry) => entry.name);
+}
+
+/**
+ * The individual renders one statistic carries, each with the event it is.
+ *
+ * A render record without an event reference cannot be cited and is skipped.
+ * Its changed-context names are read from `changedContextNames` (the service's
+ * spelling) or `changedContexts` (the upstream one).
+ *
+ * @param node One render statistic.
+ * @returns The citable renders, in carried order.
+ */
+function readRenderOccurrences(node: JsonObject): readonly RenderOccurrenceView[] {
+  const occurrences: RenderOccurrenceView[] = [];
+  for (const record of asObjectArray(node.occurrences) ?? []) {
+    const reference = singleEvidenceOf(record);
+    if (reference === undefined) {
+      continue;
+    }
+    occurrences.push({
+      reference,
+      trigger: asString(record.trigger),
+      contexts: asStringArray(readField(record, 'changedContextNames', 'changedContexts')),
+    });
+  }
+  return occurrences;
 }
 
 /**
@@ -2180,6 +2642,16 @@ function sharedOccurrenceLocation(node: JsonObject): SourceLocation | undefined 
  * literals, and never row contents — and is bounded like any other label on the
  * way into a sentence.
  *
+ * Three further readings make a group rankable by what it cost and locatable
+ * where it was issued. The service's analysis input
+ * (`apps/local-service/src/analysis/summarize.ts`) states a group's summed time
+ * as `totalDurationMs`, its executions as `occurrences[]` each with its own call
+ * site, and its issuers as `callers[]`, each with its own summed time and
+ * location. The location is the one call site every located execution shares;
+ * failing agreement, the costliest caller's own location
+ * ({@link dominantQueryCaller}); failing that, a location the group carries
+ * itself. A cause names the issuing code by that location's `file:line` label.
+ *
  * @param aggregates The capture-aggregate bag.
  * @returns The groups, in the order the context carried them.
  */
@@ -2191,13 +2663,88 @@ function readQueryGroups(aggregates: JsonObject): readonly QueryGroupView[] {
     if (count === undefined) {
       continue;
     }
+    const totalMs = asDurationMs(readField(node, 'totalDurationMs', 'totalDuration', 'durationMs'));
+    const dominant = dominantQueryCaller(node);
+    const location =
+      sharedOccurrenceLocation(node) ??
+      (dominant === undefined ? undefined : readSourceLocation(dominant)) ??
+      readSourceLocation(node);
     groups.push({
       node,
       count,
       statement: asString(readField(node, 'statement', 'db.statement', 'sql', 'text')) ?? '',
+      ...(totalMs !== undefined ? { totalMs } : {}),
+      ...(location !== undefined ? { location } : {}),
     });
   }
   return groups;
+}
+
+/**
+ * The caller that issued the most of a query group's time.
+ *
+ * Ordered by summed time, then by executions, both descending, then by name,
+ * so the choice is total: a group whose callers report no time is decided by
+ * how often each issued the statement, and two indistinguishable callers by
+ * name. A caller that reports neither measure ranks as zero on it.
+ *
+ * @param node The query-group aggregate.
+ * @returns The costliest caller record, or `undefined` when the group lists none.
+ */
+function dominantQueryCaller(node: JsonObject): JsonObject | undefined {
+  const callers = asObjectArray(node['callers']) ?? [];
+  let best: JsonObject | undefined;
+  let bestMs = 0;
+  let bestCount = 0;
+  let bestName = '';
+  for (const caller of callers) {
+    const ms =
+      asDurationMs(readField(caller, 'totalDurationMs', 'totalDuration', 'durationMs')) ?? 0;
+    const count = asCount(readField(caller, 'executionCount', 'count')) ?? 0;
+    const name = asString(readField(caller, 'name', 'callerName')) ?? '';
+    const better =
+      best === undefined ||
+      ms > bestMs ||
+      (ms === bestMs &&
+        (count > bestCount || (count === bestCount && compareStrings(name, bestName) < 0)));
+    if (better) {
+      best = caller;
+      bestMs = ms;
+      bestCount = count;
+      bestName = name;
+    }
+  }
+  return best;
+}
+
+/**
+ * Orders query groups by what they cost: summed time, then executions, both
+ * descending, then statement text and first reference ascending.
+ *
+ * Time first because a repeated statement matters to a developer in
+ * proportion to the time it took, not to how often it ran: a cheap shape
+ * executed as often as an expensive one must not outrank it. A group whose
+ * time is unknown ranks as zero on that key, so among such groups the order is
+ * the count-based one.
+ *
+ * @param left First group.
+ * @param right Second group.
+ * @returns A negative number, zero, or a positive number.
+ */
+function compareQueryGroups(left: QueryGroupView, right: QueryGroupView): number {
+  const leftMs = left.totalMs ?? 0;
+  const rightMs = right.totalMs ?? 0;
+  if (leftMs !== rightMs) {
+    return rightMs - leftMs;
+  }
+  if (left.count !== right.count) {
+    return right.count - left.count;
+  }
+  const byStatement = compareStrings(left.statement, right.statement);
+  if (byStatement !== 0) {
+    return byStatement;
+  }
+  return compareStrings(evidenceOf(left.node)[0] ?? '', evidenceOf(right.node)[0] ?? '');
 }
 
 /**
@@ -2459,6 +3006,11 @@ function reportsPresence(
  * imply the server signals, reported database use implies the query signal,
  * reported request call sites imply the request signal — and carried signals
  * are unioned in so a later stage's understanding survives a round trip. The
+ * echoed category's profile ({@link CATEGORY_PROFILES}) then adds the signals
+ * its class of behaviour needs, drops for a page-observed class the
+ * server-tier signals the project's shape implied, and keeps the interaction
+ * signal only where the class is reproduced by input on a selected element
+ * ({@link CategoryProfile.inputDriven}). The
  * entities are the selected target's component chain and whatever the project
  * summary named, de-duplicated and ordered; the search hints are derived
  * mechanically from those entities and their file stems.
@@ -2533,7 +3085,31 @@ export function buildUnderstanding(input: JsonValue | undefined): JsonValue | un
     signals.add('react');
   }
   if (reportsPresence(summaryCounts, 'handlers', 'eventHandlers', 'handlerCount')) {
-    signals.add('interactions');
+    signals.add(INTERACTION_SIGNAL);
+  }
+  // The classified category shapes the list next: its own signals join; a
+  // page-observed category sheds the server-tier signals the project's shape
+  // implied; and the interaction stays a needed signal only for a class
+  // reproduced by input about a selected element — a signal a later stage
+  // reads as "this capture is empty without a click" (AAP §0.5.5). Nothing the
+  // context carried is ever shed: an earlier stage chose it.
+  const profile = categoryProfile(understanding.category);
+  if (profile !== undefined) {
+    const carried = new Set(understanding.signals);
+    for (const signal of profile.signals) {
+      signals.add(signal);
+    }
+    if (profile.pageOnly) {
+      for (const signal of SERVER_TIER_SIGNALS) {
+        if (!carried.has(signal)) {
+          signals.delete(signal);
+        }
+      }
+    }
+    const pointedAtInput = profile.inputDriven && understanding.target !== undefined;
+    if (!pointedAtInput && !carried.has(INTERACTION_SIGNAL)) {
+      signals.delete(INTERACTION_SIGNAL);
+    }
   }
   // A question observed in the page is also observed through its performance
   // entries: long tasks, resource timing and the navigation that framed the
@@ -2541,7 +3117,7 @@ export function buildUnderstanding(input: JsonValue | undefined): JsonValue | un
   // (`blocking_time`, `long_task_count`, `transferred_bytes`), and a reload
   // during a capture is visible only as its navigation entry. The hook edits
   // no file, so it is collected whenever the page itself is.
-  if (signals.has('interactions') || signals.has('react')) {
+  if (signals.has(INTERACTION_SIGNAL) || signals.has('react')) {
     signals.add('perf');
   }
 
@@ -2707,6 +3283,198 @@ function understandingCategory(carried: string | undefined): string {
     return carried;
   }
   return CATEGORY_CLASSES[carried] ?? UNCLASSIFIED_CATEGORY;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * category profiles
+ *
+ * What a classified problem category changes about the answers after it. The
+ * category is echoed from the structured context, never derived here, and a
+ * profile is keyed by the category value alone — a table lookup, so the answer
+ * stays a function of structured input. Each profile is product vocabulary
+ * only: capture signals, action types and a panel lens, nothing of any
+ * application.
+ *
+ * Without a profile — `correctness`, `other`, or no category at all — every
+ * stage answers from the project's shape and the capture's evidence alone,
+ * exactly as it would with no classification.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** What one problem category changes about the understanding, the plan and the panel. */
+interface CategoryProfile {
+  /**
+   * Capture signals every understanding of the category asks for, beyond the
+   * ones the project's shape implies: a rendering question needs the component
+   * tree and hook-state transitions whether or not the summary counted them.
+   */
+  readonly signals: readonly string[];
+  /**
+   * Whether the behaviour is observed in the page alone, so the server and
+   * database signals the project's shape would imply are left out: a question
+   * about renders or client state is not answered by route or query timings,
+   * and collecting them would arm the server-side hooks for nothing.
+   */
+  readonly pageOnly: boolean;
+  /**
+   * Whether the behaviour is reproduced by the developer's input, so a
+   * question about a selected element needs the interaction signal — the
+   * capture stage then calls a capture without an interaction empty (AAP
+   * §0.5.5). A render, state or request problem shows while the page is idle:
+   * such a question needs no interaction, whatever element it points at, and
+   * no class needs one merely because the project has event handlers.
+   */
+  readonly inputDriven: boolean;
+  /**
+   * Signals a plan for the category observes whenever the page is observed,
+   * without the understanding needing them: an interaction during a latency
+   * capture roots the correlated trace it causes, so the hook is armed even
+   * when the question does not demand a click.
+   */
+  readonly observedSignals: readonly string[];
+  /**
+   * The action types a plan may install at an investigated candidate, or
+   * `undefined` for every type. A page-observed question installs only runtime
+   * hooks, so no application file is rewritten to time a function the question
+   * is not about (AAP §0.5.1 makes the rewrite the exception).
+   */
+  readonly candidateActionTypes?: ReadonlySet<ActionTypeId>;
+  /** The evidence lens a panel for the category is composed through. */
+  readonly lens: PanelLens;
+}
+
+/** The capture signal of a user's input. */
+const INTERACTION_SIGNAL = 'interactions';
+
+/** The signals that show a plan observes the page: renders, or its performance entries. */
+const PAGE_OBSERVED_SIGNALS: readonly string[] = Object.freeze(['react', 'perf']);
+
+/**
+ * The signals collected on the server or in its database: the ones a
+ * page-observed profile does not take from the project's shape.
+ */
+const SERVER_TIER_SIGNALS: ReadonlySet<string> = new Set([
+  'http',
+  'routeHandlers',
+  'prisma',
+  'pg',
+  'functions',
+]);
+
+/**
+ * The runtime hooks that observe the page — the only action types a
+ * page-observed plan installs at an investigated candidate.
+ */
+const PAGE_RUNTIME_ACTION_TYPES: ReadonlySet<ActionTypeId> = new Set<ActionTypeId>([
+  'react-render-tracking',
+  'state-tracking',
+  'interaction-tracking',
+  'perf-tracking',
+  'fetch-tracking',
+]);
+
+/**
+ * The runtime hooks a request-shaped question installs at a candidate: the
+ * page's hooks plus the query hook, which also installs nothing in a file.
+ */
+const REQUEST_RUNTIME_ACTION_TYPES: ReadonlySet<ActionTypeId> = new Set<ActionTypeId>([
+  ...PAGE_RUNTIME_ACTION_TYPES,
+  'db-query-tracking',
+]);
+
+/**
+ * The profile of each understanding category that has one.
+ *
+ * - `performance`, `data` and `error` are latency-, query- and failure-shaped:
+ *   every tier may hold the answer, so every signal and action type the
+ *   project supports stays available and the panel reads the timing lens.
+ *   They are reproduced by input: a selected element makes the interaction a
+ *   needed signal, and the plan observes interactions in any case.
+ *   `error` adds the page-error signal, which no project shape implies.
+ * - `network` is about the requests themselves — how many, how often, issued
+ *   by whom: it asks for the request signal, keeps the server and database
+ *   signals the requests reach, needs no input, installs runtime hooks only,
+ *   and reads the request lens.
+ * - `rendering` and `state` are about the component tree: they ask for render,
+ *   component-tree and hook-state signals, drop the server tier, need no
+ *   input, install page hooks only, and read the component lens.
+ */
+const CATEGORY_PROFILES: Readonly<Record<string, CategoryProfile>> = Object.freeze({
+  performance: {
+    signals: [],
+    pageOnly: false,
+    inputDriven: true,
+    observedSignals: [INTERACTION_SIGNAL],
+    lens: 'timing',
+  },
+  data: {
+    signals: [],
+    pageOnly: false,
+    inputDriven: true,
+    observedSignals: [INTERACTION_SIGNAL],
+    lens: 'timing',
+  },
+  error: {
+    signals: ['errors'],
+    pageOnly: false,
+    inputDriven: true,
+    observedSignals: [INTERACTION_SIGNAL],
+    lens: 'timing',
+  },
+  network: {
+    signals: ['fetch'],
+    pageOnly: false,
+    inputDriven: false,
+    observedSignals: [],
+    candidateActionTypes: REQUEST_RUNTIME_ACTION_TYPES,
+    lens: 'requests',
+  },
+  rendering: {
+    signals: ['react', 'componentTree', 'state'],
+    pageOnly: true,
+    inputDriven: false,
+    observedSignals: [],
+    candidateActionTypes: PAGE_RUNTIME_ACTION_TYPES,
+    lens: 'component',
+  },
+  state: {
+    signals: ['state', 'react', 'componentTree'],
+    pageOnly: true,
+    inputDriven: false,
+    observedSignals: [],
+    candidateActionTypes: PAGE_RUNTIME_ACTION_TYPES,
+    lens: 'component',
+  },
+});
+
+/**
+ * The signals a plan reserves a runtime hook for: the understanding's own,
+ * plus the ones its category observes ({@link CategoryProfile.observedSignals})
+ * when the understanding observes the page at all.
+ *
+ * @param understanding The context's understanding view.
+ * @returns The signals, unordered and without repeats.
+ */
+function plannedSignals(understanding: UnderstandingView): readonly string[] {
+  const signals = new Set(understanding.signals);
+  const observesPage = PAGE_OBSERVED_SIGNALS.some((signal) => signals.has(signal));
+  if (observesPage) {
+    for (const signal of categoryProfile(understanding.category)?.observedSignals ?? []) {
+      signals.add(signal);
+    }
+  }
+  return [...signals];
+}
+
+/**
+ * The profile of a carried category, read into the understanding vocabulary
+ * first so a symptom-level category shares its class's profile.
+ *
+ * @param category The category the context carried, if any.
+ * @returns The profile, or `undefined` when the category has none.
+ */
+function categoryProfile(category: string | undefined): CategoryProfile | undefined {
+  const understood = understandingCategory(category);
+  return Object.hasOwn(CATEGORY_PROFILES, understood) ? CATEGORY_PROFILES[understood] : undefined;
 }
 
 /** The database signals, one per driver, for a project whose driver is not reported. */
@@ -2994,42 +3762,128 @@ function readFlowSteps(value: JsonValue | undefined): readonly string[] {
  * stage 2 — follow-up queries: from the selected element to the route and the data layer
  *
  * The seed queries resolve the entities of the understanding; what they cannot
- * say is where a click *goes*. When the question names an element, its owner
- * chain's components are traced along their calls to the API route a call site
- * reaches, and each route reached is traced on to its data-layer call — the
- * "found the component, traced the handler, found the route, found the
- * database dependency" walk the session's progress view reports
- * (docs/ARCHITECTURE.md, "Progress from real findings"). The queries are
- * derived from the structured context alone (the owner chain, the candidates
- * the log holds, the requests already run), never from the question's
- * wording, and a query already in the log is never proposed again, so the
- * conversation converges on the final investigation within the stage's budget.
+ * say is where a click *goes*. The walk below follows the code graph from what
+ * the log already resolved — the "found the component, traced the event
+ * handler, found the route, found the database dependency" walk the session's
+ * progress view reports (docs/ARCHITECTURE.md, "Progress from real findings"):
+ *
+ * 1. **Request trace.** The followed components — the selected element's owner
+ *    chain, innermost first, or, when the understanding names no component the
+ *    log found, the components the log's name lookups returned by exactly the
+ *    name looked up — are traced along their calls to the API route a call
+ *    site reaches, one component per turn, until one reaches a route: that
+ *    component is the one whose own code issues the request.
+ * 2. **Handler trace.** When no followed component's calls reach a route, each
+ *    is traced again through the event handlers it binds, one per turn, so a
+ *    click handler that issues the request itself lies on the path found.
+ * 3. **Data layer.** Each route a trace reached is traced on to its data-layer
+ *    call.
+ * 4. **Handler binding.** When no path found so far holds an event handler,
+ *    the handler the element's nearest owner binds is looked up, one owner per
+ *    turn, nearest first, until one binds a handler: owners nearer the element
+ *    than the component that issues the request (the handler of a control
+ *    that delegates to its form), or every followed component when none
+ *    issues one. The owner that issues the
+ *    request is never asked: its request leaves from its own code, and the
+ *    first of the many handlers such a component binds would be an arbitrary
+ *    claim rather than a traced one.
+ * 5. **Resolved routes.** When no component was followed at all — a question
+ *    asked without a selected element — the API routes the log resolved are
+ *    followed both ways instead: downstream to their data-layer call, and back
+ *    against the call direction to the component whose code issues the
+ *    request.
+ *
+ * Every step is derived from the structured context alone (the
+ * understanding, the candidates the log holds, the requests already run),
+ * never from the question's wording. A query already in the log is never
+ * proposed again, at most {@link MAX_PATH_QUERIES} path queries are proposed,
+ * and none once the executor has refused one for budget, so the conversation
+ * converges on the final investigation within the stage's allowance.
  * ---------------------------------------------------------------------------------------------- */
 
 /** The context field holding the executed query log, and the field a query batch answers in. */
 const QUERY_RESULTS_FIELD = 'queryResults';
 const QUERY_BATCH_FIELD = 'queries';
 
-/** The graph query every follow-up uses, and the node kinds it walks between. */
+/** The graph query every follow-up uses, and the two lookups whose results the walk starts from. */
 const PATH_BETWEEN_TOOL = 'pathBetween';
+const FIND_BY_NAME_TOOL = 'findByName';
+const ROUTE_FOR_URL_TOOL = 'routeForUrl';
+
+/** The code-graph node kinds the walk moves between. */
 const COMPONENT_NODE_KIND = 'component';
+const HANDLER_NODE_KIND = 'handler';
 const API_ROUTE_NODE_KIND = 'api-route';
 const DB_CALL_NODE_KIND = 'db-call';
 
 /**
- * The edge kinds a component-to-route trace follows: calls, and the join from a
- * call site to the route it reaches. Rendering, handler and declaration edges
- * are left out on purpose — a component renders many children and binds many
- * handlers, and following those spends the path search's node budget before
- * the call that leaves the page is expanded.
+ * The route-map kind a `routeForUrl` result reports for a request-handler
+ * module; a page module reports `'page'`. Mirrors `API_ROUTE_KINDS` of
+ * `@debuggen/code-analysis`, restated for the layering reason given at
+ * {@link CAPTURE_SIGNAL_NAMES}.
+ */
+const REQUEST_HANDLER_ROUTE_KIND = 'route-handler';
+
+/**
+ * The two traversal directions of a path query: downstream only (the engine's
+ * default, what an absent `direction` means) and undirected, which may follow
+ * an edge against its direction.
+ */
+const DOWNSTREAM_DIRECTION = 'out';
+const UNDIRECTED_DIRECTION = 'both';
+
+/**
+ * The edge kinds a component-to-route trace follows first: calls, and the join
+ * from a call site to the route it reaches. Rendering, handler and declaration
+ * edges are left out on purpose — a component renders many children and binds
+ * many handlers, and following those spends the path search's node budget
+ * before the call that leaves the page is expanded.
  */
 const REQUEST_TRACE_EDGE_KINDS: readonly string[] = Object.freeze(['calls', 'routes-to']);
 
-/** Owner-chain components traced to a route, innermost first. */
+/**
+ * The edge kinds of the handler trace, the second attempt for components whose
+ * calls reach no route: the handler bindings too, so a path that leaves the
+ * page from inside a click handler — rather than from the component's own
+ * code — is found, with that handler on it.
+ */
+const HANDLER_TRACE_EDGE_KINDS: readonly string[] = Object.freeze([
+  'handles',
+  'calls',
+  'routes-to',
+]);
+
+/** The one edge kind of a handler-binding lookup: a component to the event handler it binds. */
+const HANDLER_BINDING_EDGE_KINDS: readonly string[] = Object.freeze(['handles']);
+
+/**
+ * The edge kinds of a caller trace, from an API route back to the component
+ * whose code issues its request: the call-site join, calls and handler
+ * bindings, all followed against their direction.
+ */
+const CALLER_TRACE_EDGE_KINDS: readonly string[] = Object.freeze(['routes-to', 'calls', 'handles']);
+
+/** Components a walk follows, innermost first. */
 const MAX_TRACED_COMPONENTS = 4;
 
 /** Routes reached by a component trace that are traced on to the data layer. */
 const MAX_TRACED_ROUTES = 2;
+
+/** API routes the log resolved that a walk following no component traces both ways. */
+const MAX_RESOLVED_ROUTES = 3;
+
+/**
+ * The most path queries one walk proposes in a stage: the code tools'
+ * allowance for a single tool (`CODE_TOOL_LIMITS.maxCallsPerTool` in
+ * `apps/local-service/src/pipeline/tools/code-tools.ts`), restated because this
+ * package sits below the service that defines it. A tighter allowance is
+ * honoured as well: the walk proposes nothing more once the executor has
+ * refused a path query with {@link BUDGET_REFUSAL_CODE}.
+ */
+const MAX_PATH_QUERIES = 6;
+
+/** The code a query refused because its budget is spent carries (`CODE_TOOL_REJECTION_CODES.budget`). */
+const BUDGET_REFUSAL_CODE = 'RATE_LIMITED';
 
 /**
  * The components a follow-up traces, in the understanding's order.
@@ -3089,14 +3943,17 @@ function tracedPathMembers(root: JsonObject): ReadonlyMap<string, string> {
   return members;
 }
 
-/** One executed query of the log: its request, and the payload of a successful run. */
+/** One query of the log: its request, and the payload of a successful run or the code of a refused one. */
 interface ExecutedRun {
   readonly request: JsonObject | undefined;
   readonly payload: JsonValue | undefined;
+  /** The error code the parser or the executor refused the query with; absent for a successful run. */
+  readonly refusal: string | undefined;
 }
 
 /**
- * The executed queries of an investigate-stage context, in log order.
+ * The queries of an investigate-stage context, executed or refused, in log
+ * order.
  *
  * @param root The structured context.
  * @returns The runs; empty when the context carries no log.
@@ -3105,15 +3962,21 @@ function readExecutedRuns(root: JsonObject): readonly ExecutedRun[] {
   const runs: ExecutedRun[] = [];
   for (const run of asObjectArray(root[QUERY_RESULTS_FIELD]) ?? []) {
     const outcome = asObject(run.outcome);
-    const value = outcome?.ok === true ? asObject(outcome.value) : undefined;
-    runs.push({ request: asObject(run.request), payload: value?.payload });
+    const succeeded = outcome?.ok === true;
+    const value = succeeded ? asObject(outcome.value) : undefined;
+    runs.push({
+      request: asObject(run.request),
+      payload: value?.payload,
+      refusal: succeeded ? undefined : asString(asObject(outcome?.error)?.code),
+    });
   }
   return runs;
 }
 
 /**
- * The identity of a path query: its tool, both endpoints' selector fields and
- * its edge filter. Two requests with the same identity ask the same question.
+ * The identity of a path query: its tool, both endpoints' selector fields, its
+ * edge filter and its direction (downstream when absent, as the engine reads
+ * it). Two requests with the same identity ask the same question.
  *
  * @param request A query request.
  * @returns The identity, or `undefined` for a query that is not a path query.
@@ -3136,6 +3999,9 @@ function pathQueryIdentity(request: JsonObject | undefined): string | undefined 
     endpoint(request.from),
     endpoint(request.to),
     sortStrings([...asStringArray(request.edgeKinds)]).join(','),
+    asString(request.direction) === UNDIRECTED_DIRECTION
+      ? UNDIRECTED_DIRECTION
+      : DOWNSTREAM_DIRECTION,
   ].join('>');
 }
 
@@ -3151,15 +4017,161 @@ function pathEndOf(payload: JsonValue | undefined): JsonObject | undefined {
 }
 
 /**
+ * The file of the API route a downstream trace reached: the last node of its
+ * path, when that node is an `api-route`.
+ *
+ * @param run The trace's run.
+ * @returns The route's project-relative file, or `undefined` when the trace
+ * found no path or its path ends elsewhere.
+ */
+function reachedRouteFile(run: ExecutedRun): string | undefined {
+  const end = pathEndOf(run.payload);
+  return asString(end?.kind) === API_ROUTE_NODE_KIND ? asProjectPath(end?.file) : undefined;
+}
+
+/**
+ * Whether a path holds an event handler: one of its nodes is a `handler`.
+ *
+ * @param path A path payload.
+ * @returns `true` when the path passes through a handler binding.
+ */
+function holdsHandler(path: JsonValue | undefined): boolean {
+  return (asObjectArray(asObject(path)?.nodes) ?? []).some(
+    (node) => asString(node.kind) === HANDLER_NODE_KIND,
+  );
+}
+
+/**
+ * The components the log's name lookups returned under exactly the name they
+ * looked up, in log order — what a walk follows when the understanding names
+ * no component the log found. A lookup's near matches are left out: they
+ * resemble the name asked for, and following them would trace a component the
+ * understanding never pointed at.
+ *
+ * @param runs The log's runs.
+ * @returns The component names, de-duplicated.
+ */
+function componentsFoundByName(runs: readonly ExecutedRun[]): string[] {
+  const names: string[] = [];
+  for (const run of runs) {
+    const looked = asString(run.request?.name);
+    if (asString(run.request?.tool) !== FIND_BY_NAME_TOOL || looked === undefined) {
+      continue;
+    }
+    for (const node of asObjectArray(run.payload) ?? []) {
+      if (
+        asString(node.kind) === COMPONENT_NODE_KIND &&
+        asString(node.name) === looked &&
+        !names.includes(looked)
+      ) {
+        names.push(looked);
+      }
+    }
+  }
+  return names;
+}
+
+/**
+ * The request-handler routes the log's URL lookups resolved, by module file,
+ * in log order. A page route is left out: a page is where a request starts,
+ * not the handler that serves it.
+ *
+ * @param runs The log's runs.
+ * @returns The route files, de-duplicated.
+ */
+function resolvedRouteFiles(runs: readonly ExecutedRun[]): string[] {
+  const files: string[] = [];
+  for (const run of runs) {
+    if (asString(run.request?.tool) !== ROUTE_FOR_URL_TOOL) {
+      continue;
+    }
+    const route = asObject(run.payload);
+    const file = asProjectPath(route?.file);
+    if (
+      asString(route?.kind) === REQUEST_HANDLER_ROUTE_KIND &&
+      file !== undefined &&
+      !files.includes(file)
+    ) {
+      files.push(file);
+    }
+  }
+  return files;
+}
+
+/**
+ * A component-to-route trace along `edgeKinds`.
+ *
+ * @param component The component's name.
+ * @param edgeKinds {@link REQUEST_TRACE_EDGE_KINDS} or {@link HANDLER_TRACE_EDGE_KINDS}.
+ * @returns The path query.
+ */
+function requestTrace(component: string, edgeKinds: readonly string[]): JsonObject {
+  return {
+    tool: PATH_BETWEEN_TOOL,
+    from: { name: component, kind: COMPONENT_NODE_KIND },
+    to: { kind: API_ROUTE_NODE_KIND },
+    edgeKinds: [...edgeKinds],
+  };
+}
+
+/**
+ * The lookup of the event handler a component binds.
+ *
+ * @param component The component's name.
+ * @returns The path query.
+ */
+function handlerBinding(component: string): JsonObject {
+  return {
+    tool: PATH_BETWEEN_TOOL,
+    from: { name: component, kind: COMPONENT_NODE_KIND },
+    to: { kind: HANDLER_NODE_KIND },
+    edgeKinds: [...HANDLER_BINDING_EDGE_KINDS],
+  };
+}
+
+/**
+ * The trace from an API route downstream to its data-layer call, along every
+ * edge kind.
+ *
+ * @param file The route's module file.
+ * @returns The path query.
+ */
+function dataLayerTrace(file: string): JsonObject {
+  return {
+    tool: PATH_BETWEEN_TOOL,
+    from: { file, kind: API_ROUTE_NODE_KIND },
+    to: { kind: DB_CALL_NODE_KIND },
+  };
+}
+
+/**
+ * The trace from an API route back to the component whose code issues its
+ * request: undirected, along {@link CALLER_TRACE_EDGE_KINDS}. The path it finds
+ * is read downstream by {@link orientedPath}.
+ *
+ * @param file The route's module file.
+ * @returns The path query.
+ */
+function callerTrace(file: string): JsonObject {
+  return {
+    tool: PATH_BETWEEN_TOOL,
+    from: { file, kind: API_ROUTE_NODE_KIND },
+    to: { kind: COMPONENT_NODE_KIND },
+    edgeKinds: [...CALLER_TRACE_EDGE_KINDS],
+    direction: UNDIRECTED_DIRECTION,
+  };
+}
+
+/**
  * The follow-up queries the log still lacks, or none once the walk is done.
  *
- * Two steps, each proposed only after the previous one ran: first a
- * component-to-route trace for each component of the understanding (the
- * selected element's owner chain, see {@link tracedComponentNames}) the log
- * already found, then a route-to-data-layer trace for each route those traces
- * reached. Nothing is proposed when the understanding names no component
- * (there is then no element to follow), without remaining budget, or when
- * every step already ran.
+ * The five steps of the walk described above this section, each proposed only
+ * once the step before it has run: request traces, then handler traces, then
+ * data-layer traces for the routes they reached, then the handler binding of
+ * the element's nearest owner, then — when no component was followed — the
+ * resolved routes both ways. Nothing is proposed without remaining budget,
+ * past {@link MAX_PATH_QUERIES} path queries, after a path query was refused
+ * for budget, or when every step already ran.
  *
  * @param root The structured context.
  * @param understanding The understanding the context carries.
@@ -3167,99 +4179,253 @@ function pathEndOf(payload: JsonValue | undefined): JsonObject | undefined {
  */
 function followUpQueries(root: JsonObject, understanding: UnderstandingView): JsonValue[] {
   const remaining = asFiniteNumber(root.remainingQueries);
-  const components = tracedComponentNames(understanding);
-  if (remaining === undefined || remaining < 1 || components.length === 0) {
+  if (remaining === undefined || remaining < 1) {
     return [];
   }
-  const budget = Math.floor(remaining);
   const runs = readExecutedRuns(root);
-  const executed = new Set<string>();
-  for (const run of runs) {
+  const pathRuns = runs.filter((run) => pathQueryIdentity(run.request) !== undefined);
+  if (pathRuns.some((run) => run.refusal === BUDGET_REFUSAL_CODE)) {
+    return [];
+  }
+  const budget = Math.min(Math.floor(remaining), MAX_PATH_QUERIES - pathRuns.length);
+  if (budget < 1) {
+    return [];
+  }
+
+  // Every path query the log holds, by identity, with the first run that answered it.
+  const answered = new Map<string, ExecutedRun>();
+  for (const run of pathRuns) {
     const identity = pathQueryIdentity(run.request);
-    if (identity !== undefined) {
-      executed.add(identity);
+    if (identity !== undefined && !answered.has(identity)) {
+      answered.set(identity, run);
     }
   }
+  const runOf = (query: JsonObject): ExecutedRun | undefined => {
+    const identity = pathQueryIdentity(query);
+    return identity === undefined ? undefined : answered.get(identity);
+  };
   const pending = (queries: readonly JsonObject[]): JsonValue[] =>
-    queries
-      .filter((query) => {
-        const identity = pathQueryIdentity(query);
-        return identity !== undefined && !executed.has(identity);
-      })
-      .slice(0, budget);
+    queries.filter((query) => runOf(query) === undefined).slice(0, budget);
 
-  // Step 1 — the owner chain's components the log found, innermost first.
+  // The followed components, innermost first: the owner chain the log found,
+  // or the components the log's lookups returned by exactly the name asked for.
   const found = new Set<string>();
   for (const candidate of readCandidates(root, understanding)) {
     if (candidate.kind === COMPONENT_NODE_KIND) {
       found.add(candidate.symbol);
     }
   }
-  const componentTraces: JsonObject[] = components
-    .filter((component) => found.has(component))
-    .slice(0, MAX_TRACED_COMPONENTS)
-    .map((component) => ({
-      tool: PATH_BETWEEN_TOOL,
-      from: { name: component, kind: COMPONENT_NODE_KIND },
-      to: { kind: API_ROUTE_NODE_KIND },
-      edgeKinds: [...REQUEST_TRACE_EDGE_KINDS],
-    }));
-  const stepOne = pending(componentTraces);
-  if (stepOne.length > 0) {
-    return stepOne;
+  const chain = tracedComponentNames(understanding).filter((component) => found.has(component));
+  const components = (chain.length > 0 ? chain : componentsFoundByName(runs)).slice(
+    0,
+    MAX_TRACED_COMPONENTS,
+  );
+
+  // Step 1 — request traces, one component per turn, until one reaches a route.
+  const requestTraces = components.map((component) =>
+    requestTrace(component, REQUEST_TRACE_EDGE_KINDS),
+  );
+  let issuer = -1;
+  for (const [index, query] of requestTraces.entries()) {
+    const run = runOf(query);
+    if (run === undefined) {
+      return pending([query]);
+    }
+    if (reachedRouteFile(run) !== undefined) {
+      issuer = index;
+      break;
+    }
   }
 
-  // Step 2 — each route a component trace reached, on to its data-layer call.
-  const traced = new Set(componentTraces.map((query) => pathQueryIdentity(query)));
-  const routeFiles: string[] = [];
-  for (const run of runs) {
-    if (!traced.has(pathQueryIdentity(run.request))) {
-      continue;
+  // Step 2 — handler traces, only when no component's own calls reached a route.
+  const handlerTraces =
+    issuer === -1
+      ? components.map((component) => requestTrace(component, HANDLER_TRACE_EDGE_KINDS))
+      : [];
+  for (const query of handlerTraces) {
+    const run = runOf(query);
+    if (run === undefined) {
+      return pending([query]);
     }
-    const end = pathEndOf(run.payload);
-    const file = asProjectPath(end?.file);
-    if (asString(end?.kind) === API_ROUTE_NODE_KIND && file !== undefined) {
-      if (!routeFiles.includes(file)) {
-        routeFiles.push(file);
+    if (reachedRouteFile(run) !== undefined) {
+      break;
+    }
+  }
+
+  // Step 3 — each route a trace reached, on to its data-layer call.
+  const routeFiles: string[] = [];
+  for (const query of [...requestTraces, ...handlerTraces]) {
+    const run = runOf(query);
+    const file = run === undefined ? undefined : reachedRouteFile(run);
+    if (file !== undefined && !routeFiles.includes(file)) {
+      routeFiles.push(file);
+    }
+  }
+  const dataLayer = pending(routeFiles.slice(0, MAX_TRACED_ROUTES).map(dataLayerTrace));
+  if (dataLayer.length > 0) {
+    return dataLayer;
+  }
+
+  // Step 4 — the handler the element's nearest owner binds, when no path holds
+  // one yet: one owner per turn, nearest first, until one binds a handler.
+  if (!executedPaths(root).some(holdsHandler)) {
+    const owners = issuer === -1 ? components : components.slice(0, issuer);
+    for (const owner of owners) {
+      const query = handlerBinding(owner);
+      const run = runOf(query);
+      if (run === undefined) {
+        return pending([query]);
+      }
+      if (holdsHandler(run.payload)) {
+        break;
       }
     }
   }
+
+  // Step 5 — without a followed component, the routes the log resolved, both ways.
+  if (components.length > 0) {
+    return [];
+  }
   return pending(
-    routeFiles.slice(0, MAX_TRACED_ROUTES).map((file) => ({
-      tool: PATH_BETWEEN_TOOL,
-      from: { file, kind: API_ROUTE_NODE_KIND },
-      to: { kind: DB_CALL_NODE_KIND },
-    })),
+    resolvedRouteFiles(runs)
+      .slice(0, MAX_RESOLVED_ROUTES)
+      .flatMap((file) => [dataLayerTrace(file), callerTrace(file)]),
   );
 }
 
 /**
- * The flows the executed path queries found, as graph paths `readFlows` renders.
+ * An executed path as a flow: its nodes in the order the code runs them, or
+ * `undefined` when the path is no flow.
+ *
+ * A downstream path is one already, and so is an undirected path every hop of
+ * which it travelled along the edge's direction. An undirected path every hop
+ * of which it travelled against the edge's direction — a caller trace, found
+ * from a route back to the component that issues it — is the flow read
+ * backwards, and is reversed so it reads from the component down to the
+ * route. A path that mixes the two relates its endpoints without either
+ * reaching the other through it (two functions joined through a helper both
+ * call), so rendering it as a chain of calls would assert a flow the code does
+ * not contain.
+ *
+ * @param payload The run's payload.
+ * @returns The path, reoriented where needed, or `undefined`.
+ */
+function orientedPath(payload: JsonValue | undefined): JsonObject | undefined {
+  const path = asObject(payload);
+  const nodes = asArray(path?.nodes);
+  if (path === undefined || nodes === undefined || nodes.length === 0) {
+    return undefined;
+  }
+  if (asBoolean(path.undirected) !== true) {
+    return path;
+  }
+  const reversedHops = (asArray(path.edges) ?? []).map(
+    (hop) => asBoolean(asObject(hop)?.traversedAgainstDirection) === true,
+  );
+  if (reversedHops.every((reversed) => !reversed)) {
+    return path;
+  }
+  return reversedHops.every((reversed) => reversed)
+    ? { nodes: [...nodes].reverse(), undirected: false }
+    : undefined;
+}
+
+/**
+ * The flows the executed path queries found, as graph paths `readFlows` renders:
+ * each read downstream by {@link orientedPath}, and a path that is no flow left
+ * out.
  *
  * @param root The structured context.
- * @returns One path per run that found one, in log order.
+ * @returns One path per run that found a flow, in log order.
  */
 function executedPaths(root: JsonObject): JsonValue[] {
   const paths: JsonValue[] = [];
   for (const run of readExecutedRuns(root)) {
-    if (pathQueryIdentity(run.request) !== undefined && pathEndOf(run.payload) !== undefined) {
-      const payload = asObject(run.payload);
-      if (payload !== undefined) {
-        paths.push(payload);
-      }
+    const flow =
+      pathQueryIdentity(run.request) === undefined ? undefined : orientedPath(run.payload);
+    if (flow !== undefined) {
+      paths.push(flow);
     }
   }
   return paths;
 }
 
 /**
+ * The graph node kinds that stand for a call expression rather than a
+ * declaration: a request a component or a server function issues, and a
+ * data-layer operation. Their name is the callee as written (`fetch`,
+ * `pool.query`), which no editor jump or patch can address as a symbol.
+ */
+const CALL_SITE_NODE_KINDS: ReadonlySet<string> = new Set(['api-call', 'db-call']);
+
+/**
+ * The investigation's shortlist: the ranked candidates, capped at
+ * {@link MAX_RELEVANT_FILES}, each entry adding a location the others do not.
+ *
+ * - A call site stands for its file: it is listed as a file-level entry (its
+ *   symbol is the file itself), because the call expression is no symbol a
+ *   relevant file can carry, while the file holding it is what the progress
+ *   view's database and route findings read.
+ * - A file-level entry is left out once the shortlist already names its file:
+ *   it adds no location, and the slot goes to a declaration further down.
+ * - A declaration of a file the shortlist names only by a file-level entry
+ *   takes that entry's place — even once the shortlist is full — so the file
+ *   stays listed, now with the declaration that locates it.
+ * - An entry repeating the file and symbol of one already listed is left out.
+ *
+ * @param candidates The candidates, ranked by {@link sortCandidates}.
+ * @returns The shortlist, ranked the same way.
+ */
+function shortlistCandidates(candidates: readonly CandidateView[]): CandidateView[] {
+  const listed: CandidateView[] = [];
+  const keys = new Set<string>();
+  // Per listed file, the position of its file-level entry while it has no other.
+  const fileLevel = new Map<string, number>();
+  const files = new Set<string>();
+  for (const ranked of candidates) {
+    const candidate = CALL_SITE_NODE_KINDS.has(ranked.kind)
+      ? { ...ranked, symbol: ranked.file }
+      : ranked;
+    const key = pathMemberKey(candidate.file, candidate.symbol);
+    if (keys.has(key)) {
+      continue;
+    }
+    if (candidate.symbol === candidate.file) {
+      if (files.has(candidate.file) || listed.length >= MAX_RELEVANT_FILES) {
+        continue;
+      }
+      fileLevel.set(candidate.file, listed.length);
+    } else {
+      const replaced = fileLevel.get(candidate.file);
+      if (replaced !== undefined) {
+        const previous = listed[replaced];
+        if (previous !== undefined) {
+          keys.delete(pathMemberKey(previous.file, previous.symbol));
+        }
+        fileLevel.delete(candidate.file);
+        listed[replaced] = candidate;
+        keys.add(key);
+        continue;
+      }
+      if (listed.length >= MAX_RELEVANT_FILES) {
+        continue;
+      }
+    }
+    keys.add(key);
+    files.add(candidate.file);
+    listed.push(candidate);
+  }
+  return sortCandidates(listed);
+}
+
+/**
  * Builds the code investigation of a request from its structured context.
  *
  * Ranks the candidates the context supplies (see {@link readCandidates} for the
- * scoring), names each one's relevance with the code-relevance frame, and
- * renders whatever graph paths the context reported. Every path is normalised
- * to a project-relative POSIX path, and a candidate whose path fails that check
- * is dropped.
+ * scoring), shortlists them (see {@link shortlistCandidates}), names each
+ * one's relevance with the code-relevance frame, and renders whatever graph
+ * paths the context reported. Every path is normalised to a project-relative
+ * POSIX path, and a candidate whose path fails that check is dropped.
  *
  * @param input The structured context of an investigate-stage request.
  * @returns The investigation as plain JSON, or `undefined` when the context
@@ -3276,10 +4442,7 @@ export function buildInvestigation(input: JsonValue | undefined): JsonValue | un
   if (followUps.length > 0) {
     return { [QUERY_BATCH_FIELD]: followUps };
   }
-  const candidates = sortCandidates(readCandidates(root, understanding)).slice(
-    0,
-    MAX_RELEVANT_FILES,
-  );
+  const candidates = shortlistCandidates(sortCandidates(readCandidates(root, understanding)));
   const paths = executedPaths(root);
   const flows = readFlows(paths.length > 0 ? { ...root, paths } : root);
 
@@ -3516,17 +4679,217 @@ function instrumentationTarget(file: string, symbol: string, type: ActionTypeId)
   };
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * The function-timing target filter
+ *
+ * A function-timing action rewrites one declaration, and the plan has only a
+ * few slots for rewrites once the runtime hooks are reserved. The slots go
+ * where no runtime hook can see: the server-side functions a request runs
+ * between the route that answers it and the query it reaches. The page side of
+ * a request is already observed by the interaction, render and request hooks,
+ * the route by the server spans, and the query by the database hooks.
+ *
+ * The planning context carries the relevant files without their code-graph
+ * kinds, but it carries the investigation's grounded flows, whose steps are the
+ * names the graph walk returned in downstream order. A step naming a route (a
+ * route path, optionally method-qualified — the one step shape the
+ * investigation writes that is not a code name) splits a flow into its page
+ * side and its server side. Only that structure is read: no name, path or
+ * framework noun of any project is known here.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Splits one rendered flow into its steps, at the arrow the investigation writes, in either spelling. */
+const PLAN_FLOW_STEP_SEPARATOR = /\s*(?:→|->)\s*/u;
+
+/** A flow step that names a route: a route path, optionally preceded by an HTTP method. */
+const ROUTE_STEP_PATTERN = /^(?:[A-Z]+\s+)?\//u;
+
+/** Where a flow places a function-timing candidate, best slot first. */
+const FLOW_PLACEMENT_RANKS = Object.freeze({
+  /** After a route: server-side work no runtime hook times. */
+  server: 0,
+  /** On no flow that passes a route: nothing says which side it runs on. */
+  unplaced: 1,
+  /** Before a route: page-side work the interaction and request hooks already observe. */
+  page: 2,
+} as const);
+
+/** Where the investigation's flows place each step name, for the function-timing filter. */
+interface FlowPlacements {
+  /**
+   * Names a flow places after a route, each with its smallest distance from
+   * that route in steps — the function the route calls first is 1.
+   */
+  readonly server: ReadonlyMap<string, number>;
+  /** Names a flow places before the route it passes through. */
+  readonly page: ReadonlySet<string>;
+  /**
+   * The last step of a flow that passed a route and ends past it: the
+   * data-layer call site a database walk ends at. A call site is not a
+   * declaration, and the database hooks already observe it.
+   */
+  readonly callSites: ReadonlySet<string>;
+}
+
+/**
+ * The steps of every flow the planning context carries, in each flow's order.
+ *
+ * A flow arrives as the investigation rendered it — one line with an arrow
+ * between steps — or as a list or object of steps; each is read as steps.
+ *
+ * @param root The structured context of a plan-stage request.
+ * @returns One step list per flow, in the context's order.
+ */
+function planFlowSteps(root: JsonObject): readonly (readonly string[])[] {
+  const flows: (readonly string[])[] = [];
+  for (const bag of [root, investigationBag(root)]) {
+    for (const member of asArray(bag?.flows) ?? []) {
+      const line = asString(member);
+      const steps =
+        line === undefined
+          ? readFlowSteps(member)
+          : line.split(PLAN_FLOW_STEP_SEPARATOR).map((step) => step.trim());
+      const kept = steps.filter((step) => step.length > 0).slice(0, MAX_FLOW_STEPS);
+      if (kept.length > 0) {
+        flows.push(kept);
+      }
+    }
+  }
+  return flows;
+}
+
+/**
+ * Places every step name of the context's flows relative to the routes they
+ * pass through (see {@link FlowPlacements}). A flow that names no route places
+ * nothing: its steps are all neutral.
+ *
+ * @param root The structured context of a plan-stage request.
+ * @returns The placements; empty when the context carries no flow.
+ */
+function readFlowPlacements(root: JsonObject): FlowPlacements {
+  const server = new Map<string, number>();
+  const page = new Set<string>();
+  const callSites = new Set<string>();
+  for (const steps of planFlowSteps(root)) {
+    const route = steps.findIndex((step) => ROUTE_STEP_PATTERN.test(step));
+    if (route === -1) {
+      continue;
+    }
+    steps.forEach((step, index) => {
+      if (index < route) {
+        page.add(step);
+      } else if (index > route && !ROUTE_STEP_PATTERN.test(step)) {
+        const distance = index - route;
+        server.set(step, Math.min(server.get(step) ?? distance, distance));
+      }
+    });
+    const last = steps[steps.length - 1];
+    if (last !== undefined && steps.length - 1 > route && !ROUTE_STEP_PATTERN.test(last)) {
+      callSites.add(last);
+    }
+  }
+  return { server, page, callSites };
+}
+
+/** One candidate with the action type the plan would install for it. */
+interface TypedCandidate {
+  readonly candidate: CandidateView;
+  readonly type: ActionTypeId;
+}
+
+/**
+ * Applies the function-timing target filter to the ranked candidates.
+ *
+ * - A candidate whose type is not `function-timing` keeps its place.
+ * - A `function-timing` candidate that is a flow's data-layer call site is
+ *   re-typed to the next action type its kind accepts that is not a rewrite —
+ *   the database hook for a database call — and dropped when there is none.
+ * - The remaining `function-timing` candidates are ordered server side first
+ *   (nearest the route first), then those no flow places, then the page side;
+ *   within one placement the candidates keep their ranked order.
+ *
+ * The sort is stable and the output depends only on the context, so the plan
+ * stays identical for identical input.
+ *
+ * @param candidates The candidates, already ranked by score.
+ * @param catalog The adapter catalog view.
+ * @param placements Where the flows place each step name.
+ * @returns The typed candidates in the order the plan considers them.
+ */
+function filterFunctionTimingTargets(
+  candidates: readonly CandidateView[],
+  catalog: AdapterCatalogView,
+  placements: FlowPlacements,
+): readonly TypedCandidate[] {
+  const typed: { readonly entry: TypedCandidate; readonly rank: number; readonly order: number }[] =
+    [];
+  candidates.forEach((candidate, order) => {
+    let type = chooseActionType(candidate.actionTypes, catalog);
+    if (type === 'function-timing' && placements.callSites.has(candidate.symbol)) {
+      type = chooseActionType(
+        candidate.actionTypes.filter((option) => !TARGET_REQUIRED_TYPES.has(option)),
+        catalog,
+      );
+    }
+    if (type === undefined) {
+      return;
+    }
+    let rank: number = FLOW_PLACEMENT_RANKS.server;
+    let distance = 0;
+    if (type === 'function-timing') {
+      const serverDistance = placements.server.get(candidate.symbol);
+      if (serverDistance !== undefined) {
+        distance = serverDistance;
+      } else {
+        rank = placements.page.has(candidate.symbol)
+          ? FLOW_PLACEMENT_RANKS.page
+          : FLOW_PLACEMENT_RANKS.unplaced;
+      }
+    }
+    typed.push({ entry: { candidate, type }, rank: rank * (MAX_FLOW_STEPS + 1) + distance, order });
+  });
+  typed.sort((left, right) =>
+    left.rank === right.rank ? left.order - right.order : left.rank - right.rank,
+  );
+  return typed.map(({ entry }) => entry);
+}
+
+/**
+ * A candidate narrowed to the action types its question's category admits.
+ *
+ * A page-observed or request-shaped category installs runtime hooks only
+ * ({@link CategoryProfile.candidateActionTypes}), so a route handler or server
+ * function the investigation related to such a question is not rewritten to
+ * time it: its preference list is filtered, and a candidate left with none is
+ * skipped by the plan like any candidate the catalog claims nothing for. A
+ * category without a profile, or a profile that admits every type, leaves the
+ * candidate as it is.
+ *
+ * @param candidate A ranked candidate.
+ * @param category The category the context carried, if any.
+ * @returns The candidate with its admitted preference list.
+ */
+function admittedByCategory(candidate: CandidateView, category: string | undefined): CandidateView {
+  const admitted = categoryProfile(category)?.candidateActionTypes;
+  if (admitted === undefined) {
+    return candidate;
+  }
+  return { ...candidate, actionTypes: candidate.actionTypes.filter((type) => admitted.has(type)) };
+}
+
 /**
  * Builds the instrumentation plan of a request from its structured context.
  *
  * The objective comes from the plan-objective frame, filled with the category
  * label and the selected target's label — never with the developer's wording.
- * The capture list is the signals the understanding asked for plus the signals
- * the chosen targets contribute, intersected with what the adapter catalog
- * reports as collectable. The targets are chosen from the investigation
+ * The capture list is the signals the understanding asked for, the signals its
+ * category observes whenever the page is observed ({@link plannedSignals}) and
+ * the signals the chosen targets contribute, intersected with what the adapter
+ * catalog reports as collectable. The targets are chosen from the investigation
  * candidates the context supplies, each one's action type taken from its node
- * kind and filtered through the catalog's claims, runtime hooks preferred over
- * rewrites.
+ * kind, narrowed to what the question's category admits
+ * ({@link admittedByCategory}) and filtered through the catalog's claims,
+ * runtime hooks preferred over rewrites.
  *
  * @param input The structured context of a plan-stage request.
  * @returns The plan in its authoring shape, or `undefined` when the context
@@ -3540,13 +4903,15 @@ export function buildPlanInput(input: JsonValue | undefined): JsonValue | undefi
 
   const understanding = readUnderstanding(root);
   const catalog = readAdapterCatalog(root);
-  const candidates = sortCandidates(readCandidates(root, understanding));
+  const candidates = sortCandidates(readCandidates(root, understanding)).map((candidate) =>
+    admittedByCategory(candidate, understanding.category),
+  );
 
   // The page- and process-wide runtime action each needed signal would be
   // collected by. Their slots are reserved before candidates are considered, so
   // a long candidate list can never crowd out the hooks a capture depends on.
   const signalTypes: ActionTypeId[] = [];
-  for (const signal of sortStrings([...understanding.signals])) {
+  for (const signal of sortStrings(plannedSignals(understanding))) {
     const type = (SIGNAL_ACTION_TYPES[signal] ?? []).find(
       (candidate) =>
         catalog.claimed.has(candidate) &&
@@ -3563,13 +4928,10 @@ export function buildPlanInput(input: JsonValue | undefined): JsonValue | undefi
   const emitted = new Set<string>();
   const emittedTypes = new Set<ActionTypeId>();
   const contributed = new Set<string>();
-  for (const candidate of candidates) {
+  const considered = filterFunctionTimingTargets(candidates, catalog, readFlowPlacements(root));
+  for (const { candidate, type } of considered) {
     if (targets.length >= candidateBudget) {
       break;
-    }
-    const type = chooseActionType(candidate.actionTypes, catalog);
-    if (type === undefined) {
-      continue;
     }
     // A runtime hook the plan already reserves observes the whole page or
     // process, this candidate included: a second action of that type would
@@ -3641,6 +5003,7 @@ export function buildPlanInput(input: JsonValue | undefined): JsonValue | undefi
 type FactClass =
   | 'slowestSpan'
   | 'duplicateRequests'
+  | 'contextRenders'
   | 'unchangedRenders'
   | 'repeatedQuery'
   | 'renderCount'
@@ -3658,10 +5021,17 @@ type FactClass =
  * material is decided by the capture, which is why one capture's analysis reads
  * as a latency finding and another's as a rendering finding without either
  * outcome being written down anywhere.
+ *
+ * `contextRenders` sits just above `unchangedRenders`: in a capture of a
+ * context cascade the consumers re-rendered by the changing value are the
+ * finding and the unchanged-input renders are usually their children, so the
+ * cascade's facts must survive {@link MAX_OBSERVED_FACTS} even when the
+ * slowest operations and the unchanged-input facts fill most of it.
  */
 const FACT_CLASS_WEIGHTS: Readonly<Record<FactClass, number>> = Object.freeze({
   slowestSpan: 95,
   duplicateRequests: 90,
+  contextRenders: 88,
   unchangedRenders: 85,
   repeatedQuery: 80,
   renderCount: 70,
@@ -3677,6 +5047,30 @@ const MAX_SLOWEST_SPAN_FACTS = 2;
 
 /** Components reported as render outliers. */
 const MAX_RENDER_OUTLIER_FACTS = 3;
+
+/** Components reported for their context-triggered renders. */
+const MAX_CONTEXT_RENDER_FACTS = 2;
+
+/** Context-triggered renders of one component before they are reported or explained. */
+const CONTEXT_RENDER_MIN_COUNT = 2;
+
+/**
+ * Providers followed upstream from the consumer's immediate provider.
+ *
+ * A provider whose own renders are mostly context-triggered is itself a
+ * consumer of a context further up, so the chain is followed to the component
+ * whose renders are state-triggered — the origin of the changing value. Real
+ * provider nesting is a handful of levels deep; the bound, with the visited
+ * set, is what makes a cyclic or pathological attribution terminate.
+ */
+const MAX_CONTEXT_CHAIN_HOPS = 4;
+
+/**
+ * Consumer renders a context-change cause cites, leaving room within
+ * {@link MAX_EVIDENCE_PER_FACT} for one render of the provider and one of the
+ * origin, so every link of the chain the sentence names is substantiated.
+ */
+const MAX_CONTEXT_CONSUMER_EVIDENCE = MAX_EVIDENCE_PER_FACT - 2;
 
 /** Duplicate request groups reported as facts. */
 const MAX_DUPLICATE_GROUP_FACTS = 3;
@@ -3700,10 +5094,24 @@ interface FactCandidate {
 interface CauseDetectionBase {
   /** Whole steps of evidence strength, for {@link confidenceForSteps}. */
   readonly steps: number;
+  /**
+   * The steps the detection is **ranked** by, when that differs from
+   * {@link steps}. Confidence always comes from `steps`; this only lets a
+   * detection that explains another rank with it without claiming more
+   * confidence than its own evidence carries.
+   */
+  readonly rankingSteps?: number;
   /** The references the detection would cite, before filtering. */
   readonly references: readonly string[];
   /** A location to suggest, when the context supplied a usable one. */
   readonly location?: SourceLocation;
+  /**
+   * The measured time the detected pattern accounts for, in milliseconds: a
+   * query group's summed time, a dominant operation's duration, a request
+   * group's summed time. Orders two equally strong causes by what they cost; a
+   * detection whose time the capture does not state omits it and ranks as zero.
+   */
+  readonly accountedMs?: number;
 }
 
 /**
@@ -3740,7 +5148,32 @@ type CauseDetection = CauseDetectionBase &
         readonly statement: string;
         readonly caller?: string;
       }
+    | {
+        readonly pattern: Extract<EvidencePattern, 'context-change-renders'>;
+        readonly consumer: string;
+        readonly contextRenders: number;
+        readonly provider?: string;
+        readonly origin?: string;
+      }
   );
+
+/**
+ * How detections of equal ranking strength are ordered, lowest first, before
+ * their statements break the tie.
+ *
+ * A context cascade explains the renders with unchanged inputs it leaves
+ * behind — the children of the consumers it re-rendered — so at equal
+ * strength it leads. Every other pattern shares one value, which keeps their
+ * relative order exactly the statement order it has always been. Keyed by the
+ * shared vocabulary, so a new pattern without an entry is a compile error.
+ */
+const CAUSE_PATTERN_PRECEDENCE: Readonly<Record<EvidencePattern, number>> = Object.freeze({
+  'context-change-renders': 0,
+  'duplicate-requests': 1,
+  'unchanged-input-renders': 1,
+  'dominant-span': 1,
+  'repeated-query-shape': 1,
+});
 
 /**
  * The sentence for one detected pattern.
@@ -3766,6 +5199,13 @@ function causeStatement(detection: CauseDetection): string {
       );
     case 'repeated-query-shape':
       return repeatedQueryShapeCause(detection.count, detection.statement, detection.caller);
+    case 'context-change-renders':
+      return contextChangeRenderCause(
+        detection.consumer,
+        detection.contextRenders,
+        detection.provider,
+        detection.origin,
+      );
     default:
       return assertNever(
         detection,
@@ -3816,6 +5256,83 @@ function sortSpans(spans: readonly SpanView[]): SpanView[] {
 }
 
 /**
+ * Telemetry kinds whose span is the envelope of a capture rather than work
+ * inside it: a user interaction's root span and a page navigation each measure
+ * the whole interval every other operation was recorded within.
+ *
+ * Product vocabulary, restated from `@debuggen/telemetry`'s kind list with the
+ * others in {@link EVIDENCE_REF_KINDS}.
+ */
+const ENVELOPE_SPAN_KINDS: ReadonlySet<string> = new Set(['interaction', 'navigation']);
+
+/**
+ * Whether a span is the capture's envelope: of an {@link ENVELOPE_SPAN_KINDS}
+ * kind, or at least as long as the interaction's measured total.
+ *
+ * Such a span covers the interaction by construction, so naming it as the
+ * slowest operation or as the one that dominates the total restates the
+ * total — "the interaction accounts for all of the interaction" — and hides
+ * the operation that actually took the time.
+ *
+ * @param span A measured operation.
+ * @param totalMs The interaction's measured total, when there is one.
+ * @returns `true` when the span is the envelope.
+ */
+function isEnvelopeSpan(span: SpanView, totalMs: number | undefined): boolean {
+  if (span.kind !== undefined && ENVELOPE_SPAN_KINDS.has(span.kind)) {
+    return true;
+  }
+  return totalMs !== undefined && span.duration >= totalMs;
+}
+
+/**
+ * The operations that took time inside the interaction, in the given order:
+ * every span except the envelope ({@link isEnvelopeSpan}).
+ *
+ * @param spans The ordered operations of the capture.
+ * @param totalMs The interaction's measured total, when there is one.
+ * @returns The non-envelope operations.
+ */
+function contributingSpans(
+  spans: readonly SpanView[],
+  totalMs: number | undefined,
+): readonly SpanView[] {
+  return spans.filter((span) => !isEnvelopeSpan(span, totalMs));
+}
+
+/**
+ * What an operation of a kind whose names are generic is, in words.
+ *
+ * The browser agent names a performance entry by its entry type (`resource`,
+ * `paint`), a long task by its attribution and a navigation by its type, so
+ * "resource took 1564.9 ms" says nothing about what kind of thing took the
+ * time. A span of one of these kinds is named with its phrase appended. Fixed
+ * product wording keyed by product kinds, never by anything a capture names.
+ */
+const SPAN_KIND_PHRASES: ReadonlyMap<string, string> = new Map([
+  ['perf.entry', 'browser performance entry'],
+  ['perf.longtask', 'browser long task'],
+  ['navigation', 'page navigation'],
+]);
+
+/**
+ * The name an operation is stated by: its own, qualified with its kind's
+ * phrase when its kind names generically ({@link SPAN_KIND_PHRASES}), and the
+ * phrase alone when it has no name.
+ *
+ * @param span A measured operation.
+ * @returns The name to interpolate; empty when the span has neither, so the
+ * frame applies its own fallback wording.
+ */
+function operationLabel(span: SpanView): string {
+  const phrase = span.kind === undefined ? undefined : SPAN_KIND_PHRASES.get(span.kind);
+  if (phrase === undefined) {
+    return span.name;
+  }
+  return span.name.length === 0 ? phrase : `${span.name} (${phrase})`;
+}
+
+/**
  * Builds the observed-fact candidates of a capture.
  *
  * One pass per candidate class, each ordered and capped within its class, so a
@@ -3840,14 +5357,16 @@ function factCandidates(
   const candidates: FactCandidate[] = [];
 
   if (totalMs !== undefined && totalMs > 0) {
-    for (const span of spans.slice(0, MAX_SLOWEST_SPAN_FACTS)) {
+    // The envelope is excluded: "the interaction took all of the interaction's
+    // time" is the total restated, not a fact about where the time went.
+    for (const span of contributingSpans(spans, totalMs).slice(0, MAX_SLOWEST_SPAN_FACTS)) {
       if (span.duration <= 0) {
         continue;
       }
       candidates.push({
         factClass: 'slowestSpan',
         magnitude: span.duration,
-        statement: slowestSpanFact(span.name, span.duration, totalMs),
+        statement: slowestSpanFact(operationLabel(span), span.duration, totalMs),
         references: evidenceOf(span.node),
       });
     }
@@ -3903,11 +5422,28 @@ function factCandidates(
     }
   }
 
-  const renders = [...readRenders(aggregates)].sort((left, right) =>
+  // The project's own components when the capture says which they are, so a
+  // framework's internal components, however often they rendered, never take
+  // the places of the components a developer can change.
+  const projectOwned = projectRenders(readRenders(aggregates));
+  const renders = [...projectOwned].sort((left, right) =>
     left.count === right.count
       ? compareStrings(left.component, right.component)
       : right.count - left.count,
   );
+  for (const render of rankContextConsumers(projectOwned).slice(0, MAX_CONTEXT_RENDER_FACTS)) {
+    candidates.push({
+      factClass: 'contextRenders',
+      magnitude: contextScore(render),
+      statement: contextTriggeredRenderFact(
+        render.component,
+        render.contextTriggered,
+        render.count,
+        render.changedContexts.slice(0, CONTEXT_PROVIDER_LIST_MAX_ITEMS),
+      ),
+      references: triggerEvidence(render, 'context', render.changedContexts[0]),
+    });
+  }
   for (const render of renders.slice(0, MAX_RENDER_OUTLIER_FACTS)) {
     if (render.count < RENDER_OUTLIER_MIN_COUNT) {
       continue;
@@ -3919,36 +5455,38 @@ function factCandidates(
       statement: renderCountFact(render.component, render.count),
       references,
     });
+    // Each sentence names the component its counts belong to and cites that
+    // component's renders of the trigger it describes, not its other renders.
     if (render.unchanged >= UNCHANGED_RENDER_MIN_COUNT) {
       candidates.push({
         factClass: 'unchangedRenders',
         magnitude: render.unchanged,
-        statement: unchangedInputRenderFact(render.unchanged, render.count),
-        references,
+        statement: unchangedInputRenderFact(render.unchanged, render.count, render.component),
+        references: triggerEvidence(render, 'unchanged'),
       });
     }
     if (render.unknownTrigger >= UNKNOWN_TRIGGER_MIN_COUNT) {
       candidates.push({
         factClass: 'unknownTrigger',
         magnitude: render.unknownTrigger,
-        statement: unknownTriggerRenderFact(render.unknownTrigger, render.count),
-        references,
+        statement: unknownTriggerRenderFact(render.unknownTrigger, render.count, render.component),
+        references: triggerEvidence(render, 'unknown'),
       });
     }
   }
 
+  // Costliest first ({@link compareQueryGroups}), so the capped list keeps the
+  // shapes that took the time rather than the ones that merely ran as often.
+  // The magnitude is the rank itself, which keeps that order through the
+  // cross-class sort in {@link buildAnalysis}.
   const queryGroups = [...readQueryGroups(aggregates)]
     .filter((group) => group.count >= REPEATED_QUERY_MIN_COUNT)
-    .sort((left, right) =>
-      left.count === right.count
-        ? compareStrings(left.statement, right.statement)
-        : right.count - left.count,
-    )
+    .sort(compareQueryGroups)
     .slice(0, MAX_QUERY_GROUP_FACTS);
-  for (const group of queryGroups) {
+  for (const [position, group] of queryGroups.entries()) {
     candidates.push({
       factClass: 'repeatedQuery',
-      magnitude: group.count,
+      magnitude: queryGroups.length - position,
       statement: repeatedQueryShapeFact(group.count, group.statement),
       references: evidenceOf(group.node),
     });
@@ -3997,6 +5535,253 @@ function factCandidates(
 }
 
 /**
+ * The render statistics a render fact or cause may be about.
+ *
+ * When the context marks any component as declared by the project, only those
+ * are candidates: a framework or library component — often minified, placed
+ * only through the project component that rendered it — is not a place a
+ * developer can change, however often it rendered, and its count is usually
+ * the downstream echo of a project component's renders. A context that says
+ * nothing about ownership keeps every statistic.
+ *
+ * @param renders The capture's render statistics.
+ * @returns The candidates, in carried order.
+ */
+function projectRenders(renders: readonly RenderView[]): readonly RenderView[] {
+  const declared = renders.filter((render) => render.declared === true);
+  return declared.length > 0 ? declared : renders;
+}
+
+/**
+ * The share of a component's renders a count covers, bounded to one.
+ *
+ * @param count Renders of one classification.
+ * @param total The component's renders.
+ * @returns The share, `0` for a component with no renders.
+ */
+function renderShare(count: number, total: number): number {
+  return total > 0 ? Math.min(1, count / total) : 0;
+}
+
+/**
+ * How strongly a component's renders point at a changing context: its
+ * context-triggered renders weighted by the share of its renders they are.
+ *
+ * A component that re-rendered thousands of times almost only because of a
+ * context outranks both one that rendered as often for other reasons and one
+ * whose every render was context-triggered but that rendered twice.
+ *
+ * @param render One render statistic.
+ * @returns The score.
+ */
+function contextScore(render: RenderView): number {
+  return render.contextTriggered * renderShare(render.contextTriggered, render.count);
+}
+
+/**
+ * How strongly a component's renders point at inputs that did not change,
+ * weighted the same way as {@link contextScore}.
+ *
+ * @param render One render statistic.
+ * @returns The score.
+ */
+function unchangedScore(render: RenderView): number {
+  return render.unchanged * renderShare(render.unchanged, render.count);
+}
+
+/**
+ * The components with context-triggered renders worth reporting, strongest
+ * first: {@link contextScore} descending, then the context-triggered count,
+ * then the component name, so the order is total.
+ *
+ * @param renders The candidate statistics.
+ * @returns A new, ordered array.
+ */
+function rankContextConsumers(renders: readonly RenderView[]): RenderView[] {
+  return renders
+    .filter((render) => render.contextTriggered >= CONTEXT_RENDER_MIN_COUNT)
+    .sort((left, right) => {
+      const byScore = contextScore(right) - contextScore(left);
+      if (byScore !== 0) {
+        return byScore;
+      }
+      if (left.contextTriggered !== right.contextTriggered) {
+        return right.contextTriggered - left.contextTriggered;
+      }
+      return compareStrings(left.component, right.component);
+    });
+}
+
+/**
+ * Whether most of a component's renders were triggered by a changed context.
+ *
+ * @param render One render statistic.
+ * @returns `true` when context-triggered renders are more than half of them.
+ */
+function isMostlyContextTriggered(render: RenderView): boolean {
+  return render.contextTriggered * 2 > render.count;
+}
+
+/**
+ * The statistic of the component a provider name refers to.
+ *
+ * Provider names are component display names, the same names the statistics
+ * carry. Two statistics of one name (the same component mounted under two
+ * identities) resolve to the busier one, then to the first carried, so the
+ * answer is deterministic.
+ *
+ * @param renders Every render statistic of the capture.
+ * @param component The display name to find.
+ * @returns The statistic, or `undefined` when the capture carries none for it.
+ */
+function renderOfComponent(
+  renders: readonly RenderView[],
+  component: string,
+): RenderView | undefined {
+  let found: RenderView | undefined;
+  for (const render of renders) {
+    if (render.component === component && (found === undefined || render.count > found.count)) {
+      found = render;
+    }
+  }
+  return found;
+}
+
+/**
+ * The events of a component's renders of one trigger, as references.
+ *
+ * Renders that name `provider` among their changed contexts come first when
+ * any do, so a citation shows the change the sentence names.
+ *
+ * A render of another trigger never stands in: when the carried renders are
+ * classified and none is of `trigger`, nothing is cited, and a sentence left
+ * with no evidence is dropped rather than substantiated by renders that
+ * contradict it. Only when no carried render reports a classification at all —
+ * a context that cannot say which render had which trigger — does the
+ * statistic's own evidence (the component's renders) stand in.
+ *
+ * @param render One render statistic.
+ * @param trigger The trigger classification to cite.
+ * @param provider A provider the cited renders should name, when there is one.
+ * @returns The references, before filtering against the context.
+ */
+function triggerEvidence(
+  render: RenderView,
+  trigger: string,
+  provider?: string,
+): readonly string[] {
+  const matching = render.occurrences.filter((occurrence) => occurrence.trigger === trigger);
+  const naming =
+    provider === undefined
+      ? []
+      : matching.filter((occurrence) => occurrence.contexts.includes(provider));
+  const chosen = naming.length > 0 ? naming : matching;
+  if (chosen.length > 0) {
+    return chosen.map((occurrence) => occurrence.reference);
+  }
+  const classified = render.occurrences.some((occurrence) => occurrence.trigger !== undefined);
+  return classified ? [] : evidenceOf(render.node);
+}
+
+/** The context cascade behind a capture's strongest context-triggered consumer. */
+interface ContextCascade {
+  /** The project component whose renders most followed a changed context. */
+  readonly consumer: RenderView;
+  /** The component providing that context, when the capture named it. */
+  readonly provider: string | undefined;
+  /** The provider's own statistic, when the capture carries one. */
+  readonly providerRender: RenderView | undefined;
+  /**
+   * The component whose state updates the chain traces back to: the first
+   * provider up the chain whose renders are state-triggered rather than
+   * mostly context-triggered. May be the immediate provider itself.
+   */
+  readonly origin: RenderView | undefined;
+}
+
+/**
+ * Follows a capture's strongest context-triggered consumer up its provider
+ * chain.
+ *
+ * The consumer is the first of {@link rankContextConsumers} over the project's
+ * components; its provider is the first of its changed contexts. A provider
+ * whose renders are mostly context-triggered is itself re-rendered by a
+ * context further up, so its own first changed context is followed — at most
+ * {@link MAX_CONTEXT_CHAIN_HOPS} statistics, never one twice — until a
+ * provider with state-triggered renders is reached. That one is the origin of
+ * the changing value. The chain stops, with no origin, at a provider the
+ * capture carries no statistic for or one it cannot attribute further.
+ *
+ * Names are compared only with the names other statistics carry; nothing here
+ * knows what any component is called.
+ *
+ * @param candidates The statistics a consumer may be chosen from.
+ * @param renders Every statistic of the capture, providers included.
+ * @returns The cascade, or `undefined` when no component has enough
+ * context-triggered renders.
+ */
+function contextCascade(
+  candidates: readonly RenderView[],
+  renders: readonly RenderView[],
+): ContextCascade | undefined {
+  const consumer = rankContextConsumers(candidates)[0];
+  if (consumer === undefined) {
+    return undefined;
+  }
+  const provider = consumer.changedContexts[0];
+  const providerRender = provider === undefined ? undefined : renderOfComponent(renders, provider);
+  const visited = new Set<string>([consumer.component]);
+  let link = providerRender;
+  let origin: RenderView | undefined;
+  for (let hop = 0; link !== undefined && hop < MAX_CONTEXT_CHAIN_HOPS; hop += 1) {
+    if (visited.has(link.component)) {
+      break;
+    }
+    visited.add(link.component);
+    const upstream = link.changedContexts[0];
+    if (isMostlyContextTriggered(link) && upstream !== undefined) {
+      link = renderOfComponent(renders, upstream);
+      continue;
+    }
+    if (link.stateTriggered > 0) {
+      origin = link;
+    }
+    break;
+  }
+  return { consumer, provider, providerRender, origin };
+}
+
+/** A render statistic and the validated location a cause would suggest for it. */
+interface LocatedRender {
+  /** The statistic. */
+  readonly render: RenderView;
+  /** Its declaration. */
+  readonly location: SourceLocation;
+}
+
+/**
+ * The statistic's validated location, paired with it.
+ *
+ * @param render A statistic, or `undefined`.
+ * @returns The pair, or `undefined` when there is no statistic or it is not located.
+ */
+function locatedRender(render: RenderView | undefined): LocatedRender | undefined {
+  const location = render === undefined ? undefined : readSourceLocation(render.node);
+  return render === undefined || location === undefined ? undefined : { render, location };
+}
+
+/**
+ * The location a cascade names: the immediate provider's declaration — where
+ * the changing value is built — else the origin's.
+ *
+ * @param cascade The cascade, when there is one.
+ * @returns The located link, or `undefined` when neither link is located.
+ */
+function cascadeLocation(cascade: ContextCascade | undefined): LocatedRender | undefined {
+  return locatedRender(cascade?.providerRender) ?? locatedRender(cascade?.origin);
+}
+
+/**
  * The component a capture's context-triggered renders most likely came from.
  *
  * A context value changes only when the component providing it renders with a
@@ -4006,10 +5791,13 @@ function factCandidates(
  * least {@link CONTEXT_PUBLISHER_MIN_FAN_OUT} such renders is the likely
  * publisher. Among several, the one with the most own-state updates wins, and
  * the component name breaks a tie; only a statistic the capture located can be
- * suggested, because the answer is a place to open.
+ * suggested, because the answer is a place to open, and only one of the
+ * project's own components ({@link projectRenders}) when the capture says
+ * which those are.
  *
- * Counts only, never names: nothing here knows which components provide a
- * context — the trigger histogram of each statistic is the whole input.
+ * Counts only, never names: this is the guess for a capture whose context
+ * renders carry no provider names. When they do, {@link contextCascade}
+ * follows the names instead and its answer is preferred.
  *
  * @param renders The capture's render statistics.
  * @returns The likely publisher, or `undefined` when the capture shows no
@@ -4017,7 +5805,7 @@ function factCandidates(
  */
 function contextPublisher(renders: readonly RenderView[]): RenderView | undefined {
   const contextRenders = renders.reduce((total, render) => total + render.contextTriggered, 0);
-  return [...renders]
+  return [...projectRenders(renders)]
     .filter(
       (render) =>
         render.stateTriggered > 0 &&
@@ -4032,21 +5820,35 @@ function contextPublisher(renders: readonly RenderView[]): RenderView | undefine
 }
 
 /**
+ * {@link contextPublisher} with its location, which it always has.
+ *
+ * @param renders The capture's render statistics.
+ * @returns The located publisher, or `undefined` when there is none.
+ */
+function publisherLocation(renders: readonly RenderView[]): LocatedRender | undefined {
+  return locatedRender(contextPublisher(renders));
+}
+
+/**
  * Detects the evidence patterns a capture's numbers form.
  *
  * Every detection is numeric: a duplicate group above its threshold, an
- * unchanged-input render count materially above zero, one operation covering
- * most of the measured total, a statement shape repeated within one
- * interaction. Each carries the whole steps of strength its confidence is
- * derived from, so the confidence rule stays monotonic and shared.
+ * unchanged-input render count materially above zero, a project component
+ * whose renders mostly followed a changed context (with the provider chain the
+ * capture attributed), one operation covering most of the measured total, a
+ * statement shape repeated within one interaction. Each carries the whole
+ * steps of strength its confidence is derived from, so the confidence rule
+ * stays monotonic and shared.
  *
  * @param root The structured context.
+ * @param reading The metric reading, for the tier totals a detection is weighed against.
  * @param spans The ordered operations of the capture.
  * @param totalMs The interaction's measured total, when there is one.
  * @returns The detections, unordered.
  */
 function causeDetections(
   root: JsonObject,
+  reading: MetricReading,
   spans: readonly SpanView[],
   totalMs: number | undefined,
 ): readonly CauseDetection[] {
@@ -4062,6 +5864,9 @@ function causeDetections(
     )[0];
   if (duplicate !== undefined) {
     const { location } = duplicate;
+    const accountedMs = asDurationMs(
+      readField(duplicate.node, 'totalDurationMs', 'totalDuration', 'durationMs'),
+    );
     detections.push({
       pattern: 'duplicate-requests',
       count: duplicate.count,
@@ -4070,42 +5875,103 @@ function causeDetections(
       steps: duplicate.count - 1,
       references: duplicate.references,
       ...(location !== undefined ? { location } : {}),
+      ...(accountedMs !== undefined ? { accountedMs } : {}),
     });
   }
 
   const renders = readRenders(aggregates);
-  const unchanged = [...renders]
+  const candidates = projectRenders(renders);
+  // A cascade is a finding only when most of its consumer's renders followed
+  // the context change; a component re-rendered by a context now and then is
+  // not one, and its provider is no better a suggestion than the counts' guess.
+  const traced = contextCascade(candidates, renders);
+  const cascade =
+    traced !== undefined && isMostlyContextTriggered(traced.consumer) ? traced : undefined;
+  const named = cascadeLocation(cascade);
+
+  const unchanged = [...candidates]
     .filter((render) => render.unchanged >= UNCHANGED_RENDER_MIN_COUNT)
-    .sort((left, right) =>
-      left.unchanged === right.unchanged
+    .sort((left, right) => {
+      const byScore = unchangedScore(right) - unchangedScore(left);
+      if (byScore !== 0) {
+        return byScore;
+      }
+      return left.unchanged === right.unchanged
         ? compareStrings(left.component, right.component)
-        : right.unchanged - left.unchanged,
-    )[0];
-  if (unchanged !== undefined) {
+        : right.unchanged - left.unchanged;
+    })[0];
+  const unchangedSteps = unchanged === undefined ? undefined : unchanged.unchanged - 1;
+  if (unchanged !== undefined && unchangedSteps !== undefined) {
     // The frame names the consumer whose inputs held; the location points at
-    // where the change came from when the capture shows one: a component whose
-    // own state updates fanned out into context-triggered renders elsewhere is
-    // the likely publisher of the value, and a developer fixes the publisher,
-    // not the consumer.
-    const publisher = contextPublisher(renders);
-    const location =
-      (publisher === undefined ? undefined : readSourceLocation(publisher.node)) ??
-      readSourceLocation(unchanged.node);
+    // where the change came from when the capture shows one: the provider the
+    // capture named for the strongest context cascade — where the changing
+    // value is built — else a component whose own state updates fanned out
+    // into context-triggered renders elsewhere, the likely publisher. A
+    // developer fixes the publisher, not the consumer.
+    const source = named ?? publisherLocation(renders);
+    const location = source?.location ?? readSourceLocation(unchanged.node);
+    // The component's own renders first, with one render of the suggested
+    // component beside them: citations are ordered by id and capped, so an
+    // uncapped second list could crowd out every render the sentence counts.
     const references = [
-      ...evidenceOf(unchanged.node),
-      ...(publisher === undefined ? [] : evidenceOf(publisher.node)),
+      ...triggerEvidence(unchanged, 'unchanged').slice(
+        0,
+        source === undefined ? MAX_EVIDENCE_PER_FACT : MAX_EVIDENCE_PER_FACT - 1,
+      ),
+      ...(source === undefined ? [] : evidenceOf(source.render.node).slice(0, 1)),
     ];
     detections.push({
       pattern: 'unchanged-input-renders',
       component: unchanged.component,
       unchanged: unchanged.unchanged,
-      steps: unchanged.unchanged - 1,
+      steps: unchangedSteps,
       references: [...new Set(references)],
       ...(location !== undefined ? { location } : {}),
     });
   }
 
-  const dominant = spans[0];
+  if (cascade !== undefined) {
+    // The consumer is where the renders were counted; the suggestion is the
+    // immediate provider's declaration, where the value that keeps changing is
+    // built, else the origin's, else the consumer's own. Every link the
+    // sentence names cites one of its renders.
+    const { consumer, provider, providerRender, origin } = cascade;
+    const upstream = origin !== undefined && origin !== providerRender ? origin : undefined;
+    const location = named?.location ?? readSourceLocation(consumer.node);
+    const providerTrigger =
+      providerRender !== undefined && isMostlyContextTriggered(providerRender)
+        ? 'context'
+        : 'state';
+    const references = [
+      ...triggerEvidence(consumer, 'context', provider).slice(0, MAX_CONTEXT_CONSUMER_EVIDENCE),
+      ...(providerRender === undefined
+        ? []
+        : triggerEvidence(providerRender, providerTrigger).slice(0, 1)),
+      ...(upstream === undefined ? [] : triggerEvidence(upstream, 'state').slice(0, 1)),
+    ];
+    const steps = consumer.contextTriggered - 1;
+    detections.push({
+      pattern: 'context-change-renders',
+      consumer: consumer.component,
+      contextRenders: consumer.contextTriggered,
+      ...(provider !== undefined ? { provider } : {}),
+      ...(upstream !== undefined ? { origin: upstream.component } : {}),
+      steps,
+      // The unchanged-input renders a cascade leaves behind are its own
+      // downstream renders, so it ranks with them, and ahead of them by
+      // precedence, while its confidence stays its own.
+      ...(unchangedSteps !== undefined && unchangedSteps > steps
+        ? { rankingSteps: unchangedSteps }
+        : {}),
+      references: [...new Set(references)],
+      ...(location !== undefined ? { location } : {}),
+    });
+  }
+
+  // The longest operation inside the interaction, never its envelope: the
+  // interaction's root span or the navigation covers the whole total by
+  // construction, and naming it would restate the total as its own cause.
+  const dominant = contributingSpans(spans, totalMs)[0];
   if (dominant !== undefined && totalMs !== undefined && totalMs > 0) {
     const share = dominant.duration / totalMs;
     if (share >= DOMINANT_SPAN_MIN_SHARE) {
@@ -4115,35 +5981,50 @@ function causeDetections(
         Math.floor(DOMINANT_SPAN_MIN_SHARE * DOMINANT_SHARE_STEP_SCALE);
       detections.push({
         pattern: 'dominant-span',
-        operation: dominant.name,
+        operation: operationLabel(dominant),
         durationMs: dominant.duration,
         totalMs,
         ...(dominant.tier !== undefined ? { tier: telemetryTierLabel(dominant.tier) } : {}),
         steps,
         references: evidenceOf(dominant.node),
         ...(location !== undefined ? { location } : {}),
+        accountedMs: dominant.duration,
       });
     }
   }
 
+  // The costliest repeated shape ({@link compareQueryGroups}), carrying the call
+  // site its executions share so the cause can be opened where it happens.
   const repeated = [...readQueryGroups(aggregates)]
     .filter((group) => group.count >= REPEATED_QUERY_MIN_COUNT)
-    .sort((left, right) =>
-      left.count === right.count
-        ? compareStrings(left.statement, right.statement)
-        : right.count - left.count,
-    )[0];
+    .sort(compareQueryGroups)[0];
   if (repeated !== undefined) {
-    const location = readSourceLocation(repeated.node);
-    const caller = callSiteLabel(repeated.node);
+    const { location, totalMs: groupMs } = repeated;
+    // The frame names the issuing code by its `file:line` label, the contract of
+    // `repeatedQueryShapeCause`: a caller record's name is the span the
+    // executions ran inside, which need not be the code that issued them.
+    const caller = callSiteLabel(location);
+    const countSteps = repeated.count - 1;
+    // Repetition that cost a negligible share of its tier's time is reported,
+    // but never with more than `low` confidence. A statement shape is database
+    // work, so it is weighed against the database tier's measured time; only
+    // when the capture states none is the interaction's total the yardstick.
+    const databaseMs = reading.values.get(DATABASE_DURATION_METRIC);
+    const yardstickMs = databaseMs !== undefined && databaseMs > 0 ? databaseMs : totalMs;
+    const immaterial =
+      groupMs !== undefined &&
+      yardstickMs !== undefined &&
+      yardstickMs > 0 &&
+      groupMs / yardstickMs < REPEATED_QUERY_MATERIAL_SHARE;
     detections.push({
       pattern: 'repeated-query-shape',
       count: repeated.count,
       statement: repeated.statement,
       ...(caller.length > 0 ? { caller } : {}),
-      steps: repeated.count - 1,
+      steps: immaterial ? Math.min(countSteps, IMMATERIAL_MAX_STEPS) : countSteps,
       references: evidenceOf(repeated.node),
       ...(location !== undefined ? { location } : {}),
+      ...(groupMs !== undefined ? { accountedMs: groupMs } : {}),
     });
   }
 
@@ -4179,7 +6060,9 @@ export function buildAnalysis(input: JsonValue | undefined): JsonValue | undefin
   const aggregates = aggregatesBag(root);
   const spans = sortSpans(readSpans(aggregates));
   const totalMs = readTotalDuration(root, reading, spans);
-  const index = indexEvidence([aggregates, root]);
+  // References are harvested from the whole context, and described only from
+  // the capture's own event records ({@link describeEvidence}).
+  const index = indexEvidence([aggregates, root], aggregates);
 
   const observed: JsonValue[] = [];
   const ranked = [...factCandidates(root, reading, spans, totalMs)].sort((left, right) => {
@@ -4210,21 +6093,34 @@ export function buildAnalysis(input: JsonValue | undefined): JsonValue | undefin
     observed.push({ statement: candidate.statement, evidence });
   }
 
+  // Strongest first; two equally strong causes by the time each accounts for,
+  // so the one that cost the interaction more leads, and then by the fixed
+  // precedence of their patterns; the statement last, which is unique among
+  // the detections because each pattern yields at most one.
   const likelyCauses: JsonValue[] = [];
-  const causes = causeDetections(root, spans, totalMs)
+  const causes = causeDetections(root, reading, spans, totalMs)
     .map((detection) => ({
       statement: causeStatement(detection),
-      strength: boundedSteps(detection.steps),
+      strength: boundedSteps(detection.rankingSteps ?? detection.steps),
+      accountedMs: detection.accountedMs ?? 0,
+      precedence: CAUSE_PATTERN_PRECEDENCE[detection.pattern],
       confidence: confidenceForSteps(detection.steps),
       evidence: citeEvidence(detection.references, index),
       location: detection.location,
     }))
     .filter((cause) => cause.evidence.length > 0)
-    .sort((left, right) =>
-      left.strength === right.strength
-        ? compareStrings(left.statement, right.statement)
-        : right.strength - left.strength,
-    )
+    .sort((left, right) => {
+      if (left.strength !== right.strength) {
+        return right.strength - left.strength;
+      }
+      if (left.accountedMs !== right.accountedMs) {
+        return right.accountedMs - left.accountedMs;
+      }
+      if (left.precedence !== right.precedence) {
+        return left.precedence - right.precedence;
+      }
+      return compareStrings(left.statement, right.statement);
+    })
     .slice(0, MAX_LIKELY_CAUSES);
 
   for (const cause of causes) {
@@ -4263,14 +6159,24 @@ export function buildAnalysis(input: JsonValue | undefined): JsonValue | undefin
  *   the dependency graph and the event log — for a capture that rendered
  *   without crossing the network.
  *
+ * - the **request** lens — the request groups, the render statistics of the
+ *   components that issued them, and the requests plotted against the page's
+ *   commits on one time axis — for a question about the requests themselves.
+ *
  * An entry is emitted only when its *primary* declared source belongs to the
  * active lens, so a latency capture and a rendering capture compose disjoint
  * visualization bodies and share only the metric cards and the source link,
  * whose content is lens-specific too. A detected pattern may admit one further
  * source into the timing lens: duplicated requests bring in the render
- * statistics of the components that issued them. None of this reads a
- * question: the lens is a function of the capture's source counts and detected
- * patterns.
+ * statistics of the components that issued them.
+ *
+ * **Which lens.** A classified problem category names its lens
+ * ({@link CATEGORY_PROFILES}), so one question is read the same way whatever
+ * else its capture happens to hold — a latency question over a capture that
+ * rendered on its own schedule is still a latency panel. The category is
+ * echoed from the structured context, never derived from prose. When there is
+ * no profile, or the category's lens has no material at all in this capture,
+ * the lens is chosen from the capture's own numbers ({@link panelLens}).
  * ---------------------------------------------------------------------------------------------- */
 
 /** One node catalog entry, as the context declared it. */
@@ -4400,52 +6306,113 @@ function readNodeCatalog(root: JsonObject): readonly CatalogEntryView[] {
 /**
  * The evidence lens a panel is composed through; see the section comment.
  */
-type PanelLens = 'timing' | 'component';
+type PanelLens = 'timing' | 'component' | 'requests';
 
 /**
- * The lens each known data source belongs to.
+ * The lenses each known data source belongs to.
  *
- * The metrics source belongs to neither — the metric-card node is shared, and
- * its *content* is what the lens selects ({@link METRIC_LENS}). A source this
- * table does not know belongs to both, so a catalog that grows a source is
- * still served by whichever lens is active instead of being silently dropped.
+ * The metrics source belongs to none — the metric-card node is shared, and its
+ * *content* is what the lens selects ({@link METRIC_LENSES}). The request
+ * groups belong to the timing lens and the request lens alike, and the render
+ * statistics to the component lens and the request lens, whose initiating
+ * components they are. A source this table does not know belongs to every
+ * lens, so a catalog that grows a source is still served by whichever lens is
+ * active instead of being silently dropped.
  */
-const SOURCE_LENS: Readonly<Record<string, PanelLens>> = Object.freeze({
-  trace: 'timing',
-  spans: 'timing',
-  requests: 'timing',
-  queries: 'timing',
-  renders: 'component',
-  componentTree: 'component',
-  stateTransitions: 'component',
-  graph: 'component',
-  events: 'component',
+const SOURCE_LENSES: Readonly<Record<string, readonly PanelLens[]>> = Object.freeze({
+  trace: ['timing'],
+  spans: ['timing'],
+  requests: ['timing', 'requests'],
+  queries: ['timing'],
+  renders: ['component', 'requests'],
+  componentTree: ['component'],
+  stateTransitions: ['component'],
+  graph: ['component'],
+  events: ['component'],
 });
 
 /**
- * The lens each computed metric belongs to, so the cards of a timing panel
- * measure time and traffic and the cards of a component panel measure
- * rendering and main-thread work (the four duration cards against
- * `render_count`, `unchanged_render_count`, `render_trigger_unknown_count` and
- * `blocking_time`). Keyed by {@link ComputedMetricId} and therefore total: a
- * metric added to the computed tuple without a lens is a compile error.
+ * The lenses each computed metric belongs to, so the cards of a timing panel
+ * measure time and traffic, the cards of a component panel measure rendering
+ * and main-thread work (the four duration cards against `render_count`,
+ * `unchanged_render_count`, `render_trigger_unknown_count` and
+ * `blocking_time`), and the cards of a request panel count the requests, their
+ * duplicates, their bytes and their failures. Keyed by {@link ComputedMetricId}
+ * and therefore total: a metric added to the computed tuple without a lens is a
+ * compile error.
  */
-const METRIC_LENS: Readonly<Record<ComputedMetricId, PanelLens>> = Object.freeze({
-  total_duration: 'timing',
-  frontend_duration: 'timing',
-  backend_duration: 'timing',
-  database_duration: 'timing',
-  render_count: 'component',
-  unchanged_render_count: 'component',
-  render_trigger_unknown_count: 'component',
-  request_count: 'timing',
-  query_count: 'timing',
-  transferred_bytes: 'timing',
-  blocking_time: 'component',
-  duplicate_request_count: 'timing',
-  long_task_count: 'component',
-  error_count: 'timing',
+const METRIC_LENSES: Readonly<Record<ComputedMetricId, readonly PanelLens[]>> = Object.freeze({
+  total_duration: ['timing'],
+  frontend_duration: ['timing'],
+  backend_duration: ['timing'],
+  database_duration: ['timing'],
+  render_count: ['component'],
+  unchanged_render_count: ['component'],
+  render_trigger_unknown_count: ['component'],
+  request_count: ['timing', 'requests'],
+  query_count: ['timing'],
+  transferred_bytes: ['timing', 'requests'],
+  blocking_time: ['component'],
+  duplicate_request_count: ['timing', 'requests'],
+  long_task_count: ['component'],
+  error_count: ['timing', 'requests'],
 });
+
+/**
+ * Whether a computed metric is measured by the cards of a lens.
+ *
+ * @param id A computed metric id.
+ * @param lens The active lens.
+ * @returns `true` when the metric belongs to the lens.
+ */
+function metricInLens(id: ComputedMetricId, lens: PanelLens): boolean {
+  return METRIC_LENSES[id].includes(lens);
+}
+
+/**
+ * The event kinds a lens narrows a node over each source to, before the kinds
+ * are narrowed again to what the capture reports.
+ *
+ * The component lens reads the event log as the render and state record the
+ * render views summarise, so the log shows the evidence beneath them rather
+ * than every request and paint of the capture. A source absent here is not
+ * narrowed by the lens.
+ */
+const LENS_SOURCE_KINDS: Readonly<Record<PanelLens, Readonly<Record<string, readonly string[]>>>> =
+  Object.freeze({
+    timing: Object.freeze({}),
+    component: Object.freeze({ events: ['render', 'state'] }),
+    requests: Object.freeze({}),
+  });
+
+/**
+ * The event kinds a lens draws a trace-shaped view over as one flat time axis,
+ * for a lens whose evidence spans many traces.
+ *
+ * A request panel is about requests an interaction did *not* cause alone — a
+ * refetch loop, a double mount — so no single correlated trace holds them, and
+ * a view designed around one trace would show whichever trace happened to be
+ * the capture's longest. Such a view is drawn instead over the flat span list
+ * of the requests and the page's commits, in start order: the requests plotted
+ * against the renders that issued them. Commits rather than component renders,
+ * because one commit stands for every render of a pass and so keeps the axis
+ * readable however many components re-rendered. Only a view that declares the
+ * flat `spans` source as its alternative is drawn this way; one that can read
+ * nothing but a trace tree is left out.
+ */
+const LENS_FLAT_TRACE_KINDS: Readonly<Partial<Record<PanelLens, readonly string[]>>> =
+  Object.freeze({
+    requests: ['fetch', 'xhr', 'commit'],
+  });
+
+/** The source a trace-shaped view reads when a lens flattens it. */
+const FLAT_TRACE_SOURCE = 'spans';
+
+/** The source whose unit is a correlated trace. */
+const TRACE_SOURCE = 'trace';
+
+/** The order a flattened trace view lists its spans in: start order, as on a time axis. */
+const FLAT_TRACE_SORT = 'start_asc';
 
 /**
  * Sources a detected pattern admits into the lens it is read through, beyond
@@ -4460,12 +6427,14 @@ const PATTERN_ADMITTED_SOURCES: Readonly<Record<EvidencePattern, readonly string
     'unchanged-input-renders': [],
     'dominant-span': [],
     'repeated-query-shape': [],
+    'context-change-renders': [],
   });
 
 /** The aggregate fields a leaf's location is read from under each lens, in probe order. */
 const LENS_LOCATION_FIELDS: Readonly<Record<PanelLens, readonly string[]>> = Object.freeze({
   timing: ['spans', 'topSpans', 'queries', 'requests'],
   component: ['renders', 'stateTransitions'],
+  requests: ['requests', 'renders'],
 });
 
 /**
@@ -4492,8 +6461,49 @@ function panelLens(
     isMaterialSource('componentTree', counts) ||
     isMaterialSource('stateTransitions', counts);
   const timingDominates =
-    patterns.includes('dominant-span') && !patterns.includes('unchanged-input-renders');
+    patterns.includes('dominant-span') &&
+    !patterns.includes('unchanged-input-renders') &&
+    !patterns.includes('context-change-renders');
   return rendered && !crossedNetwork && !timingDominates ? 'component' : 'timing';
+}
+
+/**
+ * Whether a lens has anything of its own to show in this capture: a source
+ * that belongs to it, other than the shared metrics, is material.
+ *
+ * @param lens A lens.
+ * @param counts The per-source counts of the context.
+ * @returns `true` when at least one of the lens's sources is material.
+ */
+function lensHasMaterial(lens: PanelLens, counts: ReadonlyMap<string, number>): boolean {
+  for (const source of sortStrings(Object.keys(SOURCE_LENSES))) {
+    if (SOURCE_LENSES[source]?.includes(lens) === true && isMaterialSource(source, counts)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The lens a panel is composed through: the one its classified category names,
+ * while that lens has material in the capture; otherwise the one the capture's
+ * own numbers select ({@link panelLens}).
+ *
+ * @param category The category the context carried, if any.
+ * @param counts The per-source counts of the context.
+ * @param patterns The evidence patterns the capture exhibits.
+ * @returns The lens.
+ */
+function composedLens(
+  category: string | undefined,
+  counts: ReadonlyMap<string, number>,
+  patterns: readonly EvidencePattern[],
+): PanelLens {
+  const named = categoryProfile(category)?.lens;
+  if (named !== undefined && lensHasMaterial(named, counts)) {
+    return named;
+  }
+  return panelLens(counts, patterns);
 }
 
 /**
@@ -4505,8 +6515,10 @@ function panelLens(
  * @returns `true` when the source is the lens's own, admitted, or unknown here.
  */
 function lensAdmits(source: string, lens: PanelLens, admitted: ReadonlySet<string>): boolean {
-  const owner = SOURCE_LENS[source];
-  return owner === undefined || owner === lens || admitted.has(source);
+  // An own-property read: a catalog is context data, and a source spelled like
+  // an inherited member must read as unknown rather than reach the prototype.
+  const owners = Object.hasOwn(SOURCE_LENSES, source) ? SOURCE_LENSES[source] : undefined;
+  return owners === undefined || owners.includes(lens) || admitted.has(source);
 }
 
 /**
@@ -4530,15 +6542,35 @@ function locationLineKey(location: SourceLocation): string {
 const COMPONENT_WORK_KINDS: ReadonlySet<string> = new Set(['render', 'commit', 'state']);
 
 /**
+ * Differently-named operations located at one line before that line counts as
+ * a shared helper rather than the site of any one of them.
+ *
+ * A request helper that every call of an application routes through is where
+ * each of those calls is located when a resolver stops at the innermost
+ * project frame, so its line is shared by operations with different names —
+ * different endpoints, different statements. Sending a developer there sends
+ * them to plumbing, not to the operation that took the time.
+ */
+const SHARED_HELPER_MIN_OPERATIONS = 2;
+
+/** One located node of the timing lens's aggregates. */
+interface TimingLocatedNode {
+  /** Where it is. */
+  readonly location: SourceLocation;
+  /** The operation it names: its name, statement or address; empty when it names none. */
+  readonly name: string;
+}
+
+/**
  * The located nodes of the timing lens's aggregates, in probe order: every
  * operation, query and request the context carries a location for, except
  * operations of a {@link COMPONENT_WORK_KINDS} kind.
  *
  * @param aggregates The capture-aggregate bag.
- * @returns The locations, first probed first.
+ * @returns The located nodes, first probed first.
  */
-function timingLocatedNodes(aggregates: JsonObject): readonly SourceLocation[] {
-  const locations: SourceLocation[] = [];
+function timingLocatedNodes(aggregates: JsonObject): readonly TimingLocatedNode[] {
+  const located: TimingLocatedNode[] = [];
   for (const field of LENS_LOCATION_FIELDS.timing) {
     for (const node of asObjectArray(aggregates[field]) ?? []) {
       const kind = asString(node.kind);
@@ -4547,11 +6579,15 @@ function timingLocatedNodes(aggregates: JsonObject): readonly SourceLocation[] {
       }
       const location = readSourceLocation(node);
       if (location !== undefined) {
-        locations.push(location);
+        const name =
+          asString(
+            readField(node, 'name', 'operation', 'label', 'statement', 'url', 'endpoint', 'path'),
+          ) ?? '';
+        located.push({ location, name });
       }
     }
   }
-  return locations;
+  return located;
 }
 
 /**
@@ -4561,7 +6597,50 @@ function timingLocatedNodes(aggregates: JsonObject): readonly SourceLocation[] {
  * @returns The `file:line` keys of {@link timingLocatedNodes}.
  */
 function timingEvidenceLines(aggregates: JsonObject): ReadonlySet<string> {
-  return new Set(timingLocatedNodes(aggregates).map(locationLineKey));
+  return new Set(timingLocatedNodes(aggregates).map((node) => locationLineKey(node.location)));
+}
+
+/**
+ * The lines {@link SHARED_HELPER_MIN_OPERATIONS} or more differently-named
+ * operations are located at. Unnamed nodes are not counted: nothing says they
+ * are different operations.
+ *
+ * @param nodes The located nodes of the timing lens.
+ * @returns The `file:line` keys of shared helpers.
+ */
+function sharedHelperLines(nodes: readonly TimingLocatedNode[]): ReadonlySet<string> {
+  const namesByLine = new Map<string, Set<string>>();
+  for (const node of nodes) {
+    if (node.name.length === 0) {
+      continue;
+    }
+    const key = locationLineKey(node.location);
+    const names = namesByLine.get(key) ?? new Set<string>();
+    names.add(node.name);
+    namesByLine.set(key, names);
+  }
+  const shared = new Set<string>();
+  for (const [key, names] of namesByLine) {
+    if (names.size >= SHARED_HELPER_MIN_OPERATIONS) {
+      shared.add(key);
+    }
+  }
+  return shared;
+}
+
+/**
+ * The location a timing panel falls back to when no cause supplied one: the
+ * first located timing node that is not a shared helper
+ * ({@link sharedHelperLines}), else the first located timing node.
+ *
+ * @param aggregates The capture-aggregate bag.
+ * @returns The location, or `undefined` when no timing node is located.
+ */
+function timingFallbackLocation(aggregates: JsonObject): SourceLocation | undefined {
+  const nodes = timingLocatedNodes(aggregates);
+  const shared = sharedHelperLines(nodes);
+  const own = nodes.find((node) => !shared.has(locationLineKey(node.location)));
+  return (own ?? nodes[0])?.location;
 }
 
 /**
@@ -4583,6 +6662,42 @@ function locationLens(location: SourceLocation, timingLines: ReadonlySet<string>
 }
 
 /**
+ * The lens a likely cause belongs to.
+ *
+ * The kinds of the events it cites decide first, because they say what the
+ * cause is about whatever the panel context happens to locate: a cause citing
+ * a query, a request or a server span is about timing, and one citing only
+ * renders, commits and state updates is about component work. The panel
+ * context's query and request rows carry no location, so a cause located at a
+ * statement's call site would find nothing to corroborate it and would read as
+ * a component cause. A cause that cites no kind — the model path may omit one —
+ * is classified by line corroboration ({@link locationLens}). Only kinds of the
+ * product's vocabulary ({@link EVIDENCE_REF_KINDS}) count.
+ *
+ * @param cause The likely-cause record from the analysis.
+ * @param location Its validated suggested location.
+ * @param timingLines The lines {@link timingEvidenceLines} reports.
+ * @returns The lens.
+ */
+function causeLens(
+  cause: JsonObject,
+  location: SourceLocation,
+  timingLines: ReadonlySet<string>,
+): PanelLens {
+  const kinds: string[] = [];
+  for (const reference of asObjectArray(cause['evidence']) ?? []) {
+    const kind = asString(reference['kind']);
+    if (kind !== undefined && EVIDENCE_REF_KINDS.has(kind)) {
+      kinds.push(kind);
+    }
+  }
+  if (kinds.length === 0) {
+    return locationLens(location, timingLines);
+  }
+  return kinds.every((kind) => COMPONENT_WORK_KINDS.has(kind)) ? 'component' : 'timing';
+}
+
+/**
  * The location a leaf node would point at, when the context supplies a usable
  * one for the active lens.
  *
@@ -4590,30 +6705,55 @@ function locationLens(location: SourceLocation, timingLines: ReadonlySet<string>
  * chosen as the most useful place to send a developer — but only a location of
  * the lens the panel is composed through, so a latency panel never sends the
  * developer to a component that merely re-rendered during the interaction and a
- * rendering panel never to a query. Failing that, the lens's own aggregates are
- * read in a fixed order so the answer does not depend on which bag happened to
- * be probed first.
+ * rendering panel never to a query. A cause's lens is read from the kinds of
+ * the events it cites ({@link causeLens}), and the first cause in the
+ * analysis's own order whose lens the panel admits supplies the location: the
+ * active lens, or a lens whose sources a detected pattern admits
+ * ({@link PATTERN_ADMITTED_SOURCES}) — repeated identical requests admit the
+ * component work that initiates them, so the panel for that pattern follows
+ * its own leading cause to the initiating code rather than passing it over for
+ * a lesser one. Failing that, the lens's own aggregates are read in a fixed
+ * order so the answer does not depend on which bag happened to be probed
+ * first, and a timing panel passes over a shared helper's line for an
+ * operation's own ({@link timingFallbackLocation}).
  *
  * @param root The structured context.
  * @param lens The active lens.
+ * @param admitted Sources the detected patterns admit in addition to the lens's own.
  * @returns The validated location, or `undefined`.
  */
-function readSuggestedLocation(root: JsonObject, lens: PanelLens): SourceLocation | undefined {
+function readSuggestedLocation(
+  root: JsonObject,
+  lens: PanelLens,
+  admitted: ReadonlySet<string>,
+): SourceLocation | undefined {
   const aggregates = aggregatesBag(root);
   const timingLines = timingEvidenceLines(aggregates);
+  const admittedLenses = new Set<PanelLens>([lens]);
+  for (const source of admitted) {
+    const owners = Object.hasOwn(SOURCE_LENSES, source) ? SOURCE_LENSES[source] : undefined;
+    for (const owner of owners ?? []) {
+      admittedLenses.add(owner);
+    }
+  }
 
   const analysis = analysisBag(root);
   for (const cause of asObjectArray(readField(analysis ?? root, 'likelyCauses', 'causes')) ?? []) {
     const location = readSourceLocation(cause);
-    if (location !== undefined && locationLens(location, timingLines) === lens) {
+    // A request panel spans both halves — the call site of a request and the
+    // component that issued it — so any located cause is its own.
+    if (
+      location !== undefined &&
+      (lens === 'requests' || admittedLenses.has(causeLens(cause, location, timingLines)))
+    ) {
       return location;
     }
   }
 
   if (lens === 'timing') {
-    return timingLocatedNodes(aggregates)[0];
+    return timingFallbackLocation(aggregates);
   }
-  for (const field of LENS_LOCATION_FIELDS.component) {
+  for (const field of LENS_LOCATION_FIELDS[lens]) {
     for (const node of asObjectArray(aggregates[field]) ?? []) {
       const location = readSourceLocation(node);
       if (location !== undefined) {
@@ -4632,7 +6772,8 @@ function readSuggestedLocation(root: JsonObject, lens: PanelLens): SourceLocatio
  * counts, renders with unchanged inputs by the render counts that qualify them
  * (the undetermined-trigger count is the complement that keeps "unchanged"
  * honest), a repeated statement shape by the query count and database time,
- * and a dominant operation by the total it dominates. Keyed by the shared
+ * a dominant operation by the total it dominates, and a context cascade by the
+ * render count with its undetermined-trigger complement. Keyed by the shared
  * {@link EvidencePattern} vocabulary so a new pattern without an entry is a
  * compile error.
  */
@@ -4646,12 +6787,13 @@ const PATTERN_METRIC_IDS: Readonly<Record<EvidencePattern, readonly ComputedMetr
     ],
     'repeated-query-shape': ['query_count', 'database_duration'],
     'dominant-span': ['total_duration'],
+    'context-change-renders': ['render_count', 'render_trigger_unknown_count'],
   });
 
 /**
  * The metric ids a card node should name.
  *
- * Only the active lens's metrics ({@link METRIC_LENS}) are candidates. The
+ * Only the active lens's metrics ({@link METRIC_LENSES}) are candidates. The
  * first {@link MAX_METRIC_CARDS} reported ones of {@link COMPUTED_METRIC_IDS}
  * — intersected with the entry's own constraint where it declares one — are
  * the headline row, in the tuple's order. Every further reported candidate
@@ -4677,7 +6819,7 @@ function metricCardIds(
   const permitted = new Set(entry.metrics);
   const reported = COMPUTED_METRIC_IDS.filter(
     (id) =>
-      METRIC_LENS[id] === lens &&
+      metricInLens(id, lens) &&
       reading.values.has(id) &&
       (permitted.size === 0 || permitted.has(id)),
   );
@@ -4699,7 +6841,20 @@ function metricCardIds(
  * @returns The kinds, ordered and capped.
  */
 function filterKindsFor(entry: CatalogEntryView, root: JsonObject): readonly string[] {
-  if (entry.kinds.length === 0) {
+  return reportedKindsAmong(entry.kinds, root);
+}
+
+/**
+ * The members of a list of event kinds the capture reports, in the list's
+ * order and capped; the whole list when the capture reports no kinds at all,
+ * because a context that tallies nothing has not said the kinds are absent.
+ *
+ * @param kinds Candidate kinds, in preference order.
+ * @param root The structured context.
+ * @returns The reported kinds, ordered and capped; empty for an empty list.
+ */
+function reportedKindsAmong(kinds: readonly string[], root: JsonObject): readonly string[] {
+  if (kinds.length === 0) {
     return [];
   }
   const aggregates = aggregatesBag(root);
@@ -4714,9 +6869,84 @@ function filterKindsFor(entry: CatalogEntryView, root: JsonObject): readonly str
     }
   }
 
-  const kinds =
-    reported.size === 0 ? entry.kinds : entry.kinds.filter((kind) => reported.has(kind));
-  return kinds.slice(0, MAX_FILTER_KINDS);
+  const narrowed = reported.size === 0 ? kinds : kinds.filter((kind) => reported.has(kind));
+  return narrowed.slice(0, MAX_FILTER_KINDS);
+}
+
+/**
+ * The tiers a capture recorded nothing in, when it reports per-tier counts.
+ *
+ * Read from the aggregates' `tierCounts` tally — the one field that says a tier
+ * is *absent* rather than merely unmentioned. A context without the tally
+ * reports no silent tier, because silence about a tier is not evidence that it
+ * was silent.
+ *
+ * @param root The structured context.
+ * @returns The silent tiers, in {@link TIER_DURATION_METRICS} order.
+ */
+function silentTiers(root: JsonObject): readonly string[] {
+  const tally = readObjectField(aggregatesBag(root), 'tierCounts', 'countsByTier');
+  if (tally === undefined) {
+    return [];
+  }
+  const silent: string[] = [];
+  for (const tier of Object.keys(TIER_DURATION_METRICS)) {
+    const count = asCount(tally[tier]);
+    if (count !== undefined && count === 0) {
+      silent.push(tier);
+    }
+  }
+  return silent;
+}
+
+/**
+ * The kinds a lens narrows a source to ({@link LENS_SOURCE_KINDS}).
+ *
+ * @param lens The active lens.
+ * @param source A data source name from a catalog entry.
+ * @returns The lens's kinds for the source; empty when the lens does not narrow it.
+ */
+function lensKindsFor(lens: PanelLens, source: string): readonly string[] {
+  const bySource = LENS_SOURCE_KINDS[lens];
+  // An own-property read, for the reason given at `lensAdmits`.
+  return Object.hasOwn(bySource, source) ? (bySource[source] ?? []) : [];
+}
+
+/**
+ * A trace-shaped view drawn over the flat span list of a lens's kinds, or
+ * `undefined` when the entry cannot read the flat list or the capture holds
+ * none of those kinds.
+ *
+ * The node carries the kinds the capture reports among the lens's own — never
+ * a trace filter, since the point is to span every trace — and the start
+ * order a time axis reads in, with the entry's declared limit when it has one.
+ *
+ * @param entry A catalog entry whose primary source is the trace.
+ * @param kinds The lens's flat-axis kinds ({@link LENS_FLAT_TRACE_KINDS}).
+ * @param counts The per-source counts of the context.
+ * @param root The structured context.
+ * @returns The authored node, or `undefined`.
+ */
+function flatTraceNode(
+  entry: CatalogEntryView,
+  kinds: readonly string[],
+  counts: ReadonlyMap<string, number>,
+  root: JsonObject,
+): JsonObject | undefined {
+  if (!entry.sources.includes(FLAT_TRACE_SOURCE) || !isMaterialSource(FLAT_TRACE_SOURCE, counts)) {
+    return undefined;
+  }
+  const reported = reportedKindsAmong(kinds, root);
+  if (reported.length === 0) {
+    return undefined;
+  }
+  return {
+    type: entry.type,
+    source: FLAT_TRACE_SOURCE,
+    filter: { kinds: [...reported] },
+    sort: FLAT_TRACE_SORT,
+    ...(entry.limit !== undefined ? { limit: entry.limit } : {}),
+  };
 }
 
 /**
@@ -4727,9 +6957,11 @@ function filterKindsFor(entry: CatalogEntryView, root: JsonObject): readonly str
  * the panel's non-evidentiary headline, and a string can never become an
  * observed fact — the panel's facts and causes are copied by the panel
  * normaliser from the validated analysis, which is what keeps the evidence rule
- * intact across the boundary. The layout is the catalog entries of the
- * capture's evidence lens ({@link panelLens}) whose declared sources the
- * capture has material for, in the catalog's own order.
+ * intact across the boundary. The layout is the catalog entries of the panel's
+ * lens ({@link composedLens}: the classified category's, else the capture's
+ * evidence lens) whose declared sources the capture has material for, in the
+ * catalog's own order; the headline of a timing panel also names any tier the
+ * capture recorded nothing in.
  *
  * @param input The structured context of a panel-generation request.
  * @returns The specification in its authoring shape, or `undefined` when the
@@ -4749,9 +6981,12 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
   const traceId = readTraceId(root);
   // The patterns the capture's numbers form, detected exactly as the analysis
   // detects them, so the metric cards quantify what the analysis explains.
-  const patterns = causeDetections(root, spans, totalMs).map((detection) => detection.pattern);
-  const lens = panelLens(counts, patterns);
+  const patterns = causeDetections(root, reading, spans, totalMs).map(
+    (detection) => detection.pattern,
+  );
+  const lens = composedLens(understanding.category, counts, patterns);
   const admitted = new Set(patterns.flatMap((pattern) => PATTERN_ADMITTED_SOURCES[pattern]));
+  const flatTraceKinds = LENS_FLAT_TRACE_KINDS[lens];
 
   const catalog = [...readNodeCatalog(root)].sort((left, right) =>
     left.index === right.index ? compareStrings(left.type, right.type) : left.index - right.index,
@@ -4772,6 +7007,21 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
     // whose fallback source happens to be populated (a span table over the
     // event log, say) cannot cross into the other lens's panel.
     const primary = entry.sources[0];
+    // A trace-shaped view under a lens that reads many traces at once is drawn
+    // over the flat span list of that lens's kinds instead (see
+    // `LENS_FLAT_TRACE_KINDS`), or left out when it can read nothing else.
+    if (
+      primary === TRACE_SOURCE &&
+      flatTraceKinds !== undefined &&
+      !lensAdmits(TRACE_SOURCE, lens, admitted)
+    ) {
+      const node = flatTraceNode(entry, flatTraceKinds, counts, root);
+      if (node !== undefined) {
+        emittedTypes.add(entry.type);
+        layout.push(node);
+      }
+      continue;
+    }
     if (
       primary !== undefined &&
       primary !== METRICS_SOURCE &&
@@ -4799,7 +7049,7 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
       if (!entry.wantsLocation) {
         continue;
       }
-      const location = readSuggestedLocation(root, lens);
+      const location = readSuggestedLocation(root, lens, admitted);
       if (location === undefined) {
         continue;
       }
@@ -4808,12 +7058,18 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
       continue;
     }
 
-    const kinds = filterKindsFor(entry, root);
+    // The lens narrows a source it reads through a fixed kind set (the render
+    // views' event log, say) whatever the catalog declares about filters, since
+    // every query accepts a kinds filter; otherwise the entry's own declared
+    // kinds and the capture's trace apply where the entry declares filters.
+    const lensKinds = reportedKindsAmong(lensKindsFor(lens, source), root);
+    const kinds =
+      lensKinds.length > 0 ? lensKinds : entry.supportsFilter ? filterKindsFor(entry, root) : [];
     const filter: JsonObject = {
-      ...(traceId !== undefined ? { traceId } : {}),
+      ...(entry.supportsFilter && traceId !== undefined ? { traceId } : {}),
       ...(kinds.length > 0 ? { kinds: [...kinds] } : {}),
     };
-    const hasFilter = entry.supportsFilter && Object.keys(filter).length > 0;
+    const hasFilter = Object.keys(filter).length > 0;
 
     emittedTypes.add(entry.type);
     layout.push({
@@ -4830,7 +7086,7 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
   const countedNouns: CountedNoun[] = [];
   for (const id of COMPUTED_METRIC_IDS) {
     const value = reading.values.get(id);
-    if (value === undefined || METRIC_LENS[id] !== lens || !Object.hasOwn(METRIC_COUNT_NOUNS, id)) {
+    if (value === undefined || !metricInLens(id, lens) || !Object.hasOwn(METRIC_COUNT_NOUNS, id)) {
       continue;
     }
     if (countedNouns.length >= MAX_METRIC_CARDS) {
@@ -4839,7 +7095,12 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
     countedNouns.push({ count: value, noun: metricCountNoun(id) });
   }
 
-  const summary = material ? panelSummaryHeadline(countedNouns, totalMs) : EMPTY_CAPTURE_NOTICE;
+  // A timing panel's views cover every tier, so a tier the capture recorded
+  // nothing in is named rather than left to read as a missing view.
+  const silent = lens === 'timing' ? silentTiers(root).map(telemetryTierLabel) : [];
+  const summary = material
+    ? panelSummaryHeadline(countedNouns, totalMs, silent)
+    : EMPTY_CAPTURE_NOTICE;
 
   return {
     title: panelTitle(
@@ -4876,25 +7137,245 @@ const SOURCE_CAPTURE_SIGNALS: Readonly<Record<string, readonly string[]>> = Obje
 });
 
 /**
+ * Captured signals that never vouch for the sibling signals of their hook.
+ *
+ * A captured signal proves its hook was live only when that hook is the one
+ * producer that reports it. Errors are reported both by the page-error
+ * listeners perf-tracking arms and by the server preload (`error`,
+ * `server.error`), and outbound requests both by the page's fetch/XHR patch and
+ * by the server's HTTP-client instrumentation (`fetch`, `xhr`, `http.client`):
+ * a recorded member of either proves no particular hook was armed, so neither
+ * makes a sibling signal count as captured.
+ */
+const SHARED_PRODUCER_SIGNALS: ReadonlySet<string> = new Set(['errors', 'fetch']);
+
+/**
+ * The telemetry kinds a capture summary recorded at least one event of.
+ *
+ * Read from the summary's per-kind tally, `kindCounts`, which the telemetry
+ * package's `computeCaptureSummary` zero-fills over the whole telemetry-kind
+ * vocabulary: a kind counted zero times is a hook that recorded nothing, which
+ * is exactly a gap, and a kind counted at least once is evidence the capture
+ * holds. Keys are read in sorted order and counts through {@link asCount}, so a
+ * negative, fractional-garbage or non-numeric tally reads as nothing recorded.
+ *
+ * @param bag The capture bag of the context, when it carried one.
+ * @returns The recorded kinds, ascending; empty when no tally was carried.
+ */
+function readRecordedKinds(bag: JsonObject | undefined): string[] {
+  const tally = readObjectField(bag, 'kindCounts');
+  if (tally === undefined) {
+    return [];
+  }
+  const kinds: string[] = [];
+  for (const kind of sortedKeys(tally)) {
+    const count = asCount(tally[kind]);
+    if (count !== undefined && count > 0) {
+      kinds.push(kind);
+    }
+  }
+  return kinds;
+}
+
+/**
+ * The signals the hooks that demonstrably recorded evidence also collected.
+ *
+ * One action type arms one hook set, and that hook set records every signal
+ * {@link SIGNAL_ACTION_TYPES} lists for it: react-render-tracking both the
+ * renders and the component tree, perf-tracking both the performance entries
+ * and the page errors, server-span both the request span and the route-handler
+ * spans one server tracer records beneath it, db-query-tracking both drivers. A
+ * hook that recorded one of its signals was therefore live for the whole
+ * capture, and a sibling signal it recorded nothing for was genuinely absent
+ * from the interaction rather than unobserved — which is evidence the existing
+ * capture already holds, not a gap.
+ *
+ * Still conservative, and deliberately so: liveness comes from events the
+ * capture actually recorded, never from what the plan installed. A hook the
+ * plan asked for that recorded nothing vouches for nothing, and a signal more
+ * than one producer reports ({@link SHARED_PRODUCER_SIGNALS}) vouches for no
+ * hook at all.
+ *
+ * @param captured The signals the capture recorded directly.
+ * @returns Every signal a live hook covers, ascending; a superset of the
+ * vouching members of `captured`.
+ */
+function liveHookSignals(captured: ReadonlySet<string>): string[] {
+  const live = new Set<ActionTypeId>();
+  for (const signal of sortStrings([...captured])) {
+    if (SHARED_PRODUCER_SIGNALS.has(signal)) {
+      continue;
+    }
+    for (const type of SIGNAL_ACTION_TYPES[signal] ?? []) {
+      live.add(type);
+    }
+  }
+  const covered: string[] = [];
+  for (const signal of sortStrings(Object.keys(SIGNAL_ACTION_TYPES))) {
+    if ((SIGNAL_ACTION_TYPES[signal] ?? []).some((type) => live.has(type))) {
+      covered.push(signal);
+    }
+  }
+  return covered;
+}
+
+/** What the installed plan already applies, in the views the follow-up decision reads. */
+interface InstalledActionsView {
+  /** `file|symbol|type` of every installed action. */
+  readonly keys: ReadonlySet<string>;
+  /** Every installed action type, whatever it targets. */
+  readonly types: ReadonlySet<string>;
+  /**
+   * `file|symbol` of every declaration an installed action already wraps with
+   * a timing ({@link TARGET_REQUIRED_TYPES}): a declaration is measured once,
+   * whichever of the two timings measures it.
+   */
+  readonly timed: ReadonlySet<string>;
+}
+
+/**
+ * Reads the actions the installed plan already applies.
+ *
+ * The plan bag is probed as `plan`, `latestPlan` then `currentPlan`, and the
+ * root is read as well for a context that lists its installed actions beside
+ * the plan rather than inside it. A targetless runtime action reads like any
+ * other: its `.` file and `*` symbol are a valid project path and symbol.
+ *
+ * @param root The structured context.
+ * @returns The installed keys, types and timed declarations; empty when no plan
+ * was carried.
+ */
+function readInstalledActions(root: JsonObject): InstalledActionsView {
+  const keys = new Set<string>();
+  const types = new Set<string>();
+  const timed = new Set<string>();
+  for (const bag of [readObjectField(root, 'plan', 'latestPlan', 'currentPlan'), root]) {
+    for (const action of readObjectArrayField(
+      bag,
+      'instrumentationTargets',
+      'installedActions',
+      'actions',
+      'targets',
+    ) ?? []) {
+      const file = asProjectPath(readField(action, 'file', 'path'));
+      const symbol = asString(readField(action, 'symbol', 'name'));
+      const type = asString(readField(action, 'type', 'actionType'));
+      if (file !== undefined && symbol !== undefined && type !== undefined) {
+        keys.add(`${file}|${symbol}|${type}`);
+        types.add(type);
+        if (TARGET_REQUIRED_TYPES.has(type)) {
+          timed.add(`${file}|${symbol}`);
+        }
+      }
+    }
+  }
+  return { keys, types, timed };
+}
+
+/**
+ * The timing a declaration named by the follow-up asks for, when it asks for
+ * one.
+ *
+ * A follow-up context carries, as its `candidates`, the declarations its
+ * wording named, already resolved through the code graph — the lexical lookup
+ * happens in the stage, never here, so this reads structure only. A
+ * declaration whose kind's **first** preference in
+ * {@link CODE_KIND_ACTION_TYPES} is a timing (a plain function or a server
+ * function: `function-timing`; a route handler: `server-span`) is one whose
+ * evidence only a wrapper can collect, so naming it asks for that wrapper. A
+ * kind whose first preference is a runtime hook — a component, an event
+ * handler, an outbound call, a query site — asks for nothing here: its evidence
+ * comes from the hook, which the gap rule arms when it is missing. A kind the
+ * graph did not report, or a symbol that does not spell a declaration (see
+ * {@link isDeclarationSpelling}, already applied to `actionTypes`), asks for
+ * nothing either.
+ *
+ * @param candidate One graph-resolved declaration of the context.
+ * @param catalog The catalog view; the timing must be one it claims.
+ * @returns The timing action type, or `undefined`.
+ */
+function namedDeclarationTimingType(
+  candidate: CandidateView,
+  catalog: AdapterCatalogView,
+): ActionTypeId | undefined {
+  const preference = Object.hasOwn(CODE_KIND_ACTION_TYPES, candidate.kind)
+    ? CODE_KIND_ACTION_TYPES[candidate.kind]
+    : undefined;
+  const first = preference?.[0];
+  if (first === undefined || !TARGET_REQUIRED_TYPES.has(first)) {
+    return undefined;
+  }
+  return candidate.actionTypes.find(
+    (type) => TARGET_REQUIRED_TYPES.has(type) && catalog.claimed.has(type),
+  );
+}
+
+/**
+ * The page- or process-wide runtime action that collects a signal, when the
+ * catalog claims one.
+ *
+ * The follow-up counterpart of the reservation {@link buildPlanInput} makes for
+ * every needed signal: the first action type in the signal's preference list
+ * the catalog claims, installs as a runtime hook and does not require a named
+ * target.
+ *
+ * @param signal A capture signal.
+ * @param catalog The catalog view.
+ * @returns The runtime action type, or `undefined` when only a target-requiring
+ * action (or none) collects the signal.
+ */
+function runtimeActionTypeFor(
+  signal: string,
+  catalog: AdapterCatalogView,
+): ActionTypeId | undefined {
+  return (SIGNAL_ACTION_TYPES[signal] ?? []).find(
+    (candidate) =>
+      catalog.claimed.has(candidate) &&
+      isRuntimeActionType(candidate, catalog) &&
+      !TARGET_REQUIRED_TYPES.has(candidate),
+  );
+}
+
+/**
  * Builds the follow-up decision of a request from its structured context.
  *
  * The decision is made from what the context reports about the **existing**
  * capture: the signals it asked for against the signals it recorded, the gaps
- * it names explicitly, and whether its aggregates carry anything at all. The
- * new request's wording plays no part — it is not read, and the dispatch cannot
- * supply it.
+ * it names explicitly, and whether it recorded anything at all — and from the
+ * declarations the context's `candidates` name, which the stage resolved
+ * through the code graph before the request was built. The new request's
+ * wording plays no part — it is not read, and the dispatch cannot supply it —
+ * so two phrasings that name the same declaration answer identically.
  *
- * Two outcomes, both additive by construction:
+ * ## What counts as captured
+ *
+ * The union of the signal lists a context names explicitly, the signals of the
+ * telemetry kinds the capture summary's `kindCounts` tally recorded at least
+ * one event of (read through {@link SIGNAL_ALIASES}), the signals of the
+ * populated aggregate sources ({@link SOURCE_CAPTURE_SIGNALS}), and the sibling
+ * signals of every hook that demonstrably recorded evidence
+ * ({@link liveHookSignals}). A capture whose summary reports zero events, or
+ * whose context carries nothing material at all, is an empty capture.
+ *
+ * ## Two outcomes, both additive by construction
  *
  * - Nothing missing, so the existing evidence is re-analysed with no new
  *   instrumentation. That is the smallest safe answer, and it is the one an
- *   unknown context gets: a context that carries no capture bag at all reports
- *   no gap, and asking for instrumentation on no information would modify a
- *   developer's project for nothing.
- * - A signal genuinely absent, so a new capture is asked for along with the
- *   actions that would collect it. Only actions the catalog claims, only
- *   actions the context does not report as already installed, and never a
- *   removal — a follow-up plan is the previous plan plus these.
+ *   unknown context gets: asking for instrumentation on no information would
+ *   modify a developer's project for nothing.
+ * - A signal genuinely absent, an empty capture, or a named declaration only a
+ *   wrapper can measure that no installed timing wraps, so a new capture is
+ *   asked for along with the actions that would collect what is missing. A gap
+ *   a runtime hook collects gets one targetless action of that hook's type —
+ *   the hook observes the whole page or process — unless the plan already
+ *   installs an action of that type, in which case the hook is already armed
+ *   and nothing is added. A named declaration gets the timing its kind asks
+ *   for ({@link namedDeclarationTimingType}). A gap only a target-requiring
+ *   action collects is attached to the candidates the context names. Only
+ *   actions the catalog claims, never one the plan already installs, never a
+ *   second timing of a declaration already timed, at most
+ *   {@link MAX_ADDITIONAL_ACTIONS}, and never a removal — a follow-up plan is
+ *   the previous plan plus these.
  *
  * @param input The structured context of a follow-up request.
  * @returns The decision as plain JSON, or `undefined` when the context is not
@@ -4911,11 +7392,13 @@ export function buildFollowUpDecision(input: JsonValue | undefined): JsonValue |
   const reading = readMetrics(root);
   const counts = readSourceCounts(root, reading);
   const captureBag = readObjectField(root, 'captureSummary', 'capture', 'latestCapture');
+  const recordedKinds = readRecordedKinds(captureBag);
 
   const captured = new Set<string>(
     canonicalSignals([
       ...readStringSet(captureBag, 'capturedSignals', 'signals', 'kinds'),
       ...readStringSet(root, 'capturedSignals'),
+      ...recordedKinds,
     ]),
   );
   for (const source of sortStrings(Object.keys(SOURCE_CAPTURE_SIGNALS))) {
@@ -4925,6 +7408,9 @@ export function buildFollowUpDecision(input: JsonValue | undefined): JsonValue |
     for (const signal of SOURCE_CAPTURE_SIGNALS[source] ?? []) {
       captured.add(signal);
     }
+  }
+  for (const signal of liveHookSignals(captured)) {
+    captured.add(signal);
   }
 
   const wanted = new Set<string>(understanding.signals);
@@ -4945,59 +7431,90 @@ export function buildFollowUpDecision(input: JsonValue | undefined): JsonValue |
   const gaps = sortStrings([...wanted].filter((signal) => !captured.has(signal)));
 
   // "Present but empty" is a finding; "absent" is not. Only a context that
-  // carried a capture bag, and reports nothing material in it, establishes that
-  // the capture itself yielded nothing.
+  // carried a capture bag, and reports nothing material in it — or whose
+  // summary counts no event at all — establishes that the capture itself
+  // yielded nothing.
   const capturePresent = captureBag !== undefined || counts.size > 0;
-  const material = [...counts.keys()].some((source) => isMaterialSource(source, counts));
-  const emptyCapture = capturePresent && !material;
+  const material =
+    recordedKinds.length > 0 ||
+    [...counts.keys()].some((source) => isMaterialSource(source, counts));
+  const reportedEvents = asCount(readField(captureBag, 'eventCount'));
+  const emptyCapture = capturePresent && (reportedEvents === 0 || !material);
 
-  const needsNewCapture = gaps.length > 0 || emptyCapture;
+  const installed = readInstalledActions(root);
+  const candidates = sortCandidates(readCandidates(root, understanding));
+
+  // A declaration the follow-up names that only a wrapper can measure, and
+  // that no installed timing already wraps, is evidence the stored capture
+  // cannot hold: its measurement is a new capture's.
+  const namedTimings: { readonly candidate: CandidateView; readonly type: ActionTypeId }[] = [];
+  for (const candidate of candidates) {
+    const type = namedDeclarationTimingType(candidate, catalog);
+    if (type !== undefined && !installed.timed.has(`${candidate.file}|${candidate.symbol}`)) {
+      namedTimings.push({ candidate, type });
+    }
+  }
+
+  const needsNewCapture = gaps.length > 0 || emptyCapture || namedTimings.length > 0;
   if (!needsNewCapture) {
     return { needsNewCapture: false, additionalActions: [] };
   }
 
-  const installed = new Set<string>();
-  for (const bag of [readObjectField(root, 'plan', 'latestPlan', 'currentPlan'), root]) {
-    for (const action of readObjectArrayField(
-      bag,
-      'instrumentationTargets',
-      'installedActions',
-      'actions',
-      'targets',
-    ) ?? []) {
-      const file = asProjectPath(readField(action, 'file', 'path'));
-      const symbol = asString(readField(action, 'symbol', 'name'));
-      const type = asString(readField(action, 'type', 'actionType'));
-      if (file !== undefined && symbol !== undefined && type !== undefined) {
-        installed.add(`${file}|${symbol}|${type}`);
-      }
+  const additionalActions: JsonObject[] = [];
+  const emitted = new Set<string>();
+  const emittedTimed = new Set<string>();
+  const propose = (file: string, symbol: string, type: ActionTypeId): void => {
+    const key = `${file}|${symbol}|${type}`;
+    const declaration = `${file}|${symbol}`;
+    const timing = TARGET_REQUIRED_TYPES.has(type);
+    if (
+      additionalActions.length >= MAX_ADDITIONAL_ACTIONS ||
+      installed.keys.has(key) ||
+      emitted.has(key) ||
+      (timing && (installed.timed.has(declaration) || emittedTimed.has(declaration)))
+    ) {
+      return;
+    }
+    emitted.add(key);
+    if (timing) {
+      emittedTimed.add(declaration);
+    }
+    additionalActions.push(instrumentationTarget(file, symbol, type));
+  };
+
+  // A gap a runtime hook collects: the hook observes the whole page or process,
+  // so one targetless action arms it — and a hook the plan already installs an
+  // action of is already armed, where a second action would collect nothing
+  // new. Runtime gaps are served first, as the plan reserves its hooks first, so
+  // a long candidate list can never crowd out the hooks a capture depends on.
+  for (const gap of gaps) {
+    const type = runtimeActionTypeFor(gap, catalog);
+    if (type !== undefined && !installed.types.has(type)) {
+      propose(TARGETLESS_ACTION_FILE, TARGETLESS_ACTION_SYMBOL, type);
     }
   }
 
-  const candidates = sortCandidates(readCandidates(root, understanding));
-  const additionalActions: JsonObject[] = [];
-  const emitted = new Set<string>();
+  // Each named declaration gets the one timing its kind asks for, in candidate
+  // order — a wrapped declaration's patch chains onto an earlier patch of the
+  // same file when an earlier plan version instrumented it.
+  for (const { candidate, type } of namedTimings) {
+    propose(candidate.file, candidate.symbol, type);
+  }
+
+  // A gap only an action on a named declaration collects is attached to the
+  // candidates the context names that support that action.
   for (const gap of gaps) {
-    if (additionalActions.length >= MAX_ADDITIONAL_ACTIONS) {
-      break;
+    if (runtimeActionTypeFor(gap, catalog) !== undefined) {
+      continue;
     }
     for (const type of SIGNAL_ACTION_TYPES[gap] ?? []) {
       if (!catalog.claimed.has(type)) {
         continue;
       }
       for (const candidate of candidates) {
-        if (additionalActions.length >= MAX_ADDITIONAL_ACTIONS) {
-          break;
+        if (candidate.actionTypes.includes(type)) {
+          propose(candidate.file, candidate.symbol, type);
         }
-        if (!candidate.actionTypes.includes(type)) {
-          continue;
-        }
-        const key = `${candidate.file}|${candidate.symbol}|${type}`;
-        if (installed.has(key) || emitted.has(key)) {
-          continue;
-        }
-        emitted.add(key);
-        additionalActions.push(instrumentationTarget(candidate.file, candidate.symbol, type));
       }
     }
   }

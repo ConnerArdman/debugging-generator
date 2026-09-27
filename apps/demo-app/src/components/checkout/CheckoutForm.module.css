@@ -8,10 +8,11 @@
  * What this stylesheet owns: the form's arrangement. The reset that lets the field groups sit
  * inside the one `<fieldset>` the form locks while an order is in flight, the vertical rhythm of
  * those titled groups, the two-column field grid and the single point at which it becomes one
- * column, the placement of the shipping, failure, placed-order, confirmation and submit regions,
- * and the two pieces of type it draws itself - the caption beside the place-order control and the
- * link out of the placed-order notice - plus the indicator that shows where focus landed when the
- * receipt replaced the fields.
+ * column, the placement of the error-summary, shipping, failure, placed-order, confirmation and
+ * submit regions, and the pieces of type it draws itself - the caption beside the place-order
+ * control, the link out of the placed-order notice (which the error summary's entries share) and
+ * the summary's lead and list - plus the indicator that shows where focus landed when the receipt
+ * replaced the fields.
  *
  * What it deliberately does not own - each of these belongs to the module of the component that
  * renders the element, and none of their properties is restated here:
@@ -160,6 +161,34 @@
   color: var(--ls-text-muted, #475569);
   font-size: var(--ls-text-sm, 13px);
   line-height: 1.5;
+}
+
+/* The error summary a refused validation pass shows at the top of the fields, and the element focus
+ * moves to when it appears. Placement only, as for the notices above: the alert inside owns the
+ * tone, border and padding. The scroll margin gives it the same room the failure notice takes when
+ * it is focused into view. */
+.errorSummary {
+  min-width: 0;
+  margin-block-end: var(--ls-space-4, 16px);
+  scroll-margin-block-start: var(--ls-space-5, 24px);
+}
+
+/* The sentence under the summary's heading: how many problems there are. Body copy at the notice's
+ * own size, with the list's rhythm beneath it. */
+.errorSummaryLead {
+  margin-block: 0 var(--ls-space-2, 8px);
+}
+
+/* The problems, one link per line. A real list so a screen reader announces how many entries
+ * there are; the marker is kept, because each entry is a separate problem and the bullets are what
+ * make a wrapped entry read as one item rather than two. The indent is one spacing step so the
+ * markers sit inside the alert's padding. Each link wears `.noticeLink`, the form's one link
+ * treatment, so the entries read as links by their underline rather than by colour. */
+.errorSummaryList {
+  display: grid;
+  gap: var(--ls-space-1, 4px);
+  margin: 0;
+  padding-inline-start: var(--ls-space-4, 16px);
 }
 
 /* Where an order this tab placed but never showed a receipt for is named, at the top of the form.

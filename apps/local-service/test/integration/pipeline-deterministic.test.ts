@@ -22,7 +22,9 @@
  *   by the service's own code-index loader, with the product's built-in adapter
  *   registry — the registry `startService` constructs. Each rejection code the
  *   pipeline can meet (`symbol-not-found`, `file-not-indexed`,
- *   `duplicate-action`) is driven through a persisted session, and the two it
+ *   `duplicate-action`) is driven through a persisted session — whose recorded
+ *   plan keeps only the feasible action, so no refusal reaches the installer
+ *   or a degradation row — and the two it
  *   cannot meet through the pipeline because an earlier gate refuses first
  *   (`path-outside-project`, `no-adapter`) are driven through the gate itself
  *   against real graphs, next to the earlier gate that refuses them.
@@ -88,6 +90,7 @@ import {
   ACTION_ID_PATTERN,
   AGENT_HOOK_KEYS,
   CAPTURE_SIGNALS,
+  DORMANT_AGENT_HOOK_CONFIG,
   FEASIBILITY_REJECTION_CODES,
   INSTRUMENTATION_ACTION_TYPES,
   INSTRUMENTATION_MARKERS,
@@ -139,7 +142,6 @@ import {
   PROGRESS_STATUSES,
   PROMPT_STAGE_KEYS,
   SESSION_STATUSES,
-  instrumentationFailedPayloadSchema,
   instrumentationPlanPayloadSchema,
   instrumentationReadyPayloadSchema,
   isMessageOfType,
@@ -161,7 +163,12 @@ import type { CodeIndexPort } from '../../src/pipeline/orchestrator.js';
 import { contextBoundResolver } from '../../src/pipeline/stages/plan.js';
 import type { PlanRejectionReason } from '../../src/pipeline/stages/plan.js';
 import { tokenizeQuestion } from '../../src/pipeline/stages/understand.js';
-import { buildInvestigationRows } from '../../src/sessions/progress.js';
+import { CODE_TOOL_LIMITS } from '../../src/pipeline/tools/code-tools.js';
+import {
+  CAPTURE_SIGNAL_LABELS,
+  PROGRESS_STAGE_GROUPS,
+  buildInvestigationRows,
+} from '../../src/sessions/progress.js';
 import type { ProgressEntry } from '../../src/store/sessions-repo.js';
 import {
   DEFAULT_FIXTURE_PROJECT,
@@ -256,8 +263,9 @@ const READY_STATUS = member(SESSION_STATUSES, 'ready');
 const GENERATED_STATUS = member(SESSION_STATUSES, 'generated');
 
 /** The statuses of a run that proceeded: installed, with or without a satisfied readiness gate. */
+const INSTRUMENTING_STATUS = member(SESSION_STATUSES, 'instrumenting');
 const PROCEEDING_STATUSES: readonly SessionStatus[] = Object.freeze([
-  member(SESSION_STATUSES, 'instrumenting'),
+  INSTRUMENTING_STATUS,
   READY_STATUS,
 ]);
 
@@ -866,6 +874,16 @@ function callsFor(run: SessionRun, stage: PromptStage): readonly ForwardedCall[]
   return run.calls.filter((call) => call.stage === stage);
 }
 
+/**
+ * A sequence with each run of equal consecutive entries collapsed onto its
+ * first: the stages a session asked the model, in order, however many turns
+ * each took — the investigate stage is asked once per query turn and once for
+ * its answer.
+ */
+function collapseRepeats<T>(values: readonly T[]): T[] {
+  return values.filter((value, index) => index === 0 || values[index - 1] !== value);
+}
+
 /** The session's `instrumentation.ready` payloads, validated against protocol's schema. */
 function readyPayloads(run: SessionRun): InstrumentationReadyPayload[] {
   const payloads: InstrumentationReadyPayload[] = [];
@@ -1225,14 +1243,6 @@ function parseDegradation(message: string): DegradationSentence {
   };
 }
 
-/**
- * The lower-case stem a signal's human label contains: the signal name without
- * its plural `s` (`functions` → "function timing").
- */
-function signalStem(signal: CaptureSignal): string {
-  return signal.replace(/s$/u, '').toLowerCase();
-}
-
 /* -------------------------------------------------------------------------------------------------
  * The suite
  * ---------------------------------------------------------------------------------------------- */
@@ -1308,24 +1318,42 @@ describe('pipeline-deterministic', () => {
       );
     });
 
-    it('runs understand → investigate → plan, asking the model once per stage, and installs', () => {
+    it('runs understand → investigate → plan, asking understand and plan once and investigate once per turn, and installs', () => {
       const { run } = subject();
       expect(run.question).toBe(QUESTION);
       expect(sessionRecordSchema.safeParse(run.settled).success).toBe(true);
       expect(PROCEEDING_STATUSES).toContain(run.settled.status);
-      expect(run.calls.map((call) => call.stage)).toEqual([...INITIAL_MODEL_STAGES]);
+      // The stages in order, each asked in one stretch. The investigate stage's
+      // turns follow the code graph from what its seeds resolved — at least one,
+      // and never more than its query allowance plus the answering turn.
+      expect(collapseRepeats(run.calls.map((call) => call.stage))).toEqual([
+        ...INITIAL_MODEL_STAGES,
+      ]);
+      expect(callsFor(run, UNDERSTAND_STAGE)).toHaveLength(1);
+      expect(callsFor(run, PLAN_STAGE)).toHaveLength(1);
+      expect(callsFor(run, INVESTIGATE_STAGE).length).toBeGreaterThanOrEqual(1);
+      expect(callsFor(run, INVESTIGATE_STAGE).length).toBeLessThanOrEqual(
+        CODE_TOOL_LIMITS.maxCallsPerStage + 1,
+      );
       for (const call of run.calls) {
         expect(call.sessionId).toBe(run.created.id);
       }
 
+      // Every stage reported progress inside its Step-8 group, in order: the investigation within
+      // "Understanding problem" and planning within "Preparing instrumentation", so the wire
+      // carries each of those two groups as one run of rows.
       const order = [...INITIAL_MODEL_STAGES, INSTRUMENT_STAGE].map((stage) =>
-        firstProgressIndex(run, stage),
+        firstProgressIndex(run, PROGRESS_STAGE_GROUPS[stage]),
       );
       expect(
         order.every((index) => index >= 0),
         'every stage reported progress',
       ).toBe(true);
       expect([...order].sort((left, right) => left - right)).toEqual(order);
+      expect(collapseRepeats(run.progress.map((entry) => entry.stage)).slice(0, 2)).toEqual([
+        UNDERSTAND_STAGE,
+        INSTRUMENT_STAGE,
+      ]);
 
       // No model stage failed. The only failed rows are the installer's
       // per-signal readiness sentences for the browser tier — no page agent
@@ -1374,10 +1402,12 @@ describe('pipeline-deterministic', () => {
       };
 
       // The real pipeline: the class is at most one row, worded exactly as Step 8 prints it —
-      // never a handler symbol folded into the message — with its evidence in the detail.
-      const traced = run.progress.filter(
-        (entry) => entry.stage === INVESTIGATE_STAGE && entry.message.startsWith('Traced'),
-      );
+      // never a handler symbol folded into the message — with its evidence in the detail, and
+      // listed under "Understanding problem", the group the investigation reports in.
+      const traced = run.progress.filter((entry) => entry.message.startsWith('Traced'));
+      for (const entry of traced) {
+        expect(entry.stage).toBe(PROGRESS_STAGE_GROUPS[INVESTIGATE_STAGE]);
+      }
       expect(traced.length).toBeLessThanOrEqual(1);
       for (const entry of traced) {
         expect(entry.message).toBe(TRACED_EVENT_HANDLER_LABEL);
@@ -1404,7 +1434,7 @@ describe('pipeline-deterministic', () => {
       });
       expect(rows).toEqual([
         {
-          stage: INVESTIGATE_STAGE,
+          stage: PROGRESS_STAGE_GROUPS[INVESTIGATE_STAGE],
           status: DONE_ROW,
           message: TRACED_EVENT_HANDLER_LABEL,
           detail: `${clickSite.map((node) => node.name).join(DETAIL_LIST_SEPARATOR)}${DETAIL_PART_SEPARATOR}${CORPUS.clickSiteFile}`,
@@ -1641,38 +1671,75 @@ describe('pipeline-deterministic', () => {
 
       const scripted = run.scripted;
       expect(scripted, 'the session was scripted').toBeDefined();
-      expect(scripted?.calls.map((call) => [call.stage, call.scripted])).toEqual([
-        [UNDERSTAND_STAGE, false],
-        [INVESTIGATE_STAGE, false],
-        [PLAN_STAGE, true],
+      const scriptedCalls = scripted?.calls ?? [];
+      // Understand and investigate run unscripted, investigate over as many turns as its walk
+      // takes; the plan request, asked once, is the one scripted call.
+      expect(collapseRepeats(scriptedCalls.map((call) => call.stage))).toEqual([
+        ...INITIAL_MODEL_STAGES,
       ]);
+      expect(scriptedCalls.filter((call) => call.scripted).map((call) => call.stage)).toEqual([
+        PLAN_STAGE,
+      ]);
+      expect(scriptedCalls.filter((call) => call.stage === PLAN_STAGE)).toHaveLength(1);
       expect(() => {
         scripted?.assertConsumed();
       }).not.toThrow();
     });
 
+    /**
+     * The authored plan as the plan stage normalized it, before the feasibility
+     * gate narrowed it: every authored target, through the same live registry.
+     */
+    function normalizedAuthored(): InstrumentationPlan {
+      const { authored, run, suite } = subject();
+      return unwrap(
+        normalizePlan(authored, {
+          sessionId: run.created.id,
+          planVersion: recordedPlan(run).planVersion,
+          resolver: contextBoundResolver(registry, suite.context),
+        }),
+        'Normalizing the authored plan',
+      );
+    }
+
     it('normalizes every action through the live registry and fills each omitted rationale from the objective', () => {
       const { authored, run, suite } = subject();
-      const plan = recordedPlan(run);
-      expect(plan.objective).toBe(authored.objective);
-      expect(plan.hypotheses).toEqual([]);
-      expect(identities(plan.instrumentationTargets)).toEqual(
+      const normalized = normalizedAuthored();
+      expect(identities(normalized.instrumentationTargets)).toEqual(
         authored.instrumentationTargets.map((target) =>
           actionIdentityKey({ file: target.file, symbol: target.symbol ?? '', type: target.type }),
         ),
       );
+      expectRegistryNormalized(normalized, suite.context);
+
+      // The recorded plan is that plan narrowed to what the gate accepted
+      // (AAP §0.4.2 "adapter feasibility check"): the one feasible target, once.
+      const plan = recordedPlan(run);
+      expect(plan.objective).toBe(authored.objective);
+      expect(plan.hypotheses).toEqual([]);
+      expect(identities(plan.instrumentationTargets)).toEqual(
+        identities(normalized.instrumentationTargets.slice(0, 1)),
+      );
       expectRegistryNormalized(plan, suite.context);
-      for (const action of plan.instrumentationTargets) {
+      for (const action of [...normalized.instrumentationTargets, ...plan.instrumentationTargets]) {
         expect(action.rationale).toBe(authored.objective);
       }
     });
 
     it('returns each rejection as data — code, reason and hint — and never throws', () => {
       const { run, suite } = subject();
-      const plan = recordedPlan(run);
-      const [feasibleAction, absentSymbol, unindexedFile, duplicate] = plan.instrumentationTargets;
+      const normalized = normalizedAuthored();
+      const [feasibleAction, absentSymbol, unindexedFile, duplicate] =
+        normalized.instrumentationTargets;
 
-      const report = feasibilityOf(plan, suite);
+      // The recorded plan holds nothing the gate refuses.
+      const recorded = feasibilityOf(recordedPlan(run), suite);
+      expect(recorded.rejected).toEqual([]);
+      expect(identities(recorded.feasible)).toEqual(
+        identities(feasibleAction ? [feasibleAction] : []),
+      );
+
+      const report = feasibilityOf(normalized, suite);
       expect(report.rejected.map((rejection) => rejection.code)).toEqual([
         REJECTION.symbolNotFound,
         REJECTION.fileNotIndexed,
@@ -1695,22 +1762,28 @@ describe('pipeline-deterministic', () => {
       expect(suite.writeReads).toEqual([]);
     });
 
-    it('turns every rejected action into an UnavailableSignal and proceeds with the feasible one', () => {
+    it('keeps every planning refusal away from the installer and proceeds with the feasible action', () => {
       const { valid, run, suite } = subject();
-      const report = feasibilityOf(recordedPlan(run), suite);
+      const report = feasibilityOf(normalizedAuthored(), suite);
+      expect(report.rejected).toHaveLength(3);
 
       expect(PROCEEDING_STATUSES).toContain(run.settled.status);
       const ready = readyPayloads(run).at(-1);
       expect(ready, 'instrumentation.ready was announced').toBeDefined();
       const unavailable = ready?.unavailable ?? [];
-      expect(unavailable).toHaveLength(report.rejected.length);
-      for (const rejection of report.rejected) {
-        const signal = unavailable.find((entry) => entry.reason === rejection.reason);
-        expect(signal, `an UnavailableSignal reports "${rejection.reason}"`).toBeDefined();
-        expect(signal?.hint).toBe(rejection.hint);
-        expect(isCaptureSignal(signal?.signal)).toBe(true);
-        expect(signalsOf([rejection.action])).toContain(signal?.signal);
+      for (const entry of unavailable) {
+        expect(isCaptureSignal(entry.signal)).toBe(true);
       }
+      for (const rejection of report.rejected) {
+        expect(
+          unavailable.some((entry) => entry.reason === rejection.reason),
+          `the refused plan action "${rejection.reason}" never reaches the installer`,
+        ).toBe(false);
+      }
+      // What the recorded plan enables is exactly what its one feasible action enables.
+      expect(signalsOf(recordedPlan(run).instrumentationTargets)).toEqual(
+        signalsOf(report.feasible),
+      );
 
       expect(run.settled.modifications.map((record) => [record.file, record.status])).toEqual([
         [valid.file, APPLIED_MODIFICATION],
@@ -1718,35 +1791,35 @@ describe('pipeline-deterministic', () => {
       expect(ready?.applied.map((record) => record.file)).toEqual([valid.file]);
     });
 
-    it('names the signal and the reason in the AAP §0.5.5 degradation sentence', () => {
+    it('shows no AAP §0.5.5 degradation sentence for an action the planning gate refused', () => {
       const { run, suite } = subject();
-      const report = feasibilityOf(recordedPlan(run), suite);
+      const report = feasibilityOf(normalizedAuthored(), suite);
       const rows = run.progress.filter(
         (entry) =>
           entry.stage === INSTRUMENT_STAGE && entry.message.startsWith(DEGRADATION_OPENING),
       );
-      const labels = new Set<string>();
-      for (const rejection of report.rejected) {
-        const reason = withoutTrailingPunctuation(rejection.reason);
-        const row = rows.find((entry) => entry.message.includes(`: ${reason}`));
-        expect(row, `a degradation row names "${reason}"`).toBeDefined();
-        const sentence = parseDegradation(row?.message ?? '');
-        expect(sentence.reason).toBe(reason);
-        expect(row?.status).toBe(RUNNING_ROW);
-        expect(row?.detail).toBe(rejection.hint);
-        const unavailable = readyPayloads(run)
-          .at(-1)
-          ?.unavailable.find((entry) => entry.reason === rejection.reason);
-        expect(unavailable, `an UnavailableSignal reports "${rejection.reason}"`).toBeDefined();
-        expect(isCaptureSignal(unavailable?.signal)).toBe(true);
-        if (unavailable !== undefined && isCaptureSignal(unavailable.signal)) {
-          expect(sentence.label.toLowerCase()).toContain(signalStem(unavailable.signal));
-        }
-        expect(sentence.continuation.length).toBeGreaterThan(0);
-        expect(sentence.continuation).not.toContain(sentence.label);
-        labels.add(sentence.label);
+      expect(report.rejected.length).toBeGreaterThan(0);
+      // Each degradation is one terminal ✗ row: no `running` twin a client
+      // merging rows by stage and message would leave spinning beside it.
+      expect(rows.filter((entry) => entry.status === RUNNING_ROW)).toEqual([]);
+      const refused = new Set(
+        report.rejected.map((rejection) => withoutTrailingPunctuation(rejection.reason)),
+      );
+      // Any degradation row the run did show is a well-formed sentence about an
+      // install-time gap, never about an action the planning gate refused.
+      for (const row of rows) {
+        const sentence = parseDegradation(row.message);
+        expect(row.status).toBe(FAILED_ROW);
+        expect(refused.has(sentence.reason), `"${sentence.reason}" is a planning refusal`).toBe(
+          false,
+        );
       }
-      expect(labels.size, 'one signal, one label').toBe(1);
+      for (const reason of refused) {
+        expect(
+          rows.some((entry) => entry.message.includes(`: ${reason}`)),
+          `no degradation row names the planning refusal "${reason}"`,
+        ).toBe(false);
+      }
     });
 
     it('refuses an escaping path at the authoring schema, and the feasibility gate still reports it as data', () => {
@@ -1886,7 +1959,11 @@ describe('pipeline-deterministic', () => {
     it(`repairs at most DEFAULT_MAX_REPAIRS times: ${String(DEFAULT_MAX_REPAIRS + 1)} plan requests, never another`, () => {
       const { run } = invalidSubject();
       expect(callsFor(run, UNDERSTAND_STAGE)).toHaveLength(1);
-      expect(callsFor(run, INVESTIGATE_STAGE)).toHaveLength(1);
+      // A plan repair never re-asks an earlier stage: the investigate stage takes exactly the
+      // turns the unscripted session over the same corpus and question took.
+      expect(callsFor(run, INVESTIGATE_STAGE)).toHaveLength(
+        callsFor(requireRun(happyRun, 'The generic-question session'), INVESTIGATE_STAGE).length,
+      );
       expect(callsFor(run, PLAN_STAGE)).toHaveLength(DEFAULT_MAX_REPAIRS + 1);
 
       const scripted = run.scripted;
@@ -1955,16 +2032,24 @@ describe('pipeline-deterministic', () => {
       expect(fallbacks).toHaveLength(1);
       expect(fallbacks[0]?.fields['repairs']).toBe(DEFAULT_MAX_REPAIRS);
 
-      const planRows = run.progress.filter((entry) => entry.stage === PLAN_STAGE);
+      // Planning reports inside "Preparing instrumentation"; a planning failure would keep the
+      // plan stage on its row, and none does — no row carries that stage at all.
+      const planningGroup = run.progress.filter(
+        (entry) => entry.stage === PROGRESS_STAGE_GROUPS[PLAN_STAGE],
+      );
+      const refusalRows = planningGroup.filter((entry) =>
+        entry.message.includes('instrumentationTargets['),
+      );
       for (const badTarget of [1, 2, 3]) {
         expect(
-          planRows.some((entry) =>
+          refusalRows.some((entry) =>
             entry.message.includes(`instrumentationTargets[${String(badTarget)}]`),
           ),
           `the developer is shown why target ${String(badTarget)} was refused`,
         ).toBe(true);
       }
-      expect(planRows.some((entry) => entry.status === FAILED_ROW)).toBe(false);
+      expect(refusalRows.some((entry) => entry.status === FAILED_ROW)).toBe(false);
+      expect(run.progress.some((entry) => entry.stage === PLAN_STAGE)).toBe(false);
     });
 
     it('rejects a normaliser failure without a re-prompt, logging the closed input shape as a product defect', () => {
@@ -2000,14 +2085,28 @@ describe('pipeline-deterministic', () => {
       expect(fallbacks[0]?.fields['repairs']).toBe(0);
     });
 
-    it('fails at the named stage when nothing can be armed, and never reports success', () => {
+    it('holds a fallback of page hooks at the readiness gate until a tab binds, and never reports success', () => {
       const run = requireRun(normalizer, 'The normaliser-failure session');
-      expect(run.settled.status).toBe(FAILED_STATUS);
+      // The runtime-only fallback's page hooks are armed pending the bound tab's
+      // agent — a session's plan installs before its panel binds the tab, so
+      // that absence is a wait, not a refusal. The session stays at the gate,
+      // which lists each such hook as a waiting instrumentation row (its ✓ row
+      // replaces it once the page reports) and never as ✗ (AAP §0.5.5,
+      // §0.7.1), and no `instrumentation.failed` is sent for a plan nothing
+      // refused.
+      expect(run.settled.status).toBe(INSTRUMENTING_STATUS);
+      const pageLabels = new Set<string>(
+        Object.keys(DORMANT_AGENT_HOOK_CONFIG)
+          .filter(isCaptureSignal)
+          .map((signal) => CAPTURE_SIGNAL_LABELS[signal]),
+      );
+      const instrumentRows = run.progress.filter((entry) => entry.stage === INSTRUMENT_STAGE);
       expect(
-        run.progress.some(
-          (entry) => entry.stage === INSTRUMENT_STAGE && entry.status === FAILED_ROW,
+        instrumentRows.some(
+          (entry) => entry.status === RUNNING_ROW && pageLabels.has(entry.message),
         ),
       ).toBe(true);
+      expect(instrumentRows.filter((entry) => entry.status === FAILED_ROW)).toEqual([]);
 
       const failures = run.editor.received.filter(
         (message, index) =>
@@ -2015,14 +2114,11 @@ describe('pipeline-deterministic', () => {
           isMessageOfType(message, 'instrumentation.failed') &&
           message.payload.sessionId === run.created.id,
       );
-      expect(failures.length).toBeGreaterThan(0);
-      for (const message of failures) {
-        expect(instrumentationFailedPayloadSchema.safeParse(message.payload).success).toBe(true);
-      }
+      expect(failures).toEqual([]);
 
       const statuses = broadcastRecords(run).map((record) => record.status);
-      expect(statuses.at(-1)).toBe(FAILED_STATUS);
-      for (const successful of [READY_STATUS, GENERATED_STATUS]) {
+      expect(statuses.at(-1)).toBe(INSTRUMENTING_STATUS);
+      for (const successful of [READY_STATUS, GENERATED_STATUS, FAILED_STATUS]) {
         expect(statuses).not.toContain(successful);
       }
       expect(run.settled.modifications).toEqual([]);

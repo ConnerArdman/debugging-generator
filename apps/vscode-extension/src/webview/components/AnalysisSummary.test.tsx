@@ -11,6 +11,8 @@
  *     inside the "Likely cause" region with a confidence badge whose level is
  *     spelled in words. Every assertion is scoped to a region element, because
  *     a document-wide query would still pass if both lists were merged into one.
+ *     An analysis that infers nothing keeps the "Likely cause" region, holding
+ *     `SummaryHeader`'s muted no-cause sentence rather than vanishing.
  *   - **Evidence is cited, never actionable.** Each fact renders one chip per
  *     `EventRef` it cites, and those chips are inert: the editor holds no event
  *     store, so no chip is a button, takes focus or reaches any callback.
@@ -23,6 +25,11 @@
  *   - **No invented prose.** Beyond its generic title and, when flagged, the
  *     banner, the component adds no sentence of its own: an `AnalysisResult`
  *     has no headline.
+ *   - **Long runs wrap between identifiers.** A whitespace-free run of twenty
+ *     characters or more gains U+200B break opportunities after `,` `.` `)` and
+ *     before `(` — never before closing punctuation — while prose is rendered
+ *     exactly as written, the analysis is never mutated, and a copied
+ *     selection loses the inserted characters again.
  *   - **The states and their precedence:** error > pending > empty > analysis.
  *     A failure is never shaped like an observed fact (AAP 0.5.5).
  *   - **Privacy.** Nothing is ever written to the console in any state (AAP
@@ -33,7 +40,7 @@
  * inspected project's component, route or file appears in it (AAP 0.5.4).
  */
 
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -56,6 +63,9 @@ afterEach(() => {
 /** The accessible names `SummaryHeader` gives its two regions. */
 const OBSERVED_REGION = 'Observed';
 const LIKELY_CAUSE_REGION = 'Likely cause';
+
+/** `SummaryHeader`'s sentence for an empty likely-cause register, which this view opts into. */
+const NO_CAUSES_TEXT = 'No likely cause was identified.';
 
 /** The component's own generic copy, which this suite pins. */
 const DEFAULT_TITLE = 'Analysis';
@@ -305,11 +315,22 @@ describe('AnalysisSummary keeps observed facts and likely causes apart', () => {
     }
   });
 
-  it('omits the Likely cause region when the analysis infers nothing, keeping the facts', () => {
+  it('keeps the Likely cause region with its no-cause sentence when the analysis infers nothing', () => {
     render(<AnalysisSummary analysis={makeAnalysis({ likelyCauses: [] })} />);
 
     expect(statementsIn(observedRegion())).toEqual([FACT_ONE, FACT_TWO]);
-    expect(screen.queryByRole('region', { name: LIKELY_CAUSE_REGION })).toBeNull();
+
+    // The register answers rather than disappearing: its heading, then the
+    // design system's muted sentence — never a finding, badge or citation.
+    const causes = causesRegion();
+    expect(within(causes).getByRole('heading', { name: LIKELY_CAUSE_REGION })).not.toBeNull();
+    const sentence = within(causes).getByText(NO_CAUSES_TEXT);
+    expect(sentence.classList.contains('dg-summary-header__none')).toBe(true);
+    expect(findingItems(causes)).toHaveLength(0);
+    expect(statementsIn(causes)).toEqual([]);
+    expect(causes.querySelector('.dg-summary-header__confidence')).toBeNull();
+    expect(causes.querySelector('[data-event-id]')).toBeNull();
+    expect(observedRegion().contains(causes)).toBe(false);
   });
 
   it('hands the analysis arrays on as a SummaryHeader summary with no cast', () => {
@@ -638,6 +659,195 @@ describe('AnalysisSummary states', () => {
 
     expect(container.children).toHaveLength(1);
     expect(container.firstElementChild?.className).toBe('dgv-analysis extra-layout');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The analysis version
+// ---------------------------------------------------------------------------
+
+describe('AnalysisSummary analysis version', () => {
+  it("states a follow-up analysis's version beside the unchanged title", () => {
+    const { container } = render(
+      <AnalysisSummary
+        analysis={makeAnalysis({
+          id: 'analysis-sample-2',
+          analysisVersion: 2,
+          supersedes: 'analysis-sample-1',
+        })}
+      />,
+    );
+
+    // The head's own indicator, drawn by `SummaryHeader` beside the title and
+    // outside the heading, whose name stays the title.
+    const heading = screen.getByRole('heading', { level: 3, name: DEFAULT_TITLE });
+    expect(heading.textContent).toBe(DEFAULT_TITLE);
+    const indicator = container.querySelector<HTMLElement>('.dg-summary-header__version');
+    if (indicator === null) {
+      throw new Error('the head rendered no version indicator');
+    }
+    expect(within(indicator).getByText('Version 2')).toBeDefined();
+    expect(within(indicator).getByText('Updates version 1')).toBeDefined();
+    expect(heading.contains(indicator)).toBe(false);
+
+    // Still no prose of its own: the version is not a paragraph.
+    expect(Array.from(container.querySelectorAll('p'), (p) => p.textContent?.trim())).toEqual([
+      FACT_ONE,
+      FACT_TWO,
+      CAUSE_ONE,
+      CAUSE_TWO,
+    ]);
+  });
+
+  it('states no version for a first analysis', () => {
+    const { container } = render(<AnalysisSummary analysis={makeAnalysis()} />);
+
+    expect(container.querySelector('.dg-summary-header__version')).toBeNull();
+    expect(screen.queryByText(/^Version \d/u)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Line breaks in long statements
+// ---------------------------------------------------------------------------
+
+/** U+200B ZERO WIDTH SPACE, the break opportunity the component inserts. */
+const ZWSP = '\u200B';
+
+/** A fact quoting a statement shape whose column list is one long run. */
+const SQL_FACT =
+  '12 sample queries shared one shape (INSERT INTO "sample"."sample_rows" ("id","alpha_value","beta_value")).';
+
+/** {@link SQL_FACT} as displayed: breaks between identifiers, none before closing punctuation. */
+const SQL_FACT_DISPLAYED = `12 sample queries shared one shape (INSERT INTO "sample".${ZWSP}"sample_rows" ("id",${ZWSP}"alpha_value",${ZWSP}"beta_value")).`;
+
+/** A hypothesis naming a call chain, whose run breaks before `(` and after `.`. */
+const CALL_CAUSE = 'The chain sampleLookup(alpha).then(beta) may run once per item.';
+
+/** {@link CALL_CAUSE} as displayed. */
+const CALL_CAUSE_DISPLAYED = `The chain sampleLookup${ZWSP}(alpha).${ZWSP}then${ZWSP}(beta) may run once per item.`;
+
+/**
+ * An analysis with one long-run fact and one long-run hypothesis beside the
+ * default fixture's prose, frozen throughout so any mutation throws.
+ *
+ * @returns The frozen analysis.
+ */
+function makeLongRunAnalysis(): AnalysisResult {
+  const base = makeAnalysis();
+  const analysis: AnalysisResult = {
+    ...base,
+    observed: [
+      { statement: SQL_FACT, evidence: [{ eventId: 'evt-sample-009' }] },
+      ...base.observed,
+    ],
+    likelyCauses: [
+      ...base.likelyCauses,
+      {
+        statement: CALL_CAUSE,
+        evidence: [{ eventId: 'evt-sample-009' }],
+        confidence: 'medium',
+      },
+    ],
+  };
+  return deepFreeze(analysis);
+}
+
+/**
+ * Freezes a value and everything reachable from it.
+ *
+ * @param value The value to freeze.
+ * @returns The same value, frozen.
+ */
+function deepFreeze<Value>(value: Value): Value {
+  if (typeof value === 'object' && value !== null) {
+    for (const member of Object.values(value)) {
+      deepFreeze(member);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/**
+ * Selects the whole text of an element in the document's selection.
+ *
+ * @param element The element whose contents to select.
+ */
+function selectContents(element: Element): void {
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  const selection = document.getSelection();
+  if (selection === null) {
+    throw new Error('expected the document to expose a selection');
+  }
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+describe('AnalysisSummary long statements', () => {
+  it('inserts break opportunities only inside long unbroken runs, at identifier boundaries', () => {
+    render(<AnalysisSummary analysis={makeLongRunAnalysis()} />);
+
+    expect(statementsIn(observedRegion())).toEqual([SQL_FACT_DISPLAYED, FACT_ONE, FACT_TWO]);
+    expect(statementsIn(causesRegion())).toEqual([CAUSE_ONE, CAUSE_TWO, CALL_CAUSE_DISPLAYED]);
+  });
+
+  it('changes nothing but the invisible characters, and never the analysis', () => {
+    const analysis = makeLongRunAnalysis();
+    render(<AnalysisSummary analysis={analysis} />);
+
+    const shown = [...statementsIn(observedRegion()), ...statementsIn(causesRegion())];
+    expect(shown.map((statement) => statement.replaceAll(ZWSP, ''))).toEqual([
+      ...analysis.observed.map((fact) => fact.statement),
+      ...analysis.likelyCauses.map((hypothesis) => hypothesis.statement),
+    ]);
+    expect(analysis.observed[0]?.statement).toBe(SQL_FACT);
+    expect(analysis.likelyCauses[2]?.statement).toBe(CALL_CAUSE);
+    // The long-run finding keeps its citations and its level.
+    expect(
+      evidenceChips(itemFor(observedRegion(), SQL_FACT_DISPLAYED)).map(
+        (chip) => chip.dataset['eventId'],
+      ),
+    ).toEqual(['evt-sample-009']);
+    expect(
+      itemFor(causesRegion(), CALL_CAUSE_DISPLAYED).querySelector('.dg-summary-header__confidence')
+        ?.textContent,
+    ).toBe('medium');
+  });
+
+  it('copies a selected statement without the inserted characters', () => {
+    const setData = vi.fn<(format: string, data: string) => void>();
+    render(<AnalysisSummary analysis={makeLongRunAnalysis()} />);
+
+    const statement = itemFor(observedRegion(), SQL_FACT_DISPLAYED).querySelector(
+      '.dg-summary-header__statement',
+    );
+    if (statement === null) {
+      throw new Error('expected the long-run statement element');
+    }
+    selectContents(statement);
+    const notPrevented = fireEvent.copy(statement, { clipboardData: { setData } });
+
+    expect(notPrevented).toBe(false);
+    expect(setData.mock.calls).toEqual([['text/plain', SQL_FACT]]);
+  });
+
+  it('leaves a copy without inserted characters to the browser', () => {
+    const setData = vi.fn<(format: string, data: string) => void>();
+    render(<AnalysisSummary analysis={makeLongRunAnalysis()} />);
+
+    const statement = itemFor(observedRegion(), FACT_ONE).querySelector(
+      '.dg-summary-header__statement',
+    );
+    if (statement === null) {
+      throw new Error('expected the prose statement element');
+    }
+    selectContents(statement);
+    const notPrevented = fireEvent.copy(statement, { clipboardData: { setData } });
+
+    expect(notPrevented).toBe(true);
+    expect(setData).not.toHaveBeenCalled();
   });
 });
 

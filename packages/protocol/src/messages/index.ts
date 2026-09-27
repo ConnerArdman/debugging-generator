@@ -474,11 +474,15 @@ export type {
  * `telemetry.event` is the batch a producer sends inward, carrying the ingress
  * schema that cannot claim a session or a capture — attribution happens in the
  * service, for every producer — and `telemetry.tail` the already-redacted replay
- * the service sends outward to the DevTools panel (AAP §0.5.2).
+ * the service sends outward to the DevTools panel (AAP §0.5.2), with each of its
+ * captures' running totals (`telemetryTailCaptureTallySchema`, bounded by
+ * `MAX_TAIL_CAPTURE_TALLIES`).
  */
 export {
+  MAX_TAIL_CAPTURE_TALLIES,
   TELEMETRY_MESSAGE_PAYLOADS,
   telemetryEventPayloadSchema,
+  telemetryTailCaptureTallySchema,
   telemetryTailPayloadSchema,
 } from './telemetry.js';
 
@@ -486,7 +490,11 @@ export {
 export { parseTelemetryEventPayload, parseTelemetryTailPayload } from './telemetry.js';
 
 /** The telemetry-domain inferred types: see `./telemetry.js`. */
-export type { TelemetryEventPayload, TelemetryTailPayload } from './telemetry.js';
+export type {
+  TelemetryEventPayload,
+  TelemetryTailCaptureTally,
+  TelemetryTailPayload,
+} from './telemetry.js';
 
 /* -------------------------------------------------------------------------------------------------
  * messages/panel — handing a validated panel specification to the surfaces

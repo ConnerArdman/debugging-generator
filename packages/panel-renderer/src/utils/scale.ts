@@ -262,14 +262,18 @@ export function alignHairline(value: number): number {
  * ---------------------------------------------------------------------------
  * Canvas width
  *
- * The time views draw in one fixed logical coordinate space and never read the
- * size of the element they are drawn into: `Timeline` and `FlameChart` lay out
- * in a `viewBox` {@link CHART_VIEWBOX_WIDTH} units wide, declare
- * `width="100%"` and `preserveAspectRatio="xMinYMin meet"`, and leave sizing
- * to the stylesheet, which scales the drawing uniformly to its container. A
- * label is set in the stylesheet's type role, which inside the viewBox is that
- * many user units tall, so a label that fits its bar in logical units fits it
- * at every panel width. `DependencyGraph` lays out at its own deterministic
+ * `FlameChart` draws in one fixed logical coordinate space and never reads the
+ * size of the element it is drawn into: it lays out in a `viewBox`
+ * {@link CHART_VIEWBOX_WIDTH} units wide, declares `width="100%"` and
+ * `preserveAspectRatio="xMinYMin meet"`, and leaves sizing to the stylesheet,
+ * which scales the drawing uniformly to its container. A label is set in the
+ * stylesheet's type role, which inside the viewBox is that many user units
+ * tall, so a label that fits its bar in logical units fits it at every panel
+ * width. `Timeline` takes the same attributes but lays out at its canvas's
+ * MEASURED width — one user unit to a CSS pixel, so its labels stay at their
+ * type role at every panel width instead of scaling with it — and uses
+ * {@link CHART_VIEWBOX_WIDTH} only until a width has been measured (first
+ * paint, a layout-free test DOM). `DependencyGraph` lays out at its own deterministic
  * logical size, one unit to a CSS pixel, and its viewport scrolls a graph
  * wider than the panel. Either way the drawing is a pure function of the data,
  * identical in a browser and in a layout-free test DOM.
@@ -279,13 +283,14 @@ export function alignHairline(value: number): number {
 /**
  * The fixed logical width of a time chart's canvas, in SVG user units: 1 000.
  *
- * `Timeline` and `FlameChart` lay every bar, frame, tick and label out in a
- * `viewBox` exactly this wide, and the stylesheet sizes the element
- * relationally (`inline-size: 100%`, its block size following the viewBox's
- * aspect ratio) with `preserveAspectRatio="xMinYMin meet"`, so the drawing
- * scales uniformly to its container and a glyph is never stretched sideways.
- * No view reads its container's size: the drawing is a pure function of the
- * data, identical in a browser and in a layout-free test DOM.
+ * `FlameChart` lays every frame, tick and label out in a `viewBox` exactly
+ * this wide, and the stylesheet sizes the element relationally
+ * (`inline-size: 100%`, its block size following the viewBox's aspect ratio)
+ * with `preserveAspectRatio="xMinYMin meet"`, so the drawing scales uniformly
+ * to its container and a glyph is never stretched sideways; that drawing is a
+ * pure function of the data, identical in a browser and in a layout-free test
+ * DOM. `Timeline` uses this width only as its fallback frame until its canvas
+ * has been measured, then lays out at the measured width, one unit to a pixel.
  *
  * A thousand units keeps every placement a round per-mille of the plotted
  * window, which is what the package's layout-free tests assert against.
@@ -1808,6 +1813,33 @@ export const DEFAULT_GRAPH_COLUMN_GAP = 56;
 export const DEFAULT_GRAPH_ROW_GAP = 16;
 
 /**
+ * The most rows one column of the layered layout draws, its overflow box
+ * included: 6.
+ *
+ * A column holding more participants draws the first five in their own boxes
+ * and gathers the rest into one overflow box in the sixth row (see
+ * {@link planGraphRows}). The bound exists so that no column is ever cut
+ * through a box by the canvas's scroll viewport, and it is coupled to three
+ * values that must keep satisfying one inequality:
+ *
+ *   - `components.css` caps `dg-dependency-graph__viewport` at
+ *     `--dg-scroll-cap-md`, `calc(var(--dg-space-7) * 16)` = 384 px;
+ *   - the canvas declares one SVG user unit per CSS pixel at rest;
+ *   - six rows of {@link DEFAULT_GRAPH_NODE_HEIGHT} (44) with five
+ *     {@link DEFAULT_GRAPH_ROW_GAP}s (16) between them, plus the one-unit
+ *     outline inset the canvas keeps on each side, are
+ *     6 × 44 + 5 × 16 + 2 = 346 units.
+ *
+ * 346 ≤ 384 leaves the viewport room for a horizontal scrollbar under the
+ * tallest column. A change to either rhythm constant, to the inset or to the
+ * cap token must keep the tallest bounded column within the cap.
+ */
+export const DEFAULT_GRAPH_MAX_ROWS = 6;
+
+/** The smallest usable row bound: one participant's own box and the overflow box. */
+const MIN_GRAPH_MAX_ROWS = 2;
+
+/**
  * The coordinate range this module will serialise into path data: ±1 000 000.
  *
  * A guard on {@link edgePathData}: a coordinate beyond this would be written in
@@ -1842,6 +1874,14 @@ export interface GraphLayoutOptions {
    * is treated as absent.
    */
   readonly rowGap?: number | undefined;
+  /**
+   * The most rows one column draws, its overflow box included; defaults to
+   * {@link DEFAULT_GRAPH_MAX_ROWS}. Read by {@link planGraphRows} and
+   * {@link layoutDependencyGraph} only — a single box's geometry does not
+   * depend on it. A value that is not an integer of at least two (one
+   * participant's own box and the overflow box) is treated as absent.
+   */
+  readonly maxRowsPerLayer?: number | undefined;
 }
 
 /** A point in SVG user units. */
@@ -1911,14 +1951,150 @@ export interface EdgeCurve {
 export interface PositionedGraphNode {
   /** The participant, borrowed read-only from the input graph. */
   readonly node: DependencyGraphNode;
-  /** Its box. */
+  /**
+   * Its box: the participant's own, or — when {@link collapsed} — its
+   * column's overflow box, which it shares with every participant gathered
+   * there. Either way `layer` is the participant's own column.
+   */
   readonly box: GraphNodeBox;
+  /**
+   * Whether the participant is gathered into its column's overflow box rather
+   * than drawn in a box of its own; see {@link planGraphRows}.
+   */
+  readonly collapsed: boolean;
 }
 
 /** One relationship, positioned. */
 export interface PositionedGraphEdge {
   /** The relationship, borrowed read-only from the input graph. */
   readonly edge: DependencyGraphEdge;
+  /** Its anchors and orientation, between the boxes its endpoints are drawn in. */
+  readonly anchors: EdgeAnchors;
+  /** Its curve, ready for {@link edgePathData}. */
+  readonly curve: EdgeCurve;
+}
+
+/** A cell of the layered grid: a column and a drawn row in it. */
+export interface GraphCell {
+  /** The column, counting from `0`. */
+  readonly layer: number;
+  /** The drawn row within the column, counting from `0`. */
+  readonly row: number;
+}
+
+/** Where one participant is drawn. */
+export interface GraphSlot extends GraphCell {
+  /**
+   * Whether the participant is gathered into its column's overflow box, which
+   * is then the cell this slot names, rather than drawn in a box of its own.
+   */
+  readonly collapsed: boolean;
+}
+
+/** One column's overflow box, before geometry: its cell and what it gathers. */
+export interface GraphOverflowGroup extends GraphCell {
+  /**
+   * The participants gathered into it, in the order the input listed them —
+   * which, for a canonical payload, is descending total time.
+   */
+  readonly nodes: readonly DependencyGraphNode[];
+}
+
+/** One relationship whose endpoints both exist, with the slots it runs between. */
+export interface PlannedGraphEdge {
+  /** The relationship, borrowed read-only from the input graph. */
+  readonly edge: DependencyGraphEdge;
+  /** Where its caller is drawn. */
+  readonly from: GraphSlot;
+  /** Where its callee is drawn. */
+  readonly to: GraphSlot;
+}
+
+/**
+ * One drawn connector, before geometry: every relationship between the same
+ * two drawn boxes, merged.
+ *
+ * Without a row bound a connector is exactly one relationship. With one, the
+ * relationships to or from the participants a column gathers all anchor on its
+ * overflow box, and drawing each of them would stack identical curves on top
+ * of each other with their counts piled in one spot — so they are merged into
+ * one connector standing for all of them.
+ */
+export interface GraphConnectorPlan {
+  /**
+   * The connector's identity: its two cells, `‹layer›:‹row›>‹layer›:‹row›`.
+   * Unique within one plan, and the same for the same two boxes in every
+   * order of arrival.
+   */
+  readonly key: string;
+  /** The box the connector leaves. */
+  readonly from: GraphCell;
+  /** The box the connector meets. */
+  readonly to: GraphCell;
+  /** The relationships it stands for, in the order the input listed them; never empty. */
+  readonly edges: readonly DependencyGraphEdge[];
+  /**
+   * How many records those relationships stand for: the sum of their counts,
+   * each read as a finite number of zero or more.
+   */
+  readonly count: number;
+}
+
+/**
+ * The rows of a layered graph, before any geometry: where every participant
+ * is drawn, which participants each bounded column gathers, and the connectors
+ * the relationships merge into. A pure function of the participants, their
+ * relationships, the layering and the row bound; see {@link planGraphRows}.
+ */
+export interface GraphRowPlan {
+  /** The row bound the plan was made with, overflow box included. */
+  readonly maxRowsPerLayer: number;
+  /** One slot per input participant, index-aligned with the input's `nodes`. */
+  readonly nodeSlots: readonly GraphSlot[];
+  /** One group per bounded column, by ascending column. */
+  readonly overflow: readonly GraphOverflowGroup[];
+  /** The relationships whose endpoints both exist, in the order the input listed them. */
+  readonly edges: readonly PlannedGraphEdge[];
+  /**
+   * The connectors to draw: one per distinct pair of drawn boxes joined by at
+   * least one relationship, excluding a box joined only to itself. Ordered by
+   * the cell they leave (column, then row), then by the cell they meet.
+   */
+  readonly connectors: readonly GraphConnectorPlan[];
+  /** How many relationships named a participant the input does not contain. */
+  readonly droppedEdgeCount: number;
+  /** How many columns the layout uses. */
+  readonly layerCount: number;
+  /** The tallest column's drawn row count — what sets the canvas height. */
+  readonly rowCount: number;
+  /** The tallest column's participant count, gathered ones included. */
+  readonly maxNodesPerLayer: number;
+  /** How many participants are gathered into overflow boxes, over every column. */
+  readonly gatheredCount: number;
+}
+
+/** One column's overflow box, positioned. */
+export interface PositionedGraphOverflow {
+  /** Its column, counting from `0`. */
+  readonly layer: number;
+  /** Its box: the last drawn row of its column. */
+  readonly box: GraphNodeBox;
+  /** The participants it gathers, in the order the input listed them. */
+  readonly nodes: readonly DependencyGraphNode[];
+}
+
+/** One drawn connector, positioned. */
+export interface PositionedGraphConnector {
+  /** Its identity; see {@link GraphConnectorPlan.key}. */
+  readonly key: string;
+  /** The relationships it stands for, in the order the input listed them. */
+  readonly edges: readonly DependencyGraphEdge[];
+  /** How many records they stand for; see {@link GraphConnectorPlan.count}. */
+  readonly count: number;
+  /** The box it leaves. */
+  readonly source: GraphNodeBox;
+  /** The box it meets. */
+  readonly target: GraphNodeBox;
   /** Its anchors and orientation. */
   readonly anchors: EdgeAnchors;
   /** Its curve, ready for {@link edgePathData}. */
@@ -1927,18 +2103,35 @@ export interface PositionedGraphEdge {
 
 /** A layered graph, positioned. */
 export interface DependencyGraphLayout {
-  /** The participants, in the order the input listed them. */
+  /**
+   * Every participant, in the order the input listed them, gathered ones
+   * included (flagged {@link PositionedGraphNode.collapsed}).
+   */
   readonly nodes: readonly PositionedGraphNode[];
-  /** The relationships whose endpoints were both present. */
+  /**
+   * The relationships whose endpoints were both present, each anchored on the
+   * boxes its endpoints are drawn in. What a view enumerates; the curves it
+   * draws are {@link connectors}.
+   */
   readonly edges: readonly PositionedGraphEdge[];
+  /** The overflow boxes, by ascending column; empty when no column is bounded. */
+  readonly overflow: readonly PositionedGraphOverflow[];
+  /** The connectors to draw, in the plan's order; see {@link GraphRowPlan.connectors}. */
+  readonly connectors: readonly PositionedGraphConnector[];
   /** The canvas width. */
   readonly width: number;
   /** The canvas height. */
   readonly height: number;
   /** How many columns the layout uses. */
   readonly layerCount: number;
-  /** The tallest column's participant count — what sets the canvas height. */
+  /** The tallest column's participant count, gathered ones included. */
   readonly maxNodesPerLayer: number;
+  /** The tallest column's drawn row count — what sets the canvas height. */
+  readonly rowCount: number;
+  /** The row bound the layout was made with, overflow box included. */
+  readonly maxRowsPerLayer: number;
+  /** How many participants are gathered into overflow boxes, over every column. */
+  readonly gatheredCount: number;
   /**
    * Whether the layer indices were computed rather than read from the input:
    * the {@link GraphLayering.computed} flag of the layering the layout used.
@@ -1971,6 +2164,12 @@ function resolveGraphRhythm(options?: GraphLayoutOptions): {
     columnGap: asNonNegative(options?.columnGap, DEFAULT_GRAPH_COLUMN_GAP),
     rowGap: asNonNegative(options?.rowGap, DEFAULT_GRAPH_ROW_GAP),
   };
+}
+
+/** Resolves the row bound a caller asked for, or {@link DEFAULT_GRAPH_MAX_ROWS}. */
+function resolveMaxRows(options?: GraphLayoutOptions): number {
+  const requested = asNonNegativeInt(options?.maxRowsPerLayer, DEFAULT_GRAPH_MAX_ROWS);
+  return requested >= MIN_GRAPH_MAX_ROWS ? requested : DEFAULT_GRAPH_MAX_ROWS;
 }
 
 /**
@@ -2452,7 +2651,8 @@ export function resolveGraphLayering(
  * The layout `DependencyGraph` draws. Participants keep the order the input
  * gave them — upstream orders them by layer, then by descending total time,
  * then by id, and re-sorting here would make the same capture draw differently
- * in two views — and are stacked down their column in that order.
+ * in two views — and are stacked down their column in that order, up to the
+ * row bound.
  *
  * ## Where the columns come from
  *
@@ -2470,6 +2670,22 @@ export function resolveGraphLayering(
  * layer indices when **every** participant carries a usable one, and otherwise a
  * layering computed from the relationships for all of them.
  *
+ * ## Where the rows come from
+ *
+ * From `plan` when the caller supplies one — a view that planned the rows to
+ * size its column gap passes that same object here — and otherwise from
+ * {@link planGraphRows} with `options` and the resolved layering. A column
+ * taller than the row bound draws its first participants in their own boxes
+ * and gathers the rest into one overflow box in its last row
+ * ({@link DependencyGraphLayout.overflow}); every relationship to or from a
+ * gathered participant anchors on that box, and the relationships between the
+ * same two drawn boxes are drawn as one connector
+ * ({@link DependencyGraphLayout.connectors}). A supplied plan **must** have
+ * been made from the same `data` and layering, and its own row bound wins
+ * over `options.maxRowsPerLayer`. The canvas is as tall as the tallest drawn
+ * column, so with the default bound it never outgrows the viewport's cap; see
+ * {@link DEFAULT_GRAPH_MAX_ROWS}.
+ *
  * ## Degenerate inputs
  *
  * An empty graph yields no nodes, no edges, a `0` by `0` canvas and a layer
@@ -2481,66 +2697,597 @@ export function resolveGraphLayering(
  * has no usable column for is placed in column `0`.
  *
  * @param data The graph, read and never mutated.
- * @param options Rhythm overrides.
+ * @param options Rhythm and row-bound overrides.
  * @param layering The layering already resolved for `data`, when the caller has
  * one; see above.
+ * @param plan The rows already planned for `data` under that layering, when
+ * the caller has them; see above.
  */
 export function layoutDependencyGraph(
   data: DependencyGraphData,
   options?: GraphLayoutOptions,
   layering?: GraphLayering,
+  plan?: GraphRowPlan,
 ): DependencyGraphLayout {
-  const { layers, computed: layersComputed } =
-    layering ?? resolveGraphLayering(data.nodes, data.edges);
+  const resolved = layering ?? resolveGraphLayering(data.nodes, data.edges);
+  const rows = plan ?? planGraphRows(data, options, resolved);
 
-  const nodes: PositionedGraphNode[] = [];
+  // One box per cell, built once: every participant, relationship and
+  // connector that names a cell anchors on the very same object.
   const boxes = new Map<string, GraphNodeBox>();
-  const filled = new Map<number, number>();
-  let maxLayerSeen = -1;
-  let maxNodesPerLayer = 0;
-
-  for (const node of data.nodes) {
-    const layer = asNonNegativeInt(layers.get(node.id), 0);
-    const indexInLayer = filled.get(layer) ?? 0;
-    filled.set(layer, indexInLayer + 1);
-    maxLayerSeen = Math.max(maxLayerSeen, layer);
-    maxNodesPerLayer = Math.max(maxNodesPerLayer, indexInLayer + 1);
-
-    const box = graphNodeBox(layer, indexInLayer, options);
-    nodes.push({ node, box });
-    // A duplicate id would otherwise make an edge anchor on whichever box was
-    // written last; keeping the first is what makes the layout deterministic.
-    if (!boxes.has(node.id)) {
-      boxes.set(node.id, box);
+  const boxAt = (cell: GraphCell): GraphNodeBox => {
+    const key = cellKey(cell);
+    const known = boxes.get(key);
+    if (known !== undefined) {
+      return known;
     }
-  }
+    const box = graphNodeBox(cell.layer, cell.row, options);
+    boxes.set(key, box);
+    return box;
+  };
 
-  const edges: PositionedGraphEdge[] = [];
-  let droppedEdgeCount = 0;
+  const nodes: PositionedGraphNode[] = data.nodes.map((node, index) => {
+    // A supplied plan is index-aligned with `data`; a slot it does not hold is
+    // a plan of some other graph, and the participant lands on the grid's
+    // origin rather than off the canvas.
+    const slot = rows.nodeSlots[index] ?? ORIGIN_SLOT;
+    return { node, box: boxAt(slot), collapsed: slot.collapsed };
+  });
 
-  for (const edge of data.edges) {
-    const from = boxes.get(edge.from);
-    const to = boxes.get(edge.to);
-    if (from === undefined || to === undefined) {
-      droppedEdgeCount += 1;
-      continue;
-    }
+  const edges: PositionedGraphEdge[] = rows.edges.map(({ edge, from, to }) => {
+    const anchors = edgeAnchors(boxAt(from), boxAt(to));
+    return { edge, anchors, curve: edgeCurve(anchors.source, anchors.target) };
+  });
 
-    const anchors = edgeAnchors(from, to);
-    edges.push({ edge, anchors, curve: edgeCurve(anchors.source, anchors.target) });
-  }
+  const connectors: PositionedGraphConnector[] = rows.connectors.map((connector) => {
+    const source = boxAt(connector.from);
+    const target = boxAt(connector.to);
+    const anchors = edgeAnchors(source, target);
+    return {
+      key: connector.key,
+      edges: connector.edges,
+      count: connector.count,
+      source,
+      target,
+      anchors,
+      curve: edgeCurve(anchors.source, anchors.target),
+    };
+  });
 
-  const layerCount = nodes.length === 0 ? 0 : maxLayerSeen + 1;
-  const { width, height } = graphCanvasSize(layerCount, maxNodesPerLayer, options);
+  const overflow: PositionedGraphOverflow[] = rows.overflow.map((group) => ({
+    layer: group.layer,
+    box: boxAt(group),
+    nodes: group.nodes,
+  }));
+
+  const { width, height } = graphCanvasSize(rows.layerCount, rows.rowCount, options);
 
   return {
     nodes,
     edges,
+    overflow,
+    connectors,
     width,
     height,
-    layerCount,
-    maxNodesPerLayer,
-    layersComputed,
-    droppedEdgeCount,
+    layerCount: rows.layerCount,
+    maxNodesPerLayer: rows.maxNodesPerLayer,
+    rowCount: rows.rowCount,
+    maxRowsPerLayer: rows.maxRowsPerLayer,
+    gatheredCount: rows.gatheredCount,
+    layersComputed: resolved.computed,
+    droppedEdgeCount: rows.droppedEdgeCount,
   };
+}
+
+/** The slot of a participant a plan does not place: the grid's origin, drawn. */
+const ORIGIN_SLOT: GraphSlot = Object.freeze({ layer: 0, row: 0, collapsed: false });
+
+/** A cell's identity, as the connector keys spell it: `‹layer›:‹row›`. */
+function cellKey(cell: GraphCell): string {
+  return `${String(cell.layer)}:${String(cell.row)}`;
+}
+
+/** Ascending by the cell a connector leaves, then by the cell it meets. */
+function compareConnectors(left: GraphConnectorPlan, right: GraphConnectorPlan): number {
+  return (
+    left.from.layer - right.from.layer ||
+    left.from.row - right.from.row ||
+    left.to.layer - right.to.layer ||
+    left.to.row - right.to.row
+  );
+}
+
+/**
+ * Plans the rows of a layered graph: which cell every participant is drawn
+ * in, which participants a column too tall for the row bound gathers into its
+ * overflow box, and which connectors the relationships merge into.
+ *
+ * {@link layoutDependencyGraph} is this plan turned into geometry, and a view
+ * that must know the connectors before it lays the graph out — to size the
+ * column gap for their count labels — calls this once and hands the result to
+ * the layout, exactly as it hands over the layering, so the rows are planned
+ * once per payload.
+ *
+ * ## The row bound
+ *
+ * Participants keep the order the input gave them and fill their column from
+ * the top. A column holding no more participants than the bound
+ * ({@link GraphLayoutOptions.maxRowsPerLayer}, by default
+ * {@link DEFAULT_GRAPH_MAX_ROWS}) draws every one in a box of its own. A
+ * taller column draws its first `bound − 1` participants — for a canonical
+ * payload, the costliest by total time — and gathers the rest into one
+ * overflow box in its last row. Every participant keeps a slot, gathered or
+ * not, so a view can still list and select it; a gathered one's slot is the
+ * overflow box's cell.
+ *
+ * ## Connectors
+ *
+ * Every relationship whose endpoints both exist runs between the cells its
+ * endpoints are drawn in, and the relationships between the same two cells
+ * merge into one connector whose count is the sum of theirs. A relationship
+ * whose endpoints share one cell — a participant calling itself, or two
+ * participants gathered into the same overflow box — has no connector to draw
+ * and joins none, though it is still a relationship of the graph
+ * ({@link GraphRowPlan.edges}). The connectors are ordered by their cells, so
+ * the plan is the same for any order the relationships arrive in.
+ *
+ * ## Degenerate inputs
+ *
+ * An empty graph plans no slots and a `0` by `0` grid. A relationship naming a
+ * participant the input does not contain is counted in
+ * {@link GraphRowPlan.droppedEdgeCount}. A repeated participant id takes a row
+ * of its own, and its relationships anchor on its first occurrence. A
+ * participant the layering has no usable column for is placed in column `0`.
+ * A count that is not a finite number of zero or more adds nothing to its
+ * connector.
+ *
+ * @param data The graph, read and never mutated.
+ * @param options The row bound; the box rhythm is not read.
+ * @param layering The layering already resolved for `data`, under the same
+ * rule as {@link layoutDependencyGraph}'s; resolved here when absent.
+ * @returns The plan: every array frozen, nothing shared with the input but the
+ * participants and relationships themselves.
+ *
+ * @example
+ * ```ts
+ * const layering = resolveGraphLayering(data.nodes, data.edges);
+ * const plan = planGraphRows(data, undefined, layering);
+ * const gap = gapFor(plan.connectors); // the view's own label rule
+ * const layout = layoutDependencyGraph(data, { columnGap: gap }, layering, plan);
+ * ```
+ */
+export function planGraphRows(
+  data: DependencyGraphData,
+  options?: GraphLayoutOptions,
+  layering?: GraphLayering,
+): GraphRowPlan {
+  const { layers } = layering ?? resolveGraphLayering(data.nodes, data.edges);
+  const maxRowsPerLayer = resolveMaxRows(options);
+
+  // First pass: each participant's column and every column's height, which
+  // decides whether that column is bounded before any row is assigned.
+  const columns = data.nodes.map((node) => asNonNegativeInt(layers.get(node.id), 0));
+  const heights = new Map<number, number>();
+  for (const layer of columns) {
+    heights.set(layer, (heights.get(layer) ?? 0) + 1);
+  }
+
+  // Second pass: rows, top down in input order.
+  const nodeSlots: GraphSlot[] = [];
+  const slotsById = new Map<string, GraphSlot>();
+  const filled = new Map<number, number>();
+  const gathered = new Map<number, DependencyGraphNode[]>();
+  const lastRow = maxRowsPerLayer - 1;
+
+  for (const [index, node] of data.nodes.entries()) {
+    const layer = columns[index] ?? 0;
+    const position = filled.get(layer) ?? 0;
+    filled.set(layer, position + 1);
+
+    const bounded = (heights.get(layer) ?? 0) > maxRowsPerLayer;
+    const collapsed = bounded && position >= lastRow;
+    const slot: GraphSlot = Object.freeze({
+      layer,
+      row: collapsed ? lastRow : position,
+      collapsed,
+    });
+    nodeSlots.push(slot);
+
+    if (collapsed) {
+      const group = gathered.get(layer) ?? [];
+      group.push(node);
+      gathered.set(layer, group);
+    }
+    // A duplicate id would otherwise make a relationship anchor on whichever
+    // row was written last; keeping the first is what keeps the plan
+    // deterministic.
+    if (!slotsById.has(node.id)) {
+      slotsById.set(node.id, slot);
+    }
+  }
+
+  const edges: PlannedGraphEdge[] = [];
+  const merged = new Map<
+    string,
+    { from: GraphCell; to: GraphCell; edges: DependencyGraphEdge[]; count: number }
+  >();
+  let droppedEdgeCount = 0;
+
+  for (const edge of data.edges) {
+    const from = slotsById.get(edge.from);
+    const to = slotsById.get(edge.to);
+    if (from === undefined || to === undefined) {
+      droppedEdgeCount += 1;
+      continue;
+    }
+    edges.push(Object.freeze({ edge, from, to }));
+
+    const fromKey = cellKey(from);
+    const toKey = cellKey(to);
+    if (fromKey === toKey) {
+      continue;
+    }
+
+    const key = `${fromKey}>${toKey}`;
+    const connector = merged.get(key) ?? { from, to, edges: [], count: 0 };
+    connector.edges.push(edge);
+    connector.count += asNonNegative(edge.count, 0);
+    merged.set(key, connector);
+  }
+
+  const connectors = [...merged.entries()]
+    .map(([key, connector]) =>
+      Object.freeze({
+        key,
+        from: Object.freeze({ layer: connector.from.layer, row: connector.from.row }),
+        to: Object.freeze({ layer: connector.to.layer, row: connector.to.row }),
+        edges: Object.freeze(connector.edges),
+        count: connector.count,
+      }),
+    )
+    .sort(compareConnectors);
+
+  const overflow = [...gathered.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([layer, group]) => Object.freeze({ layer, row: lastRow, nodes: Object.freeze(group) }));
+
+  let maxLayer = -1;
+  let maxNodesPerLayer = 0;
+  let rowCount = 0;
+  for (const [layer, height] of heights) {
+    maxLayer = Math.max(maxLayer, layer);
+    maxNodesPerLayer = Math.max(maxNodesPerLayer, height);
+    rowCount = Math.max(rowCount, Math.min(height, maxRowsPerLayer));
+  }
+
+  return Object.freeze({
+    maxRowsPerLayer,
+    nodeSlots: Object.freeze(nodeSlots),
+    overflow: Object.freeze(overflow),
+    edges: Object.freeze(edges),
+    connectors: Object.freeze(connectors),
+    droppedEdgeCount,
+    layerCount: data.nodes.length === 0 ? 0 : maxLayer + 1,
+    rowCount,
+    maxNodesPerLayer,
+    gatheredCount: overflow.reduce((total, group) => total + group.nodes.length, 0),
+  });
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Connector count labels
+ *
+ * A connector that stands for several records carries its count on the
+ * canvas. Drawn at the midpoint of every connector, the counts of a fan — one
+ * participant calling many, the shape a render cascade or a request burst
+ * takes — pile into one narrow gutter, where they overlap each other and read
+ * as noise. So each label is placed at the first of a few candidate positions
+ * that collides with nothing already drawn, and one that fits nowhere is not
+ * drawn at all: a view reports how many were left off and lists every count in
+ * its text equivalent. Like the rest of this section, the placement is a pure
+ * function of the layout and the label widths the caller estimated — nothing
+ * is measured.
+ * ---------------------------------------------------------------------------
+ */
+
+/** Where along its connector a count label may sit. */
+export type EdgeLabelPosition = 'midpoint' | 'near-target' | 'near-source';
+
+/** An axis-aligned rectangle in SVG user units. */
+export interface GraphRect {
+  readonly left: number;
+  readonly top: number;
+  readonly right: number;
+  readonly bottom: number;
+}
+
+/**
+ * The type metrics and spacing the labels are placed with. All three are the
+ * caller's, because the label's type role and the outline's stroke are the
+ * stylesheet's decisions, not this module's.
+ */
+export interface EdgeLabelMetrics {
+  /**
+   * The labels' font size (their em) in SVG user units. A label is drawn with
+   * `text-anchor: middle` on an alphabetic baseline, so its ink box is taken
+   * as {@link LABEL_ASCENT_EM} of the em above the baseline and
+   * {@link LABEL_DESCENT_EM} below it. A value that is not finite and zero or
+   * more is read as `0`.
+   */
+  readonly fontSize: number;
+  /**
+   * The clear space kept between a label's ink and a box's outline, and
+   * between two labels. A value that is not finite and zero or more is read as
+   * `0`.
+   */
+  readonly clearance: number;
+  /**
+   * How far a box's outline reaches outside the box — half its stroke — and
+   * the inset the canvas keeps on every side. A value that is not finite and
+   * zero or more is read as `0`.
+   */
+  readonly outlineInset: number;
+}
+
+/** One count label, placed. */
+export interface EdgeLabelPlacement {
+  /** The connector it labels; see {@link GraphConnectorPlan.key}. */
+  readonly key: string;
+  /** The candidate it was placed at. */
+  readonly position: EdgeLabelPosition;
+  /** Its horizontal centre, for `text-anchor: middle`. */
+  readonly x: number;
+  /** Its baseline. */
+  readonly y: number;
+  /** The ink box it was checked against every other label and box with. */
+  readonly bounds: GraphRect;
+}
+
+/** Where every requested count label went. */
+export interface EdgeLabelLayout {
+  /** The labels placed, in the layout's connector order. */
+  readonly placed: readonly EdgeLabelPlacement[];
+  /** The connectors whose label fits at no candidate, in the same order. */
+  readonly suppressed: readonly string[];
+}
+
+/** The share of the em a label's ink is taken to rise above its baseline: 0.8. */
+export const LABEL_ASCENT_EM = 0.8;
+
+/** The share of the em a label's ink is taken to fall below its baseline: 0.2. */
+export const LABEL_DESCENT_EM = 0.2;
+
+/**
+ * The tolerance of every overlap test, in SVG user units: a label placed
+ * exactly against a box's clearance boundary touches it and does not overlap
+ * it, whatever the last bit of the floating-point sum that put it there.
+ */
+const PLACEMENT_EPSILON = 1e-6;
+
+/** Whether two rectangles share any area, touching edges excepted. */
+function rectsOverlap(a: GraphRect, b: GraphRect): boolean {
+  return (
+    a.left < b.right - PLACEMENT_EPSILON &&
+    b.left < a.right - PLACEMENT_EPSILON &&
+    a.top < b.bottom - PLACEMENT_EPSILON &&
+    b.top < a.bottom - PLACEMENT_EPSILON
+  );
+}
+
+/** Whether `inner` lies within `outer`, touching edges included. */
+function rectWithin(inner: GraphRect, outer: GraphRect): boolean {
+  return (
+    inner.left >= outer.left - PLACEMENT_EPSILON &&
+    inner.right <= outer.right + PLACEMENT_EPSILON &&
+    inner.top >= outer.top - PLACEMENT_EPSILON &&
+    inner.bottom <= outer.bottom + PLACEMENT_EPSILON
+  );
+}
+
+/** A rectangle grown by `by` on every side. */
+function expandRect(rect: GraphRect, by: number): GraphRect {
+  return {
+    left: rect.left - by,
+    top: rect.top - by,
+    right: rect.right + by,
+    bottom: rect.bottom + by,
+  };
+}
+
+/** A box's own rectangle. */
+function boxRect(box: GraphNodeBox): GraphRect {
+  return { left: box.x, top: box.y, right: box.x + box.width, bottom: box.y + box.height };
+}
+
+/**
+ * The candidates a connector's label is tried at, in order.
+ *
+ * - A connector between two neighbouring columns may sit at its midpoint,
+ *   which is the centre of the gap it crosses. When its source fans out to two
+ *   or more labelled connectors across that gap, the midpoints converge on
+ *   the source's side and the label goes near the target first, where each
+ *   target's row keeps it apart; when its target fans in, near the source
+ *   first, for the mirror reason. Otherwise — a plain chain — the midpoint
+ *   comes first, so a lone count stays centred in its gap.
+ * - A connector that skips columns has no midpoint in any gap (it lies over
+ *   an intermediate column), so it is tried near its target, then near its
+ *   source.
+ * - A connector within one column (what a cycle produces) runs between boxes
+ *   of the same column, so only its midpoint is tried; the row gap is rarely
+ *   tall enough, and the label is then left off.
+ */
+function candidateOrder(
+  connector: PositionedGraphConnector,
+  fansOut: boolean,
+  fansIn: boolean,
+): readonly EdgeLabelPosition[] {
+  if (connector.anchors.orientation === 'vertical') {
+    return ['midpoint'];
+  }
+  if (Math.abs(connector.target.layer - connector.source.layer) !== 1) {
+    return ['near-target', 'near-source'];
+  }
+  if (fansOut) {
+    return ['near-target', 'midpoint', 'near-source'];
+  }
+  if (fansIn) {
+    return ['near-source', 'midpoint', 'near-target'];
+  }
+  return ['midpoint', 'near-target', 'near-source'];
+}
+
+/**
+ * The anchor point — horizontal centre and baseline — of a label of `width`
+ * at one candidate of a connector.
+ *
+ * Near the target means just outside the target box on the side the connector
+ * meets it, on its anchor row, with `reach` (the outline's reach plus the
+ * clearance) between the label's ink and the box; near the source is the
+ * mirror image at the source box. Both follow the connector's direction, so a
+ * connector that runs backwards is labelled on the sides it actually leaves
+ * and meets.
+ */
+function candidatePoint(
+  connector: PositionedGraphConnector,
+  position: EdgeLabelPosition,
+  width: number,
+  reach: number,
+): Point {
+  const { source, target, orientation } = connector.anchors;
+  const half = width / 2;
+  const backward = orientation === 'backward';
+
+  switch (position) {
+    case 'midpoint':
+      return { x: interpolate(0.5, source.x, target.x), y: interpolate(0.5, source.y, target.y) };
+    case 'near-target':
+      return { x: backward ? target.x + reach + half : target.x - reach - half, y: target.y };
+    case 'near-source':
+      return { x: backward ? source.x - reach - half : source.x + reach + half, y: source.y };
+  }
+}
+
+/**
+ * Places the count label of every labelled connector where it collides with
+ * no box and no other label, or leaves it off.
+ *
+ * The connectors are taken in the layout's order — by the cell they leave,
+ * then the cell they meet — so the result does not depend on the order the
+ * relationships arrived in. Each one's label is tried at its candidates in
+ * {@link candidateOrder}'s order and placed at the first whose ink box:
+ *
+ *   - lies within the canvas's `viewBox` (the layout's extent plus the outline
+ *     inset on every side);
+ *   - overlaps no drawn box — every participant's own box and every overflow
+ *     box — grown by the outline's reach and the clearance;
+ *   - overlaps no label already placed, grown by the clearance.
+ *
+ * A label that fits at no candidate is returned in `suppressed` instead. The
+ * view sizes its column gap so that a label always fits between two columns
+ * (the widest label, plus the reach on both sides), which makes the
+ * near-target and near-source candidates collide only with other labels.
+ *
+ * Degenerate inputs: a width that is not finite and zero or more is read as
+ * `0`; a key the layout has no connector for is ignored.
+ *
+ * @param layout The positioned graph.
+ * @param widths The advance of each labelled connector's text, by connector
+ * key; a connector with no entry carries no label.
+ * @param metrics The labels' type size and the spacing to keep.
+ * @returns The placed labels and the suppressed ones, each in connector order.
+ *
+ * @example
+ * ```ts
+ * const widths = new Map(layout.connectors
+ *   .filter((connector) => connector.count > 1)
+ *   .map((connector) => [connector.key, measure(countText(connector.count))]));
+ * const { placed, suppressed } = placeEdgeLabels(layout, widths, {
+ *   fontSize: 11, clearance: 4, outlineInset: 1,
+ * });
+ * ```
+ */
+export function placeEdgeLabels(
+  layout: DependencyGraphLayout,
+  widths: ReadonlyMap<string, number>,
+  metrics: EdgeLabelMetrics,
+): EdgeLabelLayout {
+  const fontSize = asNonNegative(metrics.fontSize, 0);
+  const clearance = asNonNegative(metrics.clearance, 0);
+  const inset = asNonNegative(metrics.outlineInset, 0);
+  const reach = inset + clearance;
+
+  const labelled = layout.connectors.filter((connector) => widths.has(connector.key));
+
+  // How many labelled connectors each box sends across, or receives across,
+  // one gap to a neighbouring column.
+  const fanOut = new Map<string, number>();
+  const fanIn = new Map<string, number>();
+  const fanKeys = (
+    connector: PositionedGraphConnector,
+  ): { readonly out: string; readonly into: string } => ({
+    out: `${cellKey({ layer: connector.source.layer, row: connector.source.indexInLayer })}>${String(connector.target.layer)}`,
+    into: `${cellKey({ layer: connector.target.layer, row: connector.target.indexInLayer })}<${String(connector.source.layer)}`,
+  });
+  for (const connector of labelled) {
+    if (Math.abs(connector.target.layer - connector.source.layer) !== 1) {
+      continue;
+    }
+    const keys = fanKeys(connector);
+    fanOut.set(keys.out, (fanOut.get(keys.out) ?? 0) + 1);
+    fanIn.set(keys.into, (fanIn.get(keys.into) ?? 0) + 1);
+  }
+
+  const obstacles = [
+    ...layout.nodes.filter((positioned) => !positioned.collapsed).map(({ box }) => box),
+    ...layout.overflow.map(({ box }) => box),
+  ].map((box) => expandRect(boxRect(box), reach));
+  const canvas: GraphRect = {
+    left: -inset,
+    top: -inset,
+    right: layout.width + inset,
+    bottom: layout.height + inset,
+  };
+
+  const placed: EdgeLabelPlacement[] = [];
+  const suppressed: string[] = [];
+
+  for (const connector of labelled) {
+    const width = asNonNegative(widths.get(connector.key), 0);
+    const keys = fanKeys(connector);
+    const order = candidateOrder(
+      connector,
+      (fanOut.get(keys.out) ?? 0) >= 2,
+      (fanIn.get(keys.into) ?? 0) >= 2,
+    );
+
+    let placement: EdgeLabelPlacement | undefined;
+    for (const position of order) {
+      const point = candidatePoint(connector, position, width, reach);
+      const bounds: GraphRect = {
+        left: point.x - width / 2,
+        top: point.y - fontSize * LABEL_ASCENT_EM,
+        right: point.x + width / 2,
+        bottom: point.y + fontSize * LABEL_DESCENT_EM,
+      };
+      const spaced = expandRect(bounds, clearance);
+      const fits =
+        rectWithin(bounds, canvas) &&
+        !obstacles.some((obstacle) => rectsOverlap(bounds, obstacle)) &&
+        !placed.some((other) => rectsOverlap(spaced, other.bounds));
+
+      if (fits) {
+        placement = { key: connector.key, position, x: point.x, y: point.y, bounds };
+        break;
+      }
+    }
+
+    if (placement === undefined) {
+      suppressed.push(connector.key);
+    } else {
+      placed.push(placement);
+    }
+  }
+
+  return { placed, suppressed };
 }

@@ -68,6 +68,8 @@
  */
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer as createTcpServer } from 'node:net';
+import type { AddressInfo, Server, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -93,11 +95,13 @@ import {
   DEV_SERVER_PRELOAD_REASONS,
   FRAMEWORK_DEV_CLIS,
   LAUNCH_DEV_SERVER_COMMAND_TITLE,
+  MAX_ACCEPT_HOLD_MS,
   MAX_MANIFEST_BYTES,
   MAX_PROBE_TIMEOUT_MS,
   PACKAGE_MANAGER_SOURCES,
   PRELOAD_DEPENDENT_SIGNALS,
   RELAUNCH_PLACEHOLDERS,
+  acceptDevServerConnection,
   buildPreloadUnavailableSignals,
   buildRelaunchHint,
   detectDevServer,
@@ -108,6 +112,7 @@ import {
   selectDevScript,
 } from './detect.js';
 import type {
+  ConnectLike,
   DevScriptSelection,
   DevServerDetectDeps,
   DevServerDetection,
@@ -1030,6 +1035,377 @@ describe('probeDevServer', () => {
     expect(probe.reachable).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// acceptDevServerConnection
+// ---------------------------------------------------------------------------
+
+/** Servers a test opened, closed in `afterEach` so no listener outlives it. */
+const acceptServers: Server[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    acceptServers.splice(0).map(
+      (server) =>
+        new Promise<void>((resolve) => {
+          server.close(() => {
+            resolve();
+          });
+        }),
+    ),
+  );
+});
+
+/**
+ * A loopback TCP listener that accepts connections and never writes a byte —
+ * a dev server that listens while it compiles — and the origin it serves at.
+ */
+async function silentListener(): Promise<{
+  readonly origin: string;
+  readonly accepted: () => number;
+}> {
+  let count = 0;
+  const sockets = new Set<Socket>();
+  const server = createTcpServer((socket) => {
+    count += 1;
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+  server.on('close', () => {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+  });
+  acceptServers.push(server);
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve();
+    });
+  });
+  const { port } = server.address() as AddressInfo;
+  return { origin: `http://127.0.0.1:${String(port)}`, accepted: () => count };
+}
+
+/** A port on loopback that nothing listens on: bound once, then released. */
+async function closedPort(): Promise<number> {
+  const server = createTcpServer();
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve();
+    });
+  });
+  const { port } = server.address() as AddressInfo;
+  await new Promise<void>((resolve) => {
+    server.close(() => {
+      resolve();
+    });
+  });
+  return port;
+}
+
+/** A {@link ConnectLike} double whose socket never connects nor fails, recording what it was asked. */
+function hangingConnect(): {
+  readonly connect: Mock<ConnectLike>;
+  readonly destroyed: () => number;
+} {
+  let destroyed = 0;
+  const connect = vi.fn<ConnectLike>(() => ({
+    once: () => undefined,
+    on: () => undefined,
+    destroy: () => {
+      destroyed += 1;
+    },
+  }));
+  return { connect, destroyed: () => destroyed };
+}
+
+describe('acceptDevServerConnection', () => {
+  it('accepts at a listener that never answers HTTP, and records only origin and pathname', async () => {
+    const listener = await silentListener();
+
+    const result = expectOk(
+      await acceptDevServerConnection(`${listener.origin}/checkout?cart=${'c'.repeat(6)}`, {
+        timeoutMs: 2_000,
+      }),
+    );
+
+    expect(result).toMatchObject({ url: `${listener.origin}/checkout`, accepted: true });
+    expect(result.error).toBeUndefined();
+    expect(result.durationMs).toBeGreaterThanOrEqual(0);
+    expect(listener.accepted()).toBe(1);
+  });
+
+  it('answers accepted: false with ECONNREFUSED where nothing listens — an answer, not an error', async () => {
+    const port = await closedPort();
+
+    const result = expectOk(
+      await acceptDevServerConnection(`http://127.0.0.1:${String(port)}/`, { timeoutMs: 2_000 }),
+    );
+
+    expect(result.accepted).toBe(false);
+    expect(result.error?.code).toBe('ECONNREFUSED');
+    expect(result.error?.message).toBe('Connection refused: nothing is listening at this address.');
+  });
+
+  it.each([
+    { label: 'a LAN address', url: 'http://192.168.1.20:3000/' },
+    { label: 'a public host', url: 'https://example.test/' },
+    { label: 'every interface', url: 'http://0.0.0.0:3000/' },
+    { label: 'embedded credentials', url: credentialUrl('127.0.0.1:3000') },
+    { label: 'another scheme', url: 'ftp://127.0.0.1:3000/' },
+    { label: 'a malformed URL', url: 'not a url' },
+  ])('refuses $label with CONFIG_INVALID before opening any connection', async ({ url }) => {
+    const { connect } = hangingConnect();
+
+    const result = await acceptDevServerConnection(url, { connect, timeoutMs: 50 });
+
+    expect(isErr(result) && result.error.code).toBe('CONFIG_INVALID');
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it('times out a connection that never completes, destroying the socket and leaving no timer', async () => {
+    vi.useFakeTimers();
+    try {
+      const { connect, destroyed } = hangingConnect();
+      const pending = acceptDevServerConnection('http://localhost:4100/', {
+        connect,
+        timeoutMs: 250,
+      });
+
+      await vi.advanceTimersByTimeAsync(250);
+      const result = expectOk(await pending);
+
+      expect(result).toMatchObject({ url: 'http://localhost:4100/', accepted: false });
+      expect(result.error?.code).toBe('TIMEOUT');
+      expect(result.error?.message).toBe('No connection was accepted within 250 ms.');
+      expect(connect).toHaveBeenCalledExactlyOnceWith({ host: 'localhost', port: 4100 });
+      expect(destroyed()).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { label: 'an IPv6 loopback, unbracketed', url: 'http://[::1]:4100/', host: '::1', port: 4100 },
+    { label: 'the http default port', url: 'http://127.0.0.1/', host: '127.0.0.1', port: 80 },
+    { label: 'the https default port', url: 'https://localhost/', host: 'localhost', port: 443 },
+  ])('connects to $label', async ({ url, host, port }) => {
+    const { connect } = hangingConnect();
+
+    await acceptDevServerConnection(url, { connect, timeoutMs: 1 });
+
+    expect(connect).toHaveBeenCalledExactlyOnceWith({ host, port });
+  });
+
+  it('answers accepted: false for a connector that throws or a socket that fails, never rejecting', async () => {
+    const throwing: ConnectLike = () => {
+      throw Object.assign(new Error('socket limit'), { code: 'EMFILE' });
+    };
+    const failing: ConnectLike = () => ({
+      once: () => undefined,
+      on: (event: 'error' | 'end' | 'close', listener: (error?: unknown) => void) => {
+        if (event !== 'error') {
+          return;
+        }
+        queueMicrotask(() => {
+          listener(Object.assign(new Error('reset'), { code: 'ECONNRESET' }));
+        });
+      },
+      destroy: () => undefined,
+    });
+
+    const thrown = expectOk(
+      await acceptDevServerConnection(DEV_URL, { connect: throwing, timeoutMs: 1_000 }),
+    );
+    const failed = expectOk(
+      await acceptDevServerConnection(DEV_URL, { connect: failing, timeoutMs: 1_000 }),
+    );
+
+    expect(thrown).toMatchObject({ accepted: false, error: { code: 'EMFILE' } });
+    expect(failed).toMatchObject({ accepted: false, error: { code: 'ECONNRESET' } });
+  });
+
+  it('with a hold, accepts at a listener that keeps the connection open for the whole hold', async () => {
+    const listener = await silentListener();
+
+    const result = expectOk(
+      await acceptDevServerConnection(`${listener.origin}/`, { timeoutMs: 2_000, holdMs: 120 }),
+    );
+
+    expect(result).toMatchObject({ url: `${listener.origin}/`, accepted: true });
+    expect(listener.accepted()).toBe(1);
+  });
+
+  it('with a hold, answers DROPPED for a listener that closes what it accepted — a server exiting after it bound its port', async () => {
+    const listener = await droppingListener();
+
+    const result = expectOk(
+      await acceptDevServerConnection(`${listener.origin}/`, { timeoutMs: 2_000, holdMs: 400 }),
+    );
+
+    expect(result.accepted).toBe(false);
+    expect(result.error).toStrictEqual({
+      code: 'DROPPED',
+      message: 'The connection was accepted, then closed by the other side within 400 ms.',
+    });
+    expect(listener.accepted()).toBe(1);
+  });
+
+  it('holds an accepted connection for exactly the hold, then destroys it and leaves no timer', async () => {
+    vi.useFakeTimers();
+    try {
+      const scripted = scriptedConnect();
+      let settled = false;
+      const pending = acceptDevServerConnection(DEV_URL, {
+        connect: scripted.connect,
+        timeoutMs: 1_000,
+        holdMs: 200,
+      }).then((result) => {
+        settled = true;
+        return result;
+      });
+
+      scripted.emit('connect');
+      await vi.advanceTimersByTimeAsync(199);
+      expect(settled).toBe(false);
+      expect(scripted.destroyed()).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(expectOk(await pending)).toMatchObject({ accepted: true });
+      expect(scripted.destroyed()).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { event: 'end' as const, label: 'ends' },
+    { event: 'close' as const, label: 'closes' },
+    { event: 'error' as const, label: 'resets' },
+  ])(
+    'answers DROPPED when the other side $label the connection during the hold',
+    async ({ event }) => {
+      vi.useFakeTimers();
+      try {
+        const scripted = scriptedConnect();
+        const pending = acceptDevServerConnection(DEV_URL, {
+          connect: scripted.connect,
+          timeoutMs: 1_000,
+          holdMs: 500,
+        });
+
+        scripted.emit('connect');
+        await vi.advanceTimersByTimeAsync(50);
+        scripted.emit(event, Object.assign(new Error('reset'), { code: 'ECONNRESET' }));
+        const result = expectOk(await pending);
+
+        expect(result).toMatchObject({ accepted: false, error: { code: 'DROPPED' } });
+        expect(scripted.destroyed()).toBe(1);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('counts a connection at once for a hold that is not a positive number, and clamps a long one', async () => {
+    vi.useFakeTimers();
+    try {
+      for (const holdMs of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const scripted = scriptedConnect();
+        const pending = acceptDevServerConnection(DEV_URL, {
+          connect: scripted.connect,
+          timeoutMs: 1_000,
+          holdMs,
+        });
+        scripted.emit('connect');
+        expect(expectOk(await pending)).toMatchObject({ accepted: true });
+        expect(vi.getTimerCount()).toBe(0);
+      }
+
+      const scripted = scriptedConnect();
+      let settled = false;
+      const pending = acceptDevServerConnection(DEV_URL, {
+        connect: scripted.connect,
+        timeoutMs: 1_000,
+        holdMs: MAX_ACCEPT_HOLD_MS * 10,
+      }).then((result) => {
+        settled = true;
+        return result;
+      });
+      scripted.emit('connect');
+      await vi.advanceTimersByTimeAsync(MAX_ACCEPT_HOLD_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(expectOk(await pending)).toMatchObject({ accepted: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+/**
+ * A loopback TCP listener that accepts each connection and destroys it 10 ms
+ * later — a dev server that bound its port and then exited — and its origin.
+ */
+async function droppingListener(): Promise<{
+  readonly origin: string;
+  readonly accepted: () => number;
+}> {
+  let count = 0;
+  const server = createTcpServer((socket) => {
+    count += 1;
+    setTimeout(() => {
+      socket.destroy();
+    }, 10);
+  });
+  acceptServers.push(server);
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve();
+    });
+  });
+  const { port } = server.address() as AddressInfo;
+  return { origin: `http://127.0.0.1:${String(port)}`, accepted: () => count };
+}
+
+/**
+ * A {@link ConnectLike} double whose one socket the test drives: `emit`
+ * fires the listeners registered for an event, in registration order.
+ */
+function scriptedConnect(): {
+  readonly connect: ConnectLike;
+  readonly emit: (event: 'connect' | 'error' | 'end' | 'close', value?: unknown) => void;
+  readonly destroyed: () => number;
+} {
+  const listeners = new Map<string, ((value?: unknown) => void)[]>();
+  let destroyed = 0;
+  const add = (event: string, listener: (value?: unknown) => void): void => {
+    listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+  };
+  const connect: ConnectLike = () => ({
+    once: (event: 'connect', listener: () => void) => {
+      add(event, listener);
+    },
+    on: (event: 'error' | 'end' | 'close', listener: (error?: unknown) => void) => {
+      add(event, listener);
+    },
+    destroy: () => {
+      destroyed += 1;
+    },
+  });
+  return {
+    connect,
+    emit: (event, value) => {
+      for (const listener of listeners.get(event) ?? []) {
+        listener(value);
+      }
+    },
+    destroyed: () => destroyed,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // readTargetManifest

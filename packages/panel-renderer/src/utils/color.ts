@@ -2,9 +2,10 @@
  * Colour, severity and contrast — the single home of every colour *decision*
  * in `@debuggen/panel-renderer`.
  *
- * A generated panel colours four different vocabularies: the kind of a
+ * A generated panel colours several different vocabularies: the kind of a
  * telemetry event, the tier a lane belongs to, the participant class of a
- * dependency-graph node, and how slow a duration is. Each of those folds a
+ * dependency-graph node, a render's trigger, an operation's span status and
+ * HTTP response code, and how slow a duration is. Each of those folds a
  * vocabulary owned by `@debuggen/telemetry` onto the token scale owned by
  * `../tokens/tokens`, and each fold is a design decision rather than a
  * mechanical rename. They are taken here, once: a component asks this module
@@ -49,6 +50,14 @@
  *   a member upstream fails to compile here until the new member has been given
  *   a colour — which is the intended way to find this file.
  * - No sibling edge: this module imports nothing from `./format` or `./scale`.
+ * - `../primitives/Badge` is a **type-only** dependency, for `BadgeTone`. A
+ *   status, a render trigger or a request outcome is drawn as a chip far more
+ *   often than as a fill, and the chip's tone is part of the same colour
+ *   decision: answering it here is what keeps the request table, the
+ *   waterfall and the timeline from each keeping a status table of their own
+ *   that can drift (a 404 read as a warning in one view and as a failure in
+ *   the next). `Badge` imports nothing from this module, so the edge is
+ *   one-way and erased at build time.
  * - `./utils` is package-internal; `src/index.ts` does not re-export it.
  *
  * Every export is a pure function or a frozen table. Importing this module
@@ -59,8 +68,10 @@
  * `../components/Timeline.tsx`, `Waterfall.tsx`, `FlameChart.tsx`,
  * `EventLog.tsx`, `SpanTable.tsx`, `RenderTable.tsx`, `ComponentTree.tsx`,
  * `RequestTable.tsx`, `QueryTable.tsx`, `StateTransitionViewer.tsx`,
- * `DependencyGraph.tsx`, `../primitives/DurationCell.tsx` and
- * `../tokens/tokens.test.ts` (the contrast helpers).
+ * `DependencyGraph.tsx`, `../primitives/DurationCell.tsx`,
+ * `../tokens/tokens.test.ts` (the contrast helpers) and `./color.test.ts`,
+ * which pins the status, outcome and render-trigger decisions and measures the
+ * render-trigger hues as text in every theme.
  */
 
 import { clampNonNegative } from '@debuggen/shared';
@@ -72,6 +83,7 @@ import type {
   TelemetryTier,
 } from '@debuggen/telemetry';
 
+import type { BadgeTone } from '../primitives/Badge';
 import { cssVar, type TokenKey } from '../tokens/tokens';
 
 /**
@@ -406,23 +418,36 @@ export function dependencyParticipantColorVar(
  * ---------------------------------------------------------------------------
  * Render trigger → token
  *
- * A render's trigger is the finding the render panel exists for, so its colour
- * answers one question: is this render evidence of wasted work? The five
- * trigger values are three determinate "an input changed" cases, one
- * determinate "nothing changed" case and one "could not be determined" case,
- * and the colour distinguishes those three answers rather than the five values.
- * The values themselves are distinguished by their labels, which keeps colour
- * from being the sole carrier of meaning.
+ * A render's trigger is the finding the render panel exists for, and a reader
+ * scans a column of trigger chips for two things at once: *which* input drove
+ * a component's renders, and whether any of them were wasted. So each of the
+ * five values has a hue of its own — three distinct hues for the three inputs,
+ * the warning colour for the actionable "nothing changed" case and the muted
+ * colour for "could not be determined" — and a bucket that holds nothing is
+ * drawn idle, whatever its value, because a chip reading "unchanged 0" in the
+ * warning colour flags a problem the capture does not contain.
+ *
+ * Colour is never the only signal: each chip prints its value as a word, and
+ * `unknown` additionally carries a dashed hairline ({@link
+ * RenderTriggerAppearance.dashed}) so its distinction from `unchanged`
+ * survives a monochrome surface.
  * ---------------------------------------------------------------------------
  */
 
 /**
- * The token a render trigger is drawn in, in the render table's trigger column,
- * a component-tree badge and a state-transition row.
+ * The token a render trigger is drawn in, in the render table's trigger column
+ * and a component-tree badge.
  *
- * - `props`, `state` and `context` → `info`. A render with a changed input is
- *   work the framework was asked to do: explanatory, not a defect. Which input
- *   changed is stated by the label, so the three share a colour.
+ * - `props` → `info`, `state` → `kindInteraction`, `context` → `kindDb`. A
+ *   render with a changed input is work the framework was asked to do —
+ *   explanatory, not a defect — so none of the three borrows a status colour
+ *   that means "bad". They take three hues a reader can tell apart at a glance
+ *   (sky, violet and pink in the dark theme, and their darker counterparts in
+ *   the light one), because "these renders were driven by context" and "these
+ *   were driven by props" point at different code. Every one of the three
+ *   clears the 4.5:1 text minimum on every surface of all three themes, which
+ *   `./color.test.ts` measures, so a chip label in any of them is legible
+ *   text and not only a fill.
  * - `unchanged` → `warning`. The actionable case, and the one the
  *   unchanged-render metric counts: every one of the three inputs was
  *   evaluated and none of them changed, so the render was caused by an ancestor
@@ -438,11 +463,89 @@ export function dependencyParticipantColorVar(
  */
 export const RENDER_TRIGGER_TOKEN_KEYS: Readonly<Record<RenderTrigger, TokenKey>> = Object.freeze({
   props: 'info',
-  state: 'info',
-  context: 'info',
+  state: 'kindInteraction',
+  context: 'kindDb',
   unchanged: 'warning',
   unknown: 'textMuted',
 });
+
+/**
+ * The badge tone each render trigger's chip carries, paired with
+ * {@link RENDER_TRIGGER_TOKEN_KEYS}.
+ *
+ * `Badge`'s tone vocabulary has no violet or pink, so the three input triggers
+ * take the informational tone for the chip's surface and receive their own hue
+ * through the chip's `color` ({@link renderTriggerAppearance}), which the
+ * stylesheet prefers over the tone. `unchanged` is the warning tone and
+ * `unknown` the neutral one, matching their token.
+ *
+ * Total by construction over the closed trigger union, and frozen.
+ */
+export const RENDER_TRIGGER_TONES: Readonly<Record<RenderTrigger, BadgeTone>> = Object.freeze({
+  props: 'info',
+  state: 'info',
+  context: 'info',
+  unchanged: 'warning',
+  unknown: 'neutral',
+});
+
+/**
+ * Everything a view needs to draw one render-trigger chip, so the render table
+ * and the component tree draw the same trigger identically.
+ */
+export interface RenderTriggerAppearance {
+  /** The chip's `Badge` tone. */
+  readonly tone: BadgeTone;
+  /** The token the chip's label and hairline are drawn in. */
+  readonly tokenKey: TokenKey;
+  /** {@link tokenKey} as a `var(--dg-*)` reference, for the chip's `color`. */
+  readonly colorVar: string;
+  /**
+   * Whether the chip's hairline is dashed — the non-colour signal that sets
+   * `unknown` apart from `unchanged`. Independent of the count: an empty
+   * `unknown` bucket is still the "could not be determined" answer.
+   */
+  readonly dashed: boolean;
+  /**
+   * Whether the chip is drawn idle because its bucket holds nothing. An idle
+   * chip takes the muted colour and the neutral tone, so a zero never carries
+   * the warning colour or an input's hue.
+   */
+  readonly idle: boolean;
+}
+
+/**
+ * The appearance of one render-trigger chip.
+ *
+ * @param trigger The trigger the chip names.
+ * @param count The number of renders in the chip's bucket, when the chip
+ *   prints one. `0` draws the chip idle; `undefined` (a chip that names the
+ *   trigger of one render, with no count) and any positive count draw it in
+ *   the trigger's own colour. A non-finite or negative count is treated as
+ *   no count rather than as zero: it is not evidence that the bucket is empty.
+ * @returns The tone, token, colour reference and hairline style to draw.
+ */
+export function renderTriggerAppearance(
+  trigger: RenderTrigger,
+  count?: number,
+): RenderTriggerAppearance {
+  const idle = count === 0;
+  // Annotated as possibly undefined for the reason given on `kindTokenKey`: a
+  // trigger read from the wire may be one this build does not know.
+  const knownToken: TokenKey | undefined = RENDER_TRIGGER_TOKEN_KEYS[trigger];
+  const knownTone: BadgeTone | undefined = RENDER_TRIGGER_TONES[trigger];
+  const tokenKey = idle ? UNCLASSIFIED_TOKEN_KEY : (knownToken ?? UNCLASSIFIED_TOKEN_KEY);
+  const tone: BadgeTone = idle ? 'neutral' : (knownTone ?? 'neutral');
+  return Object.freeze({
+    tone,
+    tokenKey,
+    colorVar: cssVar(tokenKey),
+    // An unrecognised trigger makes no claim either, so it takes the same
+    // dashed "could not be determined" hairline as `unknown`.
+    dashed: trigger === 'unknown' || knownToken === undefined,
+    idle,
+  });
+}
 
 /**
  * The token for `trigger`, falling back to {@link UNCLASSIFIED_TOKEN_KEY} for a
@@ -504,6 +607,245 @@ export function statusTokenKey(status: TelemetryStatus): TokenKey {
  */
 export function statusColorVar(status: TelemetryStatus): string {
   return cssVar(statusTokenKey(status));
+}
+
+/**
+ * The badge tone each span status reads in — the single status → tone table
+ * every chip that prints a span status uses (the timeline's detail rows, the
+ * request table's code-less occurrences, the waterfall's "Error" badge).
+ *
+ * The same decision as {@link STATUS_TOKEN_KEYS}, stated in `Badge`'s tone
+ * vocabulary: `unset` is neutral because it makes no claim.
+ *
+ * Total by construction over the closed status union, and frozen.
+ */
+export const STATUS_TONES: Readonly<Record<TelemetryStatus, BadgeTone>> = Object.freeze({
+  unset: 'neutral',
+  ok: 'success',
+  error: 'danger',
+});
+
+/**
+ * The badge tone for a span `status`, neutral for a status this build does not
+ * know. Never throws, for the reason given on {@link kindTokenKey}.
+ */
+export function statusTone(status: TelemetryStatus): BadgeTone {
+  const tone: BadgeTone | undefined = STATUS_TONES[status];
+  return tone ?? 'neutral';
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * HTTP response status → token and tone
+ *
+ * A response code is a second, finer outcome vocabulary than the span status,
+ * and it is printed by three views: the request table's status column, the
+ * waterfall's status chip and the timeline's detail row. Each of those used to
+ * classify codes itself, so one 404 read as a warning in one view and as a
+ * failure in the next. The classification and its colour are decided here,
+ * once, and every view asks.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The classes of HTTP response status the product distinguishes, in code
+ * order, plus `unknown` for a value that is not a status code at all (absent,
+ * non-integer or outside 100–599).
+ */
+export const HTTP_STATUS_CLASSES = Object.freeze([
+  'informational',
+  'success',
+  'redirect',
+  'client-error',
+  'server-error',
+  'unknown',
+] as const);
+
+/** One member of {@link HTTP_STATUS_CLASSES}. */
+export type HttpStatusClass = (typeof HTTP_STATUS_CLASSES)[number];
+
+/** The lowest code of each class, and the ceiling above the last one. */
+const HTTP_STATUS_CLASS_FLOORS = Object.freeze({
+  informational: 100,
+  success: 200,
+  redirect: 300,
+  clientError: 400,
+  serverError: 500,
+  ceiling: 600,
+});
+
+/**
+ * Classify one response status code.
+ *
+ * Half-open ranges on the class floors: 100–199 informational, 200–299
+ * success, 300–399 redirect, 400–499 client error, 500–599 server error.
+ * Anything else — `undefined`, a fraction, `NaN`, zero (the "no response"
+ * value an XHR reports), a negative or a value of 600 or more — is `unknown`,
+ * because it is not a code a server sent.
+ *
+ * @param statusCode The code an event reported, or `undefined` for none.
+ * @returns The class whose tone and token every view draws the code in.
+ */
+export function httpStatusClass(statusCode: number | undefined): HttpStatusClass {
+  if (statusCode === undefined || !Number.isInteger(statusCode)) {
+    return 'unknown';
+  }
+  const floors = HTTP_STATUS_CLASS_FLOORS;
+  if (statusCode < floors.informational || statusCode >= floors.ceiling) {
+    return 'unknown';
+  }
+  if (statusCode < floors.success) {
+    return 'informational';
+  }
+  if (statusCode < floors.redirect) {
+    return 'success';
+  }
+  if (statusCode < floors.clientError) {
+    return 'redirect';
+  }
+  if (statusCode < floors.serverError) {
+    return 'client-error';
+  }
+  return 'server-error';
+}
+
+/**
+ * The token each status class is drawn in.
+ *
+ * - `success` → `success`.
+ * - `redirect` → `info`: the server answered with a pointer elsewhere, which is
+ *   neither a failure nor the final answer.
+ * - `client-error` → `warning`: the request was refused as made. A failure of
+ *   the call, but one the caller can usually correct, and kept apart from a
+ *   server error so a reader can tell "asked wrongly" from "the server broke"
+ *   at a glance.
+ * - `server-error` → `danger`: the server failed.
+ * - `informational` and `unknown` → `textMuted`: an interim code and a
+ *   non-code make no claim about the outcome.
+ *
+ * Total by construction over the class union, and frozen.
+ */
+export const HTTP_STATUS_CLASS_TOKEN_KEYS: Readonly<Record<HttpStatusClass, TokenKey>> =
+  Object.freeze({
+    informational: 'textMuted',
+    success: 'success',
+    redirect: 'info',
+    'client-error': 'warning',
+    'server-error': 'danger',
+    unknown: 'textMuted',
+  });
+
+/**
+ * The badge tone each status class reads in — {@link
+ * HTTP_STATUS_CLASS_TOKEN_KEYS} in `Badge`'s tone vocabulary, with the two
+ * no-claim classes neutral.
+ *
+ * Total by construction over the class union, and frozen.
+ */
+export const HTTP_STATUS_CLASS_TONES: Readonly<Record<HttpStatusClass, BadgeTone>> = Object.freeze({
+  informational: 'neutral',
+  success: 'success',
+  redirect: 'info',
+  'client-error': 'warning',
+  'server-error': 'danger',
+  unknown: 'neutral',
+});
+
+/**
+ * The badge tone of a response status code, through {@link httpStatusClass}.
+ */
+export function httpStatusTone(statusCode: number | undefined): BadgeTone {
+  return HTTP_STATUS_CLASS_TONES[httpStatusClass(statusCode)];
+}
+
+/**
+ * The token a response status code is drawn in, through {@link
+ * httpStatusClass}.
+ */
+export function httpStatusTokenKey(statusCode: number | undefined): TokenKey {
+  return HTTP_STATUS_CLASS_TOKEN_KEYS[httpStatusClass(statusCode)];
+}
+
+/**
+ * {@link httpStatusTokenKey} as a CSS value reference, for an inline stroke,
+ * fill or `--dgc-*` colour.
+ */
+export function httpStatusColorVar(statusCode: number | undefined): string {
+  return cssVar(httpStatusTokenKey(statusCode));
+}
+
+/**
+ * Whether a response status code reports a failed call: a client or a server
+ * error. Informational, success, redirect and non-codes are not failures.
+ */
+export function isHttpFailureStatus(statusCode: number | undefined): boolean {
+  const statusClass = httpStatusClass(statusCode);
+  return statusClass === 'client-error' || statusClass === 'server-error';
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Operation outcome → token and tone
+ *
+ * A request carries two outcome signals — the span status and, when a response
+ * arrived, its code — and they can disagree: a record written by an older
+ * producer reports `ok` beside a 500, and an aborted call reports `error` with
+ * no code at all. A view that draws one outcome per row (a waterfall bar, a
+ * timeline detail chip) reconciles the two here rather than choosing one.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The outcome class of one operation, from its span status and its response
+ * code when it has one.
+ *
+ * The code is the finer signal and wins whenever it is a failure or the span
+ * makes no failure claim; a span that reported `error` beside a code that does
+ * not read as a failure (a failed call whose response was a success or a
+ * redirect) is a server-grade failure, because the call itself failed. A call
+ * with no code falls back to its span status: `error` → `server-error` (the
+ * call failed with no answer — a network error or an abort), `ok` →
+ * `success`, `unset` → `unknown`.
+ *
+ * @param status The operation's span status.
+ * @param statusCode Its response code, when one was reported.
+ * @returns The class to draw the operation's outcome in.
+ */
+export function outcomeClass(status: TelemetryStatus, statusCode?: number): HttpStatusClass {
+  const codeClass = httpStatusClass(statusCode);
+  if (codeClass === 'client-error' || codeClass === 'server-error') {
+    return codeClass;
+  }
+  if (status === 'error') {
+    return 'server-error';
+  }
+  if (codeClass !== 'unknown') {
+    return codeClass;
+  }
+  return status === 'ok' ? 'success' : 'unknown';
+}
+
+/**
+ * Whether an operation failed, by {@link outcomeClass}.
+ */
+export function isFailureOutcome(status: TelemetryStatus, statusCode?: number): boolean {
+  const statusClass = outcomeClass(status, statusCode);
+  return statusClass === 'client-error' || statusClass === 'server-error';
+}
+
+/** The badge tone of an operation's outcome, by {@link outcomeClass}. */
+export function outcomeTone(status: TelemetryStatus, statusCode?: number): BadgeTone {
+  return HTTP_STATUS_CLASS_TONES[outcomeClass(status, statusCode)];
+}
+
+/** The token an operation's outcome is drawn in, by {@link outcomeClass}. */
+export function outcomeTokenKey(status: TelemetryStatus, statusCode?: number): TokenKey {
+  return HTTP_STATUS_CLASS_TOKEN_KEYS[outcomeClass(status, statusCode)];
+}
+
+/** {@link outcomeTokenKey} as a CSS value reference. */
+export function outcomeColorVar(status: TelemetryStatus, statusCode?: number): string {
+  return cssVar(outcomeTokenKey(status, statusCode));
 }
 
 /*

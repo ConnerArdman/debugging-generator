@@ -109,6 +109,7 @@
  */
 
 import { Buffer } from 'node:buffer';
+import { connect as netConnect } from 'node:net';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -410,8 +411,10 @@ export type DevServerPackageManagerSource = (typeof PACKAGE_MANAGER_SOURCES)[num
 /** Why a probe got no HTTP response. Never carries a raw exception message. */
 export interface DevServerProbeError {
   /**
-   * `'TIMEOUT'`, `'ABORTED'`, an errno-style code such as `'ECONNREFUSED'`, or
-   * `'NETWORK_ERROR'` when the failure carried no recognisable code.
+   * `'TIMEOUT'`, `'ABORTED'`, an errno-style code such as `'ECONNREFUSED'`,
+   * `'DROPPED'` when {@link acceptDevServerConnection} saw an accepted
+   * connection closed during its hold, or `'NETWORK_ERROR'` when the failure
+   * carried no recognisable code.
    */
   readonly code: string;
   /** A fixed developer-facing sentence; never echoes the URL or the error. */
@@ -824,6 +827,265 @@ export async function probeDevServer(
     });
   });
   return ok({ url: probedUrl, reachable: false, durationMs, error });
+}
+
+// ---------------------------------------------------------------------------
+// acceptDevServerConnection
+// ---------------------------------------------------------------------------
+
+/**
+ * The outcome of one {@link acceptDevServerConnection}: whether the address
+ * accepted a TCP connection, never what (if anything) it would have answered.
+ */
+export interface DevServerAcceptResult {
+  /** The probed origin and pathname, the form {@link DevServerProbeResult.url} records. */
+  readonly url: string;
+  /**
+   * Whether a connection to the URL's host and port was accepted within the
+   * timeout and — with a {@link DevServerAcceptDeps.holdMs} — stayed open,
+   * not closed or reset by the other side, for the whole hold.
+   */
+  readonly accepted: boolean;
+  /** Wall time of the attempt from the injected clock; finite and `>= 0`. */
+  readonly durationMs: number;
+  /** Why no connection was accepted, when `accepted` is `false`. */
+  readonly error?: DevServerProbeError;
+}
+
+/** The slice of a `net.Socket` {@link acceptDevServerConnection} uses. */
+export interface ConnectableSocket {
+  once(event: 'connect', listener: () => void): unknown;
+  /**
+   * `'error'` — the attempt, or a held connection, failed; `'end'` / `'close'`
+   * — the other side ended or closed the connection, which during a hold
+   * means it did not stay accepted.
+   */
+  on(event: 'error' | 'end' | 'close', listener: (error?: unknown) => void): unknown;
+  destroy(): unknown;
+}
+
+/** Opens a TCP connection; the default is `node:net`'s `connect`. */
+export type ConnectLike = (options: {
+  readonly host: string;
+  readonly port: number;
+}) => ConnectableSocket;
+
+/** Collaborators of {@link acceptDevServerConnection}; every member optional. */
+export interface DevServerAcceptDeps {
+  /** Default: `node:net`'s `connect`. */
+  readonly connect?: ConnectLike | undefined;
+  /** How long to wait for the connection, in ms. Default {@link DEFAULT_PROBE_TIMEOUT_MS}; clamped to `(0, 60 000]`. */
+  readonly timeoutMs?: number | undefined;
+  /**
+   * How long an accepted connection is held open before it counts, in ms, on
+   * top of `timeoutMs`. A peer that ends, closes or resets it within the hold
+   * has not accepted in any lasting sense — `accepted: false` with code
+   * `'DROPPED'`: a dev server that listens and then fails to load its
+   * configuration (Next.js 16 prints "Ready" before it reads `next.config`)
+   * drops every connection it accepted as it exits, where one that is still
+   * compiling holds them. Default `0`: counted the moment it is accepted. A
+   * non-positive or non-finite value is `0`; above
+   * {@link MAX_ACCEPT_HOLD_MS} is clamped to it.
+   */
+  readonly holdMs?: number | undefined;
+  /** Parent logger; the one debug line is bound to `subsystem: "dev-server"`. Default: no-op. */
+  readonly logger?: Logger | undefined;
+  /** Clock for the duration, in milliseconds. Default: `nowEpochMs`. */
+  readonly now?: (() => number) | undefined;
+}
+
+/**
+ * Whether a local dev server accepts a TCP connection at `url` — the cheapest
+ * proof that it is listening, and one a server compiling its first route still
+ * gives at once, where an HTTP request would wait for the compile.
+ *
+ * The same target policy as {@link probeDevServer} applies, checked **before
+ * any connection is opened**: a malformed URL, a scheme other than `http:` /
+ * `https:`, embedded credentials or a host other than `127.0.0.1`, `localhost`
+ * or `[::1]` is refused with `CONFIG_INVALID`. The port is the URL's own, else
+ * 80 or 443 by scheme. Nothing is written to the connection: it is destroyed
+ * the moment it is accepted (or, with a `holdMs`, once the hold passes or the
+ * other side drops it), when it fails, or when the timeout passes, and every
+ * timer is cleared, so neither a socket nor a timer outlives the call. A
+ * refused, timed-out or dropped connection is an answer (`accepted: false`
+ * with a coded {@link DevServerProbeError}), never an `Err`.
+ *
+ * @param url The address to connect to, e.g. a readiness candidate `http://127.0.0.1:3000/`.
+ * @param deps `connect`, `timeoutMs`, `holdMs`, `logger` and `now`.
+ * @returns Whether it accepted, or `CONFIG_INVALID` for a URL that may not be probed.
+ *
+ * @example
+ * ```ts
+ * const accepted = await acceptDevServerConnection('http://127.0.0.1:3000/', { timeoutMs: 5_000 });
+ * if (isOk(accepted) && accepted.value.accepted) {
+ *   // something listens there; which process holds it is a separate question
+ * }
+ * ```
+ */
+export async function acceptDevServerConnection(
+  url: string,
+  deps: DevServerAcceptDeps = {},
+): Promise<Result<DevServerAcceptResult, DebuggenError>> {
+  const logger = bindLogger(deps.logger);
+  const target = parseProbeTarget(url);
+  if (isErr(target)) {
+    logSafely(() => {
+      logger.debug('Refused to connect to a dev-server URL', { code: target.error.code });
+    });
+    return target;
+  }
+  const probedUrl = displayUrlOf(target.value);
+  const port = portOf(target.value);
+  // `URL` keeps an IPv6 host in brackets; a socket wants the bare address.
+  const host = target.value.hostname.replace(/^\[(.*)\]$/, '$1');
+  const now = deps.now ?? nowEpochMs;
+  const timeoutMs = normalizeProbeTimeout(deps.timeoutMs);
+  const holdMs = normalizeAcceptHold(deps.holdMs);
+  const startedAt = readClock(now);
+  const outcome = await connectWithTimeout(
+    deps.connect ?? defaultConnect,
+    host,
+    port,
+    timeoutMs,
+    holdMs,
+  );
+  const durationMs = elapsedMs(startedAt, readClock(now));
+  if (outcome.accepted) {
+    logSafely(() => {
+      logger.debug('Dev-server address accepted a connection', {
+        url: probedUrl,
+        holdMs,
+        durationMs,
+      });
+    });
+    return ok({ url: probedUrl, accepted: true, durationMs });
+  }
+  logSafely(() => {
+    logger.debug('Dev-server address accepted no connection', {
+      url: probedUrl,
+      errorCode: outcome.error.code,
+      durationMs,
+    });
+  });
+  return ok({ url: probedUrl, accepted: false, durationMs, error: outcome.error });
+}
+
+/** How one connection attempt ended. */
+type ConnectOutcome =
+  { readonly accepted: true } | { readonly accepted: false; readonly error: DevServerProbeError };
+
+/** The default {@link ConnectLike}: `node:net`'s `connect`. */
+const defaultConnect: ConnectLike = (options) =>
+  netConnect({ host: options.host, port: options.port });
+
+/** The longest {@link DevServerAcceptDeps.holdMs} honoured, in ms. */
+export const MAX_ACCEPT_HOLD_MS = 10_000;
+
+/** A {@link DevServerAcceptDeps.holdMs} as it applies: whole milliseconds in `[0, MAX_ACCEPT_HOLD_MS]`. */
+function normalizeAcceptHold(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.min(Math.floor(value), MAX_ACCEPT_HOLD_MS)
+    : 0;
+}
+
+/** The TCP port of a probe target: its explicit port, else 80 or 443 by scheme. */
+function portOf(url: URL): number {
+  return url.port !== '' ? Number(url.port) : url.protocol === 'https:' ? 443 : 80;
+}
+
+/**
+ * Open one connection and settle on the first of: accepted (and, with a
+ * `holdMs`, still open when the hold passes), failed, dropped during the hold,
+ * timed out before it was accepted. The socket is destroyed and both timers
+ * cleared on every path; an `error`, `end` or `close` the socket emits after
+ * settling reaches a listener that stays attached and changes nothing, so a
+ * late failure can never surface as an unhandled `error` event.
+ */
+function connectWithTimeout(
+  connect: ConnectLike,
+  host: string,
+  port: number,
+  timeoutMs: number,
+  holdMs: number,
+): Promise<ConnectOutcome> {
+  return new Promise<ConnectOutcome>((resolve) => {
+    let settled = false;
+    let connected = false;
+    let socket: ConnectableSocket | undefined;
+    let holdTimer: ReturnType<typeof setTimeout> | undefined;
+    // `finish` reads `timer` only when it runs, and every caller of `finish`
+    // (the timers, the socket listeners, the synchronous catch) runs after the
+    // connect timer below is armed.
+    const finish = (outcome: ConnectOutcome): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(holdTimer);
+      try {
+        socket?.destroy();
+      } catch {
+        // A socket that cannot be destroyed is reclaimed with its handle; the
+        // answer is already known.
+      }
+      resolve(outcome);
+    };
+    /** The other side ended, closed or reset a connection it had accepted. */
+    const dropped = (): void => {
+      finish({
+        accepted: false,
+        error: {
+          code: 'DROPPED',
+          message: `The connection was accepted, then closed by the other side within ${holdMs} ms.`,
+        },
+      });
+    };
+    const timer = setTimeout(() => {
+      finish({
+        accepted: false,
+        error: { code: 'TIMEOUT', message: `No connection was accepted within ${timeoutMs} ms.` },
+      });
+    }, timeoutMs);
+    try {
+      socket = connect({ host, port });
+      socket.on('error', (error) => {
+        if (connected) {
+          dropped();
+          return;
+        }
+        finish({ accepted: false, error: describeTransportFailure(error) });
+      });
+      socket.on('end', () => {
+        if (connected) {
+          dropped();
+        }
+      });
+      socket.on('close', () => {
+        if (connected) {
+          dropped();
+          return;
+        }
+        // Closed before it connected, without an `error` first: not accepted.
+        finish({ accepted: false, error: describeTransportFailure(undefined) });
+      });
+      socket.once('connect', () => {
+        connected = true;
+        clearTimeout(timer);
+        if (holdMs === 0) {
+          finish({ accepted: true });
+          return;
+        }
+        holdTimer = setTimeout(() => {
+          finish({ accepted: true });
+        }, holdMs);
+      });
+    } catch (error) {
+      // A connector that throws synchronously has failed the attempt; it is an
+      // answer ("not accepted"), not a crash of the probe.
+      finish({ accepted: false, error: describeTransportFailure(error) });
+    }
+  });
 }
 
 /** How one probe request ended. */

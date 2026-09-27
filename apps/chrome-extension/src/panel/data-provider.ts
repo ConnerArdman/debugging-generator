@@ -31,9 +31,9 @@
  * acquires nothing: the request function (`panelRequest`, or
  * `getPanelConnection().request`), the port-loss registration
  * (`onPortDisconnect`), the session getter (`getSessionId` from
- * `./state/session-store.ts`), the capture getter and the trace cache's
- * authorisation predicate (both reading that store's snapshot) are all
- * injected by `../App.tsx`. This module
+ * `./state/session-store.ts`), the capture getter, the trace cache's
+ * authorisation predicate and the ended-session predicate (all reading that
+ * store's snapshot) are all injected by `../App.tsx`. This module
  * never creates, holds or reconnects a port, never opens a socket and never
  * calls `fetch` — the worker owns every HTTP call, so the protocol package's
  * `HttpClient` (whose documentation lists this file among its consumers) is
@@ -266,6 +266,8 @@ type PanelDataQueryAnswer = PortResponsePayloads[typeof PANEL_DATA_QUERY_KIND];
 const HINTS = {
   unbound: 'Start a session from the Debug Generator view in VS Code, then reopen this panel.',
   foreignSession: 'Reload the panel to show the session this tab is bound to.',
+  endedSession:
+    'What this panel already shows stays on screen. Start a new session from the Debug Generator view in VS Code to capture again.',
   unusablePanel: 'Reload the panel; if it keeps failing, reopen Chrome DevTools.',
   disconnected: 'The panel reconnects on its own; retry in a moment.',
   timeout: 'Retry in a moment; if it keeps failing, reload the extension.',
@@ -351,6 +353,25 @@ export interface PanelDataProviderOptions {
    * credential. Read at every cache read and write, never remembered.
    */
   readonly canServeCached?: ((sessionId: SessionId) => boolean) | undefined;
+  /**
+   * Whether `sessionId` is an ended session this panel still shows —
+   * `isEndedSessionShown` from `./state/session-store.ts`, injected by
+   * `../App.tsx`: the ended session on screen on a tab no longer bound.
+   *
+   * Ending a session unbinds its tab, and the store keeps the ended session's
+   * final state on screen, rendered views included. A read that view makes
+   * afterwards — another page, an expanded row, an event lookup — cannot
+   * succeed: a devtools client reads panel data only for the session bound to
+   * its tab (AAP §0.5.6), and a session that has ended accepts no binding. So
+   * such a read is refused here, before anything is sent, with copy that says
+   * why and that the views on screen stay — rather than a worker refusal whose
+   * hint to reopen the panel would discard them.
+   *
+   * Read at every call, never remembered. Omitted, answering anything but
+   * exactly `true`, or throwing (logged with the error's name only), the query
+   * is sent as usual and the worker and service decide.
+   */
+  readonly isSessionEnded?: ((sessionId: SessionId) => boolean) | undefined;
   /**
    * `onPortDisconnect` from `./state/connection.ts`. When given, the provider
    * subscribes while it has queries in flight **or** holds cached traces: the
@@ -841,6 +862,20 @@ function foreignSessionError(source: DataQuerySource): DebuggenError {
   );
 }
 
+/**
+ * A query addressed to the ended session this panel still shows: no binding
+ * can authorise it any more (see {@link PanelDataProviderOptions.isSessionEnded}).
+ * `SESSION_INVALID_STATE`, the code the service refuses a bind to an ended
+ * session with.
+ */
+function endedSessionError(source: DataQuerySource): DebuggenError {
+  return new DebuggenError(
+    'SESSION_INVALID_STATE',
+    `The "${source}" data for this view cannot be requested: the session has ended, and DevTools reads captured evidence only while its tab is bound to a live session.`,
+    { hint: HINTS.endedSession, details: { source, session: 'ended' } },
+  );
+}
+
 /** The kind of an unusable panel id, for a detail — never the value itself. */
 function panelIdKind(panelId: unknown): string {
   if (typeof panelId === 'string') {
@@ -1078,7 +1113,8 @@ interface SharedRequest {
  * {@link PanelDataProvider.pendingCount} beside `query`.
  */
 export function createPanelDataProvider(options: PanelDataProviderOptions): PanelDataProvider {
-  const { request, getSessionId, getCaptureId, canServeCached, onPortDisconnect } = options;
+  const { request, getSessionId, getCaptureId, canServeCached, isSessionEnded, onPortDisconnect } =
+    options;
   const logger = options.logger ?? noopLogger;
   const timeoutMs = usableTimeout(options.timeoutMs, PANEL_DATA_REQUEST_TIMEOUT_MS);
 
@@ -1373,7 +1409,29 @@ export function createPanelDataProvider(options: PanelDataProviderOptions): Pane
     if (isAddressable(shown) && shown !== sessionId) {
       throw foreignSessionError(source);
     }
+    if (sessionEnded(sessionId)) {
+      throw endedSessionError(source);
+    }
     return sessionId;
+  }
+
+  /**
+   * Whether the injected `isSessionEnded` answers exactly `true` for
+   * `sessionId`; a missing predicate, any other answer or a throw (logged with
+   * the error's name only) is `false`, and the query is sent.
+   */
+  function sessionEnded(sessionId: SessionId): boolean {
+    if (isSessionEnded === undefined) {
+      return false;
+    }
+    try {
+      return isSessionEnded(sessionId) === true;
+    } catch (cause) {
+      logger.warn('Reading whether the panel session ended failed; sending the query.', {
+        error: errorName(cause),
+      });
+      return false;
+    }
   }
 
   /**

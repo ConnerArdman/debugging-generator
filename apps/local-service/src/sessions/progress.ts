@@ -5,33 +5,46 @@
  * The view the editor shows for a session reads like this (prompt §11, Step 8):
  *
  * ```text
- * Understanding problem          ← the `understand` stage's `running` row
- * Investigating code             ← the `investigate` stage's `running` row
+ * Understanding problem          ← the `understand` group's header: the understand
+ *                                  stage's `running` row, re-opened by the
+ *                                  investigation and settled when it closes
  * ✓ Found ‹component›            ← a `done` row per component the code graph found
  * ✓ Traced event handler         ← one `done` row when an event handler was traced;
- *                                  its detail lists the traced symbols and a file
- * ✓ Found ‹route path›           ← a `done` row per API route actually resolved
+ *                                  its detail lists the traced symbols and files
+ * ✓ Found ‹route path›           ← a `done` row per route actually resolved
  * ✓ Found database dependency    ← one `done` row when a database call site exists
  *
- * Preparing instrumentation      ← the `instrument` stage's `running` row, settled
- *                                  to `done` when readiness is satisfied
+ * Preparing instrumentation      ← the `instrument` group's header: opened by the
+ *                                  plan stage, settled to `done` when readiness
+ *                                  is satisfied
  * ✓ Browser performance          ← one `done` row per signal actually armed
  * ✓ React renders
  * ✓ Network tracing
  * ✓ Server spans
  * ✓ Database tracing
- * ✗ Could not enable ‹signal›: ‹reason›.   ← one `failed` row per unavailable signal
+ * ✗ Could not enable ‹signal›: ‹reason›. Continuing with: ‹enabled list›.
+ *                                ← one terminal `failed` row per unavailable
+ *                                  signal, naming the ✓ labels above
  *
  * Ready to capture               ← the `instrument` stage's closing `done` row
  * ```
  *
- * A **group header** is a stage's `running` row, whose `message` is the stage
+ * Stages are grouped as Step 8 shows them ({@link PROGRESS_STAGE_GROUPS}): the
+ * code investigation reports inside "Understanding problem" and instrumentation
+ * planning inside "Preparing instrumentation". Every row but a `failed` one
+ * travels under its stage's **group**, so the wire carries one group per Step-8
+ * heading; a `failed` row keeps the stage that failed, which its public copy
+ * and both user interfaces' failure notices name.
+ *
+ * A **group header** is a group's `running` row, whose `message` is the group
  * title from {@link PROGRESS_STAGE_TITLES}; the `done` row a stage closes with
  * carries that same title unless its caller states another, so a client keying
- * rows on `(stage, message)` settles the header rather than adding a line. A
- * **✓ row** is any other `done` row and a **✗ row** a `failed` one. Both user
- * interfaces group whatever the service sent by stage and draw it in arrival
- * order, so neither of them restates a title, a label or a step list.
+ * rows on `(stage, message)` settles the header rather than adding a line — and
+ * a grouped stage re-opens its group's header as it starts and settles it as
+ * it closes. A **✓ row** is any other `done` row and a **✗ row** a `failed`
+ * one. Both user interfaces group whatever the service sent by stage and draw
+ * it in arrival order, so neither of them restates a title, a label or a step
+ * list.
  *
  * ## The rows are rendered from findings, never from canned text
  *
@@ -157,14 +170,17 @@ import type { SessionFailure } from './state-machine.js';
 // ---------------------------------------------------------------------------
 
 /**
- * The group header of every progress stage.
+ * The title of every progress stage.
  *
- * Travels on the wire as the `message` of each stage's `running` row, which is
- * how both user interfaces obtain it: neither duplicates a title, and a stage
- * added to protocol's `PROGRESS_STAGES` is a compile error here until it has
- * one. The two titles prompt §11 prints are used verbatim; the other seven are
- * written in the same plain voice and name only the product's own pipeline
- * phases — no framework, no application, no project noun.
+ * A group's title travels on the wire as the `message` of its header row,
+ * which is how both user interfaces obtain it: neither duplicates a title, and
+ * a stage added to protocol's `PROGRESS_STAGES` is a compile error here until
+ * it has one. The two titles prompt §11 prints are used verbatim; the other
+ * seven are written in the same plain voice and name only the product's own
+ * pipeline phases — no framework, no application, no project noun. The title
+ * of a stage reporting inside another stage's group
+ * ({@link PROGRESS_STAGE_GROUPS}) heads no group; it names the stage in its
+ * public failure copy (`Investigating code failed: …`).
  */
 export const PROGRESS_STAGE_TITLES = Object.freeze({
   understand: 'Understanding problem',
@@ -177,6 +193,44 @@ export const PROGRESS_STAGE_TITLES = Object.freeze({
   followup: 'Evaluating follow-up question',
   cleanup: 'Removing instrumentation',
 } as const satisfies Readonly<Record<ProgressStage, string>>);
+
+/**
+ * The Step-8 group each stage reports in (AAP §0.1.2, prompt §11 Step 8): the
+ * code investigation is part of "Understanding problem" and instrumentation
+ * planning part of "Preparing instrumentation"; every other stage is a group
+ * of its own.
+ *
+ * Every row except a `failed` one is sent under its stage's group
+ * ({@link SessionProgress.emit} applies this map), and a stage's header and
+ * closing rows default to the group's title — so the investigation re-opens
+ * the understanding's header and settles it again, planning opens the header
+ * the instrumentation settles, and the wire carries exactly the groups Step 8
+ * shows. A `failed` row keeps the stage that failed: its public copy names
+ * that stage, and both user interfaces read the failing stage off it.
+ *
+ * Keyed by the closed `ProgressStage` vocabulary with `satisfies`, so a stage
+ * added upstream is a compile error until it is placed in a group.
+ */
+export const PROGRESS_STAGE_GROUPS = Object.freeze({
+  understand: 'understand',
+  investigate: 'understand',
+  plan: 'instrument',
+  instrument: 'instrument',
+  capture: 'capture',
+  analyze: 'analyze',
+  'generate-panel': 'generate-panel',
+  followup: 'followup',
+  cleanup: 'cleanup',
+} as const satisfies Readonly<Record<ProgressStage, ProgressStage>>);
+
+/**
+ * The group a stage's rows are sent under. A stage outside the vocabulary —
+ * possible only from an untyped caller — is its own group, and the schema then
+ * judges it as it would have unmapped.
+ */
+function progressGroupOf(stage: ProgressStage): ProgressStage {
+  return Object.hasOwn(PROGRESS_STAGE_GROUPS, stage) ? PROGRESS_STAGE_GROUPS[stage] : stage;
+}
 
 /**
  * The human label of every capture signal: the text of an instrumentation
@@ -634,6 +688,13 @@ const DATABASE_DEPENDENCY_MESSAGE = 'Found database dependency';
  */
 const TRACED_EVENT_HANDLER_MESSAGE = 'Traced event handler';
 
+/**
+ * The stage the investigation's finding rows are sent under: the group the
+ * investigation reports in ({@link PROGRESS_STAGE_GROUPS}), so Step 8 lists
+ * them under "Understanding problem".
+ */
+const INVESTIGATION_ROWS_STAGE: ProgressStage = PROGRESS_STAGE_GROUPS.investigate;
+
 /** The logger binding naming this folder, per `../logging.ts`'s convention. */
 const LOG_SUBSYSTEM = 'sessions';
 
@@ -690,6 +751,20 @@ const MAX_MESSAGE_TEXT_LENGTH = 1000;
  */
 const MAX_DETAIL_TEXT_LENGTH = 1000;
 
+/**
+ * Protocol's transport bound for a `session.progress` row's `detail`
+ * (`packages/protocol/src/messages/session.ts`, which does not export it; its
+ * schema stays the validator of record in {@link SessionProgress.emit}).
+ *
+ * Only a failed row's proven hint is held to it rather than to
+ * {@link MAX_DETAIL_TEXT_LENGTH}: a proven hint is at most
+ * {@link PRODUCT_TEXT_MAX_LENGTH} long, so it and the row's
+ * `(error code: …, ref: …)` suffix always fit, and an exact recovery step —
+ * the dev-server relaunch command AAP §0.5.5 requires — is never cut
+ * mid-command.
+ */
+const MAX_TRANSPORT_DETAIL_LENGTH = 4000;
+
 /** Separator between the entries a single `detail` line lists. */
 const DETAIL_LIST_SEPARATOR = ', ';
 
@@ -709,6 +784,24 @@ const CALL_SITE_PATTERN = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:\(\))?$/u;
 
 /** Trailing sentence punctuation stripped from a reason before it is quoted. */
 const TRAILING_PUNCTUATION_PATTERN = /[\s.]+$/u;
+
+/**
+ * The connective of AAP §0.5.5's degradation sentence, between the clause
+ * naming the signal that could not be enabled and the list the capture
+ * proceeds with. {@link unavailableSignalMessage} writes it into every
+ * sentence — an empty list included — so the sentence always has both halves.
+ */
+const CONTINUING_WITH = ' Continuing with: ';
+
+/**
+ * The `‹enabled list›` of a degradation sentence when no other signal is
+ * confirmed: the capture has nothing else it can vouch for, and the sentence
+ * says so instead of naming a signal no producer was shown to deliver.
+ */
+const NO_CONFIRMED_SIGNAL = 'no confirmed signal';
+
+/** The full stop that closes a composed sentence. */
+const SENTENCE_END = '.';
 
 /**
  * The only shape a diagnostic reference may take before a `failed` row shows
@@ -750,7 +843,9 @@ export type ProgressRow = Pick<SessionProgressPayload, 'stage' | 'status' | 'mes
  *   entity kind (see {@link buildInvestigationRows}), so a caller holding only
  *   the Stage-1 entities and the investigation's relevant files is served too.
  * - {@link relevantFiles} is never a class of its own; it supplies the
- *   evidential origin (the file) a finding row carries as its `detail`.
+ *   evidential origin (the file) a finding row carries as its `detail`, and
+ *   {@link origins} supplies it first where the caller located the finding
+ *   itself.
  */
 export interface InvestigationFindings {
   /** Component or symbol names the code graph actually resolved. */
@@ -765,6 +860,13 @@ export interface InvestigationFindings {
   readonly entities?: readonly ProblemEntity[];
   /** The investigation's relevant files, used for each row's origin. */
   readonly relevantFiles?: readonly RelevantFile[];
+  /**
+   * The file each finding was located in, by finding name, when the caller
+   * knows it from the code graph itself — a data-layer call site, for one, is
+   * a location but never a relevant file's symbol. Takes precedence over the
+   * origin {@link relevantFiles} gives the same name.
+   */
+  readonly origins?: ReadonlyMap<string, string>;
 }
 
 /**
@@ -1077,13 +1179,24 @@ function boundStageRows(
 // ---------------------------------------------------------------------------
 
 /**
- * Indexes the investigation's relevant files by symbol, keeping the first file
- * listed for a symbol so the origin a row shows is deterministic.
+ * Indexes the origin of each finding name: the caller's own located origins
+ * first, then the investigation's relevant files by symbol, keeping the first
+ * file given for a name so the origin a row shows is deterministic.
  */
 function indexOriginsBySymbol(
   relevantFiles: readonly RelevantFile[] | undefined,
+  located?: ReadonlyMap<string, string>,
 ): Map<string, string> {
   const origins = new Map<string, string>();
+
+  for (const [name, path] of located ?? []) {
+    const symbol = toDisplayText(name, MAX_FINDING_TEXT_LENGTH);
+    const file = toDisplayPath(path);
+
+    if (symbol.length > 0 && file.length > 0 && !origins.has(symbol)) {
+      origins.set(symbol, file);
+    }
+  }
 
   for (const relevant of relevantFiles ?? []) {
     const symbol = toDisplayText(relevant.symbol, MAX_FINDING_TEXT_LENGTH);
@@ -1155,10 +1268,30 @@ function withOrigin(name: string, file: string | undefined): Finding {
 }
 
 /**
+ * The origin files of a class's findings, as one bounded line: each distinct
+ * file once, in the order its first finding appears, so a class whose
+ * findings span several files never reads as though all of them sat in the
+ * first one. `undefined` when no finding resolved to a file.
+ */
+function originFilesLine(findings: readonly Finding[]): string | undefined {
+  const files: string[] = [];
+
+  for (const finding of findings) {
+    if (finding.file !== undefined && !files.includes(finding.file)) {
+      files.push(finding.file);
+    }
+  }
+
+  return files.length === 0
+    ? undefined
+    : joinBounded(files, DETAIL_LIST_SEPARATOR, MAX_DETAIL_TEXT_LENGTH / 2);
+}
+
+/**
  * The single database row: emitted only when at least one call site exists,
- * with a detail listing the call sites that are in callee form and the origin
- * file of the first one that has one. A site that is not in callee form is
- * counted, never printed.
+ * with a detail listing the call sites that are in callee form, then the
+ * origin files of the sites that have one (see {@link originFilesLine}). A
+ * site that is not in callee form is counted, never printed.
  */
 function databaseRows(findings: readonly Finding[]): ProgressRow[] {
   if (findings.length === 0) {
@@ -1168,7 +1301,7 @@ function databaseRows(findings: readonly Finding[]): ProgressRow[] {
   const printable = findings
     .map((finding) => finding.name)
     .filter((name) => CALL_SITE_PATTERN.test(name));
-  const origin = findings.find((finding) => finding.file !== undefined)?.file;
+  const origin = originFilesLine(findings);
   const parts: string[] = [];
 
   if (printable.length > 0) {
@@ -1189,16 +1322,21 @@ function databaseRows(findings: readonly Finding[]): ProgressRow[] {
   }
 
   return [
-    makeRow('investigate', 'done', DATABASE_DEPENDENCY_MESSAGE, parts.join(DETAIL_PART_SEPARATOR)),
+    makeRow(
+      INVESTIGATION_ROWS_STAGE,
+      'done',
+      DATABASE_DEPENDENCY_MESSAGE,
+      parts.join(DETAIL_PART_SEPARATOR),
+    ),
   ];
 }
 
 /**
  * The single event-handler row: emitted only when at least one handler was
  * traced, with a detail listing the traced symbols (bounded, with an omission
- * note past the bound) and the origin file of the first handler that has one —
- * so one handler reads `` `${symbol} · ${file}` ``. The file part is omitted
- * when no traced handler resolved to a file.
+ * note past the bound) and the origin files of the handlers that have one (see
+ * {@link originFilesLine}) — so one handler reads `` `${symbol} · ${file}` ``.
+ * The file part is omitted when no traced handler resolved to a file.
  *
  * One row for the whole class rather than one per handler: both user
  * interfaces de-duplicate rows by `(stage, message)`, so several rows sharing
@@ -1210,7 +1348,7 @@ function eventHandlerRows(findings: readonly Finding[]): ProgressRow[] {
     return [];
   }
 
-  const origin = findings.find((finding) => finding.file !== undefined)?.file;
+  const origin = originFilesLine(findings);
   const parts = [
     joinBounded(
       findings.map((finding) => finding.name),
@@ -1224,7 +1362,12 @@ function eventHandlerRows(findings: readonly Finding[]): ProgressRow[] {
   }
 
   return [
-    makeRow('investigate', 'done', TRACED_EVENT_HANDLER_MESSAGE, parts.join(DETAIL_PART_SEPARATOR)),
+    makeRow(
+      INVESTIGATION_ROWS_STAGE,
+      'done',
+      TRACED_EVENT_HANDLER_MESSAGE,
+      parts.join(DETAIL_PART_SEPARATOR),
+    ),
   ];
 }
 
@@ -1242,12 +1385,15 @@ function eventHandlerRows(findings: readonly Finding[]): ProgressRow[] {
  * known (a project-relative path the editor can open). The event-handler and
  * database rows each stand for their whole class, so their `detail` lists the
  * class's findings — the traced handler symbols, the call sites — then the
- * origin file of the first finding that has one, separated by `` ` · ` ``
- * (`` `${symbol} · ${file}` `` for a single traced handler). A class with no
+ * distinct origin files of the findings that have one, separated by
+ * `` ` · ` `` (`` `${symbol} · ${file}` `` for a single traced handler). A class with no
  * finding emits no row, and an empty input returns an empty array. Output is
  * bounded by {@link MAX_FINDING_ROWS_PER_STAGE}, follows input order within
- * each class, and is identical for identical input. All rows belong to the
- * `investigate` stage and are `done`.
+ * each class, and is identical for identical input. All rows are `done` and
+ * belong to the group the investigation reports in — the `understand` stage,
+ * whose "Understanding problem" heading Step 8 lists them under (see
+ * {@link PROGRESS_STAGE_GROUPS}) — so they are exactly the rows the emitter
+ * sends.
  *
  * Pure, synchronous and I/O-free: no store, no transport, no clock, no logger.
  *
@@ -1257,13 +1403,13 @@ function eventHandlerRows(findings: readonly Finding[]): ProgressRow[] {
  * @example
  * ```ts
  * buildInvestigationRows({ components: [name], routes: [] });
- * // → [{ stage: 'investigate', status: 'done', message: `Found ${name}` }]
+ * // → [{ stage: 'understand', status: 'done', message: `Found ${name}` }]
  * buildInvestigationRows({});
  * // → []
  * ```
  */
 export function buildInvestigationRows(findings: InvestigationFindings): readonly ProgressRow[] {
-  const origins = indexOriginsBySymbol(findings.relevantFiles);
+  const origins = indexOriginsBySymbol(findings.relevantFiles, findings.origins);
   const entities = findings.entities;
 
   const components = resolveFindings('components', findings.components, entities, origins);
@@ -1278,15 +1424,17 @@ export function buildInvestigationRows(findings: InvestigationFindings): readonl
 
   const groups: readonly (readonly ProgressRow[])[] = [
     components.map((finding) =>
-      makeRow('investigate', 'done', `Found ${finding.name}`, finding.file),
+      makeRow(INVESTIGATION_ROWS_STAGE, 'done', `Found ${finding.name}`, finding.file),
     ),
     eventHandlerRows(handlers),
-    routes.map((finding) => makeRow('investigate', 'done', `Found ${finding.name}`, finding.file)),
+    routes.map((finding) =>
+      makeRow(INVESTIGATION_ROWS_STAGE, 'done', `Found ${finding.name}`, finding.file),
+    ),
     databaseRows(database),
   ];
 
   return boundStageRows(
-    'investigate',
+    INVESTIGATION_ROWS_STAGE,
     groups,
     groups.map((_group, index) => index),
   );
@@ -1382,16 +1530,66 @@ function labelForReportedSignal(signal: unknown): string {
 }
 
 /**
- * The AAP §0.5.5 failure row: `` `Could not enable ${label}: ${reason}.` ``,
- * with the adapter's hint as the detail. A reason that is blank after
- * normalisation leaves the sentence at `` `Could not enable ${label}.` ``; an
- * entry that does not even name its signal yields no row, since its failure
- * still reaches both user interfaces through `instrumentation.ready`.
+ * Composes AAP §0.5.5's degradation sentence for one signal that could not be
+ * enabled — `` `Could not enable ${label}: ${reason}. Continuing with: ${enabled}.` ``
+ * — the single wording of that fact.
+ *
+ * The instrumentation stage's ✗ rows ({@link buildInstrumentationRows}), the
+ * instrumentation service's degradation notices (`buildDegradationNotice` in
+ * `../instrumentation/service.ts`) and its capture-time preload-gap rows all
+ * call this, so one unavailable signal reads the same wherever it is reported
+ * and a client that keys progress rows on `(stage, message)` sees one row for
+ * it, never a second, differently worded one left behind.
+ *
+ * - **‹label›** — one line of display text, bounded as a finding name.
+ * - **‹reason›** — one line of display text within protocol's readiness reason
+ *   bound, with trailing whitespace and full stops dropped so the sentence
+ *   closes it once. A reason that is blank after normalisation leaves the
+ *   clause at `` `Could not enable ${label}.` ``.
+ * - **‹enabled›** — `enabledLabels` as display text, blanks dropped, duplicates
+ *   collapsed onto their first occurrence, in the caller's order (the progress
+ *   view's ✓ order, {@link INSTRUMENTATION_ROW_ORDER}), and without `label`
+ *   itself: a sentence never says it continues with the signal it could not
+ *   enable. An empty remainder reads {@link NO_CONFIRMED_SIGNAL}. The
+ *   {@link CONTINUING_WITH} connective is present in every sentence.
+ *
+ * The sentence never exceeds {@link MAX_MESSAGE_TEXT_LENGTH} code points —
+ * well inside protocol's `session.progress` message bound. The label and the
+ * reason are bounded on their own, so only the list can grow; a list that
+ * would overflow is cut after its last whole entry and closed with
+ * `` `+${n} more` ``, deterministically, and the sentence keeps its full stop.
+ *
+ * Pure, synchronous and I/O-free.
+ *
+ * @example
+ * ```ts
+ * unavailableSignalMessage('Database tracing', 'the driver hook refused to attach.', [
+ *   'React renders',
+ *   'Network tracing',
+ * ]);
+ * // 'Could not enable Database tracing: the driver hook refused to attach.
+ * //  Continuing with: React renders, Network tracing.'
+ *
+ * unavailableSignalMessage('Runtime errors', '', []);
+ * // 'Could not enable Runtime errors. Continuing with: no confirmed signal.'
+ * ```
+ *
+ * @param label The signal's display label (a {@link CAPTURE_SIGNAL_LABELS}
+ * label, or a third-party adapter's own signal name).
+ * @param reason The adapter's or the readiness gate's reason; a non-string
+ * counts as blank.
+ * @param enabledLabels The labels the capture proceeds with.
+ * @returns The sentence, or `undefined` when `label` is blank after
+ * normalisation — such an entry names no signal, and no sentence can be about it.
  */
-function unavailableRow(signal: unknown, reason: unknown, hint: unknown): ProgressRow | undefined {
-  const label = labelForReportedSignal(signal);
+export function unavailableSignalMessage(
+  label: string,
+  reason: unknown,
+  enabledLabels: readonly string[],
+): string | undefined {
+  const name = toDisplayText(label, MAX_FINDING_TEXT_LENGTH);
 
-  if (label.length === 0) {
+  if (name.length === 0) {
     return undefined;
   }
 
@@ -1399,8 +1597,47 @@ function unavailableRow(signal: unknown, reason: unknown, hint: unknown): Progre
     TRAILING_PUNCTUATION_PATTERN,
     '',
   );
-  const message =
-    because.length === 0 ? `Could not enable ${label}.` : `Could not enable ${label}: ${because}.`;
+  const opening =
+    because.length === 0 ? `Could not enable ${name}.` : `Could not enable ${name}: ${because}.`;
+  const others = uniqueDisplayNames(enabledLabels).filter((entry) => entry !== name);
+
+  if (others.length === 0) {
+    return `${opening}${CONTINUING_WITH}${NO_CONFIRMED_SIGNAL}${SENTENCE_END}`;
+  }
+
+  // `joinBounded` stops before its bound and may then append one separator and
+  // the omission note, so both are reserved out of the list's share. It counts
+  // code units, never fewer than the code points the bound is stated in, so
+  // the finished sentence stays within MAX_MESSAGE_TEXT_LENGTH code points.
+  const omissionReserve = DETAIL_LIST_SEPARATOR.length + `+${String(others.length)} more`.length;
+  const listBudget =
+    MAX_MESSAGE_TEXT_LENGTH -
+    Array.from(opening).length -
+    CONTINUING_WITH.length -
+    SENTENCE_END.length -
+    omissionReserve;
+
+  return `${opening}${CONTINUING_WITH}${joinBounded(others, DETAIL_LIST_SEPARATOR, listBudget)}${SENTENCE_END}`;
+}
+
+/**
+ * The AAP §0.5.5 ✗ row of one unavailable signal: a terminal `failed` row
+ * whose message is {@link unavailableSignalMessage}'s sentence over
+ * `enabledLabels` and whose detail is the adapter's hint. An entry that does
+ * not even name its signal yields no row, since its failure still reaches both
+ * user interfaces through `instrumentation.ready`.
+ */
+function unavailableRow(
+  signal: unknown,
+  reason: unknown,
+  hint: unknown,
+  enabledLabels: readonly string[],
+): ProgressRow | undefined {
+  const message = unavailableSignalMessage(labelForReportedSignal(signal), reason, enabledLabels);
+
+  if (message === undefined) {
+    return undefined;
+  }
 
   return makeRow('instrument', 'failed', message, toDisplayText(hint, READINESS_HINT_MAX_LENGTH));
 }
@@ -1417,10 +1654,16 @@ function unavailableRow(signal: unknown, reason: unknown, hint: unknown): Progre
  *   `unavailable` readiness row — is withdrawn, so a ✓ is never shown beside
  *   its own ✗; a `degraded` readiness row keeps the ✓ and puts its reason in
  *   the detail.
- * - **✗ rows** — one `failed` row per `unavailable` entry, in input order, as
- *   AAP §0.5.5 words it (`` `Could not enable ${label}: ${reason}.` ``, the
- *   hint as detail), plus one per `unavailable` readiness row whose signal no
- *   entry already reported. Byte-identical rows are collapsed onto the first.
+ * - **✗ rows** — one terminal `failed` row per `unavailable` entry, in input
+ *   order, as AAP §0.5.5 words it
+ *   (`` `Could not enable ${label}: ${reason}. Continuing with: ${enabled}.` ``,
+ *   composed by {@link unavailableSignalMessage}, the hint as detail), plus one
+ *   per `unavailable` readiness row whose signal no entry already reported.
+ *   The `‹enabled›` list is exactly this build's ✓ labels, in their display
+ *   order, less the row's own label — so what a ✗ row says the capture
+ *   continues with is what the ✓ rows above it show. Byte-identical rows are
+ *   collapsed onto the first. A ✗ row is the only row reported for its signal:
+ *   no `running` row precedes it, so nothing is left spinning beside it.
  *
  * When nothing at all could be enabled there are no ✓ rows; the caller
  * (`src/instrumentation/service.ts`) raises `instrumentation.failed`. Output is
@@ -1482,8 +1725,11 @@ export function buildInstrumentationRows(installed: InstalledSignals): readonly 
     }
   }
 
-  const enabledRows = INSTRUMENTATION_ROW_ORDER.filter((label) => enabledLabels.has(label)).map(
-    (label) => makeRow('instrument', 'done', label, degradedReasons.get(label)),
+  // The ✓ labels in display order: the ✓ rows themselves, and the list every
+  // ✗ row below names after "Continuing with:".
+  const continuing = INSTRUMENTATION_ROW_ORDER.filter((label) => enabledLabels.has(label));
+  const enabledRows = continuing.map((label) =>
+    makeRow('instrument', 'done', label, degradedReasons.get(label)),
   );
 
   const failedRows: ProgressRow[] = [];
@@ -1505,13 +1751,13 @@ export function buildInstrumentationRows(installed: InstalledSignals): readonly 
 
   for (const entry of unavailable) {
     reported.add(entry.signal);
-    pushFailure(unavailableRow(entry.signal, entry.reason, entry.hint));
+    pushFailure(unavailableRow(entry.signal, entry.reason, entry.hint, continuing));
   }
 
   for (const row of readinessRows) {
     if (row.status === 'unavailable' && !reported.has(row.signal)) {
       reported.add(row.signal);
-      pushFailure(unavailableRow(row.signal, row.reason, row.hint));
+      pushFailure(unavailableRow(row.signal, row.reason, row.hint, continuing));
     }
   }
 
@@ -1594,7 +1840,9 @@ export interface SessionProgressDeps {
  */
 export interface SessionProgress {
   /**
-   * The core: addresses `row` to `sessionId`, validates it against protocol's
+   * The core: addresses `row` to `sessionId`, files it under its stage's
+   * Step-8 group ({@link PROGRESS_STAGE_GROUPS}) unless it is a `failed` row,
+   * which keeps the stage that failed, validates it against protocol's
    * `session.progress` schema, appends it to the session's progress log and
    * broadcasts it to the session's editor and DevTools clients.
    *
@@ -1604,7 +1852,8 @@ export interface SessionProgress {
 
   /**
    * A stage's group header: a `running` row whose message defaults to the
-   * stage's title in {@link PROGRESS_STAGE_TITLES}.
+   * title, in {@link PROGRESS_STAGE_TITLES}, of the group the stage reports in
+   * — so a grouped stage re-opens its group's header.
    */
   stageStarted(
     sessionId: SessionId,
@@ -1613,7 +1862,7 @@ export interface SessionProgress {
   ): Result<SessionProgressPayload, DebuggenError>;
 
   /**
-   * A stage's closing `done` row; the message defaults to the stage's title, so
+   * A stage's closing `done` row; the message defaults to its group's title, so
    * a stage that found nothing worth a row of its own still closes its group.
    */
   stageCompleted(
@@ -1721,13 +1970,14 @@ export interface SessionProgress {
 
 /**
  * The first line of a stage's header or closing row: the caller's message as
- * one line of display text when given, otherwise the stage's title. A message
- * that normalises to nothing stays empty and is refused by the schema, which is
- * the right answer to a caller that passed a blank line.
+ * one line of display text when given, otherwise the title of the group the
+ * stage reports in (see {@link PROGRESS_STAGE_GROUPS}). A message that
+ * normalises to nothing stays empty and is refused by the schema, which is the
+ * right answer to a caller that passed a blank line.
  */
 function stageLine(stage: ProgressStage, message: string | undefined): string {
   return message === undefined
-    ? PROGRESS_STAGE_TITLES[stage]
+    ? PROGRESS_STAGE_TITLES[progressGroupOf(stage)]
     : toDisplayText(message, MAX_MESSAGE_TEXT_LENGTH);
 }
 
@@ -1770,9 +2020,15 @@ interface ProjectedFailure {
  * propagated from an adapter can quote a path, a statement or a URL. The
  * proof is taken on the raw value before any normalisation, because the
  * registry proves exact text and a normalised string is not what was
- * registered. The hint shown is clipped so that it and the suffix fit the
- * detail bound together, and the suffix — code and reference — is never the
- * part cut.
+ * registered.
+ *
+ * A proven hint is shown whole: it and the suffix are held to protocol's
+ * transport bound for `detail` ({@link MAX_TRANSPORT_DETAIL_LENGTH}), which a
+ * proven hint — at most {@link PRODUCT_TEXT_MAX_LENGTH} long — always fits, so
+ * an exact relaunch command is never cut mid-command. The code's default hint
+ * keeps the display bound ({@link MAX_DETAIL_TEXT_LENGTH}). Whichever bound
+ * applies, the hint is what would be clipped, and the suffix — code and
+ * reference — is never the part cut.
  *
  * @param failure The failure being filed.
  * @param ref The diagnostic reference minted for it.
@@ -1782,9 +2038,12 @@ function projectFailure(failure: SessionFailure, ref: string): ProjectedFailure 
   const code = publicCodeOf(failure.code);
   const copy = publicFailureCopy(failure.stage, code);
   const suffix = `(error code: ${code}, ref: ${ref})`;
-  const hintBound = Math.max(0, MAX_DETAIL_TEXT_LENGTH - suffix.length - 1);
-  const stated = isProductAuthoredText(failure.hint) ? toDisplayText(failure.hint, hintBound) : '';
-  const hint = stated.length > 0 ? stated : toDisplayText(copy.hint, hintBound);
+  const roomBefore = (bound: number): number => Math.max(0, bound - suffix.length - 1);
+  const stated = isProductAuthoredText(failure.hint)
+    ? toDisplayText(failure.hint, roomBefore(MAX_TRANSPORT_DETAIL_LENGTH))
+    : '';
+  const hint =
+    stated.length > 0 ? stated : toDisplayText(copy.hint, roomBefore(MAX_DETAIL_TEXT_LENGTH));
 
   return {
     code,
@@ -1842,6 +2101,8 @@ function failureDiagnostic(
  * progress.stageStarted(sessionId, 'investigate');
  * progress.reportInvestigation(sessionId, { components, eventHandlers, routes, relevantFiles });
  * progress.stageCompleted(sessionId, 'investigate');
+ * // → every row under `understand`: "Understanding problem" re-opened as
+ * //   `running`, one `done` row per finding, then "Understanding problem" `done`.
  * ```
  */
 export function createSessionProgress(deps: SessionProgressDeps): SessionProgress {
@@ -1920,12 +2181,14 @@ export function createSessionProgress(deps: SessionProgressDeps): SessionProgres
     sessionId: SessionId,
     row: ProgressRow,
   ): Result<SessionProgressPayload, DebuggenError> {
+    // Filed under its Step-8 group; a failure keeps the stage that failed.
+    const stage = row.status === 'failed' ? row.stage : progressGroupOf(row.stage);
     const candidate =
       row.detail === undefined
-        ? { sessionId, stage: row.stage, status: row.status, message: row.message }
+        ? { sessionId, stage, status: row.status, message: row.message }
         : {
             sessionId,
-            stage: row.stage,
+            stage,
             status: row.status,
             message: row.message,
             detail: row.detail,

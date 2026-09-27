@@ -1,6 +1,13 @@
 /**
- * `utils/format`: the byte-size formatters, and the label fitting every SVG
- * view places its labels with.
+ * `utils/format`: the duration formatters, the byte-size formatters, and the
+ * label fitting every SVG view places its labels with.
+ *
+ * The duration formatters are what every bar, tick, cell, tooltip and sentence
+ * that mentions time prints. What is pinned is how they answer an input that
+ * is not a measurement: a negative duration is corrupt, not fast, so it reads
+ * as unavailable rather than as `0.00 ms`; a value below zero only by
+ * floating-point noise is still zero; and an offset — a subtraction, not a
+ * measurement — keeps flooring at zero.
  *
  * The byte-size formatters are the split form a metric tile renders as a
  * figure and a unit, and the joined form every other surface shows.
@@ -25,10 +32,117 @@ import {
   fitTextToWidth,
   formatBytes,
   formatBytesParts,
+  formatDuration,
+  formatDurationCompact,
+  formatDurationParts,
   formatMetric,
+  formatOffset,
   splitGraphemes,
 } from './format';
 import type { TextMeasure } from './format';
+
+/** An epoch instant the offset cases measure from, in milliseconds. */
+const ORIGIN_MS = 1_767_225_600_000;
+
+/**
+ * A duration field as a malformed record carries it: `null` where the schema
+ * promises a number, which is what a store round-trip gone wrong delivers.
+ */
+const NULL_DURATION: unknown = null;
+
+describe('formatDurationParts', () => {
+  it.each([
+    { ms: 0.4, value: '400', unit: 'µs' },
+    { ms: 46.9994, value: '47.00', unit: 'ms' },
+    { ms: 999.9, value: '999.90', unit: 'ms' },
+    { ms: 1175, value: '1.175', unit: 's' },
+    { ms: 44_722.6, value: '44.723', unit: 's' },
+    { ms: 0, value: '0.00', unit: 'ms' },
+  ])('splits $ms ms into $value and $unit', ({ ms, value, unit }) => {
+    expect(formatDurationParts(ms)).toEqual({
+      available: true,
+      value,
+      unit,
+      text: `${value} ${unit}`,
+    });
+  });
+
+  it.each([
+    { reading: 'a negative duration', ms: -5 },
+    { reading: 'a negative duration one microsecond below zero', ms: -0.001 },
+    { reading: 'NaN', ms: Number.NaN },
+    { reading: 'Infinity', ms: Number.POSITIVE_INFINITY },
+    { reading: '-Infinity', ms: Number.NEGATIVE_INFINITY },
+    { reading: 'null in a malformed record', ms: NULL_DURATION as number },
+    { reading: 'a magnitude fixed notation cannot express', ms: 1e40 },
+  ])('answers the unavailable arm, with no unit, for $reading', ({ ms }) => {
+    const parts = formatDurationParts(ms);
+
+    expect(parts).toEqual({
+      available: false,
+      value: NOT_AVAILABLE_LABEL,
+      text: NOT_AVAILABLE_LABEL,
+    });
+    expect('unit' in parts).toBe(false);
+    // The one frozen answer, whichever reading produced it.
+    expect(parts).toBe(formatDurationParts(Number.NaN));
+    expect(Object.isFrozen(parts)).toBe(true);
+  });
+
+  it('reads a value below zero only by floating-point noise as the zero it is', () => {
+    // Rounds to zero at the stored resolution of three decimals.
+    expect(formatDurationParts(-0.0004)).toEqual(formatDurationParts(0));
+    expect(formatDurationParts(-0)).toEqual(formatDurationParts(0));
+    expect(formatDurationParts(-0.0004, 'compact')).toEqual(formatDurationParts(0, 'compact'));
+    expect(formatDuration(-0)).toBe('0.00 ms');
+  });
+});
+
+describe('formatDuration and formatDurationCompact', () => {
+  it('keep their documented examples', () => {
+    expect(formatDuration(0.4)).toBe('400 µs');
+    expect(formatDuration(46.9994)).toBe('47.00 ms');
+    expect(formatDuration(1175)).toBe('1.175 s');
+    expect(formatDuration(Number.NaN)).toBe(NOT_AVAILABLE_LABEL);
+    expect(formatDuration(-5)).toBe(NOT_AVAILABLE_LABEL);
+    expect(formatDurationCompact(46.9994)).toBe('47 ms');
+    expect(formatDurationCompact(1175)).toBe('1.2 s');
+  });
+
+  it('print a corrupt duration as unavailable at both precisions, never as a measured zero', () => {
+    for (const ms of [-5, -0.001, NULL_DURATION as number]) {
+      expect(formatDuration(ms)).toBe(NOT_AVAILABLE_LABEL);
+      expect(formatDuration(ms, 'compact')).toBe(NOT_AVAILABLE_LABEL);
+      expect(formatDurationCompact(ms)).toBe(NOT_AVAILABLE_LABEL);
+    }
+  });
+
+  it('are exactly the split form joined, for every reading', () => {
+    for (const ms of [0, 0.4, 46.9994, 1175, -0.0004, -5, Number.NaN, 1e40]) {
+      expect(formatDuration(ms)).toBe(formatDurationParts(ms).text);
+      expect(formatDurationCompact(ms)).toBe(formatDurationParts(ms, 'compact').text);
+    }
+  });
+});
+
+describe('formatOffset', () => {
+  it('prints how far after the origin an instant is', () => {
+    expect(formatOffset(ORIGIN_MS + 12.5, ORIGIN_MS)).toBe('12.50 ms');
+    expect(formatOffset(ORIGIN_MS + 1175, ORIGIN_MS)).toBe('1.175 s');
+    expect(formatOffset(ORIGIN_MS + 1175, ORIGIN_MS, 'compact')).toBe('1.2 s');
+    expect(formatOffset(ORIGIN_MS, ORIGIN_MS)).toBe('0.00 ms');
+  });
+
+  it('still clamps an instant before the origin to zero: a subtraction, not a measurement', () => {
+    expect(formatOffset(ORIGIN_MS - 5, ORIGIN_MS)).toBe('0.00 ms');
+    expect(formatOffset(ORIGIN_MS - 5, ORIGIN_MS, 'compact')).toBe('0 ms');
+  });
+
+  it('answers n/a for an instant or an origin that is not finite', () => {
+    expect(formatOffset(Number.NaN, ORIGIN_MS)).toBe(NOT_AVAILABLE_LABEL);
+    expect(formatOffset(ORIGIN_MS, Number.POSITIVE_INFINITY)).toBe(NOT_AVAILABLE_LABEL);
+  });
+});
 
 /** One kilobyte on the decimal (SI) scale the formatter uses. */
 const KB = 1000;

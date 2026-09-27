@@ -13,16 +13,22 @@
  * at all, and the shutdown sequence decides whether a stopped service leaves
  * one readable file behind or a write-ahead log nobody folded back in.
  *
- * Three things live here and nowhere else:
+ * Four things live here and nowhere else:
  *
  * 1. **The DDL loader** ({@link loadSchemaSql}) — the three-source probe that
  *    finds `./schema.sql` in every layout this service runs in.
- * 2. **The connection's pragmas** ({@link STORE_PRAGMAS}) — `journal_mode`,
- *    `foreign_keys`, `busy_timeout` and `synchronous`, which `./schema.sql` and
- *    `./migrations.ts` both document as this module's responsibility because
- *    none of them can be declared in a DDL file or set inside a transaction.
+ * 2. **The connection's pragmas** ({@link STORE_PRAGMAS}) — `auto_vacuum`,
+ *    `journal_mode`, `foreign_keys`, `busy_timeout`, `synchronous` and
+ *    `cache_size`, which `./schema.sql` and `./migrations.ts` both document as
+ *    this module's responsibility because none of them can be declared in a
+ *    DDL file or set inside a transaction.
  * 3. **The {@link Store} handle** — a prepared-statement cache, a composable
- *    transaction helper, a tolerant checkpoint and an idempotent close.
+ *    transaction helper, a background write-ahead-log checkpointer, a tolerant
+ *    checkpoint and an idempotent close.
+ * 4. **Checkpoints on request** ({@link openWalCheckpointer},
+ *    {@link suspendAutoCheckpoint}) — how a long run of write transactions, the
+ *    retention sweep's, keeps the write-ahead log bounded without the event
+ *    loop paying for it (see "Checkpoints off the event loop" below).
  *
  * The engine is the runtime's built-in `node:sqlite` binding and nothing else
  * (AAP 0.3.2): a native module would have to be rebuilt per platform and would
@@ -63,6 +69,21 @@
  *
  * ## The pragmas, and why each one is here
  *
+ * - `auto_vacuum = INCREMENTAL` makes the pages a retention purge frees
+ *   returnable to the filesystem. Without it a deleted session's telemetry
+ *   leaves its pages on the freelist and the file never shrinks. In
+ *   `INCREMENTAL` mode the store keeps the bookkeeping that lets
+ *   `PRAGMA incremental_vacuum` hand those pages back later, at a time the
+ *   caller chooses, rather than moving pages at every commit as `FULL` would.
+ *   SQLite applies the mode to a new database only while the file is still
+ *   empty, and `journal_mode = WAL` is the first statement that writes to it,
+ *   so this pragma must come **first**: after WAL, a new store would be created
+ *   with `auto_vacuum = NONE`. The file this module creates is an empty
+ *   placeholder, so every store it creates gets the mode. On an existing
+ *   `NONE` file the statement is harmless — `PRAGMA auto_vacuum` keeps
+ *   answering `0`, and the mode is only recorded as pending on the connection
+ *   — and it is what lets a later `VACUUM` on this connection convert that file
+ *   to incremental mode as it rewrites it.
  * - `journal_mode = WAL` is the mode AAP 0.4.2 specifies for this store. It is
  *   persistent in the file, but it is set on every open because a copied,
  *   restored or hand-created file may not carry it, and it **cannot be set from
@@ -80,12 +101,54 @@
  *   waits for a disk flush, and the exposure is a power loss losing the last
  *   commits of a *debugging session* — never a developer's source file, which
  *   is restored from a backup that was `fsync`ed before anything was patched.
+ * - `cache_size = -65536` gives the connection a 64 MiB page cache instead of
+ *   SQLite's 2 MiB default. `telemetry_events` carries a dozen indexes, several
+ *   on random keys, so a 5 000-event ingest batch touches index pages all over
+ *   the file; once those exceed the cache every row insert and every panel
+ *   read goes back to the operating system for pages it just had. The cache is
+ *   an upper bound that fills only as pages are used, so a small store never
+ *   pays for it.
  *
  * They are applied through `db.exec` in the declared order and outside any
  * transaction, and the resulting `journal_mode` is read back: a filesystem that
  * cannot support WAL reports something else, which is logged at `warn` rather
  * than treated as a failure. For an in-memory database the mode is `memory` and
  * that is expected, so it is reported at `debug`.
+ *
+ * ## Checkpointing off the event loop
+ *
+ * Left to itself, SQLite folds the write-ahead log back into the database
+ * inside the `COMMIT` that grows the log past `wal_autocheckpoint` (1 000
+ * pages). That checkpoint copies every page the log holds and `fsync`s both
+ * files, and `node:sqlite` is synchronous, so it ran on the service's only
+ * thread: a telemetry batch dirties megabytes of pages, and its `COMMIT` stalled
+ * every request, socket and timer for seconds, growing with the store.
+ *
+ * A file-backed store in WAL mode therefore gets a **background checkpointer**
+ * ({@link BackgroundCheckpointer}): a `node:worker_threads` worker with its own
+ * `node:sqlite` connection to the same file, which every
+ * {@link WAL_CHECKPOINTER_INTERVAL_MS} runs `PRAGMA wal_checkpoint(PASSIVE)`
+ * once the log holds at least the 1 000 pages SQLite itself would have waited
+ * for. A passive checkpoint never takes the write lock and never waits for a
+ * reader, so the main connection's writes and reads proceed while it runs.
+ * Only once the worker reports its connection open — and the store's files
+ * have been re-verified, since that connection opened the path by name — is
+ * `wal_autocheckpoint` set to `0` on the main connection; should the worker
+ * fail, exit or be refused, it is set back to 1 000 and a `warn` is logged, so
+ * the store degrades to SQLite's own behaviour and never stops checkpointing.
+ * The worker is spawned from inline source (`eval`), so neither this
+ * workspace's `dist/main.js` nor the editor extension's bundled service needs
+ * a second entry file, and it is `unref`'d, so it never holds the process open.
+ * It opens the database as a `file:` URL with `mode=rw`, so it can never create
+ * a file the policy below has not judged. The in-memory store has no file for
+ * a second connection to share and keeps SQLite's own checkpointing.
+ *
+ * The two threads coordinate through a small shared control block rather than
+ * messages, because {@link Store.checkpoint} and {@link Store.close} are
+ * synchronous: a stop flag, a pause flag and the worker's state, read and
+ * written with `Atomics` so that a flag raised by the main thread is always
+ * seen by a worker about to touch the database, and a worker already touching
+ * it is always waited for — for at most {@link WAL_CHECKPOINTER_STOP_WAIT_MS}.
  *
  * ## The transaction model
  *
@@ -103,11 +166,49 @@
  * `src/main.ts` checkpoints and closes the store from its `SIGINT`/`SIGTERM`
  * handler and from its own failure paths, which is why {@link Store.checkpoint}
  * and an idempotent {@link Store.close} are part of the public handle.
- * `close()` clears the statement cache, runs `PRAGMA wal_checkpoint(TRUNCATE)`
- * so the `-wal` sidecar is folded back into the database file, closes the
- * connection and flips {@link Store.isClosed}. Calling it twice is a no-op —
- * the binding itself throws `ERR_INVALID_STATE` on a second close, and a signal
- * handler racing a test teardown must not turn a clean stop into a crash.
+ * `close()` clears the statement cache, stops the background checkpointer —
+ * the worker closes its own connection first, so it holds no lock the next step
+ * would be refused by — then runs `PRAGMA wal_checkpoint(TRUNCATE)` so the
+ * `-wal` sidecar is folded back into the database file, closes the connection
+ * (the last one, so SQLite removes the sidecars) and flips
+ * {@link Store.isClosed}, then writes one `info` record naming the checkpoint's
+ * outcome and its frame counts — the line that tells a developer reading a
+ * stopped service's log that its data reached the database file.
+ * {@link Store.checkpoint} holds the worker paused for the length of its own
+ * `TRUNCATE` for the same reason. Calling `close()` twice is a no-op that logs
+ * nothing — the binding itself throws `ERR_INVALID_STATE` on a second close,
+ * and a signal handler racing a test teardown must not turn a clean stop into
+ * a crash.
+ *
+ * ## Checkpoints off the event loop
+ *
+ * With `synchronous = NORMAL`, SQLite syncs only when it checkpoints, and by
+ * default it checkpoints inside the commit of whichever transaction pushes the
+ * log past 1 000 pages. `node:sqlite` is synchronous, so that commit — and the
+ * `fsync` of the database file it ends with — runs on the event loop. For
+ * ordinary traffic that is a few milliseconds. For a purge that deletes
+ * hundreds of thousands of rows it was the whole cost: on a loaded host one
+ * 5 000-row batch took 3.6 s with commit-time checkpoints and 0.1 s without
+ * them, and every one of those seconds was a stretch in which the service
+ * answered nothing.
+ *
+ * A caller about to run such work takes the checkpoint out of the commit:
+ * {@link suspendAutoCheckpoint} sets this connection's `wal_autocheckpoint` to
+ * `0` (reference-counted, so overlapping callers restore the original only
+ * when the last one is done), and {@link openWalCheckpointer} provides a
+ * second connection, owned by a worker thread, that folds the log back in on
+ * request — `wal_checkpoint(PASSIVE)`, then `wal_checkpoint(TRUNCATE)`, the
+ * same pair {@link Store.close} runs. The caller awaits it whenever the log has
+ * grown past its bound, so the log stays bounded and the waiting happens on
+ * the worker. Only the in-memory store has no second connection to offer; it
+ * has no log either, so it needs none.
+ *
+ * Beside the store's own background checkpointer (above) the two compose:
+ * while that checkpointer runs, the commit-time checkpoint is already off and a
+ * suspension changes nothing, and the sweep's own checkpoints still bound the
+ * log at the sweep's pace — the background one checkpoints `PASSIVE` on its
+ * interval, which a run of large transactions can outpace. A checkpoint that
+ * finds the other one busy is reported as `busy`, never as a failure.
  *
  * ## The files, and what protects them
  *
@@ -175,10 +276,11 @@
  * @packageDocumentation
  */
 
-import { chmodSync, readFileSync, realpathSync } from 'node:fs';
+import { chmodSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { Worker } from 'node:worker_threads';
 
 import {
   DebuggenError,
@@ -240,8 +342,22 @@ const MEMORY_DATABASE_PATH = ':memory:';
 const BUSY_TIMEOUT_MS = 5000;
 
 /**
+ * The connection's page cache, in KiB: 64 MiB. `PRAGMA cache_size` reads a
+ * negative value as KiB rather than as a page count, which keeps the bound the
+ * same whatever page size the file was created with. See this module's
+ * overview for why the default 2 MiB is too small for the telemetry indexes.
+ */
+const PAGE_CACHE_KIB = 65_536;
+
+/**
  * The per-connection settings applied to every store connection, in the order
  * they are applied.
+ *
+ * The order is load-bearing for the first entry: `auto_vacuum` takes effect on
+ * a new file only while that file is still empty, and `journal_mode = WAL`
+ * writes the database header, so issued second it would be too late and the
+ * new store would be created without incremental vacuum. Harmless on an
+ * existing file, where it only records a pending mode the next `VACUUM` applies.
  *
  * Exported so a suite can assert the set and the order rather than restate it,
  * and frozen so nothing can append to the sequence at run time. See this
@@ -249,11 +365,208 @@ const BUSY_TIMEOUT_MS = 5000;
  * `./schema.sql` or in a migration step.
  */
 export const STORE_PRAGMAS: readonly string[] = Object.freeze([
+  'PRAGMA auto_vacuum = INCREMENTAL;',
   'PRAGMA journal_mode = WAL;',
   'PRAGMA foreign_keys = ON;',
   `PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};`,
   'PRAGMA synchronous = NORMAL;',
+  `PRAGMA cache_size = -${PAGE_CACHE_KIB};`,
 ]);
+
+/**
+ * SQLite's compiled-in `wal_autocheckpoint`, in pages: the threshold at which a
+ * `COMMIT` checkpoints the write-ahead log itself.
+ *
+ * It is both the value the main connection is returned to whenever the
+ * background checkpointer is not running, and the log size at which that
+ * checkpointer runs, so moving the checkpoint off the event loop changes where
+ * it happens and never how often.
+ */
+export const DEFAULT_WAL_AUTOCHECKPOINT_PAGES = 1000;
+
+/**
+ * How often the background checkpointer looks at the write-ahead log, in
+ * milliseconds. Looking costs one read of the log's shared-memory header, so
+ * the interval only bounds how long a grown log waits before it is folded in.
+ */
+export const WAL_CHECKPOINTER_INTERVAL_MS = 200;
+
+/**
+ * The longest {@link Store.close} and {@link Store.checkpoint} block waiting
+ * for the background checkpointer to finish the database call it is making, in
+ * milliseconds.
+ *
+ * A passive checkpoint of a large log can take seconds on a slow disk. Past
+ * this bound the call proceeds anyway — `close()` terminates the worker, and a
+ * `TRUNCATE` the worker is still holding up is reported as busy, which both
+ * callers already tolerate — so a stop is never held hostage by the disk, and
+ * the bound stays well inside `src/main.ts`'s shutdown deadline.
+ */
+export const WAL_CHECKPOINTER_STOP_WAIT_MS = 2_000;
+
+/** Stops the main connection checkpointing inside `COMMIT`, while the worker does it instead. */
+const DISABLE_AUTOCHECKPOINT_SQL = 'PRAGMA wal_autocheckpoint = 0;';
+
+/** Returns the main connection to SQLite's own checkpointing. */
+const RESTORE_AUTOCHECKPOINT_SQL = `PRAGMA wal_autocheckpoint = ${DEFAULT_WAL_AUTOCHECKPOINT_PAGES};`;
+
+/**
+ * The slots of the control block the main thread and the checkpointer share,
+ * one `Int32` each: `stop` and `pause` are raised by the main thread only,
+ * `state` is written by the worker only.
+ */
+const CHECKPOINTER_SLOT = Object.freeze({ stop: 0, pause: 1, state: 2 });
+
+/** How many `Int32` slots the control block holds. */
+const CHECKPOINTER_SLOTS = 3;
+
+/**
+ * The values of the `state` slot.
+ *
+ * - `starting` — the worker has not yet tried to touch the database, and once
+ *   the stop flag is raised it never will;
+ * - `idle` — between two database calls (asleep, or backing off a raised flag);
+ * - `busy` — inside a database call: opening, measuring or checkpointing;
+ * - `done` — its connection is closed and the thread is ending.
+ */
+const CHECKPOINTER_STATE = Object.freeze({ starting: 0, idle: 1, busy: 2, done: 3 });
+
+/**
+ * The background checkpointer's source, run by a `node:worker_threads` worker
+ * with `eval: true` (CommonJS, so `require` is available).
+ *
+ * Inline rather than a file for the reason the module overview gives: the
+ * service is bundled twice — `dist/main.js` by this workspace, and the editor
+ * extension's `dist/service/main.js` by its `esbuild.mjs` — and a worker entry
+ * file would have to be a second output of both. Everything it needs arrives
+ * in `workerData`, so no constant is restated here:
+ *
+ * - `control` — the shared control block ({@link CHECKPOINTER_SLOT});
+ * - `location` — the database's `file:` URL with `mode=rw`, so a database that
+ *   has disappeared is refused rather than created;
+ * - `intervalMs`, `thresholdPages`, `busyTimeoutMs`, `slot`, `state`.
+ *
+ * The protocol a database call follows (`enter`/`leave`): the worker publishes
+ * `busy` **then** reads both flags, and backs off to `idle` when either is
+ * raised; the main thread raises a flag **then** reads the state, and waits
+ * while it is `busy`. With sequentially consistent `Atomics`, at least one side
+ * sees the other's write, so no call starts after the main thread has decided
+ * not to wait for it.
+ *
+ * Deciding whether a checkpoint is due reads `PRAGMA wal_checkpoint(NOOP)`,
+ * which reports the log's size without doing any work (SQLite 3.51 and later).
+ * An older engine would treat `NOOP` as `PASSIVE`, so there the worker instead
+ * checkpoints whenever `PRAGMA data_version` says another connection has
+ * committed since its last look. Any throw ends the loop with a `failed`
+ * report, and the connection is closed and `done` published however the loop
+ * ends.
+ */
+const WAL_CHECKPOINTER_SOURCE = `
+'use strict';
+const { parentPort, workerData } = require('node:worker_threads');
+const { DatabaseSync } = require('node:sqlite');
+
+const { control, location, intervalMs, thresholdPages, busyTimeoutMs, slot, state } = workerData;
+
+function stopped() {
+  return Atomics.load(control, slot.stop) !== 0;
+}
+
+function leave() {
+  Atomics.store(control, slot.state, state.idle);
+  Atomics.notify(control, slot.state);
+}
+
+function enter() {
+  Atomics.store(control, slot.state, state.busy);
+  if (stopped() || Atomics.load(control, slot.pause) !== 0) {
+    leave();
+    return false;
+  }
+  return true;
+}
+
+function sleep() {
+  Atomics.wait(control, slot.stop, 0, intervalMs);
+}
+
+function reasonOf(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function supportsNoop(version) {
+  const [major, minor] = String(version).split('.').map(Number);
+  return major > 3 || (major === 3 && minor >= 51);
+}
+
+let db;
+let measure;
+let changes;
+let passive;
+let seen;
+let operation = 'open';
+
+function due() {
+  if (measure !== undefined) {
+    const wal = measure.get();
+    return Number(wal.log) - Number(wal.checkpointed) >= thresholdPages;
+  }
+  const current = changes.get().data_version;
+  const changed = current !== seen;
+  seen = current;
+  return changed;
+}
+
+try {
+  while (db === undefined && !stopped()) {
+    if (!enter()) {
+      sleep();
+      continue;
+    }
+    try {
+      db = new DatabaseSync(new URL(location));
+      db.exec('PRAGMA busy_timeout = ' + String(busyTimeoutMs) + ';');
+      const version = db.prepare('SELECT sqlite_version() AS version').get().version;
+      measure = supportsNoop(version) ? db.prepare('PRAGMA wal_checkpoint(NOOP)') : undefined;
+      changes = db.prepare('PRAGMA data_version');
+      passive = db.prepare('PRAGMA wal_checkpoint(PASSIVE)');
+    } finally {
+      leave();
+    }
+  }
+
+  if (db !== undefined) {
+    parentPort.postMessage({ type: 'ready' });
+    operation = 'checkpoint';
+
+    while (!stopped()) {
+      sleep();
+      if (stopped() || !enter()) {
+        continue;
+      }
+      try {
+        if (due()) {
+          passive.get();
+        }
+      } finally {
+        leave();
+      }
+    }
+  }
+} catch (error) {
+  parentPort.postMessage({ type: 'failed', operation, reason: reasonOf(error) });
+} finally {
+  try {
+    if (db !== undefined && db.isOpen) {
+      db.close();
+    }
+  } catch (error) {
+    parentPort.postMessage({ type: 'failed', operation: 'close', reason: reasonOf(error) });
+  }
+  Atomics.store(control, slot.state, state.done);
+  Atomics.notify(control, slot.state);
+}
+`;
 
 /**
  * The relative specifiers {@link loadSchemaSql} probes, in probe order, each
@@ -303,6 +616,19 @@ const CREATE_TABLE_PATTERN = /\bCREATE\s+(?:TEMP\s+|TEMPORARY\s+)?TABLE\b/i;
 
 /** Reads a pragma that returns a row, for the verification reads below. */
 const READ_JOURNAL_MODE_SQL = 'PRAGMA journal_mode';
+
+/**
+ * Copies every write-ahead log frame no reader still needs back into the
+ * database file, without waiting on anyone, and answers how many frames the
+ * log holds and how many it copied.
+ *
+ * Run immediately before {@link CHECKPOINT_SQL} for its counts: a truncating
+ * checkpoint that succeeds answers `log = 0, checkpointed = 0` because it has
+ * already reset the log, so it cannot say how much it folded in. The copying
+ * this step does is work the truncating step would otherwise do itself, so the
+ * pair costs what the truncating step alone did.
+ */
+const CHECKPOINT_PASSIVE_SQL = 'PRAGMA wal_checkpoint(PASSIVE)';
 
 /** Folds the write-ahead log back into the database file and truncates it. */
 const CHECKPOINT_SQL = 'PRAGMA wal_checkpoint(TRUNCATE)';
@@ -647,6 +973,393 @@ function validateDdl(ddl: string, source: string): Result<string, DebuggenError>
 }
 
 /* -------------------------------------------------------------------------------------------------
+ * The background checkpointer
+ * ---------------------------------------------------------------------------------------------- */
+
+/** What {@link BackgroundCheckpointer.start} is given. */
+interface BackgroundCheckpointerInit {
+  /** The store's main connection, whose `wal_autocheckpoint` the checkpointer takes over. */
+  readonly db: DatabaseSync;
+
+  /** The database's absolute path; the worker opens the same file. */
+  readonly path: string;
+
+  /** Where the checkpointer reports that it runs, and why it stopped. */
+  readonly logger: Logger;
+
+  /**
+   * Re-verifies the store's files, run once the worker reports its connection
+   * open. That connection opened the database by name, so it is held to the
+   * same identity check every open in {@link openStore} is, and a store whose
+   * files no longer pass keeps SQLite's own checkpointing.
+   */
+  readonly verify: () => Result<void, DebuggenError>;
+}
+
+/** What the worker posts: its connection is open, or it has given up. */
+type CheckpointerMessage =
+  | { readonly type: 'ready' }
+  | { readonly type: 'failed'; readonly operation: string; readonly reason: string };
+
+/**
+ * Reads a message from the worker, or `undefined` for anything else.
+ *
+ * The worker is this module's own inline source, but a message crosses a
+ * thread boundary as a structured clone and is checked rather than cast.
+ *
+ * @param value What the worker posted.
+ * @returns The message, or `undefined` when it is not one.
+ */
+function checkpointerMessage(value: unknown): CheckpointerMessage | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  const { type, operation, reason } = value as Record<string, unknown>;
+  if (type === 'ready') {
+    return { type };
+  }
+  if (type === 'failed') {
+    return {
+      type,
+      operation: typeof operation === 'string' ? operation : 'unknown',
+      reason: typeof reason === 'string' ? reason : 'unknown',
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Where a {@link BackgroundCheckpointer} is in its life, as the main thread sees it.
+ *
+ * - `starting` — spawned; the main connection still checkpoints on `COMMIT`.
+ * - `running` — the worker's connection is open and the store's files were
+ *   re-verified; the main connection's `wal_autocheckpoint` is `0`.
+ * - `failed` — the worker failed, exited or was refused; the main connection
+ *   checkpoints on `COMMIT` again.
+ * - `stopped` — {@link BackgroundCheckpointer.stop} has run.
+ */
+type BackgroundCheckpointerStatus = 'starting' | 'running' | 'failed' | 'stopped';
+
+/**
+ * The main thread's side of the background checkpointer described in the
+ * module overview: it owns the worker and the shared control block, hands the
+ * main connection's `wal_autocheckpoint` over when the worker is ready and
+ * takes it back when the worker is gone, and lets {@link SqliteStore} pause or
+ * stop the worker synchronously.
+ *
+ * Nothing here throws into the event loop: every listener is guarded, and a
+ * failure of the worker degrades the store to SQLite's own checkpointing
+ * rather than failing it.
+ */
+class BackgroundCheckpointer {
+  readonly #db: DatabaseSync;
+
+  readonly #logger: Logger;
+
+  readonly #verify: () => Result<void, DebuggenError>;
+
+  /** The control block shared with the worker; see {@link CHECKPOINTER_SLOT}. */
+  readonly #control: Int32Array;
+
+  readonly #worker: Worker;
+
+  #status: BackgroundCheckpointerStatus = 'starting';
+
+  /** Whether the worker thread is known to be gone, or has been told to terminate. */
+  #halted = false;
+
+  /** Whether this checkpointer set the main connection's `wal_autocheckpoint` to `0`. */
+  #autocheckpointOff = false;
+
+  private constructor(init: BackgroundCheckpointerInit, control: Int32Array, worker: Worker) {
+    this.#db = init.db;
+    this.#logger = init.logger;
+    this.#verify = init.verify;
+    this.#control = control;
+    this.#worker = worker;
+
+    worker.on('message', (value: unknown) => {
+      this.#guarded(() => {
+        this.#onMessage(value);
+      });
+    });
+    worker.on('error', (error: unknown) => {
+      this.#guarded(() => {
+        this.#fail('worker', DebuggenError.from(error, 'STORE_ERROR').message);
+      });
+    });
+    worker.on('exit', (code: number) => {
+      this.#guarded(() => {
+        this.#onExit(code);
+      });
+    });
+  }
+
+  /**
+   * Spawns the worker for a file-backed store in WAL mode.
+   *
+   * The main connection keeps checkpointing on `COMMIT` until the worker
+   * reports its own connection open, so a store is never left without a
+   * checkpoint while the worker starts.
+   *
+   * @param init The main connection, its path, the logger and the file check.
+   * @returns The checkpointer, or `undefined` — logged at `warn` — when the
+   * runtime refused to start a worker, in which case the store keeps SQLite's
+   * own checkpointing.
+   */
+  static start(init: BackgroundCheckpointerInit): BackgroundCheckpointer | undefined {
+    const control = new Int32Array(
+      new SharedArrayBuffer(CHECKPOINTER_SLOTS * Int32Array.BYTES_PER_ELEMENT),
+    );
+    // `mode=rw`: a database that has disappeared is refused, never created by
+    // a connection whose file the store policy has not judged.
+    const location = pathToFileURL(init.path);
+    location.searchParams.set('mode', 'rw');
+
+    let worker: Worker;
+    try {
+      worker = new Worker(WAL_CHECKPOINTER_SOURCE, {
+        eval: true,
+        workerData: {
+          control,
+          location: location.href,
+          intervalMs: WAL_CHECKPOINTER_INTERVAL_MS,
+          thresholdPages: DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+          busyTimeoutMs: BUSY_TIMEOUT_MS,
+          slot: CHECKPOINTER_SLOT,
+          state: CHECKPOINTER_STATE,
+        },
+      });
+    } catch (cause) {
+      init.logger.warn(
+        'could not start the session store background checkpointer; commits checkpoint the write-ahead log themselves',
+        { subsystem: SUBSYSTEM, reason: DebuggenError.from(cause, 'STORE_ERROR').message },
+      );
+      return undefined;
+    }
+
+    // Never what keeps the service alive: the store's own close stops it.
+    worker.unref();
+    return new BackgroundCheckpointer(init, control, worker);
+  }
+
+  /**
+   * Runs `fn` while the worker makes no database call, for a checkpoint of the
+   * main connection's own.
+   *
+   * The pause flag is raised, a call already in flight is waited out for at
+   * most {@link WAL_CHECKPOINTER_STOP_WAIT_MS}, and the flag is lowered again
+   * however `fn` ends. A worker that is not running is not waited for.
+   *
+   * @typeParam T What `fn` returns.
+   * @param fn The work the worker must not overlap.
+   * @returns Whatever `fn` returned.
+   */
+  withPaused<T>(fn: () => T): T {
+    if (this.#status !== 'starting' && this.#status !== 'running') {
+      return fn();
+    }
+
+    Atomics.store(this.#control, CHECKPOINTER_SLOT.pause, 1);
+    try {
+      const idle = this.#awaitState((state) => state !== CHECKPOINTER_STATE.busy);
+      if (!idle) {
+        this.#logger.debug(
+          'the session store background checkpointer was still checkpointing when a checkpoint was requested',
+          { subsystem: SUBSYSTEM, waitedMs: WAL_CHECKPOINTER_STOP_WAIT_MS },
+        );
+      }
+      return fn();
+    } finally {
+      Atomics.store(this.#control, CHECKPOINTER_SLOT.pause, 0);
+    }
+  }
+
+  /**
+   * Stops the worker and hands checkpointing back to the main connection.
+   * Idempotent, synchronous and never throws.
+   *
+   * The stop flag is raised and the worker woken. A worker that had not yet
+   * touched the database never will (see {@link WAL_CHECKPOINTER_SOURCE}), so
+   * it is not waited for; any other is waited for until it has closed its
+   * connection, for at most {@link WAL_CHECKPOINTER_STOP_WAIT_MS}, and then
+   * terminated either way.
+   */
+  stop(): void {
+    if (this.#status === 'stopped') {
+      return;
+    }
+    this.#status = 'stopped';
+
+    Atomics.store(this.#control, CHECKPOINTER_SLOT.stop, 1);
+    Atomics.notify(this.#control, CHECKPOINTER_SLOT.stop);
+
+    const untouched =
+      Atomics.load(this.#control, CHECKPOINTER_SLOT.state) === CHECKPOINTER_STATE.starting;
+    if (!this.#halted && !untouched) {
+      const done = this.#awaitState((state) => state === CHECKPOINTER_STATE.done);
+      if (!done) {
+        this.#logger.warn(
+          'the session store background checkpointer did not stop in time and was terminated',
+          { subsystem: SUBSYSTEM, waitedMs: WAL_CHECKPOINTER_STOP_WAIT_MS },
+        );
+      }
+    }
+
+    this.#restoreAutocheckpoint();
+    this.#halt();
+  }
+
+  /**
+   * Blocks until the worker's state satisfies `accepts`, or the stop bound
+   * passes. `Atomics.wait` on the state slot returns as soon as the worker
+   * publishes a new state, so no time is spent polling.
+   *
+   * @param accepts Whether a state is the one being waited for.
+   * @returns `true` when it was reached, `false` when the bound passed first.
+   */
+  #awaitState(accepts: (state: number) => boolean): boolean {
+    const deadline = performance.now() + WAL_CHECKPOINTER_STOP_WAIT_MS;
+    for (;;) {
+      const current = Atomics.load(this.#control, CHECKPOINTER_SLOT.state);
+      if (accepts(current)) {
+        return true;
+      }
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) {
+        return false;
+      }
+      Atomics.wait(this.#control, CHECKPOINTER_SLOT.state, current, remaining);
+    }
+  }
+
+  /** Dispatches one message from the worker. */
+  #onMessage(value: unknown): void {
+    const message = checkpointerMessage(value);
+    if (message === undefined) {
+      return;
+    }
+    if (message.type === 'ready') {
+      this.#onReady();
+      return;
+    }
+    this.#fail(message.operation, message.reason);
+  }
+
+  /**
+   * The worker's connection is open: re-verify the store's files, then turn the
+   * main connection's automatic checkpoint off.
+   */
+  #onReady(): void {
+    if (this.#status !== 'starting' || !this.#db.isOpen) {
+      return;
+    }
+
+    const verified = this.#verify();
+    if (isErr(verified)) {
+      this.#logger.warn(
+        'the session store background checkpointer was not used: the store files changed after they were verified',
+        errorFields(verified.error),
+      );
+      this.#status = 'failed';
+      this.#halt();
+      return;
+    }
+
+    try {
+      this.#db.exec(DISABLE_AUTOCHECKPOINT_SQL);
+    } catch (cause) {
+      this.#fail('handover', DebuggenError.from(cause, 'STORE_ERROR').message);
+      return;
+    }
+    this.#autocheckpointOff = true;
+    this.#status = 'running';
+    this.#logger.debug('the session store write-ahead log is checkpointed in the background', {
+      subsystem: SUBSYSTEM,
+      intervalMs: WAL_CHECKPOINTER_INTERVAL_MS,
+      thresholdPages: DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+    });
+  }
+
+  /** The worker thread ended; unless it was asked to, that is a failure. */
+  #onExit(code: number): void {
+    this.#halted = true;
+    if (this.#status === 'starting' || this.#status === 'running') {
+      this.#fail('exit', `the worker exited with code ${String(code)}`);
+    }
+  }
+
+  /**
+   * Gives up on the worker: the main connection checkpoints on `COMMIT` again,
+   * the failure is logged once, and the worker is told to stop and terminated.
+   *
+   * @param operation What the worker was doing (`open`, `checkpoint`, `close`,
+   * `worker`, `exit`, `handover`) — this module's own vocabulary.
+   * @param reason The binding's or the runtime's message, as the other store
+   * diagnostics in this module carry it.
+   */
+  #fail(operation: string, reason: string): void {
+    if (this.#status === 'failed' || this.#status === 'stopped') {
+      return;
+    }
+    this.#status = 'failed';
+    this.#restoreAutocheckpoint();
+    this.#logger.warn(
+      'the session store background checkpointer stopped; commits checkpoint the write-ahead log themselves again',
+      { subsystem: SUBSYSTEM, operation, reason },
+    );
+    this.#halt();
+  }
+
+  /** Sets the main connection's `wal_autocheckpoint` back, when this checkpointer had turned it off. */
+  #restoreAutocheckpoint(): void {
+    if (!this.#autocheckpointOff) {
+      return;
+    }
+    this.#autocheckpointOff = false;
+    if (!this.#db.isOpen) {
+      return;
+    }
+    try {
+      this.#db.exec(RESTORE_AUTOCHECKPOINT_SQL);
+    } catch (cause) {
+      this.#logger.error('could not restore the session store automatic checkpoint', {
+        subsystem: SUBSYSTEM,
+        reason: DebuggenError.from(cause, 'STORE_ERROR').message,
+      });
+    }
+  }
+
+  /** Raises the stop flag and terminates the worker, once. */
+  #halt(): void {
+    Atomics.store(this.#control, CHECKPOINTER_SLOT.stop, 1);
+    Atomics.notify(this.#control, CHECKPOINTER_SLOT.stop);
+    if (this.#halted) {
+      return;
+    }
+    this.#halted = true;
+    this.#worker.terminate().catch((cause: unknown) => {
+      this.#logger.debug('could not terminate the session store background checkpointer', {
+        subsystem: SUBSYSTEM,
+        reason: DebuggenError.from(cause, 'STORE_ERROR').message,
+      });
+    });
+  }
+
+  /** Runs a listener body, reporting rather than raising whatever it throws. */
+  #guarded(body: () => void): void {
+    try {
+      body();
+    } catch (cause) {
+      this.#logger.error('the session store background checkpointer failed unexpectedly', {
+        subsystem: SUBSYSTEM,
+        reason: DebuggenError.from(cause, 'STORE_ERROR').message,
+      });
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------------------------------
  * The store handle
  * ---------------------------------------------------------------------------------------------- */
 
@@ -751,24 +1464,38 @@ export interface Store {
    *
    * Called on graceful shutdown and after a large retention purge, so a stopped
    * service leaves one file any SQLite client can read and a purge's freed pages
-   * are actually reclaimed. A checkpoint that cannot complete — a reader is
-   * still open, or a transaction is in flight — is reported at `debug` and never
-   * raised: the cost is disk space, and there is no caller for whom that is
-   * worth failing.
+   * are actually reclaimed. The background checkpointer is held paused for the
+   * length of the call, so its own passive checkpoint cannot make this one
+   * busy. Every checkpoint is reported at `debug` with its outcome —
+   * `checkpoint` `completed`, `busy`, `failed` or `no-wal`; for the first two
+   * the `busy`, `logFrames` and `checkpointedFrames` counts, and for `failed`
+   * the binding's `checkpointReason`. A checkpoint that cannot complete — a
+   * reader is still open, or a transaction is in flight — is never raised: the
+   * cost is disk space, and there is no caller for whom that is worth failing.
    *
    * @throws {DebuggenError} With code `STORE_ERROR` when the handle is closed.
    */
   checkpoint(): void;
 
   /**
-   * Releases the statement cache, checkpoints the write-ahead log and closes the
-   * connection.
+   * Releases the statement cache, stops the background checkpointer,
+   * checkpoints the write-ahead log and closes the connection.
    *
-   * Idempotent: a second call does nothing. `src/main.ts` may reach it from a
-   * signal handler and from its own failure path in the same stop, and the
-   * binding throws `ERR_INVALID_STATE` on a second close, so this must absorb
-   * that rather than turn a clean stop into a crash. After it returns,
-   * {@link Store.statement} and {@link Store.transaction} throw.
+   * Once the connection has closed, exactly one `info` record says so and names
+   * the checkpoint that preceded it, with the fields {@link Store.checkpoint}
+   * reports: `the session store checkpointed its write-ahead log and closed`
+   * when the log was folded in and truncated, `the session store closed
+   * without completing its write-ahead log checkpoint` when a reader or an open
+   * transaction prevented that, and `the session store closed` for a store with
+   * no write-ahead log. That record is what lets a stopped service's log show
+   * that its data reached the database file. A close the binding refuses is
+   * reported at `error` instead, with the same checkpoint fields.
+   *
+   * Idempotent: a second call does nothing and logs nothing. `src/main.ts` may
+   * reach it from a signal handler and from its own failure path in the same
+   * stop, and the binding throws `ERR_INVALID_STATE` on a second close, so this
+   * must absorb that rather than turn a clean stop into a crash. After it
+   * returns, {@link Store.statement} and {@link Store.transaction} throw.
    */
   close(): void;
 }
@@ -784,8 +1511,144 @@ interface SqliteStoreInit {
   /** The version `PRAGMA user_version` reported after migration. */
   readonly schemaVersion: number;
 
-  /** Where this handle reports checkpoint and close problems. */
+  /** Where this handle reports its checkpoints and its close. */
   readonly logger: Logger;
+
+  /**
+   * The store's background checkpointer; absent for the in-memory store, for
+   * a connection not in WAL mode, and when the runtime refused a worker.
+   */
+  readonly checkpointer?: BackgroundCheckpointer | undefined;
+}
+
+/**
+ * The frame counts a checkpoint that ran reports.
+ *
+ * Counts only — never a page, a row or a statement — so the record they travel
+ * in carries nothing from the store's contents (AAP 0.5.2).
+ */
+interface CheckpointCounts {
+  /** `1` when a reader or writer kept the log from being truncated, else `0`. */
+  readonly busy: number;
+
+  /** How many frames the write-ahead log held when the checkpoint began. */
+  readonly logFrames: number;
+
+  /** How many of those frames are now copied back into the database file. */
+  readonly checkpointedFrames: number;
+}
+
+/**
+ * What one checkpoint of the write-ahead log achieved.
+ *
+ * - `completed` — every frame was copied back and the log truncated to zero
+ *   bytes, so the database file alone holds the store;
+ * - `busy` — a reader or writer held part of the log, so it could not be
+ *   truncated; `checkpointedFrames` may be below `logFrames`, and the rest is
+ *   folded in by the next checkpoint or by the last connection's close;
+ * - `failed` — the checkpoint raised, which it does while a transaction is
+ *   open on this connection, or could not start because another connection —
+ *   the background checkpointer of {@link openWalCheckpointer}, say — was
+ *   running one; `reason` is the binding's message or
+ *   {@link CONCURRENT_CHECKPOINT_REASON}, which name the condition and never a
+ *   value;
+ * - `no-wal` — the connection is not in WAL mode (the in-memory store, or a
+ *   filesystem that refused WAL), so there was no log to fold in;
+ * - `skipped` — the connection had already been closed through
+ *   {@link Store.db}, so nothing could run.
+ */
+type CheckpointOutcome =
+  | ({ readonly status: 'completed' | 'busy' } & CheckpointCounts)
+  | { readonly status: 'failed'; readonly reason: string }
+  | { readonly status: 'no-wal' | 'skipped' };
+
+/** The `debug` message {@link Store.checkpoint} reports each outcome under. */
+const CHECKPOINT_MESSAGES: Readonly<Record<CheckpointOutcome['status'], string>> = {
+  completed: 'checkpointed the session store write-ahead log',
+  busy: 'the session store write-ahead log was busy during the checkpoint',
+  failed: 'could not checkpoint the session store write-ahead log',
+  'no-wal': 'the session store has no write-ahead log to checkpoint',
+  skipped: 'skipped the session store checkpoint because its connection is closed',
+};
+
+/**
+ * The one `info` message {@link Store.close} reports each checkpoint outcome
+ * under, once the connection has closed.
+ */
+const CLOSE_MESSAGES: Readonly<Record<CheckpointOutcome['status'], string>> = {
+  completed: 'the session store checkpointed its write-ahead log and closed',
+  busy: 'the session store closed without completing its write-ahead log checkpoint',
+  failed: 'the session store closed without completing its write-ahead log checkpoint',
+  'no-wal': 'the session store closed',
+  skipped: 'the session store closed',
+};
+
+/**
+ * The reason a checkpoint is reported as `failed` when the pragma answered,
+ * but not with the three counts it is documented to return.
+ */
+const UNREADABLE_CHECKPOINT_REASON = 'the checkpoint pragma did not answer with its frame counts';
+
+/**
+ * The reason a checkpoint is reported as `failed` when another connection held
+ * the checkpoint lock. SQLite answers that case with `busy = 1` and `-1` for
+ * both frame counts — the counts a connection outside WAL mode answers with
+ * `busy = 0` — so it must be told apart from `no-wal` by `busy`.
+ */
+const CONCURRENT_CHECKPOINT_REASON = 'another connection was checkpointing the write-ahead log';
+
+/**
+ * The log fields that describe a checkpoint outcome: `checkpoint`, the
+ * outcome's status, then its counts (`busy`, `logFrames`,
+ * `checkpointedFrames`) or its `checkpointReason`.
+ *
+ * @param outcome What the checkpoint achieved.
+ * @returns Fields safe to log — a status, counts and the binding's message.
+ */
+function checkpointFields(outcome: CheckpointOutcome): LogFields {
+  switch (outcome.status) {
+    case 'completed':
+    case 'busy':
+      return {
+        checkpoint: outcome.status,
+        busy: outcome.busy,
+        logFrames: outcome.logFrames,
+        checkpointedFrames: outcome.checkpointedFrames,
+      };
+    case 'failed':
+      // Not `reason`: the close's own error record carries that field for the
+      // close failure, and the two must not overwrite each other.
+      return { checkpoint: outcome.status, checkpointReason: outcome.reason };
+    case 'no-wal':
+    case 'skipped':
+      return { checkpoint: outcome.status };
+  }
+}
+
+/**
+ * Runs one `PRAGMA wal_checkpoint(…)` and reads its three counts.
+ *
+ * @param db An open connection.
+ * @param sql {@link CHECKPOINT_PASSIVE_SQL} or {@link CHECKPOINT_SQL}.
+ * @returns The `busy`, `log` and `checkpointed` columns as numbers — `log` and
+ * `checkpointed` are `-1` on a connection that is not in WAL mode — or
+ * `undefined` when the answer lacks one of them.
+ * @throws The binding's error, which a checkpoint raises while a transaction is
+ * open on the connection.
+ */
+function runCheckpoint(
+  db: DatabaseSync,
+  sql: string,
+): { readonly busy: number; readonly log: number; readonly checkpointed: number } | undefined {
+  const row: Record<string, unknown> | undefined = db.prepare(sql).get();
+  const busy = toFiniteNumber(row?.['busy']);
+  const log = toFiniteNumber(row?.['log']);
+  const checkpointed = toFiniteNumber(row?.['checkpointed']);
+
+  if (busy === undefined || log === undefined || checkpointed === undefined) {
+    return undefined;
+  }
+  return { busy, log, checkpointed };
 }
 
 /**
@@ -806,6 +1669,9 @@ class SqliteStore implements Store {
 
   readonly #logger: Logger;
 
+  /** The background checkpointer, stopped by {@link close}; see {@link SqliteStoreInit.checkpointer}. */
+  readonly #checkpointer: BackgroundCheckpointer | undefined;
+
   /**
    * Prepared statements by their exact text. Cleared by {@link close}; the
    * binding finalises the statements themselves when the connection closes,
@@ -825,6 +1691,7 @@ class SqliteStore implements Store {
     this.#path = init.path;
     this.#schemaVersion = init.schemaVersion;
     this.#logger = init.logger;
+    this.#checkpointer = init.checkpointer;
   }
 
   get path(): string {
@@ -918,11 +1785,20 @@ class SqliteStore implements Store {
 
   checkpoint(): void {
     this.#assertUsable('checkpoint');
-    this.#checkpointQuietly();
+    const outcome =
+      this.#checkpointer === undefined
+        ? this.#checkpointQuietly()
+        : this.#checkpointer.withPaused(() => this.#checkpointQuietly());
+    this.#logger.debug(CHECKPOINT_MESSAGES[outcome.status], {
+      subsystem: SUBSYSTEM,
+      ...checkpointFields(outcome),
+    });
   }
 
   close(): void {
     if (this.#closed) {
+      // Silent as well as harmless: the first close already wrote the one
+      // record that says this store stopped.
       return;
     }
 
@@ -939,23 +1815,51 @@ class SqliteStore implements Store {
     this.#statements.clear();
     this.#depth = 0;
 
-    // Before the close, and tolerated: a checkpoint cannot run while a
-    // transaction is in flight, which is exactly the state the branch above
-    // reports.
-    this.#checkpointQuietly();
-
+    // First, so the worker has closed its own connection before the `TRUNCATE`
+    // below — which it could otherwise leave busy — and before this connection
+    // closes as the last one, which is what removes the sidecars.
     try {
-      if (this.#db.isOpen) {
-        this.#db.close();
-      }
+      this.#checkpointer?.stop();
     } catch (cause) {
-      this.#logger.error('could not close the session store cleanly', {
+      this.#logger.error('could not stop the session store background checkpointer cleanly', {
         subsystem: SUBSYSTEM,
         reason: DebuggenError.from(cause, 'STORE_ERROR').message,
       });
     }
 
+    // Before the close, and tolerated: a checkpoint cannot run while a
+    // transaction is in flight, which is exactly the state the branch above
+    // reports.
+    const outcome = this.#checkpointQuietly();
+
+    // The path is the one the open record already named, so a reader can pair
+    // the two lines; nothing else about the store travels.
+    const fields: LogFields = {
+      subsystem: SUBSYSTEM,
+      databasePath: this.#path,
+      ...checkpointFields(outcome),
+    };
+
+    let closedCleanly = true;
+    try {
+      if (this.#db.isOpen) {
+        this.#db.close();
+      }
+    } catch (cause) {
+      closedCleanly = false;
+      this.#logger.error('could not close the session store cleanly', {
+        ...fields,
+        reason: DebuggenError.from(cause, 'STORE_ERROR').message,
+      });
+    }
+
     this.#closed = true;
+
+    // After the close rather than before it, so the record states what
+    // happened rather than what was about to.
+    if (closedCleanly) {
+      this.#logger.info(CLOSE_MESSAGES[outcome.status], fields);
+    }
   }
 
   /**
@@ -1017,33 +1921,715 @@ class SqliteStore implements Store {
   }
 
   /**
-   * Checkpoints the write-ahead log, tolerating a busy result.
+   * Checkpoints the write-ahead log and says what that achieved, never
+   * raising.
    *
-   * Used by {@link checkpoint} and by {@link close}. `PRAGMA
-   * wal_checkpoint(TRUNCATE)` answers with `busy`, `log` and `checkpointed`
-   * counts and raises outright when a transaction holds the database, so both
-   * outcomes are reported at `debug` and neither is raised.
+   * Used by {@link checkpoint} and by {@link close}, which each report the
+   * outcome at their own level; this method logs nothing, so a close writes one
+   * record rather than one per step.
+   *
+   * Two pragmas, in order. `wal_checkpoint(PASSIVE)` copies back every frame no
+   * reader still needs and answers how many frames the log holds — `-1` on a
+   * connection that is not in WAL mode, which ends the attempt as `no-wal`.
+   * `wal_checkpoint(TRUNCATE)` then waits, up to `busy_timeout`, for readers
+   * and writers to finish, copies what remains and truncates the log to zero
+   * bytes; its `busy` column says whether it could. A successful truncating
+   * checkpoint answers zero for both frame counts, having reset the log, which
+   * is why the counts of a `completed` outcome come from the first pragma. Either
+   * pragma raises outright while a transaction is open on this connection,
+   * which is the `failed` outcome.
+   *
+   * @returns The {@link CheckpointOutcome}.
    */
-  #checkpointQuietly(): void {
+  #checkpointQuietly(): CheckpointOutcome {
     if (!this.#db.isOpen) {
-      return;
+      return { status: 'skipped' };
     }
 
     try {
-      const busy = toFiniteNumber(readPragma(this.#db, CHECKPOINT_SQL, 'busy'));
-      if (busy !== undefined && busy !== 0) {
-        this.#logger.debug('the session store write-ahead log was busy during the checkpoint', {
-          subsystem: SUBSYSTEM,
-          busy,
-        });
+      const copied = runCheckpoint(this.#db, CHECKPOINT_PASSIVE_SQL);
+      if (copied === undefined) {
+        return { status: 'failed', reason: UNREADABLE_CHECKPOINT_REASON };
       }
+      if (copied.log < 0) {
+        // `-1` counts mean either "not in WAL mode" or "another connection
+        // holds the checkpoint lock"; only the latter answers `busy`.
+        return copied.busy === 0
+          ? { status: 'no-wal' }
+          : { status: 'failed', reason: CONCURRENT_CHECKPOINT_REASON };
+      }
+
+      const truncated = runCheckpoint(this.#db, CHECKPOINT_SQL);
+      if (truncated === undefined) {
+        return { status: 'failed', reason: UNREADABLE_CHECKPOINT_REASON };
+      }
+
+      if (truncated.busy === 0) {
+        // Truncated: every frame the log held has been copied back.
+        return {
+          status: 'completed',
+          busy: 0,
+          logFrames: copied.log,
+          checkpointedFrames: copied.log,
+        };
+      }
+
+      // Not truncated, so the second answer describes the log as it stands,
+      // and the copied count only ever grows between the two.
+      return {
+        status: 'busy',
+        busy: truncated.busy,
+        logFrames: Math.max(copied.log, truncated.log),
+        checkpointedFrames: Math.max(copied.checkpointed, truncated.checkpointed),
+      };
     } catch (cause) {
-      this.#logger.debug('could not checkpoint the session store write-ahead log', {
-        subsystem: SUBSYSTEM,
-        reason: DebuggenError.from(cause, 'STORE_ERROR').message,
-      });
+      return { status: 'failed', reason: DebuggenError.from(cause, 'STORE_ERROR').message };
     }
   }
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Background checkpoints
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Reads this connection's commit-time checkpoint threshold, in pages. */
+const READ_WAL_AUTOCHECKPOINT_SQL = 'PRAGMA wal_autocheckpoint';
+
+/** Turns this connection's commit-time checkpoint off. */
+const SUSPEND_WAL_AUTOCHECKPOINT_SQL = 'PRAGMA wal_autocheckpoint = 0;';
+
+/**
+ * How long the checkpointer's own connection waits for readers and writers
+ * before its truncating checkpoint reports `busy`, in milliseconds.
+ *
+ * Short, because the wait holds the write lock for its whole length: a write
+ * on the service's connection that arrives meanwhile waits too, on the event
+ * loop. It is also enough — the passive checkpoint before it has already
+ * copied the log, so what is left is the truncation, and a truncation that
+ * cannot happen now is simply retried by the next request. Nothing is lost
+ * either way; only the log's size is at stake.
+ */
+const BACKGROUND_CHECKPOINT_BUSY_TIMEOUT_MS = 250;
+
+/**
+ * How long {@link WalCheckpointer.close} waits for the thread to end on its own
+ * before terminating it, in milliseconds. The thread ends as soon as the
+ * checkpoint it is running returns, so this bounds only a checkpoint that is
+ * itself stuck.
+ */
+const BACKGROUND_CHECKPOINT_CLOSE_TIMEOUT_MS = 2_000;
+
+/**
+ * The checkpointer thread's program.
+ *
+ * Plain CommonJS evaluated from this string (`new Worker(source, { eval: true })`)
+ * rather than a module of its own: the service is bundled — by `tsup` into
+ * `dist/main.js` and by the editor extension into its VSIX — and a thread
+ * entry file would have to survive both bundles as a separate asset, while a
+ * string needs nothing but `node:` built-ins.
+ *
+ * It opens its connection on the first request, and proves before using it
+ * that the path still names the file the service opened: the same `lstat`
+ * identity check {@link openStore} performs after its own open, because
+ * `DatabaseSync` opens by path and follows a link at the final component. It
+ * sets nothing else: `journal_mode` is a property of the file, and every other
+ * store pragma governs statements this connection never runs. Each request
+ * runs `wal_checkpoint(PASSIVE)` — which never waits and copies back every
+ * frame no reader still needs — and then `wal_checkpoint(TRUNCATE)`, which
+ * resets the log to zero bytes when nothing holds it; both answers are posted
+ * back as numbers. A failure is posted back as its message, never thrown, so
+ * the thread outlives it and the next request can try again.
+ */
+const BACKGROUND_CHECKPOINT_SOURCE = [
+  "'use strict';",
+  "const { parentPort, workerData } = require('node:worker_threads');",
+  "const { lstatSync } = require('node:fs');",
+  "const { DatabaseSync } = require('node:sqlite');",
+  'let db;',
+  'const reasonOf = (cause) => (cause instanceof Error ? cause.message : String(cause));',
+  "const numberOf = (value) => (typeof value === 'bigint' ? Number(value) : value);",
+  'const countsOf = (row) => ({',
+  '  busy: numberOf(row && row.busy),',
+  '  log: numberOf(row && row.log),',
+  '  checkpointed: numberOf(row && row.checkpointed),',
+  '});',
+  'const connection = () => {',
+  '  if (db !== undefined) return db;',
+  '  const opened = new DatabaseSync(workerData.path);',
+  '  try {',
+  '    const stats = lstatSync(workerData.path, { bigint: true });',
+  '    if (!stats.isFile() || String(stats.dev) !== workerData.dev || String(stats.ino) !== workerData.ino) {',
+  "      throw new Error('the session store file is no longer the one the service opened');",
+  '    }',
+  "    opened.exec('PRAGMA busy_timeout = ' + String(workerData.busyTimeoutMs) + ';');",
+  '  } catch (cause) {',
+  '    opened.close();',
+  '    throw cause;',
+  '  }',
+  '  db = opened;',
+  '  return db;',
+  '};',
+  "parentPort.on('message', (message) => {",
+  "  if (message === null || typeof message !== 'object') return;",
+  "  if (message.kind === 'close') {",
+  '    try {',
+  '      if (db !== undefined && db.isOpen) db.close();',
+  '    } catch {',
+  '      // The thread is ending; the process closes what is left.',
+  '    }',
+  '    db = undefined;',
+  '    parentPort.close();',
+  '    return;',
+  '  }',
+  "  if (message.kind !== 'checkpoint') return;",
+  '  try {',
+  '    const handle = connection();',
+  "    const copied = countsOf(handle.prepare('PRAGMA wal_checkpoint(PASSIVE)').get());",
+  "    const truncated = countsOf(handle.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get());",
+  "    parentPort.postMessage({ kind: 'result', id: message.id, ok: true, copied, truncated });",
+  '  } catch (cause) {',
+  "    parentPort.postMessage({ kind: 'result', id: message.id, ok: false, reason: reasonOf(cause) });",
+  '  }',
+  '});',
+].join('\n');
+
+/**
+ * What one background checkpoint achieved, as {@link WalCheckpointer.checkpoint}
+ * answers it.
+ *
+ * - `completed` — the log was copied back and truncated to zero bytes;
+ * - `busy` — a reader or writer kept the log from being truncated; the frames
+ *   copied so far stay copied, and the next request tries again;
+ * - `failed` — the checkpoint could not run: the thread could not start, its
+ *   connection could not be opened or verified, or the pragma raised; `reason`
+ *   is the message, a local path at most, never a row;
+ * - `no-wal` — the file is not in WAL mode, so there is nothing to fold in;
+ * - `closed` — the checkpointer was closed before or while the request waited.
+ *
+ * `durationMs` is how long the caller waited, from the request to the answer.
+ * Counts and durations only, so the record a caller writes from this carries
+ * nothing from the store's contents (AAP 0.5.2).
+ */
+export type WalCheckpointOutcome =
+  | {
+      readonly status: 'completed' | 'busy';
+      /** `1` when a reader or writer kept the log from being truncated, else `0`. */
+      readonly busy: number;
+      /** How many frames the log held when the checkpoint began. */
+      readonly logFrames: number;
+      /** How many of those frames are now copied back into the database file. */
+      readonly checkpointedFrames: number;
+      readonly durationMs: number;
+    }
+  | { readonly status: 'failed'; readonly reason: string; readonly durationMs: number }
+  | { readonly status: 'no-wal'; readonly durationMs: number }
+  | { readonly status: 'closed' };
+
+/**
+ * A second connection to a file-backed store, owned by a worker thread, that
+ * folds the write-ahead log back into the database file on request.
+ *
+ * The request is answered asynchronously, so the copying and the `fsync` that
+ * ends it — the part of a checkpoint that takes seconds on a busy disk — never
+ * run on the event loop. Obtained from {@link openWalCheckpointer}; see
+ * "Checkpoints off the event loop" in this module's overview.
+ *
+ * The thread is started by the first {@link checkpoint}, not before, keeps the
+ * process alive only while a request is in flight, and is ended by
+ * {@link close}.
+ */
+export interface WalCheckpointer {
+  /**
+   * The size of the `-wal` file in bytes, or `0` when there is none or it
+   * cannot be read. A completed checkpoint truncates the file, so this is also
+   * how much log has accumulated since the last one completed.
+   */
+  walBytes(): number;
+
+  /**
+   * Runs one checkpoint on the thread's connection and answers what it
+   * achieved.
+   *
+   * Requests are served one at a time in the order made. Never rejects: every
+   * failure is an outcome, so a caller that only wanted the log smaller can
+   * carry on either way.
+   */
+  checkpoint(): Promise<WalCheckpointOutcome>;
+
+  /**
+   * Ends the thread and closes its connection.
+   *
+   * A request still waiting is answered `closed` at once. When a checkpoint is
+   * running on the thread — nothing can interrupt one — the thread is released
+   * rather than awaited: it closes its connection and ends as soon as that
+   * checkpoint returns, and never keeps the process alive meanwhile, so a
+   * shutdown is not held behind a slow disk. Otherwise this waits for the
+   * thread to end, terminating it after
+   * {@link BACKGROUND_CHECKPOINT_CLOSE_TIMEOUT_MS}. Requests made after this
+   * answer `closed`. Idempotent — every call returns the first call's
+   * promise; never rejects.
+   */
+  close(): Promise<void>;
+}
+
+/** A reply the checkpointer thread posts. */
+interface CheckpointReply {
+  readonly id: number;
+  readonly ok: boolean;
+  readonly copied?: unknown;
+  readonly truncated?: unknown;
+  readonly reason?: unknown;
+}
+
+/** The three counts a `wal_checkpoint` pragma answers, as the thread posts them. */
+interface ReportedCounts {
+  readonly busy: number;
+  readonly log: number;
+  readonly checkpointed: number;
+}
+
+/** Reads a thread's posted counts, or `undefined` when one of them is not a finite number. */
+function reportedCounts(value: unknown): ReportedCounts | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const busy = toFiniteNumber(record['busy']);
+  const log = toFiniteNumber(record['log']);
+  const checkpointed = toFiniteNumber(record['checkpointed']);
+  if (busy === undefined || log === undefined || checkpointed === undefined) {
+    return undefined;
+  }
+  return { busy, log, checkpointed };
+}
+
+/** Whether a message from the thread is a {@link CheckpointReply}. */
+function isCheckpointReply(value: unknown): value is CheckpointReply {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    record['kind'] === 'result' &&
+    typeof record['id'] === 'number' &&
+    typeof record['ok'] === 'boolean'
+  );
+}
+
+/**
+ * Turns a thread's reply into a {@link WalCheckpointOutcome}, reading the two
+ * answers exactly as {@link SqliteStore}'s own close does: the passive answer
+ * carries the counts, and the truncating answer's `busy` says whether the log
+ * was reset.
+ */
+function outcomeOfReply(reply: CheckpointReply, durationMs: number): WalCheckpointOutcome {
+  if (!reply.ok) {
+    const reason =
+      typeof reply.reason === 'string' && reply.reason.length > 0
+        ? reply.reason
+        : UNREADABLE_CHECKPOINT_REASON;
+    return { status: 'failed', reason, durationMs };
+  }
+  const copied = reportedCounts(reply.copied);
+  const truncated = reportedCounts(reply.truncated);
+  if (copied === undefined || truncated === undefined) {
+    return { status: 'failed', reason: UNREADABLE_CHECKPOINT_REASON, durationMs };
+  }
+  if (copied.log < 0) {
+    return copied.busy === 0
+      ? { status: 'no-wal', durationMs }
+      : { status: 'failed', reason: CONCURRENT_CHECKPOINT_REASON, durationMs };
+  }
+  if (truncated.busy === 0) {
+    return {
+      status: 'completed',
+      busy: 0,
+      logFrames: copied.log,
+      checkpointedFrames: copied.log,
+      durationMs,
+    };
+  }
+  return {
+    status: 'busy',
+    busy: truncated.busy,
+    logFrames: Math.max(copied.log, truncated.log),
+    checkpointedFrames: Math.max(copied.checkpointed, truncated.checkpointed),
+    durationMs,
+  };
+}
+
+/** The reason the exit handler answers a request with once the checkpointer was closed. */
+const CLOSED_REPLY_REASON = 'the checkpointer was closed';
+
+/** The {@link WalCheckpointer} implementation; obtained from {@link openWalCheckpointer}. */
+class ThreadedWalCheckpointer implements WalCheckpointer {
+  readonly #path: string;
+
+  readonly #walPath: string;
+
+  readonly #identity: FileIdentity;
+
+  #worker: Worker | undefined;
+
+  /** Why the thread can no longer serve requests, once it cannot. */
+  #broken: string | undefined;
+
+  #closed = false;
+
+  /** The first {@link close}, which every later one returns. */
+  #closing: Promise<void> | undefined;
+
+  /** Resolves once the thread has exited; set when it is started. */
+  #exited: Promise<void> | undefined;
+
+  #nextId = 0;
+
+  /** Requests awaiting their reply, by id. */
+  readonly #pending = new Map<number, (reply: CheckpointReply) => void>();
+
+  constructor(path: string, identity: FileIdentity) {
+    this.#path = path;
+    this.#walPath = `${path}-wal`;
+    this.#identity = identity;
+  }
+
+  walBytes(): number {
+    try {
+      return statSync(this.#walPath, { throwIfNoEntry: false })?.size ?? 0;
+    } catch {
+      // Unreadable reads as empty: the caller then skips a checkpoint it
+      // cannot size, and SQLite's own checkpoint at close still runs.
+      return 0;
+    }
+  }
+
+  async checkpoint(): Promise<WalCheckpointOutcome> {
+    if (this.#closed) {
+      return { status: 'closed' };
+    }
+    const startedAt = performance.now();
+    const worker = this.#ensureWorker();
+    if (worker === undefined) {
+      return {
+        status: 'failed',
+        reason: this.#broken ?? UNREADABLE_CHECKPOINT_REASON,
+        durationMs: performance.now() - startedAt,
+      };
+    }
+
+    const id = this.#nextId;
+    this.#nextId += 1;
+    const replied = new Promise<CheckpointReply>((resolveReply) => {
+      this.#pending.set(id, resolveReply);
+    });
+    // Held alive only while a request waits, so an idle checkpointer never
+    // keeps a finished process running.
+    worker.ref();
+    try {
+      worker.postMessage({ kind: 'checkpoint', id });
+    } catch (cause) {
+      this.#pending.delete(id);
+      worker.unref();
+      return {
+        status: 'failed',
+        reason: DebuggenError.from(cause, 'STORE_ERROR').message,
+        durationMs: performance.now() - startedAt,
+      };
+    }
+
+    const reply = await replied;
+    if (this.#pending.size === 0 && this.#worker !== undefined) {
+      this.#worker.unref();
+    }
+    if (reply.reason === CLOSED_REPLY_REASON) {
+      return { status: 'closed' };
+    }
+    return outcomeOfReply(reply, performance.now() - startedAt);
+  }
+
+  close(): Promise<void> {
+    this.#closing ??= this.#closeOnce();
+    return this.#closing;
+  }
+
+  /** The body of {@link close}, run once. */
+  async #closeOnce(): Promise<void> {
+    this.#closed = true;
+    const worker = this.#worker;
+    if (worker === undefined || this.#exited === undefined) {
+      return;
+    }
+
+    // Every request still waiting is answered now rather than when its
+    // checkpoint returns: a caller closing is done with them.
+    const inFlight = this.#pending.size > 0;
+    for (const [id, settle] of this.#pending) {
+      settle({ id, ok: false, reason: CLOSED_REPLY_REASON });
+    }
+    this.#pending.clear();
+    try {
+      worker.postMessage({ kind: 'close' });
+    } catch {
+      // Already gone: the exit handler has settled everything.
+    }
+
+    if (inFlight) {
+      // A checkpoint is still running on the thread and nothing can interrupt
+      // it; the thread closes its connection and ends as soon as it returns.
+      // Released rather than awaited, and never holding the process, so a
+      // stop is not held up behind a slow disk. SQLite keeps the store
+      // consistent whichever connection finishes last.
+      worker.unref();
+      return;
+    }
+
+    // Held alive until the thread has gone, so a caller awaiting this is never
+    // left with a promise the process exits under.
+    worker.ref();
+    let timer: NodeJS.Timeout | undefined;
+    const exited = this.#exited;
+    const timedOut = new Promise<'timed-out'>((resolveTimeout) => {
+      timer = setTimeout(() => {
+        resolveTimeout('timed-out');
+      }, BACKGROUND_CHECKPOINT_CLOSE_TIMEOUT_MS);
+    });
+    try {
+      if ((await Promise.race([exited, timedOut])) === 'timed-out') {
+        await worker.terminate();
+        await exited;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * The running thread, started on first use, or `undefined` when it cannot be
+   * started or has stopped serving requests ({@link #broken} says why).
+   */
+  #ensureWorker(): Worker | undefined {
+    if (this.#broken !== undefined) {
+      return undefined;
+    }
+    if (this.#worker !== undefined) {
+      return this.#worker;
+    }
+
+    let worker: Worker;
+    try {
+      worker = new Worker(BACKGROUND_CHECKPOINT_SOURCE, {
+        eval: true,
+        name: 'debuggen-store-checkpointer',
+        // Nothing of the service's own flags — a loader, a preload — applies
+        // to a program that uses only `node:` built-ins.
+        execArgv: [],
+        workerData: {
+          path: this.#path,
+          dev: String(this.#identity.dev),
+          ino: String(this.#identity.ino),
+          busyTimeoutMs: BACKGROUND_CHECKPOINT_BUSY_TIMEOUT_MS,
+        },
+        resourceLimits: { maxOldGenerationSizeMb: 64 },
+      });
+    } catch (cause) {
+      this.#broken = DebuggenError.from(cause, 'STORE_ERROR').message;
+      return undefined;
+    }
+    worker.unref();
+
+    worker.on('message', (message: unknown) => {
+      if (!isCheckpointReply(message)) {
+        return;
+      }
+      const settle = this.#pending.get(message.id);
+      if (settle !== undefined) {
+        this.#pending.delete(message.id);
+        settle(message);
+      }
+    });
+    worker.on('error', (cause: unknown) => {
+      this.#broken = DebuggenError.from(cause, 'STORE_ERROR').message;
+    });
+    this.#exited = new Promise<void>((resolveExit) => {
+      worker.once('exit', () => {
+        this.#broken ??= 'the checkpoint thread stopped';
+        this.#worker = undefined;
+        // Every request still waiting is answered, so no caller is left
+        // awaiting a thread that is gone.
+        const reason = this.#closed ? CLOSED_REPLY_REASON : this.#broken;
+        for (const [id, settle] of this.#pending) {
+          settle({ id, ok: false, reason });
+        }
+        this.#pending.clear();
+        resolveExit();
+      });
+    });
+    this.#worker = worker;
+    return worker;
+  }
+}
+
+/**
+ * Opens a {@link WalCheckpointer} for a file-backed store in WAL mode.
+ *
+ * Starts nothing: the thread and its connection come with the first
+ * checkpoint request, so a caller that never needs one pays for neither.
+ *
+ * @param store An open store from {@link openStore}.
+ * @returns The checkpointer, or `undefined` when there is nothing it could do:
+ * the store is closed or in memory, the file is not in WAL mode, or the
+ * database path no longer names a private regular file — the refusals
+ * {@link openStore} makes, which a checkpointer opening the same path by name
+ * must make too.
+ *
+ * @example
+ * ```ts
+ * const checkpointer = openWalCheckpointer(store);
+ * const suspension = checkpointer === undefined ? undefined : suspendAutoCheckpoint(store);
+ * try {
+ *   for (const batch of batches) {
+ *     store.transaction(() => deleteBatch(batch));
+ *     if (checkpointer !== undefined && checkpointer.walBytes() > 32 * 1024 * 1024) {
+ *       await checkpointer.checkpoint(); // the event loop stays free meanwhile
+ *     }
+ *   }
+ * } finally {
+ *   suspension?.restore();
+ *   await checkpointer?.close();
+ * }
+ * ```
+ */
+export function openWalCheckpointer(store: Store): WalCheckpointer | undefined {
+  if (store.isClosed || isInMemory(store.path)) {
+    return undefined;
+  }
+  try {
+    const mode = readPragma(store.db, READ_JOURNAL_MODE_SQL, 'journal_mode');
+    if (typeof mode !== 'string' || mode.toLowerCase() !== 'wal') {
+      return undefined;
+    }
+    const state = inspectPrivateFileNoFollow(store.path);
+    if (state === undefined) {
+      return undefined;
+    }
+    return new ThreadedWalCheckpointer(store.path, state.identity);
+  } catch {
+    // A refusal of the file, or a closed connection: nothing to checkpoint
+    // through a second connection, and the caller keeps SQLite's own.
+    return undefined;
+  }
+}
+
+/**
+ * A suspension of one store connection's commit-time checkpoint, from
+ * {@link suspendAutoCheckpoint}.
+ */
+export interface AutoCheckpointSuspension {
+  /**
+   * The connection's `wal_autocheckpoint` before the first suspension, in
+   * pages — what {@link restore} puts back once no suspension is left.
+   */
+  readonly previousPages: number;
+
+  /**
+   * Ends this suspension. The last one to end restores
+   * {@link previousPages}; a closed store has no setting left to restore, so
+   * that is skipped. Idempotent; never throws.
+   *
+   * @returns Whether this call ended the suspension (`false` when it had
+   * already ended).
+   */
+  restore(): boolean;
+}
+
+/**
+ * The suspensions currently held on each connection, and the value the first
+ * one replaced. Keyed on the connection rather than on the handle, because the
+ * setting belongs to the connection: two handles — or a wrapper and the handle
+ * it wraps — over one connection share one count.
+ */
+const autoCheckpointSuspensions = new WeakMap<
+  DatabaseSync,
+  { depth: number; readonly previousPages: number }
+>();
+
+/**
+ * Turns off the commit-time checkpoint of a store's connection until the
+ * returned suspension is restored.
+ *
+ * For a caller about to run a long series of write transactions that keeps
+ * the log bounded itself, through {@link openWalCheckpointer}: without that,
+ * nothing folds the log back in until the store closes, and it grows with
+ * every commit. Reference-counted per connection, so two overlapping callers
+ * — a start-up sweep and an on-demand purge, say — each restore only their own
+ * suspension, and the original threshold returns when the last one ends.
+ *
+ * @param store An open store.
+ * @returns The suspension, or `undefined` when the connection is closed or its
+ * setting cannot be read, in which case nothing was changed.
+ */
+export function suspendAutoCheckpoint(store: Store): AutoCheckpointSuspension | undefined {
+  if (store.isClosed) {
+    return undefined;
+  }
+  const connection = store.db;
+  let held = autoCheckpointSuspensions.get(connection);
+  try {
+    if (held === undefined) {
+      const previousPages = toFiniteNumber(
+        readPragma(connection, READ_WAL_AUTOCHECKPOINT_SQL, 'wal_autocheckpoint'),
+      );
+      if (
+        previousPages === undefined ||
+        !Number.isSafeInteger(previousPages) ||
+        previousPages < 0
+      ) {
+        return undefined;
+      }
+      connection.exec(SUSPEND_WAL_AUTOCHECKPOINT_SQL);
+      held = { depth: 0, previousPages };
+      autoCheckpointSuspensions.set(connection, held);
+    }
+  } catch {
+    return undefined;
+  }
+
+  const suspension = held;
+  suspension.depth += 1;
+  let ended = false;
+  return Object.freeze({
+    previousPages: suspension.previousPages,
+    restore: (): boolean => {
+      if (ended) {
+        return false;
+      }
+      ended = true;
+      suspension.depth -= 1;
+      if (suspension.depth > 0) {
+        return true;
+      }
+      autoCheckpointSuspensions.delete(connection);
+      if (connection.isOpen) {
+        try {
+          // Restored only while the setting is still the suspension's own `0`:
+          // the store's background checkpointer hands the commit-time
+          // checkpoint back to this connection when its worker fails, and that
+          // hand-back must outlive a suspension that began before it.
+          const current = toFiniteNumber(
+            readPragma(connection, READ_WAL_AUTOCHECKPOINT_SQL, 'wal_autocheckpoint'),
+          );
+          if (current === 0) {
+            // An integer SQLite itself answered, so the text is one of a known
+            // set rather than anything a caller supplied.
+            connection.exec(`PRAGMA wal_autocheckpoint = ${String(suspension.previousPages)};`);
+          }
+        } catch {
+          // The connection is going away; it takes the setting with it.
+        }
+      }
+      return true;
+    },
+  });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1195,6 +2781,11 @@ interface StoreTarget {
  *    closing the connection before returning any failure so a refused start
  *    leaks no handle.
  * 9. Read the stamped schema version back and build the handle.
+ * 10. For a file-backed store in WAL mode, start the background checkpointer
+ *    (see "Checkpointing off the event loop" in the module notes). It is
+ *    asynchronous and never part of the open's outcome: until its worker has
+ *    opened its connection and the store's files have been re-verified once
+ *    more, the store checkpoints the way SQLite does by itself.
  *
  * ## Why no step opens a descriptor on an existing store file
  *
@@ -1387,7 +2978,20 @@ export function openStore(options: OpenStoreOptions): Result<Store, DebuggenErro
     return err(error);
   }
 
-  const store = new SqliteStore({ db, path, schemaVersion, logger });
+  // Step 10. Only a file has a second connection to share; `identity` is
+  // defined exactly for a file-backed store.
+  const judged = identity;
+  const checkpointer =
+    judged !== undefined && configured.value === 'wal'
+      ? BackgroundCheckpointer.start({
+          db,
+          path,
+          logger,
+          verify: () => verifyStoreFiles(path, judged, logger),
+        })
+      : undefined;
+
+  const store = new SqliteStore({ db, path, schemaVersion, logger, checkpointer });
 
   logger.info('session store opened', {
     subsystem: SUBSYSTEM,
@@ -1551,10 +3155,11 @@ function resolvePath(
  * A policy refusal keeps the diagnosis of the refusal it wraps: `details.path`
  * is the offending directory (the outermost one, which may be the state root
  * rather than the database's own directory), `details.reason` is its reason,
- * and the hint names the developer's action on that exact path — `chmod 700`
- * after checking its contents, or another `DEBUGGEN_HOME`, for a directory
- * that is merely too open; removing or replacing it for a link or a directory
- * another account owns.
+ * `details.mode` its permission bits when the refusal reported them, and the
+ * hint names the developer's action on that exact path — for a directory that
+ * is merely too open, the mode it has, the `0700` it needs and `chmod 700`
+ * after checking its contents, or another `DEBUGGEN_HOME`; removing or
+ * replacing it for a link or a directory another account owns.
  *
  * @param path The database path.
  * @param stateRoot The declared boundary, when the database sits inside one.
@@ -1580,6 +3185,9 @@ function prepareStoreDirectory(
     const offendingPath: unknown = failure.details?.path;
     const offending = typeof offendingPath === 'string' ? offendingPath : directory;
     const reason: unknown = failure.details?.reason;
+    // The permission bits `@debuggen/shared/node` reports for a directory it
+    // refused as too open, as the three octal digits `chmod` takes ('755').
+    const mode: unknown = failure.details?.mode;
 
     return err(
       new DebuggenError(
@@ -1588,13 +3196,14 @@ function prepareStoreDirectory(
           ? 'The Debug Generator state directory is not a private directory this account owns.'
           : 'Could not create the Debug Generator state directory for the session store.',
         {
-          hint: unsafe ? unsafeStoreDirectoryHint(offending, reason) : STATE_DIRECTORY_HINT,
+          hint: unsafe ? unsafeStoreDirectoryHint(offending, reason, mode) : STATE_DIRECTORY_HINT,
           details: {
             subsystem: SUBSYSTEM,
             directory,
             ...(stateRoot === undefined ? {} : { stateRoot }),
             ...(unsafe ? { path: offending } : {}),
             ...(unsafe && typeof reason === 'string' ? { reason } : {}),
+            ...(unsafe && typeof mode === 'string' ? { mode } : {}),
             errno: errno ?? 'unknown',
           },
           cause,
@@ -1615,17 +3224,50 @@ function prepareStoreDirectory(
  * and remove the access, or to move the state elsewhere; the store never
  * narrows the mode itself. A link, a foreign owner or a non-directory cannot be
  * made safe in place, so the action there is to remove or replace it. Only
- * the path and the required mode appear, never anything the directory holds.
+ * the path, the mode found and the mode required appear, never anything the
+ * directory holds.
+ *
+ * Modes are written the way a developer reads one (`0755`, `0700`), and the
+ * command the way it is typed (`chmod 700 <dir>`), so the hint points at the
+ * fix — removing access — rather than leaving "permissions" to be read as a
+ * reason to grant more.
  *
  * @param offending The directory the refusal named.
  * @param reason The refusal's `details.reason`, as it was reported.
- * @returns The hint text.
+ * @param mode The refusal's `details.mode`, as it was reported: the directory's
+ * permission bits as octal digits, or anything else when it carried none.
+ * @returns The hint text, for example `/home/dev/.debuggen has mode 0755, which
+ * grants group or other access; it must be 0700 …, then run 'chmod 700
+ * /home/dev/.debuggen', or set DEBUGGEN_HOME to a private directory …`.
  */
-function unsafeStoreDirectoryHint(offending: string, reason: unknown): string {
+function unsafeStoreDirectoryHint(offending: string, reason: unknown, mode: unknown): string {
   if (reason === 'group-or-other-permissions') {
-    return `${offending} grants group or other access, and the session store's directory tree must be private to this account because it holds captured telemetry and the backups of every file this tool patches. Check what it contains, then run 'chmod ${octal(SECURE_DIR_MODE)} ${offending}', or set DEBUGGEN_HOME to a private directory and start the service again.`;
+    const found = displayedMode(mode);
+    const state =
+      found === undefined
+        ? `${offending} grants group or other access`
+        : `${offending} has mode ${found}, which grants group or other access`;
+    return `${state}; it must be 0${octal(SECURE_DIR_MODE)}, because the session store's directory tree holds captured telemetry and the backups of every file this tool patches. Check what it contains, then run 'chmod ${octal(SECURE_DIR_MODE)} ${offending}', or set DEBUGGEN_HOME to a private directory and start the service again.`;
   }
   return `Remove or replace ${offending}: the session store's directory must be a real directory owned by this account with no group or other access, because it holds captured telemetry and the backups of every file this tool patches.`;
+}
+
+/**
+ * A reported mode as a developer reads one in a sentence: a leading zero, then
+ * the three permission digits (`'755'` → `'0755'`).
+ *
+ * The value comes from another module's error details, so it is checked rather
+ * than trusted: anything but one to four octal digits yields `undefined`, and
+ * the hint then describes the access without quoting a mode.
+ *
+ * @param mode The reported `details.mode`.
+ * @returns The displayed mode, or `undefined` when none was reported.
+ */
+function displayedMode(mode: unknown): string | undefined {
+  if (typeof mode !== 'string' || !/^[0-7]{1,4}$/u.test(mode)) {
+    return undefined;
+  }
+  return `0${octal(Number.parseInt(mode, 8))}`;
 }
 
 /**
@@ -1644,13 +3286,15 @@ function unsafeStoreDirectoryHint(offending: string, reason: unknown): string {
  * @param db The freshly opened connection.
  * @param path The path it was opened at, for the in-memory distinction.
  * @param logger Where the journal-mode observation is reported.
- * @returns `Ok` when every pragma was applied, or `Err` with `STORE_ERROR`.
+ * @returns `Ok` with the journal mode read back, lower-cased (`undefined` when
+ * it could not be read) — {@link openStore} starts the background checkpointer
+ * only for `wal` — or `Err` with `STORE_ERROR` when a pragma was refused.
  */
 function configureConnection(
   db: DatabaseSync,
   path: string,
   logger: Logger,
-): Result<void, DebuggenError> {
+): Result<string | undefined, DebuggenError> {
   for (const pragma of STORE_PRAGMAS) {
     try {
       db.exec(pragma);
@@ -1696,7 +3340,7 @@ function configureConnection(
     }
   }
 
-  return ok(undefined);
+  return ok(journalMode);
 }
 
 /* -------------------------------------------------------------------------------------------------

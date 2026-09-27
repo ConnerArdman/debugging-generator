@@ -1,7 +1,7 @@
 /**
  * Unit suite for `./installer.ts` — the ordered installation driver.
  *
- * Nine of its promises cannot be read off the type system, and each one is a
+ * Ten of its promises cannot be read off the type system, and each one is a
  * product guarantee rather than an implementation detail:
  *
  * 1. **Runtime hooks are armed before the first byte is written.** A capture
@@ -55,6 +55,12 @@
  *    contradicts the revision, and a journal that cannot be read are each
  *    refused before any adapter is asked — asserted as zero journal writes, no
  *    new backup and a project tree byte-identical to what it was.
+ * 10. **A target another session holds is a gap, not a failed session.** A
+ *    held patch target is set aside as a Function-timing gap naming the
+ *    holder and the rest installs; a held route handler's request and
+ *    route-handler spans stay armed as preload residue; and when nothing else
+ *    could be enabled the failure carries the holder as structured
+ *    `heldTargets`, bounded like every other detail list.
  *
  * Three habits here are deliberate.
  *
@@ -127,7 +133,7 @@ import type {
 import { installPlan } from './installer.js';
 import type { AggregateInstallResult, InstallPlanOptions } from './installer.js';
 import { createBackupStore } from './patch/backup-store.js';
-import { createPatcher } from './patch/patcher.js';
+import { PATCH_TARGET_HELD_REASON, createPatcher, describeTargetYield } from './patch/patcher.js';
 import type { Patcher, PatchStageObserver } from './patch/patcher.js';
 import type {
   ModificationJournal,
@@ -1441,7 +1447,9 @@ describe('aggregation', () => {
     expect(installed.serverSignals).toEqual({
       http: true,
       routeHandlers: true,
-      fetch: false,
+      // The server's outgoing calls ride with the spine: an external call the
+      // handler awaits is part of the request tree.
+      fetch: true,
       prisma: true,
       pg: true,
       functions: ['applyDiscounts', 'submitOrder'],
@@ -4020,6 +4028,860 @@ describe('an adapter that rejects with a coded error', () => {
     expect(error.hint).toBe(
       'Nothing from this attempt remains in the project; ask the question again to install instrumentation afresh.',
     );
+  }, 30_000);
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * A target instrumented already: a gap to install around, not a failed install
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The session that holds the targets the cases below cannot patch. */
+const HOLDING_SESSION_ID = 'ses_holding000000001';
+
+/**
+ * The refusal the patch layer returns for a target whose file holds another
+ * session's patch — the shape `./patch/patcher.ts` raises in step 1a.
+ *
+ * @param target The action whose file is held.
+ * @param owningSessionId The session holding it.
+ * @returns The refusal.
+ */
+function heldRefusal(
+  target: InstrumentationAction,
+  owningSessionId: string = HOLDING_SESSION_ID,
+): DebuggenError {
+  return new DebuggenError(
+    'PATCH_UNSUPPORTED',
+    `${target.file} is already instrumented by session ${owningSessionId}, so this session cannot patch it as well.`,
+    {
+      hint: `End session ${owningSessionId} — its cleanup restores ${target.file} — then ask again to time ${target.symbol} in this session.`,
+      details: {
+        reason: PATCH_TARGET_HELD_REASON,
+        file: target.file,
+        symbol: target.symbol,
+        owningSessionId,
+        recordId: 'mod_holding0000000001',
+      },
+    },
+  );
+}
+
+/**
+ * The fatal-channel entry a patch adapter reports for a held target: the
+ * refusal and the action, and — because nothing was written — no record.
+ *
+ * @param target The held action.
+ * @returns The failure.
+ */
+function heldFailure(target: InstrumentationAction): InstallFailure {
+  return {
+    error: heldRefusal(target),
+    signal: 'functions',
+    actionId: target.id,
+    file: target.file,
+    symbol: target.symbol,
+  };
+}
+
+/**
+ * The gap the installer is expected to report for a held target.
+ *
+ * @param target The held action.
+ * @param owningSessionId The session holding it.
+ * @returns The gap.
+ */
+function heldGap(
+  target: InstrumentationAction,
+  owningSessionId: string = HOLDING_SESSION_ID,
+): UnavailableSignal {
+  return {
+    signal: 'functions',
+    reason: `${target.file} is already instrumented by session ${owningSessionId}`,
+    hint: `End session ${owningSessionId} — its cleanup restores ${target.file} — then ask again to time ${target.symbol} in this session.`,
+  };
+}
+
+/** A preload gap a patch adapter carries beside its answer. */
+const SILENT_PRELOAD_GAP: UnavailableSignal = {
+  signal: 'routeHandlers',
+  reason: 'the dev-server preload has not reported for a while',
+  hint: 'Relaunch the dev server through the extension so the preload reports again.',
+};
+
+describe('a target instrumented already', () => {
+  it('sets a held target aside as a gap and asks the adapter again with the rest', async () => {
+    const calls: string[] = [];
+    const asked: string[][] = [];
+    const render = action({ adapter: 'renders', id: 'act_0000000000000701' });
+    const held = action({
+      adapter: 'framework',
+      id: 'act_0000000000000702',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const kept = action({
+      adapter: 'framework',
+      id: 'act_0000000000000703',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.planner,
+    });
+    const recorder = recordingLogger();
+    const framework = fakeAdapter('framework', (actions): Promise<InstallResult> => {
+      calls.push('framework');
+      asked.push(actions.map((item) => item.id));
+
+      return Promise.resolve(
+        actions.some((item) => item.id === held.id)
+          ? {
+              adapterId: 'framework',
+              applied: [],
+              runtimeHooks: [],
+              unavailable: [SILENT_PRELOAD_GAP],
+              failure: heldFailure(held),
+            }
+          : {
+              adapterId: 'framework',
+              applied: [],
+              runtimeHooks: ['Named function spans'],
+              unavailable: [SILENT_PRELOAD_GAP],
+              serverSignals: { functions: actions.map((item) => item.symbol) },
+            },
+      );
+    });
+
+    const installed = expectOk(
+      await installPlan(planWith([render, held, kept]), makeContext({ logger: recorder.logger }), {
+        adapters: [runtimeAdapter('renders', calls), framework],
+        skipFeasibility: true,
+      }),
+    );
+
+    // Asked twice: once with both targets, then again with the held one
+    // removed — and never about the held one again.
+    expect(calls).toEqual(['renders', 'framework', 'framework']);
+    expect(asked).toEqual([[held.id, kept.id], [kept.id]]);
+
+    // The held target is a gap worded from the refusal, ahead of the gap the
+    // kept answer reported; the set-aside ask's own copy of that gap is not
+    // reported twice.
+    expect(installed.unavailable).toEqual([heldGap(held), SILENT_PRELOAD_GAP]);
+    expect(installed.unavailable[0]).toEqual({
+      signal: 'functions',
+      ...describeTargetYield(heldRefusal(held)),
+    });
+
+    // The capture proceeds with everything else, and the preload is not asked
+    // to wrap the symbol nobody patched.
+    expect(installed.applied).toEqual([]);
+    expect(installed.runtimeHooks).toEqual(['renders hook', 'Named function spans']);
+    expect(installed.serverSignals.functions).toEqual([kept.symbol]);
+    expect(installed.serverSignals.functions).not.toContain(held.symbol);
+    expect(installed.perAdapter.map((result) => result.adapterId)).toEqual([
+      'renders',
+      'framework',
+    ]);
+
+    // One informational line per set-aside target, with identifiers only.
+    const setAside = recorder.records.filter(
+      (entry) => entry.level === 'info' && entry.message.includes('instrumented already'),
+    );
+
+    expect(setAside).toHaveLength(1);
+    expect(setAside[0]?.fields).toMatchObject({
+      sessionId: SESSION_ID,
+      adapter: 'framework',
+      actionId: held.id,
+      signal: 'functions',
+      code: 'PATCH_UNSUPPORTED',
+      reason: PATCH_TARGET_HELD_REASON,
+      owningSessionId: HOLDING_SESSION_ID,
+      remaining: 1,
+    });
+  });
+
+  it('continues with runtime hooks and the held server span’s preload residue when every patch target is held', async () => {
+    const calls: string[] = [];
+    const asked: string[][] = [];
+    const render = action({ adapter: 'renders', id: 'act_0000000000000711' });
+    const first = action({
+      adapter: 'framework',
+      id: 'act_0000000000000712',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const second = action({
+      adapter: 'framework',
+      id: 'act_0000000000000713',
+      type: 'server-span',
+      mode: 'patch',
+      ...TARGETS.route,
+    });
+    // Every ask is answered with its first target held, which is how the
+    // patch layer answers a batch whose files another session holds.
+    const framework = fakeAdapter('framework', (actions): Promise<InstallResult> => {
+      calls.push('framework');
+      asked.push(actions.map((item) => item.id));
+
+      const [target] = actions;
+
+      return Promise.resolve({
+        adapterId: 'framework',
+        applied: [],
+        runtimeHooks: [],
+        unavailable: [SILENT_PRELOAD_GAP],
+        ...(target === undefined ? {} : { failure: heldFailure(target) }),
+      });
+    });
+
+    const installed = expectOk(
+      await installPlan(planWith([render, first, second]), makeContext(), {
+        adapters: [runtimeAdapter('renders', calls), framework],
+        skipFeasibility: true,
+      }),
+    );
+
+    // Asked once per target and never with an empty list.
+    expect(asked).toEqual([[first.id, second.id], [second.id]]);
+    expect(calls).toEqual(['renders', 'framework', 'framework']);
+
+    // Both targets are Function-timing gaps — a patch only ever supplied the
+    // named span, whatever its action type — and the last ask's preload gap is
+    // kept once so it is not lost with the group.
+    expect(installed.unavailable).toEqual([heldGap(first), heldGap(second), SILENT_PRELOAD_GAP]);
+    expect(installed.unavailable.slice(0, 2).map((gap) => gap.signal)).toEqual([
+      'functions',
+      'functions',
+    ]);
+    expect(installed.applied).toEqual([]);
+    expect(installed.runtimeHooks).toEqual(['renders hook']);
+
+    // The held server span's request and route-handler spans come from the
+    // preload, so they stay armed — with the outgoing calls that ride with that
+    // spine; neither held symbol is named for wrapping.
+    expect(installed.serverSignals).toEqual({
+      http: true,
+      routeHandlers: true,
+      fetch: true,
+      prisma: false,
+      pg: false,
+      functions: [],
+    });
+    expect(installed.serverSignals).toEqual(
+      deriveServerAgentSignals([{ ...second, mode: 'runtime' }]),
+    );
+
+    // The residue arms nothing in the page: the agent's hooks are the render
+    // action's alone.
+    expect(installed.agentHooks).toEqual(deriveAgentHookConfig([render]));
+    expect(installed.perAdapter.map((result) => result.adapterId)).toEqual(['renders']);
+  });
+
+  it('arms the preload residue alone when the only planned target is a held server span', async () => {
+    const held = action({
+      adapter: 'framework',
+      id: 'act_0000000000000781',
+      type: 'server-span',
+      mode: 'patch',
+      ...TARGETS.route,
+    });
+    const recorder = recordingLogger();
+    const framework = fakeAdapter('framework', (): Promise<InstallResult> =>
+      Promise.resolve({
+        adapterId: 'framework',
+        applied: [],
+        runtimeHooks: [],
+        unavailable: [],
+        failure: heldFailure(held),
+      }),
+    );
+
+    const installed = expectOk(
+      await installPlan(planWith([held]), makeContext({ logger: recorder.logger }), {
+        adapters: [framework],
+        skipFeasibility: true,
+      }),
+    );
+
+    // No hook and no file, yet not the nothing-enabled failure: the residue
+    // arms the preload's request and route-handler spans, which a capture
+    // collects without the edit.
+    expect(installed.applied).toEqual([]);
+    expect(installed.runtimeHooks).toEqual([]);
+    expect(installed.unavailable).toEqual([heldGap(held)]);
+    expect(installed.serverSignals).toMatchObject({ http: true, routeHandlers: true });
+    expect(installed.serverSignals.functions).toEqual([]);
+    expect(installed.agentHooks).toEqual(deriveAgentHookConfig([]));
+    expect(installed.perAdapter).toEqual([]);
+
+    const summary = recorder.records.find((entry) => entry.message === 'instrumentation installed');
+
+    expect(summary?.fields).toMatchObject({ applied: 0, setAside: 1, residue: 1 });
+  });
+
+  it('keeps a set-aside runtime-mode action under its own signal and leaves no residue for it', async () => {
+    const render = action({ adapter: 'renders', id: 'act_0000000000000791' });
+    const declined = action({
+      adapter: 'spans',
+      id: 'act_0000000000000792',
+      type: 'server-span',
+      mode: 'runtime',
+      ...TARGETS.route,
+    });
+    const spans = fakeAdapter('spans', (): Promise<InstallResult> =>
+      Promise.resolve({
+        adapterId: 'spans',
+        applied: [],
+        runtimeHooks: [],
+        unavailable: [],
+        failure: heldFailure(declined),
+      }),
+    );
+
+    const installed = expectOk(
+      await installPlan(planWith([render, declined]), makeContext(), {
+        adapters: [runtimeAdapter('renders', []), spans],
+        skipFeasibility: true,
+      }),
+    );
+
+    // Only a patch is renamed: a runtime action keeps the signal its type
+    // names, and an adapter that declined to arm it is not overruled.
+    expect(installed.unavailable).toEqual([{ ...heldGap(declined), signal: 'routeHandlers' }]);
+    expect(installed.serverSignals).toEqual(DISABLED_SERVER_AGENT_SIGNALS);
+    expect(installed.runtimeHooks).toEqual(['renders hook']);
+  });
+
+  it('fails with the held target’s own hint when nothing else could be enabled', async () => {
+    const held = action({
+      adapter: 'framework',
+      id: 'act_0000000000000721',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const framework = fakeAdapter('framework', (): Promise<InstallResult> =>
+      Promise.resolve({
+        adapterId: 'framework',
+        applied: [],
+        runtimeHooks: [],
+        unavailable: [],
+        failure: heldFailure(held),
+      }),
+    );
+
+    const error = expectErr(
+      await installPlan(planWith([held]), makeContext(), {
+        adapters: [framework],
+        skipFeasibility: true,
+      }),
+    );
+
+    // AAP §0.5.5's one hard failure, and it tells the developer which session
+    // holds the file rather than a generic "could not be installed".
+    expect(error.code).toBe('INSTRUMENTATION_UNAVAILABLE');
+    expect(error.hint).toBe(heldGap(held).hint);
+    expect(error.message).toContain(`Could not enable functions: ${heldGap(held).reason}.`);
+    expect(error.details?.['unavailable']).toEqual([heldGap(held)]);
+
+    // The holder as structured identifiers, which the service words its own
+    // public hint from instead of quoting the gap.
+    expect(error.details?.['heldTargets']).toEqual([
+      { file: held.file, symbol: held.symbol, owningSessionId: HOLDING_SESSION_ID },
+    ]);
+    expect(error.details?.['heldTargetCount']).toBe(1);
+  });
+
+  it('lists every holder as bounded heldTargets, leaving out a declaration no session holds', async () => {
+    // One more held target than an error detail carries, and a declaration
+    // that already carries the span helper, which no session holds.
+    const heldCount = 21;
+    const held = Array.from({ length: heldCount }, (_, index) =>
+      action({
+        adapter: 'framework',
+        id: `act_${String(800 + index).padStart(16, '0')}`,
+        type: 'function-timing',
+        mode: 'patch',
+        file: `src/server/held-${String(index).padStart(2, '0')}.ts`,
+        symbol: `heldSymbol${String(index)}`,
+      }),
+    );
+    const helperAlready = action({
+      adapter: 'framework',
+      id: 'act_0000000000000899',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.planner,
+    });
+    const alreadyInstrumented = new DebuggenError(
+      'PATCH_UNSUPPORTED',
+      `${helperAlready.symbol} already contains the span helper.`,
+      {
+        hint: `Revert the existing modification of ${helperAlready.file} before instrumenting it again.`,
+        details: {
+          reason: 'already-instrumented',
+          file: helperAlready.file,
+          symbol: helperAlready.symbol,
+        },
+      },
+    );
+    // Every ask is answered with its first target set aside, in id order.
+    const framework = fakeAdapter('framework', (actions): Promise<InstallResult> => {
+      const [target] = actions;
+
+      if (target === undefined) {
+        return Promise.resolve({
+          adapterId: 'framework',
+          applied: [],
+          runtimeHooks: [],
+          unavailable: [],
+        });
+      }
+
+      return Promise.resolve({
+        adapterId: 'framework',
+        applied: [],
+        runtimeHooks: [],
+        unavailable: [],
+        failure:
+          target.id === helperAlready.id
+            ? {
+                error: alreadyInstrumented,
+                signal: 'functions',
+                actionId: target.id,
+                file: target.file,
+                symbol: target.symbol,
+              }
+            : heldFailure(target),
+      });
+    });
+
+    const error = expectErr(
+      await installPlan(planWith([...held, helperAlready]), makeContext(), {
+        adapters: [framework],
+        skipFeasibility: true,
+      }),
+    );
+
+    expect(error.code).toBe('INSTRUMENTATION_UNAVAILABLE');
+    expect(error.details?.['unavailableCount']).toBe(heldCount + 1);
+    expect(error.details?.['heldTargetCount']).toBe(heldCount);
+    expect(error.details?.['heldTargets']).toEqual(
+      held.slice(0, 20).map((target) => ({
+        file: target.file,
+        symbol: target.symbol,
+        owningSessionId: HOLDING_SESSION_ID,
+      })),
+    );
+  });
+
+  it('keeps a held target fatal once the same ask applied a record, and unwinds that record', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    let asks = 0;
+    const patched = action({
+      adapter: 'framework',
+      id: 'act_0000000000000731',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.planner,
+    });
+    const held = action({
+      adapter: 'framework',
+      id: 'act_0000000000000732',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const framework = fakeAdapter('framework', async (actions, context): Promise<InstallResult> => {
+      asks += 1;
+
+      const applied = await patchThrough(
+        actions.filter((item) => item.id === patched.id),
+        context,
+      );
+
+      return {
+        adapterId: 'framework',
+        applied,
+        runtimeHooks: [],
+        unavailable: [],
+        failure: heldFailure(held),
+      };
+    });
+
+    const error = expectErr(
+      await installPlan(planWith([patched, held]), makeContext({ workspace, journal }), {
+        adapters: [framework],
+        skipFeasibility: true,
+      }),
+    );
+
+    // Setting the held target aside would leave this call's record standing
+    // under a retry, so the install fails and the record is unwound.
+    expect(asks).toBe(1);
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('action-failed');
+    expect(error.details?.['restoredCount']).toBe(1);
+    expect(digestIn(workspace, TARGETS.planner.file)).toBe(FIXTURE_DIGESTS[TARGETS.planner.file]);
+    expect(journal.rows().map((row) => row.status)).toEqual(['reverted']);
+  }, 30_000);
+
+  it('keeps a held target fatal when the same ask appended a record it did not report', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    let asks = 0;
+    const patched = action({
+      adapter: 'framework',
+      id: 'act_0000000000000741',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.planner,
+    });
+    const held = action({
+      adapter: 'framework',
+      id: 'act_0000000000000742',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const framework = fakeAdapter('framework', async (actions, context): Promise<InstallResult> => {
+      asks += 1;
+
+      // Patched and journaled, then left out of the answer: only the
+      // install's ledger knows this ask wrote anything.
+      await patchThrough(
+        actions.filter((item) => item.id === patched.id),
+        context,
+      );
+
+      return {
+        adapterId: 'framework',
+        applied: [],
+        runtimeHooks: [],
+        unavailable: [],
+        failure: heldFailure(held),
+      };
+    });
+
+    const error = expectErr(
+      await installPlan(planWith([patched, held]), makeContext({ workspace, journal }), {
+        adapters: [framework],
+        skipFeasibility: true,
+      }),
+    );
+
+    expect(asks).toBe(1);
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('action-failed');
+    expect(digestIn(workspace, TARGETS.planner.file)).toBe(FIXTURE_DIGESTS[TARGETS.planner.file]);
+    expect(journal.rows().map((row) => row.status)).toEqual(['reverted']);
+  }, 30_000);
+
+  it('keeps a held target fatal when the failure names no action it was asked about', async () => {
+    let asks = 0;
+    const held = action({
+      adapter: 'framework',
+      id: 'act_0000000000000751',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const stranger = action({
+      adapter: 'framework',
+      id: 'act_0000000000000759',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.planner,
+    });
+    const framework = fakeAdapter('framework', (): Promise<InstallResult> => {
+      asks += 1;
+
+      return Promise.resolve({
+        adapterId: 'framework',
+        applied: [],
+        runtimeHooks: [],
+        unavailable: [],
+        failure: heldFailure(stranger),
+      });
+    });
+
+    const error = expectErr(
+      await installPlan(planWith([held]), makeContext(), {
+        adapters: [framework],
+        skipFeasibility: true,
+      }),
+    );
+
+    // Dropping an action nobody asked about would drop nothing, and asking
+    // again would get the same answer: the failure is reported as it came.
+    expect(asks).toBe(1);
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('action-failed');
+  });
+
+  it('unwinds as aborted, without asking again, when the install is cancelled during the ask', async () => {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    let asks = 0;
+    const render = action({ adapter: 'renders', id: 'act_0000000000000761' });
+    const held = action({
+      adapter: 'framework',
+      id: 'act_0000000000000762',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const kept = action({
+      adapter: 'framework',
+      id: 'act_0000000000000763',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.planner,
+    });
+    const framework = fakeAdapter('framework', (): Promise<InstallResult> => {
+      asks += 1;
+      controller.abort();
+
+      return Promise.resolve({
+        adapterId: 'framework',
+        applied: [],
+        runtimeHooks: [],
+        unavailable: [],
+        failure: heldFailure(held),
+      });
+    });
+
+    const error = expectErr(
+      await installPlan(
+        planWith([render, held, kept]),
+        makeContext({ signal: controller.signal }),
+        { adapters: [runtimeAdapter('renders', calls), framework], skipFeasibility: true },
+      ),
+    );
+
+    expect(asks).toBe(1);
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('aborted');
+  });
+
+  it('lets a second session on the project continue without the targets the first session patched', async () => {
+    // Two sessions, one project copy and one journal, as the service holds
+    // them, with the production patcher doing every read and write: session 1
+    // installs the plan, then session 2 installs the same plan.
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const secondSessionId = 'ses_installer00000002';
+    const firstCalls: string[] = [];
+    const secondCalls: string[] = [];
+    const render = action({ adapter: 'renders', id: 'act_0000000000000771' });
+    const cones = action({
+      adapter: 'framework',
+      id: 'act_0000000000000772',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const planner = action({
+      adapter: 'framework',
+      id: 'act_0000000000000773',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.planner,
+    });
+    const actions = [render, cones, planner];
+
+    const firstInstall = expectOk(
+      await installPlan(planWith(actions), makeContext({ workspace, journal }), {
+        adapters: [
+          runtimeAdapter('renders', firstCalls),
+          reportingPatchAdapter('framework', firstCalls).adapter,
+        ],
+        skipFeasibility: true,
+      }),
+    );
+
+    expect(firstInstall.applied).toHaveLength(2);
+
+    const patchedDigests = {
+      [TARGETS.cones.file]: digestIn(workspace, TARGETS.cones.file),
+      [TARGETS.planner.file]: digestIn(workspace, TARGETS.planner.file),
+    };
+    const secondContext: InstrumentationContext = {
+      ...makeContext({ workspace, journal }),
+      sessionId: secondSessionId,
+      backups: createBackupStore({
+        debuggenHome: workspace.debuggenHome,
+        sessionId: secondSessionId,
+      }),
+    };
+    const secondReporter = reportingPatchAdapter('framework', secondCalls);
+
+    const secondInstall = expectOk(
+      await installPlan({ ...planWith(actions), sessionId: secondSessionId }, secondContext, {
+        adapters: [runtimeAdapter('renders', secondCalls), secondReporter.adapter],
+        skipFeasibility: true,
+      }),
+    );
+
+    // Session 2 continues runtime-only: its hook is armed, nothing of its own
+    // is patched, and each held target is a gap naming session 1.
+    expect(secondCalls).toEqual(['renders', 'framework', 'framework']);
+    expect(secondInstall.applied).toEqual([]);
+    expect(secondInstall.runtimeHooks).toEqual(['renders hook']);
+    expect(secondInstall.serverSignals.functions).toEqual([]);
+    expect(secondInstall.unavailable).toEqual([
+      heldGap(cones, SESSION_ID),
+      heldGap(planner, SESSION_ID),
+    ]);
+
+    // And it touched nothing: the files hold session 1's patches, the journal
+    // holds session 1's records alone, and session 2 took no backup.
+    expect(digestIn(workspace, TARGETS.cones.file)).toBe(patchedDigests[TARGETS.cones.file]);
+    expect(digestIn(workspace, TARGETS.planner.file)).toBe(patchedDigests[TARGETS.planner.file]);
+    expect(journal.rows().map((row) => row.sessionId)).toEqual([SESSION_ID, SESSION_ID]);
+    expect(journal.rows().map((row) => row.status)).toEqual(['applied', 'applied']);
+    expect(existsSync(join(workspace.debuggenHome, 'backups', secondSessionId))).toBe(false);
+  }, 30_000);
+
+  it('names the holder on the same project when another copy holds the same patch', async () => {
+    // Two copies of one project and one journal, as a service holds them: the
+    // session on the first copy and the session on the second patch the same
+    // target, so both files hold the same bytes under the same relative path,
+    // and the second copy's record is listed last. Session 2, on the first
+    // copy, is handed the caller's project predicate.
+    const primary = makeWorkspace();
+    const secondary = makeWorkspace();
+    const journal = fakeJournal();
+    const otherCopySessionId = 'ses_installer00000004';
+    const secondSessionId = 'ses_installer00000005';
+    const cones = action({
+      adapter: 'framework',
+      id: 'act_0000000000000781',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const contextFor = (
+      workspace: ReturnType<typeof makeWorkspace>,
+      sessionId: string,
+    ): InstrumentationContext => ({
+      ...makeContext({ workspace, journal }),
+      sessionId,
+      backups: createBackupStore({ debuggenHome: workspace.debuggenHome, sessionId }),
+    });
+
+    expectOk(
+      await installPlan(planWith([cones]), makeContext({ workspace: primary, journal }), {
+        adapters: [reportingPatchAdapter('framework', []).adapter],
+        skipFeasibility: true,
+      }),
+    );
+    expectOk(
+      await installPlan(
+        { ...planWith([cones]), sessionId: otherCopySessionId },
+        contextFor(secondary, otherCopySessionId),
+        { adapters: [reportingPatchAdapter('framework', []).adapter], skipFeasibility: true },
+      ),
+    );
+
+    expect(digestIn(secondary, TARGETS.cones.file)).toBe(digestIn(primary, TARGETS.cones.file));
+    expect(journal.rows().map((row) => row.sessionId)).toEqual([SESSION_ID, otherCopySessionId]);
+
+    const projects = new Map([
+      [SESSION_ID, 'primary'],
+      [otherCopySessionId, 'secondary'],
+    ]);
+    const asked: string[] = [];
+    const second = expectErr(
+      await installPlan(
+        { ...planWith([cones]), sessionId: secondSessionId },
+        contextFor(primary, secondSessionId),
+        {
+          adapters: [reportingPatchAdapter('framework', []).adapter],
+          skipFeasibility: true,
+          sessionOnAnotherProject: (sessionId) => {
+            asked.push(sessionId);
+            const project = projects.get(sessionId);
+            return project !== undefined && project !== 'primary';
+          },
+        },
+      ),
+    );
+
+    // Nothing else could be enabled, so the install is the nothing-enabled
+    // failure — naming the session on this copy, never the other copy's.
+    expect(second.code).toBe('INSTRUMENTATION_UNAVAILABLE');
+    expect(second.details?.['heldTargets']).toEqual([
+      { file: TARGETS.cones.file, symbol: TARGETS.cones.symbol, owningSessionId: SESSION_ID },
+    ]);
+    expect(second.details?.['unavailable']).toEqual([heldGap(cones, SESSION_ID)]);
+    expect(asked).toContain(otherCopySessionId);
+    expect(journal.rows().map((row) => row.status)).toEqual(['applied', 'applied']);
+    expect(existsSync(join(primary.debuggenHome, 'backups', secondSessionId))).toBe(false);
+  }, 30_000);
+
+  it('keeps a second session’s request spans armed when the route handler it planned is held', async () => {
+    // The production patcher again, on a route handler this time: session 1
+    // patches it as a server span, then session 2 plans the same action.
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const secondSessionId = 'ses_installer00000003';
+    const route = action({
+      adapter: 'framework',
+      id: 'act_0000000000000901',
+      type: 'server-span',
+      mode: 'patch',
+      ...TARGETS.route,
+    });
+
+    const firstInstall = expectOk(
+      await installPlan(planWith([route]), makeContext({ workspace, journal }), {
+        adapters: [reportingPatchAdapter('framework', []).adapter],
+        skipFeasibility: true,
+      }),
+    );
+
+    expect(firstInstall.applied).toHaveLength(1);
+
+    const patchedDigest = digestIn(workspace, TARGETS.route.file);
+    const secondCalls: string[] = [];
+    const secondContext: InstrumentationContext = {
+      ...makeContext({ workspace, journal }),
+      sessionId: secondSessionId,
+      backups: createBackupStore({
+        debuggenHome: workspace.debuggenHome,
+        sessionId: secondSessionId,
+      }),
+    };
+
+    const secondInstall = expectOk(
+      await installPlan({ ...planWith([route]), sessionId: secondSessionId }, secondContext, {
+        adapters: [reportingPatchAdapter('framework', secondCalls).adapter],
+        skipFeasibility: true,
+      }),
+    );
+
+    // Session 2 is not failed: the handler's own span is a Function-timing
+    // gap naming session 1, and the preload still collects the request and
+    // route-handler spans, and the outgoing calls that ride with them —
+    // without being asked to wrap the held symbol.
+    expect(secondCalls).toEqual(['framework']);
+    expect(secondInstall.applied).toEqual([]);
+    expect(secondInstall.unavailable).toEqual([heldGap(route, SESSION_ID)]);
+    expect(secondInstall.serverSignals).toEqual({
+      http: true,
+      routeHandlers: true,
+      fetch: true,
+      prisma: false,
+      pg: false,
+      functions: [],
+    });
+    expect(digestIn(workspace, TARGETS.route.file)).toBe(patchedDigest);
+    expect(journal.rows().map((row) => row.sessionId)).toEqual([SESSION_ID]);
+    expect(existsSync(join(workspace.debuggenHome, 'backups', secondSessionId))).toBe(false);
   }, 30_000);
 });
 

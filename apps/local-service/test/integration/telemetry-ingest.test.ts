@@ -3133,3 +3133,364 @@ describe('server-tier capture identity and loss', () => {
     });
   });
 });
+
+/* -------------------------------------------------------------------------------------------------
+ * The page's replayed lifecycle entries (pre-capture)
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The inspected tab of the lifecycle suite: its own credential, project and session. */
+const LIFECYCLE_TAB_ID = 4_223;
+
+/**
+ * AAP §0.5.5, "Capture yielded nothing": the developer-facing sentence, quoted
+ * from the specification rather than from the implementation it tests.
+ */
+const EMPTY_CAPTURE_MESSAGE =
+  'No telemetry was captured. Interact with the page while capture is running, then Capture again.';
+
+/** The `perf.entry` attribute naming the `PerformanceEntry` type, as the page agent writes it. */
+const ENTRY_TYPE_KEY = 'entry.type';
+
+/**
+ * The page agent observes `navigation` and `paint` with `buffered: true`, so
+ * the first batch after it is armed replays the load and first paints of a
+ * document that loaded before Start. This suite sends exactly that batch over
+ * the real relay path and proves, by what the store kept, that those entries
+ * are dropped per event as `pre-capture` — so a capture in which nothing else
+ * happened is empty (AAP §0.5.5) and the window of one that holds evidence
+ * starts no earlier than the capture — while a reload during the capture keeps
+ * its own navigation and paint, and the relay answers every such batch as an
+ * accepted one: no error frame, no batch-level drop, no refusal.
+ */
+describe('the page’s replayed lifecycle entries', () => {
+  /** What the setup establishes for this suite. */
+  interface LifecycleTab {
+    /** The DevTools connection that announced {@link LIFECYCLE_TAB_ID} in its hello. */
+    readonly devtools: HarnessWsClient;
+    /** The editor connection of the suite's project: where progress is announced. */
+    readonly editor: HarnessWsClient;
+    /** The session bound to that tab, on a project copy of its own. */
+    readonly sessionId: string;
+    /** The page agent's producer id for the tab's document. */
+    readonly producerId: string;
+  }
+
+  /** One open capture of the suite's session, with the start its store row records. */
+  interface OpenCapture {
+    readonly captureId: string;
+    readonly startedAt: number;
+  }
+
+  let lifecycle: LifecycleTab | undefined;
+  let emptyCapture: OpenCapture | undefined;
+  let evidenceCapture: OpenCapture | undefined;
+  let seq = 0;
+
+  /** The suite's state, or a failure naming the setup that did not run. */
+  function lifecycleOf(): LifecycleTab {
+    if (lifecycle === undefined) {
+      throw new Error('The lifecycle tab was not set up.');
+    }
+    return lifecycle;
+  }
+
+  /** An open capture, or a failure naming the step that did not open it. */
+  function required(capture: OpenCapture | undefined, name: string): OpenCapture {
+    if (capture === undefined) {
+      throw new Error(`The ${name} capture was not opened.`);
+    }
+    return capture;
+  }
+
+  /** Opens a capture of the suite's session and reads its recorded start back from the store. */
+  async function openCapture(): Promise<OpenCapture> {
+    const { harness } = current();
+    const { sessionId } = lifecycleOf();
+    const started = recordResponse(await harness.startCapture(sessionId));
+    if (isErr(started)) {
+      throw new Error(
+        `The lifecycle capture did not start (${started.error.code}): ${started.error.message}`,
+      );
+    }
+    const captureId = started.value.captureId;
+    const stored = harness.repos.sessions.getCapture(captureId);
+    if (isErr(stored) || stored.value === undefined) {
+      throw new Error('The lifecycle capture row could not be read back.');
+    }
+    return { captureId, startedAt: stored.value.capture.startedAt };
+  }
+
+  /** A strictly valid browser ingress event of the tab's producer, one trace per event. */
+  function browserEvent(
+    kind: 'navigation' | 'perf.entry' | 'render',
+    name: string,
+    startTime: number,
+    duration: number,
+    attributes: Readonly<Record<string, unknown>>,
+  ): TelemetryEventIngress {
+    seq += 1;
+    const parsed = parseTelemetryEventIngress({
+      id: newEventId(),
+      traceId: newTraceId(),
+      spanId: newSpanId(),
+      kind,
+      name,
+      startTime,
+      duration,
+      tier: 'browser',
+      attributes: { ...attributes },
+      status: 'ok',
+      producerId: lifecycleOf().producerId,
+      seq,
+    });
+    if (isErr(parsed)) {
+      throw new Error(`The ${kind} event does not parse as ingress: ${parsed.error.message}`);
+    }
+    return parsed.value;
+  }
+
+  /**
+   * The batch the page agent sends first after it is armed on a document that
+   * loaded before Start: its navigation, then its two paint marks — all of
+   * them over before `startedAt`.
+   */
+  function replayedPageLoad(startedAt: number): TelemetryEventIngress[] {
+    return [
+      browserEvent('navigation', 'navigation', startedAt - 2_446.5, 342.5, {
+        'navigation.type': 'navigate',
+      }),
+      browserEvent('perf.entry', 'first-paint', startedAt - 2_010.25, 0, {
+        [ENTRY_TYPE_KEY]: 'paint',
+      }),
+      browserEvent('perf.entry', 'first-contentful-paint', startedAt - 2_010.25, 0, {
+        [ENTRY_TYPE_KEY]: 'paint',
+      }),
+    ];
+  }
+
+  /** Relays one `telemetry.event` payload on the tab's connection and returns its error codes. */
+  async function relayLifecycle(
+    events: readonly TelemetryEventIngress[],
+    armedCaptureId: string,
+  ): Promise<readonly string[]> {
+    const { devtools } = lifecycleOf();
+    const receipt = devtools.send('telemetry.event', { events: [...events], armedCaptureId });
+    expect(isErr(receipt.result), 'the telemetry.event frame was written').toBe(false);
+    expect(await devtools.flush(), 'the service processed the frame before the barrier').toBe(true);
+    return devtools.errorsFor(receipt.id).map((error) => error.code);
+  }
+
+  /** The route's refusal records since `from`: a relayed frame answered as a failure. */
+  function frameRefusals(from: number): CapturedLogRecord[] {
+    return current()
+      .harness.logger.records.slice(from)
+      .filter((record) => record.message === 'telemetry ingest refused a relayed frame');
+  }
+
+  /** Every event id the tab's connection received on `telemetry.tail`. */
+  function tailedIds(): Set<string> {
+    return new Set(tailedEvents(lifecycleOf().devtools).map((event) => event.id));
+  }
+
+  beforeAll(async () => {
+    const { harness } = current();
+    // Captures are exclusive per project, so this session gets a copy of its
+    // own, readied exactly like the file's first session.
+    const project = await harness.copyFixtureProject();
+    const launched = recordResponse(await harness.launchDevServer(project.root));
+    if (isErr(launched)) {
+      throw new Error(`The lifecycle dev server did not launch: ${launched.error.message}`);
+    }
+    const session = recordResponse(
+      await harness.createSession({
+        projectRoot: project.root,
+        question: 'Why is the report slow to load?',
+      }),
+    );
+
+    const { client: devtools } = await harness.connectDevtools({ tabId: LIFECYCLE_TAB_ID });
+    const bound = await harness.bindTab(devtools, {
+      tabId: LIFECYCLE_TAB_ID,
+      url: session.devServerUrl,
+      origin: new URL(session.devServerUrl).origin,
+    });
+    if (isErr(bound)) {
+      throw new Error(
+        `The lifecycle tab was not bound (${bound.error.code}): ${bound.error.message}`,
+      );
+    }
+    const producerId = newProducerId();
+    const ready = devtools.send('agent.ready', {
+      tabId: LIFECYCLE_TAB_ID,
+      documentId: assemble('doc-', randomHex(8)),
+      producerId,
+      url: session.devServerUrl,
+      installedBeforeReact: true,
+      reactDetected: true,
+    });
+    if (!(await devtools.flush()) || devtools.errorsFor(ready.id).length > 0) {
+      throw new Error(`agent.ready for the lifecycle tab was refused: ${devtools.describe()}`);
+    }
+    await harness.ws({
+      client: 'server-agent',
+      projectRoot: project.root,
+      token: harness.issueServerAgentCredential(project.root).token,
+    });
+    const editor = await harness.editor(project.root);
+
+    const settled = await harness.waitForSession(
+      session.id,
+      (record: SessionRecord) => record.status === 'ready' || record.status === 'failed',
+    );
+    if (settled.status !== 'ready') {
+      throw new Error(`The lifecycle session settled in "${settled.status}" instead of "ready".`);
+    }
+    lifecycle = { devtools, editor, sessionId: session.id, producerId };
+    emptyCapture = await openCapture();
+  });
+
+  it('drops a batch made up only of the replayed page load, answering it as accepted', async () => {
+    const { harness } = current();
+    const { captureId, startedAt } = required(emptyCapture, 'empty');
+    const rowsBefore = tableRowCount();
+    const mark = harness.logger.records.length;
+    const batch = replayedPageLoad(startedAt);
+
+    const errors = await relayLifecycle(batch, captureId);
+
+    // Benign on the relay: no error frame, no batch-level drop, no refusal —
+    // the agent working as designed is never answered as a producer failure.
+    expect(errors, 'the page agent is not told its batch failed').toEqual([]);
+    expect(withoutTrailingSummaries(dropRecords(mark)), 'the batch itself resolved').toEqual([]);
+    expect(frameRefusals(mark), 'the route did not refuse the frame').toEqual([]);
+    expect(tableRowCount(), 'no replayed entry was stored').toBe(rowsBefore);
+    for (const event of batch) {
+      expect(rawRow(event.id), `${event.kind} ${event.name} was not stored`).toBeUndefined();
+    }
+  });
+
+  it('leaves a capture that holds only that replay empty: analysis is skipped and the session returns to ready', async () => {
+    const { harness } = current();
+    const { sessionId, editor } = lifecycleOf();
+    const { captureId } = required(emptyCapture, 'empty');
+    const framesBefore = editor.received.length;
+
+    const stopped = recordResponse(await harness.stopCapture(sessionId));
+    if (isErr(stopped)) {
+      throw new Error(`capture.stop was refused (${stopped.error.code}): ${stopped.error.message}`);
+    }
+    expect(stopped.value.summary.eventCount, 'the capture holds no event').toBe(0);
+
+    const record = await harness.waitForSession(
+      sessionId,
+      (candidate: SessionRecord) =>
+        candidate.status === 'ready' &&
+        candidate.captures.some(
+          (capture) => capture.id === captureId && capture.stoppedAt !== undefined,
+        ),
+    );
+    expect(record.status).toBe('ready');
+    expect(record.analyses, 'no analysis ran').toEqual([]);
+    expect(record.panelIds, 'no panel was generated').toEqual([]);
+
+    // The developer is told, in AAP §0.5.5's words.
+    expect(await editor.flush()).toBe(true);
+    const messages = editor.received
+      .slice(framesBefore)
+      .flatMap((message) =>
+        isMessageOfType(message, 'session.progress') && message.payload.sessionId === sessionId
+          ? [message.payload.message]
+          : [],
+      );
+    expect(messages).toContain(EMPTY_CAPTURE_MESSAGE);
+  });
+
+  it('stores only the capture’s own evidence from a batch that opens with the replayed page load', async () => {
+    const { harness, sessionId: firstSessionId } = current();
+    const { sessionId } = lifecycleOf();
+    evidenceCapture = await openCapture();
+    const { captureId, startedAt } = evidenceCapture;
+    const mark = harness.logger.records.length;
+    const render = browserEvent('render', 'Widget', startedAt + 850.125, 18.5, {
+      component: 'Widget',
+      phase: 'update',
+    });
+    const batch = [...replayedPageLoad(startedAt), render];
+
+    const errors = await relayLifecycle(batch, captureId);
+
+    expect(errors, 'the batch was accepted').toEqual([]);
+    expect(frameRefusals(mark)).toEqual([]);
+    expect(withoutTrailingSummaries(dropRecords(mark)), 'the batch itself resolved').toEqual([]);
+    const row = rawRow(render.id);
+    expect(row?.sessionId, 'the render belongs to the lifecycle session').toBe(sessionId);
+    expect(row?.sessionId).not.toBe(firstSessionId);
+    expect(row?.captureId, 'the render belongs to the open capture').toBe(captureId);
+    for (const event of batch.slice(0, -1)) {
+      expect(rawRow(event.id), `${event.kind} ${event.name} was not stored`).toBeUndefined();
+    }
+    expect(
+      summaryRecords(mark)
+        .filter((record) => record.fields.captureId === captureId)
+        .map((record) => [record.fields.received, record.fields.dropped, record.fields.persisted]),
+      'three replayed entries dropped per event, one event persisted',
+    ).toEqual([[batch.length, 3, 1]]);
+
+    // Only what was stored is tailed.
+    await lifecycleOf().devtools.until(
+      () => (tailedIds().has(render.id) ? true : undefined),
+      HARNESS_TIMEOUTS.capture,
+      () => `The tail did not deliver the render: ${lifecycleOf().devtools.describe()}`,
+    );
+    for (const event of batch.slice(0, -1)) {
+      expect(tailedIds().has(event.id), `${event.kind} ${event.name} was not tailed`).toBe(false);
+    }
+  });
+
+  it('keeps a reload during the capture: the fresh document’s navigation and paint are stored', async () => {
+    const { captureId, startedAt } = required(evidenceCapture, 'evidence');
+    const reload = browserEvent('navigation', 'navigation', startedAt + 1_500.5, 480.25, {
+      'navigation.type': 'reload',
+    });
+    const paint = browserEvent('perf.entry', 'first-contentful-paint', startedAt + 1_720.75, 0, {
+      [ENTRY_TYPE_KEY]: 'paint',
+    });
+
+    const errors = await relayLifecycle([reload, paint], captureId);
+
+    expect(errors).toEqual([]);
+    for (const event of [reload, paint]) {
+      expect(rawRow(event.id)?.captureId, `${event.kind} ${event.name} was stored`).toBe(captureId);
+    }
+  });
+
+  it('bounds the stopped capture’s summary by the capture window', async () => {
+    const { harness } = current();
+    const { sessionId } = lifecycleOf();
+    const { captureId, startedAt } = required(evidenceCapture, 'evidence');
+
+    const stopped = recordResponse(await harness.stopCapture(sessionId));
+    if (isErr(stopped)) {
+      throw new Error(`capture.stop was refused (${stopped.error.code}): ${stopped.error.message}`);
+    }
+    const summary = stopped.value.summary;
+
+    // The render, the reload's navigation and its paint — none of the replay.
+    expect(summary.captureId).toBe(captureId);
+    expect(summary.eventCount).toBe(3);
+    expect(summary.kindCounts.navigation, 'only the reload’s navigation').toBe(1);
+    expect(summary.kindCounts['perf.entry'], 'only the reload’s paint').toBe(1);
+    expect(
+      summary.startTime,
+      'the window opens no earlier than the capture',
+    ).toBeGreaterThanOrEqual(startedAt);
+
+    // The pipeline runs on the capture's evidence; let it settle before
+    // teardown, whichever way the analysis of this small capture ends.
+    await harness.waitForSession(
+      sessionId,
+      (record: SessionRecord) =>
+        record.status === 'generated' || record.status === 'ready' || record.status === 'failed',
+    );
+  });
+});

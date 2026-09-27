@@ -24,7 +24,11 @@
  *   ranks it, by operation-name group — the stable `id` tie-breaker over the
  *   batch's identical-`startTime`-and-`duration` block under the two sorts
  *   that rank by those keys, the clamp at `DATA_QUERY_MAX_LIMIT`, and filters
- *   narrowing `total` itself. Every named sort is answered in its own order,
+ *   narrowing `total` itself. `spans` under `start_asc` is the canonical order
+ *   of AAP §0.2.3 — parent before child, then `startTime`, then
+ *   `(producerId, seq)`, then arrival — held to a derivation of it here and,
+ *   over a capture of its own, to the reproduction of the finding that the
+ *   order once broke ties by event id. Every named sort is answered in its own order,
  *   never in the source default: the metric values under `duration_desc` and
  *   `count_desc` and the state transitions under `count_desc` and
  *   `duration_desc` are held to orders derived here from the unsorted answer
@@ -86,6 +90,7 @@
  */
 
 import { Buffer } from 'node:buffer';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -132,6 +137,7 @@ import {
   METRIC_IDS,
   ORPHAN_REASONS,
   STATE_KINDS,
+  computeCaptureSummary,
   flattenTrace,
   parseTelemetryEventIngress,
 } from '@debuggen/telemetry';
@@ -148,6 +154,7 @@ import { createAnalysisSummarizer } from '../../src/analysis/summarize.js';
 import type { AnalysisSummarizer } from '../../src/analysis/summarize.js';
 import {
   DEFAULT_SORT_BY_SOURCE,
+  MAX_AGGREGATE_INPUT_EVENTS,
   SPAN_SOURCE_KINDS,
   createPanelDataResolver,
 } from '../../src/panels/data.js';
@@ -157,7 +164,9 @@ import type { TelemetryRepo } from '../../src/store/telemetry-repo.js';
 import { createTraceCorrelator } from '../../src/telemetry/correlate.js';
 
 import {
+  FIXTURE_BASE_EPOCH_MS,
   HARNESS_TIMEOUTS,
+  createHarnessClock,
   randomSecretLike,
   readFixtureJson,
   readTelemetryBatch,
@@ -253,6 +262,23 @@ const REQUEST_KEY_PATTERN = /^[0-9a-f]{64}$/u;
 
 /** How long one capture group's setup may take: the pipeline to `ready` plus ingest. */
 const GROUP_SETUP_TIMEOUT_MS = HARNESS_TIMEOUTS.pipeline + HARNESS_TIMEOUTS.capture;
+
+/**
+ * How long before the corpus's epoch ({@link FIXTURE_BASE_EPOCH_MS}) the
+ * service clock starts: one minute.
+ *
+ * Every fixture event is timed from that epoch, as evidence recorded during a
+ * capture, so each capture must open before it — as a real capture opens
+ * before the page records what it holds. The service drops a page's replayed
+ * `navigation` and `paint` entries that ended before the capture opened
+ * (`src/telemetry/attribute.ts`, `pre-capture`), and a clock seeded at the
+ * epoch itself has advanced past the navigation of
+ * `telemetry-perf-errors.json` (`[+0, +380]`) by the time that group's capture
+ * opens: some 500 reads, one millisecond each, when this was measured. A
+ * minute leaves room for many times that; {@link openCaptureGroup} checks the
+ * margin rather than assuming it.
+ */
+const SERVICE_CLOCK_LEAD_MS = 60_000;
 
 /* -------------------------------------------------------------------------------------------------
  * Fixture shapes, checked at run time rather than cast
@@ -677,6 +703,11 @@ async function openCaptureGroup(
   );
   expect(ready.status, `session for ${fixtures.join(', ')} reached ready`).toBe('ready');
   const { captureId } = expectOk(await harness.startCapture(session.id), 'capture.start');
+  const opened = expectOk(harness.repos.sessions.getActiveCapture(session.id), 'getActiveCapture');
+  expect(
+    opened?.capture.startedAt,
+    `the capture for ${fixtures.join(', ')} opens before the evidence it holds`,
+  ).toBeLessThanOrEqual(Math.min(...events.map((event) => event.startTime)));
 
   const relayed = await harness.ingestFromAgent(devtools.client, browserEvents);
   expectOk(relayed.sent, 'telemetry.event');
@@ -1004,10 +1035,65 @@ function flatComparator(
 }
 
 /**
+ * The canonical order of AAP §0.2.3 over one filtered selection — what `spans`
+ * under `start_asc` answers — derived without the service: repeatedly the
+ * earliest row whose parent (the earliest row of its trace carrying the span
+ * id it names, the row itself excepted) has been taken or is not in the
+ * selection, and on a parent cycle the earliest row left; "earliest" is
+ * `startTime`, then the producer id in UTF-8 byte order, then `seq`.
+ *
+ * The store's last key, the arrival number, is assigned at ingest and is not
+ * in the fixture, so a selection holding two rows that tie on all three keys
+ * is refused rather than ordered by a guess.
+ */
+function canonicalParentFirst(
+  selection: readonly TelemetryEventIngress[],
+): TelemetryEventIngress[] {
+  const byFlatChain = (left: TelemetryEventIngress, right: TelemetryEventIngress): number =>
+    left.startTime - right.startTime ||
+    compareUtf8(left.producerId, right.producerId) ||
+    left.seq - right.seq;
+  const flat = [...selection].sort(byFlatChain);
+  for (const [index, event] of flat.entries()) {
+    const previous = flat[index - 1];
+    if (previous !== undefined && byFlatChain(previous, event) === 0) {
+      throw new Error('Two events tie on start, producer and seq: only arrival could order them.');
+    }
+  }
+  const parentOf = (event: TelemetryEventIngress): TelemetryEventIngress | undefined => {
+    if (event.parentSpanId === undefined) {
+      return undefined;
+    }
+    const parent = flat.find(
+      (candidate) => candidate.traceId === event.traceId && candidate.spanId === event.parentSpanId,
+    );
+    return parent === event ? undefined : parent;
+  };
+  const taken = new Set<TelemetryEventIngress>();
+  const ordered: TelemetryEventIngress[] = [];
+  while (ordered.length < flat.length) {
+    const next =
+      flat.find((event) => {
+        const parent = parentOf(event);
+        return !taken.has(event) && (parent === undefined || taken.has(parent));
+      }) ?? flat.find((event) => !taken.has(event));
+    if (next === undefined) {
+      break;
+    }
+    taken.add(next);
+    ordered.push(next);
+  }
+  return ordered;
+}
+
+/**
  * The page a flat query must answer: the `spans` source excludes the instant
  * kinds (`SPAN_SOURCE_KINDS`), the filter narrows before counting, the sort
- * ends in `id`, the limit defaults and clamps, and `nextOffset` advances only
- * while the page returned rows and rows remain.
+ * ends in `id` — except `spans` under `start_asc`, which is the canonical
+ * parent-first order ({@link canonicalParentFirst}) of the filtered selection,
+ * so a parent the filter removed leaves its child a root — the limit defaults
+ * and clamps, and `nextOffset` advances only while the page returned rows and
+ * rows remain.
  */
 function deriveFlatPage(
   events: readonly TelemetryEventIngress[],
@@ -1019,7 +1105,11 @@ function deriveFlatPage(
       (source === 'events' || SPAN_SOURCE_KINDS.includes(event.kind)) &&
       matchesFilter(event, query.filter),
   );
-  const ordered = [...selected].sort(flatComparator(appliedFlatSort(source, query.sort), selected));
+  const sort = appliedFlatSort(source, query.sort);
+  const ordered =
+    source === 'spans' && sort === 'start_asc'
+      ? canonicalParentFirst(selected)
+      : [...selected].sort(flatComparator(sort, selected));
   const limit = Math.min(query.limit ?? DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_MAX_LIMIT);
   const offset = query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
   const page = ordered.slice(offset, offset + limit);
@@ -1383,7 +1473,9 @@ async function runCase(testCase: PanelDataCase): Promise<void> {
 
 beforeAll(
   async () => {
-    harness = await startHarness();
+    harness = await startHarness({
+      now: createHarnessClock(FIXTURE_BASE_EPOCH_MS - SERVICE_CLOCK_LEAD_MS).now,
+    });
     const logger = harness.logger.root;
     const correlator = createTraceCorrelator({ telemetry: harness.repos.telemetry, logger });
     summarizer = createAnalysisSummarizer({
@@ -1804,8 +1896,10 @@ describe('paging and ordering', () => {
     expect(walk.ids).toEqual(derived.ids);
 
     // Under the two sorts that rank by start time or duration, the block ties
-    // on the primary key, so only the secondary key discriminates: contiguous,
-    // id ascending. `count_desc` ranks by operation-name group instead, and
+    // on the primary key, so only the keys behind it discriminate: contiguous,
+    // id ascending. (`spans` under `start_asc` breaks the tie by producer and
+    // `seq` rather than by id; the batch writes the block in both orders, and
+    // the derivation above pins the canonical one.) `count_desc` ranks by operation-name group instead, and
     // the block's records carry distinct names, so the name — not the id —
     // orders them there; the derivation above already pins that order.
     const block = tieBlockOf(group.events);
@@ -2175,6 +2269,152 @@ describe('filters narrow the total itself', () => {
       expect(idsOf(requireRows(page, source))).toEqual(expected.ids);
       expect(page.nextOffset).toBe(expected.nextOffset);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The canonical order of `spans` under `start_asc`
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The roles of the finding's reproduction, and of the second trace beside it. */
+type ReproductionRole = 'a0' | 'a1' | 'a2' | 'b0' | 'b1' | 'c0' | 'c1';
+
+describe('the canonical order of spans under start_asc', () => {
+  /** The capture holding the reproduction, ingested through the real producers. */
+  let group: CaptureGroup;
+
+  /** The reproduction's trace. */
+  let reproductionTrace: string;
+
+  /** Every ingested event of the capture, by role. */
+  let role: Readonly<Record<ReproductionRole, TelemetryEventIngress>>;
+
+  beforeAll(async () => {
+    // Templates from the cross-tier batch, so every event is one its producer
+    // really sends: A = the browser producer (an interaction and two fetches),
+    // B = the server producer (a request span and its database call). The
+    // browser producer's id sorts below the server's in UTF-8 byte order.
+    const interaction = firstEventWhere(
+      CROSS_TIER_FIXTURE,
+      (event) => event.kind === 'interaction',
+    );
+    const fetch = firstEventWhere(CROSS_TIER_FIXTURE, (event) => event.kind === 'fetch');
+    const request = firstEventWhere(CROSS_TIER_FIXTURE, (event) => event.kind === 'http.server');
+    const statement = firstEventWhere(CROSS_TIER_FIXTURE, (event) => event.kind === 'db.query');
+    expect(compareUtf8(interaction.producerId, request.producerId)).toBeLessThan(0);
+    expect(fetch.producerId).toBe(interaction.producerId);
+    expect(statement.producerId).toBe(request.producerId);
+
+    reproductionTrace = newTraceId();
+    const otherTrace = newTraceId();
+    const tied = interaction.startTime + 10;
+    const spanOf = (ordinal: number): string => (0xb000 + ordinal).toString(16).padStart(16, '0');
+    const emitted = (
+      template: TelemetryEventIngress,
+      traceId: string,
+      seq: number,
+      spanId: string,
+      parentSpanId: string | undefined,
+      startTime: number,
+    ): TelemetryEventIngress => {
+      const event = parseTelemetryEventIngress({
+        ...template,
+        id: newEventId(),
+        traceId,
+        spanId,
+        ...(parentSpanId !== undefined ? { parentSpanId } : {}),
+        startTime,
+        seq,
+      });
+      if (isErr(event)) {
+        throw new Error(`A reproduction event left the ingress schema (${event.error.code}).`);
+      }
+      return event.value;
+    };
+    // The finding's trace: root A0; children A2 (seq 2), B0 and A1 (seq 1) at
+    // one instant; B1, B0's child, 5 ms before them. Beside it a second trace
+    // whose server span C1 reads 5 ms before its browser root C0 — both earlier
+    // than the whole reproduction.
+    role = Object.freeze({
+      a0: emitted(interaction, reproductionTrace, 0, spanOf(0), undefined, tied),
+      a1: emitted(fetch, reproductionTrace, 1, spanOf(1), spanOf(0), tied),
+      a2: emitted(fetch, reproductionTrace, 2, spanOf(2), spanOf(0), tied),
+      b0: emitted(request, reproductionTrace, 0, spanOf(3), spanOf(0), tied),
+      b1: emitted(statement, reproductionTrace, 1, spanOf(4), spanOf(3), tied - 5),
+      c0: emitted(interaction, otherTrace, 3, spanOf(5), undefined, tied - 20),
+      c1: emitted(request, otherTrace, 2, spanOf(6), spanOf(5), tied - 25),
+    });
+    // Sent out of every order the answer could be mistaken for.
+    group = await openCaptureGroup(
+      harness,
+      [CROSS_TIER_FIXTURE],
+      distinctIngestLists().length + 2,
+      redactionProbe,
+      [role.a2, role.c0, role.a0, role.a1, role.b1, role.c1, role.b0],
+    );
+  }, GROUP_SETUP_TIMEOUT_MS);
+
+  /** The ids of `roles`, in order. */
+  const idsOfRoles = (roles: readonly ReproductionRole[]): string[] =>
+    roles.map((name) => role[name].id);
+
+  it('answers the reproduction parent first, then by start, producer and sequence', async () => {
+    const query: DataQuery = {
+      source: 'spans',
+      sort: 'start_asc',
+      filter: { traceId: reproductionTrace },
+    };
+    const page = pagedOf(await panelData(group.sessionId, query), 'reproduction');
+    const expected = idsOfRoles(['a0', 'a1', 'a2', 'b0', 'b1']);
+
+    expect(idsOf(requireRows(page, 'reproduction'))).toEqual(expected);
+    expect(page.total).toBe(expected.length);
+    expect(page.nextOffset).toBeNull();
+    expect(deriveFlatPage(group.events, 'spans', query).ids).toEqual(expected);
+
+    // One row per page: each row once, in the single-page order.
+    const walk = await walkPages(group.sessionId, { ...query, limit: 1 });
+    expect(walk.ids).toEqual(expected);
+    expect(walk.pages).toHaveLength(expected.length);
+
+    // The events log keeps its flat order — start, then the event id — so
+    // B1, the earliest, still leads it.
+    const logQuery: DataQuery = { ...query, source: 'events' };
+    const log = idsOf(requireRows(await panelData(group.sessionId, logQuery), 'events'));
+    expect(log).toEqual(deriveFlatPage(group.events, 'events', logQuery).ids);
+    expect(log[0]).toBe(role.b1.id);
+  });
+
+  it('keeps every trace parent first across the whole capture, and every page walk visits each row once', async () => {
+    const query: DataQuery = { source: 'spans', sort: 'start_asc' };
+    const expected = idsOfRoles(['c0', 'c1', 'a0', 'a1', 'a2', 'b0', 'b1']);
+    const page = pagedOf(await panelData(group.sessionId, query), 'whole capture');
+
+    expect(idsOf(requireRows(page, 'whole capture'))).toEqual(expected);
+    expect(page.total).toBe(expected.length);
+    expect(deriveFlatPage(group.events, 'spans', query).ids).toEqual(expected);
+    for (const limit of [1, 2, 3]) {
+      const walk = await walkPages(group.sessionId, { ...query, limit });
+      expect(walk.ids, `${String(limit)} per page`).toEqual(expected);
+      expect(walk.pages, `${String(limit)} per page`).toHaveLength(
+        Math.ceil(expected.length / limit),
+      );
+    }
+  });
+
+  it('treats a span whose parent the filter removed as a root', async () => {
+    // Only the server's spans: B0's and C1's browser parents are filtered
+    // out, so both are roots and the flat chain puts C1 first; B1 reads
+    // earlier than B0 but still follows it, because the filter kept its parent.
+    const query: DataQuery = {
+      source: 'spans',
+      sort: 'start_asc',
+      filter: { kinds: [role.b0.kind, role.b1.kind] },
+    };
+    const answered = idsOf(requireRows(await panelData(group.sessionId, query), 'server spans'));
+
+    expect(answered).toEqual(deriveFlatPage(group.events, 'spans', query).ids);
+    expect(answered).toEqual(idsOfRoles(['c1', 'b0', 'b1']));
   });
 });
 
@@ -3049,6 +3289,212 @@ describe('panel-bound reads', () => {
       expect(refusalStatus(refused)).toBe(CONFLICT_STATUS);
       expect(isErr(refused) ? refused.error.code : 'answered').toBe(INVALID_STATE_CODE);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The metric cards of a capture above the aggregate ceiling
+ * ---------------------------------------------------------------------------------------------- */
+
+/** How many stored events the capture above the ceiling holds past it. */
+const PAST_THE_CEILING = 1_234;
+
+/**
+ * The event-id prefix of the rows copied into the capture above the ceiling:
+ * the event prefix, then two of the sixteen id characters, so that the
+ * fourteen-digit copy number completes a well-formed event id.
+ */
+const CEILING_FILL_ID_PREFIX = `${ID_PREFIXES.event}_cf`;
+
+/** How many rows one statement of {@link copyStoredEvent} writes before it yields. */
+const CEILING_FILL_CHUNK = 25_000;
+
+/**
+ * How long filling the capture above the ceiling may take: a quarter of a
+ * million rows, which took about twelve seconds on a shared twelve-core host
+ * at a load average of ten, with room for a slower one.
+ */
+const CEILING_FILL_TIMEOUT_MS = 120_000;
+
+/**
+ * Copies one stored event `copies` times into its own capture, over the
+ * service's own connection: each copy a distinct event — its own id, span id,
+ * sequence number and start time, in the flat columns and the stored document
+ * alike — and every other field the template's. What makes a capture too large
+ * to aggregate is how many rows it holds, and inserting a quarter of a million
+ * rows one validated event at a time would take minutes.
+ *
+ * The copies are written {@link CEILING_FILL_CHUNK} rows per statement, with a
+ * turn of the event loop between statements. The statements run on the
+ * service's own thread, so one long statement would stall its HTTP server
+ * too: its idle keep-alive sockets would time out unseen, and the next request
+ * would be written to a socket the server had already closed.
+ */
+async function copyStoredEvent(template: TelemetryEvent, copies: number): Promise<void> {
+  const statement = harness.store.db.prepare(
+    `WITH RECURSIVE copy(n) AS (
+       SELECT :from + 1 UNION ALL SELECT n + 1 FROM copy WHERE n < :to
+     )
+     INSERT INTO telemetry_events
+       (id, session_id, capture_id, trace_id, span_id, parent_span_id, kind, tier, name,
+        start_time, duration, producer_id, seq, request_key, event)
+     SELECT
+       printf('%s%014d', :prefix, n), t.session_id, t.capture_id, t.trace_id,
+       printf('%016x', :spanBase + n), NULL, t.kind, t.tier, t.name,
+       t.start_time + n, t.duration, t.producer_id, t.seq + n, t.request_key,
+       json_set(
+         json_remove(t.event, '$.parentSpanId'),
+         '$.id', printf('%s%014d', :prefix, n),
+         '$.spanId', printf('%016x', :spanBase + n),
+         '$.seq', t.seq + n,
+         '$.startTime', t.start_time + n
+       )
+     FROM copy, telemetry_events AS t
+     WHERE t.id = :templateId`,
+  );
+  for (let from = 0; from < copies; from += CEILING_FILL_CHUNK) {
+    statement.run({
+      from,
+      to: Math.min(copies, from + CEILING_FILL_CHUNK),
+      prefix: CEILING_FILL_ID_PREFIX,
+      spanBase: 0x7e11_0000_0000,
+      templateId: template.id,
+    });
+    await yieldToEventLoop();
+  }
+}
+
+describe('the metric cards of a capture above the aggregate ceiling', () => {
+  /** The session and the capture that holds more events than one view may aggregate. */
+  let sessionId: SessionId;
+  let captureId: CaptureId;
+
+  /** The summary stored with the capture: its first events, as the capture stage stores it. */
+  let partial: CaptureSummary;
+
+  /** How many events the capture holds. */
+  let stored: number;
+
+  beforeAll(
+    async () => {
+      // A session of its own, generated through the real pipeline, then a
+      // newer capture opened, filled and closed at the store.
+      const group = await openCaptureGroup(
+        harness,
+        [CROSS_TIER_FIXTURE],
+        distinctIngestLists().length + 2,
+        redactionProbe,
+        reidentified(batchFor([CROSS_TIER_FIXTURE], redactionProbe)),
+      );
+      sessionId = group.sessionId;
+      expectOk(await harness.stopCapture(sessionId), 'capture.stop');
+      const generated = await harness.waitForSession(
+        sessionId,
+        (record) => record.status === 'generated' || record.status === 'failed',
+        { timeoutMs: HARNESS_TIMEOUTS.pipeline },
+      );
+      expect(generated.status, 'the first capture generated a panel').toBe('generated');
+
+      const opened = expectOk(
+        harness.repos.sessions.startCapture({
+          sessionId,
+          planVersion: generated.plans.at(-1)?.planVersion ?? 1,
+        }),
+        'sessions.startCapture',
+      );
+      captureId = opened.capture.id;
+      const inserted = expectOk(
+        harness.repos.telemetry.insertMany(
+          reidentified(readTelemetryBatch(CROSS_TIER_FIXTURE)).map((event) => ({
+            ...event,
+            sessionId,
+            captureId,
+          })),
+        ),
+        'telemetry.insertMany',
+      );
+      const leading = inserted.events;
+      // The rest of the capture: a page re-rendering in the background.
+      const template = leading.find((event) => event.kind === 'render');
+      if (template === undefined) {
+        throw new Error('The cross-tier fixture holds no render to copy.');
+      }
+      await copyStoredEvent(
+        template,
+        MAX_AGGREGATE_INPUT_EVENTS + PAST_THE_CEILING - leading.length,
+      );
+      stored = expectOk(
+        harness.repos.telemetry.captureStamp(sessionId, captureId),
+        'captureStamp',
+      ).count;
+
+      // What the capture stage stores for a capture past its ceiling: the
+      // summary of the capture's first events, with coverage saying so.
+      const summary = computeCaptureSummary(leading, { captureId, sessionId });
+      partial = {
+        ...summary,
+        eventCount: MAX_AGGREGATE_INPUT_EVENTS,
+        coverage: {
+          storedEvents: stored,
+          summarizedEvents: MAX_AGGREGATE_INPUT_EVENTS,
+          producerDroppedEvents: 0,
+          drain: 'quiescent',
+          complete: false,
+        },
+      };
+      expectOk(
+        harness.repos.sessions.stopCapture({ captureId, summary: partial }),
+        'sessions.stopCapture',
+      );
+    },
+    GROUP_SETUP_TIMEOUT_MS + HARNESS_TIMEOUTS.pipeline + CEILING_FILL_TIMEOUT_MS,
+  );
+
+  it('holds more events than one view may aggregate', () => {
+    expect(stored).toBe(MAX_AGGREGATE_INPUT_EVENTS + PAST_THE_CEILING);
+    const latest = expectOk(harness.repos.sessions.getLatestCapture(sessionId), 'getLatestCapture');
+    expect(latest?.capture.id).toBe(captureId);
+    expect(latest?.capture.summary?.eventCount).toBe(MAX_AGGREGATE_INPUT_EVENTS);
+  });
+
+  it('answers every card from the stored summary, each noted with how much of the capture it covers', async () => {
+    const note = `Based on the first ${MAX_AGGREGATE_INPUT_EVENTS.toLocaleString('en-US')} of ${stored.toLocaleString('en-US')} captured events.`;
+    const answered = await panelData(sessionId, { source: 'metrics' });
+    const values = metricValuesOf(answered, 'metrics above the ceiling');
+
+    // One value per METRIC_IDS member, in order, each the summary's own value
+    // with the coverage appended to whatever note it already carried.
+    expect(values.map((value) => value.id)).toEqual([...METRIC_IDS]);
+    const summarized = new Map(partial.metrics.map((value) => [value.id, value]));
+    for (const value of values) {
+      const own = summarized.get(value.id);
+      expect(own, value.id).toBeDefined();
+      expect(value.available, value.id).toBe(own?.available);
+      expect(value.value, value.id).toBe(own?.value);
+      expect(value.note, value.id).toBe(own?.note === undefined ? note : `${own.note} ${note}`);
+    }
+    expect(values.some((value) => value.available)).toBe(true);
+
+    // The service's own resolver and the one this suite wires answer the same.
+    expect(
+      expectOk(
+        await resolver.resolve({ sessionId, captureId }, { source: 'metrics' }),
+        'resolve (metrics above the ceiling)',
+      ),
+    ).toStrictEqual(answered);
+  });
+
+  it('still refuses a filtered read of the capture that selects more than one view may aggregate', async () => {
+    // A filter narrows the view, so the summary of the whole capture cannot
+    // answer it; this one still selects more rows than one read aggregates.
+    const query: DataQuery = { source: 'metrics', filter: { tier: 'browser' } };
+    const refused = await requestPanelData(harness.http(), sessionId, query);
+    expect(isErr(refused) ? refused.error.code : 'answered').toBe(PAGING_REFUSAL_CODE);
+    const direct = await resolver.resolve({ sessionId, captureId }, query);
+    expect(isErr(direct) ? direct.error.code : 'answered').toBe(PAGING_REFUSAL_CODE);
+    expect(isErr(direct) ? fieldOf(direct.error.details, 'reason') : undefined).toBe(
+      'aggregate-input-too-large',
+    );
   });
 });
 

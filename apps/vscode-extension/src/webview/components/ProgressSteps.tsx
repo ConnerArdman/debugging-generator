@@ -51,9 +51,10 @@
  * ## Bounded rendering (a long session stays cheap)
  *
  * The sections are rebuilt only when `entries` changes (`useMemo`). Rows and
- * headings are `memo` components over primitive props, keyed by stage, message
- * and first-arrival time rather than by list position, so an update reconciles
- * the rows that changed and every other row keeps its DOM node — also when the
+ * headings are `memo` components over primitive props, keyed by stage and
+ * first-arrival time rather than by list position or wording, so an update
+ * reconciles the rows that changed — a row the host settled in place under a
+ * new message included — and every other row keeps its DOM node — also when the
  * host's bound compacts the oldest episodes to their header and failed rows
  * (`../../state.ts`), which keeps every section's heading and identity. Only
  * the latest `LIVE_SECTION_WINDOW` sections are drawn in full; an older
@@ -75,7 +76,7 @@
  *       Stack > Button  aria-expanded           "Show N steps" | "Hide steps", older only
  *       ol.dgv-progress__rows  aria-labelledby  the other rows, when any and shown
  *         li.dgv-progress__row                  two-column grid
- *           span.dgv-progress__marker--<status> glyph (aria-hidden) + hidden label
+ *           span.dgv-progress__marker--<tone>   glyph (aria-hidden) + hidden label
  *           Text .dgv-progress__label           the service's message
  *           Text .dgv-progress__detail          the service's detail, when sent
  *   ErrorState | LoadingState | EmptyState      the state affordance, if any
@@ -95,11 +96,23 @@
  *
  * ## Status is never colour alone
  *
- * Each marker carries exactly one of `--running`, `--done` or `--failed`, a
- * decorative glyph (a spinner, `✓` or `✕`) hidden from assistive technology,
- * and a visually hidden status word that is announced before the message. A
- * failed stage is always drawn as a failed row: a failure is never restyled as
- * a success and never omitted (AAP 0.5.5).
+ * Each marker carries exactly one of `--running`, `--done`, `--failed` or
+ * `--warning`, a decorative glyph (a spinner, `✓`, `✕` or `!`) hidden from
+ * assistive technology, and a visually hidden status word that is announced
+ * before the message. A failed stage is always drawn as a failed row: a
+ * failure is never restyled as a success and never omitted (AAP 0.5.5).
+ *
+ * The fourth tone, `warning`, is not a status: the protocol's vocabulary is
+ * `running`, `done` and `failed` (AAP 0.4.2), and the service reports an
+ * outcome that is complete but degraded as a `done` row. Where such a row sits
+ * is what tells it apart, so the only knowledge this file holds is which
+ * stages send them, keyed by the protocol's stage vocabulary in
+ * `NOTICE_STAGES`: in the `capture` and `generate-panel` sections, every
+ * `done` row other than the section's heading — the incomplete-evidence and
+ * interaction-hook notices, the empty-capture sentence, the fallback-panel
+ * banner — is a notice about the evidence and is drawn as a warning, never as
+ * a green check. Headings keep their own status, and every other stage's
+ * `done` rows are the successes they report.
  *
  * ## States (AAP 0.5.5)
  *
@@ -293,11 +306,52 @@ const SECTION_LEAD_BY_STAGE: ReadonlyMap<string, ProgressStage> = new Map(
 type ProgressStatus = ProgressEntry['status'];
 
 /**
- * How one status is drawn: the marker's modifier class, the decorative glyph
+ * How a marker is drawn: one of the protocol's three statuses, or `warning`
+ * for a `done` row that is a notice about a degraded outcome (see
+ * {@link NOTICE_STAGES} and {@link rowTone}).
+ */
+type MarkerTone = ProgressStatus | 'warning';
+
+/**
+ * The pipeline stages whose `done` rows, other than the section heading, are
+ * notices rather than successes (see the module documentation): the capture
+ * stage reports incomplete evidence, an interaction hook that was off and an
+ * empty capture as `done` rows after its header row, and the panel stage
+ * reports a fallback panel as its only other `done` row.
+ *
+ * Keyed by the protocol's `ProgressStage` vocabulary, like
+ * {@link SECTION_LEADS}, so a renamed stage fails to compile here. Only the
+ * stage lives in this file: the words of every notice are the service's own.
+ */
+const NOTICE_STAGES = Object.freeze({
+  capture: true,
+  'generate-panel': true,
+} as const satisfies Readonly<Partial<Record<ProgressStage, true>>>);
+
+/**
+ * {@link NOTICE_STAGES} as a lookup over the contract's open `stage` string;
+ * an unknown stage sends no notices.
+ */
+const NOTICE_STAGE_SET: ReadonlySet<string> = new Set(Object.keys(NOTICE_STAGES));
+
+/**
+ * The tone a section row's marker is drawn in — never used for a heading,
+ * which keeps its own status.
+ *
+ * @param entry The row's entry, as received.
+ * @returns `warning` for a `done` row of a {@link NOTICE_STAGES} stage, the
+ *   entry's own status otherwise.
+ */
+function rowTone(entry: ProgressEntry): MarkerTone {
+  return entry.status === 'done' && NOTICE_STAGE_SET.has(entry.stage) ? 'warning' : entry.status;
+}
+
+/**
+ * How one tone is drawn: the marker's modifier class, the decorative glyph
  * and the word announced in place of that glyph.
  */
 interface StatusPresentation {
-  /** Exactly one of the three marker modifiers of `../styles.css`. */
+  /** Exactly one of the four marker modifiers of `../styles.css`. */
   readonly modifierClass: string;
   /** Decoration only; always rendered inside an `aria-hidden` wrapper. */
   readonly glyph: ReactNode;
@@ -315,17 +369,17 @@ interface StatusPresentation {
 const SPINNER_GLYPH = <span className="dg-spinner dgv-progress__spinner" />;
 
 /**
- * Resolves how a status is drawn.
+ * Resolves how a tone is drawn.
  *
- * A `switch` closed by `assertNever` rather than a lookup table, so a fourth
- * status added to the protocol's vocabulary is a compile error here instead of
- * a row drawn with no marker.
+ * A `switch` closed by `assertNever` rather than a lookup table, so a status
+ * added to the protocol's vocabulary is a compile error here instead of a row
+ * drawn with no marker.
  *
- * @param status The entry's status.
+ * @param tone The entry's status, or `warning` for a notice row.
  * @returns The marker class, glyph and announced word for it.
  */
-function statusPresentation(status: ProgressStatus): StatusPresentation {
-  switch (status) {
+function statusPresentation(tone: MarkerTone): StatusPresentation {
+  switch (tone) {
     case 'running':
       return {
         modifierClass: 'dgv-progress__marker--running',
@@ -336,8 +390,10 @@ function statusPresentation(status: ProgressStatus): StatusPresentation {
       return { modifierClass: 'dgv-progress__marker--done', glyph: '✓', spokenLabel: 'Done' };
     case 'failed':
       return { modifierClass: 'dgv-progress__marker--failed', glyph: '✕', spokenLabel: 'Failed' };
+    case 'warning':
+      return { modifierClass: 'dgv-progress__marker--warning', glyph: '!', spokenLabel: 'Warning' };
     default:
-      return assertNever(status, 'Unhandled progress status');
+      return assertNever(tone, 'Unhandled progress status');
   }
 }
 
@@ -346,15 +402,17 @@ interface KeyedEntry {
   /** The entry as received. */
   readonly entry: ProgressEntry;
   /**
-   * Stage, message and the host's first-arrival time (`ts`, which the host
-   * keeps when it updates a row in place), plus how many earlier entries
-   * carried that same triple — independent of list position and of how many
-   * older rows the host has compacted away, so a row keeps its key (and its
-   * DOM node, and its section keeps its disclosure state) while rows are added
-   * or removed around it and while it moves from running to done. The host
-   * stamps every row it holds with a distinct time, so the count is `0` for
-   * each of them and never shifts when an older row leaves; it only
-   * disambiguates a list whose times repeat.
+   * The entry's receipt identity — its stage and the host's first-arrival
+   * time (`ts`, which the host keeps when it updates a row in place) — plus
+   * how many earlier entries carried that same pair. It is independent of
+   * list position, of how many older rows the host has compacted away, and of
+   * the row's wording, so a row keeps its key (and its DOM node, and its
+   * section keeps its disclosure state) while rows are added or removed
+   * around it and while the host settles it in place — running to done or
+   * failed, under the same message or a new one. The host stamps every row it
+   * holds with a distinct time, so the count is `0` for each of them and never
+   * shifts when an older row leaves; it only disambiguates a list whose times
+   * repeat.
    */
   readonly key: string;
 }
@@ -409,7 +467,10 @@ function buildSections(entries: readonly ProgressEntry[]): ProgressSection[] {
   const runs: { readonly sectionKey: string; readonly items: KeyedEntry[] }[] = [];
 
   for (const entry of entries) {
-    const identity = JSON.stringify([entry.stage, entry.message, entry.ts]);
+    // The receipt identity only: the message is left out because the host
+    // settles a row in place under new wording ("‹title›" becoming
+    // "‹title› failed: ‹summary›"), and that row must keep its key.
+    const identity = JSON.stringify([entry.stage, entry.ts]);
     const seen = occurrences.get(identity) ?? 0;
     occurrences.set(identity, seen + 1);
     const keyed: KeyedEntry = { entry, key: `${identity}#${String(seen)}` };
@@ -469,10 +530,10 @@ function hasText(value: string | undefined): value is string {
  * Renders a status marker: the modifier class, the decorative glyph hidden
  * from assistive technology, and the status word announced in its place.
  *
- * @param status The entry's status.
+ * @param status The entry's status, or `warning` for a notice row.
  * @returns The marker element.
  */
-function renderMarker(status: ProgressStatus): ReactElement {
+function renderMarker(status: MarkerTone): ReactElement {
   const presentation = statusPresentation(status);
 
   return (
@@ -499,8 +560,11 @@ function renderDetail(detail: string | undefined): ReactElement | null {
 
 /** The props of {@link ProgressRow}: the entry's three rendered fields. */
 interface ProgressRowProps {
-  /** The entry's status. */
-  readonly status: ProgressStatus;
+  /**
+   * The tone of the entry's marker: its status, or `warning` for a section
+   * row {@link rowTone} reads as a notice.
+   */
+  readonly status: MarkerTone;
   /** The service's message, rendered verbatim. */
   readonly message: string;
   /** The service's detail line, rendered verbatim when present. */
@@ -626,7 +690,7 @@ function renderSection(section: ProgressSection, presentation: SectionPresentati
           {rows.map(({ entry, key }) => (
             <ProgressRow
               key={key}
-              status={entry.status}
+              status={rowTone(entry)}
               message={entry.message}
               detail={entry.detail}
             />

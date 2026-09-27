@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createEnvelope } from '@debuggen/protocol';
 import { newCaptureId, newMessageId, newSessionId } from '@debuggen/shared';
 import type { CaptureId, SessionId } from '@debuggen/shared';
+import type { TelemetryEvent } from '@debuggen/telemetry';
 import type { ReactElement } from 'react';
 
 import { LiveTail } from '../src/panel/components/LiveTail';
@@ -227,5 +228,68 @@ describe('LiveTail capture notices', () => {
     const list = noticeList();
     expect(list.closest('[aria-live]')).toBeNull();
     expect(list.querySelector('[aria-live]')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What the tail is of the capture
+// ---------------------------------------------------------------------------
+
+/** A persisted event of the capture under test, as the tail relays one. */
+function tailEvent(index: number): TelemetryEvent {
+  const hex = (index + 1).toString(16).padStart(16, '0');
+  return {
+    id: `evt_${hex}`,
+    traceId: `${hex}${hex}`,
+    spanId: hex,
+    kind: 'render',
+    name: `render row ${String(index)}`,
+    startTime: T0 + index,
+    duration: 1,
+    tier: 'browser',
+    attributes: {},
+    status: 'ok',
+    producerId: 'producer-live-tail-test',
+    seq: index,
+    sessionId,
+    captureId,
+    ingestSeq: index + 1,
+  };
+}
+
+describe('LiveTail — events the service did not stream', () => {
+  it('names the capture’s total and what was not streamed live beside the rows', () => {
+    const events = Array.from({ length: 3 }, (_, index) => tailEvent(index));
+    render(pane({ events, droppedCount: 0, capturedCount: 68_111, skippedCount: 55_600 }));
+
+    expect(
+      screen.getByText(
+        'Showing the newest 3 of 68,111 captured events; 55,600 were not streamed live',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('reads both counts from the store when the root omits them, even with no rows', () => {
+    bindAndCapture();
+    act(() => {
+      applyRelayedMessage(
+        createEnvelope('telemetry.tail', {
+          sessionId,
+          events: [tailEvent(0)],
+          captures: [{ captureId, storedEvents: 9_000, skippedEvents: 8_999 }],
+        }),
+      );
+    });
+    render(pane({ events: [] }));
+
+    expect(screen.getByText('8,999 of 9,000 captured events were not streamed live')).toBeTruthy();
+  });
+
+  it('states nothing while the tail is merely behind the stored count', () => {
+    const events = Array.from({ length: 3 }, (_, index) => tailEvent(index));
+    render(pane({ events, droppedCount: 0, capturedCount: 400, skippedCount: 0 }));
+
+    expect(screen.queryByText(/not streamed live/u)).toBeNull();
+    expect(screen.queryByText(/Showing the newest/u)).toBeNull();
   });
 });

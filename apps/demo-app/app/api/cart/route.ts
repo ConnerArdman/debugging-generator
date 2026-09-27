@@ -23,9 +23,10 @@ export const dynamic = 'force-dynamic';
  *
  * @param request The incoming request; only its URL is read.
  * @returns `200` with the cart's `CartView` - the session's open cart, or the
- * empty one opened for it - or the failure envelope `storefrontErrorResponse`
- * builds: `404` when a checkout is holding this session's cart, and `400` when
- * the query itself was rejected.
+ * empty one opened for it, which is also what a session whose last checkout
+ * ended with its payment unsettled is answered with - or the failure envelope
+ * `storefrontErrorResponse` builds: `404` only while a checkout is in flight
+ * against this session's cart, and `400` when the query itself was rejected.
  */
 export async function GET(request: Request): Promise<Response> {
   try {

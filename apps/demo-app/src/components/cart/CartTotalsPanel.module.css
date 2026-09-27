@@ -1,7 +1,7 @@
 /*
  * CartTotalsPanel - the cart's derived-totals block (items, merchandise subtotal, one line per
- * charge the placing surface passes, the emphasised closing figure, free-freight state and the
- * dispatch/delivery line).
+ * charge the placing surface passes, the emphasised closing figure and the dispatch/delivery
+ * line).
  *
  * Scope, and deliberately nothing more
  * ---------------------------------------------------------------------------------------------
@@ -98,9 +98,6 @@
 .rowLabel {
   /* Lets a long label wrap inside the `1fr` track instead of pushing the value out of the card. */
   min-width: 0;
-  /* Inert in the grid row above. It matters when the label sits on a flex line - the freight line
-   * below is one - where it lets the label absorb the slack so the value still ends the line. */
-  flex: 1 1 auto;
   color: var(--ls-text-muted, #475569);
 }
 
@@ -150,24 +147,6 @@
  * up two of the three emphasis channels (weight, size) and drop the third. */
 .total .rowLabel {
   color: inherit;
-}
-
-/* The free-freight line: a sentence that may be preceded by a `../ui/Badge` when the cart
- * qualifies, so it is laid out as a wrapping flex line rather than as a label/value pair. The
- * badge is what carries the qualifying state; the colour change below only reinforces it, so
- * colour is never the sole indicator of the state. */
-.freight {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  column-gap: var(--ls-space-2, 8px);
-  row-gap: var(--ls-space-1, 4px);
-  color: var(--ls-text-muted, #475569);
-  font-variant-numeric: tabular-nums;
-}
-
-.freight[data-qualifies='true'] {
-  color: var(--ls-success, #0f766e);
 }
 
 /* Small print: the dispatch/estimated-delivery line and the optional note (a unit-count echo, for

@@ -207,8 +207,10 @@ export * from './analysis.js';
 // ---------------------------------------------------------------------------
 // session-record — the state of one debugging session, defined exactly once for
 // the whole product (AAP §0.9.1): the eleven-status and four-cleanup-status
-// vocabularies, the relevant-file, bound-tab, capture, follow-up, cleanup,
-// prompt-version and provider sub-records, and the `SessionRecord` the service
+// vocabularies, the one question rule (`MAX_QUESTION_LENGTH` and the
+// `questionSchema` the session request bodies embed and the VS Code webview's
+// text areas count against), the relevant-file, bound-tab, capture, follow-up,
+// cleanup, prompt-version and provider sub-records, and the `SessionRecord` the service
 // persists as its `sessions.record` JSON column, broadcasts on
 // `session.created`/`session.updated` and returns from every session route —
 // which both user interfaces render directly.

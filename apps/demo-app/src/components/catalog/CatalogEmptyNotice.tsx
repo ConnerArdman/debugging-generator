@@ -3,9 +3,11 @@
  *
  * Three situations reach this block, and `reason` is the discriminant between them:
  *
- *   - `no-matches`: the catalog itself has products, but the active search term and category
- *     filter select none of them. The message is about the filters, and the way out is to change
- *     them, so the caller usually supplies a "Clear filters" control as `action`.
+ *   - `no-matches`: the catalog itself has products, but the active search term, category filter
+ *     or both select none of them. The message is about the filters, and the way out is to change
+ *     them, so the caller usually supplies a "Clear filters" control as `action`. Its advice names
+ *     only the filters actually in force: a reader who searched without choosing a category is not
+ *     told to clear a category filter they never set.
  *   - `empty-catalog`: there is nothing published to select from in the first place. No change of
  *     filter will help, so the message says so plainly rather than inviting the reader to try
  *     again.
@@ -51,7 +53,9 @@
  *
  * WORDING
  * Every string the reader sees is declared in `NOTICE_COPY` below, keyed by `reason`, so a new
- * situation cannot be added without the compiler demanding its wording.
+ * situation cannot be added without the compiler demanding its wording. The one sentence that
+ * depends on more than the reason - the advice a no-match notice closes on - is declared beside it
+ * in `NO_MATCH_ADVICE`, keyed by which filters are in force.
  */
 
 import type { ReactNode } from 'react';
@@ -126,7 +130,7 @@ const NOTICE_COPY: Record<
 > = {
   'no-matches': {
     heading: 'No products match your filters',
-    body: 'Try a different search term, or clear the category filter to see the full range.',
+    body: 'Clear the filters to see the full range.',
     alt: '',
     echoesFilters: true,
   },
@@ -142,6 +146,22 @@ const NOTICE_COPY: Record<
     alt: '',
     echoesFilters: false,
   },
+};
+
+/**
+ * The advice a `no-matches` sentence closes on, keyed by which filters it names.
+ *
+ * The catalog passes a term only when one was searched and a category only when one is selected,
+ * so the pair the sentence echoes is exactly the pair in force, and the advice is chosen from the
+ * same pair: a search on its own is answered with a different search or none, a category on its
+ * own with another category or none, and the two together name both, since either could be the
+ * one excluding everything. A no-match notice that names neither - a category address the catalog
+ * no longer lists, say - closes on `NOTICE_COPY`'s own body, which names no filter in particular.
+ */
+const NO_MATCH_ADVICE: Record<'term' | 'category' | 'both', string> = {
+  term: 'Try a different search term, or clear the search to see the full range.',
+  category: 'Try another category, or clear the category filter to see the full range.',
+  both: 'Try a different search term, or clear the category filter to see the full range.',
 };
 
 /**
@@ -200,8 +220,24 @@ export function CatalogEmptyNotice({
   }
 
   /*
-   * The sentence. When something was asked for, an opening clause names it before the standing
-   * advice; otherwise the advice stands alone.
+   * The advice the sentence closes on. Every reason has a standing one in `NOTICE_COPY`; a
+   * no-match notice replaces it with the advice for the filters it is about to name, so the way
+   * out it suggests is always a filter the reader actually has in force.
+   */
+  let advice = copy.body;
+  if (reason === 'no-matches') {
+    if (term !== undefined && category !== undefined) {
+      advice = NO_MATCH_ADVICE.both;
+    } else if (term !== undefined) {
+      advice = NO_MATCH_ADVICE.term;
+    } else if (category !== undefined) {
+      advice = NO_MATCH_ADVICE.category;
+    }
+  }
+
+  /*
+   * The sentence. When something was asked for, an opening clause names it before the advice;
+   * otherwise the advice stands alone.
    *
    * Two details of the assembly are deliberate. The spaces between the pieces live inside the
    * string expressions rather than in the source layout, because JSX drops the whitespace around a
@@ -213,26 +249,29 @@ export function CatalogEmptyNotice({
    * begins; a sentence that needs no marker survives any pipeline that rewrites or strips comments
    * on its way to the browser.
    */
-  let sentence: ReactNode = copy.body;
+  let sentence: ReactNode = advice;
   if (term !== undefined) {
     const tail = category === undefined ? '\u201d. ' : `\u201d in ${category}. `;
     sentence = (
       <>
         {'No products are listed for \u201c'}
         <span className={styles.term}>{term}</span>
-        {`${tail}${copy.body}`}
+        {`${tail}${advice}`}
       </>
     );
   } else if (category !== undefined) {
-    sentence = `No products are listed in ${category}. ${copy.body}`;
+    sentence = `No products are listed in ${category}. ${advice}`;
   }
 
   return (
     <div className={styles.root}>
+      {/* An `h3`: the notice sits inside the catalog section, whose own heading is the `h2`
+          "Product catalog", so the notice is a subsection of it rather than a sibling. */}
       <BlankSlate
         art="no-results"
         alt={copy.alt}
         heading={copy.heading}
+        headingAs="h3"
         tone="neutral"
         action={action}
       >

@@ -133,7 +133,12 @@ import {
   DEFAULT_MAX_OCCURRENCES_PER_GROUP,
   DEFAULT_MAX_REQUEST_OCCURRENCES_PER_GROUP,
   DEFAULT_RESOURCE_TIMING_TOLERANCE_MS,
+  INITIATOR_OWNER_SEPARATOR,
+  MAX_INITIATOR_LABEL_LENGTH,
+  MAX_INITIATOR_NAME_LENGTH,
+  MAX_INITIATOR_OWNER_NAMES,
   REQUEST_GROUPED_BY,
+  REQUEST_INITIATOR_BASES,
   REQUEST_IN_FLIGHT_ATTRIBUTE,
   REQUEST_TRANSFER_SOURCES,
   RESOURCE_ENTRY_TYPE,
@@ -1548,6 +1553,478 @@ describe('aggregateRequests aggregates', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * Initiator labels
+ *
+ * The browser agent records a call-site stack of generated-chunk frames, and
+ * every one begins in the application's shared request helper, so a label
+ * taken from that text would name one helper for every request of the page.
+ * These cases pin the header's "Initiator labels": the runtime component chain
+ * first, then a producer's own label, then the resolved call site, then the
+ * stack's first frame — with the stack itself kept beside the label.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A request key the initiator cases share, labelled per case. */
+function initiatorKey(label: string): string {
+  return opaqueRequestKey(`n${label}`);
+}
+
+/** The component that ran the effect in the two-mount cases. */
+const RAIL_COMPONENT = 'ReadingsRail';
+
+/** The owners above the first mount, nearest first. */
+const HEADER_OWNERS = ['ConsoleHeader', 'ConsolePage'] as const;
+
+/** The owners above the second mount, nearest first. */
+const DETAIL_OWNERS = ['GaugeDetail', 'ConsolePage'] as const;
+
+/**
+ * A V8 initiator stack as `../browser/fetch.ts` records it: the shared helper's
+ * frames first, then the hook's effect, then React's own frames — which is
+ * exactly what both mounts of one component produce, frame for frame.
+ */
+const HOOK_STACK = [
+  '    at __orig (http://127.0.0.1:4100/_next/static/chunks/src_lib_client_1a._.js:610:30)',
+  '    at __orig (http://127.0.0.1:4100/_next/static/chunks/src_lib_client_1a._.js:628:16)',
+  '    at useReadings.useEffect (http://127.0.0.1:4100/_next/static/chunks/src_hooks_2b._.js:44:9)',
+  '    at Object.react_stack_bottom_frame (http://127.0.0.1:4100/_next/static/chunks/react-dom_3c._.js:14944:22)',
+].join('\n');
+
+/** The same call site reached through different framework frames. */
+const HOOK_STACK_OTHER_FRAMEWORK_FRAMES = [
+  '    at __orig (http://127.0.0.1:4100/_next/static/chunks/src_lib_client_1a._.js:610:30)',
+  '    at __orig (http://127.0.0.1:4100/_next/static/chunks/src_lib_client_1a._.js:628:16)',
+  '    at useReadings.useEffect (http://127.0.0.1:4100/_next/static/chunks/src_hooks_2b._.js:44:9)',
+  '    at runWithFiberInDEV (http://127.0.0.1:4100/_next/static/chunks/react-dom_3c._.js:761:74)',
+].join('\n');
+
+/** Where the service's source-map route resolved {@link HOOK_STACK}. */
+const HOOK_SOURCE = makeSourceLocation('src/hooks/useReadings.ts', 44, 'useReadings');
+
+describe('aggregateRequests initiator labels', () => {
+  it('labels a resolved stack by its call site and keeps the stack beside the label', () => {
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({
+          requestKey: initiatorKey('1'),
+          initiator: HOOK_STACK,
+          source: HOOK_SOURCE,
+        }),
+      ]),
+    );
+    const occurrence = occurrenceAt(group, 0);
+
+    expect(occurrence.initiator).toBe('useReadings (src/hooks/useReadings.ts:44)');
+    expect(occurrence.initiatorBasis).toBe('source');
+    expect(occurrence.initiatorStack).toBe(HOOK_STACK);
+    expect(occurrence.source).toStrictEqual(HOOK_SOURCE);
+    expect(group.initiators).toStrictEqual(['useReadings (src/hooks/useReadings.ts:44)']);
+  });
+
+  it('labels a location without a symbol by its file and line alone', () => {
+    const unnamed: SourceLocation = {
+      file: HOOK_SOURCE.file,
+      line: HOOK_SOURCE.line,
+      column: HOOK_SOURCE.column,
+      resolvedBy: HOOK_SOURCE.resolvedBy,
+      confidence: HOOK_SOURCE.confidence,
+    };
+    const occurrence = occurrenceAt(
+      onlyGroup(
+        aggregateRequests([
+          makeRequestEvent({
+            requestKey: initiatorKey('2'),
+            initiator: HOOK_STACK,
+            source: unnamed,
+          }),
+        ]),
+      ),
+      0,
+    );
+
+    expect(occurrence.initiator).toBe('src/hooks/useReadings.ts:44');
+    expect(occurrence.initiatorBasis).toBe('source');
+  });
+
+  it('gives one call site one initiator, whatever framework frames its stacks carried', () => {
+    const requestKey = initiatorKey('3');
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey, initiator: HOOK_STACK, source: HOOK_SOURCE }),
+        makeRequestEvent({
+          requestKey,
+          initiator: HOOK_STACK_OTHER_FRAMEWORK_FRAMES,
+          source: HOOK_SOURCE,
+          startTime: BASE_TIME + 5,
+        }),
+      ]),
+    );
+
+    expect(group.count).toBe(2);
+    expect(group.duplicateCount).toBe(1);
+    expect(group.initiators).toStrictEqual(['useReadings (src/hooks/useReadings.ts:44)']);
+    expect(group.occurrences.map((occurrence) => occurrence.initiatorStack)).toStrictEqual([
+      HOOK_STACK,
+      HOOK_STACK_OTHER_FRAMEWORK_FRAMES,
+    ]);
+  });
+
+  it('falls back on the first frame, shortened to its file, when nothing resolved the stack', () => {
+    const occurrence = occurrenceAt(
+      onlyGroup(
+        aggregateRequests([
+          makeRequestEvent({ requestKey: initiatorKey('4'), initiator: HOOK_STACK }),
+        ]),
+      ),
+      0,
+    );
+
+    expect(occurrence.initiator).toBe('__orig (src_lib_client_1a._.js:610:30)');
+    expect(occurrence.initiatorBasis).toBe('frame');
+    expect(occurrence.initiatorStack).toBe(HOOK_STACK);
+    expect(Object.hasOwn(occurrence, 'source')).toBe(false);
+  });
+
+  it('reads the first frame past a message line, in both engines’ frame formats', () => {
+    const labelOf = (initiator: string, label: string): string | undefined =>
+      occurrenceAt(
+        onlyGroup(
+          aggregateRequests([makeRequestEvent({ requestKey: initiatorKey(label), initiator })]),
+        ),
+        0,
+      ).initiator;
+
+    expect(labelOf(`Error\n${HOOK_STACK}`, '5')).toBe('__orig (src_lib_client_1a._.js:610:30)');
+    expect(labelOf('    at http://127.0.0.1:4100/chunks/anon_4d._.js:12:3', '6')).toBe(
+      'anon_4d._.js:12:3',
+    );
+    expect(
+      labelOf(
+        'loadReadings@http://127.0.0.1:4100/chunks/src_hooks_2b._.js:44:9\n@debugger eval code:1:1',
+        '7',
+      ),
+    ).toBe('loadReadings (src_hooks_2b._.js:44:9)');
+    expect(labelOf('@http://127.0.0.1:4100/chunks/src_hooks_2b._.js:44:9', '8')).toBe(
+      'src_hooks_2b._.js:44:9',
+    );
+  });
+
+  it('keeps a label the producer wrote itself verbatim, with no basis and no stack', () => {
+    const labels = ['WidgetPanel', 'at home', 'src/ui/list-row.ts:84:9', 'mail@example'];
+    for (const [index, initiator] of labels.entries()) {
+      const occurrence = occurrenceAt(
+        onlyGroup(
+          aggregateRequests([
+            makeRequestEvent({
+              requestKey: initiatorKey(`9${String(index)}`),
+              initiator,
+              source: HOOK_SOURCE,
+            }),
+          ]),
+        ),
+        0,
+      );
+
+      expect(occurrence.initiator).toBe(initiator);
+      expect(Object.hasOwn(occurrence, 'initiatorBasis')).toBe(false);
+      expect(Object.hasOwn(occurrence, 'initiatorStack')).toBe(false);
+    }
+  });
+
+  it('names a component with one owner chain in its group by the component alone, keeping the chain', () => {
+    const occurrence = occurrenceAt(
+      onlyGroup(
+        aggregateRequests([
+          makeRequestEvent({
+            requestKey: initiatorKey('a'),
+            initiator: HOOK_STACK,
+            source: HOOK_SOURCE,
+            extraAttributes: {
+              initiatorComponent: RAIL_COMPONENT,
+              initiatorOwners: [...HEADER_OWNERS],
+            },
+          }),
+        ]),
+      ),
+      0,
+    );
+
+    // Nothing in the group needs telling apart, so no framework wrapper is
+    // named — and the whole chain is still there for a reader who wants it.
+    expect(occurrence.initiator).toBe(RAIL_COMPONENT);
+    expect(occurrence.initiatorOwners).toStrictEqual([...HEADER_OWNERS]);
+    expect(occurrence.initiatorBasis).toBe('component');
+    expect(occurrence.initiatorStack).toBe(HOOK_STACK);
+    // The call site is still the occurrence's own: the label says who, the
+    // location says where.
+    expect(occurrence.source).toStrictEqual(HOOK_SOURCE);
+  });
+
+  it('tells two mounts of one component apart although their stacks are identical', () => {
+    // AAP 0.8.2 defect 3: one duplicate group, two initiating components.
+    const requestKey = initiatorKey('b');
+    const mount = (owners: readonly string[], offsetMs: number): TelemetryEvent =>
+      makeRequestEvent({
+        requestKey,
+        initiator: HOOK_STACK,
+        source: HOOK_SOURCE,
+        startTime: BASE_TIME + offsetMs,
+        extraAttributes: { initiatorComponent: RAIL_COMPONENT, initiatorOwners: [...owners] },
+      });
+
+    const group = onlyGroup(
+      aggregateRequests([
+        mount(HEADER_OWNERS, 0),
+        mount(DETAIL_OWNERS, 3),
+        mount(HEADER_OWNERS, 400),
+        mount(DETAIL_OWNERS, 404),
+      ]),
+    );
+
+    expect(group.count).toBe(4);
+    expect(group.duplicateCount).toBe(3);
+    // The nearest owner already tells the mounts apart, so it is the only one
+    // named; the shared `ConsolePage` above both would add nothing.
+    expect(group.initiators).toStrictEqual([
+      'ReadingsRail ‹ ConsoleHeader',
+      'ReadingsRail ‹ GaugeDetail',
+    ]);
+    const counts = new Map<string, number>();
+    for (const occurrence of group.occurrences) {
+      const label = occurrence.initiator ?? '';
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+    expect([...counts.entries()]).toStrictEqual([
+      ['ReadingsRail ‹ ConsoleHeader', 2],
+      ['ReadingsRail ‹ GaugeDetail', 2],
+    ]);
+    expect(group.occurrences.map((occurrence) => occurrence.initiatorOwners)).toStrictEqual([
+      [...HEADER_OWNERS],
+      [...DETAIL_OWNERS],
+      [...HEADER_OWNERS],
+      [...DETAIL_OWNERS],
+    ]);
+  });
+
+  it('names as many owners as it takes to tell mounts apart, per component and in any order', () => {
+    const requestKey = initiatorKey('g');
+    const request = (
+      component: string,
+      owners: readonly string[],
+      offsetMs: number,
+    ): TelemetryEvent =>
+      makeRequestEvent({
+        requestKey,
+        initiator: HOOK_STACK,
+        source: HOOK_SOURCE,
+        startTime: BASE_TIME + offsetMs,
+        extraAttributes: { initiatorComponent: component, initiatorOwners: [...owners] },
+      });
+    const events = [
+      // Two mounts that share their nearest owner and part at the second.
+      request(RAIL_COMPONENT, ['Section', 'ConsoleHeader', 'ConsolePage'], 0),
+      request(RAIL_COMPONENT, ['Section', 'GaugeDetail', 'ConsolePage'], 1),
+      // A mount whose chain is a prefix of another's: told apart by length.
+      request('GaugeDial', ['Section'], 2),
+      request('GaugeDial', ['Section', 'ConsolePage'], 3),
+      // A component with a single chain stays bare, whatever its neighbours need.
+      request('StatusBar', ['ConsoleHeader', 'ConsolePage'], 4),
+    ];
+
+    const forward = onlyGroup(aggregateRequests(events));
+    const backward = onlyGroup(aggregateRequests([...events].reverse()));
+
+    expect(forward.initiators).toStrictEqual([
+      'GaugeDial ‹ Section',
+      'GaugeDial ‹ Section ‹ ConsolePage',
+      'ReadingsRail ‹ Section ‹ ConsoleHeader',
+      'ReadingsRail ‹ Section ‹ GaugeDetail',
+      'StatusBar',
+    ]);
+    expect(backward.initiators).toStrictEqual(forward.initiators);
+    expect(backward.occurrences).toStrictEqual(forward.occurrences);
+  });
+
+  it('decides the owner depth over every occurrence, not the published slice', () => {
+    const requestKey = initiatorKey('h');
+    const events = [HEADER_OWNERS, HEADER_OWNERS, DETAIL_OWNERS].map((owners, index) =>
+      makeRequestEvent({
+        requestKey,
+        initiator: HOOK_STACK,
+        startTime: BASE_TIME + index,
+        extraAttributes: { initiatorComponent: RAIL_COMPONENT, initiatorOwners: [...owners] },
+      }),
+    );
+
+    const group = onlyGroup(aggregateRequests(events, { maxOccurrencesPerGroup: 1 }));
+
+    expect(group.occurrencesTruncated).toBe(true);
+    expect(occurrenceAt(group, 0).initiator).toBe('ReadingsRail ‹ ConsoleHeader');
+    expect(group.initiators).toStrictEqual([
+      'ReadingsRail ‹ ConsoleHeader',
+      'ReadingsRail ‹ GaugeDetail',
+    ]);
+  });
+
+  it('labels a component with no owners by the component alone, even without a stack', () => {
+    const occurrence = occurrenceAt(
+      onlyGroup(
+        aggregateRequests([
+          makeRequestEvent({
+            requestKey: initiatorKey('c'),
+            omitAttributes: [INITIATOR_ATTRIBUTE],
+            extraAttributes: { initiatorComponent: `  ${RAIL_COMPONENT}  `, initiatorOwners: [] },
+          }),
+        ]),
+      ),
+      0,
+    );
+
+    expect(occurrence.initiator).toBe(RAIL_COMPONENT);
+    expect(occurrence.initiatorBasis).toBe('component');
+    expect(Object.hasOwn(occurrence, 'initiatorStack')).toBe(false);
+    expect(Object.hasOwn(occurrence, 'initiatorOwners')).toBe(false);
+  });
+
+  it('bounds the owner chain and each name, and skips owners that are not names', () => {
+    const longName = `${'Q'.repeat(MAX_INITIATOR_NAME_LENGTH)}Overflow`;
+    const owners: unknown[] = [
+      '',
+      '   ',
+      7,
+      null,
+      { name: 'Hidden' },
+      longName,
+      ...Array.from(
+        { length: MAX_INITIATOR_OWNER_NAMES + 3 },
+        (_unused, index) => `Owner${String(index)}`,
+      ),
+    ];
+    const occurrence = occurrenceAt(
+      onlyGroup(
+        aggregateRequests([
+          makeRequestEvent({
+            requestKey: initiatorKey('d'),
+            initiator: HOOK_STACK,
+            extraAttributes: {
+              initiatorComponent: `${'R'.repeat(MAX_INITIATOR_NAME_LENGTH)}Overflow`,
+              initiatorOwners: owners,
+            },
+          }),
+        ]),
+      ),
+      0,
+    );
+    const kept = occurrence.initiatorOwners ?? [];
+
+    expect(occurrence.initiator).toBe('R'.repeat(MAX_INITIATOR_NAME_LENGTH));
+    expect(kept).toHaveLength(MAX_INITIATOR_OWNER_NAMES);
+    expect(kept[0]).toBe('Q'.repeat(MAX_INITIATOR_NAME_LENGTH));
+    expect(kept.at(-1)).toBe(`Owner${String(MAX_INITIATOR_OWNER_NAMES - 2)}`);
+  });
+
+  it('never cuts a full-length chain short, so the label bound cannot merge two mounts', () => {
+    // Every name at its bound, and two chains that differ only in the last
+    // owner's presence: the label that tells them apart is the longest one
+    // the aggregate can build, and it must survive whole.
+    const component = 'R'.repeat(MAX_INITIATOR_NAME_LENGTH);
+    const longest = Array.from(
+      { length: MAX_INITIATOR_OWNER_NAMES },
+      (_unused, index) => `${'Q'.repeat(MAX_INITIATOR_NAME_LENGTH - 1)}${String(index)}`,
+    );
+    const requestKey = initiatorKey('i');
+    const group = onlyGroup(
+      aggregateRequests(
+        [longest, longest.slice(0, -1)].map((owners, index) =>
+          makeRequestEvent({
+            requestKey,
+            initiator: HOOK_STACK,
+            startTime: BASE_TIME + index,
+            extraAttributes: { initiatorComponent: component, initiatorOwners: owners },
+          }),
+        ),
+      ),
+    );
+    const full = occurrenceAt(group, 0).initiator ?? '';
+
+    expect(full.split(INITIATOR_OWNER_SEPARATOR)).toStrictEqual([component, ...longest]);
+    expect([...full].length).toBe(MAX_INITIATOR_LABEL_LENGTH);
+    expect(group.initiators).toHaveLength(2);
+  });
+
+  it('ignores component evidence that is not a name, and owners that are not a list', () => {
+    const requestKey = initiatorKey('e');
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({
+          requestKey,
+          initiator: HOOK_STACK,
+          source: HOOK_SOURCE,
+          extraAttributes: { initiatorComponent: '   ', initiatorOwners: [...HEADER_OWNERS] },
+        }),
+        makeRequestEvent({
+          requestKey,
+          initiator: HOOK_STACK,
+          source: HOOK_SOURCE,
+          startTime: BASE_TIME + 1,
+          extraAttributes: { initiatorComponent: 42 },
+        }),
+        makeRequestEvent({
+          requestKey,
+          initiator: HOOK_STACK,
+          source: HOOK_SOURCE,
+          startTime: BASE_TIME + 2,
+          extraAttributes: { initiatorComponent: RAIL_COMPONENT, initiatorOwners: 'ConsoleHeader' },
+        }),
+      ]),
+    );
+
+    expect(group.occurrences.map((occurrence) => occurrence.initiatorBasis)).toStrictEqual([
+      'source',
+      'source',
+      'component',
+    ]);
+    expect(group.initiators).toStrictEqual([
+      RAIL_COMPONENT,
+      'useReadings (src/hooks/useReadings.ts:44)',
+    ]);
+  });
+
+  it('costs a hostile owner list only the owners it could not read', () => {
+    const hostile = new Proxy([...HEADER_OWNERS], {
+      get(target, property, receiver): unknown {
+        if (property === '1') {
+          throw new Error('the owner list is hostile by design');
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+    const occurrence = occurrenceAt(
+      onlyGroup(
+        aggregateRequests([
+          makeRequestEvent({
+            requestKey: initiatorKey('f'),
+            initiator: HOOK_STACK,
+            extraAttributes: { initiatorComponent: RAIL_COMPONENT, initiatorOwners: hostile },
+          }),
+        ]),
+      ),
+      0,
+    );
+
+    expect(occurrence.initiator).toBe(RAIL_COMPONENT);
+    expect(occurrence.initiatorOwners).toStrictEqual(['ConsoleHeader']);
+    expect(occurrence.initiatorBasis).toBe('component');
+  });
+
+  it('declares every basis it can publish', () => {
+    expect([...REQUEST_INITIATOR_BASES]).toStrictEqual(['component', 'source', 'frame']);
+    expect(Object.isFrozen(REQUEST_INITIATOR_BASES)).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * Order, determinism and purity
  * ---------------------------------------------------------------------------
  */
@@ -2957,6 +3434,172 @@ describe('aggregateRequests in-flight snapshots', () => {
     for (const kind of REQUEST_KINDS) {
       expect(attributeKeysFor(kind)).toContain(REQUEST_IN_FLIGHT_ATTRIBUTE);
     }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Status codes, failures and the occurrences that reported no code
+ *
+ * `statusCodes` lists the codes the settled occurrences reported, so an
+ * occurrence that settled without one — an abort, a network error, an opaque
+ * response — is absent from it while `errorCount` may count it. The group
+ * therefore states how many such occurrences it holds, so that every
+ * occurrence is accounted for: pending, settled with a code, or settled
+ * without one.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * How many of a group's occurrences its three accounts cover: its pending
+ * ones, its settled ones without a code, and the listed occurrences whose codes
+ * `statusCodes` holds. Read off an untruncated list, it must equal the count.
+ *
+ * @param group A group whose occurrence list was not truncated.
+ * @returns The occurrences accounted for.
+ */
+function accountedFor(group: RequestGroup): number {
+  const withCode = group.occurrences.filter(
+    (occurrence) => occurrence.pending !== true && occurrence.statusCode !== undefined,
+  ).length;
+  return (group.pendingCount ?? 0) + (group.noStatusCodeCount ?? 0) + withCode;
+}
+
+describe('aggregateRequests status reconciliation', () => {
+  it('counts the aborted occurrences a list of successful codes leaves out', () => {
+    // The reported case: two answered requests and two aborted by the page.
+    // The codes are [200] and two occurrences failed; the count of settled
+    // occurrences without a code is what makes both statements agree.
+    const requestKey = opaqueRequestKey('ns1');
+    const events = [
+      makeRequestEvent({ requestKey, statusCode: 200, status: OK_STATUS }),
+      makeRequestEvent({
+        requestKey,
+        statusCode: 200,
+        status: OK_STATUS,
+        startTime: BASE_TIME + 4000,
+      }),
+      ...[8000, 12_000].map((offset) =>
+        makeRequestEvent({
+          requestKey,
+          status: ERROR_STATUS,
+          startTime: BASE_TIME + offset,
+          omitAttributes: [STATUS_CODE_ATTRIBUTE],
+          extraAttributes: { aborted: true },
+        }),
+      ),
+    ];
+
+    const group = onlyGroup(aggregateRequests(events));
+
+    expect(group.count).toBe(4);
+    expect(group.statusCodes).toStrictEqual([200]);
+    expect(group.errorCount).toBe(2);
+    expect(group.noStatusCodeCount).toBe(2);
+    expect(Object.hasOwn(group, 'pendingCount')).toBe(false);
+    expect(accountedFor(group)).toBe(group.count);
+    // The occurrences themselves carry no code, and their span status is kept.
+    const codeless = group.occurrences.filter((occurrence) => occurrence.statusCode === undefined);
+    expect(codeless.map((occurrence) => occurrence.status)).toStrictEqual([
+      ERROR_STATUS,
+      ERROR_STATUS,
+    ]);
+  });
+
+  it('counts a settled occurrence without a code whether or not it failed', () => {
+    // An opaque response settles `ok` with no code to report; it is counted,
+    // and it is no failure, so `errorCount` and the new count move apart.
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({
+          requestKey: opaqueRequestKey('ns2'),
+          status: OK_STATUS,
+          omitAttributes: [STATUS_CODE_ATTRIBUTE],
+        }),
+        makeRequestEvent({
+          requestKey: opaqueRequestKey('ns2'),
+          status: UNSET_STATUS,
+          startTime: BASE_TIME + 4000,
+          omitAttributes: [STATUS_CODE_ATTRIBUTE],
+        }),
+      ]),
+    );
+
+    expect(group.statusCodes).toStrictEqual([]);
+    expect(group.errorCount).toBe(0);
+    expect(group.noStatusCodeCount).toBe(2);
+    expect(accountedFor(group)).toBe(group.count);
+  });
+
+  it('never counts a pending occurrence as one that settled without a code', () => {
+    const requestKey = opaqueRequestKey('ns3');
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey }),
+        makeInFlightEvent({ requestKey, startTime: BASE_TIME + 4000 }),
+      ]),
+    );
+
+    expect(group.pendingCount).toBe(1);
+    expect(Object.hasOwn(group, 'noStatusCodeCount')).toBe(false);
+    expect(accountedFor(group)).toBe(group.count);
+  });
+
+  it('counts over every occurrence, before truncation', () => {
+    const requestKey = opaqueRequestKey('ns4');
+    const events = [
+      ...makeKeyedSeries(requestKey, [0, 3000]),
+      ...[6000, 9000, 12_000].map((offset) =>
+        makeRequestEvent({
+          requestKey,
+          status: ERROR_STATUS,
+          startTime: BASE_TIME + offset,
+          omitAttributes: [STATUS_CODE_ATTRIBUTE],
+        }),
+      ),
+    ];
+
+    const bounded = onlyGroup(aggregateRequests(events, { maxOccurrencesPerGroup: 2 }));
+    const none = onlyGroup(aggregateRequests(events, { maxOccurrencesPerGroup: 0 }));
+
+    expect(bounded.occurrencesTruncated).toBe(true);
+    expect(bounded.noStatusCodeCount).toBe(3);
+    expect(bounded.errorCount).toBe(3);
+    expect(none.noStatusCodeCount).toBe(3);
+    expect(none.occurrences).toStrictEqual([]);
+  });
+
+  it('adds no field to a capture in which every settled request reported a code', () => {
+    const groups = aggregateRequests([
+      ...makeKeyedSeries(opaqueRequestKey('ns5'), [0, 7, 14]),
+      makeRequestEvent({ requestKey: opaqueRequestKey('ns6'), statusCode: 503 }),
+    ]);
+
+    expect(groups).toHaveLength(2);
+    for (const group of groups) {
+      expect(Object.hasOwn(group, 'noStatusCodeCount')).toBe(false);
+      expect(accountedFor(group)).toBe(group.count);
+    }
+  });
+
+  it('treats a code that is not a finite integer as no code at all', () => {
+    // The occurrence publishes no `statusCode` for a malformed value, so the
+    // group counts it with the occurrences that reported none.
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({
+          requestKey: opaqueRequestKey('ns7'),
+          status: ERROR_STATUS,
+          omitAttributes: [STATUS_CODE_ATTRIBUTE],
+          extraAttributes: { [STATUS_CODE_ATTRIBUTE]: '500' },
+        }),
+      ]),
+    );
+
+    expect(occurrenceAt(group, 0).statusCode).toBeUndefined();
+    expect(group.statusCodes).toStrictEqual([]);
+    expect(group.noStatusCodeCount).toBe(1);
+    expect(group.errorCount).toBe(1);
   });
 });
 

@@ -267,12 +267,18 @@ const TEMP_SUFFIX_BYTES = 6;
 const MAX_ECHOED_NAME_LENGTH = 64;
 
 /**
- * Why this module refused a path, recorded as `details.reason` on the error so
+ * Why this module refuses a path, recorded as `details.reason` on the error so
  * a caller can branch or report without parsing a message.
  *
- * Module-internal: the public surface is the exports above and below, and every
- * refusal they raise carries the single error code `FS_UNSAFE_PATH`. The
- * reason is the finer diagnosis underneath it.
+ * Every refusal the module raises carries the single error code
+ * `FS_UNSAFE_PATH`; the reason is the finer diagnosis underneath it. The list
+ * is exported so that a caller which reports a refusal to a developer — the
+ * local service's start-up, which prints the state-tree refusal on stderr —
+ * recognises a reason with {@link unsafePathReasonOf} and words its report per
+ * reason, rather than matching message text or restating these strings as
+ * literals of its own. The error's own message and hint already name the
+ * offending path and the exact fix, so such a caller forwards them instead of
+ * replacing them with a generic sentence.
  *
  * - `symlink-component` — a component of the chain, or the state file itself,
  *   is a symbolic link. It is refused instead of resolved, because what it
@@ -286,19 +292,94 @@ const MAX_ECHOED_NAME_LENGTH = 64;
  * - `foreign-owner` — a component or a state file is owned by another account,
  *   which can therefore replace or read it whatever its mode says.
  * - `group-or-other-permissions` — a component grants group or other access, so
- *   another account can read the credential or backup written beneath it.
+ *   another account can read the credential or backup written beneath it. The
+ *   refusal carries `details.mode` (the directory's permission bits) and
+ *   `details.expectedMode` (`'700'`), both as the three-digit octal strings
+ *   `chmod` takes.
  * - `multiply-linked` — a state file has more than one hard link, so the same
  *   inode is also reachable through a path outside the private tree. The
  *   product never hard-links its own state files, so a second link was made by
  *   something else.
+ *
+ * Frozen, so no consumer can widen the vocabulary every other consumer relies
+ * on; the order is the order above and carries no meaning beyond it.
  */
-type UnsafePathReason =
-  | 'symlink-component'
-  | 'not-a-directory'
-  | 'not-a-regular-file'
-  | 'foreign-owner'
-  | 'group-or-other-permissions'
-  | 'multiply-linked';
+export const UNSAFE_PATH_REASONS = Object.freeze([
+  'symlink-component',
+  'not-a-directory',
+  'not-a-regular-file',
+  'foreign-owner',
+  'group-or-other-permissions',
+  'multiply-linked',
+] as const);
+
+/** One of {@link UNSAFE_PATH_REASONS}: the `details.reason` of an `FS_UNSAFE_PATH` refusal. */
+export type UnsafePathReason = (typeof UNSAFE_PATH_REASONS)[number];
+
+/** Whether `value` is one of {@link UNSAFE_PATH_REASONS}. */
+function isUnsafePathReason(value: unknown): value is UnsafePathReason {
+  // Widened to `readonly string[]` by assignment, which is what lets `includes`
+  // accept a plain string without a cast.
+  const known: readonly string[] = UNSAFE_PATH_REASONS;
+  return typeof value === 'string' && known.includes(value);
+}
+
+/**
+ * The {@link UnsafePathReason} of a refusal this module raised, read without
+ * trusting the value it is read from.
+ *
+ * The value is typically whatever a `catch` bound, so it may be anything: a
+ * runtime errno, a `DebuggenError` with another code, a revived or
+ * foreign-bundle copy, or an object whose property traps throw. Every one of
+ * those answers `undefined` rather than an exception, because the caller is
+ * already on a failure path choosing how to word its report, and a diagnostic
+ * helper that could throw there would replace the original refusal with a
+ * failure of its own.
+ *
+ * Only an `FS_UNSAFE_PATH` error (by `DebuggenError.is`, so a copy built by
+ * another bundle counts) whose **own** `details.reason` is one of
+ * {@link UNSAFE_PATH_REASONS} yields a reason. An inherited `reason` is
+ * ignored, so a polluted prototype cannot manufacture a diagnosis, and a
+ * reason outside the vocabulary — the `INTERNAL` boundary errors'
+ * `boundary-not-an-ancestor`, or a consumer's own wrapper reason such as
+ * `cache-write-failed` — is `undefined` rather than guessed at. The cause chain
+ * is not walked: a caller that wrapped the refusal still holds the refusal.
+ *
+ * @param value Any value, typically one caught.
+ * @returns The reason, or `undefined` when `value` is not such a refusal.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   ensureSecureDir(stateRoot);
+ * } catch (caught) {
+ *   if (unsafePathReasonOf(caught) === 'group-or-other-permissions') {
+ *     // The refusal's message and hint name the directory, its mode (0755)
+ *     // and the fix (chmod 700 <dir>): report them as they are.
+ *   }
+ *   throw caught;
+ * }
+ * ```
+ */
+export function unsafePathReasonOf(value: unknown): UnsafePathReason | undefined {
+  try {
+    if (!DebuggenError.is(value) || value.code !== 'FS_UNSAFE_PATH') {
+      return undefined;
+    }
+
+    const { details } = value;
+    if (details === undefined || !Object.hasOwn(details, 'reason')) {
+      return undefined;
+    }
+
+    const reason: unknown = details.reason;
+    return isUnsafePathReason(reason) ? reason : undefined;
+  } catch {
+    // A value whose traps or accessors throw is not a refusal this module
+    // raised; the caller keeps the value it caught and reports it unchanged.
+    return undefined;
+  }
+}
 
 /**
  * The `O_NOFOLLOW` flag, or `0` where the platform has no such flag.
@@ -339,9 +420,29 @@ function currentUid(): number | undefined {
   return typeof process.getuid === 'function' ? process.getuid() : undefined;
 }
 
-/** A mode rendered the way a developer will type it into `chmod`. */
+/**
+ * A mode rendered the way a developer will type it into `chmod`: three octal
+ * digits of permission bits, `755`.
+ *
+ * This is the form `details.mode` and `details.expectedMode` carry, and the
+ * form a refusal's hint puts in its `chmod` command. Consumers compare those
+ * details with this exact shape, so it is not changed to suit prose — see
+ * {@link displayMode} for that.
+ */
 function octal(mode: number): string {
   return (mode & PERMISSION_BITS).toString(8).padStart(3, '0');
+}
+
+/**
+ * A mode rendered the way a developer reads one in a sentence and in `stat`
+ * output: {@link octal} with the leading zero that marks it as octal, `0755`.
+ *
+ * Used only in a refusal's human-readable message. Without the zero, "mode 755"
+ * reads as a decimal number, and a mode next to its requirement ("0755 … it
+ * must be 0700") has to look like the value the developer will compare it with.
+ */
+function displayMode(mode: number): string {
+  return `0${octal(mode)}`;
 }
 
 /**
@@ -366,6 +467,18 @@ function unsafePath(
 }
 
 /**
+ * The hint of a refusal naming one directory-chain component that is a
+ * symbolic link: the developer's next action is to replace exactly that link,
+ * or to stop reaching the tree through it, so the hint names the path as well
+ * as the message does.
+ *
+ * @param linkAbs The component that is a link.
+ */
+function replaceLinkHint(linkAbs: string): string {
+  return `Replace the link '${linkAbs}' with a real directory, or point the tool at a location that is not reached through a link.`;
+}
+
+/**
  * Refuses a path because a component of it is a symbolic link.
  *
  * Every refusal of this kind carries the same code, the same reason and the
@@ -375,8 +488,8 @@ function unsafePath(
  * returning `never` so a caller reads as a terminator and the compiler narrows
  * the code after it.
  *
- * @param componentAbs The offending component, named in both the message and
- * `details.path` because the developer has to act on that exact path.
+ * @param componentAbs The offending component, named in the message, the hint
+ * and `details.path` because the developer has to act on that exact path.
  * @param consequence What was therefore not done, as a clause completing
  * "…is a symbolic link, so …".
  */
@@ -385,7 +498,7 @@ function refuseSymlinkComponent(componentAbs: string, consequence: string): neve
     `'${componentAbs}' is a symbolic link, so ${consequence}.`,
     'symlink-component',
     componentAbs,
-    'Replace the link with a real directory, or point the tool at a location that is not reached through a link.',
+    replaceLinkHint(componentAbs),
   );
 }
 
@@ -403,14 +516,15 @@ function refuseSymlinkComponent(componentAbs: string, consequence: string): neve
  * @param ownerUid The uid `lstat` reported for it.
  * @param expectedUid This process's own uid.
  * @param hint The developer's next action. Defaults to the directory wording
- * every chain refusal uses; {@link inspectPrivateFileNoFollow} passes the
+ * every chain refusal uses, which names the refused path and the account that
+ * has to own its replacement; {@link inspectPrivateFileNoFollow} passes the
  * file wording, so the same refusal names the right kind of entry to replace.
  */
 function assertOwnedByThisAccount(
   componentAbs: string,
   ownerUid: number,
   expectedUid: number,
-  hint = 'Use a directory owned by the account running this tool.',
+  hint = `Point the tool at a directory owned by the account running it (uid ${String(expectedUid)}) instead of '${componentAbs}'; a directory another account owns cannot be made private by this one.`,
 ): void {
   if (ownerUid !== expectedUid) {
     throw unsafePath(
@@ -537,7 +651,7 @@ function assertComponentSecure(componentAbs: string, requireOwner: boolean): voi
       `'${componentAbs}' is a symbolic link, and this path must be a real directory.`,
       'symlink-component',
       componentAbs,
-      'Replace the link with a real directory, or point the tool at a location that is not reached through a link.',
+      replaceLinkHint(componentAbs),
     );
   }
 
@@ -546,11 +660,23 @@ function assertComponentSecure(componentAbs: string, requireOwner: boolean): voi
       `'${componentAbs}' exists but is not a directory.`,
       'not-a-directory',
       componentAbs,
-      'Move or remove that entry so a directory can take its place.',
+      replaceNonDirectoryHint(componentAbs),
     );
   }
 
   assertOwnershipAndMode(componentAbs, stats, requireOwner);
+}
+
+/**
+ * The hint of a refusal naming a state-tree component that exists but is not a
+ * directory — a file, a FIFO, a socket where the chain needs a directory. It
+ * cannot be made into one in place, so the action is to move that exact entry
+ * aside or use another location, and the hint names the path to act on.
+ *
+ * @param entryAbs The entry that is not a directory.
+ */
+function replaceNonDirectoryHint(entryAbs: string): string {
+  return `Move or remove '${entryAbs}' so a directory can take its place, or point the tool at another location.`;
 }
 
 /**
@@ -565,13 +691,23 @@ function assertComponentSecure(componentAbs: string, requireOwner: boolean): voi
  * different state directory — and never a change this module makes for them:
  * a directory that was readable by another account may already have been read,
  * so only the developer can decide whether its contents are still trustworthy.
- * The hint carries the path and the modes only, never anything the directory
- * holds.
+ * The message states the mode found and the mode required, with the leading
+ * zero a developer reads a mode with (`0755`, `0700`); the hint gives the
+ * command in the form it is typed (`chmod 700 <dir>`); `details.mode` and
+ * `details.expectedMode` keep the three-digit form (`'755'`, `'700'`) consumers
+ * compare against. None of them carries anything the directory holds.
  *
  * Off POSIX, where there is no user id, both tests are skipped.
  *
  * @throws {DebuggenError} With code `FS_UNSAFE_PATH` when the directory is owned
  * by another account (when `requireOwner`) or grants group or other access.
+ *
+ * @example
+ * ```text
+ * message: '/home/dev/.debuggen' has mode 0755, which grants access to group or other accounts; it must be 0700.
+ * hint:    Check what it contains, then run 'chmod 700 /home/dev/.debuggen' (or point the tool at a directory only this account can reach).
+ * details: { path: '/home/dev/.debuggen', reason: 'group-or-other-permissions', mode: '755', expectedMode: '700' }
+ * ```
  */
 function assertOwnershipAndMode(componentAbs: string, stats: Stats, requireOwner: boolean): void {
   const uid = currentUid();
@@ -588,10 +724,10 @@ function assertOwnershipAndMode(componentAbs: string, stats: Stats, requireOwner
 
   if ((stats.mode & GROUP_AND_OTHER_BITS) !== 0) {
     throw unsafePath(
-      `'${componentAbs}' has mode ${octal(stats.mode)}, which grants access to group or other accounts.`,
+      `'${componentAbs}' has mode ${displayMode(stats.mode)}, which grants access to group or other accounts; it must be ${displayMode(SECURE_DIR_MODE)}.`,
       'group-or-other-permissions',
       componentAbs,
-      `Check what it contains, then tighten it with 'chmod ${octal(SECURE_DIR_MODE)} ${componentAbs}', or point the tool at a directory only this account can reach.`,
+      `Check what it contains, then run 'chmod ${octal(SECURE_DIR_MODE)} ${componentAbs}' (or point the tool at a directory only this account can reach).`,
       { mode: octal(stats.mode), expectedMode: octal(SECURE_DIR_MODE) },
     );
   }
@@ -1837,7 +1973,7 @@ export function inspectPrivateFileNoFollow(path: string): PrivateFileState | und
       `'${targetAbs}' is a symbolic link, and this path must be a regular file.`,
       'symlink-component',
       targetAbs,
-      'Remove the link so the file can be created in its place, or replace it with a regular file owned by this account.',
+      `Remove the link '${targetAbs}' so the file can be created in its place, or replace it with a regular file owned by this account.`,
     );
   }
 
@@ -1846,7 +1982,7 @@ export function inspectPrivateFileNoFollow(path: string): PrivateFileState | und
       `'${targetAbs}' exists but is not a regular file.`,
       'not-a-regular-file',
       targetAbs,
-      'Move or remove that entry so a regular file can take its place.',
+      `Move or remove '${targetAbs}' so a regular file can take its place.`,
     );
   }
 
@@ -1857,7 +1993,7 @@ export function inspectPrivateFileNoFollow(path: string): PrivateFileState | und
       targetAbs,
       Number(stats.uid),
       uid,
-      'Remove the file, or replace it with a copy owned by the account running this tool.',
+      `Remove '${targetAbs}', or replace it with a copy owned by the account running this tool.`,
     );
   }
 
@@ -1867,7 +2003,7 @@ export function inspectPrivateFileNoFollow(path: string): PrivateFileState | und
       `'${targetAbs}' has ${String(links)} hard links, so the same file is also reachable through a path outside this directory.`,
       'multiply-linked',
       targetAbs,
-      'Remove the other links, or replace the file with a copy of it that has a single link.',
+      `Remove the other hard links to '${targetAbs}', or replace it with a copy of itself (copy it, then move the copy over it) so it has a single link.`,
       { links },
     );
   }
@@ -2274,7 +2410,7 @@ function assertDescriptorSecure(fd: number, componentAbs: string): void {
       `'${componentAbs}' exists but is not a directory.`,
       'not-a-directory',
       componentAbs,
-      'Move or remove that entry so a directory can take its place.',
+      replaceNonDirectoryHint(componentAbs),
     );
   }
 
@@ -2303,7 +2439,7 @@ function openComponent(componentPath: string, directoryAbs: string): number {
         `A component of '${directoryAbs}' is a symbolic link or is not a directory, so the path cannot be pinned.`,
         'symlink-component',
         directoryAbs,
-        'Replace the link with a real directory, or point the tool at a location that is not reached through a link.',
+        `Replace the symbolic link on the path to '${directoryAbs}' with a real directory, or point the tool at a location that is not reached through a link.`,
       );
     }
 

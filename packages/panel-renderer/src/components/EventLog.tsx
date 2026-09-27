@@ -58,6 +58,14 @@
  *     the length of a page or from `total`, which would drift the moment the
  *     resolver clamped a limit; and it is followed only when it moves forward,
  *     so a response that points back at the page just drawn cannot loop.
+ *     Appending never replaces what is on screen: while the next page is on
+ *     its way the grid stays mounted with the rows already drawn — its scroll
+ *     position and its active row untouched — and the control that was
+ *     pressed stays in place, focused, reading "Loading more…"; a page that
+ *     fails is reported beneath those rows with a retry for that page alone.
+ *     When the last page arrives and the control goes, a reader who was on it
+ *     is moved to the first row in view — the grid's tab stop from then on —
+ *     rather than to the document body.
  *     The page sequence starts at the node's own authored `offset`, and when
  *     that is past the first record the footer counts from there — "of N" is
  *     how many records the source holds from that position on, and the
@@ -81,24 +89,51 @@
  * once.
  *
  * The kind filter is the opposite case: `kinds` IS a field of the query's
- * filter, so choosing a kind narrows the request and re-queries. The picker's
- * options are discovered from the records that have actually arrived (plus any
- * kinds the panel's author already named, plus those seen before a narrowing),
- * because the kind vocabulary is a runtime value of `@debuggen/telemetry`,
- * which this package depends on for types only.
+ * filter, so choosing a kind narrows the request and re-queries. Its options
+ * describe the SOURCE, not the page. While the loaded records reach the end of
+ * the source they are the proof of every kind it holds, and the options are
+ * discovered from them (plus any kinds the panel's author already named, plus
+ * those seen before a narrowing). While they do not — a capture that opens
+ * with a burst of renders keeps its requests and statements thousands of
+ * records further on — the component takes a kind census: one count-only
+ * request (`limit: 0`) per kind through the same provider, and offers exactly
+ * the kinds the source holds, each with its count ("Database query (84)").
+ * The kind vocabulary it counts is the one the query filter itself admits,
+ * read from `@debuggen/panel-schema`'s filter schema, because the runtime
+ * vocabulary of `@debuggen/telemetry` is off limits to this package, which
+ * depends on it for types only.
  *
- * ## REDACTION AND TRUNCATION ARE UPSTREAM GUARANTEES, HONOURED HERE
+ * ## REDACTION IS AN UPSTREAM GUARANTEE, HONOURED HERE
  *
- * Attribute values arrive already redacted and already bounded to 120
- * characters with key-name-plus-summary semantics (`docs/SECURITY.md`,
- * "Never captured"). This component displays them as given: it never expands,
- * re-parses, pretty-prints, joins or reconstructs a value, offers no "show raw"
- * affordance, and passes every string through this package's own truncation
- * helper so that the rendered text can only ever be shorter than what the
- * producer was permitted to capture. The compact attribute column shows at most
- * {@link MAX_ATTRIBUTE_PAIRS} primitive pairs and counts everything else — a
- * structured summary, an overflowing pair — as "more", so a reader knows the
- * record carries more without this view unpacking it.
+ * Attribute values arrive already redacted (`docs/SECURITY.md`, "Never
+ * captured"): a URL with its query values replaced, a statement parameterized
+ * with its literals replaced, a prop or state value as a type plus a preview
+ * the capture bounded to 120 characters. This component displays them as
+ * given: it never decodes, re-parses, pretty-prints, joins or reconstructs a
+ * value, and it never unpacks a structured summary. The compact attribute
+ * column shows at most {@link MAX_ATTRIBUTE_PAIRS} primitive pairs, each as a
+ * one-line preview cut to that same 120-character budget, and counts
+ * everything else — a structured summary, an overflowing pair — as "more", so
+ * a reader knows the record carries more.
+ *
+ * ## THE WHOLE OF A LONG VALUE IS ONE HOVER OR ONE KEY AWAY
+ *
+ * A redacted URL or a parameterized statement is not a preview and routinely
+ * runs past 120 characters, so the strip cuts it. It is never unreachable
+ * (WCAG 2.1.1): each chip carries its whole pair as its `title`, and a row
+ * whose strip abbreviates a value or leaves a primitive pair out is
+ * expandable. Its disclosure — the design system's expand toggle at the start
+ * of the record's name, `tabIndex={-1}` like every control in a row — opens
+ * the row's detail, which lists every primitive attribute whole and exactly as
+ * it arrived, in the producer's key order, each in a focusable wrapping code
+ * block the table's keyboard model walks and scrolls. Structured summaries
+ * stay summaries there too, and are counted. The rows that show everything
+ * whole already offer no disclosure, so a detail never merely repeats its row.
+ *
+ * Wherever the host can open a record in full, the count is also a control:
+ * "+N more" selects the record, which opens it in the host surface's
+ * record-detail drawer, where every attribute is listed and every redacted
+ * value is marked as such. The strip itself still unpacks nothing.
  *
  * ## VIRTUALIZATION, GRID SEMANTICS AND KEYBOARD OPERATION BELONG TO DataTable
  *
@@ -115,21 +150,28 @@
  *
  * The grid is ONE Tab stop — its active row — however many records are loaded.
  * The table's keyboard model reaches the controls inside a row: ArrowRight (or
- * F2) moves onto a row's source chip, ArrowLeft or Escape returns to the row,
- * and the vertical keys move between rows from either. The single `tabIndex`
- * this file writes is the one obligation that model places on a caller: the
- * only focusable control a cell renders, the source chip, is `tabIndex={-1}`,
- * so it stays reachable by those keys and by the pointer and never adds a Tab
- * stop per row.
+ * F2, or Tab) moves onto a row's first control — its disclosure, where it has
+ * one, then its source chip, then the attribute strip's "+N more" control,
+ * then the value blocks of its open detail — ArrowLeft or Escape returns to
+ * the row, and the vertical keys move between rows from any of them. The
+ * `tabIndex={-1}` this file writes is the one obligation that model places on
+ * a caller: every focusable control a cell or the detail renders stays
+ * reachable by those keys and by the pointer and never adds a Tab stop per
+ * row. Expansion is the disclosure's alone, so the table is given no
+ * `onRowToggle`: a row with nothing to reveal must not answer an expand key,
+ * and ArrowRight keeps moving into every row alike.
  *
  * ## THREE STATES, IN ONE FIXED ORDER
  *
  * Loading, then error, then empty, then the table — the precedence every
  * query-backed view follows, each state here in its own `__loading`, `__error`
- * and `__empty` box. An empty page and a failed request are kept apart, because
- * a failure is never presented as a result: `useQuery`'s `"success"` with no
- * rows reads as an empty state, while a rejection carries the failure, its code
- * and the serialised query into an error state with a working retry, worded by
+ * and `__empty` box. The loading and error bodies answer for the FIRST page:
+ * a later page in flight or failed keeps the table and reports itself below
+ * it (see "What it shows is one page"). An empty page and a failed request are
+ * kept apart, because a failure is never presented as a result: `useQuery`'s
+ * `"success"` with no rows reads as an empty state, while a rejection carries
+ * the failure, its code and the serialised query into an error state with a
+ * working retry, worded by
  * the host's one error-state contract (`queryFailureProps` in
  * `../host/useQuery`) so it reads like every other failed node in the panel. An
  * empty page is not always an empty capture, and the empty state says which one
@@ -163,7 +205,8 @@
  *                             content
  *   `dg-event-log__toolbar`   the filter row, which never takes free space
  *   `dg-event-log__loading`   the busy box
- *   `dg-event-log__error`     the failure box
+ *   `dg-event-log__error`     the failure box, and the failure of a later page
+ *                             beneath the rows it could not extend
  *   `dg-event-log__empty`     the absence box
  *   `dg-event-log__seq`       the sequence cell, muted and tabular
  *   `dg-event-log__time`      the offset cell, secondary and tabular
@@ -173,8 +216,15 @@
  *                             toward nothing and grows toward its own text,
  *                             so short pairs show whole and only the longest
  *                             share what is left, ellipsized
- *   `dg-event-log__more`      the strip's "+N more" count, which never
- *                             shrinks and so stays visible after the chips
+ *   `dg-event-log__more`      the strip's "+N more" count — a ghost button
+ *                             under a host, plain text otherwise — which
+ *                             never shrinks and so stays visible after the
+ *                             chips
+ *   `dg-event-log__detail`    an expanded row's detail: the whole value of
+ *                             every primitive attribute, one per entry
+ *   `dg-data-table__expand-button`  the table's own class for the expand
+ *                             toggle it asks a caller to place in the
+ *                             identity column
  *   `dg-data-table__footer`   the paging counts below the grid — the
  *                             stylesheet's own class for exactly this, since
  *                             the table renders no footer itself
@@ -188,6 +238,9 @@
  * The strip is laid out by those two rules alone, never by measuring: no chip
  * count is computed from a width, so the component renders — and is driven by
  * its suite — without a layout engine, and a resize never re-renders a row.
+ * Nor does a scroll step: each cell's element is built once per row model and
+ * handed back unchanged while the virtualizer moves its window (see "The
+ * columns"), so only the rows that scroll into view are rendered.
  *
  * @see ../host/useQuery for the loading/error/success state machine.
  * @see ../host/DataProvider for what resolves a query, and its paging counters.
@@ -206,13 +259,21 @@ import {
   DATA_QUERY_DEFAULT_OFFSET,
   DATA_QUERY_MAX_LIMIT,
   catalogEntryFor,
+  dataQueryFilterSchema,
 } from '@debuggen/panel-schema';
 import type { TelemetryEvent, TelemetryKind } from '@debuggen/telemetry';
 import clsx from 'clsx';
-import { ChevronDown, ListX, ScrollText, X } from 'lucide-react';
-import { useCallback, useMemo, useState, useRef } from 'react';
+import { ChevronDown, ChevronRight, ListX, ScrollText, X } from 'lucide-react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
+import {
+  checkDataQueryResponse,
+  isAddressableSessionId,
+  useDataProvider,
+  usePanelSessionId,
+} from '../host/DataProvider';
+import type { DataProvider } from '../host/DataProvider';
 import type { PanelEventRef, PanelSelection } from '../host/PanelActions';
 import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
 import { queryFailureProps, useQuery } from '../host/useQuery';
@@ -223,21 +284,30 @@ import { Badge } from '../primitives/Badge';
 import { Button } from '../primitives/Button';
 import { Code } from '../primitives/Code';
 import { DataTable } from '../primitives/DataTable';
-import type { DataTableColumn } from '../primitives/DataTable';
+import type { DataTableCellMeta, DataTableColumn } from '../primitives/DataTable';
 import { EmptyState } from '../primitives/EmptyState';
-import { ErrorState } from '../primitives/ErrorState';
+import {
+  ERROR_STATE_RETRY_FOCUS_KEY,
+  ErrorState,
+  FOCUS_KEY_ATTRIBUTE,
+} from '../primitives/ErrorState';
 import { LoadingState } from '../primitives/LoadingState';
 import type { SelectOption } from '../primitives/Select';
 import { Text } from '../primitives/Text';
 import { kindColorVar } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
+  collapseWhitespace,
+  countedNoun,
   formatCount,
+  formatCountOf,
   formatKindLabel,
   formatOffset,
   formatStatusLabel,
   oneLinePreview,
+  pluralize,
 } from '../utils/format';
+import type { CountedNoun } from '../utils/format';
 import { SourceLink } from './SourceLink';
 
 /*
@@ -329,9 +399,15 @@ const COLUMN_HEADER_ATTRIBUTES = 'Attributes';
 /** What is announced while the first page resolves. */
 const LOADING_LABEL = 'Loading captured records…';
 
-/** What a capture that holds no record for this query says. */
+/**
+ * What a capture that holds no record for this view says.
+ *
+ * Worded like every other query-backed view's empty state ("No … were
+ * captured for this interaction."), so the panel speaks of the capture in one
+ * voice rather than of the query behind one node.
+ */
 const EMPTY_MESSAGE =
-  'No records were captured for this query. Start a capture, reproduce the behaviour, then look again.';
+  'No records were captured for this interaction. Start a capture, reproduce the behaviour, then look again.';
 
 /** The heading above {@link EMPTY_MESSAGE}. */
 const EMPTY_TITLE = 'No records';
@@ -383,11 +459,85 @@ const LIVE_STATUS_SEPARATOR = '. ';
  */
 const SEARCH_FIELD_SELECTOR = '.dg-event-log__toolbar input';
 
+/**
+ * The noun the footer and the toolbar count records with, agreeing with its
+ * count: "1 record", "2 records".
+ */
+const RECORD_NOUN = countedNoun('record');
+
+/**
+ * The verb of the toolbar's match count, agreeing with the number of records
+ * that matched: "1 of 3 loaded records matches", "2 of 3 loaded records match".
+ * Spelled through the same counted-word rule as the nouns, so the verb and the
+ * figure beside it can never disagree.
+ */
+const MATCH_VERB = countedNoun('matches', 'match');
+
 /** The paging control's label. */
 const LOAD_MORE_LABEL = 'Load more';
 
+/**
+ * The paging control's label while the page it asked for is on its way.
+ *
+ * The control stays mounted, focused and in place for the whole request —
+ * marked `aria-disabled` and `aria-busy`, so pressing it again does nothing
+ * and says so — which is what keeps a keyboard reader on it and the rows
+ * already drawn where they were.
+ */
+const LOADING_MORE_LABEL = 'Loading more…';
+
 /** The trailing word of the hidden-attribute count. */
 const MORE_ATTRIBUTES_SUFFIX = 'more';
+
+/**
+ * The noun of the hidden-attribute control's accessible name, agreeing with
+ * its count.
+ */
+const ATTRIBUTE_NOUN = countedNoun('attribute');
+
+/**
+ * Where a keyboard reader lands when the last page arrives and the paging
+ * control they pressed is gone, when no row can be seen to be in view: the
+ * grid's roving tab stop, the one row `../primitives/DataTable` keeps
+ * focusable whatever window is drawn (see {@link landingRow}).
+ */
+const GRID_TAB_STOP_SELECTOR = '[role="grid"] [role="row"][tabindex="0"]';
+
+/** The grid's data rows: every row the table writes a result index on. */
+const GRID_DATA_ROW_SELECTOR = '[role="grid"] [role="row"][data-row-index]';
+
+/** The grid's header row, which stays pinned at the top of the viewport. */
+const GRID_HEADER_ROW_SELECTOR = '[role="grid"] [role="row"]:not([data-row-index])';
+
+/**
+ * The scroll viewport `../primitives/DataTable` draws the grid in — the shared
+ * `dg-virtual-*` class contract this block's own stylesheet rule already
+ * addresses (`.dg-event-log .dg-virtual-viewport`).
+ */
+const GRID_VIEWPORT_SELECTOR = '.dg-virtual-viewport';
+
+/**
+ * Where a keyboard reader lands when the page they asked for failed: the
+ * failure's own retry, found by the focus key `../primitives/ErrorState`
+ * publishes for it, inside this view's page-failure box.
+ */
+const PAGE_RETRY_SELECTOR = `.dg-event-log__error [${FOCUS_KEY_ATTRIBUTE}="${ERROR_STATE_RETRY_FOCUS_KEY}"]`;
+
+/**
+ * How an attribute disclosure's name begins, by the state it would toggle to;
+ * the record's name follows it, so every disclosure says which record it opens.
+ */
+const EXPAND_ATTRIBUTES_PREFIX = 'Show the full attributes of';
+const COLLAPSE_ATTRIBUTES_PREFIX = 'Hide the full attributes of';
+
+/** The noun an expanded detail counts the structured summaries it does not unpack in. */
+const STRUCTURED_VALUE_NOUN: CountedNoun = countedNoun('structured value');
+
+/** What follows that count in the detail. */
+const STRUCTURED_VALUES_NOTE_SUFFIX = 'not unpacked here';
+
+/** The expansion a component starts with: no row open. */
+const EMPTY_ROW_KEYS: readonly string[] = Object.freeze([]);
 
 /**
  * The note that keeps the text filter honest.
@@ -407,6 +557,21 @@ const EMPTY_KINDS: readonly TelemetryKind[] = Object.freeze([]);
 /** The empty picker list a toolbar with nothing to pick from receives. */
 const EMPTY_SELECTS: readonly ToolbarSelect[] = Object.freeze([]);
 
+/**
+ * Every kind a `DataQueryFilter.kinds` entry may name, in the vocabulary's own
+ * order: the domain of the kind census (see {@link useKindCensus}).
+ *
+ * Read off the query schema of `@debuggen/panel-schema` — the runtime
+ * dependency whose contract every query this view sends must satisfy — rather
+ * than from `@debuggen/telemetry`, which this package reads for types only.
+ * The schema derives its enum from the telemetry vocabulary itself, so this is
+ * the same closed list without a second import path or a restated copy: a kind
+ * the filter cannot name is a kind no census query could ask about.
+ */
+const FILTER_KIND_VOCABULARY: readonly TelemetryKind[] = Object.freeze([
+  ...dataQueryFilterSchema.shape.kinds.unwrap().element.options,
+]);
+
 /*
  * ---------------------------------------------------------------------------
  * The row model
@@ -418,13 +583,24 @@ const EMPTY_SELECTS: readonly ToolbarSelect[] = Object.freeze([]);
  * ---------------------------------------------------------------------------
  */
 
-/** One attribute of a record, as a key and an already-bounded value preview. */
+/** One primitive attribute of a record: its key, its preview and its whole value. */
 interface EventLogAttributePair {
   /** The attribute's key, exactly as the producer named it. */
   readonly key: string;
 
   /** The value's preview: primitive, one line, and within the 120-character bound. */
   readonly text: string;
+
+  /**
+   * The whole value as text, exactly as it arrived: a string untouched, a
+   * number or boolean in its canonical form, a non-finite number as the
+   * package's "not available" label. What the chip's title (whitespace folded)
+   * and the expanded detail (verbatim) show.
+   */
+  readonly value: string;
+
+  /** Whether {@link text} cuts part of {@link value} off, rather than only folding its whitespace. */
+  readonly abbreviated: boolean;
 }
 
 /** What one row of the log renders from. */
@@ -444,6 +620,19 @@ interface EventLogRow {
   /** How many further attributes the record carries and this row does not show. */
   readonly hiddenAttributeCount: number;
 
+  /** Every primitive attribute of the record, in the producer's key order: what the detail lists. */
+  readonly primitiveAttributes: readonly EventLogAttributePair[];
+
+  /** How many structured summaries the record carries, which no view here unpacks. */
+  readonly structuredAttributeCount: number;
+
+  /**
+   * Whether the row can be expanded into its detail: its strip abbreviates a
+   * value, or leaves a primitive pair out. A row that shows everything whole
+   * already has nothing its detail would add.
+   */
+  readonly expandable: boolean;
+
   /** The lower-cased text of every run this row renders, for the text filter. */
   readonly searchIndex: string;
 }
@@ -455,7 +644,21 @@ interface AttributeSummary {
 
   /** How many attributes were left out, whether by kind or by the pair bound. */
   readonly hiddenCount: number;
+
+  /** Every primitive attribute, the rendered pairs included, in the producer's key order. */
+  readonly primitives: readonly EventLogAttributePair[];
+
+  /** How many attributes are structured summaries rather than primitives. */
+  readonly structuredCount: number;
 }
+
+/**
+ * Opens or closes one row's detail.
+ *
+ * @param row The row whose disclosure was pressed.
+ * @param expanded Whether its detail is open now, before the toggle.
+ */
+type EventLogRowToggle = (row: EventLogRow, expanded: boolean) => void;
 
 /**
  * One page boundary, held as a single value so that the offset and the records
@@ -681,6 +884,11 @@ function baseQueryIdentity(
  * 1-based ordinal of the first record requested, so the ratio cannot be read as
  * coverage of the whole capture.
  *
+ * The noun agrees with the count that governs it — the loaded count when it
+ * stands alone ("1 record loaded"), the total when there is one ("1 of 1
+ * record loaded", "3 of 40 records loaded") — so a single record is never
+ * described in the plural.
+ *
  * @param loadedCount How many records are on screen.
  * @param total The reported total, already vetted by {@link reportedTotal}.
  * @param baseOffset The offset the page sequence started at.
@@ -691,15 +899,15 @@ function coverageLabel(loadedCount: number, total: number | undefined, baseOffse
 
   if (baseOffset === DATA_QUERY_DEFAULT_OFFSET) {
     return total === undefined
-      ? `${loaded} records loaded`
-      : `${loaded} of ${formatCount(total)} records loaded`;
+      ? `${formatCountOf(loadedCount, RECORD_NOUN)} loaded`
+      : `${loaded} of ${formatCountOf(total, RECORD_NOUN)} loaded`;
   }
 
   const position = formatCount(baseOffset + 1);
 
   return total === undefined
-    ? `${loaded} records loaded, from position ${position}`
-    : `${loaded} of ${formatCount(Math.max(total - baseOffset, 0))} records loaded, from position ${position}`;
+    ? `${formatCountOf(loadedCount, RECORD_NOUN)} loaded, from position ${position}`
+    : `${loaded} of ${formatCountOf(Math.max(total - baseOffset, 0), RECORD_NOUN)} loaded, from position ${position}`;
 }
 
 /** The copy of the empty state a settled page with no records resolves to. */
@@ -813,7 +1021,7 @@ function describeEmptyPage(
 }
 
 /**
- * The preview of one attribute value, or `undefined` when this view will not
+ * The whole text of one attribute value, or `undefined` when this view will not
  * show it.
  *
  * Primitive values only, and that is a privacy decision rather than a
@@ -823,16 +1031,12 @@ function describeEmptyPage(
  * Those values are counted as "more" instead, and the host's detail drawer is
  * where a reader opens the record in full.
  *
- * Strings go through this package's truncation helper, whose default budget is
- * the 120-character bound the producer was held to, so the rendered text can
- * only ever be shorter than what was captured.
- *
  * @param value One attribute value, as the open attribute bag holds it.
- * @returns A one-line preview, or `undefined` for a value not shown here.
+ * @returns The value as text, or `undefined` for a value not shown here.
  */
-function primitiveAttributeText(value: unknown): string | undefined {
+function primitiveAttributeValue(value: unknown): string | undefined {
   if (typeof value === 'string') {
-    return oneLinePreview(value);
+    return value;
   }
   if (typeof value === 'number') {
     return Number.isFinite(value) ? String(value) : NOT_AVAILABLE_LABEL;
@@ -845,31 +1049,68 @@ function primitiveAttributeText(value: unknown): string | undefined {
 }
 
 /**
- * The pairs one row shows, and how many attributes it leaves for the drawer.
+ * One primitive attribute as the row and its detail render it, or `undefined`
+ * for a structured value.
+ *
+ * The preview goes through this package's truncation helper, whose default
+ * budget is the 120-character bound the capture holds previews to, so the strip
+ * never shows more of a value than a preview may; the whole value is kept
+ * beside it for the chip's title and the expanded detail.
+ *
+ * @param key The attribute's key.
+ * @param raw Its value, as the open attribute bag holds it.
+ * @returns The pair, or `undefined` for a value not shown here.
+ */
+function primitiveAttribute(key: string, raw: unknown): EventLogAttributePair | undefined {
+  const value = primitiveAttributeValue(raw);
+
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const text = oneLinePreview(value);
+
+  return { key, text, value, abbreviated: text !== collapseWhitespace(value) };
+}
+
+/**
+ * The pairs one row shows, how many attributes it leaves out, and every
+ * primitive attribute its detail can list whole.
  *
  * Key order is the producer's own, never re-sorted: the order a record carries
  * its attributes in is part of what the producer recorded, and re-ordering it
  * would make two views of one record disagree.
  *
  * @param attributes The record's open attribute bag.
- * @returns The bounded pair list and the count of everything omitted.
+ * @returns The bounded pair list, the count of everything omitted from it, and
+ * the primitives and structured summaries it was drawn from.
  */
 function summariseAttributes(attributes: Record<string, unknown>): AttributeSummary {
   const pairs: EventLogAttributePair[] = [];
+  const primitives: EventLogAttributePair[] = [];
   let hiddenCount = 0;
+  let structuredCount = 0;
 
   for (const [key, value] of Object.entries(attributes)) {
-    const text = primitiveAttributeText(value);
+    const pair = primitiveAttribute(key, value);
 
-    if (text === undefined || pairs.length >= MAX_ATTRIBUTE_PAIRS) {
+    if (pair === undefined) {
+      structuredCount += 1;
       hiddenCount += 1;
       continue;
     }
 
-    pairs.push({ key, text });
+    primitives.push(pair);
+
+    if (pairs.length >= MAX_ATTRIBUTE_PAIRS) {
+      hiddenCount += 1;
+      continue;
+    }
+
+    pairs.push(pair);
   }
 
-  return { pairs, hiddenCount };
+  return { pairs, hiddenCount, primitives, structuredCount };
 }
 
 /**
@@ -958,7 +1199,7 @@ function loadedOrigin(events: readonly TelemetryEvent[]): number {
 function buildRowModel(event: TelemetryEvent, originEpochMs: number): EventLogRow {
   const seqLabel = formatCount(event.seq);
   const offsetLabel = formatOffset(event.startTime, originEpochMs);
-  const { pairs, hiddenCount } = summariseAttributes(event.attributes);
+  const { pairs, hiddenCount, primitives, structuredCount } = summariseAttributes(event.attributes);
 
   return {
     event,
@@ -966,6 +1207,9 @@ function buildRowModel(event: TelemetryEvent, originEpochMs: number): EventLogRo
     offsetLabel,
     pairs,
     hiddenAttributeCount: hiddenCount,
+    primitiveAttributes: primitives,
+    structuredAttributeCount: structuredCount,
+    expandable: primitives.length > pairs.length || pairs.some((pair) => pair.abbreviated),
     searchIndex: buildSearchIndex(event, seqLabel, offsetLabel, pairs),
   };
 }
@@ -1007,25 +1251,42 @@ function compareKinds(left: TelemetryKind, right: TelemetryKind): number {
 }
 
 /**
+ * How many records of each kind the node's authored query holds, as the kind
+ * census counted them (see {@link useKindCensus}).
+ */
+type KindCounts = ReadonlyMap<TelemetryKind, number>;
+
+/**
  * The kinds the picker offers.
  *
- * The kind vocabulary is a runtime value of `@debuggen/telemetry`, which this
- * package may use for types only, so the option set is discovered rather than
- * enumerated, from four sources whose union is what a reader needs:
+ * Two regimes, one per question the picker can answer honestly:
  *
- *   1. the kinds present in the loaded records — the ones this capture can
- *      prove exist;
- *   2. the kinds the panel's author already named in the node's filter, which
- *      remain meaningful even before a record of that kind has arrived;
- *   3. the kinds seen before the last narrowing, remembered at the moment the
- *      reader narrowed, so choosing one kind does not empty the picker of the
- *      others;
- *   4. the chosen kind itself, so the control can always show its own value.
+ * - **With a census** — the loaded page does not reach the end of the source,
+ *   so the kinds on screen cannot stand for the capture, and the census counted
+ *   every kind the node's authored query holds. The options are exactly the
+ *   kinds it counted at least one record of, plus any kind on a loaded row (a
+ *   record on screen is proof enough on its own) and the chosen kind, so the
+ *   control can always show its value. A kind the author named but the capture
+ *   never produced is not offered: the census proved it would narrow to
+ *   nothing.
+ * - **Without one** — the page is the whole source, or the census is still
+ *   running or could not be taken. The option set is then discovered from four
+ *   sources whose union is what a reader needs:
+ *     1. the kinds present in the loaded records — the ones this capture can
+ *        prove exist, and all of them whenever the page covers the source;
+ *     2. the kinds the panel's author already named in the node's filter,
+ *        which remain meaningful even before a record of that kind has
+ *        arrived;
+ *     3. the kinds seen before the last narrowing, remembered at the moment
+ *        the reader narrowed, so choosing one kind does not empty the picker
+ *        of the others;
+ *     4. the chosen kind itself.
  *
  * @param rows The loaded rows.
  * @param authored The kinds the node's own filter names, if any.
  * @param remembered The kinds seen before the reader last narrowed.
  * @param selected The chosen kind, or {@link ALL_KINDS_VALUE}.
+ * @param counts The census, or `undefined` while there is none.
  * @returns The kinds to offer, in a stable order.
  */
 function collectKinds(
@@ -1033,12 +1294,25 @@ function collectKinds(
   authored: readonly TelemetryKind[] | undefined,
   remembered: readonly TelemetryKind[],
   selected: TelemetryKind | typeof ALL_KINDS_VALUE,
+  counts: KindCounts | undefined,
 ): readonly TelemetryKind[] {
-  const kinds = new Set<TelemetryKind>(remembered);
+  const kinds = new Set<TelemetryKind>();
 
-  if (authored !== undefined) {
-    for (const kind of authored) {
+  if (counts === undefined) {
+    for (const kind of remembered) {
       kinds.add(kind);
+    }
+
+    if (authored !== undefined) {
+      for (const kind of authored) {
+        kinds.add(kind);
+      }
+    }
+  } else {
+    for (const [kind, count] of counts) {
+      if (count > 0) {
+        kinds.add(kind);
+      }
     }
   }
 
@@ -1054,16 +1328,286 @@ function collectKinds(
 }
 
 /**
+ * A picker label, with the census count beside it when there is one: "Render",
+ * or "Render (1,204)".
+ *
+ * @param label The option's own label.
+ * @param count The census count for it, or `undefined` for none.
+ * @returns The label to show.
+ */
+function countedOptionLabel(label: string, count: number | undefined): string {
+  return count === undefined ? label : `${label} (${formatCount(count)})`;
+}
+
+/**
  * The picker's options: the "no narrowing" choice, then one per kind.
  *
+ * With a census, every option states how many records it narrows to — and "all
+ * kinds" the sum of them, which is the node's whole authored source — so a
+ * reader sees the capture's composition before choosing, and a kind the
+ * census has no count for (one that reached the page after it was taken)
+ * simply carries none.
+ *
  * @param kinds The kinds to offer, already ordered.
+ * @param counts The census, or `undefined` while there is none.
  * @returns The options, "all kinds" first.
  */
-function buildKindOptions(kinds: readonly TelemetryKind[]): readonly SelectOption[] {
+function buildKindOptions(
+  kinds: readonly TelemetryKind[],
+  counts: KindCounts | undefined,
+): readonly SelectOption[] {
+  let censusTotal: number | undefined;
+
+  if (counts !== undefined) {
+    censusTotal = 0;
+    for (const count of counts.values()) {
+      censusTotal += count;
+    }
+  }
+
   return [
-    { value: ALL_KINDS_VALUE, label: ALL_KINDS_LABEL },
-    ...kinds.map((kind) => ({ value: kind, label: formatKindLabel(kind) })),
+    { value: ALL_KINDS_VALUE, label: countedOptionLabel(ALL_KINDS_LABEL, censusTotal) },
+    ...kinds.map((kind) => ({
+      value: kind,
+      label: countedOptionLabel(formatKindLabel(kind), counts?.get(kind)),
+    })),
   ];
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The kind census
+ *
+ * A page of 200 records says nothing about the kinds recorded after it: a
+ * capture that opens with a burst of renders and commits shows only those in
+ * its first page, while its requests, server spans and statements sit two
+ * thousand records further on. Discovering the picker's options from the page
+ * therefore offers a reader exactly the kinds they did not come to find. The
+ * census answers the one question the page cannot — which kinds does the
+ * node's query hold, and how many of each — with the data contract's own
+ * count-only request: `limit: 0` asks the service for a `total` and no rows
+ * (`docs/ARCHITECTURE.md`, "Panel data"), and one such request per kind,
+ * narrowed exactly as the node is plus that kind, is the kind's count.
+ *
+ * It is taken once per authored query, only when the loaded page does not
+ * reach the end of the source (a page that holds the whole source already
+ * proves every kind it contains, and costs nothing more), and only through the
+ * panel's own `DataProvider` and session — no transport, no second address. A
+ * census that fails, or answers with something that is not a count, is simply
+ * not used: the picker falls back to discovery, which is what it offered
+ * before, and the log itself is unaffected, so no error state is drawn for it.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * One settled census, stamped with the request it answered, so a changed
+ * provider, session or authored filter reads as "no census" in the very render
+ * that changed it — the same stamping rule `../host/useQuery` settles by.
+ */
+interface KindCensusState {
+  /** The provider that answered, compared by identity. */
+  readonly provider: DataProvider;
+
+  /** The session the census was addressed to. */
+  readonly sessionId: string;
+
+  /** The authored filter it counted under; see {@link censusIdentity}. */
+  readonly identity: string;
+
+  /** The counts, or `null` when the census could not be taken. */
+  readonly counts: KindCounts | null;
+}
+
+/**
+ * The census's reset key: the node's authored filter, serialised.
+ *
+ * Deliberately not the merged filter the log requests with: the census counts
+ * what the reader can narrow TO, so choosing a kind must never re-take it.
+ *
+ * @param filter The node's own filter, or `undefined` for the whole source.
+ * @returns The identity of that filter.
+ */
+function censusIdentity(filter: DataQueryFilter | undefined): string {
+  return JSON.stringify({ source: EVENT_LOG_SOURCE, filter: filter ?? null });
+}
+
+/**
+ * The kinds a census counts: every kind the filter vocabulary admits, or —
+ * when the author already narrowed the node by kind — only those, since the
+ * reader can never narrow outside the node's own query.
+ *
+ * @param authored The kinds the node's own filter names, if any.
+ * @returns The kinds to count, in the vocabulary's order.
+ */
+function censusKinds(authored: readonly TelemetryKind[] | undefined): readonly TelemetryKind[] {
+  return authored === undefined
+    ? FILTER_KIND_VOCABULARY
+    : FILTER_KIND_VOCABULARY.filter((kind) => authored.includes(kind));
+}
+
+/**
+ * Counts one kind with a count-only request.
+ *
+ * The request is the node's authored filter with `kinds` replaced by the one
+ * kind — narrowing only, like {@link mergeKindFilter} — at `limit: 0` from the
+ * first record. The answer is checked with the same structural check every
+ * page is (`checkDataQueryResponse`) and its `total` with the same vetting the
+ * footer applies; anything else counts as "no count".
+ *
+ * @param provider The panel's provider.
+ * @param sessionId The panel's session.
+ * @param filter The node's own filter.
+ * @param kind The kind to count.
+ * @param signal The census's cancellation.
+ * @returns The count, or `undefined` when the answer was not one.
+ */
+async function countKind(
+  provider: DataProvider,
+  sessionId: string,
+  filter: DataQueryFilter | undefined,
+  kind: TelemetryKind,
+  signal: AbortSignal,
+): Promise<number | undefined> {
+  const query: DataQuery & { source: typeof EVENT_LOG_SOURCE } = {
+    source: EVENT_LOG_SOURCE,
+    filter: { ...filter, kinds: [kind] },
+    limit: 0,
+    offset: DATA_QUERY_DEFAULT_OFFSET,
+  };
+  const response = await provider.query(sessionId, query, { signal });
+
+  return checkDataQueryResponse(query, response) === undefined
+    ? reportedTotal(response.total)
+    : undefined;
+}
+
+/**
+ * Takes the kind census for the node's authored query while `wanted`, and
+ * answers with its counts once it has settled.
+ *
+ * Every count is requested at once and the census settles only when all of
+ * them have: a partial census would offer some kinds with counts and hide
+ * others, which reads as "the capture holds only these". It is cancelled —
+ * its requests aborted and their answers dropped — when the provider, the
+ * session or the authored filter changes, when it stops being wanted before
+ * it settled, and when the view unmounts.
+ *
+ * @param filter The node's own filter, or `undefined` for the whole source.
+ * @param wanted Whether the loaded page leaves kinds the census could reveal.
+ * @returns The census counts, or `undefined` while none is usable.
+ */
+function useKindCensus(
+  filter: DataQueryFilter | undefined,
+  wanted: boolean,
+): KindCounts | undefined {
+  const provider = useDataProvider();
+  const sessionId = usePanelSessionId();
+  const identity = censusIdentity(filter);
+  const [census, setCensus] = useState<KindCensusState | undefined>(undefined);
+
+  // Whether the held census answers the current request, decided during
+  // render: a census for another provider, session or filter is never read.
+  const settled =
+    census !== undefined &&
+    census.provider === provider &&
+    census.sessionId === sessionId &&
+    census.identity === identity;
+
+  useEffect(() => {
+    if (settled || !wanted || provider === undefined || !isAddressableSessionId(sessionId)) {
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    let cancelled = false;
+    const kinds = censusKinds(filter?.kinds);
+    const settle = (counts: KindCounts | null): void => {
+      if (!cancelled) {
+        setCensus({ provider, sessionId, identity, counts });
+      }
+    };
+
+    void Promise.all(
+      kinds.map((kind) => countKind(provider, sessionId, filter, kind, controller.signal)),
+    ).then(
+      (totals) => {
+        const counts = new Map<TelemetryKind, number>();
+
+        for (const [index, kind] of kinds.entries()) {
+          const total = totals[index];
+
+          if (total === undefined) {
+            settle(null);
+            return;
+          }
+
+          counts.set(kind, total);
+        }
+
+        settle(counts);
+      },
+      () => {
+        // A rejection — including the abort this effect's own cleanup raises —
+        // leaves the picker on discovery; `settle` drops it once cancelled.
+        settle(null);
+      },
+    );
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [filter, identity, provider, sessionId, settled, wanted]);
+
+  return settled ? (census.counts ?? undefined) : undefined;
+}
+
+/**
+ * Whether focus is on an element or inside it.
+ *
+ * @param element The element.
+ * @returns `true` while the document's focused element is it or a descendant.
+ */
+function holdsFocus(element: HTMLElement): boolean {
+  const active = element.ownerDocument.activeElement;
+
+  return active !== null && element.contains(active);
+}
+
+/**
+ * The grid row a keyboard reader is handed to when the paging control they
+ * were on leaves: the first data row drawn wholly inside the scroll viewport,
+ * below its pinned header — the top of what they were reading.
+ *
+ * The table's own roving tab stop is the fallback, and it alone is not enough:
+ * while the reader's active row is outside the rendered window, the table
+ * gives the stop to the topmost rendered row, which sits in the overscan above
+ * the viewport, and focusing it without scrolling would leave focus where it
+ * cannot be seen. Focusing a visible row instead moves the table's stop to it
+ * (the table follows focus onto its rows), and nothing scrolls. Where nothing
+ * is laid out — no viewport, or rows with no box — the stop is used as is.
+ *
+ * @param root This block's element.
+ * @returns The row to focus, or `null` when the grid has none.
+ */
+function landingRow(root: HTMLElement): HTMLElement | null {
+  const viewport = root.querySelector<HTMLElement>(GRID_VIEWPORT_SELECTOR);
+
+  if (viewport !== null) {
+    const bounds = viewport.getBoundingClientRect();
+    const header = root.querySelector<HTMLElement>(GRID_HEADER_ROW_SELECTOR);
+    const top = Math.max(bounds.top, header?.getBoundingClientRect().bottom ?? bounds.top);
+
+    for (const row of root.querySelectorAll<HTMLElement>(GRID_DATA_ROW_SELECTOR)) {
+      const box = row.getBoundingClientRect();
+
+      if (box.height > 0 && box.top >= top && box.bottom <= bounds.bottom) {
+        return row;
+      }
+    }
+  }
+
+  return root.querySelector<HTMLElement>(GRID_TAB_STOP_SELECTOR);
 }
 
 /**
@@ -1116,9 +1660,22 @@ function selectedEventLogRowKey(
  * ---------------------------------------------------------------------------
  * The columns
  *
- * Module constants, and pure functions of one row model. They close over
- * nothing from a render, so the column list has one identity for the life of
- * the module and a row's cells depend on the row alone.
+ * Pure functions of one row model and the table's cell meta: a row's cells
+ * depend on the row alone, on the one callback the attribute strip's "+N more"
+ * control reports through, and — for the record's name cell, which leads an
+ * expandable row with its disclosure — on the row's expansion and the one
+ * toggle that opens or closes it (see {@link createEventLogColumns}).
+ *
+ * That purity is what lets each cell's element be built ONCE per row model
+ * (and, for the name cell, once per expansion state) and handed back unchanged
+ * on every later render. `DataTable` re-renders the rows in its window on
+ * every scroll step — its virtualizer moves the window — and calls each
+ * column's `cell` for every one of them. An element returned by identity is
+ * one React does not render again: the chips, badges, source chips and strips
+ * of the rows that stay in view cost nothing while the window moves, and only
+ * the rows that scroll in are built. The cache is keyed on the row model
+ * object, which is rebuilt exactly when the records it describes change (a new
+ * page, a new query), so no cached cell can outlive its data.
  *
  * Every column declares its width ROLE, never a size (`DataTableColumnWidth`
  * in `../primitives/DataTable`): `DataTable` resolves each role to a track
@@ -1192,14 +1749,51 @@ function renderKindCell(row: EventLogRow): ReactNode {
  * The chip is `tabIndex={-1}`: the grid's arrow keys move focus onto it, and a
  * chip left in the Tab order would add one Tab stop per loaded record.
  *
+ * An expandable row leads the cell with its disclosure: the design system's
+ * expand toggle, placed in the identity column as `../primitives/DataTable`
+ * asks, carrying the expanded state and the detail row it controls (a grid row
+ * cannot carry `aria-expanded` itself), named by what it opens and for which
+ * record, and `tabIndex={-1}` like the chip beside it. It is the pointer's and
+ * the keyboard's one route to the detail.
+ *
  * The cell is itself a flex row with the design system's own gap, so the runs
  * below need no spacing of their own.
+ *
+ * @param row The row model.
+ * @param meta The row's expansion, as the table reports it.
+ * @param onToggle Opens or closes the row's detail, told its current state.
  */
-function renderNameCell(row: EventLogRow): ReactNode {
+function renderNameCell(
+  row: EventLogRow,
+  meta: DataTableCellMeta,
+  onToggle: EventLogRowToggle,
+): ReactNode {
   const { event } = row;
 
   return (
     <>
+      {row.expandable ? (
+        <Button
+          variant="ghost"
+          size="sm"
+          iconOnly
+          className="dg-data-table__expand-button"
+          tabIndex={-1}
+          aria-expanded={meta.expanded}
+          aria-controls={meta.detailRowId}
+          aria-label={`${meta.expanded ? COLLAPSE_ATTRIBUTES_PREFIX : EXPAND_ATTRIBUTES_PREFIX} ${oneLinePreview(event.name)}`}
+          icon={
+            meta.expanded ? (
+              <ChevronDown aria-hidden="true" className="dg-icon" />
+            ) : (
+              <ChevronRight aria-hidden="true" className="dg-icon" />
+            )
+          }
+          onClick={() => {
+            onToggle(row, meta.expanded);
+          }}
+        />
+      ) : null}
       {event.status === 'error' ? (
         <Badge tone="danger">{formatStatusLabel(event.status)}</Badge>
       ) : null}
@@ -1216,21 +1810,44 @@ function renderNameCell(row: EventLogRow): ReactNode {
 /**
  * A compact strip of the record's attributes, and an honest count of the rest.
  *
- * Values are shown exactly as they arrived — already redacted, already bounded
- * — and nothing here expands, re-parses or reconstructs one. What is not shown
- * is counted rather than dropped, so the strip never implies that a record
- * carries less than it does.
+ * Values are shown as they arrived — already redacted, previews cut to the
+ * 120-character budget — and nothing here re-parses or reconstructs one. What
+ * is not shown is counted rather than dropped, so the strip never implies that
+ * a record carries less than it does.
  *
  * The strip is one line inside a cell that is often narrower than its chips,
  * so what fits is decided by the stylesheet, never by a measured width: every
  * chip (`dg-event-log__attr`) may shrink to nothing and grow only toward its
  * own text, which leaves short pairs whole and ellipsizes only the longest,
  * while the count (`dg-event-log__more`) never shrinks and therefore always
- * stays in view right after the last chip. A chip that the cell cut short
- * carries its rendered text as its `title` — exactly the bounded preview it
- * shows, never anything fuller — so the whole pair is still one hover away.
+ * stays in view right after the last chip. Each chip carries its WHOLE pair as
+ * its `title`, whitespace folded onto the chip's one line — the redacted value
+ * the service stored, never a decoded or rebuilt one — so a pair the cell or
+ * the preview budget cut short is one hover away; the row's detail is the
+ * keyboard's route to the same value (see {@link renderAttributeDetail}).
+ *
+ * The count is a CONTROL wherever the host can open a record in full: the
+ * strip never unpacks what it counts, so "+N more" is the reader's way to the
+ * rest of the bag, and it takes them there by selecting the record — the same
+ * report a row activation makes, which is what drives the host surface's
+ * record-detail drawer, where every attribute is shown with its redaction
+ * marked. It is a real button, named with its own visible text followed by
+ * what it does, `tabIndex={-1}` like the source chip (the grid's arrow keys
+ * reach it and it adds no Tab stop per row), and its click is its own: the
+ * table excludes clicks from interactive descendants from row activation, so
+ * the control reports the selection itself. A surface that only displays has
+ * nowhere to open the record, and there the count stays plain text rather than
+ * a control that cannot act.
+ *
+ * @param row The row model.
+ * @param onShowAll Selects the record so the host shows it in full, or
+ * `undefined` when the surface offers no such view.
+ * @returns The strip.
  */
-function renderAttributesCell(row: EventLogRow): ReactNode {
+function renderAttributesCell(
+  row: EventLogRow,
+  onShowAll: ((row: EventLogRow) => void) | undefined,
+): ReactNode {
   if (row.pairs.length === 0 && row.hiddenAttributeCount === 0) {
     return (
       <Text size="xs" tone="muted">
@@ -1239,20 +1856,148 @@ function renderAttributesCell(row: EventLogRow): ReactNode {
     );
   }
 
+  const hidden = row.hiddenAttributeCount;
+  const moreLabel = `+${formatCount(hidden)} ${MORE_ATTRIBUTES_SUFFIX}`;
+
   return (
     <Stack direction="horizontal" gap={1} align="center" className="dg-event-log__attrs">
-      {row.pairs.map((pair) => {
-        const text = `${pair.key}${ATTRIBUTE_PAIR_SEPARATOR}${pair.text}`;
-
-        return (
-          <Code key={pair.key} size="sm" title={text} className="dg-event-log__attr">
-            {text}
-          </Code>
-        );
-      })}
-      {row.hiddenAttributeCount > 0 ? (
+      {row.pairs.map((pair) => (
+        <Code
+          key={pair.key}
+          size="sm"
+          title={`${pair.key}${ATTRIBUTE_PAIR_SEPARATOR}${collapseWhitespace(pair.value)}`}
+          className="dg-event-log__attr"
+        >
+          {`${pair.key}${ATTRIBUTE_PAIR_SEPARATOR}${pair.text}`}
+        </Code>
+      ))}
+      {hidden === 0 ? null : onShowAll === undefined ? (
         <Text size="xs" tone="muted" className="dg-event-log__more">
-          {`+${formatCount(row.hiddenAttributeCount)} ${MORE_ATTRIBUTES_SUFFIX}`}
+          {moreLabel}
+        </Text>
+      ) : (
+        <Button
+          variant="ghost"
+          size="sm"
+          tabIndex={-1}
+          className="dg-event-log__more"
+          aria-label={`${moreLabel} ${pluralize(hidden, ATTRIBUTE_NOUN)}: select this record to see every attribute`}
+          title={`Select this record to see all ${formatCountOf(
+            row.pairs.length + hidden,
+            ATTRIBUTE_NOUN,
+          )}`}
+          onClick={() => {
+            onShowAll(row);
+          }}
+        >
+          {moreLabel}
+        </Button>
+      )}
+    </Stack>
+  );
+}
+
+/** One column's cell renderer, over the row model alone. */
+type EventLogCellRenderer = (row: EventLogRow) => ReactNode;
+
+/**
+ * A cell renderer that builds each row's element once and returns that same
+ * element for as long as the row model lives (see the section header above).
+ *
+ * `has` rather than a truthiness test, so a cell that legitimately renders
+ * nothing is cached too. A `WeakMap`, so a row model dropped with its page
+ * takes its cached cells with it.
+ *
+ * @param render The column's renderer.
+ * @returns A renderer with the same output that renders each row model once.
+ */
+function renderOncePerRow(render: EventLogCellRenderer): EventLogCellRenderer {
+  const rendered = new WeakMap<EventLogRow, ReactNode>();
+
+  return (row) => {
+    if (rendered.has(row)) {
+      return rendered.get(row);
+    }
+
+    const cell = render(row);
+    rendered.set(row, cell);
+    return cell;
+  };
+}
+
+/** A cell renderer that also reads the table's cell meta: the row's expansion. */
+type EventLogMetaCellRenderer = (row: EventLogRow, meta: DataTableCellMeta) => ReactNode;
+
+/**
+ * {@link renderOncePerRow} for a cell that depends on its row's expansion too:
+ * each row model keeps the element last built for it, and hands it back while
+ * the row is in the same expansion state with the same detail row — so a
+ * scroll step renders nothing new, and only opening or closing a row rebuilds
+ * that row's cell.
+ *
+ * @param render The column's renderer.
+ * @returns A renderer with the same output that renders each row model once
+ * per expansion state.
+ */
+function renderOncePerRowExpansion(
+  render: EventLogMetaCellRenderer,
+): (row: EventLogRow, index: number, meta: DataTableCellMeta) => ReactNode {
+  const rendered = new WeakMap<
+    EventLogRow,
+    {
+      readonly expanded: boolean;
+      readonly detailRowId: string | undefined;
+      readonly cell: ReactNode;
+    }
+  >();
+
+  return (row, _index, meta) => {
+    const cached = rendered.get(row);
+    if (
+      cached !== undefined &&
+      cached.expanded === meta.expanded &&
+      cached.detailRowId === meta.detailRowId
+    ) {
+      return cached.cell;
+    }
+
+    const cell = render(row, meta);
+    rendered.set(row, { expanded: meta.expanded, detailRowId: meta.detailRowId, cell });
+    return cell;
+  };
+}
+
+/**
+ * An expanded row's detail: every primitive attribute of the record, whole.
+ *
+ * Each entry is the key over the value exactly as it arrived — the redacted
+ * URL, the parameterized statement, its line breaks kept — in a wrapping code
+ * block. The block is the design system's scroll box, capped at a token block
+ * size, and `tabIndex={-1}` as every control in a grid row must be: the
+ * table's keyboard model walks the open detail after the row's own controls,
+ * and a focused block that overflows keeps its arrow keys to scroll, so a
+ * value of any length is read to its end from the keyboard. Structured
+ * summaries are counted, never unpacked, as in the strip.
+ *
+ * @param row The expanded row.
+ * @returns The detail's content.
+ */
+function renderAttributeDetail(row: EventLogRow): ReactNode {
+  return (
+    <Stack gap={2} className="dg-event-log__detail">
+      {row.primitiveAttributes.map((pair) => (
+        <Stack key={pair.key} gap={1}>
+          <Text as="span" size="xs" tone="muted">
+            {pair.key}
+          </Text>
+          <Code block wrap size="sm" tabIndex={-1}>
+            {pair.value}
+          </Code>
+        </Stack>
+      ))}
+      {row.structuredAttributeCount > 0 ? (
+        <Text size="xs" tone="muted">
+          {`${formatCountOf(row.structuredAttributeCount, STRUCTURED_VALUE_NOUN)} ${STRUCTURED_VALUES_NOTE_SUFFIX}`}
         </Text>
       ) : null}
     </Stack>
@@ -1260,37 +2005,65 @@ function renderAttributesCell(row: EventLogRow): ReactNode {
 }
 
 /**
- * The five columns of the log, left to right.
+ * The five columns of the log, left to right, each rendering a row once, with
+ * the record's name cell leading an expandable row with its disclosure.
  *
  * No column is sortable and no `onSortChange` is offered: the ordering is the
  * one the node's query asked the resolver for, and a control that re-ordered
  * the loaded page locally would disagree with the paging counters the same
  * response carried.
+ *
+ * Built per `onShowAll` and `onToggle` rather than once per module, because
+ * the attribute strip's control and the name cell's disclosure report through
+ * them; the component memoizes the list on both callbacks, whose identities
+ * change only with the host's actions or the node's id, so the columns — and
+ * their per-row caches — keep one identity for as long as they do.
+ *
+ * @param onShowAll What the "+N more" control does, or `undefined` for a
+ * surface that only displays.
+ * @param onToggle Opens or closes a row's detail.
+ * @returns The column definitions `DataTable` takes.
  */
-const EVENT_LOG_COLUMNS: readonly DataTableColumn<EventLogRow>[] = Object.freeze([
-  { key: 'seq', header: COLUMN_HEADER_SEQ, align: 'end', width: 'ordinal', cell: renderSeqCell },
-  {
-    key: 'startTime',
-    header: COLUMN_HEADER_OFFSET,
-    align: 'end',
-    width: 'quantity',
-    cell: renderOffsetCell,
-  },
-  { key: 'kind', header: COLUMN_HEADER_KIND, width: 'label', cell: renderKindCell },
-  {
-    key: 'name',
-    header: COLUMN_HEADER_NAME,
-    width: 'name',
-    rowHeader: true,
-    cell: renderNameCell,
-  },
-  {
-    key: 'attributes',
-    header: COLUMN_HEADER_ATTRIBUTES,
-    width: 'text',
-    cell: renderAttributesCell,
-  },
-]);
+function createEventLogColumns(
+  onShowAll: ((row: EventLogRow) => void) | undefined,
+  onToggle: EventLogRowToggle,
+): readonly DataTableColumn<EventLogRow>[] {
+  return Object.freeze([
+    {
+      key: 'seq',
+      header: COLUMN_HEADER_SEQ,
+      align: 'end',
+      width: 'ordinal',
+      cell: renderOncePerRow(renderSeqCell),
+    },
+    {
+      key: 'startTime',
+      header: COLUMN_HEADER_OFFSET,
+      align: 'end',
+      width: 'quantity',
+      cell: renderOncePerRow(renderOffsetCell),
+    },
+    {
+      key: 'kind',
+      header: COLUMN_HEADER_KIND,
+      width: 'label',
+      cell: renderOncePerRow(renderKindCell),
+    },
+    {
+      key: 'name',
+      header: COLUMN_HEADER_NAME,
+      width: 'name',
+      rowHeader: true,
+      cell: renderOncePerRowExpansion((row, meta) => renderNameCell(row, meta, onToggle)),
+    },
+    {
+      key: 'attributes',
+      header: COLUMN_HEADER_ATTRIBUTES,
+      width: 'text',
+      cell: renderOncePerRow((row) => renderAttributesCell(row, onShowAll)),
+    },
+  ]);
+}
 
 /*
  * ---------------------------------------------------------------------------
@@ -1325,8 +2098,9 @@ export interface EventLogProps {
  *
  * @param props The props, as documented on {@link EventLogProps}.
  * @returns The block: a filter row, one of the four bodies (busy, failed,
- * empty, or the grid) and — once anything has loaded, or while the service
- * reports a further page — the paging footer.
+ * empty, or the grid), and — once anything has loaded, or while the service
+ * reports a further page — the paging footer, followed by the failure of a
+ * later page when one failed.
  *
  * @example A node straight from a validated panel specification.
  * ```tsx
@@ -1349,8 +2123,16 @@ export function EventLog(props: EventLogProps): ReactElement {
     ALL_KINDS_VALUE,
   );
   const [rememberedKinds, setRememberedKinds] = useState<readonly TelemetryKind[]>(EMPTY_KINDS);
+  // Whether the reader narrowed by kind from a page that did not cover its
+  // source: the kind census stays wanted for as long as that narrowing holds,
+  // even once the narrowed sequence is short enough to fit on one page.
+  const [narrowedFromPartial, setNarrowedFromPartial] = useState(false);
   const [searchValue, setSearchValue] = useState('');
   const [page, setPage] = useState<EventLogPageState>(INITIAL_PAGE_STATE);
+  // The rows whose detail is open, by row key. Kept across filtering and
+  // paging: the table ignores a key that matches no drawn row, so a record the
+  // text filter hides is open again when it is drawn again.
+  const [expandedRowKeys, setExpandedRowKeys] = useState<readonly string[]>(EMPTY_ROW_KEYS);
 
   const authoredQuery = node.query;
   const authoredKinds = authoredQuery.filter?.kinds;
@@ -1397,50 +2179,8 @@ export function EventLog(props: EventLogProps): ReactElement {
     [needle, rows],
   );
 
-  const availableKinds = useMemo(
-    () => collectKinds(rows, authoredKinds, rememberedKinds, selectedKind),
-    [authoredKinds, rememberedKinds, rows, selectedKind],
-  );
-  const kindOptions = useMemo(() => buildKindOptions(availableKinds), [availableKinds]);
-
-  const handleSearchChange = useCallback((next: string): void => {
-    setSearchValue(next);
-  }, []);
-
-  // The block's own element, read only from the clear handler below — never
-  // during a render — to find the text field it returns focus to.
-  const rootRef = useRef<HTMLDivElement>(null);
-
-  // The no-match state's one control. It empties the text field and moves
-  // focus into it BEFORE the re-render that removes the control: the rows come
-  // back in that render and the empty state with its button goes, so without
-  // this the focused element would vanish and focus would fall to the document
-  // body. The field is found inside this block's own toolbar because the text
-  // primitive exposes no `ref` and the toolbar forwards no `id`; it is the
-  // view's only text field, so the lookup is exact and never leaves this view.
-  const handleClearSearch = useCallback((): void => {
-    setSearchValue('');
-    rootRef.current?.querySelector<HTMLElement>(SEARCH_FIELD_SELECTOR)?.focus();
-  }, []);
-
-  // Choosing a kind is a RE-QUERY, not a local filter: the kind goes into the
-  // request's `filter.kinds`, the accumulator resets with the new request
-  // identity, and the host is told which narrowing the reader asked for. The
-  // options in hand are remembered first, so narrowing to one kind does not
-  // empty the picker of the others.
-  const handleKindChange = useCallback(
-    (next: string): void => {
-      const resolved = availableKinds.find((kind) => kind === next) ?? ALL_KINDS_VALUE;
-
-      setRememberedKinds(availableKinds);
-      setSelectedKind(resolved);
-      actions?.onFilterChange?.(node.id, { kinds: resolved });
-    },
-    [actions, availableKinds, node.id],
-  );
-
   // What the page that just resolved says about the sequence. Derived here,
-  // BEFORE the callbacks below, on purpose: every helper that reads the
+  // BEFORE every callback below, on purpose: every helper that reads the
   // sequence's numbers (`offset`, `baseOffset`, `limit`) is called ahead of the
   // `useCallback` that closes over `identity`, which is derived from those same
   // numbers. The React Compiler cannot see that they are primitives, so a
@@ -1466,6 +2206,88 @@ export function EventLog(props: EventLogProps): ReactElement {
       : undefined;
   const hasMore = loadMoreOffset !== undefined;
 
+  // A further page in flight behind rows already on screen, and a further page
+  // that failed behind them. Neither replaces what the reader is reading: the
+  // grid stays mounted with the carried rows — its scroll position, its active
+  // row and the paging control that was pressed all survive the request — and
+  // the request's progress or failure is reported beneath it. Only a sequence
+  // with nothing on screen yet takes the full-view loading or error body.
+  const appending = status === 'loading' && carried.length > 0;
+  const pageFailed = status === 'error' && carried.length > 0;
+  // The paging control is drawn while a further page is offered and while the
+  // one it asked for is on its way, so the element a keyboard reader pressed is
+  // the element still holding focus when that page lands.
+  const showLoadMore = hasMore || appending;
+
+  // Whether the loaded records fall short of the source: the page ends before
+  // the reported total, or — with no total — the service offers a further
+  // page. Only then can a kind exist in the capture that no loaded row shows,
+  // which is when the kind census is worth its requests. A node that starts at
+  // an authored offset is a window into its sequence, and counting kinds the
+  // window can never reach would offer narrowings that draw nothing, so the
+  // census is taken only for a sequence that starts at the first record.
+  const sourceUncovered = knownTotal === undefined ? hasMore : loadedCount < knownTotal;
+  // A settled census is kept once taken — loading the last page does not take
+  // the counts off the picker — but only ever read for a node shaped to use
+  // one, so it can never describe a window the node was not asked to draw.
+  const censusApplies = limit > 0 && baseOffset === DATA_QUERY_DEFAULT_OFFSET;
+  const census = useKindCensus(
+    authoredQuery.filter,
+    censusApplies && (sourceUncovered || narrowedFromPartial),
+  );
+  const kindCounts = censusApplies ? census : undefined;
+
+  const availableKinds = useMemo(
+    () => collectKinds(rows, authoredKinds, rememberedKinds, selectedKind, kindCounts),
+    [authoredKinds, kindCounts, rememberedKinds, rows, selectedKind],
+  );
+  const kindOptions = useMemo(
+    () => buildKindOptions(availableKinds, kindCounts),
+    [availableKinds, kindCounts],
+  );
+
+  const handleSearchChange = useCallback((next: string): void => {
+    setSearchValue(next);
+  }, []);
+
+  // The block's own element, read only from the clear handler and the paging
+  // focus handoff below — never during a render — to find the control or row
+  // focus is returned to.
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  // The no-match state's one control. It empties the text field and moves
+  // focus into it BEFORE the re-render that removes the control: the rows come
+  // back in that render and the empty state with its button goes, so without
+  // this the focused element would vanish and focus would fall to the document
+  // body. The field is found inside this block's own toolbar because the text
+  // primitive exposes no `ref` and the toolbar forwards no `id`; it is the
+  // view's only text field, so the lookup is exact and never leaves this view.
+  const handleClearSearch = useCallback((): void => {
+    setSearchValue('');
+    rootRef.current?.querySelector<HTMLElement>(SEARCH_FIELD_SELECTOR)?.focus();
+  }, []);
+
+  // Choosing a kind is a RE-QUERY, not a local filter: the kind goes into the
+  // request's `filter.kinds`, the accumulator resets with the new request
+  // identity, and the host is told which narrowing the reader asked for. The
+  // options in hand are remembered first, so narrowing to one kind does not
+  // empty the picker of the others — and so is whether the page they were
+  // chosen from fell short of its source, which keeps the kind census wanted
+  // under the narrowing.
+  const handleKindChange = useCallback(
+    (next: string): void => {
+      const resolved = availableKinds.find((kind) => kind === next) ?? ALL_KINDS_VALUE;
+
+      setRememberedKinds(availableKinds);
+      setNarrowedFromPartial(
+        resolved !== ALL_KINDS_VALUE && (narrowedFromPartial || sourceUncovered),
+      );
+      setSelectedKind(resolved);
+      actions?.onFilterChange?.(node.id, { kinds: resolved });
+    },
+    [actions, availableKinds, narrowedFromPartial, node.id, sourceUncovered],
+  );
+
   const footerLabel = coverageLabel(loadedCount, knownTotal, baseOffset);
 
   // Present exactly when a settled success loaded no record at all — nothing on
@@ -1489,6 +2311,102 @@ export function EventLog(props: EventLogProps): ReactElement {
     });
   }, [carried, data, identity, knownTotal, loadMoreOffset]);
 
+  // Two paging elements can leave the document while a keyboard reader is on
+  // them: the paging control — when the last page arrives, or when a page
+  // fails — and a failed page's retry, once the retried page is on its way.
+  // Focus would then fall to the document body and the reader would lose their
+  // place. Instead it moves, without scrolling the rows being read, to what
+  // the reader would press next: a failed page's retry; else the paging
+  // control, which is back while the retried page loads; else the first grid
+  // row in view, which becomes the grid's tab stop (see `landingRow`).
+  //
+  // Whether a leaving element held focus is read in its ref's CLEANUP, which
+  // React runs while the element is still in the document — before the
+  // removal that would already have moved focus away — and acted on in the
+  // layout effect of the same commit, before the browser paints and before the
+  // host's node focus keeper judges the loss (it reconciles after the commit,
+  // and records this move like any other).
+  const pagingFocusLostRef = useRef(false);
+  const pagingControlRef = useRef<HTMLButtonElement | null>(null);
+
+  const trackPagingControl = useCallback(
+    (element: HTMLButtonElement | null): (() => void) | undefined => {
+      if (element === null) {
+        return undefined;
+      }
+
+      pagingControlRef.current = element;
+
+      return () => {
+        if (pagingControlRef.current === element) {
+          pagingControlRef.current = null;
+        }
+        if (holdsFocus(element)) {
+          pagingFocusLostRef.current = true;
+        }
+      };
+    },
+    [],
+  );
+
+  const trackPageFailure = useCallback(
+    (element: HTMLDivElement | null): (() => void) | undefined => {
+      if (element === null) {
+        return undefined;
+      }
+
+      return () => {
+        if (holdsFocus(element)) {
+          pagingFocusLostRef.current = true;
+        }
+      };
+    },
+    [],
+  );
+
+  useLayoutEffect(() => {
+    if (!pagingFocusLostRef.current) {
+      return;
+    }
+
+    pagingFocusLostRef.current = false;
+
+    const root = rootRef.current;
+
+    if (root === null) {
+      return;
+    }
+
+    const target = pageFailed
+      ? root.querySelector<HTMLElement>(PAGE_RETRY_SELECTOR)
+      : (pagingControlRef.current ?? landingRow(root));
+
+    target?.focus({ preventScroll: true });
+  });
+
+  // A row's disclosure opens or closes its detail, and the host hears which
+  // record was expanded — reported here, from the state the disclosure was
+  // pressed in, never from inside the state update, which React may run twice.
+  const reportExpand = actions?.onExpand;
+  const nodeId = node.id;
+  const handleRowToggle = useCallback<EventLogRowToggle>(
+    (row, expanded) => {
+      const key = eventLogRowKey(row);
+
+      setExpandedRowKeys((current) => {
+        const open = current.includes(key);
+
+        if (expanded) {
+          return open ? current.filter((candidate) => candidate !== key) : current;
+        }
+
+        return open ? current : [...current, key];
+      });
+      reportExpand?.(nodeId, row.event.id, !expanded);
+    },
+    [nodeId, reportExpand],
+  );
+
   const selectEvent = actions?.onSelectEvent;
   const handleRowActivate = useCallback(
     (row: EventLogRow): void => {
@@ -1501,6 +2419,17 @@ export function EventLog(props: EventLogProps): ReactElement {
       selectEvent?.(ref);
     },
     [markSelected, selectEvent],
+  );
+
+  // What a row's "+N more" control does: the same selection a row activation
+  // reports, and nothing — the count stays plain text — on a surface with no
+  // record view to open. The columns are memoized on it, so each column's
+  // per-row cell cache (`renderOncePerRow`) survives every render that keeps
+  // the callback, which is every scroll step of the virtualized grid.
+  const showAll = selectEvent === undefined ? undefined : handleRowActivate;
+  const columns = useMemo(
+    () => createEventLogColumns(showAll, handleRowToggle),
+    [showAll, handleRowToggle],
   );
 
   // Whether this log's rows have a selected state at all. Under a host they
@@ -1528,7 +2457,7 @@ export function EventLog(props: EventLogProps): ReactElement {
     ...(filtering
       ? [
           {
-            label: `${formatCount(visibleCount)} of ${formatCount(loadedCount)} loaded records match`,
+            label: `${formatCount(visibleCount)} of ${formatCount(loadedCount)} loaded ${pluralize(loadedCount, RECORD_NOUN)} ${pluralize(visibleCount, MATCH_VERB)}`,
           },
         ]
       : []),
@@ -1577,20 +2506,25 @@ export function EventLog(props: EventLogProps): ReactElement {
   // different answers and are never merged - `"success"` with no rows is an
   // absence phrased from the response's own counters (see `describeEmptyPage`),
   // while a rejection is a failure with a retry, never presented as a result.
+  //
+  // The busy and failed bodies stand for the FIRST page only. A further page in
+  // flight or failed behind rows already on screen keeps the grid — the same
+  // mounted element, so its virtualizer, its scroll position and its active row
+  // are untouched — and the request's progress is carried by the paging control
+  // below, its failure by a page-scoped error beneath the footer.
   let body: ReactNode;
 
-  if (status === 'loading') {
+  if (status === 'loading' && !appending) {
     body = (
       <div className="dg-event-log__loading">
         <LoadingState variant="rows" label={LOADING_LABEL} />
       </div>
     );
-  } else if (status === 'error') {
+  } else if (status === 'error' && !pageFailed) {
     // The shared failure contract, with the query exactly as it was asked: the
     // generic lead and the provider's own cause, its hint on a line of its own,
-    // its code and a retry. Scoped to the whole view even for a later page,
-    // because this body replaces the rows carried from the earlier pages rather
-    // than keeping them above the failure.
+    // its code and a retry. Scoped to the whole view: nothing has loaded, so
+    // the failure is the view's whole answer.
     body = (
       <div className="dg-event-log__error">
         <ErrorState
@@ -1612,11 +2546,17 @@ export function EventLog(props: EventLogProps): ReactElement {
     body = (
       <DataTable
         rows={visibleRows}
-        columns={EVENT_LOG_COLUMNS}
+        columns={columns}
         rowKey={eventLogRowKey}
         caption={node.title ?? EVENT_LOG_CATALOG_ENTRY.label}
         selectedRowKey={selectedRowKey}
         onRowActivate={selectEvent === undefined ? undefined : handleRowActivate}
+        // The detail of a row whose strip cuts a value or leaves a pair out.
+        // Opened by the row's own disclosure only — no `onRowToggle` — so a row
+        // with nothing to reveal never answers an expand key and ArrowRight
+        // moves into every row alike.
+        expandedRowKeys={expandedRowKeys}
+        renderExpandedRow={renderAttributeDetail}
         // Reached only by a text filter that matched nothing: a settled page
         // with no record at all takes the empty body above, so these rows are
         // empty exactly when the filter emptied them, and the state's control
@@ -1675,7 +2615,7 @@ export function EventLog(props: EventLogProps): ReactElement {
       {/* The footer follows what has loaded, and also an empty page the service
           reports a forward `nextOffset` for: that page ends nothing, and the
           next one must stay reachable. */}
-      {loadedCount > 0 || hasMore ? (
+      {loadedCount > 0 || showLoadMore ? (
         <Stack
           direction="horizontal"
           align="center"
@@ -1689,17 +2629,36 @@ export function EventLog(props: EventLogProps): ReactElement {
           <Text size="xs" tone="muted" aria-live="polite">
             {footerLabel}
           </Text>
-          {hasMore ? (
+          {showLoadMore ? (
+            // One element for the whole request: while the page it asked for
+            // is on its way the control keeps its place and its focus, says
+            // what it is doing, and ignores a second press (`handleLoadMore`
+            // acts only on a settled page) — `aria-disabled` rather than the
+            // native attribute, which would take focus away from the reader
+            // who pressed it.
             <Button
+              ref={trackPagingControl}
               variant="secondary"
               size="sm"
               icon={<ChevronDown className="dg-icon" />}
+              aria-disabled={appending ? true : undefined}
+              aria-busy={appending ? true : undefined}
               onClick={handleLoadMore}
             >
-              {LOAD_MORE_LABEL}
+              {appending ? LOADING_MORE_LABEL : LOAD_MORE_LABEL}
             </Button>
           ) : null}
         </Stack>
+      ) : null}
+      {pageFailed ? (
+        // A further page that failed, reported beneath the rows it could not
+        // extend: those rows stay where the reader left them, and the retry
+        // asks for exactly the page that failed.
+        <div className="dg-event-log__error" ref={trackPageFailure}>
+          <ErrorState
+            {...queryFailureProps({ error, announcement, retry }, query, { scope: 'page' })}
+          />
+        </div>
       ) : null}
     </div>
   );

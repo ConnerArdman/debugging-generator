@@ -57,7 +57,10 @@
  * patcher and cleanup share while the service keeps one place that knows SQL.
  * The repository also answers {@link ModificationCorroborationReader}, the
  * metadata-only read the telemetry ingest path corroborates patch stamps with,
- * which never loads a diff.
+ * which never loads a diff. Two standalone functions over the store sit beside
+ * it, outside the port: {@link readSessionModifications}, the synchronous read
+ * `./sessions-repo.ts` refreshes `SessionRecord.modifications` from, and
+ * {@link scanSessionBackupReferences}, the retention sweep's probe.
  *
  * Every shape crossing that seam is imported, never restated:
  * {@link ModificationRecord}, {@link ModificationStatus},
@@ -2973,6 +2976,89 @@ export function createModificationsRepo(
     listCorroborationsBySession,
     listPatchEvidenceBySessionFile,
   } satisfies ModificationJournal & ModificationsRepo & ModificationCorroborationReader;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The session record's journal read
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Reads every journal record of one session, in append order, synchronously.
+ *
+ * The read `./sessions-repo.ts` keeps `SessionRecord.modifications` current
+ * with. That member is a *mirror* of this table, written when an install or a
+ * follow-up applies its records; every later status change — the conflict
+ * watcher's `applied → conflict`, cleanup's `→ reverted` or `→ conflict`,
+ * start-up reconciliation — is written here and nowhere else. The sessions
+ * repository therefore overlays each mirrored entry with the record this read
+ * returns for its id, on every read of a session and before every write of
+ * one, so a session record never reports a status the journal has moved past.
+ *
+ * A standalone function over the store rather than a
+ * {@link ModificationsRepo} member, for the reason
+ * {@link scanSessionBackupReferences} is one: the repository implements the
+ * `ModificationJournal` port that `@debuggen/instrumentation` and the
+ * service's in-memory journal fakes type-check against, and a synchronous
+ * read made from inside another repository's transaction does not belong in
+ * that asynchronous contract. It stays this module's only way to read the
+ * table on another module's behalf, so the SQL and the row validation remain
+ * here: the same statement and the same row mapping
+ * {@link ModificationsRepo.listBySession} uses, so the two can never disagree
+ * about a record.
+ *
+ * Synchronous from the first row to the last, so it composes with — and reads
+ * the state of — a transaction the caller already holds on this connection.
+ * As in {@link ModificationsRepo.listBySession}, a single row that no longer
+ * parses fails the whole read rather than being skipped, reported by its id
+ * and never by its content: a caller that received a partial journal could
+ * not tell a record it was not given from one that does not exist.
+ *
+ * @param store The open, migrated store.
+ * @param sessionId The session whose records are read. A session with no
+ * record — or no such session — yields an empty list.
+ * @returns `ok(records)` in `applied_at, rowid` order, or `err` `STORE_ERROR`:
+ * `invalid-argument` for an id that is not a non-empty string, the corrupt-row
+ * error naming the first row that does not parse, or `store-failed` when the
+ * statement could not run. Never throws.
+ *
+ * @example
+ * ```ts
+ * const journal = readSessionModifications(store, record.id);
+ * if (journal.ok) {
+ *   const current = new Map(journal.value.map((entry) => [entry.id, entry]));
+ *   // replace each mirrored entry by `current.get(entry.id) ?? entry`
+ * }
+ * ```
+ */
+export function readSessionModifications(
+  store: Store,
+  sessionId: SessionId,
+): Result<ModificationRecord[]> {
+  const operation = 'readSessionModifications';
+
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return err(invalidWindowError(operation, 'sessionId', 'a non-empty string'));
+  }
+
+  return attempt(
+    operation,
+    (): Result<ModificationRecord[]> => {
+      const records: ModificationRecord[] = [];
+
+      for (const row of store.statement(SELECT_BY_SESSION_SQL).all(sessionId)) {
+        const parsed = parseModificationRecord(toRecordCandidate(row));
+
+        if (isErr(parsed)) {
+          return err(corruptRowError(rowIdOf(row), parsed.error));
+        }
+
+        records.push(parsed.value);
+      }
+
+      return ok(records);
+    },
+    { [LOG_BINDING_KEYS.sessionId]: sessionId },
+  );
 }
 
 /* -------------------------------------------------------------------------------------------------

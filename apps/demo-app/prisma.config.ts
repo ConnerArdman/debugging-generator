@@ -112,8 +112,8 @@ function loadLocalEnvFile(): void {
  * it), so `env()` is reached only where a URL really is required, which is what
  * {@link resolveDatasource} below decides. A blank or whitespace-only value
  * counts as absent: it cannot produce a valid URL, and treating it as unset
- * yields Prisma's actionable "the datasource.url property is required" message
- * instead of a parse error.
+ * yields this file's actionable "DATABASE_URL is not set" message for a command
+ * that needs a database, instead of a parse error.
  *
  * This is a presence probe only: the value is inspected here solely to see
  * whether it is non-blank. The connection value handed to Prisma always comes
@@ -180,6 +180,49 @@ const VALUE_TAKING_GLOBAL_FLAGS = new Set(['--config']);
 const CONFIG_DATASOURCE_DIFF_FLAGS = ['--from-config-datasource', '--to-config-datasource'];
 
 /**
+ * The commands that open a connection to the database `DATABASE_URL` names,
+ * written as {@link invokedCommandName} returns them. Without a URL, each is
+ * refused by {@link resolveDatasource} with a message naming the variable and
+ * the setup step, rather than left to Prisma's "The datasource.url property is
+ * required in your Prisma config file when using prisma migrate deploy.", which
+ * names neither.
+ *
+ * `studio` is a one-word command whose `--port` and `--browser` values can
+ * follow it as a second positional (`prisma studio --port 5555` reads as
+ * `'studio 5555'`), so an entry matches the command itself or the command
+ * followed by further words. `db seed` is deliberately absent: the seed script
+ * checks the variable itself and prints the full setup sequence. So is
+ * `migrate diff`, whose live endpoints {@link namesConfigDatasource} recognises
+ * instead.
+ */
+const CONNECTING_COMMANDS = [
+  'migrate deploy',
+  'migrate dev',
+  'migrate status',
+  'migrate reset',
+  'migrate resolve',
+  'db push',
+  'db pull',
+  'db execute',
+  'studio',
+];
+
+/**
+ * The flags that ask a command for its usage text. Help opens no connection,
+ * so an invocation carrying one is never refused for a missing URL.
+ */
+const HELP_FLAGS = ['--help', '-h'];
+
+/**
+ * The flag with which prisma 7.10.0's `migrate dev`, `db push`, `db pull` and
+ * `studio` take a connection string on the command line ("Override the
+ * datasource URL from the Prisma config file"). Such an invocation has its
+ * connection without `DATABASE_URL`, so it is left to Prisma. `migrate diff`
+ * has no such flag: its live endpoints read only this config's datasource.
+ */
+const URL_OVERRIDE_FLAGS = ['--url'];
+
+/**
  * The command the CLI was invoked with, as its first two positional arguments
  * joined by a space — `'migrate diff'`, `'generate'`, `'db seed'`, `''` when
  * the CLI was given no command at all.
@@ -214,6 +257,20 @@ function invokedCommandName(): string {
 }
 
 /**
+ * Whether any of `flags` appears among the CLI's arguments, either bare
+ * (`--url`) or in its `--flag=value` spelling (`--url=…`), so a value attached
+ * with `=` cannot slip past the check.
+ *
+ * @param flags The flag spellings to look for.
+ * @returns `true` when at least one of them was passed.
+ */
+function flagged(flags: readonly string[]): boolean {
+  return process.argv
+    .slice(2)
+    .some((argument) => flags.some((flag) => argument === flag || argument.startsWith(`${flag}=`)));
+}
+
+/**
  * Whether the invocation names this config's datasource as a diff endpoint,
  * i.e. whether it intends to read a live database.
  *
@@ -224,63 +281,106 @@ function invokedCommandName(): string {
  * is present.
  */
 function namesConfigDatasource(): boolean {
-  return process.argv
-    .slice(2)
-    .some((argument) =>
-      CONFIG_DATASOURCE_DIFF_FLAGS.some(
-        (flag) => argument === flag || argument.startsWith(`${flag}=`),
-      ),
-    );
+  return flagged(CONFIG_DATASOURCE_DIFF_FLAGS);
+}
+
+/**
+ * The error that refuses a command needing a database while `DATABASE_URL` is
+ * absent, worded as `prisma/seed.ts` reports the same missing variable for
+ * `prisma db seed`.
+ *
+ * Thrown while this module is evaluated, it reaches the developer through the
+ * CLI's `Failed to load config file "…" as a TypeScript/JavaScript module.
+ * Error: …` report, and the command exits 1 before it opens anything. Only the
+ * variable's name appears: no connection string is printed, defaulted or
+ * suggested here — `.env.example` carries the local development one.
+ *
+ * The CLI prints the error as `String(error)`, i.e. `<name>: <message>`, after
+ * its own `Error: `. The name is therefore set to the same kind of source
+ * prefix the seed script writes (`lumen-supply seed: …`), which reads as
+ * `Error: lumen-supply config: prisma migrate deploy needs …` instead of the
+ * doubled `Error: Error: …` a plain `Error` would produce.
+ *
+ * @param command The refused command as it follows `prisma` on the command
+ * line, e.g. `'migrate deploy'`.
+ * @returns The error to throw.
+ */
+function unconfigured(command: string): Error {
+  const error = new Error(
+    [
+      `prisma ${command} needs a database connection, but ${DATABASE_URL_VAR} is not set.`,
+      '  1. start PostgreSQL:  pnpm demo:db',
+      '  2. copy apps/demo-app/.env.example to apps/demo-app/.env, which carries the local',
+      `     development connection URL (or export ${DATABASE_URL_VAR} yourself)`,
+      '  3. run the command again',
+    ].join('\n'),
+  );
+  error.name = 'lumen-supply config';
+  return error;
 }
 
 /**
  * The `datasource` object for this invocation, or `undefined` when the key must
  * be absent altogether.
  *
- * Three cases, in order:
+ * Four cases, in order:
  *
  *  1. `DATABASE_URL` is set — every command gets
  *     `{ url: env('DATABASE_URL') }`, the shape AAP 0.3.4 and 0.7.1 Group 5
  *     prescribe. The URL handed to Prisma is always read through `env()`, the
  *     accessor the CLI expects; `process.env` is consulted only by
  *     {@link hasDatabaseUrl}'s presence probe.
- *  2. No `DATABASE_URL`, and the command is `prisma migrate diff`:
- *     - naming a config datasource (`--from-config-datasource` /
- *       `--to-config-datasource`) means a live database is required, so
- *       `env()` is called and its `PrismaConfigEnvError` aborts the command
- *       with exit 1 naming `DATABASE_URL`. That is deliberate: with no
- *       datasource key at all, prisma 7.10.0 answers this invocation with exit
- *       0 and zero bytes, which is the same silent success this file exists to
- *       prevent, and a placeholder would only report a connection error against
- *       port 1 instead of the missing variable.
- *     - otherwise both endpoints are offline and
- *       {@link OFFLINE_DIFF_DATASOURCE_URL} supplies the dialect, so the full
- *       DDL is rendered. `--from-migrations` lands here too and fails loudly and
- *       correctly ("You must set `datasource.shadowDatabaseUrl`…") rather than
- *       succeeding empty.
- *  3. No `DATABASE_URL`, any other command — no `datasource` key. This is what
- *     keeps `generate`, `validate` and `format` working on a clean clone with no
- *     database (`prisma generate` is this workspace's `prebuild` and
- *     `pretypecheck` step), and what lets connecting commands report the missing
- *     datasource in their own words: `prisma migrate deploy` answers "The
- *     datasource.url property is required in your Prisma config file when using
- *     prisma migrate deploy."
+ *  2. No `DATABASE_URL`, and the command is `prisma migrate diff` with both
+ *     endpoints offline (neither `--from-config-datasource` nor
+ *     `--to-config-datasource`): {@link OFFLINE_DIFF_DATASOURCE_URL} supplies
+ *     the dialect, so the full DDL is rendered. `--from-migrations` lands here
+ *     too and fails loudly and correctly ("You must set
+ *     `datasource.shadowDatabaseUrl`…") rather than succeeding empty.
+ *  3. No `DATABASE_URL`, and the command must connect — `migrate diff` naming
+ *     a config datasource, or one of {@link CONNECTING_COMMANDS} without a
+ *     `--url` override: the command is refused with {@link unconfigured}'s
+ *     error, which names the variable, `pnpm demo:db` and the `.env.example`
+ *     copy step. Left to Prisma, `prisma migrate deploy` would answer only "The
+ *     datasource.url property is required in your Prisma config file when
+ *     using prisma migrate deploy."; a config-datasource diff would fail in
+ *     `env()` without the setup step or, given no datasource key at all, exit 0
+ *     with zero bytes — the silent success this file exists to prevent — and a
+ *     placeholder would only report a connection error against port 1. An
+ *     invocation carrying `--help` or `-h` is exempt and falls to case 4: help
+ *     opens no connection.
+ *  4. No `DATABASE_URL`, any other command — no `datasource` key. This is what
+ *     keeps `generate`, `validate`, `format` and `version` working on a clean
+ *     clone with no database (`prisma generate` is this workspace's `prebuild`
+ *     and `pretypecheck` step), and what leaves `prisma db seed` to the seed
+ *     script, which reports the missing variable with the full setup sequence.
  *
  * @returns The datasource to contribute, or `undefined` to contribute none.
- * @throws `PrismaConfigEnvError` from `env()` when a `migrate diff` invocation
- * needs a live datasource that the environment does not provide.
+ * @throws `Error` naming `DATABASE_URL`, `pnpm demo:db` and the
+ * `apps/demo-app/.env.example` → `apps/demo-app/.env` copy step when the
+ * command needs a database that neither the environment, `apps/demo-app/.env`
+ * nor a `--url` override provides.
  */
 function resolveDatasource(): { readonly url: string } | undefined {
   if (hasDatabaseUrl()) {
     return { url: env(DATABASE_URL_VAR) };
   }
-  if (invokedCommandName() !== MIGRATE_DIFF_COMMAND) {
+  const command = invokedCommandName();
+  if (command === MIGRATE_DIFF_COMMAND && !namesConfigDatasource()) {
+    return { url: OFFLINE_DIFF_DATASOURCE_URL };
+  }
+  if (flagged(HELP_FLAGS)) {
     return undefined;
   }
-  if (namesConfigDatasource()) {
-    return { url: env(DATABASE_URL_VAR) };
+  if (command === MIGRATE_DIFF_COMMAND) {
+    throw unconfigured(command);
   }
-  return { url: OFFLINE_DIFF_DATASOURCE_URL };
+  const connecting = CONNECTING_COMMANDS.find(
+    (entry) => command === entry || command.startsWith(`${entry} `),
+  );
+  if (connecting !== undefined && !flagged(URL_OVERRIDE_FLAGS)) {
+    throw unconfigured(connecting);
+  }
+  return undefined;
 }
 
 loadLocalEnvFile();
@@ -308,7 +408,8 @@ export default defineConfig({
   },
   // Spread rather than a `datasource: undefined` key: an explicitly undefined
   // value is still a present key, and `exactOptionalPropertyTypes` rejects it.
-  // `resolveDatasource()` above decides which of the three cases applies — a
-  // configured URL, the offline `migrate diff` placeholder, or no key at all.
+  // `resolveDatasource()` above decides which case applies — a configured URL,
+  // the offline `migrate diff` placeholder, or no key at all; a command that
+  // needs a database it was not given has already been refused there.
   ...(datasource === undefined ? {} : { datasource }),
 });

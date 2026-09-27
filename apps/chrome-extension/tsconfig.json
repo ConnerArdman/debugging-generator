@@ -15,7 +15,9 @@
 
   "// compilerOptions.jsx": "Restates the base's \"react-jsx\" because the panel is written in .tsx.",
 
-  "// compilerOptions.module": "`module`/`moduleResolution` are not overridden: bundler resolution matches Vite's resolver, and relative specifiers are extensionless.",
+  "// compilerOptions.module": "`module`/`moduleResolution` are not overridden: bundler resolution matches Vite's resolver, and relative specifiers in src/** and test/** are extensionless.",
+
+  "// compilerOptions.allowImportingTsExtensions": "true for vite.config.ts alone, which imports ./manifest.config.ts with its extension: Vite's `native` config loader runs the config through Node's ESM resolver, which never adds an extension, and the default loader warns on every build about an extensionless relative import. Legal only because this program emits declarations only (`emitDeclarationOnly`); keep src/** and test/** extensionless.",
 
   "// compilerOptions.resolveJsonModule": "Inherited but unused: test/manifest.test.ts reads the built dist/manifest.json at runtime instead of importing it, so a build artefact never becomes a program input.",
 
@@ -46,7 +48,9 @@
 
     "types": ["chrome", "node"],
 
-    "jsx": "react-jsx"
+    "jsx": "react-jsx",
+
+    "allowImportingTsExtensions": true
   },
 
   "include": [

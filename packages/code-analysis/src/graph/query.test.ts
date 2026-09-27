@@ -79,12 +79,13 @@ import { fileURLToPath } from 'node:url';
 
 import {
   DEFAULT_RESOLUTION_CONFIDENCE,
+  createConsoleLogger,
   formatSourceLocation,
   isErr,
   isOk,
   parseSourceLocation,
 } from '@debuggen/shared';
-import type { SourceLocation } from '@debuggen/shared';
+import type { LogLevelSetting, LogRecord, Logger, SourceLocation } from '@debuggen/shared';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { buildIndex } from '../indexer.js';
@@ -1450,6 +1451,149 @@ describe('excerpt', () => {
     expect(widest.text.length).toBeLessThanOrEqual(CODE_QUERY_LIMITS.maxExcerptChars);
     expect(widest.text.length).toBeLessThan(whole.length);
     expect(widest.truncated).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Log levels: per-query outcomes at trace, defects at debug
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The message `pathBetween` records a miss under. */
+const PATH_MISS_LOG = 'pathBetween found no path within the bounds';
+
+/**
+ * A real shared-package logger whose sink keeps every record it is handed.
+ *
+ * `createConsoleLogger` rather than a hand-written recorder, so the threshold
+ * filtering under test is the product's own: a record at a level below
+ * `level` never reaches the sink.
+ *
+ * @param level The threshold.
+ * @returns The logger and the records its sink received.
+ */
+function capturingLogger(level: LogLevelSetting): {
+  readonly logger: Logger;
+  readonly records: LogRecord[];
+} {
+  const records: LogRecord[] = [];
+  const logger = createConsoleLogger({
+    level,
+    sink: (record) => {
+      records.push(record);
+    },
+  });
+
+  return { logger, records };
+}
+
+describe('log levels', () => {
+  it('records a pathBetween miss at trace and nothing at debug', () => {
+    const { logger, records } = capturingLogger('trace');
+    const logged = createCodeQueries(corpus.graph, { loaded: corpus.loaded, logger });
+    const layout = assertDefined(
+      logged
+        .findByName('ObservatoryLayout', { exact: true })
+        .find((match) => match.kind === 'component'),
+      'the layout component',
+    );
+    const component = assertDefined(
+      logged
+        .findByName('GaugeReadout', { exact: true })
+        .find((match) => match.kind === 'component'),
+      'the GaugeReadout component',
+    );
+    const query = corpusNode('db-call', 'prisma.gauge.findMany');
+
+    // Three misses of three kinds — unreachable, cut by depth, cut by the node
+    // budget — which is what a caller probing candidate after candidate sees.
+    expect(logged.pathBetween(layout.nodeId, { kind: 'db-call' })).toBeUndefined();
+    expect(logged.pathBetween(component.nodeId, query.id, { maxDepth: 4 })).toBeUndefined();
+    expect(logged.pathBetween(component.nodeId, query.id, { maxNodes: 1 })).toBeUndefined();
+
+    const misses = records.filter((record) => record.message === PATH_MISS_LOG);
+    expect(misses).toHaveLength(3);
+    expect(misses.map((record) => record.level)).toStrictEqual(['trace', 'trace', 'trace']);
+    expect(records.filter((record) => record.level === 'debug')).toStrictEqual([]);
+
+    // Bounds and counts only: nothing names a node, a file or a line of source.
+    for (const miss of misses) {
+      expect(Object.keys(miss.fields).sort()).toStrictEqual([
+        'direction',
+        'expanded',
+        'maxDepth',
+        'maxNodes',
+        'sources',
+        'targets',
+        'truncated',
+      ]);
+    }
+    expect(assertDefined(misses[1], 'the depth-bounded miss').fields.truncated).toBe(true);
+
+    // A search that finds its path records nothing at all.
+    records.length = 0;
+    expect(logged.pathBetween(component.nodeId, query.id)).toBeDefined();
+    expect(records).toStrictEqual([]);
+  });
+
+  it('emits nothing for a miss through a debug-threshold logger', () => {
+    const { logger, records } = capturingLogger('debug');
+    const logged = createCodeQueries(corpus.graph, { loaded: corpus.loaded, logger });
+    const component = assertDefined(
+      logged
+        .findByName('GaugeReadout', { exact: true })
+        .find((match) => match.kind === 'component'),
+      'the GaugeReadout component',
+    );
+    const query = corpusNode('db-call', 'prisma.gauge.findMany');
+
+    // The service's debug log is the one the misses flooded: fifty of them
+    // there now write not a single line.
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      expect(logged.pathBetween(component.nodeId, query.id, { maxDepth: 1 })).toBeUndefined();
+    }
+    expect(records).toStrictEqual([]);
+  });
+
+  it('records the other bounded outcomes at trace: capped answers and a clamped selector', () => {
+    const { logger, records } = capturingLogger('trace');
+    const tight = createCodeQueries(corpus.graph, {
+      loaded: corpus.loaded,
+      limits: { maxResults: 1, maxCallers: 1 },
+      logger,
+    });
+
+    // Three callers capped to one, two methods capped to one, and a selector
+    // naming every database call clamped to one — each a well-formed query
+    // answered inside its bounds. Whether the clamped search then reaches its
+    // single remaining target depends on which one survived the clamp, so the
+    // path itself is not the assertion; the records are.
+    expect(tight.whoCalls('summarizeBasin')).toHaveLength(1);
+    expect(tight.handlersFor('/api/gauges')).toHaveLength(1);
+    tight.pathBetween({ name: 'summarizeBasin', kind: 'server-function' }, { kind: 'db-call' });
+
+    const levels = new Map(records.map((record) => [record.message, record.level]));
+    expect(levels.get('whoCalls result was capped')).toBe('trace');
+    expect(levels.get('handlersFor result was capped')).toBe('trace');
+    expect(levels.get('endpoint selector matched more nodes than the limit')).toBe('trace');
+    // The one debug record is the once-per-surface route-map derivation the
+    // first route query paid for, not anything a query repeats.
+    expect(
+      records.filter((record) => record.level === 'debug').map((record) => record.message),
+    ).toStrictEqual(['derived the route map from the code graph']);
+  });
+
+  it('keeps a refused argument at debug, where a caller defect belongs', () => {
+    const { logger, records } = capturingLogger('debug');
+    const logged = createCodeQueries(corpus.graph, { loaded: corpus.loaded, logger });
+
+    expect(logged.findByName(null as unknown as string)).toStrictEqual([]);
+    expect(logged.whoCalls('x'.repeat(CODE_QUERY_LIMITS.maxNameLength + 1))).toStrictEqual([]);
+    expect(logged.findByName('x'.repeat(CODE_QUERY_LIMITS.maxNameLength + 1))).toStrictEqual([]);
+
+    expect(records.map((record) => `${record.level}:${record.message}`)).toStrictEqual([
+      'debug:refused a query argument that is not the shape the query declares',
+      'debug:rejected a name argument outside the length bound',
+    ]);
   });
 });
 

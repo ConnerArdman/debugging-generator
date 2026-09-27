@@ -7,8 +7,13 @@
  * `forbidPending`.
  *
  * Hermeticity, so no run reads or writes the developer's state:
- *   - a throwaway `<os.tmpdir()>/debuggen-vscode-test-XXXXXX/` holds `home/` (`DEBUGGEN_HOME`),
- *     `user-data/` and `extensions/`; it is removed on exit, and a failed removal fails the run;
+ *   - a throwaway `<base>/debuggen-vscode-test-XXXXXX/` holds `home/` (`DEBUGGEN_HOME`),
+ *     `user-data/` and `extensions/`; it is removed on exit, and a failed removal fails the run.
+ *     `<base>` is the real path of `os.tmpdir()` whenever every Unix-domain socket VS Code and the
+ *     suites create under it stays shorter than the platform's limit (107 characters on Linux,
+ *     103 on macOS). Otherwise it is the real path of `/tmp` and the editor runs with
+ *     `TMPDIR=<base>`, so its own sockets, the suites' scratch directories and the packaged-vsix
+ *     window move with it ({@link resolveScratchBase});
  *   - inherited `DEBUGGEN_*` and `ANTHROPIC_*` variables are stripped and
  *     `DEBUGGEN_PROVIDER=deterministic` is forced;
  *   - the workspace is the generic fixture `test/fixtures/workspace`, never the repository root or
@@ -26,7 +31,14 @@
  *   - `VSCODE_TEST_PATH`: absolute path of an installed editor; wins over `VSCODE_TEST_VERSION`;
  *   - `DEBUGGEN_VSCODE_TEST_TIMEOUT_MS`: mocha timeout, default 600000; `0` disables it;
  *   - `DEBUGGEN_VSCODE_TEST_KEEP_STATE=1` (or `true`): keep and print the throwaway directory;
- *   - `DEBUGGEN_TEST_NODE`: Node for suites that run Node themselves; defaults to this CLI's Node.
+ *   - `DEBUGGEN_TEST_NODE`: Node for suites that run Node themselves; defaults to this CLI's Node;
+ *   - `TMPDIR` (or `TMP`/`TEMP`, which `os.tmpdir()` falls back to): must name an existing
+ *     directory. One too long for the editor's sockets is replaced by `/tmp`, with one stderr line
+ *     saying so; when `/tmp` cannot stand in either, the run fails before anything is created,
+ *     naming the socket, its length, the limit and the longest usable `TMPDIR`;
+ *   - `XDG_RUNTIME_DIR` (read by VS Code itself, on Linux): when set, the editor creates its
+ *     sockets there rather than under `<base>` (its main socket only without `VSCODE_PORTABLE`),
+ *     so a value too long for them fails the run early, naming the variable.
  *
  * @module apps/vscode-extension/.vscode-test
  */
@@ -100,8 +112,93 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 /** Prefix of the throwaway directory; `test/helpers.ts` uses the same one. */
 const SCRATCH_PREFIX = 'debuggen-vscode-test-';
 
-/** Prefix of the one line this file prints, on stderr (stdout carries `--list-configuration` JSON). */
+/** Prefix of the lines this file prints, on stderr (stdout carries `--list-configuration` JSON). */
 const LOG_PREFIX = '[vscode-test config]';
+
+/** The profile directory inside the throwaway state, and inside the packaged-vsix suite's profile. */
+const USER_DATA_DIR_NAME = 'user-data';
+
+/**
+ * The Unix-domain socket path limit VS Code enforces, by `process.platform`
+ * (`validateIPCHandleLength` in `src/vs/base/parts/ipc/node/ipc.net.ts`;
+ * the kernel's `sun_path` holds 108 bytes on Linux and 104 on macOS, the
+ * terminator included). A handle fits only when it is shorter than the limit,
+ * the bound VS Code checks itself: from there on it warns "IPC handle … is
+ * longer than N chars", and a path the kernel cannot hold makes `listen()`
+ * fail with EINVAL. Windows uses named pipes, which have no such limit, so it
+ * has no entry.
+ */
+const IPC_HANDLE_LIMITS = new Map([
+  ['linux', 107],
+  ['darwin', 103],
+]);
+
+/** What `mkdtemp` appends to its prefix: six random characters. */
+const MKDTEMP_SUFFIX = 'XXXXXX';
+
+/**
+ * An editor's main IPC socket in its `--user-data-dir`:
+ * `<version.substr(0, 4)>-<type.substr(0, 6)>.sock` for type `main`
+ * (`createStaticIPCHandle` in `ipc.net.ts`), such as `1.13-main.sock`, and
+ * never longer than this placeholder.
+ */
+const MAIN_HANDLE_NAME = 'X.XX-main.sock';
+
+/**
+ * The same socket when VS Code puts it in `XDG_RUNTIME_DIR` (any platform
+ * but macOS and Windows, unless `VSCODE_PORTABLE` is set):
+ * `vscode-<8 hex digits of sha256(userDataPath)>-<version 4>-main.sock`.
+ */
+const XDG_MAIN_HANDLE_NAME = `vscode-${'X'.repeat(8)}-X.XX-main.sock`;
+
+/**
+ * Sockets VS Code creates directly in the temporary directory, or in
+ * `XDG_RUNTIME_DIR` when that rule applies (VS Code ignores `VSCODE_PORTABLE`
+ * for these), at their longest across the releases `engines.vscode` admits.
+ * Newer releases shorten both ids: the git id to 10 hex digits, and the uuid
+ * to whatever fits.
+ */
+const TEMP_DIR_HANDLES = Object.freeze([
+  {
+    owner: "the built-in git extension's IPC socket",
+    name: `vscode-git-${'X'.repeat(40)}.sock`,
+  },
+  {
+    owner: "an extension host's random IPC socket (createRandomIPCHandle)",
+    name: `vscode-ipc-${'X'.repeat(36)}.sock`,
+  },
+]);
+
+/**
+ * The `--user-data-dir` of every editor window the run starts, as path
+ * segments below the scratch base with `mkdtemp` placeholders. Each window
+ * creates its main socket ({@link MAIN_HANDLE_NAME}) in its own:
+ *   - this file's throwaway profile ({@link createThrowawayState});
+ *   - the packaged-vsix suite's second, isolated window, mirrored from
+ *     `test/suite/packaged-vsix.test.ts` and `test/helpers.ts`: the suite's
+ *     `createScratchDir('packaged-vsix-')` makes
+ *     `<base>/debuggen-vscode-test-packaged-vsix-XXXXXX`, and
+ *     `throwawayCliProfileArgs(<scratch>/profile)` adds `user-data/`. It holds
+ *     the deepest socket of the run (`<base>` plus 75 characters), so a change
+ *     to that layout must be made here as well.
+ */
+const EDITOR_PROFILES = Object.freeze([
+  {
+    owner: "this run's editor",
+    segments: [`${SCRATCH_PREFIX}${MKDTEMP_SUFFIX}`, USER_DATA_DIR_NAME],
+  },
+  {
+    owner: "the packaged-vsix suite's isolated window",
+    segments: [`${SCRATCH_PREFIX}packaged-vsix-${MKDTEMP_SUFFIX}`, 'profile', USER_DATA_DIR_NAME],
+  },
+]);
+
+/**
+ * The short scratch base tried when the inherited one is too long: Node's
+ * `os.tmpdir()` default on POSIX. It is used only when its real path (on
+ * macOS `/private/tmp`) is an existing, writable directory whose sockets fit.
+ */
+const POSIX_FALLBACK_TEMP_DIR = '/tmp';
 
 // ---------------------------------------------------------------------------
 // Small utilities
@@ -378,6 +475,259 @@ function resolveKeepState() {
 }
 
 // ---------------------------------------------------------------------------
+// The scratch base: a temporary directory short enough for VS Code's sockets
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {object} IpcHandle
+ * @property {string} owner      what creates the socket, for messages
+ * @property {string} directory  where it is created: the scratch base or `XDG_RUNTIME_DIR`
+ * @property {string} relative   its path below `directory`, with placeholders of the real lengths
+ * @property {string} path       `directory` and `relative` joined: the path whose length counts
+ * @property {boolean} underBase whether `directory` is the scratch base, so moving the base moves it
+ */
+
+/**
+ * @typedef {object} Relocation
+ * @property {string} inherited the real path of the inherited `os.tmpdir()`, which is too long
+ * @property {IpcHandle} handle the longest socket under it
+ * @property {number} limit     the platform's limit ({@link IPC_HANDLE_LIMITS})
+ */
+
+/**
+ * @typedef {object} ScratchBase
+ * @property {string} path the real path the throwaway state is created under
+ * @property {Relocation | undefined} relocation set when `path` replaces the inherited
+ *   `os.tmpdir()`; the editor then runs with `TMPDIR=<path>` ({@link extensionHostEnvironment})
+ */
+
+/**
+ * The real path of `target` when it names an existing directory.
+ *
+ * @param {string} target
+ * @returns {string | undefined}
+ */
+function realDirectory(target) {
+  try {
+    const real = fs.realpathSync(target);
+    return isDirectory(real) ? real : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * @param {string} directory
+ * @returns {boolean} whether this process may create entries in `directory`
+ */
+function isWritableDirectory(directory) {
+  try {
+    fs.accessSync(directory, fs.constants.W_OK | fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The variable `os.tmpdir()` took its value from, for messages: the first
+ * non-empty one of `TMPDIR`, `TMP` and `TEMP` on POSIX (`TEMP` and `TMP` on
+ * Windows), or `undefined` when it used the platform default.
+ *
+ * @returns {string | undefined}
+ */
+function tempDirectoryVariable() {
+  const candidates = process.platform === 'win32' ? ['TEMP', 'TMP'] : ['TMPDIR', 'TMP', 'TEMP'];
+  return candidates.find((name) => (process.env[name] ?? '') !== '');
+}
+
+/**
+ * `XDG_RUNTIME_DIR` when VS Code creates its sockets there: on every
+ * platform but macOS and Windows, whenever the variable is non-empty. VS Code
+ * reads it verbatim, so it is not trimmed here.
+ *
+ * @returns {string | undefined}
+ */
+function socketRuntimeDirectory() {
+  const value = process.env.XDG_RUNTIME_DIR;
+  if (
+    process.platform === 'darwin' ||
+    process.platform === 'win32' ||
+    value === undefined ||
+    value === ''
+  ) {
+    return undefined;
+  }
+  return value;
+}
+
+/**
+ * @param {string} owner
+ * @param {string} directory
+ * @param {string} relative
+ * @param {boolean} underBase
+ * @returns {IpcHandle}
+ */
+function ipcHandle(owner, directory, relative, underBase) {
+  return { owner, directory, relative, path: path.join(directory, relative), underBase };
+}
+
+/**
+ * Every Unix-domain socket VS Code and the suites create in a run whose
+ * scratch base is `base`, each at its longest and in the directory VS Code
+ * picks for it: the main socket of every window ({@link EDITOR_PROFILES}) in
+ * its profile, or in `XDG_RUNTIME_DIR` unless `VSCODE_PORTABLE` is set; and
+ * the temporary-directory sockets ({@link TEMP_DIR_HANDLES}) in the base,
+ * which is the editor's `os.tmpdir()`, or in `XDG_RUNTIME_DIR`.
+ *
+ * @param {string} base
+ * @returns {IpcHandle[]}
+ */
+function plannedIpcHandles(base) {
+  const runtimeDir = socketRuntimeDirectory();
+  const portable = (process.env.VSCODE_PORTABLE ?? '') !== '';
+  const mainHandles = EDITOR_PROFILES.map(({ owner, segments }) =>
+    runtimeDir === undefined || portable
+      ? ipcHandle(
+          `the main IPC socket of ${owner}`,
+          base,
+          path.join(...segments, MAIN_HANDLE_NAME),
+          true,
+        )
+      : ipcHandle(`the main IPC socket of ${owner}`, runtimeDir, XDG_MAIN_HANDLE_NAME, false),
+  );
+  const tempDirHandles = TEMP_DIR_HANDLES.map(({ owner, name }) =>
+    runtimeDir === undefined
+      ? ipcHandle(owner, base, name, true)
+      : ipcHandle(owner, runtimeDir, name, false),
+  );
+  return [...mainHandles, ...tempDirHandles];
+}
+
+/**
+ * @param {readonly IpcHandle[]} handles
+ * @returns {IpcHandle | undefined} the one with the longest path; `undefined` for none
+ */
+function longestHandle(handles) {
+  /** @type {IpcHandle | undefined} */
+  let longest;
+  for (const handle of handles) {
+    if (longest === undefined || handle.path.length > longest.path.length) {
+      longest = handle;
+    }
+  }
+  return longest;
+}
+
+/**
+ * The longest directory, in characters, under which `handle` still fits:
+ * one less than the limit, less its path below the directory and the
+ * separator.
+ *
+ * @param {IpcHandle} handle
+ * @param {number} limit
+ * @returns {number}
+ */
+function maxDirectoryLength(handle, limit) {
+  return limit - 1 - (handle.relative.length + 1);
+}
+
+/**
+ * @param {IpcHandle} handle
+ * @param {number} limit
+ * @returns {string} what the socket is, its path and length, and the limit
+ */
+function describeHandle(handle, limit) {
+  return `${handle.owner}, ${handle.path}, would be ${handle.path.length} characters, and on ${process.platform} a socket path must be shorter than ${limit}`;
+}
+
+/**
+ * {@link POSIX_FALLBACK_TEMP_DIR}'s real path when it can hold the run's
+ * throwaway state and every socket under it fits, otherwise why it cannot.
+ *
+ * @param {number} limit
+ * @returns {{ path: string, reason: undefined } | { path: undefined, reason: string }}
+ */
+function fallbackScratchBase(limit) {
+  const fallback = realDirectory(POSIX_FALLBACK_TEMP_DIR);
+  if (fallback === undefined) {
+    return { path: undefined, reason: 'it is not an existing directory' };
+  }
+  if (!isWritableDirectory(fallback)) {
+    return { path: undefined, reason: `${fallback} is not writable` };
+  }
+  const handle = longestHandle(plannedIpcHandles(fallback).filter((entry) => entry.underBase));
+  if (handle !== undefined && handle.path.length >= limit) {
+    return {
+      path: undefined,
+      reason: `its sockets are too long as well (${handle.path} would be ${handle.path.length} characters)`,
+    };
+  }
+  return { path: fallback, reason: undefined };
+}
+
+/**
+ * Where the throwaway state goes, chosen before anything is created so that
+ * no window of the run dies with `listen EINVAL` on a socket path at or past
+ * the platform's limit ({@link IPC_HANDLE_LIMITS}):
+ *   1. the real path of `os.tmpdir()`, which must be an existing directory.
+ *      On Windows, or when every one of {@link plannedIpcHandles} under it is
+ *      shorter than the limit, that is the base and nothing else changes;
+ *   2. a socket VS Code creates in `XDG_RUNTIME_DIR` does not depend on the
+ *      base, so one too long there fails the run naming that variable;
+ *   3. otherwise the real path of {@link POSIX_FALLBACK_TEMP_DIR}, when it is
+ *      an existing, writable directory whose sockets fit. The editor then
+ *      gets it as `TMPDIR`, so its own sockets, the suites' scratch
+ *      directories (`test/helpers.ts` `createScratchDir()`) and the
+ *      packaged-vsix window all follow it, and `activation.test.ts`'s check
+ *      that `DEBUGGEN_HOME` lies under the editor's `os.tmpdir()` still holds;
+ *   4. otherwise the run fails, naming the socket, its length, the limit and
+ *      the longest usable `TMPDIR`.
+ *
+ * @returns {ScratchBase}
+ * @throws {TestConfigurationError}
+ */
+function resolveScratchBase() {
+  const configured = os.tmpdir();
+  const variable = tempDirectoryVariable();
+  const source = variable === undefined ? 'the platform default' : variable;
+  const inherited = realDirectory(configured);
+  if (inherited === undefined) {
+    throw new TestConfigurationError(
+      `The temporary directory ${configured} (os.tmpdir(), from ${source}) is not an existing directory.`,
+      'Point TMPDIR at an existing, writable directory, or unset it.',
+    );
+  }
+  const limit = IPC_HANDLE_LIMITS.get(process.platform);
+  if (limit === undefined) {
+    return { path: inherited, relocation: undefined };
+  }
+
+  const handles = plannedIpcHandles(inherited);
+  const runtimeHandle = longestHandle(handles.filter((handle) => !handle.underBase));
+  if (runtimeHandle !== undefined && runtimeHandle.path.length >= limit) {
+    throw new TestConfigurationError(
+      `XDG_RUNTIME_DIR=${runtimeHandle.directory} is too long for VS Code's IPC sockets: ${describeHandle(runtimeHandle, limit)}.`,
+      `Point XDG_RUNTIME_DIR at a directory of at most ${maxDirectoryLength(runtimeHandle, limit)} characters, or unset it. VS Code creates these sockets there whatever TMPDIR is, so a shorter TMPDIR cannot help.`,
+    );
+  }
+
+  const inheritedHandle = longestHandle(handles.filter((handle) => handle.underBase));
+  if (inheritedHandle === undefined || inheritedHandle.path.length < limit) {
+    return { path: inherited, relocation: undefined };
+  }
+
+  const fallback = fallbackScratchBase(limit);
+  if (fallback.path !== undefined) {
+    return { path: fallback.path, relocation: { inherited, handle: inheritedHandle, limit } };
+  }
+  throw new TestConfigurationError(
+    `The temporary directory ${inherited} (os.tmpdir(), from ${source}) is too long for VS Code's IPC sockets: ${describeHandle(inheritedHandle, limit)}. ${POSIX_FALLBACK_TEMP_DIR} cannot stand in: ${fallback.reason}.`,
+    `Point TMPDIR at an existing, writable directory whose real path is at most ${maxDirectoryLength(inheritedHandle, limit)} characters.`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Preflight: refuse a run that could pass without testing what it claims to
 // ---------------------------------------------------------------------------
 
@@ -517,29 +867,38 @@ function userOnlyFixtureSettings() {
  */
 
 /**
- * Create the run's throwaway directory and arrange for its removal when this
- * CLI process exits. `os.tmpdir()` is realpath-resolved first (on macOS it is
- * a symlink), so every path handed to the editor is canonical and the
- * workspace-containment logic under test never sees a symlinked prefix.
+ * Create the run's throwaway directory under `scratchBase` and arrange for its
+ * removal when this CLI process exits. The base is a real path (on macOS
+ * `os.tmpdir()` is a symlink), so every path handed to the editor is canonical
+ * and the workspace-containment logic under test never sees a symlinked
+ * prefix. When the base replaces a too-long `os.tmpdir()`, one line on stderr
+ * says so first.
  *
  * `mkdtemp` creates the root with mode 0700, so no other account can read the
- * credential the extension may write into `home/`.
+ * credential the extension may write into `home/`, even under a shared `/tmp`.
  *
  * `userSettings` becomes the fresh profile's `User/settings.json` (skipped
  * when empty), which VS Code reads as the user settings of the run.
  *
  * @param {boolean} keep leave the directory in place and print its path
  * @param {Record<string, unknown>} userSettings from {@link userOnlyFixtureSettings}
+ * @param {ScratchBase} scratchBase from {@link resolveScratchBase}
  * @returns {ThrowawayState}
  */
-function createThrowawayState(keep, userSettings) {
-  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), SCRATCH_PREFIX));
+function createThrowawayState(keep, userSettings, scratchBase) {
+  const { relocation } = scratchBase;
+  if (relocation !== undefined) {
+    console.error(
+      `${LOG_PREFIX} the temporary directory ${relocation.inherited} is too long for VS Code's IPC sockets (${describeHandle(relocation.handle, relocation.limit)}; TMPDIR may be at most ${maxDirectoryLength(relocation.handle, relocation.limit)} characters), so the throwaway state is created under ${scratchBase.path} and the editor runs with TMPDIR=${scratchBase.path}`,
+    );
+  }
+  const root = fs.mkdtempSync(path.join(scratchBase.path, SCRATCH_PREFIX));
   process.once('exit', () => {
     removeThrowawayState(root, keep);
   });
 
   const home = path.join(root, 'home');
-  const userData = path.join(root, 'user-data');
+  const userData = path.join(root, USER_DATA_DIR_NAME);
   const extensions = path.join(root, 'extensions');
   fs.mkdirSync(home, { mode: 0o700 });
   // mkdir honours the umask; the service's safe-fs checks require exactly 0700.
@@ -613,13 +972,21 @@ function removeThrowawayState(root, keep) {
  *     known here, for the suites that drive its CLI (`--install-extension`) and
  *     for the packaged-vsix suite, which also launches it directly as a
  *     second, isolated window on its throwaway profile (`test/helpers.ts`
- *     `resolveVsCodeExecutable()`), so the window runs exactly this build.
+ *     `resolveVsCodeExecutable()`), so the window runs exactly this build;
+ *   - `TMPDIR` is the scratch base when {@link resolveScratchBase} moved it
+ *     off a too-long `os.tmpdir()`: the editor's temporary-directory sockets,
+ *     every `createScratchDir()` of the suites (and with it the packaged-vsix
+ *     window's profile) and the Node children they spawn then use the short
+ *     base too. `TMPDIR` is the first variable `os.tmpdir()` reads on POSIX,
+ *     so it overrides an inherited `TMP` or `TEMP`. Otherwise the inherited
+ *     value is left alone.
  *
  * @param {ThrowawayState} state
  * @param {string | undefined} vscodeExecutable
+ * @param {ScratchBase} scratchBase
  * @returns {Record<string, string | undefined>}
  */
-function extensionHostEnvironment(state, vscodeExecutable) {
+function extensionHostEnvironment(state, vscodeExecutable, scratchBase) {
   /** @type {Record<string, string | undefined>} */
   const env = { ANTHROPIC_API_KEY: undefined };
   for (const name of Object.keys(process.env)) {
@@ -632,6 +999,9 @@ function extensionHostEnvironment(state, vscodeExecutable) {
   env.DEBUGGEN_TEST_NODE = readEnv('DEBUGGEN_TEST_NODE') ?? process.execPath;
   if (vscodeExecutable !== undefined) {
     env.VSCODE_TEST_EXECUTABLE_PATH = vscodeExecutable;
+  }
+  if (scratchBase.relocation !== undefined) {
+    env.TMPDIR = scratchBase.path;
   }
   return env;
 }
@@ -646,9 +1016,10 @@ const vscodeExecutable = resolveInstallation();
 const version = resolveVersion();
 const timeout = resolveTimeout();
 const keepState = resolveKeepState();
+const scratchBase = resolveScratchBase();
 assertRunInputs();
 const userSettings = userOnlyFixtureSettings();
-const state = createThrowawayState(keepState, userSettings);
+const state = createThrowawayState(keepState, userSettings, scratchBase);
 
 export default defineConfig({
   label: 'extension-host',
@@ -682,7 +1053,7 @@ export default defineConfig({
     `--user-data-dir=${state.userData}`,
     `--extensions-dir=${state.extensions}`,
   ],
-  env: extensionHostEnvironment(state, vscodeExecutable),
+  env: extensionHostEnvironment(state, vscodeExecutable, scratchBase),
   // The manifest declares no extension dependencies; skipping the lookup
   // guarantees none is ever fetched from a marketplace.
   skipExtensionDependencies: true,

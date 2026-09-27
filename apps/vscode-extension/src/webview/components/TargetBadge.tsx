@@ -28,7 +28,20 @@
  *     as a sentence saying so rather than as an empty list.
  *   - `url` as monospace `Code`, exactly as received.
  *   - A control that asks the DevTools panel bound to the session to enter
- *     picker mode again.
+ *     picker mode again — or, when no pick can be requested, a muted note
+ *     saying why in its place.
+ *
+ * ## When a pick can be requested (`pickAvailability`)
+ *
+ * A pick is asked of the DevTools panel bound to the running session, so it
+ * needs a live session and a reachable local service. `App.tsx` reads which
+ * of those holds from the snapshot and passes it as `pickAvailability`:
+ * `available` (the default), `noSession`, `serviceUnavailable`, `ended` or
+ * `failed`. Anything but `available` withholds every pick control — the pick,
+ * the re-pick and the error state's retry — rather than offering one the host
+ * could only refuse, and the component says why in words instead: the "No
+ * target" state carries a sentence for that reason, and a selected target is
+ * shown read-only with a short note where the re-pick control would be.
  *
  * ## States (AAP 0.5.5 — never a blank area)
  *
@@ -37,13 +50,15 @@
  * about to replace:
  *
  *   1. `error` (non-blank) — `ErrorState` with that message, announced as an
- *      alert by the primitive, with a retry that requests a new pick.
+ *      alert by the primitive, with a retry that requests a new pick while a
+ *      pick is available.
  *   2. `pending` — `LoadingState` while the pick request is on its way to the
  *      bound DevTools panel and the host has not answered yet; the primitive
  *      owns `role="status"` and `aria-busy`.
  *   3. no `target` — the explicit "No target" `EmptyState`, whose action is the
- *      pick `Button`. `EmptyState` ships no copy of its own, so the wording is
- *      this component's, and it is deliberately generic.
+ *      pick `Button` while a pick is available. `EmptyState` ships no copy of
+ *      its own, so the wording is this component's, one sentence per
+ *      availability, and it is deliberately generic.
  *   4. otherwise — the selected target.
  *
  * Every state carries the `dgv-target` root class plus `className`, on the
@@ -54,7 +69,8 @@
  *
  * Props in, one callback out: `onRequestTarget()` is invoked with no
  * arguments in both the no-target and target-present cases (pick versus
- * re-pick) and from the error state's retry. The parent relays it to the host,
+ * re-pick) and from the error state's retry, and never while
+ * `pickAvailability` withholds the pick. The parent relays it to the host,
  * which calls the service's `target.request` operation; the service pushes
  * `target.request` to the DevTools panel bound to the session, and the host
  * answers with a notice saying the panel was asked to enter picker mode or why
@@ -93,8 +109,23 @@ import {
   Text,
 } from '@debuggen/panel-renderer';
 import type { SelectedTarget } from '@debuggen/protocol';
+import { assertNever } from '@debuggen/shared';
 import { useId } from 'react';
 import type { ReactElement } from 'react';
+
+/**
+ * Whether the view can ask for a pick now, and if not, why — as `App.tsx`
+ * reads it from the host's snapshot.
+ *
+ * - `available` — a session is running and the local service is reachable.
+ * - `noSession` — no session exists yet, so there is no bound panel to ask.
+ * - `serviceUnavailable` — the local service is not reachable, so the request
+ *   could not be delivered.
+ * - `ended` — the session has ended; its target, if any, is history.
+ * - `failed` — the session stopped at a failed stage.
+ */
+export type TargetPickAvailability =
+  'available' | 'noSession' | 'serviceUnavailable' | 'ended' | 'failed';
 
 /** Root class of every state; declared in `../styles.css`. */
 const ROOT_CLASS = 'dgv-target';
@@ -116,6 +147,31 @@ const NO_TARGET_TITLE = 'No target';
  */
 const NO_TARGET_MESSAGE =
   'No element is selected, so questions are investigated from the current page. "Pick element" puts the Debug Generator panel in Chrome DevTools into picker mode, so you can click the element to focus on.';
+
+/**
+ * Bodies of the no-target state while no pick can be requested, one per
+ * {@link TargetPickAvailability} other than `available`. Each says why the
+ * pick control is absent and what makes it available; generic product copy.
+ */
+const NO_TARGET_NO_SESSION_MESSAGE =
+  'No element is selected. Once a session is running, "Pick element" puts the Debug Generator panel in Chrome DevTools into picker mode, so you can click the element to focus on.';
+const NO_TARGET_SERVICE_MESSAGE =
+  'No element is selected. Picking one needs the local Debug Generator service; start it, and "Pick element" returns here.';
+const NO_TARGET_ENDED_MESSAGE = 'No element was selected for this session, which has ended.';
+const NO_TARGET_FAILED_MESSAGE =
+  'No element is selected. This session stopped at a failed stage; ask a new question to start another session.';
+
+/**
+ * Shown under a selected target, in place of the re-pick control, while no
+ * pick can be requested — one per {@link TargetPickAvailability} other than
+ * `available`. Generic product copy.
+ */
+const TARGET_NO_SESSION_NOTE =
+  'Picking another element becomes possible once a session is running.';
+const TARGET_SERVICE_NOTE =
+  'Picking another element needs the local Debug Generator service; start it to pick again.';
+const TARGET_ENDED_NOTE = 'Selected for this session, which has ended.';
+const TARGET_FAILED_NOTE = 'Selected for this session, which stopped at a failed stage.';
 
 /** Accessible name and label of the pick control when no target exists. */
 const PICK_LABEL = 'Pick element';
@@ -187,8 +243,69 @@ export interface TargetBadgeProps {
    */
   error?: string | undefined;
 
+  /**
+   * Whether a pick can be requested now, as the parent reads it from the
+   * session and the service connection. Anything but `available` renders no
+   * pick, re-pick or retry control and says why instead: the no-target state
+   * with a sentence for the reason, a selected target read-only with a note.
+   *
+   * @default 'available'
+   */
+  pickAvailability?: TargetPickAvailability | undefined;
+
   /** Extra classes for the root element, appended after `dgv-target`. */
   className?: string | undefined;
+}
+
+/** How one {@link TargetPickAvailability} presents: its control and its copy. */
+interface PickPresentation {
+  /** Whether the pick, re-pick and retry controls render. */
+  readonly canPick: boolean;
+  /** The body of the "No target" state. */
+  readonly noTargetMessage: string;
+  /** The note shown in place of the re-pick control; absent while a pick is possible. */
+  readonly targetNote: string | undefined;
+}
+
+/**
+ * What each pick availability renders. Closed by `assertNever`, so an
+ * availability added to {@link TargetPickAvailability} is a compile error here
+ * until it says what it looks like.
+ *
+ * @param availability Whether, and why not, a pick can be requested.
+ * @returns Whether the controls render, and the copy that stands in for them.
+ */
+function describePickAvailability(availability: TargetPickAvailability): PickPresentation {
+  switch (availability) {
+    case 'available':
+      return { canPick: true, noTargetMessage: NO_TARGET_MESSAGE, targetNote: undefined };
+    case 'noSession':
+      return {
+        canPick: false,
+        noTargetMessage: NO_TARGET_NO_SESSION_MESSAGE,
+        targetNote: TARGET_NO_SESSION_NOTE,
+      };
+    case 'serviceUnavailable':
+      return {
+        canPick: false,
+        noTargetMessage: NO_TARGET_SERVICE_MESSAGE,
+        targetNote: TARGET_SERVICE_NOTE,
+      };
+    case 'ended':
+      return {
+        canPick: false,
+        noTargetMessage: NO_TARGET_ENDED_MESSAGE,
+        targetNote: TARGET_ENDED_NOTE,
+      };
+    case 'failed':
+      return {
+        canPick: false,
+        noTargetMessage: NO_TARGET_FAILED_MESSAGE,
+        targetNote: TARGET_FAILED_NOTE,
+      };
+    default:
+      return assertNever(availability, 'Unhandled target pick availability');
+  }
 }
 
 /**
@@ -215,13 +332,17 @@ function joinClassNames(...parts: ReadonlyArray<string | undefined>): string {
 /** Inputs of the target-present view. */
 interface SelectedTargetViewProps {
   readonly target: SelectedTarget;
-  readonly onPick: () => void;
+  /** Requests a re-pick; `undefined` while no pick can be requested. */
+  readonly onPick: (() => void) | undefined;
+  /** Why no pick can be requested, shown in place of the re-pick control. */
+  readonly note: string | undefined;
   readonly className: string;
 }
 
 /**
  * The selected element: identity row, visible text, component chain, page URL
- * and the re-pick control, stacked in that order.
+ * and the re-pick control — or, while no pick can be requested, the note that
+ * says why — stacked in that order.
  *
  * A separate component so that its `useId` call is unconditional — the parent
  * returns early for the three other states.
@@ -230,7 +351,7 @@ interface SelectedTargetViewProps {
  * @returns The root `Stack` of the target-present state.
  */
 function SelectedTargetView(props: SelectedTargetViewProps): ReactElement {
-  const { target, onPick, className } = props;
+  const { target, onPick, note, className } = props;
   const chainLabelId = useId();
 
   // Blank entries cannot occur in a schema-valid target; dropping them keeps a
@@ -294,20 +415,31 @@ function SelectedTargetView(props: SelectedTargetViewProps): ReactElement {
         </Code>
       </Stack>
 
-      {/* A row of its own so the control keeps its intrinsic width instead of
-          stretching across the column the outer Stack lays out. */}
-      <Stack direction="horizontal" gap={2}>
-        <Button variant="ghost" size="sm" onClick={onPick}>
-          {REPICK_LABEL}
-        </Button>
-      </Stack>
+      {onPick === undefined ? (
+        // Read-only: no control that the host could only refuse, and the
+        // reason in words where the control would be.
+        hasText(note) ? (
+          <Text as="p" size="xs" tone="muted">
+            {note}
+          </Text>
+        ) : null
+      ) : (
+        // A row of its own so the control keeps its intrinsic width instead of
+        // stretching across the column the outer Stack lays out.
+        <Stack direction="horizontal" gap={2}>
+          <Button variant="ghost" size="sm" onClick={onPick}>
+            {REPICK_LABEL}
+          </Button>
+        </Stack>
+      )}
     </Stack>
   );
 }
 
 /**
  * Renders the selected DevTools target, or the pending, error or "No target"
- * state, with a control that requests a new pick.
+ * state, with a control that requests a new pick while one can be requested
+ * and the reason in words while one cannot.
  *
  * @param props See {@link TargetBadgeProps}.
  * @returns The component's root in its current state.
@@ -317,18 +449,31 @@ function SelectedTargetView(props: SelectedTargetViewProps): ReactElement {
  *   target={session.target}
  *   pending={pickPending}
  *   error={pickError}
+ *   pickAvailability={session.status === 'ended' ? 'ended' : 'available'}
  *   onRequestTarget={requestTarget}
  * />
  */
 export function TargetBadge(props: TargetBadgeProps): ReactElement {
-  const { target, onRequestTarget, pending = false, error, className } = props;
+  const {
+    target,
+    onRequestTarget,
+    pending = false,
+    error,
+    pickAvailability = 'available',
+    className,
+  } = props;
   const rootClassName = joinClassNames(ROOT_CLASS, className);
+  const presentation = describePickAvailability(pickAvailability);
 
   // Wrapped so the callback is invoked with no arguments: the primitives hand
   // their click handlers a React event, which is not part of this contract.
-  const requestTarget = (): void => {
-    onRequestTarget();
-  };
+  // Absent while no pick can be requested, so no state renders a control the
+  // host could only refuse.
+  const requestTarget = presentation.canPick
+    ? (): void => {
+        onRequestTarget();
+      }
+    : undefined;
 
   if (hasText(error)) {
     return (
@@ -337,7 +482,7 @@ export function TargetBadge(props: TargetBadgeProps): ReactElement {
         title={ERROR_TITLE}
         message={error}
         onRetry={requestTarget}
-        retryLabel={RETRY_LABEL}
+        retryLabel={requestTarget === undefined ? undefined : RETRY_LABEL}
       />
     );
   }
@@ -358,15 +503,24 @@ export function TargetBadge(props: TargetBadgeProps): ReactElement {
       <EmptyState
         className={rootClassName}
         title={NO_TARGET_TITLE}
-        message={NO_TARGET_MESSAGE}
+        message={presentation.noTargetMessage}
         action={
-          <Button variant="secondary" size="sm" onClick={requestTarget}>
-            {PICK_LABEL}
-          </Button>
+          requestTarget === undefined ? undefined : (
+            <Button variant="secondary" size="sm" onClick={requestTarget}>
+              {PICK_LABEL}
+            </Button>
+          )
         }
       />
     );
   }
 
-  return <SelectedTargetView target={target} onPick={requestTarget} className={rootClassName} />;
+  return (
+    <SelectedTargetView
+      target={target}
+      onPick={requestTarget}
+      note={presentation.targetNote}
+      className={rootClassName}
+    />
+  );
 }

@@ -14,7 +14,9 @@
  * two responses' schemas enforce: the window read from `limit`/`offset` with
  * its defaults echoed, the `total`, a `nextOffset` a paging loop can follow to
  * the end without repeating or skipping an item, the `400` of a malformed
- * window, the editor's workspace scope, and — for the journal — the diff budget
+ * window — in protocol's parser's words, naming the refused parameter and
+ * never its value, only after the caller was admitted and before any page is
+ * read — the editor's workspace scope, and — for the journal — the diff budget
  * that ends a page early. Every response is parsed with protocol's own
  * `parseHttpResponse`, the parser a client applies.
  *
@@ -75,6 +77,7 @@ import {
   MODIFICATIONS_PAGE_DEFAULT_LIMIT,
   MODIFICATIONS_PAGE_DIFF_BUDGET,
   SESSION_LIST_DEFAULT_LIMIT,
+  httpErrorResponseSchema,
   modificationsDiffBytes,
   parseHttpResponse,
   parseSessionRecord,
@@ -91,7 +94,7 @@ import type { LogFields, LogLevel, Logger, Result, SessionId } from '@debuggen/s
 import { STATE_HOME_OVERLAP_MESSAGE } from '../../config.js';
 import { createSessionManager } from '../../sessions/manager.js';
 import type { SessionBroadcaster, SessionManager } from '../../sessions/manager.js';
-import { createSessionProgress } from '../../sessions/progress.js';
+import { FAILURE_COPY_BY_CODE, createSessionProgress } from '../../sessions/progress.js';
 import { openStore } from '../../store/db.js';
 import type { RetentionReport, RetentionScope } from '../../store/retention.js';
 import type { Store } from '../../store/db.js';
@@ -107,7 +110,7 @@ import type {
   ServerEnv,
   TabBinding,
 } from '../auth.js';
-import { createSessionRoutes } from './sessions.js';
+import { SESSION_REQUEST_REFUSED_LOG_MESSAGE, createSessionRoutes } from './sessions.js';
 import type {
   SessionDevServerHold,
   SessionDevServerLookup,
@@ -240,12 +243,20 @@ let logs: CapturedLog[];
 let principal: Principal | undefined;
 /** The acting tab the stand-in middleware verifies for a DevTools principal, if any. */
 let actingTab: number | undefined;
+/**
+ * The correlation ref the stand-in middleware puts on the context as
+ * `../http.ts`'s request context does, if any; `undefined` runs the routes as
+ * a bare app.
+ */
+let requestRef: string | undefined;
 let binding: TabBinding | undefined;
 let app: Hono<ServerEnv>;
 /** The manager's whole-record read, observed: the journal listing must never make it. */
 let managerGet: Mock<SessionsRepo['get']>;
 /** The store's id-and-root read, observed: what the journal listing admits on. */
 let accessTargetRead: Mock<SessionsRepo['getAccessTarget']>;
+/** The store's list-row page read, observed: a refused window must never reach it. */
+let listRowsRead: Mock<SessionsRepo['listWithinFolders']>;
 
 beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), 'debuggen-session-routes-'));
@@ -255,9 +266,13 @@ beforeEach(() => {
   logs = [];
   principal = editor(['/w/a']);
   actingTab = INSPECTED_TAB_ID;
+  requestRef = undefined;
   binding = undefined;
   managerGet = vi.fn((sessionId: SessionId) => sessions.get(sessionId));
   accessTargetRead = vi.fn((sessionId: SessionId) => sessions.getAccessTarget(sessionId));
+  listRowsRead = vi.fn((options: Parameters<SessionsRepo['listWithinFolders']>[0]) =>
+    sessions.listWithinFolders(options),
+  );
 
   const routes: SessionRoutes = createSessionRoutes({
     manager: {
@@ -281,7 +296,7 @@ beforeEach(() => {
     sessions: {
       getActiveCapture: unused,
       getCapture: unused,
-      listWithinFolders: (options) => sessions.listWithinFolders(options),
+      listWithinFolders: listRowsRead,
       getAccessTarget: accessTargetRead,
     },
     panels: { getLatestPanel: unused, getPanel: unused },
@@ -297,9 +312,13 @@ beforeEach(() => {
   });
 
   app = new Hono<ServerEnv>();
-  // Stands in for `../auth.ts`'s middleware: the resolved principal, if any,
-  // and — for a DevTools principal — the acting tab it verified.
+  // Stands in for `../http.ts`'s request context (the correlation ref, when a
+  // test sets one) and `../auth.ts`'s middleware: the resolved principal, if
+  // any, and — for a DevTools principal — the acting tab it verified.
   app.use('*', async (c, next) => {
+    if (requestRef !== undefined) {
+      c.set('requestRef', requestRef);
+    }
     if (principal !== undefined) {
       c.set('principal', principal);
       if (principal.role === 'devtools' && actingTab !== undefined) {
@@ -359,6 +378,65 @@ async function listed<O extends HttpOperationId>(operation: O, path: string) {
   expect(answer.cacheControl).toBe('no-store');
 
   return unwrap(parseHttpResponse(operation, answer.body));
+}
+
+/**
+ * A query-string value no answer and no log record may ever quote: it stands
+ * for whatever a client put in a parameter the listing refuses.
+ */
+const QUERY_VALUE_SENTINEL = 'QV-SENTINEL-5d1c-never-echo-me';
+
+/** One page window a listing must refuse. */
+interface RefusedWindow {
+  /** The query string sent, without its `?`. */
+  readonly query: string;
+  /** The parameter the refusal must name: `limit`, `offset` or the unrecognised key. */
+  readonly parameter: string;
+  /** The rejected value, which the answer must not quote. */
+  readonly rejected: string;
+}
+
+/**
+ * Sends one listing request whose window protocol's `parseListPageQuery`
+ * refuses, and holds the answer to the `400` a malformed body gets: protocol's
+ * error body in the parser's own words, naming `refused.parameter` — never the
+ * generic malformed-message copy, never the rejected value — plus exactly one
+ * `warn` record naming the operation, the status and the code, and no record
+ * quoting {@link QUERY_VALUE_SENTINEL}.
+ *
+ * @param operation The listing the path addresses.
+ * @param path The listing's path, without a query string.
+ * @param refused The window sent and what its refusal must say.
+ * @returns The refusal's message, for a caller that compares refusals.
+ */
+async function expectWindowRefused(
+  operation: 'session.list' | 'modifications.list',
+  path: string,
+  refused: RefusedWindow,
+): Promise<string> {
+  const logged = logs.length;
+  const answer = await get(`${path}?${refused.query}`);
+
+  expect(answer.status, refused.query).toBe(400);
+  expect(answer.cacheControl, refused.query).toBe('no-store');
+  const body = httpErrorResponseSchema.parse(answer.body);
+  expect(body.code, refused.query).toBe('PROTOCOL_INVALID_MESSAGE');
+  expect(body.message, refused.query).not.toBe(
+    FAILURE_COPY_BY_CODE.PROTOCOL_INVALID_MESSAGE.summary,
+  );
+  expect(body.message, refused.query).toMatch(new RegExp(`\\b${refused.parameter}\\b`, 'u'));
+  expect(JSON.stringify(answer.body), refused.query).not.toContain(refused.rejected);
+
+  const records = logs.slice(logged);
+  const refusals = records.filter((entry) => entry.message === SESSION_REQUEST_REFUSED_LOG_MESSAGE);
+  expect(refusals, refused.query).toHaveLength(1);
+  expect(refusals[0], refused.query).toMatchObject({
+    level: 'warn',
+    fields: { operation, status: 400, errorCode: 'PROTOCOL_INVALID_MESSAGE' },
+  });
+  expect(JSON.stringify(records), refused.query).not.toContain(QUERY_VALUE_SENTINEL);
+
+  return body.message;
 }
 
 /**
@@ -524,20 +602,108 @@ describe('GET /sessions answers one scoped page of list rows', () => {
     expect(await listed('session.list', '/sessions')).toMatchObject({ sessions: [], total: 0 });
   });
 
-  it('refuses a malformed window with 400, before any store read', async () => {
-    for (const query of [
-      'limit=501',
-      'limit=abc',
-      'limit=-1',
-      'offset=01',
-      'page=2',
-      'limit=1e3',
-    ]) {
-      const answer = await get(`/sessions?${query}`);
-      expect(answer.status, query).toBe(400);
-      expect(answer.cacheControl).toBe('no-store');
-      expect(answer.body).toMatchObject({ code: 'PROTOCOL_INVALID_MESSAGE' });
+  it('refuses a malformed window with a 400 naming the parameter, before any store read', async () => {
+    seed();
+    const overCeiling: RefusedWindow = {
+      query: 'limit=100000',
+      parameter: 'limit',
+      rejected: '100000',
+    };
+    const negative: RefusedWindow = { query: 'limit=-1', parameter: 'limit', rejected: '-1' };
+    const refusedWindows: readonly RefusedWindow[] = [
+      overCeiling,
+      { query: 'limit=501', parameter: 'limit', rejected: '501' },
+      negative,
+      { query: 'limit=abc', parameter: 'limit', rejected: 'abc' },
+      { query: 'limit=1e3', parameter: 'limit', rejected: '1e3' },
+      { query: 'offset=abc', parameter: 'offset', rejected: 'abc' },
+      { query: 'offset=01', parameter: 'offset', rejected: '01' },
+      {
+        query: `offset=${QUERY_VALUE_SENTINEL}`,
+        parameter: 'offset',
+        rejected: QUERY_VALUE_SENTINEL,
+      },
+      { query: 'page=2', parameter: 'page', rejected: '2' },
+      { query: `page=${QUERY_VALUE_SENTINEL}`, parameter: 'page', rejected: QUERY_VALUE_SENTINEL },
+      {
+        query: `limit=1&cursor=${QUERY_VALUE_SENTINEL}`,
+        parameter: 'cursor',
+        rejected: QUERY_VALUE_SENTINEL,
+      },
+    ];
+
+    for (const refused of refusedWindows) {
+      await expectWindowRefused('session.list', '/sessions', refused);
     }
+    expect(listRowsRead).not.toHaveBeenCalled();
+
+    // The parser's two refusals of an over-ceiling limit and of a non-integer
+    // limit are told apart, so a client learns which rule it broke.
+    const tooLarge = await expectWindowRefused('session.list', '/sessions', overCeiling);
+    const notInteger = await expectWindowRefused('session.list', '/sessions', negative);
+    expect(tooLarge).not.toBe(notInteger);
+
+    // A well-formed window still answers its page.
+    expect(await listed('session.list', '/sessions?limit=1&offset=0')).toMatchObject({
+      total: 1,
+      limit: 1,
+      offset: 0,
+      nextOffset: null,
+    });
+    expect(listRowsRead).toHaveBeenCalledTimes(1);
+  });
+
+  it("files a refusal answered without a ref of its own under the request's correlation ref", async () => {
+    requestRef = 'msg_requestref0000001';
+    const refusalsFor = (from: number): readonly CapturedLog[] =>
+      logs.slice(from).filter((entry) => entry.message === SESSION_REQUEST_REFUSED_LOG_MESSAGE);
+
+    // A refused window: its body names no ref (`../http.ts` adds the request's),
+    // so the record carries the request's ref — without the error field.
+    const beforeWindow = logs.length;
+    const window = await get('/sessions?offset=abc');
+    expect(window.status).toBe(400);
+    expect(httpErrorResponseSchema.parse(window.body).ref).toBeUndefined();
+    const windowRefusals = refusalsFor(beforeWindow);
+    expect(windowRefusals).toHaveLength(1);
+    expect(windowRefusals[0]?.fields).toMatchObject({
+      operation: 'session.list',
+      status: 400,
+      errorCode: 'PROTOCOL_INVALID_MESSAGE',
+      ref: requestRef,
+    });
+    expect(windowRefusals[0]?.fields).not.toHaveProperty('err');
+
+    // A described refusal sent in its own words (an unknown session) likewise.
+    const beforeUnknown = logs.length;
+    const unknown = await get(`/sessions/${newSessionId()}/modifications`);
+    expect(unknown.status).toBe(404);
+    expect(httpErrorResponseSchema.parse(unknown.body).ref).toBeUndefined();
+    expect(refusalsFor(beforeUnknown)[0]?.fields).toMatchObject({
+      operation: 'modifications.list',
+      status: 404,
+      errorCode: 'SESSION_NOT_FOUND',
+      ref: requestRef,
+    });
+
+    // Run bare — no request context — the record names no ref at all.
+    requestRef = undefined;
+    const beforeBare = logs.length;
+    expect((await get('/sessions?offset=abc')).status).toBe(400);
+    expect(refusalsFor(beforeBare)[0]?.fields).not.toHaveProperty('ref');
+  });
+
+  it('authorizes before it reads the window: a refused principal learns nothing about it', async () => {
+    principal = DEVTOOLS;
+    const devtools = await get('/sessions?limit=-1');
+    expect(devtools.status).toBe(403);
+    expect(devtools.body).toMatchObject({ code: 'UNAUTHORIZED' });
+
+    principal = undefined;
+    const missing = await get(`/sessions?page=${QUERY_VALUE_SENTINEL}`);
+    expect(missing.status).toBe(401);
+    expect(missing.body).toMatchObject({ code: 'UNAUTHORIZED' });
+    expect(JSON.stringify(logs)).not.toContain(QUERY_VALUE_SENTINEL);
   });
 
   it('authorizes exactly as before: a DevTools credential is refused, a missing principal is 401', async () => {
@@ -699,12 +865,68 @@ describe('GET /sessions/:id/modifications answers one diff-budgeted page of the 
     });
   });
 
-  it('refuses a malformed window with 400', async () => {
-    for (const query of ['limit=257', 'offset=x', 'limit=2&cursor=1']) {
-      const answer = await get(`/sessions/${sessionId}/modifications?${query}`);
-      expect(answer.status, query).toBe(400);
-      expect(answer.body).toMatchObject({ code: 'PROTOCOL_INVALID_MESSAGE' });
+  it('refuses a malformed window with a 400 naming the parameter, before any journal read', async () => {
+    await journal(sessionId);
+    const pageRead = vi.spyOn(modifications, 'listPageBySession');
+    const path = `/sessions/${sessionId}/modifications`;
+    const refusedWindows: readonly RefusedWindow[] = [
+      { query: 'limit=100000', parameter: 'limit', rejected: '100000' },
+      { query: 'limit=257', parameter: 'limit', rejected: '257' },
+      { query: 'limit=-1', parameter: 'limit', rejected: '-1' },
+      { query: 'offset=abc', parameter: 'offset', rejected: 'abc' },
+      {
+        query: `offset=${QUERY_VALUE_SENTINEL}`,
+        parameter: 'offset',
+        rejected: QUERY_VALUE_SENTINEL,
+      },
+      { query: 'limit=2&cursor=1', parameter: 'cursor', rejected: '1' },
+      { query: `page=${QUERY_VALUE_SENTINEL}`, parameter: 'page', rejected: QUERY_VALUE_SENTINEL },
+    ];
+
+    for (const refused of refusedWindows) {
+      await expectWindowRefused('modifications.list', path, refused);
     }
+    expect(pageRead).not.toHaveBeenCalled();
+
+    // Both listings share one parser, so one window is refused in the same words by each.
+    const offset: RefusedWindow = { query: 'offset=abc', parameter: 'offset', rejected: 'abc' };
+    expect(await expectWindowRefused('modifications.list', path, offset)).toBe(
+      await expectWindowRefused('session.list', '/sessions', offset),
+    );
+
+    // A well-formed window still answers its page.
+    expect(await listed('modifications.list', `${path}?limit=1&offset=0`)).toMatchObject({
+      total: 1,
+      limit: 1,
+      offset: 0,
+      nextOffset: null,
+    });
+    expect(pageRead).toHaveBeenCalledTimes(1);
+  });
+
+  it('admits the request before it reads the window: a refused caller learns nothing about it', async () => {
+    const path = `/sessions/${sessionId}/modifications?limit=-1`;
+
+    principal = editor(['/x']);
+    expect(await get(path)).toMatchObject({
+      status: 403,
+      body: { code: 'PATH_OUTSIDE_PROJECT' },
+    });
+
+    principal = DEVTOOLS;
+    expect(await get(path)).toMatchObject({ status: 403, body: { code: 'TAB_NOT_BOUND' } });
+
+    principal = editor(['/w/a']);
+    expect(await get(`/sessions/${newSessionId()}/modifications?limit=-1`)).toMatchObject({
+      status: 404,
+      body: { code: 'SESSION_NOT_FOUND' },
+    });
+
+    principal = undefined;
+    expect(
+      await get(`/sessions/${sessionId}/modifications?page=${QUERY_VALUE_SENTINEL}`),
+    ).toMatchObject({ status: 401, body: { code: 'UNAUTHORIZED' } });
+    expect(JSON.stringify(logs)).not.toContain(QUERY_VALUE_SENTINEL);
   });
 
   it('admits exactly the principals it admitted before', async () => {

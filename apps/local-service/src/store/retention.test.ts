@@ -21,7 +21,10 @@
  * 3. **Orphans age out, references never do.** A backup no journal row names
  *    survives the grace window; one a record names survives forever.
  * 4. **Caches follow their project.** An old code-index entry whose project was
- *    opened inside the window survives; an abandoned one goes.
+ *    opened inside the window survives; an abandoned one goes. An entry the
+ *    cache can no longer reach — written under an older envelope version, or
+ *    superseded by a newer entry of the same project — goes whatever its age,
+ *    so each project is left with the one entry the cache reads and writes.
  * 5. **Nothing outside the state root is touched**, not through a planted link
  *    and not through a sibling that merely shares the root's name as a prefix.
  * 6. **A dry run is honest, one bad item never aborts the pass, and no report
@@ -35,6 +38,10 @@
  *    disk keeps a link inside A that points into B; and a directory-shaped
  *    cache entry is inspected whole — one holding more documents than the
  *    sweep reads, a subdirectory, or a document it cannot attribute is kept.
+ * 8. **A sweep keeps the write-ahead log bounded off the event loop.** While a
+ *    real sweep deletes, the connection's commit-time checkpoint is suspended
+ *    and the sweep waits for background checkpoints instead; the threshold is
+ *    restored however the sweep ends, and a dry run leaves it alone.
  *
  * The store is the real one: `openStore` against a file in an `mkdtemp`
  * sandbox — never `:memory:` — so WAL and the `foreign_keys` pragma behave as
@@ -71,6 +78,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
@@ -81,6 +89,13 @@ import type { SQLInputValue, SQLOutputValue, StatementSync } from 'node:sqlite';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import {
+  CODE_INDEX_SCHEMA_VERSION,
+  INDEXER_VERSION,
+  INDEX_CACHE_SCHEMA_VERSION,
+  createIndexCache,
+} from '@debuggen/code-analysis';
+import type { CodeIndex, IndexCacheKeyInput } from '@debuggen/code-analysis';
 import { createModificationRecord } from '@debuggen/instrumentation';
 import type {
   InstrumentationPlan,
@@ -122,17 +137,24 @@ import type { PanelsRepo } from './panels-repo.js';
 import {
   BACKUP_PROBE_BATCH_SIZE,
   DEFAULT_RETENTION_DAYS,
+  INCREMENTAL_VACUUM_STEP_PAGES,
   IN_FLIGHT_SESSION_STATUSES,
   MAX_INDEX_METADATA_FILES,
   MAX_REPORTED_ITEMS,
   ORPHAN_BACKUP_GRACE_DAYS,
   RETENTION_CANDIDATE_PAGE_SIZE,
+  RETENTION_WAL_CHECKPOINT_BYTES,
+  SESSION_TELEMETRY_PROBE_SQL,
+  VACUUM_CONVERSION_MAX_LIVE_BYTES,
+  VACUUM_CONVERSION_MIN_FREE_BYTES,
+  VACUUM_CONVERSION_MIN_FREE_SHARE,
   runRetention,
 } from './retention.js';
 import type {
   RetentionDeps,
   RetentionIssue,
   RetentionOptions,
+  RetentionReclaimTuning,
   RetentionReport,
   RetentionScope,
 } from './retention.js';
@@ -444,9 +466,25 @@ async function sweep(
   return result.value;
 }
 
-/** A report with its one non-deterministic member zeroed, for equality checks. */
+/**
+ * A report with its layout-dependent members zeroed, for equality checks: its
+ * duration, and the bytes the database file shrank by — which follow the
+ * store's page layout and auto-vacuum mode rather than its rows, and which a
+ * dry run never reclaims — taken back out of `bytesReclaimed` too.
+ */
 function comparable(report: RetentionReport): RetentionReport {
-  return { ...report, durationMs: 0 };
+  const databaseBytes = report.databaseBytesReclaimed ?? 0;
+  return {
+    ...report,
+    durationMs: 0,
+    bytesReclaimed: (report.bytesReclaimed ?? 0) - databaseBytes,
+    databaseBytesReclaimed: 0,
+  };
+}
+
+/** The bytes of files a sweep removed: `bytesReclaimed` without the database's share. */
+function fileBytesReclaimed(report: RetentionReport): number {
+  return (report.bytesReclaimed ?? 0) - (report.databaseBytesReclaimed ?? 0);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -487,6 +525,36 @@ function writeIndexEntry(harness: Harness, name: string, document: unknown, at: 
   const body = typeof document === 'string' ? document : JSON.stringify(document);
   writeDatedFile(path, body, at);
   return path;
+}
+
+/**
+ * A document with the envelope shape `@debuggen/code-analysis` writes: a
+ * numeric top-level `schemaVersion` and an `index` recording `projectRoot`,
+ * with synthetic digests in the members the sweep never reads.
+ *
+ * `version` defaults to the envelope version the cache reads and writes now,
+ * taken from the package itself so the fixture follows a bump. `extra` adds
+ * top-level members — a second `projectRoot`, for an entry recording two.
+ */
+function makeIndexEnvelope(
+  projectRoot: string,
+  version: number = INDEX_CACHE_SCHEMA_VERSION,
+  extra: Readonly<Record<string, unknown>> = {},
+): Record<string, unknown> {
+  return {
+    schemaVersion: version,
+    key: 'a'.repeat(64),
+    stateKey: 'a'.repeat(64),
+    writtenAt: RECENT_AT,
+    index: { projectRoot },
+    stamps: [],
+    ...extra,
+  };
+}
+
+/** The names directly inside `index/`, sorted. */
+function indexEntryNames(harness: Harness): string[] {
+  return readdirSync(harness.indexCacheDir).sort();
 }
 
 /** Whether anything — a file, a directory or a link, dangling or not — sits at `path`. */
@@ -997,7 +1065,7 @@ describe('Rule 1: aged sessions', () => {
     expect(report.orphanBackupsDeleted).toBe(0);
     expect(report.indexCachesDeleted).toBe(0);
     expect(report.sessionsRetainedForConflicts).toEqual([]);
-    expect(report.bytesReclaimed).toBe(contents.modification.bytes.length);
+    expect(fileBytesReclaimed(report)).toBe(contents.modification.bytes.length);
     expect(report.errors).toEqual([]);
 
     // The cascade fired: every child table is empty for the purged session,
@@ -1213,6 +1281,16 @@ const TELEMETRY_SEED_CHUNK = 1_000;
 /** More telemetry than one batch of the telemetry repository's batched purge holds. */
 const LARGE_TELEMETRY = DEFAULT_PURGE_BATCH_SIZE + 25;
 
+/**
+ * The timeout of a test that seeds a large fixture — more than one purge batch
+ * of telemetry, validated event by event through `insertMany`, or more than
+ * one candidate page of sessions — and sweeps it: **60 s**, the bound the
+ * telemetry repository's own large-purge tests use. Such a test takes a few
+ * seconds on an idle host and legitimately exceeds the 5 s default on a loaded
+ * one; a genuinely hung sweep still fails.
+ */
+const LARGE_FIXTURE_TEST_TIMEOUT_MS = 60_000;
+
 /** What {@link seedTelemetry} may vary. */
 interface TelemetrySeed {
   /** Leave the capture window open, as a capture still in progress does. */
@@ -1266,106 +1344,341 @@ function lastIngestSeq(harness: Harness, sessionId: SessionId): number {
   );
 }
 
+/** The `ingest_seq` of a session's first-inserted event. */
+function firstIngestSeq(harness: Harness, sessionId: SessionId): number {
+  return readCount(
+    harness.store
+      .statement('SELECT MIN(ingest_seq) AS n FROM telemetry_events WHERE session_id = ?')
+      .get(sessionId),
+  );
+}
+
+/**
+ * Makes the delete of one telemetry row fail with {@link SENTINEL} as the
+ * engine's message, so the report and the logs can be proven free of it.
+ * Dropped with {@link dropDeleteFailure}.
+ */
+function failDeleteOf(harness: Harness, ingestSeq: number): void {
+  harness.store.db.exec(
+    `CREATE TEMP TRIGGER retention_cascade_failure BEFORE DELETE ON main.telemetry_events ` +
+      `WHEN old.ingest_seq = ${String(ingestSeq)} ` +
+      `BEGIN SELECT RAISE(ABORT, '${SENTINEL}'); END`,
+  );
+}
+
+/** Removes the trigger {@link failDeleteOf} planted. */
+function dropDeleteFailure(harness: Harness): void {
+  harness.store.db.exec('DROP TRIGGER retention_cascade_failure');
+}
+
+/**
+ * A store that forwards everything to `store` and calls `beforeTransaction`
+ * with the 1-based ordinal of each transaction the sweep itself opens, just
+ * before it opens it — the moment between two drain batches of a large
+ * session. The repositories keep the real store, so only the sweep's own
+ * deciding transactions are seen.
+ */
+function hookTransactions(store: Store, beforeTransaction: (ordinal: number) => void): Store {
+  let ordinal = 0;
+  return new Proxy(store, {
+    get(target, key): unknown {
+      if (key === 'transaction') {
+        return <T>(fn: () => T): T => {
+          ordinal += 1;
+          beforeTransaction(ordinal);
+          return target.transaction(fn);
+        };
+      }
+      const value: unknown = Reflect.get(target, key);
+      return typeof value === 'function'
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  });
+}
+
+/** Every scoped table's row count for one session, telemetry left out. */
+function evidenceBesideTelemetry(
+  harness: Harness,
+  sessionId: SessionId,
+): Record<SessionScopedTable, number> {
+  return { ...scopedCounts(harness, sessionId), telemetry_events: 0 };
+}
+
+/** The `warn` records of a large session whose drain stopped before its cascade. */
+function drainStops(harness: Harness): CapturedLog[] {
+  return harness.logs.filter(
+    (log) =>
+      log.level === 'warn' &&
+      log.message ===
+        'a large session stopped being eligible part-way through its purge; its row and remaining evidence were kept',
+  );
+}
+
 /** The resting statuses: every status outside {@link IN_FLIGHT_SESSION_STATUSES}. */
 const RESTING_STATUSES: readonly SessionStatus[] = SESSION_STATUSES.filter(
   (status) => !IN_FLIGHT_SESSION_STATUSES.includes(status),
 );
 
 describe('an atomic purge that never touches an active session', () => {
-  it('purges a session holding more than one purge batch of telemetry in a single cascade', async () => {
-    const { sessionId, contents } = await seedFullSession(h, AGED_AT);
-    seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
+  it(
+    'purges a session holding more than one purge batch of telemetry in bounded batches, then one cascade',
+    async () => {
+      const { sessionId, contents } = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
+      const total = contents.telemetryEvents + LARGE_TELEMETRY;
 
-    const report = await sweep(h);
+      const dry = await sweep(h, { dryRun: true });
+      expect(dry.telemetryEventsDeleted).toBe(total);
+      expect(rowsFor(h, 'telemetry_events', sessionId)).toBe(total);
 
-    expect(report.sessionIdsDeleted).toEqual([sessionId]);
-    expect(report.telemetryEventsDeleted).toBe(contents.telemetryEvents + LARGE_TELEMETRY);
-    expect(report.backupDirsDeleted).toBe(1);
-    expect(report.errors).toEqual([]);
-    expectNoRowsLeft(h, sessionId);
-    expect(sessionExists(h, sessionId)).toBe(false);
-  });
+      // What the session still held as each of the sweep's transactions opened.
+      const heldAtEachTransaction: number[] = [];
+      const store = hookTransactions(h.store, () => {
+        heldAtEachTransaction.push(rowsFor(h, 'telemetry_events', sessionId));
+      });
+      const report = await sweep(h, {}, { store });
 
-  it('rolls a large session back whole when its cascade fails past the first purge batch, and carries on', async () => {
-    const failing = await seedFullSession(h, AGED_AT);
-    seedTelemetry(h, failing.sessionId, AGED_AT, LARGE_TELEMETRY);
-    const sibling = await seedFullSession(h, AGED_AT + DAY_MS);
-    const rowsBefore = scopedCounts(h, failing.sessionId);
-    expect(rowsBefore.telemetry_events).toBeGreaterThan(DEFAULT_PURGE_BATCH_SIZE);
+      expect(report.sessionIdsDeleted).toEqual([sessionId]);
+      expect(report.telemetryEventsDeleted).toBe(total);
+      expect(report.telemetryEventsDeleted).toBe(dry.telemetryEventsDeleted);
+      expect(report.panelsDeleted).toBe(contents.panels);
+      expect(report.analysesDeleted).toBe(contents.analyses);
+      expect(report.modificationsDeleted).toBe(1);
+      expect(report.backupDirsDeleted).toBe(1);
+      expect(report.errors).toEqual([]);
+      expectNoRowsLeft(h, sessionId);
+      expect(sessionExists(h, sessionId)).toBe(false);
+      // One drain batch, then the cascade over the rest: no transaction held
+      // the write lock — and the event loop — for more than one batch.
+      expect(heldAtEachTransaction).toEqual([total, total - DEFAULT_PURGE_BATCH_SIZE]);
+      expect(total - DEFAULT_PURGE_BATCH_SIZE).toBeLessThanOrEqual(DEFAULT_PURGE_BATCH_SIZE);
+      expect(drainStops(h)).toEqual([]);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
 
-    // The session's last-inserted event refuses to be deleted, so the cascade
-    // fails after more rows than one purge batch holds. The engine's message is
-    // the sentinel, so the report and the logs can be proven free of it.
-    h.store.db.exec(
-      `CREATE TEMP TRIGGER retention_cascade_failure BEFORE DELETE ON main.telemetry_events ` +
-        `WHEN old.ingest_seq = ${String(lastIngestSeq(h, failing.sessionId))} ` +
-        `BEGIN SELECT RAISE(ABORT, '${SENTINEL}'); END`,
-    );
+  it(
+    'keeps the batches it committed when the final cascade of a large session fails, reports it, and carries on',
+    async () => {
+      const failing = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, failing.sessionId, AGED_AT, LARGE_TELEMETRY);
+      const sibling = await seedFullSession(h, AGED_AT + DAY_MS);
+      const rowsBefore = scopedCounts(h, failing.sessionId);
+      expect(rowsBefore.telemetry_events).toBeGreaterThan(DEFAULT_PURGE_BATCH_SIZE);
+      expect(rowsBefore.telemetry_events).toBeLessThanOrEqual(2 * DEFAULT_PURGE_BATCH_SIZE);
 
-    const report = await sweep(h);
+      // The session's last-inserted — newest — event refuses to be deleted, so
+      // the first batch drains cleanly and the final cascade fails.
+      failDeleteOf(h, lastIngestSeq(h, failing.sessionId));
 
-    // Nothing of the failing session went — not one event of any batch.
-    expect(sessionExists(h, failing.sessionId)).toBe(true);
-    expect(scopedCounts(h, failing.sessionId)).toEqual(rowsBefore);
-    expect(present(failing.contents.modification.backupPath)).toBe(true);
-    expect(issuesAt(report, 'session', failing.sessionId)).toHaveLength(1);
-    expect(report.errors).toHaveLength(1);
-    // The sweep went on to the next candidate.
-    expect(report.sessionIdsDeleted).toEqual([sibling.sessionId]);
-    expect(report.telemetryEventsDeleted).toBe(sibling.contents.telemetryEvents);
-    expectNoRowsLeft(h, sibling.sessionId);
-    // No engine text reaches the report or a log record.
-    expect(JSON.stringify(report)).not.toContain(SENTINEL);
-    expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
+      const report = await sweep(h);
 
-    h.store.db.exec('DROP TRIGGER retention_cascade_failure');
-    const retry = await sweep(h);
+      // The drained batch stays deleted; the row and everything else stay.
+      expect(sessionExists(h, failing.sessionId)).toBe(true);
+      expect(rowsFor(h, 'telemetry_events', failing.sessionId)).toBe(
+        rowsBefore.telemetry_events - DEFAULT_PURGE_BATCH_SIZE,
+      );
+      expect(evidenceBesideTelemetry(h, failing.sessionId)).toEqual({
+        ...rowsBefore,
+        telemetry_events: 0,
+      });
+      expect(present(failing.contents.modification.backupPath)).toBe(true);
+      const issues = issuesAt(report, 'session', failing.sessionId);
+      expect(issues).toHaveLength(1);
+      expect(issues[0]?.message).toContain(String(DEFAULT_PURGE_BATCH_SIZE));
+      expect(report.errors).toHaveLength(1);
+      expect(drainStops(h).map((log) => log.fields)).toEqual([
+        expect.objectContaining({
+          sessionId: failing.sessionId,
+          outcome: 'failed',
+          drainedEvents: DEFAULT_PURGE_BATCH_SIZE,
+        }),
+      ]);
+      // The sweep went on to the next candidate, and counted every event it deleted.
+      expect(report.sessionIdsDeleted).toEqual([sibling.sessionId]);
+      expect(report.telemetryEventsDeleted).toBe(
+        sibling.contents.telemetryEvents + DEFAULT_PURGE_BATCH_SIZE,
+      );
+      expectNoRowsLeft(h, sibling.sessionId);
+      // No engine text reaches the report or a log record.
+      expect(JSON.stringify(report)).not.toContain(SENTINEL);
+      expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
 
-    expect(retry.sessionIdsDeleted).toEqual([failing.sessionId]);
-    expect(retry.telemetryEventsDeleted).toBe(rowsBefore.telemetry_events);
-    expect(retry.errors).toEqual([]);
-    expectNoRowsLeft(h, failing.sessionId);
-    expect(present(failing.contents.modification.backupPath)).toBe(false);
-  });
+      dropDeleteFailure(h);
+      const retry = await sweep(h);
 
-  it('keeps every event of a large session refreshed after it was listed', async () => {
-    const { sessionId, contents } = await seedFullSession(h, AGED_AT);
-    seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
-    const rowsBefore = scopedCounts(h, sessionId);
+      // The next sweep resumes where the failed one stopped.
+      expect(retry.sessionIdsDeleted).toEqual([failing.sessionId]);
+      expect(retry.telemetryEventsDeleted).toBe(
+        rowsBefore.telemetry_events - DEFAULT_PURGE_BATCH_SIZE,
+      );
+      expect(retry.errors).toEqual([]);
+      expectNoRowsLeft(h, failing.sessionId);
+      expect(present(failing.contents.modification.backupPath)).toBe(false);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
 
-    // A client touches the session between the candidate listing and the
-    // decision, as a live service does when the developer resumes it.
-    let refreshed = false;
-    const modifications: ModificationsRepo = {
-      ...h.modifications,
-      listConflicts: (...args: Parameters<ModificationsRepo['listConflicts']>) => {
-        if (args[0] === sessionId && !refreshed) {
-          refreshed = true;
-          unwrap(h.sessions.setStatus(sessionId, 'ended'));
+  it(
+    'records a drain batch the store refuses as an issue, keeps the batches before it, and still purges the sibling',
+    async () => {
+      const failing = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, failing.sessionId, AGED_AT, 2 * DEFAULT_PURGE_BATCH_SIZE + 25);
+      const sibling = await seedFullSession(h, AGED_AT + DAY_MS);
+      const rowsBefore = scopedCounts(h, failing.sessionId);
+      expect(rowsBefore.telemetry_events).toBeGreaterThan(2 * DEFAULT_PURGE_BATCH_SIZE);
+
+      // Events are drained oldest first, so this one falls in the second batch:
+      // the first commits, the second rolls back, and no cascade is attempted.
+      failDeleteOf(h, firstIngestSeq(h, failing.sessionId) + DEFAULT_PURGE_BATCH_SIZE + 10);
+
+      const report = await sweep(h);
+
+      expect(sessionExists(h, failing.sessionId)).toBe(true);
+      expect(rowsFor(h, 'telemetry_events', failing.sessionId)).toBe(
+        rowsBefore.telemetry_events - DEFAULT_PURGE_BATCH_SIZE,
+      );
+      expect(evidenceBesideTelemetry(h, failing.sessionId)).toEqual({
+        ...rowsBefore,
+        telemetry_events: 0,
+      });
+      expect(present(failing.contents.modification.backupPath)).toBe(true);
+      expect(issuesAt(report, 'session', failing.sessionId)).toHaveLength(1);
+      expect(report.errors).toHaveLength(1);
+      expect(report.sessionIdsDeleted).toEqual([sibling.sessionId]);
+      expect(report.telemetryEventsDeleted).toBe(
+        sibling.contents.telemetryEvents + DEFAULT_PURGE_BATCH_SIZE,
+      );
+      expectNoRowsLeft(h, sibling.sessionId);
+      expect(JSON.stringify(report)).not.toContain(SENTINEL);
+      expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
+
+      dropDeleteFailure(h);
+      const retry = await sweep(h);
+
+      expect(retry.sessionIdsDeleted).toEqual([failing.sessionId]);
+      expect(retry.telemetryEventsDeleted).toBe(
+        rowsBefore.telemetry_events - DEFAULT_PURGE_BATCH_SIZE,
+      );
+      expect(retry.errors).toEqual([]);
+      expectNoRowsLeft(h, failing.sessionId);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'stops draining a large session refreshed or claimed part-way, keeping its row and every undrained piece of evidence',
+    async () => {
+      const refreshed = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, refreshed.sessionId, AGED_AT, LARGE_TELEMETRY);
+      const claimed = await seedFullSession(h, AGED_AT + DAY_MS);
+      seedTelemetry(h, claimed.sessionId, AGED_AT + DAY_MS, LARGE_TELEMETRY);
+      const before = new Map(
+        [refreshed.sessionId, claimed.sessionId].map((id) => [id, scopedCounts(h, id)]),
+      );
+
+      // Candidates are decided oldest first. The refreshed session's second
+      // transaction opens after the developer resumed it; the claimed session is
+      // free for its first transaction and claimed for its second.
+      const store = hookTransactions(h.store, (ordinal) => {
+        if (ordinal === 2) {
+          unwrap(h.sessions.setStatus(refreshed.sessionId, 'ended'));
         }
-        return h.modifications.listConflicts(...args);
-      },
-    };
+      });
+      const asked = new Map<SessionId, number>();
+      const report = await sweep(
+        h,
+        {},
+        {
+          store,
+          isSessionInUse: (sessionId) => {
+            const calls = (asked.get(sessionId) ?? 0) + 1;
+            asked.set(sessionId, calls);
+            return sessionId === claimed.sessionId && calls >= 2;
+          },
+        },
+      );
 
-    const report = await sweep(h, {}, { modifications });
+      expect(storedUpdatedAt(h, refreshed.sessionId)).toBe(NOW);
+      expect(report.sessionsDeleted).toBe(0);
+      expect(report.sessionIdsDeleted).toEqual([]);
+      expect(report.sessionsRetainedActive).toEqual([claimed.sessionId]);
+      expect(report.telemetryEventsDeleted).toBe(2 * DEFAULT_PURGE_BATCH_SIZE);
+      expect(report.errors).toEqual([]);
+      for (const { sessionId, contents } of [refreshed, claimed]) {
+        const rowsBefore = before.get(sessionId);
+        expect(sessionExists(h, sessionId)).toBe(true);
+        expect(rowsFor(h, 'telemetry_events', sessionId)).toBe(
+          (rowsBefore?.telemetry_events ?? 0) - DEFAULT_PURGE_BATCH_SIZE,
+        );
+        expect(evidenceBesideTelemetry(h, sessionId)).toEqual({
+          ...rowsBefore,
+          telemetry_events: 0,
+        });
+        expect(present(contents.modification.backupPath)).toBe(true);
+      }
+      const stops = drainStops(h);
+      expect(stops.map((log) => log.fields)).toEqual([
+        expect.objectContaining({
+          sessionId: refreshed.sessionId,
+          outcome: 'refreshed',
+          drainedEvents: DEFAULT_PURGE_BATCH_SIZE,
+        }),
+        expect.objectContaining({
+          sessionId: claimed.sessionId,
+          outcome: 'in-use',
+          drainedEvents: DEFAULT_PURGE_BATCH_SIZE,
+        }),
+      ]);
+      // Ids and counts only: no path reaches the record.
+      expect(JSON.stringify(stops)).not.toContain(h.root);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
 
-    expect(refreshed).toBe(true);
-    expect(storedUpdatedAt(h, sessionId)).toBe(NOW);
-    expect(report.sessionsDeleted).toBe(0);
-    expect(report.sessionIdsDeleted).toEqual([]);
-    expect(report.telemetryEventsDeleted).toBe(0);
-    expect(report.errors).toEqual([]);
-    expect(sessionExists(h, sessionId)).toBe(true);
-    expect(scopedCounts(h, sessionId)).toEqual(rowsBefore);
-    expect(present(contents.modification.backupPath)).toBe(true);
-    expect(
-      h.logs.some(
-        (log) =>
-          log.message === 'aged session no longer eligible at deletion time' &&
-          log.fields['outcome'] === 'refreshed',
-      ),
-    ).toBe(true);
-  });
+  it(
+    'keeps every event of a large session refreshed after it was listed',
+    async () => {
+      const { sessionId, contents } = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
+      const rowsBefore = scopedCounts(h, sessionId);
+
+      // A client touches the session between the candidate listing and the
+      // decision, as a live service does when the developer resumes it.
+      let refreshed = false;
+      const modifications: ModificationsRepo = {
+        ...h.modifications,
+        listConflicts: (...args: Parameters<ModificationsRepo['listConflicts']>) => {
+          if (args[0] === sessionId && !refreshed) {
+            refreshed = true;
+            unwrap(h.sessions.setStatus(sessionId, 'ended'));
+          }
+          return h.modifications.listConflicts(...args);
+        },
+      };
+
+      const report = await sweep(h, {}, { modifications });
+
+      expect(refreshed).toBe(true);
+      expect(storedUpdatedAt(h, sessionId)).toBe(NOW);
+      expect(report.sessionsDeleted).toBe(0);
+      expect(report.sessionIdsDeleted).toEqual([]);
+      expect(report.telemetryEventsDeleted).toBe(0);
+      expect(report.errors).toEqual([]);
+      expect(sessionExists(h, sessionId)).toBe(true);
+      expect(scopedCounts(h, sessionId)).toEqual(rowsBefore);
+      expect(present(contents.modification.backupPath)).toBe(true);
+      expect(
+        h.logs.some(
+          (log) =>
+            log.message === 'aged session no longer eligible at deletion time' &&
+            log.fields['outcome'] === 'refreshed',
+        ),
+      ).toBe(true);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
 
   it('retains an aged session in any in-flight status and purges one at rest, dry run and real alike', async () => {
     const active: SessionId[] = [];
@@ -1655,7 +1968,7 @@ describe('Rule 2: code-index caches', () => {
     expect(present(topLevel)).toBe(true);
   });
 
-  it('removes an old entry that records no project, and keeps a recent one without reading it', async () => {
+  it('removes an old entry that records no project, and keeps a recent one', async () => {
     const staleEmpty = writeIndexEntry(h, 'alpha.json', {}, daysAgo(DEFAULT_RETENTION_DAYS + 1));
     const staleGarbage = writeIndexEntry(h, 'bravo.json', 'not json at all', ANCIENT_AT);
     const staleOther = writeIndexEntry(h, 'charlie.bin', 'opaque bytes', ANCIENT_AT);
@@ -1732,6 +2045,290 @@ describe('Rule 2: code-index caches', () => {
     expect(present(abandoned)).toBe(false);
     expect(present(freshChild)).toBe(true);
     expect(report.errors).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Rule 2, ahead of the age rule: entries the cache can no longer reach
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The records the sweep logged for entries it removed ahead of the age rule, in sweep order. */
+function supersededRecords(harness: Harness): CapturedLog[] {
+  return harness.logs.filter((log) => log.message === 'an index-cache entry was superseded');
+}
+
+describe('Rule 2: superseded and older-envelope code-index caches', () => {
+  it('removes an entry of an older envelope version whatever its age, even while its project is active', async () => {
+    seedSession(h, { projectRoot: PROJECT_A, updatedAt: RECENT_AT });
+    const previous = writeIndexEntry(
+      h,
+      'alpha.json',
+      makeIndexEnvelope(PROJECT_A, INDEX_CACHE_SCHEMA_VERSION - 1),
+      RECENT_AT,
+    );
+    const earlier = writeIndexEntry(
+      h,
+      'bravo.json',
+      makeIndexEnvelope(PROJECT_A, INDEX_CACHE_SCHEMA_VERSION - 2),
+      ANCIENT_AT,
+    );
+    const current = writeIndexEntry(h, 'charlie.json', makeIndexEnvelope(PROJECT_A), ANCIENT_AT);
+    const reclaimable = lstatSync(previous).size + lstatSync(earlier).size;
+
+    const report = await sweep(h);
+
+    expect(report.indexCachesDeleted).toBe(2);
+    expect(report.bytesReclaimed).toBe(reclaimable);
+    expect(present(previous)).toBe(false);
+    expect(present(earlier)).toBe(false);
+    // Old on disk, but the current version and its project is active: the age rule keeps it.
+    expect(present(current)).toBe(true);
+    expect(report.errors).toEqual([]);
+  });
+
+  it('keeps only the newest current-version entry of each project, however recent the others are', async () => {
+    seedSession(h, { projectRoot: PROJECT_A, updatedAt: RECENT_AT });
+    const olderA = writeIndexEntry(h, 'alpha.json', makeIndexEnvelope(PROJECT_A), daysAgo(3));
+    // Both spellings of a root name one project.
+    const slashA = writeIndexEntry(h, 'bravo.json', makeIndexEnvelope(`${PROJECT_A}/`), daysAgo(2));
+    const newestA = writeIndexEntry(h, 'charlie.json', makeIndexEnvelope(PROJECT_A), RECENT_AT);
+    const onlyB = writeIndexEntry(h, 'delta.json', makeIndexEnvelope(PROJECT_B), daysAgo(5));
+
+    const report = await sweep(h);
+
+    expect(report.indexCachesDeleted).toBe(2);
+    expect(present(olderA)).toBe(false);
+    expect(present(slashA)).toBe(false);
+    expect(present(newestA)).toBe(true);
+    // A project's only entry is its newest one.
+    expect(present(onlyB)).toBe(true);
+    expect(report.errors).toEqual([]);
+
+    // Nothing is superseded twice: an immediate second sweep finds nothing to do.
+    expect((await sweep(h)).indexCachesDeleted).toBe(0);
+  });
+
+  it('breaks a tie in modification time by name, so exactly one entry of a project survives', async () => {
+    const earlierName = writeIndexEntry(h, 'alpha.json', makeIndexEnvelope(PROJECT_A), RECENT_AT);
+    const laterName = writeIndexEntry(h, 'bravo.json', makeIndexEnvelope(PROJECT_A), RECENT_AT);
+
+    const report = await sweep(h);
+
+    expect(report.indexCachesDeleted).toBe(1);
+    expect(present(earlierName)).toBe(false);
+    expect(present(laterName)).toBe(true);
+  });
+
+  it('leaves a document without the envelope shape, and one of a newer envelope version, to the age rule', async () => {
+    const current = writeIndexEntry(h, 'alpha.json', makeIndexEnvelope(PROJECT_A), RECENT_AT);
+    const older = daysAgo(2);
+    const bare = writeIndexEntry(h, 'bravo.json', { index: { projectRoot: PROJECT_A } }, older);
+    const topLevelRoot = writeIndexEntry(
+      h,
+      'charlie.json',
+      { schemaVersion: INDEX_CACHE_SCHEMA_VERSION - 1, projectRoot: PROJECT_A },
+      older,
+    );
+    const textVersion = writeIndexEntry(
+      h,
+      'delta.json',
+      { schemaVersion: String(INDEX_CACHE_SCHEMA_VERSION - 1), index: { projectRoot: PROJECT_A } },
+      older,
+    );
+    const rootless = writeIndexEntry(
+      h,
+      'echo.json',
+      { schemaVersion: INDEX_CACHE_SCHEMA_VERSION - 1, index: {} },
+      older,
+    );
+    const newer = writeIndexEntry(
+      h,
+      'foxtrot.json',
+      makeIndexEnvelope(PROJECT_A, INDEX_CACHE_SCHEMA_VERSION + 1),
+      older,
+    );
+    const agedNewer = writeIndexEntry(
+      h,
+      'golf.json',
+      makeIndexEnvelope(PROJECT_B, INDEX_CACHE_SCHEMA_VERSION + 1),
+      ANCIENT_AT,
+    );
+
+    const report = await sweep(h);
+
+    // Only the age rule removed anything: the newer-version entry of an abandoned project.
+    expect(report.indexCachesDeleted).toBe(1);
+    expect(present(agedNewer)).toBe(false);
+    for (const kept of [current, bare, topLevelRoot, textVersion, rootless, newer]) {
+      expect(present(kept)).toBe(true);
+    }
+    expect(supersededRecords(h)).toEqual([]);
+    expect(report.errors).toEqual([]);
+  });
+
+  it('keeps an entry recording two projects until each of them has a newer entry', async () => {
+    const mixed = writeIndexEntry(
+      h,
+      'alpha.json',
+      makeIndexEnvelope(PROJECT_A, INDEX_CACHE_SCHEMA_VERSION, { projectRoot: PROJECT_B }),
+      daysAgo(3),
+    );
+    writeIndexEntry(h, 'bravo.json', makeIndexEnvelope(PROJECT_A), RECENT_AT);
+
+    const first = await sweep(h);
+
+    // B's newest entry is still the mixed one, so no project loses its last cache.
+    expect(first.indexCachesDeleted).toBe(0);
+    expect(present(mixed)).toBe(true);
+
+    writeIndexEntry(h, 'charlie.json', makeIndexEnvelope(PROJECT_B), RECENT_AT);
+    const second = await sweep(h);
+
+    expect(second.indexCachesDeleted).toBe(1);
+    expect(present(mixed)).toBe(false);
+    expect(indexEntryNames(h)).toEqual(['bravo.json', 'charlie.json']);
+  });
+
+  it('still ages out the newest entry of a project abandoned before the window, and keeps an active one', async () => {
+    seedSession(h, { projectRoot: PROJECT_A, updatedAt: RECENT_AT });
+    writeIndexEntry(h, 'alpha.json', makeIndexEnvelope(PROJECT_B), ANCIENT_AT);
+    writeIndexEntry(h, 'bravo.json', makeIndexEnvelope(PROJECT_B), AGED_AT);
+    writeIndexEntry(h, 'charlie.json', makeIndexEnvelope(PROJECT_A), ANCIENT_AT);
+
+    const report = await sweep(h);
+
+    // B's older entry was superseded and its newest aged out; A's is old but active.
+    expect(report.indexCachesDeleted).toBe(2);
+    expect(indexEntryNames(h)).toEqual(['charlie.json']);
+    expect(supersededRecords(h).map((log) => log.fields['reason'])).toEqual(['superseded']);
+    expect(report.errors).toEqual([]);
+  });
+
+  it('reports on a dry run exactly what the real sweep then removes, logging each entry by path and reason only', async () => {
+    seedSession(h, { projectRoot: PROJECT_A, updatedAt: RECENT_AT });
+    const legacy = writeIndexEntry(
+      h,
+      'alpha.json',
+      makeIndexEnvelope(PROJECT_A, INDEX_CACHE_SCHEMA_VERSION - 1),
+      RECENT_AT,
+    );
+    const older = writeIndexEntry(h, 'bravo.json', makeIndexEnvelope(PROJECT_A), daysAgo(2));
+    const newest = writeIndexEntry(h, 'charlie.json', makeIndexEnvelope(PROJECT_A), RECENT_AT);
+    const treeBefore = snapshotTree(h);
+
+    const dry = await sweep(h, { dryRun: true });
+
+    expect(snapshotTree(h)).toEqual(treeBefore);
+    expect(dry.indexCachesDeleted).toBe(2);
+    const records = supersededRecords(h);
+    expect(records.map(({ level, fields }) => [level, fields['target'], fields['reason']])).toEqual(
+      [
+        ['debug', relativeToHome(h, legacy), 'older-envelope'],
+        ['debug', relativeToHome(h, older), 'superseded'],
+      ],
+    );
+    // A path relative to the state root and a reason: never the project the cache belongs to.
+    expect(JSON.stringify(records)).not.toContain(PROJECT_A);
+
+    const real = await sweep(h);
+
+    expect(comparable(real)).toEqual(comparable(dry));
+    expect(present(legacy)).toBe(false);
+    expect(present(older)).toBe(false);
+    expect(present(newest)).toBe(true);
+  });
+
+  it("removes only the scoped workspace's unreachable entries, leaving the rest to the machine-wide sweep", async () => {
+    const legacyA = writeIndexEntry(
+      h,
+      'alpha.json',
+      makeIndexEnvelope(PROJECT_A, INDEX_CACHE_SCHEMA_VERSION - 1),
+      RECENT_AT,
+    );
+    const legacyB = writeIndexEntry(
+      h,
+      'bravo.json',
+      makeIndexEnvelope(PROJECT_B, INDEX_CACHE_SCHEMA_VERSION - 1),
+      RECENT_AT,
+    );
+    const olderA = writeIndexEntry(h, 'charlie.json', makeIndexEnvelope(PROJECT_A), daysAgo(2));
+    const olderB = writeIndexEntry(h, 'delta.json', makeIndexEnvelope(PROJECT_B), daysAgo(2));
+    const newestA = writeIndexEntry(h, 'echo.json', makeIndexEnvelope(PROJECT_A), RECENT_AT);
+    const newestB = writeIndexEntry(h, 'foxtrot.json', makeIndexEnvelope(PROJECT_B), RECENT_AT);
+
+    const scoped = await sweep(h, { scope: scopeOf(PROJECT_A) });
+
+    expect(scoped.indexCachesDeleted).toBe(2);
+    expect(present(legacyA)).toBe(false);
+    expect(present(olderA)).toBe(false);
+    for (const kept of [legacyB, olderB, newestA, newestB]) {
+      expect(present(kept)).toBe(true);
+    }
+    // B's entries are not A's to remove, nor to log.
+    expect(supersededRecords(h).map((log) => log.fields['target'])).toEqual([
+      relativeToHome(h, legacyA),
+      relativeToHome(h, olderA),
+    ]);
+
+    const machineWide = await sweep(h);
+
+    expect(machineWide.indexCachesDeleted).toBe(2);
+    expect(indexEntryNames(h)).toEqual(['echo.json', 'foxtrot.json']);
+  });
+
+  it('collapses the per-state files an older cache left to the one entry the current cache writes and serves', async () => {
+    // A real project and a real entry written by `@debuggen/code-analysis`,
+    // so the sweep is held to the envelope the cache actually writes.
+    const projectRoot = join(h.root, 'workspace');
+    writeDatedFile(join(projectRoot, FILE_ONE), 'export const one = 1;\n', RECENT_AT);
+    const stats = lstatSync(join(projectRoot, FILE_ONE));
+    const index: CodeIndex = {
+      schemaVersion: CODE_INDEX_SCHEMA_VERSION,
+      projectRoot,
+      indexerVersion: INDEXER_VERSION,
+      generatedAt: RECENT_AT,
+      nodes: [],
+      edges: [],
+      files: [{ file: FILE_ONE, mtimeMs: stats.mtimeMs, size: stats.size }],
+    };
+    const keyInput: IndexCacheKeyInput = {
+      projectRoot,
+      indexerVersion: INDEXER_VERSION,
+      extractors: ['alpha'],
+      files: index.files,
+    };
+    const cache = createIndexCache({ cacheDir: h.indexCacheDir });
+    expect(isErr(await cache.save(keyInput, index))).toBe(false);
+    const written = indexEntryNames(h);
+    expect(written).toHaveLength(1);
+    const envelope = JSON.parse(
+      readFileSync(join(h.indexCacheDir, written[0] ?? ''), 'utf8'),
+    ) as unknown;
+    expect(envelope).toMatchObject({
+      schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
+      index: { projectRoot },
+    });
+
+    // What the previous cache version left behind: one file per state of the
+    // same project, every one of them recent, and the project in active use.
+    seedSession(h, { projectRoot, updatedAt: RECENT_AT });
+    const legacyStates = 26;
+    for (let state = 0; state < legacyStates; state += 1) {
+      writeIndexEntry(
+        h,
+        `${String(state).padStart(64, '0')}.json`,
+        makeIndexEnvelope(projectRoot, INDEX_CACHE_SCHEMA_VERSION - 1),
+        RECENT_AT + state * 1000,
+      );
+    }
+
+    const report = await sweep(h);
+
+    expect(report.indexCachesDeleted).toBe(legacyStates);
+    expect(report.errors).toEqual([]);
+    expect(indexEntryNames(h)).toEqual(written);
+    // The entry the sweep kept is the one the cache reads: a hit, unchanged.
+    expect(await cache.load(keyInput)).toEqual(index);
   });
 });
 
@@ -2017,6 +2614,640 @@ describe('resilience', () => {
     }
     expect(sessionExists(h, aged)).toBe(true);
   });
+
+  it('answers CONFIG_INVALID, deleting nothing, for a signal that is not an AbortSignal', async () => {
+    const aged = seedSession(h, { updatedAt: AGED_AT });
+    const signal = { aborted: 'yes' } as unknown as AbortSignal;
+
+    const result = await runRetention(depsOf(h), { signal });
+
+    expect(isErr(result) ? result.error.code : 'ok').toBe('CONFIG_INVALID');
+    expect(sessionExists(h, aged)).toBe(true);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Interruption
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The `info` records of the sweep's first interrupted step boundary. */
+function interruptions(harness: Harness): CapturedLog[] {
+  return harness.logs.filter(
+    (log) => log.message === 'retention sweep interrupted; the next sweep carries on from here',
+  );
+}
+
+/** The fields of the sweep's closing summary record, which must be logged exactly once. */
+function finishedFields(harness: Harness): LogFields {
+  const finished = harness.logs.filter((log) => log.message === 'retention sweep finished');
+  expect(finished).toHaveLength(1);
+  return finished[0]?.fields ?? {};
+}
+
+describe('interruption', () => {
+  it('answers Ok with interrupted set, and touches nothing, when its signal is aborted before it starts', async () => {
+    const fixture = await seedEveryRule(h);
+    const rowsBefore = tableTotals(h);
+    const treeBefore = snapshotTree(h);
+    const observed = observeStore(h.store);
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await runRetention(depsOf(h, { store: observed.store }), {
+      signal: controller.signal,
+    });
+
+    expect(isErr(result)).toBe(false);
+    const report = unwrap(result);
+    expect(report).toMatchObject({
+      interrupted: true,
+      sessionsDeleted: 0,
+      telemetryEventsDeleted: 0,
+      backupDirsDeleted: 0,
+      orphanBackupsDeleted: 0,
+      indexCachesDeleted: 0,
+      bytesReclaimed: 0,
+      errors: [],
+    });
+    // Not a transaction, not a probe, not a checkpoint.
+    expect(observed.calls).toEqual({ transactions: 0, checkpoints: 0, referenceRowsRead: 0 });
+    expect(tableTotals(h)).toEqual(rowsBefore);
+    expect(snapshotTree(h)).toEqual(treeBefore);
+    expect(interruptions(h).map((log) => log.fields['at'])).toEqual(['candidate-page']);
+    expect(finishedFields(h)).toMatchObject({ interrupted: true, sessionsDeleted: 0 });
+
+    // An uninterrupted sweep then does all of it.
+    const resumed = await sweep(h);
+
+    expect(resumed.interrupted).toBe(false);
+    expect(resumed.sessionIdsDeleted).toEqual([...fixture.agedIds].sort());
+    expect(present(fixture.orphan)).toBe(false);
+    expect(present(fixture.staleCache)).toBe(false);
+  });
+
+  it('stops before the next session once aborted mid-sweep, runs no reclaim, and leaves the rest to the next sweep', async () => {
+    const fixture = await seedEveryRule(h);
+    const [first, second] = fixture.agedIds;
+    const observed = observeStore(h.store);
+    const controller = new AbortController();
+
+    const report = await sweep(
+      h,
+      { signal: controller.signal },
+      {
+        store: observed.store,
+        onSessionDeleted: () => {
+          controller.abort();
+        },
+      },
+    );
+
+    expect(report.interrupted).toBe(true);
+    expect(report.sessionsDeleted).toBe(1);
+    expect(report.sessionIdsDeleted).toEqual([first]);
+    expect(report.errors).toEqual([]);
+    expect(sessionExists(h, second ?? fixedSessionId('missing'))).toBe(true);
+    // Nothing after the boundary ran: no backup directory, orphan or cache
+    // was removed, and neither the checkpoint nor any other reclaim ran.
+    expect(report.backupDirsDeleted).toBe(0);
+    expect(report.orphanBackupsDeleted).toBe(0);
+    expect(report.indexCachesDeleted).toBe(0);
+    expect(present(join(h.backupsDir, first ?? 'missing'))).toBe(true);
+    expect(present(fixture.orphan)).toBe(true);
+    expect(present(fixture.staleCache)).toBe(true);
+    expect(observed.calls.checkpoints).toBe(0);
+    expect(interruptions(h).map((log) => log.fields['at'])).toEqual(['session']);
+    expect(finishedFields(h)).toMatchObject({ interrupted: true, sessionsDeleted: 1 });
+
+    const resumed = await sweep(h);
+
+    expect(resumed.interrupted).toBe(false);
+    expect(resumed.sessionIdsDeleted).toEqual([second]);
+    // The interrupted sweep's first session left its backups behind without a
+    // row; they are orphans now, and the orphan rule removes them.
+    expect(present(join(h.backupsDir, first ?? 'missing'))).toBe(false);
+    expect(present(fixture.orphan)).toBe(false);
+    expect(present(fixture.staleCache)).toBe(false);
+    expect(resumed.errors).toEqual([]);
+  });
+
+  it(
+    'stops between drain batches once aborted, keeping the large session for the next sweep',
+    async () => {
+      const { sessionId, contents } = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
+      const rowsBefore = scopedCounts(h, sessionId);
+      const observed = observeStore(h.store);
+      const controller = new AbortController();
+
+      // Asked inside the first drain transaction: the abort lands mid-drain.
+      const report = await sweep(
+        h,
+        { signal: controller.signal },
+        {
+          store: observed.store,
+          isSessionInUse: () => {
+            controller.abort();
+            return false;
+          },
+        },
+      );
+
+      expect(report.interrupted).toBe(true);
+      expect(report.sessionsDeleted).toBe(0);
+      expect(report.telemetryEventsDeleted).toBe(DEFAULT_PURGE_BATCH_SIZE);
+      expect(report.errors).toEqual([]);
+      expect(observed.calls).toMatchObject({ transactions: 1, checkpoints: 0 });
+      expect(sessionExists(h, sessionId)).toBe(true);
+      expect(rowsFor(h, 'telemetry_events', sessionId)).toBe(
+        rowsBefore.telemetry_events - DEFAULT_PURGE_BATCH_SIZE,
+      );
+      expect(evidenceBesideTelemetry(h, sessionId)).toEqual({ ...rowsBefore, telemetry_events: 0 });
+      expect(present(contents.modification.backupPath)).toBe(true);
+      // The sweep was stopped, not the session: reported at `info`, and never
+      // as a session that stopped being eligible.
+      expect(drainStops(h)).toEqual([]);
+      expect(
+        h.logs
+          .filter(
+            (log) =>
+              log.message ===
+              'the purge of a large session stopped part-way because the sweep was stopped; the next sweep carries on with it',
+          )
+          .map((log) => [log.level, log.fields]),
+      ).toEqual([
+        [
+          'info',
+          expect.objectContaining({
+            sessionId,
+            outcome: 'interrupted',
+            drainedEvents: DEFAULT_PURGE_BATCH_SIZE,
+          }),
+        ],
+      ]);
+      expect(interruptions(h).map((log) => log.fields['at'])).toEqual(['drain-batch']);
+
+      const resumed = await sweep(h);
+
+      expect(resumed.interrupted).toBe(false);
+      expect(resumed.sessionIdsDeleted).toEqual([sessionId]);
+      expect(resumed.telemetryEventsDeleted).toBe(
+        rowsBefore.telemetry_events - DEFAULT_PURGE_BATCH_SIZE,
+      );
+      expectNoRowsLeft(h, sessionId);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Returning database space to the filesystem
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A store's space, as the four pragmas the reclaim reads report it. */
+interface SpaceReading {
+  readonly autoVacuum: number;
+  readonly pageSize: number;
+  readonly pageCount: number;
+  readonly freelistCount: number;
+}
+
+/** SQLite's number for each auto-vacuum mode a test establishes, by its pragma name. */
+const AUTO_VACUUM = { NONE: 0, INCREMENTAL: 2 } as const;
+
+/** The sandbox store's space, read straight from its connection. */
+function databaseSpace(harness: Harness): SpaceReading {
+  const read = (sql: string, column: string): number => {
+    const value = harness.store.db.prepare(sql).get()?.[column];
+    if (typeof value !== 'number') {
+      throw new Error(`${sql} answered no numeric ${column} column`);
+    }
+    return value;
+  };
+  return {
+    autoVacuum: read('PRAGMA auto_vacuum', 'auto_vacuum'),
+    pageSize: read('PRAGMA page_size', 'page_size'),
+    pageCount: read('PRAGMA page_count', 'page_count'),
+    freelistCount: read('PRAGMA freelist_count', 'freelist_count'),
+  };
+}
+
+/**
+ * Puts the sandbox store in `mode` before anything is seeded — `PRAGMA
+ * auto_vacuum`, then `VACUUM`, the one way an existing database changes mode —
+ * so each reclaim test holds whatever mode `openStore` gives a new store.
+ */
+function establishAutoVacuum(harness: Harness, mode: keyof typeof AUTO_VACUUM): void {
+  harness.store.db.exec(`PRAGMA auto_vacuum = ${mode}; VACUUM;`);
+  expect(databaseSpace(harness).autoVacuum).toBe(AUTO_VACUUM[mode]);
+}
+
+/** The size on disk of the sandbox's database file, its write-ahead log aside. */
+function databaseFileSize(harness: Harness): number {
+  return statSync(join(harness.home, 'sessions.sqlite')).size;
+}
+
+/**
+ * Checkpoints the store and reads its space — the baseline a reclaim test
+ * measures against — proving the file on disk is exactly its pages.
+ */
+function settledSpace(harness: Harness): SpaceReading {
+  harness.store.checkpoint();
+  const space = databaseSpace(harness);
+  expect(databaseFileSize(harness)).toBe(space.pageCount * space.pageSize);
+  return space;
+}
+
+/** Whether `sql` is the reclaim's incremental step. */
+function isIncrementalStep(sql: string): boolean {
+  return sql.startsWith('PRAGMA incremental_vacuum(');
+}
+
+/**
+ * A store that forwards everything to the sandbox's and records, for each
+ * incremental reclaim step the sweep runs through it, how many pages the step
+ * released — the freelist read from the connection before and after.
+ */
+function observeVacuumSteps(harness: Harness): {
+  readonly store: Store;
+  readonly released: number[];
+} {
+  const released: number[] = [];
+  const forward = <T extends object>(target: T, key: PropertyKey): unknown => {
+    const value: unknown = Reflect.get(target, key);
+    return typeof value === 'function'
+      ? (value as (...args: unknown[]) => unknown).bind(target)
+      : value;
+  };
+  const store = new Proxy(harness.store, {
+    get(target, key): unknown {
+      if (key !== 'statement') {
+        return forward(target, key);
+      }
+      return (sql: string): StatementSync => {
+        const statement = target.statement(sql);
+        if (!isIncrementalStep(sql)) {
+          return statement;
+        }
+        return new Proxy(statement, {
+          get(inner, member): unknown {
+            if (member !== 'all') {
+              return forward(inner, member);
+            }
+            return (...args: SQLInputValue[]): Record<string, SQLOutputValue>[] => {
+              const before = databaseSpace(harness).freelistCount;
+              const rows = inner.all(...args);
+              released.push(before - databaseSpace(harness).freelistCount);
+              return rows;
+            };
+          },
+        });
+      };
+    },
+  });
+  return { store, released };
+}
+
+/** The records a reclaim logged under `message`, from the log index `from` on. */
+function reclaimLogs(harness: Harness, message: string, from = 0): CapturedLog[] {
+  return harness.logs.slice(from).filter((log) => log.message === message);
+}
+
+/** The `info` record of a store without auto-vacuum whose conversion a gate refused. */
+const PAGES_STAY_REUSABLE =
+  'the purged database pages stay reusable; the store file keeps its size';
+
+/** The `info` record of a store without auto-vacuum the reclaim converted. */
+const STORE_CONVERTED = 'converted the session store to incremental auto-vacuum and compacted it';
+
+describe('returning database space to the filesystem', () => {
+  it('documents the reclaim step and the conversion gates', () => {
+    expect(INCREMENTAL_VACUUM_STEP_PAGES).toBe(2_048);
+    expect(VACUUM_CONVERSION_MIN_FREE_SHARE).toBe(0.25);
+    expect(VACUUM_CONVERSION_MIN_FREE_BYTES).toBe(8 * 1024 * 1024);
+    expect(VACUUM_CONVERSION_MAX_LIVE_BYTES).toBe(256 * 1024 * 1024);
+  });
+
+  it(
+    'returns the pages a purge freed in bounded steps on an incremental store, and reports the real shrink',
+    async () => {
+      establishAutoVacuum(h, 'INCREMENTAL');
+      const live = await seedFullSession(h, RECENT_AT);
+      const aged = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, aged.sessionId, AGED_AT, 2 * DEFAULT_PURGE_BATCH_SIZE + 25);
+      const before = settledSpace(h);
+      expect(before.freelistCount).toBe(0);
+      const steps = observeVacuumSteps(h);
+      const observed = observeStore(steps.store);
+
+      const report = await sweep(h, {}, { store: observed.store });
+
+      const after = databaseSpace(h);
+      const releasedPages = before.pageCount - after.pageCount;
+      expect(report.sessionIdsDeleted).toEqual([aged.sessionId]);
+      expect(report.errors).toEqual([]);
+      expect(after).toMatchObject({ autoVacuum: AUTO_VACUUM.INCREMENTAL, freelistCount: 0 });
+      // More than one step's worth was freed, so it went in several bounded
+      // steps, each of which made progress.
+      expect(releasedPages).toBeGreaterThan(INCREMENTAL_VACUUM_STEP_PAGES);
+      expect(steps.released.length).toBeGreaterThan(1);
+      expect(Math.max(...steps.released)).toBeLessThanOrEqual(INCREMENTAL_VACUUM_STEP_PAGES);
+      expect(steps.released.every((pages) => pages > 0)).toBe(true);
+      // The report states the real shrink, and the checkpoint put it on disk.
+      expect(report.databaseBytesReclaimed).toBe(releasedPages * before.pageSize);
+      expect(report.bytesReclaimed).toBe(
+        aged.contents.modification.bytes.length + releasedPages * before.pageSize,
+      );
+      expect(observed.calls.checkpoints).toBe(1);
+      expect(databaseFileSize(h)).toBe(after.pageCount * after.pageSize);
+      expect(finishedFields(h)).toMatchObject({
+        bytesReclaimed: report.bytesReclaimed,
+        databaseBytesReclaimed: report.databaseBytesReclaimed,
+        interrupted: false,
+      });
+      expect(sessionExists(h, live.sessionId)).toBe(true);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'converts a store without auto-vacuum once, compacting it, and releases incrementally from then on',
+    async () => {
+      establishAutoVacuum(h, 'NONE');
+      const live = await seedFullSession(h, RECENT_AT);
+      const aged = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, aged.sessionId, AGED_AT, LARGE_TELEMETRY);
+      const before = settledSpace(h);
+      const steps = observeVacuumSteps(h);
+      const observed = observeStore(steps.store);
+
+      // This purge frees less than the default minimum, which the call waives.
+      const report = await sweep(h, { reclaim: { minFreeBytes: 0 } }, { store: observed.store });
+
+      const after = databaseSpace(h);
+      expect(report.sessionIdsDeleted).toEqual([aged.sessionId]);
+      expect(report.errors).toEqual([]);
+      expect(after).toMatchObject({ autoVacuum: AUTO_VACUUM.INCREMENTAL, freelistCount: 0 });
+      expect(after.pageCount).toBeLessThan(before.pageCount);
+      expect(report.databaseBytesReclaimed).toBe(
+        (before.pageCount - after.pageCount) * before.pageSize,
+      );
+      expect(fileBytesReclaimed(report)).toBe(aged.contents.modification.bytes.length);
+      expect(steps.released).toEqual([]);
+      expect(observed.calls.checkpoints).toBe(1);
+      expect(databaseFileSize(h)).toBe(after.pageCount * after.pageSize);
+      expect(reclaimLogs(h, STORE_CONVERTED)).toHaveLength(1);
+      expect(sessionExists(h, live.sessionId)).toBe(true);
+
+      // Converted once: the next purge, under the default gates, takes the
+      // incremental path and converts nothing.
+      const next = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, next.sessionId, AGED_AT, LARGE_TELEMETRY);
+      const beforeNext = settledSpace(h);
+      const nextSteps = observeVacuumSteps(h);
+
+      const again = await sweep(h, {}, { store: nextSteps.store });
+
+      const afterNext = databaseSpace(h);
+      expect(again.sessionIdsDeleted).toEqual([next.sessionId]);
+      expect(again.errors).toEqual([]);
+      expect(nextSteps.released.length).toBeGreaterThan(0);
+      expect(afterNext.freelistCount).toBe(0);
+      expect(again.databaseBytesReclaimed).toBe(
+        (beforeNext.pageCount - afterNext.pageCount) * beforeNext.pageSize,
+      );
+      expect(again.databaseBytesReclaimed).toBeGreaterThan(0);
+      expect(reclaimLogs(h, STORE_CONVERTED)).toHaveLength(1);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'keeps the freed pages reusable on a store without auto-vacuum when a conversion gate fails, and logs which',
+    async () => {
+      establishAutoVacuum(h, 'NONE');
+      await seedFullSession(h, RECENT_AT);
+      // The defaults first, while one purge's pages are all the store has
+      // free: a thousand events dominate the store, so the free share passes,
+      // and they free far less than the minimum.
+      const cases: readonly (readonly [RetentionReclaimTuning | undefined, string])[] = [
+        [undefined, 'free-bytes-below-minimum'],
+        [{ minFreeShare: 1, minFreeBytes: 0 }, 'free-share-below-threshold'],
+        [{ minFreeShare: 0, minFreeBytes: 0, maxLiveBytes: 0 }, 'live-bytes-above-cap'],
+      ];
+
+      for (const [reclaim, reason] of cases) {
+        const aged = seedSession(h, { updatedAt: AGED_AT });
+        seedTelemetry(h, aged, AGED_AT, TELEMETRY_SEED_CHUNK);
+        const before = settledSpace(h);
+        const observed = observeStore(h.store);
+        const mark = h.logs.length;
+
+        const report = await sweep(h, { reclaim }, { store: observed.store });
+
+        const after = databaseSpace(h);
+        expect(report.sessionIdsDeleted).toEqual([aged]);
+        expect(report.errors).toEqual([]);
+        expect(report.databaseBytesReclaimed).toBe(0);
+        expect(report.bytesReclaimed).toBe(0);
+        expect(after.autoVacuum).toBe(AUTO_VACUUM.NONE);
+        expect(after.pageCount).toBe(before.pageCount);
+        expect(after.freelistCount).toBeGreaterThan(before.freelistCount);
+        // The write-ahead log is still folded back.
+        expect(observed.calls.checkpoints).toBe(1);
+        expect(
+          reclaimLogs(h, PAGES_STAY_REUSABLE, mark).map((log) => log.fields['reason']),
+        ).toEqual([reason]);
+        expect(reclaimLogs(h, STORE_CONVERTED, mark)).toEqual([]);
+      }
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'runs no reclaim in a dry run or once interrupted, and the next sweep returns what was left',
+    async () => {
+      establishAutoVacuum(h, 'INCREMENTAL');
+      const first = seedSession(h, { updatedAt: AGED_AT });
+      seedTelemetry(h, first, AGED_AT, TELEMETRY_SEED_CHUNK);
+      const second = seedSession(h, { updatedAt: AGED_AT + DAY_MS });
+      seedTelemetry(h, second, AGED_AT + DAY_MS, TELEMETRY_SEED_CHUNK);
+      const before = settledSpace(h);
+
+      const dry = await sweep(h, { dryRun: true });
+
+      expect(dry.sessionIdsDeleted).toEqual([first, second].sort());
+      expect(dry.databaseBytesReclaimed).toBe(0);
+      expect(databaseSpace(h)).toEqual(before);
+
+      const controller = new AbortController();
+      const steps = observeVacuumSteps(h);
+      const observed = observeStore(steps.store);
+      const interrupted = await sweep(
+        h,
+        { signal: controller.signal },
+        {
+          store: observed.store,
+          onSessionDeleted: () => {
+            controller.abort();
+          },
+        },
+      );
+
+      const left = databaseSpace(h);
+      expect(interrupted).toMatchObject({
+        interrupted: true,
+        sessionIdsDeleted: [first],
+        databaseBytesReclaimed: 0,
+        bytesReclaimed: 0,
+        errors: [],
+      });
+      expect(steps.released).toEqual([]);
+      expect(observed.calls.checkpoints).toBe(0);
+      expect(left.pageCount).toBe(before.pageCount);
+      expect(left.freelistCount).toBeGreaterThan(0);
+
+      const resumed = await sweep(h);
+
+      const after = databaseSpace(h);
+      expect(resumed.sessionIdsDeleted).toEqual([second]);
+      expect(resumed.interrupted).toBe(false);
+      expect(after.freelistCount).toBe(0);
+      // The resumed sweep's shrink includes the pages the interrupted one freed.
+      expect(resumed.databaseBytesReclaimed).toBe(
+        (left.pageCount - after.pageCount) * left.pageSize,
+      );
+      expect(after.pageCount).toBeLessThan(before.pageCount - left.freelistCount);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it('sets incremental auto-vacuum before a requested VACUUM, so the rewrite converts the store', async () => {
+    establishAutoVacuum(h, 'NONE');
+    const aged = await seedFullSession(h, AGED_AT);
+    const before = settledSpace(h);
+    const observed = observeStore(h.store);
+
+    const report = await sweep(h, { vacuum: true }, { store: observed.store });
+
+    const after = databaseSpace(h);
+    expect(report.sessionIdsDeleted).toEqual([aged.sessionId]);
+    expect(report.errors).toEqual([]);
+    expect(after).toMatchObject({ autoVacuum: AUTO_VACUUM.INCREMENTAL, freelistCount: 0 });
+    expect(report.databaseBytesReclaimed).toBe(
+      Math.max(0, (before.pageCount - after.pageCount) * before.pageSize),
+    );
+    expect(observed.calls.checkpoints).toBe(1);
+    expect(databaseFileSize(h)).toBe(after.pageCount * after.pageSize);
+  });
+
+  it(
+    'records a reclaim step that fails as a database issue, never an Err, and still checkpoints',
+    async () => {
+      establishAutoVacuum(h, 'INCREMENTAL');
+      const aged = seedSession(h, { updatedAt: AGED_AT });
+      seedTelemetry(h, aged, AGED_AT, TELEMETRY_SEED_CHUNK);
+      const failingStep = new Proxy(h.store, {
+        get(target, key): unknown {
+          if (key === 'statement') {
+            return (sql: string): StatementSync => {
+              const statement = target.statement(sql);
+              if (!isIncrementalStep(sql)) {
+                return statement;
+              }
+              return new Proxy(statement, {
+                get(inner, member): unknown {
+                  if (member === 'all') {
+                    return (): never => {
+                      throw new Error(SENTINEL);
+                    };
+                  }
+                  const value: unknown = Reflect.get(inner, member);
+                  return typeof value === 'function'
+                    ? (value as (...args: unknown[]) => unknown).bind(inner)
+                    : value;
+                },
+              });
+            };
+          }
+          const value: unknown = Reflect.get(target, key);
+          return typeof value === 'function'
+            ? (value as (...args: unknown[]) => unknown).bind(target)
+            : value;
+        },
+      });
+      const observed = observeStore(failingStep);
+
+      const report = await sweep(h, {}, { store: observed.store });
+
+      expect(report.sessionIdsDeleted).toEqual([aged]);
+      expect(report.errors.map(({ scope, target }) => ({ scope, target }))).toEqual([
+        { scope: 'database', target: 'incremental_vacuum' },
+      ]);
+      expect(report.databaseBytesReclaimed).toBe(0);
+      expect(databaseSpace(h).freelistCount).toBeGreaterThan(0);
+      expect(observed.calls.checkpoints).toBe(1);
+      expect(JSON.stringify(report)).not.toContain(SENTINEL);
+      expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
+
+      // A store without auto-vacuum whose conversion meets an open transaction.
+      const other = createHarness();
+      establishAutoVacuum(other, 'NONE');
+      const otherAged = seedSession(other, { updatedAt: AGED_AT });
+      seedTelemetry(other, otherAged, AGED_AT, TELEMETRY_SEED_CHUNK);
+      const busyDb = new Proxy(other.store.db, {
+        get(target, key): unknown {
+          if (key === 'isTransaction') {
+            return true;
+          }
+          const value: unknown = Reflect.get(target, key);
+          return typeof value === 'function'
+            ? (value as (...args: unknown[]) => unknown).bind(target)
+            : value;
+        },
+      });
+      const busyStore = new Proxy(other.store, {
+        get(target, key): unknown {
+          if (key === 'db') {
+            return busyDb;
+          }
+          const value: unknown = Reflect.get(target, key);
+          return typeof value === 'function'
+            ? (value as (...args: unknown[]) => unknown).bind(target)
+            : value;
+        },
+      });
+
+      const refused = await sweep(other, { reclaim: { minFreeBytes: 0 } }, { store: busyStore });
+
+      expect(refused.sessionIdsDeleted).toEqual([otherAged]);
+      expect(refused.errors.map(({ scope, target }) => ({ scope, target }))).toEqual([
+        { scope: 'database', target: 'auto_vacuum' },
+      ]);
+      expect(databaseSpace(other).autoVacuum).toBe(AUTO_VACUUM.NONE);
+      expect(refused.databaseBytesReclaimed).toBe(0);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it('answers CONFIG_INVALID, deleting nothing, for reclaim gates it cannot use', async () => {
+    const aged = seedSession(h, { updatedAt: AGED_AT });
+    const refusals: readonly RetentionReclaimTuning[] = [
+      { minFreeShare: 1.5 },
+      { minFreeShare: -0.1 },
+      { minFreeShare: Number.NaN },
+      { minFreeBytes: -1 },
+      { minFreeBytes: Number.POSITIVE_INFINITY },
+      { maxLiveBytes: Number.NaN },
+      'every gate' as unknown as RetentionReclaimTuning,
+    ];
+
+    for (const reclaim of refusals) {
+      const result = await runRetention(depsOf(h), { reclaim });
+      expect(isErr(result) ? result.error.code : 'ok').toBe('CONFIG_INVALID');
+    }
+    expect(sessionExists(h, aged)).toBe(true);
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -2213,80 +3444,120 @@ describe('bounded work', () => {
     expect(plans[1]?.[0]).toContain('idx_sessions_updated_at');
   });
 
-  it('purges a backlog of several candidate pages page by page, ties included, with capped lists and exact counts', async () => {
-    // The two oldest are in flight, so they stay behind the cursor on page one.
-    const retainedAhead = [0, 1].map((offset) =>
-      seedSession(h, { updatedAt: ANCIENT_AT + offset, status: 'capturing' }),
+  it('probes whether a session outgrows one purge batch through a bounded index read, never a scan', () => {
+    const plan = planOf(
+      h,
+      SESSION_TELEMETRY_PROBE_SQL,
+      fixedSessionId('plan'),
+      DEFAULT_PURGE_BATCH_SIZE + 1,
     );
-    // Six hundred sessions share one updated_at — more than a page — so a page
-    // boundary falls inside the tie group and the keyset's tie-break carries
-    // the cursor through it; the rest come in groups of seven.
-    const purgeable = new Set<SessionId>();
-    for (let index = 0; index < MAX_REPORTED_ITEMS + 1; index += 1) {
-      const updatedAt = index < 600 ? AGED_AT : AGED_AT + 1 + Math.floor(index / 7);
-      purgeable.add(seedSession(h, { updatedAt }));
-    }
-    const total = retainedAhead.length + purgeable.size;
 
-    const pages: ListRetentionCandidatesOptions[] = [];
-    const seen: SessionId[] = [];
-    const sessions: SessionsRepo = {
-      ...h.sessions,
-      listRetentionCandidates: (options: ListRetentionCandidatesOptions) => {
-        pages.push(options);
-        const page = h.sessions.listRetentionCandidates(options);
-        if (!isErr(page)) {
-          seen.push(...page.value.map((candidate) => candidate.id));
-        }
-        return page;
-      },
-    };
-    const report = await sweep(h, {}, { sessions });
-
-    // Every count is exact; the lists stop at the cap and `omitted` holds the rest.
-    expect(report.sessionsDeleted).toBe(purgeable.size);
-    expect(report.sessionIdsDeleted).toHaveLength(MAX_REPORTED_ITEMS);
-    expect(new Set(report.sessionIdsDeleted).size).toBe(MAX_REPORTED_ITEMS);
-    expect(report.sessionIdsDeleted.every((sessionId) => purgeable.has(sessionId))).toBe(true);
-    expect(report.sessionIdsDeleted).toEqual([...report.sessionIdsDeleted].sort());
-    expect(report.sessionsRetainedActive).toEqual([...retainedAhead].sort());
-    expect(report.omitted).toEqual({
-      sessionIdsDeleted: purgeable.size - MAX_REPORTED_ITEMS,
-      sessionsRetainedForConflicts: 0,
-      sessionsRetainedActive: 0,
-      errors: 0,
-    });
-    expect(report.errors).toEqual([]);
-    for (const sessionId of purgeable) {
-      expect(sessionExists(h, sessionId)).toBe(false);
-    }
-    for (const sessionId of retainedAhead) {
-      expect(sessionExists(h, sessionId)).toBe(true);
-    }
-
-    // Every candidate was read exactly once, across keyset pages under one
-    // stable cutoff: the first from the start, each later one strictly past
-    // the last candidate of the one before.
-    expect(seen).toHaveLength(total);
-    expect(new Set(seen).size).toBe(total);
-    expect(pages).toHaveLength(Math.ceil(total / RETENTION_CANDIDATE_PAGE_SIZE));
-    expect(pages[0]?.after).toBeUndefined();
-    expect(new Set(pages.map((page) => page.updatedBefore))).toEqual(new Set([report.cutoff]));
-    expect(pages.every((page) => page.limit === RETENTION_CANDIDATE_PAGE_SIZE)).toBe(true);
-    const cursors = pages.slice(1).map((page) => page.after);
-    // The first page boundary falls inside the six-hundred-session tie group.
-    expect(cursors[0]?.updatedAt).toBe(AGED_AT);
-    for (const [index, cursor] of cursors.entries()) {
-      expect(cursor).toBeDefined();
-      const previous = cursors[index - 1];
-      if (cursor !== undefined && previous !== undefined) {
-        const ascending =
-          cursor.updatedAt > previous.updatedAt ||
-          (cursor.updatedAt === previous.updatedAt && cursor.position > previous.position);
-        expect(ascending).toBe(true);
-      }
+    expect(
+      plan.some((detail) => /^SEARCH telemetry_events USING COVERING INDEX /.test(detail)),
+    ).toBe(true);
+    for (const detail of plan) {
+      expect(detail).not.toMatch(/^SCAN telemetry_events\b/);
+      expect(detail).not.toContain('TEMP B-TREE');
     }
   });
+
+  it(
+    'answers the probe with the event count up to one batch, and one past it beyond',
+    () => {
+      const small = seedSession(h, { updatedAt: AGED_AT });
+      seedTelemetry(h, small, AGED_AT, 7);
+      const large = seedSession(h, { updatedAt: AGED_AT });
+      seedTelemetry(h, large, AGED_AT, DEFAULT_PURGE_BATCH_SIZE + 3);
+      const probe = (sessionId: SessionId): unknown =>
+        h.store
+          .statement(SESSION_TELEMETRY_PROBE_SQL)
+          .get(sessionId, DEFAULT_PURGE_BATCH_SIZE + 1)?.['events'];
+
+      expect(probe(small)).toBe(7);
+      expect(probe(large)).toBe(DEFAULT_PURGE_BATCH_SIZE + 1);
+      expect(probe(fixedSessionId('none'))).toBe(0);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'purges a backlog of several candidate pages page by page, ties included, with capped lists and exact counts',
+    async () => {
+      // The two oldest are in flight, so they stay behind the cursor on page one.
+      const retainedAhead = [0, 1].map((offset) =>
+        seedSession(h, { updatedAt: ANCIENT_AT + offset, status: 'capturing' }),
+      );
+      // Six hundred sessions share one updated_at — more than a page — so a page
+      // boundary falls inside the tie group and the keyset's tie-break carries
+      // the cursor through it; the rest come in groups of seven.
+      const purgeable = new Set<SessionId>();
+      for (let index = 0; index < MAX_REPORTED_ITEMS + 1; index += 1) {
+        const updatedAt = index < 600 ? AGED_AT : AGED_AT + 1 + Math.floor(index / 7);
+        purgeable.add(seedSession(h, { updatedAt }));
+      }
+      const total = retainedAhead.length + purgeable.size;
+
+      const pages: ListRetentionCandidatesOptions[] = [];
+      const seen: SessionId[] = [];
+      const sessions: SessionsRepo = {
+        ...h.sessions,
+        listRetentionCandidates: (options: ListRetentionCandidatesOptions) => {
+          pages.push(options);
+          const page = h.sessions.listRetentionCandidates(options);
+          if (!isErr(page)) {
+            seen.push(...page.value.map((candidate) => candidate.id));
+          }
+          return page;
+        },
+      };
+      const report = await sweep(h, {}, { sessions });
+
+      // Every count is exact; the lists stop at the cap and `omitted` holds the rest.
+      expect(report.sessionsDeleted).toBe(purgeable.size);
+      expect(report.sessionIdsDeleted).toHaveLength(MAX_REPORTED_ITEMS);
+      expect(new Set(report.sessionIdsDeleted).size).toBe(MAX_REPORTED_ITEMS);
+      expect(report.sessionIdsDeleted.every((sessionId) => purgeable.has(sessionId))).toBe(true);
+      expect(report.sessionIdsDeleted).toEqual([...report.sessionIdsDeleted].sort());
+      expect(report.sessionsRetainedActive).toEqual([...retainedAhead].sort());
+      expect(report.omitted).toEqual({
+        sessionIdsDeleted: purgeable.size - MAX_REPORTED_ITEMS,
+        sessionsRetainedForConflicts: 0,
+        sessionsRetainedActive: 0,
+        errors: 0,
+      });
+      expect(report.errors).toEqual([]);
+      for (const sessionId of purgeable) {
+        expect(sessionExists(h, sessionId)).toBe(false);
+      }
+      for (const sessionId of retainedAhead) {
+        expect(sessionExists(h, sessionId)).toBe(true);
+      }
+
+      // Every candidate was read exactly once, across keyset pages under one
+      // stable cutoff: the first from the start, each later one strictly past
+      // the last candidate of the one before.
+      expect(seen).toHaveLength(total);
+      expect(new Set(seen).size).toBe(total);
+      expect(pages).toHaveLength(Math.ceil(total / RETENTION_CANDIDATE_PAGE_SIZE));
+      expect(pages[0]?.after).toBeUndefined();
+      expect(new Set(pages.map((page) => page.updatedBefore))).toEqual(new Set([report.cutoff]));
+      expect(pages.every((page) => page.limit === RETENTION_CANDIDATE_PAGE_SIZE)).toBe(true);
+      const cursors = pages.slice(1).map((page) => page.after);
+      // The first page boundary falls inside the six-hundred-session tie group.
+      expect(cursors[0]?.updatedAt).toBe(AGED_AT);
+      for (const [index, cursor] of cursors.entries()) {
+        expect(cursor).toBeDefined();
+        const previous = cursors[index - 1];
+        if (cursor !== undefined && previous !== undefined) {
+          const ascending =
+            cursor.updatedAt > previous.updatedAt ||
+            (cursor.updatedAt === previous.updatedAt && cursor.position > previous.position);
+          expect(ascending).toBe(true);
+        }
+      }
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
 
   it('caps the issue list at the reported maximum and counts the rest', async () => {
     const target = join(h.outside, 'link-target');
@@ -3103,5 +4374,162 @@ describe('scoped sweeps: a directory-shaped cache entry is inspected whole', () 
     expect(present(owned)).toBe(true);
     expect(report.indexCachesDeleted).toBe(0);
     expect(keptDirectories(h)).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The write-ahead log during a sweep
+ * ---------------------------------------------------------------------------------------------- */
+
+/** SQLite's default commit-time checkpoint threshold, which the store never changes. */
+const DEFAULT_AUTOCHECKPOINT_PAGES = 1_000;
+
+/** The debug record of each background checkpoint the sweep waited for. */
+const BACKGROUND_CHECKPOINT_MESSAGE =
+  'checkpointed the session store write-ahead log off the event loop';
+
+/** The store connection's `wal_autocheckpoint`, as the pragma answers it. */
+function autoCheckpointOf(harness: Harness): unknown {
+  return harness.store.db.prepare('PRAGMA wal_autocheckpoint').get()?.['wal_autocheckpoint'];
+}
+
+/** The size of the store's `-wal` file, `0` when there is none. */
+function walFileBytes(harness: Harness): number {
+  const wal = `${harness.store.path}-wal`;
+  return existsSync(wal) ? statSync(wal).size : 0;
+}
+
+describe('the write-ahead log during a sweep', () => {
+  it('documents the bound a sweep keeps the log to', () => {
+    expect(RETENTION_WAL_CHECKPOINT_BYTES).toBe(32 * 1024 * 1024);
+  });
+
+  it(
+    'suspends the commit-time checkpoint while it drains, waits for background checkpoints instead, and restores the threshold',
+    async () => {
+      const { sessionId } = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
+      const seen: unknown[] = [];
+
+      // Asked inside every drain transaction and the final cascade.
+      const report = await sweep(
+        h,
+        { walCheckpointBytes: 0 },
+        {
+          isSessionInUse: () => {
+            seen.push(autoCheckpointOf(h));
+            return false;
+          },
+        },
+      );
+
+      expect(report.sessionsDeleted).toBe(1);
+      expect(report.errors).toEqual([]);
+      expect(sessionExists(h, sessionId)).toBe(false);
+      expect(seen.length).toBeGreaterThanOrEqual(2);
+      expect(new Set(seen)).toEqual(new Set([0]));
+      expect(autoCheckpointOf(h)).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
+
+      const waited = h.logs.filter((log) => log.message === BACKGROUND_CHECKPOINT_MESSAGE);
+      expect(waited.length).toBeGreaterThan(0);
+      for (const log of waited) {
+        expect(log.level).toBe('debug');
+        expect(log.fields).toMatchObject({ subsystem: 'store', checkpoint: 'completed', busy: 0 });
+        expect(typeof log.fields['walBytes']).toBe('number');
+        expect(log.fields['checkpointedFrames']).toBe(log.fields['logFrames']);
+      }
+      expect(finishedFields(h)).toMatchObject({ walCheckpoints: waited.length });
+      // The last wait left nothing for the closing truncation but the truncation.
+      expect(walFileBytes(h)).toBe(0);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it('waits only once, before its closing truncation, while the log stays under its bound', async () => {
+    const aged = seedSession(h, { updatedAt: AGED_AT });
+
+    const report = await sweep(h);
+
+    expect(report.sessionIdsDeleted).toEqual([aged]);
+    // No batch reached the bound; the one wait is the reclaim's, which copies
+    // what is left off the event loop before the store truncates the log.
+    expect(h.logs.filter((log) => log.message === BACKGROUND_CHECKPOINT_MESSAGE)).toHaveLength(1);
+    expect(finishedFields(h)).toMatchObject({ walCheckpoints: 1 });
+    expect(autoCheckpointOf(h)).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
+    expect(walFileBytes(h)).toBe(0);
+  });
+
+  it('waits for no background checkpoint when it deletes nothing', async () => {
+    seedSession(h, { updatedAt: RECENT_AT });
+
+    const report = await sweep(h, { walCheckpointBytes: 0 });
+
+    expect(report.sessionsDeleted).toBe(0);
+    expect(h.logs.filter((log) => log.message === BACKGROUND_CHECKPOINT_MESSAGE)).toEqual([]);
+    expect(finishedFields(h)).toMatchObject({ walCheckpoints: 0 });
+    expect(autoCheckpointOf(h)).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
+  });
+
+  it('leaves the commit-time checkpoint in force for a dry run, which writes nothing', async () => {
+    const aged = seedSession(h, { updatedAt: AGED_AT });
+    const seen: unknown[] = [];
+
+    const report = await sweep(
+      h,
+      { dryRun: true, walCheckpointBytes: 0 },
+      {
+        isSessionInUse: () => {
+          seen.push(autoCheckpointOf(h));
+          return false;
+        },
+      },
+    );
+
+    expect(report.sessionIdsDeleted).toEqual([aged]);
+    expect(sessionExists(h, aged)).toBe(true);
+    expect(seen).toEqual([DEFAULT_AUTOCHECKPOINT_PAGES]);
+    expect(h.logs.filter((log) => log.message === BACKGROUND_CHECKPOINT_MESSAGE)).toEqual([]);
+  });
+
+  it(
+    'restores the commit-time checkpoint when an abort stops the sweep mid-drain',
+    async () => {
+      const { sessionId } = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
+      const controller = new AbortController();
+
+      const report = await sweep(
+        h,
+        { signal: controller.signal, walCheckpointBytes: 0 },
+        {
+          isSessionInUse: () => {
+            controller.abort();
+            return false;
+          },
+        },
+      );
+
+      expect(report.interrupted).toBe(true);
+      expect(report.telemetryEventsDeleted).toBe(DEFAULT_PURGE_BATCH_SIZE);
+      expect(sessionExists(h, sessionId)).toBe(true);
+      expect(autoCheckpointOf(h)).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
+      // Aborted before the wait: the shutdown the signal stands for is not
+      // held up behind a checkpoint.
+      expect(h.logs.filter((log) => log.message === BACKGROUND_CHECKPOINT_MESSAGE)).toEqual([]);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it('answers CONFIG_INVALID, deleting nothing, for a walCheckpointBytes it cannot use', async () => {
+    const aged = seedSession(h, { updatedAt: AGED_AT });
+
+    for (const walCheckpointBytes of [-1, Number.NaN, Number.POSITIVE_INFINITY, '1']) {
+      const result = await runRetention(depsOf(h), {
+        walCheckpointBytes: walCheckpointBytes as number,
+      });
+      expect(isErr(result) ? result.error.code : 'ok').toBe('CONFIG_INVALID');
+    }
+    expect(sessionExists(h, aged)).toBe(true);
+    expect(autoCheckpointOf(h)).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
   });
 });

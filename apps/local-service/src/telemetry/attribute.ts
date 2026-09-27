@@ -30,10 +30,11 @@
  *   is one tab, one ingest request is one credential — so resolving once is
  *   exact, not an approximation.
  * - **Once per event — {@link IngestAttributor.attributeEvent}.** Stamps the
- *   resolved identity onto one event and applies the per-event rule (the tier
- *   gate). Pure, synchronous and free of I/O: it reads no store, calls no
- *   dependency and logs nothing. {@link IngestAttributor.attributeBatch} is the
- *   same decision over a whole batch plus one summary log line of counts.
+ *   resolved identity onto one event and applies the per-event rules (the tier
+ *   gate, then `pre-capture`). Pure, synchronous and free of I/O: it reads no
+ *   store, calls no dependency and logs nothing.
+ *   {@link IngestAttributor.attributeBatch} is the same decision over a whole
+ *   batch plus one summary log line of counts.
  *
  * ## Capture identity, not timestamps — why a late batch is refused, not relabelled
  *
@@ -70,7 +71,7 @@
  * `capture-owner-mismatch`: those reasons already refuse it whole, and the
  * first keeps the routine flush after a stop at `debug`.
  *
- * Event `startTime`s are deliberately **not** compared with capture windows.
+ * Event `startTime`s are, as a rule, **not** compared with capture windows.
  * AAP §0.2.3 applies no clock alignment between producers and the service
  * (`clockOffsetMs` is informational): a window's bounds are read from the
  * service's clock while an event's `startTime` is the producer's, and a span
@@ -85,6 +86,48 @@
  * past both guards, so a POST of it retried after the re-arm reaches the
  * service while the next capture is open — and is refused here, because its
  * body still names the capture it was recorded for.
+ *
+ * ## The one time test: the page's replayed lifecycle entries (`pre-capture`)
+ *
+ * Identity cannot place one family of browser events. The page agent
+ * observes `navigation` and `paint` entries with `buffered: true`
+ * (`@debuggen/telemetry`'s `browser/perf.ts`, `BUFFERED_ENTRY_TYPES`), so the
+ * first batch after it is armed replays the document's load and first-paint
+ * timings — produced before Start, yet recorded by the agent armed for this
+ * capture and so indistinguishable from its own evidence by identity. Kept,
+ * they stretch the capture's window and `total_duration` back to the page
+ * load, produce facts about a load nobody asked about, and make a capture in
+ * which nothing happened look non-empty, so it never reaches AAP §0.5.5's
+ * "No telemetry was captured" path.
+ *
+ * The replay exists on purpose — it is how a capture that spans a reload sees
+ * the fresh document's own navigation — and the agent cannot filter it:
+ * after a reload it is re-armed only once the new document has loaded, so its
+ * own notion of "capture start" postdates the very entry the replay is for.
+ * Only the service knows the capture's start, so the filter lives here, as
+ * {@link IngestAttributor.attributeEvent}'s `pre-capture` drop. It drops an
+ * event only when **all** of these hold:
+ *
+ * - it is `browser`-tier;
+ * - it is a `navigation`, or a `perf.entry` whose `entry.type` attribute is
+ *   `paint` — the lifecycle entries, and nothing else the agent reports;
+ * - its **end** (`startTime + duration`) is strictly earlier than the open
+ *   capture's `startedAt`, as read from the store's capture row.
+ *
+ * An entry that ends at or after Start is kept, so a load still in flight
+ * when the capture opened, and a reload during the capture, both stay. The
+ * test is sound for exactly these entries and no others: a lifecycle entry
+ * sits at the document's time origin (a navigation at offset zero, a paint a
+ * few hundred milliseconds after it), which the browser fixes from the wall
+ * clock when the navigation starts, so it carries no drift the document
+ * accrued since. Every other timestamp is `timeOrigin + performance.now()`
+ * read later in the document's life — or, server-side, OpenTelemetry `hrTime`
+ * — and those monotonic readings can lag the wall clock by the length of a
+ * system sleep; clamping them to the window would silently discard real
+ * evidence. No other kind or tier is ever compared with a time, and an event
+ * whose times, kind or attributes cannot be read, or a capture row without a
+ * readable start, is never dropped by this rule: it drops only what it can
+ * show to predate the capture.
  *
  * ## The drop contract (relied on by `./ingest.ts` and `../server/routes/telemetry.ts`)
  *
@@ -155,6 +198,7 @@
  * `duration` and every other field of an event pass through untouched, and no
  * `ingestSeq` is added — the store assigns it (`telemetry_events.ingest_seq
  * INTEGER PRIMARY KEY AUTOINCREMENT`, returned by `TelemetryRepo.insertMany`).
+ * The `pre-capture` rule drops an entry whole; it never trims or shifts one.
  *
  * ## Privacy
  *
@@ -206,7 +250,13 @@ import type {
   SessionId,
 } from '@debuggen/shared';
 import { TELEMETRY_TIERS, isTelemetryTier } from '@debuggen/telemetry';
-import type { TelemetryEvent, TelemetryEventIngress, TelemetryTier } from '@debuggen/telemetry';
+import type {
+  PERF_ENTRY_ATTRIBUTE_KEYS,
+  TelemetryEvent,
+  TelemetryEventIngress,
+  TelemetryKind,
+  TelemetryTier,
+} from '@debuggen/telemetry';
 
 import { LOG_BINDING_KEYS, guardLogger, sessionLogger, subsystemLogger } from '../logging.js';
 
@@ -254,6 +304,11 @@ export type IngestOrigin = (typeof INGEST_ORIGINS)[number];
  *   session's for a browser batch, the project's capture owner's for a server
  *   batch): evidence recorded for an earlier window that arrived after it
  *   closed (see "Capture identity, not timestamps" above).
+ * - `pre-capture` — per event: a browser `navigation`, or a `paint`
+ *   `perf.entry`, that the page agent replayed from the performance buffer
+ *   and that ended before the open capture started (see "The one time test"
+ *   above). Never a batch-level refusal: the batch resolves, and only those
+ *   entries are left out of it.
  */
 export const DROP_REASONS = Object.freeze([
   'no-binding',
@@ -263,6 +318,7 @@ export const DROP_REASONS = Object.freeze([
   'capture-owner-mismatch',
   'tier-not-permitted',
   'stale-capture',
+  'pre-capture',
 ] as const);
 
 /** One member of {@link DROP_REASONS}. */
@@ -299,6 +355,11 @@ export function isDropReason(value: unknown): value is DropReason {
  * - `tier-not-permitted` → `UNAUTHORIZED`: the producer's role does not cover
  *   that tier. Per-event drops are outcomes, not errors; the entry exists so the
  *   table stays total for a caller that reports one as an error.
+ * - `pre-capture` → `SESSION_INVALID_STATE`, like the other window reasons:
+ *   the entry falls outside the open capture window. Also per-event only, so
+ *   no refusal carries it; and it is deliberately **not** `UNAUTHORIZED` — the
+ *   replay is the agent working as designed, not a producer overstepping its
+ *   role, so a caller that did report it could never mistake it for one.
  */
 export const DROP_REASON_ERROR_CODES: Readonly<Record<DropReason, DebuggenErrorCode>> =
   Object.freeze({
@@ -309,6 +370,7 @@ export const DROP_REASON_ERROR_CODES: Readonly<Record<DropReason, DebuggenErrorC
     'capture-owner-mismatch': 'SESSION_INVALID_STATE',
     'tier-not-permitted': 'UNAUTHORIZED',
     'stale-capture': 'SESSION_INVALID_STATE',
+    'pre-capture': 'SESSION_INVALID_STATE',
   });
 
 /**
@@ -457,6 +519,16 @@ export interface IngestAttribution {
   readonly sessionId: SessionId;
   /** The session's open capture window at resolution time. */
   readonly captureId: CaptureId;
+  /**
+   * When that capture started, in epoch milliseconds, exactly as its store row
+   * records it: the bound the `pre-capture` rule compares a replayed lifecycle
+   * entry's end with (module notes, "The one time test").
+   *
+   * Resolved for a browser batch, the only one that rule concerns — a server
+   * batch reports no browser-tier event, so it is never set there. Absent when
+   * the row carries no finite start, and then the rule drops nothing.
+   */
+  readonly captureStartedAt?: number | undefined;
   /** The transport the batch arrived on; selects the permitted tiers. */
   readonly origin: IngestContext['origin'];
   /**
@@ -532,6 +604,13 @@ export interface ActiveCaptureLike {
   readonly capture: {
     /** The capture's id. */
     readonly id: CaptureId;
+    /**
+     * When the capture started, in epoch milliseconds — `CaptureRecord.startedAt`,
+     * which the real repository always returns. Optional in this port so a
+     * collaborator that knows only the id still attributes; without it the
+     * `pre-capture` rule has no bound and drops nothing.
+     */
+    readonly startedAt?: number | undefined;
   };
 }
 
@@ -638,8 +717,11 @@ export interface IngestAttributor {
   resolveBatch(context: IngestContext): Promise<Result<IngestAttribution, DebuggenError>>;
 
   /**
-   * Attributes one event: applies the tier gate and returns a **new** object
-   * with `sessionId` and `captureId` stamped and every other field preserved.
+   * Attributes one event: applies the tier gate and the `pre-capture` rule
+   * (a browser `navigation` or `paint` entry that ended before
+   * {@link IngestAttribution.captureStartedAt} is dropped) and returns a
+   * **new** object with `sessionId` and `captureId` stamped and every other
+   * field preserved.
    *
    * Pure, synchronous, free of I/O and of logging, and never throws — an event
    * whose fields cannot even be read is refused `tier-not-permitted`, because
@@ -789,6 +871,11 @@ const REFUSAL_TEXT: Readonly<Record<DropReason, RefusalText>> = Object.freeze({
       'The telemetry was recorded for a different capture than the one now running, so it was not stored.',
     hint: 'No action is needed: late events from a previous capture are discarded so they cannot mix into this one. Reproduce the issue again if this capture looks incomplete.',
   },
+  'pre-capture': {
+    message:
+      'The page load and paint timings were recorded before the capture started, so they were not stored.',
+    hint: 'No action is needed: timings from before Start are discarded so they cannot stretch this capture. Reload the page while the capture is running to record its load.',
+  },
 });
 
 /** The sentence for a refusal caused by a failed or throwing dependency read. */
@@ -825,6 +912,11 @@ function isIdentifier(value: unknown): value is string {
 /** Whether `value` is a well-formed browser tab id: a non-negative safe integer. */
 function isTabId(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Whether `value` is a readable instant or length: a finite number. */
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
 }
 
 /**
@@ -890,6 +982,7 @@ function zeroCounts(): Record<DropReason, number> {
     'capture-owner-mismatch': 0,
     'tier-not-permitted': 0,
     'stale-capture': 0,
+    'pre-capture': 0,
   };
 }
 
@@ -905,22 +998,111 @@ interface EventDecision {
 }
 
 /**
+ * The kind the page agent reports the document's `navigation` timing under —
+ * one of the two lifecycle entries the `pre-capture` rule concerns.
+ */
+const NAVIGATION_KIND = 'navigation' satisfies TelemetryKind;
+
+/**
+ * The kind the page agent reports every other `PerformanceEntry` under
+ * (resource, paint); only its `paint` entries are lifecycle entries.
+ */
+const PERF_ENTRY_KIND = 'perf.entry' satisfies TelemetryKind;
+
+/**
+ * The `perf.entry` attribute naming which `PerformanceEntry` type the event
+ * came from — `@debuggen/telemetry`'s declared key, typed against its
+ * `PERF_ENTRY_ATTRIBUTE_KEYS` so a renamed key is a compile error here.
+ */
+const ENTRY_TYPE_ATTRIBUTE: (typeof PERF_ENTRY_ATTRIBUTE_KEYS)[number] = 'entry.type';
+
+/**
+ * The {@link ENTRY_TYPE_ATTRIBUTE} value of a first-paint or first-contentful-
+ * paint mark: the `PerformanceEntry.entryType` the agent's `browser/perf.ts`
+ * replays with `buffered: true` beside `navigation`.
+ */
+const PAINT_ENTRY_TYPE = 'paint';
+
+/**
+ * Whether a browser-tier event is a replayed lifecycle entry that ended before
+ * the open capture started — the `pre-capture` rule (module notes, "The one
+ * time test").
+ *
+ * Proof-only: `false` unless every fact is readable and shows the entry
+ * predates the capture — a start that is not a readable instant, an entry of
+ * any other kind or type, attributes that cannot be read, and an end at or
+ * after the start all keep the event. Reads the snapshot; writes nothing.
+ *
+ * @param snapshot The event's shallow copy, already through the tier gate.
+ * @param captureStartedAt The open capture's start, from its store row.
+ * @returns `true` when the event must be dropped as `pre-capture`.
+ */
+function endsBeforeCapture(snapshot: TelemetryEventIngress, captureStartedAt: unknown): boolean {
+  if (!isFiniteNumber(captureStartedAt)) {
+    return false;
+  }
+
+  try {
+    if (snapshot.tier !== 'browser') {
+      return false;
+    }
+
+    const kind: unknown = snapshot.kind;
+    let lifecycle = kind === NAVIGATION_KIND;
+
+    if (!lifecycle && kind === PERF_ENTRY_KIND) {
+      const attributes: unknown = snapshot.attributes;
+      lifecycle =
+        typeof attributes === 'object' &&
+        attributes !== null &&
+        (attributes as Readonly<Record<string, unknown>>)[ENTRY_TYPE_ATTRIBUTE] ===
+          PAINT_ENTRY_TYPE;
+    }
+    if (!lifecycle) {
+      return false;
+    }
+
+    const startTime: unknown = snapshot.startTime;
+    const duration: unknown = snapshot.duration;
+
+    if (!isFiniteNumber(startTime) || !isFiniteNumber(duration) || duration < 0) {
+      return false;
+    }
+
+    // The entry's end, not its start: a load still in flight when the
+    // capture opened reaches into the window and is kept.
+    return startTime + duration < captureStartedAt;
+  } catch {
+    // An attribute record whose read throws cannot be shown to be a paint:
+    // the rule drops only what it can prove, so the event is kept.
+    return false;
+  }
+}
+
+/**
  * The per-event decision shared by `attributeEvent` and `attributeBatch`.
  *
  * Pure: it reads the event once into a shallow snapshot (so a getter runs at
- * most once and the input is never touched again), checks the attribution and
- * the tier gate, and builds a new object.
+ * most once and the input is never touched again), checks the attribution,
+ * the tier gate and the `pre-capture` rule, and builds a new object.
  */
 function decideEvent(event: TelemetryEventIngress, attribution: IngestAttribution): EventDecision {
   let snapshot: TelemetryEventIngress;
   let sessionId: unknown;
   let captureId: unknown;
+  let captureStartedAt: unknown;
   let origin: unknown;
   let announcedProducer: unknown;
 
   try {
     snapshot = { ...event };
-    ({ sessionId, captureId, origin, producerId: announcedProducer } = attribution);
+    ({
+      sessionId,
+      captureId,
+      captureStartedAt,
+      origin,
+      producerId: announcedProducer,
+    } = attribution);
   } catch {
     // An event (or attribution) whose fields cannot be read cannot be shown to
     // carry a permitted tier: fail closed.
@@ -944,6 +1126,14 @@ function decideEvent(event: TelemetryEventIngress, attribution: IngestAttributio
 
   if (permitted === undefined || !isTelemetryTier(tier) || !permitted.includes(tier)) {
     return { outcome: dropped('tier-not-permitted'), producerMismatch: false };
+  }
+
+  // The page's buffered lifecycle replay (module notes, "The one time test"):
+  // a navigation or paint entry that ended before Start describes the page
+  // load, not the capture. Checked after the tier gate, so a forged tier stays
+  // `tier-not-permitted` whatever its times.
+  if (endsBeforeCapture(snapshot, captureStartedAt)) {
+    return { outcome: dropped('pre-capture'), producerMismatch: false };
   }
 
   // Identity is stamped last so a smuggled sessionId/captureId is overwritten;
@@ -1161,9 +1351,14 @@ export function createIngestAttributor(deps: IngestAttributorDeps): IngestAttrib
       });
     }
 
+    // The capture's start is read with its id, from the same row: it bounds
+    // the per-event `pre-capture` rule, and nothing at the batch level.
     const capture = readStore(
       () => sessions.getActiveCapture(sessionId),
-      (value): unknown => (value === undefined ? undefined : value.capture.id),
+      (value): { readonly id: unknown; readonly startedAt: unknown } | undefined =>
+        value === undefined
+          ? undefined
+          : { id: value.capture.id, startedAt: value.capture.startedAt },
     );
 
     if (capture.read === 'failed') {
@@ -1180,7 +1375,8 @@ export function createIngestAttributor(deps: IngestAttributorDeps): IngestAttrib
       return refuse({ reason: 'no-active-capture', origin, tabId, sessionId });
     }
 
-    const captureId = capture.value;
+    const captureId = capture.value.id;
+    const captureStartedAt = capture.value.startedAt;
 
     if (!isIdentifier(captureId)) {
       return refuse({
@@ -1219,6 +1415,7 @@ export function createIngestAttributor(deps: IngestAttributorDeps): IngestAttrib
     return resolved({
       sessionId,
       captureId,
+      ...(isFiniteNumber(captureStartedAt) ? { captureStartedAt } : {}),
       origin,
       tabId,
       ...(isIdentifier(projectRoot) ? { projectRoot: projectKey(projectRoot) } : {}),

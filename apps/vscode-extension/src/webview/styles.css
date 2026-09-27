@@ -22,8 +22,15 @@
  * keyword.
  *
  * The `dgv-*` namespace is consumed only by `src/webview/App.tsx` and
- * `src/webview/components/**`; every `dg-*` block belongs to the design system
- * and is never overridden from here.
+ * `src/webview/components/**`. Every `dg-*` block belongs to the design system,
+ * and exactly one section here restyles any of them: "Webview surface
+ * refinements", directly below the document rules. Its rules are scoped under
+ * `.dgv-view` or a `dgv-*` block, so they reach the editor view and nothing the
+ * design system renders elsewhere; they change which tokens a block spends,
+ * never a token's value; and they are the only rules in this file that name a
+ * theme, through `:where([data-theme='…'])`, the zero-specificity scope the
+ * design system's own theme overrides use. Every other section styles `dgv-*`
+ * elements only.
  */
 
 /* ==========================================================================
@@ -57,6 +64,336 @@ body {
   block-size: var(--dg-size-full);
   min-block-size: 0;
   min-inline-size: 0;
+}
+
+/* ==========================================================================
+ * Webview surface refinements — WCAG 1.4.11 boundaries, analysis hierarchy,
+ * compact states
+ *
+ * The one section that restyles `dg-*` blocks, and only inside this view.
+ * The design system's defaults suit the DevTools panel. In the editor sidebar
+ * every card, control and chip sits on the elevated card surface, where those
+ * defaults leave control edges at 1.25:1 (`--dg-border-subtle`), under the
+ * 3:1 that WCAG 1.4.11 asks of a control's boundary. `--dg-border-strong`
+ * (1.76:1 dark, 1.72:1 light) does not reach it either. These rules move each
+ * affected block onto tokens that do, measured against `--dg-surface-elevated`:
+ *
+ *   boundary                 token                  dark    light
+ *   control edge, at rest    --dg-text-muted        5.60    5.23
+ *   control edge, hover      --dg-text-secondary    7.75    6.98
+ *   card edge                --dg-border-strong     1.76    1.72
+ *
+ * A card edge outlines a container, not a control, so 1.4.11 sets it no
+ * minimum; the strong token makes it visible. The high-contrast theme
+ * resolves both border tokens to its primary text colour, so enabled controls
+ * keep that full-strength edge there and only disabled edges step down to
+ * `--dg-text-muted`.
+ *
+ * Tints are unweighted `color-mix()`es of tokens: each mix is half and half,
+ * so nesting one mix inside another halves the tone's share again, and no
+ * number is written for `./styles.test.ts` to refuse. With S the surface the
+ * tint is laid on and C the tone:
+ *
+ *   color-mix(in srgb, S, C)                                     one half
+ *   color-mix(in srgb, S, color-mix(in srgb, S, C))              one quarter
+ *   color-mix(in srgb, S, color-mix(in srgb, S, color-mix(…)))   one eighth
+ *
+ * C is `currentColor` wherever the tone is the block's own text colour, so a
+ * tint follows the tone class the design system already applied.
+ *
+ * Specificity: each rule is one class heavier than the design-system rule it
+ * replaces, and each control's states are declared as a ladder — rest, hover,
+ * press, invalid, disabled, each followed by its high-contrast form — so a
+ * later state wins over an earlier one of the same weight.
+ * ========================================================================== */
+
+/* --- cards ---------------------------------------------------------------- */
+
+/* Every section card, and the analysis head nested inside one. */
+.dgv-view .dg-section--card,
+.dgv-view .dg-summary-header {
+  border-color: var(--dg-border-strong);
+}
+
+/* --- text fields: the question and follow-up boxes ------------------------ */
+
+/* A recessed well: the base surface, darker than the card in the dark theme
+ * and lighter in the light one, inside an edge that clears 3:1 on the card. */
+.dgv-view .dg-field__control {
+  background: var(--dg-surface-base);
+  border-color: var(--dg-text-muted);
+}
+
+.dgv-view .dg-field__control:hover {
+  border-color: var(--dg-text-secondary);
+}
+
+/* High contrast: the enabled edge returns to the theme's full-strength border
+ * and hover is carried by the accent, as the design system does there. */
+:where([data-theme='high-contrast']) .dgv-view .dg-field__control {
+  border-color: var(--dg-border-strong);
+}
+
+:where([data-theme='high-contrast']) .dgv-view .dg-field__control:hover {
+  border-color: var(--dg-accent);
+}
+
+/* The design system's invalid edge, restated above the hover rules so that a
+ * pointer over an invalid field never hides the state. */
+.dgv-view .dg-field.dg-is-invalid .dg-field__control {
+  border-color: var(--dg-danger);
+}
+
+/* --- secondary buttons ---------------------------------------------------- */
+
+.dgv-view .dg-button--secondary {
+  border-color: var(--dg-text-muted);
+}
+
+.dgv-view .dg-button--secondary:hover {
+  border-color: var(--dg-text-secondary);
+}
+
+/* Press and a pressed toggle keep the design system's accent edge, which the
+ * rest rule above would otherwise replace. */
+.dgv-view .dg-button--secondary:active,
+.dgv-view .dg-button--secondary.dg-is-active {
+  border-color: var(--dg-accent);
+}
+
+:where([data-theme='high-contrast']) .dgv-view .dg-button--secondary {
+  border-color: var(--dg-border-strong);
+}
+
+:where([data-theme='high-contrast']) .dgv-view .dg-button--secondary:hover {
+  border-color: var(--dg-accent);
+}
+
+/* --- disabled controls ---------------------------------------------------- */
+
+/* The design system draws every disabled control with the card's fill and a
+ * subtle edge, so a disabled primary action, a disabled secondary one and an
+ * enabled secondary one differed only in text colour. Here each keeps a trace
+ * of what it is, and all of them share one cue that no enabled control
+ * carries, a dashed edge:
+ *
+ *   disabled primary             muted accent fill (a faded primary), dashed
+ *                                muted edge, secondary text (4.31:1 dark,
+ *                                6.08:1 light on the fill)
+ *   disabled secondary, danger   no fill, dashed strong edge, muted text
+ *   disabled text field          no fill (the enabled well is gone), dashed
+ *                                strong edge
+ *
+ * WCAG 1.4.11 exempts inactive controls, so these edges may sit below 3:1.
+ * `cursor: not-allowed` stays the design system's. Declared after every
+ * enabled state above, at one class more, so hover and press never repaint a
+ * disabled control. */
+.dgv-view .dg-button--primary:is([disabled], .dg-is-disabled) {
+  background: var(--dg-accent-muted);
+  border-style: dashed;
+  border-color: var(--dg-text-muted);
+  color: var(--dg-text-secondary);
+}
+
+.dgv-view .dg-button--secondary:is([disabled], .dg-is-disabled),
+.dgv-view .dg-button--danger:is([disabled], .dg-is-disabled) {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--dg-border-strong);
+  color: var(--dg-text-muted);
+}
+
+.dgv-view .dg-field.dg-is-disabled .dg-field__control {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--dg-border-strong);
+}
+
+/* High contrast: a disabled edge steps down from the full-strength border to
+ * muted text, so an unavailable control no longer draws the edge an available
+ * one does. The disabled primary already uses muted text for its edge. */
+:where([data-theme='high-contrast'])
+  .dgv-view
+  .dg-button--secondary:is([disabled], .dg-is-disabled),
+:where([data-theme='high-contrast']) .dgv-view .dg-button--danger:is([disabled], .dg-is-disabled),
+:where([data-theme='high-contrast']) .dgv-view .dg-field.dg-is-disabled .dg-field__control {
+  border-color: var(--dg-text-muted);
+}
+
+/* --- soft badges ---------------------------------------------------------- */
+
+/* The tone as a one-eighth tint of the fill, where the design system paints the
+ * card's own fill and leaves the tone to the text alone. Over the elevated
+ * surface, one eighth keeps every tone's label at 4.5:1 or more in the dark and
+ * high-contrast themes; the lowest is danger at 5.30:1. The analysis head's
+ * inert evidence chips share the fill (see "analysis head" below). */
+.dgv-view .dg-badge--soft,
+.dgv-analysis .dg-summary-header__evidence .dg-badge {
+  background: color-mix(
+    in srgb,
+    var(--dg-surface-elevated),
+    color-mix(
+      in srgb,
+      var(--dg-surface-elevated),
+      color-mix(in srgb, var(--dg-surface-elevated), currentColor)
+    )
+  );
+}
+
+/* The light theme's tones sit near 5:1 on the elevated surface, so a tint over
+ * it would take accent, info and danger labels below 4.5:1. The tint is laid
+ * over the base surface, the lightest, instead; the lowest label is danger at
+ * 4.67:1. */
+:where([data-theme='light']) .dgv-view .dg-badge--soft,
+:where([data-theme='light']) .dgv-analysis .dg-summary-header__evidence .dg-badge {
+  background: color-mix(
+    in srgb,
+    var(--dg-surface-base),
+    color-mix(
+      in srgb,
+      var(--dg-surface-base),
+      color-mix(in srgb, var(--dg-surface-base), currentColor)
+    )
+  );
+}
+
+/* --- analysis head: components/AnalysisSummary.tsx ------------------------ */
+
+/* "Observed" and "Likely cause" introduce the registers beneath them. The
+ * design system sets them at 11 px in muted text, below the 13 px facts they
+ * head; here they take the large role (15 px, medium weight) in primary text,
+ * between the head's 16 px semibold title and the facts. */
+.dgv-analysis .dg-summary-header__region-heading {
+  color: var(--dg-text-primary);
+  font: var(--dg-text-lg);
+}
+
+/* The confidence badge, graded so the level reads before its word does. The
+ * design system's tone map selects the rule: high is `accent`, medium `info`,
+ * low `neutral`.
+ *
+ *   high     solid accent fill, base-surface label (7.84:1 dark, 5.73:1 light)
+ *   medium   the soft tint above, with an info edge
+ *   low      no fill, the strong edge, muted label (5.60:1 dark, 5.23:1 light)
+ *
+ * The level word and the per-level signal glyph, which paints in
+ * `currentColor`, still name the level; fill and edge are a third cue. */
+.dgv-analysis .dg-summary-header__confidence.dg-badge--accent {
+  background: var(--dg-accent);
+  border-color: var(--dg-accent);
+  color: var(--dg-surface-base);
+}
+
+.dgv-analysis .dg-summary-header__confidence.dg-badge--info {
+  border-color: currentColor;
+}
+
+.dgv-analysis .dg-summary-header__confidence.dg-badge--neutral {
+  background: transparent;
+  border-color: var(--dg-border-strong);
+  color: var(--dg-text-muted);
+}
+
+/* High contrast: the strong edge is full-strength there, which would draw the
+ * lowest level with the heaviest outline; muted text keeps it the quietest. */
+:where([data-theme='high-contrast'])
+  .dgv-analysis
+  .dg-summary-header__confidence.dg-badge--neutral {
+  border-color: var(--dg-text-muted);
+}
+
+/* Evidence chips. The editor holds no event store, so `SummaryHeader` renders
+ * each citation as an inert badge in the accent outline, the look the DevTools
+ * panel gives chips that are controls. Here a citation is a neutral tag: the
+ * neutral tint (shared with the soft badges above), secondary text (6.19:1
+ * dark, 6.26:1 light on it) and no edge, so nothing suggests activation. */
+.dgv-analysis .dg-summary-header__evidence .dg-badge {
+  border-color: transparent;
+  color: var(--dg-text-secondary);
+}
+
+/* High contrast outlines every box, and a one-eighth tint alone does not
+ * separate two neighbouring citations there; a muted edge does, without the
+ * full-strength edge its controls carry. */
+:where([data-theme='high-contrast']) .dgv-analysis .dg-summary-header__evidence .dg-badge {
+  border-color: var(--dg-text-muted);
+}
+
+/* --- compact states: placeholders inside a card --------------------------- */
+
+/* The design system sizes an empty state for a panel region that will fill
+ * with a chart: a 96 px block, centred and padded on every side. A sidebar
+ * card that has nothing yet only needs its sentence and its action, so inside
+ * a card the state collapses to its content on the card body's own inset and
+ * reads from the start edge like the rest of the card. Title, message and
+ * action are unchanged; the view-level state outside any card keeps the
+ * design system's centred block. */
+.dgv-view .dg-section--card .dg-empty-state {
+  align-items: start;
+  min-block-size: 0;
+  padding: 0;
+  text-align: start;
+}
+
+.dgv-view .dg-section--card .dg-empty-state__action {
+  justify-content: start;
+  margin-block-start: var(--dg-space-1);
+}
+
+/* The loading silhouette, likewise: the design system reserves a 72 px block
+ * padded on every side, so inside a card a single bar sat inset from the card
+ * title with a blank band beneath it. Inside a card the silhouette is exactly
+ * its bars, on the card body's inset. The bars keep their own sizes (the
+ * `block` and `chart` variants size their one bar themselves), and the
+ * status role, busy state and announced label stay the design system's. */
+.dgv-view .dg-section--card .dg-loading-state {
+  min-block-size: 0;
+  padding: 0;
+}
+
+/* Skeleton bars. The design system sweeps the elevated surface to the overlay
+ * one, 1.08:1 apart, which all but vanishes on a card. Here a bar is a quarter
+ * of the muted text colour over the card (1.48:1 dark, 1.40:1 light) and the
+ * sweep's crest a half (2.37:1, 2.04:1): a silhouette that reads, in a quiet
+ * grey. High contrast shares the dark theme's surfaces and muted text, so its
+ * bars are that same grey rather than its full-strength white. Only colours
+ * change; the sweep's geometry, its animation and the reduced-motion stop stay
+ * the design system's. */
+.dgv-view .dg-skeleton {
+  background-color: color-mix(
+    in srgb,
+    var(--dg-surface-elevated),
+    color-mix(in srgb, var(--dg-surface-elevated), var(--dg-text-muted))
+  );
+  background-image: linear-gradient(
+    to right,
+    color-mix(
+      in srgb,
+      var(--dg-surface-elevated),
+      color-mix(in srgb, var(--dg-surface-elevated), var(--dg-text-muted))
+    ),
+    color-mix(in srgb, var(--dg-surface-elevated), var(--dg-text-muted)),
+    color-mix(
+      in srgb,
+      var(--dg-surface-elevated),
+      color-mix(in srgb, var(--dg-surface-elevated), var(--dg-text-muted))
+    )
+  );
+}
+
+/* --- pairing code: components/PairingCode.tsx ----------------------------- */
+
+/* The one-time code is read off this card and typed, or pasted, into the
+ * DevTools pair dialog. `Code` sets it in the 12 px monospace role; here it
+ * takes the heading role (16 px, semibold) in the monospace face, with room
+ * around the glyphs, and one click selects all of it, the fallback the copy
+ * failure line asks for. It stays a single selectable text node. */
+.dgv-pairing .dg-code {
+  padding-block: var(--dg-space-0);
+  padding-inline: var(--dg-space-2);
+  font: var(--dg-heading);
+  font-family: var(--dg-font-mono);
+  user-select: all;
 }
 
 /* ==========================================================================
@@ -383,6 +720,12 @@ body {
   color: var(--dg-danger);
 }
 
+/* A `done` row that is a notice about a degraded outcome — incomplete
+ * evidence, an empty capture, a fallback panel — beside the `!` glyph. */
+.dgv-progress__marker--warning {
+  color: var(--dg-warning);
+}
+
 .dgv-progress__label {
   min-inline-size: 0;
   color: var(--dg-text-primary);
@@ -416,11 +759,72 @@ body {
 }
 
 /* ==========================================================================
+ * Paths — components/RelevantFiles.tsx, components/ModificationsList.tsx
+ *
+ * A project-relative path shortened in the middle. `../path-display.ts`
+ * splits it into a lead and a tail — the shortest run of trailing segments no
+ * other path of the same list ends in — and the tail into its context and the
+ * file name. The lead ellipsizes first, then the context, and the file name
+ * only when it alone is wider than the column: a narrow view keeps the start
+ * of the path, the segment that tells two same-named files apart, and the file
+ * name. The chip's text is the whole path, byte for byte.
+ * ========================================================================== */
+
+/* The chip, a flex row capped at its container, so a long path truncates
+ * instead of widening a narrow view. */
+.dgv-path {
+  display: flex;
+  min-inline-size: 0;
+  max-inline-size: var(--dg-size-full);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* The two parts that shrink, and never grow. Each is floored by the cap on
+ * the part after it rather than by a minimum of its own, so a lead or context
+ * narrower than the floor keeps its own width and leaves no gap. */
+.dgv-path__lead,
+.dgv-path__context {
+  flex: auto;
+  flex-grow: 0;
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Never shrinks for the lead's sake: capped at the chip, it shortens its own
+ * context once it is wider than that. */
+.dgv-path__tail {
+  display: flex;
+  flex: none;
+  max-inline-size: var(--dg-size-full);
+  overflow: hidden;
+}
+
+/* Never shrinks for the context's sake. A file name wider than the whole tail
+ * is capped at it and ellipsizes on its own. */
+.dgv-path__name {
+  flex: none;
+  max-inline-size: var(--dg-size-full);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The floor a shrinking part keeps for its ellipsis, taken from the part after
+ * it: text overflow never replaces a line's first character, so `…` needs one
+ * character plus the glyph, and `--dg-space-5` is the smallest space token
+ * wider than two `--dg-mono-sm` characters. */
+.dgv-path__lead + .dgv-path__tail,
+.dgv-path__context + .dgv-path__name {
+  max-inline-size: calc(var(--dg-size-full) - var(--dg-space-5));
+}
+
+/* ==========================================================================
  * RelevantFiles — components/RelevantFiles.tsx
  *
  * Each row is a ghost `Button` whose label holds a `__row` column: path,
- * `__meta` (symbol and score), reason. The path and symbol truncate on one
- * line; the reason wraps.
+ * `__meta` (symbol and score), reason. The path (a `.dgv-path` chip) and the
+ * symbol truncate on one line; the reason wraps.
  * ========================================================================== */
 
 .dgv-files {
@@ -437,10 +841,22 @@ body {
   min-inline-size: 0;
 }
 
-/* Placement of the label box only: the button's padding, colours, hover and
- * focus ring stay the design system's. */
-.dgv-files__button {
+/* Placement of the label box, and the row's alignment with the card: the
+ * button keeps the design system's colours, hover and focus ring, but its
+ * inline padding narrows to `--dg-space-1` and the row hangs that padding and
+ * its hairline into the card's `--dg-space-4` inset on both sides, so a path
+ * starts on the same edge as the card title above it. The hover surface, and
+ * the focus ring outside it (two pixels at a two-pixel offset at most, in high
+ * contrast), still fit inside the inset. The width adds back what both sides
+ * hang, because a full-width button is sized against its list item. */
+.dgv-files .dgv-files__button {
   justify-content: start;
+  inline-size: calc(
+    var(--dg-size-full) + var(--dg-space-1) + var(--dg-space-1) + var(--dg-pixel-unit) +
+      var(--dg-pixel-unit)
+  );
+  margin-inline: calc(var(--dg-space-inverse-1) - var(--dg-pixel-unit));
+  padding-inline: var(--dg-space-1);
 }
 
 .dgv-files__row {
@@ -475,15 +891,6 @@ body {
   flex: none;
 }
 
-.dgv-files__path {
-  display: block;
-  min-inline-size: 0;
-  max-inline-size: var(--dg-size-full);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .dgv-files__reason {
   min-inline-size: 0;
   color: var(--dg-text-secondary);
@@ -493,56 +900,56 @@ body {
 /* ==========================================================================
  * ModificationsList — components/ModificationsList.tsx
  *
- * The table itself is `.dg-data-table*` and every gap in a cell is a `Stack`;
- * these rules only let a long path truncate instead of widening its column.
+ * An ordered list of full-width items in the page's own flow: no column
+ * floors, no nested scroller, so the list fits the narrowest sidebar and the
+ * `PanelShell` viewport stays the one vertical scroll container. Every gap
+ * inside an item is a `Stack` and the path is a `.dgv-path` chip; these rules
+ * separate the items, let a long path truncate instead of widening the view,
+ * and frame the conflict and failure callouts.
  * ========================================================================== */
 
 .dgv-modifications {
   min-inline-size: 0;
 }
 
-/* The identity column, a flex item of the flex-row cell: it takes the cell's
- * width and may shrink, which lets the path ellipsize. */
-.dgv-modifications__identity {
-  flex: auto;
-  min-inline-size: 0;
-}
-
-/* The path as two `Code` spans, directory and file name. A flex row, unlike
- * `.dgv-cleanup__conflict-file`, so the directory ellipsizes first and the
- * file name stays visible; the element's text is the whole path. */
-.dgv-modifications__file {
+.dgv-modifications__list {
   display: flex;
+  flex-direction: column;
   min-inline-size: 0;
-  max-inline-size: var(--dg-size-full);
-  overflow: hidden;
-  white-space: nowrap;
+  list-style: none;
 }
 
-/* Shrinks before the file name does, floored at the room its ellipsis needs:
- * text overflow never replaces a line's first character, so `…` needs one
- * character plus the glyph. `--dg-space-5` is the smallest space token wider
- * than two `--dg-mono-sm` characters. */
-.dgv-modifications__directory {
-  flex: auto;
-  flex-grow: 0;
-  min-inline-size: var(--dg-space-5);
-  overflow: hidden;
-  text-overflow: ellipsis;
+/* One record at the list's full width, ruled off from the one before it. */
+.dgv-modifications__item {
+  min-inline-size: 0;
+  padding-block: var(--dg-space-3);
 }
 
-/* Never shrinks for the directory's sake. A file name wider than the whole
- * column is capped at it — less the directory's floor when a directory
- * precedes it — and ellipsizes on its own. */
-.dgv-modifications__name {
+.dgv-modifications__item:first-child {
+  padding-block-start: 0;
+}
+
+.dgv-modifications__item:last-child {
+  padding-block-end: 0;
+}
+
+.dgv-modifications__item + .dgv-modifications__item {
+  border-block-start: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
+}
+
+.dgv-modifications__record {
+  min-inline-size: 0;
+}
+
+/* Path and status badge on one wrapping line (a horizontal Stack): side by
+ * side when both fit, the badge under the path when they do not. */
+.dgv-modifications__head {
+  min-inline-size: 0;
+}
+
+/* The badge keeps its whole label: it never shrinks, so it wraps instead. */
+.dgv-modifications__status {
   flex: none;
-  max-inline-size: var(--dg-size-full);
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.dgv-modifications__directory + .dgv-modifications__name {
-  max-inline-size: calc(var(--dg-size-full) - var(--dg-space-5));
 }
 
 /* Plan version, layering and time on one wrapping line (a horizontal Stack). */
@@ -550,22 +957,57 @@ body {
   min-inline-size: 0;
 }
 
-/* The status explanation under the path. Wraps at any point so a narrow view
- * never clips the sentence that says what the product did with the file. */
+/* The status explanation under the path, at the item's full width. Prose
+ * breaks between words; only an unbroken value that is wider than the item
+ * breaks inside itself, and the paths in it are `Code wrap`, which break
+ * anywhere, so a narrow view never clips the sentence that says what the
+ * product did with the file. */
 .dgv-modifications__note {
   min-inline-size: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
-/* The disclosure and open-file buttons (a horizontal, wrapping Stack): they
- * sit side by side when the track allows and stack when it does not. */
-.dgv-modifications__actions {
-  flex: auto;
+/* A conflict's or failure's explanation, framed like the view's notices: a
+ * hairline border in the status colour with a marker edge. The sentence
+ * carries the meaning; the colour only reinforces it. */
+.dgv-modifications__callout {
+  display: flex;
+  flex-direction: column;
+  align-items: start;
+  gap: var(--dg-space-1);
+  padding-block: var(--dg-space-2);
+  padding-inline: var(--dg-space-3);
+  background: var(--dg-surface-elevated);
+  border-radius: var(--dg-radius-sm);
+  color: var(--dg-text-primary);
+}
+
+.dgv-modifications__callout--warning {
+  border: var(--dg-border-width-hairline) solid var(--dg-warning);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-warning);
+}
+
+.dgv-modifications__callout--danger {
+  border: var(--dg-border-width-hairline) solid var(--dg-danger);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-danger);
+}
+
+/* The callout's sentences span its width, rather than shrinking to the start
+ * alignment its copy control needs. */
+.dgv-modifications__callout > p {
+  align-self: stretch;
   min-inline-size: 0;
 }
 
-/* The expanded detail: the hashes row, then the diff. It fills the single
- * full-width cell of the design system's detail row. */
+/* The diff disclosures and the open-file button (a horizontal, wrapping
+ * Stack): side by side when the item allows, under each other when it does
+ * not. */
+.dgv-modifications__actions {
+  min-inline-size: 0;
+}
+
+/* The open diff, directly under the actions at the item's full width: the
+ * hashes row, then the diff, in the page's own flow. */
 .dgv-modifications__detail {
   min-inline-size: 0;
 }
@@ -601,12 +1043,19 @@ body {
   border: none;
 }
 
-/* The optional file label, inset to the line text. */
+/* The optional file label and subject, inset to the line text. The label is
+ * `Code wrap`, so a long path breaks across lines instead of widening the
+ * strip. */
 .dgv-diff__file {
   min-inline-size: 0;
   padding-block-end: var(--dg-space-1);
   padding-inline: var(--dg-space-3);
   border-block-end: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
+}
+
+/* What the diff compares, under the file label. */
+.dgv-diff__subject {
+  min-inline-size: 0;
 }
 
 .dgv-diff__scroll {
@@ -778,9 +1227,51 @@ body {
 }
 
 /* ==========================================================================
+ * Asked questions — components/QuestionForm.tsx, components/FollowUp.tsx
+ *
+ * The session's question as the developer typed it, and the follow-ups asked
+ * on it, oldest first. The text is the developer's own: it keeps their line
+ * breaks and wraps at any point, so a long token never widens the view and no
+ * part of the question is clipped.
+ * ========================================================================== */
+
+.dgv-asked__text {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* The follow-up history: an ordered list, so assistive technology announces
+ * its length and order; `base.css` keeps user-agent markers, so the list opts
+ * out here. */
+.dgv-asked-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  list-style: none;
+}
+
+/* One follow-up: its question over its outcome badge, on a neutral edge — the
+ * edge the analysis head gives what was asked and measured, never the warning
+ * edge of an inference. Items keep their intrinsic width so the badge does not
+ * stretch across the column. */
+.dgv-asked-list__item {
+  display: flex;
+  flex-direction: column;
+  align-items: start;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+  padding-inline-start: var(--dg-space-3);
+  border-inline-start: var(--dg-border-width-marker) solid var(--dg-border-strong);
+}
+
+/* ==========================================================================
  * PairingCode — components/PairingCode.tsx
  *
- * The code renders through `Code`; this gives it a surface and room.
+ * The code renders through `Code`; this gives it a surface and room, places
+ * the copy control and the copy outcome, and leaves the code's size and face
+ * to "Webview surface refinements" above.
  * ========================================================================== */
 
 .dgv-pairing {
@@ -801,6 +1292,19 @@ body {
   background: var(--dg-surface-overlay);
   border: var(--dg-border-width-hairline) solid var(--dg-border-strong);
   border-radius: var(--dg-radius-md);
+}
+
+/* The copy control ends the code's row, and wraps beneath the code, still at
+ * the end, on a row too narrow for all three parts. */
+.dgv-pairing__copy {
+  margin-inline-start: auto;
+}
+
+/* The copy outcome is a line of its own beneath the code, so its appearing or
+ * clearing never moves the code or the control sideways. */
+.dgv-pairing__copy-status {
+  flex-basis: var(--dg-size-full);
+  min-inline-size: 0;
 }
 
 .dgv-pairing__expiry {
@@ -849,17 +1353,25 @@ body {
   list-style: none;
 }
 
-/* A preserved original's path. `display: block` is required: `Code` is
- * inline, which ignores `max-inline-size`, `overflow` and `text-overflow` but
- * keeps `nowrap`, so a long path would widen the list item and give the
- * viewport a second scroll axis. */
+/* One listed file: its path, the saved original and "Copy path". Items after
+ * the first are ruled off, so each file's lines read as one group. */
+.dgv-cleanup__conflict > li {
+  min-inline-size: 0;
+}
+
+.dgv-cleanup__conflict > li + li {
+  padding-block-start: var(--dg-space-1);
+  border-block-start: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
+}
+
+/* A listed file's path or its preserved original's path, in full: `Code wrap`
+ * breaks it across lines, so nothing is ellipsized and the whole value can be
+ * read, selected and copied. `display: block` gives it the item's width to
+ * wrap within instead of sizing to the unbroken path. */
 .dgv-cleanup__conflict-file {
   display: block;
   min-inline-size: 0;
   max-inline-size: var(--dg-size-full);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* ==========================================================================

@@ -13,7 +13,7 @@
  * and the figure printed under the lines is the same figure printed beside the radio button.
  *
  * WHAT TRAVELS, AND IN WHAT UNIT
- * Two things, and both for the same reason - the column that knows is not the column that prints.
+ * Three things, and all for the same reason - the column that knows is not the column that prints.
  *
  * The first is the service the buyer chose and the rate currently quoted for it, as
  * {@link SelectedFreight}. `amountCents` is a whole number of cents, like every monetary field in
@@ -34,14 +34,21 @@
  * has already been charged something else for. The form is what learns the order was placed, and
  * the review is what has to stop, so the fact travels the same way the charge does.
  *
+ * The third is whether the order is being placed right now, as a plain boolean: `true` from the
+ * press of Place order until the store has answered. For that stretch the form's own fields are
+ * held, and the review's lines have to be held with them - they carry quantity and remove
+ * controls, and a change made while the request is in flight edits a cart the store is already
+ * turning into an order, so what the buyer sees afterwards would not be what they ordered. The
+ * form is what knows the request is in flight, and the review is what has to hold still.
+ *
  * A VALUE AND ITS PUBLISHER TRAVEL SEPARATELY
- * Each published fact and its publisher sit on their own contexts, so four in all. A publisher's
+ * Each published fact and its publisher sit on their own contexts, so six in all. A publisher's
  * context value is a function that never changes identity, so a component that only publishes - the
  * form - is not re-rendered when the value it published comes back round; and each value's context
  * carries the bare value, `SelectedFreight | null` or `boolean`, so there is no per-render object to
  * keep stable. One combined `{ value, publish }` object would have needed exactly that, for no gain
- * to either side. The two facts are kept apart for the same reason: they change independently, and
- * a single value holding both would wake every reader of either whenever one of them moved.
+ * to either side. The three facts are kept apart for the same reason: they change independently,
+ * and a single value holding them all would wake every reader of any whenever one of them moved.
  *
  * THE EQUALITY GUARD IS LOAD-BEARING
  * The form publishes from an effect that builds a fresh object each time it runs, so an identity
@@ -59,7 +66,7 @@
  * `/cart` page), and a throwing hook would take those surfaces down.
  *
  * This module renders no element of its own: the provider returns the tree it was given, wrapped only
- * in the two context providers, so the page's own layout classes and DOM structure are untouched.
+ * in its context providers, so the page's own layout classes and DOM structure are untouched.
  */
 
 import {
@@ -117,6 +124,12 @@ function ignorePlacement(): void {
   // to tell, and the review it would have told is not there to be left in the wrong state.
 }
 
+/** The same, for the in-flight flag. See {@link ignoreFreight}. */
+function ignorePending(): void {
+  // Intentionally empty, for the same reason: with no review column on the surface there are no
+  // reviewed lines to hold while the order is being placed.
+}
+
 /**
  * Whether two published freight charges say the same thing.
  *
@@ -166,6 +179,18 @@ const OrderPlacedContext = createContext<boolean>(false);
  */
 const PublishOrderPlacedContext = createContext<(placed: boolean) => void>(ignorePlacement);
 
+/**
+ * Whether the order this page is for is being placed at this moment - `false` while no submission
+ * is in flight, and also the value read on a surface that mounts no provider.
+ */
+const OrderPendingContext = createContext<boolean>(false);
+
+/**
+ * The publisher for that flag. Its default discards what it is given, so publishing outside a
+ * provider is a no-op rather than a failure; see the header.
+ */
+const PublishOrderPendingContext = createContext<(pending: boolean) => void>(ignorePending);
+
 /** What {@link CheckoutChargesProvider} takes: the subtree the channel is mounted around. */
 interface Props {
   /** The columns that publish and read the charge. The provider adds no element around them. */
@@ -183,11 +208,9 @@ interface Props {
  * ```tsx
  * <CheckoutChargesProvider>
  *   <div className="ls-split">
+ *     <CheckoutSummaryPanel className="ls-split-side" />
  *     <div className="ls-split-main">
  *       <CheckoutForm />
- *     </div>
- *     <div className="ls-split-side">
- *       <CheckoutSummaryPanel />
  *     </div>
  *   </div>
  * </CheckoutChargesProvider>
@@ -196,6 +219,7 @@ interface Props {
 export function CheckoutChargesProvider({ children }: Props): ReactElement {
   const [freight, setFreight] = useState<SelectedFreight | null>(null);
   const [placed, setPlaced] = useState<boolean>(false);
+  const [pending, setPending] = useState<boolean>(false);
 
   /*
    * One stable publisher for the life of the provider. `useCallback` with no dependencies is what
@@ -216,12 +240,23 @@ export function CheckoutChargesProvider({ children }: Props): ReactElement {
     setPlaced(next);
   }, []);
 
+  // The same again, for the in-flight flag, and for the same reason needing no guard of its own.
+  const publishPending = useCallback((next: boolean): void => {
+    setPending(next);
+  }, []);
+
   return (
     <PublishSelectedFreightContext.Provider value={publish}>
       <PublishOrderPlacedContext.Provider value={publishPlacement}>
-        <SelectedFreightContext.Provider value={freight}>
-          <OrderPlacedContext.Provider value={placed}>{children}</OrderPlacedContext.Provider>
-        </SelectedFreightContext.Provider>
+        <PublishOrderPendingContext.Provider value={publishPending}>
+          <SelectedFreightContext.Provider value={freight}>
+            <OrderPlacedContext.Provider value={placed}>
+              <OrderPendingContext.Provider value={pending}>
+                {children}
+              </OrderPendingContext.Provider>
+            </OrderPlacedContext.Provider>
+          </SelectedFreightContext.Provider>
+        </PublishOrderPendingContext.Provider>
       </PublishOrderPlacedContext.Provider>
     </PublishSelectedFreightContext.Provider>
   );
@@ -280,4 +315,31 @@ export function usePublishOrderPlaced(): (placed: boolean) => void {
  */
 export function useOrderPlaced(): boolean {
   return useContext(OrderPlacedContext);
+}
+
+/**
+ * Reads the publisher for whether the order is being placed.
+ *
+ * The returned function is stable for as long as the provider is mounted, so it is safe as an effect
+ * dependency. Publish `true` while a submission is in flight and `false` once it has been answered -
+ * including from the publishing component's cleanup, so a form that goes away mid-request does not
+ * leave the review holding its lines for a submission nobody is waiting on.
+ *
+ * @returns The publisher, or an inert one outside a `<CheckoutChargesProvider>`.
+ */
+export function usePublishOrderPending(): (pending: boolean) => void {
+  return useContext(PublishOrderPendingContext);
+}
+
+/**
+ * Reads whether the order this page is for is being placed at this moment.
+ *
+ * `true` means the store has been asked to place the order and has not answered yet, which a review
+ * column answers by holding its lines still until it has. `false` means no submission is in flight -
+ * or that the reading component is outside a `<CheckoutChargesProvider>`.
+ *
+ * @returns Whether a submission of this page's order is in flight.
+ */
+export function useOrderPending(): boolean {
+  return useContext(OrderPendingContext);
 }

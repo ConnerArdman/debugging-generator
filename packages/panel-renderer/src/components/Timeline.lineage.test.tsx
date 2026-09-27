@@ -28,9 +28,13 @@
  * Both the flat `spans` page — where the producer's attribute keys are the only
  * route — and the correlated `trace` — where the correlator's lineage record
  * carries them — are exercised, because the component reads each route
- * separately. The last cases pin what the stylesheet does with the state
- * classes, since happy-dom applies no stylesheet and a class no rule paints is
- * a distinction nobody sees.
+ * separately. The detail strip is held to the same honesty: its lineage note is
+ * the one item of the clipped trailing run that gives way, with a visible
+ * ellipsis, and a flag in the lead run carries the whole note — the candidates
+ * at its end included — in a bubble nothing clips. The last cases pin what the
+ * stylesheet does with the state classes and with that note, since happy-dom
+ * applies no stylesheet and a class no rule paints is a distinction nobody
+ * sees.
  *
  * ## Harness conventions (shared with `./Timeline.test.tsx`)
  *
@@ -403,7 +407,7 @@ async function renderTimeline(node: TimelineNode, provider: DataProvider): Promi
     </DataProviderContext.Provider>,
   );
 
-  return screen.findByRole('img');
+  return screen.findByRole('figure');
 }
 
 /** The equivalent table's data rows, in document order. */
@@ -555,19 +559,22 @@ describe('Timeline lineage candidates', () => {
 
     // The row's description: the mechanism, the uncertainty and the named
     // candidate, with nothing left as a bare id a reader would have to look up.
+    // One other candidate is named in the singular, never as "the others were".
     const description = await descriptionOf(rowNamed(AMBIGUOUS_COMMIT.name));
     expect(description).toContain(ASYNC_CONTINUATION);
     expect(description).toContain(AMBIGUITY_SENTENCE);
-    expect(description).toContain(`the others were ${named}.`);
+    expect(description).toContain(`the other was ${named}.`);
+    expect(description).not.toContain('the others were');
 
     // The bar's own title says the same, so the two cannot drift apart.
     expect(
       barTitled(canvas, AMBIGUOUS_COMMIT.name).querySelector('title')?.textContent ?? '',
-    ).toContain(`the others were ${named}.`);
+    ).toContain(`the other was ${named}.`);
 
     // And so does the detail strip between the canvas and the table, once the
-    // row is selected: in its own lineage note, and in the one description its
-    // name carries — the only description outside the table.
+    // row is selected: in its own lineage note, in the description its name
+    // carries, and in the bubble of the note's flag — the only two
+    // descriptions outside the table.
     await userEvent.setup().click(rowNamed(AMBIGUOUS_COMMIT.name));
     const strip = screen.getByRole('group', { name: 'Span detail' });
     expect(within(strip).getByText('Selected')).toBeDefined();
@@ -576,15 +583,19 @@ describe('Timeline lineage candidates', () => {
     // which stays mounted while closed and would otherwise answer for it.
     expect(
       within(strip)
-        .getAllByText(`the others were ${named}.`, { exact: false })
+        .getAllByText(`the other was ${named}.`, { exact: false })
         .filter((element) => element.closest('[role="tooltip"]') === null),
     ).toHaveLength(1);
 
     const grid = screen.getByRole('grid');
-    expect(
-      screen.getAllByRole('tooltip', { hidden: true }).filter((tooltip) => !grid.contains(tooltip)),
-    ).toHaveLength(1);
-    expect(await openDescriptionIn(strip)).toContain(`the others were ${named}.`);
+    const stripBubbles = screen
+      .getAllByRole('tooltip', { hidden: true })
+      .filter((tooltip) => !grid.contains(tooltip));
+    expect(stripBubbles).toHaveLength(2);
+    for (const bubble of stripBubbles) {
+      expect(bubble.textContent ?? '').toContain(`the other was ${named}.`);
+    }
+    expect(await openDescriptionIn(strip)).toContain(`the other was ${named}.`);
   });
 
   it('names the candidate from the correlated trace’s own lineage record as well', async () => {
@@ -592,9 +603,7 @@ describe('Timeline lineage candidates', () => {
 
     const description = await descriptionOf(rowNamed(AMBIGUOUS_COMMIT.name));
     expect(description).toContain(AMBIGUITY_SENTENCE);
-    expect(description).toContain(
-      `the others were ${FIRST_REQUEST.name} (${FIRST_REQUEST.spanId}).`,
-    );
+    expect(description).toContain(`the other was ${FIRST_REQUEST.name} (${FIRST_REQUEST.spanId}).`);
   });
 
   it('states a candidate it cannot resolve in this trace exactly as it was recorded', async () => {
@@ -642,6 +651,126 @@ describe('Timeline lineage candidates', () => {
     expect(description).toContain(ASYNC_CONTINUATION);
     expect(description).not.toContain(AMBIGUITY_SENTENCE);
     expect(description).not.toContain('the others were');
+    expect(description).not.toContain('the other was');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The lineage note in the detail strip
+ *
+ * The note sits in the strip's trailing run, which is clipped rather than
+ * wrapped on a narrow panel, and it names the other candidates of an ambiguous
+ * attribution at its END — the part a narrow strip cuts. So it is the one item
+ * of that run that gives way, ending in a visible ellipsis, and its whole text
+ * is carried by a flag in the lead run, whose bubble nothing clips.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The detail strip, once a row is selected or previewed. */
+function detailStrip(): HTMLElement {
+  return screen.getByRole('group', { name: 'Span detail' });
+}
+
+/** The lineage note the strip draws, or `null` when the shown row has none. */
+function detailNoteIn(strip: HTMLElement): HTMLElement | null {
+  return strip.querySelector<HTMLElement>('.dg-timeline__detail-note');
+}
+
+/**
+ * The flag of the strip's lineage note, found by its label — outside every
+ * description bubble, which stays mounted while closed.
+ */
+function detailFlagIn(strip: HTMLElement, label: string): HTMLElement | null {
+  return (
+    within(strip)
+      .queryAllByText(label)
+      .find((element) => element.closest('[role="tooltip"]') === null) ?? null
+  );
+}
+
+/**
+ * The bubble a flag is described by, opened the way a pointer opens it and
+ * read while open.
+ */
+async function flagBubbleText(flag: HTMLElement): Promise<string> {
+  const user = userEvent.setup();
+  await user.hover(flag);
+  const bubbleId = (flag.getAttribute('aria-describedby') ?? '').split(/\s+/u)[0] ?? '';
+  const bubble = await waitFor(() => {
+    const open = document.getElementById(bubbleId);
+    if (open === null || !open.classList.contains('dg-is-open')) {
+      throw new Error('the flag’s bubble did not open on hover');
+    }
+    return open;
+  });
+  const text = bubble.textContent ?? '';
+  await user.unhover(flag);
+
+  return text;
+}
+
+describe('Timeline lineage note in the detail strip', () => {
+  it('lets the note alone give way in the clipped run, and carries all of it, candidates included, in the lead run', async () => {
+    await renderTimeline(spansNode(), spansProvider(FLOW_EVENTS));
+    await userEvent.setup().click(rowNamed(AMBIGUOUS_COMMIT.name));
+    const strip = detailStrip();
+    const named = `${FIRST_REQUEST.name} (${FIRST_REQUEST.spanId})`;
+
+    // The note: in the trailing run, a DIRECT child of that run's items — the
+    // position the stylesheet lets shrink to an ellipsis, while every other
+    // item of the run keeps its width — and whole in the document.
+    const note = detailNoteIn(strip);
+    if (note === null) {
+      throw new Error('the strip drew no lineage note');
+    }
+    expect(note.parentElement?.classList.contains('dg-stack__items')).toBe(true);
+    expect(note.closest('.dg-timeline__detail-rest')).not.toBeNull();
+    expect(note.textContent ?? '').toContain(AMBIGUITY_SENTENCE);
+    expect(note.textContent ?? '').toContain(`the other was ${named}.`);
+
+    // The flag: in the lead run, which clips nothing, after the name — so the
+    // name stays the strip's first described element — and in the table's own
+    // words for the state.
+    const flag = detailFlagIn(strip, 'Ambiguous parent');
+    if (flag === null) {
+      throw new Error('the strip drew no flag for the note');
+    }
+    expect(flag.closest('.dg-timeline__detail-rest')).toBeNull();
+    expect(flag.classList.contains('dg-badge--warning')).toBe(true);
+    expect(describedNameIn(strip)?.textContent).toBe(AMBIGUOUS_COMMIT.name);
+
+    // Its bubble is the whole note, byte for byte, and opens outside the
+    // clipped run, so a narrow strip can never cut the candidates off.
+    expect(await flagBubbleText(flag)).toBe(note.textContent);
+    const bubbleId = flag.getAttribute('aria-describedby') ?? '';
+    expect(document.getElementById(bubbleId)?.closest('.dg-timeline__detail-rest')).toBeNull();
+  });
+
+  it('flags an attribution that had one candidate as inferred, in the info tone', async () => {
+    await renderTimeline(spansNode(), spansProvider(FLOW_EVENTS));
+    await userEvent.setup().click(rowNamed(INFERRED_COMMIT.name));
+    const strip = detailStrip();
+
+    const note = detailNoteIn(strip);
+    expect(note?.textContent ?? '').toContain(ASYNC_CONTINUATION);
+    const flag = detailFlagIn(strip, 'Inferred parent');
+    if (flag === null) {
+      throw new Error('the strip drew no flag for the note');
+    }
+    expect(flag.classList.contains('dg-badge--info')).toBe(true);
+    expect(detailFlagIn(strip, 'Ambiguous parent')).toBeNull();
+    expect(await flagBubbleText(flag)).toBe(note?.textContent);
+  });
+
+  it('draws neither a note nor a flag for a span that joined its trace the ordinary way', async () => {
+    await renderTimeline(spansNode(), spansProvider(FLOW_EVENTS));
+    await userEvent.setup().click(rowNamed(FIRST_REQUEST.name));
+    const strip = detailStrip();
+
+    expect(detailNoteIn(strip)).toBeNull();
+    // One description in the strip, the name's, and no other.
+    expect(strip.querySelectorAll('[aria-describedby]')).toHaveLength(1);
   });
 });
 
@@ -779,5 +908,19 @@ describe('Timeline lineage styling', () => {
         declaration.startsWith('stroke:'),
       ),
     ).toEqual(['stroke: var(--dg-graph-edge)']);
+  });
+
+  it('cuts the detail strip’s lineage note with a visible ellipsis, and holds every other item of its run', () => {
+    const note = declarationsOf('.dg-timeline__detail-note');
+    expect(note).toContain('text-overflow: ellipsis');
+    expect(note).toContain('overflow: hidden');
+    expect(note).toContain('white-space: nowrap');
+    expect(note).toContain('min-inline-size: 0');
+
+    expect(
+      declarationsOf(
+        '.dg-timeline__detail-rest > .dg-stack > .dg-stack__items > :not(.dg-timeline__detail-note)',
+      ),
+    ).toContain('flex: none');
   });
 });

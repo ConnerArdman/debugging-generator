@@ -39,10 +39,18 @@
  * ONE PRESS, ONE ADDITION
  * Two presses that reach this control before it has finished the first addition produce one
  * request, and the thing that ensures it is the `adding` ref `addToCart` latches before its first
- * `await` - not the button's `disabled`, which React writes at commit, and not `syncStatus`, which
- * a handler reads as it was when that handler was created. The button's `disabled` and `busy` are
+ * `await` - not the button's `busy`, which React writes at commit, and not `syncStatus`, which a
+ * handler reads as it was when that handler was created. The button's `busy` and `disabled` are
  * what a buyer sees; the latch is what the cart relies on. `addToCart` spells out why, and it is
  * released in a `finally` so no ending can leave the control inert.
+ *
+ * FOCUS STAYS ON THE BUTTON
+ * The button a buyer presses is the element holding keyboard focus, and the cart goes to `saving`
+ * the moment the press is handled. So that transient state reaches the button as `busy` - which
+ * `ui/Button` renders as `aria-disabled` and an indicator while keeping the element focusable -
+ * and never as the native `disabled` attribute, which would blur the focused button and drop the
+ * reader onto `<body>`. Native `disabled` is kept for the one state a buyer does not reach by
+ * pressing: a product that cannot be ordered at all.
  *
  * THE CLOCK IS NOT READ HERE
  * The dispatch line is built from what `useShippingEta` published - the arrival wording and the
@@ -275,16 +283,17 @@ export function AddToCartControl({
    *
    * Two guards, in the order that matters. `adding` is a synchronous latch: it is read and written
    * before the first `await`, so a press that arrives while an addition is already on the wire is
-   * dropped whatever React has committed by then. `canAddToCart` is the state the control is
-   * disabled by, and it still answers the cases the latch says nothing about - an unorderable
-   * product, a cart that is loading, a cart saving something another part of the page started.
+   * dropped whatever React has committed by then. `canAddToCart` is the state the control is held
+   * by - disabled for an unorderable product, busy for a cart that is loading or saving - and it
+   * still answers the cases the latch says nothing about: an unorderable product, a cart that is
+   * loading, a cart saving something another part of the page started.
    *
    * The latch is what makes the guarantee, and it is a ref rather than state because state read
    * inside a handler is the value from the render that created the handler: two presses dispatched
    * in one JavaScript task - a double-click the browser delivers before React commits, a keyboard
    * repeat, a script - both saw `syncStatus` as it was before the first one, both passed, and both
    * posted, adding the quantity twice. Measured before this latch existed: two concurrent
-   * `POST /api/cart/items` 12 ms apart. `disabled` and `busy` on the button are presentation only;
+   * `POST /api/cart/items` 12 ms apart. `busy` and `disabled` on the button are presentation only;
    * they are written at commit, 18-25 ms after the press, which is not soon enough to be a guard.
    */
   async function addToCart(): Promise<void> {
@@ -361,8 +370,11 @@ export function AddToCartControl({
             type="button"
             variant="primary"
             size="lg"
-            busy={cartIsSaving}
-            disabled={!canAddToCart}
+            // A cart that is loading or saving is a wait, not an unavailable product, so it is
+            // `busy`: the button keeps focus and refuses the press (see FOCUS STAYS ON THE BUTTON).
+            // Only a product that cannot be ordered makes the control natively unavailable.
+            busy={isOrderable && !canAddToCart}
+            disabled={!isOrderable}
             onClick={() => {
               void addToCart();
             }}
@@ -372,8 +384,20 @@ export function AddToCartControl({
         </div>
       </div>
 
+      {/*
+        The dispatch line quotes a collection and an arrival, and both are promises only an
+        orderable product can keep: a product with nothing to sell leaves on no collection and
+        arrives nowhere, so it states that instead of an estimate a buyer cannot order against. The
+        sentence takes the estimate's slot rather than removing it, so the control holds one shape
+        whatever the stock state, and each branch is a single string, so the paragraph is one text
+        node in the server's markup and in the browser's.
+      */}
       <p className={styles.eta}>
-        {beforeCutoff ? `${etaLabel} — ${dispatchClause(msUntilCutoff)}` : etaLabel}
+        {isOrderable
+          ? beforeCutoff
+            ? `${etaLabel} — ${dispatchClause(msUntilCutoff)}`
+            : etaLabel
+          : 'No dispatch date while this product is out of stock.'}
       </p>
 
       {cartError === null ? null : (

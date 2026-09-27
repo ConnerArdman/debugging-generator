@@ -347,6 +347,21 @@
   white-space: nowrap;
 }
 
+/* The capped single-line ellipsis: the clip above, also bounded at a control
+ * row's field measure, for a long identifier that shares a row with controls
+ * (a host surface's selected-element selector beside its picker buttons). A
+ * host writes the pair itself, so `dg-truncate--capped` is published in
+ * scripts/check-css-classes.mjs. The cap is the closest token to that role,
+ * `--dg-search-max-inline-size` — the widest a field in a control row grows.
+ * It is a length on purpose, not a `min()` with the box's percentage: a
+ * percentage cannot resolve while a wrapping row measures its items, so it
+ * would drop the cap from the very size that decides whether the row wraps.
+ * The clip's `min-inline-size: 0` still lets a row narrower than the cap
+ * shrink the value below it. */
+.dg-truncate.dg-truncate--capped {
+  max-inline-size: var(--dg-search-max-inline-size);
+}
+
 /* Scroll containers whose component writes no `dg-scroll` class of its own.
  * These four declarations mirror `.dg-scroll` in base.css — the one place this
  * file repeats that helper, because plain CSS cannot compose a class. */
@@ -355,7 +370,8 @@
 .dg-flame__viewport,
 .dg-timeline__viewport,
 .dg-dependency-graph__viewport,
-.dg-waterfall__viewport {
+.dg-waterfall__viewport,
+.dg-split--drawer > .dg-split__panes > .dg-split__pane:last-child:not(:first-child) {
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
@@ -1676,21 +1692,42 @@
   color: var(--dg-text-primary);
   font: var(--dg-text-sm);
   z-index: var(--dg-z-tooltip);
-  /* Never takes a pointer away from the trigger beneath it. */
-  pointer-events: none;
 }
 
 /* The open bubble sits at the two UNITLESS viewport coordinates Tooltip.tsx
  * measured in CSS pixels, each given its unit by `--dg-pixel-unit`.
  *
  * `--dg-tooltip-max-inline-size` is about a short sentence at the
- * `--dg-text-sm` role, which is what a tooltip carries. */
+ * `--dg-text-sm` role, which is what a tooltip usually carries. A description
+ * can be far longer — a whole parameterized statement, a redacted URL — so the
+ * block size is capped too, at the extent a code block's scroll box uses
+ * (`--dg-code-block-max-block-size`) and never past the viewport the fixed box
+ * is laid out against (`--dg-size-full` of it), and what does not fit scrolls
+ * inside the bubble with the wheel, contained so reaching its end never
+ * scrolls the page and moves the trigger out from under the pointer.
+ *
+ * An open bubble lets the pointer pass through it (`pointer-events: none`):
+ * one that shows everything it says is read where it is, and a bubble that
+ * took the pointer would sit over the neighbouring rows' triggers and chips,
+ * keeping their descriptions from opening and swallowing their clicks. Only a
+ * bubble whose description overflows its capped block size — the one that
+ * must be scrolled to be read — accepts the pointer, through the
+ * `data-dg-scrollable` attribute Tooltip.tsx measures and writes on every
+ * placement (the rule below). Tooltip.tsx then keeps that bubble open while
+ * the pointer crosses onto it and rests there, which is what makes it
+ * hoverable (WCAG 1.4.13), and stops a click inside it from reaching the row
+ * beneath. */
 .dg-tooltip__bubble.dg-is-open {
   position: fixed;
   inset-block-start: calc(var(--dgc-tooltip-block, 0) * var(--dg-pixel-unit));
   inset-inline-start: calc(var(--dgc-tooltip-inline, 0) * var(--dg-pixel-unit));
   inline-size: max-content;
   max-inline-size: var(--dg-tooltip-max-inline-size);
+  max-block-size: min(var(--dg-code-block-max-block-size), var(--dg-size-full));
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--dg-border-strong) var(--dg-surface-overlay);
   padding-block: var(--dg-space-1);
   padding-inline: var(--dg-space-2);
   /* The hairline is what delineates the bubble in the high-contrast theme,
@@ -1700,6 +1737,14 @@
   /* A long unbroken value — a URL, a SQL identifier — wraps inside the
    * maximum width instead of running out of the bubble. */
   overflow-wrap: anywhere;
+  pointer-events: none;
+}
+
+/* The bubble that has more to show than it holds: it takes the pointer, so it
+ * can be scrolled and rested on (stated as `auto` so no inert ancestor can
+ * take it away). */
+.dg-tooltip__bubble.dg-is-open[data-dg-scrollable] {
+  pointer-events: auto;
 }
 
 /* The gap between trigger and bubble, per side, as a signed START margin on
@@ -2327,6 +2372,47 @@
   flex-grow: var(--dgc-split-weight, 0);
 }
 
+/* The drawer division (`--drawer`): the last of two or more panes floats over
+ * the inline end of the viewport as the body's right drawer, instead of taking
+ * a share of the line. Fixed rather than in flow, and that is the whole fix for
+ * two observed failures of an in-flow drawer pane: opening it narrowed the body
+ * and re-wrapped every view in it (the document grew by hundreds of pixels and
+ * the selected row moved), and its top edge sat at the top of the division, so
+ * a row selected thousands of pixels down had its details off-screen and the
+ * focus moved into them scrolled the document back to the top. Out of flow, the
+ * pane leaves the body alone on its line at full width, so opening the drawer
+ * changes nothing beneath it, and it is in the viewport wherever the document
+ * is scrolled. A lone pane never matches (`:not(:first-child)`), so the body of
+ * a closed drawer is an ordinary pane.
+ *
+ * Full height through both block insets, so the drawer needs no viewport-height
+ * length and the token table none; its content scrolls inside it (the grouped
+ * "Scroll containers" rule near the top of this file, whose
+ * `overscroll-behavior: contain` also keeps a wheel at the drawer's end from
+ * scrolling the body beneath). One weighted pane basis wide — the width a pane
+ * asks for before it shares a line — and never wider than the viewport, so on a
+ * docked panel narrower than that basis the drawer covers the body until it is
+ * closed. The base surface, a strong inline-start edge and the deepest shadow
+ * set it above the body in every theme (the edge carries it where the
+ * high-contrast theme resolves the shadow to `none`). The tooltip level, not
+ * the overlay level: the pinned toolbars and table headers that follow the
+ * division in document order already sit at the overlay level, and at an equal
+ * level the later one paints over the drawer. */
+.dg-split--drawer > .dg-split__panes > .dg-split__pane:last-child:not(:first-child) {
+  position: fixed;
+  inset-block: 0;
+  inset-inline-end: 0;
+  z-index: var(--dg-z-tooltip);
+  inline-size: calc(
+    var(--dg-split-pane-basis) * var(--dgc-split-weight, var(--dg-split-pane-weight))
+  );
+  max-inline-size: var(--dg-size-full);
+  padding: var(--dg-space-3);
+  background: var(--dg-surface-base);
+  border-inline-start: var(--dg-border-width-hairline) solid var(--dg-border-strong);
+  box-shadow: var(--dg-shadow-2);
+}
+
 /* ==========================================================================
  * layout/Stack.tsx
  *
@@ -2551,8 +2637,22 @@
 
 /* The result indicators are statements, shorter than a control: a control's
  * height, with the badges centred in it, puts them level with the controls
- * beside them. Declared after the grouped rule so its alignment wins. */
+ * beside them. Declared after the grouped rule so its alignment wins.
+ *
+ * Unlike the two control sections, the statements may SHRINK: a count, a
+ * paused note or a truncation notice is text whose length the data decides
+ * ("Showing the newest 1,000; 20,610 older events were dropped"), and a
+ * section that kept its one-line width would stand wider than a narrow bar
+ * and overflow the whole panel sideways — observed at 360 and 375 px, where
+ * such a notice measured 385–392 px. `flex: auto` followed by `flex-grow: 0`
+ * is the shrink-only form: the section still takes its natural width and
+ * never grows, so the bar still breaks between sections first, and only a
+ * section already alone on its row narrows to that row. Each badge in it is
+ * capped at the section's width by the chip rule; how its text then gives
+ * way is the bar's variant's decision below. */
 .dg-toolbar__status {
+  flex: auto;
+  flex-grow: 0;
   align-items: center;
   min-block-size: var(--dg-space-7);
 }
@@ -2593,6 +2693,19 @@
   max-inline-size: none;
 }
 
+/* In the narrowest form a statement also breaks INSIDE its badge rather than
+ * being cut at the badge's edge: the text of a truncation notice is the
+ * warning itself, and an ellipsis would drop the count the developer needs.
+ * The badge stays capped at its section's width (the chip rule), so its lines
+ * break at word boundaries within it — and, for a word longer than the row,
+ * anywhere — and the badge grows by a line instead of widening the bar. In the
+ * default bar the chip rule's single line stands, clipped at the badge's own
+ * edge, so it still cannot widen the bar. */
+.dg-toolbar--wrap .dg-toolbar__status > .dg-badge {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /* ==========================================================================
  * layout/SummaryHeader.tsx
  *
@@ -2613,10 +2726,32 @@
   padding: var(--dg-space-4);
 }
 
+/* The title and, on a later generation of the document, its version beside
+ * it. Wrapping rather than truncating: a title too long for one line takes the
+ * row and wraps inside the heading, and the version drops beneath it. */
+.dg-summary-header__title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+}
+
 .dg-summary-header__title {
   min-inline-size: 0;
   color: var(--dg-text-primary);
   font: var(--dg-heading);
+}
+
+/* The version badge and the sentence naming the version it updates. Their type
+ * roles and colours are the `Badge` and `Text` primitives'; this rule only keeps
+ * the pair together on the title's baseline. */
+.dg-summary-header__version {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
 }
 
 /* The headline is prose, not evidence: secondary colour and an italic face, so
@@ -2632,6 +2767,16 @@
  * colour, and the word carries the meaning. */
 .dg-summary-header__confidence {
   font: var(--dg-text-xs);
+}
+
+/* A cause's visible "Confidence" label and its level badge, kept on one line
+ * together when the row wraps, so the level word is never separated from the
+ * word that says what it ranks. */
+.dg-summary-header__confidence-group {
+  display: inline-flex;
+  flex: none;
+  align-items: baseline;
+  gap: var(--dg-space-1);
 }
 
 /* The slot a suggested location's `SourceLink` sits in. */
@@ -2904,9 +3049,9 @@
   font: var(--dg-text-xs);
 }
 
-/* The keyboard-reachable text equivalent of an SVG canvas: the canvas is
- * `role="img"` and cannot be entered, so the same records are listed in a
- * `DataTable` beneath it. It may shrink below its content like the view it
+/* The keyboard-reachable text equivalent of an SVG canvas: a canvas cannot be
+ * entered with a keyboard, because its marks are not focusable, so the same
+ * records are listed in a `DataTable` beneath it. It may shrink below its content like the view it
  * describes, so a long identifier truncates in its cell instead of widening
  * the panel. */
 .dg-timeline__equivalent,
@@ -2945,11 +3090,13 @@
 /* Every SVG canvas in the package. `display: block` removes the inline
  * baseline gap under it.
  *
- * No canvas is measured: each is drawn in a fixed logical coordinate space
- * (`utils/scale.ts`, "Canvas width"), so its drawing is a pure function of the
- * data. `max-inline-size: none` lifts base.css's cap on every `svg`, which
- * would otherwise scale a canvas down to its container past the minimum each
- * one sets below. */
+ * The flame view and the dependency graph are drawn in a fixed logical
+ * coordinate space (`utils/scale.ts`, "Canvas width"), so each drawing is a
+ * pure function of the data; the timeline is laid out at its canvas's measured
+ * width, one user unit to a CSS pixel, with that fixed space as its fallback
+ * until a width is measured (components/Timeline.tsx). `max-inline-size: none`
+ * lifts base.css's cap on every `svg`, which would otherwise scale a canvas
+ * down to its container past the minimum each one sets below. */
 .dg-timeline__canvas,
 .dg-flame__canvas,
 .dg-dependency-graph__canvas {
@@ -2958,17 +3105,23 @@
   max-inline-size: none;
 }
 
-/* The two time charts declare a viewBox `CHART_VIEWBOX_WIDTH` units wide with
- * `width="100%"` and `preserveAspectRatio="xMinYMin meet"`, so CSS scales the
- * drawing uniformly to its section. `inline-size: var(--dg-size-full)` makes
- * the element as wide as its viewport and `block-size: auto` lets its height
- * follow the viewBox's aspect ratio, so the drawing fills the element with no
- * blank band beneath or beside it; the `height` attribute is only the
- * intrinsic fallback. The labels inside are set in a type role and scale with
- * the drawing, so the minimum is what keeps them legible on a narrow panel:
- * below it the canvas stops shrinking and its viewport scrolls horizontally
- * instead. That minimum, `--dg-chart-min-inline-size`, keeps an 11-unit label
- * above eight pixels.
+/* The two time charts declare `width="100%"` and
+ * `preserveAspectRatio="xMinYMin meet"`. `inline-size: var(--dg-size-full)`
+ * makes the element as wide as its viewport and `block-size: auto` lets its
+ * height follow the viewBox's aspect ratio, so the drawing fills the element
+ * with no blank band beneath or beside it; the `height` attribute is only the
+ * intrinsic fallback. Below `--dg-chart-min-inline-size` the canvas stops
+ * shrinking and its viewport scrolls horizontally instead, so the time axis
+ * keeps room for its bars and tick labels on a narrow panel.
+ *
+ * The flame view's viewBox is `CHART_VIEWBOX_WIDTH` units wide, so CSS scales
+ * that drawing — its labels included — uniformly to the element, and the
+ * minimum is also what keeps its 11-unit labels above eight pixels. The
+ * timeline's viewBox is the element's own measured width, so the same two
+ * declarations render it one unit to a pixel: its labels stay at their type
+ * role's size at every panel width, and its height is its lanes' height,
+ * never a width-scaled one that pushes the lower lanes out of the viewport's
+ * scroll cap.
  *
  * The dependency graph is not in this rule: it declares its own deterministic
  * logical size as its `width` and `height`, one unit to a CSS pixel, so its
@@ -3109,7 +3262,31 @@
 }
 
 .dg-timeline__detail-rest > .dg-stack {
+  flex: auto;
+  flex-grow: 0;
+  min-inline-size: 0;
+}
+
+/* Every item of the trailing run keeps its width except the lineage note, the
+ * one item long enough to overflow the strip. */
+.dg-timeline__detail-rest > .dg-stack > .dg-stack__items > :not(.dg-timeline__detail-note) {
   flex: none;
+}
+
+/* The lineage note in the trailing run: the one item that gives way when the
+ * strip is narrow, cut with a visible ellipsis rather than clipped mid-word, so
+ * a reader can see the sentence continues. Its whole text, the other candidate
+ * parents included, stays reachable in full (the component pairs it with a
+ * tooltip outside the clipped run, and the table row's description carries
+ * it). */
+.dg-timeline__detail-note {
+  display: block;
+  flex: auto;
+  flex-grow: 0;
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dg-timeline__lanes {
@@ -3161,8 +3338,9 @@
   stroke: var(--dg-text-primary);
 }
 
-/* No focus rule: the canvas is `role="img"` and its bars are not focusable, so
- * the keyboard reads them in the table beneath it, whose rows carry the ring. */
+/* No focus rule: the bars are named images a screen reader can browse but not
+ * focusable controls, so the keyboard reads them in the table beneath the
+ * canvas, whose rows carry the ring. */
 .dg-timeline__bar.dg-is-selected {
   stroke: var(--dg-accent);
   stroke-width: var(--dg-stroke-width-emphasis);
@@ -3273,6 +3451,24 @@
   stroke-width: var(--dg-stroke-width-emphasis);
 }
 
+/* A '+N' mark: the operations of one lane row that overlap more deeply than the
+ * lane draws sub-rows for, gathered into one outlined band instead of being
+ * painted over one another. The surface fill and the relationship-edge stroke
+ * (which clears 3:1 on every surface) keep it from reading as a span of any
+ * kind; every operation it gathers is still a row of the table beneath. */
+.dg-timeline__overflow {
+  fill: var(--dg-surface-overlay);
+  stroke: var(--dg-graph-edge);
+  stroke-width: var(--dg-stroke-width-hairline);
+}
+
+.dg-timeline__overflow-label {
+  fill: var(--dg-text-secondary);
+  font: var(--dg-mono-sm);
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
 /* ==========================================================================
  * components/Waterfall.tsx
  *
@@ -3282,44 +3478,63 @@
  * the rows scroll together in `__viewport`; the footer sits below it.
  * ========================================================================== */
 
-/* The scroll viewport the axis and the tree of rows share. The footer is
- * outside it, so the counts and the paging controls never scroll out of reach.
+/* The scroll viewport the axis and the tree of rows share, and the ONE grid
+ * every row of the chart is laid out on. The footer is outside it, so the
+ * counts and the paging controls never scroll out of reach.
  *
- * The row rule below floors the time track, so every row has a minimum inline
- * size; a panel narrower than that scrolls here, horizontally, rather than
- * squeezing the axis labels into each other or spilling tracks past the rows
- * that hold them. One grid column holds both children: never narrower than the
- * widest row's minimum (`min-content`), otherwise the viewport's whole width
- * (`--dg-column-share-default`). So the axis row and the top-level rows always
- * share one inline size — scrolling changes nothing about how the strip lines
- * up with their tracks — and each row's background, state edge and focus ring
- * span its tracks rather than stopping short of an overflowing one. A row
- * pulls its focus ring inward, so the scroll edge never clips it, and an open
- * description bubble is fixed to the browser viewport (primitives/Tooltip), so
- * the scroll container does not clip it either. `min-inline-size: 0` lets the
- * viewport itself narrow with the panel. */
+ * Three tracks — the label, the time track and the duration — declared here
+ * once, and adopted as a SUBGRID by the axis row, the tree, every child group
+ * and every row (the rules below), so every row's time track starts and ends
+ * at exactly the same place as the axis strip's, however long its duration
+ * figure and however deeply it is nested. A per-row grid could not promise
+ * that: each row sized its own duration column to its own figure and so moved
+ * its track, and an indented child group narrowed the whole of every row
+ * inside it, so a child that started at the same instant as its parent was
+ * drawn to the right of it.
+ *
+ * - The time track is floored at the design strip Waterfall.tsx fits its tick
+ *   labels to (`AXIS_DESIGN_WIDTH_EM`, fourteen ems of the `xs` role: 154 px at
+ *   its 11 px), so the tick set fitted to that strip is never drawn on a
+ *   narrower one, where its labels would collide. That floor is
+ *   `--dg-waterfall-axis-min-inline-size` (168 px), which clears the strip, and
+ *   Waterfall.test.tsx holds the two together in every theme.
+ * - The duration track is `max-content` of the whole chart, so it is exactly as
+ *   wide as the widest figure drawn in it — the axis's window extent, or a
+ *   pending call's "at least …" — and the same width in every row.
+ * - The label track's minimum is `auto`: the widest minimum any row's name
+ *   column declares plus that row's own inset (its padding and marker edge, and
+ *   one indent per nesting level, which a subgrid adds to its edge tracks). A
+ *   name column never holds less than its token floor (`.dg-waterfall__name`),
+ *   so its label and chips never paint across the time track at any depth.
+ *
+ * Above their floors the label and the time track divide the spare width in
+ * the waterfall's own shares, `--dg-waterfall-label-share` against
+ * `--dg-waterfall-bar-share`. A panel narrower than the sum of the floors
+ * scrolls here, horizontally, rather than squeezing the axis labels into each
+ * other or spilling a track past the row that holds it, and the axis and the
+ * rows scroll as one. Each row's background, state edge and focus ring span
+ * all three tracks. A row pulls its focus ring inward, so the scroll edge
+ * never clips it, and an open description bubble is fixed to the browser
+ * viewport (primitives/Tooltip), so the scroll container does not clip it
+ * either. `min-inline-size: 0` lets the viewport itself narrow with the panel.
+ * The column gap is declared here, on the grid that owns the tracks, and
+ * matches the row's own, so no subgrid shifts an item against its track. */
 .dg-waterfall__viewport {
   display: grid;
-  grid-template-columns: minmax(min-content, var(--dg-column-share-default));
+  grid-template-columns:
+    [full-start] minmax(auto, var(--dg-waterfall-label-share))
+    minmax(var(--dg-waterfall-axis-min-inline-size), var(--dg-waterfall-bar-share))
+    max-content [full-end];
+  column-gap: var(--dg-space-2);
   min-inline-size: 0;
 }
 
-/* The time track is floored at the design strip Waterfall.tsx fits its tick
- * labels to (`AXIS_DESIGN_WIDTH_EM`, fourteen ems of the `xs` role: 154 px at
- * its 11 px), so the tick set fitted to that strip is never drawn on a
- * narrower one, where its labels would collide. The axis row uses this same
- * grid, so its strip takes the same floor as the bars' tracks. That floor is
- * `--dg-waterfall-axis-min-inline-size` (168 px), which clears the strip, and
- * Waterfall.test.tsx holds the two together in every theme. Above their
- * floors the label and the time track divide the spare width in the
- * waterfall's own shares, `--dg-waterfall-label-share` against
- * `--dg-waterfall-bar-share`. */
+/* One row of the chart — a call, or the axis — on the viewport's three tracks
+ * (see above), spanning all of them. */
 .dg-waterfall__row {
   display: grid;
-  grid-template-columns:
-    minmax(0, var(--dg-waterfall-label-share))
-    minmax(var(--dg-waterfall-axis-min-inline-size), var(--dg-waterfall-bar-share))
-    max-content;
+  grid-template-columns: subgrid;
+  grid-column: full;
   align-items: center;
   gap: var(--dg-space-2);
   padding-block: var(--dg-space-0);
@@ -3353,13 +3568,18 @@
   border-inline-start-style: dashed;
 }
 
-/* A call whose telemetry reported failure: a danger edge. The row always shows
- * the word as well — its status-code chip, or an "Error" badge where no code
- * conveys the failure — so colour is never the only signal. Declared after the
- * orphan state (a failed re-attached call keeps the dash and takes the danger
- * colour) and before the selected state, whose accent edge still wins. */
+/* A call that failed — a failing response code, or a span that reported
+ * `error` — takes its outcome colour on the edge: the client-error or
+ * server-error token Waterfall.tsx hands the row as `--dgc-bar-color` from
+ * utils/color.ts (`outcomeColorVar`), which is also what its bar and its
+ * status chip are drawn in, so the three never disagree. The danger token is
+ * the fallback. The row always shows the word as well — its status-code chip,
+ * or an "Error" badge where no code conveys the failure — so colour is never
+ * the only signal. Declared after the orphan state (a failed re-attached call
+ * keeps the dash and takes the outcome colour) and before the selected state,
+ * whose accent edge still wins. */
 .dg-waterfall__row.dg-is-error {
-  border-inline-start-color: var(--dg-danger);
+  border-inline-start-color: var(--dgc-bar-color, var(--dg-danger));
 }
 
 .dg-waterfall__row.dg-is-selected {
@@ -3383,7 +3603,8 @@
 }
 
 /* `inset-inline-start` and `inline-size` are the component's, computed from the
- * time scale. */
+ * time scale. The colour is the row's `--dgc-bar-color`, inherited: the call's
+ * kind colour, or its outcome colour when it failed. */
 .dg-waterfall__bar {
   position: absolute;
   inset-block: 0;
@@ -3404,39 +3625,82 @@
   justify-self: end;
 }
 
-/* The child spans of an expanded row, indented on the elevated surface so the
- * nesting is visible without a second grid. The component writes both names
- * on the one `role="group"` element, and it renders the group only while its
- * row is expanded, so the `display` here never fights a `hidden` attribute. */
-.dg-waterfall__child-rows,
-.dg-waterfall__children {
+/* The full-value detail of an expanded row whose label the row abbreviates:
+ * the heading word over the whole value, below the row's three cells and
+ * across every track (`full-start` to `full-end`). The value wraps anywhere
+ * (`.dg-code--wrap`), so an unbroken URL or identifier neither widens the
+ * row's minimum nor runs out of it, and it is never a scroll box of its own —
+ * the treeitem is the row's only focus stop, so a box it would have to scroll
+ * would be out of the keyboard's reach. */
+.dg-waterfall__detail {
+  grid-column: full;
   display: flex;
   flex-direction: column;
+  gap: var(--dg-space-0);
+  min-inline-size: 0;
+  padding-block-end: var(--dg-space-1);
+}
+
+/* The child spans of an expanded row, on the elevated surface. The group is a
+ * subgrid of the viewport's tracks, like the rows inside it, so its indent is
+ * a subgrid's padding: it insets the LABEL track's content of every row it
+ * holds, one step per level, and moves no row's time track — a child that
+ * started with its parent is drawn exactly under it. The component writes both
+ * names on the one `role="group"` element (and on a continuation of a group
+ * whose row is outside the drawn window), and it renders the group only while
+ * its row is expanded, so the `display` here never fights a `hidden`
+ * attribute. */
+.dg-waterfall__child-rows,
+.dg-waterfall__children {
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: full;
   min-inline-size: 0;
   padding-inline-start: var(--dg-space-4);
   background: var(--dg-surface-elevated);
 }
 
-/* The `role="tree"` of top-level rows below the axis. */
+/* The `role="tree"` of top-level rows below the axis: a subgrid of the
+ * viewport's tracks, stacking its rows and groups one per grid row. */
 .dg-waterfall__rows {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: full;
   min-inline-size: 0;
 }
 
-/* The identity column: the expand toggle, the method badge and the label
- * slot. It may shrink below its content so the label truncates in place. */
+/* The identity column: the expand toggle, the method badge, the label slot and
+ * the row's chips — the status code, the call and row counts, the lineage
+ * notes and the source chip. Its floor is the label's, so the label track is
+ * never narrower than a readable run of the label at any nesting depth (see
+ * the viewport rule), and its items WRAP (Waterfall.tsx renders the column as
+ * a wrapping `Stack`): the label keeps its floor on its line while the chips
+ * that do not fit beside it move onto further lines in reverse order — the
+ * source chip first, then the lineage notes, then the counts and the status —
+ * instead of starving the label to nothing and painting across the time
+ * track. Every chip is
+ * capped at the column's width and clips inside its own edge (the chip rule
+ * under "Shared helpers"), so nothing in this column reaches the track. */
 .dg-waterfall__name {
-  min-inline-size: 0;
+  min-inline-size: var(--dg-column-min-ordinal);
 }
 
-/* The slot the label and its tooltip sit in. The component gives it its flex
- * basis; this makes it a row of its own, so the tooltip trigger inside is a
- * flex item that can shrink and the label's ellipsis engages. */
+/* The slot the label and its tooltip sit in: a zero flex basis that grows into
+ * whatever its line leaves, so the chips beside it keep their whole width and
+ * the label takes the rest — and a floor of its own, `--dg-column-min-ordinal`
+ * (eight characters), so when a line cannot give it that the chips wrap onto
+ * the next line rather than the label vanishing. A single line of `nowrap`
+ * text has an automatic minimum as wide as the whole string, which is what
+ * the floor replaces: the slot can end in an ellipsis at eight characters,
+ * but not overflow. It is a row of its own, so the tooltip trigger inside is
+ * a flex item that can shrink and the label's ellipsis engages. The full label
+ * is always in the row's tooltip and accessible name. */
 .dg-waterfall__label-slot {
   display: flex;
+  flex: auto;
+  flex-basis: 0;
   align-items: center;
-  min-inline-size: 0;
+  min-inline-size: var(--dg-column-min-ordinal);
 }
 
 /* The time axis is the header of the rows beneath it, composed from the row's
@@ -3501,8 +3765,8 @@
  * and grows toward its own text — the `max-content` ceiling — so free space is
  * shared out like water: pairs short enough to fit are shown whole, and only
  * the longest divide what remains and ellipsize, each at its own border. The
- * component sets the chip's text as its title, so a shortened pair is still
- * readable on hover. */
+ * component sets the chip's whole pair as its title, so a shortened pair is
+ * still readable on hover, and the row's detail holds it for the keyboard. */
 .dg-event-log__attr {
   flex: auto;
   flex-basis: 0;
@@ -3518,6 +3782,25 @@
  * and the strip never claims a record carries less than it does. */
 .dg-event-log__more {
   flex: none;
+}
+
+/* Where the host can open a record the count is a button, and the strip that
+ * holds it clips at its own box (it ellipsizes the chips), which coincides
+ * with the button's top, bottom and trailing edges. The ring is therefore
+ * pulled inward, like every other control a clipping box holds, so keyboard
+ * focus on it is drawn whole. */
+.dg-event-log__more:focus-visible {
+  outline-offset: var(--dg-space-inverse-0);
+}
+
+/* An expanded row's detail: one entry per primitive attribute, its key over
+ * its whole value in the design system's wrapping code block, which caps its
+ * own block size and scrolls. The detail row's single track is already
+ * `minmax(0, …)`; this keeps the column itself from being sized by a value's
+ * longest line, so every block wraps inside the row's width. */
+.dg-event-log__detail {
+  min-inline-size: 0;
+  color: var(--dg-text-primary);
 }
 
 /* ==========================================================================
@@ -3672,9 +3955,9 @@
   stroke: var(--dg-text-primary);
 }
 
-/* No focus rule: the canvas is `role="img"` and its frames are not focusable,
- * so the keyboard reads them in the tree beneath it, whose rows carry the
- * ring. */
+/* No focus rule: the frames are named images a screen reader can browse but
+ * not focusable controls, so the keyboard reads them in the tree beneath the
+ * canvas, whose rows carry the ring. */
 .dg-flame__frame.dg-is-selected {
   stroke: var(--dg-accent);
   stroke-width: var(--dg-stroke-width-emphasis);
@@ -3687,11 +3970,30 @@
   pointer-events: none;
 }
 
+/* A '+N' mark: the frames of one depth that overlap more deeply than the icicle
+ * draws sub-rows for, gathered into one outlined band so a depth crowded with
+ * near-simultaneous operations cannot push the deeper levels out of the
+ * viewport. The surface fill and the relationship-edge stroke keep it from
+ * reading as a frame of any kind; every frame it gathers is still a row of the
+ * tree beneath. */
+.dg-flame__overflow {
+  fill: var(--dg-surface-overlay);
+  stroke: var(--dg-graph-edge);
+  stroke-width: var(--dg-stroke-width-hairline);
+}
+
+.dg-flame__overflow-label {
+  fill: var(--dg-text-secondary);
+  font: var(--dg-mono-sm);
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
 /* The provenance note above the chart — what the widths mean, and what the
  * chart is not showing — is the grouped note rule of the shared section. */
 
-/* The chart's text equivalent. The canvas is `role="img"` and cannot be entered
- * with a keyboard, so the same frames are listed beneath it as a tree, one row
+/* The chart's text equivalent. The canvas's frames are named for a screen
+ * reader but cannot be entered with a keyboard, so the same frames are listed beneath it as a tree, one row
  * each, in the order the icicle draws them. The component mounts one page of
  * the tree at a time — at most sixty rows, the page holding its tab stop, with
  * a Previous/Next row pager laid out by `Stack` beneath it; nothing is
@@ -3839,24 +4141,32 @@
   color: var(--dg-text-secondary);
 }
 
-.dg-render-table__trigger--props,
-.dg-render-table__trigger--state,
-.dg-render-table__trigger--context {
-  border-color: var(--dg-info);
-  color: var(--dg-info);
+/* A render-trigger chip, drawn identically by the render table and the
+ * component tree. Its label and hairline take the trigger's own hue, which
+ * `Badge` receives as `color` from `utils/color.ts` (`renderTriggerAppearance`):
+ * a distinct hue per input (props, state, context), the warning colour for
+ * `unchanged`, and the muted colour for `unknown` and for any bucket that
+ * holds nothing. Unlike a span-kind fill, every trigger hue clears the 4.5:1
+ * text minimum on every surface of every theme (utils/color.test.ts), so it may
+ * paint the label. Two classes, so the rule outranks the badge's single-tone
+ * compound rules declared above it. */
+.dg-badge.dg-trigger-chip {
+  border-color: var(--dgc-badge-color, var(--dg-border-strong));
+  color: var(--dgc-badge-color, var(--dg-text-secondary));
 }
 
-.dg-render-table__trigger--unchanged {
-  border-color: var(--dg-warning);
-  color: var(--dg-warning);
-}
-
-/* Nothing is claimed: muted, and a dashed hairline so the distinction from
- * `unchanged` survives a monochrome surface. */
-.dg-render-table__trigger--unknown {
+/* Nothing is claimed: a dashed hairline, so the distinction between `unknown`
+ * and `unchanged` survives a monochrome surface, in both views. */
+.dg-badge.dg-trigger-chip--dashed {
   border-style: dashed;
-  border-color: var(--dg-border-strong);
-  color: var(--dg-text-muted);
+}
+
+/* A bucket that holds nothing recedes: its label keeps the muted colour, and
+ * its hairline drops to the subtle border, so an empty chip never reads like a
+ * populated one — not even a populated `unknown` bucket, which shares the
+ * muted label colour. */
+.dg-badge.dg-trigger-chip--idle {
+  border-color: var(--dg-border-subtle);
 }
 
 .dg-render-table__changed-props {
@@ -4052,22 +4362,42 @@
 }
 
 /* The grouping chip ("Request key") is the identity row's last slot and keeps
- * its width: when the Request column is tight it is the URL before it that
- * ellipsizes — its full value is one hover or focus away in its tooltip —
- * so the chip always names how the group was keyed. */
+ * its width, so it always names how the group was keyed: in a tight Request
+ * column it wraps under the URL (see the URL slot below) rather than being cut
+ * or taking the URL's readable run. */
 .dg-request-table__group-row > .dg-stack__items > :last-child {
   flex: none;
 }
 
-/* The URL's slot starts from a zero basis and grows to its own content and no
- * further, so it takes only the width the toggle, the method and the chip
- * leave: a row that fits reads exactly as one whose URL simply shrank. A
- * Request column narrowed below even those three — the column narrowed to fit
- * its table — moves the chip onto a line of its own instead of cutting it at
- * the cell's edge; the wrap is only ever reached then, because the URL's zero
- * basis never pushes anything onto a second line. The URL keeps at least one
- * glyph square (`--dg-icon-size`), the room its ellipsis needs, so the chip
- * wraps before the URL could shrink to a sliver of its first letter. */
+/* The URL has priority over the grouping chip. Its slot's basis is the
+ * readable run a `text` column guarantees even when it yields — its floor
+ * scaled by `--dg-column-yield`, the Request column's own minimum — clamped to
+ * the URL's own width by `max-inline-size: max-content`, so a short URL claims
+ * no more than itself, and it grows from there to its full content. The items
+ * wrap, and a flex line breaks on those bases: when the toggle, the method, a
+ * readable run of the URL and the chip do not fit on one line, the chip moves
+ * under the URL instead of cutting it to a few characters, and the URL takes
+ * the whole remaining line. A column narrower still moves the URL itself onto
+ * a line of its own. Only there can it shrink below that run, and never below
+ * one glyph square (`--dg-icon-size`), the room its ellipsis needs; its full
+ * value is one hover or focus away in its tooltip at every width. The slot
+ * takes the URL's own font, so the `ch` of that run counts the URL's
+ * characters rather than the narrower glyphs of the cell's text; the URL and
+ * the tooltip bubble each declare their own font, so nothing drawn changes.
+ *
+ * A short URL is not cut to that run. When the URL's own width (`size`, its
+ * max-content) is within the unscaled text floor `--dg-column-min-text`, the
+ * basis is that whole width, so a line that cannot hold the URL beside the
+ * chip moves the chip — never a character of an `/api/items/related?id=?` —
+ * and a URL of up to that floor is shown whole wherever its line can hold it.
+ * A longer URL keeps the readable run as its basis, exactly as before. The
+ * switch is a step, not a blend: `(floor - size)` scaled by
+ * `--dg-column-yield-return-scale`, the same steep ramp the grid's own
+ * column-yield step uses, is far above any URL width while `size` is under
+ * the floor and negative past it, so `max()` picks the run for a long URL and
+ * `min()` the URL's own width for a short one. `calc-size()` is what lets a
+ * basis compute from the content's width; the plain run declared first is
+ * the basis wherever `calc-size()` is not understood. */
 .dg-request-table__group-row > .dg-stack__items {
   flex-wrap: wrap;
 }
@@ -4075,8 +4405,19 @@
 .dg-request-table__group-row
   > .dg-stack__items
   > :has(> .dg-tooltip__trigger > .dg-request-table__url) {
+  font: var(--dg-mono-md);
   flex: auto;
-  flex-basis: 0;
+  flex-basis: calc(var(--dg-column-min-text) * var(--dg-column-yield));
+  flex-basis: calc-size(
+    max-content,
+    min(
+      size,
+      max(
+        calc(var(--dg-column-min-text) * var(--dg-column-yield)),
+        (var(--dg-column-min-text) - size) * var(--dg-column-yield-return-scale)
+      )
+    )
+  );
   min-inline-size: var(--dg-icon-size);
   max-inline-size: max-content;
 }
@@ -4156,11 +4497,13 @@
   min-inline-size: 0;
 }
 
-/* The composite cells — the duplicate badge beside its count, the initiating
- * components' chips — and the expanded list of occurrences. Each is a
- * `layout/Stack`, which owns its axis and gap; these only let it shrink with
- * its column so a long chip truncates instead of widening the table. */
+/* The composite cells — the duplicate badge beside its count, a group's
+ * labelled duration figures, the initiating components' chips — and the
+ * expanded list of occurrences. Each is a `layout/Stack`, which owns its axis
+ * and gap; these only let it shrink with its column so a long chip truncates,
+ * and a figure wraps under its label, instead of widening the table. */
 .dg-request-table__duplicates,
+.dg-request-table__durations,
 .dg-request-table__initiators,
 .dg-request-table__occurrences {
   min-inline-size: 0;

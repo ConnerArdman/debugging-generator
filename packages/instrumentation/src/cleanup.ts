@@ -43,6 +43,25 @@
  * failure. Step 7 after step 5 is the other half: a backup deleted before the
  * restored content verified would leave a file nobody can prove is original.
  *
+ * ## A conflict is judged again on every pass
+ *
+ * A record's `conflict` status says what its file held when the divergence was
+ * seen — by the live watcher, or by an earlier pass — not what it holds now,
+ * so a record already in `conflict` goes through step 2 exactly like every
+ * other record (AAP §0.5.1: "a file whose current hash equals
+ * `instrumentedHash` is restored from the backup; a file that differs is left
+ * untouched"):
+ *
+ * ```text
+ * file hashes to instrumentedHash again  → restored from the backup (the developer undid their edit)
+ * file hashes to originalHash            → closed without a write (nothing is left to restore)
+ * file holds anything else               → left exactly as it is, backup kept, report renewed
+ * ```
+ *
+ * Only the third line keeps the record in `conflict`, and only it keeps the
+ * backup: a conflict backup survives for exactly as long as the divergence it
+ * was kept for.
+ *
  * ## Chains across plan versions
  *
  * A follow-up question can produce plan version *n + 1* whose delta patches a
@@ -187,11 +206,7 @@ import type {
   RecordedBackup,
 } from './patch/backup-store.js';
 import { buildConflictReport, detectConflict, isConflictVerdict } from './patch/conflict.js';
-import type {
-  ConflictDetectionContext,
-  ConflictFileReader,
-  ConflictVerdict,
-} from './patch/conflict.js';
+import type { ConflictDetectionContext, ConflictFileReader } from './patch/conflict.js';
 
 // ---------------------------------------------------------------------------
 // The vocabulary a pass reports in.
@@ -377,7 +392,12 @@ const STORED_DIGEST_MISMATCH = 'stored-digest-mismatch' satisfies BackupStoreFai
  *   that is no longer ours means something outside this product changed it, and
  *   the conservative answer is to tell the developer rather than to close the
  *   record quietly.
- * - `retain` — leave everything exactly as it is, keep the backup, re-report.
+ * - `retain` — the record is already in `conflict`, so it is judged again
+ *   rather than assumed: restored when the file holds our content once more
+ *   (the developer undid their edit), closed without a write when it holds the
+ *   recorded original, and otherwise left exactly as it is with its backup
+ *   kept and its report renewed. The record was reported once already, so a
+ *   file back at the original has nothing left to lose or to report.
  * - `none` — nothing to do, and nothing is read: the record is finished
  *   business.
  */
@@ -402,7 +422,9 @@ export type ReconcileDisposition = (typeof RECONCILE_DISPOSITIONS)[number];
  *                    otherwise                  → conflict
  * applied            hash === instrumentedHash  → restore from the backup
  *                    otherwise                  → conflict
- * conflict           retained, backup kept, re-reported
+ * conflict           hash === instrumentedHash  → restore from the backup (the edit was undone)
+ *                    hash === originalHash      → close the record (nothing was written)
+ *                    otherwise                  → retained, backup kept, re-reported
  * reverted           nothing to do
  * ```
  *
@@ -417,8 +439,9 @@ export type ReconcileDisposition = (typeof RECONCILE_DISPOSITIONS)[number];
  * The same table governs both entry points. `session.end` is not a special
  * case: a session's records are usually all `applied`, but one left `pending`
  * by a crash mid-install gets the three-way branch it needs, and one already
- * `conflict` keeps its backup instead of being restored over the developer's
- * edit.
+ * `conflict` keeps its backup while the developer's edit is still there — and
+ * is restored the moment it is not, because the watcher that marked it only
+ * ever sees the edit, never its undoing.
  *
  * @param status The record's current status.
  * @returns What a pass may do with it.
@@ -444,6 +467,24 @@ export function reconcileDispositionFor(status: ModificationStatus): ReconcileDi
         'A modification status reached cleanup that the reconciliation table does not cover. Add the case to reconcileDispositionFor() in packages/instrumentation/src/cleanup.ts.',
       );
   }
+}
+
+/**
+ * Whether a disposition closes a record, without a write, whose file already
+ * holds the recorded original — the `hash === originalHash` line of the table
+ * above.
+ *
+ * `restore-or-close` does, because for a `pending` or `failed` record the write
+ * may never have landed. `retain` does, because a record already in `conflict`
+ * has been reported once and a file that is now byte-identical to its original
+ * has nothing left to lose or to report. `restore-only` does not: for an
+ * `applied` record that state is news the developer is told about first.
+ *
+ * @param disposition What the record's status entitles it to.
+ * @returns Whether a pristine target closes the record.
+ */
+function closesPristineTarget(disposition: ReconcileDisposition): boolean {
+  return disposition === 'restore-or-close' || disposition === 'retain';
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +847,8 @@ export interface RestoreModificationOptions {
    *
    * This is the one place the reconciliation table's three-way branch differs
    * from its two-way one, and {@link reconcileDispositionFor} is what chooses:
-   * `restore-or-close` passes `true`, `restore-only` leaves it `false`. A
+   * `restore-or-close` and `retain` pass `true`, `restore-only` leaves it
+   * `false`. A
    * caller driving a single record — `./installer.ts` unwinding a delta it just
    * applied — wants the default, because for a record it knows it applied, a
    * file that is no longer ours is news.
@@ -1069,17 +1111,19 @@ export interface ReconcileOutcome {
  * The restore-versus-conflict comparison is `./patch/conflict.ts`'s and is
  * consulted, never repeated: this function reads the verdict and acts. What it
  * adds is the acting — the write, the verification, the journal transition and
- * the backup's disposal — plus two readings of the verdict that only a restorer
- * can make:
+ * the backup's disposal — plus three readings of the verdict that only a
+ * restorer can make:
  *
  * - **A missing target is not a conflict when the backup is intact.** The
  *   guarantee is about the bytes: a file the developer deleted, renamed or
  *   moved is recreated from its verified backup and the outcome reports
  *   `recreated`.
- * - **A record that is already in `conflict`** is re-reported and nothing is
- *   written, whatever the file now holds: closing a conflict is the developer's
- *   decision, and the report is recomposed from the file as it stands so the
- *   diff they are offered is current.
+ * - **A record that is already in `conflict`** is judged on the file as it
+ *   stands now, exactly like any other record: restored when the developer has
+ *   undone their edit and the file hashes to `instrumentedHash` again (the
+ *   journal moves it `conflict → reverted`), closed without a write when it
+ *   hashes to `originalHash`, and otherwise re-reported with nothing written,
+ *   the report recomposed so the diff they are offered is current.
  * - **A target that already holds the recorded original** is either closed
  *   without a write or reported, depending on
  *   {@link RestoreModificationOptions.closeWhenTargetIsOriginal} — which
@@ -1093,8 +1137,10 @@ export interface ReconcileOutcome {
  * does not hash to its own name, a restore whose result does not verify: each
  * returns `ok` with `kind: 'conflict'`, the report in
  * {@link RestoreOutcome.conflict}, **nothing written and the backup kept**. The
- * record is moved to `conflict` so the next service start re-reports it until
- * the developer resolves it. `err` is reserved for the conditions that make the
+ * record is moved to `conflict`, and every later pass — the next service start
+ * included — judges it again: it is re-reported for as long as the divergence
+ * lasts, and restored or closed once the file is back at a recorded digest.
+ * `err` is reserved for the conditions that make the
  * question unanswerable, and each of them also leaves the file and the backup
  * exactly as they were:
  *
@@ -1152,7 +1198,7 @@ export async function restoreModification(
     now: clockReading(context, logger),
     disposition,
     closeWhenTargetIsOriginal:
-      options.closeWhenTargetIsOriginal ?? disposition === 'restore-or-close',
+      options.closeWhenTargetIsOriginal ?? closesPristineTarget(disposition),
     retainBackup: options.retainBackup ?? false,
     conflictMessage: options.conflictMessage,
   });
@@ -1511,6 +1557,18 @@ export async function cleanupSession(
  * patched is recoverable, while writing one project's content into another is
  * not.
  *
+ * ## Housekeeping
+ *
+ * The same as {@link cleanupSession}'s, per session: each backup is deleted
+ * only after its restored content verified, a shared one once its last holder
+ * is done, and a session this pass reverted at least one record of and left
+ * nothing of outstanding — no retained or skipped record, no conflict, no
+ * refused fork, no failure — then has its emptied backup directory removed
+ * through the store its records were restored with. A session with anything
+ * still open keeps its directory whole, because that copy is the one the
+ * developer was pointed at. A directory that cannot be removed is a warning,
+ * never a failure of the pass: the files are already back.
+ *
  * Never rejects and never throws.
  *
  * @param context See {@link restoreModification}.
@@ -1573,6 +1631,7 @@ export async function reconcileModifications(
   // answer, so the disposition table filters rather than trusting the query.
   const work = wanted.filter((record) => reconcileDispositionFor(record.status) !== 'none');
   const ledger = new BackupLedger();
+  const stores = new Map<string, BackupStore>();
 
   ledger.register(work);
 
@@ -1583,6 +1642,7 @@ export async function reconcileModifications(
     scope: undefined,
     scopeFor: options.scopeFor,
     conflictMessage: options.conflictMessage,
+    stores,
   };
 
   for (const group of groupsInReverseApplicationOrder(work, true)) {
@@ -1601,6 +1661,20 @@ export async function reconcileModifications(
   }
 
   await ledger.sweep(logger);
+
+  // After the sweep, so every deferred deletion has run through its verified
+  // route before a directory is asked to empty.
+  await removeSettledSessionDirectories(
+    {
+      reverted: [...restored, ...closed],
+      conflicts,
+      forks,
+      outstanding: [...retained, ...skipped],
+      failures,
+    },
+    stores,
+    logger,
+  );
 
   const status = statusFor({
     conflicts,
@@ -1664,6 +1738,17 @@ interface PassSettings {
 
   /** The developer-facing conflict wording, when the caller authored one. */
   readonly conflictMessage: string | undefined;
+
+  /**
+   * The backup store each session's records were placed with, filled as the
+   * walk resolves a record's scope.
+   *
+   * Only {@link reconcileModifications} collects them: it spans sessions, and
+   * after the walk it removes the backup directory of every session it left
+   * clean through the very store that session's records were restored with,
+   * never one composed afresh. Absent for a pass that removes no directory.
+   */
+  readonly stores?: Map<string, BackupStore> | undefined;
 }
 
 /** What restoring one record needs. */
@@ -1855,6 +1940,8 @@ async function restoreFileChain(
       continue;
     }
 
+    pass.stores?.set(record.sessionId, scope.value.backups);
+
     const disposition = reconcileDispositionFor(record.status);
     const result = await restoreOne(record, context, {
       scope: scope.value,
@@ -1862,7 +1949,7 @@ async function restoreFileChain(
       logger: pass.logger,
       now: clockReading(context, pass.logger),
       disposition,
-      closeWhenTargetIsOriginal: disposition === 'restore-or-close',
+      closeWhenTargetIsOriginal: closesPristineTarget(disposition),
       retainBackup: pass.ledger.holds(record),
       conflictMessage: pass.conflictMessage,
     });
@@ -2131,6 +2218,13 @@ async function refuseForkedChain(
  * Shared by {@link restoreModification} and {@link restoreFileChain} so that a
  * record restored on its own and a record restored as part of a chain take
  * exactly the same steps in exactly the same order.
+ *
+ * A record already in `conflict` (disposition `retain`) takes the same branch
+ * as every other record, because the verdict — not the status — says what the
+ * file holds now: `restorable` once the developer's edit is undone,
+ * `already-reverted` once the file is back at the original, and a conflicting
+ * verdict while the edit is still there. Only the last keeps it in `conflict`;
+ * {@link recordConflict} then renews its report without a journal write.
  */
 async function restoreOne(
   record: ModificationRecord,
@@ -2163,8 +2257,18 @@ async function restoreOne(
 
   const judgement = verdict.value;
 
-  if (settings.disposition === 'retain') {
-    return await retainRecord(record, judgement, path, context, settings);
+  if (settings.disposition === 'retain' && !isConflictVerdict(judgement)) {
+    // The conflict described the file as it was when the divergence was seen.
+    // It now hashes to a recorded digest again — the developer undid the edit,
+    // or put the original back by hand — so the verdict authorises exactly what
+    // it would for any other record, and the journal takes the record out of
+    // `conflict` (`conflict → reverted`) once that is done and verified.
+    settings.logger.info('a conflicted file holds a recorded digest again; it is re-judged', {
+      recordId: record.id,
+      sessionId: record.sessionId,
+      file: record.file,
+      verdict: judgement.kind,
+    });
   }
 
   switch (judgement.kind) {
@@ -2574,39 +2678,6 @@ async function closeRecord(
     conflict: undefined,
     completedAt: settings.now,
   });
-}
-
-/**
- * Re-reports a record that is already in conflict, without touching anything.
- *
- * The reconciliation table's `conflict` row: retained, backup kept and
- * re-reported on every pass until the developer resolves it. The report is
- * recomposed from the file as it stands now rather than cached, so the diff the
- * developer is offered describes the divergence that exists today; where the
- * file has since come back to either recorded digest, the report says so and
- * the record still stays open, because closing a conflict is the developer's
- * decision and not this module's.
- */
-async function retainRecord(
-  record: ModificationRecord,
-  judgement: ConflictVerdict,
-  path: string,
-  context: CleanupContext,
-  settings: RestoreSettings,
-): Promise<Result<RestoreOutcome>> {
-  if (isConflictVerdict(judgement)) {
-    return await recordConflict(record, judgement.conflict, path, context, settings);
-  }
-
-  return await reportSynthesizedConflict(
-    record,
-    path,
-    'content-changed',
-    judgement.actualHash,
-    retainedConflictMessage(record, judgement.actualHash === record.originalHash),
-    context,
-    settings,
-  );
 }
 
 /**
@@ -3208,7 +3279,110 @@ async function removeSessionBackups(
     return;
   }
 
-  const removed = await store.removeSessionDirectory();
+  await removeBackupDirectory(store, logger);
+}
+
+/** What a finished reconciliation pass left behind, per record, for its housekeeping. */
+interface SettledPass {
+  /** Every record the pass restored or closed. */
+  readonly reverted: readonly ModificationRecord[];
+
+  /** Every conflict report the pass produced or renewed. */
+  readonly conflicts: readonly ModificationConflict[];
+
+  /** Every file refused because its records do not form a single chain. */
+  readonly forks: readonly ChainFork[];
+
+  /** Every record the pass left open: retained ones and skipped ones alike. */
+  readonly outstanding: readonly ModificationRecord[];
+
+  /** Every failure, including one with no record attributed to it. */
+  readonly failures: readonly CleanupFailure[];
+}
+
+/**
+ * Removes the backup directory of every session a reconciliation pass left
+ * clean — the start-up counterpart of what {@link cleanupSession} does on
+ * `session.end`, so a session a crashed service never ended leaves no empty
+ * `$DEBUGGEN_HOME/backups/<sessionId>/` behind once its files are back.
+ *
+ * A session qualifies when the pass reverted at least one of its records and
+ * nothing of it is outstanding: no retained or skipped record, no conflict
+ * report, no refused fork and no failure names it. The pass is handed every
+ * open record of each session it covers, so that is the session's whole open
+ * set: every record of it is now `reverted`, every backup was deleted as its
+ * restore verified (or kept by a store refusal that was logged), and nothing
+ * left in the directory is the copy a developer was pointed at. A session
+ * with anything still open keeps its directory whole.
+ *
+ * The directory is removed through the store the session's records were
+ * restored with, which unlinks only the digest-named files it creates and the
+ * emptied directory itself, and refuses anything else. Sessions are visited in
+ * sorted id order, so the log reads the same for the same journal.
+ *
+ * @param pass What the pass left behind.
+ * @param stores The store each session's records were placed with.
+ * @param logger Where the pass logs; bound to each session in turn.
+ */
+async function removeSettledSessionDirectories(
+  pass: SettledPass,
+  stores: ReadonlyMap<string, BackupStore>,
+  logger: Logger,
+): Promise<void> {
+  const unsettled = new Set<string>([
+    ...pass.outstanding.map((record) => record.sessionId),
+    ...pass.conflicts.map((conflict) => conflict.sessionId),
+    ...pass.forks.map((fork) => fork.sessionId),
+    ...pass.failures.map((failure) => failure.sessionId),
+  ]);
+  const settled = new Set(
+    pass.reverted
+      .map((record) => record.sessionId)
+      .filter((sessionId) => !unsettled.has(sessionId)),
+  );
+
+  for (const sessionId of [...settled].sort()) {
+    const store = stores.get(sessionId);
+
+    // Every reverted record's scope was resolved, so its store is known; one
+    // that belongs to another session was refused before a byte was written.
+    if (store?.sessionId !== sessionId) {
+      continue;
+    }
+
+    await removeBackupDirectory(store, logger.child({ sessionId }));
+  }
+}
+
+/**
+ * Asks a session's store to remove its backup directory, and turns every way
+ * that can go wrong into one logged warning.
+ *
+ * Shared by {@link removeSessionBackups} and
+ * {@link removeSettledSessionDirectories}, the only two places a directory is
+ * removed. The store refuses to remove anything it did not create and reports
+ * what it retained; its `removeSessionDirectory` may also throw the runtime's
+ * own error for a directory it cannot list or remove. Both are logged rather
+ * than escalated — a leftover entry in the product's state directory is
+ * housekeeping, not a cleanup failure, and the session's files are already
+ * back — which keeps both passes true to "never rejects and never throws".
+ *
+ * @param store The session's backup store.
+ * @param logger Where to log, bound to the session.
+ */
+async function removeBackupDirectory(store: BackupStore, logger: Logger): Promise<void> {
+  let removed: Result<number>;
+
+  try {
+    removed = await store.removeSessionDirectory();
+  } catch (error) {
+    logger.warn('the session backup directory was not removed', {
+      errno: errnoCodeOf(error) ?? 'unknown',
+      directory: store.sessionDirectory,
+    });
+
+    return;
+  }
 
   if (isErr(removed)) {
     logger.warn('the session backup directory was not removed', {
@@ -3282,18 +3456,21 @@ class BackupLedger {
   >();
 
   /**
-   * Counts the records a pass is about to process, and pins the backups of the
-   * ones that arrive already in conflict — their backups are retained by
-   * definition.
+   * Counts the records a pass is about to process.
+   *
+   * Nothing is pinned up front — not even the backup of a record that arrives
+   * already in `conflict`, because such a record is judged again and one whose
+   * edit was undone is restored like any other, its backup then deleted as
+   * verified. Being counted as a holder is what keeps a digest it shares with
+   * another record alive until it has been answered for, and the walk pins its
+   * backup the moment it is not reverted — its outcome is still a conflict, it
+   * failed, it was skipped, or the walk never reached it — so a backup the
+   * developer is pointed at is never deleted.
    */
   register(records: readonly ModificationRecord[]): void {
     for (const record of records) {
       for (const key of ledgerKeys(record)) {
         this.holders.set(key, (this.holders.get(key) ?? 0) + 1);
-
-        if (record.status === 'conflict') {
-          this.pinned.add(key);
-        }
       }
     }
   }
@@ -3772,13 +3949,4 @@ function chainForkMessage(record: ModificationRecord, fork: ChainFork): string {
       : 'it has more than one open chain of modification records';
 
   return `${record.file} was not restored: ${shape}, so Debug Generator cannot tell which of them the file holds and did not write to it. Every backup was kept; this record's original is at ${record.backupPath} and the modification record is ${record.id}.`;
-}
-
-/** A conflict carried over from an earlier pass. */
-function retainedConflictMessage(record: ModificationRecord, matchesOriginal: boolean): string {
-  const state = matchesOriginal
-    ? 'the file now matches the original Debug Generator recorded'
-    : 'the file now matches the instrumented content Debug Generator wrote';
-
-  return `${record.file} has an unresolved conflict, so Debug Generator left it alone: ${state}. Resolve the conflict to close the record; the original is at ${record.backupPath}.`;
 }

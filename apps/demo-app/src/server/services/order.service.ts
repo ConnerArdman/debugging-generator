@@ -1084,25 +1084,24 @@ export async function listCustomerOrders(
 }
 
 /**
- * One order in full: its figures, its lines, the service it ships by and the
- * account it was placed against.
+ * One order in full, found by either of the two keys that name exactly one
+ * order: the identifier the store assigned it, or the reference printed on it.
  *
- * The lookup is by the order's own identifier, so nothing has to be searched
- * for, and the lines are read in a fixed order so the same order reads the same
- * way on every visit. The contact and the destination come from the order's own
- * columns, falling back to the account's contact and to {@link blank} for an
- * order written without a collected contact or destination.
+ * Both exported reads below are this one query and this one mapping, so an
+ * order opened by its identifier and the same order opened by its reference
+ * cannot be described differently - the same columns, the same lines in the
+ * same order, the same fallbacks for a contact or a destination the order never
+ * recorded. Each key is unique in the schema, which is what lets the lookup be a
+ * `findUnique` rather than a search.
  *
- * @param id The order's identifier.
+ * @param where The one unique key to find the order by.
  * @returns The order's full detail payload.
- * @throws StorefrontNotFoundError When no order owns the identifier. The
- * failure is an error rather than a `null` return so that every caller - a
- * route handler and a server component alike - reports it the one way, and the
- * message names no value the caller supplied.
+ * @throws StorefrontNotFoundError When no order owns the key. The message names
+ * no value the caller supplied.
  */
-export async function readOrderDetail(id: string): Promise<OrderDetail> {
+async function detailWhere(where: { id: string } | { orderNumber: string }): Promise<OrderDetail> {
   const row = await prisma.order.findUnique({
-    where: { id },
+    where,
     select: {
       id: true,
       orderNumber: true,
@@ -1162,6 +1161,52 @@ export async function readOrderDetail(id: string): Promise<OrderDetail> {
 }
 
 /**
+ * One order in full: its figures, its lines, the service it ships by and the
+ * account it was placed against.
+ *
+ * The lookup is by the order's own identifier, so nothing has to be searched
+ * for, and the lines are read in a fixed order so the same order reads the same
+ * way on every visit. The contact and the destination come from the order's own
+ * columns, falling back to the account's contact and to {@link blank} for an
+ * order written without a collected contact or destination.
+ *
+ * @param id The order's identifier.
+ * @returns The order's full detail payload.
+ * @throws StorefrontNotFoundError When no order owns the identifier. The
+ * failure is an error rather than a `null` return so that every caller - a
+ * route handler and a server component alike - reports it the one way, and the
+ * message names no value the caller supplied.
+ */
+export async function readOrderDetail(id: string): Promise<OrderDetail> {
+  return detailWhere({ id });
+}
+
+/**
+ * One order in full, found by the reference the store printed on it - the
+ * `LS-…` order number a buyer reads out, copies and finds in the address of
+ * their receipt.
+ *
+ * It is the read behind that address: `/checkout?order=…` names an order by
+ * its reference, because that is the value a buyer holds, and the page renders
+ * the receipt from what this returns. The answer is {@link readOrderDetail}'s
+ * in every respect - the same query, the same mapping - so an order read back by
+ * its reference is described exactly as it is everywhere else it is read.
+ *
+ * The reference is matched exactly as given. The caller decides what counts as
+ * a well-formed reference before it asks; a value no order carries is answered
+ * as not found, never as a near match.
+ *
+ * @param orderNumber The order's reference, such as `LS-2026-MUJ8HJ2CV31`.
+ * @returns The order's full detail payload.
+ * @throws StorefrontNotFoundError When no order carries the reference, for the
+ * reason {@link readOrderDetail} gives for throwing rather than returning
+ * `null`.
+ */
+export async function readOrderByNumber(orderNumber: string): Promise<OrderDetail> {
+  return detailWhere({ orderNumber });
+}
+
+/**
  * What the attempt of a given name did, as the store's records say: the cart it
  * claimed, and the order that cart became.
  *
@@ -1176,11 +1221,15 @@ export async function readOrderDetail(id: string): Promise<OrderDetail> {
  * * **`ABANDONED`.** The attempt is holding the cart - running now, or ended
  *   with an authorization that may stand against it - and no order was written.
  *   The cart comes back with `order: null`, which is never a statement that
- *   nothing was charged.
+ *   nothing was charged. A hold that outlived its attempt has given the
+ *   session's open-cart pointer up (`./cart.service` `vacate`, and its stale-hold
+ *   recovery), so the session shops on with another cart while this one stays
+ *   held under the name; the lookup below is by name, not by pointer, so it
+ *   answers for the held cart either way.
  * * **`ACTIVE`, or no cart at all.** The name holds nothing: the attempt never
- *   claimed a cart, or the cart it held has been reopened by hand for the
- *   customer to shop with again. That is `null`, the same answer a name nobody
- *   has used gets.
+ *   claimed a cart, or put the cart back having taken nothing, or the store
+ *   settled the hold by hand and reopened the cart. That is `null`, the same
+ *   answer a name nobody has used gets.
  *
  * The cart is addressed by the session's own token as well as by the name, so
  * what this returns is only ever the order of a cart the caller was already

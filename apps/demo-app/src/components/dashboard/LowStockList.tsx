@@ -18,7 +18,9 @@
  * arrive, in what order or how many: the server's low-stock query orders its page by how far each
  * line has fallen below its point and bounds its size, so this component renders `rows` exactly as
  * given - no sorting, no slicing, no filtering, and therefore no second, disagreeing definition of
- * "urgent" between the dashboard and the query behind it.
+ * "urgent" between the dashboard and the query behind it. How many lines matched in full is the
+ * server's count as well: when it is larger than the rows given, the list says under its heading
+ * that it shows the most urgent of that many, so a bounded list never reads as a complete one.
  *
  * COLOUR IS NEVER THE MESSAGE
  * Each row carries a `ui/Badge` whose text names the state in words, and the quantity is printed
@@ -190,6 +192,14 @@ interface Props {
    */
   threshold: number;
 
+  /**
+   * How many lines the filters matched as low in full (`InventorySummary.lowStockCount`), of which
+   * `rows` is the most urgent few. When it is larger than the rows given, the list states the
+   * relation under its heading ("Showing the 12 most urgent of 130 lines"); when it is not, or it
+   * is omitted or not a usable number, the rows are the whole answer and nothing is added.
+   */
+  total?: number | undefined;
+
   /** The placing component's own class, for the geometry a list cannot know about. */
   className?: string | undefined;
 }
@@ -235,9 +245,9 @@ interface LowStockNoticeProps {
  *
  * @example
  * // On the dashboard, from the payload the route already resolved.
- * <LowStockList rows={summary.lowStock} threshold={0} />
+ * <LowStockList rows={summary.lowStock} threshold={0} total={summary.lowStockCount} />
  */
-export function LowStockList({ rows, threshold, className }: Props): ReactElement {
+export function LowStockList({ rows, threshold, total, className }: Props): ReactElement {
   if (rows.length === 0) {
     /*
      * A whole, non-negative margin for the sentence below. The value is only ever printed, so the
@@ -269,10 +279,12 @@ export function LowStockList({ rows, threshold, className }: Props): ReactElemen
           `clsx` normalises the absent case to an empty string, so a stylesheet that failed to load
           leaves the block unplaced rather than failing the typecheck of every call site.
         */}
+        {/* `headingAs="h3"`: the empty state is a subsection of this list's `h2` above. */}
         <BlankSlate
           art="no-results"
           alt={EMPTY_ART_ALT}
           heading={EMPTY_HEADING}
+          headingAs="h3"
           tone="positive"
           className={clsx(styles.blankSlate)}
         >
@@ -282,9 +294,24 @@ export function LowStockList({ rows, threshold, className }: Props): ReactElemen
     );
   }
 
+  /*
+   * How the rows relate to the server's full count, stated only when they are not the whole
+   * answer. The count is truncated to a whole number and a value that is not a usable number is
+   * read as absent, so the list never claims lines nobody counted. The sentence is one string, so
+   * the paragraph is a single text node on both sides of hydration, and a lone row is named
+   * without a figure because "the 1 most urgent" is not how a sentence reads.
+   */
+  const count = total !== undefined && Number.isFinite(total) ? Math.trunc(total) : 0;
+  const lead =
+    rows.length === 1 ? 'the most urgent' : `the ${formatQuantityLabel(rows.length)} most urgent`;
+  const note =
+    count > rows.length ? `Showing ${lead} of ${formatQuantityLabel(count)} lines` : null;
+
   return (
     <section className={clsx(styles.root, className)} aria-label={HEADING_TEXT}>
       <h2>{HEADING_TEXT}</h2>
+
+      {note === null ? null : <p className={styles.summary}>{note}</p>}
 
       <ul className={styles.list}>
         {rows.map((row) => {

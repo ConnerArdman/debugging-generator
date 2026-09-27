@@ -102,6 +102,18 @@
  * runs against the same state it sees in production, and one test deliberately
  * removes the spy to prove the capture gate really is in the path.
  *
+ * **Deferred analysis, drained at the dispatch helpers.** `./react.ts` records
+ * a commit inside React's commit callback and analyses it later, from an idle
+ * slice. The two helpers that drive commits — {@link commitSynthetic} and
+ * {@link inAct} — therefore end with `flushPendingReactWork()`, the same drain
+ * `./agent.js` performs at every terminal point, so each assertion reads the
+ * events its commit produces. The deferral itself — nothing emitted inside the
+ * callback, the idle scheduling, the queue bounds, discard on detach and reset
+ * — is asserted by the "deferred commit analysis" suite, which dispatches
+ * through the hook directly and drains only where it means to. The same suite
+ * asserts render coalescing: one `render` event per component, phase, trigger
+ * and changed-prop list within a commit, weighted by `instanceCount`.
+ *
  * No `node:` builtin is imported and no fixture file is read: this module is
  * bundled into the page-injected agent IIFE (`esbuild.agent.mjs` hard-fails on
  * a Node builtin), so every input below is constructed inline.
@@ -111,6 +123,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Mock } from 'vitest';
 
 import { getRDTHook, hasRDTHook, installRDTHook } from 'bippy';
 import type { Fiber, FiberRoot } from 'bippy';
@@ -124,15 +137,20 @@ import {
   isInteractionsAttached,
 } from './interaction.js';
 import {
+  IDLE_TIMEOUT_MS,
   MAX_FIBER_VISITS_PER_COMMIT,
   MAX_OWNER_CHAIN,
+  MAX_PENDING_COMMITS,
+  MAX_PENDING_RENDERS,
   MAX_RENDERS_PER_COMMIT,
   MAX_TREE_DEPTH,
   MAX_TREE_NODES,
   attachReact,
   detachReact,
   detectReact,
+  flushPendingReactWork,
   getReactStats,
+  hasPendingReactWork,
   isReactAttached,
   resetReactCounters,
   snapshotComponentTree,
@@ -285,6 +303,13 @@ const LAZY_LEAF = 'LazyLeaf';
 const CONTEXT_APP = 'ContextApp';
 const CONSUMER = 'Consumer';
 const QUIET = 'Quiet';
+const VALUE_APP = 'ValueApp';
+const VALUE_PROVIDER = 'ValueProvider';
+const VALUE_READER = 'ValueReader';
+const ROOT_READER = 'RootReader';
+
+/** The `displayName` of the context the provider-attribution fixture publishes. */
+const VALUE_CONTEXT = 'ValueContext';
 
 /** The prop the lazily loaded component renders, so the DOM proves it ran. */
 const LAZY_LABEL = 'lazy-label';
@@ -502,6 +527,15 @@ function renderedComponents(): unknown[] {
 }
 
 /**
+ * How many rendered fibers one `render` draft stands for: its `instanceCount`,
+ * or one when the key is absent — the weight every consumer applies.
+ */
+function instanceCountOf(draft: EventDraft): number {
+  const count = draft.attributes['instanceCount'];
+  return typeof count === 'number' ? count : 1;
+}
+
+/**
  * The first element of a list, or a failure naming what was missing.
  *
  * `noUncheckedIndexedAccess` makes every index read `T | undefined`; this
@@ -620,7 +654,11 @@ function expectWellFormedCommits(): CommitShape[] {
     const own = renders.filter((render) => render.parentSpanId === commit.spanId);
 
     expect(commit.name).toBe('React commit');
-    expect(commit.attributes['renderCount']).toBe(own.length);
+    // The commit counts the fibers its render events stand for, which is the
+    // events' summed weight: a coalesced event of 48 cards is 48 renders.
+    expect(commit.attributes['renderCount']).toBe(
+      own.reduce((total, render) => total + instanceCountOf(render), 0),
+    );
 
     for (const draft of [commit, ...own]) {
       expect(draft.traceId).toMatch(TRACE_ID_SHAPE);
@@ -642,8 +680,16 @@ function expectWellFormedCommits(): CommitShape[] {
       expect(render.name).toBe(render.attributes['component']);
       const phase = render.attributes['phase'];
       expect(isRenderPhase(phase)).toBe(true);
-      expect(render.attributes['renderCount']).toBeGreaterThanOrEqual(1);
+      expect(render.attributes['renderCount']).toBeGreaterThanOrEqual(instanceCountOf(render));
       expect(Array.isArray(render.attributes['changedProps'])).toBe(true);
+      // `instanceCount` is written only for a real group, so a single-fiber
+      // event reads exactly as it did before coalescing existed.
+      if ('instanceCount' in render.attributes) {
+        expect(render.attributes['instanceCount']).toBeGreaterThan(1);
+        expect(Number.isInteger(render.attributes['instanceCount'])).toBe(true);
+      } else {
+        expect('maxInstanceDuration' in render.attributes).toBe(false);
+      }
 
       if (phase === 'mount') {
         // The rule that keeps `render_trigger_unknown_count` honest (AAP
@@ -932,11 +978,150 @@ function syntheticRoot(
   return { current, containerInfo: container } as unknown as FiberRoot;
 }
 
-/** Dispatch one commit of a synthetic root through the installed hook. */
-function commitSynthetic(root: FiberRoot): void {
+/**
+ * Dispatch one commit of a synthetic root through the installed hook, as React
+ * would, without draining the deferred analysis.
+ *
+ * What the deferral cases use: the callback returns having recorded the
+ * commit, and nothing has been emitted yet.
+ */
+function dispatchSynthetic(root: FiberRoot): void {
   const hook = getRDTHook();
   expect(hook).toBeDefined();
   hook?.onCommitFiberRoot?.(RENDERER_ID, root);
+}
+
+/**
+ * Dispatch one commit of a synthetic root through the installed hook and drain
+ * its analysis, so the events it produces are recorded when this returns.
+ */
+function commitSynthetic(root: FiberRoot): void {
+  dispatchSynthetic(root);
+  flushPendingReactWork();
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Idle scheduling harness
+ *
+ * `./react.ts` reads `requestIdleCallback` and `cancelIdleCallback` off the
+ * page's global each time it schedules, so a test can hand it a recorder
+ * whose callbacks it invokes by hand — with the deadline it chooses — or take
+ * the API away to exercise the timer fallback. Installed as own properties of
+ * `globalThis` and restored in `afterEach`, after `detachReact()` has used
+ * the stub's cancel for the last time.
+ * ---------------------------------------------------------------------------
+ */
+
+/** One `requestIdleCallback` call the stub recorded. */
+interface IdleRequest {
+  /** The callback `./react.ts` scheduled. */
+  readonly callback: IdleRequestCallback;
+  /** The options it passed, whose `timeout` is the deferral's upper bound. */
+  readonly options: IdleRequestOptions | undefined;
+}
+
+/** The displaced global descriptors, while a stub is installed. */
+let savedIdleDescriptors:
+  | {
+      readonly request: PropertyDescriptor | undefined;
+      readonly cancel: PropertyDescriptor | undefined;
+    }
+  | undefined;
+
+/** Swap `globalThis[key]` for `value`, remembering nothing (the caller does). */
+function defineGlobal(key: 'requestIdleCallback' | 'cancelIdleCallback', value: unknown): void {
+  Object.defineProperty(globalThis, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
+/** Remember the host's idle API once, so any number of stubs restore to it. */
+function saveIdleDescriptors(): void {
+  savedIdleDescriptors ??= {
+    request: Object.getOwnPropertyDescriptor(globalThis, 'requestIdleCallback'),
+    cancel: Object.getOwnPropertyDescriptor(globalThis, 'cancelIdleCallback'),
+  };
+}
+
+/**
+ * Replace the host's idle API with a recorder.
+ *
+ * @param cancelThrows Make `cancelIdleCallback` throw, as a page that broke it
+ * would — the case the slice generation gate exists for.
+ */
+function installIdleStub(cancelThrows = false): {
+  readonly requests: IdleRequest[];
+  readonly cancel: Mock<(handle: number) => void>;
+} {
+  saveIdleDescriptors();
+  const requests: IdleRequest[] = [];
+  // The handle is the call's argument, recorded by the mock; the body only
+  // decides whether the page's cancellation works.
+  const cancel = vi.fn<(handle: number) => void>(() => {
+    if (cancelThrows) {
+      throw new Error('react.test.tsx: a cancelIdleCallback the page broke');
+    }
+  });
+  defineGlobal(
+    'requestIdleCallback',
+    (callback: IdleRequestCallback, options?: IdleRequestOptions): number => {
+      requests.push({ callback, options });
+      return requests.length;
+    },
+  );
+  defineGlobal('cancelIdleCallback', cancel);
+  return { requests, cancel };
+}
+
+/** Take the idle API away, as a host without it (Safari, happy-dom) has none. */
+function removeIdleApi(): void {
+  saveIdleDescriptors();
+  defineGlobal('requestIdleCallback', undefined);
+  defineGlobal('cancelIdleCallback', undefined);
+}
+
+/** Hand the host's idle API back exactly as it was found. */
+function restoreIdleApi(): void {
+  const saved = savedIdleDescriptors;
+  if (saved === undefined) {
+    return;
+  }
+  savedIdleDescriptors = undefined;
+  for (const [key, descriptor] of [
+    ['requestIdleCallback', saved.request],
+    ['cancelIdleCallback', saved.cancel],
+  ] as const) {
+    if (descriptor === undefined) {
+      Reflect.deleteProperty(globalThis, key);
+    } else {
+      Object.defineProperty(globalThis, key, descriptor);
+    }
+  }
+}
+
+/** An idle deadline with a fixed amount of time left, for a hand-run slice. */
+function idleDeadline(remainingMs: number, didTimeout = false): IdleDeadline {
+  return { didTimeout, timeRemaining: () => remainingMs };
+}
+
+/** The recorded request at `index`, or a failure naming how many there were. */
+function idleRequestAt(requests: readonly IdleRequest[], index: number): IdleRequest {
+  const request = requests[index];
+  if (request === undefined) {
+    throw new Error(`expected idle request #${String(index)}, recorded ${String(requests.length)}`);
+  }
+  return request;
+}
+
+/** Wait on the host's real timers, for a slice scheduled on one. */
+async function waitForTimers(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 /*
@@ -951,18 +1136,22 @@ function enableActEnvironment(): void {
 }
 
 /**
- * Run `scope` inside one `act` window and let React settle before it closes.
+ * Run `scope` inside one `act` window, let React settle before it closes, and
+ * drain the commits it produced.
  *
  * The callback is `async` and awaits a microtask turn for two reasons: React's
  * scheduled work and any microtask-queued effect must land inside the same
  * window, and `act` returns a plain `void` for a synchronous callback — which
  * cannot be awaited — so the promise-returning overload is the one to take.
+ * The drain afterwards is `./react.ts`'s own, the one `./agent.js` performs at
+ * every terminal point; see the module documentation's harness note.
  */
 async function inAct(runtime: ReactRuntime, scope: () => void): Promise<void> {
   await runtime.react.act(async () => {
     scope();
     await Promise.resolve();
   });
+  flushPendingReactWork();
 }
 
 /** A mounted React root and the element it owns. */
@@ -1200,6 +1389,132 @@ function createContextFixture(runtime: ReactRuntime): ContextFixture {
   };
 }
 
+/** The provider-attribution tree, and the control that changes its value. */
+interface ProviderFixture {
+  /** An app rendering a stateful provider component over one memoized reader. */
+  readonly App: ComponentType<Record<string, never>>;
+  /** Change the provider component's state, and with it both context values. */
+  bumpValue(): void;
+}
+
+/**
+ * A provider **component** holding state and publishing it through React 19's
+ * `<Ctx value>` form, over a memoized reader that consumes it.
+ *
+ * The idiomatic shape of "a provider re-renders and every consumer follows":
+ * the provider component receives the reader as `children` from the app above
+ * it, so when its own state changes React re-renders it and nothing between it
+ * and the reader — the reader's element is the same object — and reaches the
+ * reader only because a context it reads changed. That reader's render is the
+ * one whose `changedContexts` must name the provider component.
+ *
+ * The provider publishes **two** contexts from the same state, and the reader
+ * reads both, so the one provider name is reported once rather than per
+ * dependency. `ValueContext` carries a `displayName` so the case also shows the
+ * provider component outranking the context's own name.
+ *
+ * @param providerName The provider component's display name; overridable so a
+ * case can hand it a name longer than the event bound.
+ */
+function createProviderFixture(
+  runtime: ReactRuntime,
+  providerName: string = VALUE_PROVIDER,
+): ProviderFixture {
+  const react = runtime.react;
+  const ValueContext = react.createContext(0);
+  ValueContext.displayName = VALUE_CONTEXT;
+  const ParityContext = react.createContext('even');
+
+  function ValueReaderImplementation(): ReactNode {
+    const value = react.useContext(ValueContext);
+    const parity = react.useContext(ParityContext);
+    return <span data-value={String(value)} data-parity={parity} />;
+  }
+  ValueReaderImplementation.displayName = VALUE_READER;
+  const ValueReader = react.memo(ValueReaderImplementation);
+  ValueReader.displayName = VALUE_READER;
+
+  /** A `useState` setter, narrowed to the functional form the fixture uses. */
+  type Bump = (updater: (previous: number) => number) => void;
+
+  let bumpValueState: Bump | undefined;
+
+  function ValueProvider(props: { readonly children: ReactNode }): ReactNode {
+    const [value, setValue] = react.useState(0);
+    // Captured during render, as in the fixtures above.
+    bumpValueState = setValue;
+    return (
+      <ValueContext value={value}>
+        <ParityContext value={value % 2 === 0 ? 'even' : 'odd'}>
+          <section className="value-provider">{props.children}</section>
+        </ParityContext>
+      </ValueContext>
+    );
+  }
+  ValueProvider.displayName = providerName;
+
+  function ValueApp(): ReactNode {
+    return (
+      <ValueProvider>
+        <div className="value-app">
+          <ValueReader />
+        </div>
+      </ValueProvider>
+    );
+  }
+  ValueApp.displayName = VALUE_APP;
+
+  return {
+    App: ValueApp,
+    bumpValue: () => {
+      if (bumpValueState === undefined) {
+        throw new Error(`bumpValue is unavailable: ${providerName} has not rendered yet`);
+      }
+      bumpValueState((previous) => previous + 1);
+    },
+  };
+}
+
+/** A context provided at the root, with nothing but React's own fibers above it. */
+interface RootProvidedFixture {
+  /** The element to hand `root.render`, publishing `value` through both contexts. */
+  element(value: number): ReactNode;
+}
+
+/**
+ * Two contexts provided directly by `root.render`, so no component renders
+ * either provider: one context carries a `displayName` and one does not, and a
+ * memoized reader consumes both.
+ *
+ * What `changedContexts` falls back to when no provider component exists:
+ * the context's own name where it has one, and nothing where it has none.
+ */
+function createRootProvidedFixture(runtime: ReactRuntime): RootProvidedFixture {
+  const react = runtime.react;
+  const NamedContext = react.createContext(0);
+  NamedContext.displayName = VALUE_CONTEXT;
+  const UnnamedContext = react.createContext(0);
+
+  function RootReaderImplementation(): ReactNode {
+    const named = react.useContext(NamedContext);
+    const unnamed = react.useContext(UnnamedContext);
+    return <span data-root-value={String(named + unnamed)} />;
+  }
+  RootReaderImplementation.displayName = ROOT_READER;
+  const RootReader = react.memo(RootReaderImplementation);
+  RootReader.displayName = ROOT_READER;
+
+  return {
+    element: (value: number) => (
+      <NamedContext value={value}>
+        <UnnamedContext value={value}>
+          <RootReader />
+        </UnnamedContext>
+      </NamedContext>
+    ),
+  };
+}
+
 /** Props of the component loaded behind the Suspense boundary. */
 interface LazyLeafProps {
   /** Rendered into the DOM, so a commit's effect is observable there too. */
@@ -1366,6 +1681,9 @@ beforeEach(() => {
 afterEach(async () => {
   detachState();
   detachReact();
+  // After the detach, which cancels its scheduled slice through whatever idle
+  // API the test installed.
+  restoreIdleApi();
   detachInteractions();
   await unmountAll();
   vi.restoreAllMocks();
@@ -1681,10 +1999,19 @@ describe('commit traversal — synthetic fiber root', () => {
 
     const commit = first(draftsOfKind('commit'), 'commit draft');
     expect(commit.attributes['truncated']).toBe(true);
-    // The two components are reported over and over as the cycle is walked,
-    // up to the event bound — evidence that is odd but honest, and bounded.
-    expect(draftsOfKind('render')).toHaveLength(MAX_RENDERS_PER_COMMIT);
+    // The two components are captured over and over as the cycle is walked,
+    // up to the capture bound — evidence that is odd but honest, and bounded —
+    // and every capture of one component is a mount with nothing changed, so
+    // coalescing folds them into one event each, weighted by how many there
+    // were. The weights add up to exactly the bound.
+    const renders = draftsOfKind('render');
     expect(new Set(renderedComponents())).toStrictEqual(new Set([PARENT, CHILD]));
+    expect(renders).toHaveLength(2);
+    expect(renders.reduce((total, render) => total + instanceCountOf(render), 0)).toBe(
+      MAX_RENDERS_PER_COMMIT,
+    );
+    expect(commit.attributes['renderCount']).toBe(MAX_RENDERS_PER_COMMIT);
+    expect(getReactStats().renders).toBe(2);
     expect(getReactStats().failures).toBe(0);
   });
 
@@ -1704,6 +2031,576 @@ describe('commit traversal — synthetic fiber root', () => {
     expect(deepest?.attributes['ownerChain']).toHaveLength(MAX_OWNER_CHAIN);
     const shallowest = renderOf('Level1');
     expect(shallowest?.attributes['ownerChain']).toStrictEqual(['Level0']);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Deferred commit analysis
+ *
+ * The contract behind PERF-F07: inside React's commit the module records, and
+ * nothing more; the analysis, the events and the state hand-off happen in an
+ * idle slice, a whole commit at a time and in order, from a queue that stays
+ * bounded under any storm and that a cleared hook or a new capture discards.
+ * Every case here dispatches through the hook without the helpers' drain, and
+ * drains — or runs a slice by hand — only where it means to.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A three-level synthetic mount, named after the root so commits stay apart. */
+function threeLevelRoot(containerId: string): { root: FiberRoot; fibers: Fiber[] } {
+  const fibers = syntheticChain([
+    { name: PARENT, props: { level: 0 }, actualDuration: 6, actualStartTime: 12 },
+    { name: CHILD, props: { label: 'a' }, actualDuration: 4, actualStartTime: 13 },
+    { name: LEAF, props: { label: 'a' }, actualDuration: 2, actualStartTime: 14 },
+  ]);
+  return { root: syntheticRoot([first(fibers, 'synthetic fiber')], containerId), fibers };
+}
+
+/** The `rootName` of every recorded commit, in emission order. */
+function committedRootNames(): unknown[] {
+  return draftsOfKind('commit').map((draft) => draft.attributes['rootName']);
+}
+
+describe('deferred commit analysis', () => {
+  it('records a commit in the callback and emits nothing until its analysis runs', () => {
+    const { root } = threeLevelRoot('deferred-record');
+
+    attachReact();
+    dispatchSynthetic(root);
+
+    // The callback returned having walked the tree and queued the commit —
+    // and having emitted nothing: no event, no sequence number, no state.
+    expect(captured).toHaveLength(0);
+    expect(hasPendingReactWork()).toBe(true);
+    expect(getReactStats()).toStrictEqual({
+      commits: 1,
+      renders: 0,
+      truncatedCommits: 0,
+      failures: 0,
+    });
+
+    flushPendingReactWork();
+
+    const { renders } = expectWellFormedCommit('mount');
+    expect(renderedComponents()).toStrictEqual([PARENT, CHILD, LEAF]);
+    expect(renders).toHaveLength(3);
+    expect(hasPendingReactWork()).toBe(false);
+    expect(getReactStats().renders).toBe(3);
+
+    // Idempotent: a second drain of an empty queue emits nothing more.
+    flushPendingReactWork();
+    expect(draftsOfKind('commit')).toHaveLength(1);
+  });
+
+  it('schedules one idle callback per burst, bounded by IDLE_TIMEOUT_MS', () => {
+    const { requests } = installIdleStub();
+
+    attachReact();
+    dispatchSynthetic(threeLevelRoot('burst-1').root);
+    dispatchSynthetic(threeLevelRoot('burst-2').root);
+    dispatchSynthetic(threeLevelRoot('burst-3').root);
+
+    // A burst of commits shares one scheduled slice, whose timeout is the
+    // longest any of them waits for idle time.
+    expect(requests).toHaveLength(1);
+    expect(idleRequestAt(requests, 0).options).toStrictEqual({ timeout: IDLE_TIMEOUT_MS });
+    expect(captured).toHaveLength(0);
+
+    idleRequestAt(requests, 0).callback(idleDeadline(50));
+
+    expect(committedRootNames()).toStrictEqual(['#burst-1', '#burst-2', '#burst-3']);
+    expect(hasPendingReactWork()).toBe(false);
+    expect(requests).toHaveLength(1);
+  });
+
+  it('takes whole commits while idle time lasts and reschedules the remainder', () => {
+    const { requests } = installIdleStub();
+
+    attachReact();
+    dispatchSynthetic(threeLevelRoot('slice-1').root);
+    dispatchSynthetic(threeLevelRoot('slice-2').root);
+    dispatchSynthetic(threeLevelRoot('slice-3').root);
+
+    // No idle time left: a slice still takes one whole commit — progress is
+    // guaranteed — and never splits it, then hands the rest to a new slice.
+    idleRequestAt(requests, 0).callback(idleDeadline(0));
+    expect(committedRootNames()).toStrictEqual(['#slice-1']);
+    expect(draftsOfKind('render')).toHaveLength(3);
+    expect(requests).toHaveLength(2);
+
+    // A callback fired on its timeout reports no idle time either; it is held
+    // to the slice budget instead, which a frozen clock never exhausts.
+    idleRequestAt(requests, 1).callback(idleDeadline(0, true));
+    expect(committedRootNames()).toStrictEqual(['#slice-1', '#slice-2', '#slice-3']);
+    expect(hasPendingReactWork()).toBe(false);
+  });
+
+  it('falls back to a timer on a host without requestIdleCallback', async () => {
+    removeIdleApi();
+    const { root } = threeLevelRoot('timer-fallback');
+
+    attachReact();
+    dispatchSynthetic(root);
+    expect(captured).toHaveLength(0);
+    expect(hasPendingReactWork()).toBe(true);
+
+    await waitForTimers(80);
+
+    expectWellFormedCommit('mount');
+    expect(hasPendingReactWork()).toBe(false);
+  });
+
+  it('works off a backlog on the next task once the queue passes MAX_PENDING_COMMITS', async () => {
+    const { requests, cancel } = installIdleStub();
+
+    attachReact();
+    for (let index = 0; index <= MAX_PENDING_COMMITS; index += 1) {
+      dispatchSynthetic(threeLevelRoot(`backlog-${String(index)}`).root);
+    }
+
+    // Past the soft bound the pending idle callback is replaced by a task:
+    // a page that never idles must not keep an ever-growing queue waiting.
+    expect(requests).toHaveLength(1);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(captured).toHaveLength(0);
+
+    await waitForTimers(20);
+
+    expect(draftsOfKind('commit')).toHaveLength(MAX_PENDING_COMMITS + 1);
+    expect(first(committedRootNames(), 'commit rootName')).toBe('#backlog-0');
+    expect(hasPendingReactWork()).toBe(false);
+    expect(getReactStats().failures).toBe(0);
+  });
+
+  it('analyses the oldest commit in the callback past twice MAX_PENDING_COMMITS', () => {
+    installIdleStub();
+    const hardBound = MAX_PENDING_COMMITS * 2;
+
+    attachReact();
+    for (let index = 0; index < hardBound; index += 1) {
+      dispatchSynthetic(threeLevelRoot(`overflow-${String(index)}`).root);
+    }
+    expect(captured).toHaveLength(0);
+
+    // One commit past the hard bound, with no slice having had a chance to
+    // run: the oldest commit is analysed right here, which keeps the queue —
+    // and every fiber it references — bounded, and loses nothing.
+    dispatchSynthetic(threeLevelRoot('overflow-last').root);
+    expect(committedRootNames()).toStrictEqual(['#overflow-0']);
+
+    flushPendingReactWork();
+    const names = committedRootNames();
+    expect(names).toHaveLength(hardBound + 1);
+    expect(names[names.length - 1]).toBe('#overflow-last');
+    expect(getReactStats().commits).toBe(hardBound + 1);
+    expect(getReactStats().renders).toBe((hardBound + 1) * 3);
+  });
+
+  it('bounds the queue by captured renders as well as by commits', () => {
+    installIdleStub();
+    const rows = Array.from({ length: MAX_RENDERS_PER_COMMIT }, (_unused, index) =>
+      syntheticFiber({ name: `Cell${String(index)}` }),
+    );
+    const root = syntheticRoot(rows, 'render-bound');
+    // Full commits until the render count passes twice its soft bound.
+    const commitsToOverflow = Math.floor((MAX_PENDING_RENDERS * 2) / MAX_RENDERS_PER_COMMIT) + 1;
+    expect(commitsToOverflow).toBeLessThanOrEqual(MAX_PENDING_COMMITS * 2);
+
+    attachReact();
+    for (let index = 0; index < commitsToOverflow - 1; index += 1) {
+      dispatchSynthetic(root);
+    }
+    expect(captured).toHaveLength(0);
+
+    dispatchSynthetic(root);
+    expect(draftsOfKind('commit')).toHaveLength(1);
+    expect(draftsOfKind('render')).toHaveLength(MAX_RENDERS_PER_COMMIT);
+  });
+
+  it('discards the queue on detachReact, cancels its slice and never emits it', () => {
+    const { requests, cancel } = installIdleStub();
+
+    attachReact();
+    dispatchSynthetic(threeLevelRoot('detach-discard').root);
+    expect(hasPendingReactWork()).toBe(true);
+
+    detachReact();
+
+    // A cleared hook is disabled, not idled (AAP 0.5.1): nothing queued,
+    // nothing scheduled, and nothing that fires later can emit.
+    expect(hasPendingReactWork()).toBe(false);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    idleRequestAt(requests, 0).callback(idleDeadline(50));
+    flushPendingReactWork();
+    expect(captured).toHaveLength(0);
+    expect(getReactStats()).toStrictEqual({
+      commits: 0,
+      renders: 0,
+      truncatedCommits: 0,
+      failures: 0,
+    });
+  });
+
+  it('never lets a slice scheduled before a detach run after it, even if cancelling it failed', () => {
+    const { requests } = installIdleStub(true);
+
+    attachReact();
+    dispatchSynthetic(threeLevelRoot('stale-slice').root);
+    detachReact();
+
+    // A new capture: the same module observing again, with its own commit.
+    attachReact();
+    dispatchSynthetic(threeLevelRoot('fresh-slice').root);
+    expect(requests).toHaveLength(2);
+
+    // The page's broken `cancelIdleCallback` left the first callback live.
+    // Its generation is stale, so it must not touch the new capture's queue.
+    idleRequestAt(requests, 0).callback(idleDeadline(50));
+    expect(captured).toHaveLength(0);
+    expect(hasPendingReactWork()).toBe(true);
+
+    idleRequestAt(requests, 1).callback(idleDeadline(50));
+    expect(committedRootNames()).toStrictEqual(['#fresh-slice']);
+  });
+
+  it('discards a previous capture’s queued commits on resetReactCounters', () => {
+    installIdleStub();
+
+    attachReact();
+    dispatchSynthetic(threeLevelRoot('previous-capture').root);
+
+    // A new capture begins. `./agent.js` drains before it resets; a commit
+    // still queued here would be counted into — and, once the transport is
+    // reconfigured, stamped as — the next capture's evidence.
+    resetReactCounters();
+
+    expect(hasPendingReactWork()).toBe(false);
+    flushPendingReactWork();
+    expect(captured).toHaveLength(0);
+    expect(isReactAttached()).toBe(true);
+
+    commitSynthetic(threeLevelRoot('next-capture').root);
+    expect(committedRootNames()).toStrictEqual(['#next-capture']);
+    expect(renderOf(PARENT)?.attributes['renderCount']).toBe(1);
+  });
+
+  it('drains queued commits before a component-tree snapshot reads its counts', () => {
+    installIdleStub();
+
+    attachReact();
+    dispatchSynthetic(threeLevelRoot('snapshot-drain').root);
+
+    const snapshot = snapshotComponentTree();
+    if (snapshot === undefined) {
+      throw new Error('expected a component tree snapshot after a commit');
+    }
+
+    // Counted, because the snapshot drained the queue first — and the events
+    // that count came out with it.
+    for (const node of flattenTree(snapshot).slice(1)) {
+      expect(node.renderCount).toBe(1);
+    }
+    expect(renderedComponents()).toStrictEqual([PARENT, CHILD, LEAF]);
+    expect(hasPendingReactWork()).toBe(false);
+  });
+
+  it('reads the profiler’s numbers in the commit, not when the analysis runs', () => {
+    installIdleStub();
+    const { root, fibers } = threeLevelRoot('profiler-readings');
+
+    attachReact();
+    dispatchSynthetic(root);
+
+    // React rewrites these when it reuses a fiber for the next render.
+    for (const fiber of fibers) {
+      mutateFiber(fiber, 'actualDuration', 999);
+      mutateFiber(fiber, 'actualStartTime', 4_999);
+    }
+    flushPendingReactWork();
+
+    expect(renderOf(PARENT)?.duration).toBe(6);
+    expect(renderOf(PARENT)?.startTime).toBe(epochAt(12));
+    expect(renderOf(LEAF)?.duration).toBe(2);
+    expect(renderOf(LEAF)?.attributes['actualDuration']).toBe(2);
+    // Self time from the children's readings at the commit: 6 − 4.
+    expect(renderOf(PARENT)?.attributes['selfTime']).toBe(2);
+  });
+
+  it('classifies against what the commit held after React reuses and deletes the fibers', () => {
+    installIdleStub();
+    const current = syntheticFiber({ name: PARENT, props: { label: 'next' } });
+    const previous = syntheticFiber({ name: PARENT, props: { label: 'previous' } });
+    const child = syntheticFiber({ name: CHILD, props: { label: 'next' } });
+    const previousChild = syntheticFiber({ name: CHILD, props: { label: 'previous' } });
+    pairAlternates(current, previous);
+    pairAlternates(child, previousChild);
+    linkChain([current, child]);
+    linkChain([previous, previousChild]);
+    const root = syntheticRoot([current], 'reuse-and-delete', [previous]);
+
+    attachReact();
+    dispatchSynthetic(root);
+
+    // The next render reuses the alternates as work in progress, and a
+    // deletion clears the committed fibers' own fields — including `return`,
+    // which an upward walk for the owner chain would need.
+    for (const fiber of [previous, previousChild]) {
+      mutateFiber(fiber, 'memoizedProps', { label: 'rewritten' });
+    }
+    for (const fiber of [current, child]) {
+      mutateFiber(fiber, 'memoizedProps', null);
+      mutateFiber(fiber, 'alternate', null);
+      mutateFiber(fiber, 'return', null);
+    }
+    flushPendingReactWork();
+
+    const { renders } = expectWellFormedCommit('update');
+    expect(renders).toHaveLength(2);
+    for (const component of [PARENT, CHILD]) {
+      expect(renderOf(component)?.attributes['trigger']).toBe('props');
+      expect(renderOf(component)?.attributes['changedProps']).toStrictEqual(['label']);
+    }
+    expect(renderOf(CHILD)?.attributes['ownerChain']).toStrictEqual([PARENT]);
+    expect(typeof renderOf(CHILD)?.attributes['parentFiberId']).toBe('number');
+  });
+
+  it('summarises hook values only while state capture is armed', () => {
+    installIdleStub();
+    let reads = 0;
+    const probe: Record<string, unknown> = {};
+    Object.defineProperty(probe, 'probe', {
+      enumerable: true,
+      get(): number {
+        reads += 1;
+        return reads;
+      },
+    });
+    function hookChain(value: unknown): Record<string, unknown> {
+      return { memoizedState: value, queue: { dispatch: (): void => undefined }, next: null };
+    }
+    function stateRoot(containerId: string): FiberRoot {
+      const current = syntheticFiber({ name: PARENT, props: { same: 1 } });
+      const previous = syntheticFiber({ name: PARENT, props: { same: 1 } });
+      mutateFiber(current, 'memoizedState', hookChain(probe));
+      mutateFiber(previous, 'memoizedState', hookChain('initial'));
+      pairAlternates(current, previous);
+      return syntheticRoot([current], containerId, [previous]);
+    }
+
+    attachReact();
+    commitSynthetic(stateRoot('state-off'));
+
+    // Classified — the trigger needs to know state changed — but nobody
+    // receives the value while `./state.js` is detached, so it is never read.
+    expect(renderOf(PARENT)?.attributes['trigger']).toBe('state');
+    expect(draftsOfKind('state')).toHaveLength(0);
+    expect(reads).toBe(0);
+
+    attachState();
+    clearCaptured();
+    commitSynthetic(stateRoot('state-on'));
+
+    expect(renderOf(PARENT)?.attributes['trigger']).toBe('state');
+    expect(draftsOfKind('state')).toHaveLength(1);
+    expect(reads).toBeGreaterThan(0);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Render coalescing
+ *
+ * The render-volume half of PERF-F08: the demo's idle catalogue re-renders 48
+ * memoised product cards on every shipping-estimate tick, and one event per
+ * fiber was what made a busy page out-produce the pipeline. One event per
+ * component, phase, trigger and changed-prop list within a commit, weighted by
+ * `instanceCount`, keeps every count a reader derives exactly as it was.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The number of product cards the demo's catalogue grid renders. */
+const CATALOG_CARDS = 48;
+
+/** The component name the card fixtures share. */
+const PRODUCT_CARD = 'ProductCard';
+
+/** One re-rendered card: a current fiber paired with its previous render. */
+interface CardPair {
+  readonly current: Fiber;
+  readonly previous: Fiber;
+}
+
+/**
+ * A card whose `onSelect` is a fresh function on every render — the demo's
+ * inline lambda — and whose `sku` changes only when asked.
+ */
+function cardPair(index: number, skuChanged = false): CardPair {
+  const current = syntheticFiber({
+    name: PRODUCT_CARD,
+    props: { sku: index + (skuChanged ? 1_000 : 0), onSelect: (): void => undefined },
+    actualDuration: 1 + (index % 3),
+    actualStartTime: 20 + index,
+  });
+  const previous = syntheticFiber({
+    name: PRODUCT_CARD,
+    props: { sku: index, onSelect: (): void => undefined },
+  });
+  pairAlternates(current, previous);
+  return { current, previous };
+}
+
+/** A root re-rendering `pairs`, plus any freshly mounted fibers after them. */
+function catalogRoot(
+  containerId: string,
+  pairs: readonly CardPair[],
+  mounts: Fiber[] = [],
+): FiberRoot {
+  return syntheticRoot(
+    [...pairs.map((pair) => pair.current), ...mounts],
+    containerId,
+    pairs.map((pair) => pair.previous),
+  );
+}
+
+describe('render coalescing', () => {
+  it('folds the renders of one commit that rendered for the same reason into one event', () => {
+    const identical = Array.from({ length: CATALOG_CARDS }, (_unused, index) => cardPair(index));
+    const withSku = [cardPair(CATALOG_CARDS, true), cardPair(CATALOG_CARDS + 1, true)];
+    const mounted = syntheticFiber({ name: PRODUCT_CARD, actualDuration: 5, actualStartTime: 90 });
+    const root = catalogRoot('catalog-grid', [...identical, ...withSku], [mounted]);
+
+    attachReact();
+    commitSynthetic(root);
+
+    const [shape] = expectWellFormedCommits();
+    if (shape === undefined) {
+      throw new Error('expected one commit');
+    }
+    const { commit, renders } = shape;
+
+    // Three events for fifty-one fibers: one per reason, in the order their
+    // first instances were walked.
+    expect(renders).toHaveLength(3);
+    expect(commit.attributes['renderCount']).toBe(CATALOG_CARDS + 3);
+    expect(commit.attributes['renderedFiberCount']).toBe(CATALOG_CARDS + 3);
+    expect(commit.attributes['phase']).toBe('update');
+
+    const [cards, skuCards, mount] = renders;
+    if (cards === undefined || skuCards === undefined || mount === undefined) {
+      throw new Error('expected three render events');
+    }
+
+    const durations = identical.map((_pair, index) => 1 + (index % 3));
+    expect(cards.name).toBe(PRODUCT_CARD);
+    expect(cards.attributes['phase']).toBe('update');
+    expect(cards.attributes['trigger']).toBe('props');
+    expect(cards.attributes['changedProps']).toStrictEqual(['onSelect']);
+    expect(cards.attributes['instanceCount']).toBe(CATALOG_CARDS);
+    // The running count moves by the group's size: 48 renders, not one event.
+    expect(cards.attributes['renderCount']).toBe(CATALOG_CARDS);
+    // Earliest instance start; summed durations; the slowest single card.
+    expect(cards.startTime).toBe(epochAt(20));
+    expect(cards.duration).toBe(durations.reduce((total, value) => total + value, 0));
+    expect(cards.attributes['actualDuration']).toBe(cards.duration);
+    expect(cards.attributes['maxInstanceDuration']).toBe(3);
+    expect(typeof cards.attributes['fiberId']).toBe('number');
+
+    // A second changed prop is a different reason, so a different event.
+    expect(skuCards.attributes['changedProps']).toStrictEqual(['onSelect', 'sku']);
+    expect(skuCards.attributes['instanceCount']).toBe(2);
+    expect(skuCards.attributes['renderCount']).toBe(CATALOG_CARDS + 2);
+    expect(skuCards.attributes['fiberId']).not.toBe(cards.attributes['fiberId']);
+
+    // A mount is never grouped with an update, carries no trigger, and — one
+    // fiber — is written exactly as it was before coalescing existed.
+    expect(mount.attributes['phase']).toBe('mount');
+    expect('trigger' in mount.attributes).toBe(false);
+    expect('instanceCount' in mount.attributes).toBe(false);
+    expect('maxInstanceDuration' in mount.attributes).toBe(false);
+    expect(mount.attributes['renderCount']).toBe(CATALOG_CARDS + 3);
+    expect(mount.duration).toBe(5);
+
+    expect(getReactStats().renders).toBe(3);
+  });
+
+  it('keeps the per-capture render count equal to the fibers rendered, commit after commit', () => {
+    const pairs = Array.from({ length: CATALOG_CARDS }, (_unused, index) => cardPair(index));
+    const root = catalogRoot('catalog-ticks', pairs);
+
+    attachReact();
+    const ticks = 5;
+    for (let tick = 1; tick <= ticks; tick += 1) {
+      clearCaptured();
+      commitSynthetic(root);
+      const cards = first(draftsOfKind('render'), 'card render');
+      expect(draftsOfKind('render')).toHaveLength(1);
+      expect(cards.attributes['instanceCount']).toBe(CATALOG_CARDS);
+      expect(cards.attributes['renderCount']).toBe(CATALOG_CARDS * tick);
+    }
+
+    // One event per tick instead of 48 — the order-of-magnitude cut in volume
+    // — and the count a panel shows unchanged.
+    expect(getReactStats().renders).toBe(ticks);
+  });
+
+  it('never merges instances whose trigger differs', () => {
+    const byProps = cardPair(0);
+    // Same props on both sides, so the second card re-rendered for no
+    // observable reason at all.
+    const sameProps = { sku: 1, onSelect: (): void => undefined };
+    const stable = {
+      current: syntheticFiber({ name: PRODUCT_CARD, props: sameProps }),
+      previous: syntheticFiber({ name: PRODUCT_CARD, props: { ...sameProps } }),
+    };
+    pairAlternates(stable.current, stable.previous);
+
+    attachReact();
+    commitSynthetic(catalogRoot('catalog-triggers', [byProps, stable]));
+
+    const renders = draftsOfKind('render');
+    expect(renders.map((render) => render.attributes['trigger'])).toStrictEqual([
+      'props',
+      'unchanged',
+    ]);
+    for (const render of renders) {
+      expect('instanceCount' in render.attributes).toBe(false);
+    }
+  });
+
+  it('keeps state transitions per instance, each parented to its group’s span', () => {
+    function hookChain(value: unknown): Record<string, unknown> {
+      return { memoizedState: value, queue: { dispatch: (): void => undefined }, next: null };
+    }
+    const pairs = Array.from({ length: 3 }, (_unused, index) => {
+      const props = { sku: index };
+      const current = syntheticFiber({ name: PRODUCT_CARD, props });
+      const previous = syntheticFiber({ name: PRODUCT_CARD, props: { ...props } });
+      mutateFiber(current, 'memoizedState', hookChain(index + 1));
+      mutateFiber(previous, 'memoizedState', hookChain(index));
+      pairAlternates(current, previous);
+      return { current, previous };
+    });
+
+    attachReact();
+    attachState();
+    commitSynthetic(catalogRoot('catalog-state', pairs));
+
+    const render = first(draftsOfKind('render'), 'card render');
+    expect(draftsOfKind('render')).toHaveLength(1);
+    expect(render.attributes['trigger']).toBe('state');
+    expect(render.attributes['instanceCount']).toBe(3);
+
+    const transitions = draftsOfKind('state');
+    expect(transitions).toHaveLength(3);
+    for (const transition of transitions) {
+      expect(transition.parentSpanId).toBe(render.spanId);
+      expect(transition.traceId).toBe(render.traceId);
+      // Each transition sequenced after the render it sits inside.
+      expect(captured.indexOf(transition)).toBeGreaterThan(captured.indexOf(render));
+    }
+    // Each instance's own identity, not the group's representative.
+    expect(new Set(transitions.map((transition) => transition.attributes['fiberId'])).size).toBe(3);
   });
 });
 
@@ -1993,6 +2890,107 @@ describe('commit traversal — React 19 under happy-dom', () => {
     expect(document.querySelector('#react-context [data-tick]')?.getAttribute('data-tick')).toBe(
       '1',
     );
+  });
+
+  it('names the provider component of a changed context on the consumer render only', async () => {
+    const fixture = createProviderFixture(reactRuntime);
+    const tree = createHostRoot(reactRuntime, 'react-context-provider');
+
+    attachReact();
+    await inAct(reactRuntime, () => {
+      tree.root.render(<fixture.App />);
+    });
+
+    // A mount has no previous value for a context to have changed from, so no
+    // render of the mount commit carries the key at all.
+    expectWellFormedCommit('mount');
+    expect(renderedComponents()).toStrictEqual([VALUE_APP, VALUE_PROVIDER, VALUE_READER]);
+    for (const render of draftsOfKind('render')) {
+      expect('changedContexts' in render.attributes).toBe(false);
+    }
+    clearCaptured();
+
+    await inAct(reactRuntime, () => {
+      fixture.bumpValue();
+    });
+
+    // The provider component re-rendered for its own state and the memoized
+    // reader for the two contexts it reads; the app above rendered nothing.
+    const { renders } = expectWellFormedCommit('update');
+    expect(renderedComponents()).toStrictEqual([VALUE_PROVIDER, VALUE_READER]);
+    expect(renders).toHaveLength(2);
+
+    const reader = renderOf(VALUE_READER);
+    expect(reader?.attributes['trigger']).toBe('context');
+    // "context change: ValueProvider" (AAP 0.8.2): the component holding the
+    // value, named once although it publishes both contexts the reader reads,
+    // and ahead of the context's own `displayName`.
+    expect(reader?.attributes['changedContexts']).toStrictEqual([VALUE_PROVIDER]);
+
+    // The provider itself rendered because its state changed and reads no
+    // context, so it names none.
+    const provider = renderOf(VALUE_PROVIDER);
+    expect(provider?.attributes['trigger']).toBe('state');
+    expect('changedContexts' in (provider?.attributes ?? {})).toBe(false);
+
+    expect(
+      document.querySelector('#react-context-provider [data-value]')?.getAttribute('data-parity'),
+    ).toBe('odd');
+    expect(getReactStats().failures).toBe(0);
+  });
+
+  it('names a long-named provider exactly as its own render event names it', async () => {
+    const longName = VALUE_PROVIDER + 'X'.repeat(400);
+    const fixture = createProviderFixture(reactRuntime, longName);
+    const tree = createHostRoot(reactRuntime, 'react-context-long-provider');
+
+    attachReact();
+    await inAct(reactRuntime, () => {
+      tree.root.render(<fixture.App />);
+    });
+    clearCaptured();
+    await inAct(reactRuntime, () => {
+      fixture.bumpValue();
+    });
+
+    expectWellFormedCommit('update');
+    const providerRender = draftsOfKind('render').find(
+      (draft) => draft.attributes['trigger'] === 'state',
+    );
+    const component = providerRender?.attributes['component'];
+
+    // The entry is a join key: a reader follows "context change: ‹provider›"
+    // to the provider's own row, so the two names must be the same string
+    // after both bounds — never one cut shorter or marked differently.
+    expect(typeof component).toBe('string');
+    expect(String(component).length).toBeLessThan(longName.length);
+    expect(longName.startsWith(String(component))).toBe(true);
+    expect(renderOf(VALUE_READER)?.attributes['changedContexts']).toStrictEqual([component]);
+  });
+
+  it('falls back to the context displayName when no component renders the provider', async () => {
+    const fixture = createRootProvidedFixture(reactRuntime);
+    const tree = createHostRoot(reactRuntime, 'react-context-root-provided');
+
+    attachReact();
+    await inAct(reactRuntime, () => {
+      tree.root.render(fixture.element(0));
+    });
+    expect('changedContexts' in (renderOf(ROOT_READER)?.attributes ?? {})).toBe(false);
+    clearCaptured();
+
+    await inAct(reactRuntime, () => {
+      tree.root.render(fixture.element(1));
+    });
+
+    // Both providers sit directly under the root, so there is no provider
+    // component to name. The named context is reported by its `displayName`;
+    // the unnamed one has no name at all and is left out rather than reported
+    // as an empty or invented one.
+    expectWellFormedCommit('update');
+    const reader = renderOf(ROOT_READER);
+    expect(reader?.attributes['trigger']).toBe('context');
+    expect(reader?.attributes['changedContexts']).toStrictEqual([VALUE_CONTEXT]);
   });
 
   it('counts renders per component within the capture and restarts after a reset', async () => {
@@ -2518,9 +3516,10 @@ describe('cleanup that cannot complete, and the failures it reports', () => {
         expect(reactModule.isReactAttached()).toBe(true);
 
         // Observation resumed through the subscription that was never released:
-        // one dispatch, one commit, one render.
+        // one dispatch, one commit, one render once its analysis has run.
         dispatchCommit(handlers(), oneComponentRoot('release-failure-rearm'));
         expect(reactModule.getReactStats().commits).toBe(1);
+        reactModule.flushPendingReactWork();
         expect(reactModule.getReactStats().renders).toBe(1);
 
         reactModule.detachReact();
@@ -2530,36 +3529,48 @@ describe('cleanup that cannot complete, and the failures it reports', () => {
     );
   });
 
-  it('reports a commit whose body throws once and keeps it away from React', async () => {
+  it('reports a commit whose hand-off throws once, outside React and without stalling the queue', async () => {
     await withMockedBippy(
       0,
       ({ react: reactModule, transport: freshTransport, bridge, handlers }) => {
-        // The hand-off is the last step of the commit body, so a throw here is a
-        // whole commit lost: no commit event, no render events, no evidence.
-        vi.spyOn(freshTransport, 'emitMany').mockImplementation(() => {
+        // The hand-off is the last step of a commit's deferred processing, so a
+        // throw here is a whole commit lost: no commit event, no render
+        // events, no evidence.
+        const emitMany = vi.spyOn(freshTransport, 'emitMany').mockImplementation(() => {
           throw new TypeError('react.test.tsx: deliberate emit failure');
         });
 
         reactModule.attachReact();
-        const root = oneComponentRoot('commit-body-failure');
 
         // A throw out of here would surface inside React's commit phase, which
-        // is the one failure this product may never cause.
+        // is the one failure this product may never cause — and with the
+        // analysis deferred, the hand-off is not even attempted in here.
         expect(() => {
-          dispatchCommit(handlers(), root);
+          dispatchCommit(handlers(), oneComponentRoot('commit-body-failure'));
+          dispatchCommit(handlers(), oneComponentRoot('commit-body-failure-next'));
+        }).not.toThrow();
+        expect(emitMany).not.toHaveBeenCalled();
+        expect(reactModule.getReactStats().commits).toBe(2);
+        expect(reactModule.getReactStats().failures).toBe(0);
+
+        expect(() => {
+          reactModule.flushPendingReactWork();
         }).not.toThrow();
 
-        expect(reactModule.getReactStats().commits).toBe(1);
-        expect(reactModule.getReactStats().failures).toBe(1);
+        // Each commit failed on its own and neither stopped the drain: both
+        // hand-offs were attempted, and nothing is left queued behind them.
+        expect(emitMany).toHaveBeenCalledTimes(2);
+        expect(reactModule.hasPendingReactWork()).toBe(false);
+        expect(reactModule.getReactStats().failures).toBe(2);
 
         const failures = producerFailurePayloads(bridge.frames);
         expect(failures).toHaveLength(1);
         expect(failures[0]?.['source']).toBe('react');
-        expect(failures[0]?.['stage']).toBe('commit');
+        expect(failures[0]?.['stage']).toBe('commit-processing');
         expect(failures[0]?.['error']).toBe('TypeError');
         // Bounded by the transport, not by a second limiter here: a source gets
         // one frame per capture (`MAX_PRODUCER_FAILURE_REPORTS`), so the frame
-        // this commit produced is also the last one this source gets.
+        // the first commit produced is also the last one this source gets.
         expect(failures[0]?.['final']).toBe(true);
       },
     );

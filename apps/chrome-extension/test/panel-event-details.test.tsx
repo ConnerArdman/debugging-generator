@@ -25,6 +25,15 @@
  * name, and the Source chip still reaches `onOpenSource` with the location
  * unmodified. No case may write to `console.error` or `console.warn`.
  *
+ * The Attributes section's privacy marking is pinned too: an attribute carries
+ * the "redacted" badge, and the privacy-layer note stands above the table,
+ * when its path is listed in `event.redacted` OR its value shows the redaction
+ * marker a producer wrote before ingest — the exact marker, the marker inside
+ * a longer string, a preview's cut of it, or any of those nested in a
+ * structured value. Prose that merely uses the word, another casing, or a
+ * shorter cut never does. The scan is cycle-safe, bounded and total, and every
+ * value renders byte-for-byte whatever the verdict.
+ *
  * **Harness.** Collected by the root `vitest.config.ts` into the
  * `chrome-extension` project (happy-dom). Every fixture value is neutral
  * vocabulary written for this suite (AAP 0.5.4).
@@ -64,6 +73,14 @@ const MISSING_SPAN_LABEL = 'Missing span ID';
 const LOADING_ANNOUNCEMENT = 'Loading the parent chain…';
 const ERROR_TITLE = 'Could not load the parent chain';
 const ERROR_FALLBACK_MESSAGE = 'The ancestors of this event could not be looked up in the capture.';
+const ATTRIBUTES_CAPTION = 'Attributes of the selected event';
+const REDACTION_NOTE =
+  'Values marked redacted were replaced by the privacy layer before the event was stored.';
+const REDACTED_BADGE = 'redacted';
+const UNSERIALISABLE_LABEL = 'Value could not be displayed';
+
+/** The privacy layer's replacement marker, byte for byte. */
+const MARKER = '[redacted]';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -692,5 +709,234 @@ describe('EventDetails interactions beside the chain states', () => {
 
     expect(onOpenSource).toHaveBeenCalledTimes(1);
     expect(onOpenSource.mock.calls[0]?.[0]).toBe(SOURCE);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Attributes section: marking what the privacy layer replaced
+// ---------------------------------------------------------------------------
+
+/**
+ * The selected event with `attributes` and, only when given, a `redacted`
+ * path list. Without one the event is exactly what the store holds for a value
+ * a producer redacted before ingest: the service's redactor lists no path for
+ * a value that arrived already replaced.
+ *
+ * @param attributes The attributes bag.
+ * @param redacted The attribute paths the service's redactor replaced.
+ * @returns A trace-root event carrying them.
+ */
+function eventWithAttributes(
+  attributes: TelemetryEvent['attributes'],
+  redacted?: readonly string[],
+): TelemetryEvent {
+  return {
+    ...ROOT_EVENT,
+    attributes,
+    ...(redacted === undefined ? {} : { redacted: [...redacted] }),
+  };
+}
+
+/**
+ * The attributes table's data row for `key`: the row whose header cell is the
+ * key. Fails the test when no such row renders.
+ *
+ * @param key The attribute key.
+ * @returns The `role="row"` element.
+ */
+function attributeRow(key: string): HTMLElement {
+  const grid = screen.getByRole('grid', { name: ATTRIBUTES_CAPTION });
+  const header = within(grid)
+    .getAllByRole('rowheader')
+    .find((cell) => cell.textContent === key);
+  const row = header?.closest('[role="row"]');
+  if (!(row instanceof HTMLElement)) {
+    throw new Error(`No attributes row renders for the key "${key}".`);
+  }
+  return row;
+}
+
+/**
+ * The text of the `Code` element holding the value of `key`'s row, exactly as
+ * rendered — what "byte-for-byte" is checked against.
+ *
+ * @param key The attribute key.
+ * @returns The value's text content.
+ */
+function renderedValue(key: string): string | null {
+  const codes = within(attributeRow(key)).getAllByText(
+    (_content, element) => element?.tagName === 'CODE',
+  );
+  return codes.at(-1)?.textContent ?? null;
+}
+
+/**
+ * The "redacted" badge of `key`'s row, or `null`. The captured value itself is
+ * `Code`, which is ignored, so a value that is the word "redacted" is never
+ * mistaken for the badge.
+ *
+ * @param key The attribute key.
+ * @returns The badge's text element, or `null` when the row has none.
+ */
+function redactedBadge(key: string): HTMLElement | null {
+  return within(attributeRow(key)).queryByText(REDACTED_BADGE, { ignore: 'code, script, style' });
+}
+
+/**
+ * Asserts which attribute rows carry the "redacted" badge and which do not,
+ * and that the privacy-layer note stands above the table exactly when any
+ * does.
+ *
+ * @param marked Keys whose rows must carry the badge.
+ * @param unmarked Keys whose rows must not.
+ */
+function expectRedactionMarking(marked: readonly string[], unmarked: readonly string[]): void {
+  for (const key of marked) {
+    expect(redactedBadge(key), key).not.toBeNull();
+  }
+  for (const key of unmarked) {
+    expect(redactedBadge(key), key).toBeNull();
+  }
+  const region = screen.getByRole('region', { name: 'Attributes' });
+  const note = within(region).queryByText(REDACTION_NOTE);
+  if (marked.length === 0) {
+    expect(note).toBeNull();
+    return;
+  }
+  expect(note).not.toBeNull();
+  const grid = within(region).getByRole('grid', { name: ATTRIBUTES_CAPTION });
+  // The note precedes the table in document order: it is read first.
+  expect(
+    note === null ? 0 : note.compareDocumentPosition(grid) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).not.toBe(0);
+}
+
+describe('EventDetails attributes — values the privacy layer replaced', () => {
+  it('marks a value that is exactly the marker although no path lists it, and shows the note', () => {
+    renderDrawer({
+      event: eventWithAttributes({
+        method: 'GET',
+        'http.status_code': 200,
+        authorization: MARKER,
+        note: 'plain value',
+      }),
+    });
+
+    expectRedactionMarking(['authorization'], ['method', 'http.status_code', 'note']);
+    expect(renderedValue('authorization')).toBe(MARKER);
+  });
+
+  it('marks a structured value with the marker nested at any depth, rendered as captured', () => {
+    const props = { token: MARKER, count: 0 };
+    const state = { form: { fields: [{ name: 'email' }, { name: 'secret', value: MARKER }] } };
+    renderDrawer({
+      event: eventWithAttributes({ props, state, sizes: [1, 2, 3], label: 'Save' }),
+    });
+
+    expectRedactionMarking(['props', 'state'], ['sizes', 'label']);
+    expect(renderedValue('props')).toBe(JSON.stringify(props, null, 2));
+    expect(renderedValue('state')).toBe(JSON.stringify(state, null, 2));
+  });
+
+  it('marks the marker in place of a credential inside a longer string', () => {
+    renderDrawer({
+      event: eventWithAttributes({
+        header: 'Authorization: [redacted]',
+        'db.connection': 'postgres://[redacted]@127.0.0.1:5432/items',
+        message: 'retrying with Bearer [redacted]',
+      }),
+    });
+
+    expectRedactionMarking(['header', 'db.connection', 'message'], []);
+    expect(renderedValue('message')).toBe('retrying with Bearer [redacted]');
+  });
+
+  it('marks a preview whose bound cut through the marker, but not a shorter, ambiguous cut', () => {
+    renderDrawer({
+      event: eventWithAttributes({
+        cutPreview: '"Bearer [redac\u2026',
+        nestedCut: { preview: '{ token: "[red\u2026', truncated: true },
+        ambiguousCut: 'items [re\u2026',
+        arrayCut: 'Array(3) [\u2026',
+      }),
+    });
+
+    expectRedactionMarking(['cutPreview', 'nestedCut'], ['ambiguousCut', 'arrayCut']);
+    expect(renderedValue('cutPreview')).toBe('"Bearer [redac\u2026');
+  });
+
+  it('never marks prose that uses the word, another casing, or the word without brackets', () => {
+    renderDrawer({
+      event: eventWithAttributes({
+        note: 'the token was not redacted',
+        status: 'redacted',
+        upper: '[REDACTED]',
+        spaced: '[ redacted ]',
+        nested: { reason: 'partially redacted upstream', list: ['redacted'] },
+      }),
+    });
+
+    expectRedactionMarking([], ['note', 'status', 'upper', 'spaced', 'nested']);
+  });
+
+  it('never reads a key as a value: a key spelled as the marker marks nothing', () => {
+    renderDrawer({ event: eventWithAttributes({ lookup: { [MARKER]: 'plain value' } }) });
+
+    expectRedactionMarking([], ['lookup']);
+  });
+
+  it('still marks a value whose path the service redactor listed, and only that value', () => {
+    renderDrawer({
+      event: eventWithAttributes(
+        { 'item.count': 3, 'user.email': 'hidden-by-policy', headers: { accept: 'text/html' } },
+        ['user.email', 'headers.cookie'],
+      ),
+    });
+
+    expectRedactionMarking(['user.email', 'headers'], ['item.count']);
+    expect(renderedValue('user.email')).toBe('hidden-by-policy');
+  });
+
+  it('scans a cyclic value once without throwing, finding a marker behind the cycle', () => {
+    const withMarker: Record<string, unknown> = { name: 'node' };
+    withMarker.self = withMarker;
+    withMarker.child = { back: withMarker, secret: MARKER };
+    const withoutMarker: Record<string, unknown> = { name: 'node' };
+    withoutMarker.self = withoutMarker;
+    renderDrawer({ event: eventWithAttributes({ withMarker, withoutMarker }) });
+
+    expectRedactionMarking(['withMarker'], ['withoutMarker']);
+    expect(renderedValue('withoutMarker')).toContain('[Circular]');
+  });
+
+  it('finds a marker nested far deeper than any captured value goes', () => {
+    let deep: unknown = { secret: MARKER };
+    for (let depth = 0; depth < 200; depth += 1) {
+      deep = { next: deep };
+    }
+    renderDrawer({ event: eventWithAttributes({ deep }) });
+
+    expectRedactionMarking(['deep'], []);
+  });
+
+  it('bounds the scan: a marker beyond the values it reads is not claimed', () => {
+    const withinBound = [...Array.from({ length: 100 }, () => 'plain value'), MARKER];
+    const beyondBound = [...Array.from({ length: 5_000 }, () => 'plain value'), MARKER];
+    renderDrawer({ event: eventWithAttributes({ withinBound, beyondBound }) });
+
+    expectRedactionMarking(['withinBound'], ['beyondBound']);
+  });
+
+  it('degrades an unreadable value without a claim and without taking the drawer down', () => {
+    const unreadable = Object.defineProperty({}, 'secret', {
+      enumerable: true,
+      get(): never {
+        throw new Error('This member cannot be read.');
+      },
+    });
+    renderDrawer({ event: eventWithAttributes({ unreadable, header: MARKER }) });
+
+    expectRedactionMarking(['header'], ['unreadable']);
+    expect(within(attributeRow('unreadable')).getByText(UNSERIALISABLE_LABEL)).toBeTruthy();
   });
 });

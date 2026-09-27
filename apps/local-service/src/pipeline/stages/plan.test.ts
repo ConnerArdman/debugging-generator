@@ -1369,7 +1369,7 @@ describe('gateInstrumentationPlan', () => {
     expect(outcome.plan.sessionId).toBe(SESSION_ID);
   });
 
-  it('assigns adapter, mode and ids through the registry, keeping authored order and duplicates', () => {
+  it('assigns adapter, mode and ids through the registry, keeping authored order and duplicates for feasibility to see', () => {
     const duplicated: InstrumentationPlanInput = {
       ...MODEL_PLAN,
       instrumentationTargets: [
@@ -1386,21 +1386,24 @@ describe('gateInstrumentationPlan', () => {
     if (outcome.kind !== 'accepted') {
       throw new Error(`Expected the plan to be accepted, received ${outcome.kind}.`);
     }
-    const actions = outcome.plan.instrumentationTargets;
-    expect(actions.map((action) => [action.type, action.adapter, action.mode])).toEqual([
+    // The normalised plan feasibility judged keeps order and the duplicate.
+    const judged = vi.mocked(checkPlanFeasibility).mock.calls[0]?.[0];
+    const normalized = judged?.instrumentationTargets ?? [];
+    expect(normalized.map((action) => [action.type, action.adapter, action.mode])).toEqual([
       ['interaction-tracking', PAGE_PROBE, RUNTIME],
       ['fetch-tracking', WIRE_PROBE, RUNTIME],
       ['interaction-tracking', PAGE_PROBE, RUNTIME],
     ]);
-    for (const action of actions) {
+    for (const action of normalized) {
       expect(action.id).toMatch(ACTION_ID_PATTERN);
     }
     // An absent rationale is filled from the objective; an authored one is kept.
-    expect(actions[0]?.rationale).toBe(MODEL_PLAN.objective);
-    expect(actions[1]?.rationale).toBe('Time the totals request.');
-    // The duplicate survives normalisation and is refused by feasibility, as data.
+    expect(normalized[0]?.rationale).toBe(MODEL_PLAN.objective);
+    expect(normalized[1]?.rationale).toBe('Time the totals request.');
+    // Feasibility refuses the duplicate as data, and the accepted plan leaves it out.
     expect(outcome.feasibility.feasible).toHaveLength(2);
     expect(outcome.feasibility.rejected.map((refusal) => refusal.code)).toEqual([DUPLICATE_ACTION]);
+    expect(outcome.plan.instrumentationTargets).toEqual(normalized.slice(0, 2));
   });
 
   it('rejects a plan the normaliser refuses as a logged product defect, without checking feasibility', () => {
@@ -1562,26 +1565,125 @@ describe('gateInstrumentationPlan', () => {
     expect(outcome.error.hint).toBe(outcome.feasibility?.rejected[0]?.hint);
   });
 
-  it('accepts a partially feasible plan and leaves the infeasible action in place', () => {
+  it('accepts a partially feasible plan narrowed to its feasible actions, logging only codes and counts', () => {
+    const log = capturedLogger();
     const partial: InstrumentationPlanInput = {
       ...MODEL_PLAN,
       instrumentationTargets: [
-        ...MODEL_PLAN.instrumentationTargets,
         ...INFEASIBLE_PLAN.instrumentationTargets,
+        ...MODEL_PLAN.instrumentationTargets,
       ],
     };
 
     const outcome = gateInstrumentationPlan(partial, {
       registry: fakeRegistry().registry,
-      context: instrumentationContext(),
+      context: instrumentationContext({ logger: log.logger }),
     });
 
     if (outcome.kind !== 'accepted') {
       throw new Error(`Expected the plan to be accepted, received ${outcome.kind}.`);
     }
-    expect(outcome.plan.instrumentationTargets).toHaveLength(3);
-    expect(outcome.feasibility.feasible).toHaveLength(2);
+    // Only what can be installed is in the plan version, in authored order.
+    expect(outcome.plan.instrumentationTargets).toEqual(outcome.feasibility.feasible);
+    expect(outcome.plan.instrumentationTargets.map((action) => action.type)).toEqual([
+      'interaction-tracking',
+      'fetch-tracking',
+    ]);
+    expect(outcome.plan.instrumentationTargets.map((action) => action.file)).not.toContain(
+      UNINDEXED_FILE,
+    );
+    // The rest of the plan is untouched, and still internally valid.
+    expect(outcome.plan.objective).toBe(partial.objective);
+    expect(outcome.plan.planVersion).toBe(1);
+    expect(instrumentationPlanSchema.safeParse(outcome.plan).success).toBe(true);
+    // The refusal stays on the report as data.
     expect(outcome.feasibility.rejected.map((refusal) => refusal.code)).toEqual([FILE_NOT_INDEXED]);
+    expect(outcome.feasibility.rejected[0]?.action.file).toBe(UNINDEXED_FILE);
+
+    const omitted = log.records.filter(
+      (record) => record.level === 'info' && record.fields['omitted'] !== undefined,
+    );
+    expect(omitted).toHaveLength(1);
+    expect(omitted[0]?.fields).toMatchObject({
+      stage: PLAN,
+      planVersion: 1,
+      omitted: { 'function-timing/patch': 1 },
+      rejectionCodes: [FILE_NOT_INDEXED],
+      kept: 2,
+      restated: 0,
+    });
+    const logged = log.records.map(serializeRecord).join('\n');
+    expect(logged).not.toContain(UNINDEXED_FILE);
+    expect(logged).not.toContain(UNINDEXED_SYMBOL);
+  });
+
+  it('returns a wholly feasible plan exactly as validated, logging no omission', () => {
+    const log = capturedLogger();
+
+    const outcome = gateInstrumentationPlan(MODEL_PLAN, {
+      registry: fakeRegistry().registry,
+      context: instrumentationContext({ logger: log.logger }),
+    });
+
+    if (outcome.kind !== 'accepted') {
+      throw new Error(`Expected the plan to be accepted, received ${outcome.kind}.`);
+    }
+    expect(outcome.plan).toBe(vi.mocked(checkPlanFeasibility).mock.calls[0]?.[0]);
+    expect(outcome.feasibility.rejected).toEqual([]);
+    expect(log.records.some((record) => record.fields['omitted'] !== undefined)).toBe(false);
+  });
+
+  it('never drops an action the previous version installed, even when its re-check refuses it', () => {
+    const log = capturedLogger();
+    const installed = proposal(SOURCE_PROBE, 42, 'function-timing', PATCH, {
+      file: UNINDEXED_FILE,
+      symbol: UNINDEXED_SYMBOL,
+    });
+    const restatement = {
+      file: UNINDEXED_FILE,
+      symbol: UNINDEXED_SYMBOL,
+      type: 'function-timing',
+    } as const;
+    const followUp: InstrumentationPlanInput = {
+      ...MODEL_PLAN,
+      instrumentationTargets: [
+        ...MODEL_PLAN.instrumentationTargets,
+        restatement,
+        restatement,
+        { file: UNINDEXED_FILE, symbol: 'renderSummary', type: 'function-timing' },
+      ],
+    };
+
+    const outcome = gateInstrumentationPlan(followUp, {
+      registry: fakeRegistry().registry,
+      context: instrumentationContext({ planVersion: 2, logger: log.logger }),
+      previousActions: [installed],
+    });
+
+    if (outcome.kind !== 'accepted') {
+      throw new Error(`Expected the follow-up plan to be accepted, received ${outcome.kind}.`);
+    }
+    const actions = outcome.plan.instrumentationTargets;
+    // The two new feasible actions, then the installed one, once, under its own id.
+    expect(actions.map((action) => action.type)).toEqual([
+      'interaction-tracking',
+      'fetch-tracking',
+      'function-timing',
+    ]);
+    expect(actions[2]?.id).toBe(installed.id);
+    expect(actionIdentityKey(actions[2] ?? installed)).toBe(actionIdentityKey(installed));
+    // Its re-check is still reported, next to the new actions it did not rescue.
+    expect(outcome.feasibility.rejected.map((refusal) => refusal.code)).toEqual([
+      FILE_NOT_INDEXED,
+      FILE_NOT_INDEXED,
+      FILE_NOT_INDEXED,
+    ]);
+    const omitted = log.records.filter((record) => record.fields['omitted'] !== undefined);
+    expect(omitted[0]?.fields).toMatchObject({
+      omitted: { 'function-timing/patch': 2 },
+      kept: 3,
+      restated: 1,
+    });
   });
 
   it('reports a context the feasibility gate cannot use as a failure, not a rejection', () => {
@@ -2146,6 +2248,37 @@ describe('createPlanStage', () => {
     expect(request.previousActions).toBe(previous);
   });
 
+  it('records a follow-up without its refused additions, but with every installed action it restates', async () => {
+    const installed = proposal(SOURCE_PROBE, 43, 'function-timing', PATCH, {
+      file: UNINDEXED_FILE,
+      symbol: UNINDEXED_SYMBOL,
+    });
+    const followUp: InstrumentationPlanInput = {
+      ...MODEL_PLAN,
+      instrumentationTargets: [
+        { file: UNINDEXED_FILE, symbol: UNINDEXED_SYMBOL, type: 'function-timing' },
+        ...MODEL_PLAN.instrumentationTargets,
+        { file: UNINDEXED_FILE, symbol: 'renderSummary', type: 'function-timing' },
+      ],
+    };
+    const h = harness({ nextPlanVersion: 2, outcomes: [answer(followUp)] });
+
+    const value = expectOk(await h.run({ previousActions: [installed] }));
+
+    const actions = value.plan.instrumentationTargets;
+    expect(actions.map((action) => [action.type, action.file])).toEqual([
+      ['function-timing', UNINDEXED_FILE],
+      ['interaction-tracking', TARGETLESS_FILE],
+      ['fetch-tracking', TARGETLESS_FILE],
+    ]);
+    expect(actions[0]?.id).toBe(installed.id);
+    expect(actions.map((action) => action.symbol)).not.toContain('renderSummary');
+    const request = installRequestOf(h);
+    expect(request.plan).toBe(value.plan);
+    expect(request.previousActions).toEqual([installed]);
+    expect(value.feasibility.rejected).toHaveLength(2);
+  });
+
   it('refuses a follow-up on a session with no earlier plan version', async () => {
     const h = harness({ nextPlanVersion: 1 });
     const previous = [proposal(PAGE_PROBE, 9, 'interaction-tracking', RUNTIME)];
@@ -2392,9 +2525,20 @@ describe('createPlanStage — the gate’s rejections, observed through a run', 
       expect(FEASIBILITY_REJECTION_CODES).toContain(refusal.code);
     }
 
-    // The plan is recorded and installed as validated; the installer reports the refusal.
-    expect(value.plan.instrumentationTargets).toHaveLength(3);
+    // Only the feasible actions are recorded and installed: nothing the gate
+    // refused can reach the installer and resurface as a signal that "could not
+    // be enabled".
+    expect(value.plan.instrumentationTargets.map((action) => action.type)).toEqual([
+      'interaction-tracking',
+      'fetch-tracking',
+    ]);
+    expect(recordedPlanOf(h).instrumentationTargets).toEqual(value.feasibility.feasible);
     expect(installRequestOf(h).plan).toBe(value.plan);
+    expect(
+      installRequestOf(h).plan.instrumentationTargets.map((action) => action.file),
+    ).not.toContain(UNINDEXED_FILE);
+    // The plan group closes normally: no degradation row is emitted for a refusal.
+    expect(h.progress.trail).toEqual([`stageStarted:${PLAN}`, `stageCompleted:${PLAN}`]);
 
     // The completion record carries the rejection code, never the refused file.
     const completed = recordsWith(

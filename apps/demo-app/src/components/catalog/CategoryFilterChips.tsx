@@ -41,6 +41,14 @@
  *     own - the stylesheet reaches it as a child of the row - because it has neither a glyph to
  *     align nor a name long enough to truncate.
  *
+ * THE PRESSED STATE IS ALSO HOW THE ACTIVE CHIP IS FOUND AGAIN
+ * A press asks the parent for a new listing, and a listing that arrives by remounting the surface
+ * replaces this row and the chip that had focus with it. `CatalogGrid` returns focus to the chip
+ * that is on once its listing is on screen, and it finds that chip by the `aria-pressed="true"`
+ * the primitive renders for it - the announced state, rather than a class or a marker of this
+ * file's - so the chip a reader lands on is by construction the one that describes the listing.
+ * Nothing here takes or moves focus itself.
+ *
  * ONE GROUP, ONE LABEL
  * The row is a single `role="group"` carrying one `aria-label`, so the set of filters is announced
  * once and each chip is then announced with its own pressed state. The group is the only accessible

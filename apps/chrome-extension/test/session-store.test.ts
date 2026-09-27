@@ -395,3 +395,44 @@ describe('notice lifetime', () => {
     expect(before.tailNotices).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// A binding answers the refusal that no session served the origin
+// ---------------------------------------------------------------------------
+
+/** Relay a session-less `error` frame, as the service answers a refused bind. */
+function relayError(code: MessagePayload<'error'>['code'], ts: number): void {
+  applyRelayedMessage(
+    createEnvelope('error', { code, message: 'The request was refused.' }, { ts }),
+  );
+}
+
+describe('a binding answers the refusal that no session served the origin', () => {
+  it('clears the no-session refusal once the tab binds, as when the open panel is sent its new session', () => {
+    relayError('SESSION_NOT_FOUND', T0);
+    expect(getPanelSnapshot().lastError?.code).toBe('SESSION_NOT_FOUND');
+
+    setBindingState(bound(sessionId, TAB_ID, BOUND_URL));
+
+    expect(getPanelSnapshot().connection.binding).toEqual(bound(sessionId, TAB_ID, BOUND_URL));
+    expect(getPanelSnapshot().lastError).toBeUndefined();
+  });
+
+  it('keeps any other failure across the binding', () => {
+    relayError('TRANSPORT_DISCONNECTED', T0);
+
+    setBindingState(bound(sessionId, TAB_ID, BOUND_URL));
+
+    expect(getPanelSnapshot().lastError?.code).toBe('TRANSPORT_DISCONNECTED');
+  });
+
+  it('keeps the refusal while the tab stays unbound or away', () => {
+    relayError('SESSION_NOT_FOUND', T0);
+
+    setBindingState({ kind: 'unbound' });
+    expect(getPanelSnapshot().lastError?.code).toBe('SESSION_NOT_FOUND');
+
+    setBindingState({ kind: 'tab-left', origin: ORIGIN, sessionId });
+    expect(getPanelSnapshot().lastError?.code).toBe('SESSION_NOT_FOUND');
+  });
+});

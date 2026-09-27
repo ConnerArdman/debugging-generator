@@ -4,9 +4,11 @@
  *
  * ## What the command does
  *
- * 1. **Precondition.** A session must be active. The shared guard renders the
+ * 1. **Preconditions.** A session must be active. The shared guard renders the
  *    single "No active session." notice itself, so an unmet guard is a plain
- *    early return here.
+ *    early return here. A session the store has acknowledged as ended
+ *    (`./capture-availability`) gets one informational notice saying it cannot
+ *    capture again and how to start another session, and no request is sent.
  * 2. **One operation.** `POST /sessions/:id/capture/start` through
  *    `ServiceClient.startCapture` — addressed by operation id, never by a path
  *    written here. No retry, no second request.
@@ -26,19 +28,32 @@
  *      `error.details.owningSessionId`; this module validates it with the same
  *      schema's field and renders one warning that **names the owning
  *      session**, with an action that reopens it.
+ *    - *State refusal* — `409 SESSION_INVALID_STATE`: the session's state on
+ *      the service does not allow a start (its own capture is already running,
+ *      it is not armed yet, it moved on). The service scrubs the message to a
+ *      code-level summary, so one warning is worded from the session status the
+ *      store reads once the refusal arrived (`captureRefusalNotice`), with the
+ *      next step — never the raw `status 409` failure text.
  *    - *Any other failure* is one error notice built from the typed failure,
  *      keeping the service-provided `hint` — which is where the relaunch command
  *      arrives when server-side signals are not ready (AAP §0.5.5 row 1).
+ *
+ * The title-bar action is greyed by the command's `enablement` clause
+ * (`debuggen.captureCanStart`, kept by `bindCaptureContextKeys`) whenever the
+ * session is not armed; the webview dispatches the command directly, which
+ * `enablement` does not block, so every path above stays reachable.
  *
  * ## What it deliberately does not do
  *
  * - It never mutates the store, never estimates a capture counter and never
  *   presents a refused start as a running capture (AAP §0.5.4, §0.5.5).
- * - It never short-circuits on the host's cached `captureState`: the service is
- *   the authority on whether this session may start a capture, and a second
- *   start of the session's own capture is answered `SESSION_INVALID_STATE`,
- *   which the generic failure path renders with the service's own wording. A
- *   stale projection can therefore never block a legitimate start.
+ * - It never short-circuits on non-terminal cached state (`captureState`, a
+ *   status other than `ended`): the service is the authority on whether this
+ *   session may start a capture, and a stale projection can therefore never
+ *   block a legitimate start. The single exception is an acknowledged end,
+ *   which is terminal in the store (`ExtensionState.hasAcknowledgedEnd`) and in
+ *   the service's state machine (`ended` has no outgoing edge), so skipping the
+ *   request there can only spare a certain refusal.
  * - It never detects the conflict from message text or from a status number: the
  *   only signal is a schema-valid `owningSessionId` in the structured details.
  * - It logs one line with the command id only — never a token, a session
@@ -48,7 +63,9 @@
  *
  * Imports **types only** from `./index` (the barrel imports this module at
  * runtime), so the reopen command id is a literal checked against
- * {@link CommandId} rather than a value read from `COMMAND_IDS`.
+ * {@link CommandId} rather than a value read from `COMMAND_IDS`. The
+ * availability rules and the ended and refusal copy come from
+ * `./capture-availability`, which imports nothing from this folder at runtime.
  *
  * @example
  * ```ts
@@ -61,6 +78,12 @@ import { captureStartConflictResponseSchema } from '@debuggen/protocol';
 import type { SessionListItem } from '@debuggen/protocol';
 import { DebuggenError, isErr } from '@debuggen/shared';
 
+import {
+  captureAvailabilityOf,
+  captureRefusalNotice,
+  endedSessionNotice,
+  isCaptureStateRefusal,
+} from './capture-availability';
 import type { ActiveSessionRef, CommandContext, CommandId } from './index';
 
 /** This command's id, as it appears in every log line the module writes. */
@@ -72,7 +95,7 @@ const START_CAPTURE_COMMAND = 'debuggen.startCapture' satisfies CommandId;
  */
 const REOPEN_SESSION_COMMAND = 'debuggen.reopenSession' satisfies CommandId;
 
-/** The headline prefix of every non-conflict failure. */
+/** The headline prefix of every failure other than the conflict and a state refusal. */
 const FAILURE_PREFIX = 'Could not start capture';
 
 /** The one action the conflict notice offers. */
@@ -193,7 +216,9 @@ async function renderConflict(ctx: CommandContext, ownerId: string): Promise<voi
  *
  * Resolves once the outcome has been rendered; it never rejects for an
  * expected failure, and it renders exactly one message per failure. On success
- * it renders nothing: the `capture.started` broadcast updates the view.
+ * it renders nothing: the `capture.started` broadcast updates the view. For a
+ * session the store knows has ended it sends nothing and renders the one
+ * ended-session notice.
  *
  * @param ctx The command context built by `registerCommands`.
  * @param _args Whatever VS Code invoked the command with. The command acts on
@@ -209,6 +234,16 @@ export async function startCapture(
     return;
   }
 
+  // `ended` is terminal in the store and on the service, so this is the one
+  // cached fact that may stop the request (see the module overview).
+  if (captureAvailabilityOf(ctx.state, active.sessionId).ended) {
+    ctx.logger.info('Capture start skipped: the session has ended', {
+      command: START_CAPTURE_COMMAND,
+    });
+    await ctx.ui.notify(endedSessionNotice('start'));
+    return;
+  }
+
   ctx.logger.info('Capture start requested', { command: START_CAPTURE_COMMAND });
   const started = await ctx.client.startCapture(active.sessionId);
   if (!isErr(started)) {
@@ -218,6 +253,15 @@ export async function startCapture(
   const ownerId = conflictOwnerOf(started.error);
   if (ownerId !== undefined && ownerId !== active.sessionId) {
     await renderConflict(ctx, ownerId);
+    return;
+  }
+
+  if (isCaptureStateRefusal(started.error)) {
+    // Worded from the store as it reads now: the refusal is often the first
+    // sign that the session moved on, and its frames may have arrived meanwhile.
+    await ctx.ui.notify(
+      captureRefusalNotice('start', captureAvailabilityOf(ctx.state, active.sessionId)),
+    );
     return;
   }
 

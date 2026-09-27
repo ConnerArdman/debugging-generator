@@ -37,18 +37,29 @@
  * here would be a second, drifting copy of it.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { normalizeSqlStatement } from '../redaction/sql.js';
 import type { TelemetryEvent } from '../schema/event.js';
 import type { TelemetryKind } from '../schema/kinds.js';
 import {
   MAX_CALLER_LOOKUP_HOPS,
+  STATEMENT_KEY_MEMO_CAPACITY,
   UNKNOWN_STATEMENT_KEY,
   aggregateQueries,
   isDatabaseStatementEvent,
 } from './queries.js';
 import type { QueryGroup } from './queries.js';
+
+/**
+ * `normalizeSqlStatement` as it is, observed: every call reaches the real
+ * function and returns its answer, so each case's expected keys are still the
+ * real ones — and the memo cases can count how often the module normalised.
+ */
+vi.mock('../redaction/sql.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../redaction/sql.js')>();
+  return { ...actual, normalizeSqlStatement: vi.fn(actual.normalizeSqlStatement) };
+});
 
 /*
  * ---------------------------------------------------------------------------
@@ -705,6 +716,70 @@ describe('aggregateQueries: callers, bounds and order', () => {
     expect(group.occurrences[0]?.callerName).toBe('loadItems');
   });
 
+  describe('an occurrence the resolver could not place itself', () => {
+    const OPERATION_SITE = {
+      file: 'src/server/services/items.service.ts',
+      line: 58,
+      column: 13,
+      symbol: 'loadItems',
+      resolvedBy: 'code-graph',
+      confidence: 0.85,
+    } as const;
+
+    it('opens the call site of the ORM operation that issued the statement', () => {
+      // A statement span that reached the service before the ORM operation
+      // above it could not be placed at ingest; the operation was, and its
+      // call site is where the statement was issued — not the caller's.
+      const caller = functionSpan('loadItems');
+      const operation = {
+        ...lifecycleSpan('prisma:client:operation', 'operation', {
+          parentSpanId: caller.spanId,
+          duration: 30,
+        }),
+        source: OPERATION_SITE,
+      };
+      const statement = statementSpan(SELECT_ITEMS, {
+        parentSpanId: operation.spanId,
+        duration: 12,
+      });
+
+      const group = groupOf(aggregateQueries([caller, operation, statement]), SELECT_ITEMS);
+
+      expect(group.occurrences[0]?.source).toEqual(OPERATION_SITE);
+      expect(group.callers[0]?.source?.symbol).toBe('loadItems');
+      expect(group.callers[0]?.source?.line).toBe(41);
+    });
+
+    it('keeps the statement span’s own location over any ancestor’s', () => {
+      const caller = functionSpan('loadItems');
+      const operation = {
+        ...lifecycleSpan('prisma:client:operation', 'operation', { parentSpanId: caller.spanId }),
+        source: OPERATION_SITE,
+      };
+      const own = { ...OPERATION_SITE, line: 60 };
+      const statement = {
+        ...statementSpan(SELECT_ITEMS, { parentSpanId: operation.spanId }),
+        source: own,
+      };
+
+      const group = groupOf(aggregateQueries([caller, operation, statement]), SELECT_ITEMS);
+
+      expect(group.occurrences[0]?.source).toEqual(own);
+    });
+
+    it('never walks past the database tier: without a placed ORM span the caller answers', () => {
+      const caller = functionSpan('loadItems');
+      const operation = lifecycleSpan('prisma:client:operation', 'operation', {
+        parentSpanId: caller.spanId,
+      });
+      const statement = statementSpan(SELECT_ITEMS, { parentSpanId: operation.spanId });
+
+      const group = groupOf(aggregateQueries([caller, operation, statement]), SELECT_ITEMS);
+
+      expect(group.occurrences[0]?.source).toEqual(caller.source);
+    });
+  });
+
   it('keeps the counts exact when the occurrence bound cuts the sample', () => {
     const caller = functionSpan('loadItems');
     const executions = Array.from({ length: 5 }, (_unused, index) =>
@@ -765,5 +840,101 @@ describe('aggregateQueries: callers, bounds and order', () => {
     aggregateQueries(events);
 
     expect(structuredClone(events)).toEqual(before);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The statement-key memo
+ * ---------------------------------------------------------------------------
+ */
+
+describe('aggregateQueries: normalising each statement once', () => {
+  /** How often one call of `aggregateQueries` normalised each text, by text. */
+  function normalisationsDuring(run: () => void): Map<unknown, number> {
+    const normalize = vi.mocked(normalizeSqlStatement);
+    normalize.mockClear();
+    run();
+    const counts = new Map<unknown, number>();
+    for (const [text] of normalize.mock.calls) {
+      counts.set(text, (counts.get(text) ?? 0) + 1);
+    }
+    normalize.mockClear();
+    return counts;
+  }
+
+  it('normalises each distinct text once per call, however often it ran and however nested', () => {
+    // A thousand executions of two statements, every other one observed twice
+    // (a driver span nested in the ORM's): the index and the fold both need
+    // every key, and between them each text is normalised once.
+    const caller = functionSpan('loadItems');
+    const events: TelemetryEvent[] = [caller];
+    for (let index = 0; index < 500; index += 1) {
+      const statement = index % 2 === 0 ? SELECT_ITEMS : SELECT_ITEM_GROUPS;
+      const outer = statementSpan(statement, {
+        parentSpanId: caller.spanId,
+        client: 'prisma',
+        at: index,
+        duration: 2,
+      });
+      events.push(outer, statementSpan(statement, { parentSpanId: outer.spanId, at: index }));
+      events.push(statementSpan(statement, { parentSpanId: caller.spanId, at: index }));
+    }
+
+    let groups: QueryGroup[] = [];
+    const counts = normalisationsDuring(() => {
+      groups = aggregateQueries(events);
+    });
+
+    expect(counts).toEqual(
+      new Map([
+        [SELECT_ITEMS, 1],
+        [SELECT_ITEM_GROUPS, 1],
+      ]),
+    );
+    // The fold is untouched: every outer and every lone execution counted, no
+    // nested observation counted twice.
+    expect(groupOf(groups, SELECT_ITEMS).executionCount).toBe(500);
+    expect(groupOf(groups, SELECT_ITEM_GROUPS).executionCount).toBe(500);
+
+    // A second call starts from nothing: the memo is the call's, not the module's.
+    expect(normalisationsDuring(() => aggregateQueries(events)).get(SELECT_ITEMS)).toBe(1);
+  });
+
+  it('answers past its bound exactly as within it, remembering only the first texts', () => {
+    // More distinct texts than the memo holds, each run twice, and a nested
+    // duplicate observation of the last one, which the memo no longer holds.
+    const beyond = 10;
+    const texts = Array.from(
+      { length: STATEMENT_KEY_MEMO_CAPACITY + beyond },
+      (_unused, index) => `select id from items_${String(index)} where id = $1`,
+    );
+    const events = texts.flatMap((text, index) => [
+      statementSpan(text, { at: index }),
+      statementSpan(text, { at: index }),
+    ]);
+    const last = texts.at(-1) ?? '';
+    const outer = statementSpan(last, { client: 'prisma', duration: 9 });
+    events.push(outer, statementSpan(last, { parentSpanId: outer.spanId, duration: 4 }));
+
+    let groups: QueryGroup[] = [];
+    const counts = normalisationsDuring(() => {
+      groups = aggregateQueries(events);
+    });
+
+    // One group per text, each with its exact count; the duplicate past the
+    // bound still collapsed into its outer observation.
+    expect(groups).toHaveLength(texts.length);
+    for (const text of texts.slice(0, 3)) {
+      expect(groupOf(groups, text).executionCount).toBe(2);
+    }
+    expect(groupOf(groups, last).executionCount).toBe(3);
+    // The first texts are normalised once; the ones past the bound on every use.
+    for (const text of texts.slice(0, STATEMENT_KEY_MEMO_CAPACITY)) {
+      expect(counts.get(text), text).toBe(1);
+    }
+    for (const text of texts.slice(STATEMENT_KEY_MEMO_CAPACITY)) {
+      expect(counts.get(text), text).toBeGreaterThan(1);
+    }
   });
 });

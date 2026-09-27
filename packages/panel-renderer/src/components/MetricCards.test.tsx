@@ -242,6 +242,29 @@ const UNKNOWN_TRIGGER_LABEL = 'Renders with an undetermined trigger';
 const REPEATED_LABEL = 'Repeated value';
 
 /**
+ * The line each tier duration's tile carries under its heading, restated
+ * rather than imported so a changed word is a failing case: every one says the
+ * figure is wall-clock time and how overlapping work is treated, which is what
+ * tells it apart from a dependency graph's summed participant time. No other
+ * metric carries one.
+ */
+const DURATION_QUALIFIERS: Readonly<Partial<Record<MetricId, string>>> = {
+  total_duration: 'wall clock: first start to last end',
+  frontend_duration: 'wall clock, not covered by the server',
+  backend_duration: 'wall clock: parallel work counted once',
+  database_duration: 'wall clock: overlapping statements counted once',
+};
+
+/**
+ * The heading part of a tile's accessible name: the heading, followed by its
+ * qualifier in parentheses for a metric that has one.
+ */
+function namedHeading(id: MetricId, label: string): string {
+  const qualifier = DURATION_QUALIFIERS[id];
+  return qualifier === undefined ? label : `${label} (${qualifier})`;
+}
+
+/**
  * The component's module-private copy, recognised by generic substrings rather
  * than restated sentences — the way the empty-state case reads its message —
  * so each case pins which statement a tile makes, not its exact wording.
@@ -724,7 +747,7 @@ function expectNotOnPage(card: HTMLElement, id: MetricId): void {
   expect(severityStyleOf(card)).toBeNull();
   expect(noteOf(card)).toMatch(NOT_ON_PAGE_NOTE);
   expect(noteOf(card)).not.toMatch(NOT_COMPUTED_NOTE);
-  expect(card.getAttribute('aria-label')).toBe(`${humanizeLabel(id)}: ${figure}`);
+  expect(card.getAttribute('aria-label')).toBe(`${namedHeading(id, humanizeLabel(id))}: ${figure}`);
 }
 
 /**
@@ -1696,7 +1719,7 @@ describe('MetricCards accessibility and interaction', () => {
     // Queried *by* the accessible name, so the case fails if the pairing is
     // dropped rather than merely if the attribute text changes.
     const durationCard = within(group).getByRole('listitem', {
-      name: `${TOTAL_DURATION_LABEL}: ${duration.value} ${duration.unit}`,
+      name: `${TOTAL_DURATION_LABEL} (wall clock: first start to last end): ${duration.value} ${duration.unit}`,
     });
     const countCard = within(group).getByRole('listitem', {
       name: `${RENDER_COUNT_LABEL}: ${formatCount(RENDER_COUNT)}`,
@@ -1906,6 +1929,85 @@ describe('MetricCards tile presentation', () => {
         expect.arrayContaining(['flex-direction: column', 'justify-content: space-between']),
       );
     }
+  });
+
+  it("says under each tier duration's heading what kind of time it is, and keeps its figure at the bottom", async () => {
+    // The tier durations are wall-clock spans with overlapping work counted
+    // once; a dependency graph beside them sums its participants' records.
+    // Without the qualifier, a database participant showing more time than the
+    // database tile reads as a contradiction.
+    const durations: readonly MetricId[] = [
+      'total_duration',
+      'frontend_duration',
+      'backend_duration',
+      'database_duration',
+    ];
+    const stub = resolvingProvider([
+      ...durations.map((id, index) => makeDuration(id, FAST_MS + index)),
+      makeMetric('render_count', { value: RENDER_COUNT, label: RENDER_COUNT_LABEL }),
+    ]);
+
+    renderCards(makeNode([...durations, 'render_count']), { provider: stub.provider });
+
+    const cards = await findCards(5);
+    for (const [index, id] of durations.entries()) {
+      const card = cardAt(cards, index);
+      const qualifier = DURATION_QUALIFIERS[id] ?? '';
+      const headingBlock = card.firstElementChild;
+      const figure = durationFigure(FAST_MS + index);
+
+      // Still two children — the heading block and the figure row — so the
+      // tile's space-between keeps the figure level with its neighbours'.
+      expect(card.children).toHaveLength(2);
+      expect(card.lastElementChild?.contains(partOf(card, 'value'))).toBe(true);
+
+      // The heading element holds the heading alone; the qualifier follows it,
+      // inside the same heading block, in the smaller muted role.
+      if (!(headingBlock instanceof HTMLElement)) {
+        throw new Error(`the ${id} tile rendered no heading block`);
+      }
+      const label = partOf(card, 'label');
+      expect(headingBlock.contains(label)).toBe(true);
+      expect(textOf(card, 'label')).toBe(humanizeLabel(id));
+      const qualifierLine = within(headingBlock).getByText(qualifier);
+      expect(label?.contains(qualifierLine)).toBe(false);
+      expect(
+        (label?.compareDocumentPosition(qualifierLine) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).not.toBe(0);
+      expect(qualifierLine.classList.contains('dg-text--xs')).toBe(true);
+      expect(qualifierLine.classList.contains('dg-text--muted')).toBe(true);
+      expect(qualifierLine.getAttribute('style')).toBeNull();
+
+      // And a screen reader hears it with the heading.
+      expect(card.getAttribute('aria-label')).toBe(
+        `${humanizeLabel(id)} (${qualifier}): ${figure.value} ${figure.unit}`,
+      );
+    }
+    expect(new Set(durations.map((id) => DURATION_QUALIFIERS[id])).size).toBe(durations.length);
+
+    // A count is no span of time: no qualifier, and its heading stays the
+    // tile's first child exactly as before.
+    const count = cardAt(cards, 4);
+    expect(count.firstElementChild).toBe(partOf(count, 'label'));
+    expect(count.textContent).not.toMatch(/wall clock/u);
+    expect(count.getAttribute('aria-label')).toBe(
+      `${RENDER_COUNT_LABEL}: ${formatCount(RENDER_COUNT)}`,
+    );
+  });
+
+  it('qualifies a duration tile even when its value is absent or off the page', async () => {
+    const stub = resolvingProvider([makeDuration('total_duration', FAST_MS)]);
+
+    renderCards(makeNode(['total_duration', 'database_duration']), { provider: stub.provider });
+
+    // A complete read that did not find the database duration: still the same
+    // measure, so still the same qualifier, beside the absent figure.
+    const absent = cardAt(await findCards(2), 1);
+    expectNotComputed(absent, 'database_duration');
+    expect(absent.textContent).toContain(DURATION_QUALIFIERS.database_duration);
+    expect(absent.getAttribute('aria-label')).toBe(
+      `${namedHeading('database_duration', humanizeLabel('database_duration'))}: ${NOT_AVAILABLE_LABEL}`,
+    );
   });
 
   it('spans each state box across every track of the tile grid', async () => {

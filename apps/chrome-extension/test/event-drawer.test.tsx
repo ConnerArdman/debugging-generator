@@ -35,6 +35,11 @@
  *   selection gets follows from where it was raised (`drawerEvidencePanel`).
  * - **A lookup never outlives its session.** Changing the session aborts the
  *   earlier lookup's request, and its late answer is never rendered.
+ * - **A value replaced before ingest still reads as replaced.** An event whose
+ *   attributes carry the redaction marker with no `redacted` path list — what
+ *   the store holds for a value a producer scrubbed itself — shows the
+ *   "redacted" badge on exactly those attributes, and the privacy-layer note,
+ *   whether the stored capture or the live tail answered the selection.
  *
  * **Harness.** Collected by the root `vitest.config.ts` into the
  * `chrome-extension` project (happy-dom, `@testing-library/react`). The
@@ -995,5 +1000,80 @@ describe('EventDrawer — changing the session', () => {
     );
     await renderedChain();
     expect(screen.queryByText('Synthetic stale step')).toBeNull();
+  });
+});
+
+describe('EventDrawer — values a producer redacted before ingest', () => {
+  /** The privacy layer's replacement marker, byte for byte. */
+  const MARKER = '[redacted]';
+
+  /** The note `EventDetails` shows above the attributes table. */
+  const REDACTION_NOTE =
+    'Values marked redacted were replaced by the privacy layer before the event was stored.';
+
+  /**
+   * The selected event as the store holds a value the browser agent scrubbed
+   * before sending it: the marker is in the value and no `redacted` path list
+   * exists, because the service's idempotent redactor changed nothing.
+   */
+  const REDACTED_TARGET: TelemetryEvent = {
+    ...TARGET,
+    attributes: {
+      method: 'GET',
+      authorization: MARKER,
+      props: { token: MARKER, count: 0 },
+      note: 'plain value',
+    },
+  };
+
+  /** The "redacted" badge in `key`'s attributes row, ignoring the value's own `Code`. */
+  function badgeOf(key: string): HTMLElement | null {
+    const grid = screen.getByRole('grid', { name: 'Attributes of the selected event' });
+    const row = within(grid)
+      .getAllByRole('rowheader')
+      .find((cell) => cell.textContent === key)
+      ?.closest('[role="row"]');
+    if (!(row instanceof HTMLElement)) {
+      throw new Error(`No attributes row renders for the key "${key}".`);
+    }
+    return within(row).queryByText('redacted', { ignore: 'code, script, style' });
+  }
+
+  /** The badge sits on exactly the replaced values, with the note above the table. */
+  function expectMarkedAsReplaced(): void {
+    expect(REDACTED_TARGET.redacted).toBeUndefined();
+    expect(badgeOf('authorization')).not.toBeNull();
+    expect(badgeOf('props')).not.toBeNull();
+    expect(badgeOf('method')).toBeNull();
+    expect(badgeOf('note')).toBeNull();
+    expect(
+      within(screen.getByRole('region', { name: 'Attributes' })).getByText(REDACTION_NOTE),
+    ).toBeTruthy();
+  }
+
+  it('marks them when the selection is resolved from the stored capture', async () => {
+    const harness = createDrawerHarness([ROOT, PARENT, REDACTED_TARGET]);
+
+    render(<EventDrawer {...drawerProps(harness)} />);
+
+    await renderedChain();
+    expectMarkedAsReplaced();
+  });
+
+  it('marks them when the live tail answers the selection', async () => {
+    const harness = createDrawerHarness([]);
+
+    render(
+      <EventDrawer
+        {...drawerProps(harness, {
+          selected: { eventId: REDACTED_TARGET.id, traceId: TRACE_T },
+          liveTail: [ROOT, PARENT, REDACTED_TARGET],
+        })}
+      />,
+    );
+
+    await renderedChain();
+    expect(harness.sent).toHaveLength(0);
+    expectMarkedAsReplaced();
   });
 });

@@ -215,7 +215,7 @@ import {
   Stack,
   Text,
 } from '@debuggen/panel-renderer';
-import type { Result } from '@debuggen/shared';
+import type { DebuggenErrorCode, Result } from '@debuggen/shared';
 import { DebuggenError, err, isErr } from '@debuggen/shared';
 import type {
   KeyboardEvent as ReactKeyboardEvent,
@@ -286,6 +286,32 @@ const FAILURE_FALLBACK_MESSAGE = 'The extension could not complete pairing with 
 /** The failure hint when the rejection carried none. */
 const FAILURE_FALLBACK_HINT =
   'Get a fresh code from the Debug Generator view in VS Code and try again.';
+
+/**
+ * The error code of a refusal while the service has paused pairing after too
+ * many wrong codes — the one refusal a fresh code does not fix, because the
+ * pause refuses every code, a valid one included, until it ends.
+ */
+const PAUSED_ERROR_CODE = 'RATE_LIMITED' satisfies DebuggenErrorCode;
+
+/** The failure's title while pairing is paused. */
+const PAUSED_TITLE = 'Pairing paused';
+
+/**
+ * The message while pairing is paused, when the refusal carried no usable
+ * text. The length of the pause is the service's policy and reaches the
+ * dialog in the service's own message, so it is not restated here as a number
+ * that could drift.
+ */
+const PAUSED_FALLBACK_MESSAGE =
+  'Too many incorrect codes were entered, so the local service paused pairing for a short while.';
+
+/**
+ * What to do while pairing is paused. Replaces the generic hint, which would
+ * send the developer for a fresh code that the pause refuses too.
+ */
+const PAUSED_HINT =
+  'Wait until the pause ends, then choose Try again with the current code; a new code from VS Code is refused until then too.';
 
 /** The label of the failure's explicit retry control. */
 const RETRY_ACTION_LABEL = 'Try again';
@@ -410,6 +436,8 @@ export interface PairDialogProps {
 
 /** What a failed attempt shows, derived from the rejection. */
 interface PairFailure {
+  /** The heading of the failure notice. */
+  readonly title: string;
   /** The sentence the developer reads first. */
   readonly message: string;
   /** What to do about it. */
@@ -534,12 +562,26 @@ function visibleValidationMessage(
  * falls back to generic copy. Nothing is logged: the rejection is shown, and
  * the code the developer typed is never part of the text.
  *
+ * A lockout (`RATE_LIMITED`) is titled "Pairing paused" and, since the port
+ * carries no hint, gets {@link PAUSED_HINT} rather than the generic advice to
+ * fetch a fresh code, which the pause would refuse as well. Its message is the
+ * service's, which states how long pairing is paused.
+ *
  * @param error What `submitCode` rejected with.
  * @returns The failure to render.
  */
 function describePairFailure(error: unknown): PairFailure {
   if (DebuggenError.is(error)) {
+    if (error.code === PAUSED_ERROR_CODE) {
+      return {
+        title: PAUSED_TITLE,
+        message: textOr(error.message, PAUSED_FALLBACK_MESSAGE),
+        hint: textOr(error.hint, PAUSED_HINT),
+        errorCode: error.code,
+      };
+    }
     return {
+      title: FAILURE_TITLE,
       message: textOr(error.message, FAILURE_FALLBACK_MESSAGE),
       hint: textOr(error.hint, FAILURE_FALLBACK_HINT),
       errorCode: error.code,
@@ -547,11 +589,12 @@ function describePairFailure(error: unknown): PairFailure {
   }
   if (error instanceof Error) {
     return {
+      title: FAILURE_TITLE,
       message: textOr(error.message, FAILURE_FALLBACK_MESSAGE),
       hint: FAILURE_FALLBACK_HINT,
     };
   }
-  return { message: FAILURE_FALLBACK_MESSAGE, hint: FAILURE_FALLBACK_HINT };
+  return { title: FAILURE_TITLE, message: FAILURE_FALLBACK_MESSAGE, hint: FAILURE_FALLBACK_HINT };
 }
 
 /**
@@ -1159,7 +1202,7 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
               shows its own reason on the field instead. */}
           {failure === undefined ? null : (
             <ErrorState
-              title={FAILURE_TITLE}
+              title={failure.title}
               message={failure.message}
               hint={failure.hint}
               code={failure.errorCode}

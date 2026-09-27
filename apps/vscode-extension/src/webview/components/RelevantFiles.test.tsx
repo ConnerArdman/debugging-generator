@@ -5,12 +5,21 @@
  *
  * Pinned here:
  *
- *   - **Order is the pipeline's.** One row per entry, in the order given, never
- *     re-sorted by score.
+ *   - **Order is the pipeline's.** One row per file, in the order each file
+ *     first appears, never re-sorted by score.
+ *   - **One row per file.** Entries naming the same file become one row that
+ *     keeps every distinct symbol and reason and the file's best score; files
+ *     are compared as exact strings.
  *   - **The payload is untouched.** Activating a row — by pointer or keyboard —
  *     raises `onOpenFile` with the entry's `file` string exactly as received.
  *   - **Faithful text.** Path, symbol and reason render verbatim; the score is
- *     formatted to two decimals; an absent symbol leaves no element behind.
+ *     formatted to two decimals after a visible "Relevance" label; an absent
+ *     symbol leaves no element behind.
+ *   - **Paths stay apart when shortened.** Each chip splits its path into the
+ *     `.dgv-path` lead, context and file name, with a tail that no other file
+ *     of the list ends in, so same-named files never render the same tail; the
+ *     chip is `aria-hidden` with the whole path as its tooltip, and a visually
+ *     hidden copy of the whole path names the row.
  *   - **Accessible rows.** Each row is a button named by its file (and symbol)
  *     and described by its reason, inside an ordered list.
  *   - **The three states** and their precedence: error > pending > empty > list.
@@ -147,15 +156,13 @@ function partText(row: HTMLElement, part: string): string | null {
 const CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug'] as const;
 
 describe('RelevantFiles list', () => {
-  it('renders one row per entry, in the given order, without re-sorting by score', () => {
+  it('renders one row per distinct file, in the given order, without re-sorting by score', () => {
     render(<RelevantFiles files={FILES} onOpenFile={noop} />);
 
     const items = within(theList()).getAllByRole('listitem');
     expect(items).toHaveLength(FILES.length);
 
-    const renderedPaths = items.map(
-      (item) => item.querySelector('.dgv-files__path')?.textContent ?? '',
-    );
+    const renderedPaths = items.map((item) => item.querySelector('.dgv-path')?.textContent ?? '');
     expect(renderedPaths).toEqual(FILES.map((entry) => entry.file));
   });
 
@@ -164,15 +171,15 @@ describe('RelevantFiles list', () => {
 
     const items = within(theList()).getAllByRole('listitem');
     expect(items).toHaveLength(3);
-    expect(items.map((item) => partText(item, 'dgv-files__path'))).toEqual([
+    expect(items.map((item) => partText(item, 'dgv-path'))).toEqual([
       'src/modules/first/one.ts',
       'src/modules/second/two.tsx',
       'src/modules/third/three.ts',
     ]);
     expect(items.map((item) => partText(item, 'dgv-files__score'))).toEqual([
-      'Relevance score 0.10',
-      'Relevance score 0.50',
-      'Relevance score 0.95',
+      'Relevance 0.10',
+      'Relevance 0.50',
+      'Relevance 0.95',
     ]);
   });
 
@@ -190,13 +197,14 @@ describe('RelevantFiles list', () => {
 
       // `toBe` on the whole string: the DOM carries the full path, so any
       // shortening is the stylesheet's, never a sliced string.
-      const path = item.querySelector('.dgv-files__path');
+      const path = item.querySelector('.dgv-path');
       expect(path?.tagName).toBe('CODE');
       expect(path?.textContent).toBe(entry.file);
       expect(path?.getAttribute('title')).toBe(entry.file);
+      expect(path?.getAttribute('aria-hidden')).toBe('true');
 
       expect(partText(item, 'dgv-files__reason')).toBe(entry.reason);
-      expect(partText(item, 'dgv-files__score')).toBe(`Relevance score ${entry.score.toFixed(2)}`);
+      expect(partText(item, 'dgv-files__score')).toBe(`Relevance ${entry.score.toFixed(2)}`);
 
       const symbolElements = item.querySelectorAll('.dgv-files__meta .dg-text--accent');
       if (entry.symbol === undefined) {
@@ -215,7 +223,11 @@ describe('RelevantFiles list', () => {
     const item = within(theList()).getByRole('listitem');
     expect(item.querySelectorAll('.dg-text--accent')).toHaveLength(0);
     expect(item.textContent).not.toContain('undefined');
-    expect(item.textContent).toBe(`src/modules/solo/module.tsRelevance score 0.30${entry.reason}`);
+    // The path twice and nothing else of its own: the visually hidden copy that
+    // names the row, then the aria-hidden chip.
+    expect(item.textContent).toBe(
+      `src/modules/solo/module.tssrc/modules/solo/module.tsRelevance 0.30${entry.reason}`,
+    );
 
     const button = within(item).getByRole('button');
     expect(button.getAttribute('aria-labelledby')?.split(' ')).toHaveLength(1);
@@ -273,15 +285,15 @@ describe('RelevantFiles list', () => {
       throw new Error('expected three rows');
     }
 
-    const path = first.querySelector('.dgv-files__path');
+    const path = first.querySelector('.dgv-path');
     expect(path?.tagName).toBe('CODE');
     expect(path?.getAttribute('title')).toBe('src/features/alpha/Widget.tsx');
     expect(within(first).getByText('onActivate')).toBeDefined();
     expect(first.querySelector('.dgv-files__reason')?.textContent).toBe(
       'Registers the handler the selected element dispatches to.',
     );
-    expect(first.querySelector('.dgv-files__score')?.textContent).toBe('Relevance score 0.42');
-    expect(third.querySelector('.dgv-files__score')?.textContent).toBe('Relevance score 0.13');
+    expect(first.querySelector('.dgv-files__score')?.textContent).toBe('Relevance 0.42');
+    expect(third.querySelector('.dgv-files__score')?.textContent).toBe('Relevance 0.13');
   });
 
   it('leaves no symbol element behind when an entry has no symbol', () => {
@@ -297,7 +309,7 @@ describe('RelevantFiles list', () => {
 
     const meta = second.querySelector('.dgv-files__meta');
     expect(meta?.querySelectorAll('.dg-text--accent')).toHaveLength(0);
-    expect(second.querySelector('.dgv-files__score')?.textContent).toBe('Relevance score 0.90');
+    expect(second.querySelector('.dgv-files__score')?.textContent).toBe('Relevance 0.90');
   });
 
   it('renders no score chip for a non-finite score instead of printing NaN', () => {
@@ -326,6 +338,295 @@ describe('RelevantFiles list', () => {
 
     const ids = Array.from(document.querySelectorAll('[id]'), (element) => element.id);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe('RelevantFiles grouping', () => {
+  /**
+   * The shape the investigation produces: each file selected once as a route
+   * handler and again, lower down, for a symbol it declares.
+   */
+  const REPEATED: readonly RelevantFile[] = [
+    {
+      file: 'src/routes/alpha/handler.ts',
+      symbol: '/alpha',
+      reason: 'Handles the alpha route.',
+      score: 0.5,
+    },
+    {
+      file: 'src/routes/beta/handler.ts',
+      symbol: '/beta',
+      reason: 'Handles the beta route.',
+      score: 0.5,
+    },
+    {
+      file: 'src/routes/alpha/handler.ts',
+      symbol: 'POST',
+      reason: 'Declares the alpha method.',
+      score: 0.1,
+    },
+    {
+      file: 'src/routes/beta/handler.ts',
+      symbol: 'GET',
+      reason: 'Declares the beta method.',
+      score: 0.1,
+    },
+  ];
+
+  it('lists each file once, in the order it first appears', () => {
+    render(<RelevantFiles files={REPEATED} onOpenFile={noop} />);
+
+    const items = within(theList()).getAllByRole('listitem');
+    expect(items.map((item) => partText(item, 'dgv-path'))).toEqual([
+      'src/routes/alpha/handler.ts',
+      'src/routes/beta/handler.ts',
+    ]);
+    expect(allButtons()).toHaveLength(2);
+  });
+
+  it('keeps every symbol and every reason of a file, in ranking order, and its best score', () => {
+    render(<RelevantFiles files={REPEATED} onOpenFile={noop} />);
+
+    const [alpha] = within(theList()).getAllByRole('listitem');
+    if (alpha === undefined) {
+      throw new Error('expected the alpha row');
+    }
+    const symbols = alpha.querySelectorAll('.dgv-files__meta .dg-text--accent');
+    expect(symbols).toHaveLength(1);
+    expect(symbols[0]?.textContent).toBe('/alpha, POST');
+    expect(
+      Array.from(alpha.querySelectorAll('.dgv-files__reason'), (reason) => reason.textContent),
+    ).toEqual(['Handles the alpha route.', 'Declares the alpha method.']);
+    expect(partText(alpha, 'dgv-files__score')).toBe('Relevance 0.50');
+
+    const button = within(alpha).getByRole('button');
+    expect(screen.getByRole('button', { name: 'src/routes/alpha/handler.ts /alpha, POST' })).toBe(
+      button,
+    );
+    const description = (button.getAttribute('aria-describedby')?.split(' ') ?? [])
+      .map((id) => document.getElementById(id)?.textContent ?? '')
+      .join(' ');
+    expect(description).toBe('Handles the alpha route. Declares the alpha method. Relevance 0.50');
+  });
+
+  it('takes the best score even when a later entry of the file carries it', () => {
+    render(
+      <RelevantFiles
+        files={[
+          makeFile({ file: 'src/a.ts', symbol: 'first', reason: 'Listed first.', score: 0.2 }),
+          makeFile({ file: 'src/b.ts', symbol: 'other', reason: 'Listed between.', score: 0.6 }),
+          makeFile({ file: 'src/a.ts', symbol: 'later', reason: 'Listed later.', score: 0.8 }),
+          makeFile({ file: 'src/a.ts', symbol: 'last', reason: 'Listed last.', score: Number.NaN }),
+        ]}
+        onOpenFile={noop}
+      />,
+    );
+
+    const items = within(theList()).getAllByRole('listitem');
+    expect(items.map((item) => partText(item, 'dgv-path'))).toEqual(['src/a.ts', 'src/b.ts']);
+    expect(items.map((item) => partText(item, 'dgv-files__score'))).toEqual([
+      'Relevance 0.80',
+      'Relevance 0.60',
+    ]);
+    expect(document.body.textContent).not.toContain('NaN');
+  });
+
+  it('collects a repeated symbol or reason once and drops blank ones', () => {
+    render(
+      <RelevantFiles
+        files={[
+          makeFile({ file: 'src/a.ts', symbol: 'shared', reason: 'Same reason.', score: 0.4 }),
+          makeFile({ file: 'src/a.ts', symbol: 'shared', reason: 'Same reason.', score: 0.3 }),
+          makeFile({ file: 'src/a.ts', symbol: '  ', reason: '   ', score: 0.2 }),
+        ]}
+        onOpenFile={noop}
+      />,
+    );
+
+    const item = within(theList()).getByRole('listitem');
+    expect(item.querySelector('.dgv-files__meta .dg-text--accent')?.textContent).toBe('shared');
+    expect(item.querySelectorAll('.dgv-files__reason')).toHaveLength(1);
+    // The whole path twice — the hidden copy that names the row, then the chip.
+    expect(item.textContent).toBe('src/a.tssrc/a.tssharedRelevance 0.40Same reason.');
+  });
+
+  it('keeps two spellings of one path as two rows: grouping never normalises a path', () => {
+    render(
+      <RelevantFiles
+        files={[
+          makeFile({ file: 'src/a.ts', symbol: undefined, reason: 'Plain.', score: 0.4 }),
+          makeFile({ file: './src/a.ts', symbol: undefined, reason: 'Dotted.', score: 0.3 }),
+        ]}
+        onOpenFile={noop}
+      />,
+    );
+
+    expect(
+      within(theList())
+        .getAllByRole('listitem')
+        .map((item) => partText(item, 'dgv-path')),
+    ).toEqual(['src/a.ts', './src/a.ts']);
+  });
+
+  it('opens a grouped file with its file string unchanged', async () => {
+    const user = userEvent.setup();
+    const onOpenFile = vi.fn<(file: string) => void>();
+    render(<RelevantFiles files={REPEATED} onOpenFile={onOpenFile} />);
+
+    await user.click(screen.getByRole('button', { name: 'src/routes/beta/handler.ts /beta, GET' }));
+
+    expect(onOpenFile.mock.calls).toEqual([['src/routes/beta/handler.ts']]);
+  });
+
+  it('describes a row with neither a reason nor a score by nothing at all', () => {
+    render(
+      <RelevantFiles
+        files={[{ file: 'src/bare.ts', reason: ' ', score: Number.NaN }]}
+        onOpenFile={noop}
+      />,
+    );
+
+    const button = screen.getByRole('button', { name: 'src/bare.ts' });
+    expect(button.hasAttribute('aria-describedby')).toBe(false);
+    expect(document.querySelector('.dgv-files__reason')).toBeNull();
+    expect(document.querySelector('.dgv-files__score')).toBeNull();
+  });
+});
+
+describe('RelevantFiles path display', () => {
+  /**
+   * The shapes that rendered identical chips once shortened: a file and its
+   * namesake in a subdirectory, and namesakes under identical long directory
+   * runs that differ in one outer segment. Plus one file whose name is unique
+   * and one bare file name.
+   */
+  const NAMESAKES: readonly RelevantFile[] = [
+    makeFile({ file: 'app/api/widgets/route.ts', symbol: 'GET', score: 0.92 }),
+    makeFile({ file: 'app/api/widgets/parts/route.ts', symbol: 'POST', score: 0.81 }),
+    makeFile({ file: 'src/views/first/ExtremelyLongNestedDirectoryName/Pane.tsx', score: 0.7 }),
+    makeFile({ file: 'src/views/second/ExtremelyLongNestedDirectoryName/Pane.tsx', score: 0.6 }),
+    makeFile({ file: 'src/lib/format.ts', symbol: undefined, score: 0.4 }),
+    makeFile({ file: 'README.md', symbol: undefined, score: 0.2 }),
+  ];
+
+  /** One chip's parts, `null` for a part the chip does not render. */
+  interface ChipParts {
+    readonly lead: string | null;
+    readonly tail: string | null;
+    readonly context: string | null;
+    readonly name: string | null;
+  }
+
+  /**
+   * Reads the rendered parts of one row's path chip.
+   *
+   * @param row The `<li>` of the row.
+   * @returns The text of each part.
+   */
+  function chipParts(row: HTMLElement): ChipParts {
+    const chip = row.querySelector('.dgv-path');
+    if (chip === null) {
+      throw new Error('expected a path chip in the row');
+    }
+    const text = (part: string): string | null =>
+      chip.querySelector(`.dgv-path__${part}`)?.textContent ?? null;
+    return { lead: text('lead'), tail: text('tail'), context: text('context'), name: text('name') };
+  }
+
+  it('starts each tail at the part that tells same-named files apart, and keeps the file name', () => {
+    render(<RelevantFiles files={NAMESAKES} onOpenFile={noop} />);
+
+    const rows = within(theList()).getAllByRole('listitem');
+    expect(rows.map(chipParts)).toEqual([
+      { lead: 'app/api/', tail: 'widgets/route.ts', context: 'widgets/', name: 'route.ts' },
+      { lead: 'app/api/widgets/', tail: 'parts/route.ts', context: 'parts/', name: 'route.ts' },
+      {
+        lead: 'src/views/',
+        tail: 'first/ExtremelyLongNestedDirectoryName/Pane.tsx',
+        context: 'first/ExtremelyLongNestedDirectoryName/',
+        name: 'Pane.tsx',
+      },
+      {
+        lead: 'src/views/',
+        tail: 'second/ExtremelyLongNestedDirectoryName/Pane.tsx',
+        context: 'second/ExtremelyLongNestedDirectoryName/',
+        name: 'Pane.tsx',
+      },
+      // A unique name is its own tail: no context element is left behind.
+      { lead: 'src/lib/', tail: 'format.ts', context: null, name: 'format.ts' },
+      // A bare name has no lead element either.
+      { lead: null, tail: 'README.md', context: null, name: 'README.md' },
+    ]);
+
+    // No two chips share a tail: the part that survives a narrow view differs.
+    const tails = rows.map((row) => chipParts(row).tail);
+    expect(new Set(tails).size).toBe(tails.length);
+  });
+
+  it('keeps each chip byte-faithful and tooltipped with the whole path', () => {
+    render(<RelevantFiles files={NAMESAKES} onOpenFile={noop} />);
+
+    const rows = within(theList()).getAllByRole('listitem');
+    rows.forEach((row, index) => {
+      const file = NAMESAKES[index]?.file;
+      const chip = row.querySelector('.dgv-path');
+      expect(chip?.tagName).toBe('CODE');
+      expect(chip?.textContent).toBe(file);
+      expect(chip?.getAttribute('title')).toBe(file);
+      expect(chip?.getAttribute('aria-hidden')).toBe('true');
+    });
+  });
+
+  it('names each row by a visually hidden copy of the whole path, never by the split chip', () => {
+    render(<RelevantFiles files={NAMESAKES} onOpenFile={noop} />);
+
+    expect(screen.getByRole('button', { name: 'app/api/widgets/route.ts GET' })).toBeDefined();
+    expect(
+      screen.getByRole('button', { name: 'app/api/widgets/parts/route.ts POST' }),
+    ).toBeDefined();
+
+    for (const button of allButtons()) {
+      const [pathId] = button.getAttribute('aria-labelledby')?.split(' ') ?? [];
+      const copy = pathId === undefined ? null : document.getElementById(pathId);
+      expect(copy?.classList.contains('dg-visually-hidden')).toBe(true);
+      expect(copy?.closest('[aria-hidden="true"]')).toBeNull();
+      expect(copy?.closest('.dgv-path')).toBeNull();
+    }
+    const copies = allButtons().map((button) => {
+      const [pathId] = button.getAttribute('aria-labelledby')?.split(' ') ?? [];
+      return pathId === undefined ? null : document.getElementById(pathId)?.textContent;
+    });
+    expect(copies).toEqual(NAMESAKES.map((entry) => entry.file));
+  });
+
+  it('raises onOpenFile with the whole, untouched path from a shortened row', async () => {
+    const user = userEvent.setup();
+    const onOpenFile = vi.fn<(file: string) => void>();
+    render(<RelevantFiles files={NAMESAKES} onOpenFile={onOpenFile} />);
+
+    await user.click(screen.getByRole('button', { name: 'app/api/widgets/parts/route.ts POST' }));
+    await user.click(screen.getByRole('button', { name: 'app/api/widgets/route.ts GET' }));
+
+    expect(onOpenFile.mock.calls).toEqual([
+      ['app/api/widgets/parts/route.ts'],
+      ['app/api/widgets/route.ts'],
+    ]);
+  });
+
+  it('splits a file listed twice, under two symbols, once, in its one row', () => {
+    const twice: readonly RelevantFile[] = [
+      makeFile({ file: 'src/a/entry.ts', symbol: 'first' }),
+      makeFile({ file: 'src/b/entry.ts', symbol: 'other' }),
+      makeFile({ file: 'src/a/entry.ts', symbol: 'second' }),
+    ];
+    render(<RelevantFiles files={twice} onOpenFile={noop} />);
+
+    const rows = within(theList()).getAllByRole('listitem');
+    expect(rows).toHaveLength(2);
+    const [first, other] = rows.map(chipParts);
+    expect(first).toEqual({ lead: 'src/', tail: 'a/entry.ts', context: 'a/', name: 'entry.ts' });
+    expect(other?.tail).toBe('b/entry.ts');
+    expect(screen.getByRole('button', { name: 'src/a/entry.ts first, second' })).toBeDefined();
   });
 });
 
@@ -411,7 +712,7 @@ describe('RelevantFiles states', () => {
     expect(status.textContent).toContain('Loading relevant files…');
     expect(screen.queryByRole('list')).toBeNull();
     expect(screen.queryAllByRole('listitem')).toHaveLength(0);
-    expect(document.querySelector('.dgv-files__path')).toBeNull();
+    expect(document.querySelector('.dgv-path')).toBeNull();
     for (const entry of FILES) {
       expect(document.body.textContent).not.toContain(entry.file);
     }

@@ -300,10 +300,13 @@ describe('PanelView — every node of a rendered panel reads that panel’s capt
     await waitFor(() => {
       expect(request).toHaveBeenCalled();
     });
+    // The span table states the order it opens in - slowest first - on every
+    // query of a node that names none, so its header's `aria-sort` describes
+    // the rows it receives (`@debuggen/panel-renderer` SpanTable).
     for (const call of request.mock.calls) {
       expect(call[1]).toStrictEqual({
         sessionId: SESSION_ID,
-        query: { ...SPANS_QUERY, panelId: PANEL_ID },
+        query: { ...SPANS_QUERY, sort: 'duration_desc', panelId: PANEL_ID },
       });
     }
   });

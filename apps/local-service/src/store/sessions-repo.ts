@@ -34,6 +34,33 @@
  * table; the panel document and every other panel column stay
  * `./panels-repo.ts`'s.
  *
+ * ## `modifications[]` is kept current from the journal
+ *
+ * `SessionRecord.modifications` mirrors the modification journal: an install
+ * or a follow-up writes its records onto the document when it applies them,
+ * but every later status change — the conflict watcher's `applied → conflict`,
+ * cleanup's `→ reverted` or `→ conflict`, start-up reconciliation — is written
+ * to the journal alone. Left as written, the document would go on reporting
+ * `applied` for a file cleanup has restored, in `GET /sessions/:id`, in every
+ * `session.updated` and on reopen, while `GET /sessions/:id/modifications`
+ * answers from the journal.
+ *
+ * So every record this module returns or persists carries the journal's
+ * current state: {@link SessionsRepo.get} overlays the record it read, and
+ * {@link SessionsRepo.insert}, {@link SessionsRepo.update} (and through it
+ * {@link SessionsRepo.insertPlanWithRecord}) and {@link SessionsRepo.setStatus}
+ * overlay the record they are about to write, inside their transaction, so the
+ * stored document is current too. The overlay replaces each mirrored entry,
+ * by id, with the journal's whole validated record of the same session; it
+ * never adds an entry the mirror does not list and never removes one, so the
+ * mirror's order, its bound and the entries only the document holds are left
+ * as they are. The journal is read through `./modifications-repo.ts`'s
+ * {@link readSessionModifications}, which owns the table's SQL and its row
+ * validation — this module still issues no statement against it. A journal
+ * that cannot be read is logged by code and leaves the mirrored entries as
+ * stored: the session is still returned or written, because its record is
+ * needed to restore every file its journal describes.
+ *
  * ## The JSON document is the contract
  *
  * `@debuggen/protocol` defines `SessionRecord` once and states that the service
@@ -138,7 +165,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { parseInstrumentationPlan } from '@debuggen/instrumentation';
-import type { InstrumentationPlan } from '@debuggen/instrumentation';
+import type { InstrumentationPlan, ModificationRecord } from '@debuggen/instrumentation';
 import {
   PROGRESS_STATUSES,
   SESSION_STATUSES,
@@ -177,6 +204,7 @@ import type { CaptureId, Logger, PanelId, Result, SessionId } from '@debuggen/sh
 
 import { LOG_BINDING_KEYS } from '../logging.js';
 import type { Store } from './db.js';
+import { readSessionModifications } from './modifications-repo.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Bindings and bounds
@@ -1393,7 +1421,10 @@ export interface SessionsRepo {
    * `updatedAt` is stamped with the latest of the record's own value, `now()`
    * and the stored value, so it never moves backwards. `createdAt` is
    * immutable: a stored session keeps its original creation time, which is
-   * written back into the returned document.
+   * written back into the returned document. Each mirrored entry of
+   * `modifications` is replaced, inside the write's transaction, by the
+   * journal's current record of the same id, so a record read before a
+   * journal transition is stored — and returned — with the journal's status.
    *
    * @param record The session's new state.
    * @returns The record as stored (with the reconciled stamps), or `err`
@@ -1405,6 +1436,12 @@ export interface SessionsRepo {
 
   /**
    * Reads one session.
+   *
+   * Each mirrored entry of `modifications` is replaced by the journal's
+   * current record of the same id, so the record agrees with
+   * `GET /sessions/:id/modifications` even when the journal moved on after the
+   * document was last written. A journal that cannot be read is logged and
+   * leaves the stored entries as they are; it never fails the read.
    *
    * @param id The session's id.
    * @returns `ok(record)`, `ok(undefined)` when no such session exists, or
@@ -1468,7 +1505,9 @@ export interface SessionsRepo {
    * here: this method persists a decision it does not make. It validates the
    * status against `SESSION_STATUSES`, stamps `updatedAt`, and rewrites the
    * `status` column and the document in one transaction so the projection can
-   * never drift from the record.
+   * never drift from the record. The rewritten document's mirrored
+   * modifications are refreshed from the journal, as in
+   * {@link SessionsRepo.update}.
    *
    * @param id The session's id.
    * @param status The new status.
@@ -2601,6 +2640,77 @@ function toSessionRecord(row: StoredRow, operation: string): Result<SessionRecor
 }
 
 /**
+ * Whether two modification records carry the same value in every field.
+ *
+ * Every field of `ModificationRecord` is a string or a number, so a shallow
+ * comparison over the union of both records' keys is exact — and it stays
+ * exact when the upstream schema gains a field, without this module naming
+ * any of them. A field present in one and absent in the other
+ * (`previousRecordId`) is a difference.
+ *
+ * @param a One record.
+ * @param b The other.
+ * @returns `true` when no field differs.
+ */
+function sameModification(a: ModificationRecord, b: ModificationRecord): boolean {
+  const left: Readonly<Record<string, unknown>> = a;
+  const right: Readonly<Record<string, unknown>> = b;
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+
+  for (const key of keys) {
+    if (!Object.is(left[key], right[key])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/** What {@link overlayModifications} made of a mirror. */
+interface ModificationOverlay {
+  /** The mirror with every entry the journal moved on replaced; the input array when none was. */
+  readonly modifications: SessionRecord['modifications'];
+  /** How many mirrored entries were replaced. */
+  readonly refreshed: number;
+}
+
+/**
+ * Replaces each mirrored modification with the journal's record of the same
+ * id, wherever the two differ.
+ *
+ * The mirror decides membership and order: an entry the journal does not hold
+ * is kept as it is, and a journal record the mirror does not list is not
+ * added — adding one would grow the document past what the install mirrored
+ * and could take it over the session contract's bound on the member. Only the
+ * entries whose journal record differs are replaced, so a mirror that is
+ * already current comes back as the very array it was.
+ *
+ * @param mirrored The session record's `modifications`.
+ * @param journal The session's journal records, from
+ * {@link readSessionModifications}.
+ * @returns The overlaid list and the number of entries replaced.
+ */
+function overlayModifications(
+  mirrored: SessionRecord['modifications'],
+  journal: readonly ModificationRecord[],
+): ModificationOverlay {
+  const current = new Map(journal.map((entry) => [entry.id, entry]));
+  let refreshed = 0;
+  const modifications = mirrored.map((entry) => {
+    const latest = current.get(entry.id);
+
+    if (latest === undefined || sameModification(entry, latest)) {
+      return entry;
+    }
+
+    refreshed += 1;
+    return latest;
+  });
+
+  return { modifications: refreshed === 0 ? mirrored : modifications, refreshed };
+}
+
+/**
  * Maps a session-list row to its projection, without touching the document.
  *
  * @param row The row, selecting {@link SESSION_LIST_COLUMNS}.
@@ -3582,6 +3692,91 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
       );
   }
 
+  /**
+   * `record` with its mirrored modifications brought up to the journal's
+   * current state (see the module documentation), or `record` itself when
+   * there was nothing to bring up.
+   *
+   * A record that mirrors no modification is returned without reading the
+   * journal: there is no entry to overlay, and none is ever added. Otherwise
+   * the session's journal is read on the store's connection — inside the
+   * caller's transaction when there is one, so the overlay sees exactly the
+   * state the caller's write lands in. A journal that cannot be read is logged
+   * with the session id, the operation and the error's code and reason, and
+   * the record is returned as it was: a session read or write never fails
+   * because its mirror could not be refreshed.
+   *
+   * @param record A validated session record.
+   * @param operation The calling method, for the log line.
+   * @returns The overlaid record — a new object only when an entry changed.
+   */
+  function withJournal(record: SessionRecord, operation: string): SessionRecord {
+    if (record.modifications.length === 0) {
+      return record;
+    }
+
+    const fields = { [LOG_BINDING_KEYS.sessionId]: record.id, operation };
+    const journal = readSessionModifications(store, record.id);
+
+    if (isErr(journal)) {
+      const reason = journal.error.details?.['reason'];
+
+      logger.warn(
+        'the modification journal could not be read; the session keeps its mirrored modifications',
+        {
+          ...fields,
+          code: journal.error.code,
+          ...(typeof reason === 'string' ? { reason } : {}),
+        },
+      );
+      return record;
+    }
+
+    const overlay = overlayModifications(record.modifications, journal.value);
+
+    if (overlay.refreshed === 0) {
+      return record;
+    }
+
+    logger.debug('mirrored modifications refreshed from the journal', {
+      ...fields,
+      refreshed: overlay.refreshed,
+      mirrored: record.modifications.length,
+    });
+
+    return { ...record, modifications: overlay.modifications };
+  }
+
+  /**
+   * {@link prepareSession}, with the record's mirrored modifications refreshed
+   * from the journal first — the preparation every write of `sessions.record`
+   * goes through, so no write can store a status the journal has moved past.
+   *
+   * The record is validated before the journal is read, so an invalid record
+   * is refused exactly as {@link prepareSession} refuses it, and it is
+   * prepared a second time only when the overlay changed an entry.
+   *
+   * @param record The record offered for writing.
+   * @param operation The calling method.
+   * @returns The prepared write of the current record, or `err` `STORE_ERROR`
+   * (`invalid-record`).
+   * @throws {DebuggenError} `INTERNAL` from {@link prepareSession}'s assertions.
+   */
+  function prepareCurrentSession(
+    record: SessionRecord,
+    operation: string,
+  ): Result<PreparedSession> {
+    const prepared = prepareSession(record, operation);
+
+    if (isErr(prepared)) {
+      return prepared;
+    }
+
+    const current = withJournal(prepared.value.record, operation);
+
+    return current === prepared.value.record ? prepared : prepareSession(current, operation);
+  }
+
   // -----------------------------------------------------------------------------------------------
   // composition
   // -----------------------------------------------------------------------------------------------
@@ -3658,7 +3853,11 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
       return err(refused);
     }
 
-    const prepared = attempt(operation, () => prepareSession(record, operation));
+    // A session not stored yet has no journal rows (`modifications.session_id`
+    // references `sessions`), so the refresh reads nothing for a record that
+    // mirrors none and changes nothing otherwise; it runs here all the same so
+    // that no write path stores a mirror without it.
+    const prepared = attempt(operation, () => prepareCurrentSession(record, operation));
 
     if (isErr(prepared)) {
       reportFailure('a session could not be stored', operation, prepared.error);
@@ -3757,7 +3956,10 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
               stamp(operation),
               floor,
             );
-            const prepared = prepareSession(
+            // The mirror is refreshed inside the transaction, so a caller
+            // writing back a record it read before a journal transition stores
+            // — and is handed back — the journal's current statuses.
+            const prepared = prepareCurrentSession(
               { ...touchSessionRecord(input.value, updatedAt), createdAt },
               operation,
             );
@@ -3807,7 +4009,16 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
       (): Result<SessionRecord | undefined> => {
         const row = store.statement(SELECT_SESSION_SQL).get(id);
 
-        return row === undefined ? ok(undefined) : toSessionRecord(row, operation);
+        if (row === undefined) {
+          return ok(undefined);
+        }
+
+        const read = toSessionRecord(row, operation);
+
+        // The stored mirror may predate a journal transition that wrote no
+        // session record — a watcher conflict, or a cleanup or reconciliation
+        // whose record write has not happened yet — so the read is overlaid.
+        return isErr(read) ? read : ok(withJournal(read.value, operation));
       },
       fields,
     );
@@ -3926,7 +4137,7 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
             }
 
             const updatedAt = Math.max(current.value.updatedAt, stamp(operation));
-            const prepared = prepareSession(
+            const prepared = prepareCurrentSession(
               touchSessionRecord({ ...current.value, status }, updatedAt),
               operation,
             );

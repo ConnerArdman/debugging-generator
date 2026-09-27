@@ -27,8 +27,10 @@
  * `session.list` and `modifications.list` answer one page each, never the whole
  * store (protocol's Section C.1). The window comes from the `limit` and
  * `offset` query parameters through protocol's `parseListPageQuery` — a
- * malformed or oversized one is the `400` a malformed body gets — with the
- * listing's documented default `limit` and offset `0` filled in and echoed.
+ * malformed or oversized one is answered exactly as a malformed body is: `400`
+ * in the parser's own words, which name the offending parameter and never its
+ * value — with the listing's documented default `limit` and offset `0` filled
+ * in and echoed.
  * Each page is read by one repository call that counts and pages in SQL:
  *
  * - `session.list` reads list rows (`SessionListItem`) scoped **in SQL** to
@@ -300,6 +302,7 @@
  * | body larger than the operation's bound, declared or as it arrives | `413` | `PROTOCOL_INVALID_MESSAGE` |
  * | body that did not arrive within `../http.ts`'s time ceiling | `408` | `PROTOCOL_INVALID_MESSAGE` |
  * | unreadable, non-JSON or off-schema body; a sent dev-server URL that is not a loopback address | `400` | `PROTOCOL_INVALID_MESSAGE` |
+ * | a listing's `limit`/`offset` malformed or above its ceiling, or a query parameter it does not accept | `400` | `PROTOCOL_INVALID_MESSAGE` |
  * | another session holds the project's capture | `409` | `CAPTURE_ALREADY_ACTIVE`, plus `owningSessionId` |
  * | a request the session's state does not admit, a busy pipeline | `409` | `SESSION_INVALID_STATE` |
  * | a capture refused by the readiness gate: no bound tab, no page agent, no preload | `409` | `TAB_NOT_BOUND`, `AGENT_NOT_READY`, `SERVER_AGENT_NOT_READY` |
@@ -316,15 +319,18 @@
  * a plain `SESSION_INVALID_STATE` `409` without an owning session, exactly as
  * protocol describes.
  *
- * Validation messages come from `parseHttpRequest`, which renders issue paths
- * and codes through `describeZodIssues` and never a rejected value. A `500`
- * never carries the failure's own words: it carries a fixed message and a
- * freshly minted `ref`. A described failure is sent in its own words only when
- * its code is a lifecycle or readiness refusal and `isProductAuthoredText`
- * proves its message product text; a failure a collaborator reported (the
- * installer, cleanup, the model provider, the dev server), a wrapped
- * exception's text, and any refusal sentence no product builder registered are
- * answered with the code's fixed copy from `../../sessions/progress.ts` and a
+ * Validation messages come from `parseHttpRequest` for a body and from
+ * `parseListPageQuery` for a listing's window, and are sent as those parsers
+ * built them: issue paths and codes rendered by `describeZodIssues`, or a
+ * constant sentence naming the parameter over its ceiling — never a rejected
+ * value. A `500` never carries the failure's own words: it carries a fixed
+ * message and a freshly minted `ref`. A described failure is sent in its own
+ * words only when its code is a lifecycle or readiness refusal and
+ * `isProductAuthoredText` proves its message product text; a failure a
+ * collaborator reported (the installer, cleanup, the model provider, the dev
+ * server), a wrapped exception's text, and any refusal sentence no product
+ * builder registered are answered with the code's fixed copy from
+ * `../../sessions/progress.ts` and a
  * `ref` (CWE-209). Every `ref` is repeated by the failure's log record and by
  * that record's `debug` twin, which alone carries the failure's redacted
  * message and stack. Log records carry the operation, a
@@ -670,6 +676,12 @@ const ANSWERED_STATUS = 200;
 
 /** The status of a capture-ownership conflict. */
 const CONFLICT_STATUS = 409;
+
+/**
+ * The status of a listing whose `limit`/`offset` window was refused: the `400`
+ * a malformed body gets.
+ */
+const LIST_WINDOW_REFUSED_STATUS = 400;
 
 /** The request header a client declares its body length in. */
 const CONTENT_LENGTH_HEADER = 'content-length';
@@ -2039,12 +2051,21 @@ interface ListWindow {
  * fills in what the request left out: the listing's default `limit` and offset
  * `0`. A parameter other than `limit` and `offset`, a value that is not a
  * canonical non-negative integer, or a `limit` above the ceiling is refused
- * with the `PROTOCOL_INVALID_MESSAGE` a malformed body gets — answered `400`,
- * naming the parameter and never its value.
+ * with the parser's own `PROTOCOL_INVALID_MESSAGE`, which the listing answers
+ * through {@link answerListWindowRejection}: `400`, the message as the parser
+ * built it — the offending parameter named, its value never quoted.
  *
  * @param c The request context.
  * @param paging The listing's ceiling and default.
- * @returns The applied window, or the refusal.
+ * @returns The applied window, or the parser's refusal.
+ *
+ * @example
+ * ```ts
+ * readListWindow(c, SESSION_LIST_PAGING); // GET /sessions?offset=abc
+ * // → err: 'Invalid listing query: offset (invalid_format format=regex)'
+ * readListWindow(c, SESSION_LIST_PAGING); // GET /sessions?limit=100000
+ * // → err: 'Invalid listing query: limit is too large'
+ * ```
  */
 function readListWindow(
   c: Context<ServerEnv>,
@@ -2307,6 +2328,26 @@ async function readBody<O extends BodyOperation>(
 interface RequestContext {
   readonly log: Logger;
   readonly operation: SessionRouteOperation;
+  /**
+   * The request's correlation ref, minted by `../http.ts`'s request context
+   * (`requestRef` on the hono context) — the ref that module adds to a failure
+   * body answered without one and announces in its `X-Debuggen-Ref` header.
+   * Absent when the routes run without that module (a suite's bare app).
+   */
+  readonly requestRef?: string;
+}
+
+/**
+ * `context` extended with the request's correlation ref, when the request
+ * carries one, so a failure record names the ref its reply is answered under.
+ *
+ * @param c The request context.
+ * @param context The logger and the operation.
+ * @returns `context` itself, or a copy carrying `requestRef`.
+ */
+function withRequestRef(c: Context<ServerEnv>, context: RequestContext): RequestContext {
+  const requestRef = c.get('requestRef');
+  return requestRef === undefined ? context : { ...context, requestRef };
 }
 
 /** Where a new session's dev-server URL came from; see the module overview. */
@@ -2350,7 +2391,12 @@ function boundedPayload(payload: HttpErrorResponse): HttpErrorResponse {
  * `ref` a client showed finds the failure at the default level and its
  * detail once `debug` is enabled.
  *
- * @param context The logger and the operation.
+ * When the answer carries no `ref` of its own, `../http.ts` answers it under
+ * the request's correlation ref (`context.requestRef`), so the record carries
+ * that ref instead — without the error field or the twin, since the words
+ * were sent as they are. Either way the record names the ref the reply does.
+ *
+ * @param context The logger, the operation and the request's ref.
  * @param status The status the failure was answered with.
  * @param error The failure.
  * @param ref The diagnostic reference the response body carries, when it has one.
@@ -2362,12 +2408,18 @@ function logFailure(
   ref?: string,
 ): void {
   const reason = reasonOf(error);
+  const answeredRef =
+    ref === undefined
+      ? context.requestRef === undefined
+        ? {}
+        : { ref: context.requestRef }
+      : { ref, [LOG_ERROR_FIELD_KEY]: error };
   const fields = {
     operation: context.operation,
     status,
     errorCode: error.code,
     ...(reason === undefined ? {} : { reason }),
-    ...(ref === undefined ? {} : { ref, [LOG_ERROR_FIELD_KEY]: error }),
+    ...answeredRef,
   };
   if (status >= 500) {
     context.log.error(SESSION_REQUEST_FAILED_LOG_MESSAGE, fields);
@@ -2424,7 +2476,7 @@ function answerFailure(
 ): Response {
   if (authFailureStatus(error) !== undefined) {
     const { status, body } = authErrorResponse(error);
-    logFailure(context, status, error);
+    logFailure(withRequestRef(c, context), status, error);
     return c.json(body, status);
   }
   if (isCaptureConflict(error)) {
@@ -2442,7 +2494,7 @@ function answerFailure(
     return c.json(body, 500);
   }
   const refusal = describedRefusalBody(error);
-  logFailure(context, status, error, refusal.ref);
+  logFailure(withRequestRef(c, context), status, error, refusal.ref);
   return c.json(refusal.body, status);
 }
 
@@ -2524,7 +2576,7 @@ function answerCaptureConflict(
   error: CaptureConflictError,
   context: RequestContext,
 ): Response {
-  logFailure(context, CONFLICT_STATUS, error);
+  logFailure(withRequestRef(c, context), CONFLICT_STATUS, error);
   const payload = toErrorPayload(error);
   const owningSessionId = error.details.owningSessionId;
   const candidates: readonly CaptureStartConflictResponse[] = [
@@ -2549,8 +2601,45 @@ function answerBodyRejection(
   rejection: BodyRejection,
   context: RequestContext,
 ): Response {
-  logFailure(context, rejection.status, rejection.error);
+  logFailure(withRequestRef(c, context), rejection.status, rejection.error);
   return c.json(boundedPayload(toErrorPayload(rejection.error)), rejection.status);
+}
+
+/**
+ * Answers a listing whose page window {@link readListWindow} refused exactly as
+ * {@link answerBodyRejection} answers a refused body: `400`, protocol's error
+ * payload in the words `parseListPageQuery` chose, and a `warn` record from
+ * {@link logFailure} carrying the operation, status and code.
+ *
+ * The message is sent as built rather than routed through
+ * {@link describedRefusalBody}'s fixed copy, because its provenance is the
+ * parser's and nothing else's: issue paths and codes rendered by
+ * `describeZodIssues` (an unrecognised parameter by its name, and only when the
+ * name looks like one), or a constant sentence naming `limit` or `offset` —
+ * never the rejected value. That is what lets a client learn which parameter to
+ * fix, as it does for a malformed body. The payload is still bounded by
+ * protocol's error schema, so no answer here can be refused by a client's
+ * parser.
+ *
+ * @param c The request context.
+ * @param refusal The refusal {@link readListWindow} returned.
+ * @param context The logger and the listing's operation.
+ * @returns The `400` response.
+ *
+ * @example
+ * ```ts
+ * // GET /sessions?limit=-1
+ * // → 400 { code: 'PROTOCOL_INVALID_MESSAGE',
+ * //         message: 'Invalid listing query: limit (invalid_format format=regex)' }
+ * ```
+ */
+function answerListWindowRejection(
+  c: Context<ServerEnv>,
+  refusal: DebuggenError,
+  context: RequestContext,
+): Response {
+  logFailure(withRequestRef(c, context), LIST_WINDOW_REFUSED_STATUS, refusal);
+  return c.json(boundedPayload(toErrorPayload(refusal)), LIST_WINDOW_REFUSED_STATUS);
 }
 
 /**
@@ -3640,7 +3729,9 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
    * `session.list`: one page of the sessions the editor's announced workspace
    * covers, as list rows — the window read from `limit`/`offset`, defaulting to
    * {@link SESSION_LIST_DEFAULT_LIMIT} rows from offset `0`, and echoed with
-   * `total` and `nextOffset`.
+   * `total` and `nextOffset`. The principal is authorized first; a window the
+   * parser refuses is then answered `400` naming the parameter
+   * ({@link answerListWindowRejection}), before any store read.
    */
   const listSessions: SessionRouteHandler = (c) => {
     c.header(CACHE_CONTROL_HEADER, NO_STORE);
@@ -3652,7 +3743,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
     }
     const window = readListWindow(c, SESSION_LIST_PAGING);
     if (isErr(window)) {
-      return answerFailure(c, window.error, context);
+      return answerListWindowRejection(c, window.error, context);
     }
     const page = readSessionPage(principal.value, window.value, context);
     if (isErr(page)) {
@@ -4065,8 +4156,10 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
    * before it reads the diff, so no diff past the page is loaded; `limit=0`
    * answers the count without reading a record. The request is admitted on
    * the session's id and project root ({@link admitAccessTarget}), never on
-   * its record. The records carry unified diffs, so nothing about them but
-   * counts is ever logged.
+   * its record; only an admitted request has its window read, and a window the
+   * parser refuses is answered `400` naming the parameter
+   * ({@link answerListWindowRejection}). The records carry unified diffs, so
+   * nothing about them but counts is ever logged.
    */
   const listModifications: SessionRouteHandler = async (c) => {
     c.header(CACHE_CONTROL_HEADER, NO_STORE);
@@ -4080,7 +4173,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
 
     const window = readListWindow(c, MODIFICATIONS_PAGING);
     if (isErr(window)) {
-      return answerFailure(c, window.error, context);
+      return answerListWindowRejection(c, window.error, context);
     }
     const { limit, offset } = window.value;
     const listed = await settled(

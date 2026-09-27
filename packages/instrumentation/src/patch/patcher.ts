@@ -16,7 +16,8 @@
  * 0. resolve the target inside the working root   (lexically, then canonically)
  *    — the admitted canonical root when one is given, re-proven canonical
  * 1. read the original bytes + inode   → originalHash
- * 1a. confirm the baseline the patch assumes      (./conflict.js decides)
+ * 1a. confirm the baseline the patch assumes      (no other session's patch is
+ *     in the file — the journal decides; then ./conflict.js decides)
  * 2. build the patched content         → instrumentedHash  (nothing written yet)
  * 3. copy the original to the backup   → backupPath, fsync'd
  * 4. append the record as "pending"    → BOTH hashes + the unified diff
@@ -95,6 +96,24 @@
  * and a handled failure reconcile the same way. What it never does is mark a
  * record `applied` before the rename has returned — that is the one lie
  * reconciliation cannot detect.
+ *
+ * ## A file another session already instrumented
+ *
+ * Several sessions may be open on one project at once — only a capture is
+ * exclusive — and two of them routinely plan the same symbol. The second may
+ * not layer its own record over the first's: that record's `originalHash`
+ * would name bytes the developer never had, and the two cleanups, which run
+ * whenever each session happens to end, would each restore the other's state.
+ * So step 1a refuses a file whose bytes are another session's recorded
+ * `instrumentedHash` — an `applied`, `pending` or `failed` record of that
+ * session in `ModificationJournal.listOpen` — with `PATCH_UNSUPPORTED` and
+ * {@link PATCH_TARGET_HELD_REASON}, before anything is backed up, journaled or
+ * written. The digest comparison, not the path, is what makes the check exact:
+ * two copies of a project share every relative path, and only the copy holding
+ * the patched bytes is held. {@link Patcher.patchActions} runs the same check
+ * over a whole batch before it attempts anything, and
+ * {@link describeTargetYield} turns the refusal into the gap `../installer.ts`
+ * reports while it installs everything else (AAP §0.5.5).
  *
  * ## What this module does not do
  *
@@ -304,9 +323,10 @@ const PATCHABLE_ACTION_TYPES: readonly InstrumentationActionType[] = Object.free
  * - `'read-original'` — the bytes and the inode they came from are in memory,
  *   hashed as `originalHash`, and decoded to text that provably re-encodes to
  *   those exact bytes.
- * - `'baseline-check'` — the file is in the state the patch assumes: untouched
- *   for a first patch, or holding the previous record's instrumented bytes for
- *   a chained one.
+ * - `'baseline-check'` — the file is in the state the patch assumes: it holds
+ *   no other session's instrumented bytes, and it is untouched for a first
+ *   patch or holding the previous record's instrumented bytes for a chained
+ *   one.
  * - `'build-patch'` — the patched text and `instrumentedHash` exist in memory.
  *   The project is still untouched.
  * - `'store-backup'` — the original bytes are durable under
@@ -334,6 +354,58 @@ export const PATCH_STAGES = Object.freeze([
 
 /** One step of the write sequence. See {@link PATCH_STAGES}. */
 export type PatchStage = (typeof PATCH_STAGES)[number];
+
+/**
+ * The `details.reason` of the refusal a target meets when **another session's**
+ * instrumented bytes are in its file: `'held-by-another-session'`.
+ *
+ * The refusal is `PATCH_UNSUPPORTED`, raised in step 1a before anything is
+ * backed up, journaled or written, and its details carry the project-relative
+ * `file`, the `symbol`, the `owningSessionId` and the holding `recordId` — so
+ * the developer can be told which session to end, and nothing of the file's
+ * content. See this module's header, "A file another session already
+ * instrumented", and {@link describeTargetYield}.
+ */
+export const PATCH_TARGET_HELD_REASON = 'held-by-another-session' as const;
+
+/**
+ * The `PATCH_UNSUPPORTED` reasons that mean "this target is already
+ * instrumented" rather than "this install broke".
+ *
+ * A target refused for one of these is a signal this session cannot enable,
+ * not a defect in the install: `../installer.ts` reports it as an
+ * `UnavailableSignal` and installs the rest of the plan around it (AAP §0.5.5)
+ * — provided nothing was written for it. The members:
+ *
+ * - {@link PATCH_TARGET_HELD_REASON} — step 1a's cross-session hold check: the
+ *   file holds another session's recorded instrumented bytes.
+ * - `'already-instrumented'` — `./function-timing.js`'s refusal of a
+ *   declaration that already contains the span helper, whoever put it there.
+ *
+ * Frozen because it is a module-level table the installer reads.
+ */
+export const PATCH_TARGET_YIELD_REASONS = Object.freeze([
+  PATCH_TARGET_HELD_REASON,
+  'already-instrumented',
+] as const);
+
+/** One member of {@link PATCH_TARGET_YIELD_REASONS}. */
+export type PatchTargetYieldReason = (typeof PATCH_TARGET_YIELD_REASONS)[number];
+
+/**
+ * The record statuses under which another session's record holds a file:
+ * `applied`, and the `pending` and `failed` rows whose write may have landed.
+ *
+ * `conflict` is left out on purpose — such a file holds the developer's edit,
+ * which is theirs rather than any session's — and so is `reverted`, which
+ * holds nothing. The digest comparison in {@link findHoldingRecord} then
+ * decides whether the bytes on disk really are that record's.
+ */
+const HOLDING_STATUSES: ReadonlySet<ModificationStatus> = new Set<ModificationStatus>([
+  'applied',
+  'pending',
+  'failed',
+]);
 
 /**
  * What an observer is told when a stage completes.
@@ -912,6 +984,12 @@ export interface PatchBatchFailure {
  * Deliberately not a `Result`: a batch that failed half-way is neither a
  * success nor a bare error, and the records it did apply are what
  * `../installer.ts` must reverse-restore.
+ *
+ * One failure has a fixed shape: a target another session holds
+ * ({@link PATCH_TARGET_HELD_REASON}) is found before anything in the batch is
+ * attempted, so it is reported with `applied` and `journaled` both empty and
+ * no record on the failure. That is what makes it safe for the installer to
+ * drop the held action and ask again with the rest.
  */
 export interface PatchBatchResult {
   /**
@@ -988,6 +1066,19 @@ export interface Patcher {
    * called this is about to unwind, and every further edit would be one more
    * file to restore. Ordering across adapters and the rollback itself stay with
    * `../installer.ts`.
+   *
+   * **A held target is reported before anything is attempted.** The open
+   * records of every session are listed once, up front. When one of them is
+   * another session's record for a file this batch targets, each such action
+   * is probed read-only — the path gates, the pin, the read, the hash and the
+   * hold check of step 1a, with no stage reported to
+   * {@link PatcherOptions.onStage}, no backup, no journal row, no reservation
+   * and no write — and the first one whose file really holds that session's
+   * instrumented bytes is returned as the failure with nothing applied. A
+   * batch whose files no other session has an open record for costs that one
+   * listing and no extra read. A listing that fails skips the probe: every
+   * attempt runs the same hold check against its own listing, and reports the
+   * failure there.
    *
    * @param actions The actions to install, in the order to install them.
    * @returns The applied outcomes, every journaled record, and the failure if
@@ -1109,6 +1200,145 @@ function isAbsoluteRoot(root: string): boolean {
   return root.startsWith('/') || /^[A-Za-z]:\//.test(root);
 }
 
+/**
+ * The two developer-facing strings of a gap: what was observed, and the one
+ * thing to do about it — exactly the `reason` and `hint` of the adapter
+ * contract's `UnavailableSignal`, which this package's `../adapter.ts` declares
+ * above this module and therefore cannot be imported here.
+ */
+export interface PatchTargetYield {
+  /**
+   * What was observed, as a fragment that reads after "Could not enable
+   * ‹signal›: " — single-line, no trailing full stop, and no byte of the
+   * file's content.
+   */
+  readonly reason: string;
+
+  /** The one action that frees the target, as a single-line sentence. */
+  readonly hint: string;
+}
+
+/**
+ * Describes a refusal that means "this target is already instrumented" as the
+ * gap a capture proceeds without, or answers `undefined` for every other
+ * refusal.
+ *
+ * Defined only for `PATCH_UNSUPPORTED` whose `details.reason` is one of
+ * {@link PATCH_TARGET_YIELD_REASONS}, and only when the details carry what
+ * the wording needs as single-line strings — a refusal this cannot describe
+ * honestly stays whatever the caller already treats it as. The wording is
+ * built from identifiers only (the project-relative file, the symbol, the
+ * owning session id), never from the file:
+ *
+ * - {@link PATCH_TARGET_HELD_REASON}: `reason` names the file and the session
+ *   holding it, and `hint` names the session to end — its cleanup restores the
+ *   file — before asking again.
+ * - `'already-instrumented'`: `reason` names the symbol and the file, and
+ *   `hint` is the refusal's own hint, which already says what to revert.
+ *
+ * `../installer.ts` calls this on a patch adapter's reported failure, and
+ * treats a defined answer — for a failure that wrote nothing — as an
+ * unavailable signal instead of a failed install.
+ *
+ * @example
+ * ```ts
+ * const described = describeTargetYield(failure.error);
+ *
+ * if (described !== undefined) {
+ *   unavailable.push({ signal: 'functions', ...described });
+ *   // "Could not enable functions: app/api/cart/route.ts is already
+ *   //  instrumented by session ses_abc. Continuing with: …"
+ * }
+ * ```
+ *
+ * @param error A patch refusal, as a patch batch or a patch attempt returned
+ * it.
+ * @returns The gap's `reason` and `hint`, or `undefined` when the refusal is
+ * not a yield or its details cannot be worded.
+ */
+export function describeTargetYield(error: DebuggenError): PatchTargetYield | undefined {
+  if (error.code !== 'PATCH_UNSUPPORTED') {
+    return undefined;
+  }
+
+  const details = error.details;
+  const reason = details?.['reason'];
+  const file = details?.['file'];
+  const symbol = details?.['symbol'];
+
+  if (!isTargetYieldReason(reason) || !isSingleLineText(file) || !isSingleLineText(symbol)) {
+    return undefined;
+  }
+
+  // A switch over the closed tuple, so a reason added to it cannot go
+  // unworded: the gap it produces is read verbatim by the developer.
+  switch (reason) {
+    case PATCH_TARGET_HELD_REASON: {
+      const owningSessionId = details?.['owningSessionId'];
+
+      return isSingleLineText(owningSessionId)
+        ? heldTargetWording(file, symbol, owningSessionId)
+        : undefined;
+    }
+
+    case 'already-instrumented':
+      return isSingleLineText(error.hint)
+        ? { reason: `${symbol} in ${file} is already instrumented`, hint: error.hint }
+        : undefined;
+  }
+}
+
+/**
+ * Whether a refusal's `details.reason` is one of
+ * {@link PATCH_TARGET_YIELD_REASONS}.
+ *
+ * @param value The reason as the details carry it.
+ * @returns `true` for a yield reason.
+ */
+function isTargetYieldReason(value: unknown): value is PatchTargetYieldReason {
+  return (
+    typeof value === 'string' && (PATCH_TARGET_YIELD_REASONS as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Whether a value is text a one-line row can carry: a non-blank string with no
+ * control character and no line or paragraph separator.
+ *
+ * Every string {@link describeTargetYield} composes lands in an
+ * `UnavailableSignal`, which `../schema/readiness.ts` refuses when it spans
+ * more than one line, so a detail that would break that is not worded at all.
+ *
+ * @param value A detail or hint as the refusal carries it.
+ * @returns `true` when it can be quoted in a single-line gap.
+ */
+function isSingleLineText(value: unknown): value is string {
+  return (
+    typeof value === 'string' && value.trim().length > 0 && !/[\p{Cc}\u2028\u2029]/u.test(value)
+  );
+}
+
+/**
+ * The one wording of a target another session holds, shared by the refusal
+ * step 1a raises and by {@link describeTargetYield}, so the error a log line
+ * records and the gap a developer reads cannot drift apart.
+ *
+ * @param file The held file, project-relative POSIX.
+ * @param symbol The symbol this session wanted to time in it.
+ * @param owningSessionId The session whose instrumented bytes the file holds.
+ * @returns The gap's `reason` fragment and its `hint` sentence.
+ */
+function heldTargetWording(
+  file: string,
+  symbol: string,
+  owningSessionId: string,
+): PatchTargetYield {
+  return {
+    reason: `${file} is already instrumented by session ${owningSessionId}`,
+    hint: `End session ${owningSessionId} — its cleanup restores ${file} — then ask again to time ${symbol} in this session.`,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The implementation.
 // ---------------------------------------------------------------------------
@@ -1134,14 +1364,41 @@ interface AttemptInput {
   readonly spanName: string | undefined;
 }
 
+/** An attempt that stopped: the state a rollback needs, as a batch reports it. */
+interface FailedAttempt {
+  readonly kind: 'failed';
+  readonly failure: PatchBatchFailure;
+}
+
 /**
  * The internal result of one attempt: richer than a `Result`, because a failed
  * attempt carries the state a rollback needs and a `Result`'s `Err` carries
  * only an error.
  */
-type Attempt =
-  | { readonly kind: 'applied'; readonly outcome: PatchOutcome }
-  | { readonly kind: 'failed'; readonly failure: PatchBatchFailure };
+type Attempt = { readonly kind: 'applied'; readonly outcome: PatchOutcome } | FailedAttempt;
+
+/**
+ * What a read-only hold probe found: the target held by another session — or
+ * refused before the hold check could be made — as a failure, or `'not-held'`
+ * once step 1a's hold check has passed.
+ */
+type ProbeAttempt = FailedAttempt | { readonly kind: 'not-held' };
+
+/**
+ * The request for {@link SequencedPatcher.#attempt} to run as a read-only hold
+ * probe: step 0, step 1 and step 1a's hold check, against a listing the batch
+ * already took, and nothing after.
+ *
+ * A probe reports no stage to {@link PatcherOptions.onStage} — the observer is
+ * the failure-injection seam, and an injected failure must land on the
+ * attempt a case aimed it at, not on a probe of it — logs no refusal, and
+ * never reaches the backup, the journal, the reservation or the write. The
+ * pin it takes is released in the attempt's `finally`, as every attempt's is.
+ */
+interface HoldProbe {
+  /** Every open record of every session, as `ModificationJournal.listOpen` returned it. */
+  readonly listing: readonly ModificationRecord[];
+}
 
 /**
  * The sequence, as an object holding one session's resolved dependencies.
@@ -1257,6 +1514,16 @@ class SequencedPatcher implements Patcher {
   }
 
   async patchActions(actions: readonly InstrumentationAction[]): Promise<PatchBatchResult> {
+    // A target another session holds is reported before anything is
+    // attempted, so the batch that says so has applied and journaled nothing:
+    // the installer can then drop that one action and ask again with the rest,
+    // with nothing of this call's to unwind.
+    const held = await this.#firstHeldTarget(actions);
+
+    if (held !== undefined) {
+      return { applied: [], journaled: [], failure: held };
+    }
+
     const firstRecord = this.#journaled.length;
     const applied: PatchOutcome[] = [];
     let failure: PatchBatchFailure | undefined;
@@ -1276,6 +1543,84 @@ class SequencedPatcher implements Patcher {
   }
 
   /**
+   * The batch's up-front hold check: the first action whose file holds another
+   * session's instrumented bytes, as the failure its attempt would report, or
+   * `undefined` when there is none.
+   *
+   * One `listOpen` for the whole batch. Only an action whose normalised file
+   * another session has an `applied`, `pending` or `failed` record for is
+   * probed at all, so a batch over files nobody else touched reads nothing
+   * more than that listing. The probe is {@link SequencedPatcher.#attempt} in
+   * {@link HoldProbe} mode — the same path gates, pin, read and hash as the
+   * real attempt, so the file compared is the file that would be written — and
+   * only a refusal with {@link PATCH_TARGET_HELD_REASON} is returned. A probe
+   * refused for any other reason is not answered here: the in-order pass that
+   * follows meets the same refusal at its own position in the batch.
+   *
+   * Never throws, and never fails the batch on its own account: a listing that
+   * fails or throws skips the check, because every attempt repeats it against
+   * a listing of its own and reports that failure where it belongs.
+   *
+   * @param actions The batch, in the order it would be installed.
+   * @returns The held target's failure, or `undefined`.
+   */
+  async #firstHeldTarget(
+    actions: readonly InstrumentationAction[],
+  ): Promise<PatchBatchFailure | undefined> {
+    try {
+      const listed = await this.#journal.listOpen();
+
+      if (isErr(listed)) {
+        this.#logger.debug('open records could not be listed before a batch; each attempt checks', {
+          code: listed.error.code,
+          actions: actions.length,
+        });
+
+        return undefined;
+      }
+
+      const listing = listed.value;
+      const heldFiles = filesHeldElsewhere(listing, this.sessionId);
+
+      if (heldFiles.size === 0) {
+        return undefined;
+      }
+
+      for (const action of actions) {
+        if (!heldFiles.has(normalizePosix(toPosix(action.file)))) {
+          continue;
+        }
+
+        const probed = await this.#attempt(inputFromAction(action), {}, action.mode, { listing });
+
+        if (
+          probed.kind === 'failed' &&
+          probed.failure.error.details?.['reason'] === PATCH_TARGET_HELD_REASON
+        ) {
+          this.#logger.debug('a planned target is held by another session; nothing was attempted', {
+            actionId: probed.failure.actionId,
+            file: probed.failure.file,
+            symbol: probed.failure.symbol,
+            owningSessionId: probed.failure.error.details['owningSessionId'],
+            actions: actions.length,
+          });
+
+          return probed.failure;
+        }
+      }
+
+      return undefined;
+    } catch (cause) {
+      this.#logger.debug('the up-front hold check failed; each attempt checks', {
+        cause: String(cause),
+        actions: actions.length,
+      });
+
+      return undefined;
+    }
+  }
+
+  /**
    * The crash-safe write sequence for one target, step by step: hash, backup,
    * journal, atomic rename, mark applied.
    *
@@ -1289,12 +1634,29 @@ class SequencedPatcher implements Patcher {
    * Never throws: an unexpected failure is caught at the end and turned into a
    * coded error, because an exception escaping between the backup and the
    * rename is the one thing that must not happen.
+   *
+   * Given a {@link HoldProbe}, the same sequence runs read-only and stops
+   * straight after step 1a's hold check — see {@link HoldProbe} for what a
+   * probe leaves out — answering `'not-held'` when the check passes. That is
+   * the second overload, and the only way `'not-held'` is produced.
    */
+  #attempt(
+    input: AttemptInput,
+    options: PatchAttemptOptions,
+    mode: InstrumentationMode,
+  ): Promise<Attempt>;
+  #attempt(
+    input: AttemptInput,
+    options: PatchAttemptOptions,
+    mode: InstrumentationMode,
+    probe: HoldProbe,
+  ): Promise<ProbeAttempt>;
   async #attempt(
     input: AttemptInput,
     options: PatchAttemptOptions,
     mode: InstrumentationMode,
-  ): Promise<Attempt> {
+    probe?: HoldProbe,
+  ): Promise<Attempt | ProbeAttempt> {
     const { symbol } = input;
     const stages: PatchStage[] = [];
 
@@ -1318,8 +1680,12 @@ class SequencedPatcher implements Patcher {
      * would make reconciliation restore a file this call successfully
      * instrumented. A journal that refuses the transition is logged and
      * tolerated, because the `pending` row it leaves reconciles the same way.
+     *
+     * A hold probe logs nothing here: it never reaches the journal, so it has
+     * no record to move, and its refusal is either reported by the batch that
+     * asked for it or met again by the attempt that follows, which logs it.
      */
-    const failed = async (error: DebuggenError): Promise<Attempt> => {
+    const failed = async (error: DebuggenError): Promise<FailedAttempt> => {
       if (record !== undefined && record.status === 'pending') {
         try {
           const marked = await this.#journal.updateStatus(record.id, 'failed', {
@@ -1345,15 +1711,17 @@ class SequencedPatcher implements Patcher {
         }
       }
 
-      this.#logger.warn('a patch was not applied', {
-        file,
-        symbol,
-        stage,
-        code: error.code,
-        reason: error.details?.['reason'],
-        recordId: record?.id,
-        fileMayHoldPatch,
-      });
+      if (probe === undefined) {
+        this.#logger.warn('a patch was not applied', {
+          file,
+          symbol,
+          stage,
+          code: error.code,
+          reason: error.details?.['reason'],
+          recordId: record?.id,
+          fileMayHoldPatch,
+        });
+      }
 
       return {
         kind: 'failed',
@@ -1376,13 +1744,17 @@ class SequencedPatcher implements Patcher {
      * The observer is awaited, so a rejection stops the sequence exactly as a
      * throw does, and either is re-coded as a patch failure rather than as an
      * internal error: an injected failure is the seam working, not a defect.
+     *
+     * A hold probe reports nothing to the observer: a failure a case injects
+     * at a stage belongs to the attempt that writes, not to a read-only look
+     * at the file ahead of it.
      */
     const completed = async (finished: PatchStage): Promise<void> => {
       stages.push(finished);
 
       const observer = this.#onStage;
 
-      if (observer === undefined) {
+      if (observer === undefined || probe !== undefined) {
         return;
       }
 
@@ -1614,6 +1986,30 @@ class SequencedPatcher implements Patcher {
       // ---------------------------------------------------------------------
       stage = 'baseline-check';
 
+      // First, whether these bytes are another session's patch. That session's
+      // record already claims the file, and a record of this session layered
+      // on it would give its `originalHash` to bytes the developer never had —
+      // and let two cleanups, run whenever each session ends, each restore
+      // the other's state. So the file is refused here, before a chain is
+      // resolved, a backup is taken, a record is journaled or a byte is
+      // written. The comparison is the digest just taken against that
+      // record's `instrumentedHash`, which is what makes it exact for this
+      // project: another copy of it shares the relative path, not the bytes.
+      const holder = await this.#holderOf(file, originalHash, probe);
+
+      if (isErr(holder)) {
+        return await failed(holder.error);
+      }
+
+      if (holder.value !== undefined) {
+        return await failed(heldByAnotherSession(file, symbol, holder.value));
+      }
+
+      // A probe has learned what it came for, and goes no further.
+      if (probe !== undefined) {
+        return { kind: 'not-held' };
+      }
+
       const chain = await this.#resolveChainParent(file, options.previousRecord);
 
       if (isErr(chain)) {
@@ -1621,7 +2017,8 @@ class SequencedPatcher implements Patcher {
       }
 
       // `listed` is the session listing the parent was chosen from, carried to
-      // the root walk below so one attempt reads the journal at most once.
+      // the root walk below so one attempt reads the session's records at most
+      // once.
       const { parent, listed } = chain.value;
 
       // The developer's own text, for a file this session already patched: the
@@ -1943,6 +2340,40 @@ class SequencedPatcher implements Patcher {
       // twenty directory handles.
       pinned?.release();
     }
+  }
+
+  /**
+   * The other session's record whose instrumented bytes the file holds, or
+   * `undefined` when it holds nobody else's.
+   *
+   * The open records of every session — `ModificationJournal.listOpen`, which
+   * reaches across sessions by contract — are read for an attempt, or taken
+   * from the {@link HoldProbe} a batch already listed. A journal that cannot be
+   * read fails the attempt with its own error, as a failed session listing
+   * does in {@link SequencedPatcher.#resolveChainParent}: without the listing,
+   * "nobody else holds this file" would be a guess.
+   *
+   * @param file The target's project-relative path, already proven canonical.
+   * @param currentHash The digest of the bytes step 1 just read.
+   * @param probe The batch's listing, when this attempt is a hold probe.
+   * @returns The holding record, `undefined`, or the journal's error.
+   */
+  async #holderOf(
+    file: string,
+    currentHash: string,
+    probe: HoldProbe | undefined,
+  ): Promise<Result<ModificationRecord | undefined>> {
+    if (probe !== undefined) {
+      return ok(findHoldingRecord(probe.listing, this.sessionId, file, currentHash));
+    }
+
+    const listed = await this.#journal.listOpen();
+
+    if (isErr(listed)) {
+      return listed;
+    }
+
+    return ok(findHoldingRecord(listed.value, this.sessionId, file, currentHash));
   }
 
   /**
@@ -2370,6 +2801,112 @@ function unreconciledRecord(file: string, record: ModificationRecord): DebuggenE
     {
       hint: `The recorded original is saved at ${record.backupPath}. Resolve that modification first.`,
       details: { reason: 'unreconciled-record', file, recordId: record.id, status: record.status },
+    },
+  );
+}
+
+/**
+ * The files another session has a record in {@link HOLDING_STATUSES} for,
+ * normalised the way step 0 normalises a target.
+ *
+ * The cheap half of the batch's up-front hold check: only an action whose file
+ * is in this set is worth reading, so a batch over files nobody else touched
+ * costs one listing and nothing more.
+ *
+ * @param records Every open record, as `ModificationJournal.listOpen` returned it.
+ * @param sessionId This patcher's session, whose own records never hold a file
+ * against it.
+ * @returns The candidate files, project-relative POSIX.
+ */
+function filesHeldElsewhere(
+  records: readonly ModificationRecord[],
+  sessionId: string,
+): ReadonlySet<string> {
+  const files = new Set<string>();
+
+  for (const record of records) {
+    if (record.sessionId !== sessionId && HOLDING_STATUSES.has(record.status)) {
+      files.add(normalizePosix(toPosix(record.file)));
+    }
+  }
+
+  return files;
+}
+
+/**
+ * The record of another session whose instrumented bytes a file holds right
+ * now, or `undefined`.
+ *
+ * A record holds the file when it belongs to another session, is in
+ * {@link HOLDING_STATUSES}, names the same project-relative file, and — the
+ * decisive half — its `instrumentedHash` is the digest of the bytes just read.
+ * Matching on `originalHash` instead would be wrong: two copies of one project
+ * share their pristine bytes and every relative path, so a patch in one copy
+ * would hold the other. Where a session chained several records over the file,
+ * only the latest of them describes its bytes; should more than one record
+ * match, the last one listed — the latest appended — is named.
+ *
+ * @param records Every open record, as `ModificationJournal.listOpen` returned it.
+ * @param sessionId This patcher's session.
+ * @param file The target's project-relative POSIX path.
+ * @param currentHash The digest of the target's current bytes.
+ * @returns The holding record, or `undefined`.
+ */
+function findHoldingRecord(
+  records: readonly ModificationRecord[],
+  sessionId: string,
+  file: string,
+  currentHash: string,
+): ModificationRecord | undefined {
+  let holder: ModificationRecord | undefined;
+
+  for (const record of records) {
+    if (
+      record.sessionId !== sessionId &&
+      HOLDING_STATUSES.has(record.status) &&
+      record.instrumentedHash === currentHash &&
+      normalizePosix(toPosix(record.file)) === file
+    ) {
+      holder = record;
+    }
+  }
+
+  return holder;
+}
+
+/**
+ * The refusal for a file that holds another session's instrumented bytes.
+ *
+ * `PATCH_UNSUPPORTED` with {@link PATCH_TARGET_HELD_REASON}: nothing failed
+ * and nothing was written, the target simply cannot be instrumented by this
+ * session while that one holds it — which is what lets `../installer.ts`
+ * report it as a signal this capture proceeds without. The message and hint
+ * are {@link heldTargetWording}'s, and the details carry identifiers only.
+ *
+ * @param file The held file, project-relative POSIX.
+ * @param symbol The symbol this attempt wanted to wrap.
+ * @param holder The other session's record whose bytes the file holds.
+ * @returns The refusal.
+ */
+function heldByAnotherSession(
+  file: string,
+  symbol: string,
+  holder: ModificationRecord,
+): DebuggenError {
+  const wording = heldTargetWording(file, symbol, holder.sessionId);
+
+  return new DebuggenError(
+    'PATCH_UNSUPPORTED',
+    `${wording.reason}, so this session cannot patch it as well.`,
+    {
+      hint: wording.hint,
+      details: {
+        reason: PATCH_TARGET_HELD_REASON,
+        file,
+        symbol,
+        owningSessionId: holder.sessionId,
+        recordId: holder.id,
+      },
     },
   );
 }

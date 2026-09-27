@@ -5,19 +5,27 @@
  *
  * ## Where the data comes from, and where it does not
  *
- * The service pushes `telemetry.tail { sessionId, events }` frames (AAP 0.4.2); the service worker
- * relays them to the panel, `../state/connection` hands each one to the store, and the store keeps
- * the newest {@link LIVE_TAIL_MAX_EVENTS} events in its bounded `liveTail` buffer. The composition
- * root reads that buffer and passes it here as `events`.
+ * The service pushes `telemetry.tail { sessionId, events, captures? }` frames (AAP 0.4.2); the
+ * service worker relays them to the panel, `../state/connection` hands each one to the store, and
+ * the store keeps the newest {@link LIVE_TAIL_MAX_EVENTS} events in its bounded `liveTail` buffer.
+ * The composition root reads that buffer and passes it here as `events`.
+ *
+ * The tail is a bounded share of the capture, not the capture: under a burst the service streams
+ * some of it and skips the rest, which the store still holds. Each frame's per-capture tally says
+ * so — the capture's stored count and how many of its events the tail skipped — and the store
+ * keeps both on its capture slice (`eventCount`, `tailSkipped`). Once events were skipped, the
+ * pane's truncation statement names the capture's total and what was not streamed live, so a
+ * tail that is not the whole capture never looks like it.
  *
  * Beside the events the pane shows the capture's notices — the store's bounded `tailNotices`
  * slice, which records a same-origin navigation of the bound tab while a capture runs (AAP 0.5.5:
  * "Application reloads mid-session → event log entry 'Page reloaded during capture'; the same
  * captureId continues"). A root that has them passes them as `notices`; a root that does not is
  * served from the store through `usePanelStoreSelector`, a read-only subscription to that one
- * slice, so the entry appears wherever the pane is mounted.
+ * slice, so the entry appears wherever the pane is mounted. The capture's two counts are served
+ * the same way when the root omits `capturedCount` and `skippedCount`.
  *
- * Those two slices are this component's only inputs: it never queries
+ * Those slices are this component's only inputs: it never queries
  * `POST /sessions/:id/panel-data` (that is `PanelView`'s job, through `PanelHost` and the
  * `DataProvider`), never opens a port or a socket, and never writes the store.
  *
@@ -109,8 +117,9 @@
  *
  * ## Boundaries
  *
- * No transport, no `chrome.*` API, no store writes and no validation — the one store read is the
- * `tailNotices` fallback described above, which yields an empty list in a fresh store — so the
+ * No transport, no `chrome.*` API, no store writes and no validation — the only store reads are
+ * the `tailNotices` and capture-count fallbacks described above, which yield an empty list and
+ * zeros in a fresh store — so the
  * pane renders unchanged when the panel document is opened directly as an extension page with
  * `chrome.devtools` undefined. The copy is generic product vocabulary and names nothing from any
  * inspected application (AAP 0.5.4).
@@ -303,19 +312,55 @@ function collapseLabel(collapsed: boolean, count: number, noticeCount: number): 
   return `${collapsed ? SHOW_VERB : HIDE_VERB} ${PANE_SUBJECT} (${formatCount(count)}${notices})`;
 }
 
+/** A count safe to state: a non-negative whole number. */
+function statedCount(value: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
 /**
- * The truncation statement, or `undefined` while the tail is complete.
+ * The truncation statement, or `undefined` while the tail is the whole capture.
  *
- * The store is the authority on what it dropped: with `droppedCount` supplied, the statement
- * appears exactly when something was dropped and says how much. Without it, reaching the store's
- * cap is the signal — the buffer never holds more than {@link LIVE_TAIL_MAX_EVENTS} events, so a
- * full buffer during a capture means the oldest ones are being evicted. Either way the cap is the
- * store's imported constant, so the wording stays true if the bound changes.
+ * Two bounds can leave the tail short of the capture. The service streams a bounded share of a
+ * burst and skips the rest — the store still holds it — and the panel keeps only the newest
+ * {@link LIVE_TAIL_MAX_EVENTS} of what it received. Once the service reports skipped events, the
+ * statement says how much the tail shows of the capture's total, which is the counter's number,
+ * and how much the service did not stream live: "Showing the newest 1,000 of 68,111 captured
+ * events; 55,600 were not streamed live".
+ *
+ * Otherwise the store is the authority on what it dropped: with `droppedCount` supplied, the
+ * statement appears exactly when something was dropped and says how much. Without it, reaching
+ * the store's cap is the signal — the buffer never holds more than {@link LIVE_TAIL_MAX_EVENTS}
+ * events, so a full buffer during a capture means the oldest ones are being evicted. Either way
+ * the cap is the store's imported constant, so the wording stays true if the bound changes. A tail
+ * that is merely a flush behind the stored count states nothing: it is catching up, not short.
+ *
+ * @param bufferedCount The events the pane holds.
+ * @param droppedCount What the store's bounded buffer dropped, when known.
+ * @param capturedCount The events the capture holds — the service's stored count, the counter's
+ *   number (`PanelSnapshot.capture.eventCount`).
+ * @param skippedCount The capture's events the service stored but never streamed to the tail.
  */
 function truncationLabel(
   bufferedCount: number,
   droppedCount: number | undefined,
+  capturedCount: number,
+  skippedCount: number,
 ): string | undefined {
+  const skipped = statedCount(skippedCount);
+  if (skipped > 0) {
+    // The capture's total never reads below what the tail itself accounts for.
+    const received = bufferedCount + statedCount(droppedCount ?? 0);
+    const captured = Math.max(statedCount(capturedCount), received + skipped);
+    const noun = captured === 1 ? 'event' : 'events';
+    if (bufferedCount === 0) {
+      // Nothing reached the pane (a delivery outage outlived the service's retention): the pane
+      // states what the capture holds rather than looking like a capture that caught nothing.
+      const verb = skipped === 1 ? 'was' : 'were';
+      return `${formatCount(skipped)} of ${formatCount(captured)} captured ${noun} ${verb} not streamed live`;
+    }
+    const notStreamed = skipped === 1 ? '1 was' : `${formatCount(skipped)} were`;
+    return `Showing the newest ${formatCount(bufferedCount)} of ${formatCount(captured)} captured ${noun}; ${notStreamed} not streamed live`;
+  }
   const newest = `Showing the newest ${formatCount(LIVE_TAIL_MAX_EVENTS)}`;
   if (droppedCount !== undefined) {
     if (droppedCount <= 0) {
@@ -586,6 +631,16 @@ function buildColumns(
 /** The store's capture notices. A module-level selector, so its identity never changes. */
 function selectTailNotices(snapshot: PanelSnapshot): readonly PanelTailNotice[] {
   return snapshot.tailNotices;
+}
+
+/** The capture's event count, the counter's number. Module-level, like the notice selector. */
+function selectCapturedCount(snapshot: PanelSnapshot): number {
+  return snapshot.capture.eventCount;
+}
+
+/** The capture's events the service did not stream to the tail. Module-level, likewise. */
+function selectSkippedCount(snapshot: PanelSnapshot): number {
+  return snapshot.capture.tailSkipped;
 }
 
 /**
@@ -1027,6 +1082,19 @@ export interface LiveTailProps {
   droppedCount?: number | undefined;
 
   /**
+   * The events the capture holds — the service's stored count, the counter's number
+   * (`PanelSnapshot.capture.eventCount`). Omitted, the pane reads it from the store.
+   */
+  capturedCount?: number | undefined;
+
+  /**
+   * The capture's events the service stored but did not stream to the tail
+   * (`PanelSnapshot.capture.tailSkipped`). Omitted, the pane reads it from the store. A positive
+   * count makes the truncation statement name the capture's total and what was not streamed.
+   */
+  skippedCount?: number | undefined;
+
+  /**
    * The capture's notices (`PanelSnapshot.tailNotices`), oldest first, as the store keeps them.
    * Rendered newest first above the stream body; never mutated. Omitted, the pane reads the
    * store's `tailNotices` slice itself (see the module note).
@@ -1073,6 +1141,8 @@ export function LiveTail(props: LiveTailProps): ReactElement {
     actions,
     selected,
     droppedCount,
+    capturedCount,
+    skippedCount,
     notices,
     error,
     onRetry,
@@ -1081,9 +1151,11 @@ export function LiveTail(props: LiveTailProps): ReactElement {
 
   // The root's notices when it passes them, the store's otherwise. The hook runs either way, as a
   // hook must; selecting the slice itself keeps its reference, so it re-renders the pane only when
-  // the store's notices change.
+  // the store's notices change. The capture's two counts are read the same way, as numbers.
   const storeNotices = usePanelStoreSelector(selectTailNotices);
   const shownNotices = notices ?? storeNotices;
+  const storeCaptured = usePanelStoreSelector(selectCapturedCount);
+  const storeSkipped = usePanelStoreSelector(selectSkippedCount);
 
   const regionId = useId();
   const [searchText, setSearchText] = useState('');
@@ -1107,7 +1179,12 @@ export function LiveTail(props: LiveTailProps): ReactElement {
 
   // Derived before the callbacks that follow, so none of them closes over a value computed later.
   const count = tail.length;
-  const truncation = truncationLabel(events.length, droppedCount);
+  const truncation = truncationLabel(
+    events.length,
+    droppedCount,
+    capturedCount ?? storeCaptured,
+    skippedCount ?? storeSkipped,
+  );
   // Everything the store has appended this capture: what is buffered plus what it dropped.
   const arrived = droppedCount === undefined ? undefined : droppedCount + events.length;
   const body = resolveStreamBody(count, capturing, error !== undefined);
@@ -1217,6 +1294,15 @@ export function LiveTail(props: LiveTailProps): ReactElement {
         <Stack id={regionId} gap={2}>
           {failure}
           {orderedNotices.length === 0 ? null : <NoticeList notices={orderedNotices} />}
+          {/*
+           * The stream states the truncation in its toolbar. Without rows there is no toolbar, so
+           * a capture whose events the service did not stream still says so here.
+           */}
+          {body !== 'events' && truncation !== undefined ? (
+            <Text size="xs" tone="warning">
+              {truncation}
+            </Text>
+          ) : null}
           {content}
         </Stack>
       )}

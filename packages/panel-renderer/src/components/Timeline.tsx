@@ -46,29 +46,41 @@
  *   parent never arrived at all", which is a different statement, and
  *   conflating the two would invent evidence.
  *
- * ## The canvas is a fixed logical coordinate space
+ * ## The canvas is drawn one user unit to a CSS pixel
  *
- * The canvas is laid out in a `viewBox` exactly `CHART_VIEWBOX_WIDTH` (1 000)
- * user units wide — `../utils/scale`'s fixed logical width for the time charts
- * — and as tall as the lanes it draws. The element itself declares
- * `width="100%"`, so CSS sizes it to its container, and
- * `preserveAspectRatio="xMinYMin meet"` scales the drawing uniformly into that
- * box from its top-left corner, so a glyph is never stretched sideways at any
- * panel width. Nothing here depends on measured pixels: this file reads no
- * element's size, observes no resize and measures no rendered font, so the
- * drawing is a pure function of the data — identical in a browser, in a
- * DevTools panel of any width and in the layout-free DOM every component suite
- * runs under.
+ * The canvas is laid out at its own rendered width. The element declares
+ * `width="100%"`, so the stylesheet alone decides how wide it is — as wide as
+ * its scroll viewport, down to the chart minimum below which the viewport
+ * scrolls instead — and {@link useCanvasWidth} observes that width and lays the
+ * drawing out in a `viewBox` exactly as wide, and as tall as the lanes it
+ * draws. One user unit is therefore one CSS pixel at every panel width: a
+ * label set in `--dg-mono-sm` renders at the role's 11 px whether the panel is
+ * narrow or a full-screen window, a lane is as tall as its rows and no taller,
+ * and a wider panel gives the time axis more room rather than magnifying the
+ * whole drawing. The measurement cannot feed back into itself: the element's
+ * width comes from its container, never from its `viewBox`, and the drawing's
+ * height depends on its rows alone.
  *
- * A bar's label is fitted in the same logical units before it is placed, with
+ * Until a width has been measured — the first layout of a host that cannot
+ * report one, or the layout-free DOM every component suite runs under, where
+ * nothing has a size and `ResizeObserver` observes nothing — the drawing is
+ * laid out in `../utils/scale`'s fixed logical width, `CHART_VIEWBOX_WIDTH`
+ * (1 000) units, and `preserveAspectRatio="xMinYMin meet"` scales it uniformly
+ * into the element from its top-left corner, so a glyph is never stretched
+ * sideways. Either way the drawing is a pure function of the data and one
+ * width: the same model at the same width always draws the same picture, and
+ * the fallback width makes an unmeasured render deterministic.
+ *
+ * A bar's label is fitted in the same user units before it is placed, with
  * `../utils/format`'s deterministic advance estimate at the label role's size
  * (`fitTextToWidth` over `createEstimateMeasure(DEFAULT_LABEL_FONT_SIZE)`; the
- * label is set in `--dg-mono-sm`, 11 units tall however the drawing is
- * scaled), so it is drawn only where it fits — after the bar, before it, inside
- * it, or shortened to an ellipsis — and never across the lane labels, past the
- * canvas edge or over another bar or label (see "Bar labels" below). The
- * estimate errs towards "does not fit", so a label it places is not clipped by
- * the face the stylesheet renders it in.
+ * label is set in `--dg-mono-sm`, 11 px, which is 11 user units once the
+ * drawing is laid out at its rendered width), so it is drawn only where it
+ * fits — after the bar, before it, inside it, or shortened to an ellipsis —
+ * and never across the lane labels, past the canvas edge or over another bar
+ * or label (see "Bar labels" below). The estimate errs towards "does not fit",
+ * so a label it places is not clipped by the face the stylesheet renders it
+ * in.
  *
  * Every coordinate comes from `../utils/scale` and every colour from
  * `../utils/color`; this file performs no interval arithmetic of its own and
@@ -76,11 +88,27 @@
  * the stylesheet as `--dgc-bar-color` and a lane's tier accent as
  * `--dgc-lane-color`, which are the only inline values written anywhere below.
  *
+ * ## Overlapping spans are stacked, never painted over one another
+ *
+ * A lane places a span by its depth, and spans of one depth routinely overlap
+ * in time — parallel requests, the renders of one commit, the queries of one
+ * handler. Each depth is therefore packed into the sub-rows its overlapping
+ * spans need, by their drawn extent, so every bar stays visible beside the
+ * others instead of hidden under a longer one. A depth that would need more
+ * than `MAX_SUB_ROWS_PER_DEPTH` keeps its longest spans as bars and gathers the
+ * rest into "+N" marks on one row beneath it, so one crowded depth cannot push
+ * the other lanes out of view; the canvas's text alternative and the footer
+ * state how many spans were gathered, and the table lists every one of them
+ * (see "Packing a depth" in the geometry below). The panel's selection is never
+ * among them: a selected span a crowded depth would gather is drawn as a bar.
+ *
  * ## An SVG alone is not a representation
  *
- * The canvas is `role="img"` with a text alternative, which means its contents
- * are not in the accessibility tree and its bars are not focusable. The
- * keyboard-reachable representation is therefore mandatory rather than a
+ * The canvas is a `role="figure"` with a text alternative, and each bar and
+ * "+N" mark in it is a `role="img"` carrying its full description as its
+ * accessible name, so a screen reader browsing the picture hears what a pointer
+ * hovering it sees. Its bars are not focusable, though, so the
+ * keyboard-reachable representation is mandatory rather than a
  * convenience: the same rows render below the canvas through `DataTable` —
  * name, kind, tier, offset, duration and a `SourceLink` chip wherever a row
  * resolved to a location — with row activation raising the same selection the
@@ -175,12 +203,19 @@
  *   dg-timeline__bar-label--inside
  *   dg-timeline__bar-label-backdrop
  *   dg-timeline__edge          a parent → child connector
+ *   dg-timeline__overflow      a "+N" mark: the spans of one lane depth that
+ *   dg-timeline__overflow-label  overlap more deeply than it draws sub-rows
+ *                              for, gathered on the depth's overflow row, and
+ *                              the mark's count
  *   dg-timeline__detail        the reserved, never-wrapping line between the
  *                              canvas and the table: the selected span, or a
  *                              hovered or focused one previewed in its place
  *   dg-timeline__detail-rest   that line's trailing run, clipped rather than
  *                              wrapped on a narrow panel
- *   dg-timeline__tooltip       the slot the shown row's description sits in
+ *   dg-timeline__detail-note   the lineage note in that run: the one item that
+ *                              gives way, cut with a visible ellipsis
+ *   dg-timeline__tooltip       the slot the shown row's description sits in,
+ *                              and the slot of the note's flag beside it
  *   dg-timeline__equivalent    the keyboard-reachable table of the same rows
  *   dg-timeline__empty         the three states
  *   dg-timeline__loading
@@ -203,6 +238,7 @@
 import type { DataQuery, TimelineNode } from '@debuggen/panel-schema';
 import { PANEL_NODE_CATALOG } from '@debuggen/panel-schema';
 import type { SourceLocation } from '@debuggen/shared';
+import { clampNonNegative } from '@debuggen/shared';
 import type {
   TelemetryEvent,
   TelemetryKind,
@@ -211,7 +247,7 @@ import type {
   TraceTree,
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   CSSProperties,
   FocusEvent as ReactFocusEvent,
@@ -246,22 +282,24 @@ import type { DataProvider } from '../host/DataProvider';
 import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
 import type { PanelEventRef, PanelSelection } from '../host/PanelActions';
 import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
-import { kindColorVar, tierColorVar } from '../utils/color';
+import { kindColorVar, statusTone, tierColorVar } from '../utils/color';
 import {
   DEFAULT_LABEL_FONT_SIZE,
   NOT_AVAILABLE_LABEL,
   collapseWhitespace,
+  countedNoun,
   createEstimateMeasure,
   fitTextToWidth,
   formatCount,
+  formatCountOf,
   formatDuration,
-  formatDurationCompact,
   formatKindLabel,
   formatOffset,
   formatStatusLabel,
   formatTierLabel,
+  pluralize,
 } from '../utils/format';
-import type { TextMeasure } from '../utils/format';
+import type { CountedNoun, TextMeasure } from '../utils/format';
 import {
   CHART_VIEWBOX_WIDTH,
   DEFAULT_MAX_TRACE_ROWS,
@@ -286,6 +324,7 @@ import type {
   AxisTick,
   FlatTraceRow,
   RowWindow,
+  SpanGeometry,
   TimeScale,
   TraceLayoutOptions,
 } from '../utils/scale';
@@ -328,11 +367,13 @@ const TIER_LANE_ORDER: readonly TelemetryTier[] = Object.freeze([
  *
  * Unitless SVG user units, which is what `../utils/scale` speaks and what the
  * stylesheet deliberately does not: every rule there sets paint and text only,
- * so a coordinate has exactly one owner. They are positions in the canvas's
- * fixed logical space, `CHART_VIEWBOX_WIDTH` units wide, which the drawing
- * scales uniformly to its container (see this module's header), so each is a
- * fixed share of the canvas's width at every panel width. None of these is a
- * CSS value — no `px`, no `rem`, no colour.
+ * so a coordinate has exactly one owner. Once the canvas's width has been
+ * measured a user unit is one CSS pixel (see this module's header), so each of
+ * these is the same pixel extent at every panel width — a gutter or a row does
+ * not grow with the panel — and only the time axis between the two gutters
+ * takes up the panel's width. Before a measurement they are units of the
+ * fallback frame, `CHART_VIEWBOX_WIDTH` wide, and scale with it. None of these
+ * is a CSS value — no `px`, no `rem`, no colour.
  * ---------------------------------------------------------------------------
  */
 
@@ -341,16 +382,17 @@ const TIER_LANE_ORDER: readonly TelemetryTier[] = Object.freeze([
  * deterministic advance estimate at the label role's size — `--dg-mono-sm`,
  * 11 units, which is `DEFAULT_LABEL_FONT_SIZE`. Created once, since it depends
  * on nothing but that size, so the geometry below is a pure function of the
- * model.
+ * model and the canvas width.
  */
 const BAR_LABEL_MEASURE: TextMeasure = createEstimateMeasure(DEFAULT_LABEL_FONT_SIZE);
 
 /**
- * The canvas every model is drawn on: the fixed logical width and the label
- * measure. One frozen value, so no render can lay a model out differently from
- * another.
+ * The frame a model is drawn on before its canvas has been measured: the fixed
+ * logical width `CHART_VIEWBOX_WIDTH` and the label measure. One frozen value,
+ * so every unmeasured render — a host's first layout, or a layout-free test DOM
+ * — lays a model out exactly as every other does (see {@link canvasFrameFor}).
  */
-const CANVAS_FRAME: CanvasFrame = Object.freeze({
+const FALLBACK_CANVAS_FRAME: CanvasFrame = Object.freeze({
   width: CHART_VIEWBOX_WIDTH,
   measureText: BAR_LABEL_MEASURE,
 });
@@ -1386,9 +1428,10 @@ function modelFromWalk(walk: TimelineWalk, start: number): TimelineModel {
  * ---------------------------------------------------------------------------
  * Geometry
  *
- * One pure function of the model and the fixed canvas it is drawn on — the
- * logical width and the label estimate of {@link CANVAS_FRAME} — so the same
- * model always draws the same picture, and no layout is read. Every number
+ * One pure function of the model and the frame it is drawn on — the canvas's
+ * width and the label estimate of {@link CanvasFrame} — so the same model at
+ * the same width always draws the same picture, and no layout is read here:
+ * the width is measured once, by the view, and handed in. Every number
  * below comes out of `../utils/scale`: the time-to-coordinate map, a bar's
  * offset and width with its minimum visible width and its edge clipping, the
  * lane stack, the depth rhythm and the axis ticks. Re-deriving any of that
@@ -1398,6 +1441,36 @@ function modelFromWalk(walk: TimelineWalk, start: number): TimelineModel {
 
 /** A floor on a bar's height, so a row rhythm change can never erase a bar. */
 const MIN_BAR_HEIGHT = 4;
+
+/**
+ * The most sub-rows one depth of one lane is packed into: 6.
+ *
+ * Spans of one depth that overlap once drawn are stacked into sub-rows (see
+ * "Packing a depth" below) rather than painted over one another. Stacking
+ * without a bound would let one crowded depth — a commit that re-rendered two
+ * thousand components inside a few milliseconds — push every other lane out
+ * of the viewport, which is the failure the bound exists to prevent. Six rows
+ * keep the longest overlapping operations of a depth legible side by side;
+ * beyond that, the depth's remaining spans are gathered into "+N" marks on one
+ * extra row beneath it, and every one of them is still a row of the table
+ * below the canvas.
+ */
+const MAX_SUB_ROWS_PER_DEPTH = 6;
+
+/**
+ * How far one bar may run past the next one's left edge and still count as
+ * merely touching it, in user units: one millionth of a unit.
+ *
+ * Two spans where one ends exactly as the next begins share an edge and belong
+ * on one sub-row. Their edges are computed through the scale separately — the
+ * first as `x + width`, the second as a mapped instant — so a shared edge can
+ * differ by a rounding step of floating-point arithmetic, and without this
+ * slack such a pair would be split onto two sub-rows for no visible reason.
+ * The tolerance is far below anything a display can resolve, so a real overlap
+ * is never mistaken for a touch. It is the flame chart's value for the same
+ * judgement, so the two views pack one capture alike.
+ */
+const TOUCH_TOLERANCE = 1e-6;
 
 /** One lane band: where it sits, how tall it is and which accent it carries. */
 interface LaneGeometry {
@@ -1411,7 +1484,12 @@ interface LaneGeometry {
   readonly y: number;
   /** The band's height: its depth rows and the gutters between them. */
   readonly height: number;
-  /** How many rows the lane holds: one per distinct depth among its spans. */
+  /**
+   * How many rows the lane holds. Each distinct depth among its spans takes
+   * the sub-rows its overlapping spans pack into — one where none overlap, at
+   * most {@link MAX_SUB_ROWS_PER_DEPTH} — plus one overflow row where more
+   * overlapped than that (see "Packing a depth" below).
+   */
   readonly rowCount: number;
 }
 
@@ -1424,7 +1502,7 @@ type BarLabelPlacement = 'after' | 'before' | 'inside';
 /** A bar's label, fitted and placed (see "Bar labels" below). */
 interface BarLabelGeometry {
   /**
-   * The text drawn: the span's name and compact duration, or — where that does
+   * The text drawn: the span's name and precise duration, or — where that does
    * not fit anywhere — a shortened form: the name cut to an ellipsis with the
    * duration kept, or the name alone.
    */
@@ -1488,14 +1566,60 @@ interface EdgeGeometry {
   readonly orphaned: boolean;
 }
 
+/** A "+N" mark's count label, placed where it fits (see `labelOverflowRow`). */
+interface OverflowLabelGeometry {
+  /** The text drawn: `+` and the count. */
+  readonly text: string;
+  /** Where the text starts, or ends when it is anchored at its end. */
+  readonly x: number;
+  /** Which side of {@link x} the text occupies. */
+  readonly anchor: 'start' | 'end';
+}
+
+/**
+ * One "+N" mark: a run of overlapping spans of one lane depth that the depth's
+ * sub-rows could not hold, gathered into one outlined band on the depth's
+ * overflow row instead of being painted over one another.
+ */
+interface OverflowGeometry {
+  /** A stable key: the event id of the first span the mark gathers. */
+  readonly id: string;
+  /** The band's left edge: the leftmost drawn extent it gathers. */
+  readonly x: number;
+  /** The band's width, from that edge to the rightmost drawn end it gathers. */
+  readonly width: number;
+  /** The band's top edge. */
+  readonly y: number;
+  /** The band's height: a bar's height on its row. */
+  readonly height: number;
+  /** The band's vertical centre, where its count label sits. */
+  readonly centerY: number;
+  /** How many spans the mark gathers. */
+  readonly count: number;
+  /** The earliest start among them, in epoch milliseconds. */
+  readonly startTime: number;
+  /** The latest end among them, in epoch milliseconds. */
+  readonly endTime: number;
+  /** The count label, or `undefined` where it fits nowhere beside the band. */
+  readonly label: OverflowLabelGeometry | undefined;
+}
+
 /** Everything the canvas needs, computed once per model. */
 interface TimelineGeometry {
   /** The time-to-coordinate map the bars and the axis share, in user units. */
   readonly scale: TimeScale;
   /** The lane bands, in lane order. */
   readonly lanes: readonly LaneGeometry[];
-  /** One bar per row, in the model's order. */
+  /**
+   * One bar per row the lanes draw a bar for, in the model's order. A row
+   * gathered into a "+N" mark has no bar; it is counted by its mark and listed
+   * in the table like every other row.
+   */
   readonly bars: readonly BarGeometry[];
+  /** The "+N" marks, lane by lane and left to right on each overflow row. */
+  readonly overflow: readonly OverflowGeometry[];
+  /** The event ids of every row gathered into a "+N" mark. */
+  readonly gatheredEventIds: ReadonlySet<string>;
   /** The connectors, drawn before the bars so none crosses a label. */
   readonly edges: readonly EdgeGeometry[];
   /** The axis ticks, already positioned and labelled. */
@@ -1513,22 +1637,61 @@ function usableDepth(depth: number): number {
 
 /**
  * The canvas a model is drawn on: what {@link buildGeometry} needs beyond the
- * data. It knows nothing about the page — every render passes the one
- * {@link CANVAS_FRAME}.
+ * data. It holds a width and nothing else about the page — the view resolves
+ * it from the canvas's measured width with {@link canvasFrameFor}.
  */
 interface CanvasFrame {
-  /** The canvas's fixed logical width in user units: `CHART_VIEWBOX_WIDTH`. */
+  /**
+   * The canvas's width in user units, which is also its `viewBox` width: the
+   * measured width in CSS pixels, or `CHART_VIEWBOX_WIDTH` before one exists.
+   */
   readonly width: number;
   /** Estimates a string's advance in the bar-label role, in the same user units. */
   readonly measureText: TextMeasure;
 }
 
+/**
+ * The narrowest frame a model is laid out in: both gutters and a time axis as
+ * wide as the lane-label gutter.
+ *
+ * The stylesheet's chart minimum keeps a real canvas far wider than this; the
+ * floor only stops a pathological measurement — a canvas squeezed below its
+ * own gutters — from handing the time scale an inverted range, which it would
+ * swap and so draw bars across the lane labels. An element narrower than the
+ * floor shows this frame scaled down to fit it, as `meet` fits any drawing
+ * wider than its box.
+ */
+const MIN_CANVAS_FRAME_WIDTH = LANE_LABEL_WIDTH * 2 + CANVAS_RIGHT_GUTTER;
+
+/**
+ * The frame a model is drawn on at a measured canvas width.
+ *
+ * @param width The canvas's accepted rendered width in CSS pixels (see
+ *   {@link acceptCanvasWidth}), or `undefined` while none has been measured.
+ * @returns {@link FALLBACK_CANVAS_FRAME} while nothing is measured, and
+ *   otherwise a frame exactly that wide — never narrower than
+ *   {@link MIN_CANVAS_FRAME_WIDTH} — so one user unit is one CSS pixel.
+ */
+function canvasFrameFor(width: number | undefined): CanvasFrame {
+  if (width === undefined) {
+    return FALLBACK_CANVAS_FRAME;
+  }
+
+  return Object.freeze({
+    width: Math.max(width, MIN_CANVAS_FRAME_WIDTH),
+    measureText: BAR_LABEL_MEASURE,
+  });
+}
+
 /*
  * Bar labels
  *
- * A bar's label is its span's name and compact duration ("name · 12 ms"),
- * fitted in logical units with the frame's advance estimate and drawn in the
- * first place it fits whole:
+ * A bar's label is its span's name and precise duration ("name · 12.40 ms"),
+ * the very text the bar's title, the detail strip and the table print for the
+ * same span, so one span never reads "1.6 s" on its bar and "1.567 s" in its
+ * row. Only the axis ticks are compact: a tick marks a position on the scale,
+ * not a measurement a reader compares. The label is fitted in logical units
+ * with the frame's advance estimate and drawn in the first place it fits whole:
  *
  *   1. after the bar — start-anchored `BAR_LABEL_GAP` past its end;
  *   2. before the bar — end-anchored `BAR_LABEL_GAP` before its start;
@@ -1824,7 +1987,7 @@ function placeBarLabel(
 ): BarLabelGeometry | undefined {
   const { measureText } = frame;
   const name = collapseWhitespace(bar.row.name);
-  const suffix = `${BAR_LABEL_SEPARATOR}${formatDurationCompact(bar.row.durationMs)}`;
+  const suffix = `${BAR_LABEL_SEPARATOR}${formatDuration(bar.row.durationMs)}`;
   const whole = `${name}${suffix}`;
   const wholeWidth = measureText(whole);
 
@@ -1903,8 +2066,325 @@ function labelBars(bars: readonly UnlabelledBar[], frame: CanvasFrame): BarGeome
   });
 }
 
-/** Turns the model into the canvas it is drawn on, reading no layout and mutating nothing. */
-function buildGeometry(model: TimelineModel, frame: CanvasFrame): TimelineGeometry {
+/*
+ * Packing a depth
+ *
+ * A lane's depths are ranked (`rankLaneDepths`), so a deeper span always sits
+ * below a shallower one, and each depth is then packed into sub-rows, so spans
+ * of one depth that overlap once drawn are stacked rather than painted over
+ * one another. Overlap is the ordinary case, not the exception: parallel
+ * requests under one interaction overlap by construction, one commit renders
+ * many components within a few milliseconds, and a run of short operations
+ * each widened to the minimum visible width can overlap once drawn even where
+ * their measured windows do not.
+ *
+ * The packing is greedy interval partitioning over the DRAWN extent — the
+ * placement after the scale's minimum-width clamp, because that is what
+ * paints. Taken by left edge, then model order, each span goes into the first
+ * sub-row whose last span ends at or before its left edge (within
+ * `TOUCH_TOLERANCE`, so spans that only touch share a sub-row), and a span
+ * that fits in none opens the next. Taking spans by left edge makes that
+ * choice optimal: a depth takes exactly as many sub-rows as the most spans
+ * stacked over any one point, so a depth whose spans never overlap keeps the
+ * single row it always had. It is the flame chart's packing of an icicle depth.
+ *
+ * A depth that would need more than `MAX_SUB_ROWS_PER_DEPTH` sub-rows is packed
+ * by priority instead: the longest spans first — a pinned span, the panel's
+ * selection, before all of them (see `buildGeometry`) — each into the first of
+ * the capped sub-rows where it overlaps nothing. Whatever fits nowhere is
+ * gathered, overlapping and touching runs merged, into "+N" marks on one extra
+ * row beneath the depth. The longest operations are the ones a reading of
+ * where the time went needs as bars; each mark states, in place, how many spans
+ * it holds and that the table below lists every one of them.
+ *
+ * Sub-rows are numbered depth-major across the lane — every sub-row of one
+ * depth, and its overflow row, above every sub-row of the next — so nesting
+ * still reads downward and a connector still runs down from a parent to its
+ * child. The result is a pure function of the placements: identical on every
+ * render and in every environment.
+ */
+
+/** One row's drawn extent, before it is given a sub-row of its lane. */
+interface PlacedSpan {
+  /** The row it draws. */
+  readonly row: TimelineBar;
+  /** Its position in the model's rows: the tie-break of every packing order. */
+  readonly order: number;
+  /** Its drawn extent: the scale's placement, after the minimum-width clamp. */
+  readonly placement: SpanGeometry;
+}
+
+/** One depth of one lane, packed. */
+interface DepthPacking {
+  /** The sub-rows, top to bottom — at most `MAX_SUB_ROWS_PER_DEPTH` — each left to right. */
+  readonly subRows: readonly (readonly PlacedSpan[])[];
+  /** The spans no sub-row could hold, left to right; empty when the depth fits. */
+  readonly overflow: readonly PlacedSpan[];
+}
+
+/** Whether a run ending at `end` reaches past `start` by more than a touch. */
+function runsPast(end: number, start: number): boolean {
+  return end - start > TOUCH_TOLERANCE;
+}
+
+/** Orders spans by drawn left edge, then by model order. */
+function byLeftEdge(left: PlacedSpan, right: PlacedSpan): number {
+  return left.placement.x - right.placement.x || left.order - right.order;
+}
+
+/**
+ * A duration as a packing priority and a mark's time bound: the measured
+ * milliseconds, and `0` for a value that is not a finite, positive measurement.
+ * Geometry only — what a reader is told about such a value is the formatter's.
+ */
+function drawnDurationMs(ms: number): number {
+  return Number.isFinite(ms) && ms > 0 ? ms : 0;
+}
+
+/**
+ * Left-edge first-fit packing (see "Packing a depth" above) into at most `cap`
+ * sub-rows.
+ *
+ * @param spans One depth's spans, in any order.
+ * @param cap The most sub-rows the depth may take.
+ * @returns The sub-rows, or `undefined` once the depth needs more than `cap`.
+ */
+function packByLeftEdge(spans: readonly PlacedSpan[], cap: number): PlacedSpan[][] | undefined {
+  const subRows: PlacedSpan[][] = [];
+  const ends: number[] = [];
+
+  for (const span of [...spans].sort(byLeftEdge)) {
+    const target = ends.findIndex((end) => !runsPast(end, span.placement.x));
+    const subRow = target < 0 ? undefined : subRows[target];
+    if (subRow !== undefined) {
+      subRow.push(span);
+      ends[target] = Math.max(ends[target] ?? span.placement.end, span.placement.end);
+      continue;
+    }
+    if (subRows.length >= cap) {
+      return undefined;
+    }
+    subRows.push([span]);
+    ends.push(span.placement.end);
+  }
+
+  return subRows;
+}
+
+/**
+ * One capped sub-row while it is filled by priority: its spans and their drawn
+ * extents, ordered by left edge. The extents never overlap beyond a touch, so
+ * ordered by start they are ordered by end too, and whether a new span fits is
+ * one binary search against its two neighbours rather than a scan of the row.
+ */
+interface PrioritySubRow {
+  readonly starts: number[];
+  readonly ends: number[];
+  readonly spans: PlacedSpan[];
+}
+
+/**
+ * Where `placement` would go in `subRow`'s left-edge order, or `undefined` when
+ * it overlaps a span already there by more than a touch.
+ */
+function insertionPoint(subRow: PrioritySubRow, placement: SpanGeometry): number | undefined {
+  const at = countUpTo(subRow.starts, placement.x, false);
+  const endBefore = subRow.ends[at - 1];
+  if (endBefore !== undefined && runsPast(endBefore, placement.x)) {
+    return undefined;
+  }
+  const startAfter = subRow.starts[at];
+  if (startAfter !== undefined && runsPast(placement.end, startAfter)) {
+    return undefined;
+  }
+
+  return at;
+}
+
+/**
+ * Priority packing (see "Packing a depth" above) into exactly `cap` sub-rows:
+ * the pinned span first, then the longest spans, each into the first sub-row
+ * where it overlaps nothing; what fits nowhere overflows.
+ *
+ * @param spans One depth's spans, in any order.
+ * @param cap How many sub-rows the depth may take.
+ * @param pinnedEventId A span placed before every other, when it is among them.
+ */
+function packByPriority(
+  spans: readonly PlacedSpan[],
+  cap: number,
+  pinnedEventId: string | undefined,
+): DepthPacking {
+  const ordered = [...spans].sort((left, right) => {
+    const leftPinned = left.row.eventId === pinnedEventId;
+    if (leftPinned !== (right.row.eventId === pinnedEventId)) {
+      return leftPinned ? -1 : 1;
+    }
+
+    return (
+      drawnDurationMs(right.row.durationMs) - drawnDurationMs(left.row.durationMs) ||
+      left.order - right.order
+    );
+  });
+  const subRows: PrioritySubRow[] = Array.from({ length: cap }, () => ({
+    starts: [],
+    ends: [],
+    spans: [],
+  }));
+  const overflow: PlacedSpan[] = [];
+
+  for (const span of ordered) {
+    let placed = false;
+    for (const subRow of subRows) {
+      const at = insertionPoint(subRow, span.placement);
+      if (at === undefined) {
+        continue;
+      }
+      subRow.starts.splice(at, 0, span.placement.x);
+      subRow.ends.splice(at, 0, span.placement.end);
+      subRow.spans.splice(at, 0, span);
+      placed = true;
+      break;
+    }
+    if (!placed) {
+      overflow.push(span);
+    }
+  }
+
+  // A sub-row is used only once every sub-row above it refused a span, so the
+  // used ones are a prefix and dropping the empty tail keeps their order.
+  return {
+    subRows: subRows.filter((subRow) => subRow.spans.length > 0).map((subRow) => subRow.spans),
+    overflow: overflow.sort(byLeftEdge),
+  };
+}
+
+/**
+ * Packs one depth of one lane (see "Packing a depth" above).
+ *
+ * @param spans The depth's spans.
+ * @param pinnedEventId A span to keep drawn as a bar should the depth overflow.
+ */
+function packDepth(spans: readonly PlacedSpan[], pinnedEventId: string | undefined): DepthPacking {
+  const subRows = packByLeftEdge(spans, MAX_SUB_ROWS_PER_DEPTH);
+
+  return subRows === undefined
+    ? packByPriority(spans, MAX_SUB_ROWS_PER_DEPTH, pinnedEventId)
+    : { subRows, overflow: [] };
+}
+
+/** A run of gathered spans before its row is placed vertically. */
+interface OverflowRun {
+  readonly id: string;
+  readonly x: number;
+  readonly end: number;
+  readonly count: number;
+  readonly startTime: number;
+  readonly endTime: number;
+}
+
+/**
+ * Merges a depth's overflowing spans, ordered by left edge, into runs: a span
+ * that overlaps or touches the run before it joins that run, and any other
+ * starts the next one.
+ */
+function gatherOverflow(spans: readonly PlacedSpan[]): OverflowRun[] {
+  const runs: OverflowRun[] = [];
+  let open: OverflowRun | undefined;
+
+  for (const span of spans) {
+    const { x, end } = span.placement;
+    const { startTime } = span.row;
+    // A span with no usable start widens no time bound; its mark still counts it.
+    const timed = Number.isFinite(startTime);
+    const spanStart = timed ? startTime : Number.POSITIVE_INFINITY;
+    const spanEnd = timed
+      ? startTime + drawnDurationMs(span.row.durationMs)
+      : Number.NEGATIVE_INFINITY;
+
+    if (open !== undefined && !runsPast(x, open.end)) {
+      open = {
+        ...open,
+        end: Math.max(open.end, end),
+        count: open.count + 1,
+        startTime: Math.min(open.startTime, spanStart),
+        endTime: Math.max(open.endTime, spanEnd),
+      };
+      continue;
+    }
+
+    if (open !== undefined) {
+      runs.push(open);
+    }
+    open = { id: span.row.eventId, x, end, count: 1, startTime: spanStart, endTime: spanEnd };
+  }
+  if (open !== undefined) {
+    runs.push(open);
+  }
+
+  return runs;
+}
+
+/**
+ * Places the count label of every "+N" mark on one overflow row, left to
+ * right: inside the mark where it fits there, otherwise after it, otherwise
+ * before it, each kept `BAR_LABEL_GAP` clear of the neighbouring marks and
+ * labels, the lane-label column and the canvas's trailing gutter — and nowhere,
+ * where none of the three holds it. The mark's own title carries the count in
+ * every case.
+ *
+ * @param runs The row's runs, left to right.
+ * @param frame The canvas width and the label measure.
+ * @returns One label, or `undefined`, per run.
+ */
+function labelOverflowRow(
+  runs: readonly OverflowRun[],
+  frame: CanvasFrame,
+): (OverflowLabelGeometry | undefined)[] {
+  const plotEnd = frame.width - CANVAS_RIGHT_GUTTER;
+  let floor = LANE_LABEL_WIDTH;
+
+  return runs.map((run, index) => {
+    const text = `+${formatCount(run.count)}`;
+    const textWidth = frame.measureText(text);
+    const next = runs[index + 1];
+    const afterX = run.end + BAR_LABEL_GAP;
+    const afterLimit = next === undefined ? plotEnd : next.x - BAR_LABEL_GAP;
+    const beforeX = run.x - BAR_LABEL_GAP;
+
+    let label: OverflowLabelGeometry | undefined;
+    let occupiedEnd = run.end;
+    if (run.end - run.x - BAR_LABEL_INSET * 2 >= textWidth) {
+      label = { text, x: run.x + BAR_LABEL_INSET, anchor: 'start' };
+    } else if (afterLimit - afterX >= textWidth) {
+      label = { text, x: afterX, anchor: 'start' };
+      occupiedEnd = afterX + textWidth;
+    } else if (beforeX - textWidth >= floor) {
+      label = { text, x: beforeX, anchor: 'end' };
+    }
+    floor = occupiedEnd + BAR_LABEL_GAP;
+
+    return label;
+  });
+}
+
+/**
+ * Turns the model into the canvas it is drawn on, reading no layout and
+ * mutating nothing.
+ *
+ * @param model The drawn window's rows.
+ * @param frame The canvas width and the label measure.
+ * @param pinnedEventId A row to keep drawn as a bar even where its depth
+ *   overflows — the panel's selection, passed only when the unpinned layout
+ *   gathered it into a "+N" mark (see `TimelineView`), so a selection made
+ *   elsewhere is still marked on the canvas and a layout never moves under a
+ *   bar the reader just clicked.
+ */
+function buildGeometry(
+  model: TimelineModel,
+  frame: CanvasFrame,
+  pinnedEventId?: string,
+): TimelineGeometry {
   const { width } = frame;
   const scale = createTimeScale(
     [model.startTime, model.endTime],
@@ -1915,17 +2395,68 @@ function buildGeometry(model: TimelineModel, frame: CanvasFrame): TimelineGeomet
   // a tier holds the spans of one process, nested under spans drawn in other
   // lanes, so a database lane can hold an orphan re-attached at depth 1 and a
   // query nested at depth 5. Each lane's depths are ranked (`rankLaneDepths`):
-  // every distinct depth occupies one row, a deeper span still sits below a
-  // shallower one, and no row is reserved for a depth nothing in the lane
-  // occupies — so a lane that begins six levels down starts at its own first
-  // row, and a gap in its depths opens no empty band.
+  // a deeper span still sits below a shallower one, and no row is reserved for
+  // a depth nothing in the lane occupies — so a lane that begins six levels
+  // down starts at its own first row, and a gap in its depths opens no empty
+  // band. Each ranked depth is then packed into the sub-rows its overlapping
+  // spans need (see "Packing a depth" above).
   const laneDepths: number[][] = model.tiers.map(() => []);
   for (const row of model.rows) {
     laneDepths[row.laneIndex]?.push(usableDepth(row.depth));
   }
   const laneRanks = laneDepths.map((depths) => rankLaneDepths(depths));
 
-  const laneStack = layoutLaneStack(laneRanks.map((rank) => rank.rowCount));
+  // Every bar's drawn extent, placed once: the packing reads it, and so does
+  // the bar itself. The extent is the scale's, after its minimum-width clamp,
+  // because that is what paints.
+  const placed: PlacedSpan[] = model.rows.map((row, order) => ({
+    row,
+    order,
+    placement: placeSpanDuration(row.startTime, row.durationMs, scale),
+  }));
+
+  // The spans of each lane, grouped by ranked depth, shallowest first. Every
+  // depth was ranked above, so each group is non-empty.
+  const spansByLaneDepth: PlacedSpan[][][] = laneRanks.map((rank) =>
+    Array.from({ length: rank.rowCount }, (): PlacedSpan[] => []),
+  );
+  for (const span of placed) {
+    const depthRank = laneRanks[span.row.laneIndex]?.rowOf.get(usableDepth(span.row.depth)) ?? 0;
+    spansByLaneDepth[span.row.laneIndex]?.[depthRank]?.push(span);
+  }
+
+  // Each row's lane row — depth-major across its lane — or `undefined` for a
+  // row gathered into a "+N" mark; and each overflow row's gathered runs.
+  const laneRowOf: (number | undefined)[] = placed.map(() => undefined);
+  const overflowRows: {
+    readonly laneIndex: number;
+    readonly laneRow: number;
+    readonly runs: readonly OverflowRun[];
+  }[] = [];
+  const gatheredEventIds = new Set<string>();
+  const laneRowCounts = spansByLaneDepth.map((depths, laneIndex) => {
+    let nextRow = 0;
+    for (const spans of depths) {
+      const packing = packDepth(spans, pinnedEventId);
+      for (const [subRow, members] of packing.subRows.entries()) {
+        for (const member of members) {
+          laneRowOf[member.order] = nextRow + subRow;
+        }
+      }
+      nextRow += packing.subRows.length;
+      if (packing.overflow.length > 0) {
+        for (const span of packing.overflow) {
+          gatheredEventIds.add(span.row.eventId);
+        }
+        overflowRows.push({ laneIndex, laneRow: nextRow, runs: gatherOverflow(packing.overflow) });
+        nextRow += 1;
+      }
+    }
+
+    return nextRow;
+  });
+
+  const laneStack = layoutLaneStack(laneRowCounts);
 
   const lanes: LaneGeometry[] = model.tiers.map((tier, index) => {
     const box = laneStack.lanes[index];
@@ -1940,17 +2471,27 @@ function buildGeometry(model: TimelineModel, frame: CanvasFrame): TimelineGeomet
     };
   });
 
-  const unlabelled: UnlabelledBar[] = model.rows.map((row) => {
-    const lane = lanes[row.laneIndex];
-    // Every depth was ranked above; the fallback is the compiler's reassurance.
-    const laneRow = laneRanks[row.laneIndex]?.rowOf.get(usableDepth(row.depth)) ?? 0;
+  // Where a bar or a mark on row `laneRow` of lane `laneIndex` sits: inset in
+  // its row, never shorter than the floor.
+  const rowBox = (laneIndex: number, laneRow: number): { y: number; height: number } => {
     const depthRow = layoutDepth(laneRow);
-    const placement = placeSpanDuration(row.startTime, row.durationMs, scale);
-
-    const height = clamp(depthRow.height - BAR_INSET * 2, MIN_BAR_HEIGHT, depthRow.height);
-    const y = (lane?.y ?? AXIS_BAND_HEIGHT) + depthRow.y + BAR_INSET;
 
     return {
+      y: (lanes[laneIndex]?.y ?? AXIS_BAND_HEIGHT) + depthRow.y + BAR_INSET,
+      height: clamp(depthRow.height - BAR_INSET * 2, MIN_BAR_HEIGHT, depthRow.height),
+    };
+  };
+
+  const unlabelled: UnlabelledBar[] = [];
+  for (const { row, order, placement } of placed) {
+    const laneRow = laneRowOf[order];
+    if (laneRow === undefined) {
+      // Gathered into a "+N" mark: counted there, and a row of the table.
+      continue;
+    }
+    const { y, height } = rowBox(row.laneIndex, laneRow);
+
+    unlabelled.push({
       row,
       laneRow,
       x: placement.x,
@@ -1961,8 +2502,28 @@ function buildGeometry(model: TimelineModel, frame: CanvasFrame): TimelineGeomet
       centerY: y + height / 2,
       color: kindColorVar(row.kind),
       minWidthApplied: placement.minWidthApplied,
-    };
-  });
+    });
+  }
+
+  const overflow: OverflowGeometry[] = [];
+  for (const { laneIndex, laneRow, runs } of overflowRows) {
+    const { y, height } = rowBox(laneIndex, laneRow);
+    const labels = labelOverflowRow(runs, frame);
+    for (const [index, run] of runs.entries()) {
+      overflow.push({
+        id: run.id,
+        x: run.x,
+        width: run.end - run.x,
+        y,
+        height,
+        centerY: y + height / 2,
+        count: run.count,
+        startTime: run.startTime,
+        endTime: run.endTime,
+        label: labels[index],
+      });
+    }
+  }
 
   // Every bar is placed before any is labelled, because a label must keep clear
   // of the bars that come after it on its row as well as those before it.
@@ -1991,11 +2552,12 @@ function buildGeometry(model: TimelineModel, frame: CanvasFrame): TimelineGeomet
         ? undefined
         : barsByWalkIndex.get(parentWalkIndex);
     if (parent === undefined) {
-      // The parent is not drawn — not on a loaded page, outside the drawn
-      // window, or the row itself. The row is still drawn; only the connector
-      // is absent, because a line to nowhere, or to another row, would assert a
-      // relationship the reader cannot check. The row's description says where
-      // a parent outside the window is (see `lineageNoteFor`).
+      // The parent has no bar — not on a loaded page, outside the drawn
+      // window, gathered into a "+N" mark, or the row itself. The row is still
+      // drawn; only the connector is absent, because a line to nowhere, or to
+      // another row, would assert a relationship the reader cannot check. The
+      // row's description says where a parent outside the window is (see
+      // `lineageNoteFor`), and its table row lists it under the same parent.
       continue;
     }
 
@@ -2019,8 +2581,44 @@ function buildGeometry(model: TimelineModel, frame: CanvasFrame): TimelineGeomet
     AXIS_BAND_HEIGHT + DEFAULT_ROW_HEIGHT + CANVAS_BOTTOM_PADDING,
   );
 
-  return { scale, lanes, bars, edges, ticks, width, height };
+  return { scale, lanes, bars, overflow, gatheredEventIds, edges, ticks, width, height };
 }
+
+/*
+ * ---------------------------------------------------------------------------
+ * Counted words
+ *
+ * Every count this view prints agrees its noun — and the pronoun and verb of
+ * the same sentence — with the number beside it through the package's one rule
+ * in `../utils/format`, which decides from the count as `formatCount` prints
+ * it. Never an inline plural: that is how a summary pill ends up reading
+ * "1 spans" and a canvas description "1 tier lanes".
+ * ---------------------------------------------------------------------------
+ */
+
+/** "1 span" / "4 spans". */
+const SPAN_NOUN: CountedNoun = countedNoun('span');
+
+/** The summary pill's lane count: "1 tier" / "3 tiers". */
+const TIER_NOUN: CountedNoun = countedNoun('tier');
+
+/** The canvas description's lane count: "1 tier lane" / "3 tier lanes". */
+const TIER_LANE_NOUN: CountedNoun = countedNoun('tier lane');
+
+/** The drawn spans a window statement refers back to: "before it" / "before them". */
+const DRAWN_PRONOUN: CountedNoun = countedNoun('it', 'them');
+
+/** The listed spans' possessive: "with its kind" / "with their kind". */
+const SPAN_POSSESSIVE: CountedNoun = countedNoun('its', 'their');
+
+/** The verb that agrees with how many spans a window leaves undrawn. */
+const IS_VERB: CountedNoun = countedNoun('is', 'are');
+
+/**
+ * The other candidates of an ambiguous attribution, with their verb: one is
+ * "the other was …", several are "the others were …".
+ */
+const OTHER_CANDIDATES: CountedNoun = countedNoun('the other was', 'the others were');
 
 /*
  * ---------------------------------------------------------------------------
@@ -2034,20 +2632,6 @@ function buildGeometry(model: TimelineModel, frame: CanvasFrame): TimelineGeomet
  * `../utils/**` resolve the same problem the same way.
  * ---------------------------------------------------------------------------
  */
-
-/** The badge tone each span status reads in. */
-const STATUS_TONES: Readonly<Record<TelemetryStatus, BadgeTone>> = Object.freeze({
-  unset: 'neutral',
-  ok: 'success',
-  error: 'danger',
-});
-
-/** The tone for `status`, neutral for a status outside this build's vocabulary. */
-function statusToneFor(status: TelemetryStatus): BadgeTone {
-  const tone: BadgeTone | undefined = STATUS_TONES[status];
-
-  return tone ?? 'neutral';
-}
 
 /**
  * The operation name of every span on screen, keyed by {@link traceSpanKey} —
@@ -2105,6 +2689,77 @@ function candidateText(row: TimelineBar, candidateSpanId: string, spanNames: Spa
 }
 
 /**
+ * Whether a row's parent is a span of this view that lies outside the rows
+ * drawn now, so no connector reaches it — a state the lineage note states and
+ * the detail strip's flag names. A type guard, so the note can name the parent
+ * and its position without re-checking either.
+ */
+function parentOutsideWindow(row: TimelineBar): row is TimelineBar & {
+  readonly parentSpanId: string;
+  readonly parentWalkIndex: number;
+} {
+  return (
+    row.parentSpanId !== undefined &&
+    row.parentWalkIndex !== undefined &&
+    row.parentWalkIndex !== row.walkIndex &&
+    !row.parentDrawn
+  );
+}
+
+/** The flag of a row the correlator re-attached to the trace root. */
+const REATTACHED_FLAG = 'Re-attached';
+
+/** The flag of a row whose parent was one of several candidates. */
+const AMBIGUOUS_PARENT_FLAG = 'Ambiguous parent';
+
+/** The flag of a row whose parent is not among the spans loaded. */
+const PARENT_NOT_LOADED_FLAG = 'Parent not loaded';
+
+/** The flag of a row whose parent lies outside the rows drawn now. */
+const PARENT_NOT_DRAWN_FLAG = 'Parent not drawn';
+
+/** The flag of a row attributed to its parent across an asynchronous boundary. */
+const INFERRED_PARENT_FLAG = 'Inferred parent';
+
+/** The one flag the detail strip's lead run shows for a row's lineage note. */
+interface LineageFlag {
+  readonly label: string;
+  readonly tone: BadgeTone;
+}
+
+/**
+ * The flag that names a row's lineage note in the detail strip's lead run, or
+ * `undefined` exactly when {@link lineageNoteFor} has nothing to say.
+ *
+ * One flag for the whole note, named by its most consequential state: a guessed
+ * parent first, then a re-attachment — both warnings, because the drawn
+ * position is not a measured one — then the informational states. The table's
+ * flag words are reused where the table has one, so a row reads the same in
+ * both places. The flag is the note's pointer path: the note itself sits in the
+ * strip's clipped trailing run, cut with an ellipsis on a narrow panel, and the
+ * flag's tooltip carries the whole of it from the lead run, which clips
+ * nothing.
+ */
+function lineageFlagFor(row: TimelineBar): LineageFlag | undefined {
+  if (row.lineageAmbiguous) {
+    return { label: AMBIGUOUS_PARENT_FLAG, tone: 'warning' };
+  }
+  if (row.orphaned) {
+    return { label: REATTACHED_FLAG, tone: 'warning' };
+  }
+  if (row.parentNotLoaded && row.parentSpanId !== undefined) {
+    return { label: PARENT_NOT_LOADED_FLAG, tone: 'info' };
+  }
+  if (parentOutsideWindow(row)) {
+    return { label: PARENT_NOT_DRAWN_FLAG, tone: 'info' };
+  }
+  if (row.lineage !== undefined) {
+    return { label: INFERRED_PARENT_FLAG, tone: 'info' };
+  }
+  return undefined;
+}
+
+/**
  * What the pipeline recorded about how this row joined its trace, and where
  * this view could not place it under its parent, as a sentence — or nothing,
  * when it joined the ordinary way and is drawn under its parent.
@@ -2132,12 +2787,7 @@ function lineageNoteFor(row: TimelineBar, spanNames: SpanNames): string | undefi
       `Its parent span ${row.parentSpanId} is not among the spans loaded here — it may be on a page not yet loaded or outside this query — so this span is drawn at the top level.`,
     );
   }
-  if (
-    row.parentSpanId !== undefined &&
-    row.parentWalkIndex !== undefined &&
-    row.parentWalkIndex !== row.walkIndex &&
-    !row.parentDrawn
-  ) {
+  if (parentOutsideWindow(row)) {
     notes.push(
       `Its parent span ${row.parentSpanId} is span ${formatCount(
         row.parentWalkIndex + 1,
@@ -2151,7 +2801,10 @@ function lineageNoteFor(row: TimelineBar, spanNames: SpanNames): string | undefi
     notes.push(
       row.lineageCandidates.length === 0
         ? 'More than one parent was possible, so this attribution is the most recently settled candidate rather than a certainty.'
-        : `More than one parent was possible, so this attribution is the most recently settled candidate rather than a certainty; the others were ${row.lineageCandidates
+        : `More than one parent was possible, so this attribution is the most recently settled candidate rather than a certainty; ${pluralize(
+            row.lineageCandidates.length,
+            OTHER_CANDIDATES,
+          )} ${row.lineageCandidates
             .map((candidate) => candidateText(row, candidate, spanNames))
             .join(', ')}.`,
     );
@@ -2185,6 +2838,61 @@ function describeBar(row: TimelineBar, origin: number, spanNames: SpanNames): st
   return note === undefined ? sentence : `${sentence} ${note}`;
 }
 
+/** The verb that agrees with a count of spans: "is" or "are". */
+const IS_NOUN = countedNoun('is', 'are');
+
+/** What a gathered span is not drawn as, agreeing with its count. */
+const BAR_NOUN = countedNoun('a bar', 'bars');
+
+/** The noun "+N" marks are counted by. */
+const OVERFLOW_MARK_NOUN = countedNoun('“+N” mark');
+
+/**
+ * A "+N" mark as a sentence — its SVG title: how many spans it gathers, over
+ * which part of the window, why they are not bars, and where every one of them
+ * is instead.
+ *
+ * @param mark The mark.
+ * @param origin The window start its offsets are measured from.
+ */
+function describeOverflow(mark: OverflowGeometry, origin: number): string {
+  const during =
+    Number.isFinite(mark.startTime) && Number.isFinite(mark.endTime)
+      ? ` from ${formatOffset(mark.startTime, origin)} to ${formatOffset(mark.endTime, origin)}`
+      : '';
+
+  return `+${formatCount(mark.count)}: ${formatCountOf(
+    mark.count,
+    'overlapping span',
+  )}${during} ${pluralize(mark.count, IS_NOUN)} not drawn as ${pluralize(
+    mark.count,
+    BAR_NOUN,
+  )}. A lane draws at most ${formatCount(
+    MAX_SUB_ROWS_PER_DEPTH,
+  )} rows of bars for one depth and keeps the longest spans as bars. Every span is listed in the table below.`;
+}
+
+/**
+ * The statement the canvas's text alternative and the footer make when the
+ * lanes gathered spans into "+N" marks, or `undefined` when every row is a bar.
+ *
+ * @param geometry The drawn canvas.
+ */
+function overflowStatement(geometry: TimelineGeometry): string | undefined {
+  const gathered = geometry.gatheredEventIds.size;
+  if (gathered === 0) {
+    return undefined;
+  }
+
+  return `${formatCountOf(gathered, 'span')} ${pluralize(
+    gathered,
+    IS_NOUN,
+  )} gathered into ${formatCountOf(
+    geometry.overflow.length,
+    OVERFLOW_MARK_NOUN,
+  )} where more spans overlap than a lane draws rows for; the table below lists each of them.`;
+}
+
 /** Where an axis label sits relative to its tick, so no label leaves the canvas. */
 function axisLabelAnchor(index: number, count: number): 'start' | 'middle' | 'end' {
   if (index === 0) {
@@ -2200,13 +2908,120 @@ function axisLabelAnchor(index: number, count: number): 'start' | 'middle' | 'en
  * ---------------------------------------------------------------------------
  */
 
+/**
+ * The canvas width to lay out at, given one reading of the canvas's rendered
+ * width.
+ *
+ * - A reading that is not a finite width of at least one pixel comes from an
+ *   element that is not laid out — detached, inside a hidden panel, or in a
+ *   DOM with no layout — and changes nothing: the width already accepted
+ *   stands, or the fallback frame while there is none, so a panel hidden and
+ *   shown again is not laid out twice on the way.
+ * - An accepted reading is floored to a whole pixel, and a reading inside the
+ *   pixel already accepted keeps that width, so sub-pixel jitter — a
+ *   fractional panel width, a zoomed window — never lays the drawing out again.
+ *
+ * Flooring rather than rounding keeps the `viewBox` never wider than the
+ * element, so `meet` never draws a label below its token size and the
+ * drawing's rendered height never falls below its logical height. A vertical
+ * scrollbar the drawing's own height brings into the scroll viewport narrows
+ * the element by whole pixels, which leaves the floored-away fraction as it
+ * was and the drawing at least as tall, so the scrollbar is never withdrawn by
+ * the width it caused and the two widths cannot alternate.
+ *
+ * @param current The width accepted so far, or `undefined` before the first.
+ * @param reading The rendered width just read, in CSS pixels.
+ * @returns The width to lay out at — `current` itself when nothing changed, so
+ *   setting it is a no-op that renders nothing.
+ */
+function acceptCanvasWidth(current: number | undefined, reading: number): number | undefined {
+  if (!Number.isFinite(reading) || reading < 1) {
+    return current;
+  }
+
+  const width = Math.floor(reading);
+
+  return width === current ? current : width;
+}
+
+/**
+ * Observes the rendered width of the canvas its ref is attached to, so the
+ * drawing is laid out one user unit to a CSS pixel (see this module's header).
+ *
+ * The ref is a state setter: attaching a canvas — the view mounts one only
+ * once it has rows to draw, and a fresh one after a state change — re-runs the
+ * layout effect for exactly that element, and detaching it, or unmounting the
+ * view, disconnects the observer. The width is read in two ways:
+ *
+ * - once synchronously, off the element's box, inside the layout effect: an
+ *   update raised there is committed before the browser paints, so a freshly
+ *   mounted canvas is never painted in the fallback frame and then laid out
+ *   again, which would shift everything below it;
+ * - then by a `ResizeObserver`, on every later change of the element's
+ *   content-box width — the panel resized, a split pane dragged, a scrollbar
+ *   appearing in the viewport.
+ *
+ * The element's width is its container's, set by the stylesheet, and never its
+ * `viewBox`'s, so laying the drawing out at the observed width cannot change
+ * the observed width. Where `ResizeObserver` does not exist the synchronous
+ * reading is the only one; where nothing is laid out (a layout-free DOM, whose
+ * boxes all measure zero) no reading is accepted and the width stays
+ * `undefined`, which the view draws in the fallback frame.
+ *
+ * @returns The accepted width in whole CSS pixels, `undefined` until one has
+ *   been measured, and the ref callback to attach to the `<svg>`.
+ */
+function useCanvasWidth(): readonly [
+  width: number | undefined,
+  canvasRef: (canvas: SVGSVGElement | null) => void,
+] {
+  const [canvas, setCanvas] = useState<SVGSVGElement | null>(null);
+  const [width, setWidth] = useState<number | undefined>(undefined);
+
+  useLayoutEffect(() => {
+    if (canvas === null) {
+      return undefined;
+    }
+
+    const accept = (reading: number): void => {
+      setWidth((current) => acceptCanvasWidth(current, reading));
+    };
+
+    accept(canvas.getBoundingClientRect().width);
+
+    if (typeof ResizeObserver === 'undefined') {
+      return undefined;
+    }
+
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target === canvas) {
+          accept(entry.contentRect.width);
+        }
+      }
+    });
+    observer.observe(canvas);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [canvas]);
+
+  return [width, setCanvas];
+}
+
 /** A `style` object that may carry this package's component-scoped properties. */
 type CssVariableStyle = CSSProperties & Record<`--${string}`, string>;
 
 /** What {@link TimelineCanvas} draws. */
 interface TimelineCanvasProps {
-  /** The positioned lanes, bars, edges and ticks, in the fixed logical space. */
+  /**
+   * The positioned lanes, bars, edges and ticks, in the canvas's user units:
+   * one to a CSS pixel once the canvas is measured (see {@link useCanvasWidth}).
+   */
   readonly geometry: TimelineGeometry;
+  /** Attaches the `<svg>` to the view's width observer. */
+  readonly canvasRef: (canvas: SVGSVGElement | null) => void;
   /** The window the offsets in the bars' descriptions are measured from. */
   readonly origin: number;
   /** The names of the spans on screen, so a description can name its candidates. */
@@ -2226,12 +3041,14 @@ interface TimelineCanvasProps {
 }
 
 /**
- * The SVG: lane bands, the axis over them, the connectors, then the bars.
+ * The SVG: lane bands, the axis over them, the connectors, the bars, then the
+ * "+N" marks.
  *
  * Paint order is the component's responsibility — SVG paints in document order
  * and `z-index` does not apply — so the groups are written in the order they
  * must be painted: the bands behind everything, the gridlines over the bands,
- * the connectors under the bars they join, and the bars and their labels last.
+ * the connectors under the bars they join, and the bars and their labels last,
+ * with the marks of each depth's overflow row, which no bar shares.
  * A label beside its bar is laid on a backdrop in the lane's own surface
  * colour, the bar's height and the label's width plus its inset: a connector
  * or gridline running under the label stops at the backdrop's edges instead of
@@ -2240,34 +3057,45 @@ interface TimelineCanvasProps {
  * than the `BAR_LABEL_GAP` every label keeps from every bar, so it never
  * covers one.
  *
- * The canvas is `role="img"` with a text alternative, so its bars are not in
- * the accessibility tree and deliberately not focusable: a tab stop with no
- * accessible name is worse than none. The keyboard-reachable representation of
+ * The canvas is a `role="figure"` named by its text alternative, and every bar
+ * and "+N" mark inside it is a `role="img"` named by its full description — the
+ * sentence its native tooltip shows — so the hover information is in the
+ * accessibility tree for a screen reader browsing the picture, not only in the
+ * tooltip and the detail strip. The lanes, the axis, the connectors and the
+ * visible labels repeat what those names say and are hidden from assistive
+ * technology. The bars are deliberately not focusable: two thousand tab stops
+ * would bury the rest of the panel. The keyboard-reachable representation of
  * exactly these rows is the table the parent renders below it.
  */
 function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
-  const { geometry, origin, spanNames, selectedEventId, onSelect, onHover, label } = props;
+  const { geometry, canvasRef, origin, spanNames, selectedEventId, onSelect, onHover, label } =
+    props;
   const gridlineEnd = geometry.height - CANVAS_BOTTOM_PADDING;
   const tickCount = geometry.ticks.length;
 
   return (
-    // A fixed logical coordinate space — `CHART_VIEWBOX_WIDTH` units wide and
-    // as tall as the lanes — that CSS sizes to its container (`width="100%"`)
-    // and that is scaled uniformly into that box from its top-left corner, so
-    // no glyph is ever stretched and nothing depends on measured pixels.
-    // `height` is the drawing's logical height, the other half of its aspect
-    // ratio; at any width `meet` scales the drawing uniformly inside the
-    // element rather than stretching it. See this module's header.
+    // CSS sizes the element to its container (`width="100%"`), and the
+    // drawing is laid out at the width it measures there, so the `viewBox` is
+    // exactly the element's width — one unit to a CSS pixel — and as tall as
+    // the lanes. `height` is the drawing's logical height, the other half of
+    // its aspect ratio, so the element is that tall too. Before a measurement
+    // the `viewBox` is the fallback frame's fixed width, and `meet` scales the
+    // drawing uniformly into the element from its top-left corner rather than
+    // stretching it. See this module's header.
     <svg
+      ref={canvasRef}
       className="dg-timeline__canvas"
-      role="img"
+      role="figure"
       aria-label={label}
       width="100%"
       height={geometry.height}
       viewBox={`0 0 ${String(geometry.width)} ${String(geometry.height)}`}
       preserveAspectRatio="xMinYMin meet"
     >
-      <g className="dg-timeline__lanes">
+      {/* Decoration for the eye: the lane bands and their labels, the axis and
+          the connectors are hidden from assistive technology, because every
+          bar and mark below names its own tier, offset and relationships. */}
+      <g className="dg-timeline__lanes" aria-hidden="true">
         {geometry.lanes.map((lane) => {
           const accentStyle: CssVariableStyle = { '--dgc-lane-color': lane.accent };
 
@@ -2300,7 +3128,7 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
         })}
       </g>
 
-      <g className="dg-timeline__axis">
+      <g className="dg-timeline__axis" aria-hidden="true">
         {geometry.ticks.map((tick, index) => {
           const x = alignHairline(tick.offset);
 
@@ -2333,7 +3161,7 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
         })}
       </g>
 
-      <g>
+      <g aria-hidden="true">
         {geometry.edges.map((edge) => (
           <path
             key={edge.id}
@@ -2353,6 +3181,10 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
 
       {geometry.bars.map((bar) => {
         const barStyle: CssVariableStyle = { '--dgc-bar-color': bar.color };
+        // One sentence, three carriers: the bar's accessible name, its native
+        // tooltip and (through the same function) the detail strip and the
+        // table row's description, so none of them can say something else.
+        const description = describeBar(bar.row, origin, spanNames);
 
         return (
           <g className="dg-timeline__row" key={bar.row.eventId}>
@@ -2368,6 +3200,8 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
               y={bar.y}
               width={bar.width}
               height={bar.height}
+              role="img"
+              aria-label={description}
               onClick={() => {
                 onSelect(bar.row);
               }}
@@ -2376,14 +3210,16 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
               }}
             >
               {/* The user agent's own tooltip, kept for the pointer. The same
-                  sentence is author-rendered in the detail strip, which the
-                  pointer can reach and Escape dismisses, and in the table row's
+                  sentence is the bar's accessible name above, and it is
+                  author-rendered in the detail strip, which the pointer can
+                  reach and Escape dismisses, and in the table row's
                   description, which keyboard focus opens. */}
-              <title>{describeBar(bar.row, origin, spanNames)}</title>
+              <title>{description}</title>
             </rect>
             {bar.label === undefined || bar.label.placement === 'inside' ? null : (
               <rect
                 className="dg-timeline__bar-label-backdrop"
+                aria-hidden="true"
                 x={bar.label.start - BAR_LABEL_INSET}
                 y={bar.y}
                 width={bar.label.width + BAR_LABEL_INSET * 2}
@@ -2396,11 +3232,49 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
                   'dg-timeline__bar-label',
                   bar.label.placement === 'inside' && 'dg-timeline__bar-label--inside',
                 )}
+                // The visible label repeats the start of the bar's name, so it
+                // is hidden rather than read twice.
+                aria-hidden="true"
                 x={bar.label.x}
                 y={bar.centerY}
                 textAnchor={bar.label.anchor}
               >
                 {bar.label.text}
+              </text>
+            )}
+          </g>
+        );
+      })}
+
+      {/* The "+N" marks, each on its depth's overflow row, which holds no bar,
+          so neither a mark nor its count can cover one. Not a control: every
+          span a mark gathers is a row of the table below, and the mark's title
+          says so. */}
+      {geometry.overflow.map((mark) => {
+        const description = describeOverflow(mark, origin);
+
+        return (
+          <g key={mark.id}>
+            <rect
+              className="dg-timeline__overflow"
+              x={mark.x}
+              y={mark.y}
+              width={mark.width}
+              height={mark.height}
+              role="img"
+              aria-label={description}
+            >
+              <title>{description}</title>
+            </rect>
+            {mark.label === undefined ? null : (
+              <text
+                className="dg-timeline__overflow-label"
+                aria-hidden="true"
+                x={mark.label.x}
+                y={mark.centerY}
+                textAnchor={mark.label.anchor}
+              >
+                {mark.label.text}
               </text>
             )}
           </g>
@@ -2551,14 +3425,18 @@ function TimelineDetail(props: TimelineDetailStripProps): ReactElement {
 /**
  * The one line {@link TimelineDetail} draws for a row, in two runs.
  *
- * The **lead run** — the lead word, the kind and tier badges, and the name with
- * its description — is what identifies the span, so it is laid out first and
- * keeps its width; on a narrow panel only the name gives way, truncating. The
- * **trailing run** — the duration, the offset, the status, the source chip and
- * the lineage note — takes what width is left and is clipped at the strip's
- * inline end rather than wrapped (`dg-timeline__detail-rest`). The name's
- * description bubble opens from the lead run, which clips nothing, so it is
- * never cut off by the strip however narrow the panel is.
+ * The **lead run** — the lead word, the kind and tier badges, the name with
+ * its description, and the flag of a lineage note — is what identifies the
+ * span, so it is laid out first and keeps its width; on a narrow panel only the
+ * name gives way, truncating. The **trailing run** — the duration, the offset,
+ * the status, the source chip and the lineage note — takes what width is left
+ * and is clipped at the strip's inline end rather than wrapped
+ * (`dg-timeline__detail-rest`). Within it the note alone gives way, ending in a
+ * visible ellipsis (`dg-timeline__detail-note`), so the reader sees that the
+ * sentence continues. The whole note stays reachable: the flag's bubble carries
+ * it, the other candidate parents of an ambiguous attribution included, and so
+ * does the name's description. Both bubbles open from the lead run, which clips
+ * nothing, so neither is ever cut off by the strip however narrow the panel is.
  *
  * @param props The row, whether it is a preview, the window start, and the
  *   names of the spans on screen, which the lineage note and the description
@@ -2570,6 +3448,7 @@ function TimelineDetailLine(
 ): ReactElement {
   const { row, previewing, origin, spanNames } = props;
   const note = lineageNoteFor(row, spanNames);
+  const flag = note === undefined ? undefined : lineageFlagFor(row);
 
   return (
     <>
@@ -2592,6 +3471,21 @@ function TimelineDetailLine(
             </Text>
           </Tooltip>
         </div>
+        {flag === undefined || note === undefined ? null : (
+          <div className="dg-timeline__tooltip">
+            {/* The lineage note's pointer path, after the name so the name
+                stays the strip's first described element. Here in the lead
+                run, which clips nothing, the bubble shows the whole note — the
+                other candidate parents included — however narrow the strip
+                cuts the note itself. No tab stop, like the name: the focused
+                row's description carries the same note for the keyboard. */}
+            <Tooltip content={note}>
+              <Badge variant="outline" tone={flag.tone}>
+                {flag.label}
+              </Badge>
+            </Tooltip>
+          </div>
+        )}
       </Stack>
       <div className="dg-timeline__detail-rest">
         <Stack direction="horizontal" gap={2} align="center">
@@ -2599,7 +3493,7 @@ function TimelineDetailLine(
           <Text size="sm" tone="secondary" numeric>
             {formatOffset(row.startTime, origin)}
           </Text>
-          <Badge variant="soft" tone={statusToneFor(row.status)}>
+          <Badge variant="soft" tone={statusTone(row.status)}>
             {formatStatusLabel(row.status)}
           </Badge>
           {/* Out of the tab order: the same chip is one arrow key into the
@@ -2609,8 +3503,11 @@ function TimelineDetailLine(
           {row.source === undefined ? null : (
             <SourceLink location={row.source} compact tabIndex={-1} />
           )}
+          {/* A direct child of the run's items, so the stylesheet can let it
+              alone give way: it shrinks and ends in a visible ellipsis while
+              every other item of the run keeps its width. */}
           {note === undefined ? null : (
-            <Text size="xs" tone="warning">
+            <Text size="xs" tone="warning" className="dg-timeline__detail-note">
               {note}
             </Text>
           )}
@@ -2738,19 +3635,19 @@ function timelineColumns(
           />
           {row.orphaned ? (
             <Badge variant="outline" tone="warning">
-              Re-attached
+              {REATTACHED_FLAG}
             </Badge>
           ) : null}
           {row.lineageAmbiguous ? (
             <Badge variant="outline" tone="warning">
-              Ambiguous parent
+              {AMBIGUOUS_PARENT_FLAG}
             </Badge>
           ) : null}
           {row.parentNotLoaded ? (
             // Informational rather than a warning: nothing was lost, this view
             // just does not hold the parent (see the module header).
             <Badge variant="outline" tone="info">
-              Parent not loaded
+              {PARENT_NOT_LOADED_FLAG}
             </Badge>
           ) : null}
         </Stack>
@@ -2781,7 +3678,7 @@ function timelineColumns(
       header: 'Reported',
       width: 'status',
       cell: (row) => (
-        <Badge variant="soft" tone={statusToneFor(row.status)}>
+        <Badge variant="soft" tone={statusTone(row.status)}>
           {formatStatusLabel(row.status)}
         </Badge>
       ),
@@ -3006,6 +3903,35 @@ type PagingDirection = 'previous' | 'next';
  */
 const REFINE_TRUNCATED_TRACE = 'Narrow the query or capture a shorter interaction to see the rest.';
 
+/**
+ * What the equivalent table holds, in the words of its caption, by the query
+ * the view draws. A `trace` query draws the spans the correlator joined into
+ * that one trace — not every span the interaction captured, since an
+ * uncorrelated span belongs to no trace — and a `spans` query draws the
+ * captured spans its filter selected, as far as its pages have been loaded
+ * (the footer states the service's total beside them). The caption names the
+ * set it lists and never claims more than that. Singular, then plural.
+ */
+const TABLE_SUBJECTS: Readonly<Record<'trace' | 'spans', readonly [string, string]>> = {
+  trace: ['span correlated into this trace', 'spans correlated into this trace'],
+  spans: [
+    "captured span loaded for this view's query",
+    "captured spans loaded for this view's query",
+  ],
+};
+
+/**
+ * The caption's name for the set of `count` spans the table lists.
+ *
+ * @param source The query source the view draws; anything but `trace` is a span query.
+ * @param count How many spans the set holds.
+ * @returns The subject, agreeing with `count` in number.
+ */
+function tableSubject(source: DataQuery['source'], count: number): string {
+  const [singular, plural] = TABLE_SUBJECTS[source === 'trace' ? 'trace' : 'spans'];
+  return count === 1 ? singular : plural;
+}
+
 /** Whether a window leaves any row of its walk undrawn. */
 function isPartialWindow(window: RowWindow): boolean {
   return window.count < window.total;
@@ -3017,10 +3943,26 @@ function windowRange(window: RowWindow): string {
 }
 
 /**
+ * The spans a window draws, named by their 1-based positions as the canvas
+ * description and the table caption write them: "spans 2,001–4,000", or
+ * "span 2,001" for a window of one span, which has no range to write.
+ *
+ * @param window The drawn window.
+ * @returns The lower-case phrase.
+ */
+function windowSpans(window: RowWindow): string {
+  return window.count === 1
+    ? `span ${formatCount(window.start + 1)}`
+    : `spans ${windowRange(window)}`;
+}
+
+/**
  * The footer's statement of which rows a partial window draws, and how many
  * of the walk's rows lie before and after it undrawn — for example "Spans
  * 2,001–4,000 of 9,500 are drawn; 2,000 before them and 5,500 after them are
- * not." A window that draws the whole walk has nothing to state here.
+ * not." A window of one span names its one span — "Span 2,001 of 2,001 is
+ * drawn; 2,000 before it are not." — and the closing verb agrees with how many
+ * are undrawn. A window that draws the whole walk has nothing to state here.
  *
  * @param window The drawn window.
  * @returns The sentence, or `undefined` when the window draws every row.
@@ -3030,18 +3972,25 @@ function windowStatement(window: RowWindow): string | undefined {
     return undefined;
   }
 
+  const total = formatCount(window.total);
+  const drawn =
+    window.count === 1
+      ? `Span ${formatCount(window.start + 1)} of ${total} is drawn`
+      : `Spans ${windowRange(window)} of ${total} are drawn`;
+  const drawnPronoun = pluralize(window.count, DRAWN_PRONOUN);
+
   const undrawn: string[] = [];
   if (window.before > 0) {
-    undrawn.push(`${formatCount(window.before)} before them`);
+    undrawn.push(`${formatCount(window.before)} before ${drawnPronoun}`);
   }
   if (window.after > 0) {
-    undrawn.push(`${formatCount(window.after)} after them`);
+    undrawn.push(`${formatCount(window.after)} after ${drawnPronoun}`);
   }
-  const verb = window.before + window.after === 1 ? 'is' : 'are';
 
-  return `Spans ${windowRange(window)} of ${formatCount(window.total)} are drawn; ${undrawn.join(
-    ' and ',
-  )} ${verb} not.`;
+  return `${drawn}; ${undrawn.join(' and ')} ${pluralize(
+    window.before + window.after,
+    IS_VERB,
+  )} not.`;
 }
 
 /**
@@ -3049,8 +3998,9 @@ function windowStatement(window: RowWindow): string | undefined {
  * reported no total for, which read as a bare count — the counterpart of a
  * span page's "Showing N of M spans.".
  *
- * A walk that fits one window states its count. A longer one states which of
- * its rows the window draws and how many it leaves before and after (see
+ * A walk that fits one window states its count, its noun agreeing with it
+ * ("1 span shown.", "4 spans shown."). A longer one states which of its rows
+ * the window draws and how many it leaves before and after (see
  * {@link windowStatement}), M being the whole walk. A trace the correlator
  * bounded, whose depth the walk clamped, or that held more nodes than the walk
  * could visit says that more was captured than this view holds — paging the
@@ -3062,7 +4012,7 @@ function windowStatement(window: RowWindow): string | undefined {
  */
 function traceFooterText(model: TimelineModel): string {
   const sentences: string[] = [
-    windowStatement(model.window) ?? `${formatCount(model.window.count)} spans shown.`,
+    windowStatement(model.window) ?? `${formatCountOf(model.window.count, SPAN_NOUN)} shown.`,
   ];
 
   // None of these is reached by paging the window, so each is stated on its
@@ -3112,9 +4062,13 @@ const NOTHING_CAPTURED_COPY: EmptyCopy = Object.freeze({
 /** The title for a span query authored with `limit: 0`: a total without rows. */
 const COUNT_ONLY_TITLE = 'Count only';
 
-/** The noun for `count` spans, singular exactly when there is one. */
+/**
+ * The noun for `count` spans, singular exactly when the count prints as `1`:
+ * the package's rule (see "Counted words"), for a noun whose number is printed
+ * apart from it.
+ */
 function spanNoun(count: number): string {
-  return count === 1 ? 'span' : 'spans';
+  return pluralize(count, SPAN_NOUN);
 }
 
 /**
@@ -3443,6 +4397,12 @@ function TimelineView(props: TimelineProps): ReactElement {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const stripRef = useRef<HTMLDivElement | null>(null);
 
+  // The canvas's rendered width, which the drawing is laid out at so a user
+  // unit is a CSS pixel; `undefined` until one is measured (see
+  // `useCanvasWidth`). Kept across a remount of the canvas, which sits in the
+  // same viewport at the same width.
+  const [canvasWidth, canvasRef] = useCanvasWidth();
+
   const source = node.query.source;
 
   // The catalog is the authority on which sources this node type can read, and
@@ -3554,12 +4514,18 @@ function TimelineView(props: TimelineProps): ReactElement {
     [walk, windowStart],
   );
 
-  // The drawing of the window, in the fixed logical canvas: a pure function of
-  // the model alone, since the frame is one module constant (see "Canvas
-  // structure"), so it is recomputed only when the drawn rows change.
-  const geometry = useMemo<TimelineGeometry | undefined>(
-    () => (model === undefined ? undefined : buildGeometry(model, CANVAS_FRAME)),
-    [model],
+  // The frame the window is drawn on: the canvas's measured width, or the
+  // fixed fallback width while there is none (see "Canvas structure"). One
+  // frame per accepted width, so an unchanged width never re-lays the drawing.
+  const frame = useMemo<CanvasFrame>(() => canvasFrameFor(canvasWidth), [canvasWidth]);
+
+  // The drawing of the window on that frame: a pure function of the model and
+  // the width, so it is recomputed only when the drawn rows or the canvas's
+  // accepted width change. The canvas draws it unless it gathered the
+  // selection into a "+N" mark (see `geometry` below).
+  const baseGeometry = useMemo<TimelineGeometry | undefined>(
+    () => (model === undefined ? undefined : buildGeometry(model, frame)),
+    [model, frame],
   );
 
   // The names every description draws candidate parents from: one lookup per
@@ -3599,6 +4565,23 @@ function TimelineView(props: TimelineProps): ReactElement {
       : rowWithId(modelRows, focusedEventId);
   const hoverPreviewing = hoveredRow !== undefined;
   const focusPreviewing = focusedRow !== undefined && focusedRow !== selectedRow;
+
+  // The selection is marked on the canvas, never hidden in a "+N" mark: where
+  // the layout above gathered the selected row, the window is drawn again with
+  // that row pinned as a bar. Only then — a selection the layout already draws
+  // as a bar changes nothing, so no bar moves under the pointer that selected
+  // it — and the drawing stays a pure function of the model and that one id.
+  const pinnedEventId =
+    selectedRow !== undefined && baseGeometry?.gatheredEventIds.has(selectedRow.eventId) === true
+      ? selectedRow.eventId
+      : undefined;
+  const geometry = useMemo<TimelineGeometry | undefined>(
+    () =>
+      model === undefined || pinnedEventId === undefined
+        ? baseGeometry
+        : buildGeometry(model, frame, pinnedEventId),
+    [baseGeometry, model, frame, pinnedEventId],
+  );
 
   const handleHover = useCallback((eventId: string): void => {
     setHoveredEventId(eventId);
@@ -3963,8 +4946,8 @@ function TimelineView(props: TimelineProps): ReactElement {
         <Stack direction="horizontal" gap={2} align="center" justify="between" wrap>
           <Text size="xs" tone="muted">
             {knownTotal === undefined
-              ? `${formatCount(0)} spans shown.`
-              : `Showing ${formatCount(0)} of ${formatCount(knownTotal)} spans.`}
+              ? `${formatCountOf(0, SPAN_NOUN)} shown.`
+              : `Showing ${formatCount(0)} of ${formatCountOf(knownTotal, SPAN_NOUN)}.`}
           </Text>
           <Button variant="secondary" size="sm" onClick={handleLoadMore}>
             {LOAD_MORE_LABEL}
@@ -3996,7 +4979,10 @@ function TimelineView(props: TimelineProps): ReactElement {
       </div>
     );
   } else {
-    const windowMs = model.endTime - model.startTime;
+    // The drawn window's extent: a subtraction, not a measured duration, so it
+    // floors at zero itself — the formatter answers a negative duration with
+    // "n/a", and a window never runs backwards.
+    const windowMs = clampNonNegative(model.endTime - model.startTime);
     const { window } = model;
     // What is drawn — the window's rows — and what the walk holds in all: for a
     // span result, every row loaded so far.
@@ -4028,21 +5014,35 @@ function TimelineView(props: TimelineProps): ReactElement {
     // A window that draws part of the walk says so in the picture's own words,
     // as the flame chart's does: the subset, which rows it is, and the walk it
     // was cut from. The table below holds exactly the rows the canvas draws.
+    // Every count agrees its noun with its number ("1 span in 1 tier lane"),
+    // and a window of one span names its one position rather than a range.
     const drawnCount = windowed
-      ? `${formatCount(drawn)} of ${formatCount(loaded)} spans (spans ${windowRange(window)})`
-      : `${formatCount(drawn)} spans`;
-    const canvasLabel = `${CATALOG_ENTRY.label}: ${drawnCount} in ${formatCount(
+      ? `${formatCount(drawn)} of ${formatCountOf(loaded, SPAN_NOUN)} (${windowSpans(window)})`
+      : formatCountOf(drawn, SPAN_NOUN);
+    const drawnPossessive = pluralize(drawn, SPAN_POSSESSIVE);
+    // Spans a crowded depth gathered into "+N" marks are stated in the canvas's
+    // own words and in the footer, not only drawn as marks.
+    const gatheredText = overflowStatement(geometry);
+    const canvasLabel = `${CATALOG_ENTRY.label}: ${drawnCount} in ${formatCountOf(
       model.tiers.length,
-    )} tier lanes over ${formatDuration(windowMs)}. ${
+      TIER_LANE_NOUN,
+    )} over ${formatDuration(windowMs)}. ${
       windowed
-        ? 'The table below lists the same spans with their kind, tier, offset and duration.'
-        : 'The table below lists every span with its kind, tier, offset and duration.'
-    }`;
+        ? `The table below lists the same ${spanNoun(
+            drawn,
+          )} with ${drawnPossessive} kind, tier, offset and duration.`
+        : drawn === 1
+          ? 'The table below lists it with its kind, tier, offset and duration.'
+          : 'The table below lists each of them with its kind, tier, offset and duration.'
+    }${gatheredText === undefined ? '' : ` ${gatheredText}`}`;
     const tableCaption = windowed
-      ? `${node.title ?? CATALOG_ENTRY.label}: spans ${windowRange(window)} of the ${formatCount(
+      ? `${node.title ?? CATALOG_ENTRY.label}: ${windowSpans(window)} of the ${formatCount(
           loaded,
-        )} captured spans of this interaction, with their kind, tier, offset and duration.`
-      : `${node.title ?? CATALOG_ENTRY.label}: every captured span of this interaction, with its kind, tier, offset and duration.`;
+        )} ${tableSubject(source, loaded)}, with ${drawnPossessive} kind, tier, offset and duration.`
+      : `${node.title ?? CATALOG_ENTRY.label}: the ${formatCount(drawn)} ${tableSubject(
+          source,
+          drawn,
+        )}, with ${drawnPossessive} kind, tier, offset and duration.`;
 
     // A span result states the service's total first; the window's own
     // statement follows whenever the window leaves loaded rows undrawn.
@@ -4050,9 +5050,12 @@ function TimelineView(props: TimelineProps): ReactElement {
     const footerText =
       total === undefined
         ? traceFooterText(model)
-        : `Showing ${formatCount(loaded)} of ${formatCount(total)} spans.${
+        : `Showing ${formatCount(loaded)} of ${formatCountOf(total, SPAN_NOUN)}.${
             spansWindowText === undefined ? '' : ` ${spansWindowText}`
           }`;
+    // What the lanes gathered into "+N" marks follows what the window holds.
+    const footerStatement =
+      gatheredText === undefined ? footerText : `${footerText} ${gatheredText}`;
 
     content = (
       <>
@@ -4062,8 +5065,8 @@ function TimelineView(props: TimelineProps): ReactElement {
           compact
           wrap
           status={[
-            { label: `${formatCount(drawn)} spans`, variant: 'soft' },
-            { label: `${formatCount(model.tiers.length)} tiers`, variant: 'soft' },
+            { label: formatCountOf(drawn, SPAN_NOUN), variant: 'soft' },
+            { label: formatCountOf(model.tiers.length, TIER_NOUN), variant: 'soft' },
             { label: `${formatDuration(windowMs)} elapsed`, variant: 'soft' },
             ...(partial
               ? [{ label: 'Partial result', tone: 'warning' as const, variant: 'outline' as const }]
@@ -4074,6 +5077,7 @@ function TimelineView(props: TimelineProps): ReactElement {
         <div ref={viewportRef} className="dg-timeline__viewport">
           <TimelineCanvas
             geometry={geometry}
+            canvasRef={canvasRef}
             origin={model.startTime}
             spanNames={spanNames}
             selectedEventId={selectedRow?.eventId}
@@ -4118,7 +5122,7 @@ function TimelineView(props: TimelineProps): ReactElement {
               reveals is announced; never `role="status"`, which is the
               loading placeholder's. */}
           <Text size="xs" tone="muted" aria-live="polite">
-            {footerText}
+            {footerStatement}
           </Text>
           {windowed ? (
             // The walk is in memory whole, so these move the drawn window over

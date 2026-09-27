@@ -2,7 +2,7 @@
 
 import clsx from 'clsx';
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { useSelectedLayoutSegment } from 'next/navigation';
 import { useId, useRef, useState, type ReactElement } from 'react';
 
 import { Button } from '@/components/ui/Button';
@@ -19,27 +19,48 @@ import styles from './SiteNav.module.css';
  * reader opens with a single control. That is the whole of its job.
  *
  * WHAT IT SUBSCRIBES TO: THE ROUTE, AND NOTHING ELSE
- * The only ambient value this component reads is the current pathname. It holds no timer and never
- * reads the clock, so it re-renders when the reader navigates and on no other occasion.
+ * The only ambient value this component reads is the route segment the router has selected
+ * directly beneath the root layout. It holds no timer and never reads the clock, so it re-renders
+ * when the router's tree changes - a navigation or a refresh - and on no other occasion.
  *
  * A CLIENT COMPONENT, FOR TWO REASONS AND NO MORE
- * `usePathname` is a client hook, and the disclosure holds one boolean of local state; either
- * alone would require the directive at the top of the file. Beyond those two the only browser-side
- * thing in here is the ref the key handler focuses, and that ref is touched inside the handler and
- * never while the markup is being produced - there is no effect, no timer, no browser global, no
- * `window` read, no randomness and no clock read - so the markup the server produces for a URL and
- * the markup the browser first produces for it agree, and hydration is silent. `useId` supplies
- * the one generated value in the file, which React keeps stable across that boundary; a random id
- * would not be.
+ * `useSelectedLayoutSegment` is a client hook, and the disclosure holds one boolean of local
+ * state; either alone would require the directive at the top of the file. Beyond those two the
+ * only browser-side thing in here is the ref the key handler focuses, and that ref is touched
+ * inside the handler and never while the markup is being produced - there is no effect, no timer,
+ * no browser global, no `window` read, no randomness and no clock read - and the one route value
+ * the markup depends on comes from the router tree the server and the browser share (see ACTIVE
+ * ROUTE), so the markup the server produces for a response and the markup the browser first
+ * produces from it agree, and hydration is silent. `useId` supplies the one generated value in the
+ * file, which React keeps stable across that boundary; a random id would not be.
  *
  * ACTIVE ROUTE
+ * The current entry is decided from the selected segment - `useSelectedLayoutSegment()`, called
+ * here from the root layout's tree, so it names the first level beneath the root - and not from
+ * the address, because the two disagree on a response whose address was rewritten. `proxy.ts`
+ * rewrites a product address no product owns to `/_missing`, so on the server `usePathname()`
+ * reports `/_missing` for that response, while the browser - whose address bar still reads
+ * `/products/<slug>` - hydrates with the address it asked for. An address-derived row would mark
+ * nothing on the server and Catalog in the browser, and React would report the difference as a
+ * hydration mismatch. The selected segment is read from the router tree the server serialises into
+ * the page's RSC payload, which is the tree the browser hydrates from and the tree every
+ * client-side navigation replaces, so both sides always read the same value: `null` for the
+ * catalog grid at `/` with or without a query, `'products'` for a product page, `'cart'`,
+ * `'checkout'`, `'orders'` and `'dashboard'` for the other four, and the router's own not-found
+ * segment (`'/_not-found'`) for an address no route owns - the rewritten product address and a
+ * plain unknown path alike - which matches no entry, so on a not-found page no link claims to be
+ * the page the reader is on. A query string is never part of a segment, so `/orders?page=2` is
+ * still the Orders page. The rule assumes the routes under `app/` sit in no route group: a
+ * `(group)` folder would be selected as a segment of its own.
+ *
  * `isActiveRoute` below is a pure module-level function, so the rule it encodes is testable
- * without rendering anything and is evaluated afresh for each entry rather than cached. Exactly
- * one element in the document carries `aria-current="page"` at a time - the current route's link -
- * and the state is carried visually by the stylesheet's `.active` colour and accent indicator as
- * well, so it never rests on colour alone. A non-current link carries no `aria-current` attribute
- * at all: the string `"false"` is a valid value of that attribute and would announce the link as
- * "not the current page", which is noise on four links out of five.
+ * without rendering anything and is evaluated afresh for each entry rather than cached. At most
+ * one element in the document carries `aria-current="page"` at a time - the current route's link,
+ * and none on a not-found page - and the state is carried visually by the stylesheet's `.active`
+ * colour and accent indicator as well, so it never rests on colour alone. A non-current link
+ * carries no `aria-current` attribute at all: the string `"false"` is a valid value of that
+ * attribute and would announce the link as "not the current page", which is noise on four links
+ * out of five.
  *
  * THE DISCLOSURE
  * The control is the application's own `Button` in its quiet variant, so its chrome, its focus
@@ -100,13 +121,23 @@ import styles from './SiteNav.module.css';
  * in-app route of this storefront - `/` (the catalog), `/cart`, `/checkout`, `/orders` and
  * `/dashboard`; there is no external destination here, and no route this application does not
  * serve.
+ *
+ * `segment` is the value `useSelectedLayoutSegment()` returns while that route is showing: the
+ * route's folder beneath `app/`, which is its `href` without the leading slash, and `null` for the
+ * catalog, whose grid is the root's own page and selects no segment. It is written out beside the
+ * `href` rather than derived from it, so the value each entry is matched on reads directly off the
+ * table.
  */
-const ROUTES: readonly { readonly label: string; readonly href: string }[] = [
-  { label: 'Catalog', href: '/' },
-  { label: 'Cart', href: '/cart' },
-  { label: 'Checkout', href: '/checkout' },
-  { label: 'Orders', href: '/orders' },
-  { label: 'Dashboard', href: '/dashboard' },
+const ROUTES: readonly {
+  readonly label: string;
+  readonly href: string;
+  readonly segment: string | null;
+}[] = [
+  { label: 'Catalog', href: '/', segment: null },
+  { label: 'Cart', href: '/cart', segment: 'cart' },
+  { label: 'Checkout', href: '/checkout', segment: 'checkout' },
+  { label: 'Orders', href: '/orders', segment: 'orders' },
+  { label: 'Dashboard', href: '/dashboard', segment: 'dashboard' },
 ];
 
 /**
@@ -129,47 +160,36 @@ const TOGGLE_SUFFIX = ' navigation';
 const CLOSE_KEY = 'Escape';
 
 /**
- * The catalog section's second path: the grid is served at `/`, and a single item of that grid at
- * `/products/<slug>`. The table above lists the section once, under the `/` it links to, so this
- * is where the rest of the section is named.
+ * The catalog section's second segment: the grid is the root's own page at `/`, and a single item
+ * of that grid is served beneath `products`, at `/products/<slug>`. The table above lists the
+ * section once, under the `/` it links to, so this is where the rest of the section is named.
  */
-const CATALOG_SECTION = '/products';
+const CATALOG_SECTION = 'products';
 
 /**
- * Whether `pathname` is `base` itself or a path beneath it.
+ * Whether the entry owning `segment` is the route the router has `selected`.
  *
- * The separator is part of the comparison, and that is the whole point of writing the test here
- * rather than as a bare `startsWith` at each call: `/orders/AB-1024` is beneath `/orders`, while
- * `/orders-archive` - a different route that merely starts with the same letters - is not.
- */
-function within(pathname: string, base: string): boolean {
-  return pathname === base || pathname.startsWith(`${base}/`);
-}
-
-/**
- * Whether `href` is the route `pathname` is currently on.
- *
- * Total and pure: the same two strings always give the same answer, no argument can make it
+ * Total and pure: the same two values always give the same answer, no argument can make it
  * throw, and it reads nothing outside its parameters - which is why it lives here rather than
  * inside the component, and why it costs nothing to evaluate once per entry on every render.
  *
- * Every route matches its own path and anything beneath it, so `/orders/AB-1024` still marks
- * Orders as the current page.
+ * A selected segment names the first level beneath the root and nothing deeper, so every entry
+ * matches its own path and any page served beneath it by construction: a page at `/orders/<id>`,
+ * were the application to serve one, would still select `'orders'` and mark Orders as the current
+ * page, while `/orders-archive` - an address that merely starts with the same letters - is not
+ * beneath `orders` and can never select it.
  *
- * The catalog is the one entry standing for two paths rather than one. Its `href` is `/`, which
- * every path in the application is beneath, so it is compared exactly - and then `/products`, the
- * section it also owns, is compared as a section. A product page is a page of the catalog, so
- * Catalog stays marked current while the reader is reading one; nothing beneath any other entry
- * can match this branch, so exactly one link is still current at a time. `/products-archive`, a
- * route this application does not serve, would not match: the comparison is `within`'s, and the
- * separator is part of it.
+ * The catalog is the one entry standing for two values rather than one: `null`, the root's own
+ * page, and {@link CATALOG_SECTION}, the section it also owns. A product page is a page of the
+ * catalog, so Catalog stays marked current while the reader is reading one; no other entry owns
+ * either value, so at most one link is current at a time.
  */
-function isActiveRoute(pathname: string, href: string): boolean {
-  if (href === '/') {
-    return pathname === '/' || within(pathname, CATALOG_SECTION);
+function isActiveRoute(selected: string | null, segment: string | null): boolean {
+  if (segment === null) {
+    return selected === null || selected === CATALOG_SECTION;
   }
 
-  return within(pathname, href);
+  return selected === segment;
 }
 
 /**
@@ -195,10 +215,12 @@ interface Props {
 export function SiteNav(props: Props): ReactElement {
   const { className } = props;
 
-  // Next 16 types `usePathname()` as `string`, so there is no absent case to defend against here
-  // and no fallback to write. It is the route without its query string, which is exactly what the
-  // comparison below wants: `/orders?page=2` is still the Orders page.
-  const pathname = usePathname();
+  // The segment selected beneath the root layout, typed `string | null` by Next 16: `null` is the
+  // root's own page, the catalog grid, and is matched as such rather than defended against. It is
+  // read from the router tree rather than the address, which is what keeps the server's render of
+  // a rewritten not-found response and the browser's hydration of it in agreement (ACTIVE ROUTE,
+  // above), and it never holds the query string: `/orders?page=2` is still the Orders page.
+  const selected = useSelectedLayoutSegment();
 
   // The disclosure's one piece of state, and the stable id that ties the control to the list it
   // controls. `useId` rather than a counter or a random value: React produces the same id on the
@@ -259,7 +281,7 @@ export function SiteNav(props: Props): ReactElement {
           {ROUTES.map((route) => {
             // Whether this entry is the route the reader is on, decided once and read by both
             // the active class and `aria-current` below.
-            const current = isActiveRoute(pathname, route.href);
+            const current = isActiveRoute(selected, route.segment);
 
             return (
               // `href` is the key: it is unique across the table above and stable across renders,

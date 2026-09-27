@@ -40,12 +40,17 @@
  *    `./auth.ts`'s {@link isAllowedOrigin} refuses — every `http:`/`https:`
  *    web origin, `file:`, `data:`, `null`, anything malformed — is answered
  *    `403 FORBIDDEN_ORIGIN` from `./auth.ts`'s own refusal table before
- *    anything else happens, the two unauthenticated operations included.
+ *    anything else happens, the two unauthenticated operations included. The
+ *    refusal is filed at `warn` with the origin's `scheme://host` — throttled
+ *    to a burst per minute, the rest at `debug` and counted — under the ref
+ *    its body and header carry.
  * 2. **Request context**: a short correlation `ref` and a start time are
- *    recorded for the request; after a {@link HttpApp.close} every request is
- *    answered `503` here; the answered request is logged at `debug` with its
- *    operation, pattern, status and duration — never a path, a header or a
- *    body.
+ *    recorded for the request (and put on the context as `requestRef`); after
+ *    a {@link HttpApp.close} every request is answered `503` here. Once the
+ *    request is answered, the reply is **correlated** (see "One error shape"
+ *    below) and the answered request is logged — a success at `debug`, a
+ *    failure at `info` with its error code — with its operation, pattern,
+ *    status, ref and duration, never a path, a header or a body.
  * 3. Per route: **operation binding** (the route's operation id is put on the
  *    context so the auth middleware, the error boundary and the log all see
  *    it), then the **response verifier**, then **authentication** —
@@ -93,6 +98,16 @@
  * The rest of a refused body is read and dropped for a bounded moment, so a
  * client still sending receives the refusal rather than a connection reset.
  *
+ * The same guard owns the body's **media type**. Every body this service reads
+ * is JSON, so a body whose `Content-Type` is not exactly `application/json`
+ * (a `charset` parameter, when named, must be `utf-8`) — `text/plain`, a form
+ * encoding, several joined values, or no `Content-Type` at all — is refused
+ * `415` at its first byte ({@link REQUEST_MEDIA_TYPE_REFUSAL_REASON}). The check
+ * is as lazy as the ceilings: a bodiless request is never judged, and a route
+ * that refuses the caller before it reads the body still answers first. The
+ * route modules do not know this reason; they answer their generic read
+ * failure, and the guard answers the `415` in its place.
+ *
  * Response bodies are validated **once**, by the route modules, through
  * `parseHttpResponse` before they are serialized. This file adds an
  * independent verifier ({@link HttpAppOwnDeps.verifyResponses}) whose default
@@ -121,6 +136,17 @@
  * here renders the same body only for a conflict error that was *thrown* to it
  * instead of answered, so the two places can never disagree and the route
  * module never has to double-handle it.
+ *
+ * **Every reply names its ref.** Every reply this module lets leave carries
+ * the request's correlation ref in an `X-Debuggen-Ref` header
+ * ({@link REF_HEADER}), and every failure body carries it as `ref`: the
+ * boundary renders its own failures with it, and the request context adds it
+ * to a route module's or the auth middleware's failure body that satisfies
+ * protocol's error schema without one (a body that already names a ref — a
+ * route that minted its own under which it logged — keeps it, and the header
+ * then names that ref). The per-request `info` record of a failure is filed
+ * under the same ref, so a developer holding either finds the other. A reply
+ * that is not protocol's error shape is left as it is, header aside.
  *
  * A `500` never carries the failure's own words: its message is a fixed
  * sentence and its `ref` ties it to the service log. Every error sink of this
@@ -210,6 +236,8 @@ import {
   authErrorResponse,
   authFailureStatus,
   createAuthMiddleware,
+  createRefusalLogThrottle,
+  describeRefusedOrigin,
   isAllowedOrigin,
 } from './auth.js';
 import type { AuthFailureReason, AuthService, ServerEnv } from './auth.js';
@@ -289,6 +317,16 @@ const RESPONSE_POLICY_HEADERS: Readonly<Record<string, string>> = Object.freeze(
 /** The response header a body's media type is read from by the response verifier. */
 const CONTENT_TYPE_HEADER = 'content-type';
 
+/**
+ * The response header every reply carries its correlation ref in — the ref a
+ * failure body names and the per-request log record is filed under. Minted by
+ * the service; never read from a request.
+ */
+const REF_HEADER = 'x-debuggen-ref';
+
+/** The header dropped when a failure body is rebuilt with its ref, so the length is recomputed. */
+const CONTENT_LENGTH_HEADER = 'content-length';
+
 /** The media type every route of this service answers with. */
 const JSON_MEDIA_TYPE = 'application/json';
 
@@ -326,6 +364,9 @@ const EXCEPTION_DIAGNOSTIC_MESSAGE = 'Diagnostic detail of the failure logged un
 
 /** The message of a request no registered route answers. */
 const ROUTE_NOT_FOUND_MESSAGE = 'No Debug Generator service route answers this method and path.';
+
+/** The record of every request the origin guard refused. */
+const ORIGIN_REFUSED_LOG = 'Refused a request from an origin this service never serves';
 
 /** The message of a request that arrived after {@link HttpApp.close}. */
 const SHUTTING_DOWN_MESSAGE =
@@ -368,6 +409,9 @@ const REQUEST_TIMEOUT_STATUS = 408;
 
 /** The status of a request body larger than its operation's ceiling. */
 const PAYLOAD_TOO_LARGE_STATUS = 413;
+
+/** The status of a request body sent under a media type other than JSON. */
+const UNSUPPORTED_MEDIA_TYPE_STATUS = 415;
 
 /* -------------------------------------------------------------------------------------------------
  * Request-body ceilings
@@ -464,12 +508,48 @@ export const REQUEST_BODY_REFUSAL_REASONS = Object.freeze({
 export type RequestBodyRefusalReason =
   (typeof REQUEST_BODY_REFUSAL_REASONS)[keyof typeof REQUEST_BODY_REFUSAL_REASONS];
 
+/**
+ * The `details.reason` of the `DebuggenError` the request-body guard errors a
+ * body stream with when the body's `Content-Type` is not JSON (see
+ * {@link isAcceptableRequestMediaType}).
+ *
+ * Deliberately **not** a member of {@link REQUEST_BODY_REFUSAL_REASONS}: it is
+ * answered by this module alone. No route module states or recognises it — a
+ * route whose `c.req.text()` rejects with it answers its generic read failure,
+ * and the guard's post-step replaces that answer with its own `415`, logged at
+ * `debug` because the replacement is the design rather than a route's mistake.
+ * The route modules' contract stays the two ceilings they each map themselves.
+ */
+export const REQUEST_MEDIA_TYPE_REFUSAL_REASON = 'unsupported-media-type';
+
+/** Every reason the request-body guard refuses a body for. */
+type RequestBodyGuardReason = RequestBodyRefusalReason | typeof REQUEST_MEDIA_TYPE_REFUSAL_REASON;
+
 /** The message of a body refused at its byte ceiling; it names no byte of the body. */
 const BODY_TOO_LARGE_MESSAGE = 'The request body is larger than this operation accepts.';
 
 /** The message of a body refused at its time ceiling. */
 const BODY_READ_TIMEOUT_MESSAGE =
   'The request body did not arrive within the time the Debug Generator local service waits for one.';
+
+/**
+ * The message of a body refused for its media type. Constant: the presented
+ * `Content-Type` is never echoed into a reply or a record.
+ */
+const UNSUPPORTED_MEDIA_TYPE_MESSAGE = 'The request body must be sent as application/json.';
+
+/** The next step a {@link UNSUPPORTED_MEDIA_TYPE_MESSAGE} refusal names. */
+const UNSUPPORTED_MEDIA_TYPE_HINT =
+  'Send the JSON body with the header Content-Type: application/json (a charset, if named, must be utf-8).';
+
+/** The one request media type this service reads: every route's body is JSON. */
+const REQUEST_MEDIA_TYPE = JSON_MEDIA_TYPE;
+
+/** The one `charset` parameter value a request media type may name, compared case-insensitively. */
+const REQUEST_CHARSET = 'utf-8';
+
+/** The media-type parameter {@link REQUEST_CHARSET} is read from. */
+const CHARSET_PARAMETER = 'charset';
 
 /* -------------------------------------------------------------------------------------------------
  * Response verification bound
@@ -490,11 +570,12 @@ const MAX_VERIFIED_FAILURE_BODY_BYTES = 16 * 1024;
 
 /**
  * Every status a failure answered by this module can carry: the statuses of
- * {@link HTTP_ERROR_STATUS_BY_CODE}, plus the request-body guard's `408` and
- * `413`, which no error code maps to because they describe the transport of a
- * body rather than a failure of the service.
+ * {@link HTTP_ERROR_STATUS_BY_CODE}, plus the request-body guard's `408`, `413`
+ * and `415`, which no error code maps to because they describe the transport of
+ * a body rather than a failure of the service.
  */
-export type HttpErrorStatus = 400 | 401 | 403 | 404 | 408 | 409 | 413 | 422 | 429 | 500 | 502 | 503;
+export type HttpErrorStatus =
+  400 | 401 | 403 | 404 | 408 | 409 | 413 | 415 | 422 | 429 | 500 | 502 | 503;
 
 /**
  * The HTTP status of every `DebuggenErrorCode`, defined once for the whole
@@ -744,7 +825,10 @@ export interface HttpApp {
 
 /** What the request-context middleware records about one request. */
 interface RequestContext {
-  /** The correlation reference an error body of this request carries. */
+  /**
+   * The correlation reference of this request: what its error body and its
+   * {@link REF_HEADER} carry, unless a route answered under a ref of its own.
+   */
   readonly ref: string;
   /** When the request entered the pipeline, on the injected monotonic clock. */
   readonly startedAt: number;
@@ -923,9 +1007,10 @@ function publicBoundaryError(error: DebuggenError, status: HttpErrorStatus): Deb
  * @param error The failure.
  * @param ref The request's correlation reference, when one was minted.
  * @param serverFailureMessage The fixed sentence a `500` says.
- * @returns The response, carrying {@link RESPONSE_POLICY_HEADERS} from
- * construction — the listener's error handler hands it to the socket without
- * passing the dispatch guard.
+ * @returns The response, carrying {@link RESPONSE_POLICY_HEADERS} — and
+ * `ref` in {@link REF_HEADER} — from construction: the listener's error
+ * handler hands it to the socket without passing the dispatch guard or the
+ * request context.
  */
 function errorResponse(
   error: DebuggenError,
@@ -935,7 +1020,10 @@ function errorResponse(
   const status = httpStatusForError(error);
   return Response.json(errorBodyFor(error, status, ref, serverFailureMessage), {
     status,
-    headers: RESPONSE_POLICY_HEADERS,
+    headers:
+      ref === undefined
+        ? RESPONSE_POLICY_HEADERS
+        : { ...RESPONSE_POLICY_HEADERS, [REF_HEADER]: ref },
   });
 }
 
@@ -991,6 +1079,153 @@ function withResponsePolicy(response: Response): Response {
     statusText: response.statusText,
     headers,
   });
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Reply correlation
+ * ---------------------------------------------------------------------------------------------- */
+
+/** What {@link correlateReply} settled on for one reply. */
+interface CorrelatedReply {
+  /** The reply to send: the one answered, or its rebuild with the ref in the body. */
+  readonly response: Response;
+  /** The ref the reply names — its body's own when it carried one, the request's otherwise. */
+  readonly ref: string;
+  /** The code of a failure body that satisfies protocol's error schema; `undefined` otherwise. */
+  readonly errorCode: DebuggenErrorCode | undefined;
+}
+
+/** A failure body read back from a reply, with the schema it satisfied. */
+type ReadFailureBody =
+  | { readonly kind: 'conflict'; readonly body: CaptureStartConflictResponse }
+  | { readonly kind: 'error'; readonly body: HttpErrorResponse };
+
+/**
+ * Sets `ref` in {@link REF_HEADER} on a reply: in place, or — for a reply whose
+ * header list the platform made immutable — on a re-wrap that moves the same
+ * body stream, as {@link withResponsePolicy} does.
+ */
+function withRefHeader(response: Response, ref: string): Response {
+  if (response.headers.get(REF_HEADER) === ref) {
+    return response;
+  }
+  try {
+    response.headers.set(REF_HEADER, ref);
+    return response;
+  } catch (caught) {
+    if (!(caught instanceof TypeError)) {
+      throw caught;
+    }
+  }
+  const headers = new Headers(response.headers);
+  headers.set(REF_HEADER, ref);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+/**
+ * Reads a failure reply's body back, as the bounded verifier does — a copy, at
+ * most {@link MAX_VERIFIED_FAILURE_BODY_BYTES} deep, only when it is declared
+ * JSON — and returns it when it satisfies protocol's error schema (or, for a
+ * `409`, its capture-conflict extension).
+ *
+ * Total: a body that is not JSON, is too large, does not parse, does not
+ * satisfy either schema or cannot be read at all yields `undefined`, and the
+ * reply itself is never consumed.
+ */
+async function readFailureBody(response: Response): Promise<ReadFailureBody | undefined> {
+  const contentType = response.headers.get(CONTENT_TYPE_HEADER) ?? '';
+  if (!contentType.includes(JSON_MEDIA_TYPE)) {
+    return undefined;
+  }
+  let value: unknown;
+  try {
+    const text = await readBoundedText(response, MAX_VERIFIED_FAILURE_BODY_BYTES);
+    if (text === undefined) {
+      return undefined;
+    }
+    value = JSON.parse(text);
+  } catch {
+    // A body already read, a stream that errored, or text that is not JSON:
+    // there is no error body to correlate.
+    return undefined;
+  }
+  if (response.status === CONFLICT_STATUS) {
+    const conflict = captureStartConflictResponseSchema.safeParse(value);
+    if (conflict.success) {
+      return { kind: 'conflict', body: conflict.data };
+    }
+  }
+  const failure = httpErrorResponseSchema.safeParse(value);
+  return failure.success ? { kind: 'error', body: failure.data } : undefined;
+}
+
+/**
+ * Makes one answered reply name its correlation ref (see the module
+ * overview's "Every reply names its ref"):
+ *
+ * - A success, and a failure whose body is not protocol's error shape, gets
+ *   `requestRef` in {@link REF_HEADER}; its body is left untouched.
+ * - A failure body that already carries a `ref` keeps it — the route logged
+ *   under that ref — and the header names the same ref.
+ * - A failure body without one is rebuilt with `ref: requestRef`: the same
+ *   status, status text and headers (`Content-Length` dropped, so it is
+ *   recomputed for the longer body), re-validated against the schema it
+ *   satisfied, and left unchanged when the rebuild would not satisfy it.
+ *
+ * @param response The reply the pipeline settled on.
+ * @param requestRef The ref the request context minted.
+ * @returns The reply to send, the ref it names and its error code.
+ *
+ * @example
+ * ```ts
+ * const { response, ref } = await correlateReply(
+ *   Response.json({ code: 'SESSION_NOT_FOUND', message: 'No such session.' }, { status: 404 }),
+ *   'msg_0123456789abcdef',
+ * );
+ * // response body: {"code":"SESSION_NOT_FOUND","message":"No such session.","ref":"msg_0123456789abcdef"}
+ * // response.headers.get('x-debuggen-ref') === ref === 'msg_0123456789abcdef'
+ * ```
+ */
+async function correlateReply(response: Response, requestRef: string): Promise<CorrelatedReply> {
+  if (response.status < FIRST_FAILURE_STATUS) {
+    return { response: withRefHeader(response, requestRef), ref: requestRef, errorCode: undefined };
+  }
+  const read = await readFailureBody(response);
+  if (read === undefined) {
+    return { response: withRefHeader(response, requestRef), ref: requestRef, errorCode: undefined };
+  }
+  const errorCode = read.body.code;
+  if (read.body.ref !== undefined) {
+    return { response: withRefHeader(response, read.body.ref), ref: read.body.ref, errorCode };
+  }
+  const rebuilt =
+    read.kind === 'conflict'
+      ? captureStartConflictResponseSchema.safeParse({ ...read.body, ref: requestRef })
+      : httpErrorResponseSchema.safeParse({ ...read.body, ref: requestRef });
+  if (!rebuilt.success) {
+    return { response: withRefHeader(response, requestRef), ref: requestRef, errorCode };
+  }
+  const headers = new Headers(response.headers);
+  headers.delete(CONTENT_LENGTH_HEADER);
+  headers.set(REF_HEADER, requestRef);
+  // The copy was read to its end, so cancelling the reply's own branch
+  // releases what it buffered; it is replaced, never sent.
+  response.body?.cancel().catch(() => {
+    // Already closed or errored: nothing left to release.
+  });
+  return {
+    response: new Response(JSON.stringify(rebuilt.data), {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    }),
+    ref: requestRef,
+    errorCode,
+  };
 }
 
 /**
@@ -1049,8 +1284,11 @@ interface RequestBodyLimits {
 
 /** A body the guard refused while a route read it, and the status it is answered with. */
 interface RequestBodyRefusal {
-  readonly reason: RequestBodyRefusalReason;
-  readonly status: typeof PAYLOAD_TOO_LARGE_STATUS | typeof REQUEST_TIMEOUT_STATUS;
+  readonly reason: RequestBodyGuardReason;
+  readonly status:
+    | typeof PAYLOAD_TOO_LARGE_STATUS
+    | typeof REQUEST_TIMEOUT_STATUS
+    | typeof UNSUPPORTED_MEDIA_TYPE_STATUS;
 }
 
 /** One guarded body: the stream a route reads, and what the guard saw. */
@@ -1074,6 +1312,85 @@ const BODY_READ_TIMEOUT_REFUSAL: RequestBodyRefusal = Object.freeze({
   reason: REQUEST_BODY_REFUSAL_REASONS.timedOut,
   status: REQUEST_TIMEOUT_STATUS,
 });
+
+/** The refusal of a body sent under a media type other than JSON. */
+const UNSUPPORTED_MEDIA_TYPE_REFUSAL: RequestBodyRefusal = Object.freeze({
+  reason: REQUEST_MEDIA_TYPE_REFUSAL_REASON,
+  status: UNSUPPORTED_MEDIA_TYPE_STATUS,
+});
+
+/**
+ * Removes one pair of surrounding double quotes from a media-type parameter
+ * value (`"utf-8"` → `utf-8`); any other value is returned as it is.
+ */
+function unquoteParameterValue(value: string): string {
+  return value.length >= 2 && value.startsWith('"') && value.endsWith('"')
+    ? value.slice(1, -1)
+    : value;
+}
+
+/**
+ * Whether a request's `Content-Type` names the one media type this service
+ * reads a body as.
+ *
+ * - The media type — the text before the first `;`, trimmed — must be exactly
+ *   {@link REQUEST_MEDIA_TYPE}, compared case-insensitively (RFC 9110 §8.3.1).
+ *   `application/merge-patch+json` and every other type is refused: no route
+ *   takes anything but a JSON document.
+ * - A `charset` parameter, when present, must be {@link REQUEST_CHARSET}
+ *   (case-insensitive, quoted or not) — the only encoding the routes decode a
+ *   body with. Other parameters carry no meaning for JSON and are ignored; a
+ *   parameter that is not `name=value` makes the value malformed.
+ * - A value holding a `,` is several `Content-Type` headers joined into one
+ *   (the platform's `Headers.get` joins repeats with `, `): ambiguous, so
+ *   refused.
+ * - No `Content-Type` at all is refused. The caller decides *when* to ask:
+ *   {@link guardRequestBody} asks only once a body byte has arrived, so a
+ *   bodiless request is never judged.
+ *
+ * The value is judged and never logged or echoed.
+ *
+ * @param value The request's `Content-Type` header, or `null` when absent.
+ * @returns `true` when a JSON body may be read under it.
+ *
+ * @example
+ * ```ts
+ * isAcceptableRequestMediaType('application/json');                  // true
+ * isAcceptableRequestMediaType('Application/JSON; charset="UTF-8"'); // true
+ * isAcceptableRequestMediaType('text/plain;charset=UTF-8');          // false
+ * isAcceptableRequestMediaType('application/json; charset=latin1');  // false
+ * isAcceptableRequestMediaType(null);                                // false
+ * ```
+ */
+function isAcceptableRequestMediaType(value: string | null): boolean {
+  if (value === null || value.includes(',')) {
+    return false;
+  }
+  const [mediaType = '', ...parameters] = value.split(';');
+  if (mediaType.trim().toLowerCase() !== REQUEST_MEDIA_TYPE) {
+    return false;
+  }
+  for (const parameter of parameters) {
+    const trimmed = parameter.trim();
+    if (trimmed.length === 0) {
+      // RFC 9110 admits an empty parameter slot (`application/json;`).
+      continue;
+    }
+    const separator = trimmed.indexOf('=');
+    if (separator <= 0) {
+      return false;
+    }
+    const name = trimmed.slice(0, separator).trim().toLowerCase();
+    if (name !== CHARSET_PARAMETER) {
+      continue;
+    }
+    const charset = unquoteParameterValue(trimmed.slice(separator + 1).trim());
+    if (charset.toLowerCase() !== REQUEST_CHARSET) {
+      return false;
+    }
+  }
+  return true;
+}
 
 /**
  * The byte ceiling of the operation a route is authorized as.
@@ -1101,8 +1418,9 @@ function requestBodyTimeoutOrDefault(value: number | undefined): number {
 /**
  * The error a guarded body stream is errored with — the value a route's
  * `c.req.text()` rejects with. Its `details.reason` is the contract of
- * {@link REQUEST_BODY_REFUSAL_REASONS}; its message and hint name the ceiling,
- * never a byte of the body.
+ * {@link REQUEST_BODY_REFUSAL_REASONS} (or {@link REQUEST_MEDIA_TYPE_REFUSAL_REASON},
+ * which only this module answers); its message and hint name the ceiling or
+ * the media type, never a byte of the body or the presented header.
  *
  * @param refusal What the guard refused.
  * @param operation The operation the body was sent to.
@@ -1113,6 +1431,12 @@ function requestBodyRefusalError(
   operation: HttpOperationId,
   limits: RequestBodyLimits,
 ): DebuggenError {
+  if (refusal.reason === REQUEST_MEDIA_TYPE_REFUSAL_REASON) {
+    return new DebuggenError('PROTOCOL_INVALID_MESSAGE', UNSUPPORTED_MEDIA_TYPE_MESSAGE, {
+      hint: UNSUPPORTED_MEDIA_TYPE_HINT,
+      details: { reason: refusal.reason, operation },
+    });
+  }
   if (refusal.reason === REQUEST_BODY_REFUSAL_REASONS.tooLarge) {
     return new DebuggenError('PROTOCOL_INVALID_MESSAGE', BODY_TOO_LARGE_MESSAGE, {
       hint: `Send a body of at most ${String(limits.maxBytes)} bytes.`,
@@ -1140,6 +1464,13 @@ function requestBodyRefusalError(
  * - **Time ceiling.** A timer starts at the first read and errors the stream
  *   with the `body-read-timeout` refusal if the body has not ended when it
  *   fires. It is unref'd, so it never holds the process open.
+ * - **Media type.** When `mediaTypeAccepted` is `false` (the request's
+ *   `Content-Type` is not JSON, see {@link isAcceptableRequestMediaType}), the
+ *   first chunk that carries a byte errors the stream with the
+ *   `unsupported-media-type` refusal and is never handed on. A body that ends
+ *   without a byte is never judged, so a bodiless `POST` — which carries no
+ *   `Content-Type`, as protocol's client sends one only with a body — reads
+ *   as the empty body it is.
  * - **The refusal reaches the client.** On a refusal the source is not
  *   cancelled at once: cancelling Node's request stream destroys the socket,
  *   and closing a socket whose peer is still sending makes the kernel answer
@@ -1157,12 +1488,15 @@ function requestBodyRefusalError(
  *
  * @param source The request's own body stream.
  * @param limits The ceilings.
+ * @param mediaTypeAccepted Whether the request's `Content-Type` admits a JSON
+ * body; judged once per request by the caller, applied at the first byte.
  * @param onRefusal Builds the error the stream is errored with.
  * @returns The guard.
  */
 function guardRequestBody(
   source: ReadableStream<Uint8Array>,
   limits: RequestBodyLimits,
+  mediaTypeAccepted: boolean,
   onRefusal: (refusal: RequestBodyRefusal) => DebuggenError,
 ): RequestBodyGuard {
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -1272,6 +1606,13 @@ function guardRequestBody(
         const bytes: unknown = chunk.value;
         if (!(bytes instanceof Uint8Array)) {
           settle({ failure: new TypeError('A request body chunk was not a byte array.') });
+          return;
+        }
+        // Judged at the first byte, never before: an empty body under any (or
+        // no) media type is the bodiless request it is. The refusal settles the
+        // stream, so no later chunk is read past it.
+        if (!mediaTypeAccepted && bytes.byteLength > 0) {
+          settle(UNSUPPORTED_MEDIA_TYPE_REFUSAL);
           return;
         }
         received += bytes.byteLength;
@@ -1743,24 +2084,47 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
    * 1. The origin guard — the first step to judge a request, for every
    * request including the two auth-exempt operations and paths no route
    * answers. The decision is `./auth.ts`'s `isAllowedOrigin`; the answer is
-   * its own refusal.
+   * its own refusal. It runs before the request context, so it mints the ref
+   * of its own refusal: the body, the header and the record all name it.
+   *
+   * The refusal is a security event a developer should see at the default
+   * level, so it is filed at `warn` — naming the origin in `./auth.ts`'s
+   * `describeRefusedOrigin` form (`scheme://host`, never a path, query or
+   * credential) — for the first few refusals of each window, and at `debug`
+   * past that burst, so a page that hammers the service cannot flood the log;
+   * the next `warn` says how many were filed at `debug` in between.
    */
+  const originRefusalLog = createRefusalLogThrottle({ now });
   const originGuard: MiddlewareHandler<ServerEnv> = async (c, next) => {
-    if (!isAllowedOrigin(c.req.header(ORIGIN_HEADER))) {
-      log.debug('Refused a request from an origin this service never serves', {
+    const origin = c.req.header(ORIGIN_HEADER);
+    if (!isAllowedOrigin(origin)) {
+      const ref = newRef();
+      const fields: LogFields = {
         method: c.req.method,
         status: FORBIDDEN_ORIGIN_RESPONSE.status,
-      });
+        origin: describeRefusedOrigin(origin),
+        ref,
+      };
+      const verdict = originRefusalLog.next();
+      if (verdict.level === 'warn') {
+        log.warn(ORIGIN_REFUSED_LOG, { ...fields, suppressed: verdict.suppressed });
+      } else {
+        log.debug(ORIGIN_REFUSED_LOG, fields);
+      }
       c.header(CACHE_CONTROL_HEADER, NO_STORE);
-      return c.json(FORBIDDEN_ORIGIN_RESPONSE.body, FORBIDDEN_ORIGIN_RESPONSE.status);
+      c.header(REF_HEADER, ref);
+      return c.json({ ...FORBIDDEN_ORIGIN_RESPONSE.body, ref }, FORBIDDEN_ORIGIN_RESPONSE.status);
     }
     await next();
     return undefined;
   };
 
   /*
-   * 2. The request context: the correlation ref, the start time, the
-   * shutdown gate and the one `debug` record per answered request.
+   * 2. The request context: the correlation ref (also `requestRef` on the
+   * context, for the auth middleware and the routes), the start time, the
+   * shutdown gate, the correlation of the answered reply with its ref, and the
+   * one record per answered request — `debug` for a success, `info` for a
+   * failure, filed under the ref the reply names.
    */
   const requestContext: MiddlewareHandler<ServerEnv> = async (c, next) => {
     const context: RequestContext = {
@@ -1770,27 +2134,73 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
       pattern: undefined,
     };
     contexts.set(c.req.raw, context);
+    c.set('requestRef', context.ref);
+
+    /** The one record of an answered request; never a path, a header or a body. */
+    const logAnswered = (
+      status: number,
+      ref: string,
+      errorCode: DebuggenErrorCode | undefined,
+    ): void => {
+      const durationMs = Math.max(0, now() - context.startedAt);
+      if (status >= FIRST_FAILURE_STATUS) {
+        log.info('Answered an HTTP request with a failure', {
+          method: c.req.method,
+          operation: context.operation,
+          pattern: context.pattern,
+          status,
+          errorCode,
+          ref,
+          durationMs,
+        });
+        return;
+      }
+      log.debug('Answered an HTTP request', {
+        method: c.req.method,
+        operation: context.operation,
+        pattern: context.pattern,
+        status,
+        durationMs,
+        ref,
+      });
+    };
 
     if (closed) {
-      return renderFailure(
+      const status = HTTP_ERROR_STATUS_BY_CODE.TRANSPORT_DISCONNECTED;
+      const reply = renderFailure(
         c,
         new DebuggenError('TRANSPORT_DISCONNECTED', SHUTTING_DOWN_MESSAGE, {
           details: { reason: 'service-closing' },
         }),
-        HTTP_ERROR_STATUS_BY_CODE.TRANSPORT_DISCONNECTED,
+        status,
       );
+      reply.headers.set(REF_HEADER, context.ref);
+      logAnswered(status, context.ref, 'TRANSPORT_DISCONNECTED');
+      return reply;
     }
 
     await next();
 
-    log.debug('Answered an HTTP request', {
-      method: c.req.method,
-      operation: context.operation,
-      pattern: context.pattern,
-      status: c.res.status,
-      durationMs: Math.max(0, now() - context.startedAt),
-      ref: context.ref,
-    });
+    let correlated: CorrelatedReply;
+    try {
+      correlated = await correlateReply(c.res, context.ref);
+    } catch (caught) {
+      // Correlation must never turn an answered request into a failure: the
+      // reply leaves as it was answered, under the request's own ref.
+      log.debug(
+        'Could not correlate an HTTP reply with its ref; sending it as answered',
+        exceptionLogFields(caught, context.ref),
+      );
+      correlated = { response: c.res, ref: context.ref, errorCode: undefined };
+    }
+    if (correlated.response !== c.res) {
+      // Cleared first, as the verifier and the body guard do, so none of the
+      // replaced reply's headers (its stale `Content-Length`) are merged back.
+      c.res = undefined;
+      c.res = correlated.response;
+    }
+
+    logAnswered(c.res.status, correlated.ref, correlated.errorCode);
     return undefined;
   };
 
@@ -1851,12 +2261,14 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
 
   /*
    * 3d. The request-body guard, innermost before the handler: the request's
-   * body is swapped for one that enforces the operation's byte ceiling and the
-   * time ceiling while the route reads it (see `guardRequestBody`). Nothing is
-   * read here. Once the route has answered, a body the guard refused is
-   * answered at the refusal's status — the route's own `413`/`408` when it
-   * rendered one, this module's otherwise — so no route can present a refused
-   * body as any other outcome.
+   * body is swapped for one that enforces the operation's byte ceiling, the
+   * time ceiling and the JSON media type while the route reads it (see
+   * `guardRequestBody`). Nothing is read here; the `Content-Type` is judged
+   * once, and applied only if a body byte arrives. Once the route has
+   * answered, a body the guard refused is answered at the refusal's status —
+   * the route's own `413`/`408` when it rendered one, this module's otherwise,
+   * and always this module's `415`, which no route knows — so no route can
+   * present a refused body as any other outcome.
    */
   const limitBody = (registration: RegisteredHttpRoute): MiddlewareHandler<ServerEnv> => {
     const { operation } = registration;
@@ -1875,7 +2287,12 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
         return undefined;
       }
 
-      const guard = guardRequestBody(source, limits, refusalError);
+      const guard = guardRequestBody(
+        source,
+        limits,
+        isAcceptableRequestMediaType(original.headers.get(CONTENT_TYPE_HEADER)),
+        refusalError,
+      );
       // Built from the parts rather than from `original`: the Node listener's
       // request object is not a platform `Request`, so it is never handed to
       // the platform constructor as an input.
@@ -1915,10 +2332,20 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
         log.debug('Refused a request body at its ceiling while the route read it', fields);
         return undefined;
       }
-      log.warn('A route answered a refused request body at another status; answering the refusal', {
-        ...fields,
-        routeStatus: answered.status,
-      });
+      if (refusal.reason === REQUEST_MEDIA_TYPE_REFUSAL_REASON) {
+        // Expected: no route module knows this reason (see
+        // `REQUEST_MEDIA_TYPE_REFUSAL_REASON`), so the route's generic read
+        // failure is replaced by design, not because the route erred.
+        log.debug('Refused a request body sent under a media type other than JSON', {
+          ...fields,
+          routeStatus: answered.status,
+        });
+      } else {
+        log.warn(
+          'A route answered a refused request body at another status; answering the refusal',
+          { ...fields, routeStatus: answered.status },
+        );
+      }
       c.res = undefined;
       c.res = Response.json(errorBodyFor(refusalError(refusal), refusal.status, context?.ref), {
         status: refusal.status,
@@ -2091,6 +2518,7 @@ export function createHttpApp(deps: HttpAppDeps): Result<HttpApp, DebuggenError>
         response.writeHead(HTTP_ERROR_STATUS_BY_CODE.INTERNAL, {
           [CONTENT_TYPE_HEADER]: JSON_MEDIA_TYPE,
           ...RESPONSE_POLICY_HEADERS,
+          [REF_HEADER]: ref,
         });
         response.end(JSON.stringify(body));
       } else if (!response.writableEnded) {

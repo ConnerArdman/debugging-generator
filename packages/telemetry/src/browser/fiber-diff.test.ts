@@ -69,25 +69,38 @@
  * monorepo's suites. No `node:` builtin is imported and no fixture file is
  * read: the module under test is bundled into the page-injected agent
  * (`esbuild.agent.mjs` hard-fails on a Node builtin) and must be provable
- * without any I/O, so every input below is built inline.
+ * without any I/O, so every input below is built inline. bippy is imported
+ * for two reference answers the provider-attribution cases are checked
+ * against: its per-version work-tag map, so their fibers carry React's own tag
+ * numbers rather than the ones the module under test declares, and its
+ * `getDisplayName`, which is how `./react.ts` names the provider's own render.
  */
 
 import { describe, expect, expectTypeOf, it } from 'vitest';
 
+import { getDisplayName, getReactWorkTags } from 'bippy';
+
 import { REDACTION_MARKER } from '../redaction/rules.js';
 import { MAX_PREVIEW_LENGTH, MAX_TRACKED_KEYS, RENDER_TRIGGERS } from '../schema/attributes.js';
 import type {
+  CapturedFiber,
+  CapturedFiberAnalysisOptions,
   ContextChange,
   DimensionEvaluability,
   FiberDiff,
   HookChange,
   PropChange,
+  RenderAnalysis,
   RenderTrigger,
+  SummaryMemo,
   ValueSummary,
 } from './fiber-diff.js';
 import {
+  analyzeCapturedFiber,
   analyzeFiber,
+  captureFiber,
   classifyRenderTrigger,
+  createSummaryMemo,
   diffContexts,
   diffHookState,
   diffProps,
@@ -602,9 +615,10 @@ function collectLeafTypes(value: unknown, into: Set<string>): void {
  * Asserts a diff survives the transport: only JSON primitives at the leaves,
  * `JSON.stringify` succeeds, and the parsed result is strictly equal to the
  * original (which no object holding an explicit `undefined`, a function or a
- * symbol could be).
+ * symbol could be). Accepts the deferred {@link RenderAnalysis} too: it is
+ * what `./react.ts` builds `render` and `state` events from.
  */
-function expectTransportable(diff: FiberDiff): void {
+function expectTransportable(diff: FiberDiff | RenderAnalysis): void {
   const leafTypes = new Set<string>();
   collectLeafTypes(diff, leafTypes);
   for (const leafType of leafTypes) {
@@ -1791,6 +1805,476 @@ describe('diffContexts', () => {
 });
 
 // ---------------------------------------------------------------------------
+// diffContexts — provider attribution
+//
+// A `context` trigger has to say which context changed, by the component that
+// provides it (AAP 0.8.2: "context change: ‹provider›"). The lookup walks the
+// consumer's `return` chain, so the cases below build that chain by hand, and
+// every work tag in it comes from bippy's own version map rather than from a
+// literal: a provider tag that drifted from React's would stop matching these
+// fibers and fail here. React 18 and 19 shape a provider — and a consumer —
+// differently, and both are covered, because the two majors swap shapes
+// between the two roles.
+// ---------------------------------------------------------------------------
+
+describe('diffContexts — provider attribution', () => {
+  /** React 19.3.0's work tags, the version this repository renders against. */
+  const REACT_19_TAGS = getReactWorkTags('19.3.0');
+
+  /** React 18.3.1's work tags, for the `Ctx.Provider`-object provider shape. */
+  const REACT_18_TAGS = getReactWorkTags('18.3.1');
+
+  /** The work tags one major assigns, as far as these builders read them. */
+  interface Tags {
+    readonly FunctionComponent: number;
+    readonly HostComponent: number;
+  }
+
+  /** A fresh context object in the shape `createContext` returns. */
+  function makeContextObject(displayName?: string): Bag {
+    const context: Bag = { $$typeof: Symbol.for('react.context'), _currentValue: 0 };
+    if (displayName !== undefined) {
+      context['displayName'] = displayName;
+    }
+    return context;
+  }
+
+  /** A component function carrying an explicit display name. */
+  function namedComponent(name: string): () => null {
+    const component = (): null => null;
+    component.displayName = name;
+    return component;
+  }
+
+  /** A function-component fiber for `name`, as React tags one. */
+  function componentFiber(tags: Tags, name: string): Bag {
+    const component = namedComponent(name);
+    return { tag: tags.FunctionComponent, elementType: component, type: component };
+  }
+
+  /** A host (`div`) fiber: stepped over, never named. */
+  function hostFiber(tags: Tags): Bag {
+    return { tag: tags.HostComponent, elementType: 'div', type: 'div' };
+  }
+
+  /** React 19's provider fiber: `<Ctx value>` puts the context itself on `type`. */
+  function provider19(context: Bag): Bag {
+    return { tag: REACT_19_TAGS.ContextProvider, elementType: context, type: context };
+  }
+
+  /** React 18's provider fiber: `<Ctx.Provider>` puts `{ _context: Ctx }` on `type`. */
+  function provider18(context: Bag): Bag {
+    const providerType: Bag = { $$typeof: Symbol.for('react.provider'), _context: context };
+    return { tag: REACT_18_TAGS.ContextProvider, elementType: providerType, type: providerType };
+  }
+
+  /** React 19's `<Ctx.Consumer>` fiber: `{ _context: Ctx }`, React 18's provider shape. */
+  function consumer19(context: Bag): Bag {
+    const consumerType: Bag = { $$typeof: Symbol.for('react.consumer'), _context: context };
+    return { tag: REACT_19_TAGS.ContextConsumer, elementType: consumerType, type: consumerType };
+  }
+
+  /** React 18's production `<Ctx.Consumer>` fiber: the context itself, React 19's provider shape. */
+  function consumer18(context: Bag): Bag {
+    return { tag: REACT_18_TAGS.ContextConsumer, elementType: context, type: context };
+  }
+
+  /** Links `fiber` under `ancestors`, nearest first, through `return`, and returns it. */
+  function underAncestors(fiber: Bag, ancestors: readonly Bag[]): Bag {
+    let child = fiber;
+    for (const ancestor of ancestors) {
+      child['return'] = ancestor;
+      child = ancestor;
+    }
+    return fiber;
+  }
+
+  /** A consuming fiber whose value of every one of `contexts` changed. */
+  function changedConsumer(contexts: readonly Bag[]): Bag {
+    return makeFiber({
+      contexts: makeContextChain(contexts.map((context, index) => ({ context, value: index + 1 }))),
+      prevContexts: makeContextChain(
+        contexts.map((context, index) => ({ context, value: -index })),
+      ),
+    });
+  }
+
+  /** The single change `diffContexts` reports for `fiber`, or a failure saying so. */
+  function onlyChange(fiber: unknown): ContextChange {
+    const result = diffContexts(fiber);
+    expect(result.changed).toHaveLength(1);
+    const change = result.changed[0];
+    if (change === undefined) {
+      throw new Error('expected exactly one context change, found none');
+    }
+    return change;
+  }
+
+  it('names the component rendering a React 19 provider (`<Ctx value>`)', () => {
+    const context = makeContextObject();
+    const fiber = underAncestors(changedConsumer([context]), [
+      hostFiber(REACT_19_TAGS),
+      provider19(context),
+      hostFiber(REACT_19_TAGS),
+      componentFiber(REACT_19_TAGS, 'PreferencesProvider'),
+      componentFiber(REACT_19_TAGS, 'AppRoot'),
+    ]);
+
+    // The host fibers either side of the provider are not components; the
+    // first composite above the provider is the one that renders it.
+    expect(onlyChange(fiber).provider).toBe('PreferencesProvider');
+  });
+
+  it('names the component rendering a React 18 provider (`Ctx.Provider` object)', () => {
+    const context = makeContextObject();
+    const fiber = underAncestors(changedConsumer([context]), [
+      provider18(context),
+      componentFiber(REACT_18_TAGS, 'PreferencesProvider'),
+    ]);
+
+    expect(onlyChange(fiber).provider).toBe('PreferencesProvider');
+  });
+
+  it('takes the nearest provider when the same context is provided twice', () => {
+    const context = makeContextObject();
+    const fiber = underAncestors(changedConsumer([context]), [
+      provider19(context),
+      componentFiber(REACT_19_TAGS, 'InnerPreferencesProvider'),
+      provider19(context),
+      componentFiber(REACT_19_TAGS, 'OuterPreferencesProvider'),
+    ]);
+
+    // React resolves a read against the nearest provider, so that is the one
+    // whose value changed.
+    expect(onlyChange(fiber).provider).toBe('InnerPreferencesProvider');
+  });
+
+  it('never takes a consumer fiber for a provider, in either major', () => {
+    const context = makeContextObject();
+    for (const consumer of [consumer19(context), consumer18(context)]) {
+      const fiber = underAncestors(changedConsumer([context]), [
+        consumer,
+        componentFiber(REACT_19_TAGS, 'ConsumerWrapper'),
+        provider19(context),
+        componentFiber(REACT_19_TAGS, 'PreferencesProvider'),
+      ]);
+
+      // Each consumer carries the context in the other major's provider
+      // shape; only its tag keeps `ConsumerWrapper` from being blamed.
+      expect(onlyChange(fiber).provider).toBe('PreferencesProvider');
+    }
+  });
+
+  it('leaves provider absent when only a consumer, or nothing, provides the context', () => {
+    const context = makeContextObject();
+    const onlyConsumer = underAncestors(changedConsumer([context]), [
+      consumer19(context),
+      componentFiber(REACT_19_TAGS, 'ConsumerWrapper'),
+    ]);
+    const noProvider = underAncestors(changedConsumer([context]), [
+      hostFiber(REACT_19_TAGS),
+      componentFiber(REACT_19_TAGS, 'AppRoot'),
+    ]);
+
+    for (const fiber of [onlyConsumer, noProvider, changedConsumer([context])]) {
+      const change = onlyChange(fiber);
+      // Still a change — attribution is never classification — but no
+      // component is named that does not provide the context.
+      expect('provider' in change).toBe(false);
+    }
+  });
+
+  it('leaves provider absent rather than naming a component further up', () => {
+    const context = makeContextObject();
+    const anonymous = (): null => null;
+    Object.defineProperty(anonymous, 'name', { value: '' });
+    const fiber = underAncestors(changedConsumer([context]), [
+      provider19(context),
+      { tag: REACT_19_TAGS.FunctionComponent, elementType: anonymous, type: anonymous },
+      componentFiber(REACT_19_TAGS, 'AppRoot'),
+    ]);
+
+    // The unnamed component is the one that renders the provider; `AppRoot`
+    // only renders that component, so naming it would blame the wrong one.
+    expect('provider' in onlyChange(fiber)).toBe(false);
+  });
+
+  it('reports the context displayName as contextName and keeps label as it was', () => {
+    const namedChange = onlyChange(changedConsumer([makeContextObject('PreferencesContext')]));
+    expect(namedChange.contextName).toBe('PreferencesContext');
+    expect(namedChange.label).toBe('PreferencesContext');
+
+    const unnamedChange = onlyChange(changedConsumer([makeContextObject()]));
+    expect('contextName' in unnamedChange).toBe(false);
+    // The existing fallback: the category of the context's current value.
+    expect(unnamedChange.label).toBe('number');
+  });
+
+  it('attributes several changed contexts in one walk, and only the changed ones', () => {
+    const preferences = makeContextObject('PreferencesContext');
+    const session = makeContextObject('SessionContext');
+    const stable = makeContextObject('StableContext');
+    const consumer = makeFiber({
+      contexts: makeContextChain([
+        { context: preferences, value: 2 },
+        { context: stable, value: 7 },
+        { context: session, value: 'next' },
+      ]),
+      prevContexts: makeContextChain([
+        { context: preferences, value: 1 },
+        { context: stable, value: 7 },
+        { context: session, value: 'previous' },
+      ]),
+    });
+    const fiber = underAncestors(consumer, [
+      provider19(session),
+      componentFiber(REACT_19_TAGS, 'SessionProvider'),
+      provider19(stable),
+      componentFiber(REACT_19_TAGS, 'StableProvider'),
+      provider18(preferences),
+      componentFiber(REACT_19_TAGS, 'PreferencesProvider'),
+    ]);
+
+    const result = diffContexts(fiber);
+
+    expect(result.evaluable).toBe(true);
+    expect(
+      result.changed.map((change) => [change.index, change.provider, change.contextName]),
+    ).toStrictEqual([
+      [0, 'PreferencesProvider', 'PreferencesContext'],
+      [2, 'SessionProvider', 'SessionContext'],
+    ]);
+    expect(JSON.stringify(result)).not.toContain('StableProvider');
+  });
+
+  it('names a memo or forwardRef provider component the way its own render is named', () => {
+    const context = makeContextObject();
+    const inner = namedComponent('PreferencesProviderImplementation');
+    const memoWrapper: Bag = { $$typeof: Symbol.for('react.memo'), type: inner };
+    const namedMemo: Bag = { ...memoWrapper, displayName: 'PreferencesProvider' };
+    const forwardRefWrapper: Bag = { $$typeof: Symbol.for('react.forward_ref'), render: inner };
+    // `memo(forwardRef(…))`: two wrappers deep, named by the function inside.
+    const memoOfForwardRef: Bag = { $$typeof: Symbol.for('react.memo'), type: forwardRefWrapper };
+    // A wrapper whose `type` is itself: React never builds one, and the lookup
+    // must end rather than spin, leaving the provider unnamed.
+    const selfWrapped: Bag = { $$typeof: Symbol.for('react.memo') };
+    selfWrapped['type'] = selfWrapped;
+    const cases: readonly (readonly [Bag, string | undefined])[] = [
+      // `displayName` on the wrapper wins, as it does for the render event.
+      [
+        { tag: REACT_19_TAGS.MemoComponent, elementType: namedMemo, type: namedMemo },
+        'PreferencesProvider',
+      ],
+      // An unnamed simple-memo wrapper falls through to the inner function.
+      [
+        { tag: REACT_19_TAGS.SimpleMemoComponent, elementType: memoWrapper, type: inner },
+        'PreferencesProviderImplementation',
+      ],
+      [
+        { tag: REACT_19_TAGS.ForwardRef, elementType: forwardRefWrapper, type: forwardRefWrapper },
+        'PreferencesProviderImplementation',
+      ],
+      [
+        { tag: REACT_19_TAGS.MemoComponent, elementType: memoOfForwardRef, type: memoOfForwardRef },
+        'PreferencesProviderImplementation',
+      ],
+      [
+        { tag: REACT_19_TAGS.MemoComponent, elementType: selfWrapped, type: selfWrapped },
+        undefined,
+      ],
+    ];
+
+    for (const [component, expected] of cases) {
+      const fiber = underAncestors(changedConsumer([context]), [provider19(context), component]);
+      expect(onlyChange(fiber).provider).toBe(expected);
+      if (expected !== undefined) {
+        // The name `./react.ts` gives the same component's own render, which
+        // is bippy's `getDisplayName` of its `elementType`. (Not asked of the
+        // self-wrapped case: bippy's unwrapping has no bound.)
+        expect(getDisplayName(component['elementType'])).toBe(expected);
+      }
+    }
+  });
+
+  it('cuts a very long provider name as an unmarked prefix', () => {
+    const context = makeContextObject();
+    const longName = 'Provider' + cycle(UPPER_LETTERS + LOWER_LETTERS, 600);
+    const fiber = underAncestors(changedConsumer([context]), [
+      provider19(context),
+      componentFiber(REACT_19_TAGS, longName),
+    ]);
+
+    const provider = onlyChange(fiber).provider ?? '';
+
+    // A prefix and never a marked one: the name has to equal the provider's
+    // own `component` attribute, which `./react.ts` cuts the same way (its
+    // suite asserts that equality against a real render).
+    expect(provider.length).toBeGreaterThan(0);
+    expect(provider.length).toBeLessThan(longName.length);
+    expect(longName.startsWith(provider)).toBe(true);
+  });
+
+  it('finds a provider below a deep chain and stops on a chain no real tree has', () => {
+    const context = makeContextObject();
+    const deep = (hosts: number): Bag =>
+      underAncestors(changedConsumer([context]), [
+        ...Array.from({ length: hosts }, () => hostFiber(REACT_19_TAGS)),
+        provider19(context),
+        componentFiber(REACT_19_TAGS, 'PreferencesProvider'),
+      ]);
+
+    // Three hundred fibers between a consumer and its provider is deeper than
+    // a framework router's layers make it in practice, and is still walked.
+    expect(onlyChange(deep(300)).provider).toBe('PreferencesProvider');
+    // Ten thousand is not a real tree; the walk's bound ends it first.
+    expect('provider' in onlyChange(deep(10_000))).toBe(false);
+  });
+
+  it('terminates on a cyclic return chain', () => {
+    const context = makeContextObject();
+    const firstHost = hostFiber(REACT_19_TAGS);
+    const secondHost = hostFiber(REACT_19_TAGS);
+    firstHost['return'] = secondHost;
+    secondHost['return'] = firstHost;
+    const loopedProvider = provider19(context);
+    const loopedHost = hostFiber(REACT_19_TAGS);
+    loopedProvider['return'] = loopedHost;
+    loopedHost['return'] = loopedProvider;
+
+    // No provider on the first cycle, and a provider whose component never
+    // comes on the second: both walks end at the bound instead of spinning.
+    for (const head of [firstHost, loopedProvider]) {
+      const consumer = changedConsumer([context]);
+      consumer['return'] = head;
+      expect('provider' in onlyChange(consumer)).toBe(false);
+    }
+  });
+
+  it('never throws, and costs a hostile fiber only its own attribution', () => {
+    const context = makeContextObject();
+    const throwing = (): never => {
+      throw new Error('a hostile getter must never escape the differ');
+    };
+    const withThrowing = (bag: Bag, key: string): Bag =>
+      Object.defineProperty(bag, key, { enumerable: true, get: throwing });
+
+    const hostileContext = withThrowing(makeContextObject(), 'displayName');
+    const scenarios: readonly {
+      readonly ancestors: readonly Bag[];
+      readonly context: Bag;
+      readonly provider: string | undefined;
+    }[] = [
+      // An unreadable `return` ends the walk with nothing found.
+      {
+        ancestors: [withThrowing(hostFiber(REACT_19_TAGS), 'return')],
+        context,
+        provider: undefined,
+      },
+      // An unreadable `tag` is "not a provider", and the walk goes on.
+      {
+        ancestors: [
+          withThrowing({}, 'tag'),
+          provider19(context),
+          componentFiber(REACT_19_TAGS, 'PreferencesProvider'),
+        ],
+        context,
+        provider: 'PreferencesProvider',
+      },
+      // A provider-tagged fiber whose `type` cannot be read provides nothing.
+      {
+        ancestors: [
+          withThrowing({ tag: REACT_19_TAGS.ContextProvider }, 'type'),
+          componentFiber(REACT_19_TAGS, 'AppRoot'),
+        ],
+        context,
+        provider: undefined,
+      },
+      // An unreadable `elementType` falls back to a readable `type`.
+      {
+        ancestors: [
+          provider19(context),
+          withThrowing(componentFiber(REACT_19_TAGS, 'PreferencesProvider'), 'elementType'),
+        ],
+        context,
+        provider: 'PreferencesProvider',
+      },
+      // A revoked Proxy in the chain throws for every read.
+      { ancestors: [makeRevokedProxy() as Bag], context, provider: undefined },
+      // A context whose `displayName` throws is still attributed by provider.
+      {
+        ancestors: [provider19(hostileContext), componentFiber(REACT_19_TAGS, 'AppRoot')],
+        context: hostileContext,
+        provider: 'AppRoot',
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const fiber = underAncestors(changedConsumer([scenario.context]), scenario.ancestors);
+      let change: ContextChange | undefined;
+      expect(() => {
+        change = onlyChange(fiber);
+      }).not.toThrow();
+      expect(change?.provider).toBe(scenario.provider);
+      expect(analyzeFiber(fiber).trigger).toBe('context');
+    }
+  });
+
+  it('never reads the value a provider fiber holds', () => {
+    const context = makeContextObject();
+    const provider = provider19(context);
+    let propsRead = false;
+    Object.defineProperty(provider, 'memoizedProps', {
+      enumerable: true,
+      get: (): Bag => {
+        propsRead = true;
+        return { value: SECRET_TAIL };
+      },
+    });
+    const fiber = underAncestors(changedConsumer([context]), [
+      provider,
+      componentFiber(REACT_19_TAGS, 'PreferencesProvider'),
+    ]);
+
+    const diff = analyzeFiber(fiber);
+
+    expect(diff.contextChanges[0]?.provider).toBe('PreferencesProvider');
+    expect(propsRead).toBe(false);
+    expect(JSON.stringify(diff)).not.toContain(SECRET_TAIL);
+  });
+
+  it('carries the attribution through analyzeFiber, and none when nothing changed', () => {
+    const context = makeContextObject('PreferencesContext');
+    const ancestors = (): Bag[] => [
+      provider19(context),
+      componentFiber(REACT_19_TAGS, 'PreferencesProvider'),
+    ];
+    const value = { mode: 'compact' };
+
+    const changed = analyzeFiber(underAncestors(changedConsumer([context]), ancestors()));
+    expect(changed.trigger).toBe('context');
+    expect(changed.contextChanges).toHaveLength(1);
+    expect(changed.contextChanges[0]).toMatchObject({
+      index: 0,
+      label: 'PreferencesContext',
+      provider: 'PreferencesProvider',
+      contextName: 'PreferencesContext',
+    });
+
+    const unchanged = analyzeFiber(
+      underAncestors(
+        makeFiber({
+          contexts: makeContextChain([{ context, value }]),
+          prevContexts: makeContextChain([{ context, value }]),
+        }),
+        ancestors(),
+      ),
+    );
+    expect(unchanged.trigger).toBe('unchanged');
+    expect(unchanged.contextChanges).toStrictEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // classifyRenderTrigger
 //
 // The precedence rules of AAP 0.7.1, asserted twice over: once on the
@@ -2231,6 +2715,7 @@ describe('analyzeFiber', () => {
       propChanges: [],
       hookChanges: [],
       contextChanges: [],
+      changedContexts: [],
       evaluable: { props: false, state: false, context: false },
       truncated: false,
     });
@@ -2309,15 +2794,570 @@ describe('analyzeFiber', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Capture now, analyse later
+//
+// `./react.ts` no longer analyses a fiber inside React's commit: it calls
+// `captureFiber` there — a handful of guarded pointer reads — and runs
+// `analyzeCapturedFiber` from an idle slice afterwards. The suites below pin
+// the three properties that split rests on:
+//
+// - **Equivalence.** The deferred answer classifies every fiber exactly as the
+//   synchronous `analyzeFiber` does, so moving the work changed when it runs
+//   and nothing about what `render_count`, `unchanged_render_count` and
+//   `render_trigger_unknown_count` report.
+// - **Deferral is safe.** After the commit, React reuses the alternate as the
+//   next work-in-progress and detaches a deleted fiber's fields. A capture
+//   holds the objects the commit held, so neither rewrite reaches it.
+// - **Less description.** The render path composes no prop preview, and hook
+//   and context previews only on request, through a per-pass memo.
+// ---------------------------------------------------------------------------
+
+/** What {@link analyzeFiber} reports minus the prop summaries the render path never composes. */
+function renderPathOf(diff: FiberDiff): RenderAnalysis {
+  return {
+    trigger: diff.trigger,
+    changedProps: diff.changedProps,
+    hookChanges: diff.hookChanges,
+    contextChanges: diff.contextChanges,
+    changedContexts: diff.changedContexts,
+    evaluable: diff.evaluable,
+    truncated: diff.truncated,
+  };
+}
+
+/** A fiber input for the capture suites, named so a failure says which shape broke. */
+interface CaptureCase {
+  /** What the fiber exercises. */
+  readonly label: string;
+  /** Builds the fiber fresh, so no case can leak state into another. */
+  readonly make: () => unknown;
+}
+
+/**
+ * Every fiber shape the equivalence suite sweeps: the trigger catalogue, the
+ * three bounds, each hook kind, cyclic chains, the identical-props fast path
+ * and every unanalysable input.
+ */
+const CAPTURE_CASES: readonly CaptureCase[] = [
+  ...FIBER_TRIGGER_CASES.map(({ label, make }) => ({ label, make })),
+  { label: 'a fiber changing all three dimensions past the key bound', make: makeRichFiber },
+  {
+    label: 'more changed hooks than the bound',
+    make: (): unknown => makeFiber({ ...makeChangingHooks(MAX_TRACKED_KEYS + 2) }),
+  },
+  {
+    label: 'more changed contexts than the bound',
+    make: (): unknown => makeFiber({ ...makeChangingContexts(MAX_TRACKED_KEYS + 2, 'all') }),
+  },
+  {
+    label: 'one changed context among many',
+    make: (): unknown => makeFiber({ ...makeChangingContexts(6, 3) }),
+  },
+  {
+    label: 'a changed reducer hook',
+    make: (): unknown =>
+      makeFiber({ hooks: makeReducerHookChain([2]), prevHooks: makeReducerHookChain([1]) }),
+  },
+  {
+    label: 'a changed effect hook',
+    make: (): unknown =>
+      makeFiber({ hooks: makeEffectHookChain([2]), prevHooks: makeEffectHookChain([1]) }),
+  },
+  {
+    label: 'a changed ref hook',
+    make: (): unknown =>
+      makeFiber({ hooks: makeRefHookChain([2]), prevHooks: makeRefHookChain([1]) }),
+  },
+  {
+    label: 'a changed memo hook',
+    make: (): unknown =>
+      makeFiber({ hooks: makeMemoHookChain([2]), prevHooks: makeMemoHookChain([1]) }),
+  },
+  {
+    label: 'cyclic hook chains',
+    make: (): unknown =>
+      makeFiber({
+        hooks: closeChain(makeHookChain(['a', 'b'])),
+        prevHooks: closeChain(makeHookChain(['a', 'c'])),
+      }),
+  },
+  {
+    label: 'the same props object on both sides',
+    make: (): unknown => {
+      const props: Bag = { count: 1 };
+      return { memoizedProps: props, alternate: { memoizedProps: props } };
+    },
+  },
+  {
+    label: 'a fiber whose alternate getter throws',
+    make: (): unknown =>
+      Object.defineProperty({ memoizedProps: { count: 1 } }, 'alternate', {
+        enumerable: true,
+        get(): never {
+          throw new Error('an alternate the differ must survive');
+        },
+      }),
+  },
+  {
+    label: 'an alternate whose memoizedProps getter throws',
+    make: (): unknown => ({
+      memoizedProps: { count: 1 },
+      alternate: Object.defineProperty({}, 'memoizedProps', {
+        enumerable: true,
+        get(): never {
+          throw new Error('previous props the differ must survive');
+        },
+      }),
+    }),
+  },
+  {
+    label: 'dependencies without a firstContext',
+    make: (): unknown =>
+      makeFiber({ props: { count: 1 }, contexts: {}, prevContexts: { firstContext: null } }),
+  },
+  { label: 'null', make: (): unknown => null },
+  { label: 'a number', make: (): unknown => 7 },
+  { label: 'a revoked proxy', make: makeRevokedProxy },
+  { label: 'an object of throwing getters', make: makeThrowingGetter },
+];
+
+/**
+ * Rewrites a captured fiber the way React does after its commit returns: the
+ * alternate becomes the next render's work-in-progress (new props, a new hook
+ * list, its context chain reset by `prepareToReadContext`), and a deletion
+ * detaches the committed fiber's own fields.
+ */
+function simulateReuseAndDeletion(fiber: Bag): void {
+  const alternate = fiber['alternate'];
+  if (typeof alternate === 'object' && alternate !== null) {
+    const reused = alternate as Bag;
+    reused['memoizedProps'] = { rewritten: true };
+    reused['memoizedState'] = makeHookChain(['rewritten']);
+    const dependencies = reused['dependencies'];
+    if (typeof dependencies === 'object' && dependencies !== null) {
+      (dependencies as Bag)['firstContext'] = null;
+    }
+  }
+  const dependencies = fiber['dependencies'];
+  if (typeof dependencies === 'object' && dependencies !== null) {
+    (dependencies as Bag)['firstContext'] = null;
+  }
+  fiber['memoizedProps'] = null;
+  fiber['memoizedState'] = null;
+  fiber['dependencies'] = null;
+  fiber['alternate'] = null;
+}
+
+/**
+ * An object with one enumerable getter that counts its reads.
+ *
+ * Summarising an object previews its keys by reading them, so a read count of
+ * zero is a behavioural proof that no summary was composed for the value.
+ */
+function makeCountingValue(): { readonly value: Bag; readonly reads: () => number } {
+  let reads = 0;
+  const value: Bag = {};
+  Object.defineProperty(value, 'probe', {
+    enumerable: true,
+    get(): number {
+      reads += 1;
+      return reads;
+    },
+  });
+  return { value, reads: () => reads };
+}
+
+/** Keys every {@link RenderAnalysis} carries, and the only ones. */
+const RENDER_ANALYSIS_KEYS = [
+  'changedContexts',
+  'changedProps',
+  'contextChanges',
+  'evaluable',
+  'hookChanges',
+  'trigger',
+  'truncated',
+];
+
+describe('captureFiber', () => {
+  it('records the six pointers the commit held, by identity', () => {
+    const fiber = makeRichFiber();
+    const alternate = fiber['alternate'] as Bag;
+
+    const captured = captureFiber(fiber);
+
+    expect(captured.hasAlternate).toBe(true);
+    expect(captured.nextProps).toBe(fiber['memoizedProps']);
+    expect(captured.previousProps).toBe(alternate['memoizedProps']);
+    expect(captured.nextHooks).toBe(fiber['memoizedState']);
+    expect(captured.previousHooks).toBe(alternate['memoizedState']);
+    // The chain head rather than the `dependencies` object: React resets
+    // `dependencies.firstContext` on the object it reuses, so only the head
+    // still names the contexts this render read.
+    expect(captured.nextContexts).toBe((fiber['dependencies'] as Bag)['firstContext']);
+    expect(captured.previousContexts).toBe((alternate['dependencies'] as Bag)['firstContext']);
+  });
+
+  it('shares one frozen record across every mount', () => {
+    const first = captureFiber(makeFiber({ props: { count: 1 }, withAlternate: false }));
+    const second = captureFiber(makeFiber({ props: { count: 2 }, withAlternate: false }));
+
+    // A commit that mounts a whole page captures one record per fiber on the
+    // commit path; a mount has nothing worth pointing at, so it allocates none.
+    expect(first).toBe(second);
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(first).toStrictEqual({
+      hasAlternate: false,
+      nextProps: undefined,
+      previousProps: undefined,
+      nextHooks: undefined,
+      previousHooks: undefined,
+      nextContexts: undefined,
+      previousContexts: undefined,
+    });
+  });
+
+  it.each(CAPTURE_CASES)('never throws for $label', ({ make }) => {
+    const fiber = make();
+
+    expect(() => captureFiber(fiber)).not.toThrow();
+    expect(typeof captureFiber(fiber).hasAlternate).toBe('boolean');
+  });
+
+  it('leaves the fiber and its alternate exactly as it found them', () => {
+    const fiber = makeRichFiber();
+    const before = structuralSnapshot(fiber);
+
+    analyzeCapturedFiber(captureFiber(fiber), { transitions: true, memo: createSummaryMemo() });
+
+    expect(structuralSnapshot(fiber)).toStrictEqual(before);
+  });
+});
+
+describe('analyzeCapturedFiber', () => {
+  it.each(CAPTURE_CASES)(
+    'classifies $label exactly as analyzeFiber does, transitions included',
+    ({ make }) => {
+      const fiber = make();
+      const expected = renderPathOf(analyzeFiber(fiber));
+
+      const analysis = analyzeCapturedFiber(captureFiber(fiber), { transitions: true });
+
+      expect(analysis).toStrictEqual(expected);
+      expect(RENDER_TRIGGERS).toContain(analysis.trigger);
+      expectTransportable(analysis);
+    },
+  );
+
+  it.each(CAPTURE_CASES)(
+    'classifies $label identically without describing a transition',
+    ({ make }) => {
+      const fiber = make();
+      const expected = analyzeFiber(fiber);
+
+      const analysis = analyzeCapturedFiber(captureFiber(fiber));
+
+      // Without `transitions` the changes are counted, which is all the
+      // trigger needs, and described nowhere: an empty list here means "not
+      // summarised", and `trigger` is what says whether anything changed.
+      expect(analysis.trigger).toBe(expected.trigger);
+      expect(analysis.changedProps).toStrictEqual(expected.changedProps);
+      expect(analysis.evaluable).toStrictEqual(expected.evaluable);
+      expect(analysis.truncated).toBe(expected.truncated);
+      expect(analysis.hookChanges).toStrictEqual([]);
+      expect(analysis.contextChanges).toStrictEqual([]);
+      expectTransportable(analysis);
+    },
+  );
+
+  it.each(CAPTURE_CASES)(
+    'reports the commit it captured for $label after React reuses and detaches the fiber',
+    ({ make }) => {
+      const fiber = make();
+      const atCommit = renderPathOf(analyzeFiber(fiber));
+      const captured = captureFiber(fiber);
+
+      if (typeof fiber === 'object' && fiber !== null) {
+        try {
+          simulateReuseAndDeletion(fiber as Bag);
+        } catch {
+          // A hostile fiber (a revoked proxy, a throwing accessor) cannot be
+          // rewritten, which is fine: its capture is already unevaluable.
+        }
+      }
+
+      expect(analyzeCapturedFiber(captured, { transitions: true })).toStrictEqual(atCommit);
+    },
+  );
+
+  it('keeps the classification but reflects an in-place mutation in a preview', () => {
+    // The documented limit of deferral: a capture holds the value *objects* the
+    // commit held, so identity — and with it every trigger — is exactly the
+    // commit's. A preview is composed from the object as it is when analysed,
+    // so a page that mutates a context value in place between its commit and
+    // the idle slice shows the mutated keys.
+    const value: Bag = { etaMinutes: 2 };
+    const fiber = makeFiber({
+      contexts: makeContextChain([{ context: ETA_CONTEXT, value }]),
+      prevContexts: makeContextChain([{ context: ETA_CONTEXT, value: { etaMinutes: 5 } }]),
+    });
+    const captured = captureFiber(fiber);
+
+    value['carrier'] = 'ground';
+    const analysis = analyzeCapturedFiber(captured, { transitions: true });
+
+    expect(analysis.trigger).toBe('context');
+    expect(analysis.contextChanges[0]?.to.preview).toContain('carrier');
+  });
+
+  it('carries no prop summaries at all', () => {
+    const analysis = analyzeCapturedFiber(captureFiber(makeRichFiber()), { transitions: true });
+
+    expect(Object.keys(analysis).sort()).toStrictEqual(RENDER_ANALYSIS_KEYS);
+    expect(analysis).not.toHaveProperty('propChanges');
+  });
+
+  it('never reads a changed prop value, with or without transitions', () => {
+    const counting = makeCountingValue();
+    const make = (): Bag =>
+      makeFiber({ props: { payload: counting.value }, prevProps: { payload: { before: true } } });
+
+    const quiet = analyzeCapturedFiber(captureFiber(make()));
+    const described = analyzeCapturedFiber(captureFiber(make()), { transitions: true });
+
+    // A prop is compared by identity and reported by name; its value is never
+    // previewed on the render path, so its getter never runs.
+    expect(quiet.changedProps).toStrictEqual(['payload']);
+    expect(described.changedProps).toStrictEqual(['payload']);
+    expect(counting.reads()).toBe(0);
+
+    // The synchronous analysis does preview it, which is the work deferral
+    // stopped doing.
+    analyzeFiber(make());
+    expect(counting.reads()).toBeGreaterThan(0);
+  });
+
+  it('previews a hook value only when transitions are requested', () => {
+    const counting = makeCountingValue();
+    const make = (): Bag =>
+      makeFiber({
+        props: { count: 1 },
+        hooks: makeHookChain([counting.value]),
+        prevHooks: makeHookChain(['initial']),
+      });
+
+    const quiet = analyzeCapturedFiber(captureFiber(make()));
+
+    expect(quiet.trigger).toBe('state');
+    expect(quiet.hookChanges).toStrictEqual([]);
+    expect(counting.reads()).toBe(0);
+
+    const described = analyzeCapturedFiber(captureFiber(make()), { transitions: true });
+
+    expect(described.trigger).toBe('state');
+    expect(described.hookChanges).toHaveLength(1);
+    expect(counting.reads()).toBeGreaterThan(0);
+  });
+
+  it('previews a context value only when transitions are requested', () => {
+    const counting = makeCountingValue();
+    const make = (): Bag =>
+      makeFiber({
+        contexts: makeContextChain([{ context: ETA_CONTEXT, value: counting.value }]),
+        prevContexts: makeContextChain([{ context: ETA_CONTEXT, value: { etaMinutes: 5 } }]),
+      });
+
+    const quiet = analyzeCapturedFiber(captureFiber(make()));
+
+    expect(quiet.trigger).toBe('context');
+    expect(quiet.contextChanges).toStrictEqual([]);
+    expect(counting.reads()).toBe(0);
+
+    const described = analyzeCapturedFiber(captureFiber(make()), { transitions: true });
+
+    expect(described.contextChanges).toHaveLength(1);
+    expect(described.contextChanges[0]?.label).toBe('ShippingEta');
+    expect(counting.reads()).toBeGreaterThan(0);
+  });
+
+  it.each(SECRET_CASES)('carries no trace of $label from a prop slot', ({ value }) => {
+    const analysis = analyzeCapturedFiber(
+      captureFiber(
+        makeFiber({ props: { lastResponse: value }, prevProps: { lastResponse: 'anonymous' } }),
+      ),
+      { transitions: true },
+    );
+
+    // Not a redacted preview: no preview at all. The prop's name is the only
+    // thing about it the render path reports.
+    const encoded = JSON.stringify(analysis);
+    expect(analysis.trigger).toBe('props');
+    expect(analysis.changedProps).toStrictEqual(['lastResponse']);
+    expect(encoded).not.toContain(SECRET_TAIL);
+    expect(encoded).not.toContain(REDACTION_MARKER);
+  });
+
+  it.each(SECRET_CASES)('redacts $label from a described hook transition', ({ value }) => {
+    const analysis = analyzeCapturedFiber(
+      captureFiber(
+        makeFiber({ hooks: makeHookChain([value]), prevHooks: makeHookChain(['anonymous']) }),
+      ),
+      { transitions: true, memo: createSummaryMemo() },
+    );
+
+    const encoded = JSON.stringify(analysis);
+    expect(analysis.trigger).toBe('state');
+    expect(encoded).not.toContain(SECRET_TAIL);
+    expect(encoded).toContain(REDACTION_MARKER);
+  });
+
+  it('degrades to an unknown, unevaluable answer for a capture that defeats every read', () => {
+    const hostile: CapturedFiber = {
+      hasAlternate: true,
+      nextProps: makeRevokedProxy(),
+      previousProps: makeRevokedProxy(),
+      nextHooks: makeRevokedProxy(),
+      previousHooks: makeRevokedProxy(),
+      nextContexts: makeRevokedProxy(),
+      previousContexts: makeRevokedProxy(),
+    };
+
+    const analysis = analyzeCapturedFiber(hostile, { transitions: true });
+
+    expect(analysis.trigger).toBe('unknown');
+    expect(analysis.changedProps).toStrictEqual([]);
+    expect(analysis.evaluable.props).toBe(false);
+    expectTransportable(analysis);
+  });
+});
+
+describe('createSummaryMemo', () => {
+  /** A fiber whose one consumed context changed to `value`. */
+  function makeConsumer(value: unknown): Bag {
+    return makeFiber({
+      contexts: makeContextChain([{ context: ETA_CONTEXT, value }]),
+      prevContexts: makeContextChain([{ context: ETA_CONTEXT, value: { etaMinutes: 5 } }]),
+    });
+  }
+
+  it('summarises a value shared by many consumers once per pass', () => {
+    // The demo's cart provider publishes one value object that close to a
+    // hundred consumers report as a changed context in the same commit.
+    const shared: Bag = { items: 3, subtotalCents: 12900 };
+    const memo = createSummaryMemo();
+
+    const analyses = Array.from({ length: 5 }, () =>
+      analyzeCapturedFiber(captureFiber(makeConsumer(shared)), { transitions: true, memo }),
+    );
+
+    const first = analyses[0]?.contextChanges[0]?.to;
+    expect(first).toBeDefined();
+    for (const analysis of analyses) {
+      expect(analysis.contextChanges[0]?.to).toBe(first);
+    }
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(first).toStrictEqual(summarizeValue(shared));
+  });
+
+  it('keys by identity, never by appearance', () => {
+    const memo = createSummaryMemo();
+
+    const one = analyzeCapturedFiber(captureFiber(makeConsumer({ items: 3 })), {
+      transitions: true,
+      memo,
+    });
+    const other = analyzeCapturedFiber(captureFiber(makeConsumer({ items: 3 })), {
+      transitions: true,
+      memo,
+    });
+
+    // Two equal-looking objects are two values: a page may mutate either one.
+    expect(one.contextChanges[0]?.to).not.toBe(other.contextChanges[0]?.to);
+    expect(one.contextChanges[0]?.to).toStrictEqual(other.contextChanges[0]?.to);
+  });
+
+  it('composes afresh for every analysis when no memo is passed', () => {
+    const shared: Bag = { items: 3 };
+
+    const one = analyzeCapturedFiber(captureFiber(makeConsumer(shared)), { transitions: true });
+    const other = analyzeCapturedFiber(captureFiber(makeConsumer(shared)), { transitions: true });
+
+    expect(one.contextChanges[0]?.to).not.toBe(other.contextChanges[0]?.to);
+    expect(one.contextChanges[0]?.to).toStrictEqual(other.contextChanges[0]?.to);
+  });
+
+  it('never remembers a prop, which is summarised under its name if at all', () => {
+    const memo = createSummaryMemo();
+
+    analyzeCapturedFiber(
+      captureFiber(makeFiber({ props: { count: 2 }, prevProps: { count: 1 } })),
+      { transitions: true, memo },
+    );
+
+    expect(memo.summaries.size).toBe(0);
+  });
+
+  it('stays usable when the page has broken Map', () => {
+    /** A Map whose lookup throws, as a page that patched `Map.prototype.get` would. */
+    class BrokenMap extends Map<unknown, ValueSummary> {
+      override get(): never {
+        throw new Error('a Map the memo must survive');
+      }
+    }
+    const broken: SummaryMemo = { summaries: new BrokenMap() };
+    const shared: Bag = { items: 3 };
+
+    const analysis = analyzeCapturedFiber(captureFiber(makeConsumer(shared)), {
+      transitions: true,
+      memo: broken,
+    });
+
+    expect(analysis.trigger).toBe('context');
+    expect(analysis.contextChanges[0]?.to).toStrictEqual(summarizeValue(shared));
+  });
+
+  it('stops remembering at its ceiling while still summarising every value', () => {
+    // `MAX_MEMOIZED_SUMMARIES` in `./fiber-diff.ts`: a memo is a per-pass
+    // cache, never a second copy of the page's state.
+    const documentedCeiling = 4096;
+    const consumers = documentedCeiling / 2 + 50;
+    const memo = createSummaryMemo();
+
+    for (let index = 0; index < consumers; index += 1) {
+      const analysis = analyzeCapturedFiber(
+        captureFiber(
+          makeFiber({
+            hooks: makeHookChain([{ next: index }]),
+            prevHooks: makeHookChain([{ previous: index }]),
+          }),
+        ),
+        { transitions: true, memo },
+      );
+      const change = analysis.hookChanges[0];
+      expect(change).toBeDefined();
+      if (change !== undefined) {
+        expectWellFormedSummary(change.from);
+        expectWellFormedSummary(change.to);
+      }
+    }
+
+    expect(memo.summaries.size).toBe(documentedCeiling);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Public type surface
 //
-// `./fiber-diff.ts` exports seven types, and a consumer imports them: the
+// `./fiber-diff.ts` exports eleven types, and a consumer imports them: the
 // render event's `changedProps` attribute is built from `PropChange`, a
 // `state` event's previous/next pair from `HookChange` and `ContextChange`,
 // and the two render-trigger metrics are bucketed from
-// `DimensionEvaluability`. The behavioural suites above would all keep passing
-// if any of those `export` modifiers were dropped, a member renamed or a
-// summary slot widened, because Vitest erases types and never sees them.
+// `DimensionEvaluability`. `./react.ts` holds a `CapturedFiber` per rendered
+// fiber between its commit and the idle slice that analyses it, passes
+// `CapturedFiberAnalysisOptions` with a pass's `SummaryMemo`, and builds its
+// events from the `RenderAnalysis` it gets back. The behavioural suites above
+// would all keep passing if any of those `export` modifiers were dropped, a
+// member renamed or a summary slot widened, because Vitest erases types and
+// never sees them.
 //
 // The assertions below close that gap, and they are checked by `tsc -b` rather
 // than at run time: this file is inside `packages/telemetry/tsconfig.json`'s
@@ -2384,9 +3424,15 @@ describe('the exported type surface', () => {
 
     expectTypeOf(result.changed).toEqualTypeOf<ContextChange[]>();
     expectTypeOf<FiberDiff['contextChanges']>().toEqualTypeOf<ContextChange[]>();
-    expectTypeOf<keyof ContextChange>().toEqualTypeOf<'index' | 'label' | 'from' | 'to'>();
+    expectTypeOf<keyof ContextChange>().toEqualTypeOf<
+      'index' | 'label' | 'provider' | 'contextName' | 'from' | 'to'
+    >();
     expectTypeOf<ContextChange['index']>().toEqualTypeOf<number>();
     expectTypeOf<ContextChange['label']>().toEqualTypeOf<string | undefined>();
+    // The two attribution names are optional for the same reason `label` is:
+    // absent when they could not be read, never present and undefined.
+    expectTypeOf<ContextChange['provider']>().toEqualTypeOf<string | undefined>();
+    expectTypeOf<ContextChange['contextName']>().toEqualTypeOf<string | undefined>();
     expectTypeOf<ContextChange['to']>().toEqualTypeOf<ValueSummary>();
 
     const change: ContextChange | undefined = result.changed[0];
@@ -2426,5 +3472,56 @@ describe('the exported type surface', () => {
 
     const trigger: RenderTrigger = classifyRenderTrigger(diff);
     expect(trigger).toBe(diff.trigger);
+  });
+
+  it('types the capture record as exactly the six pointers and the mount flag', () => {
+    const captured = captureFiber(makeTypedFiber());
+
+    expectTypeOf(captureFiber).parameters.toEqualTypeOf<[fiber: unknown]>();
+    expectTypeOf(captured).toEqualTypeOf<CapturedFiber>();
+    // A seventh pointer is a seventh reference into the page held across an
+    // idle slice; a missing one is a dimension the deferred analysis cannot
+    // compare. Either is a change to what the queue in `./react.ts` retains.
+    expectTypeOf<keyof CapturedFiber>().toEqualTypeOf<
+      | 'hasAlternate'
+      | 'nextProps'
+      | 'previousProps'
+      | 'nextHooks'
+      | 'previousHooks'
+      | 'nextContexts'
+      | 'previousContexts'
+    >();
+    expectTypeOf<CapturedFiber['hasAlternate']>().toEqualTypeOf<boolean>();
+    expectTypeOf<CapturedFiber['nextProps']>().toEqualTypeOf<unknown>();
+
+    const record: CapturedFiber = captured;
+    expect(record.hasAlternate).toBe(true);
+  });
+
+  it('types the deferred analysis as FiberDiff without its prop summaries', () => {
+    const memo: SummaryMemo = createSummaryMemo();
+    const options: CapturedFiberAnalysisOptions = { transitions: true, memo };
+    const analysis = analyzeCapturedFiber(captureFiber(makeTypedFiber()), options);
+
+    expectTypeOf(analyzeCapturedFiber).parameter(0).toEqualTypeOf<CapturedFiber>();
+    expectTypeOf(analyzeCapturedFiber)
+      .parameter(1)
+      .toEqualTypeOf<CapturedFiberAnalysisOptions | undefined>();
+    expectTypeOf(analysis).toEqualTypeOf<RenderAnalysis>();
+    // Exactly `FiberDiff` minus `propChanges`: the render path reads prop
+    // names only, and a member that drifted on one side and not the other
+    // would make the two analyses disagree about what a render carries.
+    expectTypeOf<keyof RenderAnalysis>().toEqualTypeOf<Exclude<keyof FiberDiff, 'propChanges'>>();
+    expectTypeOf<RenderAnalysis['hookChanges']>().toEqualTypeOf<HookChange[]>();
+    expectTypeOf<RenderAnalysis['contextChanges']>().toEqualTypeOf<ContextChange[]>();
+    expectTypeOf<RenderAnalysis['evaluable']>().toEqualTypeOf<DimensionEvaluability>();
+    expectTypeOf<RenderAnalysis['trigger']>().toEqualTypeOf<RenderTrigger>();
+    expectTypeOf<keyof CapturedFiberAnalysisOptions>().toEqualTypeOf<'transitions' | 'memo'>();
+    expectTypeOf(createSummaryMemo).returns.toEqualTypeOf<SummaryMemo>();
+    expectTypeOf<SummaryMemo['summaries']>().toEqualTypeOf<Map<unknown, ValueSummary>>();
+
+    expect(analysis.trigger).toBe('props');
+    expect(analysis.hookChanges[0]?.label).toBe('state');
+    expect(analysis.contextChanges[0]?.label).toBe('ShippingEta');
   });
 });

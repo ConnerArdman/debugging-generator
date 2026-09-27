@@ -85,6 +85,14 @@
  * | another path — or the same one, with a navigation recorded after it was received ({@link BrowserAgentRegistry.latestNavigationAt}: a reload, a load of the same URL) — and a new document for the bound origin reports within {@link EvaluateReadinessDeps.navigationSettleMs} | replaced: the new document's facts are judged |
  * | as above, and a new document reports from another origin | no page agent for the current document |
  * | as above, and nothing new reports within the bound | a same-document navigation: the report is kept |
+ * | no report on file for the bound tab, and its first report arrives within {@link EvaluateReadinessDeps.navigationSettleMs} for the bound origin | the first report's facts are judged |
+ * | no report on file, and none arrives within the bound (or it is for another origin) | no page agent for the current document |
+ *
+ * The last two rows exist because a tab is usually bound a moment before its
+ * page agent's `agent.ready` has been relayed: the panel binds on open, and the
+ * agent reports once the service worker has forwarded its announcement. Asking
+ * for a reload for a report that is already in flight would present a page
+ * that is about to report as one that never will (AAP §0.5.5).
  *
  * A mismatch alone never blocks. `tab.navigated` carries no document id — the
  * service worker derives commits from `chrome.tabs.onUpdated`, which names
@@ -100,6 +108,40 @@
  * aborted request, and backstopped like the reload wait. The collection
  * functions never wait: they record the report as observed, with a note when
  * it is not trusted on sight.
+ *
+ * ## A report taken before React registered
+ *
+ * The page agent announces `agent.ready` at `document_start`, before the
+ * application's bundle has run, so its first `reactDetected: false` is
+ * routinely a truthful "not yet" rather than "no React". The agent corrects it
+ * itself: it announces the same document again the moment React registers with
+ * its hook, with one re-check a second after install as a backstop. A tab is
+ * often bound — and the plan installed — while React is still loading, so
+ * judging that report as it stands would degrade the fiber-hook signals of a
+ * page that renders React, and the ✗ rows that degradation produces are final
+ * (AAP §0.5.5 reserves them for a signal that cannot be enabled: a page that
+ * has no React).
+ *
+ * So {@link evaluateReadiness} gives that re-check its window before it judges
+ * a report that found no React, when a fiber-hook signal is planned and the
+ * agent installed in time:
+ *
+ * | The settled report | Judgement |
+ * | --- | --- |
+ * | React found, installed late, or no fiber-hook signal planned | judged at once |
+ * | no React, received {@link EvaluateReadinessDeps.reactSettleMs} or longer ago | judged at once: the re-check has had its chance |
+ * | no React, received more recently, and the same document reports React before the window closes | the corrected report is judged |
+ * | as above, and a newer document on the bound page reports | that document is judged, within the same window |
+ * | as above, and nothing corrects it, the report leaves the binding, or the request aborts | judged as it stands: a page without React degrades |
+ *
+ * The re-check announces a document the registry already holds, and
+ * {@link BrowserAgentRegistry.waitForAgentReady} wakes only for another one,
+ * so the bound tab's latest report is read again every few milliseconds
+ * instead. The window is bounded ({@link DEFAULT_REACT_SETTLE_MS}, at most
+ * {@link MAX_REACT_SETTLE_MS}, `0` for none), measured from the report's
+ * receipt and never longer than the window from the moment the wait starts,
+ * so a report the page keeps repeating cannot extend it. The same window
+ * applies to the document reported after a one-click reload.
  *
  * ## The one-click reload
  *
@@ -271,6 +313,39 @@ export const DEFAULT_NAVIGATION_SETTLE_MS = 1_500;
 
 /** The ceiling an injected {@link EvaluateReadinessDeps.navigationSettleMs} is clamped to. */
 export const MAX_NAVIGATION_SETTLE_MS = 10_000;
+
+/**
+ * How long, in milliseconds from the receipt of the bound document's report,
+ * {@link evaluateReadiness} gives the page agent's own React re-check before
+ * it judges a report that found no React, when the caller injects nothing else
+ * (see "A report taken before React registered" in the module overview).
+ *
+ * The page agent announces `agent.ready` at `document_start`, where
+ * `reactDetected: false` is routinely a truthful "not yet": the application's
+ * bundle has not run. The agent announces the same document again the moment
+ * React registers with its hook (`watchForReact` in
+ * `packages/telemetry/src/browser/agent.ts`), backed by one re-check a second
+ * after it installed (`REACT_RECHECK_DELAY_MS` there). This window covers React
+ * registering within that second of the report, plus the relay from the page to
+ * the service; a registration later than that was already announced before an
+ * evaluation that starts later.
+ */
+export const DEFAULT_REACT_SETTLE_MS = 1_500;
+
+/** The ceiling an injected {@link EvaluateReadinessDeps.reactSettleMs} is clamped to. */
+export const MAX_REACT_SETTLE_MS = 10_000;
+
+/**
+ * How often the bound tab's latest report is read again while the React
+ * re-check is awaited, in milliseconds.
+ *
+ * The registry wakes a wait only for a *different* document
+ * ({@link BrowserAgentRegistry.waitForAgentReady}), and the re-check announces
+ * the same document again, so no port call can await it. Reading the in-memory
+ * report is a map lookup; this step is what bounds how late the re-check is
+ * noticed.
+ */
+const REACT_SETTLE_STEP_MS = 50;
 
 /**
  * Grace added to this module's own backstop timer around
@@ -614,6 +689,28 @@ export interface ReadinessVerdict {
 
   /** Whether this evaluation emitted the reload request. */
   readonly reloadRequested: boolean;
+
+  /**
+   * The planned browser signals held back **only** by the page gate, in
+   * capture-signal vocabulary order: no Chrome tab is bound to the session
+   * yet, or one is bound but no page agent has reported for its current
+   * document, or the one that did was installed after the page began loading
+   * (`installedBeforeReact` false). Each also appears in {@link blocking},
+   * with the gate's own reason and hint.
+   *
+   * These are the signals the page itself clears without any other change —
+   * the panel binding its tab (`bind-tab`), the page agent's first report, or
+   * the `reload-page` remediation — so a caller can tell a signal that is
+   * waiting for the page from one that cannot be enabled. The session stays
+   * `instrumenting` while any is listed (AAP §0.7.1 Group 2), so such a signal
+   * is waiting, not failed, and is never presented as a failure (AAP §0.5.5):
+   * the gate's own words say what the developer can do.
+   *
+   * Omitted when no signal is held back that way, so the verdict keeps no
+   * empty or `undefined`-valued key and a verdict built without it stays
+   * valid.
+   */
+  readonly awaitingPageSignals?: readonly CaptureSignal[];
 }
 
 // ---------------------------------------------------------------------------
@@ -738,11 +835,23 @@ export interface EvaluateReadinessDeps {
 
   /**
    * How long to wait, in milliseconds, for the document that replaced a report
-   * whose page no longer matches the binding's URL. Default
+   * whose page no longer matches the binding's URL — and, when the bound tab
+   * has no report on file, for its first one. Default
    * {@link DEFAULT_NAVIGATION_SETTLE_MS}, clamped to
-   * {@link MAX_NAVIGATION_SETTLE_MS}; `0` does not wait, and the report is kept.
+   * {@link MAX_NAVIGATION_SETTLE_MS}; `0` does not wait, and the report is kept
+   * (or, with none on file, the page agent is read as absent at once).
    */
   readonly navigationSettleMs?: number | undefined;
+
+  /**
+   * How long after the receipt of the bound document's report to wait, in
+   * milliseconds, for the page agent's own React re-check when that report
+   * found no React and a fiber-hook signal is planned (see "A report taken
+   * before React registered" in the module overview). Default
+   * {@link DEFAULT_REACT_SETTLE_MS}, clamped to {@link MAX_REACT_SETTLE_MS};
+   * `0` judges the report as it stands.
+   */
+  readonly reactSettleMs?: number | undefined;
 
   /**
    * The documents already asked about, across calls. Absent, the request is
@@ -1583,6 +1692,8 @@ interface PassOutcome {
   readonly degraded: readonly UnavailableSignal[];
   readonly remediations: readonly ReadinessRemediation[];
   readonly deliverable: readonly CaptureSignal[];
+  /** The signals the page gate (`no-tab`, `no-agent`, `hook-late`) blocks, in plan order. */
+  readonly awaitingPage: readonly CaptureSignal[];
   readonly observed: ObservedReadinessInputs;
   readonly reload?: ReloadAsk;
 }
@@ -2010,6 +2121,7 @@ async function evaluatePass(input: PassInput): Promise<PassOutcome> {
   let degraded: UnavailableSignal[] = [];
   const deliverable: CaptureSignal[] = [];
   const serverGapSignals: CaptureSignal[] = [];
+  const awaitingPage: CaptureSignal[] = [];
   let tabMissing = false;
   let reload: ReloadAsk | undefined;
 
@@ -2034,10 +2146,15 @@ async function evaluatePass(input: PassInput): Promise<PassOutcome> {
 
     if (isBlockingGate(gate)) {
       blocking.push(gateEntry(signal, gate, browserAgent));
+      // Waiting for the page — a tab to be bound, or the bound tab's page to
+      // report (again, after a reload) — which clears it with no other change.
+      awaitingPage.push(signal);
 
       if (gate === 'no-tab') {
         tabMissing = true;
-      } else if (boundTab !== undefined && reload === undefined) {
+      }
+
+      if (gate !== 'no-tab' && boundTab !== undefined && reload === undefined) {
         const documentId = gate === 'hook-late' ? browserAgent?.documentId : undefined;
         const reason =
           gate === 'hook-late'
@@ -2121,6 +2238,7 @@ async function evaluatePass(input: PassInput): Promise<PassOutcome> {
     degraded,
     remediations,
     deliverable,
+    awaitingPage,
     observed,
     ...(reload === undefined ? {} : { reload }),
   };
@@ -2130,9 +2248,11 @@ async function evaluatePass(input: PassInput): Promise<PassOutcome> {
  * An injected wait, clamped: `fallback` when nothing usable was injected (absent,
  * not finite, or negative), `0` to not wait at all, whole milliseconds, and
  * never above `ceiling`. Used for {@link EvaluateReadinessDeps.reloadWaitMs}
- * ({@link DEFAULT_RELOAD_WAIT_MS}, {@link MAX_RELOAD_WAIT_MS}) and
+ * ({@link DEFAULT_RELOAD_WAIT_MS}, {@link MAX_RELOAD_WAIT_MS}),
  * {@link EvaluateReadinessDeps.navigationSettleMs}
- * ({@link DEFAULT_NAVIGATION_SETTLE_MS}, {@link MAX_NAVIGATION_SETTLE_MS}).
+ * ({@link DEFAULT_NAVIGATION_SETTLE_MS}, {@link MAX_NAVIGATION_SETTLE_MS}) and
+ * {@link EvaluateReadinessDeps.reactSettleMs}
+ * ({@link DEFAULT_REACT_SETTLE_MS}, {@link MAX_REACT_SETTLE_MS}).
  */
 function resolveWaitMs(value: number | undefined, fallback: number, ceiling: number): number {
   if (value === undefined || !Number.isFinite(value) || value < 0) {
@@ -2201,11 +2321,15 @@ function askForReload(
 }
 
 /** What one bounded wait for a tab's next `agent.ready` is about. */
-interface NextAgentReadyWait {
+export interface NextAgentReadyWait {
   /** The tab whose next report is awaited. */
   readonly tabId: number;
 
-  /** The document already known; only a report for another document answers. */
+  /**
+   * The document already known; only a report for another document answers.
+   * `undefined` when none is known, so the tab's current report — or, with
+   * none on file, its first — answers.
+   */
   readonly afterDocumentId: string | undefined;
 
   /** The port's deadline, in milliseconds; `0` does not wait at all. */
@@ -2219,8 +2343,9 @@ interface NextAgentReadyWait {
 }
 
 /**
- * Waits, bounded, for a tab's next `agent.ready` — the one wait behind both the
- * navigation settle ({@link settleCurrentDocument}) and the reload.
+ * Waits, bounded, for a tab's next `agent.ready` — the one wait behind the
+ * navigation settle ({@link settleCurrentDocument}), the reload, and the
+ * instrumentation service's later refresh of its signal report.
  *
  * The port is asked for the next report whose document differs from
  * `afterDocumentId`. Its promise is raced against a backstop timer that fires
@@ -2228,8 +2353,24 @@ interface NextAgentReadyWait {
  * abort signal, and a rejection is contained — so this never waits longer than
  * the stated bound and never throws. The timer and listener are always
  * released.
+ *
+ * Exported so `./service.ts` waits for a page exactly as this module does,
+ * rather than keeping a second backstop of its own.
+ *
+ * @param agents The relayed page-agent reports.
+ * @param wait The tab, the known document, the bound and the abort signal.
+ * @param log Where a rejecting port is noted, by the error's closed shape only.
+ * @returns The report that answered, or `undefined` for none within the bound.
+ *
+ * @example
+ * ```ts
+ * const next = await waitForNextAgentReady(agents, {
+ *   tabId, afterDocumentId: undefined, timeoutMs: 1_500, signal,
+ *   failureMessage: 'Waiting for the page agent failed',
+ * }, log);
+ * ```
  */
-async function waitForNextAgentReady(
+export async function waitForNextAgentReady(
   agents: BrowserAgentRegistry,
   wait: NextAgentReadyWait,
   log: Logger,
@@ -2320,6 +2461,70 @@ interface CurrentDocumentCheck {
 }
 
 /**
+ * Waits, for at most `settleMs` plus the backstop grace, for the first report
+ * of a bound tab that has none on file — the order a panel's bind and its page
+ * agent's `agent.ready` usually arrive in.
+ *
+ * The registry is asked with no known document, so it answers with the tab's
+ * current report at once when one has meanwhile arrived, and otherwise with the
+ * first one to arrive ({@link waitForNextAgentReady}).
+ *
+ * - A report for the bound tab and origin ({@link describesBoundDocument}) is
+ *   the current document. It is stamped with the registry's receipt time when
+ *   the registry holds that document, else with the clock.
+ * - A report for another origin is a document the binding does not cover, and
+ *   one for another tab says nothing about this one: no page agent is known,
+ *   exactly as {@link readBoundTabAgent} reads either.
+ * - Nothing within the bound — a zero wait, an aborted request, a timeout, a
+ *   port that rejects or never answers — leaves the page agent absent, and the
+ *   page gate asks for the reload as before.
+ *
+ * Never throws, and never waits longer than the stated bound.
+ */
+async function awaitFirstReport(
+  check: CurrentDocumentCheck,
+): Promise<ObservedBrowserAgent | undefined> {
+  const { agents, boundTab, settleMs, signal, clock, log } = check;
+  const waited = settleMs > 0 && signal?.aborted !== true;
+  const first = await waitForNextAgentReady(
+    agents,
+    {
+      tabId: boundTab.tabId,
+      afterDocumentId: undefined,
+      timeoutMs: settleMs,
+      signal,
+      failureMessage: 'Waiting for the first page-agent report of the bound tab failed',
+    },
+    log,
+  );
+
+  if (first === undefined) {
+    log.debug('No page agent reported for the bound tab while readiness settled', {
+      tabId: boundTab.tabId,
+      waited,
+    });
+    return undefined;
+  }
+
+  if (!describesBoundDocument(first, boundTab)) {
+    log.debug('The first report for the bound tab is outside the binding; no current report', {
+      tabId: boundTab.tabId,
+    });
+    return undefined;
+  }
+
+  log.debug('The bound tab reported its first document while readiness settled', {
+    tabId: boundTab.tabId,
+    ...documentLogFields(first.documentId),
+  });
+
+  return toObservedBrowserAgent(
+    first,
+    receivedAtOf(agents, boundTab.tabId, first.documentId) ?? clock(),
+  );
+}
+
+/**
  * Confirms that the report readiness is about to judge is the bound tab's
  * current document (see "The current document" in the module overview).
  *
@@ -2342,6 +2547,10 @@ interface CurrentDocumentCheck {
  *   read as a navigation that stayed within one document (the history API),
  *   and the original report is kept.
  *
+ * With **no report on file** for the bound tab, the tab's first report is
+ * awaited for the same bound instead ({@link awaitFirstReport}), so a report
+ * already being relayed is judged rather than answered with a reload request.
+ *
  * Never throws, and never waits longer than the stated bound.
  */
 async function settleCurrentDocument(
@@ -2349,7 +2558,11 @@ async function settleCurrentDocument(
 ): Promise<ObservedBrowserAgent | undefined> {
   const { agents, boundTab, agent, settleMs, signal, clock, log } = check;
 
-  if (agent === undefined || isTrustedOnSight(agents, agent, boundTab)) {
+  if (agent === undefined) {
+    return awaitFirstReport(check);
+  }
+
+  if (isTrustedOnSight(agents, agent, boundTab)) {
     return agent;
   }
 
@@ -2387,6 +2600,162 @@ async function settleCurrentDocument(
     next,
     receivedAtOf(agents, boundTab.tabId, next.documentId) ?? clock(),
   );
+}
+
+/** What {@link awaitReactRecheck} gives its window to, and with what. */
+interface ReactRecheck {
+  readonly agents: BrowserAgentRegistry;
+  readonly boundTab: BoundTab;
+  /** The report the page gate is about to judge — the settled current document. */
+  readonly agent: ObservedBrowserAgent;
+  /** The planned page-agent signals; only a fiber-hook signal among them makes the wait worth it. */
+  readonly browserSignals: ReadonlySet<CaptureSignal>;
+  /** The resolved {@link EvaluateReadinessDeps.reactSettleMs}. */
+  readonly settleMs: number;
+  readonly signal: AbortSignal | undefined;
+  readonly clock: () => number;
+  readonly log: Logger;
+}
+
+/**
+ * Whether a report is one the page agent's React re-check may still correct,
+ * and whose correction would change the verdict: the agent installed in time,
+ * found no React, and a planned fiber-hook signal would be degraded for it
+ * ({@link browserGateFor}'s `react-absent`). A late install is judged by the
+ * late-install gate whatever React's state, so it is never waited on.
+ */
+function awaitsReactRecheck(
+  agent: ObservedBrowserAgent,
+  browserSignals: ReadonlySet<CaptureSignal>,
+): boolean {
+  if (!agent.installedBeforeReact || agent.reactDetected) {
+    return false;
+  }
+
+  for (const signal of browserSignals) {
+    if (FIBER_HOOK_SIGNALS.has(signal)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Resolves after `ms`, or at once when `signal` aborts. The timer and the abort
+ * listener are always released, so an abandoned wait leaves nothing scheduled.
+ */
+function pause(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise<void>((resolve) => {
+    // Called only once the timer below exists: by the timer itself or by the
+    // abort listener registered after it.
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+
+    signal?.addEventListener('abort', finish, { once: true });
+  });
+}
+
+/**
+ * Whether `signal` has aborted. Read through a call so a check made after an
+ * `await` is not narrowed away by one made before it.
+ */
+function hasAborted(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true;
+}
+
+/**
+ * Gives the page agent's own React re-check its window before a report that
+ * found no React is judged (see "A report taken before React registered" in
+ * the module overview).
+ *
+ * The window is `settleMs` from the report's receipt, and never longer than
+ * `settleMs` from now: a report received that long ago has had its re-check,
+ * and one the page keeps repeating cannot stretch the wait. Within it the bound
+ * tab's latest report is read every {@link REACT_SETTLE_STEP_MS}; the wait
+ * counts its own steps rather than reading the injected clock, so it ends on
+ * time even under a clock that does not advance.
+ *
+ * - The same document reporting React ends the wait with that report.
+ * - A newer document on the bound page ({@link isTrustedOnSight}) replaces the
+ *   subject, and the wait continues for it within the same window.
+ * - A report the binding no longer covers, one no longer trusted on sight, or
+ *   an unreadable registry ends the wait with the report already settled on:
+ *   the verdict is then what it would have been without the wait.
+ * - An abort ends it the same way, at once.
+ *
+ * Never throws, and never waits longer than `settleMs`.
+ *
+ * @returns The report to judge: the corrected one, a newer document's, or the
+ *   original.
+ */
+async function awaitReactRecheck(check: ReactRecheck): Promise<ObservedBrowserAgent> {
+  const { agents, boundTab, browserSignals, settleMs, signal, clock, log } = check;
+  let subject = check.agent;
+
+  if (settleMs <= 0 || hasAborted(signal) || !awaitsReactRecheck(subject, browserSignals)) {
+    return subject;
+  }
+
+  const windowMs = Math.min(settleMs, subject.observedAt + settleMs - clock());
+
+  if (!(windowMs > 0)) {
+    log.debug('The page agent found no React and its re-check window has passed', {
+      tabId: boundTab.tabId,
+      ...documentLogFields(subject.documentId),
+    });
+    return subject;
+  }
+
+  const steps = Math.ceil(windowMs / REACT_SETTLE_STEP_MS);
+  let waitedMs = 0;
+  let ending: 'confirmed' | 'lapsed' | 'unbound' | 'untrusted' | 'aborted' = 'lapsed';
+
+  for (let step = 0; step < steps; step += 1) {
+    const stepMs = Math.min(REACT_SETTLE_STEP_MS, windowMs - waitedMs);
+
+    await pause(stepMs, signal);
+    waitedMs += stepMs;
+
+    if (hasAborted(signal)) {
+      ending = 'aborted';
+      break;
+    }
+
+    const latest = readBoundTabAgent(agents, boundTab, clock, [], log);
+
+    if (latest === undefined) {
+      ending = 'unbound';
+      break;
+    }
+
+    if (latest.documentId !== subject.documentId && !isTrustedOnSight(agents, latest, boundTab)) {
+      ending = 'untrusted';
+      break;
+    }
+
+    subject = latest;
+
+    if (!awaitsReactRecheck(subject, browserSignals)) {
+      ending = 'confirmed';
+      break;
+    }
+  }
+
+  log.debug("Gave the page agent's React re-check its window", {
+    tabId: boundTab.tabId,
+    ...documentLogFields(subject.documentId),
+    ending,
+    waitedMs,
+    reactDetected: subject.reactDetected,
+    installedBeforeReact: subject.installedBeforeReact,
+  });
+
+  return subject;
 }
 
 /** Validates an evaluation request. */
@@ -2470,12 +2839,20 @@ function checkEvaluateRequest(request: EvaluateReadinessRequest): Result<void, D
  *    {@link EvaluateReadinessDeps.navigationSettleMs} and, when one reports,
  *    its facts are the ones judged; when none does, the navigation stayed
  *    within one document and the report is kept (see "The current document"
- *    in the module overview).
+ *    in the module overview). With no report on file at all, the tab's first
+ *    report is awaited for the same bound, so one already being relayed is
+ *    judged instead of being answered with a reload request. A settled report
+ *    that found no React, from an agent installed in time, while a fiber-hook
+ *    signal is planned, is judged only after the page agent's own React
+ *    re-check has had {@link EvaluateReadinessDeps.reactSettleMs} from its
+ *    receipt (see "A report taken before React registered").
  * 4. **Gates** apply as the module overview's table states: a missing binding,
  *    a missing page agent and a page agent installed late
  *    (`installedBeforeReact` false) block every planned browser signal; a
  *    missing preload, a page without React and every adapter-reported gap
  *    degrade; nothing deliverable at all blocks.
+ *    The signals these page gates hold back are also listed as
+ *    {@link ReadinessVerdict.awaitingPageSignals}.
  * 5. **The reload.** When a page gate blocks and the request allows it, one
  *    `running` row carrying {@link RELOAD_REQUEST_MESSAGE} is emitted — at
  *    most once per document — the next `agent.ready` is awaited for a bounded
@@ -2536,22 +2913,49 @@ export async function evaluateReadiness(
     log,
   });
 
-  const initialAgent =
-    boundTab === undefined
-      ? undefined
-      : await settleCurrentDocument({
+  const reactSettleMs = resolveWaitMs(
+    deps.reactSettleMs,
+    DEFAULT_REACT_SETTLE_MS,
+    MAX_REACT_SETTLE_MS,
+  );
+
+  // A report that found no React is judged only once the page agent's own
+  // React re-check has had its window (see "A report taken before React
+  // registered" in the module overview).
+  const afterReactRecheck = async (
+    agent: ObservedBrowserAgent | undefined,
+  ): Promise<ObservedBrowserAgent | undefined> =>
+    agent === undefined || boundTab === undefined
+      ? agent
+      : awaitReactRecheck({
           agents: deps.agents,
           boundTab,
-          agent: readBoundTabAgent(deps.agents, boundTab, clock, [], log),
-          settleMs: resolveWaitMs(
-            deps.navigationSettleMs,
-            DEFAULT_NAVIGATION_SETTLE_MS,
-            MAX_NAVIGATION_SETTLE_MS,
-          ),
+          agent,
+          browserSignals: planned.browser,
+          settleMs: reactSettleMs,
           signal: request.signal,
           clock,
           log,
         });
+
+  const initialAgent =
+    boundTab === undefined
+      ? undefined
+      : await afterReactRecheck(
+          await settleCurrentDocument({
+            agents: deps.agents,
+            boundTab,
+            agent: readBoundTabAgent(deps.agents, boundTab, clock, [], log),
+            settleMs: resolveWaitMs(
+              deps.navigationSettleMs,
+              DEFAULT_NAVIGATION_SETTLE_MS,
+              MAX_NAVIGATION_SETTLE_MS,
+            ),
+            signal: request.signal,
+            clock,
+            log,
+          }),
+        );
   let outcome = await evaluatePass(passInput(initialAgent));
   let reloadRequested = false;
 
@@ -2586,7 +2990,11 @@ export async function evaluateReadiness(
         tabId: boundTab.tabId,
         ...documentLogFields(next.documentId),
       });
-      outcome = await evaluatePass(passInput(toObservedBrowserAgent(next, clock())));
+      // The reloaded document reports at `document_start` too, so its answer
+      // about React gets the same window as the first document's.
+      outcome = await evaluatePass(
+        passInput(await afterReactRecheck(toObservedBrowserAgent(next, clock()))),
+      );
     } else {
       log.info('No new page-agent report arrived after the reload request', {
         tabId: boundTab.tabId,
@@ -2605,6 +3013,7 @@ export async function evaluateReadiness(
     evaluatedAt: clock(),
     observed: outcome.observed,
     reloadRequested,
+    ...(outcome.awaitingPage.length === 0 ? {} : { awaitingPageSignals: outcome.awaitingPage }),
   };
 
   if (verdict.satisfied && request.announceReady !== false && deps.progress !== undefined) {

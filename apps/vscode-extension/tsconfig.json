@@ -7,7 +7,7 @@
 
   "// compilerOptions.emit": "`composite` with declaration-only emit into the base's `${configDir}/.tsbuild` paths; tsconfig.webview.json moves its output and stamp to .tsbuild/webview, so the two projects never share either. tsc never writes dist/: esbuild.mjs and `vite build` own it, and the VSIX ships it.",
 
-  "// compilerOptions.rootDir": "\".\" because the inputs span src/, test/ and vite.config.ts; \"src\" would reject the last two (TS6059).",
+  "// compilerOptions.rootDir": "\".\" because the inputs span src/, test/ and vite.config.mts; \"src\" would reject the last two (TS6059).",
 
   "// compilerOptions.lib": "ES2023 only, the base's set restated so the host boundary is explicit: `window`, `document` and the other DOM globals do not type-check in host code. `lib` replaces the inherited array, so the webview project names ES2023 again beside DOM.",
 
@@ -19,7 +19,7 @@
 
   "// compilerOptions.not-set": "No `paths`/`baseUrl`: workspace packages resolve through the pnpm symlink and each package's `exports` map. esbuild follows its runtime conditions into dist/; tsc follows its source-first `types` condition to src/ (docs/ARCHITECTURE.md §3).",
 
-  "// include": "src/**/*.ts (host modules and their colocated Vitest suites), test/**/*.ts (the @vscode/test-cli suites, type-checked here, bundled by esbuild.mjs and run in a real editor rather than by Vitest) and vite.config.ts. esbuild.mjs and .vscode-test.mjs are plain ESM: linted, never compiled.",
+  "// include": "src/**/*.ts (host modules and their colocated Vitest suites), test/**/*.ts (the @vscode/test-cli suites, type-checked here, bundled by esbuild.mjs and run in a real editor rather than by Vitest) and vite.config.mts, which is `.mts` so that it is ESM under this CommonJS package manifest (see its header). esbuild.mjs and .vscode-test.mjs are plain ESM: linted, never compiled.",
 
   "// exclude": "`exclude` replaces the base list, so dist, .tsbuild and node_modules are repeated. src/webview/** belongs to the webview project alone. src/webview-messages.ts is deliberately in both projects: it is the environment-neutral message union both halves import, and each project emits it into its own directory, so do not relocate or duplicate it. test/fixtures/** is a workspace the suites open at runtime, not program input; .vscode-test is @vscode/test-electron's working directory.",
 
@@ -43,7 +43,7 @@
     "types": ["node", "vscode"]
   },
 
-  "include": ["src/**/*.ts", "test/**/*.ts", "vite.config.ts"],
+  "include": ["src/**/*.ts", "test/**/*.ts", "vite.config.mts"],
 
   "exclude": [
     "src/webview/**",

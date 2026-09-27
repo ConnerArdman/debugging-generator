@@ -16,7 +16,13 @@
 services:
   postgres:
     image: postgres:18.6-alpine
-    container_name: ${POSTGRES_CONTAINER_NAME:-debuggen-postgres}
+    # Deliberately no `container_name:`. Compose names the container
+    # `<project>-postgres-1` and the volume `<project>_postgres-data`, where the
+    # project is the checkout directory's name unless COMPOSE_PROJECT_NAME
+    # overrides it, so every checkout or worktree gets its own container and its
+    # own volume. A fixed name would make a second checkout's `pnpm demo:db` fail
+    # on a name conflict; running one side by side needs only its own
+    # POSTGRES_PORT.
     restart: unless-stopped
     # Stock image defaults: no `command:` override and no server tuning (such as
     # shared_buffers, work_mem, fsync or planner settings), so the query timings

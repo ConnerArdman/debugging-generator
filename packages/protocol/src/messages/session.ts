@@ -175,7 +175,7 @@ import type { DebuggenError, Result, SessionId } from '@debuggen/shared';
 
 import { analysisResultSchema } from '../analysis.js';
 import type { AnalysisResult } from '../analysis.js';
-import { followUpAttemptIdSchema, sessionRecordSchema } from '../session-record.js';
+import { followUpAttemptIdSchema, questionSchema, sessionRecordSchema } from '../session-record.js';
 import type { SessionRecord } from '../session-record.js';
 import { protocolParseError } from '../version.js';
 
@@ -214,14 +214,19 @@ const MAX_ID_LENGTH = 64;
 const MAX_PATH_LENGTH = 4096;
 
 /**
- * The longest single-field text this module will accept, in characters: a
- * developer's question, or a progress message the service composed.
+ * The longest progress `message` this module will accept, in characters: a line
+ * the service composed.
  *
- * Two thousand characters is several paragraphs — room for a question that
- * quotes an error and for a progress line that names what a stage found — and
- * far below the point where a field becomes a way to push a payload into the
- * store or a prompt. The bound is on the *transport*; a stage that needs to say
- * more says it in {@link MAX_DETAIL_LENGTH} characters of `detail`.
+ * Two thousand characters is several paragraphs — room for a progress line that
+ * names what a stage found — and far below the point where a field becomes a way
+ * to push a payload into the store or a user interface. The bound is on the
+ * *transport*; a stage that needs to say more says it in
+ * {@link MAX_DETAIL_LENGTH} characters of `detail`.
+ *
+ * A developer's question is **not** bounded here. The request bodies below embed
+ * `../session-record.ts`'s `questionSchema`, whose `MAX_QUESTION_LENGTH` is the
+ * product's one question limit, so the routes, the stored record and the
+ * editor's text areas cannot disagree about it.
  */
 const MAX_TEXT_LENGTH = 2000;
 
@@ -701,13 +706,16 @@ export const sessionCreateRequestSchema = z.strictObject({
    * no part of this product inspects it for a phrase, and a schema that tried to
    * classify it here would be the first step towards exactly the hardcoded
    * behaviour AAP §0.5.4 forbids.
+   *
+   * The imported {@link questionSchema} itself — the rule the stored
+   * `SessionRecord.question` is held to — so a body this route accepts is one
+   * the record accepts too: at most `MAX_QUESTION_LENGTH` characters, at least
+   * one of them not whitespace, and no control character but tab and line
+   * breaks. A blank or control-character question is refused here, as a 400
+   * naming the field, rather than accepted and failing once the session is
+   * written.
    */
-  question: z
-    .string()
-    .min(1, { error: 'expected a non-empty question' })
-    .max(MAX_TEXT_LENGTH, {
-      error: `expected a question of at most ${String(MAX_TEXT_LENGTH)} characters`,
-    }),
+  question: questionSchema,
 
   /**
    * The element the developer had already selected, when they had.
@@ -754,9 +762,9 @@ export type SessionCreateRequest = z.infer<typeof sessionCreateRequestSchema>;
  * The session is named in the route, and everything else the follow-up needs is
  * already stored — the prior understanding, the plan, the latest capture summary,
  * the latest analysis and panel. So the body is what only the asking client can
- * supply: the question, bounded exactly as {@link sessionCreateRequestSchema}'s
- * `question` is, by the same constant, because it is the same kind of value —
- * and the identity of the attempt.
+ * supply: the question, validated exactly as {@link sessionCreateRequestSchema}'s
+ * `question` is, by the same imported `questionSchema`, because it is the same
+ * kind of value — and the identity of the attempt.
  *
  * What happens next is the service's decision and not this shape's: the
  * follow-up stage either re-derives an answer from the stored capture
@@ -782,13 +790,12 @@ export type SessionCreateRequest = z.infer<typeof sessionCreateRequestSchema>;
  * place — it is always a new follow-up.
  */
 export const sessionQuestionRequestSchema = z.strictObject({
-  /** The follow-up question, in the developer's own words. */
-  question: z
-    .string()
-    .min(1, { error: 'expected a non-empty question' })
-    .max(MAX_TEXT_LENGTH, {
-      error: `expected a question of at most ${String(MAX_TEXT_LENGTH)} characters`,
-    }),
+  /**
+   * The follow-up question, in the developer's own words: the imported
+   * {@link questionSchema}, which also validates the `followUps[].question` the
+   * service stores from it.
+   */
+  question: questionSchema,
 
   /**
    * The identity of this ask: fresh for a new question, the failed attempt's

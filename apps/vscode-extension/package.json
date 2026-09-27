@@ -66,13 +66,15 @@
         "command": "debuggen.startCapture",
         "title": "Start Capture",
         "category": "Debug Generator",
-        "icon": "$(debug-start)"
+        "icon": "$(debug-start)",
+        "enablement": "debuggen.captureCanStart"
       },
       {
         "command": "debuggen.stopCapture",
         "title": "Stop Capture",
         "category": "Debug Generator",
-        "icon": "$(debug-stop)"
+        "icon": "$(debug-stop)",
+        "enablement": "debuggen.captureCanStop"
       },
       {
         "command": "debuggen.endSession",
@@ -185,12 +187,18 @@
             "deterministic"
           ],
           "enumDescriptions": [
-            "Use the hosted Anthropic model provider. Requires ANTHROPIC_API_KEY in the environment of the coordination service.",
+            "Use the hosted Anthropic model provider. Requires ANTHROPIC_API_KEY in the environment VS Code was started from, which the bundled service inherits, and a model id in the debuggen.model setting or an inherited DEBUGGEN_MODEL.",
             "Use the rules-based provider, which runs entirely offline, sends nothing off the machine, and is what the automated tests use."
           ],
-          "default": "anthropic",
+          "default": "deterministic",
           "scope": "machine-overridable",
-          "markdownDescription": "Model provider the coordination service reasons with. This value is forwarded as `DEBUGGEN_PROVIDER` when this extension starts the bundled service."
+          "markdownDescription": "Model provider the coordination service reasons with. This value is forwarded as `DEBUGGEN_PROVIDER` when this extension starts the bundled service. The default, `deterministic`, needs no account and sends nothing off the machine; `anthropic` also needs `ANTHROPIC_API_KEY` in the environment VS Code was started from and a model id in `#debuggen.model#`."
+        },
+        "debuggen.model": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Model id the `anthropic` provider calls. This value is forwarded as `DEBUGGEN_MODEL` when this extension starts the bundled service; the `deterministic` provider ignores it. Leave it empty to keep a `DEBUGGEN_MODEL` inherited from the editor's environment. No model id is built in: with `anthropic` selected and no model here or in that environment, the service does not start and names `DEBUGGEN_MODEL`. The API key is never a setting: `ANTHROPIC_API_KEY` comes only from the environment VS Code was started from."
         }
       }
     }

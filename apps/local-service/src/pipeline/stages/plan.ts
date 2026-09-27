@@ -44,14 +44,26 @@
  *
  * ## Partially infeasible plans
  *
- * Feasibility is a report, not a filter. When some actions are feasible the
- * plan is recorded and installed **as validated**, infeasible actions included:
- * the installer runs the same gate before writing a byte, turns every refusal
- * into an `UnavailableSignal`, and the instrumentation service renders AAP
- * §0.5.5's sentence ("Could not enable ‹signal›: ‹reason›. Continuing with: …")
- * through `buildDegradationNotice`. Only a plan with **no** feasible action is
- * treated as rejected. The {@link FeasibilityReport} travels out on the result
- * either way so the orchestrator and both user interfaces can show it.
+ * Feasibility is the last step of the gate, and its verdict decides what the
+ * plan version **is**. The plan recorded on the session and handed to the
+ * installer holds only the actions `checkPlanFeasibility` accepted, in authored
+ * order; every refused action — a call site spelled as a symbol, a React render
+ * function, a file the index does not hold — is left out before anything is
+ * recorded, so no plan version ever names an action nothing can install and no
+ * install reports a planning mistake as a signal that "could not be enabled".
+ * The refusals are logged by code and count ({@link OMITTED_ACTIONS_LOG}) and
+ * travel out, with the accepted actions, on the result's
+ * {@link FeasibilityReport}.
+ *
+ * One exception keeps a follow-up additive (AAP §0.4.2, "never removing
+ * installed ones"): an action the previous plan version already installed —
+ * matched by `actionIdentityKey` against `previousActions` — stays in the new
+ * version even when its re-check refuses it. It is not installed again (the
+ * service installs only the delta), and dropping it would make the plan ladder
+ * disagree with what the project holds.
+ *
+ * Only a plan with **no** feasible action is treated as rejected, and falls
+ * back.
  *
  * ## What this stage owns, and what it hands on
  *
@@ -289,7 +301,9 @@ export interface PlanGateOptions {
  * (AAP §0.5.3; partial infeasibility per AAP §0.5.5).
  *
  * - `accepted` — normalised, internally valid, and at least one action is
- *   feasible. Infeasible actions stay in the plan and in the report.
+ *   feasible. `plan` holds the feasible actions only (plus, on a follow-up,
+ *   the already-installed actions it restates); every refusal is on the
+ *   report, and the plan the report was computed over is not returned.
  * - `rejected` — the plan must not be used; `reason` says which gate refused
  *   it. For `'infeasible'` the normalised plan and its report are attached.
  * - `failed` — the gate itself could not run (an unusable instrumentation
@@ -419,7 +433,10 @@ export interface PlanStageResult {
   readonly promptVersion: string;
   /** How many repair attempts the model's answer needed. */
   readonly repairs: number;
-  /** The feasibility report of the recorded plan. */
+  /**
+   * The feasibility report the recorded plan was gated by: the actions it
+   * accepted and every action it refused, which the recorded plan leaves out.
+   */
   readonly feasibility: FeasibilityReport;
   /** `true` when the recorded plan is the runtime-only fallback. */
   readonly fallback: boolean;
@@ -488,6 +505,15 @@ const PRODUCT_DEFECT_LOG =
 
 /** Error record of a feasibility gate that could not run at all. Fields: error code. */
 const GATE_FAILED_LOG = 'The instrumentation feasibility gate could not run.';
+
+/**
+ * Info record of an accepted plan the gate removed refused actions from.
+ * Fields: stage, plan version, the omitted actions' counts by type and mode,
+ * their distinct rejection codes, how many actions were kept, and how many of
+ * those are restated already-installed actions whose re-check refused them.
+ */
+const OMITTED_ACTIONS_LOG =
+  'Left the planned instrumentation actions the feasibility gate refused out of the plan.';
 
 /** Warn record of an adapter whose proposal or readiness report could not be used. */
 const ADAPTER_SKIPPED_LOG = 'An adapter could not contribute to the plan stage; it was skipped.';
@@ -999,6 +1025,70 @@ function infeasibleError(feasibility: FeasibilityReport): DebuggenError {
   );
 }
 
+/** What {@link selectFeasibleActions} kept in, and left out of, one gated plan. */
+interface FeasibleSelection {
+  /** The plan to record: the gated plan itself, by reference, when nothing was left out. */
+  readonly plan: InstrumentationPlan;
+  /** The actions left out of it, in authored order. */
+  readonly omitted: readonly InstrumentationAction[];
+  /** How many refused actions were kept because the previous plan version installed them. */
+  readonly restated: number;
+}
+
+/**
+ * The plan version the gate hands on: the normalised plan narrowed to the
+ * actions the feasibility report accepted, in authored order.
+ *
+ * Membership is by reference, which is the report's own contract: its two
+ * arrays partition the actions it was given, each entry the input action
+ * itself. One refused action is kept all the same — one whose
+ * `actionIdentityKey` the previous plan version installed, so a follow-up
+ * version never drops an installed action (AAP §0.4.2). Only the first such
+ * restatement of an identity is kept, and never one a feasible action of the
+ * same identity already covers, so the result holds no duplicate.
+ *
+ * With nothing refused the plan is returned as it is, so a fully feasible plan
+ * is recorded exactly as it was validated.
+ *
+ * @param plan The internally valid, normalised plan.
+ * @param feasibility The report `checkPlanFeasibility` produced for it.
+ * @param previousActions The previous plan version's actions, on a follow-up.
+ * @returns The plan to record and what was left out of it.
+ */
+function selectFeasibleActions(
+  plan: InstrumentationPlan,
+  feasibility: FeasibilityReport,
+  previousActions: readonly InstrumentationAction[] | undefined,
+): FeasibleSelection {
+  if (feasibility.rejected.length === 0) {
+    return { plan, omitted: [], restated: 0 };
+  }
+
+  const accepted = new Set<InstrumentationAction>(feasibility.feasible);
+  const installed = new Set((previousActions ?? []).map((action) => actionIdentityKey(action)));
+  const keptKeys = new Set(feasibility.feasible.map((action) => actionIdentityKey(action)));
+  const kept: InstrumentationAction[] = [];
+  const omitted: InstrumentationAction[] = [];
+  let restated = 0;
+
+  for (const action of plan.instrumentationTargets) {
+    if (accepted.has(action)) {
+      kept.push(action);
+      continue;
+    }
+    const key = actionIdentityKey(action);
+    if (installed.has(key) && !keptKeys.has(key)) {
+      keptKeys.add(key);
+      kept.push(action);
+      restated += 1;
+      continue;
+    }
+    omitted.push(action);
+  }
+
+  return { plan: { ...plan, instrumentationTargets: kept }, omitted, restated };
+}
+
 /**
  * Steps 2–4 of AAP §0.5.3's gate for a plan whose authoring form has already
  * validated: **normalise → validate internally → check feasibility**, in that
@@ -1016,9 +1106,11 @@ function infeasibleError(feasibility: FeasibilityReport): DebuggenError {
  *   input's prose. This function never talks to a model, so nothing here can
  *   re-prompt.
  * - **Feasibility** (`checkPlanFeasibility`) returns its refusals as data. A
- *   plan with at least one feasible action is `accepted` with its infeasible
- *   actions left in place (the installer reports them as unavailable signals);
- *   a plan with none is `rejected` as `'infeasible'`.
+ *   plan with at least one feasible action is `accepted` **narrowed to its
+ *   feasible actions** ({@link selectFeasibleActions}: authored order kept, and
+ *   on a follow-up an already-installed action is never dropped); the refused
+ *   ones are logged by code and count and stay on the report. A plan with none
+ *   is `rejected` as `'infeasible'`.
  *
  * @param input The validated authoring input.
  * @param options The registry, the instrumentation context and the follow-up ids.
@@ -1106,7 +1198,23 @@ export function gateInstrumentationPlan(
       feasibility,
     };
   }
-  return { kind: 'accepted', plan, feasibility };
+
+  // Only what can be installed becomes the plan version; the report keeps the rest.
+  const selection = selectFeasibleActions(plan, feasibility, options.previousActions);
+  if (selection.omitted.length > 0) {
+    const omitted = new Set(selection.omitted);
+    log.info(OMITTED_ACTIONS_LOG, {
+      stage: PLAN_STAGE,
+      planVersion: context.planVersion,
+      omitted: countsByTypeAndMode(selection.omitted),
+      rejectionCodes: rejectionCodes(
+        feasibility.rejected.filter((refusal) => omitted.has(refusal.action)),
+      ),
+      kept: selection.plan.instrumentationTargets.length,
+      restated: selection.restated,
+    });
+  }
+  return { kind: 'accepted', plan: selection.plan, feasibility };
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1273,10 +1381,15 @@ export async function buildRuntimeOnlyFallbackPlan(
     return err(annotate(gated.error, { stage: PLAN_STAGE, fallback: true }));
   }
 
-  // Runtime-only is the whole point: a fallback may never patch a file.
-  const fileChanging = gated.plan.instrumentationTargets.filter(
-    (action) => action.mode !== RUNTIME_MODE,
-  );
+  // Runtime-only is the whole point: a fallback may never patch a file. Judged
+  // over everything normalisation produced — the report partitions it — rather
+  // than over the narrowed plan, so a registry that resolved an action to a
+  // file-changing mode is refused as the defect it is even when feasibility
+  // happened to refuse that action too.
+  const fileChanging = [
+    ...gated.feasibility.feasible,
+    ...gated.feasibility.rejected.map((refusal) => refusal.action),
+  ].filter((action) => action.mode !== RUNTIME_MODE);
   if (fileChanging.length > 0) {
     log.error(PRODUCT_DEFECT_LOG, {
       stage: PLAN_STAGE,

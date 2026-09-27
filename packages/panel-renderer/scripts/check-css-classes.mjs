@@ -91,6 +91,8 @@ export const PUBLISHED_CLASSES = Object.freeze({
     'free-standing inline progress indicator for a host surface (a connection pill, a pending control)',
   'dg-toolbar__spacer':
     'documented by layout/Toolbar.tsx for a bar a host composes by hand; the component never emits it',
+  'dg-truncate--capped':
+    'the capped single-line clip a host surface pairs with dg-truncate for a long value in a control row (the DevTools header target selector)',
 });
 
 /** The command that runs this check, quoted in every failure. */

@@ -85,14 +85,15 @@ export const metadata: Metadata = {
  * two screens whose emptiness is ordinary, and `tone="neutral"` keeps this page's reading
  * ordinary too. Everything that makes the block mean "you took a wrong turn" is the copy above.
  *
- * The block renders its heading as a paragraph by default, because the right level depends on the
- * page around it and the block appears at several different depths in this application. Here the
- * block IS the page, so its visible title is the page's title and `headingAs="h1"` makes it the
- * route's one real heading: it is reachable by heading navigation, and its role as the title is
- * conveyed programmatically rather than only by its size. Nothing moves - `BlankSlate.module.css`
- * states the heading class's margin, colour, size, weight and line height outright, and a
- * CSS-module class outranks the element rules in `app/globals.css` - and there is still exactly
- * one heading on the route, because the title is rendered once, in one place.
+ * The block renders its heading as an `h2` by default, and a caller states another level where the
+ * page around it calls for one, because the block appears at several different depths in this
+ * application. Here the block IS the page, so its visible title is the page's title and
+ * `headingAs="h1"` makes it the route's one real heading: it is reachable by heading navigation,
+ * and its role as the title is conveyed programmatically rather than only by its size. Nothing
+ * moves - `BlankSlate.module.css` states the heading class's margin, colour, size, weight and line
+ * height outright, and a CSS-module class outranks the element rules in `app/globals.css` - and
+ * there is still exactly one heading on the route, because the title is rendered once, in one
+ * place.
  *
  * The labelled `<section>` sits alongside that heading. The heading exposes the title; the section
  * gives this page's single block a named region a reader can jump to, and its name is the
@@ -104,11 +105,13 @@ export const metadata: Metadata = {
  *
  * The way out is an anchor, not a button: it navigates, and `Button` in this workspace is a
  * `<button>` with no link mode by design. It carries no class of its own - the utility set in
- * `app/globals.css` is closed and holds none for a link - so it inherits the block's primary ink
- * against the muted sentence above it and the one focus ring the application draws for keyboard
- * use. `.ls-actions` is the row it sits in, which would place any second destination beside it
- * rather than under it. Everything else this page might offer - the cart, orders, the dashboard -
- * is already one click away in the navigation row the layout renders above.
+ * `app/globals.css` is closed and holds none for a link - so the element baseline there styles it
+ * as an in-content link: the block's primary ink against the muted sentence above it, an
+ * underline that thickens under the pointer so it never reads as plain text, and the one focus
+ * ring the application draws for keyboard use. `.ls-actions` is the row it sits in, which would
+ * place any second destination beside it rather than under it. Everything else this page might
+ * offer - the cart, orders, the dashboard - is already one click away in the navigation row the
+ * layout renders above.
  */
 export default function NotFoundPage() {
   return (

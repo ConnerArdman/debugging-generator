@@ -164,6 +164,30 @@ const NOW = 1_700_000_000_000;
 /** A clock frozen at {@link NOW}. */
 const frozenClock = (): number => NOW;
 
+/**
+ * The editor command every default hint names, spelled as the VS Code command
+ * palette shows `debuggen.launchDevServer`: its contributed category and title
+ * (`apps/vscode-extension/package.json`). Restated rather than imported because
+ * a hint quoting any other spelling cannot be typed into the palette.
+ */
+const LAUNCH_DEV_SERVER_PALETTE_LABEL = 'Debug Generator: Launch Dev Server';
+
+/**
+ * Asserts that a hint carries no hand-typed preload command.
+ *
+ * The published specifier cannot be resolved from a target project, which
+ * declares no `@debuggen/*` dependency, and a bare `NODE_OPTIONS` line sets no
+ * ingest credential: a default hint quoting either is a command that fails, or
+ * runs and reports nothing (QA INT-F05).
+ *
+ * @param hint The hint.
+ */
+function expectNoHandTypedCommand(hint: string): void {
+  expect(hint).not.toContain(PRISMA_RELAUNCH_DEFAULTS.preloadSpecifier);
+  expect(hint).not.toContain('NODE_OPTIONS');
+  expect(hint).not.toContain('--import');
+}
+
 /* -------------------------------------------------------------------------------------------------
  * The indexing harness
  * ---------------------------------------------------------------------------------------------- */
@@ -1909,7 +1933,10 @@ describe('install', () => {
     expect((gap?.hint ?? '').length).toBeLessThanOrEqual(PRISMA_ADAPTER_LIMITS.maxMessageLength);
     expect(gap?.hint).not.toContain('\n');
     expect(gap?.hint).toContain(fixture.root);
-    expect(gap?.hint).toContain(PRISMA_RELAUNCH_DEFAULTS.preloadSpecifier);
+    // The one exact instruction this adapter can give unaided: the editor
+    // command, named as the VS Code palette labels it (QA INT-F05).
+    expect(gap?.hint).toContain(`"${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code`);
+    expectNoHandTypedCommand(gap?.hint ?? '');
 
     // Nothing is armed, because there is no process holding it - and the row
     // is renderable as the readiness row that shows the same words.
@@ -1926,23 +1953,69 @@ describe('install', () => {
     ).toBe(true);
   });
 
-  it('composes the relaunch line from the project own package manager', async () => {
+  it('names the editor command rather than a preload line the project cannot run', async () => {
     const result = await createPrismaAdapter().install(
       await plannedActions(fixture),
       contextFor({ project: fixture, readiness: preloadPresets(fixture).notConnected }),
     );
     const hint = result.unavailable[0]?.hint ?? '';
-    const packageManager = fixture.projectSummary.packageManager;
 
-    expect(packageManager).not.toBe('unknown');
-    expect(hint).toContain(packageManager);
-    expect(hint).toContain(PRISMA_RELAUNCH_DEFAULTS.devScript);
-
-    // One copy-pasteable instruction: a single line that names the preload
-    // specifier, the project and the command, and nothing a developer has to
-    // reassemble.
+    // A known package manager changes nothing: a command composed from it and
+    // the published specifier fails with ERR_MODULE_NOT_FOUND in a target that
+    // has no `@debuggen/*` dependency, and sets no ingest credential.
+    expect(fixture.projectSummary.packageManager).not.toBe('unknown');
+    expect(hint).toBe(
+      `Run "${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code for ${fixture.root}, which starts this project's dev server with the preload and a fresh ingest credential.`,
+    );
+    expectNoHandTypedCommand(hint);
+    expect(hint).not.toContain(`run ${PRISMA_RELAUNCH_DEFAULTS.devScript}`);
     expect(hint.split('\n')).toHaveLength(1);
-    expect(hint).toMatch(/--import/);
+  });
+
+  it('drops a project root that cannot be carried whole, never cutting or altering it', async () => {
+    const actions = await plannedActions(fixture);
+    const bound = PRISMA_ADAPTER_LIMITS.maxMessageLength;
+    const rootless = `Run "${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code, which starts this project's dev server with the preload and a fresh ingest credential.`;
+    // Longer than the whole bound, and a path whose bell a clamp would blank:
+    // either way, naming it would mean naming a path that is not the project's.
+    const roots = [`/${'r'.repeat(bound)}`, '/work/bell\u0007shop'];
+
+    for (const root of roots) {
+      const context: InstrumentationContext = {
+        ...contextFor({ project: fixture, readiness: {} }),
+        projectRoot: root,
+      };
+      const installed = await createPrismaAdapter().install(actions, context);
+      const report = await createPrismaAdapter().readiness(context);
+      const hints = [installed.unavailable[0]?.hint, report.signals[0]?.hint];
+
+      expect(readinessSchema.safeParse(report).success).toBe(true);
+
+      for (const hint of hints) {
+        expect(hint).toBe(rootless);
+        expect(hint?.endsWith('…')).toBe(false);
+      }
+    }
+
+    // The quiet-preload restart hint degrades the same way.
+    const longRoot = `/${'r'.repeat(bound)}`;
+    const stale = await createPrismaAdapter().install(actions, {
+      ...contextFor({
+        project: fixture,
+        readiness: {
+          serverAgent: {
+            connected: true,
+            projectRoot: longRoot,
+            lastHeartbeatAt: NOW - (PRISMA_ADAPTER_LIMITS.heartbeatStalenessMs + 5_000),
+          },
+        },
+      }),
+      projectRoot: longRoot,
+    });
+
+    expect(stale.unavailable[0]?.hint).toBe(
+      `Restart this project's dev server with "${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code so its preload reconnects.`,
+    );
   });
 
   it('treats a preload attached to another project as no preload at all', async () => {
@@ -1993,7 +2066,9 @@ describe('install', () => {
     expect(stale.unavailable[0]?.reason).not.toBe(absent.unavailable[0]?.reason);
     expect(stale.unavailable[0]?.hint).not.toBe(absent.unavailable[0]?.hint);
     expect(stale.unavailable[0]?.hint).toMatch(/restart/i);
-    expect(stale.unavailable[0]?.hint).toMatch(/VS Code/i);
+    expect(stale.unavailable[0]?.hint).toBe(
+      `Restart the dev server for ${fixture.root} with "${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code so its preload reconnects.`,
+    );
   });
 
   it('does not greet a freshly launched preload with a warning about itself', async () => {
@@ -2072,7 +2147,8 @@ describe('install', () => {
 
     expect(unknownManager.projectSummary.packageManager).toBe('unknown');
     expect(hint).toContain(unknownManager.root);
-    expect(hint).toMatch(/VS Code/i);
+    expect(hint).toContain(`"${LAUNCH_DEV_SERVER_PALETTE_LABEL}" in VS Code`);
+    expectNoHandTypedCommand(hint);
     expect(hint.split('\n')).toHaveLength(1);
   });
 

@@ -22,9 +22,9 @@
  * `web_accessible_resources`. The extension has no such surface, and each one
  * would widen the permission boundary documented in `docs/SECURITY.md`. A
  * manifest-declared content script is injected by Chrome from the extension
- * package, so the MAIN-world agent needs no web-accessible-resource entry;
- * crxjs adds one of its own for the bundled bridge chunk, which is its business
- * and not authored here.
+ * package, so the MAIN-world agent needs no web-accessible-resource entry, and
+ * neither does the bridge: `vite.config.ts` builds it as one self-contained
+ * IIFE, so it imports no chunk a page would have to be able to fetch.
  */
 import { defineManifest } from '@crxjs/vite-plugin';
 
@@ -140,10 +140,12 @@ export default defineManifest({
   // module agent.iife.js") because the file lives in `public/`; it reads the
   // object passed to `crx()` directly, so no manifest transform hook can hide
   // the entry from it. `vite.config.ts` therefore passes crxjs this manifest
-  // with the MAIN-world entry filtered out, and a post-build hook rewrites
-  // `dist/manifest.json` by walking THIS array in order - keeping a MAIN-world
-  // entry verbatim and consuming crxjs's rewritten entries for the rest - then
-  // asserts `dist/agent.iife.js` is SHA-256 identical to `public/agent.iife.js`.
+  // with the MAIN-world entry (and the bridge, see below) filtered out, and a
+  // build hook writes `dist/manifest.json` by walking THIS array in order -
+  // keeping the MAIN-world entry verbatim, keeping the bridge entry verbatim
+  // but for its `js` path, and consuming crxjs's rewritten entries for the rest
+  // - then asserts `dist/agent.iife.js` is SHA-256 identical to
+  // `public/agent.iife.js`.
   // Re-inserting at the authored index rather than prepending is what keeps the
   // built order equal to the order written here, so swapping these two entries
   // shows up in `dist/manifest.json` and `test/manifest.test.ts` can still fail
@@ -161,18 +163,19 @@ export default defineManifest({
     },
     {
       // The isolated-world relay between the page agent and the service worker.
-      // crxjs bundles this TypeScript entry and rewrites the path in the built
-      // manifest. `world: "ISOLATED"` is Chrome's default and is stated
-      // explicitly so the boundary between the two scripts is a declaration
-      // rather than an omission.
+      // `world: "ISOLATED"` is Chrome's default and is stated explicitly so the
+      // boundary between the two scripts is a declaration rather than an
+      // omission.
       //
-      // One more build constraint this entry depends on, also measured rather
-      // than assumed: crxjs wraps a bundled content-script chunk in an IIFE by
-      // appending `})()` to the emitted code, which lands INSIDE the trailing
-      // `//# sourceMappingURL=` comment when `build.sourcemap` is `true`. The
-      // chunk is then a syntax error and this script silently never runs.
-      // `vite.config.ts` therefore uses `build.sourcemap: 'hidden'`, which keeps
-      // the .map files without emitting the comment.
+      // BUILD: `vite.config.ts` bundles this TypeScript entry itself - not
+      // through crxjs, whose equivalent build warns on every run - into one
+      // self-contained IIFE, `dist/src/content/bridge.js`, and writes that path
+      // into the built manifest at this index. An IIFE rather than a crxjs
+      // loader is what lets it run at `document_start` before any page script.
+      // The bundle evaluates `src/shared/csp-runtime.ts` first, so Zod raises no
+      // CSP `eval` issue in the developer's page. Its source map is written
+      // beside it but never linked (`build.sourcemap: 'hidden'`), so DevTools
+      // on the developer's page does not fetch this extension's sources.
       matches: [...LOCAL_APP_ORIGINS],
       js: ['src/content/bridge.ts'],
       world: 'ISOLATED',

@@ -469,6 +469,58 @@ describe('ConnectionStatus — binding notice', () => {
   });
 });
 
+describe('ConnectionStatus — before the connection state is observed', () => {
+  /** The neutral label the pill reads while nothing has reported yet. */
+  const PENDING_LABEL = 'Connecting…';
+
+  it.each(PANEL_CONNECTION_STATUSES)(
+    'reads a neutral "Connecting…" instead of the assumed %s status, with no control beside it',
+    (status) => {
+      render(
+        statusElement({
+          status,
+          pending: true,
+          serviceUrl: SERVICE_URL,
+          serviceStartCommand: START_COMMAND,
+          onRequestAddressChange: noop,
+        }),
+      );
+
+      const region = statusRegion();
+      expect(textOf(region)).toBe(PENDING_LABEL);
+      expect(textOf(region)).not.toContain(PANEL_CONNECTION_LABELS.reconnecting);
+      // Neither the pairing nor the address control, and no recovery line: nothing is known to
+      // need recovering yet.
+      expect(screen.queryByRole('button')).toBeNull();
+      expect(screen.queryByText(PALETTE_TITLE)).toBeNull();
+      const hint = textOf(tooltipBubble());
+      expect(hint).toContain('waiting for the extension to report');
+      expect(hint).toContain(SERVICE_URL);
+      expect(hint).toContain('no action is needed');
+    },
+  );
+
+  it('announces the first report from the same, still-mounted region', () => {
+    const { rerender } = render(statusElement({ status: 'reconnecting', pending: true }));
+    const region = statusRegion();
+    expect(region.getAttribute('aria-live')).toBe('polite');
+
+    rerender(statusElement({ status: 'not-paired', pending: false }));
+
+    expect(statusRegion()).toBe(region);
+    expect(textOf(region)).toBe(PANEL_CONNECTION_LABELS['not-paired']);
+    expect(screen.getByRole('button', { name: 'Pair…' })).toBeDefined();
+  });
+
+  it('renders the status as before when pending is omitted or false', () => {
+    const { rerender } = render(statusElement({ status: 'reconnecting' }));
+    expect(textOf(statusRegion())).toBe(PANEL_CONNECTION_LABELS.reconnecting);
+
+    rerender(statusElement({ status: 'reconnecting', pending: false }));
+    expect(textOf(statusRegion())).toBe(PANEL_CONNECTION_LABELS.reconnecting);
+  });
+});
+
 describe('ConnectionStatus — console', () => {
   it('renders every status and transition without an error or a warning', () => {
     const spies = CONSOLE_METHODS.map((method) => vi.spyOn(console, method));

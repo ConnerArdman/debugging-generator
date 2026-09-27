@@ -71,7 +71,7 @@ import pino from 'pino';
 import { DebuggenError, noopLogger, type LogFields, type Logger } from '@debuggen/shared';
 import { MAX_ATTRIBUTE_NODES, MAX_TRACKED_KEYS, REDACTION_MARKER } from '@debuggen/telemetry';
 
-import type { ServiceConfig } from './config.js';
+import { describeServiceConfig, type ServiceConfig } from './config.js';
 import {
   CLOSED_DETAIL_KEY_PATTERN,
   CLOSED_DETAIL_MAX_LENGTH,
@@ -85,7 +85,9 @@ import {
   LOG_BINDING_KEYS,
   LOG_ERROR_FIELD_KEY,
   LOG_FAILURE_NOTICE_MESSAGE,
+  LOG_LOCATION_HEAD_WORDS,
   LOG_MARKERS,
+  LOG_SECRET_VALUE_HEAD_WORDS,
   PROTOTYPE_LOG_KEYS,
   RESERVED_FIELD_PREFIX,
   RESERVED_LOG_KEYS,
@@ -108,8 +110,8 @@ import {
  *
  * Nothing here is created, opened or bound: every case constructs its logger
  * over a capturing destination, so the paths are strings the redaction rules
- * are asserted against (`databasePath` must stay readable, `authFilePath` must
- * not) and the port is never listened on.
+ * are asserted against (`databasePath` and `authFilePath` must both stay
+ * readable) and the port is never listened on.
  */
 const BASE_CONFIG: ServiceConfig = {
   host: '127.0.0.1',
@@ -333,6 +335,188 @@ describe('child loggers', () => {
     const c = capture();
     c.logger.child({ token: fixtures.providerKey }).info('m');
     expect(c.records()[0]?.token).toBe(REDACTION_MARKER);
+  });
+});
+
+/**
+ * The top-level keys of one raw JSON line, in written order, duplicates kept.
+ *
+ * `JSON.parse` keeps the last of two equal keys and so hides exactly the
+ * defect these cases guard against; this scanner reads the text instead. It
+ * tracks string and nesting state only — enough for the lines pino writes —
+ * and decodes each key with `JSON.parse` so an escaped key compares correctly.
+ */
+function topLevelKeys(line: string): string[] {
+  const keys: string[] = [];
+  let depth = 0;
+  let index = 0;
+  while (index < line.length) {
+    const char = line.charAt(index);
+    if (char === '"') {
+      let end = index + 1;
+      while (end < line.length && line.charAt(end) !== '"') {
+        end += line.charAt(end) === '\\' ? 2 : 1;
+      }
+      let next = end + 1;
+      while (line.charAt(next) === ' ') {
+        next += 1;
+      }
+      if (depth === 1 && line.charAt(next) === ':') {
+        keys.push(JSON.parse(line.slice(index, end + 1)) as string);
+      }
+      index = end + 1;
+      continue;
+    }
+    if (char === '{' || char === '[') {
+      depth += 1;
+    } else if (char === '}' || char === ']') {
+      depth -= 1;
+    }
+    index += 1;
+  }
+  return keys;
+}
+
+/** The top-level keys a raw line writes more than once. */
+function duplicateKeys(line: string): string[] {
+  const keys = topLevelKeys(line);
+  return [...new Set(keys.filter((key, position) => keys.indexOf(key) !== position))];
+}
+
+/** How many times a raw line writes `key` at the top level. */
+function occurrences(line: string, key: string): number {
+  return topLevelKeys(line).filter((candidate) => candidate === key).length;
+}
+
+describe('bindings — each key once per record, per-call > child > parent', () => {
+  it('has a key counter that sees the duplicates a bare pino child writes', () => {
+    // The defect this suite guards against, reproduced on pino itself: its
+    // child bindings, its parent's and the merge object are written side by
+    // side. If the counter could not see this, every case below would pass
+    // vacuously.
+    const lines: string[] = [];
+    pino({ level: 'info', base: null }, { write: (line: string) => void lines.push(line) })
+      .child({ subsystem: 'pipeline' })
+      .child({ subsystem: 'pipeline.context' })
+      .info({ subsystem: 'call' }, 'm');
+    const [line = ''] = lines;
+    expect(occurrences(line, 'subsystem')).toBe(3);
+    expect(duplicateKeys(line)).toEqual(['subsystem']);
+  });
+
+  it('writes a key a child re-binds once, with the child value, at its first position', () => {
+    const c = capture();
+    c.logger
+      .child({ subsystem: 'pipeline', sessionId: 's1' })
+      .child({ subsystem: 'pipeline.context' })
+      .info('Built a stage request.', { stage: 'plan' });
+    const [line = ''] = c.lines();
+    expect(topLevelKeys(line)).toEqual(['level', 'time', 'subsystem', 'sessionId', 'stage', 'msg']);
+    expect(JSON.parse(line)).toMatchObject({ subsystem: 'pipeline.context', sessionId: 's1' });
+  });
+
+  it('writes a per-call field equal to a binding once', () => {
+    const c = capture();
+    sessionLogger(c.logger, 's1').info('m', { sessionId: 's1', captureId: 'c1' });
+    const [line = ''] = c.lines();
+    expect(duplicateKeys(line)).toEqual([]);
+    expect(occurrences(line, LOG_BINDING_KEYS.sessionId)).toBe(1);
+    expect(JSON.parse(line)).toMatchObject({ sessionId: 's1', captureId: 'c1' });
+  });
+
+  it('writes one subsystem, the innermost, through subsystem → session → subsystem', () => {
+    const c = capture();
+    const nested = subsystemLogger(sessionLogger(subsystemLogger(c.logger, 'a'), 's'), 'a.b');
+    nested.info('m');
+    nested.warn('n', { reason: 'r' });
+    for (const line of c.lines()) {
+      expect(duplicateKeys(line), line).toEqual([]);
+      expect(JSON.parse(line)).toMatchObject({ subsystem: 'a.b', sessionId: 's' });
+    }
+  });
+
+  it('writes one stage, the per-call value, when a call overrides a bound stage', () => {
+    const c = capture();
+    c.logger
+      .child({ subsystem: 'pipeline', stage: 'plan' })
+      .warn('Plan stage failed; no instrumentation plan was installed.', {
+        stage: 'instrument',
+        code: 'AGENT_NOT_READY',
+      });
+    const [line = ''] = c.lines();
+    expect(occurrences(line, 'stage')).toBe(1);
+    expect(duplicateKeys(line)).toEqual([]);
+    expect(JSON.parse(line)).toMatchObject({ stage: 'instrument', code: 'AGENT_NOT_READY' });
+  });
+
+  it('writes one sessionId and one captureId when sessionLogger is applied twice', () => {
+    const c = capture();
+    sessionLogger(sessionLogger(c.logger, 's1'), 's1', 'c1').info('same session');
+    sessionLogger(sessionLogger(c.logger, 's1', 'c1'), 's2', 'c2').info('re-bound session');
+    const [same = '', rebound = ''] = c.lines();
+    expect(duplicateKeys(same)).toEqual([]);
+    expect(duplicateKeys(rebound)).toEqual([]);
+    expect(JSON.parse(same)).toMatchObject({ sessionId: 's1', captureId: 'c1' });
+    expect(JSON.parse(rebound)).toMatchObject({ sessionId: 's2', captureId: 'c2' });
+  });
+
+  it('writes a root binding once when a child and then a call re-bind it', () => {
+    const c = capture({}, { [LOG_BINDING_KEYS.client]: 'server-agent' });
+    const child = c.logger.child({ client: 'vscode' });
+    child.info('child');
+    child.info('call', { client: 'devtools' });
+    const [fromChild = '', fromCall = ''] = c.lines();
+    expect(occurrences(fromChild, 'client')).toBe(1);
+    expect(occurrences(fromCall, 'client')).toBe(1);
+    expect(JSON.parse(fromChild)).toMatchObject({ client: 'vscode' });
+    expect(JSON.parse(fromCall)).toMatchObject({ client: 'devtools' });
+  });
+
+  it('keeps a sensitive re-bound binding masked, once', () => {
+    const c = capture();
+    c.logger.child({ token: fixtures.providerKey }).child({ token: fixtures.bearer }).info('m');
+    const [line = ''] = c.lines();
+    expect(occurrences(line, 'token')).toBe(1);
+    expect(JSON.parse(line)).toMatchObject({ token: REDACTION_MARKER });
+    expect(line).not.toContain(fixtures.providerKey);
+    expect(line).not.toContain(fixtures.bearer);
+  });
+
+  it('writes the bindings alone when every field was dropped, and leaks no call field into them', () => {
+    const c = capture();
+    const bound = subsystemLogger(c.logger, 'store');
+    bound.info('first', { schemaVersion: 3 });
+    bound.info('second', { absent: undefined });
+    bound.info('third');
+    const [first = '', second = '', third = ''] = c.lines();
+    expect(topLevelKeys(first)).toEqual(['level', 'time', 'subsystem', 'schemaVersion', 'msg']);
+    expect(topLevelKeys(second)).toEqual(['level', 'time', 'subsystem', 'msg']);
+    expect(topLevelKeys(third)).toEqual(['level', 'time', 'subsystem', 'msg']);
+  });
+
+  it('writes no duplicate key across the binding patterns a session uses', () => {
+    // The shapes the cleanup, pipeline and instrumentation subsystems build:
+    // a subsystem logger, a session logger under it, a trigger or capture
+    // child under that, and per-call fields that repeat a bound one.
+    const c = capture({}, { [LOG_BINDING_KEYS.client]: 'service' });
+    const cleanup = subsystemLogger(c.logger, 'cleanup');
+    const scoped = sessionLogger(cleanup, 's1').child({ trigger: 'end' });
+    scoped.info('restoring', { sessionId: 's1', files: 2 });
+    scoped.child({ captureId: 'c1' }).warn('conflict', { sessionId: 's1', captureId: 'c1' });
+    const pipeline = sessionLogger(subsystemLogger(c.logger, 'pipeline'), 's1', 'c1');
+    subsystemLogger(pipeline, 'pipeline.context').debug('Built a stage request.', {
+      stage: 'analyze',
+      captureId: 'c1',
+    });
+    c.logger
+      .child({ subsystem: 'instrumentation' })
+      .child({ sessionId: 's1' })
+      .error('apply failed', { sessionId: 's1', stage: 'instrument' });
+    const lines = c.lines();
+    expect(lines).toHaveLength(4);
+    for (const line of lines) {
+      expect(duplicateKeys(line), line).toEqual([]);
+    }
   });
 });
 
@@ -746,12 +930,13 @@ describe('redaction class 5 — database connection URLs', () => {
     expect(scrubbed.url).toBe(requestUrl);
   });
 
-  it('masks the credential file path while the state paths stay readable', () => {
-    // This is the record the service emits at start-up under
-    // `subsystem: config`, and the sensitive-term vocabulary is what separates
-    // its paths: `authFilePath` folds onto `auth`, so the file holding the
-    // editor credential is masked, while the store, backup and index paths are
-    // diagnostics a developer needs and fold onto nothing.
+  it('keeps the credential file path readable beside the state paths', () => {
+    // These are the paths the service logs at start-up (`subsystem: config`
+    // and `editor credential ready`). `authFilePath` folds onto `auth`, but
+    // its head word is `path`: it names *where* the editor credential is
+    // kept, never the credential, and an operator needs it to find the file.
+    // So the sensitive-name mask does not apply and it is scrubbed by content
+    // like the store, backup and index paths, which fold onto nothing.
     const scrubbed = scrubLogFields({
       databasePath: BASE_CONFIG.databasePath,
       backupsDir: BASE_CONFIG.backupsDir,
@@ -761,7 +946,7 @@ describe('redaction class 5 — database connection URLs', () => {
     expect(scrubbed.databasePath).toBe(BASE_CONFIG.databasePath);
     expect(scrubbed.backupsDir).toBe(BASE_CONFIG.backupsDir);
     expect(scrubbed.indexCacheDir).toBe(BASE_CONFIG.indexCacheDir);
-    expect(scrubbed.authFilePath).toBe(REDACTION_MARKER);
+    expect(scrubbed.authFilePath).toBe(BASE_CONFIG.authFilePath);
   });
 
   it('masks a DSN nested deeper than a pino wildcard reaches', () => {
@@ -793,6 +978,211 @@ describe('redaction class 5 — database connection URLs', () => {
     expect(line).not.toContain(fixtures.dsnWithoutCredentials);
     expect(line).toContain(REDACTION_MARKER);
     expect(line).toContain(BASE_CONFIG.databasePath);
+  });
+});
+
+/** `authCode` from `auth` + `code`: the compound spelling a head word takes in a key. */
+function compoundKey(prefix: string, head: string): string {
+  return `${prefix}${head.charAt(0).toUpperCase()}${head.slice(1)}`;
+}
+
+describe('descriptors of a secret — the name mask narrowed to values that could be one', () => {
+  // The sensitive-term vocabulary matches a term anywhere in a name, so the
+  // diagnostics *about* a credential — whether one is configured, how many
+  // request keys were computed, where the credential file lives — share its
+  // name. These cases pin the type gate that keeps those readable while every
+  // value that could hold the credential stays masked.
+
+  it('keeps a boolean under a sensitive name: one bit cannot hold a credential', () => {
+    const scrubbed = scrubLogFields({
+      anthropicApiKeyPresent: false,
+      editorCredentialCreated: true,
+      hasAuthToken: true,
+    });
+    expect(scrubbed).toEqual({
+      anthropicApiKeyPresent: false,
+      editorCredentialCreated: true,
+      hasAuthToken: true,
+    });
+  });
+
+  it('keeps a count, a duration and a timestamp whose head word is a measure', () => {
+    const issuedAt = 1_790_071_063_756;
+    const scrubbed = scrubLogFields({
+      requestKeysComputed: 7,
+      tokenCount: 1_204,
+      credentialIssuedAt: issuedAt,
+      cliCredentialLeaseMs: 900_000,
+      keyGeneration: 3,
+      credentialsDeleted: 2,
+      'auth.retryCount': 0,
+    });
+    expect(scrubbed).toEqual({
+      requestKeysComputed: 7,
+      tokenCount: 1_204,
+      credentialIssuedAt: issuedAt,
+      cliCredentialLeaseMs: 900_000,
+      keyGeneration: 3,
+      credentialsDeleted: 2,
+      'auth.retryCount': 0,
+    });
+  });
+
+  it('keeps a location under a sensitive name readable', () => {
+    expect(Object.isFrozen(LOG_LOCATION_HEAD_WORDS)).toBe(true);
+    for (const head of LOG_LOCATION_HEAD_WORDS) {
+      const key = compoundKey('credential', head);
+      expect(scrubLogFields({ [key]: BASE_CONFIG.debuggenHome })[key], key).toBe(
+        BASE_CONFIG.debuggenHome,
+      );
+    }
+    // An empty location stays empty, exactly as a masked value would.
+    expect(scrubLogFields({ authFilePath: '' }).authFilePath).toBe('');
+  });
+
+  it('still scrubs a location by content, so an embedded credential is masked', () => {
+    const leaky = `${BASE_CONFIG.debuggenHome}/${fixtures.providerKey}/auth.json`;
+    const scrubbed = String(scrubLogFields({ authFilePath: leaky }).authFilePath);
+    expect(scrubbed).not.toContain(fixtures.providerKey);
+    expect(scrubbed).toContain(REDACTION_MARKER);
+    expect(scrubbed.startsWith(`${BASE_CONFIG.debuggenHome}/`)).toBe(true);
+  });
+
+  it('masks a number under a one-word name, a sensitive head or a value-denoting head', () => {
+    const scrubbed = scrubLogFields({
+      token: 5,
+      apiKey: 5,
+      api_key: 5,
+      sessionKey: 5,
+      clientSecret: 99,
+      'x-auth-token': 42,
+    });
+    for (const [key, value] of Object.entries(scrubbed)) {
+      expect(value, key).toBe(REDACTION_MARKER);
+    }
+    expect(Object.isFrozen(LOG_SECRET_VALUE_HEAD_WORDS)).toBe(true);
+    for (const head of LOG_SECRET_VALUE_HEAD_WORDS) {
+      const key = compoundKey('auth', head);
+      expect(scrubLogFields({ [key]: 482_913 })[key], key).toBe(REDACTION_MARKER);
+    }
+  });
+
+  it('never narrows the log-layer names or the database URL names', () => {
+    // `cookie` and `code` are not telemetry terms, so without this rule a
+    // numeric pairing code or cookie value would pass as a measure.
+    const scrubbed = scrubLogFields({
+      pairingCode: 12_345_678,
+      'pairing-code': 12_345_678,
+      'set-cookie': 5,
+      setCookie: 5,
+      shadowDatabaseUrl: 5_432,
+    });
+    for (const [key, value] of Object.entries(scrubbed)) {
+      expect(value, key).toBe(REDACTION_MARKER);
+    }
+    expect(scrubLogFields({ pairingCode: '12345678' }).pairingCode).toBe(REDACTION_MARKER);
+  });
+
+  it('masks a string under any head but a location', () => {
+    const scrubbed = scrubLogFields({
+      tokenHash: 'ab'.repeat(16),
+      credentialId: 'cred_4k2p9dq7m1zx0c3v',
+      apiKeyValue: 'value',
+      key: 'DEBUGGEN_PORT',
+      cacheKey: 'index-v3',
+      authorization: 'Basic',
+    });
+    for (const [key, value] of Object.entries(scrubbed)) {
+      expect(value, key).toBe(REDACTION_MARKER);
+    }
+  });
+
+  it('keeps the name mask for every other value kind', () => {
+    const scrubbed = scrubLogFields({
+      tokenCount: Number.NaN,
+      credentialLeaseMs: Number.POSITIVE_INFINITY,
+      credentialIssuedAt: null,
+      requestKeysComputed: 5n,
+      authFilePath: { path: BASE_CONFIG.authFilePath },
+      tokenCounts: [1, 2],
+    });
+    for (const [key, value] of Object.entries(scrubbed)) {
+      expect(value, key).toBe(REDACTION_MARKER);
+    }
+    expect(scrubLogFields({ tokenHash: '' }).tokenHash).toBe('');
+  });
+
+  it('narrows closed DebuggenError details the same way at the operating levels', () => {
+    const error = new DebuggenError('CONFIG_INVALID', 'config rejected', {
+      details: {
+        apiKeyPresent: true,
+        credentialLeaseMs: 900,
+        requestKeysComputed: 3,
+        tokenHash: 'abc',
+        authCode: 482_913,
+        token: 5,
+        pairingCode: 12_345_678,
+        // A path is a descriptor but never a closed token, so it stays out.
+        authFilePath: BASE_CONFIG.authFilePath,
+      },
+    });
+    const c = capture();
+    c.logger.error('boom', { [LOG_ERROR_FIELD_KEY]: error });
+    const err = c.records()[0]?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(err.details).toEqual({
+      apiKeyPresent: true,
+      credentialLeaseMs: 900,
+      requestKeysComputed: 3,
+    });
+    expect(err[DETAILS_OMITTED_KEY]).toBe(5);
+    expect(c.lines().join('')).not.toContain(BASE_CONFIG.authFilePath);
+  });
+
+  it('narrows full DebuggenError details the same way at DEBUG', () => {
+    const error = new DebuggenError('CONFIG_INVALID', 'config rejected', {
+      details: { apiKeyPresent: false, authFilePath: BASE_CONFIG.authFilePath, tokenHash: 'abc' },
+    });
+    const c = capture();
+    c.logger.debug('boom', { [LOG_ERROR_FIELD_KEY]: error });
+    const err = c.records()[0]?.[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(err.details).toEqual({
+      apiKeyPresent: false,
+      authFilePath: BASE_CONFIG.authFilePath,
+      tokenHash: REDACTION_MARKER,
+    });
+  });
+
+  it('writes the start-up and ingest descriptors readable through the real logger', () => {
+    const c = capture();
+    subsystemLogger(c.logger, 'config').info(
+      'service configuration resolved',
+      describeServiceConfig(BASE_CONFIG),
+    );
+    subsystemLogger(c.logger, 'service').info('editor credential ready', {
+      authFilePath: BASE_CONFIG.authFilePath,
+      created: true,
+    });
+    subsystemLogger(c.logger, 'telemetry').debug('telemetry batch ingested', {
+      received: 3,
+      persisted: 3,
+      requestKeysComputed: 2,
+    });
+    const [configured, credential, ingested] = c.lines();
+    expect(configured).toContain('"anthropicApiKeyPresent":false');
+    expect(configured).toContain(`"authFilePath":"${BASE_CONFIG.authFilePath}"`);
+    expect(credential).toContain(`"authFilePath":"${BASE_CONFIG.authFilePath}"`);
+    expect(ingested).toContain('"requestKeysComputed":2');
+    expect(c.lines().join('')).not.toContain(REDACTION_MARKER);
+  });
+
+  it('leaves Layer 1 censoring an exact deny-list path whatever its value', () => {
+    // The exemption narrows the value walk only; pino's declared paths are
+    // not loosened, so a boolean under `apiKey` itself is still censored.
+    const c = capture();
+    c.logger.info('m', { apiKey: true, anthropicApiKeyPresent: true });
+    const [line] = c.lines();
+    expect(line).toContain(`"apiKey":"${REDACTION_MARKER}"`);
+    expect(line).toContain('"anthropicApiKeyPresent":true');
   });
 });
 

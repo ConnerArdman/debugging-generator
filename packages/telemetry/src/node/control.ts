@@ -111,12 +111,21 @@
  *
  * After a disable the globals are gone and the provider is shut down, so the
  * next capture cannot reuse them: {@link ServerAgentControl} calls the provider
- * **factory** `register.ts` handed it, then `register({ propagator: new
- * W3CTraceContextPropagator() })`. Re-registering that propagator is what
- * restores extraction of the incoming `traceparent` headers the page agent
- * injects. Forget it and the browser↔server correlation seam breaks *silently*
- * on the second capture of a session — every tier still produces spans, they
- * simply stop sharing a trace.
+ * **factory** `register.ts` handed it, then `register()` with
+ * {@link providerRegistrationConfig} — a `W3CTraceContextPropagator`, and
+ * `contextManager: null` whenever a context manager is already global.
+ * Re-registering that propagator is what restores extraction of the incoming
+ * `traceparent` headers the page agent injects. Forget it and the
+ * browser↔server correlation seam breaks *silently* on the second capture of a
+ * session — every tier still produces spans, they simply stop sharing a trace.
+ *
+ * The context manager is the one global the disable path keeps (see "The one
+ * global effect that stays" in `register.ts`), so a capture that follows a
+ * teardown finds the first one still registered and must not offer another:
+ * `register()` with no `contextManager` builds a fresh
+ * `AsyncLocalStorageContextManager` and hands it to
+ * `context.setGlobalContextManager`, which `@opentelemetry/api` refuses with a
+ * `diag.error` stack and leaves the new manager enabled and unowned.
  *
  * Two more things belong to that re-registration. A teardown that did **not**
  * finish is completed first, because `trace.setGlobalTracerProvider` refuses to
@@ -158,7 +167,7 @@
  * const createProvider = () =>
  *   new NodeTracerProvider({ resource, sampler, spanProcessors: [processor] });
  * const provider = createProvider();
- * provider.register({ propagator: new W3CTraceContextPropagator() });
+ * provider.register(providerRegistrationConfig());
  * control.attach({ createProvider, provider, processor, instrumentations });
  * control.connect();
  * ```
@@ -166,8 +175,22 @@
 
 import { newMessageId, nowEpochMs } from '@debuggen/shared';
 import type { Logger } from '@debuggen/shared';
-import { propagation, trace } from '@opentelemetry/api';
-import type { Attributes, Context, Link, SpanKind, TextMapPropagator } from '@opentelemetry/api';
+// `context` is aliased because the sampler below takes a parameter of that name.
+import {
+  context as contextApi,
+  createContextKey,
+  propagation,
+  ROOT_CONTEXT,
+  trace,
+} from '@opentelemetry/api';
+import type {
+  Attributes,
+  Context,
+  ContextManager,
+  Link,
+  SpanKind,
+  TextMapPropagator,
+} from '@opentelemetry/api';
 import { W3CTraceContextPropagator } from '@opentelemetry/core';
 import {
   AlwaysOnSampler,
@@ -1135,9 +1158,29 @@ export const INSTRUMENTATION_ROLES = Object.freeze({
   orm: 'prisma',
   /** The driver's instrumentation, governed by the `pg` flag. */
   driver: 'pg',
+  /**
+   * The outgoing-request trace-context hook `register.ts` installs, governed by
+   * the `fetch` flag: it writes `traceparent` onto the dev server's own
+   * loopback requests, so the request a route handler makes to another route
+   * of the same machine nests under the `http.client` span that made it.
+   */
+  outbound: 'fetch',
   /** An instrumentation this build does not recognise. */
   unknown: 'unknown',
 } as const);
+
+/**
+ * The name the outgoing-request trace-context hook reports as its
+ * `instrumentationName`, which is what {@link classifyInstrumentation} knows it
+ * by.
+ *
+ * Product-owned rather than an OpenTelemetry package name, because the hook is
+ * this package's own: Next.js already spans the outgoing request, so the
+ * package that would otherwise propagate its context
+ * (`@opentelemetry/instrumentation-undici`) would duplicate that span (AAP
+ * §0.3.2) and is deliberately not registered.
+ */
+export const OUTBOUND_PROPAGATION_INSTRUMENTATION_NAME = '@debuggen/telemetry/outbound-context';
 
 /** One member of {@link INSTRUMENTATION_ROLES}. */
 export type InstrumentationRole =
@@ -1172,6 +1215,9 @@ export function classifyInstrumentation(
   if (name === DB_INSTRUMENTATION_SCOPES.driver) {
     return INSTRUMENTATION_ROLES.driver;
   }
+  if (name === OUTBOUND_PROPAGATION_INSTRUMENTATION_NAME) {
+    return INSTRUMENTATION_ROLES.outbound;
+  }
   return INSTRUMENTATION_ROLES.unknown;
 }
 
@@ -1180,10 +1226,11 @@ export function classifyInstrumentation(
  *
  * The ORM and the driver follow their own flags, which is what makes a
  * prisma-only plan leave `pg.Client.prototype.query` unwrapped in the
- * developer's process. An unrecognised instrumentation is kept enabled for
- * every capture: it arrived from `register.ts` enabled, this build cannot say
- * which signal it serves, and disabling it on a guess would remove a signal a
- * plan may depend on.
+ * developer's process; the outgoing-request context hook follows `fetch`, the
+ * signal whose spans it links to what they called. An unrecognised
+ * instrumentation is kept enabled for every capture: it arrived from
+ * `register.ts` enabled, this build cannot say which signal it serves, and
+ * disabling it on a guess would remove a signal a plan may depend on.
  *
  * @param role The instrumentation's role.
  * @param signals The capture's signal switches.
@@ -1197,6 +1244,9 @@ export function wantsInstrumentation(
   }
   if (role === INSTRUMENTATION_ROLES.driver) {
     return signals.pg;
+  }
+  if (role === INSTRUMENTATION_ROLES.outbound) {
+    return signals.fetch;
   }
   return true;
 }
@@ -1212,13 +1262,100 @@ export interface ControlTracerProvider {
   /**
    * Install this provider, the propagator and the context manager globally.
    *
-   * @param config Registration options; this module always passes an explicit
-   * `propagator`.
+   * @param config Registration options; this module always passes
+   * {@link providerRegistrationConfig}'s: an explicit `propagator`, and
+   * `contextManager: null` when a context manager is already global.
    */
-  register(config?: { readonly propagator?: TextMapPropagator | null }): void;
+  register(config?: ProviderRegistrationConfig): void;
 
   /** Flush and stop the provider; resolves when it is finished. */
   shutdown(): Promise<void>;
+}
+
+/**
+ * The options `register()` is given — the subset of the SDK's
+ * `SDKRegistrationConfig` this product sets.
+ *
+ * In both members `undefined` (absent) means "register the SDK default" and
+ * `null` means "register nothing".
+ */
+export interface ProviderRegistrationConfig {
+  /** The propagator to make global. */
+  readonly propagator?: TextMapPropagator | null;
+
+  /** The context manager to make global; `null` keeps the existing one. */
+  readonly contextManager?: ContextManager | null;
+}
+
+/**
+ * The key {@link hasGlobalContextManager} carries through `context.with()`.
+ * Private to that probe, so no other code can make it answer `true`.
+ */
+const CONTEXT_MANAGER_PROBE_KEY = createContextKey('debuggen.context-manager-probe');
+
+/**
+ * Whether `@opentelemetry/api` has a global context manager registered.
+ *
+ * Asked through the public API alone, because the API offers no getter for it:
+ * run a callback inside a context carrying a private key and read the key back
+ * from `context.active()`. The API's fallback `NoopContextManager` ignores the
+ * context `with()` is given — its `active()` is always `ROOT_CONTEXT` — so the
+ * key comes back only when a real manager is global, whoever registered it: the
+ * host, another OpenTelemetry setup, or this preload during an earlier capture.
+ * The callback runs synchronously and leaves nothing behind.
+ *
+ * A throw can only come from a registered manager, since the no-op one cannot
+ * throw, so it answers `true`: offering a second manager would not help one
+ * that is already broken, and the API would refuse it anyway.
+ *
+ * @example
+ * ```ts
+ * hasGlobalContextManager(); // false in a fresh process
+ * new NodeTracerProvider().register();
+ * hasGlobalContextManager(); // true
+ * ```
+ *
+ * @returns `true` when a context manager other than the API's no-op one is
+ * global.
+ */
+export function hasGlobalContextManager(): boolean {
+  try {
+    return contextApi.with(
+      ROOT_CONTEXT.setValue(CONTEXT_MANAGER_PROBE_KEY, true),
+      () => contextApi.active().getValue(CONTEXT_MANAGER_PROBE_KEY) === true,
+    );
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The registration options for every provider this product registers — the
+ * preload's first one in `register.ts` and each one a capture after a teardown
+ * builds here — so both follow one rule.
+ *
+ * - `propagator` is always an explicit `W3CTraceContextPropagator`: SDK 2.0
+ *   dropped environment-variable propagator configuration, and the
+ *   `traceparent` it extracts is the browser↔server seam.
+ * - `contextManager` is `null` when {@link hasGlobalContextManager} finds one
+ *   already global, which tells the SDK to register none; otherwise it is left
+ *   absent, so the SDK installs its default `AsyncLocalStorageContextManager`
+ *   and this package needs no `@opentelemetry/context-async-hooks` dependency.
+ *   Offering a second manager instead is what the API refuses with an
+ *   "Attempted duplicate registration of API: context" `diag.error` stack, and
+ *   it would leave the rejected manager enabled with no owner. Keeping the
+ *   existing manager is also the design: the disable path deliberately never
+ *   removes it (see "The one global effect that stays" in `register.ts`).
+ *
+ * Built fresh on every call because the answer can change between captures —
+ * the host may disable its own context manager — and a propagator instance is
+ * cheap.
+ *
+ * @returns The options to pass to `register()`.
+ */
+export function providerRegistrationConfig(): ProviderRegistrationConfig {
+  const propagator = new W3CTraceContextPropagator();
+  return hasGlobalContextManager() ? { propagator, contextManager: null } : { propagator };
 }
 
 /**
@@ -1446,6 +1583,8 @@ export const CAPTURE_RESOURCES = Object.freeze({
   ormInstrumentation: 'prisma-instrumentation',
   /** The driver's instrumentation patches. */
   driverInstrumentation: 'pg-instrumentation',
+  /** The outgoing-request trace-context subscription. */
+  outboundPropagation: 'outbound-context',
   /** An instrumentation this build could not identify. */
   instrumentation: 'instrumentation',
   /** The pre-teardown flush of evidence already captured. */
@@ -1528,6 +1667,7 @@ const INSTRUMENTATION_RESOURCES: Readonly<Record<InstrumentationRole, CaptureRes
   Object.freeze({
     [INSTRUMENTATION_ROLES.orm]: CAPTURE_RESOURCES.ormInstrumentation,
     [INSTRUMENTATION_ROLES.driver]: CAPTURE_RESOURCES.driverInstrumentation,
+    [INSTRUMENTATION_ROLES.outbound]: CAPTURE_RESOURCES.outboundPropagation,
     [INSTRUMENTATION_ROLES.unknown]: CAPTURE_RESOURCES.instrumentation,
   });
 
@@ -1537,6 +1677,7 @@ const INSTRUMENTATION_SIGNALS: Readonly<
 > = Object.freeze({
   [INSTRUMENTATION_ROLES.orm]: Object.freeze<ServerAgentSignalName[]>(['prisma']),
   [INSTRUMENTATION_ROLES.driver]: Object.freeze<ServerAgentSignalName[]>(['pg']),
+  [INSTRUMENTATION_ROLES.outbound]: Object.freeze<ServerAgentSignalName[]>(['fetch']),
   [INSTRUMENTATION_ROLES.unknown]: Object.freeze<ServerAgentSignalName[]>([]),
 });
 
@@ -2567,9 +2708,14 @@ export class ServerAgentControl implements CaptureGate {
    * every tier looks healthy on its own — which is why the propagator is passed
    * explicitly here rather than left to `register()`'s defaults.
    *
-   * `register()` supplies the Node `AsyncLocalStorage` context manager itself,
-   * which is why this package needs no direct dependency on
-   * `@opentelemetry/context-async-hooks`.
+   * The context manager is **kept**, not re-registered: the disable path
+   * leaves the first one global on purpose, so {@link providerRegistrationConfig}
+   * passes `contextManager: null` whenever one is registered. Without that,
+   * `register()` would build a second `AsyncLocalStorage` manager for the API
+   * to refuse — a `diag.error` stack on every re-arm — and leave it enabled and
+   * unowned. Where none is global (a host disabled it), `register()` supplies
+   * the SDK's default itself, which is why this package needs no direct
+   * dependency on `@opentelemetry/context-async-hooks`.
    *
    * Every path through this method ends in the same question, asked of the
    * global registry rather than of this object's own flags: is the provider
@@ -2631,7 +2777,7 @@ export class ServerAgentControl implements CaptureGate {
     let provider: ControlTracerProvider;
     try {
       provider = factory();
-      provider.register({ propagator: new W3CTraceContextPropagator() });
+      provider.register(providerRegistrationConfig());
     } catch (error) {
       return this.#resourceFailure(
         CAPTURE_RESOURCES.provider,

@@ -13,163 +13,139 @@
  *     into a control, and nothing here targets a `select`, `input` or `button` element.
  *   - `ui/FormField` owns the `<label>`, the hint and the error paragraph, and the vertical rhythm
  *     between a label and its control. Label typography is therefore not restated below.
- *   - This file owns the row: how the labelled columns share the available width, where the Apply
- *     group sits, how the row behaves when it no longer fits on one line, and how the row reads
- *     while a filter change is in flight.
+ *   - This file owns the row: how the labelled columns share the available width, which line each
+ *     column and the Apply group sit on, how the row wraps when it no longer fits on one line, and
+ *     how the row reads while a filter change is in flight.
+ *
+ * THE LINE MODEL
+ * The row is one grid, and every labelled column adopts three of its rows - the label, the
+ * control, the hint - as a row subgrid. That is what lines the columns up, and it holds whatever
+ * each column contains: the headroom column carries a hint under its input and the three selects
+ * carry none, a label may take two lines where another takes one, and none of it moves a control
+ * off the control row or a label off the label row, because each of them is placed on its row
+ * rather than aligned by the edges of a column box of its own height. The Apply group adopts the
+ * same three rows and puts its buttons on the control row. When the row wraps, the next line of
+ * columns adopts the next three rows, so every line keeps the same three invariants: its labels
+ * share one top edge, its controls share one top and one bottom edge, and the Apply group, if it
+ * is on that line, sits on the controls' line.
  *
  * Cascade note worth keeping in mind when editing `.field`: that class is passed to `FormField`'s
  * `className`, so it lands on the same element as `FormField.module.css`'s own `.root`, which
  * declares `display`, `flex-direction`, `gap` and `min-width: 0`. Two single-class rules in two
  * stylesheets tie on specificity, and which one wins then depends on the order the bundler emits
- * the modules in - not something this file should rely on. So `.field` declares none of those four
- * properties: it sizes its column with the `flex` shorthand, which `FormField` never sets. Where
- * this file does need one of them - the shrink floor, and the visual order of a column's children -
- * it says so through a selector rooted at `.root`, which outranks a single-class rule outright
- * rather than tying with it. Anything added here that touches `display`, `flex-direction`, `gap`,
+ * the modules in - not something this file should rely on. So every rule here that sets a
+ * property on that element - its `display`, its placement, its floor - is written through a
+ * selector rooted at `.root`, which outranks a single-class rule outright rather than tying with
+ * it. Anything added here that touches `display`, `flex-direction`, `gap`,
  * `min-width`/`min-inline-size` or a column's children belongs in that two-class form for the same
- * reason.
+ * reason. `FormField`'s own `gap` is deliberately left in force: it is the space between a label,
+ * its control and its hint inside a column (see `.root`).
  *
  * Token contract: every colour, space and type size is `var(--ls-TOKEN, <literal fallback>)`, as
  * declared in `apps/demo-app/app/globals.css`. The fallback keeps this module sensible on its own
  * and states the pixel value the token resolves to at the default root font size. Bare literals
- * are limited to `0`, `none`, `auto` and the relative units (`ch`, `%`) that express a column
- * measure the token scale deliberately does not model.
+ * are limited to `0`, `none`, `auto`, the grid's structural keywords (`subgrid`, `span`,
+ * `min-content`, `max-content`, `fr` factors, line numbers), the `ch` measure of the headroom
+ * column's floor and the two breakpoint lengths - measures the token scale deliberately does not
+ * model.
  *
  * There is no motion here - no transition, no animation, nothing that needs a reduced-motion
  * counterpart - because a filter row that animates reads as slow, and this row must read as
  * instant.
  */
 
-/* The `<form method="get">` itself: a wrapping row of labelled controls.
+/* The `<form method="get">` itself: one grid of labelled columns.
  *
- * `align-items: flex-end` is what lines the Apply button up with the bottom edge of the controls,
- * since `FormField` stacks a label above each one and so makes the columns taller than a bare
- * button. Wrapping - rather than a horizontal scroller - is the right narrow-viewport behaviour
- * for a handful of short controls: each column keeps its usable width and moves to the next line.
+ * The narrow layout is the base: two equal columns, the stocking location across both of them
+ * (see `.root > .field:first-child`), then the headroom and stock-state columns, then the movement
+ * column with the Apply group beside it. The two breakpoints at the end of the file widen it.
+ * Wrapping onto further lines - rather than a horizontal scroller - is the right narrow-viewport
+ * behaviour for a handful of short controls: each column keeps a usable width and the next ones
+ * move to the next line, where they adopt the next three rows.
+ *
+ * The two gaps are different on purpose, and it is the subgrid that makes that safe. Inside a
+ * column, a label, its control and its hint keep `FormField`'s own 4px gap: a subgrid that states
+ * a gap of its own is laid out with its parent's gap between its tracks and the difference taken
+ * back as margins on its items, so each column still reads as one tight unit. Between the lines of
+ * columns the row's gap - one spacing step - applies, so a wrapped line reads as a new line and
+ * the status line under the last one sits a step clear of it. Every column on a line takes the
+ * same margins from the same two gaps, so none of them moves a control off its line.
  *
  * `min-width: 0` lets the row shrink with the dashboard's grid track instead of widening it, and
  * there is deliberately no `overflow` here: a native select draws its focus ring outside its own
  * box, and a clipping ancestor would cut it off. */
 .root {
-  display: flex;
+  display: grid;
   min-width: 0;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: var(--ls-space-3, 12px);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: var(--ls-space-3, 12px);
+  row-gap: var(--ls-space-3, 12px);
 }
 
-/* One labelled column, passed to `FormField`'s `className`.
+/* One labelled column, passed to `FormField`'s `className`: it spans three rows of the row's grid
+ * and adopts them, so its children - the label, the control and, for the headroom column, the hint
+ * - are placed in source order on the label, control and hint rows of their line. The hint is
+ * therefore under the control it describes, which is also the order it is announced in.
  *
- * `flex: 1 1 15ch` reads as: take an equal share of the leftover width, hand width back rather
- * than overhang a line narrower than the basis, and let the row wrap when the basis no longer
- * fits. The `ch` basis is measured in the row's own font - 8.58px here, so 15ch is 128.70px - and
- * a column is therefore sized by the text it has to show rather than by a pixel figure guessed at
- * authoring time.
- *
- * The basis is the width the row wraps at, not the width a column ends up at. A flex line is
- * filled from the items' bases and only then has its leftover width distributed, and all three
- * growable columns share one basis, so each ends up at (line - 291.17px) / 3 whatever that basis
- * is - 291.17px being the headroom column's fixed 128.69px, the action group's 114.48px and the
- * row's four 12px gaps. What the basis does decide is how much has to fit before a line accepts
- * everything: the row keeps the controls and the Apply group together while the line measures at
- * least 3 x 15ch + 291.17px = 677.27px.
- *
- * With a 15ch basis the controls and the Apply group share one line down to 677.27px. At 768 the
- * line is 704px, so the group sits beside the controls it applies to with 26.73px to spare and
- * each column measures 137.61px; on the 1136px line the page container caps at, each measures
- * 281.61px. Below 677.27px the row wraps - at 375 into four lines, the narrowest control 128.69px
- * wide.
- *
- * 15ch is also the narrowest a column can be and still say what it holds at rest. A `Select` at
- * the `sm` scale spends 32.5px of its width on two borders, its 8px inline-start padding and the
- * 22.5px lane reserved for the caret, so a 128.70px column leaves 96.20px of text against the
- * 92.26px of the widest unconstrained option any of the three carries ("Any movement", measured at
- * the 13px `sm` size) - so a column at the wrapping threshold still shows its resting value whole.
- * A longer selection, a warehouse name, truncates with the ellipsis `Select` already asks for
- * instead of being clipped mid-glyph, at this width as at every other. */
-.field {
-  flex: 1 1 15ch;
-}
-
-/* The floor those columns shrink to, now that they shrink at all.
- *
- * Two classes deep deliberately. `FormField.module.css` puts `min-width: 0` on this same element;
- * a logical and a physical property are resolved against each other by the cascade, so a
- * single-class rule here would tie with it and be settled by whichever module the bundler emits
- * last - the hazard the header opens with. `.root .field` outranks it by specificity instead.
- *
- * 12ch (102.96px) sits below the 15ch basis, so it never enters the wrapping arithmetic above: a
- * line is filled from bases, and shrinking only happens to a column left alone on a line narrower
- * than its own basis. That is narrower than the 343px the 375 viewport gives this row, so on this
- * dashboard the floor is a guarantee rather than a working value - inside a narrower track it
- * holds the control wide enough to still show an option and lets the row overhang instead. The
- * row has no clipping ancestor, so an overhanging control stays legible and operable, where one
- * squeezed to the track's width would be neither. */
+ * `display` is the property `FormField.module.css` also declares on this element, hence the
+ * two-class selector the header asks for. A column's width is its grid track's, set on `.root`; the
+ * column itself states no width. */
 .root .field {
-  min-inline-size: 12ch;
+  display: grid;
+  grid-row: span 3;
+  grid-template-rows: subgrid;
 }
 
-/* The compact variant, for the low-stock threshold: a fixed, visibly narrower column that neither
- * grows nor shrinks, so the numeric control stays the size of the number it holds and the text
- * selects absorb the leftover width instead. Declared after `.field`, in the same file, so the
- * override order is deterministic; a control with long option labels should take plain `.field`.
- *
- * The two rules name the same 15ch for different jobs: here it is the width the column takes, in
- * `.field` it is only the width the row wraps at. That is why this is still the narrow column even
- * though the figures match - a growable column ends up wider than its basis on any line with
- * width to give, measured 137.61px against this column's 128.69px at 768 and 281.61px at 1136. */
-.fieldNarrow {
-  flex: 0 0 15ch;
+/* The stocking location - the first column, and the one whose values are long: "<code> - <site
+ * name>", up to "NWK-05 - Newark Distribution Center" today, 227px of text at the 13px `sm` size
+ * plus the 32.5px `Select` spends on its borders, padding and caret lane. In the narrow layout it
+ * takes the whole line, 343px at 375, so the selected site is shown whole rather than cut to an
+ * ellipsis. The wider layouts below give it a track whose floor is its own `max-content` width,
+ * which is the width of its longest option, so the same holds for whatever sites the data holds.
+ * Addressed structurally because it is the one `.field` column `WarehouseFilter.tsx` renders first
+ * and gives no class of its own. */
+.root > .field:first-child {
+  grid-column: 1 / -1;
 }
 
-/* The control inside a labelled column, made the last thing in that column.
- *
- * `FormField` renders the label, then the control, then the hint - the right order to hear, and
- * the wrong one to look at in this row. `align-items: flex-end` above aligns the columns' boxes,
- * not the controls inside them, and only the headroom column carries a hint: measured, its box is
- * 104.88px tall against 50.39px for a select's, and the hint's own 33.59px plus the column's
- * 4.00px gap lifted its input exactly 37.59px clear of the three selects at 768, 1280, 1440 and
- * 1920 (37.60px at 375). Showing the hint above the control leaves a control as the last box in
- * all four columns, so aligning the boxes' bottom edges aligns the controls' bottom edges too -
- * and four controls of the same measured 29.50px height then share one top edge exactly.
- *
- * It settles the narrow-viewport reading as well. At 375 the headroom column shares a line with
- * "Stocking location", and with the hint below the input the hint fell between that label and its
- * select, so guidance about one field read as belonging to the field beside it. Above the input it
- * sits directly under the label it describes. Nothing about the announcement changes: the DOM
- * order and `aria-describedby` are untouched, so the control is still read with its label first
- * and its guidance after.
- *
- * `order` carries the whole change because `FormField`'s column is already a flex container, so
- * this file states no `display`, `flex-direction` or `gap` of its own - the properties the header
- * warns would tie with `FormField.module.css`. The selector reads as "a child of a column that is
- * neither the label nor a message paragraph", which names the control without this file naming an
- * `input`, `select` or `button` element, and being two classes deep it outranks that module's
- * single-class rules by specificity rather than by the order the bundler happens to emit them. */
-.root .field > :not(label):not(p) {
-  order: 1;
+/* The low-stock headroom column: the compact numeric field, and the only column with a hint. Its
+ * label, "Low-stock headroom", is the longest of the four (135.53px at 13px), so from the medium
+ * layout up the column is floored at 17ch - 145.86px in the row's 15px font - which keeps that
+ * label on one line and puts it on the same line as the three one-line labels beside it. The floor
+ * is part of the column's min-content contribution, which is what the wider layouts' tracks size
+ * from; in the narrow layout the column is half the line, 165.5px at 375. The hint takes whatever
+ * lines the column's width gives it, under the input. */
+@media (min-width: 48rem) {
+  .root .fieldNarrow {
+    min-inline-size: 17ch;
+  }
 }
 
-/* The trailing control group: the Apply submit button, and a reset control beside it if the
- * component renders one. `flex: none` keeps the group at its natural width, so a button never
- * stretches to fill a column's worth of space.
+/* The trailing control group: the Apply submit button and the reset control beside it. It adopts
+ * the same three rows as a labelled column and places both buttons on the control row, so they
+ * share that row's top and bottom edges with the controls on their line; stating the same 4px row
+ * gap `FormField` states is what gives the buttons the same margins the controls take (see
+ * `.root`). The buttons are reached as the group's children - `WarehouseFilter.tsx` renders them
+ * from the shared `Button` primitive, whose metrics and focus ring are Apply's and Clear's alike,
+ * which is exactly why this file draws no focus ring and defines no link treatment.
  *
- * `margin-inline-start: auto` earns its place on the wrapped row rather than the wide one. While
- * every control fits on one line the growing columns have already taken the free space, so the
- * group sits at the trailing edge with nothing for the auto margin to absorb; once the row wraps
- * and the group starts a line of its own, that margin is what holds it at the trailing edge
- * instead of letting it fall back to the leading one. It is also the guard for a row built from
- * fixed-width columns only, where free space does exist on a single line.
- *
- * A reset control belongs in here and needs no class of its own: rendering it with the shared
- * `Button` primitive keeps its metrics and its focus ring identical to Apply's, which is exactly
- * why this file draws no focus ring and defines no link treatment. */
+ * It sits in the last column of its line and against that column's end edge (`justify-self: end`
+ * sizes it to the two buttons), so a button never stretches to fill a column's worth of space. In
+ * the narrow layout that is beside the movement column; in the medium layout, on a line of its own
+ * under it; in the wide layout, at the end of the one line. */
 .actions {
-  display: flex;
-  flex: none;
-  align-items: center;
-  gap: var(--ls-space-2, 8px);
-  margin-inline-start: auto;
+  display: grid;
+  grid-row: span 3;
+  grid-column: -2 / -1;
+  grid-template-rows: subgrid;
+  grid-auto-flow: column;
+  justify-self: end;
+  column-gap: var(--ls-space-2, 8px);
+  row-gap: var(--ls-space-1, 4px);
+}
+
+.actions > * {
+  grid-row: 2;
 }
 
 /* Applied alongside `.root` while a filter change is in flight.
@@ -193,11 +169,39 @@
 }
 
 /* The polite status line that names the filter now in force, on its own full-width line under the
- * controls (`flex: 1 0 100%`) so it never competes with a column for space. Muted and small: it
- * confirms what just happened and is not a control. */
+ * controls (`grid-column: 1 / -1`, a row of its own after the last line of columns) so it never
+ * competes with a column for space. Muted and small: it confirms what just happened and is not a
+ * control. */
 .status {
-  flex: 1 0 100%;
+  grid-column: 1 / -1;
   color: var(--ls-text-muted, #475569);
   font-size: var(--ls-text-xs, 12px);
   line-height: 1.4;
+}
+
+/* Medium widths, from 48rem - 768px at the default root size: four columns on one line and the
+ * Apply group on a line of its own under the last of them. The location track is floored at its
+ * own `max-content` width, the width of its longest option, and otherwise takes two shares of the
+ * line to the others' one; the other three are floored at their min-content widths - a select's
+ * is the width of its widest option, the headroom column's is its 17ch floor - so no label wraps
+ * and no resting value is cut. At the 736px line 768 gives the row, the location column measures
+ * about 277px against the 260px its longest option needs. The five columns and the group do not
+ * fit on one line here: they need about 790px. */
+@media (min-width: 48rem) {
+  .root {
+    grid-template-columns: minmax(max-content, 2fr) repeat(3, minmax(min-content, 1fr));
+  }
+
+  .root > .field:first-child {
+    grid-column: auto;
+  }
+}
+
+/* Wide widths, from 64rem: the Apply group joins the four columns on the one line, in a fifth,
+ * content-sized track at the end of it. On the 1152px line the page shell caps at, the location
+ * column measures about 396px and the other three about 198px each. */
+@media (min-width: 64rem) {
+  .root {
+    grid-template-columns: minmax(max-content, 2fr) repeat(3, minmax(min-content, 1fr)) auto;
+  }
 }

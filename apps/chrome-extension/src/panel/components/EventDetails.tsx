@@ -80,9 +80,15 @@
  * multi-line value takes `Code`'s block form instead), never logged and never
  * sent anywhere. Non-string values are stringified deterministically, with a
  * cycle-safe JSON serialisation for objects, and an unexpected value degrades
- * to a textual marker instead of throwing. The attribute paths the redactor
- * replaced (`TelemetryEvent.redacted`) are surfaced as a worded "redacted"
- * badge, so a missing value reads as policy rather than as a capture fault.
+ * to a textual marker instead of throwing. An attribute the privacy layer
+ * replaced is surfaced as a worded "redacted" badge beside its unaltered value,
+ * with a note above the table, so a missing value reads as policy rather than
+ * as a capture fault. Either record of a replacement marks it: a path the
+ * service's redactor listed in `TelemetryEvent.redacted`, or the redaction
+ * marker itself in the value or in a string nested in it — the only record of a
+ * value a producer (the browser agent, the Node preload) replaced before
+ * ingest, since the service's idempotent redactor lists no path for a value
+ * that arrived already replaced.
  * Times are epoch milliseconds and durations are milliseconds on every tier,
  * so no unit conversion happens here.
  *
@@ -121,10 +127,12 @@
  * class of this file's own. All spacing is a `Stack`/`Section` space step.
  * The raw elements used are the ones no primitive renders: the region's
  * `<section>`, the chain's `<ol>`/`<li>` and the start time's `<time>`. The
- * drawer creates no scroll container of its own — `PanelShell` is the only
- * `overflow: auto` element in the design system, `DataTable` brings its own
- * viewport and `Code`'s block form scrolls itself — so a pane-level scroll for
- * a tall drawer belongs to the `Split` pane that hosts it in `../App.tsx`.
+ * drawer creates no scroll container of its own — `DataTable` brings its own
+ * viewport and `Code`'s block form scrolls itself — because the pane-level
+ * scroll of a tall drawer belongs to the pane that hosts it: `../App.tsx`
+ * renders this drawer as the last pane of a `Split` drawer division, which
+ * floats that pane over the body's inline end at the viewport's full height
+ * with a scroll range of its own.
  *
  * ## Boundaries
  *
@@ -451,6 +459,47 @@ const REDACTION_NOTE =
 /** The badge text on a redacted attribute. */
 const REDACTED_LABEL = 'redacted';
 
+/**
+ * The product-wide redaction marker: the bytes the privacy layer writes in
+ * place of a denied value. A local mirror of `REDACTION_MARKER` in
+ * `packages/telemetry/src/redaction/rules.ts`, because this file imports no
+ * runtime value from the telemetry package (see Boundaries); it must match that
+ * constant byte for byte, as the renderer's own mirror in `useQuery.ts` does.
+ */
+const REDACTION_MARKER = '[redacted]';
+
+/**
+ * What the telemetry layer's bounded previews end with when they cut a value
+ * (U+2026 HORIZONTAL ELLIPSIS): a local mirror of `TRUNCATION_SUFFIX` in the
+ * same module, for the same reason.
+ */
+const TRUNCATION_SUFFIX = '\u2026';
+
+/**
+ * The shortest head of {@link REDACTION_MARKER} recognised in front of
+ * {@link TRUNCATION_SUFFIX} at the end of a value. A preview bound that cuts
+ * through the marker leaves `[red…`, `[redac…` and so on; a shorter head
+ * (`[…`, `[r…`, `[re…`) is indistinguishable from ordinary bracketed text — a
+ * cut array preview, `[react…` — so it is never claimed.
+ */
+const CUT_MARKER_MIN_HEAD = 4;
+
+/**
+ * Every cut form of the marker that counts, computed once: `[red…` through
+ * `[redacted…` (the uncut marker is matched on its own).
+ */
+const CUT_MARKER_TAILS: readonly string[] = Array.from(
+  { length: REDACTION_MARKER.length - CUT_MARKER_MIN_HEAD },
+  (_unused, offset) => REDACTION_MARKER.slice(0, CUT_MARKER_MIN_HEAD + offset) + TRUNCATION_SUFFIX,
+);
+
+/**
+ * The most nested values one attribute's marker scan reads. An attribute is
+ * captured data of any shape, so the scan is bounded; a value larger than the
+ * bound is judged on the part read, and nothing beyond it is claimed redacted.
+ */
+const REDACTION_SCAN_MAX_VALUES = 2_048;
+
 /** Shown for an identifier or a time that is absent or unusable. */
 const NOT_AVAILABLE_LABEL = 'Not available';
 
@@ -669,27 +718,115 @@ function describeAttributeValue(value: unknown): AttributeDisplay {
 }
 
 /**
- * Whether the privacy layer replaced the value under `key`.
+ * Whether one captured string shows the privacy layer's replacement. The rule
+ * is exact and case-sensitive; a string counts when it:
  *
- * The redactor records key-relative paths — `key`, `key.nested`, `key[0]` —
- * so a primitive value is redacted when its own key is listed, and a
- * container when its key or a path beneath it is. Restricting the prefix match
- * to containers keeps a dotted sibling key (`a` beside `a.b`) from inheriting
- * the other's marker.
+ * - CONTAINS {@link REDACTION_MARKER} — the marker alone (`[redacted]`, a
+ *   denied header's value) or in place of a credential inside a longer text
+ *   (`Bearer [redacted]`, `Authorization: [redacted]`,
+ *   `postgres://[redacted]@db`), since the pattern rules replace a credential
+ *   anywhere in an attribute (AAP 0.5.2); or
+ * - ENDS with a cut of the marker: one of {@link CUT_MARKER_TAILS}, which is
+ *   what a bounded preview leaves when its cut falls inside the marker.
+ *
+ * Nothing else counts. Prose that merely uses the word (`was not redacted`),
+ * another casing (`[REDACTED]`) or the word without its brackets is captured
+ * text, because the privacy layer never writes those forms.
+ *
+ * @example
+ * showsRedactionMarker('[redacted]');                 // true
+ * showsRedactionMarker('Authorization: [redacted]');  // true
+ * showsRedactionMarker('"Bearer [redac…');           // true: a cut marker
+ * showsRedactionMarker('the token was not redacted'); // false
+ */
+function showsRedactionMarker(text: string): boolean {
+  return text.includes(REDACTION_MARKER) || CUT_MARKER_TAILS.some((tail) => text.endsWith(tail));
+}
+
+/**
+ * Whether a captured value, or any string nested in it at any depth, shows the
+ * privacy layer's replacement ({@link showsRedactionMarker}).
+ *
+ * A producer can redact before ingest — the browser agent scrubs its prop and
+ * state previews, the Node preload its span attributes — and the service's
+ * redactor is idempotent: it lists a path in `TelemetryEvent.redacted` only for
+ * a value it changed itself, so a value that arrived as the marker is stored
+ * with no path. The marker in the value is then the only record of the
+ * replacement.
+ *
+ * Values are read, never keys. The walk is iterative (no recursion depth to
+ * exhaust), enters each object once (a shared or cyclic reference is not
+ * re-entered), reads at most {@link REDACTION_SCAN_MAX_VALUES} nested values,
+ * and is total: a read that throws — a hostile getter or proxy — ends the scan
+ * with `false`. Nothing is claimed redacted that the scan did not see.
+ */
+function carriesRedactionMarker(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return showsRedactionMarker(value);
+  }
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const entered = new Set<object>([value]);
+  const pending: object[] = [value];
+  let remaining = REDACTION_SCAN_MAX_VALUES;
+  try {
+    for (let container = pending.pop(); container !== undefined; container = pending.pop()) {
+      // Own enumerable values: an array's elements, an object's members.
+      const members: readonly unknown[] = Object.values(container);
+      for (const member of members) {
+        remaining -= 1;
+        if (remaining < 0) {
+          return false;
+        }
+        if (typeof member === 'string') {
+          if (showsRedactionMarker(member)) {
+            return true;
+          }
+        } else if (typeof member === 'object' && member !== null && !entered.has(member)) {
+          entered.add(member);
+          pending.push(member);
+        }
+      }
+    }
+  } catch {
+    // An unreadable member proves nothing either way; the value still renders
+    // through its own degradation path, just without a claim of redaction.
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Whether the privacy layer replaced the value under `key`, or a value nested
+ * in it, by either record of a replacement:
+ *
+ * 1. The path list. The service's redactor records key-relative paths — `key`,
+ *    `key.nested`, `key[0]` — so a primitive value is redacted when its own key
+ *    is listed, and a container when its key or a path beneath it is.
+ *    Restricting the prefix match to containers keeps a dotted sibling key
+ *    (`a` beside `a.b`) from inheriting the other's marker.
+ * 2. The marker in the value ({@link carriesRedactionMarker}), for a value a
+ *    producer replaced before ingest, which no path records.
+ *
+ * Detection only: the value is rendered exactly as captured either way.
  */
 function isRedactedAttribute(
   key: string,
   value: unknown,
   redactedPaths: readonly string[] | undefined,
 ): boolean {
-  if (redactedPaths === undefined || redactedPaths.length === 0) {
-    return false;
+  if (redactedPaths !== undefined && redactedPaths.length > 0) {
+    const container = typeof value === 'object' && value !== null;
+    const listed = redactedPaths.some(
+      (path) =>
+        path === key || (container && (path.startsWith(`${key}.`) || path.startsWith(`${key}[`))),
+    );
+    if (listed) {
+      return true;
+    }
   }
-  const container = typeof value === 'object' && value !== null;
-  return redactedPaths.some(
-    (path) =>
-      path === key || (container && (path.startsWith(`${key}.`) || path.startsWith(`${key}[`))),
-  );
+  return carriesRedactionMarker(value);
 }
 
 /**

@@ -27,7 +27,16 @@
  * | `DEBUGGEN_HOME` | absolute path, `~` accepted; outside every project worked on | {@link DEFAULT_DEBUGGEN_HOME} |
  * | `DEBUGGEN_LOG_LEVEL` | one of {@link LOG_LEVEL_SETTINGS} | {@link DEFAULT_LOG_LEVEL} |
  * | `DEBUGGEN_RETENTION_DAYS` | integer of `0` or more | {@link DEFAULT_RETENTION_DAYS} |
- * | `DEBUGGEN_PROMPTS_DIR` | absolute path | derived from this module's own location |
+ * | `DEBUGGEN_PROMPTS_DIR` | absolute path; at start-up, an existing directory holding {@link PROMPTS_MANIFEST_FILE_NAME} ({@link verifyPromptsDirectory}) | derived from this module's own location |
+ *
+ * Every rule in that table except one is a rule about the value, and
+ * {@link loadServiceConfig} settles it without touching the disk. The
+ * exception is whether the prompt directory is there at all, a fact about the
+ * machine rather than the value. {@link verifyPromptsDirectory} checks it, and
+ * `src/main.ts` calls it immediately after {@link loadServiceConfig}, before
+ * the logger, the state root or anything else writes a byte. A missing prompt
+ * tree therefore fails the start the way a malformed variable does: one
+ * `CONFIG_INVALID` naming `DEBUGGEN_PROMPTS_DIR`, with nothing left behind.
  *
  * An **empty or whitespace-only value counts as absent** for every one of
  * them, so the default applies. That rule is load-bearing rather than
@@ -65,8 +74,10 @@
  * Every path this module produces is normalised POSIX, which is the one
  * spelling the rest of the product speaks; `@debuggen/shared`'s pure-string
  * path helpers do the work, so {@link loadServiceConfig} touches no
- * filesystem. The one filesystem read in this module is the explicit,
- * asynchronous {@link canonicalizePath} described next.
+ * filesystem. This module reads the filesystem in two places, each an explicit
+ * call of its own and neither one writing: {@link verifyPromptsDirectory},
+ * which runs two `stat`s on the prompt directory, and the asynchronous
+ * {@link canonicalizePath} described next.
  *
  * ## The state root stays outside every project
  *
@@ -158,6 +169,16 @@
  * has left the machine's memory for its disk. {@link describeServiceConfig}
  * exists so that the loggable view of a configuration is built in one place
  * that cannot forget this.
+ *
+ * That rule governs every value {@link loadServiceConfig} rejects. The one
+ * failure that quotes something is {@link verifyPromptsDirectory}'s, and what
+ * it quotes is not a rejected value. It is the resolved prompt directory, a
+ * path that already passed validation and that {@link describeServiceConfig}
+ * logs verbatim on every start. It is quoted because it is often the derived
+ * default, a path the developer never typed and could not otherwise find.
+ * Control characters are replaced and the length is bounded before it
+ * appears, and a credential can never reach it, since it is only ever the
+ * prompt directory.
  */
 
 import {
@@ -190,6 +211,7 @@ import {
 } from '@debuggen/model-provider';
 import { z } from 'zod';
 
+import { statSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -524,6 +546,8 @@ export interface ServiceConfigOverrides {
  * `reason` and `hint` are assembled from the key name, the accepted vocabulary
  * and the accepted range only. **Neither may contain the value**, which is the
  * rule that keeps a credential out of a log line; see this module's overview.
+ * The one reason that names a path is {@link verifyPromptsDirectory}'s, which
+ * quotes the validated prompt directory it looked in, never a rejected value.
  */
 export interface ServiceConfigIssue {
   /** The environment key whose value was rejected. */
@@ -2279,6 +2303,9 @@ function normaliseServiceSettings(
  * `src/main.ts` creates the state root `0700` from
  * {@link ServiceConfig.debuggenHome} after this returns. The result is frozen,
  * so a subsystem cannot retune shared configuration by assigning to it.
+ * Whether {@link ServiceConfig.promptsDir} exists is deliberately not asked
+ * here: {@link verifyPromptsDirectory} is that separate, read-only question,
+ * and `src/main.ts` asks it next, before anything touches disk.
  *
  * @param env The environment to read. Only the nine keys of
  * {@link SERVICE_ENV_KEYS} are consulted.
@@ -2491,7 +2518,7 @@ export const serviceConfigSchema: ServiceConfigSchema = Object.freeze({
       kind: 'path',
       secret: false,
       description:
-        'The versioned prompt directory. Set by the editor extension for the service it bundles; otherwise derived from the service module location.',
+        'The versioned prompt directory. Set by the editor extension for the service it bundles; otherwise derived from the service module location. It must exist and hold manifest.json when the service starts, which is checked before anything is written to disk.',
     }),
   }),
   safeParse: loadServiceConfig,
@@ -2737,9 +2764,9 @@ export function stateHomeOverlapError(relation: StateHomeOverlap): DebuggenError
  * denied, a link loop — is returned, because an unresolved path cannot be
  * compared safely.
  *
- * This is the only filesystem access in this module, and it only reads:
- * `realpath` follows links and stats components, it creates and opens
- * nothing.
+ * This and {@link verifyPromptsDirectory} are the only filesystem access in
+ * this module, and both only read: `realpath` follows links and stats
+ * components, it creates and opens nothing.
  *
  * @param path An absolute path, POSIX or Windows spelling.
  * @param options The resolver to use instead of `fs.promises.realpath`.
@@ -2858,4 +2885,277 @@ export async function requireProjectOutsideStateHome(
   }
   const relation = stateHomeOverlap(normalizePosix(canonicalStateHome), canonical.value);
   return relation === undefined ? ok(canonical.value) : err(stateHomeOverlapError(relation));
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The prompt directory is present before anything touches disk
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The prompt manifest's file name, directly inside
+ * {@link ServiceConfig.promptsDir}.
+ *
+ * This is the name `@debuggen/model-provider`'s prompt loader reads and
+ * documents. That package keeps its own constant module-private, so the name
+ * is restated here, and the colocated suite checks that the loader's
+ * `manifestPath` ends in it.
+ */
+export const PROMPTS_MANIFEST_FILE_NAME = 'manifest.json';
+
+/** What {@link verifyPromptsDirectory} needs to know about one entry on disk. */
+export interface PromptsEntryStats {
+  /** Whether the entry, symbolic links followed, is a directory. */
+  isDirectory(): boolean;
+
+  /** Whether the entry, symbolic links followed, is a regular file. */
+  isFile(): boolean;
+}
+
+/**
+ * Stats a path, following symbolic links, the way
+ * `fs.statSync(path, { throwIfNoEntry: false })` does. It returns `undefined`
+ * when nothing is there, and throws for every other failure. Injectable so the
+ * failure branches can be tested on a host that runs as root, where a
+ * permission denial cannot be staged.
+ */
+export type PromptsEntryStat = (path: string) => PromptsEntryStats | undefined;
+
+/** Options of {@link verifyPromptsDirectory}. */
+export interface PromptsDirectoryCheckOptions {
+  /** The stat function; defaults to `fs.statSync` with `throwIfNoEntry: false`. */
+  readonly stat?: PromptsEntryStat | undefined;
+}
+
+/**
+ * The most characters of a path a {@link verifyPromptsDirectory} failure
+ * quotes. A longer path keeps its head and its tail, where the root and the
+ * directory's own name are, with an ellipsis in between.
+ */
+const MAX_REPORTED_PATH_LENGTH = 160;
+
+/** What stands in for the elided middle of a path longer than {@link MAX_REPORTED_PATH_LENGTH}. */
+const REPORTED_PATH_ELISION = '\u2026';
+
+/** What a control character becomes in a quoted path. */
+const REPORTED_PATH_REPLACEMENT = '\uFFFD';
+
+/** The default {@link PromptsEntryStat}: `stat`, not `lstat`, so a linked prompt tree is accepted. */
+function statPromptsEntry(path: string): PromptsEntryStats | undefined {
+  return statSync(path, { throwIfNoEntry: false });
+}
+
+/**
+ * Whether one code point is a C0 control, DELETE or a C1 control.
+ *
+ * A NUL truncates a path in the C APIs behind a filesystem call, and an ESC
+ * starts a terminal escape sequence in whatever renders the log line, so no
+ * such character may survive into a message.
+ */
+function isControlCharacter(character: string): boolean {
+  const code = character.codePointAt(0) ?? 0;
+  return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+}
+
+/**
+ * Renders a path for a failure message: every control character replaced and
+ * the length bounded, measured in code points so a character outside the
+ * Basic Multilingual Plane is never split in half.
+ *
+ * `@debuggen/model-provider`'s prompt loader applies the same
+ * control-character rule to the paths its own failures quote. This differs in
+ * one respect: a long path loses its middle rather than its end, because the
+ * end holds the directory's own name.
+ *
+ * @param path The path to quote.
+ * @returns The quotable form, at most {@link MAX_REPORTED_PATH_LENGTH} code points.
+ */
+function reportablePath(path: string): string {
+  const characters = Array.from(path, (character) =>
+    isControlCharacter(character) ? REPORTED_PATH_REPLACEMENT : character,
+  );
+  if (characters.length <= MAX_REPORTED_PATH_LENGTH) {
+    return characters.join('');
+  }
+  const kept = MAX_REPORTED_PATH_LENGTH - REPORTED_PATH_ELISION.length;
+  const head = Math.ceil(kept / 2);
+  const tail = kept - head;
+  return (
+    characters.slice(0, head).join('') +
+    REPORTED_PATH_ELISION +
+    characters.slice(characters.length - tail).join('')
+  );
+}
+
+/** ` (EACCES)`, or nothing when the thrown value carried no well-formed `errno` code. */
+function errnoSuffix(cause: unknown): string {
+  const errno = errnoCodeOf(cause);
+  return errno === undefined ? '' : ` (${errno})`;
+}
+
+/**
+ * The reason clauses {@link verifyPromptsDirectory} records, each naming the
+ * directory it looked in, quoted by {@link reportablePath}.
+ *
+ * Each condition has its own clause because each has a different fix: point
+ * the variable somewhere that exists, point it at a directory rather than a
+ * file, or add the manifest to a directory that is otherwise right.
+ */
+const PROMPTS_DIRECTORY_REASONS = Object.freeze({
+  missing: (dir: string) => `the directory '${dir}' does not exist`,
+  notADirectory: (dir: string) => `the path '${dir}' is not a directory`,
+  uninspectable: (dir: string, cause: unknown) =>
+    `the directory '${dir}' could not be inspected${errnoSuffix(cause)}`,
+  noManifest: (dir: string) => `the directory '${dir}' has no ${PROMPTS_MANIFEST_FILE_NAME}`,
+  manifestNotAFile: (dir: string) =>
+    `the ${PROMPTS_MANIFEST_FILE_NAME} in '${dir}' is not a regular file`,
+  manifestUninspectable: (dir: string, cause: unknown) =>
+    `the ${PROMPTS_MANIFEST_FILE_NAME} in '${dir}' could not be inspected${errnoSuffix(cause)}`,
+});
+
+/**
+ * What one `stat` found: an entry of a known kind, nothing at all, or a
+ * failure other than absence.
+ */
+type StatOutcome =
+  | { readonly kind: 'entry'; readonly directory: boolean; readonly file: boolean }
+  | { readonly kind: 'missing' }
+  | { readonly kind: 'failed'; readonly cause: unknown };
+
+/**
+ * Stats one path and classifies the answer.
+ *
+ * A thrown `ENOENT` or `ENOTDIR` counts as absence even though the default
+ * stat reports both as `undefined`, because an injected stat, or a Node
+ * release that throws where this one returns, must not turn "not there" into
+ * "could not be inspected". The entry's kind is read inside the same `try`, so
+ * nothing an injected stat returns can throw out of
+ * {@link verifyPromptsDirectory}.
+ */
+function statOutcome(stat: PromptsEntryStat, path: string): StatOutcome {
+  try {
+    const stats = stat(path);
+    return stats === undefined
+      ? { kind: 'missing' }
+      : { kind: 'entry', directory: stats.isDirectory(), file: stats.isFile() };
+  } catch (cause) {
+    const errno = errnoCodeOf(cause);
+    return errno !== undefined && MISSING_PATH_ERRNO_CODES.has(errno)
+      ? { kind: 'missing' }
+      : { kind: 'failed', cause };
+  }
+}
+
+/**
+ * Checks that the prompt directory is there before the service touches disk:
+ * {@link ServiceConfig.promptsDir} exists, is a directory (symbolic links
+ * followed), and holds {@link PROMPTS_MANIFEST_FILE_NAME} as a regular file.
+ *
+ * ## Why this is not part of {@link loadServiceConfig}
+ *
+ * {@link loadServiceConfig} is pure, and it has to stay pure. The dev-server
+ * launcher resolves configurations with it, and so do the suites, with prompt
+ * paths that do not exist on the machine running them. A loader that stat'ed
+ * the prompt directory would fail every one of those callers, or make each of
+ * them depend on the host's disk. Presence is a fact about this machine at
+ * this moment, not about the value, so it is asked as a separate question of
+ * its own, and only by the one caller that is about to serve.
+ *
+ * ## Why it runs first
+ *
+ * `src/main.ts` calls this immediately after {@link loadServiceConfig}. That
+ * is before the logger is built, before `$DEBUGGEN_HOME` is created, before
+ * `auth.json` mints an editor credential, before `sessions.sqlite` is opened
+ * and migrated, and before the reconciliation and retention sweeps. A service
+ * pointed at a missing prompt tree, such as a packaged extension whose copy
+ * is absent or a mistyped `DEBUGGEN_PROMPTS_DIR`, therefore leaves nothing
+ * behind. It fails exactly like any other bad key: one `CONFIG_INVALID` in
+ * {@link loadServiceConfig}'s own format, naming `DEBUGGEN_PROMPTS_DIR` and
+ * carrying that key's remedy.
+ *
+ * ## What it does not do
+ *
+ * It is a presence check, not a validation of the tree. The prompt loader
+ * still parses the manifest and loads every stage's current version when the
+ * service starts, with its containment and bounded-read guarantees, and
+ * reports anything wrong inside the tree with its own hint. This function
+ * only moves the most common failure ahead of every side effect: the
+ * directory or its manifest is simply not there. It is read-only. It makes at
+ * most two `stat` calls and creates, opens and writes nothing. A tree removed
+ * between this check and the loader's read is still refused by the loader.
+ *
+ * ## What the failure says
+ *
+ * The reason quotes the directory that was looked in, with control
+ * characters replaced and the length bounded. This is the one quoted path in
+ * this module's failures; see the overview for why that stays inside the
+ * privacy rule. The hint is `DEBUGGEN_PROMPTS_DIR`'s own remedy, the same one
+ * {@link loadServiceConfig} gives for that key, and it names no internal
+ * function.
+ *
+ * @param config The resolved configuration, or any object carrying its
+ * `promptsDir`: an absolute, normalised POSIX path.
+ * @param options The stat function to use instead of `fs.statSync`.
+ * @returns `ok` when the directory and its manifest are present, or one
+ * `CONFIG_INVALID` error whose message reads
+ * `The local service configuration is invalid: DEBUGGEN_PROMPTS_DIR (<reason>).`
+ * and whose `details` carry `{ subsystem: 'config', keys, issues }` exactly as
+ * {@link loadServiceConfig}'s do.
+ *
+ * @example
+ * ```ts
+ * const loaded = loadServiceConfig(env, overrides);
+ * if (isErr(loaded)) {
+ *   return loaded;
+ * }
+ * const prompts = verifyPromptsDirectory(loaded.value);
+ * if (isErr(prompts)) {
+ *   // "… DEBUGGEN_PROMPTS_DIR (the directory '/opt/prompts' does not exist)."
+ *   return prompts;
+ * }
+ * ```
+ */
+export function verifyPromptsDirectory(
+  config: Pick<ServiceConfig, 'promptsDir'>,
+  options: PromptsDirectoryCheckOptions = {},
+): Result<void, DebuggenError> {
+  const promptsDir: unknown =
+    typeof config === 'object' && config !== null ? config.promptsDir : undefined;
+  if (typeof promptsDir !== 'string') {
+    return err(configError([issue('DEBUGGEN_PROMPTS_DIR', REASONS.unexpectedType)]));
+  }
+  // The shape rule of {@link resolvedServiceConfigSchema}: a caller that did
+  // not come through {@link loadServiceConfig} gets the same verdict it would
+  // have got there, before any path reaches a filesystem call.
+  if (describePathProblem(promptsDir) !== undefined || normalizePosix(promptsDir) !== promptsDir) {
+    return err(configError([issue('DEBUGGEN_PROMPTS_DIR', REASONS.unnormalisedPath)]));
+  }
+
+  const stat = options.stat ?? statPromptsEntry;
+  const quoted = reportablePath(promptsDir);
+  const refuse = (reason: string): Result<void, DebuggenError> =>
+    err(configError([issue('DEBUGGEN_PROMPTS_DIR', reason)]));
+
+  const directory = statOutcome(stat, promptsDir);
+  if (directory.kind === 'missing') {
+    return refuse(PROMPTS_DIRECTORY_REASONS.missing(quoted));
+  }
+  if (directory.kind === 'failed') {
+    return refuse(PROMPTS_DIRECTORY_REASONS.uninspectable(quoted, directory.cause));
+  }
+  if (!directory.directory) {
+    return refuse(PROMPTS_DIRECTORY_REASONS.notADirectory(quoted));
+  }
+
+  const manifest = statOutcome(stat, joinPosix(promptsDir, PROMPTS_MANIFEST_FILE_NAME));
+  if (manifest.kind === 'missing') {
+    return refuse(PROMPTS_DIRECTORY_REASONS.noManifest(quoted));
+  }
+  if (manifest.kind === 'failed') {
+    return refuse(PROMPTS_DIRECTORY_REASONS.manifestUninspectable(quoted, manifest.cause));
+  }
+  if (!manifest.file) {
+    return refuse(PROMPTS_DIRECTORY_REASONS.manifestNotAFile(quoted));
+  }
+
+  return ok(undefined);
 }

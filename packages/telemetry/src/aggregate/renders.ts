@@ -53,11 +53,27 @@
  * come from one internal accumulation pass, so a node's count and its row in
  * the render table can never disagree.
  *
+ * ## Coalesced render events carry a weight
+ *
+ * The browser agent emits one `render` event per group of fibers that rendered
+ * alike in one commit — same component, phase, trigger and changed-prop keys —
+ * rather than one per fiber (`../browser/react.ts`, PERF-F08). Such an event
+ * carries `instanceCount`, the fibers it stands for, and `maxInstanceDuration`,
+ * the slowest of them; its own duration is their sum. So every count here is
+ * **weighted**: an event adds its `instanceCount` (1 when the attribute is
+ * absent, which is every single-fiber event and every event recorded before
+ * coalescing existed) to `renderCount`, to its trigger and phase buckets and to
+ * each changed prop's count. Durations need no weight — the event's duration
+ * already is the sum — except the maximum, which is read from
+ * `maxInstanceDuration` so a group of forty-eight 1 ms cards does not report a
+ * 48 ms render. `render_count` and the two trigger metrics therefore still
+ * count fiber renders, exactly as they did when every fiber had its own event.
+ *
  * @packageDocumentation
  */
 
 import { clampNonNegative, roundMs } from '@debuggen/shared';
-import type { EventId, SourceLocation, SpanId, TraceId } from '@debuggen/shared';
+import type { EventId, SourceLocation, SourceResolvedBy, SpanId, TraceId } from '@debuggen/shared';
 
 import {
   COMMIT_ATTRIBUTE_KEYS,
@@ -65,6 +81,7 @@ import {
   COMPONENT_TREE_EVENT_NAME,
   COMPONENT_TREE_TRUNCATED_FIELD,
   LOG_ATTRIBUTE_KEYS,
+  MAX_OWNER_CHAIN_LENGTH,
   MAX_TRACKED_KEYS,
   RENDER_ATTRIBUTE_KEYS,
   RENDER_PHASES,
@@ -102,6 +119,14 @@ import type { TelemetryKind } from '../schema/kinds.js';
  * {@link readRenderPhase}, {@link readComponentName}), so a reordering upstream
  * degrades this module to "unknown component" and "unknown trigger" — visibly
  * useless output — rather than to plausible-looking wrong output.
+ *
+ * The eighth key, `selfTime`, feeds nothing this module computes and is left
+ * unbound. The ninth and tenth are the coalescing weight and the slowest
+ * instance's duration (see the module documentation); both are validated as
+ * positive integers and finite non-negative numbers respectively, so a
+ * misbinding degrades to weight 1 and to the event's own duration — the
+ * pre-coalescing reading. The eleventh, `changedContexts`, names the contexts
+ * behind a `context` trigger.
  */
 const [
   COMPONENT_KEY,
@@ -111,7 +136,25 @@ const [
   TRIGGER_KEY,
   ACTUAL_DURATION_KEY,
   OWNER_CHAIN_KEY,
+  ,
+  INSTANCE_COUNT_KEY,
+  MAX_INSTANCE_DURATION_KEY,
+  CHANGED_CONTEXTS_KEY,
 ] = RENDER_ATTRIBUTE_KEYS;
+
+/**
+ * The resolution route that places a component by its **owner** rather than by
+ * its own declaration.
+ *
+ * The service's source resolver tries the code graph first — the component's
+ * display name against the project's declarations — and falls back to walking
+ * the render's owner chain to the nearest owner the project declares. A render
+ * whose best location came from that fallback is therefore a component the
+ * project does not declare itself: a framework or library component rendered
+ * *by* project code. Checked against the shared route vocabulary with
+ * `satisfies`, so a renamed route fails this file's typecheck.
+ */
+const OWNER_CHAIN_ROUTE = 'react-owner' satisfies SourceResolvedBy;
 
 /**
  * The two trigger members this module reports as their own totals.
@@ -315,11 +358,17 @@ export type RenderTriggerHistogram = Readonly<Record<RenderTrigger, number>>;
 export type RenderPhaseCounts = Readonly<Record<RenderPhase, number>>;
 
 /**
- * One observed render of one component.
+ * One observed render event of one component.
  *
  * The row behind an expanded render-table row. It carries the identifiers a
  * panel needs to cite this render as evidence and to jump from it to the trace
  * it happened in, and the source location the component name links to.
+ *
+ * One occurrence is one `render` event, and a coalesced event stands for
+ * several fibers of the component that rendered alike in one commit: then
+ * {@link instanceCount} says how many, {@link durationMs} is their summed time
+ * and {@link maxInstanceDurationMs} the slowest one. A component's occurrences
+ * can therefore number fewer than its {@link RenderStat.renderCount}.
  */
 export interface RenderOccurrence {
   /**
@@ -342,8 +391,22 @@ export interface RenderOccurrence {
    * base across browser, server and database tiers.
    */
   startTime: number;
-  /** How long the render took, in milliseconds, never negative. */
+  /**
+   * How long the render took, in milliseconds, never negative — summed over
+   * the fibers a coalesced event stands for.
+   */
   durationMs: number;
+  /**
+   * How many fibers this event stands for, present only when more than one:
+   * the event was coalesced from that many renders of the component in one
+   * commit. Absent means one.
+   */
+  instanceCount?: number;
+  /**
+   * The slowest of those fibers' renders, in milliseconds. Present exactly
+   * when {@link instanceCount} is.
+   */
+  maxInstanceDurationMs?: number;
   /** Mount or update, when the phase was recorded. */
   phase?: RenderPhase;
   /** Why the fiber rendered. `unknown` when that could not be determined. */
@@ -358,6 +421,15 @@ export interface RenderOccurrence {
    * never travels, and this module never reconstructs one.
    */
   changedPropKeys: readonly string[];
+  /**
+   * The contexts whose value changed at this render, each named by the
+   * component that provides it, sorted ascending by code unit.
+   *
+   * Empty when none changed or the producer could not name them. A `context`
+   * trigger with an empty list is still a context-triggered render; the list
+   * is attribution, not classification.
+   */
+  changedContexts: readonly string[];
   /** Where the component is declared, when a resolver supplied it. */
   source?: SourceLocation;
 }
@@ -387,12 +459,15 @@ export interface RenderStat {
    */
   component: string;
   /**
-   * Renders observed for this component in the capture.
+   * Renders observed for this component in the capture: fiber renders, each
+   * `render` event contributing its `instanceCount` (1 when absent).
    *
    * Counts `render` events only. A commit is structural — it is the parent of
    * the renders it performed — so counting commits here would inflate every
    * total and break the identity `render_count` = the sum of this field over
-   * the result set, which `./summary.ts` relies on.
+   * the result set, which `./summary.ts` relies on. Weighting keeps that
+   * identity meaning what it meant before the agent coalesced renders: the
+   * number of times a fiber of this component rendered.
    */
   renderCount: number;
   /** Summed render time, in milliseconds. */
@@ -406,11 +481,20 @@ export interface RenderStat {
    * row states.
    */
   averageDurationMs: number;
-  /** Longest single render, in milliseconds. */
+  /**
+   * Longest single fiber render, in milliseconds: a coalesced event
+   * contributes its `maxInstanceDuration`, never its summed duration.
+   */
   maxDurationMs: number;
   /** Start of the earliest observed render, in Unix epoch milliseconds. */
   firstStartTime: number;
-  /** Start of the latest observed render, in Unix epoch milliseconds. */
+  /**
+   * Start of the latest observed render event, in Unix epoch milliseconds.
+   *
+   * A coalesced event starts at its earliest instance, so the bound is exact
+   * to the commit rather than to the fiber: the group's other instances began
+   * inside that same commit.
+   */
   lastStartTime: number;
   /** Renders per trigger bucket; total over the vocabulary, zero-filled. */
   triggers: RenderTriggerHistogram;
@@ -448,6 +532,22 @@ export interface RenderStat {
    */
   changedPropCounts: Readonly<Record<string, number>>;
   /**
+   * The contexts whose changes re-rendered this component, most frequent
+   * first — ties by name ascending by code unit — at most
+   * {@link MAX_TRACKED_KEYS} of them.
+   *
+   * Each is named by the component that provides the context, which is what
+   * turns a bare `context` bucket into "context change: ‹provider›" and lets a
+   * reader follow the cascade to the provider's own row. Names only.
+   */
+  changedContexts: readonly string[];
+  /**
+   * How many renders each named context changed at.
+   *
+   * Keyed by exactly the names in {@link changedContexts}.
+   */
+  changedContextCounts: Readonly<Record<string, number>>;
+  /**
    * Where the component is declared, when at least one of its renders carried a
    * location.
    *
@@ -457,16 +557,31 @@ export interface RenderStat {
    */
   source?: SourceLocation;
   /**
-   * Individual renders, earliest first, bounded by
+   * Whether the project declares this component itself.
+   *
+   * `true` exactly when {@link source} exists and was resolved from the
+   * component's own declaration. `false` for a component placed only through
+   * its owner chain — a framework or library component that project code
+   * renders — and for one no route could place at all. Views use it to lead
+   * with the project's own components and to mark the rest, rather than let a
+   * framework's internal (often minified) components outnumber them.
+   */
+  declaredInProject: boolean;
+  /**
+   * Individual render events, earliest first, bounded by
    * {@link RenderAggregateOptions.maxOccurrencesPerComponent}.
    *
-   * Empty when the caller asked for counts only; see
-   * {@link occurrencesTruncated}.
+   * One per event, so a coalesced event is one occurrence standing for its
+   * {@link RenderOccurrence.instanceCount} renders; the weights of an
+   * untruncated list sum to {@link renderCount}. Empty when the caller asked
+   * for counts only; see {@link occurrencesTruncated}.
    */
   occurrences: readonly RenderOccurrence[];
   /**
-   * Whether renders exist that {@link occurrences} does not list — because the
-   * bound was reached, or because occurrences were not requested at all.
+   * Whether render events exist that {@link occurrences} does not list —
+   * because the bound was reached, or because occurrences were not requested
+   * at all. A coalesced event that is listed is not truncation: it stands for
+   * all of its instances.
    */
   occurrencesTruncated: boolean;
 }
@@ -703,7 +818,12 @@ interface RenderRecord {
   readonly parentSpanId: SpanId | undefined;
   readonly traceId: TraceId;
   readonly startTime: number;
+  /** The event's duration: summed over its instances when coalesced. */
   readonly durationMs: number;
+  /** Fibers the event stands for: its `instanceCount`, 1 when absent. */
+  readonly weight: number;
+  /** The slowest instance; equals {@link durationMs} for a single fiber. */
+  readonly maxInstanceDurationMs: number;
   readonly ingestSeq: number;
   readonly component: string;
   readonly componentId: string;
@@ -711,10 +831,18 @@ interface RenderRecord {
   readonly trigger: RenderTrigger;
   readonly reportedRenderCount: number | undefined;
   readonly changedPropKeys: readonly string[];
+  /** Names of the providers of the contexts that changed, sorted, deduplicated. */
+  readonly changedContexts: readonly string[];
   /** Ancestor component names, nearest first, as the producer recorded them. */
   readonly ownerChain: readonly string[];
   /** Whether the chain was cut at {@link MAX_OWNER_CHAIN_SEGMENTS}. */
   readonly ownerChainTruncated: boolean;
+  /**
+   * Whether the producer's chain reached its own bound,
+   * {@link MAX_OWNER_CHAIN_LENGTH}, and so may stop short of the page's root.
+   * Counted over the entries as they arrived, before repeats were collapsed.
+   */
+  readonly ownerChainAtProducerBound: boolean;
   readonly source: SourceLocation | undefined;
 }
 
@@ -761,6 +889,7 @@ interface ComponentAccumulator {
   readonly triggers: Record<RenderTrigger, number>;
   readonly phaseCounts: Record<RenderPhase, number>;
   readonly changedPropCounts: Map<string, number>;
+  readonly changedContextCounts: Map<string, number>;
   source: SourceLocation | undefined;
   lastTrigger: RenderTrigger | undefined;
   lastOrderStartTime: number;
@@ -1019,6 +1148,49 @@ function readReportedRenderCount(attributes: AttributeBag): number | undefined {
 }
 
 /**
+ * How many fibers one render event stands for.
+ *
+ * A positive safe integer when the producer coalesced the event (it writes the
+ * attribute only when more than one fiber rendered alike), and 1 for anything
+ * else — absence, which is every single-fiber event, and every value that is
+ * not a count: zero, a negative, a fraction, `NaN`, a string. Falling back to
+ * 1 rather than dropping the event keeps a malformed attribute costing only
+ * its weight: the event was still one observed render.
+ */
+function readInstanceCount(attributes: AttributeBag): number {
+  const value = asFiniteNumber(readAttribute(attributes, INSTANCE_COUNT_KEY));
+  if (value === undefined || !Number.isSafeInteger(value) || value < 1) {
+    return 1;
+  }
+  return value;
+}
+
+/**
+ * The slowest instance of a coalesced render event, in milliseconds.
+ *
+ * Read only for an event that stands for more than one fiber; a single fiber's
+ * slowest render is its own duration. Clamped non-negative and capped at the
+ * event's summed duration, because no instance can take longer than all of
+ * them together — a larger value is not a measurement. Absent or unusable, it
+ * falls back to the event's duration: the pre-coalescing reading, and an upper
+ * bound rather than a guess below the truth.
+ */
+function readMaxInstanceDurationMs(
+  attributes: AttributeBag,
+  weight: number,
+  durationMs: number,
+): number {
+  if (weight <= 1) {
+    return durationMs;
+  }
+  const reported = asFiniteNumber(readAttribute(attributes, MAX_INSTANCE_DURATION_KEY));
+  if (reported === undefined) {
+    return durationMs;
+  }
+  return Math.min(roundMs(clampNonNegative(reported)), durationMs);
+}
+
+/**
  * The name of one changed prop, from either shape the attribute may carry.
  *
  * The producer's diff emits entries, but a leaner producer — or a replayed
@@ -1085,10 +1257,11 @@ function readChangedPropKeys(attributes: AttributeBag): readonly string[] {
 function readOwnerChain(attributes: AttributeBag): {
   readonly chain: readonly string[];
   readonly truncated: boolean;
+  readonly atProducerBound: boolean;
 } {
   const entries = asArray(readAttribute(attributes, OWNER_CHAIN_KEY));
   if (entries === undefined || entries.length === 0) {
-    return { chain: [], truncated: false };
+    return { chain: [], truncated: false, atProducerBound: false };
   }
   const chain: string[] = [];
   let truncated = false;
@@ -1103,7 +1276,48 @@ function readOwnerChain(attributes: AttributeBag): {
     }
     chain.push(name);
   }
-  return { chain, truncated };
+  // Measured on the entries as they arrived: the producer's bound counts the
+  // ancestors it walked, and collapsing a memoised wrapper into its component
+  // here must not make a cut chain look like one that reached the root.
+  return { chain, truncated, atProducerBound: entries.length >= MAX_OWNER_CHAIN_LENGTH };
+}
+
+/**
+ * Names of the providers whose context changed at one render: deduplicated,
+ * sorted, and cut to {@link MAX_TRACKED_KEYS}.
+ *
+ * Only non-empty strings are names; anything else in the list is skipped, so a
+ * malformed entry costs itself and not the render's other attributions.
+ */
+function readChangedContexts(attributes: AttributeBag): readonly string[] {
+  const entries = asArray(readAttribute(attributes, CHANGED_CONTEXTS_KEY));
+  if (entries === undefined || entries.length === 0) {
+    return [];
+  }
+  const names = new Set<string>();
+  for (const entry of entries) {
+    const name = asNonEmptyString(entry);
+    if (name === undefined) {
+      continue;
+    }
+    names.add(name);
+    if (names.size >= MAX_TRACKED_KEYS) {
+      break;
+    }
+  }
+  return [...names].sort(compareStrings);
+}
+
+/**
+ * Whether a component's best location says the project declares it.
+ *
+ * A location placed through the owner chain points at the nearest *owner* the
+ * project declares — the component that rendered this one — so it is evidence
+ * that the component itself lives outside the project. No location at all is
+ * the same answer: nothing in the project's code graph carries the name.
+ */
+function isDeclaredInProject(source: SourceLocation | undefined): boolean {
+  return source !== undefined && source.resolvedBy !== OWNER_CHAIN_ROUTE;
 }
 
 /**
@@ -1200,13 +1414,17 @@ function toRenderRecord(event: TelemetryEvent): RenderRecord | undefined {
   const attributes: AttributeBag = event.attributes;
   const component = readComponentName(attributes);
   const ownerChain = readOwnerChain(attributes);
+  const durationMs = renderDurationMs(event, attributes);
+  const weight = readInstanceCount(attributes);
   return {
     eventId: event.id,
     spanId: event.spanId,
     parentSpanId: event.parentSpanId,
     traceId: event.traceId,
     startTime,
-    durationMs: renderDurationMs(event, attributes),
+    durationMs,
+    weight,
+    maxInstanceDurationMs: readMaxInstanceDurationMs(attributes, weight, durationMs),
     ingestSeq: event.ingestSeq,
     component,
     componentId: renderStatId(component),
@@ -1214,8 +1432,10 @@ function toRenderRecord(event: TelemetryEvent): RenderRecord | undefined {
     trigger: readTrigger(attributes),
     reportedRenderCount: readReportedRenderCount(attributes),
     changedPropKeys: readChangedPropKeys(attributes),
+    changedContexts: readChangedContexts(attributes),
     ownerChain: ownerChain.chain,
     ownerChainTruncated: ownerChain.truncated,
+    ownerChainAtProducerBound: ownerChain.atProducerBound,
     source: event.source,
   };
 }
@@ -1305,6 +1525,7 @@ function createAccumulator(component: string, id: string, startTime: number): Co
     triggers: zeroFilledCounts(RENDER_TRIGGERS),
     phaseCounts: zeroFilledCounts(RENDER_PHASES),
     changedPropCounts: new Map<string, number>(),
+    changedContextCounts: new Map<string, number>(),
     source: undefined,
     lastTrigger: undefined,
     lastOrderStartTime: Number.NEGATIVE_INFINITY,
@@ -1314,7 +1535,15 @@ function createAccumulator(component: string, id: string, startTime: number): Co
   };
 }
 
-/** Folds one render into its component's running totals. */
+/**
+ * Folds one render event into its component's running totals.
+ *
+ * Every count moves by the event's {@link RenderRecord.weight} — the fibers it
+ * stands for — so a coalesced event and the per-fiber events it replaced
+ * produce the same totals (see the module documentation). The summed duration
+ * is added once, because it already is the sum over those fibers; the maximum
+ * is taken from the slowest instance.
+ */
 function accumulate(components: Map<string, ComponentAccumulator>, record: RenderRecord): void {
   let accumulator = components.get(record.componentId);
   if (accumulator === undefined) {
@@ -1322,10 +1551,11 @@ function accumulate(components: Map<string, ComponentAccumulator>, record: Rende
     components.set(record.componentId, accumulator);
   }
 
-  accumulator.renderCount += 1;
+  const weight = record.weight;
+  accumulator.renderCount += weight;
   accumulator.totalDuration += record.durationMs;
-  if (record.durationMs > accumulator.maxDuration) {
-    accumulator.maxDuration = record.durationMs;
+  if (record.maxInstanceDurationMs > accumulator.maxDuration) {
+    accumulator.maxDuration = record.maxInstanceDurationMs;
   }
   if (record.startTime < accumulator.firstStartTime) {
     accumulator.firstStartTime = record.startTime;
@@ -1334,13 +1564,19 @@ function accumulate(components: Map<string, ComponentAccumulator>, record: Rende
     accumulator.lastStartTime = record.startTime;
   }
 
-  accumulator.triggers[record.trigger] += 1;
+  accumulator.triggers[record.trigger] += weight;
   if (record.phase !== undefined) {
-    accumulator.phaseCounts[record.phase] += 1;
+    accumulator.phaseCounts[record.phase] += weight;
   }
 
   for (const key of record.changedPropKeys) {
-    accumulator.changedPropCounts.set(key, (accumulator.changedPropCounts.get(key) ?? 0) + 1);
+    accumulator.changedPropCounts.set(key, (accumulator.changedPropCounts.get(key) ?? 0) + weight);
+  }
+  for (const name of record.changedContexts) {
+    accumulator.changedContextCounts.set(
+      name,
+      (accumulator.changedContextCounts.get(name) ?? 0) + 1,
+    );
   }
 
   // The latest render in canonical order owns `lastTrigger`, so the value does
@@ -1450,14 +1686,47 @@ function toOccurrence(record: RenderRecord): RenderOccurrence {
     ...(record.parentSpanId === undefined ? {} : { parentSpanId: record.parentSpanId }),
     startTime: record.startTime,
     durationMs: record.durationMs,
+    // Both or neither, and only for a coalesced event: a single-fiber
+    // occurrence keeps exactly the shape it had before coalescing existed.
+    ...(record.weight > 1
+      ? { instanceCount: record.weight, maxInstanceDurationMs: record.maxInstanceDurationMs }
+      : {}),
     ...(record.phase === undefined ? {} : { phase: record.phase }),
     trigger: record.trigger,
     ...(record.reportedRenderCount === undefined
       ? {}
       : { renderCount: record.reportedRenderCount }),
     changedPropKeys: record.changedPropKeys,
+    changedContexts: record.changedContexts,
     ...(record.source === undefined ? {} : { source: record.source }),
   };
+}
+
+/**
+ * The named contexts of one component, most frequent first, with their counts.
+ *
+ * Frequency order rather than name order, because the first name is the one a
+ * reader acts on: the provider behind most of the component's context
+ * renders. Ties fall back to the name, so the order is total.
+ */
+function rankChangedContexts(counts: ReadonlyMap<string, number>): {
+  readonly names: readonly string[];
+  readonly counts: Readonly<Record<string, number>>;
+} {
+  const names = [...counts.entries()]
+    .sort((left, right) =>
+      left[1] !== right[1] ? right[1] - left[1] : compareStrings(left[0], right[0]),
+    )
+    .slice(0, MAX_TRACKED_KEYS)
+    .map(([name]) => name);
+  const kept: Record<string, number> = {};
+  for (const name of names) {
+    const count = counts.get(name);
+    if (count !== undefined) {
+      kept[name] = count;
+    }
+  }
+  return { names, counts: kept };
 }
 
 /** Projects one component's accumulator into its transported form. */
@@ -1481,6 +1750,7 @@ function toRenderStat(
     }
     changedPropCounts[key] = count;
   }
+  const contexts = rankChangedContexts(accumulator.changedContextCounts);
 
   // Ordering is only worth paying for when the list is going to be carried.
   // `./summary.ts` aggregates every capture with occurrences switched off, so
@@ -1505,7 +1775,10 @@ function toRenderStat(
     phaseCounts: { ...accumulator.phaseCounts },
     changedPropKeys,
     changedPropCounts,
+    changedContexts: contexts.names,
+    changedContextCounts: contexts.counts,
     ...(accumulator.source === undefined ? {} : { source: accumulator.source }),
+    declaredInProject: isDeclaredInProject(accumulator.source),
     occurrences: kept.map(toOccurrence),
     // True whenever renders exist that the list does not carry — including the
     // counts-only case, where none of them do.
@@ -1519,7 +1792,8 @@ function toRenderStat(
  * Only `render` events contribute. Commits are the structure renders happened
  * inside and are consumed by {@link buildComponentTreeSnapshot} instead, so
  * that `render_count` stays the number of renders rather than the number of
- * rendering events.
+ * rendering events. For the same reason each render event is weighted by its
+ * `instanceCount`: a coalesced event counts as the fiber renders it stands for.
  *
  * The returned array is fresh, and so is every object in it; the input array
  * and the events inside it are left untouched.
@@ -2012,6 +2286,183 @@ interface DraftBuilder {
 }
 
 /**
+ * Trie nodes one graft-anchor search may visit.
+ *
+ * A hostile-input bound, like {@link MAX_OWNER_CHAIN_SEGMENTS}: real chains are
+ * at most {@link MAX_OWNER_CHAIN_LENGTH} ancestors deep and a real page yields
+ * a trie of a few thousand nodes, so the bound is never reached by a capture —
+ * it exists so a pathological one cannot make a panel-data request quadratic.
+ */
+const MAX_GRAFT_SEARCH_NODES = 65_536;
+
+/** A fresh trie node for one path segment. */
+function newDraftBuilder(component: string): DraftBuilder {
+  return {
+    draft: { component, key: undefined, children: [] },
+    children: new Map<string, DraftBuilder>(),
+  };
+}
+
+/**
+ * Inserts one root-first path into the trie, sharing every prefix that already
+ * exists, and returns the root the path hangs from.
+ */
+function insertPath(
+  roots: Map<string, DraftBuilder>,
+  path: readonly string[],
+): DraftBuilder | undefined {
+  let level = roots;
+  let parent: DraftBuilder | undefined;
+  let root: DraftBuilder | undefined;
+  for (const segment of path) {
+    const levelKey = levelKeyOf(segment, undefined);
+    let builder = level.get(levelKey);
+    if (builder === undefined) {
+      builder = newDraftBuilder(segment);
+      level.set(levelKey, builder);
+      if (parent !== undefined) {
+        parent.draft.children.push(builder.draft);
+      }
+    }
+    root ??= builder;
+    parent = builder;
+    level = builder.children;
+  }
+  return root;
+}
+
+/**
+ * How much of `source`'s subtree `target`'s subtree already contains, counted
+ * in nodes: the two roots, plus every child of `source` that `target` has
+ * under the same name, recursively.
+ *
+ * The measure a graft is chosen by. A cut chain that re-enters the tree at its
+ * true position matches the structure below that position; the same name
+ * elsewhere in the tree — a framework boundary nested at several levels, say —
+ * matches less of it.
+ */
+function overlapScore(source: DraftBuilder, target: DraftBuilder): number {
+  let score = 1;
+  for (const [levelKey, child] of source.children) {
+    const counterpart = target.children.get(levelKey);
+    if (counterpart !== undefined) {
+      score += overlapScore(child, counterpart);
+    }
+  }
+  return score;
+}
+
+/**
+ * The one non-root node a root may be grafted onto, or `undefined` when there
+ * is none or when the choice is ambiguous.
+ *
+ * A candidate carries the root's name at depth one or more in **another**
+ * root's tree — never in the root's own, so a graft cannot create a cycle. The
+ * candidate with the greatest {@link overlapScore} wins; a tie between two
+ * positions is not settled by picking one, because a reconstruction that puts
+ * a subtree in the wrong place would read exactly like one that put it in the
+ * right place. The root then stays a root, and the snapshot is caveated.
+ */
+function findGraftAnchor(
+  root: DraftBuilder,
+  roots: ReadonlyMap<string, DraftBuilder>,
+): DraftBuilder | undefined {
+  let best: DraftBuilder | undefined;
+  let bestScore = 0;
+  let tied = false;
+  let budget = MAX_GRAFT_SEARCH_NODES;
+
+  for (const other of roots.values()) {
+    if (other === root) {
+      continue;
+    }
+    const pending: DraftBuilder[] = [...other.children.values()];
+    while (pending.length > 0 && budget > 0) {
+      const node = pending.pop();
+      if (node === undefined) {
+        break;
+      }
+      budget -= 1;
+      if (node.draft.component === root.draft.component && node.draft.key === root.draft.key) {
+        const score = overlapScore(root, node);
+        if (score > bestScore) {
+          best = node;
+          bestScore = score;
+          tied = false;
+        } else if (score === bestScore) {
+          tied = true;
+        }
+      }
+      for (const child of node.children.values()) {
+        pending.push(child);
+      }
+    }
+  }
+
+  return tied ? undefined : best;
+}
+
+/**
+ * Merges `source`'s subtree into `target`: a child `target` already has under
+ * the same name absorbs the matching child of `source`, and any other child is
+ * moved across whole. `source` itself is discarded by the caller.
+ */
+function mergeDraftBuilder(target: DraftBuilder, source: DraftBuilder): void {
+  for (const [levelKey, child] of source.children) {
+    const existing = target.children.get(levelKey);
+    if (existing === undefined) {
+      target.children.set(levelKey, child);
+      target.draft.children.push(child.draft);
+    } else {
+      mergeDraftBuilder(existing, child);
+    }
+  }
+}
+
+/**
+ * Re-attaches every root that is not known to be a real root to the position
+ * in the tree its path came from.
+ *
+ * The producer walks at most {@link MAX_OWNER_CHAIN_LENGTH} ancestors, so the
+ * chains of components deeper than that start part-way down the page, each at
+ * a different ancestor — one level lower for every level deeper the component
+ * sits. Built as a trie of root-first paths alone, every one of those becomes
+ * a separate root repeating the same subtree beneath a different framework
+ * boundary. Grafting each such root onto the unique best-matching node of
+ * another root's tree rebuilds the one structure they all describe.
+ *
+ * Only roots never reached by a chain that ran to the top are candidates: a
+ * chain shorter than the bound ended at the page's root, so that root is real
+ * and stays one. Each graft removes a root, so the passes are bounded by the
+ * root count the reconstruction started with.
+ */
+function graftCutRoots(
+  roots: Map<string, DraftBuilder>,
+  anchoredRoots: ReadonlySet<DraftBuilder>,
+): void {
+  const passes = roots.size;
+  for (let pass = 0; pass < passes; pass += 1) {
+    let grafted = false;
+    for (const [levelKey, root] of roots) {
+      if (anchoredRoots.has(root)) {
+        continue;
+      }
+      const anchor = findGraftAnchor(root, roots);
+      if (anchor === undefined) {
+        continue;
+      }
+      mergeDraftBuilder(anchor, root);
+      roots.delete(levelKey);
+      grafted = true;
+      break;
+    }
+    if (!grafted) {
+      return;
+    }
+  }
+}
+
+/**
  * Rebuilds a forest from the owner chains of a set of renders.
  *
  * Paths that share a prefix share nodes, which is what turns a flat list of
@@ -2019,39 +2470,70 @@ interface DraftBuilder {
  * merge, because a chain of names carries no instance identity — the node's
  * cumulative count covers both, and the component-tree view is about which
  * components rendered, not about how many copies of one existed.
+ *
+ * A chain the producer cut at its bound does not start at the page's root, so
+ * the roots such chains produce are grafted back onto the tree they belong to
+ * ({@link graftCutRoots}). A cut root that has nowhere unambiguous to go stays
+ * a root and is counted in `unanchoredRoots`: the structure above it is not in
+ * the evidence, and the snapshot says so.
+ *
+ * Each distinct path is inserted once, however many renders share it, which
+ * keeps a capture of tens of thousands of renders of a few hundred paths cheap.
  */
 function buildForestFromChains(records: readonly RenderRecord[]): {
   readonly roots: readonly TreeDraft[];
   readonly chainlessRenders: number;
+  readonly unanchoredRoots: number;
 } {
   const roots = new Map<string, DraftBuilder>();
+  const anchoredRoots = new Set<DraftBuilder>();
+  const cutRoots = new Set<DraftBuilder>();
+  const insertedPaths = new Set<string>();
   let chainlessRenders = 0;
 
   for (const record of records) {
-    if (record.ownerChain.length === 0) {
-      chainlessRenders += 1;
+    const chainless = record.ownerChain.length === 0;
+    if (chainless) {
+      // Weighted like every other render count: a coalesced event without a
+      // chain is that many renders the reconstruction could not place.
+      chainlessRenders += record.weight;
     }
-    let level = roots;
-    let parent: DraftBuilder | undefined;
-    for (const segment of rootFirstPath(record)) {
-      const levelKey = levelKeyOf(segment, undefined);
-      let builder = level.get(levelKey);
-      if (builder === undefined) {
-        builder = {
-          draft: { component: segment, key: undefined, children: [] },
-          children: new Map<string, DraftBuilder>(),
-        };
-        level.set(levelKey, builder);
-        if (parent !== undefined) {
-          parent.draft.children.push(builder.draft);
-        }
-      }
-      parent = builder;
-      level = builder.children;
+    const cut = record.ownerChainAtProducerBound || record.ownerChainTruncated;
+    const path = rootFirstPath(record);
+    const pathKey = `${chainless ? 'n' : cut ? 'c' : 'r'}\u0001${path.join('\u0000')}`;
+    if (insertedPaths.has(pathKey)) {
+      continue;
+    }
+    insertedPaths.add(pathKey);
+
+    const root = insertPath(roots, path);
+    if (root === undefined) {
+      continue;
+    }
+    if (cut) {
+      cutRoots.add(root);
+    } else if (!chainless) {
+      // A whole chain ended here, so this is the page's root. A chainless
+      // render proves nothing about its position — the producer may simply not
+      // have recorded one — and stays graftable.
+      anchoredRoots.add(root);
     }
   }
 
-  return { roots: [...roots.values()].map((builder) => builder.draft), chainlessRenders };
+  graftCutRoots(roots, anchoredRoots);
+
+  let unanchoredRoots = 0;
+  for (const root of roots.values()) {
+    if (cutRoots.has(root) && !anchoredRoots.has(root)) {
+      unanchoredRoots += 1;
+    }
+  }
+
+  return {
+    roots: [...roots.values()].map((builder) => builder.draft),
+    chainlessRenders,
+    unanchoredRoots,
+  };
 }
 
 /**
@@ -2393,10 +2875,12 @@ export function buildComponentTreeSnapshot(
       emitted,
       droppedWhileReading: false,
       // A reconstruction is complete only when every render of an exactly
-      // matched commit carried a whole chain.
+      // matched commit carried a whole chain, and every chain the producer
+      // cut at its bound found its place again beneath a real root.
       incomplete:
         !selection.exact ||
         forest.chainlessRenders > 0 ||
+        forest.unanchoredRoots > 0 ||
         selection.records.some((record) => record.ownerChainTruncated),
     });
   }

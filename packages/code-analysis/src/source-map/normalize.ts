@@ -57,7 +57,14 @@
  * into a dependency, a bundler runtime or a foreign origin is *expected*, and
  * three other routes remain. A throw here would deny the pipeline those
  * fallbacks and turn a routine frame into a failed session, so every rejection
- * below is logged once at `debug` level and never higher.
+ * below is logged once and never above `debug`. The level says which kind it
+ * was: a rejection that is the design working — a dependency or generated tree,
+ * a bundler runtime or namespace, or an absolute path outside the root that
+ * lies inside a dependency tree (a workspace installs dependencies above the
+ * project root) — is logged at `trace`, because every stack a session resolves
+ * carries such frames and one record per frame would bury the debug log; every
+ * other rejection names a source the module could not place and is logged at
+ * `debug`.
  *
  * | Rejection | Why the source cannot become a project path |
  * | --- | --- |
@@ -351,8 +358,11 @@ const PERCENT = '%';
  */
 const MAX_PREFIX_STRIP_ROUNDS = 64;
 
+/** The message of the module's one log record, written once per rejected source. */
+const REJECTION_MESSAGE = 'Source-map source not resolved to a project path';
+
 /**
- * How much of a rejected source a `debug` record repeats back.
+ * How much of a rejected source a rejection record repeats back.
  *
  * A `sources` entry is bundler output derived from a page the developer opened,
  * so it is untrusted input that must not be copied unbounded into a log.
@@ -373,9 +383,10 @@ const REPLACEMENT_CHARACTER = '\uFFFD';
 
 /**
  * Why a source was refused, recorded as the `reason` field of the module's
- * single `debug` record so a reader can tell an expected rejection (a dependency
- * frame, a bundler runtime) from a suspicious one (a path outside the project)
- * without parsing a message.
+ * single rejection record so a reader can tell an expected rejection (a
+ * dependency frame, a bundler runtime) from a suspicious one (a path outside
+ * the project) without parsing a message. {@link EXPECTED_REJECTIONS} decides
+ * which of the two levels the record is written at.
  *
  * Module-internal: the public surface is the exports below, and every
  * rejection they produce is the same `undefined`.
@@ -394,6 +405,61 @@ type RejectionReason =
   | 'names-project-root'
   | 'excluded-segment'
   | 'unsafe-relative-path';
+
+/**
+ * The rejections that describe the design working rather than a source the
+ * module could not place, and are therefore logged at `trace`, not `debug`.
+ *
+ * Every stack a session resolves runs through framework and bundler frames —
+ * React's scheduler, the router, the bundler runtime — so these rejections are
+ * produced once per such frame of every resolved stack. At `debug` they would
+ * bury the records a reader needs; at `trace` they remain available to whoever
+ * asks for them. `outside-project-root` joins this set only for a path inside a
+ * dependency tree (see {@link isExpectedRejection}): an absolute path outside
+ * the root anywhere else is the suspicious case and stays at `debug`.
+ */
+const EXPECTED_REJECTIONS: ReadonlySet<RejectionReason> = new Set<RejectionReason>([
+  'bundler-internal',
+  'bundler-namespace',
+  'excluded-segment',
+]);
+
+/**
+ * Whether rejecting `offending` for `reason` is expected — a dependency,
+ * generated or bundler source — rather than a source the module could not
+ * place.
+ *
+ * An absolute path outside the project root is expected in two spellings:
+ *
+ * - one of its segments is a {@link REJECTED_PATH_SEGMENTS} entry. A workspace
+ *   installs its dependencies above the project root
+ *   (`<workspace>/node_modules/.pnpm/…`), so a framework frame of a workspace
+ *   member arrives as exactly such a path;
+ * - its leading segment is a bracketed bundler namespace other than a
+ *   {@link SOURCE_URL_MARKERS} entry. Turbopack writes its runtime as
+ *   `turbopack:///[turbopack]/…`, whose three slashes make the path absolute.
+ */
+function isExpectedRejection(reason: RejectionReason, offending: string): boolean {
+  if (EXPECTED_REJECTIONS.has(reason)) {
+    return true;
+  }
+  if (reason !== 'outside-project-root') {
+    return false;
+  }
+  const segments = toPosix(offending)
+    .replace(SCHEME_PATTERN, '')
+    .split(SEPARATOR)
+    .filter((segment) => segment.length > 0);
+  const leading = segments[0];
+  if (
+    leading !== undefined &&
+    BRACKETED_SEGMENT.test(leading) &&
+    !SOURCE_URL_MARKERS.includes(leading)
+  ) {
+    return true;
+  }
+  return segments.some((segment) => REJECTED_PATH_SEGMENTS.includes(segment));
+}
 
 /** The outcome of percent-decoding: the usable string, and whether decoding failed. */
 interface PercentDecoding {
@@ -434,12 +500,14 @@ export interface NormalizeSourcePathOptions {
   readonly extraRejectedSegments?: readonly string[];
 
   /**
-   * Where a rejection is explained, at `debug` level only.
+   * Where a rejection is explained: at `trace` for an expected one (a
+   * dependency, generated or bundler source), at `debug` for any other.
    *
    * Defaults to `noopLogger`. A rejected frame is normal operation (most maps
    * carry at least one dependency source), so this module never logs above
-   * `debug`: doing so would fill a session's log with entries that describe the
-   * design working as intended.
+   * `debug`, and it keeps the expected rejections — one per framework frame of
+   * every stack a session resolves — out of `debug` entirely: they describe
+   * the design working as intended.
    */
   readonly logger?: Logger;
 }
@@ -939,12 +1007,17 @@ export function normalizeSourcePath(
 ): string | undefined {
   const logger = options.logger ?? noopLogger;
 
-  /** Explains a rejection once, at `debug` level, and answers the caller. */
+  /**
+   * Explains a rejection once — at `trace` when it is expected, at `debug`
+   * otherwise — and answers the caller.
+   */
   const reject = (reason: RejectionReason, offending: string): undefined => {
-    logger.debug('Source-map source not resolved to a project path', {
-      reason,
-      source: describeSource(offending),
-    });
+    const fields = { reason, source: describeSource(offending) };
+    if (isExpectedRejection(reason, offending)) {
+      logger.trace(REJECTION_MESSAGE, fields);
+    } else {
+      logger.debug(REJECTION_MESSAGE, fields);
+    }
     return undefined;
   };
 

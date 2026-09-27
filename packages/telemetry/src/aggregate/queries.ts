@@ -725,6 +725,52 @@ function statementKeyFor(rawStatement: string): string {
   return normalized.length > 0 ? normalized : UNKNOWN_STATEMENT_KEY;
 }
 
+/**
+ * How many distinct raw statement texts one {@link aggregateQueries} call
+ * remembers the grouping key of.
+ *
+ * Normalising a statement is a scan of its text and the most expensive step of
+ * this module, and a capture repeats a handful of redacted statements
+ * thousands of times — so the key is computed once per distinct text, rather
+ * than once per execution for the fold and once more per span for the
+ * duplicate-observation index. The memo lives for one call only, so nothing is
+ * retained between captures, and it is bounded because distinct texts are
+ * not: past the bound a new text is normalised on every use, which is slower
+ * and exactly as correct.
+ */
+export const STATEMENT_KEY_MEMO_CAPACITY = 4_096;
+
+/** The grouping key of a raw statement text, as one call of {@link aggregateQueries} looks it up. */
+type StatementKeyOf = (rawStatement: string) => string;
+
+/**
+ * A per-call memo of {@link statementKeyFor}, keyed by the raw statement text.
+ *
+ * Keyed by text rather than by span id: the fold and the span index can see
+ * different events under one span id (the index keeps the first on a
+ * duplicate, {@link indexSpans}), and a key is a function of the text alone,
+ * so a text lookup answers both identically. The first
+ * {@link STATEMENT_KEY_MEMO_CAPACITY} distinct texts are remembered.
+ *
+ * @returns The lookup, answering exactly what `statementKeyFor` answers.
+ */
+function createStatementKeyMemo(): StatementKeyOf {
+  const keys = new Map<string, string>();
+
+  return (rawStatement) => {
+    const known = keys.get(rawStatement);
+    if (known !== undefined) {
+      return known;
+    }
+
+    const key = statementKeyFor(rawStatement);
+    if (keys.size < STATEMENT_KEY_MEMO_CAPACITY) {
+      keys.set(rawStatement, key);
+    }
+    return key;
+  };
+}
+
 /** The statement text an event reports, or `undefined` when it reports none. */
 function readStatement(event: TelemetryEvent): string | undefined {
   return readNonEmptyString(readAttributeBag(event)[DB_STATEMENT_KEY]);
@@ -788,17 +834,23 @@ export function isDatabaseStatementEvent(event: TelemetryEvent): boolean {
  *
  * Normalisation is the expensive step of this module (a scan of the statement
  * text), and a chain of nested observations would otherwise re-run it once per
- * hop per event; here each span's key is computed at most once per call.
+ * hop per event; here each span's key is looked up once per call, through the
+ * call's memo, which normalises each distinct text once and shares the result
+ * with the fold.
+ *
+ * @param spansBySpanId The call's span index.
+ * @param keyOf The call's statement-key memo ({@link createStatementKeyMemo}).
  */
 function indexStatementKeys(
   spansBySpanId: ReadonlyMap<SpanId, TelemetryEvent>,
+  keyOf: StatementKeyOf,
 ): ReadonlyMap<SpanId, string> {
   const keys = new Map<SpanId, string>();
 
   for (const event of spansBySpanId.values()) {
     const statement = readStatement(event);
     if (statement !== undefined && QUERY_KIND_SET.has(event.kind)) {
-      keys.set(event.spanId, statementKeyFor(statement));
+      keys.set(event.spanId, keyOf(statement));
     }
   }
 
@@ -1076,6 +1128,46 @@ function recordCaller(
   existing.totalDuration += durationMs;
 }
 
+/**
+ * The location of the nearest database span above `event` that carries one,
+ * walking only through database spans and stopping at the first span of any
+ * other kind.
+ *
+ * An ORM runs a statement below its own spans — the operation the application
+ * called, and the transaction enclosing it — and the call that issued the
+ * statement is written where the nearest of those was called. That is the
+ * location the source resolver gives the statement itself when it can see
+ * those spans; this reads it back when it could not, because a statement span
+ * reached the service before the ORM span above it and so could not be placed
+ * at ingest. The walk never reaches past the database tier, so it cannot
+ * stand in the caller's location for the statement's.
+ */
+function nearestQuerySource(
+  event: TelemetryEvent,
+  spansBySpanId: ReadonlyMap<SpanId, TelemetryEvent>,
+): SourceLocation | undefined {
+  const visited = new Set<SpanId>([event.spanId]);
+  let nextSpanId = event.parentSpanId;
+
+  for (let hop = 0; hop < MAX_CALLER_LOOKUP_HOPS; hop += 1) {
+    if (nextSpanId === undefined || visited.has(nextSpanId)) {
+      return undefined;
+    }
+    visited.add(nextSpanId);
+
+    const parent = spansBySpanId.get(nextSpanId);
+    if (parent === undefined || !QUERY_KIND_SET.has(parent.kind)) {
+      return undefined;
+    }
+    if (parent.source !== undefined) {
+      return parent.source;
+    }
+    nextSpanId = parent.parentSpanId;
+  }
+
+  return undefined;
+}
+
 /** Builds one published occurrence. */
 function buildOccurrence(
   event: TelemetryEvent,
@@ -1083,11 +1175,14 @@ function buildOccurrence(
   durationMs: number,
   rowCount: number | undefined,
   caller: ResolvedCaller | undefined,
+  spansBySpanId: ReadonlyMap<SpanId, TelemetryEvent>,
 ): QueryOccurrence {
   // The query span's own location is the statement's call site, which is what a
-  // click on this row must open; the caller's location is the fallback that
-  // keeps the row clickable when no resolver could place the span itself.
-  const source = event.source ?? caller?.source;
+  // click on this row must open. When no resolver could place the span itself,
+  // the nearest database span above it that was placed — the ORM operation
+  // that issued it — names the same call site; the caller's location is the
+  // last fallback, which keeps the row clickable when neither tier was placed.
+  const source = event.source ?? nearestQuerySource(event, spansBySpanId) ?? caller?.source;
 
   return {
     id: event.id,
@@ -1174,7 +1269,9 @@ function publishGroup(
  *
  * Folds the events in one pass over the input (after one pass to index spans
  * for the two ancestor walks), so the cost is linear in the capture and
- * independent of how the events are ordered. Nothing is inferred: the result
+ * independent of how the events are ordered; each distinct statement text is
+ * normalised once per call ({@link STATEMENT_KEY_MEMO_CAPACITY}), however often
+ * it ran. Nothing is inferred: the result
  * says how often each statement ran, how long it took and who ran it, and
  * leaves every conclusion to the analysis stage.
  *
@@ -1220,7 +1317,10 @@ export function aggregateQueries(
   const maxCallers = resolveBound(options.maxCallersPerGroup, DEFAULT_MAX_CALLERS_PER_GROUP);
 
   const spansBySpanId = indexSpans(events);
-  const statementKeys = indexStatementKeys(spansBySpanId);
+  // One memo for the whole call: the index and the fold normalise each
+  // distinct statement text once between them.
+  const keyOf = createStatementKeyMemo();
+  const statementKeys = indexStatementKeys(spansBySpanId, keyOf);
   const groups = new Map<string, GroupAccumulator>();
 
   for (const event of events) {
@@ -1233,7 +1333,7 @@ export function aggregateQueries(
       continue;
     }
 
-    const normalizedStatement = statementKeyFor(rawStatement);
+    const normalizedStatement = keyOf(rawStatement);
 
     // One execution two instrumentations both observed: keep the outermost
     // observation, which is the one whose interval contains the whole
@@ -1278,7 +1378,9 @@ export function aggregateQueries(
       recordCaller(group.callers, caller, caller.source ?? event.source, durationMs);
     }
 
-    group.occurrences.push(buildOccurrence(event, startTime, durationMs, rowCount, caller));
+    group.occurrences.push(
+      buildOccurrence(event, startTime, durationMs, rowCount, caller, spansBySpanId),
+    );
   }
 
   return [...groups.values()]

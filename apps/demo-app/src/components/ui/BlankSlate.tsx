@@ -45,15 +45,17 @@ interface Props {
   /** The one-line answer to "what is missing here". */
   heading: ReactNode;
   /**
-   * Which element the heading is rendered as. Defaults to `'p'`, which is what every block nested
-   * inside a screen that already declares its own title wants: a paragraph carrying the heading's
-   * type role without adding a level to that screen's outline.
+   * Which element the heading is rendered as. Defaults to `'h2'`: the block answers "what is
+   * missing here" for a region of a page, and that answer belongs in the page's outline, where a
+   * reader moving by heading finds the empty cart, the empty order history or the search that
+   * matched nothing instead of stepping over it. A page's own title is its `<h1>`, so a block
+   * placed directly under it is a level-two heading.
    *
-   * A screen whose whole content is this block is the other case - the not-found route is one -
-   * and there the visible title is the page's title, so it is passed `'h1'` and becomes a real
-   * heading a reader can navigate to. The level stays the caller's decision because only the
-   * caller knows what the page around the block already declares; this prop only makes that
-   * decision expressible instead of forcing a paragraph on both cases.
+   * A block nested one level deeper - inside a section, card or dialog that already carries its
+   * own `<h2>` - is passed `'h3'`, and a screen whose whole content is this block - the not-found
+   * route - is passed `'h1'`, because there the visible title is the page's title. `'p'` stays
+   * available for a placement where a heading would add nothing to the outline. The level is the
+   * caller's to override because only the caller knows what the page around the block declares.
    */
   headingAs?: 'p' | 'h1' | 'h2' | 'h3';
   /** Optional sentence under the heading: why the list is empty, or what to do about it. */
@@ -81,7 +83,7 @@ export function BlankSlate({
   art,
   alt,
   heading,
-  headingAs = 'p',
+  headingAs = 'h2',
   children,
   action,
   tone = 'neutral',
@@ -119,13 +121,12 @@ export function BlankSlate({
         loading="lazy"
       />
       {/*
-        A paragraph by default, styled as a heading, with `headingAs` as the opt-in for a real
-        heading level: the right level depends on what the page around the block already declares,
-        and the same block appears at four different depths, so the choice stays with the caller
-        rather than being fixed here. Whichever element turns up, it carries the one `heading`
-        class, and BlankSlate.module.css states that class's margin reset, colour, size, weight and
-        line height outright - a CSS-module class outranks the element rules in app/globals.css, so
-        `headingAs="h1"` renders exactly what the paragraph rendered.
+        A level-two heading by default, with `headingAs` as the caller's override: the same block
+        appears at several depths, so a caller nested under its own `<h2>` asks for `'h3'` and a
+        page that is only this block asks for `'h1'`. Whichever element turns up, it carries the one
+        `heading` class, and BlankSlate.module.css states that class's margin reset, colour, size,
+        weight and line height outright - a CSS-module class outranks the element rules in
+        app/globals.css, so every level renders exactly the same block and only the outline changes.
       */}
       <Heading className={styles.heading}>{heading}</Heading>
       {children === undefined ? null : <p className={styles.body}>{children}</p>}

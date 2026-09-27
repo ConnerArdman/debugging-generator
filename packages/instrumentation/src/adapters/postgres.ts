@@ -264,11 +264,12 @@ const POSTGRES_RUNTIME_HOOKS: readonly string[] = Object.freeze(['PostgreSQL dri
  * How a developer relaunches their dev server with the preload attached, when
  * the caller knows better than this module can.
  *
- * Supplied by `apps/local-service/src/instrumentation/service.ts`, which owns
- * the launcher and therefore knows the exact command it would run. Every member
- * is optional: an absent member falls back to the value in
- * {@link POSTGRES_ADAPTER_DEFAULTS} or, failing that, to an instruction that
- * names the editor command instead of a shell command.
+ * Supplied by the caller that owns the launcher and therefore knows the exact
+ * command it would run. Every member is optional. Without a
+ * {@link PostgresRelaunchDescriptor.command} — which is how `../registry.ts`
+ * builds this adapter — the hint is the editor command naming the project root:
+ * the one exact instruction this adapter can give without the preload's path,
+ * the ingest URL or a credential, which the service's launch supplies.
  *
  * Nothing here is ever read from the environment, and no path inside this
  * repository is ever written into it: a relaunch instruction is about the
@@ -278,24 +279,27 @@ export interface PostgresRelaunchDescriptor {
   /**
    * The whole command, ready to paste, single-line.
    *
-   * Preferred over everything else when present, because the caller that
-   * launches dev servers is the one party that knows what it would launch.
+   * The only member that puts a shell command in the hint, because the caller
+   * that launches dev servers is the one party that knows a command that
+   * actually starts an instrumented, credentialed dev server.
    */
   readonly command?: string | undefined;
 
   /**
-   * The module specifier the dev-server process must preload.
+   * A module specifier the dev-server process could preload.
    *
-   * Defaults to {@link POSTGRES_ADAPTER_DEFAULTS.preloadSpecifier}, the
-   * documented entry of `@debuggen/telemetry`.
+   * Accepted for callers that already pass it, and **never** composed into a
+   * command on its own: this descriptor names none of the ingest variables the
+   * preload needs, so `NODE_OPTIONS="--import ‹specifier›" ‹dev command›`
+   * would start a preload that reports nothing. Inject the whole
+   * {@link PostgresRelaunchDescriptor.command} instead.
    */
   readonly preloadSpecifier?: string | undefined;
 
   /**
    * The editor command that relaunches the dev server for the developer.
    *
-   * Named in the instruction of last resort, when neither a command nor a usable
-   * package manager is known. Defaults to
+   * Named in every hint that carries no injected command. Defaults to
    * {@link POSTGRES_ADAPTER_DEFAULTS.editorCommandTitle}.
    */
   readonly editorCommandTitle?: string | undefined;
@@ -393,17 +397,24 @@ export const POSTGRES_ADAPTER_DEFAULTS = Object.freeze({
   heartbeatStalenessMs: 30_000,
 
   /**
-   * The documented preload entry of `@debuggen/telemetry`, used to compose a
-   * relaunch instruction. A published package subpath, never a path inside this
-   * repository.
+   * The preload's published package subpath: the `./node/register` export of
+   * `@debuggen/telemetry`.
+   *
+   * The name of record, never put in a hint: a target project declares no
+   * `@debuggen/*` dependency (AAP §0.4.2), so `--import` of this specifier fails
+   * there with `ERR_MODULE_NOT_FOUND`, and a bare specifier carries none of the
+   * ingest variables the preload needs to report.
    */
   preloadSpecifier: '@debuggen/telemetry/node/register',
 
   /**
-   * The editor command that relaunches a dev server with the preload attached,
-   * named in the instruction of last resort.
+   * The editor command that relaunches a dev server with the preload and a
+   * freshly minted ingest credential attached: the VS Code palette label of
+   * `debuggen.launchDevServer` (category "Debug Generator", title "Launch Dev
+   * Server" in `apps/vscode-extension/package.json`), spelled exactly as the
+   * palette shows it. Named in every hint that carries no injected command.
    */
-  editorCommandTitle: 'Debug Generator: Launch dev server',
+  editorCommandTitle: 'Debug Generator: Launch Dev Server',
 });
 
 /**
@@ -1154,30 +1165,28 @@ interface GapMessage {
 }
 
 /**
- * The shell fragment that runs a project's development server, for a package
- * manager the summary recognised.
+ * The first spelling that is already a valid hint as written — trimmed, single
+ * spaces, no control character, within {@link MAX_MESSAGE_LENGTH} — returned
+ * whole.
  *
- * `undefined` for `'unknown'`, which is what routes the instruction to the
- * editor command instead of inventing a command line for a project whose tooling
- * was not identified.
+ * How a hint naming a project root is fitted to its row: {@link toBoundedMessage}
+ * would clip a long root, and a hint naming a path that is not the project's is
+ * worse than one naming none. So each candidate is taken only if bounding would
+ * leave it untouched, and the fallback — built from this module's own words —
+ * is used otherwise.
  *
- * @param summary The project summary, whose `packageManager` the indexer read
- * from the target's own manifest and lockfile.
- * @returns The command fragment, or `undefined`.
+ * @param candidates The instruction, from the most to the least specific.
+ * @param fallback The spelling built only from this module's own words.
+ * @returns The first untouched candidate, or the bounded fallback.
  */
-function devCommandFor(summary: ProjectSummary): string | undefined {
-  switch (summary.packageManager) {
-    case 'pnpm':
-      return 'pnpm dev';
-    case 'yarn':
-      return 'yarn dev';
-    case 'npm':
-      return 'npm run dev';
-    case 'bun':
-      return 'bun run dev';
-    default:
-      return undefined;
+function firstWholeMessage(candidates: readonly string[], fallback: string): string {
+  for (const candidate of candidates) {
+    if (isControlFree(candidate) && toBoundedMessage(candidate, MAX_MESSAGE_LENGTH) === candidate) {
+      return candidate;
+    }
   }
+
+  return toBoundedMessage(fallback, MAX_MESSAGE_LENGTH);
 }
 
 /**
@@ -1187,16 +1196,21 @@ function devCommandFor(summary: ProjectSummary): string | undefined {
  *
  * 1. the caller's injected command, when it supplied one — the launcher knows
  *    exactly what it would run;
- * 2. otherwise the preload specifier and the project's own development command,
- *    both read as data (the specifier from the options or the defaults, the
- *    package manager from the project summary);
- * 3. otherwise an instruction naming the editor command that does it for the
- *    developer, which is the honest answer when the project's tooling was not
- *    identified.
+ * 2. otherwise the editor command — "Run "Debug Generator: Launch Dev Server"
+ *    in VS Code for ‹root›, …" — whose launch attaches the service's own
+ *    preload path and a freshly minted ingest credential, which makes it exact.
  *
- * Every form names the project root, so a developer with several projects open
- * knows which dev server to relaunch, and no form contains a path inside this
- * repository or a value read from the environment.
+ * No `NODE_OPTIONS` line is composed from the published specifier or an
+ * injected {@link PostgresRelaunchDescriptor.preloadSpecifier}: the first
+ * cannot be resolved from a target project, and neither comes with the ingest
+ * variables the preload needs, so the command would fail or run and report
+ * nothing (QA INT-F05).
+ *
+ * The editor form names the project root whenever the root fits whole, so a
+ * developer with several projects open knows which dev server to relaunch, and
+ * drops it — never clips it — when it does not ({@link firstWholeMessage}). No
+ * form contains a path inside this repository or a value read from the
+ * environment.
  *
  * @param context The session's context.
  * @param relaunch The caller's relaunch descriptor, possibly empty.
@@ -1217,19 +1231,15 @@ function composeRelaunchHint(
     );
   }
 
-  const specifier = relaunch.preloadSpecifier ?? POSTGRES_ADAPTER_DEFAULTS.preloadSpecifier;
-  const devCommand = devCommandFor(context.projectSummary);
+  const effect =
+    "which starts this project's dev server with the preload and a fresh ingest credential";
 
-  if (devCommand !== undefined) {
-    return toBoundedMessage(
-      `Stop the dev server for ${projectRoot} and start it with NODE_OPTIONS="--import ${specifier}" ${devCommand} - or run the "${editorCommand}" command in VS Code, which does it for you.`,
-      MAX_MESSAGE_LENGTH,
-    );
-  }
-
-  return toBoundedMessage(
-    `Run the "${editorCommand}" command in VS Code for ${projectRoot}, which restarts the dev server with the Debug Generator Node preload attached.`,
-    MAX_MESSAGE_LENGTH,
+  return firstWholeMessage(
+    [
+      `Run "${editorCommand}" in VS Code for ${projectRoot}, ${effect}.`,
+      `Run "${editorCommand}" in VS Code, ${effect}.`,
+    ],
+    `Run "${POSTGRES_ADAPTER_DEFAULTS.editorCommandTitle}" in VS Code, ${effect}.`,
   );
 }
 

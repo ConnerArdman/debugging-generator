@@ -76,15 +76,17 @@
  * | --- | --- | --- |
  * | `WS_CLOSE_UNAUTHORIZED` | no hello in time; a first frame that is not a valid hello; an unsupported protocol version (the reason names the version this service speaks); a refused origin; a refused credential; hello claims that contradict the credential | treat as terminal: pair again, rotate, or update the extension — never retry blindly |
  * | 1011 (internal error) | the credential could not be checked (for example a store failure) | retry with backoff |
- * | `WS_CLOSE_TRY_AGAIN_LATER` (1013) | too many open connections, or too many unprocessed frames on this connection | retry with backoff |
+ * | `WS_CLOSE_TRY_AGAIN_LATER` (1013) | too many open connections, or too many unprocessed frames on this connection — the last resort behind read backpressure (see **Flow control**) | retry with backoff |
  * | `WS_CLOSE_GOING_AWAY` (1001) | the service is shutting down | retry with backoff |
  *
  * **After the handshake.** Frames are processed strictly in arrival order per
- * connection. A frame that cannot be decoded, names an unknown or HTTP-only
- * type, fails validation (including a `telemetry.event` batch above protocol's
- * per-batch bound, which the batch schema enforces), is not permitted for the
- * connection's principal, or fails in its handler is answered with protocol's
- * `error` message — `{ code, message, ref }` — **and the connection stays open**.
+ * connection — `client.ping` alone excepted, which is answered on arrival (see
+ * **Liveness**) and changes nothing else's order. A frame that cannot be
+ * decoded, names an unknown or HTTP-only type, fails validation (including a
+ * `telemetry.event` batch above protocol's per-batch bound, which the batch
+ * schema enforces), is not permitted for the connection's principal, or fails
+ * in its handler is answered with protocol's `error` message —
+ * `{ code, message, ref }` — **and the connection stays open**.
  * Every such reply carries a `ref`: the offending frame's `id` when it can be
  * read and is spelled exactly as this product mints message ids — `msg_`
  * followed by sixteen characters of `[0-9a-z]`, `@debuggen/shared`'s
@@ -99,6 +101,16 @@
  * path, so a client that spells its ids otherwise matches its replies by the
  * minted ref rather than by its own id.
  * One bad frame never closes a socket and never takes the process down.
+ *
+ * **One connection cannot starve the others.** Each connection's queue
+ * handles at most one frame per event-loop turn, so a peer delivering a
+ * backlog — a service worker's pre-stall socket flushing the telemetry it held
+ * while the service was stopped — shares the process with every other
+ * connection, every upgrade and every HTTP request (`GET /health` included)
+ * instead of holding the loop until its backlog is gone. Read backpressure
+ * (see **Flow control**) keeps that pacing from overflowing the queue, and
+ * only a single read burst larger than the remaining headroom still reaches
+ * the `WS_CLOSE_TRY_AGAIN_LATER` backlog close.
  *
  * `error` travels from the service to clients only (AAP §0.4.2), so an inbound
  * `error` frame is refused exactly like a spoofed service push: it is answered
@@ -130,10 +142,41 @@
  * never sees, so a client that must prove its own socket still reaches a live
  * service — the MV3 service worker, whose platform hides them — sends
  * protocol's application-level `client.ping` instead. Any authenticated
- * connection may send one; it is answered on arrival, in the connection's frame
- * order, with one `service.pong` to the sender alone whose `ref` is the ping's
- * own `id`, and it has no other effect. A ping whose `id` is longer than a
- * pong's `ref` may be is refused with `error`, so no ping goes unanswered.
+ * connection may send one; it is answered the moment it is read — ahead of
+ * every frame still queued on that connection, which it never joins — with one
+ * `service.pong` to the sender alone whose `ref` is the ping's own `id`, and it
+ * has no other effect. A sender whose earlier frames are still being handled
+ * is therefore told promptly that the service is alive, and a busy service is
+ * not mistaken for a dead one. (Only a ping inflated past
+ * {@link EARLY_PING_MAX_FRAME_BYTES} is answered in frame order instead.) A
+ * ping whose `id` is longer than a pong's `ref` may be is refused with
+ * `error`, on arrival as well, so no ping goes unanswered. A socket whose
+ * reads flow control has paused is not read at all, so a ping written behind
+ * a backlog is answered as soon as reads resume, a few frames later.
+ *
+ * **Flow control.** A connection's frames wait on its queue while the ones
+ * before them are handled — each for its own event-loop turn — so a peer
+ * delivering faster than its frames can be handled builds a queue, and a
+ * `client.ping` written behind it is read only once the frames before it are.
+ * The queue is therefore kept short by **read backpressure** rather than by
+ * closing the socket: once the frames queued or running on one connection
+ * reach a high-water mark ({@link DEFAULT_READ_PAUSE_BYTES}, or
+ * {@link DEFAULT_READ_PAUSE_FRAMES} frames), the service stops reading that
+ * socket (`ws`'s `WebSocket#pause`)
+ * and TCP's flow control holds the peer's further frames in the peer's own
+ * buffers; once the queue is back to both low-water marks
+ * ({@link DEFAULT_READ_RESUME_BYTES}, {@link DEFAULT_READ_RESUME_FRAMES}) the
+ * socket is read again. Nothing is dropped and the order is untouched; other
+ * connections are unaffected, and each ingested batch ends with a macrotask
+ * turn (`../telemetry/ingest.ts`), so a connection's backlog never starves
+ * `GET /health` or another socket. The marks keep a ping read behind a full
+ * queue within about a second of work, far inside protocol's
+ * `SERVICE_PONG_TIMEOUT_MS`. While a connection is paused its heartbeat is
+ * not judged, since its pong may be unread behind its own frames; a closing
+ * connection is read again at once, so its closing handshake completes. The
+ * `WS_CLOSE_TRY_AGAIN_LATER` backlog close ({@link DEFAULT_MAX_PENDING_FRAMES})
+ * stays as the last resort for frames `ws` had already read off the socket
+ * when reading paused.
  *
  * **Disconnects are routine.** A closed socket's registration is marked
  * offline in the client registry — frames addressed to it are dropped, its
@@ -176,7 +219,7 @@
  * | Inbound message | Who may send it | Routed to |
  * | --- | --- | --- |
  * | `client.hello` | the first frame of every connection; a second one is refused | `AuthService.authorizeHello` |
- * | `client.ping` | any authenticated connection — `vscode`, `devtools` or `server-agent` — with no session, tab or scope check | answered here with one `service.pong` to the sender alone, `ref` = the ping's `id`; nothing else happens |
+ * | `client.ping` | any authenticated connection — `vscode`, `devtools` or `server-agent` — with no session, tab or scope check | answered here on arrival, ahead of queued frames, with one `service.pong` to the sender alone, `ref` = the ping's `id`; nothing else happens |
  * | `session.bind`, `tab.navigated`, `session.unbind` | `devtools`, each for the tab its payload names — on a single-tab connection only its hello's tab | `./routes/binding.ts`, which owns the binding rules |
  * | `telemetry.event` | `devtools` (the service worker relaying the page agent), for its acting tab's live binding | `./routes/telemetry.ts`, which owns the relayed-tab rule |
  * | `agent.ready` | `devtools`, for the tab its payload names — on a single-tab connection only its hello's tab — when no other credential has bound it | the injected {@link AgentReadinessPort} |
@@ -339,7 +382,14 @@ import {
   guardLogger,
   subsystemLogger,
 } from '../logging.js';
-import { authFailureReasonOf, isAllowedOrigin, requireBoundSession, requireRole } from './auth.js';
+import {
+  authFailureReasonOf,
+  createRefusalLogThrottle,
+  describeRefusedOrigin,
+  isAllowedOrigin,
+  requireBoundSession,
+  requireRole,
+} from './auth.js';
 import type {
   AuthFailureReason,
   AuthService,
@@ -379,15 +429,84 @@ import type { TelemetryRoutes } from './routes/telemetry.js';
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
 
 /**
- * The most frames one connection may have waiting to be processed.
+ * The most frames one connection may have waiting to be processed: the last
+ * resort behind read backpressure ({@link DEFAULT_READ_PAUSE_BYTES}).
  *
  * Frames are handled strictly in order per connection, so a peer that sends
- * faster than its frames can be handled builds a queue. Past this bound the
- * connection is closed with `WS_CLOSE_TRY_AGAIN_LATER` rather than having
- * frames dropped, because a dropped frame would break the ordering guarantee;
- * the reconnecting client re-binds and is replayed from stored data.
+ * faster than its frames can be handled builds a queue. Read backpressure
+ * stops reading the socket long before this bound, so only the frames `ws`
+ * had already read off the socket when reading paused can reach it — a peer
+ * that packs hundreds of tiny frames into one TCP read. Past it the connection
+ * is closed with `WS_CLOSE_TRY_AGAIN_LATER` rather than having frames dropped,
+ * because a dropped frame would break the ordering guarantee; the reconnecting
+ * client re-binds and is replayed from stored data.
  */
 export const DEFAULT_MAX_PENDING_FRAMES = 256;
+
+/**
+ * Read backpressure's high-water mark in bytes: once the frames one
+ * connection has queued or running reach this many bytes, the service stops
+ * reading that socket (`ws`'s `WebSocket#pause`), and TCP's own flow control
+ * holds the peer's further frames in the peer's send buffer.
+ *
+ * The mark bounds how long a frame read after it waits. A telemetry event is
+ * a few hundred bytes of JSON and costs about a millisecond to store (the
+ * measured cost of the synchronous `node:sqlite` write), so 256 KiB is roughly
+ * 400 to 900 events — under a second of work. A `client.ping` read behind a
+ * full queue is therefore answered within about a second, far inside
+ * protocol's `SERVICE_PONG_TIMEOUT_MS` (5 s), which the service worker would
+ * otherwise read as a silent service and retire the socket for. What the peer
+ * keeps in its own buffers is bounded by the peer: the service worker holds
+ * a bounded number of telemetry events unacknowledged
+ * (`apps/chrome-extension/src/background/ws-bridge.ts`).
+ */
+export const DEFAULT_READ_PAUSE_BYTES = 256 * 1024;
+
+/**
+ * Read backpressure's low-water mark in bytes: a paused connection is read
+ * again once its queue is back to this many bytes or fewer — and to
+ * {@link DEFAULT_READ_RESUME_FRAMES} frames or fewer. A quarter of the high
+ * mark, so the socket is not toggled on every frame and the queue never runs
+ * dry while the peer's next frames are on their way.
+ */
+export const DEFAULT_READ_RESUME_BYTES = 64 * 1024;
+
+/**
+ * Read backpressure's high-water mark in frames: the socket is also paused
+ * once this many frames are queued or running, whatever their size — a
+ * quarter of {@link DEFAULT_MAX_PENDING_FRAMES}, which leaves three quarters
+ * of the cap for the frames `ws` had already buffered when reading paused. For
+ * telemetry the byte mark engages first; this one bounds floods of small
+ * frames.
+ *
+ * The frame pipeline yields to the event loop before each queued frame, so it
+ * handles at most one frame per connection per event-loop turn; a peer with
+ * megabytes buffered — a service worker's pre-stall socket delivering the
+ * telemetry it held while the service was stopped — would otherwise have
+ * every one of those frames read and queued while the first few are handled,
+ * and reach the 1013 backlog close. A server built with a smaller
+ * `maxPendingFrames` pauses at that bound instead.
+ */
+export const DEFAULT_READ_PAUSE_FRAMES = 64;
+
+/** Read backpressure's low-water mark in frames; see {@link DEFAULT_READ_RESUME_BYTES}. */
+export const DEFAULT_READ_RESUME_FRAMES = 16;
+
+/**
+ * The largest text frame, in bytes, decoded on arrival to find a
+ * `client.ping`, which is then answered ahead of the connection's queued
+ * frames instead of joining them.
+ *
+ * A ping is an envelope with an empty payload: a product client's is under
+ * 200 bytes, and one carrying protocol's longest `id` and `sessionId` is well
+ * under this bound, so every ping a conforming client writes is answered on
+ * arrival. Frames above it — every relayed `telemetry.event` batch, which is
+ * what a backlog is made of — join the queue undecoded, so no large frame is
+ * decoded twice, and a smaller frame that is not a ping joins it with its
+ * decoding attached. A ping inflated past the bound (JSON whitespace, escaped
+ * characters) is still answered, in frame order.
+ */
+export const EARLY_PING_MAX_FRAME_BYTES = 1_024;
 
 /**
  * How long a closing socket is given to finish the closing handshake before it
@@ -474,17 +593,19 @@ export const MAX_WS_MESSAGE_BYTES = MAX_TELEMETRY_INGEST_REQUEST_BODY_BYTES;
 const LOG_SUBSYSTEM = 'server.ws';
 
 /*
- * The four message types this module names outside its exhaustive switch
- * (the hello, the `error` reply, the `source.result` answer and the
- * `service.pong` answer), and the three roles it names. The message types are
- * protocol's own `MESSAGE_TYPE` constants — the one place each wire name is
- * spelled, and the same constants the switch in `route` is labelled with —
- * which keep their literal types, so `isMessageOfType` and `createEnvelope`
- * still narrow. The roles are literals checked by `satisfies` against
- * `./auth.ts`'s role vocabulary. Either way a rename upstream is a compile
- * error here rather than a silent mismatch on the wire.
+ * The five message types this module names outside its exhaustive switch
+ * (the hello, the `client.ping` answered on arrival, the `error` reply, the
+ * `source.result` answer and the `service.pong` answer), and the three roles
+ * it names. The message types are protocol's own `MESSAGE_TYPE` constants —
+ * the one place each wire name is spelled, and the same constants the switch
+ * in `route` is labelled with — which keep their literal types, so
+ * `isMessageOfType` and `createEnvelope` still narrow. The roles are literals
+ * checked by `satisfies` against `./auth.ts`'s role vocabulary. Either way a
+ * rename upstream is a compile error here rather than a silent mismatch on the
+ * wire.
  */
 const HELLO_TYPE = MESSAGE_TYPE.CLIENT_HELLO;
+const PING_TYPE = MESSAGE_TYPE.CLIENT_PING;
 const ERROR_REPLY_TYPE = MESSAGE_TYPE.ERROR;
 const SOURCE_RESULT_TYPE = MESSAGE_TYPE.SOURCE_RESULT;
 const SERVICE_PONG_TYPE = MESSAGE_TYPE.SERVICE_PONG;
@@ -923,6 +1044,32 @@ export interface WsServerDeps {
   /** See {@link DEFAULT_MAX_PENDING_FRAMES}. */
   readonly maxPendingFrames?: number | undefined;
   /**
+   * The queued frame bytes at which a connection's socket stops being read. An
+   * integer of at least 1; defaults to {@link DEFAULT_READ_PAUSE_BYTES}.
+   */
+  readonly readPauseBytes?: number | undefined;
+  /**
+   * The queued frame bytes at or below which a paused socket is read again.
+   * An integer from 0 to `readPauseBytes - 1`; defaults to
+   * {@link DEFAULT_READ_RESUME_BYTES}, or `readPauseBytes - 1` when that is
+   * smaller.
+   */
+  readonly readResumeBytes?: number | undefined;
+  /**
+   * The queued frames at which a connection's socket stops being read. An
+   * integer from 1 to `maxPendingFrames`; defaults to
+   * {@link DEFAULT_READ_PAUSE_FRAMES}, or `maxPendingFrames` when that is
+   * smaller.
+   */
+  readonly readPauseFrames?: number | undefined;
+  /**
+   * The queued frames at or below which a paused socket is read again. An
+   * integer from 0 to `readPauseFrames - 1`; defaults to
+   * {@link DEFAULT_READ_RESUME_FRAMES}, or `readPauseFrames - 1` when that is
+   * smaller.
+   */
+  readonly readResumeFrames?: number | undefined;
+  /**
    * How long a closed connection's registration is kept, marked offline,
    * before it is unregistered, in milliseconds; `0` unregisters at once.
    * Defaults to the registry's `DEFAULT_OFFLINE_GRACE_MS`, so the two agree on
@@ -962,6 +1109,12 @@ export interface WsServerStats {
   readonly authenticated: number;
   /** Frames waiting to be processed, across every connection. */
   readonly pendingFrames: number;
+  /** The bytes of {@link pendingFrames}. */
+  readonly pendingBytes: number;
+  /** Connections whose socket is not being read because their queue is over a high-water mark. */
+  readonly readPaused: number;
+  /** How many times read backpressure has paused a socket since the server was created. */
+  readonly readPauses: number;
   /** Closed connections still registered (offline) within their grace period. */
   readonly offlineRetained: number;
   /**
@@ -1122,12 +1275,32 @@ interface ConnectionState {
   tail: Promise<void>;
   /** Frames queued or running on {@link tail}. */
   pending: number;
+  /** The bytes of the frames counted in {@link pending}. */
+  pendingBytes: number;
+  /**
+   * Whether read backpressure has paused the socket; cleared when the queue
+   * drains to both low-water marks or the connection starts closing.
+   */
+  readPaused: boolean;
   /** Whether a ping is outstanding. */
   awaitingPong: boolean;
   /** Settles when the socket has emitted `close`. */
   readonly closed: Promise<void>;
   /** Settles {@link closed}. */
   readonly settleClosed: () => void;
+}
+
+/**
+ * The validated read-backpressure marks of one server (see
+ * {@link DEFAULT_READ_PAUSE_BYTES}): a connection's socket is paused once its
+ * queue reaches either high mark, and resumed once it is back to both low
+ * marks.
+ */
+interface ReadBackpressureMarks {
+  readonly pauseFrames: number;
+  readonly resumeFrames: number;
+  readonly pauseBytes: number;
+  readonly resumeBytes: number;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1338,6 +1511,27 @@ function rawDataToText(data: RawData): string {
     return Buffer.concat(data).toString('utf8');
   }
   return Buffer.from(data).toString('utf8');
+}
+
+/**
+ * The payload size of a frame in bytes, for read backpressure and for the
+ * cheap test that decides whether a frame is small enough to be decoded on
+ * arrival ({@link EARLY_PING_MAX_FRAME_BYTES}): read from the `RawData`
+ * itself, whatever its shape, so a frame is never measured by re-encoding its
+ * text.
+ */
+function rawDataByteLength(data: RawData): number {
+  if (Buffer.isBuffer(data)) {
+    return data.length;
+  }
+  if (Array.isArray(data)) {
+    let bytes = 0;
+    for (const fragment of data) {
+      bytes += fragment.length;
+    }
+    return bytes;
+  }
+  return data.byteLength;
 }
 
 /**
@@ -1616,6 +1810,33 @@ function settleWithin(promise: Promise<unknown>, ms: number): Promise<void> {
   });
 }
 
+/**
+ * Resolves in the event loop's next check phase (`setImmediate`), after the
+ * I/O the loop has polled in between — which is where every other
+ * connection's frames, every WebSocket upgrade and every HTTP request
+ * (`GET /health` included) are read.
+ *
+ * The frame pipeline awaits this before each queued frame. A frame handler's
+ * work runs in microtasks, and microtasks drain completely before the loop
+ * moves on, so a queue chained on promises alone would handle a whole backlog
+ * in one turn and starve everything else for as long as it takes. Awaiting a
+ * macrotask boundary first bounds that to one frame per connection per turn.
+ *
+ * The immediate is never cancelled and needs no tracking: it fires within one
+ * turn whatever happens to the connection, and {@link WsServer.close} already
+ * waits for every frame queue, so none outlives the server.
+ *
+ * @example
+ * ```ts
+ * state.tail = state.tail.then(nextEventLoopTurn).then(() => processFrame(state, frame, failure));
+ * ```
+ */
+function nextEventLoopTurn(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
 /* -------------------------------------------------------------------------------------------------
  * The server
  * ---------------------------------------------------------------------------------------------- */
@@ -1666,6 +1887,49 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   if (isErr(backlogOption)) {
     return backlogOption;
   }
+  // The read-backpressure marks nest the same way — resume < pause, and the
+  // frame mark at most the backlog cap it exists to keep a connection under —
+  // and a default above an injected smaller bound follows it down.
+  const pauseFramesOption = integerOption(
+    'readPauseFrames',
+    deps.readPauseFrames,
+    Math.min(DEFAULT_READ_PAUSE_FRAMES, backlogOption.value),
+    1,
+    backlogOption.value,
+  );
+  if (isErr(pauseFramesOption)) {
+    return pauseFramesOption;
+  }
+  const resumeFramesOption = integerOption(
+    'readResumeFrames',
+    deps.readResumeFrames,
+    Math.min(DEFAULT_READ_RESUME_FRAMES, pauseFramesOption.value - 1),
+    0,
+    pauseFramesOption.value - 1,
+  );
+  if (isErr(resumeFramesOption)) {
+    return resumeFramesOption;
+  }
+  const pauseBytesOption = integerOption(
+    'readPauseBytes',
+    deps.readPauseBytes,
+    DEFAULT_READ_PAUSE_BYTES,
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  if (isErr(pauseBytesOption)) {
+    return pauseBytesOption;
+  }
+  const resumeBytesOption = integerOption(
+    'readResumeBytes',
+    deps.readResumeBytes,
+    Math.min(DEFAULT_READ_RESUME_BYTES, pauseBytesOption.value - 1),
+    0,
+    pauseBytesOption.value - 1,
+  );
+  if (isErr(resumeBytesOption)) {
+    return resumeBytesOption;
+  }
   const graceOption = integerOption(
     'offlineGraceMs',
     deps.offlineGraceMs,
@@ -1712,6 +1976,12 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   const heartbeatIntervalMs = heartbeatOption.value;
   const helloTimeoutMs = helloOption.value;
   const maxPendingFrames = backlogOption.value;
+  const readMarks: ReadBackpressureMarks = Object.freeze({
+    pauseFrames: pauseFramesOption.value,
+    resumeFrames: resumeFramesOption.value,
+    pauseBytes: pauseBytesOption.value,
+    resumeBytes: resumeBytesOption.value,
+  });
   const offlineGraceMs = graceOption.value;
   const limits: AdmissionLimits = Object.freeze({
     maxOpenConnections: openOption.value,
@@ -1772,6 +2042,8 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   const admittedSockets = new Map<Duplex, Promise<void>>();
   /** Upgrades refused by the admission quotas since the server was created. */
   let refusedUpgrades = 0;
+  /** Sockets read backpressure has paused since the server was created. */
+  let readPauses = 0;
   /** When the last `warn` record of a refused upgrade was written (`performance.now()`). */
   let lastRefusalWarnAt: number | undefined;
   /** Refused upgrades filed at `debug` since that record, reported by the next one. */
@@ -1952,14 +2224,26 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     admittedSockets.set(socket, released);
   }
 
+  /**
+   * Which web-origin upgrade refusals reach `warn`: the first few of every
+   * window, the rest filed at `debug` and counted into the next `warn` — so a
+   * page that retries its upgrade in a loop cannot flood the log.
+   */
+  const originRefusalLog = createRefusalLogThrottle();
+
+  /** The record of every upgrade refused for its `Origin`, at either level. */
+  const ORIGIN_UPGRADE_REFUSED_LOG = 'refused a WebSocket upgrade from a refused origin';
+
   function handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
     try {
       if (closed) {
         rejectUpgrade(socket, 503);
         return;
       }
-      // Neither the path nor the origin is logged: a request target can carry
-      // a query string, and an origin is the requesting page's identity.
+      // The path is never logged: a request target can carry a query string.
+      // A refused origin is logged only in `describeRefusedOrigin`'s sanitized
+      // `scheme://host` form — never its path, query or credentials — because
+      // which page knocked is what a refusal record exists to tell.
       if (requestPathOf(request.url) !== WS_PATH) {
         log.debug('refused a WebSocket upgrade for a path other than the protocol endpoint');
         rejectUpgrade(socket, 404);
@@ -1967,7 +2251,13 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       }
       const origin = request.headers.origin;
       if (!isAllowedOrigin(origin)) {
-        log.debug('refused a WebSocket upgrade from a refused origin');
+        const fields: LogFields = { status: 403, origin: describeRefusedOrigin(origin) };
+        const verdict = originRefusalLog.next();
+        if (verdict.level === 'warn') {
+          log.warn(ORIGIN_UPGRADE_REFUSED_LOG, { ...fields, suppressed: verdict.suppressed });
+        } else {
+          log.debug(ORIGIN_UPGRADE_REFUSED_LOG, fields);
+        }
         rejectUpgrade(socket, 403);
         return;
       }
@@ -2027,6 +2317,8 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       announcement: undefined,
       tail: Promise.resolve(),
       pending: 0,
+      pendingBytes: 0,
+      readPaused: false,
       awaitingPong: false,
       closed: closedSignal,
       settleClosed,
@@ -2084,6 +2376,12 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   /**
    * Starts the closing handshake with a constant code and reason, and arms the
    * terminate fallback. Idempotent: a connection already closing is left alone.
+   *
+   * A socket whose reads flow control paused is read again first, so the
+   * peer's closing frame is seen and the handshake can finish promptly: from
+   * here on every frame the socket delivers is ignored ({@link onMessage}), so
+   * reading costs nothing. Should the peer never answer, the terminate
+   * fallback ends the socket whether or not it is being read.
    */
   function closeConnection(state: ConnectionState, directive: CloseDirective): void {
     if (state.phase === 'closing' || state.phase === 'closed') {
@@ -2091,6 +2389,10 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     }
     state.phase = 'closing';
     clearHelloTimer(state);
+    // A closing connection's frames are discarded on arrival, so nothing is
+    // left to hold back, and the peer's close frame must be read for the
+    // handshake to finish inside its grace period.
+    resumeReading(state, 'closing');
     try {
       state.socket.close(directive.code, clampCloseReason(directive.reason));
     } catch (cause) {
@@ -2206,10 +2508,21 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     retained.set(clientId, timer);
   }
 
-  /** Pings every authenticated connection, terminating those that missed the previous ping. */
+  /**
+   * Pings every authenticated connection, terminating those that missed the
+   * previous ping.
+   *
+   * A connection whose socket read backpressure has paused is skipped —
+   * neither judged nor pinged — for as long as it stays paused: its pong may
+   * be sitting unread behind the very frames that filled its queue, and those
+   * frames are themselves evidence the peer was writing. The pause ends as soon
+   * as the queue drains — within about a second at the default marks, since no
+   * frame handler waits unboundedly — and the next beat judges the connection
+   * as usual.
+   */
   function beat(): void {
     for (const state of connections.values()) {
-      if (state.phase !== 'authenticated') {
+      if (state.phase !== 'authenticated' || state.readPaused) {
         continue;
       }
       if (state.awaitingPong) {
@@ -2238,7 +2551,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
         handleFirstFrame(state, isBinary ? undefined : rawDataToText(data));
         return;
       case 'authenticated':
-        enqueueFrame(state, isBinary ? undefined : rawDataToText(data));
+        receiveFrame(state, data, isBinary);
         return;
       case 'closing':
       case 'closed':
@@ -2368,16 +2681,172 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
   /* ---- the frame pipeline ---- */
 
   /**
+   * Stops reading a connection's socket once its queue reaches either
+   * high-water mark ({@link DEFAULT_READ_PAUSE_BYTES},
+   * {@link DEFAULT_READ_PAUSE_FRAMES}). Frames `ws` had already read off the
+   * socket may still arrive; they are queued as usual, under the backlog cap.
+   * Never throws: it runs inside the frame pipeline.
+   */
+  function pauseReadingIfFull(state: ConnectionState): void {
+    if (state.readPaused || state.phase !== 'authenticated') {
+      return;
+    }
+    if (state.pending < readMarks.pauseFrames && state.pendingBytes < readMarks.pauseBytes) {
+      return;
+    }
+    try {
+      state.socket.pause();
+    } catch (cause) {
+      // Not paused, so not marked paused: the heartbeat keeps judging it.
+      log.debug('a socket refused to pause its reads', {
+        ...fieldsOf(state),
+        ...exceptionFields(cause, newMessageId()),
+      });
+      return;
+    }
+    state.readPaused = true;
+    readPauses += 1;
+    log.debug('paused reading a connection whose frame backlog reached its high-water mark', {
+      ...fieldsOf(state),
+      pendingFrames: state.pending,
+      pendingBytes: state.pendingBytes,
+    });
+  }
+
+  /**
+   * Reads a paused connection's socket again: once its queue is back to both
+   * low-water marks (`'drained'`), or at once when the connection is closing.
+   * Never throws: it runs in the frame queue's `finally`, where a throw would
+   * reject the queue's tail and skip every frame behind it.
+   */
+  function resumeReading(state: ConnectionState, why: 'drained' | 'closing'): void {
+    if (!state.readPaused) {
+      return;
+    }
+    if (
+      why === 'drained' &&
+      (state.pending > readMarks.resumeFrames || state.pendingBytes > readMarks.resumeBytes)
+    ) {
+      return;
+    }
+    state.readPaused = false;
+    try {
+      state.socket.resume();
+    } catch (cause) {
+      log.debug('a socket refused to resume its reads', {
+        ...fieldsOf(state),
+        ...exceptionFields(cause, newMessageId()),
+      });
+    }
+    if (why === 'drained') {
+      log.debug('resumed reading a connection whose frame backlog drained', {
+        ...fieldsOf(state),
+        pendingFrames: state.pending,
+        pendingBytes: state.pendingBytes,
+      });
+    }
+  }
+
+  /**
+   * One frame of an authenticated connection, on arrival.
+   *
+   * A text frame no larger than {@link EARLY_PING_MAX_FRAME_BYTES} is decoded
+   * here, and a valid `client.ping` is answered at once
+   * ({@link answerPingOnArrival}) without joining the queue: its answer proves
+   * the socket carries frames both ways, and a proof held behind the
+   * connection's own backlog would tell a busy but live service apart from a
+   * dead one only by luck. Every other frame joins the queue in arrival order
+   * — a small one with the decoding already done, so no frame is decoded
+   * twice.
+   *
+   * @param isBinary Whether `ws` delivered a binary frame, which is refused in
+   * frame order like every other invalid frame.
+   */
+  function receiveFrame(state: ConnectionState, data: RawData, isBinary: boolean): void {
+    const bytes = rawDataByteLength(data);
+    if (isBinary) {
+      enqueueFrame(state, undefined, undefined, bytes);
+      return;
+    }
+    const text = rawDataToText(data);
+    if (bytes > EARLY_PING_MAX_FRAME_BYTES) {
+      enqueueFrame(state, text, undefined, bytes);
+      return;
+    }
+    const decoded = decodeFrame(text);
+    if (decoded.result.ok && isMessageOfType(decoded.result.value, PING_TYPE)) {
+      answerPingOnArrival(state, decoded.result.value);
+      return;
+    }
+    enqueueFrame(state, text, decoded, bytes);
+  }
+
+  /**
+   * Answers a `client.ping` the moment it is read, ahead of any frame still
+   * queued on its connection, through exactly the path a queued frame's
+   * answer takes: the arrival refreshes the connection's `lastSeenAt`, the
+   * registry's snapshot must still know the connection, {@link answerPing}
+   * builds and verifies the pong, and a refusal — the `id` too long for a
+   * pong's `ref`, or an unexpected failure — is filed and answered with
+   * `error` under the ref {@link resolveFailureRef} resolves.
+   *
+   * The ping is never queued, so it neither waits for nor counts against the
+   * connection's backlog bound, and no other frame's order changes: a ping has
+   * no effect beyond its own answer.
+   */
+  function answerPingOnArrival(
+    state: ConnectionState,
+    message: MessageByType<'client.ping'>,
+  ): void {
+    if (state.clientId === undefined) {
+      return;
+    }
+    clients.touch(state.clientId);
+    const client = clients.get(state.clientId);
+    if (client === undefined) {
+      return;
+    }
+    const failure: FrameFailure = { ref: undefined };
+    let outcome: Result<void, DebuggenError>;
+    try {
+      outcome = answerPing(client, message);
+    } catch (cause) {
+      outcome = handlerFailure(state, message, cause, failure);
+    }
+    answerRefusal(state, message, outcome, failure);
+  }
+
+  /**
    * Queues one frame of an authenticated connection behind the ones before it,
    * so a connection's frames are handled strictly in arrival order even though
-   * their handlers are asynchronous.
+   * their handlers are asynchronous — and applies read backpressure, so the
+   * queue stays short.
+   *
+   * The queue is fair across connections: each frame first waits for the next
+   * event-loop turn ({@link nextEventLoopTurn}), so one connection's backlog
+   * has at most one frame handled per turn and every other connection's
+   * frames, every upgrade and every HTTP request are served in between. Read
+   * backpressure ({@link pauseReadingIfFull}, {@link resumeReading}) keeps
+   * that pacing from growing the queue into the `maxPendingFrames` close.
+   *
+   * @param text The frame's text, or `undefined` for a binary frame.
+   * @param decoded The frame's decoding, when {@link receiveFrame} already
+   * decoded it on arrival; decoded when its turn comes otherwise.
+   * @param bytes The frame's payload size, as `ws` delivered it.
    */
-  function enqueueFrame(state: ConnectionState, text: string | undefined): void {
+  function enqueueFrame(
+    state: ConnectionState,
+    text: string | undefined,
+    decoded: DecodedFrame | undefined,
+    bytes: number,
+  ): void {
     if (state.clientId === undefined) {
       return;
     }
     clients.touch(state.clientId);
     if (state.pending >= maxPendingFrames) {
+      // Reading paused long before this; only frames `ws` had already read
+      // off the socket can get here, so the cap is the last resort it was.
       log.warn('closed a connection whose frame backlog overflowed', {
         ...fieldsOf(state),
         maxPendingFrames,
@@ -2386,9 +2855,12 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       return;
     }
     state.pending += 1;
+    state.pendingBytes += bytes;
+    pauseReadingIfFull(state);
     const failure: FrameFailure = { ref: undefined };
     state.tail = state.tail
-      .then(() => processFrame(state, text, failure))
+      .then(nextEventLoopTurn)
+      .then(() => processFrame(state, text, decoded, failure))
       .catch((cause: unknown) => {
         // The last-resort sink: `processFrame` never rejects by design, so a
         // rejection here is a defect. It is filed under the ref the frame's
@@ -2404,6 +2876,8 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       })
       .finally(() => {
         state.pending -= 1;
+        state.pendingBytes -= bytes;
+        resumeReading(state, 'drained');
       });
   }
 
@@ -2420,12 +2894,16 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
    * receives always names the service's record of it and no record carries a
    * peer-chosen string.
    *
+   * @param text The frame's text, or `undefined` for a binary frame.
+   * @param decoded The frame's decoding when {@link receiveFrame} did it on
+   * arrival; `text` is decoded here otherwise.
    * @param failure The frame's failure reference holder, shared with the
    * queue's last-resort sink in {@link enqueueFrame}.
    */
   async function processFrame(
     state: ConnectionState,
     text: string | undefined,
+    decoded: DecodedFrame | undefined,
     failure: FrameFailure,
   ): Promise<void> {
     if (state.phase !== 'authenticated' || state.clientId === undefined) {
@@ -2447,7 +2925,7 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       return;
     }
 
-    const { result, frameId } = decodeFrame(text);
+    const { result, frameId } = decoded ?? decodeFrame(text);
     if (isErr(result)) {
       const ref = resolveFailureRef(failure, frameId);
       log.debug('refused a frame that failed validation', {
@@ -2464,28 +2942,57 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     try {
       outcome = await route(client, message);
     } catch (cause) {
-      // Filed at `error` in the closed shape, then — for a developer at
-      // `debug` — with the redacted message and stack under the same ref the
-      // `INTERNAL` reply below carries.
-      logException(
-        'error',
-        'a WebSocket frame handler failed unexpectedly',
-        { ...fieldsOf(state), type: message.type },
-        cause,
-        resolveFailureRef(failure, message.id),
-      );
-      outcome = refusal('INTERNAL', HANDLER_FAILURE_MESSAGE);
+      outcome = handlerFailure(state, message, cause, failure);
     }
-    if (isErr(outcome)) {
-      const ref = resolveFailureRef(failure, message.id);
-      log.debug('refused a frame', {
-        ...fieldsOf(state),
-        type: message.type,
-        code: outcome.error.code,
-        ref,
-      });
-      replyError(state, outcome.error, ref);
+    answerRefusal(state, message, outcome, failure);
+  }
+
+  /**
+   * Files a frame handler that threw — at `error` in the closed shape, then,
+   * for a developer at `debug`, with the redacted message and stack under the
+   * same ref — and returns the `INTERNAL` refusal whose reply carries that
+   * ref. Shared by the queue ({@link processFrame}) and the ping answered on
+   * arrival ({@link answerPingOnArrival}).
+   */
+  function handlerFailure(
+    state: ConnectionState,
+    message: ProtocolMessage,
+    cause: unknown,
+    failure: FrameFailure,
+  ): Result<never, DebuggenError> {
+    logException(
+      'error',
+      'a WebSocket frame handler failed unexpectedly',
+      { ...fieldsOf(state), type: message.type },
+      cause,
+      resolveFailureRef(failure, message.id),
+    );
+    return refusal('INTERNAL', HANDLER_FAILURE_MESSAGE);
+  }
+
+  /**
+   * Answers a routed frame's refusal, if it was refused: filed at `debug`
+   * under the frame's failure reference, then replied with `error` carrying
+   * it. A frame that succeeded gets no reply from here — its handler sent
+   * whatever answers it.
+   */
+  function answerRefusal(
+    state: ConnectionState,
+    message: ProtocolMessage,
+    outcome: Result<void, DebuggenError>,
+    failure: FrameFailure,
+  ): void {
+    if (!isErr(outcome)) {
+      return;
     }
+    const ref = resolveFailureRef(failure, message.id);
+    log.debug('refused a frame', {
+      ...fieldsOf(state),
+      type: message.type,
+      code: outcome.error.code,
+      ref,
+    });
+    replyError(state, outcome.error, ref);
   }
 
   /**
@@ -2532,7 +3039,9 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
 
       case MESSAGE_TYPE.CLIENT_PING:
         // Every authenticated role, deliberately unguarded: the answer proves
-        // the socket, and proving it needs no permission.
+        // the socket, and proving it needs no permission. A ping normally never
+        // reaches the queue — `receiveFrame` answers it on arrival — so this
+        // branch serves only one inflated past `EARLY_PING_MAX_FRAME_BYTES`.
         return answerPing(client, message);
 
       case MESSAGE_TYPE.AGENT_READY:
@@ -2633,13 +3142,18 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
    * the DevTools service worker and the dev-server preload alike. No role
    * guard, no session, tab or scope check, and no effect beyond the reply: the
    * frame's arrival already refreshed the connection's `lastSeenAt`
-   * ({@link enqueueFrame}), as every frame does.
+   * ({@link answerPingOnArrival}, or {@link enqueueFrame} for a ping too large
+   * to be decoded on arrival), as every frame does.
+   *
+   * Called on arrival, ahead of the connection's queued frames
+   * ({@link receiveFrame}), so the answer's latency is the service's, not that
+   * of the backlog the sender wrote before its ping.
    *
    * The answer is built with `createEnvelope` and verified with `parseMessage`
    * before it leaves, as {@link answerSourceOpen} verifies its own. An envelope
    * `id` may be longer than a pong's `ref` may be; such a ping is refused with
    * `PROTOCOL_INVALID_MESSAGE` through the normal `error` reply, under the ref
-   * {@link processFrame} resolves for it, so no ping is left to its sender's
+   * {@link answerRefusal} resolves for it, so no ping is left to its sender's
    * deadline and the sender is never handed a frame it would refuse.
    *
    * A pong that could not be delivered — the sender went offline between its
@@ -3033,6 +3547,8 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
     let awaitingHello = 0;
     let authenticated = 0;
     let pendingFrames = 0;
+    let pendingBytes = 0;
+    let readPaused = 0;
     for (const state of connections.values()) {
       if (state.phase === 'awaiting-hello') {
         awaitingHello += 1;
@@ -3040,6 +3556,10 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
         authenticated += 1;
       }
       pendingFrames += state.pending;
+      pendingBytes += state.pendingBytes;
+      if (state.readPaused) {
+        readPaused += 1;
+      }
     }
     const admission = admissions.snapshot();
     return Object.freeze({
@@ -3047,6 +3567,9 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       awaitingHello,
       authenticated,
       pendingFrames,
+      pendingBytes,
+      readPaused,
+      readPauses,
       offlineRetained: retained.size,
       admitted: admission.admitted,
       pendingHandshakes: admission.pendingHandshakes,

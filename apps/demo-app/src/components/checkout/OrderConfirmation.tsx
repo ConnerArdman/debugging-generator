@@ -8,10 +8,11 @@
  * `@/components/ui/Price` and every string is worded by `@/lib/format`. What is left - which of the
  * payload's fields earns a line, and in what order those lines read - is this file's only job.
  *
- * TWO CALLERS, ONE COMPONENT
- * The `/checkout` and `/orders` routes render it on the server from a payload they already hold,
- * and the checkout form renders it in the browser, in place of its own fields, the moment a submit
- * resolves. That is only possible because the component is hook-free and entirely prop-fed: no
+ * TWO ARRIVALS, ONE COMPONENT
+ * The checkout form renders it in place of its own fields in two situations: in the browser, the
+ * moment a submit resolves, and on the server, when `/checkout` is requested at an order's own
+ * address and the page hands the form the order it read back - which the browser then hydrates.
+ * Both are only possible because the component is hook-free and entirely prop-fed: no
  * `'use client'`, no state, no effect, no context, nothing read from the browser and nothing
  * fetched. It renders what it is given, so the markup a server sends is the markup a client mounts.
  *
@@ -23,10 +24,11 @@
  * a hydration mismatch at best and a wrong statement at worst.
  *
  * THE PAYLOAD IT ACCEPTS
- * `order` is either an `OrderDetail` - what the order routes return - or the `CheckoutResult` a
- * submit resolves to, which wraps one. Both are accepted so that neither caller has to unwrap
- * anything, and the two `'order' in order` tests below are the whole of the adaptation: one takes
- * the order, the other takes the payment that settled it.
+ * `order` is either an `OrderDetail` - what the order service reads back, as the checkout page does
+ * for the order its address names - or the `CheckoutResult` a submit resolves to, which wraps one.
+ * Both are accepted so that neither arrival has to unwrap anything, and the two `'order' in order`
+ * tests below are the whole of the adaptation: one takes the order, the other takes the payment
+ * that settled it.
  *
  * WHAT IS PRINTED OF THE PAYMENT, AND WHY IT MAY BE ABSENT
  * `payment` exists only on the `CheckoutResult` branch, and is `null` even there for an

@@ -20,7 +20,17 @@
  *     bound the oldest episodes shrink to their header and failed rows, whole
  *     episodes leave from the front only once every older one is a summary,
  *     and the newest episodes keep every row;
- *   - progress of any session other than the active one is ignored.
+ *   - progress of any session other than the active one is ignored;
+ *   - a replay of stored history — the same frames under the send times they
+ *     were first sent with — adds nothing and notifies no one, also after
+ *     compaction, after the same session is re-adopted and for frames a
+ *     creation window held, while a frame only the replay delivers is applied
+ *     once and a follow-up's new episode still opens;
+ *   - a row settles its running row in place when the service words the two
+ *     differently at a word boundary (a failed stage's header, a degradation
+ *     notice and its ✕), and a corrected ✓ supersedes the ✕ it corrects;
+ *   - ending the session drops the rows still running, so the live view of an
+ *     ended session equals the same session reopened.
  *
  * ## The `vscode` substitute
  *
@@ -45,8 +55,8 @@ import type {
   SessionRecord,
 } from '@debuggen/protocol';
 
-import { ExtensionState } from './state';
-import type { ProgressEntry } from './webview-messages';
+import { DEGRADATION_SENTENCE_LEAD, ExtensionState } from './state';
+import type { ProgressEntry, WebviewState } from './webview-messages';
 
 vi.mock('vscode', () => {
   /** The change-event emitter the store fires one snapshot per burst through. */
@@ -104,9 +114,14 @@ const MAX_PROGRESS_ENTRIES = 1_000;
  * A stored session, validated by the protocol's own schema.
  *
  * @param id The session id.
+ * @param overrides Members that differ from the in-progress default, such as
+ *   an `ended` status and a later `updatedAt`.
  * @returns The record.
  */
-function sessionRecord(id: string): SessionRecord {
+function sessionRecord(
+  id: string,
+  overrides: Readonly<Partial<Pick<SessionRecord, 'status' | 'updatedAt'>>> = {},
+): SessionRecord {
   const parsed = parseSessionRecord({
     id,
     projectRoot: '/workspace/sample-project',
@@ -126,6 +141,7 @@ function sessionRecord(id: string): SessionRecord {
     cleanup: { status: 'pending', conflicts: [] },
     promptVersions: {},
     provider: { id: 'deterministic' },
+    ...overrides,
   });
   if (!parsed.ok) {
     throw parsed.error;
@@ -149,6 +165,35 @@ function progress(
   sessionId: string = SESSION_ID,
 ): SessionProgressPayload {
   const parsed = parseSessionProgressPayload({ sessionId, stage, status, message });
+  if (!parsed.ok) {
+    throw parsed.error;
+  }
+  return parsed.value;
+}
+
+/**
+ * One `session.progress` payload of the active session carrying a detail
+ * line, validated by the protocol's own parser.
+ *
+ * @param stage The reporting stage.
+ * @param status Its status.
+ * @param message The line the service composed.
+ * @param detail The detail the service attached.
+ * @returns The payload.
+ */
+function detailed(
+  stage: ProgressStage,
+  status: ProgressStatus,
+  message: string,
+  detail: string,
+): SessionProgressPayload {
+  const parsed = parseSessionProgressPayload({
+    sessionId: SESSION_ID,
+    stage,
+    status,
+    message,
+    detail,
+  });
   if (!parsed.ok) {
     throw parsed.error;
   }
@@ -628,6 +673,510 @@ describe('ExtensionState.applyProgress', () => {
     state.applyProgress(progress('understand', 'running', 'Understanding problem'));
 
     expect(state.progress).toEqual([]);
+    state.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Replays of stored history
+// ---------------------------------------------------------------------------
+
+/**
+ * When the service first sent a transcript's frames: the service's own clock,
+ * deliberately far from the editor's {@link FIXED_NOW}, because the envelope
+ * `ts` and the receipt time the store stamps are different clocks.
+ */
+const SENT_T0 = 1_790_000_000_000;
+
+/** One frame as the service sends it: the payload and its envelope `ts`. */
+interface SentFrame {
+  readonly payload: SessionProgressPayload;
+  readonly sentAt: number;
+}
+
+/**
+ * Stamps payloads with the send times their envelopes carry, one millisecond
+ * apart, as the service's emitter does.
+ *
+ * @param payloads The frames, in the order the service sent them.
+ * @param from The first frame's send time.
+ * @returns The frames with their send times.
+ */
+function sent(payloads: readonly SessionProgressPayload[], from: number = SENT_T0): SentFrame[] {
+  return payloads.map((payload, index) => ({ payload, sentAt: from + index }));
+}
+
+/**
+ * Applies sent frames in order, each with its send time — what
+ * `src/extension.ts` does with every `session.progress` envelope.
+ *
+ * @param state The store.
+ * @param frames The frames, in arrival order.
+ */
+function applySent(state: ExtensionState, frames: readonly SentFrame[]): void {
+  for (const { payload, sentAt } of frames) {
+    state.applyProgress(payload, sentAt);
+  }
+}
+
+/**
+ * Records every snapshot the store notifies from now on.
+ *
+ * @param state The store.
+ * @returns The live list of notified snapshots.
+ */
+function recordChanges(state: ExtensionState): WebviewState[] {
+  const snapshots: WebviewState[] = [];
+  state.onDidChange((snapshot) => {
+    snapshots.push(snapshot);
+  });
+  return snapshots;
+}
+
+/** Lets every coalesced flush the store queued on the microtask queue run. */
+async function flushed(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
+/**
+ * The rows still drawn with a spinner.
+ *
+ * @param entries The store's progress list.
+ * @returns The `running` rows.
+ */
+function runningRows(entries: readonly ProgressEntry[]): ProgressEntry[] {
+  return entries.filter((entry) => entry.status === 'running');
+}
+
+/** The ✕ sentence of AAP §0.5.5 for one signal, as the service words it. */
+const SERVER_SPANS_UNAVAILABLE = `${DEGRADATION_SENTENCE_LEAD} Server spans: the dev server runs without the preload.`;
+
+/** The notice the service announces first for the same signal, still `running`. */
+const SERVER_SPANS_NOTICE = `${SERVER_SPANS_UNAVAILABLE} Continuing with: Browser performance.`;
+
+/** The hint the service attaches to the ✕ row as its detail. */
+const RELAUNCH_HINT = 'Restart the dev server with the Debug Generator preload.';
+
+describe('ExtensionState.applyProgress: replays of stored history', () => {
+  it('adds nothing and notifies no one when the history is replayed with its send times', async () => {
+    const state = activeState(tickingClock());
+    const transcript = sent(FIRST_RUN);
+    applySent(state, transcript);
+    const settled = state.progress;
+    expect(lines(settled)).toEqual(FIRST_RUN_LINES);
+    await flushed();
+    const changes = recordChanges(state);
+
+    // Three re-reads of the session (a resync, a reopen, an end's detail read),
+    // each replaying every stored row under a new envelope id.
+    for (let replay = 0; replay < 3; replay += 1) {
+      applySent(state, transcript);
+    }
+    await flushed();
+
+    expect(state.progress).toBe(settled);
+    expect(changes).toEqual([]);
+    state.dispose();
+  });
+
+  it('still adds nothing once compaction has dropped the rows the replay names', () => {
+    const state = activeState(tickingClock());
+    const transcript = sent([
+      ...FIRST_RUN,
+      ...Array.from({ length: 90 }, (_, cycle) => evidenceFollowUp(cycle, cycle % 10 === 3)).flat(),
+    ]);
+    applySent(state, transcript);
+    const kept = state.progress;
+    expect(kept.length).toBeLessThanOrEqual(MAX_PROGRESS_ENTRIES);
+    // The oldest detail rows were compacted away…
+    expect(lines(kept)).not.toContain('investigate done Found SampleComponent');
+
+    // …and neither the whole history nor the service's 500-row window brings them back.
+    applySent(state, transcript);
+    applySent(state, transcript.slice(-500));
+
+    expect(state.progress).toBe(kept);
+    state.dispose();
+  });
+
+  it('still adds nothing after the session in view is reopened and re-adopted', () => {
+    const state = activeState(tickingClock());
+    const transcript = sent(FIRST_RUN);
+    applySent(state, transcript);
+    const settled = state.progress;
+
+    // Reopening the session already in view: its replay may beat the answer…
+    const reopening = state.beginSessionCreation();
+    applySent(state, transcript);
+    reopening.adopt(sessionRecord(SESSION_ID, { updatedAt: FIXED_NOW + 5 }), SERVICE_URL);
+    // …or follow it, and the record may be adopted again directly.
+    state.adoptSession(sessionRecord(SESSION_ID, { updatedAt: FIXED_NOW + 6 }), SERVICE_URL);
+    applySent(state, transcript);
+
+    expect(state.activeSession?.updatedAt).toBe(FIXED_NOW + 6);
+    expect(state.progress).toBe(settled);
+    state.dispose();
+  });
+
+  it('keeps the send time of frames a creation window held, so a later replay adds nothing', () => {
+    const state = new ExtensionState({
+      serviceUrl: SERVICE_URL,
+      provider: 'deterministic',
+      now: tickingClock(),
+    });
+    const transcript = sent(FIRST_RUN);
+
+    // Reopening a stored session: its replay arrives before the answer and is held.
+    const reopening = state.beginSessionCreation();
+    applySent(state, transcript);
+    expect(state.progress).toEqual([]);
+    reopening.adopt(sessionRecord(SESSION_ID), SERVICE_URL);
+    const adopted = state.progress;
+    expect(lines(adopted)).toEqual(FIRST_RUN_LINES);
+
+    // A resync after a reconnect replays the same history.
+    applySent(state, transcript);
+
+    expect(state.progress).toBe(adopted);
+    state.dispose();
+  });
+
+  it('forgets the applied frames when another session becomes active', () => {
+    const state = activeState(tickingClock());
+    const transcript = sent(FIRST_RUN);
+    applySent(state, transcript);
+
+    state.adoptSession(sessionRecord(OTHER_SESSION_ID), SERVICE_URL);
+    expect(state.progress).toEqual([]);
+    // Reopened later, the first session is replayed into an empty list, whole.
+    state.adoptSession(sessionRecord(SESSION_ID), SERVICE_URL);
+    applySent(state, transcript);
+
+    expect(lines(state.progress)).toEqual(FIRST_RUN_LINES);
+    state.dispose();
+  });
+
+  it('applies, once, the frames only the replay delivers', () => {
+    const state = activeState(tickingClock());
+    const transcript = sent(FIRST_RUN);
+    const captureDone = transcript.findIndex(
+      ({ payload }) => payload.stage === 'capture' && payload.status === 'done',
+    );
+    // Live, the socket lost the capture stage's closing row and the last two frames.
+    applySent(state, transcript.filter((_, index) => index !== captureDone).slice(0, -2));
+    expect(lines(state.progress)).toContain('capture running Capturing runtime evidence');
+    expect(state.progress.some((entry) => entry.stage === 'generate-panel')).toBe(false);
+
+    applySent(state, transcript);
+    const repaired = state.progress;
+    // The missed closing row settled its header in place; the missed tail was appended.
+    expect(lines(repaired)).toEqual(FIRST_RUN_LINES);
+
+    applySent(state, transcript);
+    expect(state.progress).toBe(repaired);
+    state.dispose();
+  });
+
+  it("opens a follow-up's genuinely new episode, which carries new send times", () => {
+    const state = activeState(tickingClock());
+    const firstRun = sent(FIRST_RUN);
+    const followUp = sent(NEW_CAPTURE_FOLLOW_UP, SENT_T0 + 60_000);
+    const expected = [
+      ...FIRST_RUN_LINES,
+      'followup done Evaluating follow-up question',
+      'plan done Planning instrumentation',
+      'instrument running Preparing instrumentation',
+      'instrument done Server spans',
+      'instrument done Ready to capture',
+    ];
+
+    applySent(state, firstRun);
+    applySent(state, followUp);
+    expect(lines(state.progress)).toEqual(expected);
+
+    // The whole history replayed adds nothing to either episode.
+    applySent(state, [...firstRun, ...followUp]);
+    expect(lines(state.progress)).toEqual(expected);
+    state.dispose();
+  });
+
+  it('applies a frame without a send time exactly as before, every time', async () => {
+    const state = activeState(tickingClock());
+    state.applyProgress(progress('understand', 'running', 'Understanding problem'));
+    await flushed();
+    const changes = recordChanges(state);
+
+    state.applyProgress(progress('understand', 'running', 'Understanding problem'));
+    await flushed();
+
+    expect(lines(state.progress)).toEqual(['understand running Understanding problem']);
+    expect(changes).toHaveLength(1);
+    state.dispose();
+  });
+
+  it('forgets the oldest identities once it holds four times the row bound', () => {
+    const state = activeState(tickingClock());
+    const bound = 4 * MAX_PROGRESS_ENTRIES;
+    const transcript = sent(
+      Array.from({ length: bound + 1 }, (_, index) =>
+        progress(index % 2 === 0 ? 'capture' : 'analyze', 'done', `Attempt ${String(index)}`),
+      ),
+    );
+    applySent(state, transcript);
+    const kept = state.progress;
+    const [first, second] = transcript;
+    if (first === undefined || second === undefined) {
+      throw new Error('missing the oldest frames');
+    }
+
+    // The second-oldest identity is still held; the oldest was forgotten.
+    applySent(state, [second]);
+    expect(state.progress).toBe(kept);
+    applySent(state, [first]);
+    expect(state.progress.at(-1)?.message).toBe('Attempt 0');
+    expect(state.progress.length).toBeLessThanOrEqual(MAX_PROGRESS_ENTRIES);
+    state.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Settlement worded differently, and corrections
+// ---------------------------------------------------------------------------
+
+describe('ExtensionState.applyProgress: settlement and correction', () => {
+  it("settles a failed stage's header in place, with its position and first receipt time", () => {
+    const state = activeState(tickingClock());
+    applyAll(state, FIRST_RUN.slice(0, 10));
+    state.applyProgress(progress('instrument', 'running', 'Preparing instrumentation'));
+    const header = state.progress.at(-1);
+    state.applyProgress(progress('instrument', 'done', 'Browser performance'));
+
+    state.applyProgress(
+      detailed(
+        'instrument',
+        'failed',
+        'Preparing instrumentation failed: The planned instrumentation is not available here.',
+        RELAUNCH_HINT,
+      ),
+    );
+
+    expect(lines(state.progress).slice(-2)).toEqual([
+      'instrument failed Preparing instrumentation failed: The planned instrumentation is not available here.',
+      'instrument done Browser performance',
+    ]);
+    const settled = state.progress.at(-2);
+    expect(settled?.ts).toBe(header?.ts);
+    expect(settled?.detail).toBe(RELAUNCH_HINT);
+    expect(runningRows(state.progress)).toEqual([]);
+    state.dispose();
+  });
+
+  it('settles only the latest episode of the stage, never an earlier one', () => {
+    const state = activeState(tickingClock());
+    applyAll(state, FIRST_RUN);
+    const firstEpisodeHeader = state.progress.find(
+      (entry) => entry.stage === 'instrument' && entry.message === 'Preparing instrumentation',
+    );
+    applyAll(state, NEW_CAPTURE_FOLLOW_UP.slice(0, 5));
+
+    state.applyProgress(
+      progress('instrument', 'failed', 'Preparing instrumentation failed: No adapter accepted it.'),
+    );
+
+    expect(firstEpisodeHeader).toBeDefined();
+    expect(state.progress).toContain(firstEpisodeHeader);
+    expect(lines(state.progress).slice(-1)).toEqual([
+      'instrument failed Preparing instrumentation failed: No adapter accepted it.',
+    ]);
+    expect(runningRows(state.progress)).toEqual([]);
+    state.dispose();
+  });
+
+  it('prefers an equal message over an extension', () => {
+    const state = activeState(tickingClock());
+    applyAll(state, [
+      progress('capture', 'running', 'Capturing runtime evidence'),
+      progress('capture', 'running', 'Capturing runtime evidence: second window'),
+      progress('capture', 'done', 'Capturing runtime evidence'),
+    ]);
+
+    expect(lines(state.progress)).toEqual([
+      'capture done Capturing runtime evidence',
+      'capture running Capturing runtime evidence: second window',
+    ]);
+    state.dispose();
+  });
+
+  it('never settles a row whose message continues inside a word, in any script', () => {
+    const state = activeState(tickingClock());
+    applyAll(state, [
+      progress('analyze', 'running', 'Analyse'),
+      progress('analyze', 'done', 'Analyse2 complete'),
+      progress('analyze', 'running', 'Überprüfung'),
+      progress('analyze', 'failed', 'Überprüfungen fehlgeschlagen'),
+      progress('analyze', 'running', 'Cafe'),
+      progress('analyze', 'done', 'Cafe\u0301 closed'),
+    ]);
+    expect(state.progress).toHaveLength(6);
+    expect(runningRows(state.progress)).toHaveLength(3);
+
+    // At a word boundary the same script settles its row.
+    state.applyProgress(progress('analyze', 'failed', 'Überprüfung — fehlgeschlagen'));
+
+    expect(state.progress).toHaveLength(6);
+    expect(lines(state.progress)[2]).toBe('analyze failed Überprüfung — fehlgeschlagen');
+    state.dispose();
+  });
+
+  it('settles a degradation notice with its ✕ row: one row per signal', () => {
+    const state = activeState(tickingClock());
+    const databaseUnavailable = `${DEGRADATION_SENTENCE_LEAD} Database tracing: no database driver was found.`;
+    applyAll(state, [
+      progress('instrument', 'running', 'Preparing instrumentation'),
+      progress('instrument', 'done', 'Browser performance'),
+      progress('instrument', 'running', SERVER_SPANS_NOTICE),
+      progress(
+        'instrument',
+        'running',
+        `${databaseUnavailable} Continuing with: Browser performance.`,
+      ),
+    ]);
+    const notice = state.progress[2];
+
+    applyAll(state, [
+      detailed('instrument', 'failed', SERVER_SPANS_UNAVAILABLE, RELAUNCH_HINT),
+      progress('instrument', 'failed', databaseUnavailable),
+      progress('instrument', 'done', 'Preparing instrumentation'),
+    ]);
+
+    expect(lines(state.progress)).toEqual([
+      'instrument done Preparing instrumentation',
+      'instrument done Browser performance',
+      `instrument failed ${SERVER_SPANS_UNAVAILABLE}`,
+      `instrument failed ${databaseUnavailable}`,
+    ]);
+    expect(state.progress[2]?.ts).toBe(notice?.ts);
+    expect(state.progress[2]?.detail).toBe(RELAUNCH_HINT);
+    state.dispose();
+  });
+
+  it('lets a corrected ✓ supersede the ✕ it corrects, in place', () => {
+    const state = activeState(tickingClock());
+    applyAll(state, [
+      progress('instrument', 'running', 'Preparing instrumentation'),
+      detailed('instrument', 'failed', SERVER_SPANS_UNAVAILABLE, RELAUNCH_HINT),
+      progress('instrument', 'failed', `${DEGRADATION_SENTENCE_LEAD} Database tracing.`),
+    ]);
+    const stale = state.progress[1];
+
+    // A label that only begins another signal's label corrects nothing.
+    state.applyProgress(progress('instrument', 'done', 'Server'));
+    expect(lines(state.progress)).toEqual([
+      'instrument running Preparing instrumentation',
+      `instrument failed ${SERVER_SPANS_UNAVAILABLE}`,
+      `instrument failed ${DEGRADATION_SENTENCE_LEAD} Database tracing.`,
+      'instrument done Server',
+    ]);
+
+    // The service corrected its readiness: each ✓ replaces its own ✕.
+    state.applyProgress(progress('instrument', 'done', 'Server spans'));
+    state.applyProgress(progress('instrument', 'done', 'Database tracing'));
+
+    expect(lines(state.progress)).toEqual([
+      'instrument running Preparing instrumentation',
+      'instrument done Server spans',
+      'instrument done Database tracing',
+      'instrument done Server',
+    ]);
+    expect(state.progress[1]?.ts).toBe(stale?.ts);
+    expect(state.progress[1]?.detail).toBeUndefined();
+    state.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The end of a session
+// ---------------------------------------------------------------------------
+
+describe('ExtensionState progress at the end of a session', () => {
+  /** A live run that ends with a header, a notice and a stage still running. */
+  const UNFINISHED_RUN: readonly SessionProgressPayload[] = [
+    progress('understand', 'running', 'Understanding problem'),
+    progress('understand', 'done', 'Understanding problem'),
+    progress('instrument', 'running', 'Preparing instrumentation'),
+    progress('instrument', 'done', 'Browser performance'),
+    progress('instrument', 'running', SERVER_SPANS_NOTICE),
+    progress('capture', 'running', 'Capturing runtime evidence'),
+    progress('cleanup', 'running', 'Removing instrumentation'),
+    progress('cleanup', 'done', 'Removing instrumentation'),
+  ];
+
+  /** What remains of {@link UNFINISHED_RUN} once the session has ended. */
+  const ENDED_LINES: readonly string[] = [
+    'understand done Understanding problem',
+    'instrument done Browser performance',
+    'cleanup done Removing instrumentation',
+  ];
+
+  it('drops the rows still running when an ended record arrives, matching the reopened view', () => {
+    const live = activeState(tickingClock());
+    const transcript = sent(UNFINISHED_RUN);
+    applySent(live, transcript);
+    expect(runningRows(live.progress)).toHaveLength(3);
+
+    live.applySessionRecord(
+      sessionRecord(SESSION_ID, { status: 'ended', updatedAt: FIXED_NOW + 1 }),
+    );
+
+    expect(lines(live.progress)).toEqual(ENDED_LINES);
+    // A delayed running frame brings no spinner back.
+    live.applyProgress(progress('capture', 'running', 'Capturing runtime evidence'), SENT_T0 + 99);
+    expect(lines(live.progress)).toEqual(ENDED_LINES);
+
+    // The same session reopened later: adopted as ended, then its history replayed.
+    const reopened = new ExtensionState({
+      serviceUrl: SERVICE_URL,
+      provider: 'deterministic',
+      now: tickingClock(),
+    });
+    reopened.adoptSession(
+      sessionRecord(SESSION_ID, { status: 'ended', updatedAt: FIXED_NOW + 1 }),
+      SERVICE_URL,
+    );
+    applySent(reopened, transcript);
+
+    expect(lines(reopened.progress)).toEqual(lines(live.progress));
+    live.dispose();
+    reopened.dispose();
+  });
+
+  it('drops them as well when the service answers session.end', () => {
+    const state = activeState(tickingClock());
+    applyAll(state, UNFINISHED_RUN);
+    const kept = state.progress.filter((entry) => entry.status !== 'running');
+
+    state.applySessionEnded(SESSION_ID, { cleanup: 'clean' });
+
+    expect(lines(state.progress)).toEqual(ENDED_LINES);
+    // The rows kept are the very rows that were held.
+    kept.forEach((entry, index) => {
+      expect(state.progress[index]).toBe(entry);
+    });
+    state.dispose();
+  });
+
+  it('keeps the list as it is when nothing is running at the end', () => {
+    const state = activeState(tickingClock());
+    applyAll(state, FIRST_RUN);
+    const settled = state.progress;
+
+    state.applySessionRecord(
+      sessionRecord(SESSION_ID, { status: 'ended', updatedAt: FIXED_NOW + 1 }),
+    );
+
+    expect(state.progress).toBe(settled);
     state.dispose();
   });
 });

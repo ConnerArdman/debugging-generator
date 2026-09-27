@@ -74,7 +74,6 @@
 
 import clsx from 'clsx';
 import Link from 'next/link';
-import { Fragment } from 'react';
 import type { ComponentProps, ReactElement, ReactNode } from 'react';
 
 import { Alert } from '@/components/ui/Alert';
@@ -447,7 +446,8 @@ export function InventoryLevelsTable({
      * Nothing to table. Two situations reach here and they need different words: a filter that
      * matched nothing, and a page number past the end of a listing that does hold lines - which is
      * what a bookmarked dashboard URL turns into once the stock behind it has moved on. The second
-     * gets a way back, as a link rather than a control, since this is a server component.
+     * gets a way back, as a link rather than a control, since this is a server component. The
+     * block's heading is an `<h3>`, one level under the `<h2>` the page hands this card's head.
      */
     const past = total > 0;
 
@@ -458,6 +458,7 @@ export function InventoryLevelsTable({
           alt=""
           tone="neutral"
           heading="No stock lines to show"
+          headingAs="h3"
           action={
             past ? (
               <Link className={styles.pagerLink} href={hrefForPage(basePath, carried, 1)}>
@@ -509,6 +510,32 @@ export function InventoryLevelsTable({
   });
 
   const grouped = lines.some((line) => line.category !== null);
+
+  /*
+   * The lines as row groups, each rendered as its own `<tbody>`: one run per category, opened
+   * wherever the category changes from the line before it, in the order the listing answered them.
+   * A page with no grouping is a single run holding every line.
+   *
+   * A run is a row group because its heading is one. The grouping row's cell is a
+   * `scope="rowgroup"` header, and HTML's header-assignment rules give such a cell to every cell
+   * below it *in its own row group* - so the category names exactly the stock lines filed under it
+   * only when those lines, and no others, share its `<tbody>`. Put every category in one body and
+   * the second category's lines would be announced under the first category's name as well.
+   *
+   * Each run keeps the line that opened it, which is what its grouping row names and what keys the
+   * body: a line is unique within a page, so the key is too.
+   */
+  const runs: { opening: (typeof lines)[number]; members: (typeof lines)[number][] }[] = [];
+
+  for (const line of lines) {
+    const run = runs[runs.length - 1];
+
+    if (run !== undefined && (!grouped || run.opening.category === line.category)) {
+      run.members.push(line);
+    } else {
+      runs.push({ opening: line, members: [line] });
+    }
+  }
 
   /*
    * The caption is the table's name, and it is the whole name: when the card head shows the title,
@@ -572,46 +599,43 @@ export function InventoryLevelsTable({
             </tr>
           </thead>
 
-          <tbody>
-            {lines.map((line, index) => {
-              /*
-               * A grouping row opens wherever the category changes from the line before it - and at
-               * the top of the table, where there is no line before it. The previous entry is typed
-               * `... | undefined` under `noUncheckedIndexedAccess`, which is exactly the check this
-               * needs, so it is narrowed rather than asserted.
-               */
-              const previous = lines[index - 1];
-              const opensCategory =
-                grouped && (previous === undefined || previous.category !== line.category);
-              const available = line.row.available;
-              /*
-               * `null` is "this line's availability is not a number", which is the one case that
-               * gets no badge: `formatQuantityLabel` already prints a placeholder for the figure,
-               * and a chip would have to assert a selling state the row cannot support. Everything
-               * else is decided by the line itself - its available units against its own reorder
-               * point, widened by the threshold the listing was read under - so the badge says
-               * what the filter above it means.
-               */
-              const state = Number.isFinite(available)
-                ? stockStateFor(available, line.row.reorderPoint, threshold)
-                : null;
+          {runs.map(({ opening, members }) => (
+            <tbody key={`${opening.row.productId}:${opening.row.warehouseId}`}>
+              {/*
+                The grouping row, first in its body. Its one cell spans every column and heads the
+                row group it opens, so `scope="rowgroup"`: it labels the lines beneath it rather
+                than a group of columns, and there is no `<colgroup>` in this table for a column
+                group header to apply to.
+              */}
+              {grouped ? (
+                <tr className={styles.groupRow}>
+                  <th colSpan={COLUMNS.length} scope="rowgroup">
+                    <span className={styles.groupLabel}>
+                      {opening.category === null ? null : (
+                        <CategoryGlyph slug={opening.category} size="sm" />
+                      )}
+                      {categoryLabelFor(opening.category, opening.product?.categoryName)}
+                    </span>
+                  </th>
+                </tr>
+              ) : null}
 
-              return (
-                <Fragment key={`${line.row.productId}:${line.row.warehouseId}`}>
-                  {opensCategory ? (
-                    <tr className={styles.groupRow}>
-                      <th colSpan={COLUMNS.length} scope="colgroup">
-                        <span className={styles.groupLabel}>
-                          {line.category === null ? null : (
-                            <CategoryGlyph slug={line.category} size="sm" />
-                          )}
-                          {categoryLabelFor(line.category, line.product?.categoryName)}
-                        </span>
-                      </th>
-                    </tr>
-                  ) : null}
+              {members.map((line) => {
+                const available = line.row.available;
+                /*
+                 * `null` is "this line's availability is not a number", which is the one case that
+                 * gets no badge: `formatQuantityLabel` already prints a placeholder for the figure,
+                 * and a chip would have to assert a selling state the row cannot support.
+                 * Everything else is decided by the line itself - its available units against its
+                 * own reorder point, widened by the threshold the listing was read under - so the
+                 * badge says what the filter above it means.
+                 */
+                const state = Number.isFinite(available)
+                  ? stockStateFor(available, line.row.reorderPoint, threshold)
+                  : null;
 
-                  <tr>
+                return (
+                  <tr key={`${line.row.productId}:${line.row.warehouseId}`}>
                     <th scope="row" className={styles.rowHeadCell}>
                       {line.product === undefined ? 'Unlisted product' : line.product.name}
                       <span className={styles.sku}>
@@ -673,10 +697,10 @@ export function InventoryLevelsTable({
                       )}
                     </td>
                   </tr>
-                </Fragment>
-              );
-            })}
-          </tbody>
+                );
+              })}
+            </tbody>
+          ))}
         </table>
       </Scroller>
 

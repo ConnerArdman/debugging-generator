@@ -13,6 +13,12 @@
  *    `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, and none
  *    carries `Access-Control-Allow-Origin` (so no web page can read a reply) or
  *    a `Server` banner.
+ * 3. **Every reply names its ref.** Every reply carries `X-Debuggen-Ref`; a
+ *    failure body that satisfies protocol's error schema carries the same
+ *    value as `ref` — added to a route's or the access boundary's body that
+ *    lacked one, kept when the body already named its own — and the failure is
+ *    filed at `info` under that ref with its code. A body that is not the error
+ *    shape is left untouched.
  *
  * Every collaborator a test does not supply is a stand-in that throws one
  * chosen `DebuggenError`, so a failure arrives at `app.onError` exactly as a
@@ -34,7 +40,12 @@ import { DebuggenError, err, newMessageId, newSessionId, ok } from '@debuggen/sh
 import type { ServiceConfig } from '../config.js';
 import { createServiceLogger } from '../logging.js';
 import { FAILURE_COPY_BY_CODE, authorProductText } from '../sessions/progress.js';
-import { AUTH_FAILURE_REASONS } from './auth.js';
+import {
+  AUTH_FAILURE_REASONS,
+  REFUSAL_LOG_BURST,
+  REFUSAL_LOG_WINDOW_MS,
+  type HttpAuthorizationRequest,
+} from './auth.js';
 import { createHttpApp, type HttpApp, type HttpAppDeps } from './http.js';
 import type * as HealthModule from './routes/health.js';
 import type * as PairModule from './routes/pair.js';
@@ -122,6 +133,7 @@ const BASE_CONFIG: ServiceConfig = {
 
 /** pino's numeric levels, as the service logger writes them. */
 const WARN_LEVEL = 40;
+const INFO_LEVEL = 30;
 const DEBUG_LEVEL = 20;
 
 /** The private text a collaborator's error carries: a URL query value and an SQL literal. */
@@ -597,5 +609,319 @@ describe('the response-header policy', () => {
         .filter((record) => record['msg'] === 'The HTTP listener failed while writing a response');
       expect(fallback.map((record) => record['ref'])).toEqual([body['ref']]);
     });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Every reply names its ref
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The response header every reply carries its correlation ref in. */
+const REF_HEADER = 'x-debuggen-ref';
+
+/** The record every answered failure is filed under at `info`. */
+const FAILURE_ANSWERED_LOG = 'Answered an HTTP request with a failure';
+
+/** The record every answered success is filed under at `debug`. */
+const SUCCESS_ANSWERED_LOG = 'Answered an HTTP request';
+
+/** The shape of every ref the service mints. */
+const MINTED_REF = /^msg_[0-9a-z]{16}$/u;
+
+/** Asserts that a body names a ref the service minted, and returns it. */
+function mintedRefOf(body: Readonly<Record<string, unknown>>): string {
+  const ref = body['ref'];
+  if (typeof ref !== 'string') {
+    throw new Error('The failure body names no ref.');
+  }
+  expect(ref).toMatch(MINTED_REF);
+  return ref;
+}
+
+/** The records with `message` a harness captured. */
+function recordsWith(h: Harness, message: string): Record<string, unknown>[] {
+  return h.records().filter((record) => record['msg'] === message);
+}
+
+/** An access boundary that refuses a missing credential and keeps the ref each request handed it. */
+function refRecordingAuth(seen: (string | undefined)[]): Record<string, unknown> {
+  const descriptor = AUTH_FAILURE_REASONS['missing-credential'];
+  return {
+    authorizeHttpRequest: (request: HttpAuthorizationRequest) => {
+      seen.push(request.ref);
+      return err(
+        new DebuggenError(descriptor.code, descriptor.message, {
+          details: { reason: 'missing-credential' },
+        }),
+      );
+    },
+  };
+}
+
+describe('every reply names its ref', () => {
+  it("adds the request's ref to a route's failure body that has none, in the header and the info record too", async () => {
+    const text = JSON.stringify({ code: 'SESSION_NOT_FOUND', message: 'No such session.' });
+    overrides.healthReply = () =>
+      new Response(text, {
+        status: 404,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(Buffer.byteLength(text)),
+        },
+      });
+    const h = harness(UNREACHED, 'info', { auth: admittingAuth() });
+
+    const response = await h.fetch(operationRequest('health'));
+    const raw = await response.text();
+    const body = JSON.parse(raw) as Record<string, unknown>;
+
+    expect(response.status).toBe(404);
+    expect(body).toEqual({
+      code: 'SESSION_NOT_FOUND',
+      message: 'No such session.',
+      ref: mintedRefOf(body),
+    });
+    expect(response.headers.get(REF_HEADER)).toBe(body['ref']);
+    // The stale length of the shorter body is never sent with the longer one.
+    expect(response.headers.get('content-length')).not.toBe(String(Buffer.byteLength(text)));
+    expect(policyOf(response.headers)).toEqual(EXPECTED_POLICY);
+
+    const failures = recordsWith(h, FAILURE_ANSWERED_LOG);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      level: INFO_LEVEL,
+      method: 'GET',
+      operation: 'health',
+      status: 404,
+      errorCode: 'SESSION_NOT_FOUND',
+      ref: body['ref'],
+    });
+    expect(typeof failures[0]?.['durationMs']).toBe('number');
+    // The route's pattern, never the request's path, headers or body.
+    for (const key of ['path', 'url', 'headers', 'body']) {
+      expect(Object.keys(failures[0] ?? {})).not.toContain(key);
+    }
+  });
+
+  it('keeps the ref a failure body already names, and files the header and the record under it', async () => {
+    const own = 'msg_routeownref00001';
+    overrides.healthReply = () =>
+      Response.json(
+        { code: 'SESSION_NOT_FOUND', message: 'No such session.', ref: own },
+        { status: 404 },
+      );
+    const h = harness(UNREACHED, 'info', { auth: admittingAuth() });
+
+    const response = await h.fetch(operationRequest('health'));
+
+    expect(await response.json()).toEqual({
+      code: 'SESSION_NOT_FOUND',
+      message: 'No such session.',
+      ref: own,
+    });
+    expect(response.headers.get(REF_HEADER)).toBe(own);
+    expect(recordsWith(h, FAILURE_ANSWERED_LOG).map((record) => record['ref'])).toEqual([own]);
+  });
+
+  it('adds the ref to a capture-conflict body and keeps its owning session', async () => {
+    const owningSessionId = newSessionId();
+    overrides.healthReply = () =>
+      Response.json(
+        {
+          code: 'CAPTURE_ALREADY_ACTIVE',
+          message: 'Another session is capturing.',
+          owningSessionId,
+        },
+        { status: 409 },
+      );
+    const h = harness(UNREACHED, 'info', { auth: admittingAuth() });
+
+    const response = await h.fetch(operationRequest('health'));
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(409);
+    expect(body).toEqual({
+      code: 'CAPTURE_ALREADY_ACTIVE',
+      message: 'Another session is capturing.',
+      owningSessionId,
+      ref: mintedRefOf(body),
+    });
+    expect(response.headers.get(REF_HEADER)).toBe(body['ref']);
+  });
+
+  it('leaves a failure body that is not the error shape untouched, header aside', async () => {
+    overrides.healthReply = () =>
+      new Response('not the contract', { status: 404, headers: { 'content-type': 'text/plain' } });
+    const h = harness(UNREACHED, 'info', { auth: admittingAuth(), verifyResponses: 'off' });
+
+    const response = await h.fetch(operationRequest('health'));
+
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe('not the contract');
+    const ref = response.headers.get(REF_HEADER);
+    expect(ref).toMatch(MINTED_REF);
+    const failures = recordsWith(h, FAILURE_ANSWERED_LOG);
+    expect(failures.map((record) => record['ref'])).toEqual([ref]);
+    expect(failures[0]?.['errorCode']).toBeUndefined();
+  });
+
+  it("names the ref of the access boundary's refusal in its body, its header, the boundary's call and the record", async () => {
+    const seen: (string | undefined)[] = [];
+    const h = harness(UNREACHED, 'info', { auth: refRecordingAuth(seen) });
+
+    const response = await h.fetch(sessionsRequest());
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(401);
+    expect(body['code']).toBe('UNAUTHORIZED');
+    expect(body['ref']).toMatch(MINTED_REF);
+    expect(response.headers.get(REF_HEADER)).toBe(body['ref']);
+    // The boundary was handed the very ref its refusal is answered under.
+    expect(seen).toEqual([body['ref']]);
+    const failures = recordsWith(h, FAILURE_ANSWERED_LOG);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      level: INFO_LEVEL,
+      operation: 'session.list',
+      status: 401,
+      errorCode: 'UNAUTHORIZED',
+      ref: body['ref'],
+    });
+  });
+
+  it('names the ref of the origin guard’s refusal in its body and its header', async () => {
+    const h = harness(UNREACHED, 'info', { auth: admittingAuth() });
+
+    const response = await h.fetch(operationRequest('health', { headers: { origin: WEB_ORIGIN } }));
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(403);
+    expect(body).toEqual({
+      code: 'FORBIDDEN_ORIGIN',
+      message: AUTH_FAILURE_REASONS['forbidden-origin'].message,
+      ref: mintedRefOf(body),
+    });
+    expect(response.headers.get(REF_HEADER)).toBe(body['ref']);
+  });
+
+  it('carries the header on a success, and files the success at debug only under the same ref', async () => {
+    const quiet = harness(UNREACHED, 'info', { auth: admittingAuth() });
+    const answered = await quiet.fetch(operationRequest('health'));
+    expect(answered.status).toBe(200);
+    expect(answered.headers.get(REF_HEADER)).toMatch(MINTED_REF);
+    expect(quiet.records()).toEqual([]);
+
+    const verbose = harness(UNREACHED, 'debug', { auth: admittingAuth() });
+    const response = await verbose.fetch(operationRequest('health', { method: 'HEAD' }));
+    expect(response.status).toBe(200);
+    const ref = response.headers.get(REF_HEADER);
+    expect(ref).toMatch(MINTED_REF);
+    const successes = recordsWith(verbose, SUCCESS_ANSWERED_LOG);
+    expect(successes.map((record) => [record['level'], record['ref']])).toEqual([
+      [DEBUG_LEVEL, ref],
+    ]);
+    expect(recordsWith(verbose, FAILURE_ANSWERED_LOG)).toEqual([]);
+  });
+
+  it('keeps the shape of the boundary’s own 404, 500 and 503, each naming its ref in the header', async () => {
+    const lost = harness(UNREACHED, 'info', { auth: admittingAuth() });
+    const notFound = await lost.fetch(new Request('http://127.0.0.1/no-such-route'));
+    const notFoundBody = (await notFound.json()) as Record<string, unknown>;
+    expect(notFound.status).toBe(404);
+    expect(Object.keys(notFoundBody).sort()).toEqual(['code', 'message', 'ref']);
+    expect(notFound.headers.get(REF_HEADER)).toBe(notFoundBody['ref']);
+
+    const failing = harness(UNREACHED, 'info');
+    const failed = await failing.fetch(sessionsRequest());
+    const failedBody = (await failed.json()) as Record<string, unknown>;
+    expect(failed.status).toBe(500);
+    expect(Object.keys(failedBody).sort()).toEqual(['code', 'message', 'ref']);
+    expect(failed.headers.get(REF_HEADER)).toBe(failedBody['ref']);
+    // The boundary's error record and the request's failure record share the ref.
+    const refs = failing
+      .records()
+      .filter((record) => record['level'] === INFO_LEVEL || record['level'] === 50)
+      .map((record) => record['ref']);
+    expect(new Set(refs)).toEqual(new Set([failedBody['ref']]));
+
+    const closing = harness(UNREACHED, 'info', { auth: admittingAuth() });
+    closing.app.close();
+    const refused = await closing.fetch(operationRequest('health'));
+    const refusedBody = (await refused.json()) as Record<string, unknown>;
+    expect(refused.status).toBe(503);
+    expect(Object.keys(refusedBody).sort()).toEqual(['code', 'message', 'ref']);
+    expect(refused.headers.get(REF_HEADER)).toBe(refusedBody['ref']);
+    expect(recordsWith(closing, FAILURE_ANSWERED_LOG).map((record) => record['ref'])).toEqual([
+      refusedBody['ref'],
+    ]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The origin guard's record
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The record the origin guard files for every web origin it refuses. */
+const ORIGIN_REFUSED_LOG = 'Refused a request from an origin this service never serves';
+
+describe("the origin guard's record", () => {
+  it('files a web-origin refusal at warn, naming its sanitized origin and the ref its reply carries', async () => {
+    const h = harness(UNREACHED, 'info', { auth: admittingAuth() });
+    // The userinfo is added at run time, so the committed source holds no
+    // credential-shaped URL for `scripts/check-secrets.mjs` to flag.
+    const craftedUrl = new URL('https://evil.example:8443/zz-path?zz-query=1');
+    craftedUrl.username = 'user';
+    craftedUrl.password = 'zz-secret';
+    const crafted = craftedUrl.href;
+    expect(crafted).toContain('user:zz-secret@');
+
+    const response = await h.fetch(operationRequest('health', { headers: { origin: crafted } }));
+    const body = (await response.json()) as Record<string, unknown>;
+
+    expect(response.status).toBe(403);
+    const refusals = recordsWith(h, ORIGIN_REFUSED_LOG);
+    expect(refusals).toHaveLength(1);
+    // Through the service's own logger: its redaction leaves the `origin` field readable.
+    expect(refusals[0]).toMatchObject({
+      level: WARN_LEVEL,
+      method: 'GET',
+      status: 403,
+      origin: 'https://evil.example:8443',
+      ref: body['ref'],
+      suppressed: 0,
+    });
+    const text = JSON.stringify(h.records());
+    for (const part of ['zz-secret', 'zz-path', 'zz-query', 'user:']) {
+      expect(text).not.toContain(part);
+    }
+  });
+
+  it('files refusals past the burst at debug, and counts them into the next window’s first warn', async () => {
+    let clock = 0;
+    const h = harness(UNREACHED, 'debug', { auth: admittingAuth(), now: () => clock });
+    const refuse = async (): Promise<void> => {
+      const response = await h.fetch(
+        operationRequest('health', { headers: { origin: 'http://evil.example' } }),
+      );
+      expect(response.status).toBe(403);
+    };
+
+    for (let attempt = 0; attempt < REFUSAL_LOG_BURST + 2; attempt += 1) {
+      await refuse();
+    }
+    clock += REFUSAL_LOG_WINDOW_MS;
+    await refuse();
+
+    const levels = recordsWith(h, ORIGIN_REFUSED_LOG).map((record) => [
+      record['level'],
+      record['origin'],
+      record['suppressed'],
+    ]);
+    expect(levels).toEqual([
+      ...Array.from({ length: REFUSAL_LOG_BURST }, () => [WARN_LEVEL, 'http://evil.example', 0]),
+      [DEBUG_LEVEL, 'http://evil.example', undefined],
+      [DEBUG_LEVEL, 'http://evil.example', undefined],
+      [WARN_LEVEL, 'http://evil.example', 2],
+    ]);
   });
 });

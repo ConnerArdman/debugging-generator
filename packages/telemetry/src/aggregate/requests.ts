@@ -123,6 +123,62 @@
  *   group's duration figures. Duplicate windows are swept by issuance start,
  *   which a pending request has like any other.
  *
+ * ## Initiator labels are read, never raw stacks
+ *
+ * An occurrence's {@link RequestOccurrence.initiator} is a label a reader can
+ * act on, and a group's {@link RequestGroup.initiators} is the set of distinct
+ * labels — which is what tells one caller firing twice from two callers firing
+ * once each (AAP 0.8.2). The browser agent records the call-site *stack* of
+ * generated-chunk frames in the `initiator` attribute, and every frame of it
+ * begins in the application's shared request helper, so labelling by that text
+ * would name one helper for every request. The label is therefore chosen from
+ * the strongest evidence the event carries, in this order:
+ *
+ * 1. **The React component whose work started the request** (`component`):
+ *    `initiatorComponent`, followed by as many of its composite owners
+ *    (`initiatorOwners`, nearest first) as it takes to tell that component's
+ *    distinct mounts in the group apart, joined as `Rail ‹ Header`. A
+ *    component with one owner chain in the group is named alone; two mounts
+ *    under different parents are named `Rail ‹ Header` and `Rail ‹ Page`
+ *    rather than by eight framework wrappers each. Only the renderer can tell
+ *    two mounts apart — their stacks are frame-for-frame the same — so this
+ *    evidence wins whenever the producer captured it, and the whole bounded
+ *    chain stays on the occurrence as {@link RequestOccurrence.initiatorOwners}.
+ * 2. **A label the producer wrote itself** (no basis): an `initiator` that is
+ *    not a captured stack is already a name, and is kept verbatim.
+ * 3. **The resolved source location** (`source`): for a captured stack, the
+ *    `symbol (file:line)` the service's source-map route resolved it to.
+ * 4. **The stack's first frame** (`frame`): `fn (chunk.js:line:column)`, when
+ *    nothing resolved the stack.
+ *
+ * {@link RequestOccurrence.initiatorBasis} records which rule produced a
+ * derived label and is absent for rule 2, so an event that never carried a
+ * stack or a component produces exactly the occurrence it always did. A stack
+ * that was reduced to a label stays on the occurrence as
+ * {@link RequestOccurrence.initiatorStack}, for the reader who wants the frames.
+ *
+ * ## Status codes, failures and the occurrences that reported no code
+ *
+ * Every occurrence of a group is exactly one of three things, and each is
+ * counted over every occurrence, before `maxOccurrencesPerGroup` truncation:
+ *
+ * - **pending** — counted in `pendingCount` (above), with no status code;
+ * - **settled with a status code** — its code is one entry of the distinct,
+ *   ascending `statusCodes`;
+ * - **settled without one** — a network error, an abort, a cross-origin
+ *   refusal or an opaque response, none of which has a code to report —
+ *   counted in `noStatusCodeCount`.
+ *
+ * So `count` is `pendingCount` plus `noStatusCodeCount` plus the occurrences
+ * behind `statusCodes`, and a settled occurrence missing from `statusCodes`
+ * is never unaccounted for. `errorCount` counts the settled occurrences that
+ * failed — a code at or above 400, or span status `error` — which includes a
+ * failure that reported no code: a group whose codes are all successes can
+ * still carry failures, and `noStatusCodeCount` is where a reader finds the
+ * occurrences that explain them. Like `pendingCount`, `noStatusCodeCount` is
+ * present only when above zero, so a capture in which every settled request
+ * answered with a code produces exactly the groups it always did.
+ *
  * ## Purity
  *
  * The input is an already-ingested, already-redacted event list. This module
@@ -173,8 +229,14 @@ const URL_ATTRIBUTE: RequestAttributeKey = 'url';
 /** The response status code. */
 const STATUS_CODE_ATTRIBUTE: RequestAttributeKey = 'http.status_code';
 
-/** A label for whatever started the request (a component or a stack frame). */
+/** What started the request: a captured call-site stack, or a producer's own label. */
 const INITIATOR_ATTRIBUTE: RequestAttributeKey = 'initiator';
+
+/** The React component whose work started the request, when the renderer reported one. */
+const INITIATOR_COMPONENT_ATTRIBUTE: RequestAttributeKey = 'initiatorComponent';
+
+/** The composite components above {@link INITIATOR_COMPONENT_ATTRIBUTE}, nearest first. */
+const INITIATOR_OWNERS_ATTRIBUTE: RequestAttributeKey = 'initiatorOwners';
 
 /**
  * Bytes over the wire, from `PerformanceResourceTiming.transferSize`.
@@ -393,6 +455,60 @@ export const REQUEST_TRANSFER_SOURCES = Object.freeze(['request', 'resource-timi
 /** @see REQUEST_TRANSFER_SOURCES */
 export type RequestTransferSource = (typeof REQUEST_TRANSFER_SOURCES)[number];
 
+/**
+ * How a derived {@link RequestOccurrence.initiator} label was chosen — the
+ * rules of the header's "Initiator labels", strongest first.
+ *
+ * - `component` — the React component that was running when the request
+ *   started, followed by the fewest of its composite owners, nearest first,
+ *   that tell its distinct mounts in the group apart.
+ * - `source` — the call site the service resolved the captured stack to, as
+ *   `symbol (file:line)`.
+ * - `frame` — the captured stack's first frame, when nothing resolved it.
+ *
+ * A label the producer wrote itself carries no basis at all, which keeps every
+ * such occurrence exactly the shape it had before labels were derived.
+ */
+export const REQUEST_INITIATOR_BASES = Object.freeze(['component', 'source', 'frame'] as const);
+
+/** @see REQUEST_INITIATOR_BASES */
+export type RequestInitiatorBasis = (typeof REQUEST_INITIATOR_BASES)[number];
+
+/**
+ * What joins a component label to its owners: the component that started the
+ * request first, each owner after it, nearest first (`Rail ‹ Header ‹ Page`).
+ */
+export const INITIATOR_OWNER_SEPARATOR = ' ‹ ';
+
+/**
+ * The most owners a component label names.
+ *
+ * The browser producer already bounds its owner chain to this many names; the
+ * aggregate bounds it again because it reads events from any producer.
+ */
+export const MAX_INITIATOR_OWNER_NAMES = 8;
+
+/**
+ * The longest one component or owner name may be, in code points.
+ *
+ * The producer's own bound, applied again for the same reason as
+ * {@link MAX_INITIATOR_OWNER_NAMES}.
+ */
+export const MAX_INITIATOR_NAME_LENGTH = 200;
+
+/**
+ * The longest a derived initiator label may be, in code points.
+ *
+ * Room for a component and every owner at their own bounds, with the
+ * separators between them, so bounding a label can never merge two mounts the
+ * owner chain told apart; a `source` or `frame` label is one location. The
+ * bound keeps a pathological frame from making one label the size of the
+ * stack it was taken from.
+ */
+export const MAX_INITIATOR_LABEL_LENGTH =
+  (MAX_INITIATOR_OWNER_NAMES + 1) * MAX_INITIATOR_NAME_LENGTH +
+  MAX_INITIATOR_OWNER_NAMES * INITIATOR_OWNER_SEPARATOR.length;
+
 /*
  * ---------------------------------------------------------------------------
  * Shapes
@@ -447,8 +563,37 @@ export interface RequestOccurrence {
    * {@link endTime} is that observation instant rather than a completion.
    */
   readonly pending?: true;
-  /** The initiator label, when the producer reported one. */
+  /**
+   * Who started the request, as a label a reader can act on — see the header's
+   * "Initiator labels" for the order the evidence is read in.
+   *
+   * Absent when the producer recorded neither an initiator nor a component.
+   */
   readonly initiator?: string;
+  /**
+   * How {@link initiator} was derived; present only when it was derived.
+   *
+   * Absent both when there is no initiator and when the initiator is the
+   * producer's own label, verbatim.
+   */
+  readonly initiatorBasis?: RequestInitiatorBasis;
+  /**
+   * Every composite owner the renderer reported above the initiating
+   * component, nearest first and bounded by {@link MAX_INITIATOR_OWNER_NAMES},
+   * when {@link initiatorBasis} is `component` and the chain was not empty.
+   *
+   * {@link initiator} names only as many of them as the group needs to tell
+   * the component's mounts apart; this is the whole chain behind that label.
+   */
+  readonly initiatorOwners?: readonly string[];
+  /**
+   * The call-site stack the producer captured, verbatim as stored (already
+   * redacted at ingest), when the recorded initiator was a stack.
+   *
+   * Kept beside the label so a reader who needs the frames — the tooltip on a
+   * label, a copy for a bug report — still has them; never used for grouping.
+   */
+  readonly initiatorStack?: string;
   /** Where the request was issued from, when a location could be resolved. */
   readonly source?: SourceLocation;
   /**
@@ -562,9 +707,18 @@ export interface RequestGroup {
   readonly maxDurationMs: number;
   /** The fastest occurrence's duration, in milliseconds. */
   readonly minDurationMs: number;
-  /** Distinct status codes observed, ascending. */
+  /**
+   * Distinct status codes observed, ascending — over the settled occurrences
+   * that reported one; see {@link noStatusCodeCount} for those that did not.
+   */
   readonly statusCodes: readonly number[];
-  /** Occurrences that failed: status code at or above 400, or span status `error`. */
+  /**
+   * Occurrences that failed: status code at or above 400, or span status
+   * `error`. A failure that reported no code — an abort, a network error — is
+   * counted here and appears in {@link noStatusCodeCount}, not in
+   * {@link statusCodes} (see the header's "Status codes, failures and the
+   * occurrences that reported no code").
+   */
   readonly errorCount: number;
   /**
    * Occurrences that were still pending when the capture ended — see
@@ -580,11 +734,31 @@ export interface RequestGroup {
    */
   readonly pendingCount?: number;
   /**
-   * Distinct initiator labels, sorted.
+   * Settled occurrences that reported no status code — a network error, an
+   * abort, a cross-origin refusal or an opaque response — counted over every
+   * occurrence, before truncation, so it is never larger than {@link count}.
+   * A pending occurrence is never one of them: it is counted in
+   * {@link pendingCount} instead.
+   *
+   * With {@link pendingCount} it closes the account {@link statusCodes} leaves
+   * open: every occurrence is pending, settled with a code, or counted here.
+   * Those of them whose span status is `error` are among {@link errorCount},
+   * which is how a group whose only code is a success still reports failures.
+   *
+   * Present only when at least one occurrence settled without a code, like
+   * {@link pendingCount}: absent means none did, which keeps every group shape
+   * that predates the field valid.
+   */
+  readonly noStatusCodeCount?: number;
+  /**
+   * Distinct initiator labels ({@link RequestOccurrence.initiator}), sorted.
    *
    * Distinctness is load-bearing rather than cosmetic: a duplicate group with
    * *two* initiators is a different finding from one with a single initiator
    * firing twice (AAP 0.8.2), so the set is never collapsed to its first entry.
+   * It holds labels, never raw stacks, so two mounts of one component under
+   * different owners are two entries, and every request of one call site is
+   * one entry however its stack's framework frames varied.
    */
   readonly initiators: readonly string[];
   /**
@@ -816,6 +990,250 @@ function readRequestKey(event: TelemetryEvent): string | undefined {
   return readNonBlankString(event, REQUEST_KEY_ATTRIBUTE);
 }
 
+/** The initiator fields one occurrence publishes; see {@link readInitiator}. */
+interface OccurrenceInitiator {
+  readonly initiator: string;
+  readonly initiatorBasis?: RequestInitiatorBasis;
+  readonly initiatorOwners?: readonly string[];
+  readonly initiatorStack?: string;
+}
+
+/**
+ * A V8 frame (`    at fn (url:1:2)`, `    at url:1:2`), capturing its body.
+ *
+ * The trailing coordinates are part of the pattern on purpose: they are what
+ * tells a captured frame from a producer's label that merely begins with the
+ * word "at".
+ */
+const V8_FRAME_LINE = /^\s*at\s+(\S.*?:\d+(?::\d+)?\)?)\s*$/;
+
+/** A V8 frame body naming its function: `fn (location)`. */
+const V8_NAMED_FRAME = /^(.+?)\s+\((.+)\)$/;
+
+/** A SpiderMonkey/JavaScriptCore frame (`fn@url:1:2`, `@url:1:2`). */
+const GECKO_FRAME_LINE = /^\s*([^@\s]*)@(\S+:\d+(?::\d+)?)\s*$/;
+
+/** `text` cut to at most `limit` code points, never splitting a surrogate pair. */
+function boundCodePoints(text: string, limit: number): string {
+  if (text.length <= limit) {
+    return text;
+  }
+  return Array.from(text).slice(0, limit).join('');
+}
+
+/** A trimmed, bounded name, or `undefined` for anything that is not a non-blank string. */
+function boundedName(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? undefined : boundCodePoints(trimmed, MAX_INITIATOR_NAME_LENGTH);
+}
+
+/**
+ * The owner names an event carries, nearest first, bounded.
+ *
+ * Each element is read on its own and a hostile one costs itself only: an
+ * owner chain is evidence about a caller, never a reason to drop the request.
+ */
+function readOwnerNames(event: TelemetryEvent): readonly string[] {
+  const value = readAttribute(event, INITIATOR_OWNERS_ATTRIBUTE);
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const names: string[] = [];
+  try {
+    for (const element of value) {
+      const name = boundedName(element);
+      if (name !== undefined) {
+        names.push(name);
+      }
+      if (names.length >= MAX_INITIATOR_OWNER_NAMES) {
+        break;
+      }
+    }
+  } catch {
+    // A throwing element or iterator ends the chain at the names already read.
+  }
+  return names;
+}
+
+/** The first line of `text` that is a captured stack frame, trimmed. */
+function firstFrameLine(text: string): string | undefined {
+  for (const line of text.split('\n')) {
+    if (V8_FRAME_LINE.test(line) || GECKO_FRAME_LINE.test(line)) {
+      return line.trim();
+    }
+  }
+  return undefined;
+}
+
+/** A frame location reduced to its last path segment: `…/chunk.js:12:3` → `chunk.js:12:3`. */
+function shortFrameLocation(location: string): string {
+  const slash = location.lastIndexOf('/');
+  return slash === -1 || slash === location.length - 1 ? location : location.slice(slash + 1);
+}
+
+/**
+ * One frame as `fn (chunk.js:line:column)`, or the bare short location when the
+ * frame names no function.
+ */
+function frameLabel(frame: string): string {
+  const v8 = V8_FRAME_LINE.exec(frame);
+  if (v8?.[1] !== undefined) {
+    const named = V8_NAMED_FRAME.exec(v8[1]);
+    return named?.[1] !== undefined && named[2] !== undefined
+      ? `${named[1]} (${shortFrameLocation(named[2])})`
+      : shortFrameLocation(v8[1]);
+  }
+  const gecko = GECKO_FRAME_LINE.exec(frame);
+  if (gecko?.[2] !== undefined) {
+    const location = shortFrameLocation(gecko[2]);
+    return gecko[1] === undefined || gecko[1] === '' ? location : `${gecko[1]} (${location})`;
+  }
+  return frame;
+}
+
+/** A resolved call site as `symbol (file:line)`, or `file:line` when no symbol is known. */
+function sourceLabel(source: SourceLocation): string {
+  const place = `${source.file}:${String(source.line)}`;
+  return source.symbol === undefined ? place : `${source.symbol} (${place})`;
+}
+
+/**
+ * The initiator an occurrence publishes, by the header's "Initiator labels".
+ *
+ * Reads the recorded `initiator`, the runtime component evidence and the
+ * resolved `source`, and never throws: every attribute goes through
+ * {@link readAttribute}, and a derived label is bounded to
+ * {@link MAX_INITIATOR_LABEL_LENGTH}.
+ *
+ * A `component` occurrence leaves here named by its component alone, with its
+ * owner chain beside it; {@link labelComponentInitiators} extends the name by
+ * as many owners as its group needs once the whole group is known.
+ *
+ * @param event A request event.
+ * @returns The fields to spread onto the occurrence, or `undefined` when the
+ * producer recorded neither an initiator nor a component.
+ */
+function readInitiator(event: TelemetryEvent): OccurrenceInitiator | undefined {
+  const recorded = readNonBlankString(event, INITIATOR_ATTRIBUTE);
+  const frame = recorded === undefined ? undefined : firstFrameLine(recorded);
+  const stack = recorded === undefined || frame === undefined ? {} : { initiatorStack: recorded };
+
+  const component = boundedName(readAttribute(event, INITIATOR_COMPONENT_ATTRIBUTE));
+  if (component !== undefined) {
+    const owners = readOwnerNames(event);
+    return {
+      initiator: component,
+      initiatorBasis: 'component',
+      ...(owners.length > 0 ? { initiatorOwners: owners } : {}),
+      ...stack,
+    };
+  }
+  if (recorded === undefined) {
+    return undefined;
+  }
+  if (frame === undefined) {
+    return { initiator: recorded };
+  }
+  if (event.source !== undefined) {
+    return {
+      initiator: boundCodePoints(sourceLabel(event.source), MAX_INITIATOR_LABEL_LENGTH),
+      initiatorBasis: 'source',
+      ...stack,
+    };
+  }
+  return {
+    initiator: boundCodePoints(frameLabel(frame), MAX_INITIATOR_LABEL_LENGTH),
+    initiatorBasis: 'frame',
+    ...stack,
+  };
+}
+
+/** A component label naming the first `depth` owners of its chain. */
+function componentLabel(component: string, owners: readonly string[], depth: number): string {
+  return boundCodePoints(
+    [component, ...owners.slice(0, depth)].join(INITIATOR_OWNER_SEPARATOR),
+    MAX_INITIATOR_LABEL_LENGTH,
+  );
+}
+
+/**
+ * The fewest owners that tell every distinct chain of one component apart.
+ *
+ * Tries `0, 1, …` owners and stops at the first depth at which the distinct
+ * chains still produce as many distinct labels, so the answer is the same
+ * whatever order the chains are given in. The chain length always succeeds:
+ * two chains that differ differ in a name or in their length.
+ */
+function distinguishingDepth(chains: readonly (readonly string[])[], component: string): number {
+  let longest = 0;
+  for (const chain of chains) {
+    longest = Math.max(longest, chain.length);
+  }
+  for (let depth = 0; depth < longest; depth += 1) {
+    const labels = new Set(chains.map((chain) => componentLabel(component, chain, depth)));
+    if (labels.size === chains.length) {
+      return depth;
+    }
+  }
+  return longest;
+}
+
+/**
+ * Name every `component` occurrence of one group by its component and the
+ * fewest owners that tell that component's distinct mounts in the group
+ * apart — the header's "Initiator labels", rule 1.
+ *
+ * Group-level because distinctness is: one mount of `CartProvider` is simply
+ * `CartProvider`, while two mounts of `Rail` become `Rail ‹ Header` and
+ * `Rail ‹ Page`. Computed over every occurrence, before truncation, and keyed
+ * by content only, so the labels do not depend on arrival order. Every other
+ * occurrence is returned as it is.
+ *
+ * @param occurrences every occurrence of one group, as {@link readInitiator}
+ * labelled them.
+ * @returns the occurrences, in the same order, component labels completed.
+ */
+function labelComponentInitiators(
+  occurrences: readonly RequestOccurrence[],
+): readonly RequestOccurrence[] {
+  const chainsByComponent = new Map<string, Map<string, readonly string[]>>();
+  for (const occurrence of occurrences) {
+    if (occurrence.initiatorBasis !== 'component' || occurrence.initiator === undefined) {
+      continue;
+    }
+    const owners = occurrence.initiatorOwners ?? [];
+    const chains =
+      chainsByComponent.get(occurrence.initiator) ?? new Map<string, readonly string[]>();
+    chains.set(JSON.stringify(owners), owners);
+    chainsByComponent.set(occurrence.initiator, chains);
+  }
+  if (chainsByComponent.size === 0) {
+    return occurrences;
+  }
+
+  const depthByComponent = new Map<string, number>();
+  for (const [component, chains] of chainsByComponent) {
+    depthByComponent.set(component, distinguishingDepth([...chains.values()], component));
+  }
+
+  return occurrences.map((occurrence) => {
+    const depth =
+      occurrence.initiatorBasis === 'component' && occurrence.initiator !== undefined
+        ? depthByComponent.get(occurrence.initiator)
+        : undefined;
+    if (depth === undefined || occurrence.initiator === undefined) {
+      return occurrence;
+    }
+    return {
+      ...occurrence,
+      initiator: componentLabel(occurrence.initiator, occurrence.initiatorOwners ?? [], depth),
+    };
+  });
+}
+
 /**
  * A number that can safely take part in arithmetic and ordering.
  *
@@ -933,7 +1351,11 @@ interface GroupAccumulator {
   errorCount: number;
   /** Pending occurrences merged so far; published only when above zero. */
   pendingCount: number;
-  readonly initiators: Set<string>;
+  /**
+   * Settled occurrences merged so far that reported no status code; published
+   * only when above zero.
+   */
+  noStatusCodeCount: number;
   /** Stays `undefined` until an occurrence actually has a size. */
   transferredBytes: number | undefined;
   /**
@@ -975,7 +1397,7 @@ function createAccumulator(
     statusCodes: new Set<number>(),
     errorCount: 0,
     pendingCount: 0,
-    initiators: new Set<string>(),
+    noStatusCodeCount: 0,
     transferredBytes: undefined,
     transferEventIds: new Set<EventId>(),
   };
@@ -1023,9 +1445,10 @@ function mergeOccurrence(
   }
   if (occurrence.pending === true) {
     accumulator.pendingCount += 1;
-  }
-  if (occurrence.initiator !== undefined) {
-    accumulator.initiators.add(occurrence.initiator);
+  } else if (occurrence.statusCode === undefined) {
+    // Settled, and no code to add to `statusCodes`: counted so that every
+    // occurrence the codes leave out is accounted for.
+    accumulator.noStatusCodeCount += 1;
   }
   if (occurrence.transferredBytes !== undefined) {
     accumulator.transferredBytes =
@@ -1114,8 +1537,16 @@ function finalizeGroup(
   duplicateWindowMs: number,
   maxOccurrences: number,
 ): RequestGroup {
-  const ordered = [...accumulator.occurrences].sort(compareOccurrences);
+  // Component labels are completed against the whole group first, so the
+  // distinct labels below — and the truncated list — carry the final names.
+  const ordered = [...labelComponentInitiators(accumulator.occurrences)].sort(compareOccurrences);
   const count = ordered.length;
+  const initiators = new Set<string>();
+  for (const occurrence of ordered) {
+    if (occurrence.initiator !== undefined) {
+      initiators.add(occurrence.initiator);
+    }
+  }
 
   // Windows and counts are computed over every occurrence, so truncating the
   // exposed list can never change the duplicate evidence.
@@ -1151,7 +1582,11 @@ function finalizeGroup(
     // the published list above cannot change it; absent when zero, which keeps
     // every group without a pending request exactly the shape it always had.
     ...(accumulator.pendingCount > 0 ? { pendingCount: accumulator.pendingCount } : {}),
-    initiators: [...accumulator.initiators].sort(compareStrings),
+    // Counted the same way and published under the same rule.
+    ...(accumulator.noStatusCodeCount > 0
+      ? { noStatusCodeCount: accumulator.noStatusCodeCount }
+      : {}),
+    initiators: [...initiators].sort(compareStrings),
     ...(accumulator.transferredBytes !== undefined
       ? { transferredBytes: Math.round(accumulator.transferredBytes) }
       : {}),
@@ -2291,7 +2726,7 @@ export function aggregateRequests(
     // A snapshot's status code is ignored even when present: no response had
     // arrived, so a code on it would describe something the capture never saw.
     const statusCode = pending ? undefined : readInteger(event, STATUS_CODE_ATTRIBUTE);
-    const initiator = readNonBlankString(event, INITIATOR_ATTRIBUTE);
+    const initiator = readInitiator(event);
 
     const base: RequestOccurrence = {
       id: event.id,
@@ -2305,7 +2740,7 @@ export function aggregateRequests(
       ...(statusCode !== undefined ? { statusCode } : {}),
       status: event.status,
       ...(pending ? { pending: true as const } : {}),
-      ...(initiator !== undefined ? { initiator } : {}),
+      ...initiator,
       ...(event.source !== undefined ? { source: event.source } : {}),
       tier: event.tier,
       kind: event.kind,

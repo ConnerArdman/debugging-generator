@@ -24,7 +24,7 @@
  *     wherever the list is shown rather than being decided a second time here.
  *   - `CartTotalsPanel` reads the cart's totals itself and prints every figure - the units, the
  *     merchandise subtotal, the charge rows this column hands it, the closing figure they add up
- *     to, the free-freight state and the dispatch promise. It renders inside
+ *     to and the dispatch promise. It renders inside
  *     `@/components/ui/Card`, so `.totals` below is placement only and nothing wraps it in a
  *     second card.
  *
@@ -39,9 +39,12 @@
  * a figure assembled from a priced cart, a quoted rate and two charges nobody has computed yet.
  *
  * `variant="page"` for both, which is the arrangement `/cart` uses: the document scrolls, so
- * neither block caps its own height the way the cart drawer's compact variant does. A capped,
- * separately scrolling list beside a long checkout form would hide the very lines the column
- * exists to show.
+ * neither block caps its own height. The one cap is this column's, and only where it is pinned
+ * beside the form on a window tall enough for it: `./CheckoutSummaryPanel.module.css` holds the
+ * whole review inside the viewport there and lets the wrapper around the lines scroll when a long
+ * cart would not otherwise fit, because a pinned column taller than the screen hides its own
+ * figures below the fold and is then pushed off screen while the form is still being filled in.
+ * A cart whose review fits scrolls nothing, and the single-column page never caps anything.
  *
  * AND ONLY UNTIL IT HAS BEEN PLACED
  * Placing the order ends the review, and `./CheckoutCharges` is how this column learns it has been:
@@ -53,6 +56,16 @@
  * and the lines carry quantity and remove controls, which would be offering changes to a cart that
  * has become an order. The receipt beside this column is where the figures that apply are printed,
  * so this column points at it rather than repeating them.
+ *
+ * AND HELD STILL WHILE IT IS BEING PLACED
+ * Between the press of Place order and the store's answer the order is neither under review nor
+ * placed: the store is reserving stock and pricing exactly the lines listed here. `./CheckoutForm`
+ * holds its own fields for that stretch and publishes the fact through `./CheckoutCharges`, and
+ * this column holds its lines with them - the wrapper around the list is `inert`, so their
+ * quantity and remove controls can be neither focused nor pressed - and says so in a short status
+ * beside its heading, on the heading's own line so that nothing in the column moves when it
+ * appears. A change made in that window would edit a cart the store is already turning into an
+ * order, and the buyer would be left looking at lines that are not the ones they ordered.
  *
  * AN ORDER IS ONLY REVIEWED WHERE THERE IS A CART TO REVIEW
  * `@/hooks/useCartSummary` publishes either the cart's totals or the reason there are none, and
@@ -106,7 +119,9 @@
  * heading is an `<h2>` - the level `./CheckoutForm` uses for each of its own sections under the
  * page's `<h1>`. Because the column is titled here, `CartTotalsPanel` is handed a blank heading,
  * which suppresses its head slot rather than putting a second title into the outline for the same
- * block of figures. The reading order is heading, opening reading, lines, figures, note.
+ * block of figures. The reading order is heading, opening reading, lines, figures, note - with the
+ * status saying the lines are locked read straight after the heading while the order is being
+ * placed.
  *
  * Nothing in this file reads a clock, a random source, `window` or `document`, and it schedules
  * nothing, so the markup the server renders and the markup the browser first produces agree and
@@ -123,7 +138,7 @@ import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
 import { useCartSummary, type CartSummary } from '@/hooks/useCartSummary';
 import { formatQuantityLabel, formatShippingEtaLabel } from '@/lib/format';
 
-import { useOrderPlaced, useSelectedFreight } from './CheckoutCharges';
+import { useOrderPending, useOrderPlaced, useSelectedFreight } from './CheckoutCharges';
 
 import styles from './CheckoutSummaryPanel.module.css';
 
@@ -194,6 +209,18 @@ const PLACED_BODY =
   'beside this column.';
 
 /**
+ * The status printed beside the column's heading while the order is being placed, which is the
+ * only cue a sighted buyer has that the quantity and remove controls below it are held on purpose
+ * rather than broken.
+ *
+ * Short on purpose: it shares the heading's line and is held to that one line, so it has to fit
+ * beside "Order review" in the narrowest column the page lays out. Sharing the line is what keeps
+ * it from moving anything - a note given a line of its own would push the lines it describes down
+ * the column the moment Place order is pressed, which is exactly when a buyer's pointer is on it.
+ */
+const LOCKED_LINES_NOTE = 'Locked while the order is placed';
+
+/**
  * Alternative text for that block's illustration, which `@/components/ui/BlankSlate` draws from
  * `public/illustrations/empty-cart.svg`. The caller chooses it because only the caller knows what
  * its own heading says.
@@ -251,10 +278,10 @@ const TAX_CHARGE_LABEL = 'Tax';
  * because the checkout request works both out against the data of the moment. And the closing
  * figure is called an estimate for exactly as long as any of that is unsettled.
  *
- * What the note deliberately does not mention is a freight allowance. The storefront's
- * free-freight offer is a property of the cart's merchandise subtotal and the checkout service
- * charges the quoted freight whatever that subtotal is, so a clause about an allowance being
- * "settled on the order" would be this page promising a reduction no server applies.
+ * What the note deliberately does not suggest is that the freight could come down when the order
+ * is written. The checkout service charges the rate the carrier quotes for the shipment, so a
+ * clause about freight being reduced or waived at that point would be this page promising a
+ * reduction no server applies.
  */
 const REVIEW_NOTE =
   'Freight is the rate quoted for these units, this destination and the chosen service, and it is ' +
@@ -297,9 +324,9 @@ interface Props {
 /**
  * Render the order under review: its lines, what it comes to, and what is still to be added.
  *
- * @example The checkout page's second column, beside the form.
+ * @example The checkout page's review column, as the grid item itself so it can stay in view.
  * ```tsx
- * <CheckoutSummaryPanel />
+ * <CheckoutSummaryPanel className="ls-split-side" />
  * ```
  *
  * @example A placing that lists the cart itself and wants the figures only.
@@ -315,6 +342,7 @@ export function CheckoutSummaryPanel({
   const summary = useCartSummary();
   const freight = useSelectedFreight();
   const placed = useOrderPlaced();
+  const pending = useOrderPending();
 
   const trimmed = heading.trim();
   const title = trimmed.length > 0 ? trimmed : DEFAULT_HEADING;
@@ -337,7 +365,8 @@ export function CheckoutSummaryPanel({
         <VisuallyHidden>{PLACED_READING}</VisuallyHidden>
 
         <div className={styles.empty}>
-          <BlankSlate art="empty-cart" alt={EMPTY_ART_ALT} heading={PLACED_HEADING}>
+          {/* An `<h3>`: the column's own `<h2>` above is the level this block sits under. */}
+          <BlankSlate art="empty-cart" alt={EMPTY_ART_ALT} heading={PLACED_HEADING} headingAs="h3">
             {PLACED_BODY}
           </BlankSlate>
         </div>
@@ -377,7 +406,7 @@ export function CheckoutSummaryPanel({
   /*
    * The figures are shown whenever there is a cart to total, and also whenever the lines are
    * listed - `CartLineList` says that the cart is empty in that case, and the figures beneath it
-   * still state the free-freight offer. Only the totals-only placing with an empty cart has
+   * still show what an empty order comes to. Only the totals-only placing with an empty cart has
    * nothing to print, and that is the one state this column resolves itself.
    *
    * A cart whose contents are not established shows no figures at all, whichever placing this is:
@@ -439,15 +468,28 @@ export function CheckoutSummaryPanel({
 
   return (
     <section className={clsx(styles.root, className)} aria-label={title}>
-      <h2 className={styles.heading}>{title}</h2>
+      {/*
+        The heading shares its row with the locked-lines status, which appears only while the
+        order is being placed. The row is as tall as the heading and the status is held to one line
+        beside it, so the status appearing moves nothing below it. It sits outside the lines'
+        wrapper, so it is read rather than made inert with the lines it describes.
+      */}
+      <div className={styles.head}>
+        <h2 className={styles.heading}>{title}</h2>
+        {showLines && pending ? <p className={styles.locked}>{LOCKED_LINES_NOTE}</p> : null}
+      </div>
       <VisuallyHidden>{reading}</VisuallyHidden>
 
       {/*
         The wrapper carries the rule above the lines and the air beneath it; the list owns its own
         column, rows and states, and reads the cart for itself.
+
+        While the order is being placed the wrapper is `inert`, which takes every quantity and
+        remove control inside it out of the tab order, out of pointer hit-testing and out of the
+        accessibility tree in one attribute - see the header.
       */}
       {showLines ? (
-        <div className={styles.lines}>
+        <div className={styles.lines} inert={pending}>
           <CartLineList variant="page" />
         </div>
       ) : null}
@@ -474,12 +516,13 @@ export function CheckoutSummaryPanel({
         `.empty` is placement - it gives the block room in the column - so it goes on a wrapper
         rather than on `BlankSlate`, whose own module owns the column the illustration, heading and
         sentence are stacked in. No `action`: this file has no token-styled link of its own, and
-        the site header offers the way back to the catalog from every page.
+        the site header offers the way back to the catalog from every page. The block's heading is
+        an `<h3>`, one level under the column's own `<h2>`.
       */}
       {totalsShown || showLines ? null : (
         <div className={styles.empty}>
           {summary.contentsKnown ? (
-            <BlankSlate art="empty-cart" alt={EMPTY_ART_ALT} heading={EMPTY_HEADING}>
+            <BlankSlate art="empty-cart" alt={EMPTY_ART_ALT} heading={EMPTY_HEADING} headingAs="h3">
               {EMPTY_BODY}
             </BlankSlate>
           ) : (

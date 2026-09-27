@@ -217,6 +217,8 @@ interface Harness {
   readonly reload: Mock<(tabId: TabId) => Promise<void>>;
   /** Open a port to the worker, as Chrome's `runtime.onConnect` does. */
   connect(port: FakePort): void;
+  /** `chrome.tabs.onUpdated`, for dispatching a tab's load events. */
+  readonly onUpdated: FakeChromeEvent<[tabId: TabId, changeInfo: WorkerTabChange, tab: WorkerTab]>;
 }
 
 function build(options: { readonly paired?: boolean } = {}): Harness {
@@ -224,6 +226,8 @@ function build(options: { readonly paired?: boolean } = {}): Harness {
   const live = new Map<number, ReturnType<typeof setTimeout>>();
   let nextHandle = 0;
   const reload = vi.fn<(tabId: TabId) => Promise<void>>(() => Promise.resolve());
+  const onUpdated =
+    createChromeEvent<[tabId: TabId, changeInfo: WorkerTabChange, tab: WorkerTab]>();
   const worker = createWorker({
     runtime: {
       id: EXTENSION_ID,
@@ -235,7 +239,7 @@ function build(options: { readonly paired?: boolean } = {}): Harness {
     tabs: {
       reload,
       get: (): Promise<WorkerTab> => Promise.resolve({ url: APP_URL }),
-      onUpdated: createChromeEvent<[tabId: TabId, changeInfo: WorkerTabChange, tab: WorkerTab]>(),
+      onUpdated,
       onRemoved: createChromeEvent<[tabId: TabId]>(),
     },
     alarms: {
@@ -283,7 +287,7 @@ function build(options: { readonly paired?: boolean } = {}): Harness {
     serviceBaseUrl: 'http://127.0.0.1:43117',
     logger: noopLogger,
   });
-  return { worker, reload, connect: (port) => onConnect.fire(port) };
+  return { worker, reload, connect: (port) => onConnect.fire(port), onUpdated };
 }
 
 function panelPort(): FakePort {
@@ -458,6 +462,37 @@ describe('service worker: the consented page reload is scoped to the inspected t
     });
     expect(reloadOffers(panel).at(-1)).toEqual({ kind: 'not-needed' });
     expect(h.reload).toHaveBeenCalledTimes(1);
+    h.worker.dispose();
+  });
+
+  it('reports the consented reload of a page with no agent document at once, and once', async () => {
+    const h = build();
+    await h.worker.ready;
+    const navigated: string[] = [];
+    h.worker.registry.onChange((change) => {
+      if (change.reason === 'navigated') {
+        navigated.push(change.current?.url ?? '');
+      }
+    });
+    const { panel } = await openAssociatedPanel(h);
+    panel.send(request('page.reload', { sessionId: SESSION, tabId: TAB }));
+    await settle();
+    expect(h.reload).toHaveBeenCalledWith(TAB);
+
+    // No agent reported a document before the reload, so nothing can confirm
+    // it later: the same-URL load is reported as it starts, as it always was.
+    h.onUpdated.fire(TAB, { status: 'loading' }, { url: APP_URL });
+    await settle();
+    expect(navigated).toEqual([APP_URL]);
+
+    const bridge = bridgePort(TAB);
+    h.connect(bridge);
+    bridge.send(agentReady(RELOADED_DOCUMENT_ID));
+    h.onUpdated.fire(TAB, { status: 'complete' }, { url: APP_URL });
+    await settle();
+
+    // The new document's report adds no second navigation.
+    expect(navigated).toEqual([APP_URL]);
     h.worker.dispose();
   });
 

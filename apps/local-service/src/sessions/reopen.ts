@@ -47,16 +47,32 @@
  * ## The replay, in its fixed order
  *
  * Each frame is built with protocol's `createEnvelope` and delivered through
- * the {@link SessionBroadcaster} port the manager declares — `broadcast` to
- * every client of the session, or `broadcastToKinds` when the caller named
- * kinds:
+ * the {@link SessionBroadcaster} port the manager declares:
  *
- * | # | Frame | When | Why here |
- * | - | ----- | ---- | -------- |
- * | 1 | `session.updated { session }` | always | a client holds the session before anything referring to it arrives |
- * | 2 | `session.progress`, one per stored row, in stored order | when rows exist | the same rows the live session showed — a `failed` row is the **only** carrier of the failing stage, since protocol's `SessionRecord` has no failure field (AAP §0.5.5) |
- * | 3 | `analysis.completed { sessionId, analysis }` | when a latest analysis exists | the observed facts and likely causes |
- * | 4 | `panel.generated { sessionId, panelId, panel }` | when a latest panel exists | the panel re-renders from stored data |
+ * | # | Frame | When | To, when no kinds are named | Why here |
+ * | - | ----- | ---- | --------------------------- | -------- |
+ * | 1 | `session.updated { session }` | always | every client of the session | a client holds the session before anything referring to it arrives |
+ * | 2 | `session.progress`, one per stored row, in stored order | when rows exist | the editor kind only | the same rows the live session showed — a `failed` row is the **only** carrier of the failing stage, since protocol's `SessionRecord` has no failure field (AAP §0.5.5) |
+ * | 3 | `analysis.completed { sessionId, analysis }` | when a latest analysis exists | every client of the session | the observed facts and likely causes |
+ * | 4 | `panel.generated { sessionId, panelId, panel }` | when a latest panel exists | every client of the session | the panel re-renders from stored data |
+ *
+ * ## Who receives the replay
+ *
+ * - **Kinds named** — the bind path, `['devtools']`: every frame goes to those
+ *   kinds through `broadcastToKinds`, and to nobody else.
+ * - **No kinds named** — the editor's `GET /sessions/:id`, which it issues for
+ *   a reopen, a resync after reconnecting and a detail read alike: the record,
+ *   the analysis and the panel go to every client of the session through
+ *   `broadcast`, as AAP §0.4.2 requires, so an open panel re-renders from
+ *   stored data. The progress rows go to the editor kind alone
+ *   ({@link UNTARGETED_PROGRESS_REPLAY_KINDS}) through `broadcastToKinds`. The
+ *   requester is an editor; a bound DevTools panel already holds the history,
+ *   because it received the whole of it in its bind replay and every row live
+ *   after that, so resending it on each editor read would only deliver up to
+ *   {@link MAX_REPLAYED_PROGRESS_ROWS} duplicate frames to the panel per read.
+ *   An editor that already holds a row receives it again with its original
+ *   stored timestamp (below), which is what lets the editor recognise a
+ *   re-delivered row as the one it already shows.
  *
  * A session with no analysis and no panel (status `created` … `ready`)
  * replays steps 1–2 only; that is correct, not an error. Panels and analyses
@@ -79,17 +95,20 @@
  * {@link ReopenedSession.truncatedProgress}.
  *
  * Delivery is synchronous and in call order (`../server/clients.ts`), so each
- * recipient sees the frames in the table's order. A broadcaster that throws is
- * a transport fault: the replay stops at that frame instead of sending later
- * frames ahead of an earlier one that never arrived, the fault is logged, and
- * the result still answers `Ok` with {@link ReopenedSession.replayInterrupted}
- * set — the data was read, and a client recovers by reopening again.
+ * recipient sees the frames it is sent in the table's order — a DevTools panel
+ * reached by an untargeted replay sees rows 1, 3 and 4 in that order. A
+ * broadcaster that throws is a transport fault: the replay stops at that frame
+ * instead of sending later frames ahead of an earlier one that never arrived,
+ * the fault is logged, and the result still answers `Ok` with
+ * {@link ReopenedSession.replayInterrupted} set — the data was read, and a
+ * client recovers by reopening again.
  *
  * ## Callers
  *
  * - `../server/routes/sessions.ts` serves `GET /sessions/:id` by calling
- *   {@link SessionReopener.reopen} and answering with `session` in the body
- *   shape protocol's `HTTP_ROUTES` fixes for `session.get`. A missing session
+ *   {@link SessionReopener.reopen} without kinds — the untargeted replay
+ *   described above — and answering with `session` in the body shape
+ *   protocol's `HTTP_ROUTES` fixes for `session.get`. A missing session
  *   is an `Err` with `SESSION_NOT_FOUND`, which that route answers `404`; a
  *   session purged by retention is simply absent and is never reconstructed.
  *   `GET /sessions` reads one page of list rows from the repository's
@@ -120,6 +139,7 @@
  */
 
 import {
+  clientKindSchema,
   createEnvelope,
   parseAnalysisCompletedPayload,
   parsePanelGeneratedPayload,
@@ -170,6 +190,20 @@ import { isTerminalSessionStatus } from './state-machine.js';
  * carry the current stage and, for a failed session, the failing one.
  */
 export const MAX_REPLAYED_PROGRESS_ROWS = 500;
+
+/**
+ * The client kinds an untargeted reopen — one whose caller named no kinds,
+ * which is the editor's `GET /sessions/:id` — sends the stored progress rows
+ * to: the editor alone. The record, the analysis and the panel of that same
+ * reopen still go to every client of the session (AAP §0.4.2). A bound DevTools
+ * panel is left out of the rows because it already holds them: its bind replay
+ * (`reopen(sessionId, { kinds: ['devtools'] })`) delivered the history and the
+ * live stream every row after it. A reopen that names kinds sends the rows to
+ * exactly those kinds instead.
+ */
+export const UNTARGETED_PROGRESS_REPLAY_KINDS: readonly ClientKind[] = Object.freeze([
+  clientKindSchema.enum.vscode,
+]);
 
 /**
  * The stored artifacts a reopen may skip because they failed validation, as
@@ -244,9 +278,11 @@ export interface ReopenOptions {
    */
   readonly replay?: boolean | undefined;
   /**
-   * Restricts the replay to these client kinds — for example only the
-   * DevTools panel that just bound (`['devtools']`). Absent means every client
-   * of the session; an **empty** list names no recipient and sends nothing.
+   * Restricts the whole replay to these client kinds — for example only the
+   * DevTools panel that just bound (`['devtools']`). Absent is the untargeted
+   * replay: the record, the analysis and the panel to every client of the
+   * session, and the progress rows to {@link UNTARGETED_PROGRESS_REPLAY_KINDS}
+   * only. An **empty** list names no recipient and sends nothing.
    */
   readonly kinds?: readonly ClientKind[] | undefined;
 }
@@ -322,7 +358,10 @@ export interface SessionReopener {
    *
    * `routes/binding.ts` calls `reopen(sessionId, { kinds: ['devtools'] })`
    * after a successful `session.bind`, so the attaching panel alone receives
-   * the record, the progress history and the current panel.
+   * the record, the progress history and the current panel. `GET
+   * /sessions/:id` names no kinds, so the record, the analysis and the panel
+   * reach every client of the session and the progress history reaches its
+   * editors only ({@link UNTARGETED_PROGRESS_REPLAY_KINDS}).
    *
    * @param sessionId The session to reopen.
    * @param options Whether to replay, and to which client kinds.
@@ -371,6 +410,39 @@ interface ProgressRead {
   readonly frames: readonly StoredProgressFrame[];
   readonly truncated: number;
   readonly skipped: boolean;
+}
+
+/**
+ * Who one class of replayed frame is addressed to: `'all'`, every client of
+ * the session (`broadcast`), or exactly the listed kinds (`broadcastToKinds`).
+ * The same value is what the replay log records, so the log states the
+ * recipients without restating them.
+ */
+type ReplayRecipients = 'all' | readonly ClientKind[];
+
+/** The recipients of one replay, per frame class. */
+interface ReplayRouting {
+  /** Who receives `session.updated`, `analysis.completed` and `panel.generated`. */
+  readonly recipients: ReplayRecipients;
+  /** Who receives the replayed `session.progress` rows. */
+  readonly progressRecipients: ReplayRecipients;
+}
+
+/**
+ * The routing of a replay. Named kinds address every frame to those kinds.
+ * No kinds is the untargeted replay: the record, the analysis and the panel go
+ * to every client (AAP §0.4.2) and the progress rows to
+ * {@link UNTARGETED_PROGRESS_REPLAY_KINDS}, because every other client of the
+ * session already holds them.
+ *
+ * @param kinds The caller's kinds, already copied and known to be non-empty,
+ * or `undefined` when the caller named none.
+ * @returns The recipients of each frame class.
+ */
+function replayRouting(kinds: readonly ClientKind[] | undefined): ReplayRouting {
+  return kinds === undefined
+    ? { recipients: 'all', progressRecipients: UNTARGETED_PROGRESS_REPLAY_KINDS }
+    : { recipients: kinds, progressRecipients: kinds };
 }
 
 /** Whether a stored timestamp is a positive, finite epoch-millisecond value. */
@@ -776,24 +848,30 @@ export function createSessionReopener(deps: SessionReopenerDeps): SessionReopene
    * Sends the snapshot in the fixed order, stopping at the first frame the
    * broadcaster refuses so no later frame ever overtakes an earlier one.
    * Frames are built lazily, one at a time, so a fault costs nothing that was
-   * not already sent.
+   * not already sent. Each frame class goes to the recipients `routing`
+   * names; delivery is synchronous and in call order, so every recipient sees
+   * its frames in the fixed order whether or not it receives all of them.
    */
   function replay(
     snapshot: Snapshot,
-    kinds: readonly ClientKind[] | undefined,
+    routing: ReplayRouting,
     scoped: Logger,
   ): { readonly replayed: readonly ReplayedMessageType[]; readonly interrupted: boolean } {
     const sessionId = snapshot.session.id;
     const replayed: ReplayedMessageType[] = [];
 
-    const deliver = (type: ReplayedMessageType, build: () => ProtocolMessage): boolean => {
+    const deliver = (
+      type: ReplayedMessageType,
+      to: ReplayRecipients,
+      build: () => ProtocolMessage,
+    ): boolean => {
       try {
         const message = build();
 
-        if (kinds === undefined) {
+        if (to === 'all') {
           broadcaster.broadcast(sessionId, message);
         } else {
-          broadcaster.broadcastToKinds(sessionId, kinds, message);
+          broadcaster.broadcastToKinds(sessionId, to, message);
         }
 
         replayed.push(type);
@@ -811,19 +889,23 @@ export function createSessionReopener(deps: SessionReopenerDeps): SessionReopene
       }
     };
 
+    const { recipients, progressRecipients } = routing;
+
     // 1. The record, routed by its own id: `session.updated` carries no
     //    top-level `sessionId`, so the routing key is supplied explicitly.
-    let delivered = deliver('session.updated', () =>
+    let delivered = deliver('session.updated', recipients, () =>
       createEnvelope('session.updated', { session: snapshot.session }, { sessionId, ts: stamp() }),
     );
 
-    // 2. Every retained progress row, in stored order, with its stored stamp.
+    // 2. Every retained progress row, in stored order, with its stored stamp —
+    //    to the progress recipients, which exclude a client that already holds
+    //    the history when the caller named no kinds.
     for (const frame of snapshot.progress) {
       if (!delivered) {
         break;
       }
 
-      delivered = deliver('session.progress', () =>
+      delivered = deliver('session.progress', progressRecipients, () =>
         createEnvelope('session.progress', frame.payload, { ts: frame.ts ?? stamp() }),
       );
     }
@@ -832,14 +914,14 @@ export function createSessionReopener(deps: SessionReopenerDeps): SessionReopene
     const { analysis, panel } = snapshot;
 
     if (delivered && analysis !== undefined) {
-      delivered = deliver('analysis.completed', () =>
+      delivered = deliver('analysis.completed', recipients, () =>
         createEnvelope('analysis.completed', analysis, { ts: stamp() }),
       );
     }
 
     // 4. The latest panel.
     if (delivered && panel !== undefined) {
-      delivered = deliver('panel.generated', () =>
+      delivered = deliver('panel.generated', recipients, () =>
         createEnvelope('panel.generated', panel, { ts: stamp() }),
       );
     }
@@ -897,8 +979,12 @@ export function createSessionReopener(deps: SessionReopenerDeps): SessionReopene
       return ok(describe(snapshot.value, [], false));
     }
 
-    const { replayed, interrupted } = replay(snapshot.value, kinds, scoped);
+    const routing = replayRouting(kinds);
+    const { replayed, interrupted } = replay(snapshot.value, routing, scoped);
 
+    // The recipients are stated per frame class — `recipients` for the record,
+    // the analysis and the panel, `progressRecipients` for the rows — as `'all'`
+    // or a list of client kinds; the log carries counts and kinds, never content.
     scoped.info('session replayed from stored data', {
       frames: replayed.length,
       progressRows: snapshot.value.progress.length,
@@ -906,7 +992,8 @@ export function createSessionReopener(deps: SessionReopenerDeps): SessionReopene
       panel: snapshot.value.panel !== undefined,
       skipped: snapshot.value.skipped,
       truncatedProgress: snapshot.value.truncatedProgress,
-      recipients: kinds ?? 'all',
+      recipients: routing.recipients,
+      progressRecipients: routing.progressRecipients,
       interrupted,
     });
 

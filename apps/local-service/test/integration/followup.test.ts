@@ -98,6 +98,24 @@
  * everything after the decision — the additive-only verdict, normalisation,
  * feasibility, the install, the store writes — is the product's own.
  *
+ * The first plan of every session is the deterministic provider's own answer
+ * with one narrowing: its patch-mode timings are cut to the route handler's.
+ * The planner times the whole request path — route handler, service loader,
+ * database helper — which `pipeline-deterministic` and `cleanup-conflict`
+ * prove; the scenarios here instead need the service and pool files pristine
+ * at rung n, because every delta they install, chain or conflict on starts
+ * from those files' original bytes. The narrowed answer still passes the plan
+ * stage's structured-output gate, normalisation, feasibility and the real
+ * installer, so plan version n is exactly what the product records for it.
+ *
+ * Two suites leave the decision to the real rules-based provider instead
+ * ({@link askRealFollowUp}), proving both paths reachable without a model: a
+ * capture that recorded every signal the understanding needs is answered from
+ * the stored evidence (`generated → analyzing → generated`), and follow-ups
+ * that name an uninstrumented function of the service module are timed as
+ * additive deltas — the second one layered over the first as a
+ * `previousRecordId` chain that session end unwinds in reverse.
+ *
  * @module
  */
 
@@ -105,7 +123,7 @@ import { constants as fsConstants } from 'node:fs';
 import { access, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import {
   INSTRUMENTATION_ACTION_TYPES,
@@ -120,7 +138,8 @@ import type {
   InstrumentationTargetInput,
   ModificationRecord,
 } from '@debuggen/instrumentation';
-import type { ModelProvider } from '@debuggen/model-provider';
+import { createDeterministicProvider } from '@debuggen/model-provider';
+import type { ModelProvider, ModelRequest } from '@debuggen/model-provider';
 import { validatePanelSpec } from '@debuggen/panel-schema';
 import type { PanelSpec } from '@debuggen/panel-schema';
 import {
@@ -149,6 +168,7 @@ import {
   newProducerId,
   newSpanId,
   newTraceId,
+  ok,
 } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 import { SECURE_FILE_MODE, sha256Hex, sha256OfFile } from '@debuggen/shared/node';
@@ -278,12 +298,14 @@ const RECORDED_FOLLOW_UP_LOG = 'Recorded a follow-up question; its answer contin
 
 /**
  * The files and symbols of the `fixture-trailhead-guide` corpus the scripted
- * decisions name. The deterministic plan patches only the route handler, so the
- * follow-ups reach into the service layer: `summarizeConditions` exists in the
- * corpus precisely to give a follow-up plan its own patchable symbol beside
- * `loadTrailReport` (see the header of `app/api/trail-report/route.ts`).
+ * decisions name. Every first plan here is narrowed to the route handler's
+ * timing (see {@link withRouteHandlerFirstPlan}), so the follow-ups reach into
+ * the service layer: `summarizeConditions` exists in the corpus precisely to
+ * give a follow-up plan its own patchable symbol beside `loadTrailReport` (see
+ * the header of `app/api/trail-report/route.ts`).
  */
 const CORPUS = Object.freeze({
+  routeFile: 'app/api/trail-report/route.ts',
   serviceFile: 'src/server/services/trail-report.service.ts',
   loadSymbol: 'loadTrailReport',
   summarizeSymbol: 'summarizeConditions',
@@ -554,20 +576,110 @@ function holdNextDecision(): () => void {
 }
 
 /**
+ * The real rules-based provider — the one `DEBUGGEN_PROVIDER=deterministic`
+ * selects — which answers the follow-up decisions {@link askRealFollowUp}
+ * hands it instead of the script.
+ */
+const realDecisionProvider: ModelProvider = unwrap(
+  createDeterministicProvider(),
+  'createDeterministicProvider',
+);
+
+/** How many upcoming follow-up decision calls the real provider answers instead of the script. */
+let realDecisionsPending = 0;
+
+/** Every follow-up decision request the real provider answered, oldest first. */
+const realDecisionRequests: ModelRequest[] = [];
+
+/**
  * The scripted provider with {@link holdNextDecision}'s gate in front of its
  * follow-up decision calls. Every call is still answered by the scripted
- * provider — and recorded by it — exactly once; only its timing is held.
+ * provider — and recorded by it — exactly once; only its timing is held. A
+ * decision call {@link askRealFollowUp} claimed goes to the real rules-based
+ * provider instead, and never reaches the script, so the scripted count below
+ * stays exact.
  */
 function withDecisionGate(provider: ModelProvider): ModelProvider {
   return {
     id: provider.id,
     generateText: (request) => provider.generateText(request),
     generateStructured: async (schema, request) => {
+      if (request.metadata.stage === FOLLOW_UP_STAGE && realDecisionsPending > 0) {
+        realDecisionsPending -= 1;
+        realDecisionRequests.push(request);
+        return realDecisionProvider.generateStructured(schema, request);
+      }
       const held = request.metadata.stage === FOLLOW_UP_STAGE ? heldDecision : undefined;
       if (held !== undefined) {
         await held;
       }
       return provider.generateStructured(schema, request);
+    },
+    callTools: (request, tools) => provider.callTools(request, tools),
+  };
+}
+
+/** The action types whose install edits a developer's file, whatever adapter claims them. */
+const PATCH_ACTION_TYPES: ReadonlySet<string> = new Set<string>([
+  ACTION_TYPE.functionTiming,
+  ACTION_TYPE.serverSpan,
+]);
+
+/** Whether a decoded answer is a plain JSON object. */
+function isJsonRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Whether an authored plan target survives the narrowing: a runtime hook or the route timing. */
+function keepsTarget(target: unknown): boolean {
+  if (!isJsonRecord(target)) {
+    return true;
+  }
+  const { file, type } = target;
+  return typeof type !== 'string' || !PATCH_ACTION_TYPES.has(type) || file === CORPUS.routeFile;
+}
+
+/**
+ * A plan stage's decoded answer with every patch-mode target outside the route
+ * handler's file removed. Anything that is not an authored plan is handed back
+ * unchanged, so the stage's own gate judges it exactly as it would have.
+ */
+function narrowedPlanAnswer(raw: unknown): unknown {
+  if (!isJsonRecord(raw)) {
+    return raw;
+  }
+  const targets: unknown = raw['instrumentationTargets'];
+  if (!Array.isArray(targets)) {
+    return raw;
+  }
+  const kept: unknown[] = targets.filter(keepsTarget);
+  return { ...raw, instrumentationTargets: kept };
+}
+
+/**
+ * The provider with every plan-stage answer narrowed by {@link narrowedPlanAnswer}
+ * (see "The model boundary" in this module's header). The answer is still the
+ * provider's own — only its decoded `raw` is narrowed, and the provider's
+ * pre-parsed hint is dropped with it, so the stage validates what it runs on.
+ */
+function withRouteHandlerFirstPlan(provider: ModelProvider): ModelProvider {
+  return {
+    id: provider.id,
+    generateText: (request) => provider.generateText(request),
+    generateStructured: async (schema, request) => {
+      const answered = await provider.generateStructured(schema, request);
+      if (request.metadata.stage !== PLAN_STAGE || isErr(answered)) {
+        return answered;
+      }
+      const { raw, text, model, providerId, usage, stopReason } = answered.value;
+      return ok({
+        raw: narrowedPlanAnswer(raw),
+        model,
+        providerId,
+        ...(text === undefined ? {} : { text }),
+        ...(usage === undefined ? {} : { usage }),
+        ...(stopReason === undefined ? {} : { stopReason }),
+      });
     },
     callTools: (request, tools) => provider.callTools(request, tools),
   };
@@ -730,7 +842,8 @@ function readyRowsSince(session: LiveSession, from: number): HarnessMessage<'ses
  * pipeline: the launcher starts a stand-in dev server, a server-agent
  * connection stands for the preload (without one no file is ever patched), a
  * DevTools connection binds the tab and relays the page agent's `agent.ready`,
- * and the deterministic provider plans.
+ * and the deterministic provider plans, its patch-mode timings narrowed to the
+ * route handler's by {@link withRouteHandlerFirstPlan}.
  */
 async function openReadySession(
   project: FixtureProjectCopy,
@@ -804,7 +917,10 @@ interface CaptureOutcome {
  * Opens a capture, sends the batch through both producers — the browser half
  * as a `telemetry.event` frame on the DevTools connection, the server half on
  * the preload's ingest route — closes it, and waits for the analysis and panel
- * the capture's evidence yields.
+ * the capture's evidence yields: in the store, and then in both clients'
+ * transcripts — the editor's `generated` push and the DevTools client's
+ * `panel.generated` — so a caller's next transcript marks fall after every push
+ * this capture caused (the store is written before the push that announces it).
  */
 async function captureAndGenerate(
   session: LiveSession,
@@ -827,14 +943,28 @@ async function captureAndGenerate(
     'telemetry ingest',
   );
 
+  const editorMark = session.editor.received.length;
+  const devtoolsMark = session.devtools.received.length;
   unwrap(await harness.stopCapture(session.id), 'capture.stop');
+  const generated = (current: SessionRecord): boolean =>
+    current.status === STATUS.generated &&
+    current.analyses.length === before.analyses.length + 1 &&
+    current.panelIds.length === before.panelIds.length + 1;
   const record = await waitForStored(
     session.id,
-    (current) =>
-      current.status === STATUS.generated &&
-      current.analyses.length === before.analyses.length + 1 &&
-      current.panelIds.length === before.panelIds.length + 1,
+    generated,
     'the capture is analysed and its panel generated',
+  );
+  await waitForPushedStatus(session, editorMark, STATUS.generated, generated);
+  const panelId = record.panelIds.at(-1);
+  await waitFor(
+    session.devtools,
+    'panel.generated',
+    (message, index) =>
+      index >= devtoolsMark &&
+      message.payload.sessionId === session.id &&
+      message.payload.panel.id === panelId,
+    HARNESS_TIMEOUTS.pipeline,
   );
   return { captureId, record };
 }
@@ -885,6 +1015,29 @@ async function sendFollowUp(
     body: attemptId === undefined ? { question } : { question, attemptId },
   });
   return { mark, answered };
+}
+
+/**
+ * Asks `question` through `POST /sessions/:id/question` with the decision left
+ * to the real rules-based provider: the one call it claims is answered from the
+ * structured context the service built, exactly as under
+ * `DEBUGGEN_PROVIDER=deterministic`, and its request is kept in
+ * {@link realDecisionRequests} for the assertions on what the decision read.
+ */
+async function askRealFollowUp(session: LiveSession, question: string): Promise<AskedFollowUp> {
+  realDecisionsPending += 1;
+  return sendFollowUp(session, question);
+}
+
+/**
+ * Drops any claim {@link askRealFollowUp} made that no decision call consumed —
+ * an ask the service refused before deciding — so a later suite's decision is
+ * never diverted from the script. The tests assert the claim was consumed; the
+ * suites that ask real follow-ups run this after every test so one failure
+ * cannot cascade into the scripted suites after them.
+ */
+function releaseRealDecisionClaims(): void {
+  realDecisionsPending = 0;
 }
 
 /** The session's stored `followups` rows, in the order they were first asked. */
@@ -982,7 +1135,10 @@ const CONFLICT_TAB = 42;
 
 beforeAll(async () => {
   scripted = createScriptedProvider(DECISION_SCRIPT);
-  harness = await startHarness({ provider: withDecisionGate(scripted.provider), now: serviceNow });
+  harness = await startHarness({
+    provider: withDecisionGate(withRouteHandlerFirstPlan(scripted.provider)),
+    now: serviceNow,
+  });
 });
 
 afterAll(async () => {
@@ -2456,6 +2612,433 @@ describe('a follow-up whose panel predecessor moved', () => {
     await assertTreeUnchanged(session.project.root, session.project.snapshot);
     for (const record of await modificationsOf(session.id)) {
       expect(record.status).toBe(MODIFICATION.reverted);
+    }
+    expect(storedSession(session.id).status).toBe(STATUS.ended);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The follow-up decision made by the real rules-based provider
+ *
+ * Every suite above scripts the decision so it can force each path. These two
+ * leave it to the provider every automated run uses: the decision is built from
+ * the structured context the service itself assembled — the stored
+ * understanding, the installed plan, the capture summary `computeCaptureSummary`
+ * produced and the declarations the follow-up's words resolve to in the code
+ * graph — so both paths, and the record chain, are proven reachable without a
+ * model.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The inspected tabs of the two sessions whose follow-ups the real provider decides. */
+const REAL_EVIDENCE_TAB = 45;
+const REAL_CHAIN_TAB = 46;
+
+/** The question both sessions start from, the one the scripted suites start from. */
+const REAL_SESSION_QUESTION =
+  'Why does the trail report take so long to appear after I pick a trail?';
+
+/**
+ * The committed batches one capture replays together. Between them they record
+ * at least one event of every capture signal's telemetry kind — interactions,
+ * renders and commits, state, fetch and XHR, navigation and performance entries,
+ * page and server errors, the request and route-handler spans, a function span
+ * and the query spans — so no signal an understanding can ask for is missing.
+ */
+const FULL_COVERAGE_BATCHES: readonly string[] = [
+  CROSS_TIER_BATCH,
+  'telemetry-perf-errors.json',
+  'telemetry-renders-state.json',
+  'telemetry-requests-queries.json',
+];
+
+/** One capture's events: every batch of {@link FULL_COVERAGE_BATCHES}, freshly identified. */
+function fullCoverageCapture(): IngressEvent[] {
+  return FULL_COVERAGE_BATCHES.flatMap((name) => freshlyIdentifiedBatch(readTelemetryBatch(name)));
+}
+
+/** A request's structured input as a plain object, failing when it is anything else. */
+function structuredInputOf(request: ModelRequest): Readonly<Record<string, unknown>> {
+  const { input } = request;
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    throw new Error('The follow-up decision request carried no structured input object.');
+  }
+  return input;
+}
+
+/** The telemetry kinds the capture summary of a decision request counts at least once, ascending. */
+function recordedKindsOf(input: Readonly<Record<string, unknown>>): string[] {
+  const summary = input['captureSummary'];
+  if (typeof summary !== 'object' || summary === null || Array.isArray(summary)) {
+    throw new Error('The follow-up decision request carried no capture summary.');
+  }
+  const tally: unknown = (summary as Readonly<Record<string, unknown>>)['kindCounts'];
+  if (typeof tally !== 'object' || tally === null || Array.isArray(tally)) {
+    throw new Error('The capture summary carried no per-kind tally.');
+  }
+  return Object.entries(tally)
+    .filter(([, count]) => typeof count === 'number' && count > 0)
+    .map(([kind]) => kind)
+    .sort();
+}
+
+/**
+ * {@link captureAndGenerate}, then waits until the operation that generated the
+ * panel has released the session and its `generated` push has reached the
+ * editor — so a status walk read after the next ask starts at that ask, never
+ * at a late push of this capture.
+ */
+async function captureAndSettle(
+  session: LiveSession,
+  events: readonly IngressEvent[],
+): Promise<CaptureOutcome> {
+  const mark = session.editor.received.length;
+  const completed = completedOperations(session.id);
+  const outcome = await captureAndGenerate(session, events);
+  await waitForCompletedOperation(session.id, completed);
+  await waitForPushedStatus(
+    session,
+    mark,
+    STATUS.generated,
+    (pushed) => pushed.panelIds.length === outcome.record.panelIds.length,
+  );
+  return outcome;
+}
+
+/** The one real decision request made since `from`, failing when there is not exactly one. */
+function realDecisionSince(from: number): ModelRequest {
+  return only(realDecisionRequests.slice(from), 'follow-up decision the real provider answered');
+}
+
+describe('a follow-up the real provider answers from the stored evidence', () => {
+  /** The session whose capture already holds every signal its understanding needs. */
+  let session: LiveSession;
+
+  beforeAll(async () => {
+    const project = await harness.copyFixtureProject();
+    session = await openReadySession(project, REAL_EVIDENCE_TAB, REAL_SESSION_QUESTION);
+    await captureAndSettle(session, fullCoverageCapture());
+  });
+
+  afterEach(releaseRealDecisionClaims);
+
+  it('decides `needsNewCapture: false` from the capture summary and goes `generated → analyzing → generated`', async () => {
+    const question = 'Which step of that request accounts for most of its time?';
+    const stored = storedSession(session.id);
+    expect(stored.status).toBe(STATUS.generated);
+    expect(stored.understanding?.signalsNeeded.length ?? 0).toBeGreaterThan(0);
+    const analysesBefore = analysesOf(session.id);
+    const panelsBefore = panelsOf(session.id);
+    const plansBefore = plansOf(session.id);
+    const capturesBefore = unwrap(
+      harness.repos.sessions.listCaptures(session.id),
+      'sessions.listCaptures',
+    );
+    const recordsBefore = await modificationsOf(session.id);
+    const treeBefore = await snapshotTree(session.project.root);
+    const decidedBefore = harness.logger.withMessage(FOLLOW_UP_DECIDED_LOG).length;
+    const requestsBefore = realDecisionRequests.length;
+
+    const asked = await askRealFollowUp(session, question);
+    const { mark } = asked;
+    expect(last(unwrap(asked.answered, 'session.question').followUps, 'follow-up').question).toBe(
+      question,
+    );
+
+    const done = await waitForStored(
+      session.id,
+      (record) =>
+        record.status === STATUS.generated &&
+        record.analyses.length === analysesBefore.length + 1 &&
+        record.panelIds.length === panelsBefore.length + 1,
+      'the real decision regenerated the analysis and the panel from the stored capture',
+    );
+    await waitForPushedStatus(
+      session,
+      mark,
+      STATUS.generated,
+      (record) => record.panelIds.length === panelsBefore.length + 1,
+    );
+    expect(statusWalk(session.editor, session.id, mark, STATUS.generated)).toEqual([
+      STATUS.generated,
+      STATUS.analyzing,
+      STATUS.generated,
+    ]);
+    expect(realDecisionsPending).toBe(0);
+
+    // The real provider decided from the service's own capture summary, whose
+    // per-kind tally recorded events, and from nothing the question's words carry.
+    const request = realDecisionSince(requestsBefore);
+    const input = structuredInputOf(request);
+    const recorded = recordedKindsOf(input);
+    for (const kind of ['http.server', 'route.handler', 'perf.entry', 'render', 'db.query']) {
+      expect(recorded).toContain(kind);
+    }
+    expect(input['candidates']).toBeUndefined();
+    expect(JSON.stringify(input)).not.toContain(question);
+    const decided = only(
+      harness.logger.withMessage(FOLLOW_UP_DECIDED_LOG).slice(decidedBefore),
+      'decision log record',
+    );
+    expect(decided.fields).toMatchObject({
+      path: memberOf(FOLLOW_UP_PATHS, 'existing-evidence'),
+      needsNewCapture: false,
+      proposed: 0,
+      accepted: 0,
+      namedDeclarations: 0,
+    });
+
+    // Nothing was captured or installed.
+    expect(
+      unwrap(harness.repos.sessions.listCaptures(session.id), 'sessions.listCaptures'),
+    ).toEqual(capturesBefore);
+    expect(await modificationsOf(session.id)).toEqual(recordsBefore);
+    expect(plansOf(session.id)).toEqual(plansBefore);
+    await assertTreeUnchanged(session.project.root, treeBefore);
+
+    // analyses[n + 1] and panelVersion n + 1, each superseding rung n.
+    const previousAnalysis = last(analysesBefore, 'analysis');
+    const analysis = last(analysesOf(session.id), 'analysis');
+    expect(analysis.analysisVersion).toBe(previousAnalysis.analysisVersion + 1);
+    expect(analysis.supersedes).toBe(previousAnalysis.id);
+    expect(analysis.captureId).toBe(previousAnalysis.captureId);
+    const previousPanel = last(panelsBefore, 'panel');
+    const panel = last(panelsOf(session.id), 'panel');
+    expect(panel.panelVersion).toBe(previousPanel.panelVersion + 1);
+    expect(panel.supersedes).toBe(previousPanel.id);
+    unwrap(validatePanelSpec(panel), 'validatePanelSpec');
+    const pushed = await waitFor(
+      session.editor,
+      'panel.generated',
+      (message, index) => index >= mark && message.payload.panelId === panel.id,
+    );
+    expect(pushed.payload.panel.supersedes).toBe(previousPanel.id);
+    expect(last(done.followUps, 'follow-up')).toMatchObject({
+      question,
+      needsNewCapture: false,
+      captureId: previousAnalysis.captureId,
+      analysisId: analysis.id,
+      panelId: panel.id,
+    });
+  });
+
+  it('ends the session with every patch restored and the copy byte-identical', async () => {
+    const ended = unwrap(await harness.endSession(session.id), 'session.end');
+    expect(ended.cleanup).toBe(CLEANUP.clean);
+    await assertTreeUnchanged(session.project.root, session.project.snapshot);
+    expect(storedSession(session.id).status).toBe(STATUS.ended);
+  });
+});
+
+describe('a follow-up naming a declaration the real provider times as a chained delta', () => {
+  /** The session whose follow-ups name the service module's two functions in turn. */
+  let session: LiveSession;
+
+  beforeAll(async () => {
+    const project = await harness.copyFixtureProject();
+    session = await openReadySession(project, REAL_CHAIN_TAB, REAL_SESSION_QUESTION);
+    await captureAndSettle(session, fullCoverageCapture());
+  });
+
+  afterEach(releaseRealDecisionClaims);
+
+  /**
+   * Asks `question`, which names one function of the service module, and waits
+   * for the plan version it installs.
+   *
+   * @returns The decision request, the plan versions before and after, the
+   * journal before, and the transcript mark.
+   */
+  async function askNamingFunction(question: string): Promise<{
+    readonly request: ModelRequest;
+    readonly previousPlan: InstrumentationPlan;
+    readonly plan: InstrumentationPlan;
+    readonly recordsBefore: readonly ModificationRecord[];
+    readonly mark: number;
+  }> {
+    const plansBefore = plansOf(session.id);
+    const previousPlan = last(plansBefore, 'plan version');
+    const recordsBefore = await modificationsOf(session.id);
+    const requestsBefore = realDecisionRequests.length;
+    const decidedBefore = harness.logger.withMessage(FOLLOW_UP_DECIDED_LOG).length;
+
+    const asked = await askRealFollowUp(session, question);
+    const { mark } = asked;
+    expect(last(unwrap(asked.answered, 'session.question').followUps, 'follow-up').question).toBe(
+      question,
+    );
+    const ready = await waitForStored(
+      session.id,
+      (record) => record.status === STATUS.ready && record.plans.length === plansBefore.length + 1,
+      'the named function is timed by plan version n + 1',
+    );
+    await waitForPushedStatus(session, mark, STATUS.ready);
+    expect(statusWalk(session.editor, session.id, mark, STATUS.generated)).toEqual([
+      STATUS.generated,
+      STATUS.planning,
+      STATUS.instrumenting,
+      STATUS.ready,
+    ]);
+    expect(realDecisionsPending).toBe(0);
+    const decided = only(
+      harness.logger.withMessage(FOLLOW_UP_DECIDED_LOG).slice(decidedBefore),
+      'decision log record',
+    );
+    expect(decided.fields).toMatchObject({
+      path: memberOf(FOLLOW_UP_PATHS, 'new-capture'),
+      needsNewCapture: true,
+      proposed: 1,
+      accepted: 1,
+      identifierCandidates: 1,
+      namedDeclarations: 1,
+    });
+    const plan = last(plansOf(session.id), 'plan version');
+    expect(ready.plans).toEqual(plansOf(session.id));
+    return { request: realDecisionSince(requestsBefore), previousPlan, plan, recordsBefore, mark };
+  }
+
+  /** The one action plan version `plan` adds to `previousPlan`, checked to be purely additive. */
+  function onlyDelta(
+    previousPlan: InstrumentationPlan,
+    plan: InstrumentationPlan,
+  ): InstrumentationAction {
+    expect(plan.planVersion).toBe(previousPlan.planVersion + 1);
+    const previousCount = previousPlan.instrumentationTargets.length;
+    expect(plan.instrumentationTargets.slice(0, previousCount)).toEqual(
+      previousPlan.instrumentationTargets,
+    );
+    return only(plan.instrumentationTargets.slice(previousCount), 'delta action');
+  }
+
+  it('times a named, uninstrumented function as plan version n + 1 with one function-timing delta', async () => {
+    // The premise: the first plan leaves the service module untouched, so the
+    // first named function is a new file edit and the second one chains onto it.
+    const firstPlan = only(plansOf(session.id), 'plan version');
+    expect(firstPlan.instrumentationTargets.map((action) => action.file)).not.toContain(
+      CORPUS.serviceFile,
+    );
+
+    const question = 'How long does loadTrailReport take on its own?';
+    const { request, previousPlan, plan, recordsBefore, mark } = await askNamingFunction(question);
+
+    // The decision read the declaration the follow-up named, resolved through the
+    // code graph, and none of the question's prose.
+    const input = structuredInputOf(request);
+    expect(input['identifierCandidates']).toEqual([CORPUS.loadSymbol]);
+    expect(input['candidates']).toEqual([
+      expect.objectContaining({ file: CORPUS.serviceFile, symbol: CORPUS.loadSymbol, score: 1 }),
+    ]);
+    expect(JSON.stringify(input)).not.toContain(question);
+
+    const delta = onlyDelta(previousPlan, plan);
+    expect(delta).toMatchObject({
+      file: CORPUS.serviceFile,
+      symbol: CORPUS.loadSymbol,
+      type: ACTION_TYPE.functionTiming,
+      mode: PATCH_MODE,
+    });
+
+    const records = await modificationsOf(session.id);
+    for (const earlier of recordsBefore) {
+      expect(recordById(records, earlier.id)).toEqual(earlier);
+    }
+    const deltaRecord = only(
+      records.filter((record) => !recordsBefore.some((earlier) => earlier.id === record.id)),
+      'record of the delta install',
+    );
+    expect(deltaRecord).toMatchObject({
+      file: CORPUS.serviceFile,
+      planVersion: plan.planVersion,
+      status: MODIFICATION.applied,
+      originalHash: pristineDigest(session.project, CORPUS.serviceFile),
+    });
+    expect(deltaRecord.previousRecordId).toBeUndefined();
+    expect(await digestOf(session.project, CORPUS.serviceFile)).toBe(deltaRecord.instrumentedHash);
+
+    // A non-empty delta: `instrumentation.ready` lists exactly its record.
+    const announced = await waitFor(
+      session.editor,
+      'instrumentation.ready',
+      (message, index) => index >= mark && message.payload.sessionId === session.id,
+    );
+    expect(announced.payload.applied).toEqual([deltaRecord]);
+  });
+
+  it('layers a second named function over the patched file as a verified `previousRecordId` chain', async () => {
+    await captureAndSettle(session, fullCoverageCapture());
+    const parent = only(
+      recordsFor(await modificationsOf(session.id), CORPUS.serviceFile),
+      'record of the first service patch',
+    );
+
+    const { request, previousPlan, plan, recordsBefore, mark } = await askNamingFunction(
+      'Does summarizeConditions take long when it folds the reports?',
+    );
+    const input = structuredInputOf(request);
+    expect(input['identifierCandidates']).toEqual([CORPUS.summarizeSymbol]);
+    expect(input['candidates']).toEqual([
+      expect.objectContaining({ file: CORPUS.serviceFile, symbol: CORPUS.summarizeSymbol }),
+    ]);
+
+    const delta = onlyDelta(previousPlan, plan);
+    expect(delta).toMatchObject({
+      file: CORPUS.serviceFile,
+      symbol: CORPUS.summarizeSymbol,
+      type: ACTION_TYPE.functionTiming,
+      mode: PATCH_MODE,
+    });
+
+    // The chain: the new record replaced the bytes the earlier patch wrote.
+    const records = await modificationsOf(session.id);
+    for (const earlier of recordsBefore) {
+      expect(recordById(records, earlier.id)).toEqual(earlier);
+    }
+    const child = only(
+      records.filter((record) => !recordsBefore.some((earlier) => earlier.id === record.id)),
+      'record of the chained delta',
+    );
+    expect(child).toMatchObject({
+      file: CORPUS.serviceFile,
+      planVersion: plan.planVersion,
+      status: MODIFICATION.applied,
+      originalHash: parent.instrumentedHash,
+      previousRecordId: parent.id,
+    });
+    expect(child.instrumentedHash).not.toBe(parent.instrumentedHash);
+    expect(await digestOf(session.project, CORPUS.serviceFile)).toBe(child.instrumentedHash);
+    expect(await sha256OfFile(child.backupPath)).toBe(parent.instrumentedHash);
+    const chain = unwrap(await harness.repos.modifications.listChain(child.id), 'listChain');
+    expect(chain.map((record) => record.id)).toEqual([parent.id, child.id]);
+
+    const announced = await waitFor(
+      session.editor,
+      'instrumentation.ready',
+      (message, index) => index >= mark && message.payload.sessionId === session.id,
+    );
+    expect(announced.payload.applied).toEqual([child]);
+  });
+
+  it('restores the chain in strict reverse order on session end and leaves the copy byte-identical', async () => {
+    const recordsBefore = await modificationsOf(session.id);
+    const [parent, child] = recordsFor(recordsBefore, CORPUS.serviceFile);
+    if (parent === undefined || child === undefined) {
+      throw new Error('The service file must carry a two-record chain before the session ends.');
+    }
+    expect(child.previousRecordId).toBe(parent.id);
+
+    const ended = unwrap(await harness.endSession(session.id), 'session.end');
+    expect(ended.cleanup).toBe(CLEANUP.clean);
+
+    const records = await modificationsOf(session.id);
+    expect(records.map((record) => record.status)).toEqual(
+      records.map(() => MODIFICATION.reverted),
+    );
+    const revertedParent = recordById(records, parent.id);
+    const revertedChild = recordById(records, child.id);
+    expect(revertedChild.appliedAt).toBeLessThan(revertedParent.appliedAt);
+    expect(revertedChild.appliedAt).toBeGreaterThan(child.appliedAt);
+    await assertTreeUnchanged(session.project.root, session.project.snapshot);
+    for (const record of records) {
+      expect(await exists(record.backupPath)).toBe(false);
     }
     expect(storedSession(session.id).status).toBe(STATUS.ended);
   });

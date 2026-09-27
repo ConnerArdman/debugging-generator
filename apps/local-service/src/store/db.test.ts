@@ -14,7 +14,9 @@
  *    leaves a regular, single-link `0600` database, and the sidecars SQLite
  *    creates beside it end `0600` too; a reopened store or leftover sidecar at
  *    any other mode (`0644`, `0400`, `0700`) is set to exactly `0600` in place,
- *    with its data intact.
+ *    with its data intact. A new store is created in incremental auto-vacuum
+ *    mode, while a file an earlier build created without it still opens as it
+ *    was until a `VACUUM` converts it.
  * 2. **A mode that cannot be made owner-only fails closed.** A `chmod` the
  *    filesystem refuses, or accepts without effect, on a group- or
  *    other-readable file is `FS_UNSAFE_PATH` (`group-or-other-permissions`):
@@ -40,6 +42,30 @@
  *    directory that grants group or other access is `FS_UNSAFE_PATH`
  *    (`group-or-other-permissions`) on either route, naming that directory and
  *    the `chmod` that fixes it, with its mode and contents exactly as found.
+ * 6. **Checkpointing stays off the event loop, and never stops.** Every
+ *    connection carries the declared pragmas, the 64 MiB page cache included.
+ *    A file-backed store — never the in-memory one — gets exactly one
+ *    background checkpointer; the main connection's `wal_autocheckpoint` is `0`
+ *    only while that worker runs, a grown write-ahead log is folded back in
+ *    without the main connection checkpointing, and a worker that crashes or
+ *    exits hands `wal_autocheckpoint` back at SQLite's default. `checkpoint()`
+ *    truncates the log while the worker runs; `close()` — twice, or straight
+ *    after the open — leaves no sidecar and no worker behind. The worker is
+ *    the real one; `node:worker_threads` is wrapped only to record it, and, for
+ *    the crash case alone, to give it failing source.
+ * 7. **A close says what its checkpoint achieved.** Closing a store writes one
+ *    `info` record after the connection closes, naming the write-ahead log
+ *    checkpoint's outcome — `completed`, `busy`, `failed` or `no-wal` — with
+ *    numeric frame counts and nothing from the store's contents; an explicit
+ *    checkpoint reports the same fields at `debug`, and a second close writes
+ *    nothing at all.
+ * 8. **A checkpoint on request folds the log in off the event loop.** With the
+ *    commit-time checkpoint suspended, the worker thread's connection copies
+ *    the log back and truncates it with every row intact; a reader holding the
+ *    log answers `busy`; the in-memory store, a closed store and a database
+ *    path that has become a link offer no checkpointer; a path that names
+ *    another inode is refused by the thread; and overlapping suspensions
+ *    restore the connection's threshold only when the last one ends.
  *
  * Every case works inside its own `mkdtemp` sandbox, resolved through `realpath`
  * so a temp directory reached through a link (as on macOS) cannot fail a chain
@@ -71,14 +97,22 @@ import type { Mode, PathLike } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import type { Worker, WorkerOptions } from 'node:worker_threads';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createConsoleLogger, isErr, unwrap } from '@debuggen/shared';
 import type { DebuggenError, LogRecord, Result } from '@debuggen/shared';
 
-import { openStore } from './db.js';
-import type { OpenStoreOptions, Store } from './db.js';
+import {
+  DEFAULT_WAL_AUTOCHECKPOINT_PAGES,
+  STORE_PRAGMAS,
+  WAL_CHECKPOINTER_STOP_WAIT_MS,
+  openStore,
+  openWalCheckpointer,
+  suspendAutoCheckpoint,
+} from './db.js';
+import type { OpenStoreOptions, Store, WalCheckpointer } from './db.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Injected chmod failures
@@ -143,6 +177,34 @@ vi.mock('node:fs', async (importOriginal) => {
       real.chmodSync(path, mode);
     },
   };
+});
+
+/**
+ * Every background checkpointer `./db.ts` spawned during the current case, and
+ * the source the next spawn runs instead of the real one when a case injects a
+ * failing worker.
+ *
+ * `vi.hoisted` for the same reason as {@link chmodFault}. With no replacement
+ * set the mock below is the real `Worker`, so every case runs the real
+ * checkpointer; the only thing added is the record of which workers exist, so
+ * a case can prove one was (or was not) spawned, terminate it the way a crash
+ * would, and prove it is gone after `close()`.
+ */
+const workerSpy = vi.hoisted((): { spawned: Worker[]; replacementSource: string | undefined } => ({
+  spawned: [],
+  replacementSource: undefined,
+}));
+
+/** `node:worker_threads` with `Worker` recorded, and its source replaceable per case. */
+vi.mock('node:worker_threads', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:worker_threads')>();
+  class RecordingWorker extends real.Worker {
+    constructor(filename: string | URL, options?: WorkerOptions) {
+      super(workerSpy.replacementSource ?? filename, options);
+      workerSpy.spawned.push(this);
+    }
+  }
+  return { ...real, Worker: RecordingWorker };
 });
 
 /** Makes every later `chmod` of `target` fail as `behaviour` says, and forgets earlier attempts. */
@@ -323,12 +385,15 @@ beforeEach(() => {
   chmodSync(outsideDir, ORDINARY_DIR_MODE);
   openedStores = [];
   logs = [];
+  workerSpy.spawned = [];
+  workerSpy.replacementSource = undefined;
 });
 
 afterEach(() => {
   // First, so the teardown below and the next case run against the real
   // `chmod` whatever this case injected.
   clearChmodFault();
+  workerSpy.replacementSource = undefined;
   // `close` is idempotent, so a store a case already closed is closed again
   // harmlessly.
   for (const store of openedStores) {
@@ -471,6 +536,22 @@ function createStoreWithProbeRow(): void {
   const first = openedStore({ databasePath });
   first.db.exec(PROBE_SEED_SQL);
   first.close();
+}
+
+/** What `PRAGMA auto_vacuum` answers for a file whose header says `NONE`. */
+const NO_AUTO_VACUUM = 0;
+
+/** What `PRAGMA auto_vacuum` answers for a file in incremental auto-vacuum mode. */
+const INCREMENTAL_AUTO_VACUUM = 2;
+
+/** The auto-vacuum mode a connection's database file reports. */
+function autoVacuumOf(db: DatabaseSync): unknown {
+  return db.prepare('PRAGMA auto_vacuum').get()?.['auto_vacuum'];
+}
+
+/** The journal mode a connection reports, lower-cased. */
+function journalModeOf(db: DatabaseSync): string {
+  return String(db.prepare('PRAGMA journal_mode').get()?.['journal_mode']).toLowerCase();
 }
 
 /** The session store log records about `pathAbs` carrying `message`. */
@@ -616,6 +697,51 @@ describe('a fresh or reopened file-backed store', () => {
     openedStore({ databasePath, logger: recordingLogger() });
 
     expect(logs.filter((record) => record.message === TIGHTENED_MESSAGE)).toEqual([]);
+  });
+
+  it('creates a new store in incremental auto-vacuum mode without giving up WAL, and keeps it across a reopen', () => {
+    // The mode is only accepted while the file is empty, which is why the
+    // pragma leads the sequence: issued after `journal_mode = WAL` it would be
+    // ignored and this would read 0.
+    const store = openedStore({ databasePath });
+
+    expect(autoVacuumOf(store.db)).toBe(INCREMENTAL_AUTO_VACUUM);
+    expect(journalModeOf(store.db)).toBe('wal');
+
+    store.close();
+    const reopened = openedStore({ databasePath });
+
+    expect(autoVacuumOf(reopened.db)).toBe(INCREMENTAL_AUTO_VACUUM);
+    expect(journalModeOf(reopened.db)).toBe('wal');
+  });
+
+  it('reopens a store an earlier build created without auto-vacuum, with its data, until a VACUUM converts it', () => {
+    // What a build before incremental auto-vacuum left behind: a WAL database
+    // whose header says NONE.
+    makeStateDir();
+    const legacy = new DatabaseSync(databasePath);
+    try {
+      legacy.exec('PRAGMA journal_mode = WAL;');
+      legacy.exec(PROBE_SEED_SQL);
+      expect(autoVacuumOf(legacy)).toBe(NO_AUTO_VACUUM);
+    } finally {
+      legacy.close();
+    }
+
+    const store = openedStore({ databasePath, logger: recordingLogger() });
+
+    // The pragma cannot change an existing file's mode in place: the file still
+    // reports NONE, and it opens, migrates and reads as before.
+    expect(autoVacuumOf(store.db)).toBe(NO_AUTO_VACUUM);
+    expect(journalModeOf(store.db)).toBe('wal');
+    expect(store.statement(PROBE_SELECT_SQL).get()).toEqual(PROBE_ROW);
+
+    // The mode is pending on the connection, so the next VACUUM applies it
+    // while it rewrites the file.
+    store.db.exec('VACUUM;');
+
+    expect(autoVacuumOf(store.db)).toBe(INCREMENTAL_AUTO_VACUUM);
+    expect(store.statement(PROBE_SELECT_SQL).get()).toEqual(PROBE_ROW);
   });
 
   it('opens the in-memory store without creating any file', () => {
@@ -1053,19 +1179,26 @@ function expectConfigRefusal(
 
 /**
  * Asserts an open was refused because `directory` already existed with group
- * or other access, and that the refusal names that directory and the `chmod`
- * that fixes it, with the policy error it wraps kept as the cause.
+ * or other access, and that the refusal names that directory, the mode it has,
+ * the mode it needs and the `chmod` that fixes it, with the policy error it
+ * wraps kept as the cause.
  */
 function expectLooseDirectoryRefusal(
   opened: Result<Store, DebuggenError>,
   directory: string,
   mode: number,
 ): DebuggenError {
+  const reportedMode = (mode & PERMISSION_BITS).toString(8);
   const error = refusalFrom(opened);
   expect(error.code).toBe('FS_UNSAFE_PATH');
   expect(error.details?.reason).toBe(MODE_REFUSAL_REASON);
   expect(error.details?.path).toBe(directory);
+  expect(error.details?.mode).toBe(reportedMode);
   expect(error.details?.subsystem).toBe('store');
+  // The mode found and the mode required, as a developer reads them, then the
+  // command as it is typed.
+  expect(error.hint).toContain(`${directory} has mode 0${reportedMode}`);
+  expect(error.hint).toContain('it must be 0700');
   expect(error.hint).toContain(`chmod 700 ${directory}`);
   expect(error.hint).toContain('DEBUGGEN_HOME');
 
@@ -1075,7 +1208,7 @@ function expectLooseDirectoryRefusal(
     details: {
       reason: MODE_REFUSAL_REASON,
       path: directory,
-      mode: (mode & PERMISSION_BITS).toString(8),
+      mode: reportedMode,
     },
   });
   return error;
@@ -1305,4 +1438,724 @@ describe('the windows around the open', () => {
       );
     },
   );
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The pragmas and the background checkpointer
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('the connection pragmas and the background write-ahead-log checkpointer', () => {
+  /** How long a case waits for the worker to start or to act; generous for a loaded host. */
+  const WORKER_WAIT = { timeout: 15_000, interval: 20 } as const;
+
+  /** The per-case timeout of every case that waits on the worker. */
+  const CASE_TIMEOUT_MS = 30_000;
+
+  /** Rows of ballast one {@link writeBallast} call commits, each about one page. */
+  const BALLAST_ROWS = DEFAULT_WAL_AUTOCHECKPOINT_PAGES + 500;
+
+  /** The bytes of one ballast row: close to a 4 KiB page, so each row dirties about one. */
+  const BALLAST_BYTES = 3_500;
+
+  /** The message the store logs once the worker has taken checkpointing over. */
+  const RUNNING_MESSAGE = 'the session store write-ahead log is checkpointed in the background';
+
+  /** The message the store logs when the worker is gone and the connection checkpoints itself. */
+  const FAILED_MESSAGE =
+    'the session store background checkpointer stopped; commits checkpoint the write-ahead log themselves again';
+
+  /** One numeric column of a single-row pragma on the store's own connection. */
+  function pragmaNumber(store: Store, sql: string, column: string): number {
+    const row: Record<string, unknown> | undefined = store.db.prepare(sql).get();
+    const value = row?.[column];
+    return typeof value === 'bigint' ? Number(value) : Number(value);
+  }
+
+  /** The main connection's `wal_autocheckpoint`, in pages. */
+  function autocheckpointOf(store: Store): number {
+    return pragmaNumber(store, 'PRAGMA wal_autocheckpoint', 'wal_autocheckpoint');
+  }
+
+  /** The write-ahead log's frame count and how many of them are in the database file. */
+  function walOf(store: Store): { readonly log: number; readonly checkpointed: number } {
+    const row: Record<string, unknown> | undefined = store.db
+      .prepare('PRAGMA wal_checkpoint(NOOP)')
+      .get();
+    return { log: Number(row?.['log']), checkpointed: Number(row?.['checkpointed']) };
+  }
+
+  /** Commits one transaction that grows the write-ahead log past SQLite's own threshold. */
+  function writeBallast(store: Store): void {
+    store.db.exec('CREATE TABLE IF NOT EXISTS ballast (body BLOB NOT NULL);');
+    store.transaction(() => {
+      const insert = store.statement('INSERT INTO ballast (body) VALUES (randomblob(?))');
+      for (let row = 0; row < BALLAST_ROWS; row += 1) {
+        insert.run(BALLAST_BYTES);
+      }
+    });
+  }
+
+  /** Opens a file-backed store with the recording logger and waits for its checkpointer to run. */
+  async function runningStore(): Promise<Store> {
+    const store = openedStore({ databasePath, logger: recordingLogger() });
+    await vi.waitFor(() => {
+      expect(autocheckpointOf(store)).toBe(0);
+    }, WORKER_WAIT);
+    return store;
+  }
+
+  /** The one worker the current case spawned. */
+  function onlyWorker(): Worker {
+    expect(workerSpy.spawned).toHaveLength(1);
+    const [worker] = workerSpy.spawned;
+    if (worker === undefined) {
+      return expect.unreachable('no background checkpointer was spawned');
+    }
+    return worker;
+  }
+
+  /** Waits until a worker thread has ended: `threadId` reads -1 once it has. */
+  async function expectExited(worker: Worker): Promise<void> {
+    await vi.waitFor(() => {
+      expect(worker.threadId).toBe(-1);
+    }, WORKER_WAIT);
+  }
+
+  /** The records the store logged with `message`. */
+  function logged(message: string): LogRecord[] {
+    return logs.filter((record) => record.message === message);
+  }
+
+  it('declares the pragmas in order, the 64 MiB page cache last, and applies them to every connection', () => {
+    expect(STORE_PRAGMAS).toEqual([
+      'PRAGMA auto_vacuum = INCREMENTAL;',
+      'PRAGMA journal_mode = WAL;',
+      'PRAGMA foreign_keys = ON;',
+      'PRAGMA busy_timeout = 5000;',
+      'PRAGMA synchronous = NORMAL;',
+      'PRAGMA cache_size = -65536;',
+    ]);
+    expect(Object.isFrozen(STORE_PRAGMAS)).toBe(true);
+
+    for (const store of [
+      openedStore({ databasePath: ':memory:' }),
+      openedStore({ databasePath }),
+    ]) {
+      expect(pragmaNumber(store, 'PRAGMA cache_size', 'cache_size')).toBe(-65_536);
+      expect(pragmaNumber(store, 'PRAGMA foreign_keys', 'foreign_keys')).toBe(1);
+      expect(pragmaNumber(store, 'PRAGMA busy_timeout', 'timeout')).toBe(5_000);
+      expect(pragmaNumber(store, 'PRAGMA synchronous', 'synchronous')).toBe(1);
+    }
+  });
+
+  it('spawns no worker for the in-memory store, which keeps SQLite’s own checkpointing', () => {
+    const store = openedStore({ databasePath: ':memory:', logger: recordingLogger() });
+
+    expect(workerSpy.spawned).toHaveLength(0);
+    expect(autocheckpointOf(store)).toBe(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+    store.close();
+    expect(logged(FAILED_MESSAGE)).toEqual([]);
+  });
+
+  it(
+    'spawns exactly one worker for a file-backed store and hands it checkpointing once it runs',
+    async () => {
+      const store = openedStore({ databasePath, logger: recordingLogger() });
+      const worker = onlyWorker();
+
+      await vi.waitFor(() => {
+        expect(autocheckpointOf(store)).toBe(0);
+      }, WORKER_WAIT);
+      expect(logged(RUNNING_MESSAGE)).toHaveLength(1);
+      expect(logged(RUNNING_MESSAGE)[0]).toMatchObject({
+        level: 'debug',
+        fields: { subsystem: 'store', thresholdPages: DEFAULT_WAL_AUTOCHECKPOINT_PAGES },
+      });
+      expect(worker.threadId).toBeGreaterThan(0);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'folds a grown write-ahead log back in from the worker while the main connection never checkpoints',
+    async () => {
+      const store = await runningStore();
+
+      writeBallast(store);
+      // The main connection's automatic checkpoint is off, so the commit above
+      // left the log for the worker; it grew past SQLite's own threshold.
+      expect(autocheckpointOf(store)).toBe(0);
+      expect(walOf(store).log).toBeGreaterThanOrEqual(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+
+      await vi.waitFor(() => {
+        const wal = walOf(store);
+        expect(wal.log).toBeGreaterThanOrEqual(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        expect(wal.checkpointed).toBe(wal.log);
+      }, WORKER_WAIT);
+
+      // The data is in the database file itself: a second, independent
+      // connection reading the file alone (no log) sees every row.
+      const reader = new DatabaseSync(`file:${databasePath}?immutable=1`, { readOnly: true });
+      try {
+        const row: Record<string, unknown> | undefined = reader
+          .prepare('SELECT COUNT(*) AS rows FROM ballast')
+          .get();
+        expect(Number(row?.['rows'])).toBe(BALLAST_ROWS);
+      } finally {
+        reader.close();
+      }
+      expect(logged(FAILED_MESSAGE)).toEqual([]);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'truncates the write-ahead log on checkpoint() while the worker runs, and keeps the worker running',
+    async () => {
+      const store = await runningStore();
+
+      writeBallast(store);
+      store.checkpoint();
+
+      expect(statSync(`${databasePath}-wal`).size).toBe(0);
+      expect(autocheckpointOf(store)).toBe(0);
+      expect(onlyWorker().threadId).toBeGreaterThan(0);
+      expect(logs.filter((record) => record.message.includes('busy'))).toEqual([]);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'hands checkpointing back to the main connection when the worker exits unexpectedly',
+    async () => {
+      const store = await runningStore();
+      const worker = onlyWorker();
+
+      await worker.terminate();
+
+      await vi.waitFor(() => {
+        expect(autocheckpointOf(store)).toBe(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+      }, WORKER_WAIT);
+      expect(logged(FAILED_MESSAGE)).toHaveLength(1);
+      expect(logged(FAILED_MESSAGE)[0]).toMatchObject({
+        level: 'warn',
+        fields: { subsystem: 'store', operation: 'exit' },
+      });
+
+      // The store itself is unaffected: it writes, checkpoints on commit again,
+      // and closes cleanly without waiting for a worker that is gone.
+      writeBallast(store);
+      expect(walOf(store).checkpointed).toBeGreaterThan(0);
+      const startedAt = performance.now();
+      store.close();
+      expect(performance.now() - startedAt).toBeLessThan(WAL_CHECKPOINTER_STOP_WAIT_MS);
+      expectNoSidecarsBeside(databasePath);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'never takes checkpointing over from a worker that fails as it starts, and reports it once',
+    async () => {
+      workerSpy.replacementSource = "throw new Error('checkpointer failed to start');";
+      const store = openedStore({ databasePath, logger: recordingLogger() });
+      const worker = onlyWorker();
+
+      await vi.waitFor(() => {
+        expect(logged(FAILED_MESSAGE)).toHaveLength(1);
+      }, WORKER_WAIT);
+      expect(logged(FAILED_MESSAGE)[0]).toMatchObject({
+        level: 'warn',
+        fields: { subsystem: 'store', operation: 'worker', reason: 'checkpointer failed to start' },
+      });
+      expect(autocheckpointOf(store)).toBe(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+      expect(logged(RUNNING_MESSAGE)).toEqual([]);
+
+      writeBallast(store);
+      store.close();
+      await expectExited(worker);
+      expectNoSidecarsBeside(databasePath);
+      expect(logged(FAILED_MESSAGE)).toHaveLength(1);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'stops the worker on close, twice over, leaving no sidecar and no thread behind',
+    async () => {
+      const store = await runningStore();
+      const worker = onlyWorker();
+      writeBallast(store);
+
+      const startedAt = performance.now();
+      store.close();
+      store.close();
+      expect(performance.now() - startedAt).toBeLessThan(WAL_CHECKPOINTER_STOP_WAIT_MS);
+
+      expect(store.isClosed).toBe(true);
+      expectNoSidecarsBeside(databasePath);
+      await expectExited(worker);
+      expect(logged(FAILED_MESSAGE)).toEqual([]);
+
+      // Everything the case wrote is in the one file left behind.
+      const reopened = openedStore({ databasePath });
+      const row: Record<string, unknown> | undefined = reopened.db
+        .prepare('SELECT COUNT(*) AS rows FROM ballast')
+        .get();
+      expect(Number(row?.['rows'])).toBe(BALLAST_ROWS);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'closes a store straight after the open without waiting for a worker that has not started',
+    async () => {
+      const store = openedStore({ databasePath, logger: recordingLogger() });
+      const worker = onlyWorker();
+
+      const startedAt = performance.now();
+      store.close();
+      expect(performance.now() - startedAt).toBeLessThan(WAL_CHECKPOINTER_STOP_WAIT_MS);
+
+      expectNoSidecarsBeside(databasePath);
+      await expectExited(worker);
+      expect(logged(RUNNING_MESSAGE)).toEqual([]);
+      expect(logged(FAILED_MESSAGE)).toEqual([]);
+      expect(
+        logged('the session store background checkpointer did not stop in time and was terminated'),
+      ).toEqual([]);
+    },
+    CASE_TIMEOUT_MS,
+  );
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The checkpoint and the close
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The message of the close record when the write-ahead log was folded in and truncated. */
+const CLOSED_AFTER_CHECKPOINT_MESSAGE =
+  'the session store checkpointed its write-ahead log and closed';
+
+/** The message of the close record when the checkpoint did not complete. */
+const CLOSED_WITHOUT_CHECKPOINT_MESSAGE =
+  'the session store closed without completing its write-ahead log checkpoint';
+
+/** The field names a checkpoint with frame counts reports, sorted. */
+const CHECKPOINT_COUNT_FIELDS = ['busy', 'checkpoint', 'checkpointedFrames', 'logFrames'] as const;
+
+/** The session store's records at `level` during the current case. */
+function storeRecordsAt(level: LogRecord['level']): LogRecord[] {
+  return logs.filter((record) => record.level === level && record.fields.subsystem === 'store');
+}
+
+/**
+ * The frame counts a checkpoint record carries, asserted to be finite numbers
+ * rather than taken on trust.
+ */
+function frameCountsOf(record: LogRecord | undefined): { logFrames: number; checkpointed: number } {
+  const logFrames = record?.fields.logFrames;
+  const checkpointed = record?.fields.checkpointedFrames;
+  if (typeof logFrames !== 'number' || typeof checkpointed !== 'number') {
+    return expect.unreachable('the checkpoint record carried no numeric frame counts');
+  }
+  expect(Number.isFinite(logFrames)).toBe(true);
+  expect(Number.isFinite(checkpointed)).toBe(true);
+  return { logFrames, checkpointed };
+}
+
+describe('the checkpoint a store reports', () => {
+  it('writes one info record with the frame counts once the write-ahead log is folded in and the store closed, and nothing on a second close', () => {
+    const store = openedStore({ databasePath, logger: recordingLogger() });
+    store.db.exec(PROBE_SEED_SQL);
+    const wal = `${databasePath}-wal`;
+    expect(statSync(wal).size).toBeGreaterThan(0);
+    logs.length = 0;
+
+    store.close();
+
+    const infos = storeRecordsAt('info');
+    expect(infos).toHaveLength(1);
+    const [closed] = infos;
+    expect(closed?.message).toBe(CLOSED_AFTER_CHECKPOINT_MESSAGE);
+    expect(closed?.fields).toMatchObject({
+      subsystem: 'store',
+      databasePath,
+      checkpoint: 'completed',
+      busy: 0,
+    });
+    const { logFrames, checkpointed } = frameCountsOf(closed);
+    expect(logFrames).toBeGreaterThan(0);
+    expect(checkpointed).toBe(logFrames);
+    // A status, counts and the path the open record already named: nothing
+    // from a row, a statement or a page.
+    expect(Object.keys(closed?.fields ?? {}).sort()).toEqual(
+      [...CHECKPOINT_COUNT_FIELDS, 'databasePath', 'subsystem'].sort(),
+    );
+    expect(store.isClosed).toBe(true);
+    // Folded in: no log is left beside the database, and the row is in it.
+    expect(existsSync(wal) ? statSync(wal).size : 0).toBe(0);
+    expect(openedStore({ databasePath }).statement(PROBE_SELECT_SQL).get()).toEqual(PROBE_ROW);
+
+    logs.length = 0;
+    store.close();
+
+    expect(logs).toEqual([]);
+  });
+
+  it('reports a checkpoint a reader holds back as busy, still in the one info record, and closes', () => {
+    const store = openedStore({ databasePath, logger: recordingLogger() });
+    store.db.exec(PROBE_SEED_SQL);
+    // No wait, so the truncating checkpoint reports the reader at once rather
+    // than waiting out the store's busy timeout for it.
+    store.db.exec('PRAGMA busy_timeout = 0;');
+
+    const reader = new DatabaseSync(databasePath);
+    try {
+      reader.exec('BEGIN;');
+      expect(reader.prepare(PROBE_SELECT_SQL).get()).toEqual(PROBE_ROW);
+      // Written after the reader's snapshot, so these frames cannot be copied
+      // back while the reader holds it.
+      store.db.exec("INSERT INTO retained_probe VALUES ('after the snapshot');");
+      logs.length = 0;
+
+      store.close();
+    } finally {
+      reader.close();
+    }
+
+    const infos = storeRecordsAt('info');
+    expect(infos).toHaveLength(1);
+    const [closed] = infos;
+    expect(closed?.message).toBe(CLOSED_WITHOUT_CHECKPOINT_MESSAGE);
+    expect(closed?.fields).toMatchObject({ subsystem: 'store', checkpoint: 'busy', busy: 1 });
+    const { logFrames, checkpointed } = frameCountsOf(closed);
+    expect(checkpointed).toBeLessThan(logFrames);
+    expect(store.isClosed).toBe(true);
+  });
+
+  it('reports a checkpoint an open transaction refuses as failed, and still closes, rolling the transaction back', () => {
+    const store = openedStore({ databasePath, logger: recordingLogger() });
+    store.db.exec('BEGIN IMMEDIATE;');
+    store.db.exec(PROBE_SEED_SQL);
+    logs.length = 0;
+
+    store.close();
+
+    const infos = storeRecordsAt('info');
+    expect(infos).toHaveLength(1);
+    const [closed] = infos;
+    expect(closed?.message).toBe(CLOSED_WITHOUT_CHECKPOINT_MESSAGE);
+    expect(closed?.fields).toMatchObject({ subsystem: 'store', checkpoint: 'failed' });
+    expect(typeof closed?.fields.checkpointReason).toBe('string');
+    expect(closed?.fields).not.toHaveProperty('logFrames');
+    expect(storeRecordsAt('error')).toEqual([]);
+    expect(store.isClosed).toBe(true);
+    expect(
+      openedStore({ databasePath })
+        .statement(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'retained_probe'",
+        )
+        .get(),
+    ).toBeUndefined();
+  });
+
+  it('names no checkpoint for the in-memory store, which has no write-ahead log', () => {
+    const store = openedStore({ databasePath: ':memory:', logger: recordingLogger() });
+    store.db.exec(PROBE_SEED_SQL);
+    logs.length = 0;
+
+    store.close();
+
+    expect(storeRecordsAt('info')).toEqual([
+      expect.objectContaining({
+        message: 'the session store closed',
+        fields: { subsystem: 'store', databasePath: ':memory:', checkpoint: 'no-wal' },
+      }),
+    ]);
+  });
+
+  it('reports an explicit checkpoint at debug with the same counts, truncating the log and leaving the store open', () => {
+    const store = openedStore({ databasePath, logger: recordingLogger() });
+    store.db.exec(PROBE_SEED_SQL);
+    logs.length = 0;
+
+    store.checkpoint();
+
+    expect(storeRecordsAt('info')).toEqual([]);
+    const debugs = storeRecordsAt('debug');
+    expect(debugs).toHaveLength(1);
+    const [checkpointed] = debugs;
+    expect(checkpointed?.message).toBe('checkpointed the session store write-ahead log');
+    expect(checkpointed?.fields).toMatchObject({ checkpoint: 'completed', busy: 0 });
+    const counts = frameCountsOf(checkpointed);
+    expect(counts.logFrames).toBeGreaterThan(0);
+    expect(counts.checkpointed).toBe(counts.logFrames);
+    expect(Object.keys(checkpointed?.fields ?? {}).sort()).toEqual(
+      [...CHECKPOINT_COUNT_FIELDS, 'subsystem'].sort(),
+    );
+    expect(statSync(`${databasePath}-wal`).size).toBe(0);
+    expect(store.isClosed).toBe(false);
+    expect(store.statement(PROBE_SELECT_SQL).get()).toEqual(PROBE_ROW);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Background checkpoints
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A table the background-checkpoint cases fill, unrelated to the store schema. */
+const BULK_TABLE_SQL = 'CREATE TABLE IF NOT EXISTS bulk_probe (body TEXT NOT NULL)';
+
+/** Adds one row to {@link BULK_TABLE_SQL}. */
+const BULK_INSERT_SQL = 'INSERT INTO bulk_probe (body) VALUES (?)';
+
+/** Counts the rows of {@link BULK_TABLE_SQL}. */
+const BULK_COUNT_SQL = 'SELECT COUNT(*) AS rows FROM bulk_probe';
+
+/** SQLite's default commit-time checkpoint threshold, in pages. */
+const DEFAULT_AUTOCHECKPOINT_PAGES = 1_000;
+
+/** Writes `rows` rows of 200 bytes in one transaction, growing the write-ahead log. */
+function writeBulk(store: Store, rows: number): void {
+  store.db.exec(BULK_TABLE_SQL);
+  store.transaction(() => {
+    const insert = store.statement(BULK_INSERT_SQL);
+    for (let row = 0; row < rows; row += 1) {
+      insert.run('x'.repeat(200));
+    }
+  });
+}
+
+/** The connection's `wal_autocheckpoint`, as the pragma answers it. */
+function autoCheckpointOf(store: Store): unknown {
+  return store.db.prepare('PRAGMA wal_autocheckpoint').get()?.['wal_autocheckpoint'];
+}
+
+describe('background checkpoints of a file-backed store', () => {
+  /** Every checkpointer a case opened, closed before the store and the sandbox go. */
+  let checkpointers: WalCheckpointer[] = [];
+
+  /** A checkpointer the case requires, tracked for cleanup. */
+  function tracked(checkpointer: WalCheckpointer | undefined): WalCheckpointer {
+    if (checkpointer === undefined) {
+      return expect.unreachable('openWalCheckpointer offered no checkpointer for a WAL file store');
+    }
+    checkpointers.push(checkpointer);
+    return checkpointer;
+  }
+
+  beforeEach(() => {
+    checkpointers = [];
+  });
+
+  afterEach(async () => {
+    for (const checkpointer of checkpointers) {
+      await checkpointer.close();
+    }
+  });
+
+  it('folds the log in on a connection of its own, truncating it and keeping every row, while the commit-time checkpoint is suspended', async () => {
+    const store = openedStore({ databasePath });
+    const suspension = suspendAutoCheckpoint(store);
+    expect(suspension?.previousPages).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
+    expect(autoCheckpointOf(store)).toBe(0);
+
+    writeBulk(store, 20_000);
+    const checkpointer = tracked(openWalCheckpointer(store));
+    // Past the default threshold, so only the suspension explains a log this
+    // large: no commit folded it in.
+    expect(checkpointer.walBytes()).toBeGreaterThan(DEFAULT_AUTOCHECKPOINT_PAGES * 4096);
+
+    const outcome = await checkpointer.checkpoint();
+
+    if (outcome.status !== 'completed') {
+      return expect.unreachable(`the checkpoint answered ${outcome.status}`);
+    }
+    expect(outcome.busy).toBe(0);
+    expect(outcome.logFrames).toBeGreaterThan(0);
+    expect(outcome.checkpointedFrames).toBe(outcome.logFrames);
+    expect(outcome.durationMs).toBeGreaterThanOrEqual(0);
+    expect(checkpointer.walBytes()).toBe(0);
+    expect(store.statement(BULK_COUNT_SQL).get()).toEqual({ rows: 20_000 });
+
+    expect(suspension?.restore()).toBe(true);
+    expect(autoCheckpointOf(store)).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
+  });
+
+  it('answers busy while a reader holds the log back, and completes once the reader lets go', async () => {
+    const store = openedStore({ databasePath });
+    writeBulk(store, 100);
+    const checkpointer = tracked(openWalCheckpointer(store));
+
+    const reader = new DatabaseSync(databasePath);
+    try {
+      reader.exec('BEGIN;');
+      expect(reader.prepare(BULK_COUNT_SQL).get()).toEqual({ rows: 100 });
+      // Written after the reader's snapshot, so these frames stay in the log.
+      writeBulk(store, 100);
+
+      const held = await checkpointer.checkpoint();
+
+      if (held.status !== 'busy') {
+        return expect.unreachable(`the checkpoint answered ${held.status}`);
+      }
+      expect(held.busy).toBe(1);
+      expect(held.checkpointedFrames).toBeLessThan(held.logFrames);
+      expect(checkpointer.walBytes()).toBeGreaterThan(0);
+
+      reader.exec('COMMIT;');
+      const released = await checkpointer.checkpoint();
+
+      expect(released.status).toBe('completed');
+      expect(checkpointer.walBytes()).toBe(0);
+    } finally {
+      reader.close();
+    }
+    expect(store.statement(BULK_COUNT_SQL).get()).toEqual({ rows: 200 });
+  });
+
+  it('offers no checkpointer for the in-memory store or a closed one, and one that never checkpointed closes at once', async () => {
+    expect(openWalCheckpointer(openedStore({ databasePath: ':memory:' }))).toBeUndefined();
+
+    const store = openedStore({ databasePath });
+    const idle = tracked(openWalCheckpointer(store));
+    expect(idle.walBytes()).toBeGreaterThanOrEqual(0);
+    await idle.close();
+    expect(await idle.checkpoint()).toEqual({ status: 'closed' });
+
+    store.close();
+    expect(openWalCheckpointer(store)).toBeUndefined();
+  });
+
+  it('answers every request after close as closed, closes twice harmlessly, and leaves the rows alone', async () => {
+    const store = openedStore({ databasePath });
+    writeBulk(store, 10);
+    const checkpointer = tracked(openWalCheckpointer(store));
+
+    expect((await checkpointer.checkpoint()).status).toBe('completed');
+    await checkpointer.close();
+    await checkpointer.close();
+
+    expect(await checkpointer.checkpoint()).toEqual({ status: 'closed' });
+    expect(store.statement(BULK_COUNT_SQL).get()).toEqual({ rows: 10 });
+  });
+
+  it('answers a request still in flight as closed and releases the thread at once when closed', async () => {
+    const store = openedStore({ databasePath });
+    writeBulk(store, 100);
+    const checkpointer = tracked(openWalCheckpointer(store));
+    // Started first, so the request below is the one the thread is serving.
+    expect((await checkpointer.checkpoint()).status).toBe('completed');
+
+    const reader = new DatabaseSync(databasePath);
+    try {
+      reader.exec('BEGIN;');
+      reader.prepare(BULK_COUNT_SQL).get();
+      writeBulk(store, 100);
+
+      // The truncation waits on the reader, so this request is still running
+      // when the close arrives.
+      const pending = checkpointer.checkpoint();
+      await checkpointer.close();
+
+      expect(await pending).toEqual({ status: 'closed' });
+      expect(await checkpointer.checkpoint()).toEqual({ status: 'closed' });
+    } finally {
+      reader.close();
+    }
+  });
+
+  it('closes the store without claiming a clean checkpoint while the thread is still checkpointing', async () => {
+    const store = openedStore({ databasePath, logger: recordingLogger() });
+    // No wait: the close must answer at once, whoever holds the log.
+    store.db.exec('PRAGMA busy_timeout = 0;');
+    writeBulk(store, 100);
+    const checkpointer = tracked(openWalCheckpointer(store));
+    expect((await checkpointer.checkpoint()).status).toBe('completed');
+
+    const reader = new DatabaseSync(databasePath);
+    try {
+      reader.exec('BEGIN;');
+      reader.prepare(BULK_COUNT_SQL).get();
+      writeBulk(store, 100);
+      const pending = checkpointer.checkpoint();
+      // Inside the thread's wait on the reader, which holds its checkpoint
+      // lock; a close that lands after it still meets the reader.
+      await new Promise((resolveWait) => {
+        setTimeout(resolveWait, 100);
+      });
+      logs.length = 0;
+
+      store.close();
+
+      const closed = storeRecordsAt('info');
+      expect(closed).toHaveLength(1);
+      expect(closed[0]?.message).toBe(CLOSED_WITHOUT_CHECKPOINT_MESSAGE);
+      expect(['busy', 'failed']).toContain(closed[0]?.fields.checkpoint);
+      if (closed[0]?.fields.checkpoint === 'failed') {
+        expect(closed[0].fields.checkpointReason).toBe(
+          'another connection was checkpointing the write-ahead log',
+        );
+      }
+      expect(store.isClosed).toBe(true);
+      await pending;
+    } finally {
+      reader.close();
+    }
+  });
+
+  it('refuses to checkpoint through a path that no longer names the file the store opened', async () => {
+    const store = openedStore({ databasePath });
+    writeBulk(store, 10);
+    store.checkpoint();
+    const checkpointer = tracked(openWalCheckpointer(store));
+
+    // A different inode at the same path: the thread must not fold anything
+    // into a file the service never verified.
+    const moved = join(stateDir, 'moved.sqlite');
+    renameSync(databasePath, moved);
+    writeFileSync(databasePath, readFileSync(moved), { mode: OWNER_ONLY_FILE_MODE });
+
+    const outcome = await checkpointer.checkpoint();
+
+    if (outcome.status !== 'failed') {
+      return expect.unreachable(`the checkpoint answered ${outcome.status}`);
+    }
+    expect(outcome.reason).toContain('no longer the one the service opened');
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'offers no checkpointer once the database path is a symbolic link',
+    () => {
+      const store = openedStore({ databasePath });
+      const moved = join(stateDir, 'moved.sqlite');
+      renameSync(databasePath, moved);
+      symlinkSync(moved, databasePath);
+
+      expect(openWalCheckpointer(store)).toBeUndefined();
+    },
+  );
+
+  it('restores the commit-time checkpoint only when the last overlapping suspension ends', () => {
+    const store = openedStore({ databasePath });
+    const first = suspendAutoCheckpoint(store);
+    const second = suspendAutoCheckpoint(store);
+    expect(first?.previousPages).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
+    expect(second?.previousPages).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
+    expect(autoCheckpointOf(store)).toBe(0);
+
+    expect(first?.restore()).toBe(true);
+    expect(autoCheckpointOf(store)).toBe(0);
+    expect(first?.restore()).toBe(false);
+    expect(second?.restore()).toBe(true);
+    expect(autoCheckpointOf(store)).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
+
+    // A suspension that outlives its store ends quietly; a closed store has
+    // no setting to suspend.
+    const outlived = suspendAutoCheckpoint(store);
+    store.close();
+    expect(outlived?.restore()).toBe(true);
+    expect(suspendAutoCheckpoint(store)).toBeUndefined();
+  });
 });

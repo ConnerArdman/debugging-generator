@@ -49,6 +49,26 @@
  * - **A page-agent pick must be of the tab's current document.** A
  *   `target.described` from a bridge whose agent document is not the tab's
  *   current one is dropped, and the panel told.
+ * - **A backed-up lane holds the page back.** Once the service has answered
+ *   a barrier ping, a tab's telemetry waits in its lane for room in the socket
+ *   bridge's acknowledged window instead of being written past it. The lane
+ *   relays `bridge.pause` to the tab's content bridge once it holds a quarter
+ *   of its 64-batch bound and `bridge.resume` once it has drained — to the
+ *   bridge it paused only, while a tab's next bridge is paused afresh if the
+ *   lane is still backed up — and a batch whose deadline passes while it
+ *   waits for room is reported undelivered at the `capacity` stage without
+ *   retiring the socket.
+ * - **A tab no session serves is unbound, not failed.** The service's
+ *   `SESSION_NOT_FOUND` refusal of the worker's own `session.bind` — correlated
+ *   by the envelope id the worker minted for it — reaches no panel, neither
+ *   after the first announcement nor after the socket reconnects and the
+ *   worker asks again; any other refusal of the bind reaches the asking tab's
+ *   panel, and an `error` answering no bind is relayed as before.
+ * - **Pairing and the pill.** A refused `pair.complete` is answered with the
+ *   service's own sentence, without the HTTP client's operation lead; a
+ *   successful one pushes the worker's current status to the requesting panel
+ *   ahead of the answer; and a panel snapshot whose session reads fail pushes
+ *   the status as it is when they fail, never the one read before them.
  *
  * **Harness.** Collected into the `chrome-extension` Vitest project
  * (happy-dom). `createWorker` is fully injectable, so the whole composition —
@@ -74,28 +94,36 @@ import {
   encodeMessage,
   healthPath,
   isMessageOfType,
+  pairCompletePath,
   parseSessionRecord,
   PROTOCOL_VERSION,
+  READ_PROOF_LENGTH,
   sessionPath,
 } from '@debuggen/protocol';
 import type {
+  AgentHookConfig,
   FetchLike,
   HttpResponseLike,
   MessageByType,
   ProtocolMessage,
   SelectedTarget,
   SessionRecord,
+  TelemetryEventIngress,
   WebSocketConstructorLike,
   WebSocketLike,
   WsEventMapLike,
 } from '@debuggen/protocol';
-import { isErr } from '@debuggen/shared';
+import { DebuggenError, isErr } from '@debuggen/shared';
 import type { LogFields, Logger, LogLevel } from '@debuggen/shared';
 
 import { DEVTOOLS_TOKEN_STORAGE_KEY, STORED_CREDENTIAL_VERSION } from '../src/background/auth';
 import type { WorkerTimerApi } from '../src/background/messages';
-import { PORT_REQUEST_TIMEOUT_MS } from '../src/background/ports';
-import { createWorker, SELECTION_VERDICT_TIMEOUTS } from '../src/background/service-worker';
+import { connectionPushFromStatus, PORT_REQUEST_TIMEOUT_MS } from '../src/background/ports';
+import {
+  createWorker,
+  pairingRefusalForPanel,
+  SELECTION_VERDICT_TIMEOUTS,
+} from '../src/background/service-worker';
 import type {
   DebugGeneratorWorker,
   WorkerEnvironment,
@@ -103,6 +131,13 @@ import type {
   WorkerTab,
   WorkerTabChange,
 } from '../src/background/service-worker';
+import { BINDING_STORAGE_KEY } from '../src/background/tab-registry';
+import {
+  MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS,
+  SOCKET_HEARTBEAT_INTERVAL_MS,
+  TELEMETRY_BARRIER_EVENTS,
+  TELEMETRY_ROUTE_WAIT_MS,
+} from '../src/background/ws-bridge';
 import {
   EXTENSION_CHANNEL,
   newPortRequestId,
@@ -488,6 +523,10 @@ interface Harness {
   readonly fetch: Mock<FetchLike>;
   readonly logs: readonly LogEntry[];
   readonly onConnect: FakeEvent<(port: chrome.runtime.Port) => void>;
+  /** `chrome.tabs.onUpdated`, for dispatching a tab's load events. */
+  readonly onUpdated: FakeEvent<
+    (tabId: number, changeInfo: WorkerTabChange, tab: WorkerTab) => void
+  >;
 }
 
 /** Let every pending continuation run without firing anything due later. */
@@ -501,8 +540,13 @@ async function advance(ms: number): Promise<void> {
   await flush();
 }
 
-/** Build the worker over fresh fakes. Fake timers must already be installed. */
-function createHarness(): Harness {
+/**
+ * Build the worker over fresh fakes. Fake timers must already be installed.
+ *
+ * @param storedSession What `chrome.storage.session` already holds — a revived
+ * worker's persisted state; empty for a first start.
+ */
+function createHarness(storedSession: Record<string, unknown> = {}): Harness {
   const logs: LogEntry[] = [];
   const { ctor, sockets } = createSocketFactory();
   const world: WorldState = { serviceUp: true, storedSession: sessionRecord() };
@@ -549,6 +593,8 @@ function createHarness(): Harness {
   vi.stubGlobal('fetch', fetch);
 
   const onConnect = createEvent<(port: chrome.runtime.Port) => void>();
+  const onUpdated =
+    createEvent<(tabId: number, changeInfo: WorkerTabChange, tab: WorkerTab) => void>();
   const env: WorkerEnvironment = {
     runtime: {
       id: EXTENSION_ID,
@@ -560,8 +606,7 @@ function createHarness(): Harness {
     tabs: {
       get: () => Promise.resolve<WorkerTab>({ url: APP_URL }),
       reload: () => Promise.resolve(),
-      onUpdated:
-        createEvent<(tabId: number, changeInfo: WorkerTabChange, tab: WorkerTab) => void>(),
+      onUpdated,
       onRemoved: createEvent<(tabId: number) => void>(),
     },
     alarms: {
@@ -573,7 +618,7 @@ function createHarness(): Harness {
       local: createStorageArea({
         [DEVTOOLS_TOKEN_STORAGE_KEY]: { version: STORED_CREDENTIAL_VERSION, token: TOKEN },
       }),
-      session: createStorageArea(),
+      session: createStorageArea(storedSession),
     },
     webSocketConstructor: ctor,
     timers,
@@ -581,7 +626,7 @@ function createHarness(): Harness {
     random: () => 1,
   };
 
-  return { worker: createWorker(env), sockets, world, fetch, logs, onConnect };
+  return { worker: createWorker(env), sockets, world, fetch, logs, onConnect, onUpdated };
 }
 
 /** The most recently constructed socket. */
@@ -870,9 +915,13 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** A fresh harness, disposed after the case. */
-function setup(): Harness {
-  harness = createHarness();
+/**
+ * A fresh harness, disposed after the case.
+ *
+ * @param storedSession What `chrome.storage.session` already holds.
+ */
+function setup(storedSession?: Record<string, unknown>): Harness {
+  harness = createHarness(storedSession);
   return harness;
 }
 
@@ -2194,5 +2243,1231 @@ describe("the page pick is cancelled when the tab's last panel closes", () => {
     await flush();
     expect(onlySelectedFrame(h).payload).toEqual({ sessionId: SESSION, target: PICKED });
     expect(pickerPushes(second)).toEqual([PICKER_OFF]);
+  });
+});
+
+/*
+ * ===========================================================================
+ * Telemetry flow control — the lane waits for room and holds the page back
+ * ===========================================================================
+ */
+
+/** The downstream frame types the worker relays to hold a page agent back and let it go. */
+const FLOW_SIGNALS: readonly unknown[] = ['bridge.pause', 'bridge.resume'];
+
+/** The lane depth that holds the page agent back: a quarter of the lane's 64-batch bound. */
+const LANE_PAUSE_AT = 16;
+
+/** The lane depth at which a held-back page agent is let go. */
+const LANE_RESUME_AT = 2;
+
+/** The log line of a batch the worker accepted but could not deliver. */
+const UNDELIVERED_LOG =
+  'A telemetry batch was dropped: it could not be delivered to the local service.';
+
+/** The log line of a batch that arrived at its tab's full lane. */
+const LANE_OVERFLOW_LOG =
+  'A telemetry batch was dropped: too many batches are waiting for its tab.';
+
+/** The page agent document of {@link TAB}'s next load. */
+const NEXT_DOCUMENT_ID = 'doc_nextload00000001';
+
+/** The id of the page event at `index`; ids are how delivery order is read back. */
+function pageEventId(index: number): string {
+  return `event-test-${String(index)}`;
+}
+
+/** One raw, ingress-shaped event as the page agent of `documentId` emits it. */
+function pageEvent(index: number, documentId: string): TelemetryEventIngress {
+  return {
+    id: pageEventId(index),
+    traceId: (index + 1).toString(16).padStart(32, '0'),
+    spanId: (index + 1).toString(16).padStart(16, '0'),
+    kind: 'interaction',
+    name: 'click',
+    startTime: CREATED_AT + index,
+    duration: 1.5,
+    tier: 'browser',
+    attributes: {},
+    status: 'ok',
+    producerId: producerIdOf(documentId),
+    seq: index,
+  };
+}
+
+/**
+ * The page's telemetry, as a stream of batches: each {@link PageTelemetry.next}
+ * is the agent's next `telemetry.batch` frame, of consecutive events.
+ */
+interface PageTelemetry {
+  /** The bridge → worker frame of the next `count` events. */
+  next(count: number): Frame;
+  /** The ids of every event framed so far, in order. */
+  readonly ids: readonly string[];
+}
+
+/** The telemetry stream of the page agent of `documentId`, starting at event `from`. */
+function pageTelemetry(documentId: string, from = 0): PageTelemetry {
+  const ids: string[] = [];
+  let index = from;
+  let batchSeq = 0;
+  return {
+    next(count) {
+      const events = Array.from({ length: count }, (_, offset) =>
+        pageEvent(index + offset, documentId),
+      );
+      index += count;
+      ids.push(...events.map((event) => event.id));
+      const frame = bridgeFrame('telemetry.batch', {
+        events,
+        producerId: producerIdOf(documentId),
+        documentId,
+        batchSeq,
+        droppedCount: 0,
+      });
+      batchSeq += 1;
+      return frame;
+    },
+    ids,
+  };
+}
+
+/** The flow-control signals posted to a bridge port, in order. */
+function flowSignals(bridge: FakePort): unknown[] {
+  return downstream(bridge)
+    .map((frame) => frame.type)
+    .filter((type) => FLOW_SIGNALS.includes(type));
+}
+
+/**
+ * Record, for each flow-control signal posted to `bridge`, how many events the
+ * service had received on `socket` at that moment — which places the signal in
+ * the lane's progress, since the worker writes a batch and posts a signal
+ * synchronously as the lane moves.
+ */
+function recordSignalProgress(bridge: FakePort, socket: FakeSocket): [unknown, number][] {
+  const progress: [unknown, number][] = [];
+  const post = bridge.postMessage;
+  bridge.postMessage = (message: unknown): void => {
+    if (
+      isFrame(message) &&
+      message.direction === 'downstream' &&
+      FLOW_SIGNALS.includes(message.type)
+    ) {
+      progress.push([message.type, deliveredIds(socket).length]);
+    }
+    post(message);
+  };
+  return progress;
+}
+
+/** The ids of every event the service received on a socket, in delivery order. */
+function deliveredIds(socket: FakeSocket): string[] {
+  return framesOf(socket)
+    .filter((message): message is MessageByType<'telemetry.event'> =>
+      isMessageOfType(message, 'telemetry.event'),
+    )
+    .flatMap((message) => message.payload.events.map((event) => event.id));
+}
+
+/** The ids of the `client.ping` frames the service received on a socket, in order. */
+function pingIdsOf(socket: FakeSocket): string[] {
+  return framesOf(socket)
+    .filter((message) => message.type === 'client.ping')
+    .map((message) => message.id);
+}
+
+/**
+ * The service answers the newest `client.ping` on the live socket. It answers
+ * in frame order, so the answer acknowledges every frame written before it.
+ */
+async function answerNewestPing(h: Harness): Promise<void> {
+  const newest = pingIdsOf(latestSocket(h)).at(-1);
+  if (newest === undefined) {
+    throw new Error('the worker wrote no client.ping to answer');
+  }
+  await serviceSends(h, createEnvelope('service.pong', { ref: newest }));
+}
+
+/** The bound world of a flow-control case: the tab's ready bridge and its page's telemetry. */
+interface PacedWorld {
+  readonly bridge: FakePort;
+  readonly socket: FakeSocket;
+  readonly page: PageTelemetry;
+}
+
+/**
+ * Start bound with {@link TAB}'s agent ready, and let the service answer the
+ * socket bridge's first barrier — the ping it puts behind the first
+ * {@link TELEMETRY_BARRIER_EVENTS} events — so telemetry is paced by
+ * acknowledgements from here on, with nothing in flight.
+ */
+async function startPaced(h: Harness): Promise<PacedWorld> {
+  await startBound(h);
+  const bridge = await connectReadyBridge(h);
+  const socket = latestSocket(h);
+  const page = pageTelemetry(DOCUMENT_ID);
+  const pingsBefore = pingIdsOf(socket).length;
+  bridge.send(page.next(TELEMETRY_BARRIER_EVENTS));
+  await flush();
+  expect(pingIdsOf(socket)).toHaveLength(pingsBefore + 1);
+  await answerNewestPing(h);
+  expect(h.worker.wsBridge.getTelemetryFlow()).toMatchObject({
+    paced: true,
+    inFlightEvents: 0,
+    outstandingBarriers: 0,
+    waiting: 0,
+  });
+  expect(deliveredIds(socket)).toEqual(page.ids);
+  return { bridge, socket, page };
+}
+
+/**
+ * Fill the socket bridge's window with 200-event batches, as a busy page
+ * does against a service still storing them: every one is written, and the
+ * window then holds its bound.
+ */
+async function fillWindow(h: Harness, world: PacedWorld): Promise<void> {
+  const batches = MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS / 200;
+  for (let batch = 0; batch < batches; batch += 1) {
+    world.bridge.send(world.page.next(200));
+  }
+  await flush();
+  expect(h.worker.wsBridge.getTelemetryFlow()).toMatchObject({
+    inFlightEvents: MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS,
+    waiting: 0,
+  });
+  expect(deliveredIds(world.socket)).toEqual(world.page.ids);
+}
+
+/** Queue `count` one-event batches from a bridge, then let the worker take them. */
+async function queueBatches(bridge: FakePort, page: PageTelemetry, count: number): Promise<void> {
+  for (let batch = 0; batch < count; batch += 1) {
+    bridge.send(page.next(1));
+  }
+  await flush();
+}
+
+describe("a tab's telemetry lane waits for room on the socket and holds the page back", () => {
+  it('writes nothing past the window, holds the page agent back once at a quarter of the lane bound, and resumes it once the lane drains', async () => {
+    const h = setup();
+    const world = await startPaced(h);
+    const { bridge, socket, page } = world;
+    const progress = recordSignalProgress(bridge, socket);
+    await fillWindow(h, world);
+
+    // The service is still storing: every later batch waits in the lane for
+    // room — the first for the window, the rest behind it — and none is
+    // written past the window's bound.
+    await queueBatches(bridge, page, LANE_PAUSE_AT - 1);
+    expect(h.worker.wsBridge.getTelemetryFlow()).toMatchObject({
+      inFlightEvents: MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS,
+      waiting: 1,
+    });
+    expect(deliveredIds(socket)).toHaveLength(
+      TELEMETRY_BARRIER_EVENTS + MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS,
+    );
+    expect(flowSignals(bridge)).toEqual([]);
+
+    // The batch that takes the lane to its high-water mark holds the page
+    // agent back, once, however many more arrive.
+    await queueBatches(bridge, page, 1);
+    expect(flowSignals(bridge)).toEqual(['bridge.pause']);
+    await queueBatches(bridge, page, 4);
+    expect(flowSignals(bridge)).toEqual(['bridge.pause']);
+
+    // The service catches up: its answer to the newest barrier acknowledges
+    // everything before it, the lane drains in order, and the page agent is
+    // let go once — on the same socket, with nothing lost.
+    await answerNewestPing(h);
+    expect(flowSignals(bridge)).toEqual(['bridge.pause', 'bridge.resume']);
+    expect(deliveredIds(socket)).toEqual(page.ids);
+    // Held back while nothing past the window was written; let go only once
+    // the lane was down to its low-water mark — its last two batches unsent.
+    expect(progress).toEqual([
+      ['bridge.pause', TELEMETRY_BARRIER_EVENTS + MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS],
+      ['bridge.resume', page.ids.length - LANE_RESUME_AT],
+    ]);
+    expect(h.worker.wsBridge.getTelemetryFlow()).toMatchObject({ waiting: 0 });
+    expect(h.sockets).toHaveLength(1);
+    expect(socket.readyState).toBe(READY_STATE.open);
+    expect(h.logs.some((entry) => entry.message === UNDELIVERED_LOG)).toBe(false);
+    expect(h.logs.some((entry) => entry.message === LANE_OVERFLOW_LOG)).toBe(false);
+  });
+
+  it("never resumes a bridge it did not pause, and holds back a tab's next bridge while the lane is still backed up", async () => {
+    const h = setup();
+    const world = await startPaced(h);
+    const { bridge: first, page } = world;
+    await fillWindow(h, world);
+    await queueBatches(first, page, LANE_PAUSE_AT);
+    expect(flowSignals(first)).toEqual(['bridge.pause']);
+
+    // The page reloads: its next document's bridge and agent start unpaused.
+    // The agent's report waits in the tab's order behind the queued batches.
+    const second = connectBridge(h);
+    second.send(agentReady(NEXT_DOCUMENT_ID));
+    await flush();
+    expect(flowSignals(second)).toEqual([]);
+
+    // The new agent's first batch finds the lane still backed up: it is held
+    // back as well.
+    const next = pageTelemetry(NEXT_DOCUMENT_ID, page.ids.length);
+    await queueBatches(second, next, 1);
+    expect(flowSignals(second)).toEqual(['bridge.pause']);
+
+    // Once the lane drains, only the bridge it paused last is let go; the
+    // departed one is never told anything more.
+    await answerNewestPing(h);
+    expect(h.worker.wsBridge.getTelemetryFlow()).toMatchObject({ waiting: 0 });
+    expect(flowSignals(second)).toEqual(['bridge.pause', 'bridge.resume']);
+    expect(flowSignals(first)).toEqual(['bridge.pause']);
+  });
+
+  it('lets go of nothing when the bridge it paused has been replaced by one that sent nothing while the lane was backed up', async () => {
+    const h = setup();
+    const world = await startPaced(h);
+    const { bridge: first, page } = world;
+    await fillWindow(h, world);
+    await queueBatches(first, page, LANE_PAUSE_AT);
+    expect(flowSignals(first)).toEqual(['bridge.pause']);
+
+    // The next document's bridge attaches, and its agent sends nothing until
+    // the lane has drained: it was never held back, so it is never let go.
+    const second = connectBridge(h);
+    second.send(agentReady(NEXT_DOCUMENT_ID));
+    await flush();
+    await answerNewestPing(h);
+    expect(h.worker.wsBridge.getTelemetryFlow()).toMatchObject({ waiting: 0 });
+    expect(flowSignals(second)).toEqual([]);
+    expect(flowSignals(first)).toEqual(['bridge.pause']);
+
+    // The lane is free again: a later backlog holds the new bridge back afresh.
+    const next = pageTelemetry(NEXT_DOCUMENT_ID, page.ids.length);
+    for (let batch = 0; batch < MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS / 200; batch += 1) {
+      second.send(next.next(200));
+    }
+    await flush();
+    await queueBatches(second, next, LANE_PAUSE_AT);
+    expect(flowSignals(second)).toEqual(['bridge.pause']);
+    await answerNewestPing(h);
+    expect(flowSignals(second)).toEqual(['bridge.pause', 'bridge.resume']);
+  });
+
+  it('reports a batch whose deadline passes while it waits for room as undelivered at the capacity stage, and keeps the socket', async () => {
+    const h = setup();
+    const world = await startPaced(h);
+    const { bridge, socket, page } = world;
+    await fillWindow(h, world);
+    const waitingBatches = MAX_UNACKNOWLEDGED_TELEMETRY_EVENTS / 200 + 1;
+    for (let batch = 0; batch < waitingBatches; batch += 1) {
+      bridge.send(page.next(200));
+    }
+    await flush();
+    expect(h.worker.wsBridge.getTelemetryFlow()).toMatchObject({ waiting: 1 });
+
+    // The heartbeat's ping is answered, so the service is alive: the answer
+    // acknowledges the window, all but the last waiting batch are written,
+    // and the last one waits for the next acknowledgement.
+    await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
+    await answerNewestPing(h);
+    expect(deliveredIds(socket)).toEqual(page.ids.slice(0, -200));
+    expect(h.worker.wsBridge.getTelemetryFlow()).toMatchObject({ waiting: 1 });
+
+    // Its delivery deadline passes before one arrives: the batch is reported
+    // lost — at the capacity stage, as an undelivered count — and the live
+    // socket is kept.
+    await advance(TELEMETRY_ROUTE_WAIT_MS - SOCKET_HEARTBEAT_INTERVAL_MS);
+    expect(
+      loggedVerdict(h, UNDELIVERED_LOG, {
+        tabId: TAB,
+        events: 200,
+        stage: 'capacity',
+        errorCode: 'TRANSPORT_DISCONNECTED',
+      }),
+    ).toBe(true);
+    expect(h.logs.filter((entry) => entry.message === UNDELIVERED_LOG)).toHaveLength(1);
+    expect(deliveredIds(socket)).toEqual(page.ids.slice(0, -200));
+    expect(h.worker.wsBridge.getTelemetryFlow()).toMatchObject({ waiting: 0 });
+    expect(h.sockets).toHaveLength(1);
+    expect(socket.readyState).toBe(READY_STATE.open);
+  });
+});
+
+/*
+ * ===========================================================================
+ * A bind no session answers is the empty state, not a failure
+ * ===========================================================================
+ */
+
+describe('a session.bind that no session answers', () => {
+  /** What the service says when no active session debugs the tab's origin. */
+  const NO_SESSION = 'No active session is debugging the application at this origin.';
+
+  /**
+   * Accept the socket, open a panel on {@link TAB} and announce its DevTools
+   * page, as `startBound` does, without the service's `session.bound`.
+   */
+  async function startUnbound(h: Harness): Promise<FakePort> {
+    await flush();
+    latestSocket(h).accept();
+    await flush();
+    const panel = connectPort(h, PORT_PANEL, { id: EXTENSION_ID, url: EXTENSION_PAGE_URL });
+    const snapshot = portRequest('session.snapshot', { inspectedTabId: TAB });
+    panel.send(snapshot);
+    await flush();
+    const devtools = connectPort(h, PORT_DEVTOOLS, { id: EXTENSION_ID, url: EXTENSION_PAGE_URL });
+    devtools.send({
+      channel: EXTENSION_CHANNEL,
+      version: PORT_PROTOCOL_VERSION,
+      direction: 'upstream',
+      type: 'devtools.hello',
+      payload: { tabId: TAB, url: APP_URL, origin: APP_ORIGIN },
+    });
+    await flush();
+    return panel;
+  }
+
+  /** The id of the last `session.bind` the service received on `socket`. */
+  function lastBindId(socket: FakeSocket): string {
+    const bind = framesOf(socket)
+      .filter((message) => message.type === 'session.bind')
+      .at(-1);
+    if (bind === undefined) {
+      throw new Error('the worker sent no session.bind');
+    }
+    return bind.id;
+  }
+
+  /** The `error` envelopes relayed to a panel. */
+  function errorsReaching(panel: FakePort): Frame[] {
+    return protocolPushes(panel).filter((message) => message.type === 'error');
+  }
+
+  it('reaches no panel, and leaves the tab unbound', async () => {
+    const h = setup();
+    const panel = await startUnbound(h);
+    const bindId = lastBindId(latestSocket(h));
+
+    await serviceSends(
+      h,
+      createEnvelope('error', { code: 'SESSION_NOT_FOUND', message: NO_SESSION, ref: bindId }),
+    );
+
+    expect(errorsReaching(panel)).toEqual([]);
+    await expect(h.worker.registry.getBinding(TAB)).resolves.toBeUndefined();
+    expect(serializedLogs(h)).not.toContain(NO_SESSION);
+  });
+
+  it('is withheld again when the socket reconnects and the worker asks once more', async () => {
+    const h = setup();
+    const panel = await startUnbound(h);
+    const firstBind = lastBindId(latestSocket(h));
+    await serviceSends(
+      h,
+      createEnvelope('error', { code: 'SESSION_NOT_FOUND', message: NO_SESSION, ref: firstBind }),
+    );
+
+    latestSocket(h).drop(ABNORMAL_CLOSURE);
+    await flush();
+    const reopened = await nextConnectingSocket(h);
+    reopened.accept();
+    await flush();
+
+    const secondBind = lastBindId(reopened);
+    expect(secondBind).not.toBe(firstBind);
+    await serviceSends(
+      h,
+      createEnvelope('error', { code: 'SESSION_NOT_FOUND', message: NO_SESSION, ref: secondBind }),
+    );
+    expect(errorsReaching(panel)).toEqual([]);
+  });
+
+  it("relays any other refusal of the bind to the asking tab's panel", async () => {
+    const h = setup();
+    const panel = await startUnbound(h);
+    const bindId = lastBindId(latestSocket(h));
+
+    await serviceSends(
+      h,
+      createEnvelope('error', { code: 'RATE_LIMITED', message: 'Too many binds.', ref: bindId }),
+    );
+
+    const errors = errorsReaching(panel);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      type: 'error',
+      payload: { code: 'RATE_LIMITED', ref: bindId },
+    });
+  });
+
+  it('still relays an error that answers no bind', async () => {
+    const h = setup();
+    const panel = await startUnbound(h);
+
+    await serviceSends(h, createEnvelope('error', { code: 'INTERNAL', message: 'Failed.' }));
+
+    const errors = errorsReaching(panel);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ type: 'error', payload: { code: 'INTERNAL' } });
+  });
+});
+
+/*
+ * ===========================================================================
+ * An inspected tab binds to a session created after its DevTools opened
+ * ===========================================================================
+ */
+
+/** A second inspected tab, on {@link OTHER_ORIGIN}. */
+const AWAITING_TAB = 57;
+
+/** A local application origin no fixture session serves: another port. */
+const OTHER_ORIGIN = 'http://localhost:4200';
+
+/** A document on {@link OTHER_ORIGIN}. */
+const OTHER_URL = `${OTHER_ORIGIN}/workspace/landing`;
+
+/** A second session, served from {@link OTHER_ORIGIN}. */
+const AWAITING_SESSION = 'ses_7h3m1qz0x8vk2c4p';
+
+/** The `session.bind` frames the service received, in order. */
+function bindFrames(h: Harness): MessageByType<'session.bind'>[] {
+  return h.sockets
+    .flatMap((socket) => framesOf(socket))
+    .filter((message): message is MessageByType<'session.bind'> =>
+      isMessageOfType(message, 'session.bind'),
+    );
+}
+
+/** The `session.bind` frames the service received for one tab. */
+function bindsFor(h: Harness, tabId: number): MessageByType<'session.bind'>[] {
+  return bindFrames(h).filter((message) => message.payload.tabId === tabId);
+}
+
+/** Connect a DevTools page inspecting `tabId` at `url`, as Chrome opens one. */
+async function openDevtools(h: Harness, tabId: number, url: string): Promise<FakePort> {
+  const devtools = connectPort(h, PORT_DEVTOOLS, { id: EXTENSION_ID, url: EXTENSION_PAGE_URL });
+  devtools.send({
+    channel: EXTENSION_CHANNEL,
+    version: PORT_PROTOCOL_VERSION,
+    direction: 'upstream',
+    type: 'devtools.hello',
+    payload: { tabId, url, origin: new URL(url).origin },
+  });
+  await flush();
+  return devtools;
+}
+
+/** One committed load of `url` in `tabId`, reported as Chrome does in one event. */
+async function commitNavigation(h: Harness, tabId: number, url: string): Promise<void> {
+  h.onUpdated.fire(tabId, { status: 'loading', url }, { url });
+  await flush();
+}
+
+/** The `binding` states pushed to a panel port, in order. */
+function bindingPushes(port: FakePort): unknown[] {
+  return port.posted
+    .filter(isFrame)
+    .filter((frame) => frame.direction === 'push' && frame.kind === 'binding')
+    .map((frame) => frame.state);
+}
+
+/** A `session.created` for a session served from `devServerUrl`. */
+function sessionCreated(id: string, devServerUrl: string): ProtocolMessage {
+  return createEnvelope('session.created', {
+    session: { ...sessionRecord(), id, devServerUrl },
+  });
+}
+
+describe('an inspected tab is announced again when a session for its origin is created', () => {
+  it('re-announces only the inspected tabs on the new session’s dev-server origin', async () => {
+    const h = setup();
+    await flush();
+    latestSocket(h).accept();
+    await flush();
+    await openDevtools(h, TAB, APP_URL);
+    await openDevtools(h, AWAITING_TAB, OTHER_URL);
+    // Each DevTools page announced its tab once; no session served either.
+    expect(bindsFor(h, TAB)).toHaveLength(1);
+    expect(bindsFor(h, AWAITING_TAB)).toHaveLength(1);
+
+    await serviceSends(h, sessionCreated(SESSION, APP_ORIGIN));
+
+    expect(bindsFor(h, TAB)).toHaveLength(2);
+    expect(bindsFor(h, TAB).at(-1)?.payload).toEqual({
+      tabId: TAB,
+      url: APP_URL,
+      origin: APP_ORIGIN,
+    });
+    expect(bindsFor(h, AWAITING_TAB)).toHaveLength(1);
+
+    await serviceSends(h, sessionCreated(AWAITING_SESSION, OTHER_ORIGIN));
+
+    expect(bindsFor(h, TAB)).toHaveLength(2);
+    expect(bindsFor(h, AWAITING_TAB)).toHaveLength(2);
+  });
+
+  it('announces nothing for a tab its DevTools no longer inspects, nor for a tab already bound', async () => {
+    const h = setup();
+    const { devtools } = await startBound(h);
+    const before = bindsFor(h, TAB).length;
+
+    // Bound on the origin already: a second session there does not steal it.
+    await serviceSends(h, sessionCreated(AWAITING_SESSION, APP_ORIGIN));
+    expect(bindsFor(h, TAB)).toHaveLength(before);
+
+    devtools.onDisconnect.fire(devtools);
+    await flush();
+    await serviceSends(h, sessionCreated(AWAITING_SESSION, APP_ORIGIN));
+    expect(bindsFor(h, TAB)).toHaveLength(before);
+  });
+});
+
+describe('an inspected tab that comes back to the origin it left', () => {
+  it('withdraws "Tab left ‹origin›" and announces the tab again, which the service binds', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bindsBefore = bindsFor(h, TAB).length;
+
+    await commitNavigation(h, TAB, OTHER_URL);
+    await expect(h.worker.registry.getBinding(TAB)).resolves.toBeUndefined();
+    await expect(h.worker.registry.getPanelBindingState(TAB)).resolves.toMatchObject({
+      kind: 'tab-left',
+      origin: APP_ORIGIN,
+      sessionId: SESSION,
+    });
+    // Leaving is shown as "Tab left ‹origin›", not answered with a new bind.
+    expect(bindsFor(h, TAB)).toHaveLength(bindsBefore);
+
+    await commitNavigation(h, TAB, APP_URL);
+
+    await expect(h.worker.registry.getPanelBindingState(TAB)).resolves.toEqual({
+      kind: 'unbound',
+    });
+    expect(bindingPushes(panel).at(-1)).toEqual({ kind: 'unbound' });
+    expect(bindsFor(h, TAB)).toHaveLength(bindsBefore + 1);
+    expect(bindsFor(h, TAB).at(-1)?.payload).toMatchObject({ tabId: TAB, origin: APP_ORIGIN });
+
+    await serviceSends(
+      h,
+      createEnvelope('session.bound', { sessionId: SESSION, tabId: TAB, url: APP_URL }),
+    );
+    await expect(h.worker.registry.getTabForSession(SESSION)).resolves.toBe(TAB);
+    await expect(h.worker.registry.getPanelBindingState(TAB)).resolves.toMatchObject({
+      kind: 'bound',
+      sessionId: SESSION,
+    });
+  });
+
+  it('keeps the notice while the tab is still away, announcing each new origin it moves to', async () => {
+    const h = setup();
+    await startBound(h);
+    await commitNavigation(h, TAB, OTHER_URL);
+    const bindsAway = bindsFor(h, TAB).length;
+    const third = 'http://127.0.0.1:4300/workspace/start';
+
+    await commitNavigation(h, TAB, third);
+
+    await expect(h.worker.registry.getPanelBindingState(TAB)).resolves.toMatchObject({
+      kind: 'tab-left',
+      origin: APP_ORIGIN,
+    });
+    expect(bindsFor(h, TAB)).toHaveLength(bindsAway + 1);
+    expect(bindsFor(h, TAB).at(-1)?.payload).toMatchObject({
+      origin: 'http://127.0.0.1:4300',
+    });
+  });
+
+  it('announces an unbound inspected tab again when it moves to another origin, and not within one', async () => {
+    const h = setup();
+    await flush();
+    latestSocket(h).accept();
+    await flush();
+    await openDevtools(h, TAB, APP_URL);
+    expect(bindsFor(h, TAB)).toHaveLength(1);
+
+    await commitNavigation(h, TAB, `${APP_ORIGIN}/workspace/settings`);
+    expect(bindsFor(h, TAB)).toHaveLength(1);
+
+    await commitNavigation(h, TAB, OTHER_URL);
+    expect(bindsFor(h, TAB)).toHaveLength(2);
+    expect(bindsFor(h, TAB).at(-1)?.payload).toMatchObject({ origin: OTHER_ORIGIN });
+
+    // The announcement follows the document: a session for the origin the tab
+    // shows now re-announces it, one for the origin it left does not.
+    await serviceSends(h, sessionCreated(SESSION, APP_ORIGIN));
+    expect(bindsFor(h, TAB)).toHaveLength(2);
+    await serviceSends(h, sessionCreated(AWAITING_SESSION, OTHER_ORIGIN));
+    expect(bindsFor(h, TAB)).toHaveLength(3);
+  });
+});
+
+/*
+ * ===========================================================================
+ * Pairing, and the pill the requesting panel holds
+ * ===========================================================================
+ */
+
+/** The service's lockout sentence, as its 429 body carries it. */
+const LOCKED_MESSAGE = 'Too many failed pairing attempts; pairing is paused for up to 60 seconds.';
+
+/** A well-formed code for the requests below; the fake service never checks it. */
+const PAIR_CODE = 'TEST2345';
+
+/** Route `POST /pair/complete` to `answer`, keeping every other route as the harness has it. */
+function routePairComplete(h: Harness, answer: () => HttpResponseLike): void {
+  const fallback = h.fetch.getMockImplementation();
+  h.fetch.mockImplementation((url, init) => {
+    if (new URL(url).pathname === pairCompletePath()) {
+      return Promise.resolve(answer());
+    }
+    return fallback === undefined
+      ? Promise.reject(new TypeError('the test fetch has no route for this request'))
+      : fallback(url, init);
+  });
+}
+
+/** The `connection` pushes a panel port received, in order. */
+function connectionPushes(port: FakePort): Frame[] {
+  return port.posted
+    .filter(isFrame)
+    .filter((frame) => frame.direction === 'push' && frame.kind === 'connection');
+}
+
+describe('pairingRefusalForPanel', () => {
+  it("removes exactly the client's operation lead, keeping code, hint and details", () => {
+    const refusal = new DebuggenError(
+      'RATE_LIMITED',
+      `The pair.complete request failed (status 429): ${LOCKED_MESSAGE}`,
+      { details: { operation: 'pair.complete', status: 429 }, hint: 'Wait, then retry.' },
+    );
+
+    const shown = pairingRefusalForPanel(refusal);
+
+    expect(shown.message).toBe(LOCKED_MESSAGE);
+    expect(shown.code).toBe('RATE_LIMITED');
+    expect(shown.hint).toBe('Wait, then retry.');
+    expect(shown.details).toEqual({ operation: 'pair.complete', status: 429 });
+  });
+
+  it('returns every other failure unchanged', () => {
+    const local = new DebuggenError('STORE_ERROR', 'The credential could not be saved.');
+    const otherStatus = new DebuggenError(
+      'RATE_LIMITED',
+      `The pair.complete request failed (status 500): ${LOCKED_MESSAGE}`,
+      { details: { operation: 'pair.complete', status: 429 } },
+    );
+    const bodyless = new DebuggenError(
+      'PAIRING_INVALID',
+      'The pair.complete request failed (status 401)',
+      { details: { operation: 'pair.complete', status: 401 } },
+    );
+
+    expect(pairingRefusalForPanel(local)).toBe(local);
+    expect(pairingRefusalForPanel(otherStatus)).toBe(otherStatus);
+    expect(pairingRefusalForPanel(bodyless)).toBe(bodyless);
+  });
+});
+
+describe("the panel's pair.complete request", () => {
+  it("answers a lockout with the service's own sentence, without the HTTP client's operation lead", async () => {
+    const h = setup();
+    await flush();
+    latestSocket(h).accept();
+    await flush();
+    routePairComplete(h, () =>
+      jsonResponse(429, { code: 'RATE_LIMITED', message: LOCKED_MESSAGE }),
+    );
+    const panel = connectPort(h, PORT_PANEL, { id: EXTENSION_ID, url: EXTENSION_PAGE_URL });
+
+    const request = portRequest('pair.complete', { code: PAIR_CODE });
+    panel.send(request);
+    await flush();
+
+    expect(responseTo(panel, request.requestId)).toMatchObject({
+      ok: false,
+      kind: 'pair.complete',
+      error: { code: 'RATE_LIMITED', message: LOCKED_MESSAGE },
+    });
+    expect(serializedLogs(h)).not.toContain(PAIR_CODE);
+  });
+
+  it('pushes the status pairing produced to the requesting panel, ahead of the answer', async () => {
+    const h = setup();
+    await flush();
+    latestSocket(h).accept();
+    await flush();
+    routePairComplete(h, () =>
+      jsonResponse(200, {
+        token: 'test-repaired-token',
+        readProof: 'q'.repeat(READ_PROOF_LENGTH),
+      }),
+    );
+    // A panel associated with no tab yet — outside DevTools, or before its
+    // snapshot — is still the one that asked, and still told.
+    const panel = connectPort(h, PORT_PANEL, { id: EXTENSION_ID, url: EXTENSION_PAGE_URL });
+
+    const request = portRequest('pair.complete', { code: PAIR_CODE });
+    panel.send(request);
+    await flush();
+
+    const frames = panel.posted.filter(isFrame);
+    const answeredAt = frames.findIndex(
+      (frame) => frame.direction === 'response' && frame.requestId === request.requestId,
+    );
+    expect(frames[answeredAt]).toMatchObject({ ok: true, payload: { paired: true } });
+    const before = frames
+      .slice(0, answeredAt)
+      .filter((frame) => frame.direction === 'push' && frame.kind === 'connection');
+    expect(before.length).toBeGreaterThan(0);
+    const status = h.worker.wsBridge.snapshot();
+    expect(connectionPushes(panel).at(-1)?.state).toEqual(connectionPushFromStatus(status).state);
+  });
+});
+
+describe('a panel snapshot whose session reads fail', () => {
+  it('pushes the status as it is when the reads fail, not the one read before them', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+
+    // The socket drops, and the panel asks for its snapshot while it reconnects.
+    latestSocket(h).drop(ABNORMAL_CLOSURE);
+    await flush();
+    expect(h.worker.wsBridge.snapshot().status).not.toBe('connected');
+
+    // The session reads are held until the case answers them.
+    let refuseReads: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      refuseReads = resolve;
+    });
+    const fallback = h.fetch.getMockImplementation();
+    h.fetch.mockImplementation(async (url, init) => {
+      if (new URL(url).pathname.startsWith(sessionPath(SESSION))) {
+        await held;
+        return jsonResponse(403, {
+          code: 'TAB_NOT_BOUND',
+          message: 'The tab is not bound on this connection.',
+        });
+      }
+      if (fallback === undefined) {
+        throw new TypeError('the test fetch has no route for this request');
+      }
+      return fallback(url, init);
+    });
+    const request = portRequest('session.snapshot', { inspectedTabId: TAB, sessionId: SESSION });
+    panel.send(request);
+    await flush();
+    expect(responseTo(panel, request.requestId)).toBeUndefined();
+
+    // The socket comes back while the reads are in flight; the worker says so.
+    const socket = await nextConnectingSocket(h);
+    socket.accept();
+    await flush();
+    expect(h.worker.wsBridge.snapshot().status).toBe('connected');
+    expect(connectionPushes(panel).at(-1)?.state).toMatchObject({ status: 'connected' });
+
+    // The reads are refused: the answer is the failure, and the pill it
+    // leaves behind is the current one.
+    refuseReads?.();
+    await flush();
+
+    expect(responseTo(panel, request.requestId)).toMatchObject({
+      ok: false,
+      error: { code: 'TAB_NOT_BOUND' },
+    });
+    expect(connectionPushes(panel).at(-1)?.state).toMatchObject({ status: 'connected' });
+  });
+});
+
+/*
+ * ===========================================================================
+ * A re-announced binding the service refuses as ended
+ * ===========================================================================
+ */
+
+/** The capture the service armed {@link TAB}'s page agent for. */
+const CAPTURE = 'cap_4k2p9dq7m1zx0c3v';
+
+/** A complete agent hook set with every flag at one value. */
+function hookSet(enabled: boolean): AgentHookConfig {
+  return {
+    interactions: enabled,
+    react: enabled,
+    state: enabled,
+    fetch: enabled,
+    perf: enabled,
+    errors: enabled,
+    componentTree: enabled,
+  };
+}
+
+/** The `agent.config` payloads the worker delivered to a bridge port, in order. */
+function deliveredConfigs(bridge: FakePort): Frame[] {
+  return downstream(bridge)
+    .filter((frame) => frame.type === 'agent.config')
+    .map((frame) => frame.payload)
+    .filter(isFrame);
+}
+
+/** The `session.bind` frames the service received on one socket, in order. */
+function bindsOn(socket: FakeSocket): MessageByType<'session.bind'>[] {
+  return framesOf(socket).filter((message): message is MessageByType<'session.bind'> =>
+    isMessageOfType(message, 'session.bind'),
+  );
+}
+
+/**
+ * Bind {@link TAB}, arm its page agent for {@link CAPTURE}, then drop the socket
+ * and open the next one — the outage in which the session ends unseen — and
+ * return that socket's one re-announced `session.bind`.
+ */
+async function armThenReconnect(h: Harness): Promise<{
+  readonly bridge: FakePort;
+  readonly socket: FakeSocket;
+  readonly rebind: MessageByType<'session.bind'>;
+}> {
+  await startBound(h);
+  const bridge = await connectReadyBridge(h);
+  await serviceSends(
+    h,
+    createEnvelope('agent.config', {
+      sessionId: SESSION,
+      captureId: CAPTURE,
+      hooks: hookSet(true),
+    }),
+  );
+  expect(deliveredConfigs(bridge).at(-1)).toMatchObject({
+    captureId: CAPTURE,
+    hooks: hookSet(true),
+  });
+
+  latestSocket(h).drop(ABNORMAL_CLOSURE);
+  await flush();
+  const socket = await nextConnectingSocket(h);
+  socket.accept();
+  await flush();
+  const rebinds = bindsOn(socket);
+  expect(rebinds.map((message) => message.payload)).toEqual([
+    expect.objectContaining({ tabId: TAB, origin: APP_ORIGIN, sessionId: SESSION }),
+  ]);
+  const [rebind] = rebinds;
+  if (rebind === undefined) {
+    throw new Error('the reconnected worker re-announced no binding');
+  }
+  return { bridge, socket, rebind };
+}
+
+describe('a re-announced binding the service refuses as ended unbinds the tab and disarms its page agent', () => {
+  it.each(['SESSION_INVALID_STATE', 'SESSION_NOT_FOUND'] as const)(
+    'on %s: ends the binding as session-ended, sends the page agent its dormant configuration, and a reload re-arms nothing',
+    async (code) => {
+      const h = setup();
+      const { bridge, socket, rebind } = await armThenReconnect(h);
+
+      await serviceSends(
+        h,
+        createEnvelope('error', {
+          code,
+          message: 'The session has ended, so no tab can be bound to it.',
+          ref: rebind.id,
+        }),
+      );
+      await flush();
+
+      await expect(h.worker.registry.getTabForSession(SESSION)).resolves.toBeUndefined();
+      expect(deliveredConfigs(bridge).at(-1)).toEqual({
+        sessionId: SESSION,
+        captureId: CAPTURE,
+        hooks: hookSet(false),
+      });
+      expect(
+        framesOf(socket).some(
+          (message) => isMessageOfType(message, 'session.unbind') && message.payload.tabId === TAB,
+        ),
+      ).toBe(true);
+      expect(
+        loggedVerdict(h, 'The service refused a re-announced binding; its session is over.', {
+          tabId: TAB,
+          sessionId: SESSION,
+          code,
+        }),
+      ).toBe(true);
+
+      // The next document of the tab is never armed from the ended session.
+      const reloaded = connectBridge(h);
+      reloaded.send(agentReady('doc_afterreload00001'));
+      await flush();
+      for (const config of deliveredConfigs(reloaded)) {
+        expect(config).toMatchObject({ hooks: hookSet(false) });
+      }
+    },
+  );
+
+  it('disarms the page from the persisted binding when the worker was evicted during the outage and holds no configuration', async () => {
+    // A worker revived after an eviction: `chrome.storage.session` still holds
+    // the binding and its capture, but the configuration the previous
+    // incarnation armed the page with was lost with its memory.
+    const h = setup({
+      [BINDING_STORAGE_KEY]: {
+        [String(TAB)]: {
+          tabId: TAB,
+          sessionId: SESSION,
+          url: APP_URL,
+          origin: APP_ORIGIN,
+          boundAt: CREATED_AT,
+          captureId: CAPTURE,
+        },
+      },
+    });
+    await flush();
+    // The page's bridge reconnects and re-announces its document.
+    const bridge = await connectReadyBridge(h);
+    expect(h.worker.agent.getDesiredConfig(TAB)).toBeUndefined();
+
+    const socket = latestSocket(h);
+    socket.accept();
+    await flush();
+    const [rebind] = bindsOn(socket);
+    if (rebind === undefined) {
+      throw new Error('the revived worker re-announced no binding');
+    }
+    expect(rebind.payload).toEqual(
+      expect.objectContaining({ tabId: TAB, origin: APP_ORIGIN, sessionId: SESSION }),
+    );
+
+    await serviceSends(
+      h,
+      createEnvelope('error', {
+        code: 'SESSION_INVALID_STATE',
+        message: 'The session has ended, so no tab can be bound to it.',
+        ref: rebind.id,
+      }),
+    );
+    await flush();
+
+    await expect(h.worker.registry.getTabForSession(SESSION)).resolves.toBeUndefined();
+    expect(deliveredConfigs(bridge)).toEqual([
+      { sessionId: SESSION, captureId: CAPTURE, hooks: hookSet(false) },
+    ]);
+    expect(h.worker.agent.getDesiredConfig(TAB)).toEqual({
+      sessionId: SESSION,
+      captureId: CAPTURE,
+      hooks: hookSet(false),
+    });
+  });
+
+  it('keeps the binding and the armed page agent when the refusal is transient', async () => {
+    const h = setup();
+    const { bridge, rebind } = await armThenReconnect(h);
+    const configsBefore = deliveredConfigs(bridge).length;
+
+    await serviceSends(
+      h,
+      createEnvelope('error', {
+        code: 'STORE_ERROR',
+        message: 'The session store could not be read.',
+        ref: rebind.id,
+      }),
+    );
+    await flush();
+
+    await expect(h.worker.registry.getTabForSession(SESSION)).resolves.toBe(TAB);
+    expect(deliveredConfigs(bridge)).toHaveLength(configsBefore);
+  });
+});
+
+/*
+ * ===========================================================================
+ * A same-URL load reaches the service only once a new document proves a reload
+ * ===========================================================================
+ */
+
+/** The `tab.navigated` and `agent.ready` frames the service received on a socket from index `from`. */
+function navigationTraffic(socket: FakeSocket, from: number): ProtocolMessage[] {
+  return framesOf(socket)
+    .slice(from)
+    .filter(
+      (message) =>
+        isMessageOfType(message, 'tab.navigated') || isMessageOfType(message, 'agent.ready'),
+    );
+}
+
+describe('a same-URL load of a bound tab reaches the service only when a new page agent document proves a reload', () => {
+  it('sends nothing for a load the document survives, then one tab.navigated ahead of the new document’s agent.ready', async () => {
+    const h = setup();
+    await startBound(h);
+    await connectReadyBridge(h, PREVIOUS_DOCUMENT_ID);
+    const socket = latestSocket(h);
+    const from = socket.sent.length;
+
+    // A same-URL `history.replaceState` fires exactly these events.
+    h.onUpdated.fire(TAB, { status: 'loading' }, { url: APP_URL });
+    h.onUpdated.fire(TAB, { status: 'complete' }, { url: APP_URL });
+    await flush();
+    expect(navigationTraffic(socket, from)).toEqual([]);
+
+    // A reload fires them too, and then the new document's agent reports.
+    h.onUpdated.fire(TAB, { status: 'loading' }, { url: APP_URL });
+    await flush();
+    const reloaded = connectBridge(h);
+    reloaded.send(agentReady(DOCUMENT_ID));
+    await flush();
+
+    const traffic = navigationTraffic(socket, from);
+    expect(traffic.map((message) => message.type)).toEqual(['tab.navigated', 'agent.ready']);
+    expect(traffic[0]?.payload).toEqual({ tabId: TAB, url: APP_URL });
+    expect(traffic[1]?.payload).toMatchObject({ tabId: TAB, documentId: DOCUMENT_ID });
+    expect(
+      h.logs.filter((entry) => entry.message === 'Committed navigation of a bound tab.'),
+    ).toHaveLength(1);
+  });
+});
+
+/*
+ * ===========================================================================
+ * The latest signal report reaches a panel that attaches late
+ * ===========================================================================
+ */
+
+/** The `instrumentation.ready` the service sends for {@link SESSION}. */
+function readyReport(runtimeHooks: readonly string[]): ProtocolMessage {
+  return createEnvelope('instrumentation.ready', {
+    sessionId: SESSION,
+    applied: [],
+    runtimeHooks: [...runtimeHooks],
+    unavailable: [],
+  });
+}
+
+/** The `instrumentation.failed` the service sends for {@link SESSION}. */
+const FAILED_REPORT: ProtocolMessage = createEnvelope('instrumentation.failed', {
+  sessionId: SESSION,
+  error: {
+    code: 'INSTRUMENTATION_UNAVAILABLE',
+    message: 'The planned instrumentation is not available here.',
+    hint: 'Check the dev server and the DevTools panel, then retry.',
+  },
+});
+
+/** The signal-report frames pushed to a panel port, in order. */
+function signalReportPushes(port: FakePort): Frame[] {
+  return protocolPushes(port).filter(
+    (message) =>
+      message.type === 'instrumentation.ready' || message.type === 'instrumentation.failed',
+  );
+}
+
+/** One `session.progress` frame of {@link SESSION}, stamped `ts`. */
+function progressRow(
+  status: 'running' | 'done' | 'failed',
+  message: string,
+  ts: number,
+): ProtocolMessage {
+  return createEnvelope(
+    'session.progress',
+    { sessionId: SESSION, stage: 'instrument', status, message },
+    { ts },
+  );
+}
+
+/** The `session.progress` payloads pushed to a panel port, as `status message`, in order. */
+function progressPushes(port: FakePort): string[] {
+  return protocolPushes(port)
+    .filter((message) => message.type === 'session.progress')
+    .map((message) => {
+      const payload = isFrame(message.payload) ? message.payload : {};
+      return `${String(payload['status'])} ${String(payload['message'])}`;
+    });
+}
+
+describe("the session's progress reaches a panel that attaches after its tab was bound", () => {
+  it('pushes every row once, each at its first position with its newest status, after the snapshot answer', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    panel.onDisconnect.fire(panel);
+    await flush();
+
+    await serviceSends(h, progressRow('running', 'Preparing instrumentation', CREATED_AT + 1));
+    await serviceSends(h, progressRow('running', 'React renders', CREATED_AT + 2));
+    await serviceSends(h, progressRow('done', 'Database tracing', CREATED_AT + 3));
+    // The row turns ✓ in place; a stale frame of it changes nothing.
+    await serviceSends(h, progressRow('done', 'React renders', CREATED_AT + 4));
+    await serviceSends(h, progressRow('running', 'React renders', CREATED_AT + 2));
+    await serviceSends(h, progressRow('done', 'Ready to capture', CREATED_AT + 5));
+
+    const reopened = await openPanelOnTab(h);
+    await flush();
+
+    expect(progressPushes(reopened)).toEqual([
+      'running Preparing instrumentation',
+      'done React renders',
+      'done Database tracing',
+      'done Ready to capture',
+    ]);
+  });
+});
+
+describe('the latest signal report reaches a panel that attaches after its tab was bound', () => {
+  it('pushes the report the bind replayed before the panel attached, once its snapshot is answered', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    // The panel document closes; the DevTools page keeps the tab bound.
+    panel.onDisconnect.fire(panel);
+    await flush();
+
+    // The report reaches the worker while no panel is attached to the tab.
+    await serviceSends(h, readyReport(['React renders and commits']));
+    await serviceSends(h, FAILED_REPORT);
+
+    const reopened = await openPanelOnTab(h);
+    await flush();
+
+    expect(signalReportPushes(reopened).map((message) => message.type)).toEqual([
+      'instrumentation.ready',
+      'instrumentation.failed',
+    ]);
+    expect(signalReportPushes(reopened)[0]).toMatchObject({
+      payload: { sessionId: SESSION, runtimeHooks: ['React renders and commits'] },
+    });
+  });
+
+  it('shows only the newest report: a later instrumentation.ready replaces the failure before it', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    panel.onDisconnect.fire(panel);
+    await flush();
+
+    await serviceSends(h, readyReport([]));
+    await serviceSends(h, FAILED_REPORT);
+    await serviceSends(h, readyReport(['Network tracing']));
+
+    const reopened = await openPanelOnTab(h);
+    await flush();
+
+    const pushed = signalReportPushes(reopened);
+    expect(pushed.map((message) => message.type)).toEqual(['instrumentation.ready']);
+    expect(pushed[0]).toMatchObject({ payload: { runtimeHooks: ['Network tracing'] } });
+  });
+
+  it('forgets the report once the session is cleaned up, and pushes nothing to a later panel', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    panel.onDisconnect.fire(panel);
+    await flush();
+
+    await serviceSends(h, readyReport(['React renders and commits']));
+    await serviceSends(
+      h,
+      createEnvelope('cleanup.completed', { sessionId: SESSION, status: 'clean', conflicts: [] }),
+    );
+
+    const later = connectPort(h, PORT_PANEL, { id: EXTENSION_ID, url: EXTENSION_PAGE_URL });
+    const snapshot = portRequest('session.snapshot', { inspectedTabId: TAB });
+    later.send(snapshot);
+    await flush();
+    await flush();
+
+    expect(signalReportPushes(later)).toEqual([]);
   });
 });

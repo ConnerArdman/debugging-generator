@@ -340,9 +340,18 @@ import {
   classifyDatabaseSource,
   classifySpan,
   createSeqAllocator,
+  readHandlerRoute,
+  readSpanLineage,
+  readStatementExecution,
   spanToIngressEvent,
 } from './convert.js';
-import type { ConvertContext, DatabaseSpanSource, SeqAllocator } from './convert.js';
+import type {
+  ConvertContext,
+  DatabaseSpanSource,
+  SeqAllocator,
+  SpanLineage,
+  StatementExecution,
+} from './convert.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -395,6 +404,40 @@ export const MAX_DRAIN_BATCHES = Math.ceil(MAX_BUFFERED_EVENTS / BATCH_MAX_EVENT
  * still buffered when the deadline passes is abandoned and counted.
  */
 export const SHUTDOWN_FLUSH_DEADLINE_MS = INGEST_TIMEOUT_MS;
+
+/**
+ * Spans each of the processor's three memories of a span's relatives holds at
+ * most: the nearest emitted ancestor of a span it will not emit, the route a
+ * request's handler reported, and the row count a nested statement observed.
+ *
+ * Bounded because the processor lives as long as the dev server and an entry
+ * is keyed by a span id rather than by the span object. Each entry is consumed
+ * within one request's lifetime — a child ends before its parent in every case
+ * these memories serve — so the bound only has to cover the spans *open* at
+ * once, which a dev server never approaches; the oldest entry is evicted first.
+ * An evicted entry costs one link: the event that would have used it names the
+ * parent it recorded, and the correlator attaches it to the trace root flagged
+ * as an orphan, exactly as it did before these memories existed.
+ */
+export const MAX_REMEMBERED_RELATIVES = 8192;
+
+/**
+ * Set `key` to `value`, evicting the oldest entry first when the map is full.
+ *
+ * A `Map` iterates in insertion order, so its first key is its oldest; a key
+ * already present is re-inserted at the end so the entry counts as fresh.
+ */
+function rememberBounded<K, V>(map: Map<K, V>, key: K, value: V): void {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= MAX_REMEMBERED_RELATIVES) {
+    const oldest = map.keys().next();
+    if (oldest.done !== true) {
+      map.delete(oldest.value);
+    }
+  }
+  map.set(key, value);
+}
 
 /**
  * Milliseconds that must pass between two warnings about events the service
@@ -1682,6 +1725,35 @@ export class DebuggenSpanProcessor implements SpanProcessor {
   readonly #stamps = new WeakMap<object, SpanCaptureStamp>();
 
   /**
+   * For each started span this processor will **not** emit, the nearest
+   * ancestor it will — `null` when it has none, which makes a child a trace
+   * root.
+   *
+   * Filled in `onStart`, because spans end child-first: by the time a child
+   * ends and names its parent, that parent has not ended and nothing about it
+   * is known at `onEnd`. A span's fate is decided from facts it carries from
+   * the moment it starts — its scope, name, kind and framework span type, and
+   * the capture's signals — so the child can be pointed past it in advance.
+   * Each entry stores an already-resolved ancestor, so a chain of skipped spans
+   * costs one lookup rather than a walk. See {@link MAX_REMEMBERED_RELATIVES}.
+   */
+  readonly #skippedAncestry = new Map<string, string | null>();
+
+  /**
+   * The route a request's route handler reported, keyed by the request span
+   * the handler ran under — handed to that request span as its route hint when
+   * it ends without a route of its own (see `./convert.ts`, Pass C).
+   */
+  readonly #routeHints = new Map<string, string>();
+
+  /**
+   * A statement execution with a row count, keyed by the span it ran directly
+   * inside — the driver's observation, waiting for the ORM span that contains
+   * the same execution and saw no count.
+   */
+  readonly #nestedExecutions = new Map<string, StatementExecution>();
+
+  /**
    * Converted events waiting for a flush, each with its capture; the oldest is
    * at index 0, so one capture's events form one contiguous run.
    */
@@ -2011,10 +2083,173 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       });
     }
 
-    // The interface's signature, and the parent context is not needed to stamp.
+    // Where this span's children must point if the span itself will never be
+    // emitted. Decided now for the reason spelled out on the field: a child
+    // ends first, and it has to know then.
+    try {
+      this.#trackAncestry(span as unknown as ReadableSpan);
+    } catch (error) {
+      this.#internalErrors += 1;
+      this.#log('debug', 'a started span could not be placed in its trace', {
+        error: describeError(error),
+      });
+    }
+
+    // The interface's signature; the span's own recorded parent is what the
+    // ancestry reads, so the context it was started in is not needed.
     // Referenced explicitly so the signature can stay exact under a lint gate
     // that reports unused parameters; the statement compiles away.
     void parentContext;
+  }
+
+  /**
+   * Remember the nearest emitted ancestor of a span that will not be emitted.
+   *
+   * A span will not be emitted when `./convert.ts` skips it (framework
+   * machinery) or when the capture's signals refuse it (a disabled kind, the
+   * other database library, an unplanned function). Every fact both decisions
+   * read is present when a span starts except its status: a skipped framework
+   * span that later ends in error is still emitted, as `server.error`, and its
+   * children then name its ancestor rather than it — a flatter tree, never a
+   * broken one.
+   *
+   * Nothing is remembered outside a capture: a span that starts then is
+   * dropped at `onEnd` together with everything under it.
+   *
+   * @param span The span that just started.
+   */
+  #trackAncestry(span: ReadableSpan): void {
+    if (this.#gate.captureId === null) {
+      return;
+    }
+    const lineage = readSpanLineage(span);
+    if (lineage === null || this.#willEmit(span)) {
+      return;
+    }
+    const inherited = this.#parentOverride(lineage.parentSpanId);
+    rememberBounded(
+      this.#skippedAncestry,
+      lineage.spanId,
+      inherited !== undefined ? inherited : (lineage.parentSpanId ?? null),
+    );
+  }
+
+  /**
+   * The parent an event should record in place of `parentSpanId`, or
+   * `undefined` to record `parentSpanId` itself.
+   *
+   * @param parentSpanId The parent the span recorded.
+   * @returns The nearest emitted ancestor when the recorded parent is a span
+   * this processor will not emit — `null` when there is none — and `undefined`
+   * otherwise.
+   */
+  #parentOverride(parentSpanId: string | undefined): string | null | undefined {
+    if (parentSpanId === undefined || !this.#skippedAncestry.has(parentSpanId)) {
+      return undefined;
+    }
+    return this.#skippedAncestry.get(parentSpanId) ?? null;
+  }
+
+  /**
+   * Whether a span would be converted and enqueued, judged without counting.
+   *
+   * The same two questions `onEnd` asks — does `./convert.ts` classify it, and
+   * does the capture admit that kind from that source — so the ancestry and
+   * the drop rules cannot disagree about a span whose facts did not change.
+   */
+  #willEmit(span: ReadableSpan): boolean {
+    const classification = classifySpan(span);
+    if (classification === null) {
+      return false;
+    }
+    return this.#admissionVerdict(span, classification.kind) === 'admitted';
+  }
+
+  /**
+   * Record what an ended span's relatives will need from it.
+   *
+   * - A route handler's route, for the request span it ran under — its
+   *   nearest emitted ancestor, since framework spans may sit in between.
+   * - A statement execution that reported a row count, for the span it ran
+   *   directly inside: when that span is the ORM's observation of the same
+   *   execution, it has no count of its own.
+   *
+   * Both are consumed by {@link DebuggenSpanProcessor.#fromRelatives} when the
+   * relative ends, which is always later: a child ends before its parent.
+   *
+   * @param span The span that ended.
+   * @param kind What `./convert.ts` classified it as.
+   * @param lineage Its id and recorded parent, or `null` when unreadable.
+   */
+  #recordForRelatives(span: ReadableSpan, kind: TelemetryKind, lineage: SpanLineage | null): void {
+    if (lineage === null || lineage.parentSpanId === undefined) {
+      return;
+    }
+
+    if (kind === 'route.handler') {
+      const route = readHandlerRoute(span);
+      const request = this.#parentOverride(lineage.parentSpanId) ?? lineage.parentSpanId;
+      if (route !== undefined && request !== null) {
+        rememberBounded(this.#routeHints, request, route);
+      }
+      return;
+    }
+
+    if (QUERY_KINDS.includes(kind)) {
+      const execution = readStatementExecution(span);
+      if (execution?.rowCount !== undefined) {
+        rememberBounded(this.#nestedExecutions, lineage.parentSpanId, execution);
+      }
+    }
+  }
+
+  /**
+   * The conversion context an ended span takes from its relatives: the parent
+   * to record in place of one this processor never emits, the route its
+   * handler reported, and the row count a nested execution observed.
+   *
+   * Each memory entry is consumed here — a span ends once.
+   *
+   * @param span The span being converted.
+   * @param kind What `./convert.ts` classified it as.
+   * @param lineage Its id and recorded parent, or `null` when unreadable.
+   */
+  #fromRelatives(
+    span: ReadableSpan,
+    kind: TelemetryKind,
+    lineage: SpanLineage | null,
+  ): Pick<ConvertContext, 'parentSpanId' | 'routeHint' | 'inheritedRowCount'> {
+    if (lineage === null) {
+      return {};
+    }
+
+    const parentSpanId = this.#parentOverride(lineage.parentSpanId);
+
+    let routeHint: string | undefined;
+    if (kind === 'http.server') {
+      routeHint = this.#routeHints.get(lineage.spanId);
+      this.#routeHints.delete(lineage.spanId);
+    }
+
+    let inheritedRowCount: number | undefined;
+    if (QUERY_KINDS.includes(kind)) {
+      const nested = this.#nestedExecutions.get(lineage.spanId);
+      if (nested !== undefined) {
+        this.#nestedExecutions.delete(lineage.spanId);
+        const own = readStatementExecution(span);
+        // Only the same execution: an ORM transaction span around several
+        // statements carries no statement of its own and inherits nothing.
+        if (own !== null && own.rowCount === undefined && own.statement === nested.statement) {
+          inheritedRowCount = nested.rowCount;
+        }
+      }
+    }
+
+    return {
+      ...(parentSpanId === undefined ? {} : { parentSpanId }),
+      ...(routeHint === undefined ? {} : { routeHint }),
+      ...(inheritedRowCount === undefined ? {} : { inheritedRowCount }),
+    };
   }
 
   /**
@@ -2072,6 +2307,15 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         this.#droppedUnconvertible += 1;
         return;
       }
+
+      // What this span's relatives will need from it, recorded before the
+      // capture decides whether to keep the span itself: a route handler the
+      // plan did not ask for still names its request's route, and a driver
+      // span from the library the plan did not ask for still observed the row
+      // count of the ORM statement around it.
+      const lineage = readSpanLineage(span);
+      this.#recordForRelatives(span, classification.kind, lineage);
+
       if (!this.#admit(span, classification.kind)) {
         return;
       }
@@ -2085,6 +2329,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         captureId: recordedIn,
         producerId: this.#config.producerId,
         seq: this.#seq,
+        ...this.#fromRelatives(span, classification.kind, lineage),
       };
       const event = spanToIngressEvent(span, context);
       if (event === null) {
@@ -2156,26 +2401,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * @returns `true` to convert and enqueue it.
    */
   #admit(span: ReadableSpan, kind: TelemetryKind): boolean {
-    const gate = this.#gate;
-    if (typeof gate.admitSpan !== 'function') {
-      if (gate.isKindEnabled(kind)) {
-        return true;
-      }
-      this.#droppedByKind += 1;
-      return false;
-    }
-
-    const candidate: SpanAdmissionCandidate = {
-      kind,
-      name: readSpanDisplayName(span),
-      // Only a database span has a source to tell, and telling it costs a
-      // scope read and two string comparisons, so it is not paid for the
-      // request and render spans that make up most of a capture.
-      source: QUERY_KINDS.includes(kind) ? classifyDatabaseSource(span) : null,
-      attributes: readSpanAttributes(span),
-    };
-
-    switch (gate.admitSpan(candidate)) {
+    switch (this.#admissionVerdict(span, kind)) {
       case 'admitted':
         return true;
       case 'source-disabled':
@@ -2195,6 +2421,35 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         this.#droppedByKind += 1;
         return false;
     }
+  }
+
+  /**
+   * The gate's verdict on a span, without counting it anywhere.
+   *
+   * Shared by {@link DebuggenSpanProcessor.#admit}, which counts refusals, and
+   * {@link DebuggenSpanProcessor.#willEmit}, which asks the same question at
+   * `onStart` and must not. A gate that implements only
+   * {@link CaptureGate.isKindEnabled} answers at kind level.
+   *
+   * @param span The span, started or ended.
+   * @param kind The kind `./convert.ts` classified it as.
+   */
+  #admissionVerdict(span: ReadableSpan, kind: TelemetryKind): SpanAdmission {
+    const gate = this.#gate;
+    if (typeof gate.admitSpan !== 'function') {
+      return gate.isKindEnabled(kind) ? 'admitted' : 'kind-disabled';
+    }
+
+    const candidate: SpanAdmissionCandidate = {
+      kind,
+      name: readSpanDisplayName(span),
+      // Only a database span has a source to tell, and telling it costs a
+      // scope read and two string comparisons, so it is not paid for the
+      // request and render spans that make up most of a capture.
+      source: QUERY_KINDS.includes(kind) ? classifyDatabaseSource(span) : null,
+      attributes: readSpanAttributes(span),
+    };
+    return gate.admitSpan(candidate);
   }
 
   /**

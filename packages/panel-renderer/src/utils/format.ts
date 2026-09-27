@@ -414,13 +414,27 @@ const UNAVAILABLE_DURATION: DurationParts = Object.freeze<DurationParts>({
  *   no magnitude to choose a unit from, so it takes the canonical unit, and it
  *   keeps that unit's decimals rather than collapsing to a bare `0`: a column
  *   whose zero row has fewer digits than its neighbours no longer aligns.
- * - a negative value → clamped to `0` by the shared `clampNonNegative`, the
- *   same clamp the producers apply, and rendered exactly as the zero above.
+ * - a negative value → the unavailable arm, exactly as `NaN`. A duration
+ *   cannot be negative, so a negative one is a corrupt measurement rather than
+ *   a fast one, and printing it as `0.00 ms` would report it as the fastest
+ *   operation of the capture — the one thing it certainly was not. The same
+ *   judgement `../primitives/DurationCell` makes for a cell, made here for
+ *   every tooltip, bar label and sentence that prints a duration.
+ * - a value below zero only by floating-point noise → zero. The judgement is
+ *   made at the resolution the product stores (the shared `roundMs`, three
+ *   decimals of a millisecond): a value that rounds to zero there, such as
+ *   `-0.0004`, is the residue of subtracting two clock readings of the same
+ *   instant, and renders exactly as the zero above.
  * - `NaN`, `Infinity`, `-Infinity` → the unavailable arm, whose `text` is
  *   {@link NOT_AVAILABLE_LABEL}. Neither `NaN` nor `Infinity` ever reaches a
  *   panel as text.
  * - a magnitude at or beyond {@link MAX_FIXED_MAGNITUDE} → the unavailable arm,
  *   because fixed notation degenerates into an exponent there.
+ *
+ * A caller formatting a COMPUTED difference that must floor at zero — an
+ * offset from an origin, the extent of a window — clamps it with the shared
+ * `clampNonNegative` before calling, as {@link formatOffset} does: only the
+ * caller knows that a negative there means "no time" rather than "corrupt".
  *
  * @param ms A duration in milliseconds.
  * @param precision Digit policy; defaults to `precise`.
@@ -429,14 +443,17 @@ export function formatDurationParts(
   ms: number,
   precision: DurationPrecision = 'precise',
 ): DurationParts {
-  if (!Number.isFinite(ms)) {
+  if (!Number.isFinite(ms) || roundMs(ms) < 0) {
     return UNAVAILABLE_DURATION;
   }
 
-  const clamped = clampNonNegative(ms);
-  const scale = durationScale(clamped);
+  // Past the check above, a negative value can only be noise that rounds to
+  // zero (`-0.0004`, or `-0` itself), so the clamp maps it onto the zero arm
+  // rather than letting a signed zero reach the text.
+  const measured = clampNonNegative(ms);
+  const scale = durationScale(measured);
   const decimals = scale.decimals[precision];
-  const value = groupedFixed(scale.toMagnitude(clamped), decimals);
+  const value = groupedFixed(scale.toMagnitude(measured), decimals);
 
   if (value === undefined) {
     return UNAVAILABLE_DURATION;
@@ -463,6 +480,7 @@ export function formatDurationParts(
  * formatDuration(46.9994); // '47.00 ms'
  * formatDuration(1175); // '1.175 s'
  * formatDuration(Number.NaN); // 'n/a'
+ * formatDuration(-5); // 'n/a' — a corrupt measurement, not a fast one
  * ```
  */
 export function formatDuration(ms: number, precision: DurationPrecision = 'precise'): string {
@@ -499,7 +517,11 @@ export function formatDurationCompact(ms: number): string {
  *
  * An offset that comes out negative — a producer whose first event predates the
  * origin the caller passed — clamps to `0 ms` rather than rendering a negative
- * duration. A non-finite origin or timestamp yields {@link NOT_AVAILABLE_LABEL}.
+ * duration. The clamp is this function's own, applied before the value is
+ * formatted: {@link formatDuration} answers a negative duration with
+ * {@link NOT_AVAILABLE_LABEL}, which is right for a measured duration and wrong
+ * for a subtraction whose only meaning below zero is "at the origin". A
+ * non-finite origin or timestamp yields {@link NOT_AVAILABLE_LABEL}.
  *
  * @param epochMs The event's `startTime`, in epoch milliseconds.
  * @param originEpochMs The capture's (or trace's) start, in epoch milliseconds.
@@ -514,7 +536,7 @@ export function formatOffset(
     return NOT_AVAILABLE_LABEL;
   }
 
-  return formatDuration(roundMs(epochMs - originEpochMs), precision);
+  return formatDuration(clampNonNegative(roundMs(epochMs - originEpochMs)), precision);
 }
 
 /*

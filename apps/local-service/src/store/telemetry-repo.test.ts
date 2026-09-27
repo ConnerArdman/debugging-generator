@@ -115,9 +115,11 @@ import {
   TELEMETRY_SORTS,
   createTelemetryRepo,
   isTelemetryGroupKey,
+  parentFirstOrder,
 } from './telemetry-repo.js';
 import type {
   CaptureGeneration,
+  LineageKey,
   PersistableTelemetryEvent,
   TelemetryGroupPage,
   TelemetryPage,
@@ -1624,6 +1626,683 @@ describe('the panel-data orderings of query', () => {
 
     expect(walked).toEqual(idsOf(byName));
     expect(new Set(walked).size).toBe(byName.total);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The parent-first order
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The canonical parent-first order of AAP 0.2.3 over rows already in the flat
+ * chain, derived **independently of `parentFirstOrder`**: repeatedly emit the
+ * lowest-ranked row whose parent has been emitted or is not in the set (a row
+ * naming itself counts as having none), and when no row qualifies — a parent
+ * cycle — the lowest-ranked row left. A row's parent is the lowest-ranked row
+ * of its trace carrying the span id it names.
+ *
+ * Deliberately naive, `O(n²)`, and written as the rule reads, so an agreement
+ * with the store is evidence rather than one implementation checked against
+ * itself.
+ *
+ * @param keys The rows, in flat canonical order: a row's position is its rank.
+ * @returns The ranks, in parent-first order.
+ */
+function naiveParentFirst(keys: readonly LineageKey[]): number[] {
+  const parentOf = keys.map((key, rank) => {
+    if (key.parentSpanId === undefined) {
+      return undefined;
+    }
+
+    const parent = keys.findIndex(
+      (candidate) => candidate.traceId === key.traceId && candidate.spanId === key.parentSpanId,
+    );
+
+    return parent === -1 || parent === rank ? undefined : parent;
+  });
+  const emitted = new Set<number>();
+  const order: number[] = [];
+
+  while (order.length < keys.length) {
+    let next = keys.findIndex((_key, rank) => {
+      const parent = parentOf[rank];
+
+      return !emitted.has(rank) && (parent === undefined || emitted.has(parent));
+    });
+
+    if (next === -1) {
+      next = keys.findIndex((_key, rank) => !emitted.has(rank));
+    }
+
+    emitted.add(next);
+    order.push(next);
+  }
+
+  return order;
+}
+
+/**
+ * The ids of stored events in the canonical parent-first order: ranked by the
+ * correlator's `compareEventsCanonical`, then put parent first by
+ * {@link naiveParentFirst}.
+ */
+function parentFirstIds(events: readonly TelemetryEvent[]): string[] {
+  const flat = [...events].sort(compareEventsCanonical);
+
+  return naiveParentFirst(flat).map((rank) => flat[rank]?.id ?? '');
+}
+
+/**
+ * Whether no event of `ids` precedes its parent, where the parent — the same
+ * trace's span the event names — is among `events` too.
+ */
+function everyParentPrecedes(ids: readonly string[], events: readonly TelemetryEvent[]): boolean {
+  const position = new Map(ids.map((id, index) => [id, index] as const));
+
+  return events.every((event) => {
+    const parent = events.find(
+      (candidate) => candidate.traceId === event.traceId && candidate.spanId === event.parentSpanId,
+    );
+
+    if (parent === undefined || parent.id === event.id) {
+      return true;
+    }
+
+    return (position.get(parent.id) ?? -1) < (position.get(event.id) ?? -1);
+  });
+}
+
+/** A seeded pseudo-random source (mulberry32), so a generated fixture is the same on every run. */
+function seededRandom(seed: number): () => number {
+  let state = seed >>> 0;
+
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+
+    let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
+
+    mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
+
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
+
+describe('parentFirstOrder', () => {
+  const trace = newTraceId();
+  const otherTrace = newTraceId();
+
+  it('orders nothing as nothing and a lone row as itself', () => {
+    expect(parentFirstOrder([])).toEqual([]);
+    expect(parentFirstOrder([{ traceId: trace, spanId: 'a' }])).toEqual([0]);
+  });
+
+  it('puts a parent before a child whose clock reads earlier', () => {
+    const keys: LineageKey[] = [
+      { traceId: trace, spanId: 'b1', parentSpanId: 'a0' },
+      { traceId: trace, spanId: 'a0' },
+    ];
+
+    expect(parentFirstOrder(keys)).toEqual([1, 0]);
+  });
+
+  it('emits the lowest-ranked ready row next, not the deepest one', () => {
+    // A priority topological order, not a depth-first walk: the grandchild
+    // waits behind a sibling of its parent that ranks before it.
+    const keys: LineageKey[] = [
+      { traceId: trace, spanId: 'root' },
+      { traceId: trace, spanId: 'c1', parentSpanId: 'root' },
+      { traceId: trace, spanId: 'c2', parentSpanId: 'root' },
+      { traceId: trace, spanId: 'g1', parentSpanId: 'c1' },
+    ];
+
+    expect(parentFirstOrder(keys)).toEqual([0, 1, 2, 3]);
+  });
+
+  it('treats a self-parent, an absent parent and a parent in another trace as roots', () => {
+    const keys: LineageKey[] = [
+      { traceId: otherTrace, spanId: 'x', parentSpanId: 'p' },
+      { traceId: trace, spanId: 'self', parentSpanId: 'self' },
+      { traceId: trace, spanId: 'orphan', parentSpanId: 'never-captured' },
+      { traceId: trace, spanId: 'p' },
+    ];
+
+    expect(parentFirstOrder(keys)).toEqual([0, 1, 2, 3]);
+  });
+
+  it('hangs a child under the lowest-ranked row of a repeated span id', () => {
+    const keys: LineageKey[] = [
+      { traceId: trace, spanId: 'child', parentSpanId: 'p' },
+      { traceId: trace, spanId: 'p' },
+      { traceId: trace, spanId: 'p' },
+    ];
+
+    expect(parentFirstOrder(keys)).toEqual([1, 0, 2]);
+  });
+
+  it('releases the lowest-ranked remaining row of a parent cycle and emits every row once', () => {
+    // x and y name each other; z is x's child; r is the only root.
+    const keys: LineageKey[] = [
+      { traceId: trace, spanId: 'z', parentSpanId: 'x' },
+      { traceId: trace, spanId: 'y', parentSpanId: 'x' },
+      { traceId: trace, spanId: 'x', parentSpanId: 'y' },
+      { traceId: trace, spanId: 'r' },
+    ];
+
+    expect(parentFirstOrder(keys)).toEqual([3, 0, 1, 2]);
+    expect(naiveParentFirst(keys)).toEqual([3, 0, 1, 2]);
+  });
+
+  it('agrees with the naive derivation on generated forests with cycles and duplicates', () => {
+    const random = seededRandom(0x0b5f16);
+
+    for (let round = 0; round < 25; round += 1) {
+      const size = 1 + Math.floor(random() * 120);
+      const spanIds = Array.from({ length: size }, (_unused, index) =>
+        // Roughly one span id in ten is reused, so duplicates occur.
+        random() < 0.1 && index > 0
+          ? `s${String(Math.floor(random() * index))}`
+          : `s${String(index)}`,
+      );
+      const keys: LineageKey[] = spanIds.map((spanId) => {
+        const roll = random();
+        const traceId = random() < 0.9 ? trace : otherTrace;
+
+        // Any span id of the set — including a later one, which makes cycles
+        // and clock-skewed children common — or one the set never holds.
+        if (roll < 0.7) {
+          return {
+            traceId,
+            spanId,
+            parentSpanId: spanIds[Math.floor(random() * size)] ?? 'none',
+          };
+        }
+
+        return roll < 0.8
+          ? { traceId, spanId, parentSpanId: 'never-captured' }
+          : { traceId, spanId };
+      });
+
+      const order = parentFirstOrder(keys);
+
+      expect(order).toEqual(naiveParentFirst(keys));
+      expect([...order].sort((left, right) => left - right)).toEqual(
+        keys.map((_key, rank) => rank),
+      );
+    }
+  });
+});
+
+describe('the parent-first order of query', () => {
+  /** An event id whose first character after the prefix is `rank`, so the suite decides where it sorts. */
+  function rankedEventId(rank: string): string {
+    const prefix = 'evt_';
+
+    return `${prefix}${rank}${newEventId().slice(prefix.length + rank.length)}`;
+  }
+
+  /** A producer id whose first character after the prefix is `rank`, so the suite decides where it sorts. */
+  function rankedProducerId(rank: string): string {
+    const prefix = 'prd_';
+
+    return `${prefix}${rank}${newProducerId().slice(prefix.length + rank.length)}`;
+  }
+
+  /** The ids of a page, in page order. */
+  function idsOf(page: TelemetryPage): string[] {
+    return page.rows.map((event) => event.id);
+  }
+
+  /** Every page of a parent-first walk of `query`, `limit` rows at a time. */
+  function walk(query: TelemetryQuery, limit: number): { ids: string[]; pages: number } {
+    const ids: string[] = [];
+    let pages = 0;
+    let offset: number | undefined = 0;
+
+    while (offset !== undefined) {
+      const page: TelemetryPage = unwrap(
+        repo.query({ ...query, parentFirst: true, limit, offset }),
+      );
+
+      ids.push(...idsOf(page));
+      pages += 1;
+      offset = page.nextOffset;
+    }
+
+    return { ids, pages };
+  }
+
+  /** The trace the generated forest puts most of its spans in. */
+  const FOREST_TRACE = newTraceId();
+
+  /**
+   * Stores a generated forest of 61 spans over three traces and two
+   * producers, shuffled on the way in: every fifth span an `interaction` (so a
+   * `kinds` filter removes parents), start times on a coarse grid drawn
+   * independently of the lineage (so ties are common and children often start
+   * before their parents), and one span whose parent was never captured.
+   */
+  function seedForest(): TelemetryEvent[] {
+    const random = seededRandom(0xf0e57);
+    const traces = [FOREST_TRACE, newTraceId(), newTraceId()];
+    const producers = [rankedProducerId('a'), rankedProducerId('b')];
+    const events: PersistableTelemetryEvent[] = [];
+
+    for (let index = 0; index < 60; index += 1) {
+      const traceId = traces[index % traces.length] ?? FOREST_TRACE;
+      const earlier = events.filter((event) => event.traceId === traceId);
+      const parent =
+        earlier.length > 0 && random() < 0.8
+          ? earlier[Math.floor(random() * earlier.length)]
+          : undefined;
+
+      events.push(
+        buildEvent({
+          traceId,
+          kind: index % 5 === 0 ? 'interaction' : 'fetch',
+          ...(parent !== undefined ? { parentSpanId: parent.spanId } : {}),
+          startTime: BASE_TIME + Math.floor(random() * 6),
+          producerId: producers[Math.floor(random() * producers.length)] ?? PRODUCER_BROWSER,
+        }),
+      );
+    }
+
+    events.push(
+      buildEvent({ traceId: FOREST_TRACE, parentSpanId: newSpanId(), startTime: BASE_TIME }),
+    );
+
+    const shuffled = [...events];
+
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+      const other = Math.floor(random() * (index + 1));
+      const held = shuffled[index];
+      const swapped = shuffled[other];
+
+      if (held !== undefined && swapped !== undefined) {
+        shuffled[index] = swapped;
+        shuffled[other] = held;
+      }
+    }
+
+    return insertOk(shuffled);
+  }
+
+  it('answers the QA reproduction parent first, then by start, producer and sequence', () => {
+    // Trace T2: root A0; children A2 (seq 2), B0 and A1 (seq 1) at the same
+    // instant; grandchild B1, under B0, 5 ms earlier. The ids rank against
+    // the canonical order and the rows arrive shuffled, so neither the id nor
+    // the arrival order could produce it.
+    const traceId = newTraceId();
+    const producerA = rankedProducerId('a');
+    const producerB = rankedProducerId('b');
+    const tied = BASE_TIME + 10;
+    const a0 = buildEvent({
+      id: rankedEventId('d'),
+      traceId,
+      kind: 'interaction',
+      producerId: producerA,
+      seq: 0,
+      startTime: tied,
+    });
+    const a2 = buildEvent({
+      id: rankedEventId('a'),
+      traceId,
+      parentSpanId: a0.spanId,
+      producerId: producerA,
+      seq: 2,
+      startTime: tied,
+    });
+    const b0 = buildEvent({
+      id: rankedEventId('b'),
+      traceId,
+      parentSpanId: a0.spanId,
+      producerId: producerB,
+      seq: 0,
+      startTime: tied,
+    });
+    const a1 = buildEvent({
+      id: rankedEventId('c'),
+      traceId,
+      parentSpanId: a0.spanId,
+      producerId: producerA,
+      seq: 1,
+      startTime: tied,
+    });
+    const b1 = buildEvent({
+      id: rankedEventId('e'),
+      traceId,
+      parentSpanId: b0.spanId,
+      producerId: producerB,
+      seq: 1,
+      startTime: tied - 5,
+    });
+    // Another trace at the earliest instant, which the trace filter leaves out.
+    const elsewhere = buildEvent({ id: rankedEventId('0'), traceId: TRACE_A, startTime: tied - 5 });
+
+    const stored = insertOk([b1, a2, elsewhere, a0, b0, a1]);
+    const filter: TelemetryQuery = {
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      traceId,
+      sort: 'start_asc',
+    };
+    const page = unwrap(repo.query({ ...filter, parentFirst: true }));
+
+    expect(idsOf(page)).toEqual([a0.id, a1.id, a2.id, b0.id, b1.id]);
+    expect(page.total).toBe(5);
+    expect(page.nextOffset).toBeUndefined();
+    expect(page.skipped).toBeUndefined();
+    expect(idsOf(page)).toEqual(
+      parentFirstIds(stored.filter((event) => event.traceId === traceId)),
+    );
+
+    // Unasked, the flat panel order is untouched: start, then the event id —
+    // the order the finding observed.
+    expect(idsOf(unwrap(repo.query(filter)))).toEqual([b1.id, a2.id, b0.id, a1.id, a0.id]);
+  });
+
+  it('walks every page once, in the single-page order, under every filter', () => {
+    const stored = seedForest();
+    const parentOf = (event: TelemetryEvent): TelemetryEvent | undefined =>
+      stored.find(
+        (candidate) =>
+          candidate.traceId === event.traceId && candidate.spanId === event.parentSpanId,
+      );
+
+    // The fixture must exercise what the order exists for.
+    expect(
+      stored.some((event) => {
+        const parent = parentOf(event);
+
+        return parent !== undefined && event.startTime < parent.startTime;
+      }),
+    ).toBe(true);
+    expect(
+      stored.some((event) => event.kind === 'fetch' && parentOf(event)?.kind === 'interaction'),
+    ).toBe(true);
+
+    const cases: readonly (readonly [
+      string,
+      TelemetryQuery,
+      (event: TelemetryEvent) => boolean,
+    ])[] = [
+      ['capture', { sessionId: SESSION_A, captureId: CAPTURE_A1 }, () => true],
+      [
+        'traceId',
+        { sessionId: SESSION_A, captureId: CAPTURE_A1, traceId: FOREST_TRACE },
+        (event) => event.traceId === FOREST_TRACE,
+      ],
+      [
+        'kinds, which removes parents',
+        { sessionId: SESSION_A, captureId: CAPTURE_A1, kinds: ['fetch'] },
+        (event) => event.kind === 'fetch',
+      ],
+    ];
+
+    for (const [label, query, selects] of cases) {
+      const selected = stored.filter(selects);
+      const expected = parentFirstIds(selected);
+      const whole = unwrap(
+        repo.query({ ...query, parentFirst: true, limit: TELEMETRY_QUERY_MAX_LIMIT }),
+      );
+
+      expect(idsOf(whole), label).toEqual(expected);
+      expect(whole.total, label).toBe(selected.length);
+      expect(everyParentPrecedes(idsOf(whole), selected), label).toBe(true);
+      // The flat order is a different one, or the case would prove nothing.
+      expect(
+        idsOf(unwrap(repo.query({ ...query, limit: TELEMETRY_QUERY_MAX_LIMIT }))),
+        label,
+      ).not.toEqual(expected);
+
+      for (const limit of [1, 7, selected.length]) {
+        const walked = walk(query, limit);
+
+        expect(walked.ids, `${label}, ${String(limit)} per page`).toEqual(expected);
+        expect(walked.pages, `${label}, ${String(limit)} per page`).toBe(
+          Math.ceil(selected.length / limit),
+        );
+      }
+    }
+  });
+
+  it('pages a parent cycle without repeating or dropping a row', () => {
+    const trace = newTraceId();
+    const [xSpan, ySpan] = [newSpanId(), newSpanId()];
+    const z = buildEvent({ traceId: trace, parentSpanId: xSpan, startTime: BASE_TIME });
+    const y = buildEvent({
+      traceId: trace,
+      spanId: ySpan,
+      parentSpanId: xSpan,
+      startTime: BASE_TIME + 1,
+    });
+    const x = buildEvent({
+      traceId: trace,
+      spanId: xSpan,
+      parentSpanId: ySpan,
+      startTime: BASE_TIME + 2,
+    });
+    const r = buildEvent({ traceId: trace, startTime: BASE_TIME + 3 });
+
+    insertOk([x, r, z, y]);
+
+    const query: TelemetryQuery = { sessionId: SESSION_A, traceId: trace };
+    const expected = [r.id, z.id, y.id, x.id];
+
+    expect(idsOf(unwrap(repo.query({ ...query, parentFirst: true })))).toEqual(expected);
+    expect(walk(query, 1)).toEqual({ ids: expected, pages: 4 });
+  });
+
+  it('breaks a complete tie on the arrival number, where the flat order uses the id', () => {
+    const producerId = rankedProducerId('a');
+    const first = buildEvent({ id: rankedEventId('z'), producerId, seq: 7 });
+    const second = buildEvent({ id: rankedEventId('a'), producerId, seq: 7 });
+
+    insertOk([first]);
+    insertOk([second]);
+
+    expect(idsOf(unwrap(repo.query({ sessionId: SESSION_A, parentFirst: true })))).toEqual([
+      first.id,
+      second.id,
+    ]);
+    expect(idsOf(unwrap(repo.query({ sessionId: SESSION_A })))).toEqual([second.id, first.id]);
+  });
+
+  it('refuses a parent-first order under another sort, or one that is not a boolean', () => {
+    insertOk([buildEvent()]);
+
+    for (const sort of ['duration_desc', 'count_desc'] as const) {
+      const refused = repo.query({ sessionId: SESSION_A, sort, parentFirst: true });
+
+      expect(refusalReason(refused), sort).toBe('parent-first-requires-start-asc');
+      expect(isErr(refused) ? refused.error.details?.['sort'] : undefined, sort).toBe(sort);
+      // Refused before a filter that selects nothing could answer it unread.
+      expect(
+        refusalReason(repo.query({ sessionId: SESSION_A, sort, parentFirst: true, kinds: [] })),
+        sort,
+      ).toBe('parent-first-requires-start-asc');
+    }
+
+    const loose = { sessionId: SESSION_A, parentFirst: 'yes' } as unknown as TelemetryQuery;
+
+    expect(refusalReason(repo.query(loose))).toBe('invalid-parent-first');
+
+    // `false` is the flat page under any sort; the default sort is start_asc;
+    // a filter selecting nothing is answered empty.
+    expect(
+      unwrap(repo.query({ sessionId: SESSION_A, sort: 'duration_desc', parentFirst: false })).total,
+    ).toBe(1);
+    expect(unwrap(repo.query({ sessionId: SESSION_A, parentFirst: true })).total).toBe(1);
+    expect(unwrap(repo.query({ sessionId: SESSION_A, parentFirst: true, kinds: [] }))).toEqual({
+      rows: [],
+      total: 0,
+    });
+  });
+
+  it('reads the keys, then only the window rows by arrival number, in bounded chunks', () => {
+    // A chain in which every span is the child of the one before it and starts
+    // 1 ms earlier, so the flat chain is the exact reverse of the parent-first
+    // order, and the window needs two arrival-number chunks.
+    const count = EXISTENCE_LOOKUP_CHUNK_SIZE + 3;
+    const events: PersistableTelemetryEvent[] = [];
+
+    for (let index = 0; index < count; index += 1) {
+      const parent = events[index - 1];
+
+      events.push(
+        buildEvent({
+          ...(parent !== undefined ? { parentSpanId: parent.spanId } : {}),
+          startTime: BASE_TIME + count - index,
+        }),
+      );
+    }
+
+    insertOk(events);
+
+    const query: TelemetryQuery = {
+      sessionId: SESSION_A,
+      captureId: CAPTURE_A1,
+      parentFirst: true,
+      limit: count,
+    };
+    let page: TelemetryPage | undefined;
+    const statements = statementsRunBy((reader) => {
+      const read = reader.query(query);
+
+      page = isErr(read) ? undefined : read.value;
+
+      return read;
+    });
+
+    expect(page?.rows.map((event) => event.id)).toEqual(events.map((event) => event.id));
+    expect(page?.total).toBe(count);
+    expect(statements).toHaveLength(3);
+    expect(statements[0]).toContain(`ORDER BY ${CANONICAL_ORDER_BY}`);
+    expect(statements[0]).not.toMatch(/\bevent\b/u);
+    expect(statements.slice(1).every((sql) => sql.includes('ingest_seq IN ('))).toBe(true);
+
+    // The count alone is the one COUNT a flat page runs; a window past the end
+    // reads the keys and nothing else.
+    const countOnly = statementsRunBy((reader) => reader.query({ ...query, limit: 0 }));
+
+    expect(countOnly).toHaveLength(1);
+    expect(countOnly[0]).toContain('COUNT(*)');
+    expect(statementsRunBy((reader) => reader.query({ ...query, offset: count }))).toHaveLength(1);
+    expect(unwrap(repo.query({ ...query, limit: 0 }))).toEqual({ rows: [], total: count });
+    expect(unwrap(repo.query({ ...query, offset: count }))).toEqual({ rows: [], total: count });
+  });
+
+  it('skips an unreadable row inside the window, and still advances past it', () => {
+    const root = buildEvent({ startTime: BASE_TIME });
+    const child = buildEvent({ parentSpanId: root.spanId, startTime: BASE_TIME + 1 });
+
+    insertOk([root, child]);
+
+    // A child of the root with a document this build cannot reconstruct,
+    // starting before it, so the flat chain ranks it first.
+    store
+      .statement(
+        `INSERT INTO telemetry_events (
+           id, session_id, capture_id, trace_id, span_id, parent_span_id, kind, tier,
+           name, start_time, duration, producer_id, seq, event
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        newEventId(),
+        SESSION_A,
+        CAPTURE_A1,
+        TRACE_A,
+        newSpanId(),
+        root.spanId,
+        'fetch',
+        'browser',
+        'operation',
+        BASE_TIME - 1,
+        1,
+        PRODUCER_BROWSER,
+        97,
+        JSON.stringify({ unexpected: SENTINEL }),
+      );
+
+    // The window holds the root and the unreadable row: one skip, one warning.
+    const first = unwrap(repo.query({ sessionId: SESSION_A, parentFirst: true, limit: 2 }));
+
+    expect(idsOf(first)).toEqual([root.id]);
+    expect(first.total).toBe(3);
+    expect(first.skipped).toBe(1);
+    expect(first.nextOffset).toBe(2);
+    expect(
+      logs.find(
+        (record) =>
+          record.message === 'skipped telemetry rows that no longer match the event schema',
+      )?.fields,
+    ).toMatchObject({ skipped: 1, ingestSeqs: [3] });
+    expect(loggedText()).not.toContain(SENTINEL);
+
+    const second = unwrap(
+      repo.query({ sessionId: SESSION_A, parentFirst: true, limit: 2, offset: 2 }),
+    );
+
+    expect(idsOf(second)).toEqual([child.id]);
+    expect(second.nextOffset).toBeUndefined();
+
+    // A window that does not reach the unreadable row reads no document of it.
+    const clean = unwrap(repo.query({ sessionId: SESSION_A, parentFirst: true, limit: 1 }));
+
+    expect(idsOf(clean)).toEqual([root.id]);
+    expect(clean.skipped).toBeUndefined();
+  });
+
+  it('leaves out a row removed between its two reads and still pages past it', () => {
+    const events = [
+      buildEvent({ startTime: BASE_TIME }),
+      buildEvent({ startTime: BASE_TIME + 1 }),
+      buildEvent({ startTime: BASE_TIME + 2 }),
+    ];
+    const [kept, removed, last] = insertOk(events);
+    const records: LogRecord[] = [];
+
+    // The real store, except that the page's row read is preceded by another
+    // connection's delete: the window between the two statements.
+    const statement: Store['statement'] = (sql) => {
+      if (sql.includes('ingest_seq IN (')) {
+        store.statement('DELETE FROM telemetry_events WHERE id = ?').run(removed?.id ?? '');
+      }
+
+      return store.statement(sql);
+    };
+    const racing = new Proxy(store, {
+      get(target, property): unknown {
+        if (property === 'statement') {
+          return statement;
+        }
+
+        const value: unknown = Reflect.get(target, property, target);
+
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const reader = createTelemetryRepo({
+      store: racing,
+      logger: createConsoleLogger({ level: 'trace', sink: (record) => records.push(record) }),
+    });
+
+    const page = unwrap(reader.query({ sessionId: SESSION_A, parentFirst: true, limit: 2 }));
+
+    expect(idsOf(page)).toEqual([kept?.id]);
+    expect(page.total).toBe(3);
+    expect(page.nextOffset).toBe(2);
+    expect(
+      records.find(
+        (record) =>
+          record.message === 'rows of a parent-first page were removed between its two reads',
+      ),
+    ).toMatchObject({ level: 'debug', fields: { removed: 1 } });
+
+    // The next read sees the store as it now is.
+    const after = unwrap(repo.query({ sessionId: SESSION_A, parentFirst: true }));
+
+    expect(idsOf(after)).toEqual([kept?.id, last?.id]);
+    expect(after.total).toBe(2);
   });
 });
 
@@ -5708,6 +6387,39 @@ describe('the index each reader is answered from', () => {
       }
     },
   );
+
+  it('plans a parent-first page as one indexed key read and primary-key probes', () => {
+    const fixture = seedPlanFixture();
+    const cases: readonly (readonly [TelemetryQuery, string])[] = [
+      [{ sessionId: SESSION_A, captureId: CAPTURE_A1 }, CAPTURE_INDEX],
+      [{ sessionId: SESSION_A, captureId: CAPTURE_A1, traceId: fixture.traceId }, TRACE_INDEX],
+    ];
+
+    for (const [query, index] of cases) {
+      const [keys, ...rows] = statementsRunBy((reader) =>
+        reader.query({ ...query, parentFirst: true }),
+      );
+
+      if (keys === undefined) {
+        throw new Error('A parent-first page ran no statement.');
+      }
+
+      const keyPlan = queryPlan(keys).join(' | ');
+
+      expect(keyPlan).toMatch(
+        new RegExp(`SEARCH telemetry_events USING (?:COVERING )?INDEX ${index} \\(`, 'u'),
+      );
+      expect(keyPlan).not.toContain('SCAN telemetry_events');
+      expect(rows).toHaveLength(1);
+
+      for (const sql of rows) {
+        const plan = queryPlan(sql).join(' | ');
+
+        expect(plan).toMatch(/SEARCH telemetry_events USING INTEGER PRIMARY KEY \(rowid=\?\)/u);
+        expect(plan).not.toContain('SCAN telemetry_events');
+      }
+    }
+  });
 
   it('keeps a lookup answered from a global index inside its own session', () => {
     const traceId = newTraceId();

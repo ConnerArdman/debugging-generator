@@ -41,9 +41,12 @@
  * `instrumentedHash`, the backup read back and checked against `originalHash`,
  * the conditional atomic replace, the post-write verification, the `reverted`
  * transition and only then the backup's deletion — is `@debuggen/instrumentation`'s
- * `cleanupSession` and `reconcileModifications`. So is the per-status
- * reconciliation table and the restore-versus-conflict verdict of
- * `detectConflict`, which is the only authority that may authorise a write.
+ * `cleanupSession` and `reconcileModifications`. So is the removal of a
+ * session's emptied backup directory once a pass leaves it clean, on the end
+ * path and the start-up path alike; so is the per-status reconciliation table,
+ * including the re-judging of a record already in `conflict`; and so is the
+ * restore-versus-conflict verdict of `detectConflict`, which is the only
+ * authority that may authorise a write.
  * This module restates none of it. What it owns is everything *around* those
  * calls, in the only order that is safe:
  *
@@ -1360,7 +1363,7 @@ function combinedSignal(...signals: readonly (AbortSignal | undefined)[]): Abort
  *
  * The engine stamps `detectedAt` afresh on every pass that re-reports a
  * retained conflict (a conflict record keeps its backup and is re-reported on
- * every pass until the developer resolves it), so comparing it would rewrite
+ * every pass for as long as its file still diverges), so comparing it would rewrite
  * every conflicted session on every start. The stored stamp stays truthful —
  * it is when this unchanged conflict was first detected — and as soon as any
  * other field changes, the new report is written with its own stamp. Typed
@@ -1556,7 +1559,17 @@ async function deliverVerdict(
   return undefined;
 }
 
-/** Reconciles one session's open records and verifies what the engine reports. */
+/**
+ * Reconciles one session's open records and verifies what the engine reports.
+ *
+ * The engine's `reconcileModifications` does the writing and the deleting: it
+ * restores or closes each record, deletes each backup once its restore
+ * verified, and — when its pass reverted at least one record of the session
+ * and left nothing of it open — removes the emptied `backups/<sessionId>/`
+ * directory through the session's own store, exactly as `session.end` does.
+ * This function never touches that directory; it only verifies the end state
+ * the engine reports and delivers the verdict to the session.
+ */
 async function reconcileSession(
   runtime: ReconcileRuntime,
   sessionId: string,

@@ -120,19 +120,50 @@ export interface CountedNoun {
  * formatting policy
  * ---------------------------------------------------------------------------------------------- */
 
+/** The unit symbols a duration in a sentence can carry. */
+export type DurationUnit = 'µs' | 'ms' | 's';
+
 /**
- * Decimal places kept when a duration is rendered as text.
+ * Decimal places kept when a duration is rendered as text, per unit.
  *
  * AAP §0.2.3 fixes the product's time base at epoch milliseconds with
- * millisecond durations, and `roundMs`'s own documented floor for a *stored*
- * value is three decimals. Prose is a narrower problem than storage: a tenth of
- * a millisecond is the smallest difference worth reading in a sentence, and
- * three decimals would put floating-point noise in front of the developer. One
- * decimal is therefore the presentation policy, applied by
- * {@link formatDurationMs} and by nothing else, so every duration in every
- * deterministic sentence carries the same digits.
+ * millisecond durations. A sentence states a duration in exactly the text the
+ * panels print for the same measurement — the precise rule of
+ * `packages/panel-renderer`'s `formatDuration`, which every table cell, tooltip
+ * and bar label uses — so a summary never reads "1564.9 ms" beside a table row
+ * that reads "1.565 s": whole microseconds below a millisecond (a fractional
+ * microsecond is below the stored resolution), hundredths of a millisecond
+ * below a second, and thousandths of a second from there on, which keeps a
+ * seconds figure loss-free against the millisecond it came from. The policy is
+ * applied by {@link formatDurationMs} and by nothing else, so every duration in
+ * every deterministic sentence carries the same digits. This package depends on
+ * `@debuggen/shared` alone, so the rule is restated here rather than imported,
+ * and the cases in `./templates.test.ts` pin it to the renderer's.
  */
-export const DURATION_DECIMALS = 1;
+export const DURATION_DECIMALS: Readonly<Record<DurationUnit, number>> = Object.freeze({
+  µs: 0,
+  ms: 2,
+  s: 3,
+});
+
+/** Milliseconds in one second: the boundary at which a duration reads in seconds. */
+const MS_PER_SECOND = 1000;
+
+/** Microseconds in one millisecond. */
+const US_PER_MS = 1000;
+
+/**
+ * The magnitude at which JavaScript's fixed notation degenerates into an
+ * exponent (`(1e21).toFixed(3) === '1e+21'`), past which no digit grouping
+ * applies.
+ */
+const MAX_FIXED_MAGNITUDE = 1e21;
+
+/** Digits per thousands group. */
+const DIGIT_GROUP_SIZE = 3;
+
+/** The thousands separator, fixed rather than taken from a host locale. */
+const DIGIT_GROUP_SEPARATOR = ',';
 
 /**
  * Longest interpolated label a frame will emit, in characters.
@@ -223,7 +254,8 @@ export const UNNAMED_STATEMENT_LABEL = 'an unnamed statement';
  * The duplicate-request frames keep the endpoint itself out of their fixed
  * text — `./rules.ts` interpolates it — and fall back to this generic phrase
  * when no endpoint label is available, which is the shape AAP's own wording
- * uses: `‹n› requests to the same endpoint occurred within ‹window› ms`.
+ * uses: `‹n› requests to the same endpoint occurred within ‹window›`, where
+ * `‹window›` is the whole duration phrase {@link formatDurationMs} renders.
  */
 export const SAME_ENDPOINT_LABEL = 'the same endpoint';
 
@@ -337,7 +369,32 @@ function fitStatement(
 }
 
 /**
- * Renders a millisecond measurement as text, without a unit.
+ * Inserts thousands separators into the integer part of a fixed-notation
+ * digit string, leaving the fraction — and so its digit count — untouched.
+ *
+ * String arithmetic rather than `Intl.NumberFormat`, for the same reason the
+ * renderer groups this way: a locale would make two runs disagree.
+ */
+function groupIntegerDigits(text: string): string {
+  const point = text.indexOf('.');
+  const integer = point < 0 ? text : text.slice(0, point);
+  const fraction = point < 0 ? '' : text.slice(point);
+  const groups: string[] = [];
+  for (let end = integer.length; end > 0; end -= DIGIT_GROUP_SIZE) {
+    groups.push(integer.slice(Math.max(0, end - DIGIT_GROUP_SIZE), end));
+  }
+  return `${groups.reverse().join(DIGIT_GROUP_SEPARATOR)}${fraction}`;
+}
+
+/**
+ * Renders a millisecond measurement as text, with its unit.
+ *
+ * The canonical duration text of the product (see {@link DURATION_DECIMALS}):
+ * the unit is chosen from the measured value — below 1 ms `µs`, below 1 000 ms
+ * `ms`, otherwise `s`, the boundary belonging to the larger unit — and kept
+ * even when rounding reaches the next unit's magnitude (`999.999` reads
+ * `1,000.00 ms`), exactly as the renderer does, so the unit never depends on
+ * the digits. An exact zero reads `0.00 ms`, in the canonical unit.
  *
  * The rounding runs through `@debuggen/shared`'s {@link roundMs} so a duration
  * reads the same here as it does in a stored event or a panel-data response,
@@ -345,15 +402,53 @@ function fitStatement(
  * `NaN`, `Infinity` or a negative duration. Locale-sensitive formatting is
  * forbidden throughout this module — no `toLocaleString`, no `Intl` — because
  * the output would then depend on the environment the service happens to run
- * in, and two runs of the same capture would disagree.
+ * in, and two runs of the same capture would disagree. A magnitude too large
+ * for fixed notation keeps JavaScript's own exponent form, which is still one
+ * finite, deterministic token.
  *
  * @param value A duration in milliseconds. Non-finite and negative values are
- * rendered as `0`.
- * @returns The rounded value as digits, with no unit and no separators.
+ * rendered as `0.00 ms`.
+ * @returns The rounded value, grouped with `,`, followed by a space and its
+ * unit — the whole duration phrase, so no frame appends a unit of its own.
+ * @example
+ * // formatDurationMs(0.4) === '400 µs'
+ * // formatDurationMs(22) === '22.00 ms'
+ * // formatDurationMs(1564.94) === '1.565 s'
+ * // formatDurationMs(44722.6) === '44.723 s'
  */
 export function formatDurationMs(value: number): string {
   const safe = Number.isFinite(value) ? clampNonNegative(value) : 0;
-  return String(roundMs(safe, DURATION_DECIMALS));
+  const unit = durationUnitOf(safe);
+  const decimals = DURATION_DECIMALS[unit];
+  const rounded = roundMs(durationMagnitude(safe, unit), decimals);
+  const digits =
+    Number.isFinite(rounded) && rounded < MAX_FIXED_MAGNITUDE
+      ? groupIntegerDigits(rounded.toFixed(decimals))
+      : String(durationMagnitude(safe, unit));
+  return `${digits} ${unit}`;
+}
+
+/**
+ * The unit a non-negative millisecond value reads in, chosen from the value
+ * itself: an exact zero in the canonical `ms`, below 1 ms in `µs`, below
+ * 1 000 ms in `ms`, and from 1 000 ms in `s`.
+ */
+function durationUnitOf(ms: number): DurationUnit {
+  if (ms === 0) {
+    return 'ms';
+  }
+  if (ms < 1) {
+    return 'µs';
+  }
+  return ms < MS_PER_SECOND ? 'ms' : 's';
+}
+
+/** A millisecond value expressed in `unit`. */
+function durationMagnitude(ms: number, unit: DurationUnit): number {
+  if (unit === 'µs') {
+    return ms * US_PER_MS;
+  }
+  return unit === 's' ? ms / MS_PER_SECOND : ms;
 }
 
 /**
@@ -543,7 +638,13 @@ function lookupNoun(
  *
  * The entries cover the classes of behaviour the product is built to
  * investigate: time spent in one interaction across tiers, work repeated more
- * often than the developer expected, and outright failures.
+ * often than the developer expected, and outright failures. Two vocabularies
+ * are worded: the symptom-level categories a context may carry, and the
+ * understanding categories `ProblemUnderstanding.category` is answered in —
+ * the value every later stage reads back — so a panel title or plan objective
+ * names the class of behaviour the understanding settled on. The
+ * understanding's `other` has no entry on purpose: it reads with
+ * {@link PROBLEM_CATEGORY_FALLBACK_LABEL}.
  */
 export type ProblemCategory =
   | 'slow-interaction'
@@ -553,7 +654,14 @@ export type ProblemCategory =
   | 'duplicate-requests'
   | 'unexpected-state'
   | 'blocked-main-thread'
-  | 'runtime-error';
+  | 'runtime-error'
+  | 'performance'
+  | 'rendering'
+  | 'network'
+  | 'data'
+  | 'state'
+  | 'error'
+  | 'correctness';
 
 /** Display wording per {@link ProblemCategory}, lower-case so a frame can embed or capitalise it. */
 export const PROBLEM_CATEGORY_LABELS: Readonly<Record<ProblemCategory, string>> = Object.freeze({
@@ -565,6 +673,13 @@ export const PROBLEM_CATEGORY_LABELS: Readonly<Record<ProblemCategory, string>> 
   'unexpected-state': 'unexpected state change',
   'blocked-main-thread': 'blocked main thread',
   'runtime-error': 'runtime error',
+  performance: 'latency',
+  rendering: 'render activity',
+  network: 'network requests',
+  data: 'database queries',
+  state: 'state changes',
+  error: 'runtime errors',
+  correctness: 'incorrect behaviour',
 });
 
 /**
@@ -753,13 +868,23 @@ export const CODE_SYMBOL_KIND_FALLBACK_LABEL = 'symbol';
  * | `unchanged-input-renders`   | {@link unchangedInputRenderCause}     |
  * | `dominant-span`             | {@link dominantSpanCause}             |
  * | `repeated-query-shape`      | {@link repeatedQueryShapeCause}       |
+ * | `context-change-renders`    | {@link contextChangeRenderCause}      |
+ *
+ * `context-change-renders` is the one pattern detected from trigger
+ * attribution rather than from a count alone: a project component whose renders
+ * mostly followed a changed consumed context value, named by the component
+ * that provides that context.
  *
  * The union exists so that adding a pattern in `./rules.ts` without a frame
  * here is a compile-time question rather than a runtime surprise, and so both
  * modules name the classes identically.
  */
 export type EvidencePattern =
-  'duplicate-requests' | 'unchanged-input-renders' | 'dominant-span' | 'repeated-query-shape';
+  | 'duplicate-requests'
+  | 'unchanged-input-renders'
+  | 'dominant-span'
+  | 'repeated-query-shape'
+  | 'context-change-renders';
 
 /**
  * Short display wording per {@link EvidencePattern}, for a caller that needs to
@@ -771,6 +896,7 @@ export const EVIDENCE_PATTERN_LABELS: Readonly<Record<EvidencePattern, string>> 
   'unchanged-input-renders': 'renders with unchanged inputs',
   'dominant-span': 'one operation covering most of the interaction',
   'repeated-query-shape': 'one statement repeated within an interaction',
+  'context-change-renders': 'renders following a changed context value',
 });
 
 /** Wording for an evidence pattern this module has no entry for. */
@@ -1104,7 +1230,7 @@ export function flowPathLabel(stepLabels: readonly string[]): string {
  * @param totalDurationMs The interaction's total, in milliseconds.
  * @returns One descriptive sentence.
  * @example
- * // slowestSpanFact('‹operation›', 640, 1175) === '‹operation› took 640 ms of the 1175 ms recorded for the interaction.'
+ * // slowestSpanFact('‹operation›', 640, 1175) === '‹operation› took 640.00 ms of the 1.175 s recorded for the interaction.'
  */
 export function slowestSpanFact(
   operationLabel: string,
@@ -1112,7 +1238,7 @@ export function slowestSpanFact(
   totalDurationMs: number,
 ): string {
   const operation = sanitizeLabel(operationLabel, UNNAMED_OPERATION_LABEL);
-  return `${operation} took ${formatDurationMs(durationMs)} ms of the ${formatDurationMs(totalDurationMs)} ms recorded for the interaction.`;
+  return `${operation} took ${formatDurationMs(durationMs)} of the ${formatDurationMs(totalDurationMs)} recorded for the interaction.`;
 }
 
 /**
@@ -1129,7 +1255,7 @@ export function tierTimeSplitFact(
   totalDurationMs: number,
 ): string {
   const tier = sanitizeLabel(tierLabel, TELEMETRY_TIER_FALLBACK_LABEL);
-  return `Time recorded in the ${tier} tier was ${formatDurationMs(elapsedMs)} ms of the ${formatDurationMs(totalDurationMs)} ms total.`;
+  return `Time recorded in the ${tier} tier was ${formatDurationMs(elapsedMs)} of the ${formatDurationMs(totalDurationMs)} total.`;
 }
 
 /**
@@ -1138,7 +1264,7 @@ export function tierTimeSplitFact(
  * The endpoint stays out of the frame's fixed text: `./rules.ts` interpolates
  * it from the capture, and when it has no label the sentence falls back to
  * {@link SAME_ENDPOINT_LABEL} — the generic shape `‹n› requests to the same
- * endpoint occurred within ‹window› ms`.
+ * endpoint occurred within ‹window›`, the window carrying its own unit.
  *
  * Grouping is by the pre-redaction request key of AAP §0.5.2, so this frame
  * counts byte-identical requests rather than requests that merely share a path.
@@ -1156,7 +1282,7 @@ export function duplicateRequestFact(
   endpointLabel?: string,
 ): string {
   const endpoint = optionalLabel(endpointLabel) ?? SAME_ENDPOINT_LABEL;
-  return `${countLabel(count, METRIC_COUNT_NOUNS.request_count)} to ${endpoint} occurred within ${formatDurationMs(windowMs)} ms.`;
+  return `${countLabel(count, METRIC_COUNT_NOUNS.request_count)} to ${endpoint} occurred within ${formatDurationMs(windowMs)}.`;
 }
 
 /**
@@ -1197,12 +1323,28 @@ export function renderCountFact(componentLabel: string, count: number): string {
  * **not** counted here; {@link unknownTriggerRenderFact} reports those
  * separately, which is the distinction the two metric ids exist to preserve.
  *
+ * When the counts are one component's, `componentLabel` names it — "… of
+ * 4 977 renders of ‹component› had …" — so the sentence says whose renders
+ * these were; without it the counts read as the whole capture's.
+ *
  * @param unchangedCount Renders that met all three conditions.
  * @param totalRenderCount Renders recorded in total.
+ * @param componentLabel The component the counts belong to, when they are one component's.
  * @returns One descriptive sentence.
  */
-export function unchangedInputRenderFact(unchangedCount: number, totalRenderCount: number): string {
-  return `${formatCount(unchangedCount)} of ${countLabel(totalRenderCount, METRIC_COUNT_NOUNS.render_count)} had shallow-equal props, unchanged own hook state and no changed consumed context value.`;
+export function unchangedInputRenderFact(
+  unchangedCount: number,
+  totalRenderCount: number,
+  componentLabel?: string,
+): string {
+  const counted = `${formatCount(unchangedCount)} of ${countLabel(totalRenderCount, METRIC_COUNT_NOUNS.render_count)}`;
+  const tail =
+    'had shallow-equal props, unchanged own hook state and no changed consumed context value.';
+  const component = componentLabel === undefined ? undefined : optionalLabel(componentLabel);
+  if (component === undefined) {
+    return `${counted} ${tail}`;
+  }
+  return fitStatement([component], (fit) => `${counted} of ${fit(component)} ${tail}`);
 }
 
 /**
@@ -1213,12 +1355,108 @@ export function unchangedInputRenderFact(unchangedCount: number, totalRenderCoun
  * evaluated, which is not the same as having evaluated all three and found
  * nothing changed. Describing these as unchanged would overstate the evidence.
  *
+ * `componentLabel` names the component the counts belong to, as in
+ * {@link unchangedInputRenderFact}.
+ *
  * @param unknownCount Renders whose trigger could not be determined.
  * @param totalRenderCount Renders recorded in total.
+ * @param componentLabel The component the counts belong to, when they are one component's.
  * @returns One descriptive sentence.
  */
-export function unknownTriggerRenderFact(unknownCount: number, totalRenderCount: number): string {
-  return `The trigger could not be determined for ${formatCount(unknownCount)} of ${countLabel(totalRenderCount, METRIC_COUNT_NOUNS.render_count)}.`;
+export function unknownTriggerRenderFact(
+  unknownCount: number,
+  totalRenderCount: number,
+  componentLabel?: string,
+): string {
+  const counted = `${formatCount(unknownCount)} of ${countLabel(totalRenderCount, METRIC_COUNT_NOUNS.render_count)}`;
+  const component = componentLabel === undefined ? undefined : optionalLabel(componentLabel);
+  if (component === undefined) {
+    return `The trigger could not be determined for ${counted}.`;
+  }
+  return fitStatement(
+    [component],
+    (fit) => `The trigger could not be determined for ${counted} of ${fit(component)}.`,
+  );
+}
+
+/**
+ * Most provider names {@link contextTriggeredRenderFact} lists. The first names
+ * are the providers behind most of the component's context renders, and a
+ * longer list would crowd the component's own name out of the sentence bound.
+ */
+export const CONTEXT_PROVIDER_LIST_MAX_ITEMS = 3;
+
+/** Conjunction joining the final pair of a list of alternatives, as in `‹a› or ‹b›`. */
+const ALTERNATIVE_CONJUNCTION = ' or ';
+
+/**
+ * Joins labels as alternatives — `‹a›`, `‹a› or ‹b›`, `‹a›, ‹b› or ‹c›` — in
+ * the order given. The caller has already cleaned and bounded every label.
+ *
+ * @param items The labels, at least one.
+ * @returns The joined list.
+ */
+function alternativesLabel(items: readonly string[]): string {
+  const last = items[items.length - 1];
+  if (items.length <= 1 || last === undefined) {
+    return items.join(LIST_SEPARATOR);
+  }
+  return `${items.slice(0, -1).join(LIST_SEPARATOR)}${ALTERNATIVE_CONJUNCTION}${last}`;
+}
+
+/**
+ * How many of one component's renders followed a change in a consumed context,
+ * and which components provide the contexts that changed.
+ *
+ * It restates the capture's trigger attribution and stops: every counted
+ * render was classified as context-triggered, and the providers are the ones
+ * the capture named for those renders, most frequent first. Several providers
+ * are joined as alternatives ("‹a› or ‹b›"), because each render followed a
+ * change in at least one of them rather than in all. Rendered through
+ * {@link fitStatement}, so long names are shortened rather than pushing the
+ * sentence past {@link STATEMENT_MAX_LENGTH}.
+ *
+ * @param componentLabel The consuming component. A blank value falls back to
+ * {@link UNNAMED_COMPONENT_LABEL}.
+ * @param contextCount Its renders triggered by a changed consumed context.
+ * @param totalRenderCount Its renders in total.
+ * @param providerLabels The components providing the contexts that changed,
+ * most frequent first. Blank entries are dropped, at most
+ * {@link CONTEXT_PROVIDER_LIST_MAX_ITEMS} are named, and an empty list leaves
+ * the context unnamed.
+ * @returns One descriptive sentence of at most {@link STATEMENT_MAX_LENGTH}
+ * characters.
+ * @example
+ * // contextTriggeredRenderFact('‹component›', 40, 42, ['‹provider›'])
+ * //   === '40 of 42 renders of ‹component› followed a change in the context provided by ‹provider›.'
+ */
+export function contextTriggeredRenderFact(
+  componentLabel: string,
+  contextCount: number,
+  totalRenderCount: number,
+  providerLabels: readonly string[] = [],
+): string {
+  const component = sanitizeLabel(componentLabel, UNNAMED_COMPONENT_LABEL);
+  const providers: string[] = [];
+  for (const label of providerLabels) {
+    const provider = optionalLabel(label);
+    if (provider !== undefined && !providers.includes(provider)) {
+      providers.push(provider);
+    }
+    if (providers.length >= CONTEXT_PROVIDER_LIST_MAX_ITEMS) {
+      break;
+    }
+  }
+  const counted = `${formatCount(contextCount)} of ${countLabel(totalRenderCount, METRIC_COUNT_NOUNS.render_count)}`;
+  return fitStatement([component, ...providers], (fit) => {
+    let context = 'a consumed context value';
+    if (providers.length === 1) {
+      context = `the context provided by ${alternativesLabel(providers.map(fit))}`;
+    } else if (providers.length > 1) {
+      context = `a context provided by ${alternativesLabel(providers.map(fit))}`;
+    }
+    return `${counted} of ${fit(component)} followed a change in ${context}.`;
+  });
 }
 
 /**
@@ -1251,7 +1489,7 @@ export function longTaskFact(count: number, longestDurationMs?: number): string 
   if (longestDurationMs === undefined) {
     return `The capture recorded ${counted} during the interaction.`;
   }
-  return `The capture recorded ${counted} during the interaction, the longest lasting ${formatDurationMs(longestDurationMs)} ms.`;
+  return `The capture recorded ${counted} during the interaction, the longest lasting ${formatDurationMs(longestDurationMs)}.`;
 }
 
 /**
@@ -1302,7 +1540,7 @@ export function duplicateRequestCause(
   return fitStatement(
     [callSite],
     (fit) =>
-      `Repeated identical requests from a single call site — ${counted} from ${fit(callSite)} within ${formatDurationMs(windowMs)} ms — match the pattern of an effect that re-runs after each render, which is what happens when a value in its dependency list is rebuilt on every render instead of being reused.`,
+      `Repeated identical requests from a single call site — ${counted} from ${fit(callSite)} within ${formatDurationMs(windowMs)} — match the pattern of an effect that re-runs after each render, which is what happens when a value in its dependency list is rebuilt on every render instead of being reused.`,
   );
 }
 
@@ -1362,7 +1600,7 @@ export function dominantSpanCause(
   return fitStatement(tier === undefined ? [operation] : [operation, tier], (fit) => {
     const subject =
       tier === undefined ? fit(operation) : `${fit(operation)}, recorded in the ${fit(tier)} tier,`;
-    return `One operation covers most of the interaction: ${subject} accounts for ${formatDurationMs(durationMs)} ms of the ${formatDurationMs(totalDurationMs)} ms total, which concentrates the measured time in a single step rather than spreading it across the tiers the trace spans.`;
+    return `One operation covers most of the interaction: ${subject} accounts for ${formatDurationMs(durationMs)} of the ${formatDurationMs(totalDurationMs)} total, which concentrates the measured time in a single step rather than spreading it across the tiers the trace spans.`;
   });
 }
 
@@ -1391,6 +1629,61 @@ export function repeatedQueryShapeCause(
   });
 }
 
+/**
+ * The standard explanation for a component re-rendered by a changing context.
+ *
+ * A consumer re-renders whenever the value its provider passes changes
+ * identity, memoised or not, so a provider that builds a new value object on
+ * each of its renders re-renders every consumer each time it renders — and it
+ * renders whenever what it depends on changes. The frame names the three
+ * places a developer walks: the consumer whose renders were counted, the
+ * provider whose value changed (where that value is built) and, when the
+ * capture traced it, the component whose own state updates the provider
+ * follows. `./rules.ts` derives all three from the capture's trigger
+ * attribution; none is inferred from a name.
+ *
+ * @param consumerLabel The component whose context-triggered renders were
+ * counted. A blank value falls back to {@link UNNAMED_COMPONENT_LABEL}.
+ * @param contextCount How many of its renders followed a context change.
+ * @param providerLabel The component providing the context that changed, when
+ * the capture named it. A blank value is treated as absent and leaves the
+ * context unnamed.
+ * @param originLabel The component whose state updates the provider's renders
+ * trace back to, when the capture traced them. A blank value, or one equal to
+ * `providerLabel`, is treated as absent.
+ * @returns One sentence suitable for a hypothesis `statement`, at most
+ * {@link STATEMENT_MAX_LENGTH} characters.
+ * @example
+ * // contextChangeRenderCause('‹consumer›', 40, '‹provider›', '‹origin›')
+ */
+export function contextChangeRenderCause(
+  consumerLabel: string,
+  contextCount: number,
+  providerLabel?: string,
+  originLabel?: string,
+): string {
+  const consumer = sanitizeLabel(consumerLabel, UNNAMED_COMPONENT_LABEL);
+  const provider = optionalLabel(providerLabel);
+  const named = optionalLabel(originLabel);
+  const origin = named === undefined || named === provider ? undefined : named;
+  const counted = countLabel(contextCount, METRIC_COUNT_NOUNS.render_count);
+  const labels = [consumer];
+  if (provider !== undefined) {
+    labels.push(provider);
+  }
+  if (origin !== undefined) {
+    labels.push(origin);
+  }
+  return fitStatement(labels, (fit) => {
+    const change =
+      provider === undefined
+        ? 'a change in a consumed context value'
+        : `a new value from the context of ${fit(provider)}`;
+    const upstream = origin === undefined ? '' : `, driven by state updates in ${fit(origin)}`;
+    return `Renders after a context change — ${counted} of ${fit(consumer)} followed ${change}${upstream} — match a provider that builds a new value on each render, which re-renders all its consumers, memoised or not.`;
+  });
+}
+
 /* -------------------------------------------------------------------------------------------------
  * panel frames
  * ---------------------------------------------------------------------------------------------- */
@@ -1416,6 +1709,9 @@ export function panelTitle(categoryLabel: string, targetLabel?: string): string 
   return target === undefined ? category : `${category} — ${target}`;
 }
 
+/** The most silent tiers a headline names: there are three tiers. */
+const SILENT_TIER_MAX_ITEMS = 3;
+
 /**
  * The panel's summary headline.
  *
@@ -1430,27 +1726,49 @@ export function panelTitle(categoryLabel: string, targetLabel?: string): string 
  * {@link NO_MEASURED_ACTIVITY_LABEL}; more counts than {@link LIST_MAX_ITEMS}
  * are summarised by {@link joinWithConjunction} rather than listed in full.
  *
+ * A panel composed to show where time went across the browser, server and
+ * database tiers draws nothing for a tier that recorded no telemetry, and a
+ * missing lane or row reads as an oversight unless the headline says why. The
+ * silent tiers, when the caller names them, are therefore stated in a second
+ * sentence — a statement about what the capture *lacks*, which needs no
+ * citation either.
+ *
  * @param counts One entry per metric the capture reported, in the order they
  * should read, each pairing a value with the noun {@link metricCountNoun}
  * supplies.
  * @param totalDurationMs The span of the capture or interaction in
  * milliseconds, when one was measured. Omitted leaves the sentence at the
  * counts alone.
- * @returns One descriptive sentence.
+ * @param silentTierLabels Wording from {@link telemetryTierLabel} for each tier
+ * the panel's views cover but the capture recorded nothing in, in tier order.
+ * Omitted or empty adds no second sentence.
+ * @returns One or two descriptive sentences.
  * @example
  * // panelSummaryHeadline([{ count: 4, noun: metricCountNoun('request_count') }], 1175)
- * //   === 'The capture recorded 4 requests across 1175 ms.'
+ * //   === 'The capture recorded 4 requests across 1.175 s.'
+ * // panelSummaryHeadline([{ count: 4, noun: metricCountNoun('request_count') }], 1175, ['database'])
+ * //   === 'The capture recorded 4 requests across 1.175 s. No database telemetry was recorded, so the views show no work in that tier.'
  */
 export function panelSummaryHeadline(
   counts: readonly CountedNoun[],
   totalDurationMs?: number,
+  silentTierLabels: readonly string[] = [],
 ): string {
   const rendered = counts.map((entry) => countLabel(entry.count, entry.noun));
   const list = joinWithConjunction(rendered, NO_MEASURED_ACTIVITY_LABEL);
-  if (totalDurationMs === undefined) {
-    return `The capture recorded ${list}.`;
+  const counted =
+    totalDurationMs === undefined
+      ? `The capture recorded ${list}.`
+      : `The capture recorded ${list} across ${formatDurationMs(totalDurationMs)}.`;
+  const silent = silentTierLabels
+    .slice(0, SILENT_TIER_MAX_ITEMS)
+    .map((label) => sanitizeLabel(label, TELEMETRY_TIER_FALLBACK_LABEL));
+  if (silent.length === 0) {
+    return counted;
   }
-  return `The capture recorded ${list} across ${formatDurationMs(totalDurationMs)} ms.`;
+  const tiers = alternativesLabel(silent);
+  const referent = silent.length === 1 ? 'that tier' : 'those tiers';
+  return `${counted} No ${tiers} telemetry was recorded, so the views show no work in ${referent}.`;
 }
 
 /**

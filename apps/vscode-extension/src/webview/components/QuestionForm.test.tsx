@@ -10,10 +10,16 @@
  *     each `seq` is applied exactly once, and an outcome present at mount is
  *     not applied;
  *   - refusal of an empty or whitespace-only draft, by the button and by the
- *     keyboard chord alike, without an error;
+ *     keyboard chord alike, the chord marking the field invalid with a short
+ *     message that clears once the draft holds text;
+ *   - the protocol's question limit on the field: native `maxLength`, a paste
+ *     cut off at it, and a counter that describes the field (not a live
+ *     region) and warns once the limit is reached;
  *   - the three states of AAP 0.5.5 and their precedence (error > pending >
  *     unavailable > data), each rendered through its design-system primitive
- *     and never as a blank area;
+ *     and never as a blank area — pending keeps the labelled field on screen,
+ *     read-only with the submitted draft, beside a disabled submit control and
+ *     one visible busy status, and keeps or returns keyboard focus to the field;
  *   - the inert form while `disabled`, and the draft surviving a round trip
  *     through `disabled`, `pending` and `error`;
  *   - the design-system shape: a labelled multi-line field, no `<form>`, every
@@ -32,8 +38,10 @@
  */
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { MAX_WEBVIEW_QUESTION_LENGTH } from '../../webview-messages';
 import type { SubmissionOutcome } from '../pending-actions';
 
 import { QuestionForm } from './QuestionForm';
@@ -43,6 +51,34 @@ const SUBMIT_NAME = 'Ask question';
 const UNAVAILABLE_TEXT = 'Start the local service to begin a session.';
 const RETRY_HINT_TEXT =
   'Your question was not confirmed, so it is kept here. Press “Ask question” to try again.';
+const BLANK_DRAFT_TEXT = 'Type a question before asking.';
+const LIMIT_REACHED_TEXT = 'Limit reached: longer text is cut off.';
+const OVER_LIMIT_TEXT = 'Over the limit: shorten it to ask.';
+/** The visible busy line while a question is in flight. */
+const PENDING_TEXT = 'Submitting your question…';
+
+/** Formats a count as the counter does, in the test run's own locale. */
+const COUNT_FORMAT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+
+/** The counter's text for a draft of `length` characters below the limit. */
+function counterFor(length: number): string {
+  return `${COUNT_FORMAT.format(length)} / ${COUNT_FORMAT.format(MAX_WEBVIEW_QUESTION_LENGTH)} characters`;
+}
+
+/** The element the field names first in `aria-describedby`: the counter. */
+function getCounter(field: HTMLElement): HTMLElement {
+  const [firstId] = (field.getAttribute('aria-describedby') ?? '').split(' ');
+  const counter = firstId === undefined ? null : document.getElementById(firstId);
+  if (counter === null) {
+    throw new Error('expected the field to be described by its counter');
+  }
+  return counter;
+}
+
+/** The blank-draft validation message, when it is on display. */
+function queryBlankMessage(): HTMLElement | null {
+  return screen.queryByText(BLANK_DRAFT_TEXT);
+}
 
 /** An outcome for the submission numbered `seq`. */
 function outcome(seq: number, status: SubmissionOutcome['status']): SubmissionOutcome {
@@ -354,6 +390,141 @@ describe('QuestionForm — submission', () => {
   });
 });
 
+describe('QuestionForm — the question limit', () => {
+  it('bounds the field natively by the protocol question limit', () => {
+    render(<QuestionForm onSubmit={vi.fn()} />);
+
+    expect(MAX_WEBVIEW_QUESTION_LENGTH).toBe(2000);
+    expect(getField().maxLength).toBe(MAX_WEBVIEW_QUESTION_LENGTH);
+  });
+
+  it('counts the draft in a counter that describes the field and is not a live region', () => {
+    render(<QuestionForm onSubmit={vi.fn()} />);
+
+    const counter = getCounter(getField());
+    expect(counter.textContent).toBe(counterFor(0));
+    // Announced with the field when it takes focus, never once per keystroke.
+    expect(counter.getAttribute('aria-live')).toBeNull();
+    expect(counter.getAttribute('role')).toBeNull();
+    expect(counter.classList.contains('dg-text--xs')).toBe(true);
+
+    typeDraft('q'.repeat(1234));
+
+    expect(getCounter(getField()).textContent).toBe(counterFor(1234));
+    expect(getCounter(getField()).classList.contains('dg-text--warning')).toBe(false);
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('warns once the draft reaches the limit, without refusing it', () => {
+    render(<QuestionForm onSubmit={vi.fn()} />);
+
+    typeDraft('q'.repeat(MAX_WEBVIEW_QUESTION_LENGTH));
+
+    const counter = getCounter(getField());
+    expect(counter.textContent).toBe(
+      `${counterFor(MAX_WEBVIEW_QUESTION_LENGTH)}. ${LIMIT_REACHED_TEXT}`,
+    );
+    expect(counter.classList.contains('dg-text--warning')).toBe(true);
+    // A question of exactly the limit is valid, so the field is not marked invalid.
+    expect(getField().getAttribute('aria-invalid')).toBeNull();
+    expect(getSubmit().disabled).toBe(false);
+
+    typeDraft('q'.repeat(MAX_WEBVIEW_QUESTION_LENGTH - 1));
+    expect(getCounter(getField()).classList.contains('dg-text--warning')).toBe(false);
+    expect(screen.queryByText(LIMIT_REACHED_TEXT, { exact: false })).toBeNull();
+  });
+
+  it('cuts a longer paste off at the limit, says why, and asks exactly what the field holds', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    render(<QuestionForm onSubmit={onSubmit} />);
+
+    await user.click(getField());
+    await user.paste('q'.repeat(20_000));
+
+    expect(getField().value).toHaveLength(MAX_WEBVIEW_QUESTION_LENGTH);
+    expect(getCounter(getField()).textContent).toContain(LIMIT_REACHED_TEXT);
+
+    await user.click(getSubmit());
+    expect(onSubmit.mock.calls).toEqual([['q'.repeat(MAX_WEBVIEW_QUESTION_LENGTH)]]);
+  });
+
+  it('says a draft written past the limit is over it, not cut off', () => {
+    render(<QuestionForm onSubmit={vi.fn()} />);
+
+    // `maxLength` constrains only the developer's own edits; a value set some other way can
+    // exceed it, and the counter must not claim the text was cut off.
+    typeDraft('q'.repeat(MAX_WEBVIEW_QUESTION_LENGTH + 10));
+
+    const counter = getCounter(getField());
+    expect(counter.textContent).toBe(
+      `${counterFor(MAX_WEBVIEW_QUESTION_LENGTH + 10)}. ${OVER_LIMIT_TEXT}`,
+    );
+    expect(counter.textContent).not.toContain(LIMIT_REACHED_TEXT);
+    expect(counter.classList.contains('dg-text--warning')).toBe(true);
+  });
+});
+
+describe('QuestionForm — blank drafts', () => {
+  it('marks a blank draft submitted by the chord invalid, and clears the mark once it holds text', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    render(<QuestionForm onSubmit={onSubmit} />);
+    expect(queryBlankMessage()).toBeNull();
+
+    await user.click(getField());
+    await user.keyboard('{Control>}{Enter}{/Control}');
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    const message = queryBlankMessage();
+    expect(message).not.toBeNull();
+    expect(getField().getAttribute('aria-invalid')).toBe('true');
+    const describedBy = (getField().getAttribute('aria-describedby') ?? '').split(' ');
+    expect(describedBy).toContain(message?.id);
+    // The message is guidance on the field, not an alert, and focus stays in it.
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(document.activeElement).toBe(getField());
+
+    await user.keyboard('W');
+    expect(queryBlankMessage()).toBeNull();
+    expect(getField().getAttribute('aria-invalid')).toBeNull();
+
+    // Emptying the field again does not bring the message back unprompted.
+    await user.keyboard('{Backspace}');
+    expect(getField().value).toBe('');
+    expect(queryBlankMessage()).toBeNull();
+  });
+
+  it('marks a whitespace-only draft submitted with Cmd+Enter invalid, then asks once text is added', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    render(<QuestionForm onSubmit={onSubmit} />);
+
+    await user.type(getField(), '   ');
+    await user.keyboard('{Meta>}{Enter}{/Meta}');
+    expect(queryBlankMessage()).not.toBeNull();
+    expect(getField().value).toBe('   ');
+
+    await user.keyboard('Where is the time spent?');
+    expect(queryBlankMessage()).toBeNull();
+    await user.keyboard('{Meta>}{Enter}{/Meta}');
+
+    expect(onSubmit.mock.calls).toEqual([['Where is the time spent?']]);
+    expect(queryBlankMessage()).toBeNull();
+  });
+
+  it('shows no blank-draft message while the form is inert', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    render(<QuestionForm onSubmit={onSubmit} disabled />);
+
+    fireEvent.keyDown(getField(), { key: 'Enter', ctrlKey: true });
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(queryBlankMessage()).toBeNull();
+    expect(getField().getAttribute('aria-invalid')).toBeNull();
+  });
+});
+
 describe('QuestionForm — submission outcome', () => {
   it('clears the draft once the submission is accepted', () => {
     const onSubmit = vi.fn<(question: string) => void>();
@@ -362,7 +533,9 @@ describe('QuestionForm — submission outcome', () => {
     typeDraft('Why does the second step wait?');
     fireEvent.click(getSubmit());
     rerender(<QuestionForm onSubmit={onSubmit} pending />);
-    expect(screen.queryByRole('textbox')).toBeNull();
+    // In flight: the submitted text stays on screen, read-only.
+    expect(getField().value).toBe('Why does the second step wait?');
+    expect(getField().readOnly).toBe(true);
 
     rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'accepted')} />);
 
@@ -509,15 +682,129 @@ describe('QuestionForm — disabled', () => {
 });
 
 describe('QuestionForm — pending', () => {
-  it('replaces the field and its controls with a loading state', () => {
-    render(<QuestionForm onSubmit={vi.fn()} pending />);
+  it('keeps the field on screen, read-only with the draft, beside a disabled submit and a visible busy status', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { container, rerender } = render(<QuestionForm onSubmit={onSubmit} />);
 
-    const status = screen.getByRole('status');
-    expect(status.getAttribute('aria-busy')).toBe('true');
-    expect(status.textContent).toContain('Submitting your question');
+    typeDraft('Why does the second step wait?');
+    rerender(<QuestionForm onSubmit={onSubmit} pending />);
 
-    expect(screen.queryByRole('textbox')).toBeNull();
-    expect(screen.queryByRole('button', { name: SUBMIT_NAME })).toBeNull();
+    // Not a textless skeleton: the labelled field still shows what was asked.
+    const field = getField();
+    expect(field.value).toBe('Why does the second step wait?');
+    expect(field.readOnly).toBe(true);
+    expect(field.disabled).toBe(false);
+    expect(field.maxLength).toBe(MAX_WEBVIEW_QUESTION_LENGTH);
+    const label = container.querySelector(`label[for="${field.id}"]`);
+    expect(label?.textContent).toBe(FIELD_NAME);
+    expect(label?.classList.contains('dg-visually-hidden')).toBe(false);
+    expect(getSubmit().disabled).toBe(true);
+
+    // One visible, announced busy line — no second, hidden announcement of it.
+    const statuses = screen.getAllByRole('status');
+    expect(statuses).toHaveLength(1);
+    const [status] = statuses;
+    expect(status?.textContent).toBe(PENDING_TEXT);
+    expect(status?.closest('.dg-visually-hidden')).toBeNull();
+    expect(container.querySelector('.dg-loading-state')).toBeNull();
+
+    // It takes the shortcut hint's place, in the layout and in the field's description.
+    expect(screen.queryByText('to ask', { exact: false })).toBeNull();
+    const describedBy = (field.getAttribute('aria-describedby') ?? '').split(' ');
+    expect(describedBy).toContain(status?.id);
+    expect(describedBy.every((id) => document.getElementById(id) !== null)).toBe(true);
+  });
+
+  it('never submits while pending, by the button or the chord, and shows no blank-draft message', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} pending />);
+
+    // Blank and pending: the chord is inert, not a validation failure.
+    fireEvent.keyDown(getField(), { key: 'Enter', ctrlKey: true });
+    expect(queryBlankMessage()).toBeNull();
+    expect(getField().getAttribute('aria-invalid')).toBeNull();
+
+    rerender(<QuestionForm onSubmit={onSubmit} />);
+    typeDraft('Submitted once');
+    rerender(<QuestionForm onSubmit={onSubmit} pending />);
+    fireEvent.click(getSubmit());
+    fireEvent.keyDown(getField(), { key: 'Enter', ctrlKey: true });
+    fireEvent.keyDown(getField(), { key: 'Enter', metaKey: true });
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(getField().value).toBe('Submitted once');
+  });
+
+  it('keeps focus in the field through a Ctrl+Enter submission and its outcome', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    await user.click(getField());
+    await user.keyboard('Why does the second step wait?');
+    await user.keyboard('{Control>}{Enter}{/Control}');
+    expect(onSubmit.mock.calls).toEqual([['Why does the second step wait?']]);
+
+    rerender(<QuestionForm onSubmit={onSubmit} pending />);
+    expect(document.activeElement).toBe(getField());
+    expect(getField().readOnly).toBe(true);
+
+    // Failed: the field becomes editable again under the caret, with the draft.
+    rerender(<QuestionForm onSubmit={onSubmit} submission={outcome(1, 'failed')} />);
+    expect(document.activeElement).toBe(getField());
+    expect(getField().readOnly).toBe(false);
+    expect(getField().value).toBe('Why does the second step wait?');
+  });
+
+  it('returns focus to the field when the pending state disables the focused submit control', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    await user.type(getField(), 'Which step took the longest?');
+    await user.click(getSubmit());
+    expect(document.activeElement).toBe(getSubmit());
+
+    rerender(<QuestionForm onSubmit={onSubmit} pending />);
+
+    expect(getSubmit().disabled).toBe(true);
+    expect(document.activeElement).toBe(getField());
+  });
+
+  it('leaves focus the developer moved elsewhere where it is', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    const view = (pending: boolean): ReactElement => (
+      <>
+        <button type="button">Elsewhere</button>
+        <QuestionForm onSubmit={onSubmit} pending={pending} />
+      </>
+    );
+    const { rerender } = render(view(false));
+
+    await user.type(getField(), 'Which step took the longest?');
+    await user.click(getSubmit());
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    elsewhere.focus();
+    rerender(view(true));
+
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
+  it('stays read-only rather than disabled when the form is disabled mid-request', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    await user.click(getField());
+    await user.keyboard('Why does the second step wait?{Control>}{Enter}{/Control}');
+    // The new session's snapshot marks the form disabled before the request's own result.
+    rerender(<QuestionForm onSubmit={onSubmit} pending disabled />);
+
+    expect(getField().disabled).toBe(false);
+    expect(getField().readOnly).toBe(true);
+    expect(document.activeElement).toBe(getField());
+    expect(screen.getByRole('status').textContent).toBe(PENDING_TEXT);
   });
 
   it('keeps the draft across the pending state and never submits during it', () => {
@@ -608,8 +895,79 @@ describe('QuestionForm — state precedence', () => {
   it('shows pending before unavailable', () => {
     render(<QuestionForm onSubmit={vi.fn()} pending unavailable />);
 
-    expect(screen.getByRole('status').getAttribute('aria-busy')).toBe('true');
+    expect(screen.getByRole('status').textContent).toBe(PENDING_TEXT);
+    expect(getField().readOnly).toBe(true);
     expect(screen.queryByText(UNAVAILABLE_TEXT)).toBeNull();
+  });
+});
+
+describe('QuestionForm — the active session’s question', () => {
+  const LABEL = 'This session’s question';
+  const QUESTION = 'Why does the second step wait?\nIt waits after every click.';
+
+  /** The paragraph holding the session question, found by its shared class. */
+  function questionText(container: HTMLElement): HTMLElement | null {
+    return container.querySelector<HTMLElement>('.dgv-asked__text');
+  }
+
+  it('shows the question verbatim under its label, above the field', () => {
+    const { container } = render(<QuestionForm onSubmit={vi.fn()} currentQuestion={QUESTION} />);
+
+    const label = screen.getByText(LABEL);
+    const text = questionText(container);
+    expect(text?.tagName).toBe('P');
+    // Byte for byte, line break included.
+    expect(text?.textContent).toBe(QUESTION);
+    // Label first, then the question, then the field.
+    expect(label.compareDocumentPosition(text as Node) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(
+      (text as Node).compareDocumentPosition(getField()) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    // Display only: the field stays empty and nothing is submitted.
+    expect(getField().value).toBe('');
+    expect(getSubmit().disabled).toBe(true);
+  });
+
+  it.each([
+    ['disabled', { disabled: true }],
+    ['pending', { pending: true }],
+    ['unavailable', { unavailable: true }],
+    ['error', { error: 'Stage failed.', onRetry: vi.fn() }],
+  ])('keeps the question on screen while the form is %s', (_label, props) => {
+    const { container } = render(
+      <QuestionForm onSubmit={vi.fn()} currentQuestion={QUESTION} {...props} />,
+    );
+
+    expect(screen.getByText(LABEL)).toBeTruthy();
+    expect(questionText(container)?.textContent).toBe(QUESTION);
+    expect(container.firstElementChild?.classList.contains('dgv-question-form')).toBe(true);
+  });
+
+  it.each([
+    ['absent', undefined],
+    ['empty', ''],
+    ['blank', '   \n  '],
+  ])('shows no question and no label when it is %s', (_label, currentQuestion) => {
+    const { container } = render(
+      <QuestionForm onSubmit={vi.fn()} currentQuestion={currentQuestion} />,
+    );
+
+    expect(screen.queryByText(LABEL)).toBeNull();
+    expect(questionText(container)).toBeNull();
+  });
+
+  it('keeps the draft when the question arrives and never submits it', () => {
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    typeDraft('A draft typed before the session started');
+    rerender(<QuestionForm onSubmit={onSubmit} currentQuestion={QUESTION} />);
+
+    expect(getField().value).toBe('A draft typed before the session started');
+    fireEvent.click(getSubmit());
+    expect(onSubmit.mock.calls).toEqual([['A draft typed before the session started']]);
   });
 });
 

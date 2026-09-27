@@ -395,13 +395,15 @@ export function OrderHistoryList({
         /*
          * `.empty` is placement - it centres the block and gives it its block margin - so it goes
          * on a wrapper rather than on `BlankSlate`, whose own module owns the column the
-         * illustration, heading, sentence and control are stacked in.
+         * illustration, heading, sentence and control are stacked in. Its heading is an `<h3>`
+         * because it sits inside this section, whose own `<h2>` is the level above it.
          */
         <div className={styles.empty}>
           <BlankSlate
             art="empty-orders"
             alt={EMPTY_ART_ALT}
             heading={emptyHeading}
+            headingAs="h3"
             action={emptyAction}
           >
             {emptyBody}

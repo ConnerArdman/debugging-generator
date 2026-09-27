@@ -108,6 +108,7 @@ import { subsystemLogger } from '../../logging.js';
 import {
   AUTH_FAILURE_REASONS,
   OPERATION_ROLES,
+  PAIRING_LOCKOUT_MS,
   authErrorResponse,
   authFailureReasonOf,
   requireRole,
@@ -199,6 +200,24 @@ const CACHE_CONTROL_HEADER = 'cache-control';
 
 /** The {@link CACHE_CONTROL_HEADER} value on every pairing response. */
 const NO_STORE = 'no-store';
+
+/**
+ * The response header a rate-limited client reads its wait from, in seconds
+ * (RFC 9110 §10.2.3). Set on a lockout refusal only.
+ */
+const RETRY_AFTER_HEADER = 'retry-after';
+
+/** The `../auth.ts` verdict of a redemption refused while pairing is locked. */
+const PAIRING_LOCKED_REASON = 'pairing-locked' satisfies AuthFailureReason;
+
+/**
+ * The {@link RETRY_AFTER_HEADER} value of a lockout refusal: the whole lockout
+ * in seconds, rounded up. The access boundary does not expose how much of the
+ * lock is left, so this is its bound — an attempt inside the lock never waits
+ * longer, and one made after waiting this long is judged afresh. The refusal's
+ * message states the same bound in words, for the developer reading it.
+ */
+const PAIRING_RETRY_AFTER_SECONDS = String(Math.ceil(PAIRING_LOCKOUT_MS / 1000));
 
 /** The log subsystem binding of this module's records. */
 const LOG_SUBSYSTEM = 'server.pair';
@@ -566,7 +585,7 @@ function answerResponseDrift(c: Context<ServerEnv>): Response {
  * | credential retired or expired while the body was read | `401` (`unknown-credential` / `expired-credential` / `corrupt-credential`) | — |
  * | origin not `chrome-extension://<id>` | — | `403` (auth.ts's verdict) |
  * | wrong, used or expired code | — | `401` uniform `PAIRING_INVALID` |
- * | lockout | — | `429` `RATE_LIMITED` |
+ * | lockout | — | `429` `RATE_LIMITED`, `Retry-After` the lockout's seconds |
  * | store / random-source / revocation-fence / drift failure | `500` fixed message | `500` fixed message |
  *
  * @param deps The access boundary's pairing operations and revocation fence,
@@ -710,11 +729,13 @@ export function createPairRoutes(deps: PairRoutesDeps): PairRouteHandlers {
       origin: c.req.header(ORIGIN_HEADER),
     });
     if (isErr(redeemed)) {
-      return answerAccessBoundaryError(
-        c,
-        normalizePairingRefusal(redeemed.error),
-        PAIRING_COMPLETE_UNAVAILABLE_MESSAGE,
-      );
+      const refusal = normalizePairingRefusal(redeemed.error);
+      // A lockout tells the client how long to wait, as HTTP says a 429 may;
+      // every other refusal is final for the code presented, so it gets none.
+      if (authFailureReasonOf(refusal) === PAIRING_LOCKED_REASON) {
+        c.header(RETRY_AFTER_HEADER, PAIRING_RETRY_AFTER_SECONDS);
+      }
+      return answerAccessBoundaryError(c, refusal, PAIRING_COMPLETE_UNAVAILABLE_MESSAGE);
     }
 
     // The token and the read proof issued with it travel from here into the

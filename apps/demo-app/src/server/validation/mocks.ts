@@ -40,7 +40,7 @@
 
 import { z } from 'zod';
 
-import { MAX_SHIPMENT_UNITS } from '@/lib/types';
+import { MAX_PAYMENT_CENTS, MAX_SHIPMENT_UNITS } from '@/lib/types';
 
 /**
  * The highest code point counted as a control character, and the delete character that sits above
@@ -163,9 +163,10 @@ export const carrierMockBodySchema = z.object({
    * shipment, so an implausible count is refused before a quote is built around it.
    *
    * The figure is {@link MAX_SHIPMENT_UNITS}, read from `@/lib/types` rather than written again
-   * here, and it is the only rule this module shares with anything: the storefront's own ceiling
-   * exists *because* a carrier rates at most this many pieces at once, and the browser holds to
-   * the same number before it asks for a quote at all. One number in one place is what keeps a
+   * here, and it is one of the two rules this module shares with anything - the payment ceiling
+   * below is the other. The storefront's own ceiling exists *because* a carrier rates at most this
+   * many pieces at once, and the browser holds to the same number before it asks for a quote at
+   * all. One number in one place is what keeps a
    * cart the checkout accepted from being a shipment this provider then refuses. The postal-code
    * and service-code patterns below stay this module's own, for the reason the header gives: a
    * shape belongs to the surface a value arrives on.
@@ -221,11 +222,16 @@ export const paymentMockBodySchema = z.object({
    *
    * Zero is accepted: authorizing nothing is how an instrument is checked without being charged.
    * A negative amount is not — a refund is not an authorization — and neither is a fractional one,
-   * which is a dollar figure that was never converted. The ceiling sits far above any order this
-   * catalog produces and exists so that a figure computed wrongly upstream is refused here
-   * instead of becoming an approval.
+   * which is a dollar figure that was never converted. The ceiling is the most this provider
+   * authorizes in one payment, so a figure above it — an order that large, or one computed wrongly
+   * upstream — is refused here instead of becoming an approval.
+   *
+   * The figure is {@link MAX_PAYMENT_CENTS}, read from `@/lib/types` rather than written again
+   * here, for the reason {@link MAX_SHIPMENT_UNITS} is: the payment service refuses a larger
+   * amount itself before calling this endpoint, and the checkout form names the same figure to a
+   * buyer, so the three agree because they read one number.
    */
-  amountCents: z.number().int().min(0).max(100_000_000),
+  amountCents: z.number().int().min(0).max(MAX_PAYMENT_CENTS),
 
   /**
    * Which currency the amount is counted in, as its three-letter code.

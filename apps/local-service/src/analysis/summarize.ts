@@ -19,6 +19,13 @@
  *   is held under `maxTotalBytes` by {@link applyByteBudget}, which trims or
  *   drops sections in the fixed order of {@link BYTE_BUDGET_STEPS} — never
  *   silently.
+ * - **The events the panel data aggregates (AAP 0.8.4).** Every aggregate,
+ *   metric and window is computed over the capture's events up to one bound
+ *   shared with `../panels/data.ts` by construction
+ *   ({@link ANALYSIS_INPUT_LIMITS}), read by one store scan, so a fact the
+ *   analysis cites carries the count the panel shows beside it; a capture
+ *   above the bound is analysed over its first events and says so in
+ *   `capture.eventsTruncated` and `truncated.sections`.
  * - **Built from already-redacted, persisted evidence (AAP 0.5.2).** Events are
  *   read only through the injected telemetry port, i.e. from the store, which
  *   the ingest path fills exclusively through the redactor. Provenance is that
@@ -45,7 +52,9 @@
  *   ordered because of its wording.
  * - **Result-typed, injected, deterministic.** Store ports, correlator, code
  *   queries, logger and clock arrive by injection; nothing reads the
- *   environment, the filesystem, the network or a timer. Every expected failure
+ *   environment, the filesystem, the network or a timer (the assembly only
+ *   yields to the event loop between its heavy synchronous steps, which orders
+ *   nothing it computes). Every expected failure
  *   is an `Err` carrying a {@link DebuggenError} whose message, hint and details
  *   hold only codes, counts, ids and project-relative paths. Identical inputs
  *   yield byte-identical JSON, and no caller array or repository row is mutated.
@@ -65,6 +74,8 @@
  *
  * @module
  */
+
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 
 import {
   DebuggenError,
@@ -88,7 +99,6 @@ import {
   buildDependencyGraph,
   buildTimeline,
   computeCaptureSummary,
-  computeMetrics,
   correlateEvents,
   findDeniedRules,
   flattenTrace,
@@ -106,6 +116,7 @@ import {
   type MetricId,
   type MetricValue,
   type QueryGroup,
+  type RenderOccurrence,
   type RenderPhase,
   type RenderStat,
   type RenderTrigger,
@@ -138,6 +149,7 @@ import {
   type ExcerptOptions,
 } from '@debuggen/code-analysis';
 import type { JsonObject } from '@debuggen/model-provider';
+import { MAX_AGGREGATE_INPUT_EVENTS } from '../panels/data.js';
 import type { TelemetryRepo } from '../store/telemetry-repo.js';
 import type { SessionsRepo } from '../store/sessions-repo.js';
 import type { PanelsRepo } from '../store/panels-repo.js';
@@ -167,8 +179,22 @@ import type { TraceCorrelator } from '../telemetry/correlate.js';
  *   the aggregates carry the counts, the occurrences carry citable event ids;
  * - excerpts: 8 excerpts of at most 4 000 bytes, matching the code-analysis
  *   excerpt ceiling, only for files the investigation stage already selected;
- * - `maxEventsConsidered` (25 000 events, five maximum-size store pages) bounds
- *   the memory and CPU spent aggregating a long, render-heavy capture.
+ * - `maxEventsConsidered` is {@link MAX_AGGREGATE_INPUT_EVENTS} (250 000
+ *   events), imported from `../panels/data.ts` rather than restated.
+ *
+ * One bound, shared by construction. The panel data aggregates a capture from
+ * every one of its events up to {@link MAX_AGGREGATE_INPUT_EVENTS}, and the
+ * analysis aggregates the same events under the same constant: the capture's
+ * persisted events in capture order (`start_time`, then `id`), read by one
+ * `TelemetryRepo.scanEvents` call. So a render count, a request group or a
+ * metric the analysis cites is the number the panel's `renderTable`,
+ * `requestTable` and `metricCards` show for the same capture. The capture
+ * stage bounds its stored summary on its own side, so a stored summary is used
+ * for the input's metrics and window only when it was computed from exactly
+ * the events read here (see {@link AnalysisStageInputBuild.summary}). The row
+ * caps above bound what the prompt carries; this one bounds only how many
+ * events are aggregated, which grows the aggregates' accuracy but not the
+ * payload, because every section holds aggregates and capped rows.
  */
 export type AnalysisInputLimits = {
   /** Persisted events read from the store and aggregated. */
@@ -243,7 +269,7 @@ export type AnalysisInputLimits = {
 
 /** The default, and maximum, analysis input caps. See {@link AnalysisInputLimits}. */
 export const ANALYSIS_INPUT_LIMITS: AnalysisInputLimits = Object.freeze({
-  maxEventsConsidered: 25_000,
+  maxEventsConsidered: MAX_AGGREGATE_INPUT_EVENTS,
   maxTraces: 5,
   maxSpansPerTrace: 80,
   maxTotalSpans: 200,
@@ -379,6 +405,23 @@ export type AnalysisFactCandidateRef = {
   readonly unit?: string | undefined;
 };
 
+/**
+ * What a fact-candidate derivation reads: an assembled input and the capture
+ * summary it was drawn from (the structural shape of `facts.ts`'
+ * `FactCandidateSource`).
+ */
+export type AnalysisFactCandidateEvidence = {
+  /** The assembled analyze-prompt input. */
+  readonly input: AnalysisStageInput;
+  /** {@link AnalysisStageInputBuild.summary} of the same build. */
+  readonly summary: CaptureSummary;
+};
+
+/** Derives deterministic fact candidates; see {@link AnalysisInputOptions.deriveFactCandidates}. */
+export type AnalysisFactCandidateDerivation = (
+  evidence: AnalysisFactCandidateEvidence,
+) => readonly AnalysisFactCandidateRef[];
+
 /** Options of {@link AnalysisSummarizer.buildStageInput}. */
 export type AnalysisInputOptions = {
   /** Lower any cap of {@link ANALYSIS_INPUT_LIMITS}; a higher value is clamped to the default. */
@@ -393,6 +436,16 @@ export type AnalysisInputOptions = {
   readonly includeDependencyGraph?: boolean | undefined;
   /** Deterministic fact candidates to carry, capped and projected. */
   readonly factCandidates?: readonly AnalysisFactCandidateRef[] | undefined;
+  /**
+   * Derive the fact candidates from the input this build assembles first (with
+   * `factCandidates`, none by default) and the summary it was drawn from. A
+   * non-empty result replaces them, and the input is assembled once more from
+   * the same sections — capped, projected and held to the byte budget like any
+   * offered candidates — so the capture is read and aggregated once however the
+   * candidates are produced. The analysis stage passes the facts module's
+   * `candidatesFor`. It must not throw; a throw is an `INTERNAL` error.
+   */
+  readonly deriveFactCandidates?: AnalysisFactCandidateDerivation | undefined;
   /**
    * Treat a capture without any browser `interaction` event as empty (AAP 0.5.5
    * "zero browser interactions for an interaction question"). The capture stage
@@ -589,14 +642,41 @@ export type AnalysisRenderOccurrenceRow = {
   readonly parentSpanId?: string;
   /** Start (epoch ms). */
   readonly startTime: number;
-  /** Render duration. */
+  /**
+   * Render duration — summed over the instances when {@link instanceCount} is
+   * present, so it is never read as the cost of one render.
+   */
   readonly durationMs: number;
+  /**
+   * How many renders of the component in one commit this event stands for,
+   * present only when more than one: the browser agent coalesces fibers that
+   * rendered alike in a commit into one event. Absent means one render.
+   */
+  readonly instanceCount?: number;
+  /**
+   * The slowest of those instances' renders. Present only alongside
+   * {@link instanceCount}, when the aggregate reported it.
+   */
+  readonly maxInstanceDurationMs?: number;
   /** Mount or update. */
   readonly phase?: RenderPhase;
   /** Upstream trigger classification. */
   readonly trigger: RenderTrigger;
   /** Names of the props that changed. */
   readonly changedPropNames: readonly string[];
+  /**
+   * Names of the components providing the contexts that changed at this
+   * render, sorted; empty when none changed or none could be named.
+   */
+  readonly changedContextNames: readonly string[];
+};
+
+/** One changed consumed context, named by its provider, with how many renders it changed at. */
+export type AnalysisChangedContext = {
+  /** Display name of the component that provides the context (never its value). */
+  readonly name: string;
+  /** Renders at which it changed. */
+  readonly count: number;
 };
 
 /** Render statistics of one component. */
@@ -625,6 +705,20 @@ export type AnalysisRenderRow = {
   readonly phaseCounts: Readonly<Record<RenderPhase, number>>;
   /** Changed prop names with counts. */
   readonly changedProps: readonly AnalysisChangedProp[];
+  /**
+   * The consumed contexts whose changes re-rendered this component, named by
+   * their providers, most frequent first. This is what turns a `context`
+   * trigger into "context change: ‹provider›" and lets a reader follow the
+   * cascade to the provider's own row.
+   */
+  readonly changedContexts: readonly AnalysisChangedContext[];
+  /**
+   * Whether the project declares this component. `false` for a framework or
+   * library component placed only through its owner chain, for one no
+   * resolver could place, and for a statistic persisted before the field
+   * existed.
+   */
+  readonly declaredInProject: boolean;
   /** Component declaration. */
   readonly source?: SourceLocation;
   /** Individual renders (citable evidence). */
@@ -1089,9 +1183,48 @@ export type AnalysisTelemetryPage = {
   readonly skipped?: number | undefined;
 };
 
+/** A whole-capture read against the telemetry store: every event of one capture. */
+export type AnalysisTelemetryScanRequest = {
+  /** Session id. */
+  readonly sessionId: string;
+  /** Capture id. */
+  readonly captureId: string;
+};
+
+/**
+ * The whole of a capture's persisted events, or the statement that the
+ * capture holds more than the caller will take (the shape of
+ * `TelemetryRepo.scanEvents`' answer).
+ */
+export type AnalysisTelemetryScan = {
+  /** Every persisted event in capture order (`start_time`, then `id`); empty when not `complete`. */
+  readonly rows: readonly TelemetryEvent[];
+  /** Rows the capture holds: `rows.length + skipped` when `complete`, a lower bound otherwise. */
+  readonly total: number;
+  /** Whether `rows` holds every event of the capture, i.e. the capture fits the row ceiling. */
+  readonly complete: boolean;
+  /** Stored rows that no longer validated and were skipped by the store. */
+  readonly skipped?: number | undefined;
+};
+
 /** The telemetry store methods this module reads (satisfied by `TelemetryRepo`). */
 export interface TelemetryQueryPort {
-  /** One page of a capture's persisted events. */
+  /**
+   * The whole of a capture in one traversal — one count and, when the capture
+   * fits `maxRows`, one ordered statement without an `OFFSET` — or, when it
+   * does not fit, the count alone. The read behind every analysis input and
+   * every recomputed capture summary, exactly as the panel data reads its
+   * aggregate slices.
+   */
+  scanEvents(
+    filter: AnalysisTelemetryScanRequest,
+    maxRows: number,
+  ): Result<AnalysisTelemetryScan, DebuggenError>;
+  /**
+   * One page of a capture's persisted events. Read only for a capture larger
+   * than the row ceiling, whose first `maxEventsConsidered` events are paged in
+   * the same order the scan would have returned them.
+   */
   query(filter: AnalysisTelemetryPageRequest): Result<AnalysisTelemetryPage, DebuggenError>;
   /** Persisted events per kind. */
   countByKind(
@@ -1184,6 +1317,23 @@ export type AnalysisStageInputBuild = {
   readonly input: AnalysisStageInput;
   /** Assembly statistics. */
   readonly stats: AnalysisInputStats;
+  /**
+   * The capture summary `input.capture`'s window and `input.metrics` were
+   * drawn from, describing exactly the events the input aggregated — so the
+   * metrics an analysis stores, the fact candidates' counts and the panel
+   * data's aggregates all come from one event set.
+   *
+   * It is the stored `CaptureRecord.summary` (the same object) when that was
+   * computed from the whole capture this input read: the read was complete,
+   * no row was refused, and the stored `eventCount` equals the events
+   * aggregated. Otherwise — no stored summary, or one covering fewer events
+   * (its `coverage.summarizedEvents` below `coverage.storedEvents`, or events
+   * attributed after the capture closed), or a capture above the bound — it is
+   * `computeCaptureSummary` over the aggregated events themselves, which
+   * carries no `coverage`: `input.capture` states how many of the capture's
+   * events those are (`eventCount`, `eventsConsidered`, `eventsTruncated`).
+   */
+  readonly summary: CaptureSummary;
 };
 
 /** The analysis-input subsystem. */
@@ -1191,8 +1341,12 @@ export interface AnalysisSummarizer {
   /**
    * The capture's summary: the stored `CaptureRecord.summary` when present and
    * matching, otherwise recomputed with `computeCaptureSummary` over the
-   * capture's admitted persisted events. This is the summary
-   * `panels/validate.ts` passes to `validateAgainstCapture`.
+   * capture's admitted persisted events — every one of them up to
+   * `ANALYSIS_INPUT_LIMITS.maxEventsConsidered`, the bound the panel data
+   * aggregates under, read by one store scan. This is the summary
+   * `panels/validate.ts` passes to `validateAgainstCapture`. The analysis
+   * stage does not read it: it takes {@link AnalysisStageInputBuild.summary},
+   * which always describes the events its input aggregated.
    */
   loadCaptureSummary(
     sessionId: string,
@@ -1277,6 +1431,29 @@ function countOf(value: number): number {
 }
 
 /**
+ * The instance fields of a render occurrence that stands for several renders
+ * of its component in one commit, or none for a single render.
+ *
+ * The browser agent coalesces fibers that rendered alike in a commit into one
+ * event and the `renders` aggregate carries the group's size; without it here
+ * the prompt would read a group's summed time as the cost of one render. A
+ * size that is not a whole number above one is a single render, as the
+ * aggregate itself treats it.
+ */
+function instanceFieldsOf(
+  occurrence: RenderStat['occurrences'][number],
+): Pick<AnalysisRenderOccurrenceRow, 'instanceCount' | 'maxInstanceDurationMs'> {
+  const count = occurrence.instanceCount;
+  if (count === undefined || !Number.isInteger(count) || count <= 1) {
+    return {};
+  }
+  const slowest = occurrence.maxInstanceDurationMs;
+  return slowest === undefined || !Number.isFinite(slowest)
+    ? { instanceCount: count }
+    : { instanceCount: count, maxInstanceDurationMs: durationOf(slowest) };
+}
+
+/**
  * `text` cut to at most `max` characters, ending in an ellipsis when cut. Never
  * splits a surrogate pair, so the result always serialises to well-formed JSON.
  */
@@ -1352,6 +1529,26 @@ function emptyCaptureError(
     hint: EMPTY_CAPTURE_HINT,
     details: { sessionId, captureId, reason, eventsExcluded },
   });
+}
+
+/**
+ * The refusal of a store scan that contradicts its own contract: complete, yet
+ * holding more rows than the ceiling it was given. Counts and ids only.
+ */
+function scanInconsistentError(
+  sessionId: string,
+  captureId: string,
+  maxRows: number,
+  rows: number,
+): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    'The telemetry store answered a capture read inconsistently.',
+    {
+      hint: 'Retry the analysis; if it persists, the session store may be damaged.',
+      details: { sessionId, captureId, reason: 'scan-inconsistent', maxRows, rows },
+    },
+  );
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1676,15 +1873,90 @@ export type AnalysisRenderRowLimits = Pick<
 >;
 
 /**
- * One upstream `RenderStat` as a prompt row. Changed props travel as names and
- * counts only (never values), and the occurrences — the citable render events —
- * are capped.
+ * The context-attribution fields of a render statistic, each optional.
+ *
+ * A capture summary is persisted and reloaded (`loadCaptureSummary` prefers
+ * the stored one), so a statistic can predate `changedContexts`,
+ * `changedContextCounts` and `declaredInProject`. Reading them through this
+ * view keeps such a statistic valid: no named contexts, and "not known to be
+ * declared".
+ */
+type RenderContextAttribution = Partial<
+  Pick<RenderStat, 'changedContexts' | 'changedContextCounts' | 'declaredInProject'>
+>;
+
+/** The context-attribution field of a render occurrence, optional for the same reason. */
+type RenderOccurrenceContextAttribution = Partial<Pick<RenderOccurrence, 'changedContexts'>>;
+
+/**
+ * The render occurrences one analysis row carries: at most `maxOccurrences`,
+ * in upstream (chronological) order.
+ *
+ * Nothing is cut while every occurrence fits. Otherwise one slot goes to the
+ * earliest occurrence of each trigger present in the carried list — triggers
+ * the statistic counts most often first — and the remaining slots to the
+ * earliest occurrences not yet kept. Every per-trigger sentence the analysis
+ * writes ("N of M renders of X had unchanged inputs", "… followed a change in
+ * the context provided by P") cites renders **of that trigger**; a plain
+ * chronological cut keeps a component's mount and first updates, which
+ * routinely share one trigger and leave the others with nothing citable.
+ *
+ * @param occurrences The statistic's occurrences, in upstream order.
+ * @param triggers The statistic's whole-capture trigger histogram.
+ * @param maxOccurrences The row's occurrence budget.
+ * @returns The kept occurrences, in upstream order.
+ */
+export function selectRenderOccurrences<T extends { readonly trigger: RenderTrigger }>(
+  occurrences: readonly T[],
+  triggers: Readonly<Partial<Record<RenderTrigger, number>>>,
+  maxOccurrences: number,
+): T[] {
+  const budget = Number.isFinite(maxOccurrences) ? Math.max(0, Math.floor(maxOccurrences)) : 0;
+  if (occurrences.length <= budget) {
+    return [...occurrences];
+  }
+  const firstIndexOf = new Map<RenderTrigger, number>();
+  occurrences.forEach((occurrence, index) => {
+    if (!firstIndexOf.has(occurrence.trigger)) {
+      firstIndexOf.set(occurrence.trigger, index);
+    }
+  });
+  const byFrequency = [...firstIndexOf.entries()].sort(
+    ([leftTrigger, leftIndex], [rightTrigger, rightIndex]) => {
+      const difference = (triggers[rightTrigger] ?? 0) - (triggers[leftTrigger] ?? 0);
+      return difference !== 0 ? difference : leftIndex - rightIndex;
+    },
+  );
+  const kept = new Set<number>();
+  for (const [, index] of byFrequency) {
+    if (kept.size >= budget) {
+      break;
+    }
+    kept.add(index);
+  }
+  for (let index = 0; index < occurrences.length && kept.size < budget; index += 1) {
+    kept.add(index);
+  }
+  return [...kept].sort((left, right) => left - right).map((index) => occurrences[index] as T);
+}
+
+/**
+ * One upstream `RenderStat` as a prompt row. Changed props and changed
+ * contexts travel as names and counts only (never values) — contexts named by
+ * the component that provides them, most frequent first, capped like props —
+ * and the occurrences — the citable render events — are capped.
  */
 export function toRenderRow(
   stat: RenderStat,
   limits: AnalysisRenderRowLimits = ANALYSIS_INPUT_LIMITS,
 ): AnalysisRenderRow {
-  const occurrences = stat.occurrences.slice(0, limits.maxRenderOccurrencesPerRow);
+  const occurrences = selectRenderOccurrences(
+    stat.occurrences,
+    stat.triggers,
+    limits.maxRenderOccurrencesPerRow,
+  );
+  const attribution: RenderContextAttribution = stat;
+  const contextCounts = attribution.changedContextCounts ?? {};
   return {
     component: capText(stat.component, limits.maxNameLength),
     renderCount: countOf(stat.renderCount),
@@ -1701,22 +1973,121 @@ export function toRenderRow(
       name: capText(name, limits.maxNameLength),
       count: countOf(stat.changedPropCounts[name] ?? 0),
     })),
+    changedContexts: (attribution.changedContexts ?? [])
+      .slice(0, limits.maxChangedProps)
+      .map((name) => ({
+        name: capText(name, limits.maxNameLength),
+        count: countOf(contextCounts[name] ?? 0),
+      })),
+    declaredInProject: attribution.declaredInProject ?? false,
     ...withSource(stat.source),
-    occurrences: occurrences.map((occurrence) => ({
-      eventId: occurrence.eventId,
-      spanId: occurrence.spanId,
-      traceId: occurrence.traceId,
-      ...(occurrence.parentSpanId === undefined ? {} : { parentSpanId: occurrence.parentSpanId }),
-      startTime: timeOf(occurrence.startTime),
-      durationMs: durationOf(occurrence.durationMs),
-      ...(occurrence.phase === undefined ? {} : { phase: occurrence.phase }),
-      trigger: occurrence.trigger,
-      changedPropNames: occurrence.changedPropKeys
-        .slice(0, limits.maxChangedProps)
-        .map((name) => capText(name, limits.maxNameLength)),
-    })),
+    occurrences: occurrences.map((occurrence) => {
+      const occurrenceAttribution: RenderOccurrenceContextAttribution = occurrence;
+      return {
+        eventId: occurrence.eventId,
+        spanId: occurrence.spanId,
+        traceId: occurrence.traceId,
+        ...(occurrence.parentSpanId === undefined ? {} : { parentSpanId: occurrence.parentSpanId }),
+        startTime: timeOf(occurrence.startTime),
+        durationMs: durationOf(occurrence.durationMs),
+        ...instanceFieldsOf(occurrence),
+        ...(occurrence.phase === undefined ? {} : { phase: occurrence.phase }),
+        trigger: occurrence.trigger,
+        changedPropNames: occurrence.changedPropKeys
+          .slice(0, limits.maxChangedProps)
+          .map((name) => capText(name, limits.maxNameLength)),
+        changedContextNames: (occurrenceAttribution.changedContexts ?? [])
+          .slice(0, limits.maxChangedProps)
+          .map((name) => capText(name, limits.maxNameLength)),
+      };
+    }),
     occurrencesTruncated: stat.occurrencesTruncated || occurrences.length < stat.occurrences.length,
   };
+}
+
+/**
+ * Share of the render-row budget kept for the providers the kept rows name:
+ * a provider re-renders once per value it publishes, so it routinely has far
+ * fewer renders than the consumers it re-renders and would fall below a
+ * count-ordered cut — yet its row (its own trigger, its declaration) is what
+ * lets the analysis follow a context cascade back to where the value is built.
+ */
+const RENDER_PROVIDER_ROW_SHARE = 0.25;
+
+/**
+ * The render statistics that fit `maxRows`, in upstream order.
+ *
+ * Nothing is cut while every row fits. Otherwise the kept set is filled in
+ * three deterministic passes:
+ *
+ * 1. rows the project declares, then the others, each in upstream (most
+ *    renders first) order, up to the budget left after the provider reserve —
+ *    so framework and library components (typically minified names) cannot
+ *    crowd the project's own components out;
+ * 2. the rows of the components named as the providers of a kept row's changed
+ *    contexts, following providers of providers breadth-first, up to the
+ *    reserve ({@link RENDER_PROVIDER_ROW_SHARE});
+ * 3. whatever budget remains, in the pass-1 order.
+ *
+ * The result keeps the upstream order, so selection never reorders the
+ * section; the caller still reports the section as capped whenever rows were
+ * left out. A statistic persisted before `declaredInProject` or
+ * `changedContexts` existed reads as undeclared and naming no provider.
+ */
+export function selectRenderStats(
+  stats: readonly RenderStat[],
+  maxRows: number,
+): readonly RenderStat[] {
+  const budget = Math.max(0, Math.floor(maxRows));
+  if (stats.length <= budget) {
+    return stats;
+  }
+  const attributionOf = (stat: RenderStat): RenderContextAttribution => stat;
+  const ranked = [
+    ...stats.filter((stat) => attributionOf(stat).declaredInProject === true),
+    ...stats.filter((stat) => attributionOf(stat).declaredInProject !== true),
+  ];
+  const byComponent = new Map<string, RenderStat>();
+  for (const stat of stats) {
+    if (!byComponent.has(stat.component)) {
+      byComponent.set(stat.component, stat);
+    }
+  }
+  const reserve = Math.min(budget, Math.floor(budget * RENDER_PROVIDER_ROW_SHARE));
+  const kept = new Set<RenderStat>();
+  for (const stat of ranked) {
+    if (kept.size >= budget - reserve) {
+      break;
+    }
+    kept.add(stat);
+  }
+  const queue = [...kept];
+  let reserved = 0;
+  for (let index = 0; index < queue.length && reserved < reserve; index += 1) {
+    const consumer = queue[index];
+    if (consumer === undefined) {
+      continue;
+    }
+    for (const name of attributionOf(consumer).changedContexts ?? []) {
+      const provider = byComponent.get(name);
+      if (provider === undefined || kept.has(provider)) {
+        continue;
+      }
+      kept.add(provider);
+      queue.push(provider);
+      reserved += 1;
+      if (reserved >= reserve) {
+        break;
+      }
+    }
+  }
+  for (const stat of ranked) {
+    if (kept.size >= budget) {
+      break;
+    }
+    kept.add(stat);
+  }
+  return stats.filter((stat) => kept.has(stat));
 }
 
 /** The caps {@link toRequestRow} applies. */
@@ -2074,8 +2445,9 @@ function toCandidateRow(
 
 /**
  * The metrics in `METRIC_IDS` order, when `metrics` holds every id exactly
- * once; `undefined` otherwise (the caller then recomputes with
- * `computeMetrics`). Unavailable metrics are preserved as such.
+ * once; `undefined` otherwise (the caller then takes the metrics of the
+ * summary it computed over the aggregated events). Unavailable metrics are
+ * preserved as such.
  */
 function orderedMetrics(metrics: readonly MetricValue[]): AnalysisMetric[] | undefined {
   const byId = new Map<MetricId, MetricValue>();
@@ -2484,6 +2856,30 @@ function excerptFor(
   };
 }
 
+/**
+ * Runs a caller's fact-candidate derivation over an assembled build. A throw —
+ * a broken collaborator contract — becomes a typed error that carries ids and
+ * a reason only, never the thrown value, which may quote capture content.
+ */
+function deriveCandidates(
+  derive: AnalysisFactCandidateDerivation,
+  build: AnalysisStageInputBuild,
+): Result<readonly AnalysisFactCandidateRef[], DebuggenError> {
+  try {
+    return ok(derive({ input: build.input, summary: build.summary }));
+  } catch {
+    return err(
+      new DebuggenError('INTERNAL', 'Deriving the analysis fact candidates failed.', {
+        details: {
+          sessionId: build.input.sessionId,
+          captureId: build.input.captureId,
+          reason: 'fact-candidate-derivation-threw',
+        },
+      }),
+    );
+  }
+}
+
 /* -------------------------------------------------------------------------------------------------
  * Factory
  * ---------------------------------------------------------------------------------------------- */
@@ -2557,20 +2953,25 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
   };
 
   /**
-   * The capture's admitted events, page by page in start order, stopping at
-   * `maxEvents` rows read. Refused rows are recorded in `refused`.
+   * The first `maxEvents` admitted events of a capture the scan reported as
+   * larger than the bound, page by page in the scan's order (`start_asc`:
+   * `start_time`, then `id`). At most `maxEvents / DATA_QUERY_MAX_LIMIT`
+   * pages, reached only for a capture above the shared bound — one the panel
+   * data refuses to aggregate at all. `countedTotal` is the scan's count, the
+   * reported total until a page reports a newer one.
    */
-  const loadEvents = (
+  const loadLeadingEvents = (
     sessionId: string,
     captureId: string,
     maxEvents: number,
+    countedTotal: number,
     refused: Set<string>,
     signal: AbortSignal | undefined,
   ): Result<LoadedEvents, DebuggenError> => {
     const events: TelemetryEvent[] = [];
     let read = 0;
     let offset = 0;
-    let total = 0;
+    let total = countedTotal;
     while (read < maxEvents) {
       if (isAborted(signal)) {
         return err(abortedError());
@@ -2597,6 +2998,56 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
       offset = next;
     }
     return ok({ events, total, truncated: read < total });
+  };
+
+  /**
+   * The capture's admitted events in capture order (`start_time`, then `id`),
+   * at most `maxEvents` of them: with the default limits, exactly the events
+   * the panel data aggregates for the same capture.
+   *
+   * A capture that fits the bound is read by one `scanEvents` call — one count
+   * and one ordered statement — never by a walk of pages that each re-count
+   * the capture and re-walk every earlier row through a growing `OFFSET`,
+   * which is quadratic in the capture. A capture larger than the bound is
+   * answered by the scan from its count alone, without a row being read; its
+   * first `maxEvents` events are then paged in the same order
+   * ({@link loadLeadingEvents}) and the result is marked truncated, so the
+   * input says it covers part of the capture rather than presenting a prefix
+   * as the whole. Refused rows are recorded in `refused`.
+   */
+  const loadEvents = (
+    sessionId: string,
+    captureId: string,
+    maxEvents: number,
+    refused: Set<string>,
+    signal: AbortSignal | undefined,
+  ): Result<LoadedEvents, DebuggenError> => {
+    if (isAborted(signal)) {
+      return err(abortedError());
+    }
+    const scan = deps.telemetry.scanEvents({ sessionId, captureId }, maxEvents);
+    if (!scan.ok) {
+      return err(scan.error);
+    }
+    const { rows, complete } = scan.value;
+    const total = countOf(scan.value.total);
+    if (!complete) {
+      return loadLeadingEvents(sessionId, captureId, maxEvents, total, refused, signal);
+    }
+    if (rows.length > maxEvents) {
+      // A complete scan holding more rows than it was allowed contradicts its
+      // own contract; trusting it would break the memory bound this read keeps.
+      return err(scanInconsistentError(sessionId, captureId, maxEvents, rows.length));
+    }
+    const events: TelemetryEvent[] = [];
+    for (const row of rows) {
+      if (isAdmissibleEvent(row, sessionId, captureId)) {
+        events.push(row);
+      } else {
+        refused.add(row.id);
+      }
+    }
+    return ok({ events, total, truncated: false });
   };
 
   /** One trace tree: from the correlator when injected, else from the loaded events. */
@@ -2652,6 +3103,18 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
         excluded: refused.size,
       });
     }
+    if (loaded.value.truncated) {
+      logger.info(
+        'The recomputed capture summary covers the first events of a capture above the bound.',
+        {
+          sessionId,
+          captureId,
+          summarized: loaded.value.events.length,
+          stored: loaded.value.total,
+          bound: ANALYSIS_INPUT_LIMITS.maxEventsConsidered,
+        },
+      );
+    }
     return Promise.resolve(
       ok(computeCaptureSummary(loaded.value.events, { captureId, sessionId })),
     );
@@ -2696,7 +3159,10 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
       return err(emptyCaptureError(sessionId, captureId, 'no-interaction', 0));
     }
 
-    // 3. The admitted events, paged and capped.
+    // 3. The admitted events: one scan of the whole capture up to the shared bound, the events
+    //    the panel data aggregates. Each heavy synchronous step below is followed by a yield to
+    //    the event loop, so a capture at the bound never holds ingest and both user interfaces
+    //    for the whole assembly.
     const refused = new Set<string>();
     const admit = (event: TelemetryEvent): boolean => {
       if (isAdmissibleEvent(event, sessionId, captureId)) {
@@ -2713,14 +3179,32 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
     if (events.length === 0) {
       return err(emptyCaptureError(sessionId, captureId, 'no-admissible-events', refused.size));
     }
+    await yieldToEventLoop();
+    if (isAborted(signal)) {
+      return err(abortedError());
+    }
 
-    // 4. The capture summary and metrics, owned upstream.
+    // 4. The capture summary and metrics, owned upstream, over exactly the events aggregated
+    //    below. The stored summary stands only when it was computed from this very event set
+    //    (see AnalysisStageInputBuild.summary); a partial one — the capture stage's own bounds
+    //    cut it, or events arrived after it closed — would put its smaller counts beside
+    //    aggregates of the whole capture, so the summary of the aggregated events replaces it.
+    const sectionSummary = computeCaptureSummary(
+      events,
+      { captureId, sessionId },
+      { topN: Math.max(limits.maxTopSpans, limits.maxErrors) + 1, includeComponentTree: false },
+    );
     const stored = capture.summary;
-    const summary =
-      stored !== undefined && stored.captureId === captureId
-        ? stored
-        : computeCaptureSummary(events, { captureId, sessionId });
-    const metrics = orderedMetrics(summary.metrics) ?? orderedMetrics(computeMetrics(events));
+    const storedCoversEvents =
+      stored !== undefined &&
+      stored.captureId === captureId &&
+      !eventsTruncated &&
+      refused.size === 0 &&
+      stored.eventCount === events.length;
+    const storedMetrics = storedCoversEvents ? orderedMetrics(stored.metrics) : undefined;
+    const summary: CaptureSummary =
+      storedMetrics !== undefined && stored !== undefined ? stored : sectionSummary;
+    const metrics = storedMetrics ?? orderedMetrics(sectionSummary.metrics);
     if (metrics === undefined) {
       return err(
         new DebuggenError('INTERNAL', 'The capture metric set is incomplete.', {
@@ -2728,14 +3212,26 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
         }),
       );
     }
-    const sectionSummary = computeCaptureSummary(
-      events,
-      { captureId, sessionId },
-      { topN: Math.max(limits.maxTopSpans, limits.maxErrors) + 1, includeComponentTree: false },
-    );
+    if (stored !== undefined && summary !== stored) {
+      logger.debug(
+        'The stored capture summary does not cover the aggregated events; using theirs.',
+        {
+          sessionId,
+          captureId,
+          storedSummarized: stored.eventCount,
+          eventsConsidered: events.length,
+          eventsTruncated,
+        },
+      );
+    }
+    await yieldToEventLoop();
+    if (isAborted(signal)) {
+      return err(abortedError());
+    }
 
     // 5. Traces: selected deterministically, flattened canonically.
     const correlation = correlateEvents(events);
+    await yieldToEventLoop();
     const candidates: AnalysisTraceCandidate[] = correlation.traces.map((tree) => ({
       traceId: tree.traceId,
       totalDurationMs: tree.totalDuration,
@@ -2789,9 +3285,9 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
       maxOccurrencesPerComponent: limits.maxRenderOccurrencesPerRow,
       includeOccurrences: true,
     });
-    const renders = renderStats
-      .slice(0, limits.maxRenderRows)
-      .map((stat) => toRenderRow(stat, limits));
+    const renders = selectRenderStats(renderStats, limits.maxRenderRows).map((stat) =>
+      toRenderRow(stat, limits),
+    );
 
     let componentTree: AnalysisComponentTreeSection | undefined;
     if (options.includeComponentTree !== false && limits.maxComponentTreeNodes > 0) {
@@ -2839,6 +3335,10 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
         dependencyGraph = toDependencyGraphSection(graph, limits.maxNameLength);
       }
     }
+    await yieldToEventLoop();
+    if (isAborted(signal)) {
+      return err(abortedError());
+    }
 
     // 7. Relevant files and excerpts: only what the investigation selected.
     const safeFiles = session.relevantFiles.filter((file) => isSafeRelativePath(file.file));
@@ -2875,22 +3375,8 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
       }
     }
 
-    // 8. Fact candidates, capped and projected.
-    const offeredCandidates = options.factCandidates ?? [];
-    const projectedCandidates = offeredCandidates
-      .map((candidate) => toCandidateRow(candidate, limits))
-      .filter((candidate): candidate is AnalysisFactCandidateRef => candidate !== undefined);
-    const factCandidates = projectedCandidates.slice(0, limits.maxFactCandidates);
-    const candidatesTruncated =
-      projectedCandidates.length > limits.maxFactCandidates ||
-      projectedCandidates.length < offeredCandidates.length ||
-      offeredCandidates.some(
-        (candidate) =>
-          candidate.evidence.length > limits.maxEvidencePerCandidate ||
-          candidate.statement.length > limits.maxCandidateStatementLength,
-      );
-
-    // 9. The row-limit truncation report.
+    // 8. The row-limit truncation report of every section but the fact candidates, which
+    //    each assembly of step 9 adds for the candidates it carries.
     const capped = new Set<AnalysisSectionName>();
     if (eventsTruncated || refused.size > 0) {
       capped.add('capture');
@@ -2941,94 +3427,132 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
     if (excerptsTruncated || excerptsWithheld > 0) {
       capped.add('excerpts');
     }
-    if (candidatesTruncated) {
-      capped.add('factCandidates');
-    }
-    const sectionsTruncated = inPayloadOrder(capped);
-    const rowLimitReason = truncationReason(sectionsTruncated.length > 0, false);
 
-    // 10. Assemble, then hold the payload under the byte ceiling.
+    // 9. Assemble with one set of fact candidates, then hold the payload under the byte
+    //    ceiling. Pure over the sections above, so step 10 may assemble a second time without
+    //    reading, correlating or aggregating a single event again.
     const target = session.target;
-    const draft: AnalysisInputDraft = {
-      sessionId,
+    const targetFacet =
+      target === undefined
+        ? undefined
+        : toTargetFacet(target, limits.maxNameLength, limits.maxUrlLength);
+    const captureFacet: AnalysisCaptureFacet = {
       captureId,
-      question: request.question,
-      followUpQuestion: request.followUpQuestion,
-      target:
-        target === undefined
-          ? undefined
-          : toTargetFacet(target, limits.maxNameLength, limits.maxUrlLength),
-      capture: {
-        captureId,
-        planVersion: capture.planVersion,
-        startedAt: timeOf(capture.startedAt),
-        ...(capture.stoppedAt === undefined ? {} : { stoppedAt: timeOf(capture.stoppedAt) }),
-        startTime: timeOf(summary.startTime),
-        endTime: timeOf(summary.endTime),
-        durationMs: durationOf(summary.durationMs),
-        eventCount: persisted,
-        eventsConsidered: events.length,
-        eventsExcluded: refused.size,
-        eventsTruncated,
-        traceCount: countOf(summary.traceCount),
-        ...(summary.primaryTraceId === undefined ? {} : { primaryTraceId: summary.primaryTraceId }),
-        producerCount: summary.producerIds.length,
-        tierCounts: { ...summary.tierCounts },
-        kindCounts: { ...counts.value },
-        unavailableMetrics: [...summary.unavailableMetrics],
-      },
-      metrics,
-      traces,
-      topSpans,
-      renders,
-      componentTree,
-      requests,
-      queries,
-      stateTransitions,
-      dependencyGraph,
-      errors,
-      relevantFiles,
-      excerpts,
-      factCandidates,
-      truncated: {
-        sections: sectionsTruncated,
-        ...(rowLimitReason === undefined ? {} : { reason: rowLimitReason }),
-      },
-    };
-    const budget = applyByteBudget(composeInput(draft), limits.maxTotalBytes);
-    if (!budget.fits) {
-      return err(
-        new DebuggenError(
-          'CONFIG_INVALID',
-          'The analysis input cannot be reduced below the configured byte ceiling.',
-          {
-            hint: 'Raise maxTotalBytes towards its default; the minimal input is larger than the ceiling.',
-            details: {
-              sessionId,
-              captureId,
-              maxTotalBytes: limits.maxTotalBytes,
-              ...(Number.isFinite(budget.bytes) ? { approxBytes: budget.bytes } : {}),
-            },
-          },
-        ),
-      );
-    }
-
-    const input = budget.input;
-    let spansIncluded = 0;
-    for (const trace of input.traces) {
-      spansIncluded += trace.spans.length;
-    }
-    const stats: AnalysisInputStats = {
+      planVersion: capture.planVersion,
+      startedAt: timeOf(capture.startedAt),
+      ...(capture.stoppedAt === undefined ? {} : { stoppedAt: timeOf(capture.stoppedAt) }),
+      startTime: timeOf(summary.startTime),
+      endTime: timeOf(summary.endTime),
+      durationMs: durationOf(summary.durationMs),
+      eventCount: persisted,
       eventsConsidered: events.length,
       eventsExcluded: refused.size,
-      tracesIncluded: input.traces.length,
-      spansIncluded,
-      excerptsWithheld,
-      approxBytes: budget.bytes,
-      sectionsTruncated,
-      droppedForBudget: budget.dropped,
+      eventsTruncated,
+      traceCount: countOf(summary.traceCount),
+      ...(summary.primaryTraceId === undefined ? {} : { primaryTraceId: summary.primaryTraceId }),
+      producerCount: summary.producerIds.length,
+      tierCounts: { ...summary.tierCounts },
+      kindCounts: { ...counts.value },
+      unavailableMetrics: [...summary.unavailableMetrics],
     };
+    const assemble = (
+      offeredCandidates: readonly AnalysisFactCandidateRef[],
+    ): Result<AnalysisStageInputBuild, DebuggenError> => {
+      const projectedCandidates = offeredCandidates
+        .map((candidate) => toCandidateRow(candidate, limits))
+        .filter((candidate): candidate is AnalysisFactCandidateRef => candidate !== undefined);
+      const factCandidates = projectedCandidates.slice(0, limits.maxFactCandidates);
+      const candidatesTruncated =
+        projectedCandidates.length > limits.maxFactCandidates ||
+        projectedCandidates.length < offeredCandidates.length ||
+        offeredCandidates.some(
+          (candidate) =>
+            candidate.evidence.length > limits.maxEvidencePerCandidate ||
+            candidate.statement.length > limits.maxCandidateStatementLength,
+        );
+      const sections = new Set(capped);
+      if (candidatesTruncated) {
+        sections.add('factCandidates');
+      }
+      const sectionsTruncated = inPayloadOrder(sections);
+      const rowLimitReason = truncationReason(sectionsTruncated.length > 0, false);
+      const draft: AnalysisInputDraft = {
+        sessionId,
+        captureId,
+        question: request.question,
+        followUpQuestion: request.followUpQuestion,
+        target: targetFacet,
+        capture: captureFacet,
+        metrics,
+        traces,
+        topSpans,
+        renders,
+        componentTree,
+        requests,
+        queries,
+        stateTransitions,
+        dependencyGraph,
+        errors,
+        relevantFiles,
+        excerpts,
+        factCandidates,
+        truncated: {
+          sections: sectionsTruncated,
+          ...(rowLimitReason === undefined ? {} : { reason: rowLimitReason }),
+        },
+      };
+      const budget = applyByteBudget(composeInput(draft), limits.maxTotalBytes);
+      if (!budget.fits) {
+        return err(
+          new DebuggenError(
+            'CONFIG_INVALID',
+            'The analysis input cannot be reduced below the configured byte ceiling.',
+            {
+              hint: 'Raise maxTotalBytes towards its default; the minimal input is larger than the ceiling.',
+              details: {
+                sessionId,
+                captureId,
+                maxTotalBytes: limits.maxTotalBytes,
+                ...(Number.isFinite(budget.bytes) ? { approxBytes: budget.bytes } : {}),
+              },
+            },
+          ),
+        );
+      }
+      const input = budget.input;
+      let spansIncluded = 0;
+      for (const trace of input.traces) {
+        spansIncluded += trace.spans.length;
+      }
+      const stats: AnalysisInputStats = {
+        eventsConsidered: events.length,
+        eventsExcluded: refused.size,
+        tracesIncluded: input.traces.length,
+        spansIncluded,
+        excerptsWithheld,
+        approxBytes: budget.bytes,
+        sectionsTruncated,
+        droppedForBudget: budget.dropped,
+      };
+      return ok({ input, stats, summary });
+    };
+
+    // 10. The fact candidates: those offered, or those the caller derives from the input
+    //     assembled first, assembled once more — one read and one aggregation either way.
+    let built = assemble(options.factCandidates ?? []);
+    if (built.ok && options.deriveFactCandidates !== undefined) {
+      const derived = deriveCandidates(options.deriveFactCandidates, built.value);
+      if (!derived.ok) {
+        return err(derived.error);
+      }
+      if (derived.value.length > 0) {
+        built = assemble(derived.value);
+      }
+    }
+    if (!built.ok) {
+      return err(built.error);
+    }
+    const { stats } = built.value;
     if (refused.size > 0) {
       logger.warn(
         'Persisted rows failed the provenance check and were excluded from the analysis input.',
@@ -3055,8 +3579,10 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
       captureId,
       eventsConsidered: stats.eventsConsidered,
       eventsExcluded: stats.eventsExcluded,
+      eventsTruncated,
       tracesIncluded: stats.tracesIncluded,
       spansIncluded: stats.spansIncluded,
+      factCandidates: built.value.input.factCandidates.length,
       approxBytes: stats.approxBytes,
       sectionsTruncated: stats.sectionsTruncated,
       droppedForBudget: stats.droppedForBudget,
@@ -3064,7 +3590,7 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
         ? {}
         : { durationMs: durationOf(finished - started) }),
     });
-    return ok({ input, stats });
+    return ok(built.value);
   };
 
   const buildFollowUpContext = (

@@ -237,8 +237,12 @@ const COUNT_ONLY_TITLE = 'Count only';
 /** The first line of an empty page that is not an empty capture. */
 const EMPTY_PAGE_TITLE = 'Nothing on this page';
 
-/** The sentence reserved for a query that matched nothing at all. */
-const EMPTY_CAPTURE_MESSAGE = 'No spans matched this query.';
+/**
+ * The sentence reserved for a query that matched nothing at all — worded as
+ * every other view's empty capture is, about the interaction rather than the
+ * query.
+ */
+const EMPTY_CAPTURE_MESSAGE = 'No spans were captured for this interaction.';
 
 /** The short title above that sentence, the empty capture's alone. */
 const NOTHING_CAPTURED_TITLE = 'No spans';
@@ -739,6 +743,43 @@ function bubbleOf(trigger: HTMLElement): HTMLElement {
 }
 
 /**
+ * A row's operation name: the text in its header cell, which is also the
+ * trigger of the tooltip holding the whole name.
+ *
+ * @param row A data row.
+ * @returns The name element.
+ */
+function nameTriggerIn(row: HTMLElement): HTMLElement {
+  const name = within(row)
+    .getByRole('rowheader')
+    .querySelector<HTMLElement>('.dg-span-table__name-cell');
+
+  if (name === null) {
+    throw new Error('the row renders no operation name');
+  }
+
+  return name;
+}
+
+/**
+ * The bubble of the name's tooltip. The name reads its own text out, so the
+ * bubble describes nothing and is not named by `aria-describedby`; it is the
+ * tooltip inside the name's own wrapper.
+ *
+ * @param name The name element.
+ * @returns Its bubble.
+ */
+function nameBubbleOf(name: HTMLElement): HTMLElement {
+  const bubble = name.closest('.dg-tooltip')?.querySelector<HTMLElement>('[role="tooltip"]');
+
+  if (bubble === undefined || bubble === null) {
+    throw new Error('the name carries no tooltip');
+  }
+
+  return bubble;
+}
+
+/**
  * The grid's data rows, in document order.
  *
  * Obtained by role and then narrowed by the attribute the primitive writes on
@@ -998,9 +1039,9 @@ describe('SpanTable states', () => {
     // Queried by a generic substring of the product's own copy rather than by a
     // restatement of the sentence, then checked to be exactly that: product
     // vocabulary, naming no inspected project.
-    const message = await screen.findByText(/no spans matched/i);
+    const message = await screen.findByText(/no spans were captured/i);
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
-    expect(message.textContent).toContain('spans');
+    expect(message.textContent).toBe(EMPTY_CAPTURE_MESSAGE);
 
     for (const name of PROVIDER_ORDER_NAMES) {
       expect(message.textContent).not.toContain(name);
@@ -1197,6 +1238,38 @@ describe('SpanTable rows', () => {
     const durations = PROVIDER_ORDER.map((event) => event.duration);
     expect(durations).not.toEqual([...durations].sort((left, right) => right - left));
   });
+
+  it('keeps the whole of an ellipsized operation name one hover or focus away', async () => {
+    // Far wider than any Operation column: the cell ellipsizes it, so the
+    // tooltip is where the reader finds the rest - down to its last word.
+    const longName = `${'example.long-operation-segment.'.repeat(8)}final-segment`;
+    const record = makeEvent({ ...FUNCTION_ROW, name: longName });
+    const stub = resolvingProvider('spans', [record]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    const name = nameTriggerIn(rowNamed(longName));
+    const bubble = nameBubbleOf(name);
+
+    // The cell itself still truncates: the text is whole, the ellipsis is CSS.
+    expect(name.classList.contains('dg-span-table__name-cell')).toBe(true);
+    expect(name.textContent).toBe(longName);
+
+    // The bubble carries the whole name, and describes nothing: the name reads
+    // its own text out, so a reader hears it once.
+    expect(bubble.textContent).toBe(longName);
+    expect(bubble.getAttribute('aria-hidden')).toBe('true');
+    expect(name.hasAttribute('aria-describedby')).toBe(false);
+    expect(name.hasAttribute('title')).toBe(false);
+
+    // Focus opens it - the route the grid's keys take onto the name.
+    expect(name.getAttribute('tabindex')).toBe('-1');
+    act(() => {
+      name.focus();
+    });
+    expect(bubble.classList.contains('dg-is-open')).toBe(true);
+  });
 });
 
 describe('SpanTable ordering', () => {
@@ -1309,6 +1382,47 @@ describe('SpanTable ordering', () => {
     expect(screen.queryByText(/This order covers only/)).toBeNull();
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
   });
+
+  it.each([{ source: 'spans' as const }, { source: 'events' as const }])(
+    'opens a $source node that names no order longest first, asked for and stated, so the first Duration activation flips it',
+    async ({ source }) => {
+      // No `sort` authored. The table asks for its own opening order rather
+      // than leaving the order to a per-source service default it would have
+      // to guess, and the header states that order from the first paint.
+      const stub = resolvingProvider(source, PROVIDER_ORDER);
+      const spies = makeActions();
+      const user = userEvent.setup();
+
+      renderComponent(makeNode({ query: { source, limit: DATA_QUERY_DEFAULT_LIMIT } }), {
+        provider: stub.provider,
+        actions: spies.actions,
+      });
+
+      await screen.findByRole('grid');
+      expect(soleQuery(stub).sort).toBe(SLOWEST_FIRST);
+      expect(sortStateOf(DURATION_SORT_NAME)).toBe('descending');
+      expect(sortStateOf(START_SORT_NAME)).toBe('none');
+      expect(renderedNames()).toEqual([...PROVIDER_ORDER_NAMES]);
+
+      // The first activation of the Duration header is a visible change:
+      // shortest first, over the loaded rows, with no re-query — never a
+      // "descending" announced over the order already on screen.
+      await user.click(screen.getByRole('button', { name: DURATION_SORT_NAME }));
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+      expect(sortStateOf(DURATION_SORT_NAME)).toBe('ascending');
+      expect(renderedNames()).toEqual([REQUEST_ROW.name, FUNCTION_ROW.name, QUERY_ROW.name]);
+      expect(spies.onFilterChange).toHaveBeenCalledTimes(1);
+      expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { sort: 'duration_asc' });
+
+      // And back: the opening order is the applied service order, so returning
+      // to it clears the view order without a query.
+      await user.click(screen.getByRole('button', { name: DURATION_SORT_NAME }));
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+      expect(sortStateOf(DURATION_SORT_NAME)).toBe('descending');
+      expect(renderedNames()).toEqual([...PROVIDER_ORDER_NAMES]);
+      expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { sort: 'duration_desc' });
+    },
+  );
 
   it.each([
     {
@@ -1689,7 +1803,7 @@ describe('SpanTable interactions', () => {
 });
 
 describe('SpanTable keyboard', () => {
-  it('is one Tab stop, entered on the active row and left by the next Tab', async () => {
+  it('is one Tab stop of the page, entered on the active row, whose Tab walks that row alone', async () => {
     const stub = resolvingProvider('spans', PROVIDER_ORDER);
     const user = userEvent.setup();
 
@@ -1701,9 +1815,11 @@ describe('SpanTable keyboard', () => {
     if (firstRow === undefined || secondRow === undefined) {
       throw new Error('the grid rendered fewer than two data rows');
     }
+    const name = nameTriggerIn(firstRow);
 
-    // The chip stays a real, focusable button, and leaves the Tab order.
+    // The name and the chip stay focusable, and leave the page's Tab order.
     expect(chip.getAttribute('tabindex')).toBe('-1');
+    expect(name.getAttribute('tabindex')).toBe('-1');
 
     // Before focus: one stop in the whole grid, and it is the active row.
     expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
@@ -1714,7 +1830,16 @@ describe('SpanTable keyboard', () => {
     expect(document.activeElement).toBe(firstRow);
     expect(tabStopsIn(grid)).toEqual([firstRow]);
 
-    // The next Tab leaves the grid, past the chip and the header's sort controls.
+    // Tab walks the active row's own controls, in document order: the name,
+    // whose whole value opens with its focus, then the source chip.
+    await user.tab();
+    expect(document.activeElement).toBe(name);
+    expect(nameBubbleOf(name).classList.contains('dg-is-open')).toBe(true);
+    await user.tab();
+    expect(document.activeElement).toBe(chip);
+
+    // The Tab after the row's last control leaves the grid, past every other
+    // row and the header's sort controls.
     await user.tab();
     expect(document.activeElement).toBe(screen.getByRole('button', { name: AFTER_TABLE }));
 
@@ -1726,7 +1851,7 @@ describe('SpanTable keyboard', () => {
     expect(tabStopsIn(grid)).toEqual([secondRow]);
   });
 
-  it('reaches the source chip with ArrowRight and returns with ArrowLeft and Escape', async () => {
+  it('reaches the name, then the source chip, with ArrowRight and returns with ArrowLeft and Escape', async () => {
     const stub = resolvingProvider('spans', PROVIDER_ORDER);
     const spies = makeActions();
     const user = userEvent.setup();
@@ -1736,24 +1861,33 @@ describe('SpanTable keyboard', () => {
     const grid = await screen.findByRole('grid');
     const chip = within(grid).getByRole('button', { name: SOURCE_CHIP_NAME });
     const firstRow = rowNamed(FUNCTION_ROW.name);
+    const name = nameTriggerIn(firstRow);
 
     focusDirectly(screen.getByRole('button', { name: BEFORE_TABLE }));
     await user.tab();
     expect(document.activeElement).toBe(firstRow);
 
-    // Into the row: the chip takes focus, and its full location opens with it.
+    // Into the row: the name takes focus first, and its whole value opens.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(name);
+    expect(nameBubbleOf(name).classList.contains('dg-is-open')).toBe(true);
+
+    // Then the chip, whose full location opens with it.
     await user.keyboard('{ArrowRight}');
     expect(document.activeElement).toBe(chip);
     expect(bubbleOf(chip).classList.contains('dg-is-open')).toBe(true);
+    expect(nameBubbleOf(name).classList.contains('dg-is-open')).toBe(false);
 
     // A focused control moves no Tab stop onto itself.
     expect(tabStopsIn(grid)).toEqual([firstRow]);
 
     await user.keyboard('{ArrowLeft}');
+    expect(document.activeElement).toBe(name);
+    await user.keyboard('{ArrowLeft}');
     expect(document.activeElement).toBe(firstRow);
 
     // Escape takes two presses: the open description first, then back to the row.
-    await user.keyboard('{ArrowRight}');
+    await user.keyboard('{ArrowRight}{ArrowRight}');
     expect(document.activeElement).toBe(chip);
     await user.keyboard('{Escape}');
     expect(bubbleOf(chip).classList.contains('dg-is-open')).toBe(false);
@@ -1777,8 +1911,9 @@ describe('SpanTable keyboard', () => {
     focusDirectly(screen.getByRole('button', { name: BEFORE_TABLE }));
     await user.tab();
 
-    // Enter on a control is the control's own key, never the row's.
-    await user.keyboard('{ArrowRight}{Enter}');
+    // Enter on a control is the control's own key, never the row's: past the
+    // name, onto the chip, and activated there.
+    await user.keyboard('{ArrowRight}{ArrowRight}{Enter}');
 
     expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
     expect(spies.onOpenSource).toHaveBeenCalledWith(BASE_SOURCE);
@@ -2518,7 +2653,7 @@ describe('SpanTable query bounds', () => {
           `This view requests a count without rows: ${formatCount(42)} spans matched its query.`,
         ),
       ).toBeDefined();
-      expect(screen.queryByText(/no spans matched/i)).toBeNull();
+      expect(screen.queryByText(EMPTY_CAPTURE_MESSAGE)).toBeNull();
 
       // Zero is a legitimate request for a total without rows: it reaches the
       // provider as zero, not raised to a one-row page.
@@ -2580,9 +2715,11 @@ describe('SpanTable query bounds', () => {
     expect(query.source).toBe('events');
     expect(query.limit).toBe(DATA_QUERY_DEFAULT_LIMIT);
     expect(query.offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
-    // No ordering was authored, so none is invented: the rows are drawn in the
-    // order the service returned them.
-    expect(query.sort).toBeUndefined();
+    // No ordering was authored, so the table asks for its own opening order —
+    // longest first — rather than leaving it to a service default, and the
+    // header states it.
+    expect(query.sort).toBe(SLOWEST_FIRST);
+    expect(sortStateOf(DURATION_SORT_NAME)).toBe('descending');
     expect(query.filter).toBeUndefined();
   });
 

@@ -12,6 +12,15 @@
  * — while the platform's variables pass through, the service's own settings
  * are applied, and the parent environment object is left untouched.
  *
+ * The provider and model a spawned service runs behind come from the
+ * settings: the manifest's own defaults (`debuggen.provider` =
+ * `deterministic`, `debuggen.model` empty) start a service that needs no
+ * credential and no model id, a configured `debuggen.model` reaches the child
+ * as `DEBUGGEN_MODEL` (replacing an inherited copy, while an empty setting
+ * keeps it), a value with a control character is refused before anything is
+ * spawned without echoing it, and a changed `debuggen.model` flags the running
+ * child for the restart that applies it.
+ *
  * The manager's logger is the one `src/extension.ts` prints, unredacted, into
  * the "Debug Generator" output, so three kinds of content must never reach a
  * record (CWE-532; AAP §0.5.2):
@@ -46,8 +55,10 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import { inspect } from 'node:util';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -55,9 +66,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DebuggenError, createConsoleLogger, err, isErr, isOk, ok } from '@debuggen/shared';
 import type { LogRecord } from '@debuggen/shared';
 
-import { SERVICE_FAILURE_REASONS, buildServiceEnvironment, createServiceProcess } from './process';
+import {
+  SERVICE_FAILURE_REASONS,
+  buildServiceEnvironment,
+  createServiceProcess,
+  resolveModelSetting,
+} from './process';
 import type {
   ChildProcessLike,
+  ConfigurationChangeLike,
   PathKind,
   ServiceCredentialPort,
   ServiceProcess,
@@ -203,7 +220,14 @@ class FakeChild extends EventEmitter implements ChildProcessLike {
   /** Every signal the manager sent, in order. */
   readonly signals: (NodeJS.Signals | number | undefined)[] = [];
 
-  constructor(readonly pid: number) {
+  /**
+   * @param pid The process id the manager records.
+   * @param env The environment the manager spawned this child with.
+   */
+  constructor(
+    readonly pid: number,
+    readonly env: Readonly<Record<string, string>> = {},
+  ) {
     super();
   }
 
@@ -346,9 +370,9 @@ function createHarness(options: HarnessOptions = {}): Harness {
     credential: fakeCredential(),
     logger,
     env: {},
-    spawn: () => {
+    spawn: (_command, _args, spawnOptions) => {
       nextPid += 1;
-      const child = new FakeChild(nextPid);
+      const child = new FakeChild(nextPid, spawnOptions.env);
       world.children.push(child);
       world.onSpawn(child);
       return child;
@@ -537,6 +561,313 @@ describe('buildServiceEnvironment and the model vendor kit variables', () => {
     expect(Object.values(env)).not.toContain(HOSTILE_BASE_URL);
     expect(Object.values(env)).not.toContain('debug');
     expect(base).toEqual(snapshot);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The provider and model the service child is started with
+// ---------------------------------------------------------------------------
+
+/** The shape of the part of `apps/vscode-extension/package.json` these cases read. */
+interface ManifestSettingsShape {
+  readonly contributes?: {
+    readonly configuration?: {
+      readonly properties?: Readonly<Record<string, { readonly default?: unknown }>>;
+    };
+  };
+}
+
+/** The extension manifest, resolved from this file rather than from the working directory. */
+const MANIFEST_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  '..',
+  'package.json',
+);
+
+/** The manifest default of the contributed setting `key`, as VS Code reads it. */
+function manifestDefault(key: string): unknown {
+  const manifest = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')) as ManifestSettingsShape;
+  const properties = manifest.contributes?.configuration?.properties;
+  expect(properties, 'contributes.configuration.properties').toBeDefined();
+  expect(Object.keys(properties ?? {}), `the manifest contributes ${key}`).toContain(key);
+  return properties?.[key]?.default;
+}
+
+describe('the provider and model a spawned service runs behind', () => {
+  /** A configured model id: a neutral stand-in, never a real model's id. */
+  const CONFIGURED_MODEL = 'configured-model-under-test';
+
+  /** A model id inherited from the editor's environment. */
+  const INHERITED_MODEL = 'inherited-model-under-test';
+
+  /** A stem planted in refused values; no failure or record may repeat it. */
+  const MODEL_SENTINEL = ['model', 'sentinel', '5c2e'].join('-');
+
+  /** The state directory and address the manager resolved. */
+  const DEBUGGEN_HOME = path.join('/tmp', 'debuggen-process-test');
+  const ADDRESS = Object.freeze({ host: '127.0.0.1', port: 43117 });
+
+  /** Fails the case when any record, at any level, names a model id. */
+  function expectNoModelId(records: readonly LogRecord[]): void {
+    for (const record of records) {
+      const rendered = renderRecord(record);
+      for (const value of [CONFIGURED_MODEL, INHERITED_MODEL, MODEL_SENTINEL]) {
+        expect(rendered, `${record.level} record "${record.message}"`).not.toContain(value);
+      }
+    }
+  }
+
+  describe('the manifest defaults', () => {
+    it('select the deterministic provider and supply no model id', () => {
+      expect(manifestDefault('debuggen.provider')).toBe('deterministic');
+      expect(manifestDefault('debuggen.model')).toBe('');
+    });
+
+    it('start a service with DEBUGGEN_PROVIDER=deterministic and no DEBUGGEN_MODEL when the editor environment sets neither', async () => {
+      const providerDefault = manifestDefault('debuggen.provider');
+      const modelDefault = manifestDefault('debuggen.model');
+      const harness = createHarness({
+        settings: {
+          providerExplicit: undefined,
+          providerDefault,
+          model: typeof modelDefault === 'string' ? modelDefault : undefined,
+        },
+      });
+
+      const child = await startHealthy(harness);
+
+      expect(child.env.DEBUGGEN_PROVIDER).toBe('deterministic');
+      expect(Object.keys(child.env)).not.toContain('DEBUGGEN_MODEL');
+      expect(Object.keys(child.env)).not.toContain('ANTHROPIC_API_KEY');
+    });
+  });
+
+  describe('resolveModelSetting', () => {
+    it('forwards a configured model id, trimmed', () => {
+      expect(resolveModelSetting({ model: CONFIGURED_MODEL })).toEqual(ok(CONFIGURED_MODEL));
+      expect(resolveModelSetting({ model: `  ${CONFIGURED_MODEL} ` })).toEqual(
+        ok(CONFIGURED_MODEL),
+      );
+    });
+
+    it.each([
+      ['unset', {}],
+      ['undefined', { model: undefined }],
+      ['empty', { model: '' }],
+      ['whitespace-only', { model: ' \t\n ' }],
+    ] as const)('yields nothing to apply when the setting is %s', (_label, settings) => {
+      expect(resolveModelSetting(settings)).toEqual(ok(undefined));
+    });
+
+    it.each([
+      ['NUL', '\u0000'],
+      ['line feed', '\n'],
+      ['carriage return', '\r'],
+      ['tab', '\t'],
+      ['DEL', '\u007f'],
+      ['C1 next-line', '\u0085'],
+      ['line separator', '\u2028'],
+      ['paragraph separator', '\u2029'],
+    ])(
+      'refuses a value holding a %s, naming the setting and never the value',
+      (_label, character) => {
+        const result = resolveModelSetting({
+          model: `${MODEL_SENTINEL}${character}${MODEL_SENTINEL}`,
+        });
+
+        expect(isErr(result)).toBe(true);
+        if (!isErr(result)) {
+          return;
+        }
+        expect(result.error.code).toBe('CONFIG_INVALID');
+        expect(result.error.details).toEqual({ reason: 'model' });
+        expect(result.error.message).toContain('debuggen.model');
+        expect(result.error.hint).toContain('debuggen.model');
+        expect(JSON.stringify(result.error.toPayload())).not.toContain(MODEL_SENTINEL);
+      },
+    );
+
+    it("reports its refusal under a reason in the module's closed vocabulary", () => {
+      expect(SERVICE_FAILURE_REASONS).toContain('model');
+    });
+  });
+
+  describe('buildServiceEnvironment and DEBUGGEN_MODEL', () => {
+    it('applies the model, replacing an inherited copy (linux)', () => {
+      const env = buildServiceEnvironment({
+        base: { PATH: '/usr/bin', DEBUGGEN_MODEL: INHERITED_MODEL },
+        debuggenHome: DEBUGGEN_HOME,
+        address: ADDRESS,
+        provider: 'anthropic',
+        model: CONFIGURED_MODEL,
+        runAsNode: false,
+        platform: 'linux',
+      });
+
+      expect(env).toEqual({
+        PATH: '/usr/bin',
+        DEBUGGEN_HOME,
+        DEBUGGEN_HOST: '127.0.0.1',
+        DEBUGGEN_PORT: '43117',
+        DEBUGGEN_PROVIDER: 'anthropic',
+        DEBUGGEN_MODEL: CONFIGURED_MODEL,
+      });
+    });
+
+    it('replaces an inherited copy spelled in any case on Windows', () => {
+      const env = buildServiceEnvironment({
+        base: { Path: 'C:\\Windows\\System32', debuggen_model: INHERITED_MODEL },
+        debuggenHome: DEBUGGEN_HOME,
+        address: ADDRESS,
+        model: CONFIGURED_MODEL,
+        runAsNode: false,
+        platform: 'win32',
+      });
+
+      expect(env).toEqual({
+        Path: 'C:\\Windows\\System32',
+        DEBUGGEN_HOME,
+        DEBUGGEN_HOST: '127.0.0.1',
+        DEBUGGEN_PORT: '43117',
+        DEBUGGEN_MODEL: CONFIGURED_MODEL,
+      });
+      expect(Object.values(env)).not.toContain(INHERITED_MODEL);
+    });
+
+    it('keeps an inherited copy when no model is given', () => {
+      const env = buildServiceEnvironment({
+        base: { DEBUGGEN_MODEL: INHERITED_MODEL },
+        debuggenHome: DEBUGGEN_HOME,
+        address: ADDRESS,
+        runAsNode: false,
+        platform: 'linux',
+      });
+
+      expect(env.DEBUGGEN_MODEL).toBe(INHERITED_MODEL);
+    });
+  });
+
+  describe('a spawned child', () => {
+    it('receives debuggen.model as DEBUGGEN_MODEL, over a copy the editor inherited', async () => {
+      const harness = createHarness({
+        settings: { providerExplicit: 'anthropic', model: CONFIGURED_MODEL },
+        deps: { env: { PATH: '/usr/bin', DEBUGGEN_MODEL: INHERITED_MODEL } },
+      });
+
+      const child = await startHealthy(harness);
+
+      expect(child.env.DEBUGGEN_PROVIDER).toBe('anthropic');
+      expect(child.env.DEBUGGEN_MODEL).toBe(CONFIGURED_MODEL);
+      expectNoModelId(harness.records);
+    });
+
+    it('keeps an inherited DEBUGGEN_MODEL when debuggen.model is empty', async () => {
+      const harness = createHarness({
+        settings: { model: undefined },
+        deps: { env: { PATH: '/usr/bin', DEBUGGEN_MODEL: INHERITED_MODEL } },
+      });
+
+      const child = await startHealthy(harness);
+
+      expect(child.env.DEBUGGEN_MODEL).toBe(INHERITED_MODEL);
+      expectNoModelId(harness.records);
+    });
+
+    it('is never spawned for a model id holding a control character, and nothing logs the value', async () => {
+      const harness = createHarness({
+        settings: { model: `${MODEL_SENTINEL}\n${MODEL_SENTINEL}` },
+      });
+
+      const result = await harness.manager.ensureRunning();
+
+      expect(isErr(result) ? result.error.code : undefined).toBe('CONFIG_INVALID');
+      expect(isErr(result) ? result.error.details?.reason : undefined).toBe('model');
+      expect(isErr(result) ? JSON.stringify(result.error.toPayload()) : '').not.toContain(
+        MODEL_SENTINEL,
+      );
+      expect(harness.world.children).toHaveLength(0);
+      expect(harness.manager.status.state).toBe('failed');
+      expectNoModelId(harness.records);
+    });
+  });
+
+  describe('a changed debuggen.model', () => {
+    it('flags settingsChanged on a running child without signalling it, and a restart applies the new model', async () => {
+      let notify: ((event: ConfigurationChangeLike) => void) | undefined;
+      const harness = createHarness({
+        settings: { model: CONFIGURED_MODEL },
+        deps: {
+          onDidChangeConfiguration: (listener) => {
+            notify = listener;
+            return { dispose: () => undefined };
+          },
+        },
+      });
+      const child = await startHealthy(harness);
+      expect(harness.manager.status.settingsChanged).toBe(false);
+      expect(notify).toBeDefined();
+
+      const changedModel = 'changed-model-under-test';
+      harness.world.settings = { ...harness.world.settings, model: changedModel };
+      notify?.({
+        affectsConfiguration: (section) => section === 'debuggen' || section === 'debuggen.model',
+      });
+
+      expect(harness.manager.status.settingsChanged).toBe(true);
+      expect(harness.manager.status.state).toBe('running');
+      expect(child.signals).toEqual([]);
+      expect(harness.world.children).toHaveLength(1);
+      const record = recordOf(
+        harness.records,
+        'a setting the running service was started with changed; restart it to apply',
+      );
+      expect(record.fields).toEqual({ ...BOUND, settings: ['debuggen.model'] });
+      for (const logged of harness.records) {
+        expect(renderRecord(logged)).not.toContain(changedModel);
+      }
+      expectNoModelId(harness.records);
+
+      // restart() is how the developer applies it: the new child carries the
+      // new model, and the flag clears.
+      harness.world.answering = false;
+      const restarted = await harness.manager.restart();
+
+      expect(isOk(restarted) ? restarted.value.state : undefined).toBe('running');
+      expect(harness.manager.status.settingsChanged).toBe(false);
+      expect(harness.world.children).toHaveLength(2);
+      expect(latestChild(harness.world).env.DEBUGGEN_MODEL).toBe(changedModel);
+    });
+
+    it('lifts a latched model refusal, so the next automatic start uses the corrected value', async () => {
+      let notify: ((event: ConfigurationChangeLike) => void) | undefined;
+      const harness = createHarness({
+        settings: { model: `${MODEL_SENTINEL}\u0000` },
+        deps: {
+          onDidChangeConfiguration: (listener) => {
+            notify = listener;
+            return { dispose: () => undefined };
+          },
+        },
+      });
+      const refused = await harness.manager.ensureRunning();
+      expect(isErr(refused) ? refused.error.details?.reason : undefined).toBe('model');
+
+      // Latched: an automatic retry with the value unchanged spawns nothing.
+      const repeated = await harness.manager.ensureRunning();
+      expect(isErr(repeated) ? repeated.error.details?.reason : undefined).toBe('model');
+      expect(harness.world.children).toHaveLength(0);
+
+      harness.world.settings = { ...harness.world.settings, model: CONFIGURED_MODEL };
+      notify?.({
+        affectsConfiguration: (section) => section === 'debuggen' || section === 'debuggen.model',
+      });
+      const child = await startHealthy(harness);
+
+      expect(child.env.DEBUGGEN_MODEL).toBe(CONFIGURED_MODEL);
+      expect(harness.manager.status.settingsChanged).toBe(false);
+      expectNoModelId(harness.records);
+    });
   });
 });
 

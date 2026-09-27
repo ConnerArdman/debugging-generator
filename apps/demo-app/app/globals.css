@@ -12,8 +12,9 @@
  *      form, so a module renders sensibly on its own and renders *this* palette in the
  *      application. The fallbacks mirror the values here; when the two ever disagree, the
  *      declaration here is what the browser paints.
- *   2. The element baseline: box sizing, document and body defaults, margin reset, heading
- *      scale, replaced-element defaults, link and form-control inheritance, the focus
+ *   2. The element baseline: box sizing, document and body defaults, the scroll inset under the
+ *      sticky header, margin reset, heading scale, replaced-element defaults, the link reset and
+ *      the underline of class-less in-content links, form-control inheritance, the focus
  *      indicator, reduced-motion handling and selection colour.
  *   3. The dozen documented `.ls-*` page-composition utilities at the end of the file. Route
  *      files under `app/**` add no CSS Modules of their own, so those classes are how a page
@@ -37,11 +38,19 @@
  */
 
 :root {
-  /* Raw palette. These seven are the brand's vocabulary; the semantic tokens below name them.
+  /* Raw palette. These eight are the brand's vocabulary; the semantic tokens below name them.
    * --ls-ink and --ls-amber are fixed: public/favicon.svg and public/logo.svg paint the brand
-   * mark with exactly these two values. */
+   * mark with exactly these two values.
+   *
+   * --ls-steel sits between slate and mist and exists for one job: a line that has to be seen.
+   * It measures 3.25:1 on white and 3.10:1 on paper, so a border drawn in it clears the 3:1
+   * non-text minimum (WCAG 1.4.11) on both light surfaces. --ls-mist (1.48:1 on white) stays in
+   * the vocabulary for what is deliberately faint and identifies nothing on its own - a spinner's
+   * track, a skeleton's shimmer, a scrollbar thumb, the caret or outline of an unavailable
+   * control. */
   --ls-ink: #0f172a;
   --ls-slate: #475569;
+  --ls-steel: #8190a5;
   --ls-mist: #cbd5e1;
   --ls-paper: #f8fafc;
   --ls-amber: #f59e0b;
@@ -49,12 +58,16 @@
   --ls-white: #ffffff;
 
   /* Surfaces. `--ls-surface` is the page and card background, `--ls-surface-sunken` the recessed
-   * one (form fields, table zebra rows, skeleton placeholders), `--ls-border` the hairline. The
-   * hairline is a decorative separator only: a state is carried by text, an icon or a status
-   * colour, never by the border alone, and focus is drawn with --ls-focus. */
+   * one (form fields, table zebra rows, skeleton placeholders), `--ls-border` the hairline.
+   *
+   * The hairline is also the edge that identifies a control - a text field, a select, a
+   * secondary button, a chip, a shipping-option card - so it is held to the 3:1 non-text minimum
+   * (WCAG 1.4.11): steel measures 3.25:1 on --ls-surface and 3.10:1 on --ls-surface-sunken. It
+   * still carries no state on its own: a state is carried by text, an icon or a status colour,
+   * and focus is drawn with --ls-focus. */
   --ls-surface: var(--ls-white);
   --ls-surface-sunken: var(--ls-paper);
-  --ls-border: var(--ls-mist);
+  --ls-border: var(--ls-steel);
 
   /* Text colours. Both clear WCAG AA (4.5:1) on --ls-surface and on --ls-surface-sunken:
    * primary 17.9:1 / 17.1:1, secondary 7.6:1 / 7.2:1. */
@@ -177,6 +190,17 @@ html {
   min-height: 100%;
   /* Stop mobile Safari inflating text after an orientation change. */
   -webkit-text-size-adjust: 100%;
+  /* Keep whatever the browser scrolls to clear of the sticky header (WCAG 2.4.11). The header is
+   * `position: sticky` at the fixed --ls-header-height at every width, so without this a control
+   * reached by Tab or Shift+Tab, a `scrollIntoView()` or programmatic `focus()` target, and the
+   * skip link's or a fragment's target can all be scrolled to a position underneath the bar. The
+   * inset is the header's height plus the widest spacing step (96px at the declared values). The
+   * step is the widest one because a partly hidden field is scrolled only until its own edge meets
+   * this inset, and the label above it - a line of small text plus its gap, about 21px - has to
+   * come to rest below the bar as well, with room left for the focus ring; one 16px step measured
+   * as leaving that label under the bar. Declared on the root element because the document is the
+   * scroller these targets live in. */
+  scroll-padding-block-start: calc(var(--ls-header-height) + var(--ls-space-6));
 }
 
 /* In-page anchors (the header's skip link, a dashboard section link) glide rather than jump -
@@ -261,11 +285,36 @@ img {
   height: auto;
 }
 
-/* A link's appearance belongs to the module that renders it - a nav item, a breadcrumb crumb and
- * a product card title are all anchors and none of them wants a default underline. */
+/* Links come in two kinds, and the baseline treats them differently.
+ *
+ * A component's anchor - a nav item, a breadcrumb crumb, a product card title, a pager chip - is
+ * styled by the module that renders it, and every one of them carries that module's class. None
+ * wants a default underline, so the reset below clears it and lets the module decide.
+ *
+ * An in-content anchor - the way out of the not-found page or the error boundary, the recovery
+ * link in a page's empty or notice state - is written bare in a route file under `app/**`, which
+ * has no module of its own and a closed utility set with no link class in it. It carries no class
+ * at all, and without a cue of its own it would read as the sentence around it, so that sentence
+ * would give no sign that part of it navigates (WCAG 1.4.1). Those anchors are underlined, and a
+ * pointer over one thickens the line: the cue is the underline rather than a colour, so it holds
+ * on every surface and tone the link can sit in, and the link keeps the colour of its container.
+ *
+ * `:where()` keeps the second rule at the specificity of the bare `a` selector, so any module
+ * class still outranks it; `:not([class])` is what keeps a component's anchor out of it in the
+ * first place. */
 a {
   color: inherit;
   text-decoration: none;
+}
+
+a:where([href]:not([class])) {
+  text-decoration-line: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+
+a:where([href]:not([class])):hover {
+  text-decoration-thickness: 2px;
 }
 
 button,

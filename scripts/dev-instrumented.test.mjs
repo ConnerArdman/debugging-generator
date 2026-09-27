@@ -71,7 +71,9 @@ import {
   DEFAULT_SERVICE_PORT,
   DevInstrumentedError,
   INGEST_PATH,
+  LAUNCH_TIMEOUT_MS,
   RELEASE_PATH,
+  REQUEST_TIMEOUT_MS,
   RESPONSE_MAX_BYTES,
   SERVICE_IDENTITY_CHALLENGE_BYTES,
   SERVICE_IDENTITY_CHALLENGE_HEADER,
@@ -79,6 +81,7 @@ import {
   SERVICE_IDENTITY_PROOF_HEADER,
   SERVICE_IDENTITY_PROOF_LABEL,
   SERVICE_ROUTES,
+  STOP_TIMEOUT_MS,
   awaitShutdownSignal,
   buildChildEnv,
   buildLaunchCommand,
@@ -337,6 +340,13 @@ function captureStream() {
  *   otherwise (`CLEANUP_PARTIAL` on 500)
  * @param {Promise<unknown>} [options.releaseGate] the release route answers
  *   only once this settles, so a test can act while the release is in flight
+ * @param {number} [options.launchDelayMs] the launch route answers this many
+ *   milliseconds late, as the service's launcher does while it waits for the
+ *   dev server it spawned to be ready
+ * @param {number} [options.stopDelayMs] the stop route answers this many
+ *   milliseconds late, as the launcher does while its termination ladder runs
+ * @param {boolean} [options.launchDrop] the launch route drops the connection
+ *   instead of answering, so the command never hears how the launch went
  * @returns {Promise<StubService>}
  */
 async function startStubService(options = {}) {
@@ -462,7 +472,13 @@ async function startStubService(options = {}) {
         return;
       }
       if (requestPath === LAUNCH) {
-        answer(launchStatus, launchStatus === 200 ? launchBody : { message: 'launch refused' });
+        if (options.launchDrop === true) {
+          req.socket.destroy();
+          return;
+        }
+        setTimeout(() => {
+          answer(launchStatus, launchStatus === 200 ? launchBody : { message: 'launch refused' });
+        }, options.launchDelayMs ?? 0);
         return;
       }
       if (requestPath === CREDENTIAL) {
@@ -496,7 +512,9 @@ async function startStubService(options = {}) {
         void Promise.resolve(options.releaseGate).then(respond, respond);
         return;
       }
-      answer(stopStatus, stopStatus === 200 ? { stopped: true } : { message: 'stop refused' });
+      setTimeout(() => {
+        answer(stopStatus, stopStatus === 200 ? { stopped: true } : { message: 'stop refused' });
+      }, options.stopDelayMs ?? 0);
     });
   });
 
@@ -575,6 +593,8 @@ async function createFixture(options = {}) {
 
 /**
  * @typedef {object} FakeDevServer
+ * @property {string} id the random id in the fake's paths, and so on the
+ *   command line of every process it runs
  * @property {string} binDir directory to put first on the child's `PATH`
  * @property {Record<string, string>} env what the run's environment needs for
  *   the fake to be found: a `PATH` with {@link FakeDevServer.binDir} first
@@ -583,7 +603,16 @@ async function createFixture(options = {}) {
  *   environment, as `env` printed it
  * @property {() => boolean} ran whether the fake was executed at all
  * @property {() => boolean} ready whether the fake has written both records,
- *   and so — with `waitForSignal` — is now waiting for its signal
+ *   and so — with `waitForSignal` — is now waiting for its signal; with a
+ *   `grandchild`, also that the grandchild is running and waiting for its own
+ * @property {() => number | undefined} leaderPid the fake's own pid — the
+ *   process `--spawn-local` spawned, and so its process group id — once it
+ *   has written it
+ * @property {() => number | undefined} grandchildPid the pid of the process
+ *   the fake started below itself (`grandchild`), once that has written it
+ * @property {() => string | undefined} grandchildSignal the signal a
+ *   `'foreground'` grandchild exited on (`INT`, `TERM`, `HUP` or `QUIT`), once
+ *   it has
  */
 
 /**
@@ -619,24 +648,115 @@ function shellQuote(value) {
  *   exec with ENOENT, so the spawn itself fails although `PATH` lookup found
  *   an executable file
  * @param {boolean} [options.waitForSignal] instead of exiting at once, wait
- *   until `SIGINT` or `SIGTERM` arrives and then exit with `exitCode`, like a
- *   dev server stopped with Ctrl-C
+ *   until `SIGINT`, `SIGTERM` or `SIGHUP` arrives and then exit with
+ *   `exitCode`, like a dev server stopped with Ctrl-C
+ * @param {'foreground' | 'stray'} [options.grandchild] also run a second shell
+ *   below the fake, which records its pid ({@link FakeDevServer.grandchildPid}).
+ *   `'foreground'` mimics the corepack `pnpm` shim this command really spawns:
+ *   the fake catches `SIGINT`, `SIGTERM`, `SIGHUP` and `SIGQUIT` and does
+ *   nothing with them — it relays no signal — runs the grandchild in the
+ *   foreground and exits with its status, and the grandchild exits on each of
+ *   those signals with 128 + its number, recording which one arrived. Only a
+ *   signal to the whole process group reaches it. `'stray'` starts the grandchild in the
+ *   background, ignoring `SIGINT` and `SIGTERM`, and leaves it running
+ *   whenever the fake itself exits: a dev server that leaves a worker behind
+ *   in its process group, which only `SIGKILL` ends.
+ * @param {boolean} [options.ignoreSignals] the fake catches `SIGINT`,
+ *   `SIGTERM`, `SIGHUP` and `SIGQUIT`, does nothing with them and keeps
+ *   running: only `SIGKILL` ends it
  * @returns {Promise<FakeDevServer>}
  */
 async function createFakeDevServer(fixture, options = {}) {
-  const binDir = path.join(fixture.base, `bin-${randomUUID()}`);
+  // One id names both paths, so every process of this fake carries it on its
+  // command line (see `endFakeProcesses`).
+  const id = randomUUID();
+  const binDir = path.join(fixture.base, `bin-${id}`);
   await fs.promises.mkdir(binDir, { recursive: true });
 
-  const dump = path.join(fixture.base, `dev-server-${randomUUID()}.txt`);
+  const dump = path.join(fixture.base, `dev-server-${id}.txt`);
   const envDump = `${dump}.env`;
   const readyMarker = `${dump}.ready`;
+  const leaderPidFile = `${dump}.pid`;
+  const grandchildScript = `${dump}.grandchild.sh`;
+  const grandchildPidFile = `${dump}.grandchild.pid`;
+  const grandchildSignalFile = `${dump}.grandchild.signal`;
+  const grandchildReady = `${dump}.grandchild.ready`;
   const exitCode = options.exitCode ?? 0;
   const executable = path.join(binDir, 'pnpm');
+
+  // A trap with an action, never `trap ''`: a signal a shell ignores stays
+  // ignored in everything it starts, and the grandchild must be able to act
+  // on the group signal exactly as a real dev server does.
+  /** @type {string[]} */
+  const traps = [];
+  if (options.ignoreSignals === true || options.grandchild === 'foreground') {
+    traps.push("trap ':' INT TERM HUP QUIT");
+  } else if (options.waitForSignal === true || options.grandchild === 'stray') {
+    traps.push(`trap 'exit ${String(exitCode)}' INT TERM HUP`);
+  }
+
+  /** @type {string[]} */
+  let body;
+  if (options.grandchild === 'foreground') {
+    await fs.promises.writeFile(
+      grandchildScript,
+      [
+        // The shell reports a foreground `sleep` the group signal ended
+        // ("Terminated", "Hangup") on stderr, which the command under test
+        // shares: silenced, so that stream holds the command's own output.
+        'exec 2>/dev/null',
+        // A SIGQUIT would otherwise leave a core file of each `sleep` behind.
+        'ulimit -c 0',
+        `echo $$ > ${shellQuote(grandchildPidFile)}`,
+        `trap 'echo INT > ${shellQuote(grandchildSignalFile)}; exit 130' INT`,
+        `trap 'echo TERM > ${shellQuote(grandchildSignalFile)}; exit 143' TERM`,
+        `trap 'echo HUP > ${shellQuote(grandchildSignalFile)}; exit 129' HUP`,
+        `trap 'echo QUIT > ${shellQuote(grandchildSignalFile)}; exit 131' QUIT`,
+        `: > ${shellQuote(readyMarker)}`,
+        'while :; do sleep 0.05; done',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    body = [`/bin/sh ${shellQuote(grandchildScript)}`, 'status=$?', 'exit $status'];
+  } else if (options.grandchild === 'stray') {
+    await fs.promises.writeFile(
+      grandchildScript,
+      [
+        "trap '' INT TERM",
+        `echo $$ > ${shellQuote(grandchildPidFile)}`,
+        `: > ${shellQuote(grandchildReady)}`,
+        'while :; do sleep 0.05; done',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    body = [
+      `/bin/sh ${shellQuote(grandchildScript)} &`,
+      `while [ ! -e ${shellQuote(grandchildReady)} ]; do sleep 0.01; done`,
+      `: > ${shellQuote(readyMarker)}`,
+      ...(options.waitForSignal === true ? ['while :; do sleep 0.05; done'] : []),
+      `exit ${String(exitCode)}`,
+    ];
+  } else {
+    body = [
+      `: > ${shellQuote(readyMarker)}`,
+      // Short sleeps, so the trap runs promptly once a signal arrives: the
+      // shell defers it until its foreground command has finished.
+      ...(options.waitForSignal === true || options.ignoreSignals === true
+        ? ['while :; do sleep 0.05; done']
+        : []),
+      `exit ${String(exitCode)}`,
+    ];
+  }
+
   await fs.promises.writeFile(
     executable,
     [
       `#!${options.interpreter ?? '/bin/sh'}`,
-      ...(options.waitForSignal === true ? [`trap 'exit ${String(exitCode)}' INT TERM`] : []),
+      // No core file for a process a group signal ends.
+      'ulimit -c 0',
+      ...traps,
       '{',
       '  echo "argv=$*"',
       '  echo "cwd=$(pwd)"',
@@ -646,16 +766,34 @@ async function createFakeDevServer(fixture, options = {}) {
       '  echo "DEBUGGEN_TOKEN=${DEBUGGEN_TOKEN-<unset>}"',
       `} > ${shellQuote(dump)}`,
       `env > ${shellQuote(envDump)}`,
-      `: > ${shellQuote(readyMarker)}`,
-      // Short sleeps, so the trap runs promptly once a signal arrives: the
-      // shell defers it until its foreground command has finished.
-      ...(options.waitForSignal === true ? ['while :; do sleep 0.05; done'] : []),
-      `exit ${String(exitCode)}`,
+      `echo $$ > ${shellQuote(leaderPidFile)}`,
+      ...body,
       '',
     ].join('\n'),
     'utf8',
   );
   await fs.promises.chmod(executable, 0o755);
+
+  /**
+   * @param {string} file
+   * @returns {string | undefined}
+   */
+  const readTrimmed = (file) => {
+    try {
+      const text = fs.readFileSync(file, 'utf8').trim();
+      return text === '' ? undefined : text;
+    } catch {
+      return undefined;
+    }
+  };
+  /**
+   * @param {string} file
+   * @returns {number | undefined}
+   */
+  const readPid = (file) => {
+    const text = readTrimmed(file);
+    return text !== undefined && /^\d+$/u.test(text) ? Number(text) : undefined;
+  };
 
   /**
    * @param {string} file
@@ -672,13 +810,93 @@ async function createFakeDevServer(fixture, options = {}) {
   };
 
   return {
+    id,
     binDir,
     env: { PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}` },
     ran: () => fs.existsSync(dump),
     ready: () => fs.existsSync(readyMarker),
     read: () => parse(dump),
     readEnv: () => parse(envDump),
+    leaderPid: () => readPid(leaderPidFile),
+    grandchildPid: () => readPid(grandchildPidFile),
+    grandchildSignal: () => readTrimmed(grandchildSignalFile),
   };
+}
+
+/**
+ * What `/proc/<pid>/stat` says about a process on Linux: its state and its
+ * process group, read after the last `)` because the command name before it
+ * may hold one. `undefined` when there is no such process, or off Linux.
+ *
+ * @param {number} pid
+ * @returns {{ state: string, pgrp: number } | undefined}
+ */
+function procStatOf(pid) {
+  if (process.platform !== 'linux') return undefined;
+  let text;
+  try {
+    text = fs.readFileSync(`/proc/${String(pid)}/stat`, 'utf8');
+  } catch {
+    return undefined;
+  }
+  const fields = text
+    .slice(text.lastIndexOf(')') + 1)
+    .trim()
+    .split(/\s+/u);
+  return { state: fields[0] ?? '', pgrp: Number(fields[2]) };
+}
+
+/**
+ * Whether a process is still running. On Linux a zombie — exited, not yet
+ * reaped by whichever process inherited it — counts as gone; elsewhere
+ * `kill(pid, 0)` answers.
+ *
+ * @param {number} pid
+ * @returns {boolean}
+ */
+function isRunning(pid) {
+  if (process.platform === 'linux') {
+    const stat = procStatOf(pid);
+    return stat !== undefined && stat.state !== 'Z' && stat.state !== 'X';
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return /** @type {{ code?: unknown }} */ (error).code === 'EPERM';
+  }
+}
+
+/**
+ * End whatever a test left running of a fake dev server, so a failing
+ * assertion never leaks a process into the host. Only the pids the fake
+ * itself recorded are signalled, one by one, never a group. On Linux each is
+ * signalled only while `/proc/<pid>/cmdline` still carries the fake's id, so a
+ * pid the kernel has since handed to an unrelated process is never touched;
+ * elsewhere the recorded pid is signalled while it runs.
+ *
+ * @param {FakeDevServer} dev
+ * @returns {void}
+ */
+function endFakeProcesses(dev) {
+  for (const pid of [dev.grandchildPid(), dev.leaderPid()]) {
+    if (pid === undefined || !isRunning(pid)) continue;
+    if (process.platform === 'linux') {
+      /** @type {string} */
+      let commandLine;
+      try {
+        commandLine = fs.readFileSync(`/proc/${String(pid)}/cmdline`, 'utf8');
+      } catch {
+        continue;
+      }
+      if (!commandLine.includes(dev.id)) continue;
+    }
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // Gone in the meantime: nothing left to end.
+    }
+  }
 }
 
 /**
@@ -1181,6 +1399,83 @@ describe('route helpers in isolation', () => {
         projectRoot: path.join(os.tmpdir(), 'some-project'),
       }),
     ).resolves.toBeUndefined();
+  });
+
+  /**
+   * The value of a numeric `const NAME = 60_000;` declaration in TypeScript
+   * source, read from the text so the check needs no build of the definer.
+   *
+   * @param {string} source
+   * @param {string} name
+   * @returns {number | undefined}
+   */
+  const numericConstant = (source, name) => {
+    const match = new RegExp(`\\bconst\\s+${escapeRegExp(name)}\\s*=\\s*([\\d_]+)\\s*;`, 'u').exec(
+      source,
+    );
+    return match?.[1] === undefined ? undefined : Number(match[1].replace(/_/gu, ''));
+  };
+
+  it("outlasts the launcher's readiness wait and stop ladder, which its launch and stop answers wait on", async () => {
+    const launcher = await fs.promises.readFile(
+      path.join(REPO_ROOT, 'apps/local-service/src/dev-server/launcher.ts'),
+      'utf8',
+    );
+    const ready = numericConstant(launcher, 'DEFAULT_READY_TIMEOUT_MS');
+    const grace = numericConstant(launcher, 'DEFAULT_STOP_GRACE_MS');
+    const confirm = numericConstant(launcher, 'KILL_CONFIRM_MS');
+    expect([ready, grace, confirm].every((value) => typeof value === 'number')).toBe(true);
+
+    // The launcher answers a launch once the dev server is ready and a stop
+    // once its ladder has run, so a shorter wait would give up on an answer
+    // that is still coming — and leave a launched dev server unreported.
+    expect(LAUNCH_TIMEOUT_MS).toBeGreaterThan(ready ?? Number.POSITIVE_INFINITY);
+    expect(STOP_TIMEOUT_MS).toBeGreaterThan((grace ?? Number.POSITIVE_INFINITY) + (confirm ?? 0));
+    expect(LAUNCH_TIMEOUT_MS).toBeGreaterThan(REQUEST_TIMEOUT_MS);
+    expect(STOP_TIMEOUT_MS).toBeGreaterThan(REQUEST_TIMEOUT_MS);
+  });
+
+  it(
+    'waits past the ordinary request timeout for a launch and a stop the service answers late',
+    async () => {
+      const late = REQUEST_TIMEOUT_MS + 500;
+      service = await startStubService({ launchDelayMs: late, stopDelayMs: late });
+      const projectRoot = path.join(os.tmpdir(), 'some-project');
+      const request = { base: service.base, editorToken: EDITOR_TOKEN, projectRoot };
+
+      const [launched, stopped] = await Promise.all([
+        launchDevServer(request),
+        stopDevServer(request),
+      ]);
+
+      expect(launched).toEqual({ devServerUrl: LAUNCHED.devServerUrl, pid: LAUNCHED.pid });
+      expect(stopped).toBeUndefined();
+      expect(service.rejections).toEqual([]);
+    },
+    REQUEST_TIMEOUT_MS * 3,
+  );
+
+  it('says how to stop a dev server the launch may have started when its answer never arrives', async () => {
+    service = await startStubService({ launchDrop: true });
+    const projectRoot = path.join(os.tmpdir(), 'some-project');
+
+    const failure = await launchDevServer({
+      base: service.base,
+      editorToken: EDITOR_TOKEN,
+      projectRoot,
+    }).then(
+      () => undefined,
+      (/** @type {unknown} */ error) => error,
+    );
+
+    expect(failure).toBeInstanceOf(DevInstrumentedError);
+    const { message, hint } = /** @type {DevInstrumentedError} */ (failure);
+    expect(message).toContain(`request to ${service.base}${LAUNCH} failed`);
+    expect(squash(hint ?? '')).toContain(
+      'The service may have started a dev server before it answered',
+    );
+    expect(hint).toContain(`node scripts/dev-instrumented.mjs --stop --project ${projectRoot}`);
+    expect(`${message}\n${hint ?? ''}`).not.toContain(EDITOR_TOKEN);
   });
 });
 
@@ -2884,6 +3179,11 @@ describe('releasing the server-agent credential', () => {
       expect(started.requests[3]?.authorization).toBe(`Bearer ${EDITOR_TOKEN}`);
       expect(started.rejections).toEqual([]);
       expect(stderr.text()).toBe('');
+      // Forwarded to the dev server's own process group, and reported.
+      expect(stdout.text()).toContain(
+        `dev-instrumented: SIGINT received; stopping the dev server (process group ${String(dev.leaderPid())})`,
+      );
+      expect(stdout.text()).toContain('dev-instrumented: the dev server stopped');
       expect(stdout.text()).toContain(
         'dev-instrumented: released the server-agent credential; the service revoked it',
       );
@@ -4116,6 +4416,107 @@ describe('the command as a process', () => {
     },
   );
 
+  // The dev server this command really spawns is the corepack `pnpm` shim,
+  // which relays no signal to what it starts below itself: a signal that
+  // reaches the shim alone leaves the dev server serving and its credential
+  // live. The fake below behaves the same way, so only a signal to the whole
+  // process group reaches its grandchild. Each signal is sent to this
+  // command's pid alone, the way `kill <pid>` sends it, never to its group.
+  /** @type {Array<[NodeJS.Signals, string, number]>} */
+  const relayedSignals = [
+    ['SIGINT', 'INT', 130],
+    ['SIGTERM', 'TERM', 143],
+    ['SIGHUP', 'HUP', 129],
+    ['SIGQUIT', 'QUIT', 131],
+  ];
+
+  for (const [signal, name, status] of relayedSignals) {
+    spawns(
+      `stops the whole dev-server tree on a ${signal} sent to this command alone, though the package manager relays none`,
+      async () => {
+        service = await startStubService();
+        const fixture = await createFixture();
+        const dev = await createFakeDevServer(fixture, { grandchild: 'foreground' });
+        const script = await installScript(fixture);
+        const started = service;
+
+        const child = spawn(
+          process.execPath,
+          [script, '--spawn-local', '--service', started.base],
+          {
+            env: { PATH: dev.env.PATH, DEBUGGEN_HOME: fixture.home },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        );
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (chunk) => (stdout += String(chunk)));
+        child.stderr.on('data', (chunk) => (stderr += String(chunk)));
+        /** @type {Promise<{ code: number | null, signal: NodeJS.Signals | null }>} */
+        const exited = new Promise((resolve) => {
+          child.once('exit', (code, exitSignal) => resolve({ code, signal: exitSignal }));
+        });
+
+        try {
+          await waitFor(() => dev.ready(), 'the grandchild of the dev server to start');
+          const leader = dev.leaderPid();
+          const grandchild = dev.grandchildPid();
+          if (leader === undefined || grandchild === undefined) {
+            throw new Error('the fake dev server did not record its pids');
+          }
+          const groupOfGrandchild = procStatOf(grandchild)?.pgrp;
+
+          child.kill(signal);
+          /** @type {ReturnType<typeof setTimeout> | undefined} */
+          let timer;
+          const result = await Promise.race([
+            exited,
+            new Promise((resolve) => {
+              timer = setTimeout(() => resolve('still running 10 s after the signal'), 10_000);
+            }),
+          ]);
+          clearTimeout(timer);
+
+          expect(result, stderr).toEqual({ code: status, signal: null });
+          // The dev server led a process group of its own, with everything it
+          // started in it.
+          if (process.platform === 'linux') expect(groupOfGrandchild).toBe(leader);
+          expect(dev.grandchildSignal()).toBe(name);
+          expect(isRunning(grandchild)).toBe(false);
+          expect(isRunning(leader)).toBe(false);
+          expect(started.routes()).toEqual([
+            `GET ${HEALTH}`,
+            `POST ${CREDENTIAL}`,
+            `GET ${HEALTH}`,
+            `POST ${RELEASE}`,
+          ]);
+          expect(started.requests[3]?.body).toEqual({ token: SERVER_AGENT_TOKEN });
+
+          // One line when the signal arrives, one once the group is gone, and
+          // only then the release.
+          const lines = stdout.split('\n');
+          const stopping = lines.indexOf(
+            `dev-instrumented: ${signal} received; stopping the dev server (process group ${String(leader)})`,
+          );
+          const stopped = lines.indexOf('dev-instrumented: the dev server stopped');
+          const released = lines.indexOf(
+            'dev-instrumented: released the server-agent credential; the service revoked it',
+          );
+          expect(stopping).toBeGreaterThan(-1);
+          expect(stopped).toBeGreaterThan(stopping);
+          expect(released).toBeGreaterThan(stopped);
+          expect(stderr).toBe('');
+          expect(`${stdout}${stderr}`).not.toContain(SERVER_AGENT_TOKEN);
+        } finally {
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+          endFakeProcesses(dev);
+        }
+      },
+      // Above the 10 s bound on the exit, so the cleanup always runs.
+      20_000,
+    );
+  }
+
   it('prints usage and exits 0 for --help', async () => {
     const fixture = await createFixture();
     const script = await installScript(fixture);
@@ -4134,6 +4535,407 @@ describe('the command as a process', () => {
     expect(output).toContain('--spawn-local');
     expect(output).toContain('--stop');
     expect(output).toContain('--detach');
+  });
+});
+
+describe('the hint for a service that is not running', () => {
+  /**
+   * The commands the VS Code extension contributes, read from its manifest —
+   * the definer of every command name this script tells a developer to run —
+   * rather than transcribed, so a title renamed there fails here.
+   *
+   * @type {Array<{ command: string, title: string, category?: string }>}
+   */
+  const contributed = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, 'apps/vscode-extension/package.json'), 'utf8'),
+  ).contributes.commands;
+
+  /**
+   * A command's name as the Command Palette shows it: `Category: Title`.
+   *
+   * @param {{ title: string, category?: string }} entry
+   * @returns {string}
+   */
+  const paletteName = (entry) =>
+    entry.category === undefined ? entry.title : `${entry.category}: ${entry.title}`;
+
+  const startService = contributed.find((entry) => entry.command === 'debuggen.startService');
+  const paletteNames = new Set(contributed.map(paletteName));
+  /** What the hint must say, whitespace collapsed; unmatchable when the manifest lacks the command. */
+  const startServiceHint = `from VS Code: run the "${
+    startService === undefined
+      ? '(debuggen.startService is not contributed)'
+      : paletteName(startService)
+  }" command (debuggen.startService)`;
+
+  /**
+   * Every quoted `"Debug Generator: …"` command name in a text.
+   *
+   * @param {string} text
+   * @returns {string[]}
+   */
+  const namedCommands = (text) =>
+    [...text.matchAll(/"(Debug Generator: [^"]+)"/gu)].map((match) => match[1] ?? '');
+
+  it('names only commands the extension contributes, anywhere in this script', () => {
+    expect(startService).toBeDefined();
+    const named = namedCommands(SCRIPT_SOURCE);
+    expect(named.length).toBeGreaterThan(0);
+    for (const name of named) expect(paletteNames, name).toContain(name);
+  });
+
+  /** @type {Array<[string, string[]]>} */
+  const modes = [
+    ['the default launch', ['--detach']],
+    ['--stop', ['--stop']],
+    ['--spawn-local', ['--spawn-local']],
+  ];
+  const spawns = it.skipIf(process.platform === 'win32');
+
+  for (const [mode, flags] of modes) {
+    const test = flags.includes('--spawn-local') ? spawns : it;
+    test(`${mode} names the real start command when no local service is running`, async () => {
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture);
+      const base = await closedServiceAddress();
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+
+      const code = await main([...flags, '--service', base], context);
+
+      expect(code).toBe(2);
+      expect(stdout.text()).toBe('');
+      expect(dev.ran()).toBe(false);
+      const errors = squash(stderr.text());
+      expect(errors).toContain('the local service is not answering');
+      expect(errors).toContain(startServiceHint);
+      const named = namedCommands(errors);
+      expect(named.length).toBeGreaterThan(0);
+      for (const name of named) expect(paletteNames, name).toContain(name);
+    });
+  }
+
+  it('names the real start command when auth.json is missing', async () => {
+    const fixture = await createFixture({ withCredential: false });
+    const { context, stderr } = contextFor(fixture);
+
+    const code = await main(['--detach', '--service', await closedServiceAddress()], context);
+
+    expect(code).toBe(2);
+    const errors = squash(stderr.text());
+    expect(errors).toContain('no editor credential');
+    expect(errors).toContain(startServiceHint);
+    for (const name of namedCommands(errors)) expect(paletteNames, name).toContain(name);
+  });
+});
+
+describe('stopping the --spawn-local dev server', () => {
+  /** The signals `--spawn-local` forwards, whose listeners must all be gone once it returns. */
+  const FORWARDED = /** @type {const} */ (['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']);
+
+  /**
+   * How many listeners each forwarded signal has in this process.
+   *
+   * @returns {Record<string, number>}
+   */
+  const listenerCounts = () =>
+    Object.fromEntries(FORWARDED.map((signal) => [signal, process.listenerCount(signal)]));
+
+  /**
+   * A `devServerStop.signalProcess` that records every call and passes it on
+   * to `process.kill`, except the signals it is told to withhold — which is
+   * how a signal this command cannot deliver is simulated.
+   *
+   * @param {readonly (NodeJS.Signals | 0)[]} [withheld]
+   * @returns {{ calls: Array<[number, NodeJS.Signals | 0]>, send: (pid: number, signal: NodeJS.Signals | 0) => void }}
+   */
+  const recordingSignals = (withheld = []) => {
+    /** @type {Array<[number, NodeJS.Signals | 0]>} */
+    const calls = [];
+    return {
+      calls,
+      send(pid, signal) {
+        calls.push([pid, signal]);
+        if (!withheld.includes(signal)) process.kill(pid, signal);
+      },
+    };
+  };
+
+  /**
+   * The pids a fake recorded, once it is running.
+   *
+   * @param {FakeDevServer} dev
+   * @returns {{ leader: number, grandchild: number | undefined }}
+   */
+  const pidsOf = (dev) => {
+    const leader = dev.leaderPid();
+    if (leader === undefined) throw new Error('the fake dev server did not record its pid');
+    return { leader, grandchild: dev.grandchildPid() };
+  };
+
+  // The group can be proved the dev server's after its leader exited only
+  // through /proc, so the cases that signal it then run on Linux alone.
+  const linux = it.runIf(process.platform === 'linux');
+  const spawns = it.skipIf(process.platform === 'win32');
+
+  linux(
+    'sends SIGKILL to what a stopped dev server left in its process group once the grace period ends',
+    async () => {
+      service = await startStubService();
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture, {
+        grandchild: 'stray',
+        waitForSignal: true,
+        exitCode: 130,
+      });
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+      const signals = recordingSignals();
+      const before = listenerCounts();
+      const started = service;
+
+      const run = main(['--spawn-local', '--service', started.base], {
+        ...context,
+        devServerStop: { stopGraceMs: 300, signalProcess: signals.send },
+      });
+      try {
+        await waitFor(() => dev.ready(), 'the dev server and its stray worker to start');
+        const { leader, grandchild: stray } = pidsOf(dev);
+        const sentAt = Date.now();
+        process.emit('SIGINT');
+
+        // The leader's own status: it exited on SIGINT.
+        await expect(run).resolves.toBe(130);
+        // The worker ignores SIGINT and SIGTERM: it outlived its leader and
+        // ended only with the SIGKILL sent when the grace period was over.
+        expect(Date.now() - sentAt).toBeGreaterThanOrEqual(300);
+        expect(stray === undefined ? false : isRunning(stray)).toBe(false);
+        expect(signals.calls).toEqual([
+          [-leader, 'SIGINT'],
+          [-leader, 'SIGKILL'],
+        ]);
+
+        const text = stdout.text();
+        expect(text).toContain(
+          `dev-instrumented: SIGINT received; stopping the dev server (process group ${String(leader)})`,
+        );
+        expect(text).toMatch(
+          new RegExp(
+            `dev-instrumented: \\d+ process(es)? of the dev server still running 0\\.3 s after the signal; sending SIGKILL \\(process group ${String(leader)}\\)`,
+            'u',
+          ),
+        );
+        expect(text.indexOf('dev-instrumented: the dev server stopped')).toBeLessThan(
+          text.indexOf('released the server-agent credential'),
+        );
+        expect(text).toContain('dev-instrumented: the dev server stopped');
+        expect(stderr.text()).toBe('');
+        expect(started.routes().at(-1)).toBe(`POST ${RELEASE}`);
+        expect(listenerCounts()).toEqual(before);
+      } finally {
+        endFakeProcesses(dev);
+      }
+    },
+  );
+
+  linux(
+    'sends SIGTERM, then SIGKILL, to what a dev server that exited on its own left in its process group',
+    async () => {
+      service = await startStubService();
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture, { grandchild: 'stray', exitCode: 7 });
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+      const signals = recordingSignals();
+
+      try {
+        const code = await main(['--spawn-local', '--service', service.base], {
+          ...context,
+          devServerStop: { stopGraceMs: 300, signalProcess: signals.send },
+        });
+
+        expect(code).toBe(7);
+        const { leader, grandchild: stray } = pidsOf(dev);
+        expect(stray === undefined ? false : isRunning(stray)).toBe(false);
+        // Nothing was signalled while the dev server ran; what it left was
+        // signalled as proved the dev server's, first gently, then not.
+        expect(signals.calls).toEqual([
+          [-leader, 'SIGTERM'],
+          [-leader, 'SIGKILL'],
+        ]);
+        const text = stdout.text();
+        expect(text).toMatch(
+          new RegExp(
+            `dev-instrumented: the dev server exited and left \\d+ process(es)? running in its process group ${String(leader)}; sending SIGTERM`,
+            'u',
+          ),
+        );
+        expect(text).toContain('dev-instrumented: the dev server stopped');
+        expect(text).not.toContain('received; stopping the dev server');
+        expect(stderr.text()).toBe('');
+      } finally {
+        endFakeProcesses(dev);
+      }
+    },
+  );
+
+  linux(
+    'warns with the process group and the kill commands when what the dev server left outlives SIGKILL',
+    async () => {
+      service = await startStubService();
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture, {
+        grandchild: 'stray',
+        waitForSignal: true,
+        exitCode: 130,
+      });
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+      // SIGKILL is withheld: a signal this command could not deliver.
+      const signals = recordingSignals(['SIGKILL']);
+      const started = service;
+
+      const run = main(['--spawn-local', '--service', started.base], {
+        ...context,
+        devServerStop: { stopGraceMs: 200, killConfirmMs: 300, signalProcess: signals.send },
+      });
+      try {
+        await waitFor(() => dev.ready(), 'the dev server and its stray worker to start');
+        const { leader, grandchild: stray } = pidsOf(dev);
+        process.emit('SIGINT');
+
+        // The leader's status stands: the warning is the report, not the code.
+        await expect(run).resolves.toBe(130);
+        expect(stray === undefined ? false : isRunning(stray)).toBe(true);
+        expect(signals.calls).toEqual([
+          [-leader, 'SIGINT'],
+          [-leader, 'SIGKILL'],
+        ]);
+
+        const errors = squash(stderr.text());
+        expect(errors).toMatch(
+          new RegExp(
+            `^dev-instrumented: warning: \\d+ process(es)? of the dev server (is|are) still running in its process group ${String(leader)} after SIGKILL\\.`,
+            'u',
+          ),
+        );
+        expect(errors).toContain(`with: kill -TERM -${String(leader)}`);
+        expect(errors).toContain(`with: kill -KILL -${String(leader)}`);
+        expect(stdout.text()).not.toContain('dev-instrumented: the dev server stopped');
+        // The credential is released whatever the outcome.
+        expect(started.routes().at(-1)).toBe(`POST ${RELEASE}`);
+        expect(stdout.text()).toContain('released the server-agent credential');
+      } finally {
+        endFakeProcesses(dev);
+      }
+    },
+  );
+
+  spawns(
+    'signals nothing after the dev server exits when the group cannot be proved its own, and says so',
+    async () => {
+      service = await startStubService();
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture, {
+        grandchild: 'stray',
+        waitForSignal: true,
+        exitCode: 130,
+      });
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+      const signals = recordingSignals();
+
+      // No /proc, as on macOS: members cannot be pinned, so the group id is
+      // never signalled once the leader is reaped.
+      const run = main(['--spawn-local', '--service', service.base], {
+        ...context,
+        devServerStop: { stopGraceMs: 300, inspectProcesses: false, signalProcess: signals.send },
+      });
+      try {
+        await waitFor(() => dev.ready(), 'the dev server and its stray worker to start');
+        const { leader, grandchild: stray } = pidsOf(dev);
+        process.emit('SIGINT');
+
+        await expect(run).resolves.toBe(130);
+        expect(stray === undefined ? false : isRunning(stray)).toBe(true);
+        // One group signal while the leader was unreaped, then probes only.
+        expect(signals.calls[0]).toEqual([-leader, 'SIGINT']);
+        expect(signals.calls.length).toBeGreaterThan(1);
+        expect(signals.calls.slice(1).filter(([, signal]) => signal !== 0)).toEqual([]);
+        expect(signals.calls.every(([pid]) => pid === -leader)).toBe(true);
+
+        const errors = squash(stderr.text());
+        expect(errors).toContain(
+          `the dev server exited, but its process group ${String(leader)} still has processes running that this command could not verify as the dev server's, so it did not signal them`,
+        );
+        expect(errors).toContain(`ps -eo pid,pgid,args | awk '$2 == ${String(leader)}'`);
+        expect(errors).toContain(`with: kill -TERM -${String(leader)}`);
+        expect(errors).toContain(`with: kill -KILL -${String(leader)}`);
+        expect(stdout.text()).not.toContain('dev-instrumented: the dev server stopped');
+      } finally {
+        endFakeProcesses(dev);
+      }
+    },
+  );
+
+  spawns(
+    'returns 137 with a warning, rather than hang, when the dev server has not exited after SIGKILL',
+    async () => {
+      service = await startStubService();
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture, { ignoreSignals: true });
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+      const signals = recordingSignals(['SIGKILL']);
+      const started = service;
+
+      const run = main(['--spawn-local', '--service', started.base], {
+        ...context,
+        devServerStop: { stopGraceMs: 200, killConfirmMs: 300, signalProcess: signals.send },
+      });
+      try {
+        await waitFor(() => dev.ready(), 'the dev server to start');
+        const { leader } = pidsOf(dev);
+        process.emit('SIGINT');
+
+        await expect(run).resolves.toBe(137);
+        expect(isRunning(leader)).toBe(true);
+        expect(signals.calls).toEqual([
+          [-leader, 'SIGINT'],
+          [-leader, 'SIGKILL'],
+        ]);
+        expect(stdout.text()).toContain(
+          `dev-instrumented: the dev server is still running 0.2 s after SIGINT; sending SIGKILL (process group ${String(leader)})`,
+        );
+        const errors = squash(stderr.text());
+        expect(errors).toContain(
+          `dev-instrumented: warning: the dev server (pid ${String(leader)}) had not exited 0.3 s after SIGKILL and may still be running.`,
+        );
+        expect(errors).toContain(`Stop it with: kill -KILL -${String(leader)}`);
+        expect(started.routes().at(-1)).toBe(`POST ${RELEASE}`);
+      } finally {
+        endFakeProcesses(dev);
+      }
+    },
+  );
+
+  it('documents the stop it performs', () => {
+    const text = usage();
+    const walkthrough = squash(
+      text.slice(text.indexOf('What it does (--spawn-local)'), text.indexOf('\nOptions\n')),
+    );
+    expect(walkthrough).toContain('runs that child as the leader of a process group of its own');
+    expect(walkthrough).toContain(
+      'SIGINT (Ctrl-C), SIGTERM, SIGHUP (the terminal closing) and SIGQUIT sent to this command are forwarded to that whole group',
+    );
+    expect(walkthrough).toContain('A dev server still running 5 seconds later is sent SIGKILL');
+    expect(walkthrough).toContain('kill -TERM / kill -KILL commands for anything still running');
+    expect(walkthrough).toContain('not gone 2 seconds after SIGKILL ends this command with 137');
+    expect(walkthrough).not.toContain('forwards SIGINT/SIGTERM to that child');
+
+    const options = text.slice(text.indexOf('\nOptions\n'));
+    const start = options.indexOf('  --spawn-local');
+    const paragraph = squash(options.slice(start, options.indexOf('  --env ', start)));
+    expect(paragraph).toContain(
+      "SIGINT, SIGTERM, SIGHUP and SIGQUIT are forwarded to the dev server's whole process group, with SIGKILL 5 seconds later if it is still running",
+    );
+    expect(squash(text.slice(text.indexOf('Exit codes')))).toContain(
+      '137 also when the --spawn-local dev server had not exited 2 seconds after SIGKILL',
+    );
   });
 });
 

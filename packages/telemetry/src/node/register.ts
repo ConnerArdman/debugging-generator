@@ -41,6 +41,30 @@
  * says so at `debug` level, because that is a normal state rather than a
  * failure.
  *
+ * ## Inert in a process that serves no requests
+ *
+ * `NODE_OPTIONS` reaches **every** Node process of a launch, not only the dev
+ * server. Both launch paths run the project's own package-manager `dev` script,
+ * so one launch is a chain: the package-manager shim (corepack's `pnpm`, `npm`,
+ * `yarn`), Next.js's CLI supervisor (`next dev`, which serves nothing and forks
+ * the server), and the forked `next/dist/server/lib/start-server.js` — the
+ * process that actually handles requests. Next.js additionally runs
+ * `process.execPath <typescript>/bin/tsc --showConfig` with the inherited
+ * environment and parses that child's stdout as JSON.
+ *
+ * Installed in all of them, one launch would run three tracers and open three
+ * `server-agent` sockets, and the wrappers' hellos would mislead the service's
+ * readiness and lease bookkeeping — a shim whose event loop is blocked on the
+ * native package manager connects once and then dies at the first heartbeat.
+ * So {@link classifyPreloadProcess} recognises those entry points from
+ * `process.argv`, and {@link installPreload} returns `inert` for them before it
+ * reads the launch variables, **writing nothing at all**: a gated process's
+ * stdout may be parsed by its parent, and a diagnostic there would corrupt it.
+ * Every other process — `next start`, which serves in-process, the forked
+ * `next-server`, a custom server script — is the host and installs as usual,
+ * so one launch yields exactly one tracer and one socket, in the process that
+ * serves requests, whichever launcher started it.
+ *
  * ## Never throw into the host process
  *
  * An exception raised out of a `--import` module aborts the developer's dev
@@ -64,12 +88,16 @@
  *    `addSpanProcessor()`/`getActiveSpanProcessor()` and offers no way back from
  *    `shutdown()`: `control.ts` needs the factory to build a fresh provider for
  *    a capture that follows a teardown.
- * 6. **`register({ propagator })`** — explicitly W3C trace context, since 2.0
- *    dropped environment-variable propagator configuration. `register()`
- *    installs the Node `AsyncLocalStorage` context manager itself, which is why
- *    this package needs no `@opentelemetry/context-async-hooks` dependency —
- *    and that context manager is the one process-global effect of these steps
- *    that outlives teardown (see "The one global effect that stays" below).
+ * 6. **`register(providerRegistrationConfig())`** — explicitly W3C trace
+ *    context, since 2.0 dropped environment-variable propagator configuration.
+ *    When no context manager is global yet, `register()` installs the Node
+ *    `AsyncLocalStorage` context manager itself, which is why this package
+ *    needs no `@opentelemetry/context-async-hooks` dependency — and that
+ *    context manager is the one process-global effect of these steps that
+ *    outlives teardown (see "The one global effect that stays" below). When one
+ *    already is, the options say `contextManager: null` and it is kept. The
+ *    same {@link providerRegistrationConfig} from `control.ts` builds the
+ *    options for every later capture's registration, so both follow one rule.
  * 7. **Instrumentations** — `registerInstrumentations` **after** the provider is
  *    registered (so they bind to it) and **before** the application loads (so
  *    `pg` and Prisma are patched before the app requires them). That ordering is
@@ -116,9 +144,13 @@
  * `register()` has one more process-global effect, and nothing here gives it
  * back: when no context manager is registered yet, the SDK's default
  * `AsyncLocalStorageContextManager` becomes `@opentelemetry/api`'s global
- * context manager. When one already is, the API refuses the duplicate and the
- * existing manager stays; the same refusal keeps the first manager in place
- * through every later capture's `register()`.
+ * context manager. When one already is — the host's own, or this preload's
+ * from an earlier capture — {@link providerRegistrationConfig} passes
+ * `contextManager: null`, so `register()` offers no second manager and the
+ * existing one stays in place through every later capture's registration.
+ * (Offering one anyway is what the API answers with an "Attempted duplicate
+ * registration of API: context" `diag.error` stack, leaving the rejected
+ * manager enabled and unowned.)
  *
  * It is left **deliberately**. Neither the failure path, nor
  * {@link shutdownPreload}, nor `control.ts`'s disable path calls
@@ -170,13 +202,16 @@
  * ```
  */
 
+import { subscribe, unsubscribe } from 'node:diagnostics_channel';
+import { realpathSync } from 'node:fs';
+
 import { nowEpochMs } from '@debuggen/shared';
 import type { Logger } from '@debuggen/shared';
-import { diag, DiagLogLevel, propagation, trace } from '@opentelemetry/api';
-import type { Context, DiagLogger } from '@opentelemetry/api';
-import { W3CTraceContextPropagator } from '@opentelemetry/core';
+import { context, diag, DiagLogLevel, propagation, trace } from '@opentelemetry/api';
+import type { Context, DiagLogger, Span as ApiSpan } from '@opentelemetry/api';
 import { registerInstrumentations } from '@opentelemetry/instrumentation';
 import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
+import type { PgResponseHookInformation } from '@opentelemetry/instrumentation-pg';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import type { Resource } from '@opentelemetry/resources';
 import type { ReadableSpan, Span, SpanProcessor } from '@opentelemetry/sdk-trace-base';
@@ -188,14 +223,26 @@ import {
 } from '@opentelemetry/semantic-conventions';
 import { PrismaInstrumentation } from '@prisma/instrumentation';
 
-import { createPreloadLogger, loadPreloadConfig, TRACER_VERSION } from './config.js';
+import {
+  createPreloadLogger,
+  isLoopbackHostname,
+  loadPreloadConfig,
+  TRACER_VERSION,
+} from './config.js';
 import type { PreloadConfig } from './config.js';
-import { CONTROL_CLIENT_KIND, DebuggenCaptureSampler, ServerAgentControl } from './control.js';
+import {
+  CONTROL_CLIENT_KIND,
+  DebuggenCaptureSampler,
+  OUTBOUND_PROPAGATION_INSTRUMENTATION_NAME,
+  providerRegistrationConfig,
+  ServerAgentControl,
+} from './control.js';
 import type {
   ControlSocketConstructor,
   ToggleableInstrumentation,
   TracerProviderFactory,
 } from './control.js';
+import { DRIVER_ROW_COUNT_ATTRIBUTE } from './convert.js';
 import { DebuggenSpanProcessor, SHUTDOWN_FLUSH_DEADLINE_MS } from './exporter.js';
 import { installSpanHelper, uninstallSpanHelper } from './span-helper.js';
 
@@ -272,6 +319,17 @@ const TERMINATION_SIGNALS: readonly NodeJS.Signals[] = Object.freeze<NodeJS.Sign
  * the active path — without a local service, a database or a network socket.
  */
 export interface PreloadInstallOptions {
+  /**
+   * The command line of the process being instrumented, in `process.argv`'s
+   * shape (`[execPath, entryScript, ...args]`); defaults to `process.argv`.
+   *
+   * {@link classifyPreloadProcess} reads it to keep the preload out of the
+   * package-manager, TypeScript and Next.js CLI processes a launch also runs
+   * (see "Inert in a process that serves no requests" in this module's
+   * overview). A test passes a synthesised one.
+   */
+  readonly argv?: readonly string[] | undefined;
+
   /**
    * Where the three launch variables are read from; defaults to `process.env`.
    */
@@ -365,8 +423,12 @@ export interface InactivePreload {
   /**
    * Why nothing was installed:
    *
-   * - `inert` — a launch variable is absent or unusable. The normal state of a
-   *   dev server with no session attached.
+   * - `inert` — a launch variable is absent or unusable, the normal state of a
+   *   dev server with no session attached; or this process is one a launch
+   *   runs *around* the dev server — a package-manager shim, the Next.js dev
+   *   CLI supervisor, the TypeScript compiler CLI — which
+   *   {@link classifyPreloadProcess} recognises and which is left untouched
+   *   and unlogged so the one server process holds the only installation.
    * - `duplicate` — this process already has a preload installed.
    * - `failed` — a step threw. The dev server runs untraced; see `reason`.
    */
@@ -545,6 +607,20 @@ function describeError(error: unknown): string {
  * and {@link runShutdown} calls `diag.disable()` on the way out so the host is
  * left with whatever diagnostics configuration it had.
  *
+ * ## Threshold: `info`, never OpenTelemetry's `debug` or `verbose`
+ *
+ * Even at `trace`, only `diag.error`, `diag.warn` (forwarded as `warn`) and
+ * `diag.info` (forwarded as `debug`) are routed. OpenTelemetry's two finest
+ * levels are per-operation chatter that says nothing about this product's
+ * state: the SDK tracer emits "Recording is off, propagating context in a
+ * non-recording span" for **every** span the gating sampler declines — about
+ * nineteen per page request outside a capture — and `@opentelemetry/api`
+ * emits "Registered a global for …" for every global each registration sets.
+ * What those levels could add is withheld anyway, because this sink forwards a
+ * component logger's namespace and the *count* of its arguments, never the
+ * arguments themselves. The preload's own `trace`-level detail is unaffected;
+ * this threshold governs only what OpenTelemetry contributes to it.
+ *
  * @param logger The resolved logger, whose level is the gate.
  * @param log Where the forwarded records go.
  * @returns Whether a diag logger was installed, so teardown can undo it.
@@ -564,6 +640,8 @@ function wireDiagnostics(logger: Logger, log: PreloadLog): boolean {
     };
 
   try {
+    // `debug` and `verbose` are still members because `DiagLogger` requires
+    // them; the `INFO` threshold below means the API never calls either.
     const sink: DiagLogger = {
       error: forward('warn'),
       warn: forward('warn'),
@@ -571,7 +649,7 @@ function wireDiagnostics(logger: Logger, log: PreloadLog): boolean {
       debug: forward('debug'),
       verbose: forward('debug'),
     };
-    diag.setLogger(sink, DiagLogLevel.DEBUG);
+    diag.setLogger(sink, DiagLogLevel.INFO);
     return true;
   } catch (error) {
     log.warn('could not install the OpenTelemetry diagnostic logger', {
@@ -963,12 +1041,492 @@ function revokeGlobalTracing(log: PreloadLog): void {
 
 /*
  * ---------------------------------------------------------------------------
+ * Which process the preload belongs in
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * What kind of Node process the preload was loaded into, as far as its command
+ * line tells.
+ *
+ * - `host` — the process to instrument: the forked Next.js dev server, `next
+ *   start` (which serves in-process), a custom server, or anything
+ *   unrecognised. The preload installs here.
+ * - `package-manager` — a package-manager entry script (corepack's shims,
+ *   `npm-cli.js`, a Yarn release) that only runs the project's `dev` script.
+ * - `typescript-cli` — the TypeScript compiler or language server CLI, which
+ *   Next.js runs as `tsc --showConfig` and whose stdout it parses as JSON.
+ * - `next-cli` — Next.js's CLI running its `dev` command, a supervisor that
+ *   serves nothing and forks the server.
+ */
+export type PreloadProcessKind = 'host' | 'package-manager' | 'typescript-cli' | 'next-cli';
+
+/**
+ * Resolves an entry path through its symbolic links; `fs.realpathSync` by
+ * default. Injectable so the classifier stays pure under test.
+ */
+export type RealPathResolver = (path: string) => string;
+
+/**
+ * Final path components (lower-cased, `.js`/`.cjs`/`.mjs` stripped) of the
+ * package-manager entry scripts Node runs.
+ *
+ * corepack publishes `pnpm`, `pnpx`, `npm`, `npx`, `yarn`, `yarnpkg` and
+ * `corepack` shims (`corepack/dist/*.js`, symlinked from the Node install's
+ * `bin/`); npm's own entries are `npm-cli.js` and `npx-cli.js`; classic Yarn is
+ * `yarn/bin/yarn.js`; standalone pnpm is `pnpm/bin/pnpm.cjs`. Yarn Berry
+ * releases are matched by {@link YARN_RELEASE_STEM} instead.
+ */
+const PACKAGE_MANAGER_ENTRY_STEMS: ReadonlySet<string> = new Set([
+  'pnpm',
+  'pnpx',
+  'npm',
+  'npx',
+  'npm-cli',
+  'npx-cli',
+  'yarn',
+  'yarnpkg',
+  'corepack',
+]);
+
+/** A Yarn Berry release file, e.g. `.yarn/releases/yarn-4.5.0.cjs`. */
+const YARN_RELEASE_STEM = /^yarn-\d/;
+
+/**
+ * Normalised path suffixes of the TypeScript CLI entry points: the two `bin`
+ * launchers and the `lib` scripts they load (TypeScript 5+ splits each into a
+ * thin wrapper and an `_`-prefixed implementation).
+ */
+const TYPESCRIPT_CLI_ENTRY_SUFFIXES: readonly string[] = Object.freeze([
+  '/typescript/bin/tsc',
+  '/typescript/bin/tsserver',
+  '/typescript/lib/tsc',
+  '/typescript/lib/_tsc',
+  '/typescript/lib/tsserver',
+  '/typescript/lib/_tsserver',
+]);
+
+/** Normalised path suffix of Next.js's CLI entry, `next/dist/bin/next`. */
+const NEXT_CLI_ENTRY_SUFFIX = '/next/dist/bin/next';
+
+/**
+ * Every command Next.js's CLI declares (Next.js 16), so the first of them in the
+ * arguments decides what the CLI process is doing.
+ */
+const NEXT_CLI_COMMANDS: ReadonlySet<string> = new Set([
+  'build',
+  'dev',
+  'start',
+  'export',
+  'info',
+  'lint',
+  'telemetry',
+  'typegen',
+  'upgrade',
+  'experimental-analyze',
+  'experimental-test',
+  'experimental-request-insights',
+  'internal',
+  'help',
+]);
+
+/** The Next.js command whose CLI process only supervises a forked server. */
+const NEXT_DEV_COMMAND = 'dev';
+
+/** The script extensions an entry path is compared without. */
+const SCRIPT_EXTENSION = /\.[cm]?js$/;
+
+/**
+ * Why a process that {@link classifyPreloadProcess} gated installed nothing.
+ * Value-free by construction: each names a kind of process, never its path.
+ */
+const GATED_PROCESS_REASONS: Readonly<Record<Exclude<PreloadProcessKind, 'host'>, string>> =
+  Object.freeze({
+    'package-manager':
+      'this process is a package-manager wrapper around the dev server; the preload installs only in the process that serves requests',
+    'typescript-cli':
+      'this process is the TypeScript compiler CLI, whose output its parent parses; the preload installs only in the process that serves requests',
+    'next-cli':
+      'this process is the Next.js dev CLI supervisor, which forks the dev server; the preload installs only in the process that serves requests',
+  });
+
+/**
+ * An entry path in the one spelling every comparison uses: POSIX separators,
+ * lower case, no script extension.
+ *
+ * @param path An entry script path, as given or as resolved.
+ * @returns The normalised path.
+ */
+function normaliseEntryPath(path: string): string {
+  return path.replace(/\\/g, '/').toLowerCase().replace(SCRIPT_EXTENSION, '');
+}
+
+/**
+ * Whether a normalised path ends in `suffix` on a component boundary, or is
+ * exactly `suffix` without its leading separator (a relative entry).
+ *
+ * @param path A path from {@link normaliseEntryPath}.
+ * @param suffix A suffix beginning with `/`.
+ */
+function hasPathSuffix(path: string, suffix: string): boolean {
+  return path.endsWith(suffix) || path === suffix.slice(1);
+}
+
+/**
+ * Whether Next.js's CLI, given these arguments, runs its `dev` supervisor.
+ *
+ * `dev` is the CLI's default command, so arguments naming no known command —
+ * `next`, `next -p 3000`, `next --turbopack` — run it too. Otherwise the first
+ * known command decides, which keeps `next dev ./build` (a directory named like
+ * a command) a dev supervisor and `next start` the host.
+ *
+ * @param commandArgs `argv.slice(2)`.
+ */
+function runsNextDevSupervisor(commandArgs: readonly string[]): boolean {
+  for (const token of commandArgs) {
+    if (NEXT_CLI_COMMANDS.has(token)) {
+      return token === NEXT_DEV_COMMAND;
+    }
+  }
+  return true;
+}
+
+/**
+ * Classify one spelling of the entry path.
+ *
+ * @param entry The entry script path.
+ * @param commandArgs `argv.slice(2)`.
+ * @returns The process kind this path names.
+ */
+function classifyEntryPath(entry: string, commandArgs: readonly string[]): PreloadProcessKind {
+  const normalised = normaliseEntryPath(entry);
+  const stem = normalised.slice(normalised.lastIndexOf('/') + 1);
+
+  if (PACKAGE_MANAGER_ENTRY_STEMS.has(stem) || YARN_RELEASE_STEM.test(stem)) {
+    return 'package-manager';
+  }
+  if (TYPESCRIPT_CLI_ENTRY_SUFFIXES.some((suffix) => hasPathSuffix(normalised, suffix))) {
+    return 'typescript-cli';
+  }
+  if (hasPathSuffix(normalised, NEXT_CLI_ENTRY_SUFFIX) && runsNextDevSupervisor(commandArgs)) {
+    return 'next-cli';
+  }
+  return 'host';
+}
+
+/**
+ * Decide from a command line whether this is the process the preload belongs
+ * in — see "Inert in a process that serves no requests" in this module's
+ * overview.
+ *
+ * `argv[1]`, the entry script, is inspected as given **and** through its
+ * symbolic links, because the two spell a wrapper differently:
+ * `/usr/local/bin/pnpm` is recognisable by name while its target is
+ * `…/corepack/dist/pnpm.js`, and a project's `node_modules/.bin` launcher runs
+ * a path that may only resolve to `…/next/dist/bin/next`. Either spelling
+ * matching gates the process.
+ *
+ * Pure and total: the only I/O is `resolveRealPath`, and a path that cannot be
+ * resolved (deleted, relative to another directory, a pseudo-entry) is judged
+ * as given. A missing or empty `argv[1]` — `node -e`, a REPL — is the host.
+ *
+ * @example
+ * ```ts
+ * classifyPreloadProcess(['/usr/bin/node', '/usr/local/bin/pnpm', 'dev']); // 'package-manager'
+ * classifyPreloadProcess(['/usr/bin/node', '/app/node_modules/next/dist/bin/next', 'dev']); // 'next-cli'
+ * classifyPreloadProcess(['/usr/bin/node', '/app/node_modules/next/dist/bin/next', 'start']); // 'host'
+ * ```
+ *
+ * @param argv A command line in `process.argv`'s shape.
+ * @param resolveRealPath Resolves symbolic links; `fs.realpathSync` by default.
+ * @returns The process kind; only `host` installs the preload.
+ */
+export function classifyPreloadProcess(
+  argv: readonly string[],
+  resolveRealPath: RealPathResolver = realpathSync,
+): PreloadProcessKind {
+  const entry = argv[1];
+  if (entry === undefined || entry.length === 0) {
+    return 'host';
+  }
+  const commandArgs = argv.slice(2);
+
+  const asGiven = classifyEntryPath(entry, commandArgs);
+  if (asGiven !== 'host') {
+    return asGiven;
+  }
+
+  let resolved: string;
+  try {
+    resolved = resolveRealPath(entry);
+  } catch {
+    // Unresolvable: the spelling as given has already been judged, and a
+    // process must never fail to start over the question.
+    return 'host';
+  }
+  return resolved === entry ? 'host' : classifyEntryPath(resolved, commandArgs);
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Installation
  * ---------------------------------------------------------------------------
  */
 
 /**
- * Patch Prisma and `pg`, and return the two instances.
+ * Record how many rows a `pg` statement returned or affected, as the current
+ * convention's `db.response.returned_rows` — the `pg` instrumentation's
+ * `responseHook`.
+ *
+ * The pinned instrumentation (`@opentelemetry/instrumentation-pg` 0.74.0)
+ * records no row count of its own, so without this hook `db.rowCount` could
+ * never be populated and the query table's rows column would read "n/a" for
+ * every statement. `./convert.ts` translates the key into `db.rowCount`.
+ *
+ * Only the driver's `rowCount` is read — a count, never a row: nothing about
+ * the rows' contents is touched (AAP §0.5.2). A statement the driver reports no
+ * count for (`rowCount` is `null` for a `BEGIN`, for example) records nothing.
+ * Never throws: the hook runs inside the application's query callback.
+ *
+ * @param span The statement's span.
+ * @param info The driver's result, as the instrumentation hands it over.
+ */
+export function recordReturnedRows(span: ApiSpan, info: PgResponseHookInformation): void {
+  try {
+    const count: unknown = (info as { readonly data?: { readonly rowCount?: unknown } }).data
+      ?.rowCount;
+    if (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0) {
+      span.setAttribute(DRIVER_ROW_COUNT_ATTRIBUTE, count);
+    }
+  } catch {
+    // A result object whose getters throw is simply not counted.
+  }
+}
+
+/**
+ * The diagnostics channel Node's built-in `fetch` (its bundled undici)
+ * publishes every outgoing request on, as the request is created and before
+ * it is dispatched.
+ */
+export const UNDICI_REQUEST_CREATE_CHANNEL = 'undici:request:create';
+
+/** The header names the W3C propagator writes, compared case-insensitively. */
+const TRACE_CONTEXT_HEADERS: ReadonlySet<string> = new Set(['traceparent', 'tracestate']);
+
+/**
+ * The request object undici publishes on {@link UNDICI_REQUEST_CREATE_CHANNEL},
+ * as far as this module reads it. Every member is checked before use: the
+ * shape belongs to the host's undici, not to this package.
+ */
+interface OutgoingRequestLike {
+  /** The destination origin, `http://host:port`. */
+  readonly origin?: unknown;
+  /** The request headers: a flat `[name, value, …]` array, or a raw header block. */
+  readonly headers?: unknown;
+  /** Appends one header to the request before it is sent. */
+  readonly addHeader?: unknown;
+}
+
+/**
+ * Whether a request already carries trace context, whoever wrote it.
+ *
+ * A caller that set its own `traceparent` owns the request's lineage; adding a
+ * second one would send two contradicting parents.
+ */
+function carriesTraceContext(headers: unknown): boolean {
+  if (Array.isArray(headers)) {
+    for (let index = 0; index < headers.length; index += 2) {
+      const name: unknown = headers[index];
+      if (typeof name === 'string' && TRACE_CONTEXT_HEADERS.has(name.toLowerCase())) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (typeof headers === 'string') {
+    return /^(traceparent|tracestate)\s*:/imu.test(headers);
+  }
+  return false;
+}
+
+/**
+ * Write the active trace context onto one outgoing request, when it should
+ * carry it, and report whether it did.
+ *
+ * Next.js spans the dev server's outgoing `fetch` (its `AppRender.fetch`
+ * span, emitted as `http.client`) but never propagates that span's context
+ * onto the request, so a call a route handler makes to another route of the
+ * same dev server starts a trace of its own: the called route's request span
+ * arrives as a separate root and the calling request's timeline shows a gap.
+ * Injecting `traceparent` makes the called route's framework request span
+ * extract it (`withPropagatedContext`), so it nests under the `http.client`
+ * span that made the call — one tree, as for a browser request.
+ *
+ * Written only when all of these hold:
+ *
+ * - a **recording** span is active: the request was made inside a capture, by
+ *   a span the sampler kept (outside a capture nothing records, so nothing is
+ *   written);
+ * - the destination is **loopback** — the only place a producer this machine
+ *   runs can observe the other end. A third-party service never receives this
+ *   process's trace ids, matching the page agent's same-origin rule;
+ * - the destination is not the local service itself (`excludedOrigin`), whose
+ *   ingest traffic is this preload's own;
+ * - the request carries no trace context already.
+ *
+ * Never throws: it runs synchronously inside the application's `fetch` call.
+ *
+ * @param request The request undici published.
+ * @param excludedOrigin The local service's origin, never written to.
+ * @param activeContext The context the request is being made in; the active
+ * one by default, which is what the channel's synchronous publish runs in.
+ * @returns Whether trace context was written.
+ */
+export function injectOutboundTraceContext(
+  request: unknown,
+  excludedOrigin: string | undefined,
+  activeContext?: Context,
+): boolean {
+  try {
+    if (typeof request !== 'object' || request === null) {
+      return false;
+    }
+    const candidate = request as OutgoingRequestLike;
+    const addHeader = candidate.addHeader;
+    if (typeof addHeader !== 'function') {
+      return false;
+    }
+
+    const active = activeContext ?? context.active();
+    const span = trace.getSpan(active);
+    if (span === undefined || !span.isRecording()) {
+      return false;
+    }
+
+    const origin = new URL(String(candidate.origin));
+    if (origin.protocol !== 'http:' && origin.protocol !== 'https:') {
+      return false;
+    }
+    if (!isLoopbackHostname(origin.hostname) || origin.origin === excludedOrigin) {
+      return false;
+    }
+    if (carriesTraceContext(candidate.headers)) {
+      return false;
+    }
+
+    const carrier: Record<string, string> = {};
+    propagation.inject(active, carrier);
+    let written = false;
+    for (const [name, value] of Object.entries(carrier)) {
+      if (TRACE_CONTEXT_HEADERS.has(name.toLowerCase())) {
+        (addHeader as (this: unknown, key: string, headerValue: string) => unknown).call(
+          request,
+          name,
+          value,
+        );
+        written = true;
+      }
+    }
+    return written;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The outgoing-request trace-context hook, as an instrumentation the control
+ * object can switch with the capture's `fetch` signal.
+ *
+ * A subscription to {@link UNDICI_REQUEST_CREATE_CHANNEL} rather than a patch:
+ * nothing of the application's or the framework's is wrapped, so there is
+ * nothing to unwrap, and `disable()` — which the control object calls when a
+ * capture ends or the preload is torn down — unsubscribes, leaving no trace of
+ * the hook in the process. Like the OpenTelemetry instrumentations it sits
+ * beside, it is enabled on construction.
+ *
+ * `@opentelemetry/instrumentation-undici` would propagate the same context, but
+ * it also spans every request, duplicating the `http.client` span Next.js
+ * already emits (AAP §0.3.2), so it is deliberately not used.
+ */
+export class OutboundTraceContextPropagation implements ToggleableInstrumentation {
+  /** What `./control.ts`'s `classifyInstrumentation` knows this hook by. */
+  readonly instrumentationName = OUTBOUND_PROPAGATION_INSTRUMENTATION_NAME;
+
+  /** The local service's origin, never written to. */
+  readonly #excludedOrigin: string | undefined;
+
+  /** The subscriber, one function for the hook's whole life so it can be removed. */
+  readonly #onRequest = (message: unknown): void => {
+    const request =
+      typeof message === 'object' && message !== null
+        ? (message as { readonly request?: unknown }).request
+        : undefined;
+    if (injectOutboundTraceContext(request, this.#excludedOrigin)) {
+      this.#injected += 1;
+    }
+  };
+
+  /** Whether the subscription is in place. */
+  #enabled = false;
+
+  /** How many requests had trace context written, for diagnostics and tests. */
+  #injected = 0;
+
+  /**
+   * @param options.excludedOrigin The local service's origin: its ingest and
+   * control traffic is the preload's own and never carries the application's
+   * trace context.
+   */
+  constructor(options: { readonly excludedOrigin?: string | undefined } = {}) {
+    this.#excludedOrigin = options.excludedOrigin;
+    this.enable();
+  }
+
+  /** Subscribe; a second call is a no-op. */
+  enable(): void {
+    if (this.#enabled) {
+      return;
+    }
+    subscribe(UNDICI_REQUEST_CREATE_CHANNEL, this.#onRequest);
+    this.#enabled = true;
+  }
+
+  /** Unsubscribe; a second call is a no-op. */
+  disable(): void {
+    if (!this.#enabled) {
+      return;
+    }
+    unsubscribe(UNDICI_REQUEST_CREATE_CHANNEL, this.#onRequest);
+    this.#enabled = false;
+  }
+
+  /** Whether the subscription is in place. */
+  isEnabled(): boolean {
+    return this.#enabled;
+  }
+
+  /** How many outgoing requests this hook has written trace context onto. */
+  get injectedCount(): number {
+    return this.#injected;
+  }
+}
+
+/**
+ * The origin of the local service a configuration points at, or `undefined`.
+ *
+ * @param config The launch configuration.
+ */
+function serviceOrigin(config: PreloadConfig): string | undefined {
+  try {
+    return new URL(config.ingestUrl).origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Patch Prisma and `pg`, subscribe the outgoing-request trace-context hook,
+ * and return the three instances.
  *
  * **Ordering.** This must run *after* the provider is registered — the SDK
  * resolves each instrumentation's tracer from the global provider at this moment
@@ -982,6 +1540,13 @@ function revokeGlobalTracing(log: PreloadLog): void {
  * `@opentelemetry/instrumentation-undici` would duplicate the request and
  * outgoing-fetch spans Next.js already emits through the provider above, and
  * `@vercel/otel` owns an exporter path this product does not use (AAP §0.3.2).
+ * What Next.js does *not* do — write the outgoing request's context onto the
+ * request — is the one piece of the undici instrumentation's work the trace
+ * needs, and {@link OutboundTraceContextPropagation} does exactly that and no
+ * more.
+ *
+ * `pg` is configured with {@link recordReturnedRows} as its `responseHook`:
+ * the instrumentation records no row count of its own.
  *
  * The unload function `registerInstrumentations` returns is deliberately
  * dropped: `control.ts` owns enable/disable, and it acts on the very instances
@@ -1001,21 +1566,30 @@ function revokeGlobalTracing(log: PreloadLog): void {
  * @param acquired Mutable list the caller owns the contents of; every
  * instrumentation instance this function constructs is appended to it
  * immediately, whether or not registration then succeeds.
- * @returns The Prisma and `pg` instrumentations, enabled, in registration order,
- * frozen — the pair `control.attach` holds for the life of the process.
+ * @param config The launch configuration, whose service origin the
+ * outgoing-request hook never writes trace context to.
+ * @returns The Prisma and `pg` instrumentations and the outgoing-request hook,
+ * enabled, in registration order, frozen — the set `control.attach` holds for
+ * the life of the process.
  */
 function registerServerInstrumentations(
   acquired: ToggleableInstrumentation[],
+  config: PreloadConfig,
 ): readonly ToggleableInstrumentation[] {
   const prisma = new PrismaInstrumentation();
   acquired.push(prisma);
 
-  const pg = new PgInstrumentation();
+  const pg = new PgInstrumentation({ responseHook: recordReturnedRows });
   acquired.push(pg);
 
   registerInstrumentations({ instrumentations: [prisma, pg] });
 
-  return Object.freeze<ToggleableInstrumentation[]>([prisma, pg]);
+  // Not an `InstrumentationBase`, so not handed to `registerInstrumentations`:
+  // it patches no module, it subscribes to a channel.
+  const outbound = new OutboundTraceContextPropagation({ excludedOrigin: serviceOrigin(config) });
+  acquired.push(outbound);
+
+  return Object.freeze<ToggleableInstrumentation[]>([prisma, pg, outbound]);
 }
 
 /**
@@ -1121,6 +1695,11 @@ async function runShutdown(
 /**
  * Install the server tier's telemetry into this process, or explain why not.
  *
+ * A process {@link classifyPreloadProcess} does not judge to be the host — a
+ * package-manager shim, the Next.js dev CLI supervisor, the TypeScript CLI — is
+ * answered `inert` first, before the launch variables are read, and nothing is
+ * logged for it. The classifier is total, so that check needs no guard.
+ *
  * The whole sequence — every step of the order documented at the top of this
  * file — sits inside one `try/catch`. Every resource with a process-global
  * effect this module gives back is registered with a {@link RollbackStep} the
@@ -1151,6 +1730,15 @@ async function runShutdown(
  * @returns The installation, or an inactive result carrying the reason.
  */
 export function installPreload(options: PreloadInstallOptions = {}): PreloadInstallation {
+  // Before anything else, including the launch variables and the logger: a
+  // wrapper process carries the same credential as the dev server it wraps, and
+  // its stdout may be parsed by its parent, so it gets no installation and no
+  // diagnostic line at all.
+  const processKind = classifyPreloadProcess(options.argv ?? process.argv);
+  if (processKind !== 'host') {
+    return inactive('inert', GATED_PROCESS_REASONS[processKind]);
+  }
+
   const env = options.env ?? process.env;
   const logger = options.logger ?? createPreloadLogger(undefined, env);
 
@@ -1270,9 +1858,13 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
     //    propagator is passed explicitly because 2.0 dropped environment-variable
     //    propagator configuration; `register()` installs the Node
     //    `AsyncLocalStorage` context manager itself, so this package needs no
-    //    `@opentelemetry/context-async-hooks` dependency. That manager stays
-    //    installed after any teardown, by design (see the overview).
-    provider.register({ propagator: new W3CTraceContextPropagator() });
+    //    `@opentelemetry/context-async-hooks` dependency — unless one is already
+    //    global, in which case the options keep it (`contextManager: null`)
+    //    rather than offer the API a duplicate to refuse. The options come from
+    //    `control.ts`, which registers every later capture's provider with the
+    //    same rule. That manager stays installed after any teardown, by design
+    //    (see the overview).
+    provider.register(providerRegistrationConfig());
 
     // 7. Instrumentations: after the provider, before the application's modules.
     //
@@ -1284,8 +1876,9 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
     // does not" is a reachable state — a throw while constructing `pg`, or
     // part-way through registration — and it has to be owned like any other.
     // `disable()` is what unwraps the `pg` methods shimmer wrapped and clears
-    // Prisma's global hook (AAP §0.5.1). Each instance is guarded on its own, so
-    // one that refuses does not strand the other one's patches.
+    // Prisma's global hook (AAP §0.5.1), and what unsubscribes the
+    // outgoing-request trace-context hook. Each instance is guarded on its own,
+    // so one that refuses does not strand the other ones' patches.
     const acquiredInstrumentations: ToggleableInstrumentation[] = [];
     rollback.push({
       label: 'pg and Prisma instrumentation',
@@ -1301,7 +1894,7 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
         }
       },
     });
-    const instrumentations = registerServerInstrumentations(acquiredInstrumentations);
+    const instrumentations = registerServerInstrumentations(acquiredInstrumentations, config);
 
     control.attach({ processor, instrumentations, createProvider, provider });
 

@@ -87,15 +87,56 @@
  * mode on while focus was elsewhere. The visible badge is hidden from
  * assistive technology so that the state is announced once.
  *
- * ## The descriptor
+ * ## The target: one summary line, the full descriptor on request
+ *
+ * This component is one slot of the header's controls row, so the target is
+ * shown there as a "Target details" disclosure followed by a single summary
+ * line that never wraps inside itself: the "Target" label, the `tagName` as a
+ * `Badge`, the nearest component (`componentChain[0]`) when there is one, and
+ * the `selector` as one clipped line with its full value as the element's
+ * `title`. The clip is visual only and marked by an ellipsis: the whole
+ * selector stays in the element, so assistive technology and anything reading
+ * the text content get it in full. Visually hidden lead-ins name the component
+ * and the selector for assistive technology without widening the line.
+ *
+ * The disclosure is a row item of its own and comes before the summary. Inside
+ * the summary line it would shrink with the chips until its label clipped (a
+ * `Button` may shrink to its minimum target size); in the wrapping row it keeps
+ * its whole label and stays on the line of "Pick element" and "Use selected
+ * element", and the summary, the one item that can give up room, comes last.
+ * When the row cannot hold the summary beside the controls, the summary moves
+ * beneath them as one unit and its selector, then its component name, shrink
+ * and ellipsize. A selected element therefore costs the header at most one
+ * line of its own, never a stack of descriptor rows. The chips carry no length
+ * of their own (AAP 0.6.4): how much of the selector shows is the row's free
+ * space, so a selector wider than that free space still moves the summary to
+ * a line of its own rather than being cut to a fixed width.
+ *
+ * The disclosure is a real `Button` with `aria-expanded` and `aria-controls`.
+ * It reveals, beneath the controls row, the full descriptor: the selector in
+ * full and wrapping — a shortened selector can name a different element than
+ * the one that was picked —, the optional visible `text` in full, the
+ * `componentChain` (the React owner chain, nearest first) in the array's own
+ * order with decorative separators, and the page `url`. An absent `text`
+ * renders nothing; an empty chain is the honest "no component information"
+ * answer and says so.
+ *
+ * The details region is collapsed by default, and it stays mounted while there
+ * is a target, hidden by the `hidden` attribute: `aria-controls` always names
+ * an element in the document, and the whole descriptor stays in the document's
+ * text either way. It is a bare `<div>` carrying only `id`, `hidden` and its
+ * group role and name — no class, no style — because `Stack` takes no `hidden`
+ * prop and a `Stack`'s own `display` rule would override the attribute.
+ *
+ * Only the developer opens or closes the details. A new target, or a refreshed
+ * record of the same one, keeps the disclosure as it was left, so a confirming
+ * session record never snaps the details shut while they are being read. The
+ * toggle's name is constant — `aria-expanded` carries the state and the pressed
+ * surface (`dg-is-active`) shows it — and the toggle never moves or remounts,
+ * so focus stays on it.
  *
  * Every value comes from the `SelectedTarget` the service confirmed or the
- * panel optimistically picked, and nothing else: `tagName` as a `Badge`, the
- * `selector` and the `url` as given in `Code`, the optional visible `text` as
- * single-line `Text` with the full value in its `title`, and the
- * `componentChain` — the React owner chain, nearest first — in the array's own
- * order with decorative separators. An absent `text` renders nothing; an empty
- * chain is the honest "no component information" answer and says so.
+ * panel optimistically picked, and nothing else.
  *
  * The composition root hands this component a descriptor that is already
  * bounded by the shared `$0` descriptor parser and prepared for display
@@ -116,17 +157,19 @@
  * ## Design-system compliance (AAP 0.6.4)
  *
  * `Button`, `Tooltip`, `Badge`, `Code` and `Text` for every element, `Stack`
- * for every gap and alignment. No inline style, no length, no colour, no CSS
- * file; the only class names written here are the design system's declared
- * state classes and its `dg-visually-hidden` utility. All copy is generic
- * product vocabulary and names nothing from any inspected application
- * (AAP 0.5.4).
+ * for every gap and alignment, and one unstyled `<div>` for the details region
+ * (above). No inline style, no length, no colour, no CSS file; the only class
+ * names written here are the design system's declared state classes, its
+ * `dg-visually-hidden` utility and its `dg-truncate` single-line utility — the
+ * class the renderer's own tables give a `Code` value that must clip. All copy
+ * is generic product vocabulary and names nothing from any inspected
+ * application (AAP 0.5.4).
  *
  * @module apps/chrome-extension/src/panel/components/TargetPicker
  */
 import { Badge, Button, Code, Stack, Text, Tooltip } from '@debuggen/panel-renderer';
 import type { SelectedTarget } from '@debuggen/protocol';
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useId, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 
 /*
@@ -176,6 +219,24 @@ const NO_TARGET_LABEL = 'No element selected';
 /** Leads the descriptor, so it reads apart from the controls beside it. */
 const TARGET_LABEL = 'Target';
 
+/**
+ * The disclosure's name, and the name of the region it reveals. Constant on
+ * purpose: `aria-expanded`, not the label, says whether the details are shown.
+ */
+const DETAILS_LABEL = 'Target details';
+
+/** The visually hidden lead-in naming the summary's component chip for assistive technology. */
+const NEAREST_COMPONENT_LEAD_IN = 'Nearest component:';
+
+/** The visually hidden lead-in naming the summary's selector chip for assistive technology. */
+const SELECTOR_LEAD_IN = 'Selector:';
+
+/** Names the selector in the details. */
+const SELECTOR_LABEL = 'Selector';
+
+/** Names the element's visible text in the details. */
+const VISIBLE_TEXT_LABEL = 'Visible text';
+
 /** Names the component chain and its order — the order the schema defines. */
 const CHAIN_LABEL = 'Components, nearest first';
 
@@ -194,14 +255,37 @@ const CHAIN_SEPARATOR = '›';
  * ===========================================================================
  */
 
-/** `Button`'s pressed state (`.dg-button.dg-is-active` in `components.css`). */
+/**
+ * `Button`'s pressed state (`.dg-button.dg-is-active` in `components.css`):
+ * the picker toggle while picker mode is on, the disclosure while it is open.
+ */
 const ACTIVE_STATE_CLASS = 'dg-is-active';
 
 /** `Button`'s disabled treatment (`.dg-button.dg-is-disabled` in `components.css`). */
 const DISABLED_STATE_CLASS = 'dg-is-disabled';
 
-/** The global utility in `base.css` that keeps a live region's text announced but unpainted. */
+/**
+ * The global utility in `base.css` that keeps text announced but unpainted and
+ * out of flow: the live region's status and the summary's lead-ins.
+ */
 const VISUALLY_HIDDEN_CLASS = 'dg-visually-hidden';
+
+/**
+ * The single-line clip (`.dg-truncate` in `components.css`): the shrinkable,
+ * ellipsized box the renderer's own tables give a `Code` value. It keeps the
+ * whole value in the element and clips only what is painted.
+ */
+const TRUNCATE_CLASS = 'dg-truncate';
+
+/**
+ * The capped form of that clip (`.dg-truncate.dg-truncate--capped`, published
+ * for host surfaces by the renderer's `scripts/check-css-classes.mjs`): the same
+ * ellipsis, bounded at a control row's field measure as well as its box. The
+ * summary's selector chip wears it, so a long selector gives up its room to the
+ * header's controls before the header runs out of width and wraps a row,
+ * instead of claiming its whole length first.
+ */
+const CAPPED_TRUNCATE_CLASS = `${TRUNCATE_CLASS} dg-truncate--capped`;
 
 /*
  * ===========================================================================
@@ -462,40 +546,92 @@ function ComponentChain(props: ComponentChainProps): ReactElement {
   );
 }
 
-/** Props of {@link TargetDescriptor}. */
-interface TargetDescriptorProps {
+/** Props of {@link TargetSummary}. */
+interface TargetSummaryProps {
   /** The session's target. */
   readonly target: SelectedTarget;
+  /** The component chain without blank names, nearest first. */
+  readonly chain: readonly string[];
 }
 
 /**
- * The target element: tag, selector, visible text when it has any, component
- * chain and page URL, in that order.
+ * The target on one line: the label, the tag, the nearest component when there
+ * is one, and the selector.
+ *
+ * Not wrapping, on purpose: a wrapping line would break before its selector the
+ * moment the selector did not fit, and grow the header by a line per chip. As
+ * one unbroken line the summary moves as a unit, and only the two `dg-truncate`
+ * chips — the only items that may shrink below their content — give up room,
+ * each ellipsized at its own border with its full value as its `title`.
  */
-function TargetDescriptor(props: TargetDescriptorProps): ReactElement {
-  const { target } = props;
-  // Blank names cannot occur in a schema-valid descriptor; dropping one keeps a
-  // malformed entry from rendering an empty chip, and keeps the given order.
-  const chain = target.componentChain.filter((name) => hasText(name));
+function TargetSummary(props: TargetSummaryProps): ReactElement {
+  const { target, chain } = props;
+  const nearest = chain[0];
 
   return (
-    <Stack direction="horizontal" gap={2} align="center" wrap>
+    <Stack direction="horizontal" gap={2} align="center">
       <Text size="xs" tone="muted">
         {TARGET_LABEL}
       </Text>
       <Badge tone="accent">{target.tagName}</Badge>
-      {/* In full and wrapping, never clipped: a shortened selector can name a
-          different element than the one that was picked. */}
-      <Code size="sm" wrap>
+      {nearest === undefined ? null : (
+        <>
+          <Text className={VISUALLY_HIDDEN_CLASS}>{NEAREST_COMPONENT_LEAD_IN}</Text>
+          <Code size="sm" className={TRUNCATE_CLASS} title={nearest}>
+            {nearest}
+          </Code>
+        </>
+      )}
+      <Text className={VISUALLY_HIDDEN_CLASS}>{SELECTOR_LEAD_IN}</Text>
+      {/* Clipped when painted, whole in the element: the details below show it
+          in full and wrapping, since a shortened selector can name a different
+          element than the one that was picked. Capped at a field's measure, so
+          it never takes the header's controls' room on a wide panel either. */}
+      <Code size="sm" className={CAPPED_TRUNCATE_CLASS} title={target.selector}>
         {target.selector}
       </Code>
-      {hasText(target.text) ? (
-        <Text size="sm" tone="secondary" truncate title={target.text}>
-          {target.text}
+    </Stack>
+  );
+}
+
+/** Props of {@link TargetDetails}. */
+interface TargetDetailsProps {
+  /** The session's target. */
+  readonly target: SelectedTarget;
+  /** The component chain without blank names, nearest first. */
+  readonly chain: readonly string[];
+}
+
+/**
+ * The full descriptor the disclosure reveals: the selector in full and
+ * wrapping, the visible text when it has any, the component chain and the page
+ * URL, one labelled line each and in that order.
+ */
+function TargetDetails(props: TargetDetailsProps): ReactElement {
+  const { target, chain } = props;
+
+  return (
+    <Stack direction="vertical" gap={1} align="start">
+      <Stack direction="horizontal" gap={1} align="center" wrap>
+        <Text size="xs" tone="muted">
+          {SELECTOR_LABEL}
         </Text>
+        <Code size="sm" wrap>
+          {target.selector}
+        </Code>
+      </Stack>
+      {hasText(target.text) ? (
+        <Stack direction="horizontal" gap={1} align="center" wrap>
+          <Text size="xs" tone="muted">
+            {VISIBLE_TEXT_LABEL}
+          </Text>
+          <Text size="sm" tone="secondary">
+            {target.text}
+          </Text>
+        </Stack>
       ) : null}
       <ComponentChain chain={chain} />
-      <Stack direction="horizontal" gap={1} align="center">
+      <Stack direction="horizontal" gap={1} align="center" wrap>
         <Text size="xs" tone="muted">
           {URL_LABEL}
         </Text>
@@ -515,10 +651,13 @@ function TargetDescriptor(props: TargetDescriptorProps): ReactElement {
 
 /**
  * Renders "Pick element" and "Use selected element", the picker-mode
- * indication, and the descriptor of the session's target.
+ * indication, and the session's target as a one-line summary with its full
+ * descriptor behind a disclosure.
  *
  * @param props See {@link TargetPickerProps}.
- * @returns A horizontal, wrapping row for the panel header.
+ * @returns A column for the panel header: the horizontal, wrapping controls
+ *   row, then — while there is a target — the details region, hidden until the
+ *   developer opens it.
  *
  * @example
  * // The composition root, reading the store and binding the port requests:
@@ -563,6 +702,18 @@ export function TargetPicker(props: TargetPickerProps): ReactElement {
     run('useSelected', onUseSelected);
   }, [run, onUseSelected]);
 
+  // The disclosure's state is the developer's alone (see the module notes): no
+  // target change resets it, so a refreshed record never shuts open details.
+  const detailsId = useId();
+  const [detailsExpanded, setDetailsExpanded] = useState(false);
+  const toggleDetails = useCallback((): void => {
+    setDetailsExpanded((expanded) => !expanded);
+  }, []);
+
+  // Blank names cannot occur in a schema-valid descriptor; dropping one keeps a
+  // malformed entry from rendering an empty chip, and keeps the given order.
+  const chain = target === undefined ? [] : target.componentChain.filter((name) => hasText(name));
+
   const pickDescription = reason ?? (busy ? BUSY_DESCRIPTION : PICK_DESCRIPTION);
   const useSelectedDescription = reason ?? (busy ? BUSY_DESCRIPTION : USE_SELECTED_DESCRIPTION);
   let announcement = '';
@@ -573,53 +724,81 @@ export function TargetPicker(props: TargetPickerProps): ReactElement {
   }
 
   return (
-    <Stack direction="horizontal" gap={2} align="center" wrap className={className}>
-      <Tooltip content={pickDescription}>
-        <Button
-          variant="secondary"
-          size="sm"
-          aria-pressed={pickerActive}
-          aria-disabled={blocked ? true : undefined}
-          aria-busy={busy ? true : undefined}
-          className={joinClassNames(
-            pickerActive && ACTIVE_STATE_CLASS,
-            blocked && DISABLED_STATE_CLASS,
-          )}
-          onClick={handlePick}
-        >
-          {PICK_LABEL}
-        </Button>
-      </Tooltip>
+    <Stack direction="vertical" gap={2} className={className}>
+      <Stack direction="horizontal" gap={2} align="center" wrap>
+        <Tooltip content={pickDescription}>
+          <Button
+            variant="secondary"
+            size="sm"
+            aria-pressed={pickerActive}
+            aria-disabled={blocked ? true : undefined}
+            aria-busy={busy ? true : undefined}
+            className={joinClassNames(
+              pickerActive && ACTIVE_STATE_CLASS,
+              blocked && DISABLED_STATE_CLASS,
+            )}
+            onClick={handlePick}
+          >
+            {PICK_LABEL}
+          </Button>
+        </Tooltip>
 
-      <Tooltip content={useSelectedDescription}>
-        <Button
-          variant="secondary"
-          size="sm"
-          aria-disabled={blocked ? true : undefined}
-          aria-busy={busy ? true : undefined}
-          className={joinClassNames(blocked && DISABLED_STATE_CLASS)}
-          onClick={handleUseSelected}
-        >
-          {USE_SELECTED_LABEL}
-        </Button>
-      </Tooltip>
+        <Tooltip content={useSelectedDescription}>
+          <Button
+            variant="secondary"
+            size="sm"
+            aria-disabled={blocked ? true : undefined}
+            aria-busy={busy ? true : undefined}
+            className={joinClassNames(blocked && DISABLED_STATE_CLASS)}
+            onClick={handleUseSelected}
+          >
+            {USE_SELECTED_LABEL}
+          </Button>
+        </Tooltip>
 
-      {pickerActive ? (
-        <Badge tone="accent" variant="outline" aria-hidden="true">
-          {PICKER_ON_LABEL}
-        </Badge>
-      ) : null}
+        {pickerActive ? (
+          <Badge tone="accent" variant="outline" aria-hidden="true">
+            {PICKER_ON_LABEL}
+          </Badge>
+        ) : null}
 
-      {/* Always mounted, so a change of content is announced; out of flow, so
-          it takes no gap in the row. */}
-      <Text role="status" className={VISUALLY_HIDDEN_CLASS}>
-        {announcement}
-      </Text>
+        {/* Always mounted, so a change of content is announced; out of flow, so
+            it takes no gap in the row. */}
+        <Text role="status" className={VISUALLY_HIDDEN_CLASS}>
+          {announcement}
+        </Text>
 
-      {target === undefined ? (
-        <Badge tone="neutral">{NO_TARGET_LABEL}</Badge>
-      ) : (
-        <TargetDescriptor target={target} />
+        {target === undefined ? (
+          <Badge tone="neutral">{NO_TARGET_LABEL}</Badge>
+        ) : (
+          // The disclosure is a row item of its own, ahead of the summary: a
+          // control in the shrinking summary line would be squeezed until its
+          // label clipped, whereas here it keeps its whole label and travels
+          // with the other controls, and the summary — the one item that can
+          // give up room — comes last and takes what the line has left.
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-expanded={detailsExpanded}
+              aria-controls={detailsId}
+              className={joinClassNames(detailsExpanded && ACTIVE_STATE_CLASS)}
+              onClick={toggleDetails}
+            >
+              {DETAILS_LABEL}
+            </Button>
+            <TargetSummary target={target} chain={chain} />
+          </>
+        )}
+      </Stack>
+
+      {/* Mounted whenever the disclosure is, so `aria-controls` always names an
+          element in the document; while hidden it is out of the layout, so it
+          takes no gap beneath the row. Bare on purpose: see the module notes. */}
+      {target === undefined ? null : (
+        <div id={detailsId} role="group" aria-label={DETAILS_LABEL} hidden={!detailsExpanded}>
+          <TargetDetails target={target} chain={chain} />
+        </div>
       )}
     </Stack>
   );

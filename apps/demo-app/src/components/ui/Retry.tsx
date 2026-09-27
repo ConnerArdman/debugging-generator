@@ -27,13 +27,27 @@
  * off, or takes the control away after a press - the reader is better placed than this component to
  * judge whether pressing it again is worth their time.
  *
+ * WHERE FOCUS GOES WHEN THE NOTICE GOES
+ * A press that succeeds replaces the notice with the data it stood in for, and this control goes
+ * with it while it still holds focus - the reader pressed it. A focused element removed from the
+ * document leaves focus on `<body>`, where the next Tab starts from the top of the page (WCAG
+ * 2.4.3). {@link holdRetryFocus} is the ref callback that prevents it: its cleanup runs while the
+ * control is still in the document, and if the control holds focus there it moves focus to the
+ * page's `<main id="main">` - the one landmark `PageContainer` renders with `tabIndex={-1}`, which
+ * sits outside every route's content and outside the error boundary, so it survives whatever the
+ * retry re-renders, and which is exactly where the recovered content begins. A notice that is
+ * mounted afresh in the same commit - a boundary that failed again and rendered a new instance of
+ * itself - takes focus straight back onto its own control, so a failed retry leaves the reader
+ * where they were. The error boundary in `app/error.tsx` shares the callback for that reason.
+ *
  * THE CONTROL IS THE SHARED ONE
  * `ui/Button` in its `secondary` `sm` step, which is what every action inside a notice in this
  * application already uses - the checkout's two in-notice controls are the same two props - so a
  * reader meets one affordance across the store, and this file declares no geometry, colour or
- * spacing of its own. `busy` drives the native `disabled` attribute, `aria-busy` and the indicator
- * from that single pending flag, so what a reader sees and what a screen reader can observe cannot
- * drift apart while the page is being asked for again.
+ * spacing of its own. `busy` drives the refused press, `aria-disabled`, `aria-busy` and the
+ * indicator from that single pending flag - keeping the control focusable, so the reader who
+ * pressed it is still on it while the page is being asked for again - and what a reader sees and
+ * what a screen reader can observe cannot drift apart meanwhile.
  *
  * The label belongs to this file rather than to a prop: the answer to a surface that could not read
  * its data is to ask for it again, and one spelling of that across the store is worth more than a
@@ -48,6 +62,70 @@ import { Button } from './Button';
 
 /** What the control says. One spelling, so the affordance reads the same on every surface. */
 const LABEL = 'Try again';
+
+/**
+ * The id of the document's single main landmark, which `PageContainer` renders as
+ * `<main id="main" tabIndex={-1}>` - the same element the header's "Skip to content" link targets.
+ */
+const MAIN_LANDMARK_ID = 'main';
+
+/**
+ * Whether a retry control that held focus has just been removed in the commit now running.
+ *
+ * One flag for the whole document, in module scope, because the control that sets it and the
+ * control that reads it are different component instances - the boundary that failed again renders
+ * a new one - and neither outlives the commit the other is in. It is raised by the removed
+ * control's cleanup and lowered either by a control mounted in the same commit, which takes focus
+ * back, or by a microtask queued as it is raised. React runs a commit's removals, insertions and
+ * ref attachments synchronously, one after another, so that microtask runs only once the whole
+ * commit is done: a control mounted by the same commit always sees the flag, and a later, unrelated
+ * mount never does. The microtask is not a timer and reads no clock.
+ */
+const retryFocus = { handedOff: false };
+
+/**
+ * The ref callback every retry control is given: it keeps keyboard focus in the document when the
+ * control leaves it while focused, and hands focus back to a retry control that replaces it.
+ *
+ * On attach, it takes focus when a retry control was removed holding focus in this same commit -
+ * the boundary that failed again - so the reader stays on "Try again". Its cleanup runs before
+ * React removes the element, and only matters when the control holds focus at that moment: focus
+ * then moves to the main landmark, which survives every retry, and the hand-off above is raised.
+ * A control removed without focus changes nothing.
+ *
+ * Module-level on purpose, so every render passes the same function: React calls a ref callback's
+ * cleanup whenever the callback itself changes, and an inline arrow would change on every render -
+ * including the render that marks the control busy while it holds focus, which would send focus to
+ * the landmark in the middle of the press.
+ *
+ * @example The error boundary's own control, which is not this component but behaves as it does.
+ * ```tsx
+ * <Button ref={holdRetryFocus} onClick={retry}>Try again</Button>
+ * ```
+ */
+export function holdRetryFocus(control: HTMLButtonElement | null): (() => void) | undefined {
+  if (control === null) {
+    return undefined;
+  }
+
+  if (retryFocus.handedOff) {
+    retryFocus.handedOff = false;
+    control.focus();
+  }
+
+  return () => {
+    if (document.activeElement !== control) {
+      return;
+    }
+
+    document.getElementById(MAIN_LANDMARK_ID)?.focus();
+    retryFocus.handedOff = true;
+
+    queueMicrotask(() => {
+      retryFocus.handedOff = false;
+    });
+  };
+}
 
 /**
  * Renders the retry control.
@@ -66,6 +144,7 @@ export function Retry() {
 
   return (
     <Button
+      ref={holdRetryFocus}
       variant="secondary"
       size="sm"
       busy={pending}

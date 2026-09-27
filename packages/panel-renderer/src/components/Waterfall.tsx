@@ -117,6 +117,11 @@
  * more than one was in flight, and judges its own outcome over its settled
  * calls only — the rules the request aggregate itself applies.
  *
+ * A duration that is not a measurement at all — negative, `null`, `NaN` or an
+ * infinity in a malformed record — is kept apart from both: its bar is drawn at
+ * zero so it still marks where the call began, and its duration is printed and
+ * described as {@link NOT_AVAILABLE_LABEL}, never as a measured zero.
+ *
  * ## Privacy: render what arrived, and nothing more
  *
  * URLs arrive with every query-parameter *value* already replaced per key, and
@@ -170,10 +175,12 @@
  *     `.dg-waterfall__bar` states in `../styles/components.css` ("`inset-inline-start`
  *     and `inline-size` are the component's, computed from the time scale").
  *     Neither declaration contains a literal: both are `var()` references to the
- *     properties beside them. The label slot's flex basis (`LABEL_SLOT_STYLE`)
- *     is the file's only other inline declaration and carries no design value
- *     either — a permitted `0` literal and two unitless flex factors, for the
- *     reason recorded there.
+ *     properties beside them. The row's colour, `--dgc-bar-color`, is the
+ *     file's only other inline declaration: set on the row itself — a token
+ *     reference and nothing else — so the bar and a failed row's edge are
+ *     painted from one value. How the label column shares its width with its
+ *     chips is the stylesheet's (`.dg-waterfall__name`,
+ *     `.dg-waterfall__label-slot`), in tokens.
  *   - **Primitives, not raw elements.** Every non-SVG control and every piece of
  *     text is a primitive from `../primitives/**` or a container from
  *     `../layout/**`; there is no raw `button`, `input`, `select`, `table` or
@@ -187,14 +194,19 @@
  * The row list is the keyboard-reachable representation of the chart and is a
  * `role="tree"` of `role="treeitem"` rows: each row carries `aria-level`,
  * `aria-posinset` and `aria-setsize` — stated outright, because the mounted
- * window may hold only some of a row's siblings — and, when it has children,
- * `aria-expanded`; it owns its mounted child group through `aria-owns` (the
- * group is a DOM sibling because the row itself is the three-column grid the
- * stylesheet defines, and a fourth grid child would land in the label column).
+ * window may hold only some of a row's siblings — and, when it has children or
+ * an abbreviated label, `aria-expanded`; it owns its mounted child group
+ * through `aria-owns` (the group is a DOM sibling because the row itself is the
+ * three-column grid the stylesheet defines: a child group inside it would have
+ * to become a grid item too, and treeitems nested inside a treeitem's own grid
+ * would read as part of that one row).
  * Each row names itself with `aria-label`, so what is
  * announced is the label, what the call was, how far into the window it
  * started and how long it took, rather than the truncated label and the
- * tooltip's copy of it. The bar layer is `aria-hidden`, which the guidance
+ * tooltip's copy of it. The name carries the label bounded to
+ * {@link NAME_LABEL_PREVIEW_LENGTH} code points, because a name is announced
+ * whole on every visit and a multi-kilobyte statement would drown the rest of
+ * the sentence. The bar layer is `aria-hidden`, which the guidance
  * prefers where the duration is printed as text, and the time axis is a
  * `role="img"` graphic whose label states the window it spans. A row's states
  * are never colour alone: a failed call shows its failing status code or an
@@ -214,7 +226,9 @@
  * to it:
  *
  *   - **ArrowDown / ArrowUp** — the next and previous visible row.
- *   - **ArrowRight** — open a closed row, then step into its first child.
+ *   - **ArrowRight** — open a closed row, then step into its first child. A
+ *     row opens when it has children or an abbreviated label (see "The whole
+ *     of a long value" below); a leaf has no child to step into.
  *   - **ArrowLeft** — close an open row, then step out to its parent.
  *   - **Home / End** — the first and last visible row.
  *   - **Enter / Space** — select the row (`onSelectEvent`).
@@ -242,6 +256,35 @@
  * carry `tabIndex={-1}`, because a nested control left in the Tab order is a
  * second or third stop per row that the pattern forbids; ArrowRight/ArrowLeft
  * and Shift+Enter are the keyboard routes to the same two intents.
+ *
+ * ## The whole of a long value
+ *
+ * A row shows its label cut to {@link LABEL_PREVIEW_LENGTH} code points, so a
+ * long redacted URL or parameterized statement is abbreviated on the row. The
+ * whole value is still one hover, one focus or one key away (WCAG 1.4.13,
+ * 2.1.1):
+ *
+ *   - the description bubble — hovered, or revealed for keyboard focus —
+ *     carries the whole label, whitespace collapsed; the `Tooltip` primitive
+ *     bounds that bubble to a token block size, scrolls what does not fit and
+ *     lets the pointer rest on it;
+ *   - a row whose label is abbreviated is expandable even when it has no
+ *     children. Expanding it — ArrowRight, or its disclosure button — shows the
+ *     row's full-value detail: the whole label exactly as it arrived, wrapping,
+ *     in a fourth grid item spanning every track of the row
+ *     (`grid-column: full`) below the three the row always draws. It needs no
+ *     scroll box of its own, so no focus stop either: it grows the row, and the
+ *     panel scrolls it like any other content. While shown it describes the
+ *     treeitem (`aria-describedby`), so a screen reader hears the whole value
+ *     beside the bounded name. A row with children as well opens both at once:
+ *     one row, one expanded state, kept by record id like every expansion.
+ *
+ * Nothing is un-redacted on the way: the value shown is the one the service
+ * stored, whose URL query values and statement literals the capture already
+ * replaced (`docs/SECURITY.md`). The 120-code-point preview bound of
+ * `../utils/format` is the capture's bound on prop, state and attribute
+ * previews; a redacted URL and a parameterized statement are not previews,
+ * and arrive whole.
  */
 
 import type { DataQuery, WaterfallNode } from '@debuggen/panel-schema';
@@ -283,7 +326,6 @@ import type { PanelSelection } from '../host/PanelActions';
 import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
 import type { UseQueryResult } from '../host/useQuery';
 import { Badge } from '../primitives/Badge';
-import type { BadgeTone } from '../primitives/Badge';
 import { Button } from '../primitives/Button';
 import { Code } from '../primitives/Code';
 import { DurationCell } from '../primitives/DurationCell';
@@ -293,9 +335,16 @@ import { Kbd } from '../primitives/Kbd';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
-import { kindColorVar } from '../utils/color';
+import {
+  httpStatusTone,
+  isFailureOutcome,
+  isHttpFailureStatus,
+  kindColorVar,
+  outcomeColorVar,
+} from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
+  collapseWhitespace,
   countedNoun,
   estimateTextWidth,
   formatBytes,
@@ -304,6 +353,7 @@ import {
   formatDuration,
   formatDurationCompact,
   formatKindLabel,
+  formatShare,
   formatStatusLabel,
   formatTierLabel,
   oneLinePreview,
@@ -443,23 +493,22 @@ const AXIS_LABEL_GAP_EM = 1;
  * label font: 14.
  *
  * No track the axis is drawn on is narrower, and that is guaranteed rather
- * than estimated: the stylesheet's row grid gives the time track a minimum
- * derived from the space tokens (`.dg-waterfall__row` in
+ * than estimated: the stylesheet's chart grid gives the time track a minimum
+ * derived from the space tokens (`.dg-waterfall__viewport` in
  * `../styles/components.css`, seven units of `--dg-space-7`: 168 pixels,
  * above the 154 pixels fourteen ems of the `xs` role come to at its size in
- * the token table), and the axis row is laid out on that same grid. The
- * colocated suite reads that minimum from the stylesheet and holds it at or
- * above this width in every theme.
+ * the token table), and the axis row and every call row are laid out on that
+ * one grid, as subgrids. The colocated suite reads that minimum from the
+ * stylesheet and holds it at or above this width in every theme.
  *
  * Nothing here reads the real width: the labels are placed against this strip
  * once, from the scale alone, and every real strip is at least this wide, so
  * it only moves the ticks further apart while the labels keep their extent —
  * a set whose labels clear each other at this width clears each other on
  * every strip actually drawn, and the same data always draws the same axis. A
- * panel narrower than a row's resulting minimum does not squeeze the strip:
- * the axis and the rows scroll horizontally together in
- * `.dg-waterfall__viewport`, which holds the axis row and the top-level rows
- * at one inline size, so the strip lines up with their tracks while it
+ * panel narrower than the grid's minimum does not squeeze the strip: the axis
+ * and the rows scroll horizontally together in `.dg-waterfall__viewport`, whose
+ * tracks every row shares, so the strip lines up with their tracks while it
  * scrolls exactly as it does when nothing scrolls.
  */
 const AXIS_DESIGN_WIDTH_EM = 14;
@@ -523,11 +572,20 @@ const WATERFALL_ROW_BUDGET = 200;
  */
 const RETAINED_ITEM_BUDGET = 2 * DATA_QUERY_MAX_LIMIT;
 
-/** How much of a redacted URL or statement a row shows before it is elided. */
+/**
+ * How much of a redacted URL or statement a row shows before it is elided. A
+ * label longer than this is abbreviated on the row, which is what makes the
+ * row expandable into its full-value detail (see the module header, "The
+ * whole of a long value").
+ */
 const LABEL_PREVIEW_LENGTH = 120;
 
-/** How much of a statement the tooltip shows. */
-const TOOLTIP_PREVIEW_LENGTH = 400;
+/**
+ * How much of the label the row's accessible name repeats. The name is
+ * announced whole on every visit, so it is bounded; the description bubble and
+ * the full-value detail carry the label whole.
+ */
+const NAME_LABEL_PREVIEW_LENGTH = 400;
 
 /* ---------------------------------------------------------------------------
  * The catalog entry, and everything taken from it
@@ -754,8 +812,20 @@ interface WaterfallRow {
   readonly startTime: number;
   /** Milliseconds from the window's start to this call's start. */
   readonly offsetMs: number;
-  /** The call's measured duration, in milliseconds. */
+  /**
+   * The call's duration as DRAWN, in milliseconds: never negative and never
+   * non-finite, with a duration that was not measured drawn as zero. Geometry
+   * only — the bar's length and the window's extent. Every figure a reader is
+   * shown comes from {@link WaterfallRow.measuredMs} instead, so a corrupt
+   * duration is never printed as the fastest call of the capture.
+   */
   readonly durationMs: number;
+  /**
+   * The call's duration as SHOWN, in milliseconds, or `undefined` when the
+   * record's duration is not a measurement (see {@link measuredDuration}): the
+   * duration cell then reads "n/a" and the row's description "took n/a".
+   */
+  readonly measuredMs: number | undefined;
   /** Where the call came from in the project, when it resolved to a location. */
   readonly source: SourceLocation | undefined;
   /** Set when the parent link was inferred from an ambiguous async continuation. */
@@ -878,9 +948,32 @@ function asFiniteNumber(value: number, fallback: number): number {
   return Number.isFinite(value) ? value : fallback;
 }
 
-/** A duration that can be drawn: never negative, never non-finite. */
+/**
+ * A duration that can be drawn: never negative, never non-finite.
+ *
+ * Geometry only. A duration that was not measured is drawn as zero so the bar
+ * still marks where the call began, but that zero is never printed — see
+ * {@link measuredDuration} for the value a reader is shown.
+ */
 function drawableDuration(value: number): number {
   return Number.isFinite(value) ? clampNonNegative(value) : 0;
+}
+
+/**
+ * A duration a reader may be shown as measured, or `undefined` when the
+ * record's value is not a measurement.
+ *
+ * The display twin of {@link drawableDuration}, and the same judgement
+ * `formatDuration` and `DurationCell` make: a duration cannot be negative, so a
+ * negative one — or `null`, `NaN` or an infinity arriving through a malformed
+ * record — is corrupt rather than fast, and is stated as unavailable. A value
+ * below zero only by floating-point noise, one that rounds to zero at the
+ * shared three-decimal resolution, is the zero it is.
+ *
+ * @param value The record's duration, in milliseconds.
+ */
+function measuredDuration(value: number): number | undefined {
+  return Number.isFinite(value) && roundMs(value) >= 0 ? clampNonNegative(value) : undefined;
 }
 
 /**
@@ -1548,6 +1641,7 @@ function rowFromEvent(
     startTime: asFiniteNumber(event.startTime, viewStart),
     offsetMs: offsetFrom(viewStart, event.startTime),
     durationMs: drawableDuration(event.duration),
+    measuredMs: measuredDuration(event.duration),
     source: event.source,
     lineageAmbiguous: booleanAttribute(attributes, LINEAGE_AMBIGUOUS_KEY),
     lineageCandidates: stringListAttribute(attributes, LINEAGE_CANDIDATES_KEY),
@@ -1792,6 +1886,7 @@ function rowFromOccurrence(
     startTime: asFiniteNumber(occurrence.startTime, viewStart),
     offsetMs: offsetFrom(viewStart, occurrence.startTime),
     durationMs: drawableDuration(occurrence.durationMs),
+    measuredMs: measuredDuration(occurrence.durationMs),
     source: occurrence.source,
     lineageAmbiguous: false,
     lineageCandidates: EMPTY_STRINGS,
@@ -1836,6 +1931,11 @@ function groupPendingCount(
  * extent is then a lower bound like that call's own duration. Its outcome is
  * judged over the SETTLED occurrences only, as the aggregate judges
  * `errorCount`: a call that had not answered neither failed nor succeeded.
+ *
+ * A group holding a call whose duration was not measured still draws its bar
+ * over the known extent, but prints that extent as unavailable: the call's end
+ * is unknown, so the last end among the others is not the group's end, and a
+ * printed figure would state a measurement nobody took.
  */
 function rowFromGroup(
   group: RequestGroup,
@@ -1846,10 +1946,14 @@ function rowFromGroup(
   let first = Number.POSITIVE_INFINITY;
   let last = Number.NEGATIVE_INFINITY;
   let worstStatus: TelemetryStatus = 'unset';
+  let everyEndMeasured = true;
   for (const occurrence of occurrences) {
     const start = asFiniteNumber(occurrence.startTime, viewStart);
     first = Math.min(first, start);
     last = Math.max(last, start + drawableDuration(occurrence.durationMs));
+    if (measuredDuration(occurrence.durationMs) === undefined) {
+      everyEndMeasured = false;
+    }
     if (occurrence.pending === true) {
       continue;
     }
@@ -1861,6 +1965,8 @@ function rowFromGroup(
   }
   const start = Number.isFinite(first) ? first : viewStart;
   const end = Number.isFinite(last) ? Math.max(last, start) : start;
+  // A subtraction of two drawn instants, which floors at zero on its own.
+  const extentMs = clampNonNegative(roundMs(end - start));
   const [firstOccurrence] = occurrences;
   const pendingCount = groupPendingCount(group, occurrences);
   return {
@@ -1889,7 +1995,8 @@ function rowFromGroup(
     pendingCount,
     startTime: start,
     offsetMs: offsetFrom(viewStart, start),
-    durationMs: clampNonNegative(roundMs(end - start)),
+    durationMs: extentMs,
+    measuredMs: everyEndMeasured ? extentMs : undefined,
     source: firstOccurrence?.source,
     lineageAmbiguous: false,
     lineageCandidates: EMPTY_STRINGS,
@@ -2193,77 +2300,45 @@ function percent(value: number): string {
 type CustomPropertyStyle = CSSProperties & Record<`--${string}`, string>;
 
 /**
- * The label slot's two declarations: a zero flex basis and a zero minimum, so
- * the label claims only the width the row's chips leave it.
+ * Whether a row's call failed, by the shared outcome rule of `../utils/color`:
+ * a failing response code (client or server error) whatever the span reported,
+ * or a span that reported `error` whatever its code said.
  *
- * Everything else in the label cell is a chip with no shorter form — a request
- * method, a response status, a row count, the source chip — while the label is
- * the item built to give way: `.dg-waterfall__label` and `.dg-truncate` end it
- * in an ellipsis and its tooltip carries the value in full. Flexbox shares a
- * deficit in proportion to content width, though, so with the chips and the
- * label all sized from their content the longest item takes the largest share
- * of the *space* and the smallest share of the *loss*: a statement several
- * hundred pixels wide keeps a readable prefix while the source chip beside it —
- * the one item the stylesheet allows to shrink to nothing, through the
- * `min-inline-size: 0` on `.dg-source-link` that suits it to a table cell — is
- * squeezed to a couple of pixels. That is a control the developer cannot read,
- * aim at, or recognise when the keyboard reaches it.
- *
- * A zero basis inverts the order: the chips are laid out at their content width
- * and the label takes what is left. The zero minimum is what makes that true
- * rather than merely stated — a flex item's automatic minimum is its
- * content-based minimum, and a single line of `white-space: nowrap` text has
- * the same minimum as maximum, so without it the slot cannot go below the whole
- * statement, the cell overflows instead of the label ending in an ellipsis, and
- * the shrinking lands back on the source chip. Both declarations are structural
- * and carry no design value: `0` is a permitted literal and the two flex factors
- * are unitless. Together they are the counterpart of the `flex: none` the
- * stylesheet puts on `.dg-waterfall__status`, the one row chip the stylesheet
- * itself keeps from shrinking.
- *
- * The order this sets is deliberate where the row genuinely holds more than the
- * panel is wide: a narrow panel leaves a long statement only a few characters,
- * because the alternative is to spend those characters on the chips and hand
- * back an unreadable count and an unaimable control. A truncated label is the
- * conventional degradation and loses nothing — the value is in the tooltip, in
- * the row's name, and one click away at its source — while a two-pixel button
- * is a control that has stopped working. A row too full to draw on one line is
- * a shortage of width, not a shortage this component can resolve by choosing
- * differently.
+ * Both signals count because they can disagree: an older browser producer
+ * reports `ok` beside a 500, and an aborted call reports `error` with no code.
+ * The request table, the timeline and this view read the same rule, so one
+ * call is never a failure in one of them and a success in the next.
  */
-const LABEL_SLOT_STYLE: CSSProperties = { flex: '1 1 0', minInlineSize: 0 };
-
-/**
- * The tone of a response status code: a client or server failure reads as a
- * failure, a redirect as a caution, a success as a success, and anything else —
- * including an informational code and an absent one — stays neutral. Every tone
- * resolves to a token inside `Badge`; no colour is chosen here.
- */
-function statusCodeTone(statusCode: number): BadgeTone {
-  if (statusCode >= 400) {
-    return 'danger';
-  }
-  if (statusCode >= 300) {
-    return 'warning';
-  }
-  if (statusCode >= 200) {
-    return 'success';
-  }
-  return 'neutral';
+function rowFailed(row: WaterfallRow): boolean {
+  return isFailureOutcome(row.status, row.statusCode);
 }
 
 /**
  * Whether a row needs the word "Error" to say that its call failed.
  *
  * A failure the telemetry reported is otherwise only a state class and a tint,
- * and colour is never the only signal. A response status code of 400 or above
- * already says it in a danger-toned chip, so the word is added only where no
- * such code does: a failed statement or outgoing call that carries no HTTP
- * status at all, or a request whose code does not read as a failure although
- * the call itself did.
+ * and colour is never the only signal. A failing response code already says it
+ * in its chip — client-error or server-error toned, exactly as the request
+ * table draws it — so the word is added only where no such code does: a failed
+ * statement or outgoing call that carries no HTTP status at all, or a request
+ * whose code does not read as a failure although the call itself did.
  */
 function showsErrorBadge(row: WaterfallRow): boolean {
-  return row.status === 'error' && (row.statusCode === undefined || row.statusCode < 400);
+  return row.status === 'error' && !isHttpFailureStatus(row.statusCode);
+}
+
+/**
+ * The colour a row's bar is drawn in, as a token reference.
+ *
+ * A call that failed is drawn in its outcome colour — the client-error or
+ * server-error token its status chip and its row edge carry — so a failure is
+ * visible on the bar a reader scans, not only in the chip beside it. Any other
+ * call keeps its kind's colour, which is what lets the rows of one waterfall
+ * be told apart by what they are. Both answers come from `../utils/color`,
+ * which returns token references only.
+ */
+function barColorOf(row: WaterfallRow): string {
+  return rowFailed(row) ? outcomeColorVar(row.status, row.statusCode) : kindColorVar(row.kind);
 }
 
 /**
@@ -2284,6 +2359,59 @@ function rowLabel(row: WaterfallRow): string {
     return row.url ?? row.route ?? row.name;
   }
   return row.name;
+}
+
+/** Which of a row's fields {@link rowLabel} reads its label from. */
+type RowLabelField = 'statement' | 'url' | 'route' | 'name';
+
+/**
+ * The words a row's label is named by in its full-value detail and in the
+ * detail's disclosure: the heading printed over the whole value, and the noun
+ * the disclosure button's name uses ("Show the full URL of …").
+ */
+const LABEL_FIELD_WORDS: Readonly<
+  Record<RowLabelField, { readonly heading: string; readonly noun: string }>
+> = Object.freeze({
+  statement: Object.freeze({ heading: 'Statement', noun: 'statement' }),
+  url: Object.freeze({ heading: 'URL', noun: 'URL' }),
+  route: Object.freeze({ heading: 'Route', noun: 'route' }),
+  name: Object.freeze({ heading: 'Name', noun: 'name' }),
+});
+
+/**
+ * The field {@link rowLabel} takes a row's label from, by the same precedence:
+ * a statement, then — for a request-like kind — the URL and then the route,
+ * and otherwise the name. Kept beside `rowLabel` so the two cannot drift: the
+ * detail must never head a URL "Name".
+ */
+function rowLabelField(row: WaterfallRow): RowLabelField {
+  if (row.statement !== undefined) {
+    return 'statement';
+  }
+  if (REQUEST_LIKE_KINDS.has(row.kind)) {
+    if (row.url !== undefined) {
+      return 'url';
+    }
+    if (row.route !== undefined) {
+      return 'route';
+    }
+  }
+  return 'name';
+}
+
+/**
+ * Whether the row abbreviates its label: the one-line preview it shows drops
+ * part of the text, rather than only folding its whitespace onto one line.
+ *
+ * That is what makes a row expandable into its full-value detail, so a label
+ * the row already shows whole — a short statement laid out over several lines
+ * included — offers no disclosure that would only repeat it.
+ *
+ * @param label The row's label, as {@link rowLabel} returns it.
+ * @returns `true` when the row's preview ends in an elision.
+ */
+function isAbbreviatedLabel(label: string): boolean {
+  return oneLinePreview(label, LABEL_PREVIEW_LENGTH) !== collapseWhitespace(label);
 }
 
 /**
@@ -2362,13 +2490,40 @@ const DISCLOSURE_LABEL_PREVIEW_LENGTH = LABEL_PREVIEW_LENGTH;
  */
 function disclosureName(row: WaterfallRow, expanded: boolean): string {
   const verb = expanded ? 'Collapse' : 'Expand';
-  const label = oneLinePreview(rowLabel(row), DISCLOSURE_LABEL_PREVIEW_LENGTH);
-  const named = row.method === undefined ? label : `${row.method} ${label}`;
-  const call = `${named} (${formatKindLabel(row.kind)})`;
+  const call = disclosedCallName(row);
   const count = row.childCount;
   return row.occurrenceCount === undefined
     ? `${verb} the ${formatCountOf(count, NESTED_CALL_NOUN)} inside ${call}`
     : `${verb} the ${formatCountOf(count, CALL_NOUN)} grouped under ${call}`;
+}
+
+/**
+ * The call a disclosure button names, as the row shows it: its method chip,
+ * when it has one, then its label cut to the row's own preview, then its kind
+ * ("GET /example/resource (Fetch)").
+ */
+function disclosedCallName(row: WaterfallRow): string {
+  const label = oneLinePreview(rowLabel(row), DISCLOSURE_LABEL_PREVIEW_LENGTH);
+  const named = row.method === undefined ? label : `${row.method} ${label}`;
+  return `${named} (${formatKindLabel(row.kind)})`;
+}
+
+/**
+ * The accessible name of the disclosure button of a row that has no children
+ * but abbreviates its label, in the state it would toggle to: it shows or
+ * hides the row's full-value detail, and names which value of which call —
+ * "Show the full statement of SELECT … (Database)".
+ *
+ * Worded apart from {@link disclosureName} on purpose: "Expand the N nested
+ * calls" on a row that has none would promise rows that never appear.
+ *
+ * @param row The row the button belongs to.
+ * @param expanded Whether the detail is shown now.
+ * @returns The button's name.
+ */
+function fullValueDisclosureName(row: WaterfallRow, expanded: boolean): string {
+  const verb = expanded ? 'Hide' : 'Show';
+  return `${verb} the full ${LABEL_FIELD_WORDS[rowLabelField(row)].noun} of ${disclosedCallName(row)}`;
 }
 
 /**
@@ -2403,22 +2558,67 @@ function describePending(row: WaterfallRow): string {
 }
 
 /**
- * Everything about a row that does not fit on it, as one line of text.
+ * The timing bar's accessible name: what its position and its length say to
+ * the eye, in words — where in the window the call began, and how much of the
+ * window it spans.
+ *
+ * The row is named by {@link rowDescription}, which states the same offset and
+ * duration as figures; the bar adds the one thing only its geometry shows, the
+ * share of the window the call occupied. A duration that was not measured is
+ * said to be so rather than given the zero its bar is drawn at, and a call
+ * still in flight when the capture ended spans a lower bound, said as one.
+ *
+ * @param row The row the bar draws.
+ * @param windowMs The length of the window every bar is placed in.
+ */
+function barDescription(row: WaterfallRow, windowMs: number): string {
+  const opening = `Timing bar starting ${formatDuration(row.offsetMs)} into the ${formatDuration(
+    clampNonNegative(windowMs),
+  )} window`;
+
+  if (row.measuredMs === undefined) {
+    return `${opening}; its duration was not measured (${NOT_AVAILABLE_LABEL})`;
+  }
+
+  const extent = row.pending
+    ? `${LOWER_BOUND_LABEL} ${formatDuration(row.measuredMs)}`
+    : formatDuration(row.measuredMs);
+
+  return `${opening}, spanning ${extent}, ${formatShare(row.measuredMs, windowMs)} of it`;
+}
+
+/**
+ * Everything about a row that does not fit on it, as one line of text, opening
+ * with the given form of its label.
  *
  * Reached by pointer as a tooltip, by keyboard focus of the row as the same
  * bubble held open, and by assistive technology as the row's accessible name.
+ * The row builds it twice from one label: whole (whitespace collapsed) for the
+ * bubble, which the `Tooltip` primitive bounds and scrolls, and cut to
+ * {@link NAME_LABEL_PREVIEW_LENGTH} for the name, which is announced whole on
+ * every visit. For a label within that bound the two are the same string.
  * A byte figure that the runtime could not observe for a call that
  * would normally carry one is stated as unavailable rather than omitted or
  * shown as a zero. A call still in flight when the capture ended states its
  * duration as the lower bound it is ("took at least …") and says that no
- * response had arrived, rather than reading as a request that completed.
+ * response had arrived, rather than reading as a request that completed. A
+ * duration that was not measured is stated the same way a missing byte figure
+ * is — "took n/a" — never as the zero its bar is drawn at, and without the
+ * lower-bound words, which qualify a figure there is none of.
+ *
+ * @param row The row described.
+ * @param labelText The label as this form of the sentence carries it.
+ * @returns The sentence, its parts joined with ` · `.
  */
-function rowDescription(row: WaterfallRow): string {
-  const parts: string[] = [oneLinePreview(rowLabel(row), TOOLTIP_PREVIEW_LENGTH)];
+function rowDescription(row: WaterfallRow, labelText: string): string {
+  const parts: string[] = [labelText];
   parts.push(`${formatKindLabel(row.kind)} · ${formatTierLabel(row.tier)}`);
-  const took = row.pending
-    ? `took ${LOWER_BOUND_LABEL} ${formatDuration(row.durationMs)}`
-    : `took ${formatDuration(row.durationMs)}`;
+  const took =
+    row.measuredMs === undefined
+      ? `took ${NOT_AVAILABLE_LABEL}`
+      : row.pending
+        ? `took ${LOWER_BOUND_LABEL} ${formatDuration(row.measuredMs)}`
+        : `took ${formatDuration(row.measuredMs)}`;
   parts.push(`starts ${formatDuration(row.offsetMs)} into the window · ${took}`);
   if (row.pending) {
     parts.push(describePending(row));
@@ -2540,6 +2740,23 @@ interface VisibleRow {
   readonly childrenTruncated: boolean;
   /** Whether its children follow it in the list. */
   readonly expanded: boolean;
+  /**
+   * Whether the reader expanded the row: `expandedIds` holds its record id.
+   * Wider than {@link VisibleRow.expanded}, which also needs children to show:
+   * a leaf with an abbreviated label is expanded to show its full-value detail
+   * alone, and a row the depth bound cut keeps its nested records undrawn
+   * however it is expanded.
+   */
+  readonly open: boolean;
+  /**
+   * Whether the row may be expanded into a full-value detail of its own when
+   * it abbreviates its label. `false` only for the occurrence rows under a
+   * group row: they carry the group's URL, which the group row's own detail
+   * shows whenever they are visible, and the first of them shares the group
+   * row's record id (`HeldGroup.rowId`), so expanding it would collapse the
+   * group it sits in.
+   */
+  readonly detailable: boolean;
   /** The held data the row is built from. */
   readonly source: RowSource;
 }
@@ -2621,7 +2838,8 @@ function flattenSpans(index: SpanIndex, expandedIds: ReadonlySet<string>): Visib
     const nested = index.children.get(id) ?? EMPTY_IDS;
     const cut = nested.length > 0 && frame.depth + 1 >= MAX_ROW_DEPTH;
     const childCount = cut ? 0 : nested.length;
-    const expanded = childCount > 0 && expandedIds.has(id);
+    const open = expandedIds.has(id);
+    const expanded = childCount > 0 && open;
     const key = rowKeyFor(frame.parentKey, id);
     const at = rows.length;
     rows.push({
@@ -2634,6 +2852,8 @@ function flattenSpans(index: SpanIndex, expandedIds: ReadonlySet<string>): Visib
       childCount,
       childrenTruncated: cut,
       expanded,
+      open,
+      detailable: true,
       source: { kind: 'event', event: held.event, orphan: placement.orphan },
     });
     indexByKey.set(key, at);
@@ -2684,6 +2904,8 @@ function flattenRequests(index: RequestIndex, expandedIds: ReadonlySet<string>):
         childCount: 0,
         childrenTruncated: false,
         expanded: false,
+        open: expandedIds.has(single.eventId),
+        detailable: true,
         source: { kind: 'occurrence', held, occurrence: single },
       });
       continue;
@@ -2700,6 +2922,8 @@ function flattenRequests(index: RequestIndex, expandedIds: ReadonlySet<string>):
       childCount: held.occurrences.length,
       childrenTruncated: held.group.occurrencesTruncated,
       expanded,
+      open: expanded,
+      detailable: true,
       source: { kind: 'group', held },
     });
     if (!expanded) {
@@ -2716,6 +2940,8 @@ function flattenRequests(index: RequestIndex, expandedIds: ReadonlySet<string>):
         childCount: 0,
         childrenTruncated: false,
         expanded: false,
+        open: false,
+        detailable: false,
         source: { kind: 'occurrence', held, occurrence },
       });
     });
@@ -3109,22 +3335,16 @@ interface WaterfallAxisProps {
  * carries no colour of its own.
  *
  * The window's extent is printed through the same `DurationCell` at the same
- * size a row uses, rather than as plain text, so the strip's third column is
- * the same box as a row's duration column and the track between them starts and
- * ends in the same place. The stylesheet's grid ends in a `max-content` column,
- * which is per-row: what keeps the strip in register with a top-level track is
- * that both of them size that column from a duration in the same monospaced,
- * tabular type role.
- *
- * A nested row is a different case, and deliberately so: the stylesheet indents
- * the child group ("indented on the elevated surface so the nesting is visible
- * without a second grid"), which narrows the track it contains. A nested bar is
- * therefore exact within its own row's track — the reading the eye makes when
- * comparing a row with its children — rather than against this strip, and the
- * exact figures never depend on the pixels at all: every row prints its own
- * duration, and its tooltip states how far into the window it started. Putting
- * a nested track back in register with the strip would mean overriding the
- * stylesheet's indentation from here, which is not this component's to override.
+ * size a row uses, rather than as plain text, so it reads as the column's
+ * heading figure. The strip and every row are subgrids of ONE grid, the scroll
+ * viewport's (`.dg-waterfall__viewport` in `../styles/components.css`), so
+ * the duration column is as wide as the widest figure in the whole chart and
+ * the time track starts and ends in the same place in the strip and in every
+ * row, at every nesting depth: a child group's indent insets only the label
+ * column's content. A bar is therefore exact against this strip and against
+ * every other bar, and the exact figures never depend on the pixels at all:
+ * every row prints its own duration, and its tooltip states how far into the
+ * window it started.
  */
 function WaterfallAxis(props: WaterfallAxisProps): ReactElement {
   const { scale, origin, windowMs } = props;
@@ -3228,12 +3448,15 @@ interface WaterfallRowItemProps {
  * One row of the tree.
  *
  * The row element is the three-column grid the stylesheet defines — label,
- * track, duration — so it holds exactly three children and its child group is a
+ * track, duration — so it draws those three children, and its child group is a
  * DOM sibling ({@link WaterfallBlocks}), owned by the row through `aria-owns`
- * while it is mounted. A fourth child would land in the label column and
- * squeeze the nesting into a two-fifths-wide box. Its level, and its place
- * among its siblings, are stated outright (`aria-level`, `aria-posinset`,
- * `aria-setsize`), because the window may mount only some of its siblings.
+ * while it is mounted: treeitems inside the row's own grid would read as part
+ * of this one row. The only other child is the full-value detail of an
+ * abbreviated label while the row is expanded, which the stylesheet places
+ * below the three across every track (`grid-column: full`). Its level, and its
+ * place among its siblings, are stated outright (`aria-level`,
+ * `aria-posinset`, `aria-setsize`), because the window may mount only some of
+ * its siblings.
  *
  * The row element is the treeitem and the row's only focus target: it holds the
  * tree's roving tab stop when `tabStopIndex` names it, and its nested controls
@@ -3255,11 +3478,29 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
   } = context;
 
   const hasChildren = row.childCount > 0;
-  const expanded = hasChildren && entry.expanded;
   const selected = matchesPanelSelection(selection, row);
   const rowKey = entry.key;
   const label = rowLabel(row);
-  const description = rowDescription(row);
+  // A row that cuts its label short can be expanded into the whole of it, with
+  // or without children (see the module header, "The whole of a long value").
+  // One expanded state serves both: expanding a row shows its children, when it
+  // has any, and its full-value detail, when it abbreviates its label.
+  const abbreviated = entry.detailable && isAbbreviatedLabel(label);
+  const expandable = hasChildren || abbreviated;
+  const expanded = expandable && entry.open;
+  const detailShown = abbreviated && expanded;
+  const detailId = useId();
+  // The sentence twice from one label: bounded for the name a screen reader
+  // announces on every visit, whole for the bubble, which the `Tooltip`
+  // primitive bounds and scrolls. Within the name's bound the two are one.
+  const accessibleName = rowDescription(row, oneLinePreview(label, NAME_LABEL_PREVIEW_LENGTH));
+  const description = rowDescription(row, collapseWhitespace(label));
+  // What the disclosure opens right now, for its `aria-controls`: the child
+  // group while it is mounted and the detail while it is shown — a control may
+  // not point at an id that is not in the document.
+  const controlledIds = [expanded ? groupId : undefined, detailShown ? detailId : undefined]
+    .filter((id): id is string => id !== undefined)
+    .join(' ');
 
   // The row's source location, read once so the Shift+Enter command hands the
   // host the very object the row holds — by reference, as the chip does.
@@ -3291,15 +3532,20 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
   // duration cell and in its name. That is `../utils/scale`'s behaviour, not a
   // judgement made here.
   //
-  // The bar's geometry, and with `LABEL_SLOT_STYLE` one of the file's two
-  // inline styles. The values live in `--dgc-*` custom properties — the colour a token reference from `../utils/color`, the two
-  // coordinates percentages from `../utils/scale` — and the two declarations
+  // The row's colour: one `--dgc-bar-color` token reference from
+  // `../utils/color` (see `barColorOf`), set on the row rather than on the bar
+  // so the two things the stylesheet paints from it — the bar, and the edge of
+  // a failed row — can never disagree. Custom properties inherit, and the child
+  // group is the row's sibling, so a nested row never inherits its parent's.
+  const rowStyle: CustomPropertyStyle = { '--dgc-bar-color': barColorOf(row) };
+
+  // The bar's geometry. The values live in `--dgc-*` custom properties — two
+  // coordinates, percentages from `../utils/scale` — and the two declarations
   // beside them are `var()` references that contain no value of their own. This
   // is the contract `.dg-waterfall__bar` states in `../styles/components.css`:
   // "`inset-inline-start` and `inline-size` are the component's, computed from
   // the time scale".
   const barStyle: CustomPropertyStyle = {
-    '--dgc-bar-color': kindColorVar(row.kind),
     '--dgc-bar-offset': percent(geometry.x),
     '--dgc-bar-extent': percent(geometry.width),
     insetInlineStart: 'var(--dgc-bar-offset)',
@@ -3373,9 +3619,11 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
         return;
       case 'ArrowRight':
         // Open a closed row, then step into it: the two presses the tree
-        // pattern asks for, in that order.
+        // pattern asks for, in that order. A leaf that abbreviates its label
+        // opens too — into its full-value detail — and has no child to step
+        // into, so the second press moves nothing.
         event.preventDefault();
-        if (hasChildren && !expanded) {
+        if (expandable && !expanded) {
           onToggle(row);
           return;
         }
@@ -3459,15 +3707,16 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
         'dg-waterfall__row',
         expanded && 'dg-is-expanded',
         selected && 'dg-is-selected',
-        row.status === 'error' && 'dg-is-error',
+        rowFailed(row) && 'dg-is-error',
         row.lineageAmbiguous && 'dg-is-ambiguous',
         row.orphan !== undefined && 'dg-is-orphan',
       )}
+      style={rowStyle}
       role="treeitem"
       aria-level={entry.depth + 1}
       aria-posinset={entry.position}
       aria-setsize={entry.setSize}
-      aria-expanded={hasChildren ? expanded : undefined}
+      aria-expanded={expandable ? expanded : undefined}
       aria-selected={selected}
       aria-owns={expanded ? groupId : undefined}
       // The row's position in the visible list, which is how the keyboard
@@ -3479,8 +3728,11 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
       // started — is in neither. Naming the row explicitly also settles what
       // it is called: the tooltip's bubble is a descendant of the row, so a
       // name computed from the row's contents would read the label once as
-      // itself and once again inside the description.
-      aria-label={description}
+      // itself and once again inside the description. Its label is bounded
+      // (`NAME_LABEL_PREVIEW_LENGTH`); the whole of it is the description
+      // below while the detail is shown.
+      aria-label={accessibleName}
+      aria-describedby={detailShown ? detailId : undefined}
       aria-keyshortcuts={canOpenSource ? OPEN_SOURCE_SHORTCUT : undefined}
       // The roving tab index: one row of the whole tree is in the Tab order.
       tabIndex={index === tabStopIndex ? 0 : -1}
@@ -3490,8 +3742,13 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
       onFocus={handleFocus}
       onBlur={handleBlur}
     >
-      <Stack direction="horizontal" gap={1} align="center" className="dg-waterfall__name">
-        {hasChildren ? (
+      {/* The identity column wraps: the label keeps its floor on its line and
+          the chips after it move onto further lines, the source chip first,
+          when the column cannot hold them all (`.dg-waterfall__name` and
+          `.dg-waterfall__label-slot` in `../styles/components.css`), so the
+          label never collapses and no chip reaches the time track. */}
+      <Stack direction="horizontal" gap={1} align="center" wrap className="dg-waterfall__name">
+        {expandable ? (
           <Button
             variant="ghost"
             size="sm"
@@ -3503,11 +3760,13 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
                 <ChevronRight aria-hidden="true" className="dg-icon" />
               )
             }
-            aria-label={disclosureName(row, expanded)}
+            // Named by what it opens: the nested calls, when there are any —
+            // the detail then opens with them — and otherwise the full value.
+            aria-label={
+              hasChildren ? disclosureName(row, expanded) : fullValueDisclosureName(row, expanded)
+            }
             aria-expanded={expanded}
-            // Referenced only while the group exists: a control may not point
-            // at an id that is not in the document.
-            {...(expanded && groupId !== undefined ? { 'aria-controls': groupId } : {})}
+            {...(controlledIds === '' ? {} : { 'aria-controls': controlledIds })}
             // Out of the Tab order: the treeitem is the row's only stop, and
             // ArrowRight/ArrowLeft on it are the keyboard route to the same
             // disclosure. Still a real button for the pointer.
@@ -3520,7 +3779,7 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
             {row.method}
           </Badge>
         )}
-        <span className="dg-waterfall__label-slot" style={LABEL_SLOT_STYLE}>
+        <span className="dg-waterfall__label-slot">
           {/* One `Tooltip` in two forms, so the label has exactly one
                 `role="tooltip"` at all times and is never remounted by the
                 switch. For a pointer it is the primitive's own: hover opens
@@ -3532,12 +3791,14 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
                 own handler keeps Escape. It describes nothing then
                 (`describesTrigger`), because the treeitem's `aria-label`
                 already carries the sentence and a reader must not hear it
-                twice. */}
+                twice. While the row's full-value detail is shown below the
+                label, the held bubble opens above it instead, so it never
+                covers the value the reader expanded the row to see. */}
           <Tooltip
             className="dg-waterfall__tooltip"
             open={descriptionRevealed ? true : undefined}
             describesTrigger={!descriptionRevealed}
-            placement={descriptionRevealed ? 'bottom' : 'top'}
+            placement={descriptionRevealed && !detailShown ? 'bottom' : 'top'}
             content={
               descriptionRevealed ? (
                 <>
@@ -3563,7 +3824,7 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
           </Badge>
         )}
         {row.statusCode === undefined ? null : (
-          <Badge tone={statusCodeTone(row.statusCode)} className="dg-waterfall__status">
+          <Badge tone={httpStatusTone(row.statusCode)} className="dg-waterfall__status">
             {String(row.statusCode)}
           </Badge>
         )}
@@ -3614,15 +3875,19 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
         {source === undefined ? null : <SourceLink location={source} compact tabIndex={-1} />}
       </Stack>
       <div className="dg-waterfall__track">
-        {/* Decorative: the duration cell beside it prints the same measurement
-              as text, so the bar adds no information for a reader. */}
+        {/* A named picture of the call's timing: where in the window it
+              began and how much of the window it spans, in words
+              ({@link barDescription}) — or that its duration was not measured,
+              where the bar marks only where the call began. The duration cell
+              beside it prints the figure itself. */}
         <div
           className="dg-waterfall__bar dg-waterfall__bar--active"
           style={barStyle}
-          aria-hidden="true"
+          role="img"
+          aria-label={barDescription(row, scale.domainSpan)}
         />
       </div>
-      {row.pending ? (
+      {row.pending && row.measuredMs !== undefined ? (
         // A lower bound, said in words beside the figure: the call had been
         // outstanding this long when the capture ended, and was still going.
         // The pair is the row's third grid cell, so it takes the duration
@@ -3631,16 +3896,32 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
           <Text as="span" size="xs" tone="muted">
             {LOWER_BOUND_LABEL}
           </Text>
-          <DurationCell ms={row.durationMs} severity="auto" size="sm" />
+          <DurationCell ms={row.measuredMs} severity="auto" size="sm" />
         </Stack>
       ) : (
+        // The shown value, never the drawn one: an unmeasured duration reads
+        // "n/a", with no severity colour and no lower-bound words to qualify it.
         <DurationCell
-          ms={row.durationMs}
+          ms={row.measuredMs}
           severity="auto"
           size="sm"
           className="dg-waterfall__duration"
         />
       )}
+      {detailShown ? (
+        // The whole label, exactly as it arrived — no collapsing, no second
+        // cut — wrapping across the row's full width below its three cells.
+        // Text only: nothing in it is focusable, so the treeitem stays the
+        // row's one stop, and it describes the treeitem while it is shown.
+        <div id={detailId} className="dg-waterfall__detail">
+          <Text as="span" size="xs" tone="muted">
+            {LABEL_FIELD_WORDS[rowLabelField(row)].heading}
+          </Text>
+          <Code size="sm" wrap>
+            {label}
+          </Code>
+        </div>
+      ) : null}
     </div>
   );
 }

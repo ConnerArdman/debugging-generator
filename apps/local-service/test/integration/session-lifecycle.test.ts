@@ -31,7 +31,10 @@
  *
  * - One harness per file, booted in `beforeAll` and proven leak-free in
  *   `afterAll`. The `it` blocks of the walk share one session and run in
- *   order, each well inside the project's 30 s `testTimeout`.
+ *   order, each well inside the project's 30 s `testTimeout`. The one
+ *   exception is the classified-question suite at the end, which boots a
+ *   second harness of its own because its Stage 1 must classify the question,
+ *   and the walk's recorder must stay a pass-through.
  * - Statuses, stages, progress statuses and cleanup statuses are read from
  *   protocol's tuples through {@link vocabularyOf}; a name that is not in the
  *   tuple is a compile error rather than a silently wrong literal.
@@ -51,7 +54,14 @@ import { isDeepStrictEqual } from 'node:util';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { DORMANT_AGENT_HOOK_CONFIG } from '@debuggen/instrumentation';
+import {
+  DORMANT_AGENT_HOOK_CONFIG,
+  problemUnderstandingSchema,
+  telemetryKindsForSignal,
+} from '@debuggen/instrumentation';
+import type { ProblemUnderstanding } from '@debuggen/instrumentation';
+import { createDeterministicProvider } from '@debuggen/model-provider';
+import type { ModelProvider } from '@debuggen/model-provider';
 import { validatePanelSpec } from '@debuggen/panel-schema';
 import {
   CLEANUP_STATUSES,
@@ -83,10 +93,20 @@ import type {
   TelemetryEventIngress,
   TraceNode,
 } from '@debuggen/protocol';
-import { DebuggenError, err, isErr, newEventId, newProducerId, newTraceId } from '@debuggen/shared';
+import {
+  DebuggenError,
+  err,
+  isErr,
+  newEventId,
+  newProducerId,
+  newSpanId,
+  newTraceId,
+  ok,
+} from '@debuggen/shared';
 
 import { LOG_ERROR_FIELD_KEY } from '../../src/logging.js';
 import { PIPELINE_STAGE_ORDER } from '../../src/pipeline/orchestrator.js';
+import { MAX_SUMMARY_EVENTS, SUMMARY_PAGE_SIZE } from '../../src/pipeline/stages/capture.js';
 import { createSessionManager } from '../../src/sessions/manager.js';
 import type { SessionBroadcaster } from '../../src/sessions/manager.js';
 import {
@@ -94,6 +114,7 @@ import {
   FAILURE_COPY_BY_CODE,
   INSTRUMENTATION_ROW_ORDER,
   MAX_FINDING_ROWS_PER_STAGE,
+  PROGRESS_STAGE_GROUPS,
   PROGRESS_STAGE_TITLES,
   READY_TO_CAPTURE_MESSAGE,
   STAGE_FAILURE_DIAGNOSTIC_MESSAGE,
@@ -174,6 +195,9 @@ const ALL_CAPTURE_SIGNALS = Object.freeze(
 const SIGNAL_LABELS: ReadonlySet<string> = new Set(
   ALL_CAPTURE_SIGNALS.map((signal) => CAPTURE_SIGNAL_LABELS[signal]),
 );
+
+/** The fixed opening of AAP §0.5.5's "Could not enable ‹signal›: ‹reason›. Continuing with: …". */
+const DEGRADATION_OPENING = 'Could not enable ';
 
 /* -------------------------------------------------------------------------------------------------
  * Suite constants
@@ -383,19 +407,49 @@ function frameKey(frame: ProgressFrame): string {
 }
 
 /**
- * The finding rows of a stage: every row except the stage's own group header
- * and closing title row, and — for the instrumentation stage — except the
- * "Ready to capture" row, which is the readiness gate's, not a finding.
+ * The finding rows of a stage: every row of the Step-8 group the stage reports
+ * in ({@link PROGRESS_STAGE_GROUPS}) except the group's header and closing
+ * title rows, and — for the instrumentation group — except the "Ready to
+ * capture" row, which is the readiness gate's, not a finding.
  */
 function findingRows(rows: readonly ProgressRow[], stage: ProgressStage): ProgressRow[] {
-  const title: string = PROGRESS_STAGE_TITLES[stage];
+  const group = PROGRESS_STAGE_GROUPS[stage];
+  const title: string = PROGRESS_STAGE_TITLES[group];
   return rows.filter(
     (row) =>
-      row.stage === stage &&
+      row.stage === group &&
       row.message !== title &&
       row.message !== READY_TO_CAPTURE_MESSAGE &&
       row.status !== ROW.running,
   );
+}
+
+/** The Step-8 groups the pipeline's stages report in, each once, in pipeline order. */
+const PIPELINE_GROUP_ORDER: readonly ProgressStage[] = Object.freeze([
+  ...new Set(PIPELINE_STAGE_ORDER.map((stage) => PROGRESS_STAGE_GROUPS[stage])),
+]);
+
+/** A sequence with each run of equal consecutive entries collapsed onto its first. */
+function collapseRepeats<T>(values: readonly T[]): T[] {
+  return values.filter((value, index) => index === 0 || values[index - 1] !== value);
+}
+
+/**
+ * Asserts one group's header rows: the group opens with its title as a
+ * `running` row, every pipeline stage of the group re-opens that same header
+ * once as it starts — and no other `running` row appears — and the group
+ * closes settled.
+ */
+function expectGroupHeaders(rows: readonly ProgressRow[], group: ProgressStage): void {
+  const title: string = PROGRESS_STAGE_TITLES[group];
+  const ofGroup = rows.filter((row) => row.stage === group);
+  expect(ofGroup[0]).toEqual({ stage: group, status: ROW.running, message: title });
+  const members = PIPELINE_STAGE_ORDER.filter((stage) => PROGRESS_STAGE_GROUPS[stage] === group);
+  expect(
+    ofGroup.filter((row) => row.status === ROW.running).map((row) => row.message),
+    `${group}'s header, once per stage reporting in it`,
+  ).toEqual(members.map(() => title));
+  expect([ROW.done, ROW.failed]).toContain(ofGroup.at(-1)?.status);
 }
 
 /**
@@ -592,24 +646,21 @@ describe('a debugging session, walked end to end through the real routes and pus
     const rows = frames.map((frame) => rowOf(frame.payload));
     expect(rows.length).toBeGreaterThan(0);
 
-    // Every stage is protocol's, and the stages ran in the pipeline's order.
+    // Every stage is protocol's, and each reported inside its Step-8 group: the investigation
+    // within "Understanding problem", planning within "Preparing instrumentation". The groups
+    // ran in the pipeline's order, each as one run of rows.
     const stages = [...new Set(rows.map((row) => row.stage))];
     for (const stage of stages) {
       expect(PROGRESS_STAGES).toContain(stage);
     }
-    expect(stages).toEqual(PIPELINE_STAGE_ORDER.slice(0, stages.length));
-    expect(stages).toContain(STAGE.instrument);
+    expect(stages).toEqual(PIPELINE_GROUP_ORDER.slice(0, stages.length));
+    expect(collapseRepeats(rows.map((row) => row.stage))).toEqual(stages);
+    expect(stages).toEqual([STAGE.understand, STAGE.instrument]);
 
-    // Each stage opens with its group header and closes with `done`; nothing failed.
+    // Each group opens with its header, re-opened by each stage reporting in it, and closes
+    // with `done`; nothing failed.
     for (const stage of stages) {
-      const ofStage = rows.filter((row) => row.stage === stage);
-      expect(ofStage[0]).toEqual({
-        stage,
-        status: ROW.running,
-        message: PROGRESS_STAGE_TITLES[stage],
-      });
-      expect(ofStage.filter((row) => row.status === ROW.running)).toHaveLength(1);
-      expect([ROW.done, ROW.failed]).toContain(ofStage.at(-1)?.status);
+      expectGroupHeaders(rows, stage);
     }
     expect(rows.filter((row) => row.status === ROW.failed)).toEqual([]);
 
@@ -649,17 +700,40 @@ describe('a debugging session, walked end to end through the real routes and pus
     const record = await readSession();
     const corpus = await sourceFilesOf(project.root);
 
+    // The database row's wording is the builder's own (it is not exported), so read it back from
+    // the builder rather than restating it; its detail is call-site text this test cannot know.
+    const [databaseRow] = buildInvestigationRows({ databaseDependencies: ['query'] });
+    expect(databaseRow).toMatchObject({
+      stage: PROGRESS_STAGE_GROUPS[STAGE.investigate],
+      status: ROW.done,
+    });
+
     // There are findings, within the bound, and every one points into the corpus.
     expect(investigationRows.length).toBeGreaterThan(0);
     expect(investigationRows.length).toBeLessThanOrEqual(MAX_FINDING_ROWS_PER_STAGE);
     for (const row of investigationRows) {
       expect(row.status).toBe(ROW.done);
       expect(row.message).toMatch(/^(?:Found|Traced) \S/u);
+      // The two class rows carry their evidence in the detail (`‹names› · ‹files›`), whose file
+      // part names every corpus file holding one of the class's findings.
+      const classFiles = (): readonly string[] => {
+        const files = row.detail?.split(' · ').at(-1)?.split(', ') ?? [];
+        expect(files.length).toBeGreaterThan(0);
+        return files;
+      };
       if (row.message.startsWith('Traced')) {
-        // The one event-handler row: the Step-8 label verbatim, its evidence in the detail
-        // (`‹symbols› · ‹file›`), whose file part names the first traced handler's origin.
+        // The one event-handler row: the Step-8 label verbatim.
         expect(row.message).toBe('Traced event handler');
-        expect(corpus).toContain(row.detail?.split(' · ').at(-1));
+        for (const file of classFiles()) {
+          expect(corpus).toContain(file);
+        }
+        continue;
+      }
+      if (row.message === databaseRow?.message) {
+        // The one database row: its call sites, then their files.
+        for (const file of classFiles()) {
+          expect(corpus).toContain(file);
+        }
         continue;
       }
       expect(corpus).toContain(row.detail);
@@ -671,8 +745,9 @@ describe('a debugging session, walked end to end through the real routes and pus
     }
 
     // What the code graph resolved in this corpus — expected outputs, never inputs.
+    // Listed under "Understanding problem", the group the investigation reports in.
     expect(investigationRows).toContainEqual({
-      stage: STAGE.investigate,
+      stage: PROGRESS_STAGE_GROUPS[STAGE.investigate],
       status: ROW.done,
       message: 'Found /api/trail-report',
       detail: 'app/api/trail-report/route.ts',
@@ -724,10 +799,7 @@ describe('a debugging session, walked end to end through the real routes and pus
         databaseDependencies: [],
         relevantFiles: record.relevantFiles,
       });
-    // The database row's wording is the builder's own (it is not exported), so read it back from
-    // the builder rather than restating it; its detail is call-site text this rebuild cannot know.
-    const [databaseRow] = buildInvestigationRows({ databaseDependencies: ['query'] });
-    expect(databaseRow).toMatchObject({ stage: STAGE.investigate, status: ROW.done });
+    // The rebuild renders no database row: its call sites are text it cannot know.
     const withoutDatabaseRow = investigationRows.filter(
       (row) => row.message !== databaseRow?.message,
     );
@@ -867,21 +939,75 @@ describe('a debugging session, walked end to end through the real routes and pus
     }
     expect(new Set(enabled).size).toBe(enabled.length);
     expect(enabled).toEqual(INSTRUMENTATION_ROW_ORDER.filter((label) => enabled.includes(label)));
-    expect(findings.filter((row) => row.status === ROW.failed)).toEqual(
-      buildInstrumentationRows({ unavailable: report.unavailable }).filter(
-        (row) => row.status === ROW.failed,
+    // Every "could not enable" row is terminal and names, after "Continuing
+    // with:", exactly the ✓ labels the service showed — so the builder given
+    // those labels and the service's own report renders the same ✗ rows.
+    expect(
+      instrumentRows.filter(
+        (row) => row.message.startsWith(DEGRADATION_OPENING) && row.status !== ROW.failed,
       ),
-    );
-
-    // The pure builder, over real reports: the unbound copy's "could not enable"
-    // rows are exactly what the builder renders from that copy's own report.
-    expect(unboundUnavailable.length).toBeGreaterThan(0);
-    expect(unboundInstrumentRows.filter((row) => row.status === ROW.failed)).toEqual(
+    ).toEqual([]);
+    expect(findings.filter((row) => row.status === ROW.failed)).toEqual(
       buildInstrumentationRows({
-        signals: ALL_CAPTURE_SIGNALS,
-        unavailable: unboundUnavailable,
+        runtimeHooks: enabled,
+        unavailable: report.unavailable,
       }).filter((row) => row.status === ROW.failed),
     );
+
+    // The pure builder, over real reports. The copy whose tab was never bound
+    // still lists its page gaps in its report, and the builder renders them as
+    // "could not enable" rows; but the service shows a page signal that waits
+    // for a tab as waiting — one row per label, which its ✓ row replaces once
+    // the page reports — never as ✗ (AAP §0.5.5, §0.7.1). Its ✗ rows are
+    // exactly the builder's rows for its other gaps, over the ✓ labels that
+    // copy showed, and every one of them is terminal.
+    expect(unboundUnavailable.length).toBeGreaterThan(0);
+    const pageSignals = new Set<string>(Object.keys(DORMANT_AGENT_HOOK_CONFIG));
+    const pageGaps = unboundUnavailable.filter((gap) => pageSignals.has(gap.signal));
+    expect(pageGaps.length).toBeGreaterThan(0);
+    expect(
+      buildInstrumentationRows({ signals: ALL_CAPTURE_SIGNALS, unavailable: pageGaps }).filter(
+        (row) => row.status === ROW.failed,
+      ).length,
+    ).toBeGreaterThan(0);
+    const unboundChecked = unboundInstrumentRows
+      .filter((row) => row.status === ROW.done && SIGNAL_LABELS.has(row.message))
+      .map((row) => row.message);
+    expect(unboundInstrumentRows.filter((row) => row.status === ROW.failed)).toEqual(
+      buildInstrumentationRows({
+        runtimeHooks: unboundChecked,
+        unavailable: unboundUnavailable.filter((gap) => !pageSignals.has(gap.signal)),
+      }).filter((row) => row.status === ROW.failed),
+    );
+    expect(
+      unboundInstrumentRows.filter(
+        (row) => row.message.startsWith(DEGRADATION_OPENING) && row.status !== ROW.failed,
+      ),
+    ).toEqual([]);
+    const pageLabels = [
+      ...new Set(
+        ALL_CAPTURE_SIGNALS.filter((signal) => pageGaps.some((gap) => gap.signal === signal)).map(
+          (signal) => CAPTURE_SIGNAL_LABELS[signal],
+        ),
+      ),
+    ];
+    const waitingLabels = unboundInstrumentRows
+      .filter((row) => row.status === ROW.running && SIGNAL_LABELS.has(row.message))
+      .map((row) => row.message);
+    // Every page gap waits, once per label — beside the readiness gate's
+    // waiting rows for the page hooks the install armed pending a tab (an
+    // unbound session's plan is not refused for the tab it has yet to bind),
+    // which are page labels too.
+    expect(waitingLabels).toEqual(expect.arrayContaining(pageLabels));
+    expect(new Set(waitingLabels).size).toBe(waitingLabels.length);
+    const pageSignalLabels = new Set<string>(
+      ALL_CAPTURE_SIGNALS.filter((signal) => pageSignals.has(signal)).map(
+        (signal) => CAPTURE_SIGNAL_LABELS[signal],
+      ),
+    );
+    for (const label of waitingLabels) {
+      expect(pageSignalLabels.has(label)).toBe(true);
+    }
     const everything = buildInstrumentationRows({ signals: ALL_CAPTURE_SIGNALS });
     expect(everything.map((row) => row.message)).toEqual([...INSTRUMENTATION_ROW_ORDER]);
     expect(everything.length).toBeLessThanOrEqual(MAX_FINDING_ROWS_PER_STAGE);
@@ -1371,10 +1497,10 @@ describe('a debugging session, walked end to end through the real routes and pus
     expect(analyses.value.map((analysis) => analysis.id)).toEqual([liveAnalysis.id]);
     expect(panels.value.map((panel) => panel.id)).toEqual([livePanel.id]);
 
-    // Every stage of the whole walk opened with its header and closed with done.
+    // Every group of the whole walk opened with its header and closed with done.
     const rows = progressRows(vscode, session.id);
     const stages = [...new Set(rows.map((row) => row.stage))];
-    expect(stages).toEqual(PIPELINE_STAGE_ORDER.slice(0, stages.length));
+    expect(stages).toEqual(PIPELINE_GROUP_ORDER.slice(0, stages.length));
     expect(stages).toContain(STAGE['generate-panel']);
     for (const stage of stages) {
       const ofStage = rows.filter((row) => row.stage === stage);
@@ -1536,6 +1662,73 @@ describe('a debugging session, walked end to end through the real routes and pus
     expect(statusTrail(vscode, session.id).at(-1)).toBe(STATUS.generated);
   });
 
+  it(`an editor ${route('session.get')} re-renders the bound DevTools panel without resending the progress history it already holds`, async () => {
+    const stored = harness.repos.sessions.listProgress(session.id);
+    if (isErr(stored)) {
+      throw new Error(`listProgress failed (${stored.error.code})`);
+    }
+    expect(stored.value.length).toBeGreaterThan(0);
+    expect(await devtools.client.flush()).toBe(true);
+    expect(await vscode.flush()).toBe(true);
+    const [updatedType, progressType, analysisType, panelType] = REPLAY_MESSAGE_ORDER;
+    const replayTypes = new Set<MessageType>(REPLAY_MESSAGE_ORDER);
+    /** The replay frames about the walk's session a client received from transcript index `from`. */
+    const replayedTo = (client: HarnessWsClient, from: number): MessageType[] =>
+      client.received
+        .slice(from)
+        .filter(
+          (message) => replayTypes.has(message.type) && concerns(message, message.type, session.id),
+        )
+        .map((message) => message.type);
+    // The panel already holds every stored row exactly once — replayed on bind, live after it.
+    const panelKeysBefore = framesOf(devtools.client, progressType, session.id).map(frameKey);
+    expect(new Set(panelKeysBefore)).toEqual(
+      new Set(stored.value.map((entry) => JSON.stringify([entry.ts, storedRowOf(entry)]))),
+    );
+    const devtoolsMark = devtools.client.received.length;
+    const editorMark = vscode.received.length;
+
+    // The editor's reopen, twice — as a reopen followed by a resync would issue it.
+    for (let read = 0; read < 2; read += 1) {
+      const reopened = await harness.http().request('session.get', { params: { id: session.id } });
+      if (isErr(reopened)) {
+        throw new Error(
+          `session.get was refused (${reopened.error.code}): ${reopened.error.message}`,
+        );
+      }
+    }
+    expect(await devtools.client.flush()).toBe(true);
+    expect(await vscode.flush()).toBe(true);
+
+    // The bound panel re-renders from stored data — the record, the analysis and the panel, in the
+    // fixed order, once per read — and is sent no progress row at all.
+    expect(replayedTo(devtools.client, devtoolsMark)).toEqual([
+      updatedType,
+      analysisType,
+      panelType,
+      updatedType,
+      analysisType,
+      panelType,
+    ]);
+    expect(framesOf(devtools.client, progressType, session.id, devtoolsMark)).toEqual([]);
+    const [panelFrame] = framesOf(devtools.client, panelType, session.id, devtoolsMark);
+    expect(panelFrame?.payload.panelId).toBe(livePanel.id);
+    expect(framesOf(devtools.client, progressType, session.id).map(frameKey)).toEqual(
+      panelKeysBefore,
+    );
+
+    // The editor, the requester, receives the whole replay on each read, rows with their stored ts.
+    const perRead = [updatedType, ...stored.value.map(() => progressType), analysisType, panelType];
+    expect(replayedTo(vscode, editorMark)).toEqual([...perRead, ...perRead]);
+    expect(framesOf(vscode, progressType, session.id, editorMark).map((frame) => frame.ts)).toEqual(
+      [...stored.value, ...stored.value].map((entry) => entry.ts),
+    );
+
+    // Still read-only.
+    const after = harness.repos.sessions.listProgress(session.id);
+    expect(isErr(after) ? undefined : after.value).toEqual(stored.value);
+  });
+
   it(`${route('session.end')} removes the instrumentation through the real cleanup and keeps the session readable`, async () => {
     const mark = vscode.received.length;
     const ended = await harness.endSession(session.id);
@@ -1571,8 +1764,8 @@ describe('a debugging session, walked end to end through the real routes and pus
     expect(record.value.cleanup.status).toBe(CLEANUP.clean);
     expect(record.value.cleanup.completedAt).toEqual(expect.any(Number));
     expect(record.value.cleanup.conflicts).toEqual([]);
-    // The record lists what the installer applied; the per-record verdict lives in the journal,
-    // which `GET /sessions/:id/modifications` serves — every record of it restored.
+    // The record lists what the installer applied, each entry carrying the journal's verdict:
+    // it agrees record for record with `GET /sessions/:id/modifications` — every one restored.
     expect(record.value.modifications.length).toBeGreaterThan(0);
     const journalResponse = await harness.rawFetch({
       operation: 'modifications.list',
@@ -1583,12 +1776,49 @@ describe('a debugging session, walked end to end through the real routes and pus
     if (isErr(journal)) {
       throw new Error(`the modification journal does not parse: ${journal.error.message}`);
     }
-    expect(journal.value.modifications.map((modification) => modification.id)).toEqual(
-      record.value.modifications.map((modification) => modification.id),
-    );
-    for (const modification of journal.value.modifications) {
-      expect(modification.status).toBe(MODIFICATION.reverted);
+    // The same records on both sides, each carrying the journal's verdict. The journal is
+    // authoritative and serves them in application order; the record is its mirror, whose order
+    // the session contract leaves open, so both are compared keyed by id.
+    const byId = (left: readonly [string, string], right: readonly [string, string]): number =>
+      left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0;
+    const verdictsOf = (
+      modifications: readonly { readonly id: string; readonly status: string }[],
+    ): (readonly [string, string])[] =>
+      modifications
+        .map((modification) => [modification.id, modification.status] as const)
+        .sort(byId);
+    const verdicts = verdictsOf(journal.value.modifications);
+    expect(verdicts.length).toBeGreaterThan(0);
+    for (const [, status] of verdicts) {
+      expect(status).toBe(MODIFICATION.reverted);
     }
+    expect(verdictsOf(record.value.modifications)).toEqual(verdicts);
+
+    // So does every `session.updated` that reported the end — the cleanup outcome's and the
+    // `ended` one — rather than the statuses the install mirrored.
+    await waitForRecord(vscode, session.id, (pushed) => pushed.status === STATUS.ended);
+    const reported = framesOf(vscode, 'session.updated', session.id, mark).filter(
+      (frame) => frame.payload.session.cleanup.status === CLEANUP.clean,
+    );
+    expect(reported.length).toBeGreaterThanOrEqual(2);
+    expect(reported.at(-1)?.payload.session.status).toBe(STATUS.ended);
+    for (const frame of reported) {
+      expect(verdictsOf(frame.payload.session.modifications)).toEqual(verdicts);
+    }
+
+    // And so does the replay a reopen of the ended session sends.
+    const reopener = await harness.ws({ client: 'vscode', projectRoot: project.root });
+    const reopened = await harness.http().request('session.get', { params: { id: session.id } });
+    if (isErr(reopened)) {
+      throw new Error(
+        `session.get was refused (${reopened.error.code}): ${reopened.error.message}`,
+      );
+    }
+    expect(verdictsOf(reopened.value.modifications)).toEqual(verdicts);
+    expect(await reopener.flush()).toBe(true);
+    const [replayed] = framesOf(reopener, 'session.updated', session.id);
+    expect(replayed).toBeDefined();
+    expect(verdictsOf(replayed?.payload.session.modifications ?? [])).toEqual(verdicts);
     expect(record.value.analyses).toEqual([liveAnalysis]);
     expect(record.value.panelIds).toEqual([livePanel.id]);
     expect(statusTrail(vscode, session.id).at(-1)).toBe(STATUS.ended);
@@ -1849,4 +2079,460 @@ describe(`a ${route('session.end')} whose tab-binding removal the store refuses`
     expect(announced.payload.session).toEqual(closed.record);
     await assertTreeUnchanged(copy.root, before);
   });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The capture summary and the empty-capture rule, over captures the walk above does not make
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The page-agent-relayed fixture whose render and commit events stand in for a page idling. */
+const RENDERS_BATCH = 'telemetry-renders-state.json';
+
+/** A session on its own copy, bound to its own tab, whose pipeline has reached `ready`. */
+interface ReadySession {
+  readonly copy: FixtureProjectCopy;
+  readonly before: TreeSnapshot;
+  readonly editor: HarnessWsClient;
+  readonly tab: DevtoolsConnection;
+  readonly session: SessionRecord;
+}
+
+/**
+ * Creates a session on a fresh copy of the corpus in `target`, binds it to
+ * `tabId`, relays the page agent's report on that tab and waits for `ready` —
+ * the same steps the walk takes, on state no other test reads.
+ */
+async function openReadySession(
+  target: Harness,
+  tabId: number,
+  documentId: string,
+): Promise<ReadySession> {
+  const copy = await target.copyFixtureProject();
+  const before = await snapshotTree(copy.root);
+  const launched = await target.launchDevServer(copy.root);
+  if (isErr(launched)) {
+    throw new Error(`the dev server did not launch (${launched.error.code})`);
+  }
+  const origin = new URL(launched.value.devServerUrl).origin;
+  const editor = await target.editor(copy.root);
+  const created = await target.createSession({ projectRoot: copy.root, question: QUESTION });
+  const tab = await target.connectDevtools({ tabId });
+  const bound = await target.bindTab(tab.client, {
+    tabId,
+    url: `${origin}/`,
+    origin,
+    sessionId: created.id,
+  });
+  if (isErr(bound)) {
+    throw new Error(`session.bind was refused (${bound.error.code}): ${bound.error.message}`);
+  }
+  const report = tab.client.send('agent.ready', {
+    tabId,
+    documentId,
+    producerId: newProducerId(),
+    url: `${origin}/`,
+    installedBeforeReact: true,
+    reactDetected: true,
+  });
+  expect(await tab.client.flush()).toBe(true);
+  expect(tab.client.errorsFor(report.id)).toEqual([]);
+  // Read from the editor's own pushes: a `session.get` on the editor
+  // credential would replay the session's frames to it.
+  const { session: settled } = (
+    await waitForRecord(
+      editor,
+      created.id,
+      (record) => record.status === STATUS.ready || record.status === STATUS.failed,
+    )
+  ).payload;
+  if (settled.status !== STATUS.ready) {
+    expect(await editor.flush()).toBe(true);
+    const failed = progressRows(editor, created.id).filter((row) => row.status === ROW.failed);
+    throw new Error(`The session settled as ${settled.status}: ${JSON.stringify(failed)}`);
+  }
+  return { copy, before, editor, tab, session: settled };
+}
+
+/** When the session's open capture window started, by the service's clock. */
+function openCaptureStart(target: Harness, sessionId: string): number {
+  const active = target.repos.sessions.getActiveCapture(sessionId);
+  if (isErr(active) || active.value === undefined) {
+    throw new Error('the open capture window could not be read from the store');
+  }
+  return active.value.capture.startedAt;
+}
+
+/**
+ * One copy of a fixture batch as fresh evidence of a capture: new event,
+ * trace and span ids (parent links kept inside the copy, dropped where the
+ * parent is not in it), one fresh producer per fixture producer continuing at
+ * `seq`, and start times moved so the copy's first event starts at `startAt`
+ * with the fixture's own spacing.
+ */
+function freshCopyOf(
+  events: readonly TelemetryEventIngress[],
+  startAt: number,
+  producers: Map<string, { readonly id: string; seq: number }>,
+): TelemetryEventIngress[] {
+  const origin = Math.min(...events.map((event) => event.startTime));
+  const spans = new Map(events.map((event) => [event.spanId, newSpanId()]));
+  const traceId = newTraceId();
+  return events.map((event) => {
+    const { parentSpanId, ...rest } = event;
+    const parent = parentSpanId === undefined ? undefined : spans.get(parentSpanId);
+    const producer = producers.get(event.producerId) ?? { id: newProducerId(), seq: 0 };
+    producers.set(event.producerId, producer);
+    producer.seq += 1;
+    return {
+      ...rest,
+      id: newEventId(),
+      traceId,
+      spanId: spans.get(event.spanId) ?? newSpanId(),
+      ...(parent === undefined ? {} : { parentSpanId: parent }),
+      producerId: producer.id,
+      seq: producer.seq,
+      startTime: startAt + (event.startTime - origin),
+    };
+  });
+}
+
+/** Moves the harness clock past the evidence a test placed ahead of it. */
+function advanceClock(target: Harness, ms: number): void {
+  if (target.clock === undefined) {
+    throw new Error('This suite needs the harness clock to place its evidence inside the window.');
+  }
+  target.clock.advance(ms);
+}
+
+describe('a capture holding more events than the former 10 000-event summary bound', () => {
+  /** Background render cycles, then one cross-tier reproduction: past 10 000, under the bound. */
+  const BACKGROUND_EVENTS = 2 * SUMMARY_PAGE_SIZE + 1_234;
+
+  /** Rows per `insertMany` transaction while the capture is seeded. */
+  const SEED_BATCH = 2_000;
+
+  it('summarises every stored event, the reproduction recorded after the first 10 000 included', async () => {
+    const tabId = TAB_ID + 3;
+    const {
+      copy,
+      before,
+      editor,
+      session: created,
+    } = await openReadySession(harness, tabId, 'doc_lifecycle000000004');
+    const started = await harness.startCapture(created.id);
+    if (isErr(started)) {
+      throw new Error(
+        `capture.start was refused (${started.error.code}): ${started.error.message}`,
+      );
+    }
+    const captureId = started.value.captureId;
+    await waitForFrame(editor, 'capture.started', created.id);
+    const windowStart = openCaptureStart(harness, created.id);
+
+    // A page re-rendering in the background for the whole capture, then the
+    // interaction the question is about — its fetch, route, handler and
+    // queries all ordered after the first 10 000 events, as in XL-F05.
+    const interactionKinds: readonly string[] = telemetryKindsForSignal('interactions');
+    const renders = readTelemetryBatch(RENDERS_BATCH).filter(
+      (event) => !interactionKinds.includes(event.kind),
+    );
+    const producers = new Map<string, { readonly id: string; seq: number }>();
+    const background: TelemetryEventIngress[] = [];
+    while (background.length < BACKGROUND_EVENTS) {
+      const cycle = freshCopyOf(renders, windowStart + 1 + background.length, producers);
+      background.push(...cycle.slice(0, BACKGROUND_EVENTS - background.length));
+    }
+    const backgroundEnd = Math.max(...background.map((event) => event.startTime + event.duration));
+    const reproduction = freshCopyOf(
+      readTelemetryBatch(CROSS_TIER_BATCH),
+      Math.ceil(backgroundEnd) + 1,
+      producers,
+    );
+    expect(reproduction.map((event) => event.kind)).toEqual(
+      expect.arrayContaining([...interactionKinds]),
+    );
+    const evidence = [...background, ...reproduction];
+    expect(evidence.length).toBeGreaterThan(10_000);
+    expect(evidence.length).toBeLessThan(MAX_SUMMARY_EVENTS);
+    for (let from = 0; from < evidence.length; from += SEED_BATCH) {
+      const inserted = harness.repos.telemetry.insertMany(
+        evidence
+          .slice(from, from + SEED_BATCH)
+          .map((event) => ({ ...event, sessionId: created.id, captureId })),
+      );
+      if (isErr(inserted)) {
+        throw new Error(`insertMany failed (${inserted.error.code})`);
+      }
+    }
+    const lastEnd = Math.max(...evidence.map((event) => event.startTime + event.duration));
+    advanceClock(harness, Math.ceil(lastEnd - windowStart) + 1);
+
+    const stopped = await harness.stopCapture(created.id, {
+      timeoutMs: HARNESS_TIMEOUTS.pipeline,
+    });
+    if (isErr(stopped)) {
+      throw new Error(`capture.stop was refused (${stopped.error.code}): ${stopped.error.message}`);
+    }
+
+    // The summary the stop answered covers the whole capture: every stored
+    // event, and exactly the store's own count of every kind.
+    const stamp = harness.repos.telemetry.captureStamp(created.id, captureId);
+    const kinds = harness.repos.telemetry.countByKind(created.id, captureId);
+    if (isErr(stamp) || isErr(kinds)) {
+      throw new Error('the capture’s stored counts could not be read');
+    }
+    expect(stamp.value.count).toBe(evidence.length);
+    const { summary: answered } = stopped.value;
+    expect(answered.eventCount).toBe(stamp.value.count);
+    expect(answered.kindCounts).toEqual(kinds.value);
+    expect(answered.coverage).toMatchObject({
+      storedEvents: stamp.value.count,
+      summarizedEvents: stamp.value.count,
+      complete: true,
+    });
+    for (const event of reproduction) {
+      expect(answered.kindCounts[event.kind], event.kind).toBeGreaterThan(0);
+    }
+    for (const tier of [TIER.browser, TIER.server, TIER.db]) {
+      expect(answered.tierCounts[tier], tier).toBeGreaterThan(0);
+    }
+
+    // The stored capture holds the same summary, and no row calls it incomplete.
+    await waitForRecord(
+      editor,
+      created.id,
+      (record) => record.status === STATUS.generated || record.status === STATUS.failed,
+      HARNESS_TIMEOUTS.pipeline * 2,
+    );
+    const stored = harness.repos.sessions.get(created.id);
+    if (isErr(stored) || stored.value === undefined) {
+      throw new Error('the session could not be read from the store');
+    }
+    expect(stored.value.status).toBe(STATUS.generated);
+    const storedSummary = stored.value.captures.find(
+      (capture) => capture.id === captureId,
+    )?.summary;
+    expect(storedSummary?.eventCount).toBe(stamp.value.count);
+    expect(storedSummary?.coverage?.complete).toBe(true);
+    expect(await editor.flush()).toBe(true);
+    const captureRows = progressRows(editor, created.id).filter(
+      (row) => row.stage === STAGE.capture,
+    );
+    expect(captureRows.map((row) => row.status)).not.toContain(ROW.failed);
+    expect(captureRows.some((row) => /incomplete/iu.test(row.message))).toBe(false);
+
+    const ended = await harness.endSession(created.id);
+    if (isErr(ended)) {
+      throw new Error(`session.end was refused (${ended.error.code})`);
+    }
+    expect(ended.value.cleanup).toBe(CLEANUP.clean);
+    await assertTreeUnchanged(copy.root, before);
+  }, 180_000);
+});
+
+/**
+ * The real rules-based provider, except that Stage 1's answer is classified:
+ * its category is the one last set through `classifyAs` — standing in for a
+ * Stage 1 that classifies the question instead of answering the rules'
+ * `'other'` — and its signals include the interaction signal, as the rules
+ * add it for any project with event handlers. Every other stage, and every
+ * other field of the understanding — the entities and search hints
+ * investigation is seeded from — is the rules' own, so the pipeline runs as it
+ * does under `DEBUGGEN_PROVIDER=deterministic`. The answer still passes Stage
+ * 1's own validation gate; an answer the rules could not give is passed on
+ * untouched.
+ */
+function classifyingProvider(): {
+  readonly provider: ModelProvider;
+  readonly classifyAs: (category: ProblemUnderstanding['category']) => void;
+  readonly classified: () => number;
+} {
+  const rules = createDeterministicProvider();
+  if (isErr(rules)) {
+    throw new Error(`The rules-based provider could not be built (${rules.error.code}).`);
+  }
+  const base = rules.value;
+  let category: ProblemUnderstanding['category'] | undefined;
+  let classified = 0;
+  const generateStructured: ModelProvider['generateStructured'] = async (schema, request) => {
+    const answered = await base.generateStructured(schema, request);
+    if (request.metadata.stage !== STAGE.understand || isErr(answered) || category === undefined) {
+      return answered;
+    }
+    const understood = problemUnderstandingSchema.safeParse(answered.value.raw);
+    if (!understood.success) {
+      return answered;
+    }
+    const signals = understood.data.signalsNeeded;
+    const raw: ProblemUnderstanding = problemUnderstandingSchema.parse({
+      ...understood.data,
+      category,
+      signalsNeeded: signals.includes('interactions') ? signals : ['interactions', ...signals],
+    });
+    classified += 1;
+    return ok({
+      raw,
+      model: answered.value.model,
+      providerId: answered.value.providerId,
+      ...(answered.value.usage === undefined ? {} : { usage: answered.value.usage }),
+    });
+  };
+  return {
+    provider: {
+      id: base.id,
+      generateText: (request) => base.generateText(request),
+      generateStructured,
+      callTools: (request, tools) => base.callTools(request, tools),
+    },
+    classifyAs: (next) => {
+      category = next;
+    },
+    classified: () => classified,
+  };
+}
+
+/** What {@link captureIdleRenders} captured and what the stop answered. */
+interface IdleCapture {
+  readonly captureId: string;
+  readonly mark: number;
+  readonly eventCount: number;
+}
+
+/**
+ * Captures a page that re-renders on its own while nobody touches it: renders
+ * and commits, relayed by the tab's page agent inside the window, and no
+ * interaction. Answers once `capture.stop` has summarised them.
+ */
+async function captureIdleRenders(target: Harness, ready: ReadySession): Promise<IdleCapture> {
+  const { editor, tab, session } = ready;
+  const mark = editor.received.length;
+  const started = await target.startCapture(session.id);
+  if (isErr(started)) {
+    throw new Error(`capture.start was refused (${started.error.code}): ${started.error.message}`);
+  }
+  await waitForFrame(editor, 'capture.started', session.id, mark);
+  const windowStart = openCaptureStart(target, session.id);
+
+  const reactKinds: readonly string[] = telemetryKindsForSignal('react');
+  const renders = readTelemetryBatch(RENDERS_BATCH).filter((event) =>
+    reactKinds.includes(event.kind),
+  );
+  const idle = freshCopyOf(renders, windowStart + 1, new Map());
+  expect(idle.length).toBeGreaterThan(0);
+  const relayed = await target.ingestFromAgent(tab.client, idle);
+  expect(relayed.sent.ok).toBe(true);
+  expect(relayed.settled).toBe(true);
+  expect(relayed.errors).toEqual([]);
+  const lastEnd = Math.max(...idle.map((event) => event.startTime + event.duration));
+  advanceClock(target, Math.ceil(lastEnd - windowStart) + 1);
+
+  const stopped = await target.stopCapture(session.id);
+  if (isErr(stopped)) {
+    throw new Error(`capture.stop was refused (${stopped.error.code}): ${stopped.error.message}`);
+  }
+  const { summary } = stopped.value;
+  expect(summary.eventCount).toBe(idle.length);
+  for (const kind of telemetryKindsForSignal('interactions')) {
+    expect(summary.kindCounts[kind], kind).toBe(0);
+  }
+  return { captureId: started.value.captureId, mark, eventCount: summary.eventCount };
+}
+
+/** Ends a session through the real cleanup and proves its copy is byte-identical again. */
+async function endAndVerify(target: Harness, ready: ReadySession): Promise<void> {
+  const ended = await target.endSession(ready.session.id);
+  if (isErr(ended)) {
+    throw new Error(`session.end was refused (${ended.error.code})`);
+  }
+  expect(ended.value.cleanup).toBe(CLEANUP.clean);
+  await assertTreeUnchanged(ready.copy.root, ready.before);
+}
+
+describe('a classified interaction question whose capture holds only background renders', () => {
+  /** A service whose Stage 1 classifies the question and whose other stages answer as the rules do. */
+  let classified: Harness;
+  let classifying: ReturnType<typeof classifyingProvider>;
+
+  beforeAll(async () => {
+    classifying = classifyingProvider();
+    classified = await startHarness({ provider: classifying.provider });
+  }, HARNESS_TIMEOUTS.boot * 2);
+
+  afterAll(async () => {
+    await classified.assertNoLeaks();
+  });
+
+  it(`is empty for a performance question: ${route('capture.stop')} skips analysis, returns to ready and says so in AAP §0.5.5's words`, async () => {
+    // The slow-button question of OBS-F10, classified: renders of a page
+    // nobody touched are not a reproduction of the click it is about.
+    classifying.classifyAs('performance');
+    const ready = await openReadySession(classified, TAB_ID + 4, 'doc_lifecycle000000005');
+    const { editor, session } = ready;
+    expect(classifying.classified()).toBe(1);
+    expect(session.understanding?.category).toBe('performance');
+    expect(session.understanding?.signalsNeeded).toContain('interactions');
+
+    const { captureId, mark } = await captureIdleRenders(classified, ready);
+    await waitForRecord(
+      editor,
+      session.id,
+      (record) =>
+        record.status === STATUS.ready &&
+        record.captures.some(
+          (capture) => capture.id === captureId && capture.stoppedAt !== undefined,
+        ),
+    );
+    expect(await editor.flush()).toBe(true);
+
+    // The developer is told, in AAP §0.5.5's words, and nothing was analysed.
+    const rows = progressRows(editor, session.id, mark);
+    expect(rows).toContainEqual({
+      stage: STAGE.capture,
+      status: ROW.done,
+      message: EMPTY_CAPTURE_MESSAGE,
+    });
+    expect(rows.map((row) => row.stage)).not.toContain(STAGE.analyze);
+    expect(rows.map((row) => row.stage)).not.toContain(STAGE['generate-panel']);
+    expect(framesOf(editor, 'analysis.completed', session.id)).toEqual([]);
+    expect(framesOf(editor, 'panel.generated', session.id)).toEqual([]);
+    const trail = statusTrail(editor, session.id);
+    expect(trail.slice(-3)).toEqual([STATUS.ready, STATUS.capturing, STATUS.ready]);
+    expect(trail).not.toContain(STATUS.analyzing);
+    const analyses = classified.repos.panels.listAnalyses(session.id);
+    const panels = classified.repos.panels.listPanels(session.id);
+    expect(isErr(analyses) ? undefined : analyses.value).toEqual([]);
+    expect(isErr(panels) ? undefined : panels.value).toEqual([]);
+
+    await endAndVerify(classified, ready);
+  }, 120_000);
+
+  it('holds evidence for a rendering question: the same idle renders are analysed and a panel generated', async () => {
+    // A rendering question is answered by the renders the page records on its
+    // own, so the interaction it lists among its signals is not demanded.
+    classifying.classifyAs('rendering');
+    const ready = await openReadySession(classified, TAB_ID + 5, 'doc_lifecycle000000006');
+    const { editor, session } = ready;
+    expect(classifying.classified()).toBe(2);
+    expect(session.understanding?.category).toBe('rendering');
+    expect(session.understanding?.signalsNeeded).toContain('interactions');
+
+    const { mark } = await captureIdleRenders(classified, ready);
+    const { session: settled } = (
+      await waitForRecord(
+        editor,
+        session.id,
+        (record) => record.status === STATUS.generated || record.status === STATUS.failed,
+      )
+    ).payload;
+    expect(await editor.flush()).toBe(true);
+    const rows = progressRows(editor, session.id, mark);
+    expect(rows.map((row) => row.message)).not.toContain(EMPTY_CAPTURE_MESSAGE);
+    expect(rows.filter((row) => row.status === ROW.failed)).toEqual([]);
+    expect(settled.status).toBe(STATUS.generated);
+    expect(rows.map((row) => row.stage)).toContain(STAGE.analyze);
+    expect(framesOf(editor, 'analysis.completed', session.id)).toHaveLength(1);
+    expect(framesOf(editor, 'panel.generated', session.id)).toHaveLength(1);
+
+    await endAndVerify(classified, ready);
+  }, 120_000);
 });

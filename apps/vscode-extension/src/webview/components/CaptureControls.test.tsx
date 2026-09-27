@@ -14,6 +14,10 @@
  *   - the "Reproduce the issue now." prompt while armed and not yet capturing, and "Reproduce the
  *     issue again." instead when the armed capture was requested by a follow-up (AAP 0.4.2);
  *   - the states of AAP 0.5.5 and their precedence (error > pending > unavailable > controls);
+ *   - the unavailable copy following the session status: the instrumentation sentence before the
+ *     session is armed or when no status is supplied, the analysis sentence while analyzing, the
+ *     follow-up hint once generated, "Session ended" once ended, and the recovery sentence once
+ *     failed - never the instrumentation sentence after the session has moved past it;
  *   - focus following the action across the pending state, without stealing it;
  *   - the design-system shape: no heading, no inline style, the root block class composed with
  *     the caller's, and every rendered button a `type="button"` so the webview never submits;
@@ -30,6 +34,9 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MockInstance } from 'vitest';
 
+import { SESSION_STATUSES } from '@debuggen/protocol';
+import type { SessionStatus } from '@debuggen/protocol';
+
 import { CaptureControls } from './CaptureControls';
 import type { CaptureControlsProps } from './CaptureControls';
 
@@ -40,6 +47,15 @@ const ARMED_PROMPT = 'Reproduce the issue now.';
 const FOLLOW_UP_ARMED_PROMPT = 'Reproduce the issue again.';
 const PENDING_TEXT = 'Updating the capture…';
 const UNAVAILABLE_MESSAGE = 'Capture becomes available once instrumentation is ready.';
+const ANALYZING_MESSAGE =
+  'The capture is being analyzed. The result appears under Analysis when it is ready.';
+const GENERATED_MESSAGE =
+  'This capture has been analyzed. Ask a follow-up question below; if it needs new evidence, capture opens here again.';
+const ENDED_TITLE = 'Session ended';
+const ENDED_MESSAGE =
+  'Capture is closed for this session. Ask a new question to start another session.';
+const FAILED_MESSAGE =
+  'Capture is unavailable because the session failed. Retry the failed stage, or end the session and ask the question again.';
 
 /** A number followed by event vocabulary — the shape any live counter would take. */
 const EVENT_COUNT_PATTERN = /\d+\s*(events?|captured)/i;
@@ -575,6 +591,212 @@ describe('CaptureControls — states', () => {
 
     expect(screen.queryByRole('alert')).toBeNull();
     expect(getButton(START_NAME).disabled).toBe(false);
+  });
+});
+
+/** The copy the unavailable state must show for one session status. */
+interface ExpectedUnavailableCopy {
+  /** The first line, or `null` where the message stands on its own. */
+  readonly title: string | null;
+  readonly message: string;
+}
+
+/**
+ * The unavailable copy of every session status. A total `Record` keyed by the protocol's own
+ * union, so a status added upstream stops this suite type-checking until it is given copy here.
+ */
+const EXPECTED_UNAVAILABLE_COPY: Readonly<Record<SessionStatus, ExpectedUnavailableCopy>> = {
+  created: { title: null, message: UNAVAILABLE_MESSAGE },
+  understanding: { title: null, message: UNAVAILABLE_MESSAGE },
+  investigating: { title: null, message: UNAVAILABLE_MESSAGE },
+  planning: { title: null, message: UNAVAILABLE_MESSAGE },
+  instrumenting: { title: null, message: UNAVAILABLE_MESSAGE },
+  // `ready` and `capturing` normally render the controls; this is only their fallback when the
+  // host withholds both actions.
+  ready: { title: null, message: UNAVAILABLE_MESSAGE },
+  capturing: { title: null, message: UNAVAILABLE_MESSAGE },
+  analyzing: { title: null, message: ANALYZING_MESSAGE },
+  generated: { title: null, message: GENERATED_MESSAGE },
+  ended: { title: ENDED_TITLE, message: ENDED_MESSAGE },
+  failed: { title: null, message: FAILED_MESSAGE },
+};
+
+/** Every session status, straight from the protocol rather than a list copied here. */
+const SESSION_CASES: readonly SessionStatus[] = SESSION_STATUSES;
+
+/** Props for a session in `status` where neither action is possible and nothing is running. */
+function unavailableProps(
+  status: SessionStatus | undefined,
+  overrides: Partial<CaptureControlsProps> = {},
+): CaptureControlsProps {
+  return readyProps({ canStart: false, canStop: false, sessionStatus: status, ...overrides });
+}
+
+/** The unavailable placeholder: the `EmptyState` holding the copy. */
+function getUnavailable(container: HTMLElement): HTMLElement {
+  const empty = container.querySelector<HTMLElement>('.dg-empty-state');
+  if (empty === null) {
+    throw new Error('expected the unavailable state to be rendered');
+  }
+  return empty;
+}
+
+/** The unavailable placeholder's title line, or `null` when it renders none. */
+function unavailableTitle(container: HTMLElement): string | null {
+  return container.querySelector('.dg-empty-state__title')?.textContent ?? null;
+}
+
+/** The unavailable placeholder's message line. */
+function unavailableMessage(container: HTMLElement): string | null {
+  return container.querySelector('.dg-empty-state__message')?.textContent ?? null;
+}
+
+describe('CaptureControls — unavailable copy follows the session status', () => {
+  it('keeps the instrumentation sentence while the pipeline has not yet armed the session', () => {
+    const pipeline: SessionStatus[] = [
+      'created',
+      'understanding',
+      'investigating',
+      'planning',
+      'instrumenting',
+    ];
+
+    for (const status of pipeline) {
+      const { container, unmount } = render(<CaptureControls {...unavailableProps(status)} />);
+      expect(unavailableMessage(container), status).toBe(UNAVAILABLE_MESSAGE);
+      expect(unavailableTitle(container), status).toBeNull();
+      expect(screen.queryAllByRole('button'), status).toEqual([]);
+      unmount();
+    }
+  });
+
+  it('keeps the instrumentation sentence when no status is supplied', () => {
+    const { container } = render(<CaptureControls {...unavailableProps(undefined)} />);
+
+    expect(unavailableMessage(container)).toBe(UNAVAILABLE_MESSAGE);
+    expect(unavailableTitle(container)).toBeNull();
+    expect(screen.queryAllByRole('button')).toEqual([]);
+  });
+
+  it('says the capture is being analyzed while analyzing', () => {
+    const { container } = render(<CaptureControls {...unavailableProps('analyzing')} />);
+
+    expect(unavailableMessage(container)).toBe(ANALYZING_MESSAGE);
+    expect(unavailableTitle(container)).toBeNull();
+    expect(screen.queryByText(UNAVAILABLE_MESSAGE)).toBeNull();
+    expect(screen.queryAllByRole('button')).toEqual([]);
+  });
+
+  it('points to the follow-up once a result exists, with no controls', () => {
+    const { container } = render(<CaptureControls {...unavailableProps('generated')} />);
+
+    expect(unavailableMessage(container)).toBe(GENERATED_MESSAGE);
+    expect(unavailableTitle(container)).toBeNull();
+    expect(screen.queryByText(UNAVAILABLE_MESSAGE)).toBeNull();
+    expect(screen.queryAllByRole('button')).toEqual([]);
+    expect(container.querySelector('.dgv-capture__state')).toBeNull();
+  });
+
+  it('says "Session ended" once the session has ended, as text rather than a heading', () => {
+    const { container } = render(<CaptureControls {...unavailableProps('ended')} />);
+
+    expect(unavailableTitle(container)).toBe(ENDED_TITLE);
+    expect(unavailableMessage(container)).toBe(ENDED_MESSAGE);
+    expect(screen.getByRole('status').textContent).toBe(`${ENDED_TITLE}${ENDED_MESSAGE}`);
+    expect(screen.queryByText(UNAVAILABLE_MESSAGE)).toBeNull();
+    expect(screen.queryAllByRole('button')).toEqual([]);
+    expect(container.querySelector('h1, h2, h3, h4, h5, h6, [role="heading"]')).toBeNull();
+  });
+
+  it('offers the recovery path once the session has failed', () => {
+    const { container } = render(<CaptureControls {...unavailableProps('failed')} />);
+
+    expect(unavailableMessage(container)).toBe(FAILED_MESSAGE);
+    expect(unavailableTitle(container)).toBeNull();
+    expect(screen.queryByText(UNAVAILABLE_MESSAGE)).toBeNull();
+    expect(screen.queryAllByRole('button')).toEqual([]);
+  });
+
+  it('renders every status as one settled status placeholder with its own copy', () => {
+    for (const status of SESSION_CASES) {
+      const expected = EXPECTED_UNAVAILABLE_COPY[status];
+      const { container, unmount } = render(<CaptureControls {...unavailableProps(status)} />);
+
+      const empty = getUnavailable(container);
+      expect(empty.getAttribute('role'), status).toBe('status');
+      expect(empty.getAttribute('aria-busy'), status).toBeNull();
+      expect(empty.classList.contains('dgv-capture__placeholder'), status).toBe(true);
+      expect(container.firstElementChild?.classList.contains('dgv-capture'), status).toBe(true);
+      expect(unavailableTitle(container), status).toBe(expected.title);
+      expect(unavailableMessage(container), status).toBe(expected.message);
+      expect(screen.queryAllByRole('status'), status).toHaveLength(1);
+      expect(screen.queryAllByRole('button'), status).toEqual([]);
+      expect(
+        container.querySelector('h1, h2, h3, h4, h5, h6, [role="heading"]'),
+        status,
+      ).toBeNull();
+      expect(container.querySelector('[style]'), status).toBeNull();
+      expect(container.textContent ?? '', status).not.toMatch(EVENT_COUNT_PATTERN);
+      unmount();
+    }
+  });
+
+  it('leaves the choice of controls to canStart, canStop and capturing', () => {
+    // The status picks copy only: a caller that permits an action still gets the controls.
+    const { unmount } = render(
+      <CaptureControls {...readyProps({ sessionStatus: 'generated', armed: true })} />,
+    );
+    expect(getButton(START_NAME).disabled).toBe(false);
+    expect(screen.queryByText(GENERATED_MESSAGE)).toBeNull();
+    unmount();
+
+    render(<CaptureControls {...capturingProps({ sessionStatus: 'ended' })} />);
+    expect(getButton(STOP_NAME).disabled).toBe(false);
+    expect(screen.queryByText(ENDED_TITLE)).toBeNull();
+  });
+
+  it('keeps error and pending ahead of the status copy', () => {
+    const { unmount } = render(
+      <CaptureControls {...unavailableProps('ended', { error: 'The capture could not stop.' })} />,
+    );
+    expect(screen.getByRole('alert').textContent).toContain('The capture could not stop.');
+    expect(screen.queryByText(ENDED_TITLE)).toBeNull();
+    expect(screen.queryByText(ENDED_MESSAGE)).toBeNull();
+    unmount();
+
+    render(<CaptureControls {...unavailableProps('generated', { pending: true })} />);
+    expect(screen.getByRole('status').getAttribute('aria-busy')).toBe('true');
+    expect(screen.queryByText(GENERATED_MESSAGE)).toBeNull();
+  });
+
+  it('changes the copy in place as the status moves on, without raising anything', () => {
+    const props = unavailableProps('analyzing');
+    const { container, rerender } = render(<CaptureControls {...props} />);
+    expect(unavailableMessage(container)).toBe(ANALYZING_MESSAGE);
+
+    rerender(<CaptureControls {...props} sessionStatus="generated" />);
+    expect(unavailableMessage(container)).toBe(GENERATED_MESSAGE);
+
+    rerender(<CaptureControls {...props} sessionStatus="ended" />);
+    expect(unavailableTitle(container)).toBe(ENDED_TITLE);
+    expect(unavailableMessage(container)).toBe(ENDED_MESSAGE);
+
+    expect(props.onStart).not.toHaveBeenCalled();
+    expect(props.onStop).not.toHaveBeenCalled();
+  });
+
+  it('drops the focus move of a capture stopped from here once the session is analyzed', async () => {
+    const user = userEvent.setup();
+    const props = capturingProps();
+    const { rerender } = render(<CaptureControls {...props} />);
+
+    await user.click(getButton(STOP_NAME));
+    rerender(<CaptureControls {...props} pending />);
+    rerender(<CaptureControls {...unavailableProps('analyzing', { onStop: props.onStop })} />);
+    rerender(<CaptureControls {...readyProps({ sessionStatus: 'ready' })} />);
+
+    // The analyzing placeholder dropped the remembered action, so a later re-arm steals nothing.
+    expect(document.activeElement).toBe(document.body);
   });
 });
 

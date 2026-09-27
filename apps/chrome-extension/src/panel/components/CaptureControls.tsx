@@ -70,30 +70,32 @@
  * not jitter as the number climbs, and always with a visible unit word ("1 event", "1,204 events",
  * "0 events captured" after an empty capture). The counter is a labelled `group` stating what it
  * counts, and it is current on every render. The count arrives as a prop from the store's capture
- * slice, which the connection layer updates from the `telemetry.tail` and `capture.*` pushes —
- * nothing is polled or counted here.
+ * slice, which the connection layer keeps at the service's count of the capture's **stored**
+ * events — the per-capture tallies each `telemetry.tail` frame carries, and the summary's
+ * `coverage.storedEvents` once `capture.stopped` arrives — so the number is what the capture holds,
+ * not how many events the live tail happened to stream. Nothing is polled or counted here.
  *
  * ## The progress announcement
  *
  * The visible counter is deliberately NOT a live region: it can change many times per second and
- * would flood a screen reader. Progress reaches assistive technology through a second, visually
- * hidden element instead — a polite, atomic `role="status"` region that is always mounted (so it
- * exists before its first sentence arrives) and whose sentence changes on a schedule rather than
- * on every count:
+ * would flood a screen reader. The capture's transitions reach assistive technology through a
+ * second, visually hidden element instead — a polite, atomic `role="status"` region that is always
+ * mounted (so it exists before its first sentence arrives). It never states the running count:
+ * the visible counter is the panel's one running number, and a sampled second number would always
+ * disagree with it.
  *
- *   capture starts       at once       "Capture running. 0 events received."
- *   count changes        throttled     "1,204 events received during the running capture."
+ *   capture starts       at once       "Capture running."
  *   capture stops        at once       "Capture stopped. 1,204 events captured."
- *   count corrected      throttled     "1,206 events captured." (after a stop it announced)
+ *   total corrected      at once       "1,206 events captured." (after a stop it announced)
  *   capture id cleared   at once       the sentence is cleared, so nothing stale remains
  *
- * The throttle is trailing: the first unannounced count change starts a
- * {@link COUNT_ANNOUNCE_INTERVAL_MS} timer and the sentence is composed when it fires, from the
- * latest count, so a burst collapses into one announcement per interval and never speaks a
- * superseded number. A start or stop supersedes a pending count sentence. A capture this component
- * only ever saw stopped — a panel opened on a finished session — is never announced, and a
- * switch to such a capture clears the previous capture's sentence. The schedule lives in
- * {@link CaptureAnnouncer}; the region's text is React state set only from its timer callbacks.
+ * "At once" is a zero-delay timer, so changes made in one task collapse into one sentence composed
+ * from the latest count, and a superseded number is never spoken. A stopped capture's total moves
+ * only when the service's stored count arrives after a stop the panel saw first, so the correction
+ * cannot flood. A capture this component only ever saw stopped — a panel opened on a finished
+ * session — is never announced, and a switch to such a capture clears the previous capture's
+ * sentence. The schedule lives in {@link CaptureAnnouncer}; the region's text is React state set
+ * only from its timer callback.
  *
  * ## Accessibility
  *
@@ -137,6 +139,7 @@
  */
 import { Button, Stack, Text, Tooltip } from '@debuggen/panel-renderer';
 import type { SessionStatus } from '@debuggen/protocol';
+import { assertNever } from '@debuggen/shared';
 import { useEffect, useRef, useState } from 'react';
 import type { ReactElement } from 'react';
 
@@ -183,9 +186,6 @@ const CAPTURE_RUNNING_LEAD = 'Capture running.';
 /** The lead of the sentence announced when the running capture stops. */
 const CAPTURE_STOPPED_LEAD = 'Capture stopped.';
 
-/** The tail of the throttled sentence announced while the running capture's count climbs. */
-const RUNNING_PROGRESS_TAIL = 'received during the running capture.';
-
 /**
  * The developer-facing message of the aggregate raised when the platform's own error reporter
  * throws while reporting a failure of the capture controls' error reporter.
@@ -204,16 +204,10 @@ const VISUALLY_HIDDEN_CLASS = 'dg-visually-hidden';
 // ---------------------------------------------------------------------------
 
 /**
- * The shortest spacing, in milliseconds, between two count announcements. A count that changes
- * many times per second is spoken at most once per interval, always with the latest number; a
- * start or a stop is announced at once regardless.
- */
-const COUNT_ANNOUNCE_INTERVAL_MS = 5_000;
-
-/**
- * The delay of a prompt announcement (start, stop, clear). Zero, but still a timer: the region's
- * text is state, and state is set only from timer callbacks — never synchronously in an effect —
- * which also guarantees the always-mounted region exists before its first sentence arrives.
+ * The delay of every announcement (start, stop, corrected total, clear). Zero, but still a timer:
+ * the region's text is state, and state is set only from timer callbacks — never synchronously in
+ * an effect — which also guarantees the always-mounted region exists before its first sentence
+ * arrives, and collapses changes made within one task into one sentence.
  */
 const PROMPT_ANNOUNCE_DELAY_MS = 0;
 
@@ -541,14 +535,13 @@ function counterText(eventCount: number, live: boolean): string {
 // The progress announcement
 // ---------------------------------------------------------------------------
 
-/** The sentence announced when a capture starts: "Capture running. 0 events received." */
-function startSentence(count: number): string {
-  return `${CAPTURE_RUNNING_LEAD} ${counterText(count, true)} received.`;
-}
-
-/** The throttled sentence while it runs: "1,204 events received during the running capture." */
-function progressSentence(count: number): string {
-  return `${counterText(count, true)} ${RUNNING_PROGRESS_TAIL}`;
+/**
+ * The sentence announced when a capture starts: "Capture running." It states no count: the
+ * visible counter is the one running number, and a count spoken here would be stale the moment
+ * the next frame arrived — a second, different number beside it.
+ */
+function startSentence(): string {
+  return CAPTURE_RUNNING_LEAD;
 }
 
 /** The sentence announced when the capture stops: "Capture stopped. 1,204 events captured." */
@@ -556,7 +549,10 @@ function stopSentence(count: number): string {
   return `${CAPTURE_STOPPED_LEAD} ${counterText(count, false)}.`;
 }
 
-/** The throttled sentence for a count corrected after the stop: "1,206 events captured." */
+/**
+ * The sentence for a stopped capture's total corrected after its stop was announced — the
+ * service's stored count arriving after a stop the panel saw first: "1,206 events captured."
+ */
 function totalSentence(count: number): string {
   return `${counterText(count, false)}.`;
 }
@@ -570,23 +566,27 @@ interface FollowedCapture {
   readonly seenLive: boolean;
 }
 
-/** An announcement delivered at once: the capture started or stopped, or the sentence is cleared. */
-type PromptAnnouncement = 'start' | 'stop' | 'clear';
+/**
+ * An announcement: the capture started or stopped, a stopped capture's total was corrected, or
+ * the sentence is cleared.
+ */
+type Announcement = 'start' | 'stop' | 'total' | 'clear';
 
 /**
  * The schedule behind the progress announcement: it observes the capture on every change and
  * decides what the live region says, and when (the table in the module header).
  *
- * A plain object rather than more hooks, so the whole schedule and both of its timers are owned
- * in one place: the component creates it in a mount effect, feeds it from an effect keyed on the
- * capture, and disposes of it on unmount, which cancels every pending timer. `announce` is invoked
+ * A plain object rather than more hooks, so the whole schedule and its timer are owned in one
+ * place: the component creates it in a mount effect, feeds it from an effect keyed on the
+ * capture, and disposes of it on unmount, which cancels the pending timer. `announce` is invoked
  * only from a timer callback, never synchronously from {@link CaptureAnnouncer.observe}, so the
  * component's state is never set in an effect body.
  *
  * Invariants:
- * - at most one prompt timer and one count timer are pending, and scheduling a prompt cancels
- *   both — a start or stop supersedes whatever was about to be said;
- * - no count timer is scheduled while a prompt is pending, because the prompt states the count;
+ * - at most one timer is pending, and scheduling an announcement cancels it — the latest change
+ *   supersedes whatever was about to be said;
+ * - a running capture's climbing count is never spoken: the visible counter is the only running
+ *   number, so the region can never state a different one;
  * - every sentence is composed when its timer fires, from the latest observed count, so a
  *   superseded number is never spoken.
  */
@@ -598,12 +598,10 @@ class CaptureAnnouncer {
   /** The latest observed count of the followed capture. */
   #count = 0;
 
-  /** The count the last sentence about the followed capture stated; `undefined` before one. */
+  /** The count the last stop or total sentence stated; `undefined` before one. */
   #spokenCount: number | undefined = undefined;
 
-  #promptTimer: ReturnType<typeof setTimeout> | undefined = undefined;
-
-  #countTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  #timer: ReturnType<typeof setTimeout> | undefined = undefined;
 
   /** @param announce Replaces the live region's sentence; `''` empties it. */
   constructor(announce: (sentence: string) => void) {
@@ -624,7 +622,7 @@ class CaptureAnnouncer {
     if (captureId === undefined) {
       this.#followed = undefined;
       if (previous !== undefined) {
-        this.#prompt('clear');
+        this.#schedule('clear');
       }
       return;
     }
@@ -635,9 +633,9 @@ class CaptureAnnouncer {
       this.#followed = { captureId, live, seenLive: live };
       this.#spokenCount = undefined;
       if (live) {
-        this.#prompt('start');
+        this.#schedule('start');
       } else if (previous !== undefined) {
-        this.#prompt('clear');
+        this.#schedule('clear');
       }
       return;
     }
@@ -645,61 +643,53 @@ class CaptureAnnouncer {
     if (live !== previous.live) {
       // The same capture started or stopped; either way it has now been seen running.
       this.#followed = { captureId, live, seenLive: true };
-      this.#prompt(live ? 'start' : 'stop');
+      this.#schedule(live ? 'start' : 'stop');
       return;
     }
 
-    if (previous.seenLive && count !== this.#spokenCount) {
-      this.#scheduleCount();
+    // A stopped capture whose total moved after its stop sentence — the stored count arriving
+    // after the stop — is stated again, so the region and the counter agree. A pending stop
+    // sentence composes the latest count itself, so it is not superseded.
+    if (!live && previous.seenLive && this.#timer === undefined && count !== this.#spokenCount) {
+      this.#schedule('total');
     }
   }
 
-  /** Cancels every pending announcement; the component calls it on unmount. */
+  /** Cancels the pending announcement; the component calls it on unmount. */
   dispose(): void {
-    this.#cancelTimers();
+    this.#cancel();
   }
 
-  /** Replaces anything pending with a prompt announcement of `kind`. */
-  #prompt(kind: PromptAnnouncement): void {
-    this.#cancelTimers();
-    this.#promptTimer = setTimeout(() => {
-      this.#promptTimer = undefined;
-      if (kind === 'clear') {
-        this.#spokenCount = undefined;
-        this.#announce('');
-        return;
+  /** Replaces anything pending with an announcement of `kind`. */
+  #schedule(kind: Announcement): void {
+    this.#cancel();
+    this.#timer = setTimeout(() => {
+      this.#timer = undefined;
+      switch (kind) {
+        case 'clear':
+          this.#spokenCount = undefined;
+          this.#announce('');
+          return;
+        case 'start':
+          this.#spokenCount = undefined;
+          this.#announce(startSentence());
+          return;
+        case 'stop':
+        case 'total': {
+          const count = this.#count;
+          this.#spokenCount = count;
+          this.#announce(kind === 'stop' ? stopSentence(count) : totalSentence(count));
+          return;
+        }
+        default:
+          assertNever(kind, 'Unhandled capture announcement');
       }
-      const count = this.#count;
-      this.#spokenCount = count;
-      this.#announce(kind === 'start' ? startSentence(count) : stopSentence(count));
     }, PROMPT_ANNOUNCE_DELAY_MS);
   }
 
-  /**
-   * The trailing throttle: the first unannounced count change starts the interval, later changes
-   * within it only update `#count`, and the sentence states whatever the count is when it fires.
-   */
-  #scheduleCount(): void {
-    if (this.#promptTimer !== undefined || this.#countTimer !== undefined) {
-      return;
-    }
-    this.#countTimer = setTimeout(() => {
-      this.#countTimer = undefined;
-      const followed = this.#followed;
-      const count = this.#count;
-      if (followed === undefined || !followed.seenLive || count === this.#spokenCount) {
-        return;
-      }
-      this.#spokenCount = count;
-      this.#announce(followed.live ? progressSentence(count) : totalSentence(count));
-    }, COUNT_ANNOUNCE_INTERVAL_MS);
-  }
-
-  #cancelTimers(): void {
-    clearTimeout(this.#promptTimer);
-    clearTimeout(this.#countTimer);
-    this.#promptTimer = undefined;
-    this.#countTimer = undefined;
+  #cancel(): void {
+    clearTimeout(this.#timer);
+    this.#timer = undefined;
   }
 }
 
@@ -872,7 +862,7 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
   }, [request]);
 
   const live = sessionStatus === 'capturing';
-  // The throttled sentence of the always-mounted live region (see "The progress announcement").
+  // The transition sentence of the always-mounted live region (see "The progress announcement").
   const announcement = useCaptureAnnouncement(captureId, live, displayableCount(eventCount));
 
   const holding = holdingRequest(request, sessionStatus, captureId);

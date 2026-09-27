@@ -116,7 +116,12 @@ import { DataProviderContext, PanelSessionContext, createDataProvider } from '..
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef, PanelSelectionState } from '../host/PanelActions';
-import { estimateTextWidth, formatDuration, formatCount } from '../utils/format';
+import {
+  NOT_AVAILABLE_LABEL,
+  estimateTextWidth,
+  formatDuration,
+  formatCount,
+} from '../utils/format';
 import { kindColorVar, kindInkColorVar } from '../utils/color';
 import { FlameChart } from './FlameChart';
 
@@ -865,9 +870,9 @@ function figuresOf(row: HTMLElement): { readonly duration: string; readonly ownT
   return { duration: duration.textContent ?? '', ownTime: ownTime.textContent ?? '' };
 }
 
-/** The canvas: the picture, which is an image with a text alternative. */
+/** The canvas: the picture, a figure with a text alternative whose frames are named images. */
 function canvas(): HTMLElement {
-  return screen.getByRole('img');
+  return screen.getByRole('figure');
 }
 
 /**
@@ -912,22 +917,72 @@ interface DrawnFrame {
   readonly y: number;
 }
 
+/** A window frame's bar: a frame rect that is not part of the context band. */
+const WINDOW_FRAME_SELECTOR = 'rect.dg-flame__frame:not([data-flame-context])';
+
+/** A context bar: a frame rect drawn only to show where the window sits. */
+const CONTEXT_FRAME_SELECTOR = 'rect.dg-flame__frame[data-flame-context]';
+
 /**
- * Every frame the canvas draws, with the geometry its `<rect>` carries.
+ * The name and geometry one frame `<rect>` carries.
  *
  * The name is the first line of the bar's `<title>`, which is the frame's own
  * name; the numbers are read as opaque user units, as {@link depthOffsets}
  * reads them.
  *
- * @returns One entry per `rect.dg-flame__frame`, in document order.
+ * @param rect A frame's `<rect>`.
+ * @returns Its name and geometry.
  */
-function drawnFrames(): DrawnFrame[] {
-  return Array.from(canvas().querySelectorAll('rect.dg-flame__frame')).map((rect) => ({
+function drawnFrameOf(rect: Element): DrawnFrame {
+  return {
     name: (rect.querySelector('title')?.textContent ?? '').split('\n')[0] ?? '',
     x: Number.parseFloat(rect.getAttribute('x') ?? ''),
     width: Number.parseFloat(rect.getAttribute('width') ?? ''),
     y: Number.parseFloat(rect.getAttribute('y') ?? ''),
-  }));
+  };
+}
+
+/**
+ * Every frame of the drawn WINDOW, with the geometry its `<rect>` carries —
+ * the bars of the context band excluded, since they are not the window's.
+ *
+ * @returns One entry per window frame, in document order.
+ */
+function drawnFrames(): DrawnFrame[] {
+  return Array.from(canvas().querySelectorAll(WINDOW_FRAME_SELECTOR)).map(drawnFrameOf);
+}
+
+/**
+ * The context band's bars, in document order: the operations a window that
+ * opens below the root is nested inside, outermost first.
+ *
+ * @returns One entry per context bar.
+ */
+function contextBars(): DrawnFrame[] {
+  return Array.from(canvas().querySelectorAll(CONTEXT_FRAME_SELECTOR)).map(drawnFrameOf);
+}
+
+/** The names of the context band's bars, outermost first. */
+function contextBarNames(): string[] {
+  return contextBars().map((bar) => bar.name);
+}
+
+/**
+ * The context bar drawn for the operation named `name`.
+ *
+ * @param name The operation's recorded name.
+ * @returns Its `<rect>`.
+ */
+function contextRect(name: string): SVGRectElement {
+  const rect = Array.from(canvas().querySelectorAll<SVGRectElement>(CONTEXT_FRAME_SELECTOR)).find(
+    (candidate) => drawnFrameOf(candidate).name === name,
+  );
+
+  if (rect === undefined) {
+    throw new Error(`the canvas draws no context bar named "${name}"`);
+  }
+
+  return rect;
 }
 
 /**
@@ -976,6 +1031,89 @@ function sameRowOverlaps(): string[] {
   return overlaps;
 }
 
+/**
+ * The index, among the drawn rows, of the row holding the frame named `name`.
+ *
+ * @param name The frame name to find.
+ * @returns Its 0-based row index, top to bottom.
+ */
+function rowIndexOf(name: string): number {
+  const index = icicleRows().findIndex((group) =>
+    Array.from(group.querySelectorAll('rect.dg-flame__frame')).some(
+      (rect) => (rect.querySelector('title')?.textContent ?? '').split('\n')[0] === name,
+    ),
+  );
+
+  if (index < 0) {
+    throw new Error(`no drawn row holds a frame named "${name}"`);
+  }
+
+  return index;
+}
+
+/** One "+N" mark the canvas draws over a crowded depth's gathered operations. */
+interface DrawnOverflowMark {
+  /** How many operations it gathers, read off the count its title opens with. */
+  readonly count: number;
+  /** Its native tooltip, whole. */
+  readonly title: string;
+  /** The "+N" count drawn inside it, when one is drawn. */
+  readonly label: string | undefined;
+  /** The index, among the drawn rows, of the row it sits on. */
+  readonly row: number;
+  /** The band's `x`, in user units. */
+  readonly x: number;
+  /** The band's `width`, in user units. */
+  readonly width: number;
+  /** The band's `y`, in user units. */
+  readonly y: number;
+}
+
+/**
+ * Every "+N" mark the canvas draws, in document order, with its count, title,
+ * label, row and geometry.
+ *
+ * The count is read off the title's opening figure — the mark's label is drawn
+ * only when it fits whole, while the title always carries the count — and the
+ * label is the element right after the band, as a frame's is after its bar.
+ *
+ * @returns One entry per `rect.dg-flame__overflow`.
+ */
+function overflowMarks(): DrawnOverflowMark[] {
+  const rows = icicleRows();
+
+  return Array.from(canvas().querySelectorAll('rect.dg-flame__overflow')).map((rect) => {
+    const title = rect.querySelector('title')?.textContent ?? '';
+    const figure = /^([\d,]+) operations? /.exec(title)?.[1];
+    if (figure === undefined) {
+      throw new Error(`an overflow mark's title does not open with its count: "${title}"`);
+    }
+    const next = rect.nextElementSibling;
+    const text = next?.matches('text.dg-flame__overflow-label') === true ? next : null;
+    const group = rect.closest('g.dg-flame__row');
+
+    return {
+      count: Number(figure.replace(/,/g, '')),
+      title,
+      label: text === null ? undefined : (text.textContent ?? ''),
+      row: rows.findIndex((candidate) => candidate === group),
+      x: Number.parseFloat(rect.getAttribute('x') ?? ''),
+      width: Number.parseFloat(rect.getAttribute('width') ?? ''),
+      y: Number.parseFloat(rect.getAttribute('y') ?? ''),
+    };
+  });
+}
+
+/**
+ * How many operations the canvas accounts for: every frame it draws as a bar,
+ * and every operation a "+N" mark gathers. While no gathered frame is the
+ * panel's selection — which is drawn as a bar over its mark as well — this is
+ * exactly the number of operations the drawn window holds.
+ */
+function canvasOperationCount(): number {
+  return drawnFrames().length + overflowMarks().reduce((sum, mark) => sum + mark.count, 0);
+}
+
 /** One drawn frame's bar geometry and label, as the canvas carries them. */
 interface LabelledFrame {
   /** The bar's `x`, in user units. */
@@ -999,7 +1137,7 @@ interface LabelledFrame {
  * @returns Its bar's geometry and its label, read as numbers and text.
  */
 function drawnFrame(name: string): LabelledFrame {
-  const bar = Array.from(canvas().querySelectorAll('rect.dg-flame__frame')).find(
+  const bar = Array.from(canvas().querySelectorAll(WINDOW_FRAME_SELECTOR)).find(
     (rect) => rect.querySelector('title')?.textContent?.split('\n')[0] === name,
   );
 
@@ -1582,7 +1720,7 @@ describe('FlameChart states', () => {
 
     // Nothing is drawn yet: no picture, no text equivalent, and above all no
     // empty state — an unsettled query is not an answer.
-    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('figure')).toBeNull();
     expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
 
@@ -1613,7 +1751,7 @@ describe('FlameChart states', () => {
 
     // An empty trace is a success, so it is drawn as an absence and not as a
     // failure — and there is no picture to imply frames behind it.
-    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('figure')).toBeNull();
     expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByRole('status', { busy: true })).toBeNull();
@@ -1654,7 +1792,7 @@ describe('FlameChart states', () => {
     expect(queryOfCall(stub, 2)).toEqual(queryOfCall(stub, 1));
 
     // No frames were invented behind the failure.
-    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('figure')).toBeNull();
     expect(screen.queryByRole('tree')).toBeNull();
   });
 
@@ -1678,7 +1816,7 @@ describe('FlameChart states', () => {
 
     // Nothing was asked of the provider, and nothing was drawn as if it had been.
     expect(stub.resolve).not.toHaveBeenCalled();
-    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('figure')).toBeNull();
     expect(screen.queryByRole('tree')).toBeNull();
   });
 
@@ -1808,7 +1946,7 @@ describe('FlameChart states', () => {
     // Not the malformed-payload path: no alert, so no retry, and nothing drawn.
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByRole('button', { name: RETRY_NAME })).toBeNull();
-    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('figure')).toBeNull();
     expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(stub.resolve).toHaveBeenCalledTimes(1);
@@ -2626,6 +2764,54 @@ describe('FlameChart bounded tree', { timeout: WINDOW_CASE_TIMEOUT_MS }, () => {
     expect(frameRows()).toHaveLength(TEXT_ROW_BUDGET);
   });
 
+  it('names what a later page of rows is nested inside, above the tree and outside it', async () => {
+    const tree = nestedSiblingsTree(LONG_SIBLING_COUNT);
+    const user = userEvent.setup();
+    const rowTotal = tree.nodeCount;
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+
+    // The first page opens at the root: nothing to give context for. One
+    // drawn window holds the whole trace, so the canvas has no band either.
+    expect(contextList()).toBeNull();
+    expect(contextBarNames()).toEqual([]);
+
+    // The second page opens among the siblings, whose root and group are
+    // rows of the first page: they are named above the tree, outermost first,
+    // indented by their own depth, and marked as context by their caption.
+    await user.click(pagingControl(NEXT_ROWS_NAME));
+    expect(
+      screen.getByText(rowPageStatement(TEXT_ROW_BUDGET, TEXT_ROW_BUDGET, rowTotal)),
+    ).toBeDefined();
+    const list = contextList();
+    if (list === null) {
+      throw new Error('the second page of rows carries no context list');
+    }
+    expect(contextRowNames(list)).toEqual(['example.batch', NESTED_GROUP_NAME]);
+    const items = within(list).getAllByRole('listitem');
+    expect(items.map((item) => item.style.getPropertyValue('--dgc-depth'))).toEqual(['0', '1']);
+    expect(screen.getByText(TREE_CONTEXT_CAPTION)).toBeDefined();
+
+    // None of it is a row of the page: the tree still holds exactly the
+    // page's rows, the first of them the first sibling past the first page,
+    // and the tree is still one tab stop — the context holds none.
+    expect(frameList().contains(list)).toBe(false);
+    expect(frameRows()).toHaveLength(TEXT_ROW_BUDGET);
+    const [pageFirst] = frameRows();
+    expect(pageFirst?.getAttribute('aria-level')).toBe('3');
+    expect(nameOfRow(pageFirst ?? frameList())).toBe(pagedSiblingName(TEXT_ROW_BUDGET - 2));
+    expect(tabStops()).toHaveLength(1);
+    expect(list.querySelectorAll('button, a[href], input, [tabindex]')).toHaveLength(0);
+
+    // Back on the first page, the context is gone again.
+    await user.click(pagingControl(PREVIOUS_ROWS_NAME));
+    expect(contextList()).toBeNull();
+  });
+
   it('turns to a later page by pointer, where a row’s source chip opens its own location', async () => {
     // The sibling past the first page that resolved to a location: its row is
     // row 72 of the tree (the root is the first), on the second page.
@@ -3421,6 +3607,449 @@ describe('FlameChart canvas', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * Crowded levels, drawn on a bounded number of rows
+ *
+ * A level takes at most three rows. One whose operations stack deeper than
+ * that keeps its longest operations as bars on two sub-rows and gathers the
+ * rest into "+N" marks on ONE row beneath them, so the levels under it stay
+ * near the top of the canvas; one whose operations fit in three rows is drawn
+ * exactly as the optimal packing lays it out, every operation a bar. The
+ * crowded fixture spans 1 000 ms, so the canvas draws one unit per
+ * millisecond and every extent below is exact arithmetic. Its root holds three
+ * crowds whose members start together:
+ *
+ *   A at   0 ms: `crowdSize` operations, the first 100 ms long and each one
+ *                shorter than the one before, down to just over 50 ms;
+ *   B at 500 ms: 50, 45 and 40 ms;
+ *   C at 800 ms: 12, 11 and 10 ms;
+ *
+ * and a two-level chain hangs under the last (shortest) member of crowd A. With
+ * two rows, each keeps one member of every crowd — the longest of each on the
+ * first, the next on the second — and each crowd's remainder becomes one mark:
+ * the rest of A over the extent of its longest remaining member, B's last over
+ * its 40 units, and C's last over 10 units, too narrow to hold its count.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The most sub-rows a crowded level draws its frames on: the component's own bound, restated. */
+const LEVEL_SUB_ROW_BOUND = 2;
+
+/** The most rows any level takes: its sub-rows and the overflow row beneath them. */
+const LEVEL_ROW_BOUND = LEVEL_SUB_ROW_BOUND + 1;
+
+/**
+ * Three siblings over one instant: a level that needs exactly
+ * {@link LEVEL_ROW_BOUND} rows, which gathering could not shorten.
+ */
+const THREE_DEEP_TREE = labelTree([
+  { name: 'example.overlap.first', offsetMs: 0, durationMs: 300 },
+  { name: 'example.overlap.second', offsetMs: 10, durationMs: 300 },
+  { name: 'example.overlap.third', offsetMs: 20, durationMs: 40 },
+]);
+
+/** How many members crowd A holds in the default fixture. */
+const CROWD_SIZE = 10;
+
+/** A crowd A far larger than any level could draw one row per member for. */
+const LARGE_CROWD_SIZE = 300;
+
+/** Crowd B's durations, in milliseconds, longest first. */
+const CROWD_B_MS: readonly number[] = [50, 45, 40];
+
+/** Crowd C's durations, in milliseconds, longest first. */
+const CROWD_C_MS: readonly number[] = [12, 11, 10];
+
+/** The crowded fixture's root. */
+const CROWD_ROOT_NAME = 'example.crowd.root';
+
+/** The operation nested under crowd A's last member. */
+const CROWD_CHILD_NAME = 'example.crowd.child';
+
+/** The operation nested under {@link CROWD_CHILD_NAME}. */
+const CROWD_GRANDCHILD_NAME = 'example.crowd.grandchild';
+
+/** The name of a crowd's member. */
+function crowdName(crowd: 'a' | 'b' | 'c', index: number): string {
+  return `example.crowd.${crowd}.${String(index).padStart(3, '0')}`;
+}
+
+/** The event id of the crowded fixture's operation named `name`. */
+function crowdEventId(name: string): string {
+  return `event-${name}`;
+}
+
+/** How long crowd A's member at `index` lasts: 100 ms, shortening evenly towards 50 ms. */
+function crowdADurationMs(index: number, crowdSize: number): number {
+  return 100 - (index * 50) / crowdSize;
+}
+
+/**
+ * The crowded fixture: a 1 000 ms root over crowds A, B and C, and the chain
+ * under crowd A's last member.
+ *
+ * @param crowdSize How many members crowd A holds; at most 399, so its span
+ * ids never reach crowd B's.
+ * @returns The correlated trace.
+ */
+function crowdedTree(crowdSize: number = CROWD_SIZE): TraceTree {
+  const rootSpanId = spanIdFor(3000);
+
+  const member = (
+    name: string,
+    ordinal: number,
+    parentSpanId: string,
+    offsetMs: number,
+    durationMs: number,
+    depth: number,
+    children: readonly TraceNode[] = [],
+  ): TraceNode =>
+    makeTraceNode(
+      makeEvent({
+        id: crowdEventId(name),
+        spanId: spanIdFor(ordinal),
+        parentSpanId,
+        name,
+        kind: 'function',
+        tier: 'server',
+        startTime: BASE_START_MS + offsetMs,
+        duration: durationMs,
+        seq: ordinal - 3000,
+        ingestSeq: ordinal - 2999,
+      }),
+      children,
+      depth,
+    );
+
+  const lastOfA = crowdSize - 1;
+  const grandchild = member(CROWD_GRANDCHILD_NAME, 3601, spanIdFor(3600), 0, 25, 3);
+  const chainChild = member(CROWD_CHILD_NAME, 3600, spanIdFor(3001 + lastOfA), 0, 50, 2, [
+    grandchild,
+  ]);
+  const crowdA = Array.from({ length: crowdSize }, (_unused, index) =>
+    member(
+      crowdName('a', index),
+      3001 + index,
+      rootSpanId,
+      0,
+      crowdADurationMs(index, crowdSize),
+      1,
+      index === lastOfA ? [chainChild] : [],
+    ),
+  );
+  const crowdB = CROWD_B_MS.map((durationMs, index) =>
+    member(crowdName('b', index), 3400 + index, rootSpanId, 500, durationMs, 1),
+  );
+  const crowdC = CROWD_C_MS.map((durationMs, index) =>
+    member(crowdName('c', index), 3500 + index, rootSpanId, 800, durationMs, 1),
+  );
+
+  const root = makeEvent({
+    id: crowdEventId(CROWD_ROOT_NAME),
+    spanId: rootSpanId,
+    name: CROWD_ROOT_NAME,
+    kind: 'route.handler',
+    tier: 'server',
+    startTime: BASE_START_MS,
+    duration: 1000,
+    seq: 0,
+    ingestSeq: 1,
+  });
+
+  return makeTree([makeTraceNode(root, [...crowdA, ...crowdB, ...crowdC], 0)]);
+}
+
+/**
+ * The names of the frames drawn as bars on one row, left to right.
+ *
+ * @param index The row's 0-based index, top to bottom.
+ * @returns The first line of each bar's title.
+ */
+function frameNamesOnRow(index: number): string[] {
+  const group = icicleRows()[index];
+
+  if (group === undefined) {
+    throw new Error(`the canvas draws no row ${String(index)}`);
+  }
+
+  return Array.from(group.querySelectorAll('rect.dg-flame__frame')).map(
+    (rect) => (rect.querySelector('title')?.textContent ?? '').split('\n')[0] ?? '',
+  );
+}
+
+/**
+ * A mark's title, as the chart words it: how many operations it gathers, the
+ * stretch of the trace they cover, measured from the axis's zero, and that
+ * each is still listed in the tree. Spelled out here, so a case pins the words
+ * a reader hears.
+ *
+ * @param count How many operations the mark gathers.
+ * @param fromMs Where the earliest gathered operation starts, from the axis's zero.
+ * @param toMs Where the latest gathered operation ends, from the axis's zero.
+ * @returns The title.
+ */
+function overflowTitle(count: number, fromMs: number, toMs: number): string {
+  const gathered = count === 1 ? '1 operation' : `${formatCount(count)} operations`;
+  const listed = count === 1 ? 'it is listed' : 'every one is listed';
+  return `${gathered} from ${formatDuration(fromMs)} to ${formatDuration(
+    toMs,
+  )} gathered here, where this level overlaps more deeply than its ${String(
+    LEVEL_SUB_ROW_BOUND,
+  )} rows can draw; ${listed} in the tree below.`;
+}
+
+/**
+ * The note — and the sentence of the canvas's text alternative — a drawing
+ * that gathered operations owes its reader.
+ *
+ * @param gathered How many operations the drawn window gathered.
+ * @param marks How many marks they were gathered into.
+ * @returns The sentence.
+ */
+function compactionNote(gathered: number, marks: number): string {
+  return `Where more operations of one level overlap than its ${String(
+    LEVEL_SUB_ROW_BOUND,
+  )} rows can hold, those rows keep the longest, and the ${formatCount(
+    gathered,
+  )} operations that did not fit are gathered into ${String(
+    marks,
+  )} marks on a row beneath them; every one is listed in the tree below.`;
+}
+
+/** Every note above the chart, as the reader reads it. */
+function noteTexts(container: HTMLElement): string[] {
+  return Array.from(container.querySelectorAll('.dg-flame__note')).map(
+    (note) => note.textContent ?? '',
+  );
+}
+
+/** The crowd members no row of the default fixture can hold: all but two of each crowd. */
+const GATHERED_NAMES: readonly string[] = [
+  ...Array.from({ length: CROWD_SIZE - LEVEL_SUB_ROW_BOUND }, (_unused, index) =>
+    crowdName('a', index + LEVEL_SUB_ROW_BOUND),
+  ),
+  crowdName('b', 2),
+  crowdName('c', 2),
+];
+
+/** The row the crowded level's marks sit on: beneath the root's and the level's own rows. */
+const OVERFLOW_ROW_INDEX = 1 + LEVEL_SUB_ROW_BOUND;
+
+describe('FlameChart crowded levels', () => {
+  it('draws a level crowded past its rows on those rows and one row of marks beneath them', async () => {
+    const tree = crowdedTree();
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+
+    // Ten operations stack over the start of crowd A, so the optimal packing
+    // alone would give that level ten rows. It takes its two, and one of marks.
+    const levelRows = new Set([
+      ...drawnFrames()
+        .filter((frame) => /^example\.crowd\.[abc]\./.test(frame.name))
+        .map((frame) => rowIndexOf(frame.name)),
+      ...overflowMarks().map((mark) => mark.row),
+    ]);
+    expect([...levelRows].sort((left, right) => left - right)).toEqual([1, 2, OVERFLOW_ROW_INDEX]);
+    expect(levelRows.size).toBeLessThanOrEqual(LEVEL_ROW_BOUND);
+    expect(icicleRows()).toHaveLength(1 + LEVEL_ROW_BOUND + 2);
+
+    // The rows keep the longest of every crowd, left to right, and the level
+    // stays depth-major: the root above it, the chain below its marks.
+    expect(frameNamesOnRow(0)).toEqual([CROWD_ROOT_NAME]);
+    expect(frameNamesOnRow(1)).toEqual([crowdName('a', 0), crowdName('b', 0), crowdName('c', 0)]);
+    expect(frameNamesOnRow(2)).toEqual([crowdName('a', 1), crowdName('b', 1), crowdName('c', 1)]);
+    expect(frameNamesOnRow(OVERFLOW_ROW_INDEX)).toEqual([]);
+    expect(frameNamesOnRow(OVERFLOW_ROW_INDEX + 1)).toEqual([CROWD_CHILD_NAME]);
+    expect(frameNamesOnRow(OVERFLOW_ROW_INDEX + 2)).toEqual([CROWD_GRANDCHILD_NAME]);
+    expect(sameRowOverlaps()).toEqual([]);
+
+    // Nothing is lost: the canvas accounts for every operation, as a bar or in
+    // a mark's count, and the tree still lists every one, in traversal order.
+    expect(canvasOperationCount()).toBe(tree.nodeCount);
+    expect(frameNames()).toEqual([
+      CROWD_ROOT_NAME,
+      ...Array.from({ length: CROWD_SIZE }, (_unused, index) => crowdName('a', index)),
+      CROWD_CHILD_NAME,
+      CROWD_GRANDCHILD_NAME,
+      ...CROWD_B_MS.map((_duration, index) => crowdName('b', index)),
+      ...CROWD_C_MS.map((_duration, index) => crowdName('c', index)),
+    ]);
+  });
+
+  it('marks each run of gathered operations with its count, and says each is listed below', async () => {
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(crowdedTree()).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+
+    // One mark per run of overlapping gathered bars, each over the extent its
+    // run covers, on the one overflow row. The count is drawn when it fits
+    // whole — never cut — and the title always carries it.
+    const marks = overflowMarks();
+    expect(marks.map(({ count, label, row, title }) => ({ count, label, row, title }))).toEqual([
+      {
+        count: CROWD_SIZE - LEVEL_SUB_ROW_BOUND,
+        label: `+${String(CROWD_SIZE - LEVEL_SUB_ROW_BOUND)}`,
+        row: OVERFLOW_ROW_INDEX,
+        // Crowd A's gathered members all start with the root; the longest of
+        // them — the first the two rows could not keep — sets where the run ends.
+        title: overflowTitle(
+          CROWD_SIZE - LEVEL_SUB_ROW_BOUND,
+          0,
+          crowdADurationMs(LEVEL_SUB_ROW_BOUND, CROWD_SIZE),
+        ),
+      },
+      { count: 1, label: '+1', row: OVERFLOW_ROW_INDEX, title: overflowTitle(1, 500, 540) },
+      {
+        count: 1,
+        label: undefined,
+        row: OVERFLOW_ROW_INDEX,
+        title: overflowTitle(1, 800, 810),
+      },
+    ]);
+    // The stretch is what tells the marks apart when a reader moves through the
+    // canvas's images by name: no two of them share a name.
+    expect(new Set(marks.map((mark) => mark.title)).size).toBe(marks.length);
+    const [runA, runB, runC] = marks;
+    if (runA === undefined || runB === undefined || runC === undefined) {
+      throw new Error('the crowded level drew fewer than three marks');
+    }
+    expect(runA.x).toBeCloseTo(0, 6);
+    expect(runA.width).toBeCloseTo(crowdADurationMs(LEVEL_SUB_ROW_BOUND, CROWD_SIZE), 6);
+    expect(runB.x).toBeCloseTo(500, 6);
+    expect(runB.width).toBeCloseTo(40, 6);
+    expect(runC.x).toBeCloseTo(800, 6);
+    expect(runC.width).toBeCloseTo(10, 6);
+
+    // A gathered operation is in a mark's count, not drawn as a bar of its own.
+    const drawnNames = drawnFrames().map((frame) => frame.name);
+    for (const name of GATHERED_NAMES) {
+      expect(drawnNames).not.toContain(name);
+    }
+    expect(marks.reduce((sum, mark) => sum + mark.count, 0)).toBe(GATHERED_NAMES.length);
+  });
+
+  it('keeps the levels beneath a crowded one at the same rows, however crowded it is', async () => {
+    const tree = crowdedTree(LARGE_CROWD_SIZE);
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+
+    // Three hundred operations stack over one instant, and the chain under them
+    // still starts on the row right after the level's marks — the row it takes
+    // under a crowd of ten.
+    expect(rowIndexOf(CROWD_CHILD_NAME)).toBe(OVERFLOW_ROW_INDEX + 1);
+    expect(rowIndexOf(CROWD_GRANDCHILD_NAME)).toBe(OVERFLOW_ROW_INDEX + 2);
+    expect(icicleRows()).toHaveLength(1 + LEVEL_ROW_BOUND + 2);
+    expect(overflowMarks()[0]?.count).toBe(LARGE_CROWD_SIZE - LEVEL_SUB_ROW_BOUND);
+    expect(canvasOperationCount()).toBe(tree.nodeCount);
+  });
+
+  it.each([
+    { fixture: 'one row per level', tree: CHAIN_TREE, rows: 3 },
+    { fixture: 'a re-attached frame on a second row', tree: ORPHAN_TREE, rows: 3 },
+    { fixture: 'widened siblings on two rows', tree: shortSiblingsTree(), rows: 3 },
+    {
+      fixture: 'three overlapping siblings on three rows',
+      tree: THREE_DEEP_TREE,
+      rows: 1 + LEVEL_ROW_BOUND,
+    },
+  ])(
+    'draws $fixture exactly as the packing always has, with no mark and no note',
+    async ({ tree, rows }) => {
+      const container = renderComponent(makeNode(), {
+        provider: resolvingProvider(tree).provider,
+        actions: makeActions().actions,
+      });
+      await screen.findByRole('tree');
+
+      // No level needs more rows than it may draw, so every operation is a bar
+      // on the rows the optimal packing gives it, and nothing is gathered.
+      expect(icicleRows()).toHaveLength(rows);
+      expect(drawnFrames()).toHaveLength(tree.nodeCount);
+      expect(overflowMarks()).toEqual([]);
+      expect(sameRowOverlaps()).toEqual([]);
+      expect(noteTexts(container).some((note) => /gathered/.test(note))).toBe(false);
+      expect(canvas().getAttribute('aria-label')).not.toMatch(/gathered/);
+    },
+  );
+
+  it('states what it gathered in a note and in the picture’s text alternative, only when it gathered anything', async () => {
+    const container = renderComponent(makeNode(), {
+      provider: resolvingProvider(crowdedTree()).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+
+    // Ten operations gathered into three marks, stated once above the chart
+    // and in the picture's own description, with the bound that caused it.
+    const note = compactionNote(GATHERED_NAMES.length, 3);
+    expect(noteTexts(container).filter((text) => /gathered/.test(text))).toEqual([note]);
+    expect(canvas().getAttribute('aria-label')).toContain(note);
+
+    // The same view over a trace the bound never touches says nothing of it.
+    cleanup();
+    const quiet = renderComponent(makeNode(), {
+      provider: resolvingProvider(shortSiblingsTree()).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+    expect(noteTexts(quiet).some((text) => /gathered/.test(text))).toBe(false);
+    expect(canvas().getAttribute('aria-label')).not.toMatch(/gathered/);
+  });
+
+  it('draws a gathered frame the panel selects over its mark, and moves no row', async () => {
+    const context = {
+      provider: resolvingProvider(crowdedTree()).provider,
+      actions: makeActions().actions,
+    };
+    const gathered = crowdName('a', 5);
+
+    const { rerender } = render(
+      selectionHostedChart({ selection: { eventId: crowdEventId(gathered) } }, context),
+    );
+    await screen.findByRole('tree');
+
+    // The selection is marked in the picture, as a bar at its own extent on
+    // the overflow row, and in the list; its mark still counts it, and gives
+    // its band to the bar rather than drawing its count under it.
+    expect(selectedFrameNames()).toEqual([gathered]);
+    expect(currentRowNames()).toEqual([gathered]);
+    expect(rowIndexOf(gathered)).toBe(OVERFLOW_ROW_INDEX);
+    expect(drawnFrameNamed(gathered).x).toBeCloseTo(0, 6);
+    expect(drawnFrameNamed(gathered).width).toBeCloseTo(crowdADurationMs(5, CROWD_SIZE), 6);
+    expect(overflowMarks().map(({ count, label }) => ({ count, label }))).toEqual([
+      { count: CROWD_SIZE - LEVEL_SUB_ROW_BOUND, label: undefined },
+      { count: 1, label: '+1' },
+      { count: 1, label: undefined },
+    ]);
+
+    // The layout does not depend on the selection: every row holds what it
+    // held without one.
+    expect(icicleRows()).toHaveLength(1 + LEVEL_ROW_BOUND + 2);
+    expect(frameNamesOnRow(1)).toEqual([crowdName('a', 0), crowdName('b', 0), crowdName('c', 0)]);
+    expect(frameNamesOnRow(2)).toEqual([crowdName('a', 1), crowdName('b', 1), crowdName('c', 1)]);
+
+    // A selection a row already draws is marked there, and the overflow row
+    // holds marks alone again, with their counts.
+    rerender(
+      selectionHostedChart({ selection: { eventId: crowdEventId(crowdName('a', 0)) } }, context),
+    );
+    expect(selectedFrameNames()).toEqual([crowdName('a', 0)]);
+    expect(frameNamesOnRow(OVERFLOW_ROW_INDEX)).toEqual([]);
+    expect(overflowMarks()[0]?.label).toBe(`+${String(CROWD_SIZE - LEVEL_SUB_ROW_BOUND)}`);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * Frame labels, fitted in logical units
  *
  * Every trace below spans 1 000 ms, so the fixed 1 000-unit canvas draws
@@ -3666,6 +4295,82 @@ function pagedSiblingName(index: number): string {
 }
 
 /*
+ * The context a page that opens below the root is drawn with, as the chart
+ * words it. Spelled out here rather than read back from the component, so a
+ * case pins the words a reader sees and hears.
+ */
+
+/** The caption, and accessible name, of the tree's list of context rows. */
+const TREE_CONTEXT_CAPTION =
+  'Context from an earlier page, not rows of this one: the rows below are nested inside';
+
+/** The last line of every context bar's title. */
+const CONTEXT_BAR_NOTE =
+  'Drawn for context: an operation this window’s operations are nested inside, listed with its own operations in an earlier window.';
+
+/** The name of the middle level of {@link nestedSiblingsTree}. */
+const NESTED_GROUP_NAME = 'example.group';
+
+/** The event id of the middle level of {@link nestedSiblingsTree}. */
+const NESTED_GROUP_EVENT_ID = 'event-example-0101';
+
+/**
+ * {@link shortSiblingsTree} with one more level between the root and its
+ * siblings: the root, one group operation inside it, and `count` consecutive
+ * 1 ms operations inside the group — so a window or a page that opens among
+ * the siblings has a context of two operations.
+ *
+ * @param count How many siblings the group holds.
+ * @returns The correlated trace.
+ */
+function nestedSiblingsTree(count: number): TraceTree {
+  const [flat] = shortSiblingsTree(count).roots;
+  if (flat === undefined) {
+    throw new Error('the short-siblings fixture built no root');
+  }
+
+  const group = makeEvent({
+    id: NESTED_GROUP_EVENT_ID,
+    spanId: spanIdFor(101),
+    parentSpanId: flat.event.spanId,
+    name: NESTED_GROUP_NAME,
+    kind: 'function',
+    tier: 'server',
+    startTime: flat.event.startTime,
+    duration: flat.event.duration,
+    seq: count + 1,
+    ingestSeq: count + 2,
+  });
+  const siblings = flat.children.map((child) =>
+    makeTraceNode({ ...child.event, parentSpanId: group.spanId }, [], 2),
+  );
+
+  return makeTree([makeTraceNode(flat.event, [makeTraceNode(group, siblings, 1)], 0)]);
+}
+
+/**
+ * The tree's list of context rows: the operations the page's rows are nested
+ * inside, named by its caption.
+ *
+ * @returns The list, or `null` when the page has no context.
+ */
+function contextList(): HTMLElement | null {
+  return screen.queryByRole('list', { name: TREE_CONTEXT_CAPTION });
+}
+
+/**
+ * The names the context list shows, outermost first.
+ *
+ * @param list The context list.
+ * @returns One name per context row.
+ */
+function contextRowNames(list: HTMLElement): string[] {
+  return within(list)
+    .getAllByRole('listitem')
+    .map((item) => within(item).getByText(FRAME_NAME_PATTERN).textContent ?? '');
+}
+
+/*
  * Every case below draws at least one full window, so the group runs under
  * {@link WINDOW_CASE_TIMEOUT_MS} rather than the default.
  */
@@ -3683,16 +4388,18 @@ describe('FlameChart drawn-row budget', { timeout: WINDOW_CASE_TIMEOUT_MS }, () 
 
     await screen.findByRole('tree');
 
-    // The first window: one budget's worth of frames, and a statement — in the
-    // notice and in the canvas's text alternative alike — of what is drawn and
-    // what follows undrawn. Paging is not a partial result: every operation
-    // is one page away.
+    // The first window: one budget's worth of operations — each a bar, or
+    // counted by a "+N" mark where the siblings stack deeper than a level's
+    // rows — and a statement, in the notice and in the canvas's text
+    // alternative alike, of what is drawn and what follows undrawn. Paging is
+    // not a partial result: every operation is one page away.
     expect(total).toBe(PAGED_SIBLING_COUNT + 1);
     const first = windowStatement(0, DRAWN_ROW_BUDGET, total);
     const statement = screen.getByText(first);
     expect(statement.getAttribute('aria-live')).toBe('polite');
     expect(canvas().getAttribute('aria-label')).toContain(first);
-    expect(drawnFrames()).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(canvasOperationCount()).toBe(DRAWN_ROW_BUDGET);
+    expect(drawnFrames().length).toBeLessThanOrEqual(DRAWN_ROW_BUDGET);
     expect(screen.queryByText(PARTIAL_RESULT_BADGE)).toBeNull();
     expect(pagingControl(PREVIOUS_NAME).disabled).toBe(true);
     expect(pagingControl(NEXT_NAME).disabled).toBe(false);
@@ -3701,14 +4408,18 @@ describe('FlameChart drawn-row budget', { timeout: WINDOW_CASE_TIMEOUT_MS }, () 
     expect(frameRows()[1]?.getAttribute('aria-setsize')).toBe(String(PAGED_SIBLING_COUNT));
 
     // The next window MOVES the drawing rather than growing it: the same
-    // number of frames, the operations after the first window, and the same
-    // live statement element, so the page is announced.
+    // number of operations, the ones after the first window, and the same
+    // live statement element, so the page is announced. The root those
+    // operations hang from is not one of them: it is drawn above them as
+    // context, which the first window, opening at the root, has none of.
+    expect(contextBarNames()).toEqual([]);
     await user.click(pagingControl(NEXT_NAME));
     expect(statement.isConnected).toBe(true);
     expect(statement.textContent).toBe(windowStatement(DRAWN_ROW_BUDGET, DRAWN_ROW_BUDGET, total));
-    expect(drawnFrames()).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(canvasOperationCount()).toBe(DRAWN_ROW_BUDGET);
     expect(drawnFrames()[0]?.name).toBe(pagedSiblingName(DRAWN_ROW_BUDGET - 1));
     expect(drawnFrames().some((frame) => frame.name === 'example.batch')).toBe(false);
+    expect(contextBarNames()).toEqual(['example.batch']);
     const [firstOfSecond] = frameRows();
     expect(firstOfSecond?.getAttribute('aria-level')).toBe('2');
     expect(firstOfSecond?.getAttribute('aria-posinset')).toBe(String(DRAWN_ROW_BUDGET));
@@ -3723,7 +4434,8 @@ describe('FlameChart drawn-row budget', { timeout: WINDOW_CASE_TIMEOUT_MS }, () 
     expect(pagingControl(NEXT_NAME).disabled).toBe(true);
     expect(document.activeElement).toBe(pagingControl(PREVIOUS_NAME));
 
-    // However often more is asked for, the drawing never exceeds the budget.
+    // However often more is asked for, the drawing never exceeds the budget,
+    // and its context never more than one bar per level the layout draws.
     for (const name of [PREVIOUS_NAME, PREVIOUS_NAME, NEXT_NAME, NEXT_NAME, NEXT_NAME, NEXT_NAME]) {
       const control = pagingControl(name);
       if (!control.disabled) {
@@ -3731,6 +4443,7 @@ describe('FlameChart drawn-row budget', { timeout: WINDOW_CASE_TIMEOUT_MS }, () 
       }
       expect(drawnFrames().length).toBeLessThanOrEqual(DRAWN_ROW_BUDGET);
       expect(frameRows().length).toBeLessThanOrEqual(DRAWN_ROW_BUDGET);
+      expect(contextBars().length).toBeLessThanOrEqual(ICICLE_DEPTH_BOUND);
     }
 
     // Back to the first window, the statement is the first one again.
@@ -3742,6 +4455,89 @@ describe('FlameChart drawn-row budget', { timeout: WINDOW_CASE_TIMEOUT_MS }, () 
     // Paging is neither a selection nor a disclosure.
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
     expect(spies.onExpand).not.toHaveBeenCalled();
+  });
+
+  it('draws what a later window is nested inside as context, never as its own content', async () => {
+    const tree = nestedSiblingsTree(PAGED_SIBLING_COUNT);
+    const total = tree.nodeCount;
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    const container = renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: spies.actions,
+    });
+    await screen.findByRole('tree');
+
+    // The first window opens at the root, so it has no context: no band, no
+    // list, and the context statement — mounted, so it can announce — is
+    // empty and visually hidden.
+    const statement = screen.getByText(windowStatement(0, DRAWN_ROW_BUDGET, total));
+    expect(contextBarNames()).toEqual([]);
+    expect(contextList()).toBeNull();
+    const contextStatement = container.querySelector('p.dg-visually-hidden[aria-live="polite"]');
+    expect(contextStatement?.textContent).toBe('');
+
+    // The second window opens among the group's siblings. The two operations
+    // they hang from are drawn above them, outermost at the top, each on a row
+    // of its own above every row of the window — and neither is counted as
+    // one of the window's operations.
+    await user.click(pagingControl(NEXT_NAME));
+    expect(statement.textContent).toBe(windowStatement(DRAWN_ROW_BUDGET, DRAWN_ROW_BUDGET, total));
+    // The window's operations are its bars and whatever a crowded depth
+    // gathered into "+N" marks; the context band adds to neither.
+    expect(canvasOperationCount()).toBe(DRAWN_ROW_BUDGET);
+    expect(drawnFrames()[0]?.name).toBe(pagedSiblingName(DRAWN_ROW_BUDGET - 2));
+    expect(contextBarNames()).toEqual(['example.batch', NESTED_GROUP_NAME]);
+    const [outer, inner] = contextBars();
+    const firstWindowRow = Math.min(...drawnFrames().map((frame) => frame.y));
+    expect(outer?.y ?? Number.NaN).toBeLessThan(inner?.y ?? Number.NaN);
+    expect(inner?.y ?? Number.NaN).toBeLessThan(firstWindowRow);
+    for (const mark of overflowMarks()) {
+      expect(inner?.y ?? Number.NaN).toBeLessThan(mark.y);
+    }
+
+    // Marked as context in words and in fill: its label opens with the word,
+    // its title ends by saying what it is, and it is filled from outside the
+    // span-kind scale every window frame is filled from.
+    for (const name of ['example.batch', NESTED_GROUP_NAME]) {
+      const rect = contextRect(name);
+      const label = rect.nextElementSibling;
+      expect(label?.matches('text.dg-flame__frame-label')).toBe(true);
+      expect(label?.textContent).toBe(`Context: ${name}`);
+      expect(rect.querySelector('title')?.textContent?.split('\n').at(-1)).toBe(CONTEXT_BAR_NOTE);
+      expect(rect.style.getPropertyValue('--dgc-frame-color')).toBe('var(--dg-text-muted)');
+    }
+
+    // Stated for a reader who cannot see the band — in the canvas's text
+    // alternative, and in the polite statement, which announces it.
+    const sentence = `The top 2 rows of the chart are drawn for context: example.batch › ${NESTED_GROUP_NAME}, the operations the drawn operations are nested inside, from an earlier window.`;
+    expect(canvas().getAttribute('aria-label')).toContain(sentence);
+    expect(contextStatement?.textContent).toBe(sentence);
+    expect(contextStatement?.classList.contains('dg-visually-hidden')).toBe(false);
+
+    // The tree's first page of this window: its rows are the window's, and the
+    // context is a captioned list outside the tree with no control in it.
+    const list = contextList();
+    if (list === null) {
+      throw new Error('the second window’s rows carry no context list');
+    }
+    expect(contextRowNames(list)).toEqual(['example.batch', NESTED_GROUP_NAME]);
+    expect(frameList().contains(list)).toBe(false);
+    expect(list.querySelectorAll('button, a[href], input, [tabindex]')).toHaveLength(0);
+    expect(frameRows()).toHaveLength(TEXT_ROW_BUDGET);
+    expect(frameRows()[0]?.getAttribute('aria-level')).toBe('3');
+    expect(nameOfRow(frameRows()[0] ?? frameList())).toBe(pagedSiblingName(DRAWN_ROW_BUDGET - 2));
+
+    // Activating a context bar selects that operation, which pages the
+    // drawing back to the window that draws it as content.
+    await user.click(contextRect(NESTED_GROUP_NAME));
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith(
+      expect.objectContaining({ eventId: NESTED_GROUP_EVENT_ID }),
+    );
+    expect(statement.textContent).toBe(windowStatement(0, DRAWN_ROW_BUDGET, total));
+    expect(contextBarNames()).toEqual([]);
+    expect(drawnFrames().some((frame) => frame.name === NESTED_GROUP_NAME)).toBe(true);
   });
 
   it('starts from the first window again when the node’s query changes', async () => {
@@ -3766,7 +4562,7 @@ describe('FlameChart drawn-row budget', { timeout: WINDOW_CASE_TIMEOUT_MS }, () 
     expect(
       await screen.findByText(windowStatement(0, DRAWN_ROW_BUDGET, tree.nodeCount)),
     ).toBeDefined();
-    expect(drawnFrames()).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(canvasOperationCount()).toBe(DRAWN_ROW_BUDGET);
     expect(drawnFrames()[0]?.name).toBe('example.batch');
   });
 
@@ -3946,7 +4742,7 @@ describe('FlameChart drawn-row budget', { timeout: WINDOW_CASE_TIMEOUT_MS }, () 
     await user.keyboard('{ArrowRight}');
     expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, spanIdFor(100), true);
     expect(screen.getByText(windowStatement(0, DRAWN_ROW_BUDGET, total))).toBeDefined();
-    expect(drawnFrames()).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(canvasOperationCount()).toBe(DRAWN_ROW_BUDGET);
     expect(nameOfRow(focusedRow())).toBe('example.batch');
   });
 
@@ -3969,7 +4765,7 @@ describe('FlameChart drawn-row budget', { timeout: WINDOW_CASE_TIMEOUT_MS }, () 
     const notice = screen.getByText(sentence);
     expect(screen.getByText(PARTIAL_RESULT_BADGE).parentElement).toBe(notice.parentElement);
     expect(canvas().getAttribute('aria-label')).toContain(sentence);
-    expect(drawnFrames()).toHaveLength(DRAWN_ROW_BUDGET);
+    expect(canvasOperationCount()).toBe(DRAWN_ROW_BUDGET);
     expect(screen.queryByRole('button', { name: NEXT_NAME })).toBeNull();
   });
 
@@ -4000,5 +4796,174 @@ describe('FlameChart drawn-row budget', { timeout: WINDOW_CASE_TIMEOUT_MS }, () 
         ),
       ),
     ).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The shape of a trace whose durations are not all measurements: a root over a
+ * call recorded with a negative duration and one recorded with no number at
+ * all, which a malformed record can carry.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A call recorded with a negative duration: a corrupt measurement, not a fast one. */
+const NEGATIVE_CALL_EVENT = makeEvent({
+  id: 'event-example-0901',
+  spanId: spanIdFor(0x901),
+  parentSpanId: spanIdFor(0x900),
+  name: 'example.negative-call',
+  kind: 'fetch',
+  tier: 'browser',
+  startTime: BASE_START_MS + 10,
+  duration: -5,
+  seq: 1,
+  ingestSeq: 2,
+});
+
+/**
+ * A call whose duration arrived as no number at all — `null` in a malformed
+ * record, which the schema's type does not admit and a stored row can carry.
+ */
+const UNSET_CALL_EVENT = makeEvent({
+  id: 'event-example-0902',
+  spanId: spanIdFor(0x902),
+  parentSpanId: spanIdFor(0x900),
+  name: 'example.unset-call',
+  kind: 'fetch',
+  tier: 'browser',
+  startTime: BASE_START_MS + 20,
+  duration: null as unknown as number,
+  seq: 2,
+  ingestSeq: 3,
+});
+
+/** The root both calls hang from. */
+const UNMEASURED_ROOT_EVENT = makeEvent({
+  id: 'event-example-0900',
+  spanId: spanIdFor(0x900),
+  name: 'example.unmeasured-root',
+  kind: 'interaction',
+  tier: 'browser',
+  startTime: BASE_START_MS,
+  duration: 200,
+  seq: 0,
+  ingestSeq: 1,
+});
+
+/** The trace those three form. */
+const UNMEASURED_TREE = makeTree([
+  makeTraceNode(
+    UNMEASURED_ROOT_EVENT,
+    [makeTraceNode(NEGATIVE_CALL_EVENT, [], 1), makeTraceNode(UNSET_CALL_EVENT, [], 1)],
+    0,
+  ),
+]);
+
+/** The canvas frame drawing the operation named `name`. */
+function frameRectNamed(name: string): Element {
+  const rect = Array.from(canvas().querySelectorAll('rect.dg-flame__frame')).find(
+    (frame) => frame.querySelector('title')?.textContent.split('\n')[0] === name,
+  );
+  if (rect === undefined) {
+    throw new Error(`no frame on the canvas is named "${name}"`);
+  }
+  return rect;
+}
+
+describe('FlameChart chart accessible names', () => {
+  it('names the canvas as a figure and every frame as an image named like its tree row', async () => {
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(CHAIN_TREE).provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByRole('tree');
+
+    const picture = canvas();
+    expect(picture.tagName.toLowerCase()).toBe('svg');
+    expect(picture.getAttribute('role')).toBe('figure');
+    expect(picture.getAttribute('aria-label')).not.toBeNull();
+
+    // One named image per frame, named by the sentence its tree row is named
+    // by: the hover information is in the accessibility tree, not only in the
+    // native tooltip.
+    const images = within(picture).getAllByRole('img');
+    expect(images).toHaveLength(CHAIN_EVENTS.length);
+    for (const event of CHAIN_EVENTS) {
+      const frame = frameRectNamed(event.name);
+      expect(frame.getAttribute('role')).toBe('img');
+      expect(frame.getAttribute('aria-label')).toBe(
+        rowNamed(event.name).getAttribute('aria-label'),
+      );
+      expect(frame.getAttribute('aria-label')?.startsWith(`${event.name} · `)).toBe(true);
+    }
+
+    // The axis and the visible labels repeat those names and are hidden.
+    expect(picture.querySelector('.dg-flame__axis')?.getAttribute('aria-hidden')).toBe('true');
+    const labels = Array.from(picture.querySelectorAll('text.dg-flame__frame-label'));
+    expect(labels.length).toBeGreaterThan(0);
+    for (const label of labels) {
+      expect(label.getAttribute('aria-hidden')).toBe('true');
+    }
+  });
+
+  it('names every "+N" mark as an image stating what it gathers', async () => {
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(crowdedTree()).provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByRole('tree');
+
+    const marks = Array.from(canvas().querySelectorAll('rect.dg-flame__overflow'));
+    expect(marks.length).toBeGreaterThan(0);
+    for (const mark of marks) {
+      expect(mark.getAttribute('role')).toBe('img');
+      expect(mark.getAttribute('aria-label')).toBe(mark.querySelector('title')?.textContent);
+      expect(mark.getAttribute('aria-label')).toMatch(/listed in the tree below\.$/);
+    }
+    for (const label of Array.from(canvas().querySelectorAll('text.dg-flame__overflow-label'))) {
+      expect(label.getAttribute('aria-hidden')).toBe('true');
+    }
+  });
+});
+
+describe('FlameChart durations that are not measurements', () => {
+  it('states a negative or missing duration as n/a in the frame name, its tooltip and its row, and still draws it', async () => {
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(UNMEASURED_TREE).provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByRole('tree');
+
+    for (const event of [NEGATIVE_CALL_EVENT, UNSET_CALL_EVENT]) {
+      // Drawn — the frame still marks where the call began.
+      const frame = frameRectNamed(event.name);
+      expect(Number(frame.getAttribute('width'))).toBeGreaterThan(0);
+
+      const name = frame.getAttribute('aria-label') ?? '';
+      expect(name).toContain(`duration ${NOT_AVAILABLE_LABEL}`);
+      expect(name).toContain(`own time ${NOT_AVAILABLE_LABEL}`);
+      expect(name).not.toContain(`duration ${formatDuration(0)}`);
+
+      const tooltip = frame.querySelector('title')?.textContent ?? '';
+      expect(tooltip).toContain(`Duration ${NOT_AVAILABLE_LABEL}`);
+      expect(tooltip).toContain(`Own time ${NOT_AVAILABLE_LABEL}`);
+
+      const row = rowNamed(event.name);
+      expect(row.getAttribute('aria-label')).toBe(name);
+      expect(figuresOf(row)).toEqual({
+        duration: NOT_AVAILABLE_LABEL,
+        ownTime: NOT_AVAILABLE_LABEL,
+      });
+      for (const cell of ownDurationCells(row)) {
+        expect(cell.classList.contains('dg-is-unavailable')).toBe(true);
+      }
+    }
+
+    // The measured root is unaffected.
+    expect(figuresOf(rowNamed(UNMEASURED_ROOT_EVENT.name)).duration).toBe(formatDuration(200));
   });
 });

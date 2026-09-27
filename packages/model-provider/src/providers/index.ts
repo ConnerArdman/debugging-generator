@@ -208,6 +208,18 @@ export {
 export { ANTHROPIC_STRUCTURED_OUTPUT_MODES } from './anthropic.js';
 
 /**
+ * The provenance proof for the network-backed provider's failure texts: see
+ * `./anthropic.js`.
+ *
+ * Forwarded as a value because the proof has to be taken where the text is
+ * written, not here: `apps/local-service` logs a failed stage's message and
+ * hint at its default level only when they are, exactly, text this package
+ * wrote — one of the provider's fixed remediation hints or AAP §0.5.5's
+ * unavailable sentence — and never text a dependency or an exception supplied.
+ */
+export { isProviderFailureText } from './anthropic.js';
+
+/**
  * Constructs the rules-based provider: see `./deterministic.js`.
  *
  * Needs no credential, no model identifier and no network — every argument is

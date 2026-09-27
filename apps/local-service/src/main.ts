@@ -36,14 +36,18 @@
  *
  * 1. **Configuration** — `loadServiceConfig` over an **injected** environment.
  *    Nothing in {@link startService} reads `process.env`; {@link main} passes it
- *    after `dotenv`, so a suite's injected environment is authoritative.
+ *    after `dotenv`, so a suite's injected environment is authoritative. The
+ *    prompt directory and its manifest are then checked read-only
+ *    (`verifyPromptsDirectory`), so a missing `DEBUGGEN_PROMPTS_DIR` is refused
+ *    like any other key before anything is created under `$DEBUGGEN_HOME`.
  * 2. **Logging** — one root logger, a `subsystem` child per area; the resolved
  *    configuration is logged once through its credential-free view.
  * 3. **The state tree** — `$DEBUGGEN_HOME`, `backups/` and `index/`, created and
  *    verified `0700` and symlink-free by `ensureSecureDir` (mkdir's own mode is
  *    umask-masked, which is why it is not used) — and its canonical location,
  *    resolved once with `realpath`: the value every project root is kept
- *    apart from.
+ *    apart from. A refusal names the offending directory and its fix (for a
+ *    too-open one: its mode and `chmod 700`).
  * 4. **The session store** — `openStore` from `./store/db.js`: the owner-only
  *    database file, WAL mode, the pragmas and the schema ladder.
  * 5. **The editor credential** — `AuthService.ensureEditorCredential` from
@@ -66,11 +70,14 @@
  *    every new session, follow-up, dev-server launch and credential through
  *    the routes, and the instrumentation service repeats it before every
  *    install writes a backup or a patch.
- * 7. **Retention — before serving** (AAP 0.4.2): `runRetention` purges aged
- *    sessions, stale index caches and orphan backups, conflict backups exempt.
- *    The same dependencies back `POST /sessions/purge`, which the editor
- *    command `debuggen.purgeSessions` calls to run the sweep on demand —
- *    scoped to that editor's announced workspace folders, while the start-up
+ * 7. **Retention's dependencies** (AAP 0.4.2): the start-up `runRetention` pass
+ *    — aged sessions, stale index caches and orphan backups, conflict backups
+ *    exempt — is housekeeping, not correctness, so it is **started once the
+ *    socket listens** and runs in the background in bounded transactions
+ *    (see {@link startStartupRetention}); a large backlog never keeps the port
+ *    closed. The same dependencies back `POST /sessions/purge`, which the
+ *    editor command `debuggen.purgeSessions` calls to run the sweep on demand
+ *    — scoped to that editor's announced workspace folders, while the start-up
  *    pass is machine-wide.
  * 8. **The model provider** — `createModelProvider` over the validated
  *    selection. An unusable selection is a configuration error and fails the
@@ -104,7 +111,10 @@
  *     budget whose oldest member a newcomer evicts, so stalled connections
  *     cannot hold every slot ({@link createLimitedServer}).
  * 12. **Health** — `GET /health`, auth-exempt, answers from the first accepted
- *     connection.
+ *     connection. The start-up retention sweep begins on the next turn of the
+ *     event loop, beside live clients: it keeps every session a client has
+ *     touched since this process started, and drops each purged session's
+ *     cached trace trees.
  *
  * ## What this file adds beside the subsystems
  *
@@ -139,7 +149,8 @@
  * duration is known and smaller than the grace of every process that manages
  * the service. In order ({@link releaseParts}):
  *
- * 1. it stops accepting work and cancels in-flight pipeline operations;
+ * 1. it stops accepting work, cancels in-flight pipeline operations and stops
+ *    the start-up retention sweep at its next step boundary;
  * 2. it **ends every live session** — every session still holding
  *    instrumentation — through `SessionManager.end`, exactly as an explicit
  *    `session.end` would: the capture window closes, the page agent goes
@@ -212,7 +223,7 @@ import {
   type Result,
   type SessionId,
 } from '@debuggen/shared';
-import { ensureSecureDir } from '@debuggen/shared/node';
+import { ensureSecureDir, unsafePathReasonOf } from '@debuggen/shared/node';
 
 import { realpathSync } from 'node:fs';
 import {
@@ -226,6 +237,7 @@ import {
 import type { AddressInfo } from 'node:net';
 import { performance } from 'node:perf_hooks';
 import type { Duplex } from 'node:stream';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
@@ -248,6 +260,7 @@ import {
   loadServiceConfig,
   stateHomeOverlap,
   toModelProviderOverrides,
+  verifyPromptsDirectory,
   type ServiceConfig,
   type ServiceConfigOverrides,
   type StateHomeOverlap,
@@ -315,7 +328,11 @@ import {
 import type { ClientRegistry } from './server/clients.js';
 import { DEFAULT_REQUEST_BODY_TIMEOUT_MS, createHttpApp } from './server/http.js';
 import type { HttpApp } from './server/http.js';
-import { createBindingRoutes, redactSelectedTarget } from './server/routes/binding.js';
+import {
+  createBindingRoutes,
+  observingDocumentReports,
+  redactSelectedTarget,
+} from './server/routes/binding.js';
 import type { BindingRoutes, NavigationRecorder } from './server/routes/binding.js';
 import { devServerLookupFromLaunches } from './server/routes/sessions.js';
 import { createWsServer } from './server/ws.js';
@@ -863,10 +880,13 @@ export interface StartupReport {
   readonly interruptedSessions: InterruptedSessionsReport;
 
   /**
-   * The retention sweep's report, or `undefined` when the sweep could not run
-   * at all (logged at `error`; retention never blocks a start).
+   * The start-up retention sweep, which runs in the background once the
+   * service listens: resolves with its report when it finishes (`interrupted:
+   * true` when a stop cut it short), or with `undefined` when it could not run
+   * at all (logged at `error`; retention never blocks a start). Never rejects.
+   * A suite that asserts on what the start purged awaits it.
    */
-  readonly retention: RetentionReport | undefined;
+  readonly retention: Promise<RetentionReport | undefined>;
 }
 
 /**
@@ -1012,6 +1032,13 @@ export interface ServiceParts {
   http?: Pick<HttpApp, 'close'>;
   ws?: Pick<WsServer, 'close'>;
   server?: Server;
+
+  /**
+   * The start-up retention sweep, set once the service listens. A stop aborts
+   * it first and waits for it to settle before the store closes, so it never
+   * meets a closed store part-way through a session.
+   */
+  retention?: Pick<StartupRetentionRun, 'abort' | 'settled'>;
 
   /**
    * Set only once the service is serving, so a start refused part-way — a
@@ -1177,6 +1204,18 @@ function errorFields(error: DebuggenError): LogFields {
  * and none is a symbolic link" (AAP 0.5.6: this tree holds the session database,
  * the editor credential and the backups of a developer's patched files).
  *
+ * A policy refusal of `@debuggen/shared/node` — one that carries a known
+ * `details.reason` (see {@link unsafePathReasonOf}) — is reported with that
+ * refusal's own sentences, which name the offending directory and the exact
+ * fix: for `group-or-other-permissions`, its mode (`0755`), the required
+ * `0700` and the `chmod 700 <dir>` that restores it, rather than a generic
+ * checklist whose "permissions allow this account to write it" points the
+ * other way. Those sentences are composed by that module from the path and the
+ * mode alone, so they are product copy; the refusal stays reachable as
+ * `cause`, and `details` keep the reason for the log. Anything else — an errno
+ * from `mkdir` (`EACCES`, `ENOTDIR`, `ENOSPC`) — keeps the fixed wording below,
+ * because the raised text is the platform's and may quote more than the path.
+ *
  * @param config The resolved configuration, whose paths are already absolute.
  * @returns `Ok` when the tree is present and private, `Err` naming the path that
  * could not be established.
@@ -1188,6 +1227,27 @@ function prepareStateTree(config: ServiceConfig): Result<void, DebuggenError> {
     ensureSecureDir(config.indexCacheDir, { upTo: config.debuggenHome });
     return ok(undefined);
   } catch (cause) {
+    const reason = unsafePathReasonOf(cause);
+    if (reason !== undefined && DebuggenError.is(cause)) {
+      const hint = cause.hint === undefined ? '' : `${cause.hint} `;
+      return err(
+        new DebuggenError(
+          'FS_UNSAFE_PATH',
+          `The Debug Generator state directory cannot be used: ${cause.message}`,
+          {
+            hint: `${hint}Alternatively, set DEBUGGEN_HOME to another location and start again.`,
+            details: {
+              subsystem: SUBSYSTEM_SERVICE,
+              reason,
+              debuggenHome: config.debuggenHome,
+              backupsDir: config.backupsDir,
+              indexCacheDir: config.indexCacheDir,
+            },
+            cause,
+          },
+        ),
+      );
+    }
     return err(
       wrapStartupFailure(
         cause,
@@ -3778,10 +3838,14 @@ function disarmUnfinished(ports: LiveSessionPorts, session: LiveSession, logger:
  *
  * 1. **stop accepting** — new requests on a kept-alive connection are answered
  *    `503`, the listener stops accepting and starts draining, pending
- *    agent-readiness waits resolve;
+ *    agent-readiness waits resolve, and the start-up retention sweep is asked
+ *    to stop at its next step boundary;
  * 2. **cancel in-flight pipeline operations** (at most `budget.pipelineMs`),
  *    which may otherwise still be installing instrumentation or writing the
- *    store — an install still running would make its session's cleanup refuse;
+ *    store — an install still running would make its session's cleanup refuse
+ *    — and wait, from the same allowance, for the retention sweep to settle,
+ *    so its last transaction commits before the sessions are ended and the
+ *    store closes;
  * 3. **end the live sessions** ({@link endLiveSessions}) with everything left
  *    but the two reserves — while the sockets that carry the disarming
  *    configurations and `cleanup.completed` are still open, the dev servers
@@ -3872,9 +3936,10 @@ async function runReleaseSequence(
     ws,
     server,
     liveSessions,
+    retention,
   } = parts;
 
-  // 1 — stop accepting.
+  // 1 — stop accepting, and stop the start-up retention sweep starting work.
   if (http !== undefined) {
     releaseQuietly('http-app', log, () => {
       http.close();
@@ -3887,13 +3952,26 @@ async function runReleaseSequence(
       ledger.close();
     });
   }
+  if (retention !== undefined) {
+    releaseQuietly('retention', log, () => {
+      retention.abort();
+    });
+  }
 
-  // 2 — pipeline work in flight.
+  // 2 — pipeline work in flight, and the retention sweep's last step.
   if (orchestrator !== undefined) {
     await settleWithin(
       () => orchestrator.dispose(),
       deadline.allowance(beforeLauncher, budget.pipelineMs),
       'pipeline',
+      log,
+    );
+  }
+  if (retention !== undefined) {
+    await settleWithin(
+      () => retention.settled,
+      deadline.allowance(beforeLauncher, budget.pipelineMs),
+      'retention',
       log,
     );
   }
@@ -4060,10 +4138,19 @@ export async function startService(
   const now = options.now;
   const clock: { readonly now?: () => number } = now === undefined ? {} : { now };
 
-  // 1 — configuration, from the injected environment only.
+  // 1 — configuration, from the injected environment only. The prompt tree's
+  // directory and manifest are checked here too — read-only, before the logger
+  // or anything else can write under DEBUGGEN_HOME — so a missing or mistyped
+  // DEBUGGEN_PROMPTS_DIR (or a bundle shipped without its prompts) is refused
+  // like every other configuration key, leaving nothing behind. Step 9 still
+  // validates the tree's contents.
   const loaded = loadServiceConfig(env, options.overrides);
   if (isErr(loaded)) {
     return loaded;
+  }
+  const promptsPresent = verifyPromptsDirectory(loaded.value);
+  if (isErr(promptsPresent)) {
+    return promptsPresent;
   }
   const resolved = loaded.value;
   const httpLimits = resolveHttpServerLimits(options.httpLimits);
@@ -4213,10 +4300,12 @@ export async function startService(
     return refuse('state-home-overlap', apart.error);
   }
 
-  // 7 — retention. Housekeeping, not correctness: a sweep that cannot run is
-  // logged and the start continues, and the next start sweeps again. The same
-  // dependencies serve `session.purge` (`debuggen.purgeSessions`) below, so the
-  // start-up pass and the on-demand one apply one rule set.
+  // 7 — retention's dependencies. Housekeeping, not correctness, so the
+  // start-up sweep itself is started only once the socket listens (see
+  // `startStartupRetention` after step 11): a large backlog must never keep the
+  // port closed. The same dependencies serve `session.purge`
+  // (`debuggen.purgeSessions`) below, so the start-up pass and the on-demand one
+  // apply one rule set.
   const retentionDeps: RetentionDeps = {
     store,
     sessions: repos.sessions,
@@ -4227,21 +4316,6 @@ export async function startService(
     logger: root,
     ...clock,
   };
-  const swept = await runRetention(retentionDeps);
-  let retention: RetentionReport | undefined;
-  if (isErr(swept)) {
-    loggers.service.error(
-      'the retention sweep could not run; it runs again on the next start',
-      errorFields(swept.error),
-    );
-  } else {
-    retention = swept.value;
-    if (swept.value.errors.length > 0) {
-      loggers.service.warn('the retention sweep left some items in place', {
-        issues: swept.value.errors.length,
-      });
-    }
-  }
 
   // 8 — the model provider. Construction contacts nothing, so only a selection
   // that cannot work at all (a configuration error) can fail here; a transport
@@ -4295,7 +4369,15 @@ export async function startService(
     maxCachedTreeNodes: TRACE_CACHE_MAX_TREE_NODES,
   });
   parts.correlator = correlator;
-  const liveTail = createLiveTail({ broadcaster: clients, logger: root, ...clock });
+  // The tail reads each frame's per-capture stored count from the same
+  // repository instance ingest commits through, so the panel's capture
+  // counter agrees with the store rather than with the paced tail.
+  const liveTail = createLiveTail({
+    broadcaster: clients,
+    arrivals: repos.telemetry,
+    logger: root,
+    ...clock,
+  });
   parts.liveTail = liveTail;
 
   // Instrumentation: the conflict watcher, the dev-server launcher whose children
@@ -4519,6 +4601,7 @@ export async function startService(
     panels: repos.panels,
     captures: summarizer,
     broadcaster: clients,
+    sessions: repos.sessions,
     logger: root,
   });
   const panelData = createPanelDataResolver({
@@ -4660,6 +4743,9 @@ export async function startService(
     manager: sessionManager,
     reopener,
     arming: instrumentation,
+    // A tab refused a re-bind to an ended session is returned to dormant by
+    // its worker, which settles the page disarm the session still owes.
+    endedSessions: instrumentation,
     progress,
     // The ledger the readiness gate reads: every navigation the route accepts
     // is what lets readiness distrust a report a reload left behind.
@@ -4676,7 +4762,14 @@ export async function startService(
       root,
     ),
     telemetry: http.value.telemetry,
-    readiness: regatingReadinessPort(ledger, clients, orchestrator, root),
+    // Every report the ledger accepts also reaches the binding route, whose
+    // kept navigations a new document proves reloads (and only then announces).
+    readiness: regatingReadinessPort(
+      observingDocumentReports(ledger, binding),
+      clients,
+      orchestrator,
+      root,
+    ),
     targets: targetSelectionOf(sessionManager),
     sourceOpen,
     producers: instrumentation,
@@ -4729,6 +4822,26 @@ export async function startService(
     instrumentation,
   };
 
+  // The start-up retention sweep, now that the port is open (AAP 0.4.2: it
+  // runs on every start). It runs beside live clients, so it is handed the two
+  // collaborators a sweep needs while serving: the registry's view of which
+  // sessions a client has touched since this process started — those are kept
+  // however old, so a session reopened mid-sweep is never deleted under the
+  // manager that is about to write it back — and the trace cache's
+  // invalidation for every session it deletes. A stop aborts it (see
+  // `releaseParts`).
+  const startupRetention = startStartupRetention(
+    {
+      ...retentionDeps,
+      isSessionInUse: (sessionId) => clients.projectForSession(sessionId) !== undefined,
+      onSessionDeleted: (sessionId) => {
+        correlator.invalidate(sessionId);
+      },
+    },
+    loggers,
+  );
+  parts.retention = startupRetention;
+
   // 12 — serving. `GET /health` answers from here on.
   return ok(
     createServiceHandle({
@@ -4744,11 +4857,89 @@ export async function startService(
         editorCredentialCreated: editor.value.created,
         reconciliation: reconciled.value,
         interruptedSessions,
-        retention,
+        retention: startupRetention.settled,
       },
       parts,
     }),
   );
+}
+
+/**
+ * The start-up retention sweep, running in the background, and how a stop
+ * ends it: {@link startStartupRetention} returns it and {@link releaseParts}
+ * aborts it, then waits for it to settle before the store closes.
+ */
+export interface StartupRetentionRun {
+  /**
+   * Resolves with the sweep's report once it has finished — with
+   * `interrupted: true` when a stop aborted it — or with `undefined` when it
+   * could not run at all (logged at `error`). Never rejects.
+   */
+  readonly settled: Promise<RetentionReport | undefined>;
+
+  /** Asks the sweep to stop at its next step boundary. Idempotent. */
+  abort(): void;
+}
+
+/**
+ * Starts the machine-wide start-up retention sweep **after** the listener is
+ * bound, so a large backlog never keeps `GET /health` — or any client — waiting
+ * (a store of half a million events once held the port closed for over a
+ * minute).
+ *
+ * The first batch runs on a later turn of the event loop, never inside
+ * {@link startService}'s own turn, so the start returns — and `main` logs
+ * "listening" — before any purge work. From then on the sweep holds the event
+ * loop for at most one bounded store transaction at a time (see
+ * `./store/retention.ts`, "Atomic per session, bounded per transaction"), and
+ * requests are served between them. A sweep that cannot run is logged and the
+ * next start sweeps again; one that left items in place says how many; an
+ * aborted one says so at `info`. Retention never fails a running service.
+ *
+ * @param deps The sweep's dependencies, in-use predicate and deletion listener
+ * included.
+ * @param loggers The service's loggers.
+ * @returns The running sweep.
+ */
+function startStartupRetention(deps: RetentionDeps, loggers: ServiceLoggers): StartupRetentionRun {
+  const controller = new AbortController();
+  const run = async (): Promise<RetentionReport | undefined> => {
+    await yieldToEventLoop();
+    const swept = await runRetention(deps, { signal: controller.signal });
+    if (isErr(swept)) {
+      loggers.service.error(
+        'the retention sweep could not run; it runs again on the next start',
+        errorFields(swept.error),
+      );
+      return undefined;
+    }
+    if (swept.value.interrupted === true) {
+      loggers.service.info(
+        'the start-up retention sweep was stopped by the shutdown; the next start sweeps again',
+        { sessionsDeleted: swept.value.sessionsDeleted },
+      );
+    }
+    if (swept.value.errors.length > 0) {
+      loggers.service.warn('the retention sweep left some items in place', {
+        issues: swept.value.errors.length,
+      });
+    }
+    return swept.value;
+  };
+  const settled = run().catch((cause: unknown): undefined => {
+    // `runRetention` answers every failure as a `Result`; this is the guard
+    // that keeps a defect from becoming an unhandled rejection.
+    loggers.service.error('the start-up retention sweep failed unexpectedly', {
+      ...describeException(cause),
+    });
+    return undefined;
+  });
+  return Object.freeze({
+    settled,
+    abort: (): void => {
+      controller.abort();
+    },
+  });
 }
 
 /** What {@link createServiceHandle} assembles a handle from. */

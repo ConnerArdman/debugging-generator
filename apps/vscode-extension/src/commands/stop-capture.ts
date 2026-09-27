@@ -39,10 +39,33 @@
  * notice then says that live updates are unavailable until the connection is
  * restored, so a disconnected socket is visible rather than silent.
  *
+ * ## Preconditions and refusals
+ *
+ * - **Active session** — the shared guard renders "No active session." itself.
+ * - **Ended session** — a session the store has acknowledged as ended
+ *   (`./capture-availability`) gets one informational notice saying its capture
+ *   is already closed and how to start another session, and no request is
+ *   sent. `ended` is terminal in the store (`ExtensionState.hasAcknowledgedEnd`)
+ *   and in the service's state machine, so this is the one cached fact that
+ *   may stop the request; nothing else the host caches (`captureState`, any
+ *   other status) short-circuits it, so a stale projection never blocks a
+ *   legitimate stop.
+ * - **State refusal** — `409 SESSION_INVALID_STATE`: no capture is running on
+ *   the service (it already stopped, or never started). The service scrubs the
+ *   message to a code-level summary, so one warning is worded from the session
+ *   status the store reads once the refusal arrived (`captureRefusalNotice`),
+ *   with the next step — never the raw `status 409` failure text.
+ *
+ * The title-bar action is greyed by the command's `enablement` clause
+ * (`debuggen.captureCanStop`, kept by `bindCaptureContextKeys`) whenever no
+ * capture is running; the webview dispatches the command directly, which
+ * `enablement` does not block.
+ *
  * ## Invariants
  *
  * - Preconditions, then exactly one request: no retry, no second call.
- * - Every failure is a typed `Err` rendered once through
+ * - A state refusal is rendered once through `CommandUi.notify` as a warning;
+ *   every other failure is a typed `Err` rendered once through
  *   `CommandUi.notifyFailure`, which carries the service's `hint`. A failure is
  *   never presented as a completed capture, and nothing here throws for an
  *   expected condition.
@@ -58,6 +81,12 @@
 import type { CaptureSummary, TelemetryTier } from '@debuggen/protocol';
 import { DebuggenError, assertNever, isErr } from '@debuggen/shared';
 
+import {
+  captureAvailabilityOf,
+  captureRefusalNotice,
+  endedSessionNotice,
+  isCaptureStateRefusal,
+} from './capture-availability';
 import type { CommandContext, CommandId, CommandNotice } from './index';
 
 // ---------------------------------------------------------------------------
@@ -92,7 +121,10 @@ const LIVE_UPDATES_UNAVAILABLE_DETAIL =
 /** The headline when the capture closed but its summary carried no readable count. */
 const CAPTURE_STOPPED_MESSAGE = 'Capture stopped.';
 
-/** The `prefix` of the one failure notice a refused `capture.stop` produces. */
+/**
+ * The `prefix` of the one failure notice a failed `capture.stop` produces,
+ * unless it is a state refusal ({@link captureRefusalNotice}).
+ */
 const STOP_FAILURE_PREFIX = 'Could not stop capture';
 
 /** The `prefix` used when the "Capture again" action cannot be dispatched. */
@@ -274,7 +306,9 @@ async function captureAgain(ctx: CommandContext): Promise<void> {
  * it yielded.
  *
  * Resolves after the developer has answered or dismissed any notice that
- * offers an action. It never rejects for an expected condition.
+ * offers an action. It never rejects for an expected condition. For a session
+ * the store knows has ended it sends nothing and renders the one ended-session
+ * notice.
  *
  * @param ctx The command context built by `registerCommands`.
  * @param args Whatever VS Code invoked the command with, such as a view or
@@ -289,9 +323,27 @@ export async function stopCapture(ctx: CommandContext, ...args: readonly unknown
     return;
   }
 
+  // `ended` is terminal in the store and on the service, so this is the one
+  // cached fact that may stop the request (see the module overview).
+  if (captureAvailabilityOf(ctx.state, active.sessionId).ended) {
+    ctx.logger.info('Capture stop skipped: the session has ended', {
+      command: STOP_CAPTURE_COMMAND,
+    });
+    await ctx.ui.notify(endedSessionNotice('stop'));
+    return;
+  }
+
   ctx.logger.info('Capture stop requested', { command: STOP_CAPTURE_COMMAND });
   const stopped = await ctx.client.stopCapture(active.sessionId);
   if (isErr(stopped)) {
+    if (isCaptureStateRefusal(stopped.error)) {
+      // Worded from the store as it reads now: the capture may have been
+      // stopped elsewhere, and its frames may have arrived meanwhile.
+      await ctx.ui.notify(
+        captureRefusalNotice('stop', captureAvailabilityOf(ctx.state, active.sessionId)),
+      );
+      return;
+    }
     await ctx.ui.notifyFailure(stopped.error, { prefix: STOP_FAILURE_PREFIX });
     return;
   }

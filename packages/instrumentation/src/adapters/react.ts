@@ -455,14 +455,18 @@ interface ReactObstacle {
   readonly kind: ReactObstacleKind;
 
   /**
-   * Whether it stops the hooks from being armed at all.
+   * Whether it keeps a capture from observing a commit.
    *
    * `true` for the two obstacles that make a commit unobservable — no page agent
-   * at all, or a fiber hook installed after React had loaded — in which case an
-   * install arms nothing and says so. `false` for a page that simply has no
-   * React root *yet*: the hooks are armed, they will observe the root when it
-   * mounts, and the gap is reported as a narrower capture rather than a refusal
-   * (`../adapter.ts` states that reading of `reactDetected`).
+   * at all, or a fiber hook installed after React had loaded — so readiness
+   * holds the capture back until the obstacle is gone. An install arms nothing
+   * for a hook installed late and says so; no page agent *yet* is instead the
+   * usual state of a session whose tab binds after its plan installs, so the
+   * hooks are armed and readiness alone waits for the agent (see `install`).
+   * `false` for a page that simply has no React root *yet*: the hooks are
+   * armed, they will observe the root when it mounts, and the gap is reported
+   * as a narrower capture rather than a refusal (`../adapter.ts` states that
+   * reading of `reactDetected`).
    */
   readonly blocking: boolean;
 
@@ -1549,11 +1553,21 @@ export function createReactAdapter(options: ReactAdapterOptions = {}): ReactAdap
       const signals: readonly CaptureSignal[] = armed;
       const obstacle = resolveBrowserObstacle(context.readiness.browserAgent);
 
-      // A blocking obstacle means a commit could not be observed at all, so
-      // nothing is armed and every affected signal says why (AAP §0.5.5). This
-      // is a successful result: the capture proceeds with what other adapters
-      // enabled, and only the installer judges "nothing at all".
-      if (obstacle !== undefined && obstacle.blocking) {
+      // No page agent has reported *yet* is not a refusal. The editor creates a
+      // session before the panel binds its tab, so a plan usually installs
+      // before the bound tab's agent reports; arming edits no file, the capture
+      // arms these hooks from the plan's runtime actions in any case, and the
+      // readiness gate (`readiness` below) holds the capture back until the
+      // agent reports. Refusing here would fail every plan made of page hooks
+      // alone — a render or state question's — before its tab could bind.
+      const awaitingAgent = obstacle?.kind === 'agent-absent';
+
+      // A blocking obstacle on a page whose agent did report means a commit
+      // could not be observed at all, so nothing is armed and every affected
+      // signal says why (AAP §0.5.5). This is a successful result: the capture
+      // proceeds with what other adapters enabled, and only the installer
+      // judges "nothing at all".
+      if (obstacle !== undefined && obstacle.blocking && !awaitingAgent) {
         logger.debug('could not arm the React hooks', {
           adapter: REACT_ADAPTER_ID,
           obstacle: obstacle.kind,
@@ -1574,7 +1588,8 @@ export function createReactAdapter(options: ReactAdapterOptions = {}): ReactAdap
         adapter: REACT_ADAPTER_ID,
         accepted: accepted.length,
         hooks: armed.length,
-        degraded: obstacle?.kind,
+        degraded: awaitingAgent ? undefined : obstacle?.kind,
+        awaitingAgent,
       });
 
       return Promise.resolve({
@@ -1583,7 +1598,11 @@ export function createReactAdapter(options: ReactAdapterOptions = {}): ReactAdap
         // anywhere (AAP §0.5.1).
         applied: [],
         runtimeHooks: hookLabels(armed),
-        unavailable: obstacle === undefined ? [] : toUnavailableSignals(signals, obstacle),
+        // An agent that has not reported yet is readiness's to report, as a
+        // gap that closes when it does; only an obstacle on a reporting page
+        // narrows what the armed hooks can record.
+        unavailable:
+          obstacle === undefined || awaitingAgent ? [] : toUnavailableSignals(signals, obstacle),
         agentHooks: toAgentHooks(armed),
       });
     },

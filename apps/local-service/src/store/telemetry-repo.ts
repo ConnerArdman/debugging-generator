@@ -48,11 +48,12 @@
  *
  * ## The ordering contracts, and the half of each this module owns
  *
- * Two orders are specified, for two different readers, and this module serves
- * both, from two row-ordering tables and one group ordering:
+ * Two orders are specified, for different readers, and this module serves
+ * both, from two row-ordering tables, one in-memory lineage pass and one group
+ * ordering:
  *
- * - **The canonical order, for the correlator.** AAP 0.2.3 fixes the order of
- *   a capture as **parent before child, then `startTime`, then
+ * - **The flat canonical chain, for the correlator.** AAP 0.2.3 fixes the
+ *   order of a capture as **parent before child, then `startTime`, then
  *   `(producerId, seq)`, then `ingestSeq`**. Every convenience reader —
  *   {@link TelemetryRepo.listByTrace}, which `../telemetry/correlate.ts` pages
  *   through to build a trace tree, and `listByCapture`, `listByRequestKey`,
@@ -65,23 +66,37 @@
  *   panel node's `DataQuery` onto — orders by the key its sort names and then
  *   by the event id, {@link PANEL_SECONDARY_ORDER_BY}; the group orderings of
  *   {@link TelemetryRepo.queryGroups} likewise end in the group key and then
- *   the id of the group's first event. No panel ordering reads an arrival
- *   number, so a panel's order is a property of the evidence rather than of
- *   which batch reached the store first.
+ *   the id of the group's first event. The flat panel orderings read no
+ *   arrival number, so a panel's order is a property of the evidence rather
+ *   than of which batch reached the store first.
+ * - **The canonical parent-first order, for the `spans` panel source.** Under
+ *   `start_asc` with {@link TelemetryQuery.parentFirst}, {@link TelemetryRepo.query}
+ *   answers the whole of AAP 0.2.3's canonical order — parent before child,
+ *   then the flat chain above — because a list of correlated work that shows
+ *   a child above the request that caused it misstates causality. Its last key
+ *   is the canonical chain's `ingest_seq`, the one panel ordering that reads an
+ *   arrival number: AAP 0.2.3 names it as the final tie-breaker, and it only
+ *   ever decides between two rows of one producer with one sequence number.
  *
- * Both are **total** — `ingest_seq` and `id` are each unique — which is what
+ * All are **total** — `ingest_seq` and `id` are each unique — which is what
  * makes a page of results reproducible between two requests, and what makes
  * `limit`/`offset` paging coherent rather than a lottery over equal
  * timestamps. Of the canonical order the work is split, deliberately:
  *
- * - **This module orders rows**, by the flat-column chain above.
- * - **Parent-before-child is a property of the tree**, established by
- *   `packages/telemetry/src/correlation/correlator.ts` when it nests events by
- *   `(traceId, parentSpanId)` and walks the result depth-first. It is not
- *   attempted here: a recursive SQL ordering would duplicate that logic in a
- *   second language, and it would be wrong in the one case that matters, where
- *   a server span's clock reads slightly earlier than the browser span that
- *   caused it. AAP 0.2.3 aligns no clocks: each producer's own estimate of its
+ * - **SQL orders rows**, by the flat-column chain above, for every reader.
+ * - **Parent-before-child is computed in memory**, never in recursive SQL.
+ *   The correlator (`packages/telemetry/src/correlation/correlator.ts`)
+ *   establishes it for a trace tree when it nests events by
+ *   `(traceId, parentSpanId)` and walks the result depth-first; for a flat,
+ *   pageable list of rows {@link parentFirstOrder} establishes it over the
+ *   flat keys of the whole selection, as a topological order that reads no
+ *   event document and emits every row exactly once, cycles included. A
+ *   recursive SQL ordering would duplicate that logic in a second language,
+ *   and it would be wrong in the one case that matters, where a server span's
+ *   clock reads slightly earlier than the browser span that caused it: both
+ *   in-memory orders follow the parent link, not the clock. The flat chain is
+ *   kept as the convenience readers' order because the correlator's page walk
+ *   pages by it. AAP 0.2.3 aligns no clocks: each producer's own estimate of its
  *   offset from the server that answered it travels on its events as
  *   `clockOffsetMs`, is stored in the `clock_offset_ms` column and summarised
  *   per producer by {@link TelemetryRepo.listProducerClockOffsets}, and is
@@ -276,9 +291,11 @@ const COMPONENT_JSON_PATH = `$.attributes.${COMPONENT_ATTRIBUTE}`;
  * convenience readers ends in this chain ({@link TelemetryRepo.listByTrace},
  * the read the correlator pages through, among them), and a suite asserts
  * their order against `compareEventsCanonical` rather than restating the keys.
- * {@link TelemetryRepo.query} does **not** use it: the panel-data surface
- * orders by {@link PANEL_START_ASC_ORDER_BY} and its siblings, whose secondary
- * key is the event id AAP 0.4.2 names.
+ * {@link TelemetryRepo.query} orders by it only for a parent-first page
+ * ({@link TelemetryQuery.parentFirst}), where it ranks the rows
+ * {@link parentFirstOrder} then puts in lineage order; otherwise the
+ * panel-data surface orders by {@link PANEL_START_ASC_ORDER_BY} and its
+ * siblings, whose secondary key is the event id AAP 0.4.2 names.
  *
  * Why each key, in order (AAP 0.2.3):
  *
@@ -295,8 +312,9 @@ const COMPONENT_JSON_PATH = `$.attributes.${COMPONENT_ATTRIBUTE}`;
  *    which is what makes this order **total** and therefore reproducible
  *    across requests and across a page boundary.
  *
- * What it deliberately does not do: nest children under parents. That is the
- * tree's shape, applied by the correlator — see this module's overview.
+ * What it deliberately does not do: nest children under parents. That is
+ * applied in memory — by the correlator to a tree, by
+ * {@link parentFirstOrder} to a flat page — see this module's overview.
  */
 export const CANONICAL_ORDER_BY = 'start_time ASC, producer_id ASC, seq ASC, ingest_seq ASC';
 
@@ -337,10 +355,13 @@ export const PANEL_SECONDARY_ORDER_BY = 'id ASC';
  * The panel-data `start_asc` ordering: earliest first, the event id breaking
  * ties.
  *
- * Deliberately not {@link CANONICAL_ORDER_BY}. A panel source is a flat list of
- * events ordered by the key its sort names; `(producerId, seq)` and
- * parent-before-child are how the correlator lays out one trace tree, and that
- * order stays with {@link TelemetryRepo.listByTrace}.
+ * The flat order of a source listed by the key its sort names — the `events`
+ * log, and every whole-slice scan ({@link TelemetryRepo.scanEvents}) the
+ * aggregates read. It is deliberately not the canonical order: a record list
+ * sorted chronologically reads by time, and the aggregates are computed from
+ * sets, so neither needs lineage. The one panel source that does — `spans`,
+ * whose rows are the work of correlated traces — opts into the canonical
+ * parent-first order with {@link TelemetryQuery.parentFirst} instead.
  */
 export const PANEL_START_ASC_ORDER_BY = `start_time ASC, ${PANEL_SECONDARY_ORDER_BY}`;
 
@@ -350,6 +371,222 @@ export const PANEL_START_ASC_ORDER_BY = `start_time ASC, ${PANEL_SECONDARY_ORDER
  * panel's pages from repeating or skipping a row.
  */
 export const PANEL_DURATION_DESC_ORDER_BY = `duration DESC, ${PANEL_SECONDARY_ORDER_BY}`;
+
+/**
+ * What a parent-first ordering reads of one row: the trace it belongs to, its
+ * own span id, and the span it names as its parent.
+ *
+ * Exactly the flat columns `trace_id`, `span_id` and `parent_span_id`, and
+ * exactly the same-named fields of a {@link TelemetryEvent} — so the store can
+ * order its key rows with {@link parentFirstOrder} and `../panels/data.ts` can
+ * derive the same order from the events a page returned, through one
+ * implementation.
+ */
+export interface LineageKey {
+  /** The correlation id of the row's interaction. */
+  readonly traceId: string;
+  /** The row's own span id. */
+  readonly spanId: string;
+  /** The span the row names as its parent; absent for a root. */
+  readonly parentSpanId?: string | undefined;
+}
+
+/**
+ * Pushes a rank onto a binary min-heap held in a plain array.
+ *
+ * @param heap The heap; `heap[0]` is its smallest rank.
+ * @param rank The rank to add.
+ */
+function pushRank(heap: number[], rank: number): void {
+  let index = heap.length;
+
+  heap.push(rank);
+
+  while (index > 0) {
+    const parentIndex = (index - 1) >> 1;
+    const parentRank = heap[parentIndex] ?? rank;
+
+    if (parentRank <= rank) {
+      break;
+    }
+
+    heap[index] = parentRank;
+    index = parentIndex;
+  }
+
+  heap[index] = rank;
+}
+
+/**
+ * Removes and returns the smallest rank of a binary min-heap.
+ *
+ * @param heap The heap, non-empty.
+ * @returns The smallest rank, or `undefined` for an empty heap.
+ */
+function popRank(heap: number[]): number | undefined {
+  const top = heap[0];
+  const last = heap.pop();
+
+  if (top === undefined || last === undefined || heap.length === 0) {
+    return top;
+  }
+
+  // Sift the former last element down from the root.
+  const length = heap.length;
+  let index = 0;
+
+  for (;;) {
+    const left = 2 * index + 1;
+
+    if (left >= length) {
+      break;
+    }
+
+    const right = left + 1;
+    const leftRank = heap[left] ?? last;
+    const rightRank = right < length ? (heap[right] ?? last) : Number.POSITIVE_INFINITY;
+    const child = rightRank < leftRank ? right : left;
+    const childRank = Math.min(leftRank, rightRank);
+
+    if (last <= childRank) {
+      break;
+    }
+
+    heap[index] = childRank;
+    index = child;
+  }
+
+  heap[index] = last;
+
+  return top;
+}
+
+/** The link-list terminator of {@link parentFirstOrder}'s child lists. */
+const NO_ROW = -1;
+
+/**
+ * Orders rows **parent before child, then by their flat canonical rank** — the
+ * canonical order AAP 0.2.3 fixes for a capture: parent-before-child, then
+ * `startTime`, then `(producerId, seq)`, then `ingestSeq`.
+ *
+ * The caller supplies the rows already in the flat chain
+ * ({@link CANONICAL_ORDER_BY} in SQL, `compareEventsCanonical` in memory), so a
+ * row's position in `keys` is its rank. What this adds is the lineage, as a
+ * topological order computed in memory rather than in recursive SQL:
+ *
+ * - **Parent.** A row's parent is the row of the **same trace** whose span id
+ *   is the row's `parentSpanId`; when several rows carry that span id — a
+ *   replayed or colliding span — the lowest-ranked one, the occurrence the
+ *   correlator also keeps. A row naming no parent, a parent outside the set
+ *   (never captured, in another trace, or removed by the caller's filter), or
+ *   itself, is a **root** of the ordered set.
+ * - **Order.** Kahn's algorithm with a min-heap on rank: of the rows whose
+ *   parent has already been emitted (the roots at first), the smallest rank is
+ *   emitted next. So no row precedes its parent, and among the rows that could
+ *   come next the flat chain decides — which is why a server span whose clock
+ *   reads earlier than the browser request that caused it still follows it.
+ * - **Cycles.** When nothing is ready while rows remain — every one waits on a
+ *   parent that can only come after it, as members of a parent cycle and
+ *   their descendants do — the smallest-ranked remaining row is released as
+ *   if it were a root. Every row is emitted **exactly once**, whatever the
+ *   ancestry, so a page walk over this order can neither repeat nor drop one.
+ *
+ * Deterministic and total: the result is a function of the ranks and the
+ * three identities alone, and it is a permutation of `0 … keys.length - 1`.
+ * `O(n log n)` time and `O(n)` memory; nothing is read beyond the keys.
+ *
+ * @param keys Every row of the ordered set, in flat canonical order.
+ * @returns The ranks of `keys`, in parent-first order.
+ *
+ * @example
+ * ```ts
+ * // A child whose clock reads 5 ms before its parent's still follows it.
+ * parentFirstOrder([
+ *   { traceId: t, spanId: 'b1', parentSpanId: 'a0' }, // rank 0: earliest start
+ *   { traceId: t, spanId: 'a0' },                     // rank 1: the root
+ * ]); // → [1, 0]
+ * ```
+ */
+export function parentFirstOrder(keys: readonly LineageKey[]): number[] {
+  const count = keys.length;
+
+  // The lowest-ranked row of each (trace, span) identity. Nested maps rather
+  // than a joined string key, so no lookup allocates.
+  const bySpan = new Map<string, Map<string, number>>();
+
+  for (const [rank, key] of keys.entries()) {
+    let spans = bySpan.get(key.traceId);
+
+    if (spans === undefined) {
+      spans = new Map();
+      bySpan.set(key.traceId, spans);
+    }
+
+    if (!spans.has(key.spanId)) {
+      spans.set(key.spanId, rank);
+    }
+  }
+
+  // Each parent's children as a singly linked list threaded through two
+  // arrays; the heap, not the list, decides their order.
+  const firstChild = new Array<number>(count).fill(NO_ROW);
+  const nextSibling = new Array<number>(count).fill(NO_ROW);
+  const ready: number[] = [];
+
+  for (const [rank, key] of keys.entries()) {
+    const parent =
+      key.parentSpanId === undefined ? undefined : bySpan.get(key.traceId)?.get(key.parentSpanId);
+
+    if (parent === undefined || parent === rank) {
+      // Ascending ranks keep the heap property without a sift.
+      pushRank(ready, rank);
+    } else {
+      nextSibling[rank] = firstChild[parent] ?? NO_ROW;
+      firstChild[parent] = rank;
+    }
+  }
+
+  const order: number[] = [];
+  const emitted = new Array<boolean>(count).fill(false);
+  // Every rank below the cursor has been emitted.
+  let cursor = 0;
+
+  while (order.length < count) {
+    if (ready.length === 0) {
+      // A stall: only a cycle, or rows below one, remain. Release the
+      // smallest-ranked of them.
+      while (emitted[cursor] === true) {
+        cursor += 1;
+      }
+
+      pushRank(ready, cursor);
+    }
+
+    const rank = popRank(ready);
+
+    // Each row enters the heap at most once — as a root, when its parent is
+    // emitted, or when released — so an emitted rank is never popped; the
+    // guard keeps that a property of this loop rather than an assumption.
+    if (rank === undefined || emitted[rank] === true) {
+      continue;
+    }
+
+    emitted[rank] = true;
+    order.push(rank);
+
+    for (
+      let child = firstChild[rank] ?? NO_ROW;
+      child !== NO_ROW;
+      child = nextSibling[child] ?? NO_ROW
+    ) {
+      if (emitted[child] !== true) {
+        pushRank(ready, child);
+      }
+    }
+  }
+
+  return order;
+}
 
 /**
  * How a page of telemetry rows, or of occurrence groups, may be ordered.
@@ -1230,6 +1467,47 @@ function scanRowsSql(clause: string): string {
 ORDER BY ${PANEL_START_ASC_ORDER_BY} LIMIT ?`;
 }
 
+/**
+ * Reads the lineage key of every row a filtered read selects, in the flat
+ * canonical order ({@link CANONICAL_ORDER_BY}): the first of the two
+ * statements of a parent-first page ({@link TelemetryQuery.parentFirst}).
+ *
+ * Flat columns only — the arrival number, the trace, the span and its parent —
+ * and never the `event` document, so ordering the whole selection costs no
+ * JSON parse and no validation: only the rows of the requested page are
+ * reconstructed, by {@link rowsByIngestSeqSql}. The rank is the row's position
+ * in this read, which is why the ordering columns themselves are not selected.
+ *
+ * @param clause The `WHERE` clause from the filter planner: column names and
+ * placeholders only.
+ * @returns The statement text; binds the filter values only.
+ */
+function lineageKeysSql(clause: string): string {
+  return `SELECT ingest_seq, trace_id, span_id, parent_span_id FROM ${TABLE} WHERE ${clause}
+ORDER BY ${CANONICAL_ORDER_BY}`;
+}
+
+/**
+ * Reads the rows of one parent-first page by arrival number: the second of its
+ * two statements. Binds the session id, then the arrival numbers.
+ *
+ * `ingest_seq` is the table's `INTEGER PRIMARY KEY`, so each listed value is
+ * one rowid probe. The session term is the residual
+ * {@link RESIDUAL_SESSION_TERM}: every number came from a read scoped to that
+ * session, and `AUTOINCREMENT` never hands a number to a second row, so the
+ * term changes no answer — it keeps "this read cannot return another
+ * session's evidence" a property of the statement rather than of its caller.
+ * The rows come back in rowid order; the caller restores the page order.
+ *
+ * @param slots How many arrival numbers the `IN` list binds, at most
+ * {@link EXISTENCE_LOOKUP_CHUNK_SIZE}.
+ * @returns The statement text for that shape.
+ */
+function rowsByIngestSeqSql(slots: number): string {
+  return `SELECT ${SELECTED} FROM ${TABLE}
+WHERE ${RESIDUAL_SESSION_TERM} AND ingest_seq IN (${placeholders(slots)})`;
+}
+
 /* -------------------------------------------------------------------------------------------------
  * Public types
  * ---------------------------------------------------------------------------------------------- */
@@ -1374,7 +1652,9 @@ export interface TelemetryQuery {
    * Every `DataQuerySort` member is accepted, and what a sort ends in depends
    * on the reader: through {@link TelemetryRepo.query}, the panel-data surface,
    * each sort's key is followed by the event id
-   * ({@link PANEL_SECONDARY_ORDER_BY}); through a convenience reader, which
+   * ({@link PANEL_SECONDARY_ORDER_BY}) — or, for `'start_asc'` with
+   * {@link TelemetryQuery.parentFirst}, the whole canonical parent-first
+   * order replaces the flat one; through a convenience reader, which
    * takes this field by way of {@link TelemetryReadOptions}, it is followed by
    * the canonical chain ({@link CANONICAL_ORDER_BY}). `'count_desc'` ranks rows
    * by the size of the group each belongs to under
@@ -1382,6 +1662,34 @@ export interface TelemetryQuery {
    * {@link TelemetryRepo.queryGroups}.
    */
   readonly sort?: TelemetrySort | undefined;
+
+  /**
+   * Order a `'start_asc'` page in the **canonical** order of AAP 0.2.3 —
+   * parent before child, then `startTime`, then `(producerId, seq)`, then
+   * `ingestSeq` — instead of the flat `start_time ASC, id ASC`. Defaults to
+   * `false`, which leaves every existing ordering exactly as it was.
+   *
+   * Parent and child are rows of the filtered selection: a row's parent is the
+   * selected row of the same trace whose span id is its `parentSpanId` (the
+   * lowest-ranked one should the span id repeat), and a row whose parent is
+   * not selected is ordered as a root. A parent cycle cannot stall or drop a
+   * row: when nothing is ready, the smallest-ranked row left is released as
+   * if it were a root, and every row is emitted exactly once. See
+   * {@link parentFirstOrder}, which both this read and `../panels/data.ts`
+   * order by.
+   *
+   * The `spans` panel source sets it under `start_asc`, because its rows are
+   * the work of correlated traces and a child listed above the request that
+   * caused it — a server clock reading earlier than the browser's — would
+   * misstate the causality the view exists to show. `total`, `nextOffset`,
+   * `skipped`, the default and the ceiling of `limit` keep their meaning: the
+   * selection is ordered whole and the page is cut from that order.
+   *
+   * Refused (`STORE_ERROR`, reason `invalid-parent-first`) when it is not a
+   * boolean, and (`parent-first-requires-start-asc`) when `true` under any
+   * other sort, which has no parent-first reading.
+   */
+  readonly parentFirst?: boolean | undefined;
 
   /**
    * The group `'count_desc'` ranks rows by. Defaults to
@@ -1410,12 +1718,17 @@ export interface TelemetryQuery {
 
 /**
  * The narrowing a convenience reader accepts: every {@link TelemetryQuery}
- * field except the ones the reader itself fixes.
+ * field except the ones the reader itself fixes — including
+ * {@link TelemetryQuery.parentFirst}, because a convenience reader's order is
+ * the flat canonical chain the correlator pages through, fixed by the reader.
  *
  * Derived rather than restated so a field added to the filter is available
  * through every reader in the same edit.
  */
-export type TelemetryReadOptions = Omit<TelemetryQuery, 'sessionId' | 'traceId' | 'requestKey'>;
+export type TelemetryReadOptions = Omit<
+  TelemetryQuery,
+  'sessionId' | 'traceId' | 'requestKey' | 'parentFirst'
+>;
 
 /** One page of telemetry rows, with everything a pager needs to continue. */
 export interface TelemetryPage {
@@ -1481,7 +1794,10 @@ export interface TelemetryPage {
  * Derived rather than restated so a filter field added to the query is
  * scannable in the same edit.
  */
-export type TelemetryScanFilter = Omit<TelemetryQuery, 'sort' | 'groupBy' | 'limit' | 'offset'>;
+export type TelemetryScanFilter = Omit<
+  TelemetryQuery,
+  'sort' | 'parentFirst' | 'groupBy' | 'limit' | 'offset'
+>;
 
 /** The whole of a filtered selection, or the honest statement that it was too large. */
 export interface TelemetryScan {
@@ -1520,9 +1836,10 @@ export interface TelemetryScan {
  * `groupBy` is **required** here — a page of groups with no named key has no
  * meaning — and `sort` defaults to `'count_desc'`, the ordering this read
  * exists to answer. `limit` and `offset` count **groups**, with the same
- * default, ceiling and refusals as a row page.
+ * default, ceiling and refusals as a row page. {@link TelemetryQuery.parentFirst}
+ * orders rows, not groups, so a grouped read does not take it.
  */
-export interface TelemetryGroupQuery extends TelemetryQuery {
+export interface TelemetryGroupQuery extends Omit<TelemetryQuery, 'parentFirst'> {
   /** The key the filtered rows are grouped by. */
   readonly groupBy: TelemetryGroupKey;
 
@@ -1983,13 +2300,26 @@ export interface TelemetryRepo {
    * first, each group's rows together and in ascending id order, groups of
    * equal size in ascending key order, and rows belonging to no group last, in
    * ascending id order too. Every one of these is a total order, so paging is
-   * stable under all three. The canonical order the correlator needs is the
-   * convenience readers' ({@link TelemetryRepo.listByTrace}).
+   * stable under all three. The flat canonical chain the correlator pages
+   * through is the convenience readers' ({@link TelemetryRepo.listByTrace}).
+   *
+   * With {@link TelemetryQuery.parentFirst} under `'start_asc'`, the page is
+   * cut from the canonical **parent-first** order of AAP 0.2.3 instead
+   * ({@link parentFirstOrder}), in two statements: one read of every selected
+   * row's flat lineage key in {@link CANONICAL_ORDER_BY} — no document parsed —
+   * whose length is `total`, and one read of the page's own rows by arrival
+   * number, at most {@link EXISTENCE_LOOKUP_CHUNK_SIZE} per statement. Only
+   * the page's rows are reconstructed and validated. A count-only request
+   * (`limit: 0`) is the one `COUNT(*)` every other page runs. `nextOffset`
+   * advances by the window the order was cut to, so a row another connection
+   * removed between the two statements is neither returned nor able to stall
+   * a walk.
    *
    * @param filter What to match, how to order it and which page to return.
    * @returns The page, or the refusal for an argument this repository will not
    * accept (an unknown sort, group key, kind or tier, a negative or fractional
-   * `limit` or `offset`, a non-finite `minDuration`).
+   * `limit` or `offset`, a non-finite `minDuration`, a `parentFirst` that is
+   * not a boolean or is `true` under a sort other than `'start_asc'`).
    */
   query(filter: TelemetryQuery): Result<TelemetryPage, DebuggenError>;
 
@@ -3461,13 +3791,62 @@ function buildPagePlan(
 }
 
 /**
+ * Resolves {@link TelemetryQuery.parentFirst} against the page's effective
+ * sort.
+ *
+ * Checked apart from {@link buildPagePlan}, which a grouped read shares: a
+ * page of groups has no parent-first reading, and its type does not carry the
+ * field. The value is checked by type because a JavaScript caller can send
+ * anything, and a truthy string silently reordering a page would be a bug the
+ * ordering hides.
+ *
+ * @param filter The query as the caller wrote it.
+ * @param sort The page's effective sort.
+ * @param operation The calling method, for a refusal's `details`.
+ * @returns Whether the page is parent-first, or the refusal.
+ */
+function resolveParentFirst(
+  filter: TelemetryQuery,
+  sort: TelemetrySort,
+  operation: string,
+): Result<boolean, DebuggenError> {
+  const requested: unknown = filter.parentFirst ?? false;
+
+  if (typeof requested !== 'boolean') {
+    return err(
+      argumentError(
+        operation,
+        'A telemetry query named a parent-first ordering that is not a boolean.',
+        'Pass true to order a start_asc page parent before child, or omit the field.',
+        'invalid-parent-first',
+      ),
+    );
+  }
+
+  if (requested && sort !== 'start_asc') {
+    return err(
+      argumentError(
+        operation,
+        'A telemetry query asked for a parent-first order under a sort that has none.',
+        'Ask for parent-first ordering with sort start_asc only, or omit the field.',
+        'parent-first-requires-start-asc',
+        { sort },
+      ),
+    );
+  }
+
+  return ok(requested);
+}
+
+/**
  * Splits values into chunks of at most {@link EXISTENCE_LOOKUP_CHUNK_SIZE}.
  *
+ * @typeParam T The value type: an id, or an arrival number.
  * @param values The de-duplicated values.
  * @returns One array per statement, in input order.
  */
-function chunk(values: readonly string[]): string[][] {
-  const chunks: string[][] = [];
+function chunk<T>(values: readonly T[]): T[][] {
+  const chunks: T[][] = [];
 
   for (let index = 0; index < values.length; index += EXISTENCE_LOOKUP_CHUNK_SIZE) {
     chunks.push(values.slice(index, index + EXISTENCE_LOOKUP_CHUNK_SIZE));
@@ -3558,7 +3937,12 @@ function readEvents(
       continue;
     }
 
-    const parsed = parseTelemetryEvent({ ...candidate, ingestSeq });
+    // The parsed document is this read's own object, so the arrival number is
+    // written into it rather than into a copy of it: the input the schema sees
+    // is the same — a document's own `ingestSeq`, if it carried one, is
+    // overwritten either way — at one allocation per row fewer, on the path
+    // every whole-capture scan takes once per stored event.
+    const parsed = parseTelemetryEvent(Object.assign(candidate, { ingestSeq }));
 
     if (isErr(parsed)) {
       skipped.push(ingestSeq);
@@ -3569,6 +3953,66 @@ function readEvents(
   }
 
   return ok({ events, skipped });
+}
+
+/** What {@link readLineage} builds from the rows of {@link lineageKeysSql}. */
+interface ReadLineage {
+  /** Every row's lineage key, in flat canonical order: a key's index is its rank. */
+  readonly keys: LineageKey[];
+
+  /** Every row's arrival number, aligned with {@link ReadLineage.keys}. */
+  readonly ingestSeqs: number[];
+}
+
+/**
+ * Reads the lineage keys of a parent-first page's first statement.
+ *
+ * Flat columns only, so a row whose `event` document no longer validates is
+ * still ordered — and counted in `total` — exactly as a flat page orders and
+ * counts it; it is skipped and reported only if it falls inside the page's
+ * window, when its document is read. A column that does not hold its
+ * declared type can only come from a database this build did not write
+ * (`telemetry_events` is `STRICT`), and fails the read.
+ *
+ * @param rows The rows as read, in {@link CANONICAL_ORDER_BY}.
+ * @param operation The calling method, for a column failure's `details`.
+ * @returns The keys and arrival numbers, or the column failure.
+ */
+function readLineage(
+  rows: readonly StoredRow[],
+  operation: string,
+): Result<ReadLineage, DebuggenError> {
+  const keys: LineageKey[] = [];
+  const ingestSeqs: number[] = [];
+
+  for (const row of rows) {
+    const ingestSeq = readInteger(row['ingest_seq']);
+
+    if (ingestSeq === undefined) {
+      return err(corruptColumnError(operation, 'ingest_seq'));
+    }
+
+    const traceId = row['trace_id'];
+    const spanId = row['span_id'];
+    const parentSpanId = row['parent_span_id'];
+
+    if (typeof traceId !== 'string') {
+      return err(corruptColumnError(operation, 'trace_id'));
+    }
+
+    if (typeof spanId !== 'string') {
+      return err(corruptColumnError(operation, 'span_id'));
+    }
+
+    if (parentSpanId !== null && typeof parentSpanId !== 'string') {
+      return err(corruptColumnError(operation, 'parent_span_id'));
+    }
+
+    keys.push(parentSpanId === null ? { traceId, spanId } : { traceId, spanId, parentSpanId });
+    ingestSeqs.push(ingestSeq);
+  }
+
+  return ok({ keys, ingestSeqs });
 }
 
 /** What {@link collectGroups} builds from the rows of {@link groupRowsSql}. */
@@ -4169,6 +4613,9 @@ export function createTelemetryRepo(deps: TelemetryRepoDeps): TelemetryRepo {
    * panel-data surface, passes {@link PANEL_ORDERING_BY_SORT}; every
    * convenience reader takes the default, {@link CANONICAL_ORDERING_BY_SORT},
    * the order the correlator's page walk depends on (see the module overview).
+   * The one ordering a filter may ask for is the parent-first `start_asc`
+   * page ({@link TelemetryQuery.parentFirst}), answered by
+   * {@link readParentFirstPage} under the same refusals and the same page rules.
    *
    * @param filter What to match, how to order it and which page to return.
    * @param operation The calling method, for a refusal's `details` and logs.
@@ -4193,6 +4640,12 @@ export function createTelemetryRepo(deps: TelemetryRepoDeps): TelemetryRepo {
         return paging;
       }
 
+      const parentFirst = resolveParentFirst(filter, paging.value.sort, operation);
+
+      if (isErr(parentFirst)) {
+        return parentFirst;
+      }
+
       if (plan.value.kind === 'nothing') {
         // A filter narrowed to nothing is answered without a statement: an
         // empty `IN ()` list is a SQLite syntax error, and widening such a
@@ -4202,6 +4655,11 @@ export function createTelemetryRepo(deps: TelemetryRepoDeps): TelemetryRepo {
 
       const { clause, values } = plan.value;
       const { sort, groupBy, limit, offset } = paging.value;
+
+      if (parentFirst.value) {
+        return readParentFirstPage(filter.sessionId, clause, values, limit, offset, operation);
+      }
+
       const ordering = orderings[sort](groupBy);
 
       // One count over the identical WHERE clause, so `total` and `rows` can
@@ -4231,32 +4689,158 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
         return read;
       }
 
-      if (read.value.skipped.length > 0) {
-        // The arrival numbers and nothing else: a row that failed validation
-        // may hold any captured value, and this record is logged and may be
-        // shown to a developer (AAP 0.5.2).
-        logger.warn('skipped telemetry rows that no longer match the event schema', {
-          operation,
-          skipped: read.value.skipped.length,
-          ingestSeqs: read.value.skipped,
-        });
-      }
-
-      // Advanced by the rows the statement read, unreadable ones included, so
-      // a skipped row cannot stall a walk. A page that read nothing — the
-      // count-only `limit: 0`, or an offset at or past the end — is terminal:
-      // its "next" offset would be its own, and a pager following it would
-      // never advance (see TelemetryPage.nextOffset).
-      const nextOffset = offset + rows.length;
-      const hasNextPage = rows.length > 0 && nextOffset < total;
-
-      return ok({
-        rows: read.value.events,
-        total,
-        ...(hasNextPage ? { nextOffset } : {}),
-        ...(read.value.skipped.length > 0 ? { skipped: read.value.skipped.length } : {}),
-      });
+      return ok(finishPage(operation, read.value, total, offset, rows.length));
     });
+  }
+
+  /**
+   * The page a row read yields, once its rows are reconstructed: the one tail
+   * both {@link readPage} and {@link readParentFirstPage} end in, so the skip
+   * report and the paging rule cannot differ between them.
+   *
+   * @param operation The calling method, for the skip report.
+   * @param read The reconstructed events and the skipped arrival numbers.
+   * @param total How many rows the filter matches in full.
+   * @param offset The page's offset.
+   * @param advanced How many rows the page's window covered: the statement's
+   * rows, unreadable ones included.
+   * @returns The page.
+   */
+  function finishPage(
+    operation: string,
+    read: ReadRows,
+    total: number,
+    offset: number,
+    advanced: number,
+  ): TelemetryPage {
+    if (read.skipped.length > 0) {
+      // The arrival numbers and nothing else: a row that failed validation
+      // may hold any captured value, and this record is logged and may be
+      // shown to a developer (AAP 0.5.2).
+      logger.warn('skipped telemetry rows that no longer match the event schema', {
+        operation,
+        skipped: read.skipped.length,
+        ingestSeqs: read.skipped,
+      });
+    }
+
+    // Advanced by the rows the window covered, unreadable ones included, so a
+    // skipped row cannot stall a walk. A page that read nothing — the
+    // count-only `limit: 0`, or an offset at or past the end — is terminal:
+    // its "next" offset would be its own, and a pager following it would never
+    // advance (see TelemetryPage.nextOffset).
+    const nextOffset = offset + advanced;
+    const hasNextPage = advanced > 0 && nextOffset < total;
+
+    return {
+      rows: read.events,
+      total,
+      ...(hasNextPage ? { nextOffset } : {}),
+      ...(read.skipped.length > 0 ? { skipped: read.skipped.length } : {}),
+    };
+  }
+
+  /**
+   * One `start_asc` page in the canonical parent-first order
+   * ({@link TelemetryQuery.parentFirst}), in two statements and one in-memory
+   * pass.
+   *
+   * 1. {@link lineageKeysSql} reads the flat lineage key of every selected row
+   *    in {@link CANONICAL_ORDER_BY} — four columns, no document — and its
+   *    length is `total`, so the count and the order describe one read.
+   * 2. {@link parentFirstOrder} puts those rows parent before child, and the
+   *    page's window `[offset, offset + limit)` is cut from that order.
+   * 3. {@link rowsByIngestSeqSql} reads the window's rows by arrival number,
+   *    {@link EXISTENCE_LOOKUP_CHUNK_SIZE} per statement, and they are
+   *    reconstructed and validated in the window's order — the only documents
+   *    the page parses.
+   *
+   * A row the second read no longer finds — removed by another connection
+   * between the two statements — is left out and reported at `debug` by count;
+   * `nextOffset` still advances by the whole window, so the walk continues
+   * past it. A count-only request is the one `COUNT(*)` a flat page runs.
+   *
+   * @param sessionId The session the filter is scoped to.
+   * @param clause The filter's `WHERE` clause.
+   * @param values The filter's bound values.
+   * @param limit The effective page size.
+   * @param offset The effective offset.
+   * @param operation The calling method, for refusals and logs.
+   * @returns The page, or a column failure.
+   */
+  function readParentFirstPage(
+    sessionId: SessionId,
+    clause: string,
+    values: readonly BoundValue[],
+    limit: number,
+    offset: number,
+    operation: string,
+  ): Result<TelemetryPage, DebuggenError> {
+    if (limit === 0) {
+      // The count alone, exactly as a flat page answers it: no key is read.
+      const total = readInteger(store.statement(countRowsSql(clause)).get(...values)?.['total']);
+
+      return total === undefined
+        ? err(corruptColumnError(operation, 'total'))
+        : ok({ rows: [], total });
+    }
+
+    const lineage = readLineage(store.statement(lineageKeysSql(clause)).all(...values), operation);
+
+    if (isErr(lineage)) {
+      return lineage;
+    }
+
+    const { keys, ingestSeqs } = lineage.value;
+    const window: number[] = [];
+
+    for (const rank of parentFirstOrder(keys).slice(offset, offset + limit)) {
+      const ingestSeq = ingestSeqs[rank];
+
+      if (ingestSeq !== undefined) {
+        window.push(ingestSeq);
+      }
+    }
+
+    const byIngestSeq = new Map<number, StoredRow>();
+
+    for (const part of chunk(window)) {
+      for (const row of store.statement(rowsByIngestSeqSql(part.length)).all(sessionId, ...part)) {
+        const ingestSeq = readInteger(row['ingest_seq']);
+
+        if (ingestSeq === undefined) {
+          return err(corruptColumnError(operation, 'ingest_seq'));
+        }
+
+        byIngestSeq.set(ingestSeq, row);
+      }
+    }
+
+    const rows: StoredRow[] = [];
+
+    for (const ingestSeq of window) {
+      const row = byIngestSeq.get(ingestSeq);
+
+      if (row !== undefined) {
+        rows.push(row);
+      }
+    }
+
+    if (rows.length < window.length) {
+      // Counts only: which rows went is another connection's business.
+      logger.debug('rows of a parent-first page were removed between its two reads', {
+        operation,
+        removed: window.length - rows.length,
+      });
+    }
+
+    const read = readEvents(rows, operation);
+
+    if (isErr(read)) {
+      return read;
+    }
+
+    return ok(finishPage(operation, read.value, keys.length, offset, window.length));
   }
 
   /**

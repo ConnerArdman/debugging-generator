@@ -233,13 +233,22 @@ a.name:focus-visible,
  * The total column drops back to `auto` here, without the minimum the wide layout gives it:
  * on the second line the stepper is pinned to the row's leading edge and the total and remove
  * control to its trailing edge, so nothing sits between them whose position a longer amount
- * could push around, and the width is better spent on the name. */
+ * could push around, and the width is better spent on the name.
+ *
+ * The block-end padding grows by one spacing step here, and only here. The stepper's range hint
+ * is drawn out of flow beneath it (`./QuantityStepper.module.css` states the ~21px it occupies),
+ * and on this arrangement the stepper is the row's last line, so the hint would otherwise hang
+ * across the hairline into the next row. Reserving the room permanently, rather than when the hint
+ * appears, is what keeps the hint from moving anything: the row is the same height with or
+ * without it. The wide arrangement needs nothing, because its details column is deeper than the
+ * stepper and the hint together. */
 @container (max-width: calc(32px * 16)) {
   .root {
     grid-template-columns: var(--line-media-width) minmax(0, 1fr) auto auto;
     grid-template-areas:
       'media details details details'
       'controls controls total remove';
+    padding-block-end: calc(var(--ls-space-3, 12px) + var(--ls-space-3, 12px));
   }
 
   .total,

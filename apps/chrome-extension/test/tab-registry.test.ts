@@ -1927,6 +1927,71 @@ describe('handleNavigated — keep and re-arm, or unbind', () => {
     ]);
   });
 
+  it('ignores the late establishment answering a kept navigation the tab has since left the origin after, keeping the unbind owed', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    // A same-origin commit (the service will answer it `bound`), then one off
+    // the origin before that answer arrived.
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_A_SETTINGS });
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+    resetObservations(h);
+
+    const outcome = unwrap(
+      await h.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_A_SETTINGS)),
+    );
+
+    // Not resurrected: no record, no push, no change, and the unbind the
+    // navigation wrote ahead is still owed.
+    expect(outcome).toStrictEqual({ kind: 'ignored', reason: 'bound' });
+    expect(await h.registry.getBinding(TAB_ONE)).toBeUndefined();
+    expect(await h.registry.getTabForSession(SESSION_ALPHA)).toBeUndefined();
+    expect(h.notify).not.toHaveBeenCalled();
+    expect(h.changes).toStrictEqual([]);
+    expect(h.storage.storedTombstones()).toMatchObject([
+      { tabId: TAB_ONE, sessionId: SESSION_ALPHA, cause: 'navigated-away' },
+    ]);
+
+    // The service's drop still acknowledges it.
+    const dropped = unwrap(
+      await h.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_B_LANDING, 'origin-changed')),
+    );
+    expect(dropped).toStrictEqual({ kind: 'ignored', reason: 'origin-changed' });
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+  });
+
+  it('records a bind the worker asked for after its tab left the origin and came back, its unbind still owed', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_A_OVERVIEW });
+    expect(h.storage.storedTombstones()).toMatchObject([
+      { tabId: TAB_ONE, sessionId: SESSION_ALPHA, cause: 'navigated-away' },
+    ]);
+
+    // The worker asks for the same session again: the bind in flight makes
+    // its confirmation current, and it supersedes the owed unbind.
+    await h.registry.requestBind({
+      tabId: TAB_ONE,
+      url: URL_A_OVERVIEW,
+      origin: ORIGIN_A,
+      sessionId: SESSION_ALPHA,
+    });
+    const rebound = unwrap(
+      await h.registry.applyBound(bound(TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW)),
+    );
+    expect(rebound).toMatchObject({ kind: 'recorded', reason: 'bound' });
+    expect(await h.registry.getTabForSession(SESSION_ALPHA)).toBe(TAB_ONE);
+    expect(Object.hasOwn(h.storage.items, UNBIND_TOMBSTONE_STORAGE_KEY)).toBe(false);
+  });
+
+  it('records an establishment of another session for a tab whose unbind is owed', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+
+    // Not the late answer the owed unbind is about: another binding of the tab.
+    const other = unwrap(await h.registry.applyBound(bound(TAB_ONE, SESSION_BETA, URL_B_LANDING)));
+    expect(other).toMatchObject({ kind: 'recorded', reason: 'bound' });
+    expect(await h.registry.getTabForSession(SESSION_BETA)).toBe(TAB_ONE);
+  });
+
   it('unbinds a navigation to a document with no HTTP(S) origin', async () => {
     await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
 
@@ -3262,6 +3327,71 @@ describe('handleUnreportableNavigation — a navigation the service cannot be to
     expect(unwrap(bindResult).kind).toBe('recorded');
     expect(decision).toMatchObject({ kind: 'unbound-cross-origin', sessionId: SESSION_ALPHA });
     expect(await h.registry.listBindings()).toStrictEqual([]);
+  });
+});
+
+describe('handleReturnedNavigation — a tab back on the origin it left', () => {
+  it('withdraws the tab-left state once the tab is back on the origin it left, pushing unbound and sending nothing', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+    expect(await h.registry.getPanelBindingState(TAB_ONE)).toMatchObject({
+      kind: 'tab-left',
+      origin: ORIGIN_A,
+    });
+    resetObservations(h);
+
+    // Still away: another navigation off the origin keeps the notice.
+    expect(await h.registry.handleReturnedNavigation(TAB_ONE, ORIGIN_B)).toBe(false);
+    expect(h.notify).not.toHaveBeenCalled();
+
+    expect(await h.registry.handleReturnedNavigation(TAB_ONE, ORIGIN_A)).toBe(true);
+
+    const unbound: PanelBindingState = { kind: 'unbound' };
+    expect(h.notify.mock.calls).toStrictEqual([[TAB_ONE, bindingPushFrame(unbound)]]);
+    expect(await h.registry.getPanelBindingState(TAB_ONE)).toStrictEqual(unbound);
+    // No binding changed, so nothing is sent and no listener hears of it.
+    expect(sentFrames(h)).toStrictEqual([]);
+    expect(h.changes).toStrictEqual([]);
+    // Withdrawn once.
+    expect(await h.registry.handleReturnedNavigation(TAB_ONE, ORIGIN_A)).toBe(false);
+  });
+
+  it('changes nothing for a bound tab, a tab that never left, or a document without an origin', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    resetObservations(h);
+
+    expect(await h.registry.handleReturnedNavigation(TAB_ONE, ORIGIN_A)).toBe(false);
+    expect(await h.registry.handleReturnedNavigation(TAB_TWO, ORIGIN_A)).toBe(false);
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+    resetObservations(h);
+    expect(await h.registry.handleReturnedNavigation(TAB_ONE, undefined)).toBe(false);
+
+    expect(h.notify).not.toHaveBeenCalled();
+    expect(await h.registry.getPanelBindingState(TAB_ONE)).toMatchObject({ kind: 'tab-left' });
+    expect(await h.registry.getBinding(TAB_ONE)).toBeUndefined();
+  });
+
+  it('lets a later binding of the tab replace a withdrawn notice as it replaces any other state', async () => {
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_OVERVIEW);
+    await h.registry.handleNavigated({ tabId: TAB_ONE, url: URL_B_LANDING });
+    await h.registry.handleReturnedNavigation(TAB_ONE, ORIGIN_A);
+
+    // The returned tab binds again as any tab does: the worker asks first, so
+    // the service's confirmation is current rather than the late answer to the
+    // navigation that left the origin (which the registry ignores).
+    await h.registry.requestBind({
+      tabId: TAB_ONE,
+      url: URL_A_SETTINGS,
+      origin: ORIGIN_A,
+      sessionId: SESSION_ALPHA,
+    });
+    await confirmBinding(h, TAB_ONE, SESSION_ALPHA, URL_A_SETTINGS);
+
+    expect(await h.registry.getPanelBindingState(TAB_ONE)).toMatchObject({
+      kind: 'bound',
+      sessionId: SESSION_ALPHA,
+      url: URL_A_SETTINGS,
+    });
   });
 });
 

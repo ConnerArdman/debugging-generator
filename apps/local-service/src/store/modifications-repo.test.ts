@@ -96,6 +96,7 @@ import {
   MODIFICATION_STATUS_TRANSITIONS,
   canTransitionModificationStatus,
   createModificationsRepo,
+  readSessionModifications,
 } from './modifications-repo.js';
 import type { ModificationCorroborationReader, ModificationsRepo } from './modifications-repo.js';
 import { createSessionsRepo } from './sessions-repo.js';
@@ -3143,5 +3144,120 @@ describe('listPageBySession', () => {
 
     expect(page.records[0]?.diff).toContain(SENTINEL);
     expect(loggedText()).not.toContain(SENTINEL);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * readSessionModifications — the session record's synchronous journal read
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('readSessionModifications', () => {
+  it('answers what listBySession answers, in the same order, without a promise', async () => {
+    const first = await seedInStatus('applied');
+    const second = await seedInStatus('applied', { file: FILE_TWO });
+    await seedInStatus('applied', { sessionId: SESSION_B });
+
+    const read = readSessionModifications(store, SESSION_A);
+
+    expect(read).not.toBeInstanceOf(Promise);
+    expect(unwrap(read)).toEqual(unwrap(await repo.listBySession(SESSION_A)));
+    expect(unwrap(read).map((record) => record.id)).toEqual([first.id, second.id]);
+    expect(unwrap(read).every((record) => record.sessionId === SESSION_A)).toBe(true);
+  });
+
+  it('reflects every status transition the moment the journal takes it', async () => {
+    const restored = await seedInStatus('applied');
+    const edited = await seedInStatus('applied', { file: FILE_TWO });
+
+    unwrap(await repo.updateStatus(restored.id, 'reverted'));
+    unwrap(await repo.updateStatus(edited.id, 'conflict'));
+
+    const statuses = unwrap(readSessionModifications(store, SESSION_A)).map((record) => [
+      record.id,
+      record.status,
+    ]);
+
+    expect(statuses).toEqual([
+      [restored.id, 'reverted'],
+      [edited.id, 'conflict'],
+    ]);
+  });
+
+  it('returns records the upstream schema accepts, every field as the row holds it', async () => {
+    const parent = await seedInStatus('applied');
+    const child = await appendOk(
+      makeRecord({
+        planVersion: 2,
+        originalHash: parent.instrumentedHash,
+        instrumentedHash: hashOf('instrumented:followup'),
+        previousRecordId: parent.id,
+      }),
+    );
+
+    const read = unwrap(readSessionModifications(store, SESSION_A));
+
+    for (const record of read) {
+      expect(parseModificationRecord(record)).toEqual({ ok: true, value: record });
+    }
+    expect(read.find((record) => record.id === child.id)).toEqual(child);
+    expect(read.find((record) => record.id === parent.id)).not.toHaveProperty('previousRecordId');
+  });
+
+  it('answers an empty list for a session with no record and for an id the store does not hold', () => {
+    expect(unwrap(readSessionModifications(store, SESSION_C))).toEqual([]);
+    expect(unwrap(readSessionModifications(store, newSessionId()))).toEqual([]);
+  });
+
+  it('refuses a blank or non-string session id before any statement is prepared', () => {
+    const prepared: string[] = [];
+    const recording = recordingStore(store, prepared);
+
+    for (const sessionId of ['', undefined, 42]) {
+      const error = expectRefusal(
+        readSessionModifications(recording, sessionId as unknown as SessionId),
+        'STORE_ERROR',
+      );
+      expect(error.details?.['reason']).toBe('invalid-argument');
+      expect(error.details?.['field']).toBe('sessionId');
+    }
+    expect(prepared).toEqual([]);
+  });
+
+  it('fails the whole read on a row that is no longer a record, naming the id only', async () => {
+    await seedInStatus('applied');
+    insertCorruptRow('mod_corruptmirror000', 'src/corrupt.ts', `${DIFF}\n+// ${SENTINEL}`);
+
+    const error = expectRefusal(readSessionModifications(store, SESSION_A), 'STORE_ERROR');
+
+    expect(error.details?.['recordId']).toBe('mod_corruptmirror000');
+    expect(errorText(error)).not.toContain(SENTINEL);
+  });
+
+  it('reports a store it cannot read as store-failed instead of throwing', () => {
+    store.close();
+
+    const error = expectRefusal(readSessionModifications(store, SESSION_A), 'STORE_ERROR');
+
+    expect(error.details?.['reason']).toBe('store-failed');
+    expect(error.details?.['operation']).toBe('readSessionModifications');
+  });
+
+  it('reads through the session index and never logs a diff it returns', async () => {
+    await appendOk(makeRecord({ file: 'src/sentinel.ts', diff: SENTINEL_DIFF }));
+    const prepared: string[] = [];
+
+    const read = unwrap(readSessionModifications(recordingStore(store, prepared), SESSION_A));
+
+    expect(read[0]?.diff).toContain(SENTINEL);
+    expect(loggedText()).not.toContain(SENTINEL);
+    expect(prepared).toHaveLength(1);
+
+    const plan = store.db
+      .prepare(`EXPLAIN QUERY PLAN ${prepared[0] ?? ''}`)
+      .all(SESSION_A)
+      .map((row) => String(row['detail']))
+      .join(' | ');
+
+    expect(plan).toMatch(/USING (COVERING )?INDEX idx_modifications_session_id/);
   });
 });

@@ -22,9 +22,24 @@
  * answers is failed by the reducer's 150 s safety timeout, which outlasts every host-side bound.
  * `QuestionForm` and `FollowUp` keep the typed text until their submission's own result arrives,
  * clearing it only when the host accepted it and keeping it, with a retry hint, when it failed.
+ *
+ * ## Copy that follows the session
+ *
+ * Every section says what is true of the session now, read from one {@link SessionPhase} and the
+ * service connection rather than from ad hoc status comparisons. The Question section shows the
+ * active session's question verbatim above the form. The Target section offers "Pick element" only
+ * while a running session can take a pick over a reachable service; otherwise `TargetBadge` says
+ * why, from the {@link targetPickAvailability} this module derives. With no session, the empty
+ * state says either what asking a question does or, when the local service is not reachable, that
+ * no session can start yet. File modifications say "nothing modified yet" until the plan exists
+ * (`SessionPhase.awaitingPlan`) instead of the final "no files were modified". The Follow-up
+ * section lists every follow-up asked in the session with its outcome, and while it takes none it
+ * says why ({@link followUpUnavailableReason}): no result yet, the latest question still being
+ * answered, the session ended or failed, or the service not reachable. Each component owns its own
+ * generic wording; this module decides only which case applies (AAP 0.5.4).
  */
 
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } from 'react';
 import type { ReactElement, Ref, RefObject } from 'react';
 
 import {
@@ -35,6 +50,7 @@ import {
   ErrorState,
   Heading,
   LoadingState,
+  MODIFICATION_STATUS_TONE,
   PanelShell,
   Section,
   Stack,
@@ -44,6 +60,7 @@ import type { BadgeTone } from '@debuggen/panel-renderer';
 import type {
   CleanupStatus,
   ModificationConflict,
+  ModificationRecord,
   SessionRecord,
   SessionStatus,
   SourceLocation,
@@ -51,6 +68,7 @@ import type {
 } from '@debuggen/protocol';
 import { DEFAULT_RESOLUTION_CONFIDENCE, assertNever } from '@debuggen/shared';
 
+import { MAX_WEBVIEW_QUESTION_LENGTH, isSubmittableQuestion } from '../webview-messages';
 import type {
   HostToWebviewMessage,
   HostToWebviewMessageOf,
@@ -63,13 +81,20 @@ import type {
 import { AnalysisSummary } from './components/AnalysisSummary';
 import { CaptureControls } from './components/CaptureControls';
 import { FollowUp } from './components/FollowUp';
-import { ModificationsList } from './components/ModificationsList';
+import type { FollowUpUnavailableReason } from './components/FollowUp';
+import {
+  CopyPathButton,
+  ModificationsList,
+  copyBackupPathLabel,
+  modificationStatusLabel,
+} from './components/ModificationsList';
 import { PairingCode } from './components/PairingCode';
 import { ProgressSteps } from './components/ProgressSteps';
 import { QuestionForm } from './components/QuestionForm';
 import { RelevantFiles } from './components/RelevantFiles';
 import { StatusBar } from './components/StatusBar';
 import { TargetBadge } from './components/TargetBadge';
+import type { TargetPickAvailability } from './components/TargetBadge';
 import {
   INITIAL_PENDING_ACTIONS_STATE,
   isPending,
@@ -141,6 +166,11 @@ interface SessionPhase {
   readonly pipelineRunning: boolean;
   /** Understanding and investigation have not yet produced the relevant files. */
   readonly resolvingFiles: boolean;
+  /**
+   * The question is still being understood, investigated or planned, so no instrumentation plan
+   * has been applied and no file can have been modified yet.
+   */
+  readonly awaitingPlan: boolean;
   /** The plan is being applied; modification records may still arrive. */
   readonly instrumenting: boolean;
   /** Instrumentation is ready and the developer should reproduce the issue. */
@@ -157,6 +187,8 @@ interface SessionPhase {
   readonly live: boolean;
   /** The session has ended; its cleanup outcome stays on screen. */
   readonly ended: boolean;
+  /** The session stopped at a failed stage; it takes no pick and no follow-up. */
+  readonly failed: boolean;
 }
 
 /** How the view presents one cleanup status. */
@@ -191,6 +223,9 @@ const LOADING_ROWS = 4;
 const NO_SESSION_TITLE = 'No session yet';
 const NO_SESSION_MESSAGE =
   'Ask a question about the behaviour you are debugging. Debug Generator investigates your code, instruments only what it needs, and reports each step here as it happens.';
+/** The no-session sentence while the local service is not reachable, so asking cannot start one. */
+const NO_SESSION_SERVICE_MESSAGE =
+  'The local Debug Generator service is not reachable, so no session can start yet. Once it is running, ask a question above: Debug Generator investigates your code, instruments only what it needs, and reports each step here as it happens.';
 
 const QUESTION_SECTION_TITLE = 'Question';
 const TARGET_SECTION_TITLE = 'Target';
@@ -225,7 +260,18 @@ const UNREPORTED_FAILURE_HINT =
   'End the session to remove its instrumentation, then ask the question again.';
 
 const CONFLICTS_LABEL = 'Files left untouched';
+const UNRESTORED_LABEL = 'Files not restored';
 const BACKUP_LABEL = 'Original saved at';
+
+/**
+ * A partial cleanup's sentence when the complete journal shows that no file is outstanding: the
+ * unfinished step was not a file restore (runtime hooks whose disarm could not be confirmed), so
+ * the generic "some changes could not be restored" would misdirect the reader to their files.
+ */
+const PARTIAL_FILES_RESTORED_MESSAGE =
+  'Every file the session changed was restored, but not every cleanup step could be confirmed. Nothing was overwritten.';
+const PARTIAL_NO_FILES_MESSAGE =
+  'No file was modified, but not every cleanup step could be confirmed. Nothing was overwritten.';
 
 const SERVICE_UNREACHABLE_MESSAGE =
   'The local Debug Generator service did not answer its last health check.';
@@ -239,6 +285,15 @@ const UNBOUND_HINT =
 const UNDELIVERED_MESSAGE = 'That action could not be passed to the editor.';
 const UNDELIVERED_HINT =
   'Try again. If it keeps failing, close and reopen the Debug Generator view.';
+
+const BLANK_QUESTION_MESSAGE = 'That question is empty, so it was not sent.';
+const BLANK_QUESTION_HINT = 'Type a question, then ask again.';
+
+/**
+ * Formats a character count for the view's copy: the locale's digit grouping and no fraction, the
+ * same format the question and follow-up counters use.
+ */
+const COUNT_FORMAT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -268,6 +323,7 @@ const FILE_START_COLUMN = 1;
 const IDLE_PHASE: SessionPhase = Object.freeze({
   pipelineRunning: false,
   resolvingFiles: false,
+  awaitingPlan: false,
   instrumenting: false,
   armed: false,
   capturing: false,
@@ -276,6 +332,7 @@ const IDLE_PHASE: SessionPhase = Object.freeze({
   acceptsFollowUp: false,
   live: false,
   ended: false,
+  failed: false,
 });
 
 /** The steady state of a session mid-flow; each status below overrides what differs. */
@@ -304,9 +361,9 @@ function describeSessionPhase(status: SessionStatus): SessionPhase {
     case 'created':
     case 'understanding':
     case 'investigating':
-      return { ...LIVE_PHASE, pipelineRunning: true, resolvingFiles: true };
+      return { ...LIVE_PHASE, pipelineRunning: true, resolvingFiles: true, awaitingPlan: true };
     case 'planning':
-      return { ...LIVE_PHASE, pipelineRunning: true };
+      return { ...LIVE_PHASE, pipelineRunning: true, awaitingPlan: true };
     case 'instrumenting':
       return { ...LIVE_PHASE, pipelineRunning: true, instrumenting: true };
     case 'ready':
@@ -320,10 +377,67 @@ function describeSessionPhase(status: SessionStatus): SessionPhase {
     case 'ended':
       return { ...IDLE_PHASE, ended: true };
     case 'failed':
-      return IDLE_PHASE;
+      return { ...IDLE_PHASE, failed: true };
     default:
       return assertNever(status, 'Unhandled session status');
   }
+}
+
+/**
+ * Whether the view can ask for an element pick, and if not, why. A pick is asked of the DevTools
+ * panel bound to a running session, so it needs a session that has neither ended nor failed and a
+ * reachable service; the host answers any other pick with a notice, so the control is withheld and
+ * `TargetBadge` states the reason instead.
+ *
+ * @param hasSession Whether the snapshot carries an active session.
+ * @param phase The active session's phase ({@link IDLE_PHASE} without one).
+ * @param serviceUnavailable Whether nothing that needs the service can be started.
+ * @returns The availability `TargetBadge` renders.
+ */
+function targetPickAvailability(
+  hasSession: boolean,
+  phase: SessionPhase,
+  serviceUnavailable: boolean,
+): TargetPickAvailability {
+  if (!hasSession) {
+    return serviceUnavailable ? 'serviceUnavailable' : 'noSession';
+  }
+  if (phase.ended) {
+    return 'ended';
+  }
+  if (phase.failed) {
+    return 'failed';
+  }
+  return serviceUnavailable ? 'serviceUnavailable' : 'available';
+}
+
+/**
+ * Why the follow-up entry is closed, for the sentence `FollowUp` shows while it is. An ended or
+ * failed session takes no follow-up at all, whatever the connection; an unreachable service
+ * closes it next; otherwise a session that already has an analysis is answering its latest
+ * question (a follow-up being re-analysed or re-captured), and one without an analysis has not
+ * produced its first result.
+ *
+ * @param phase The active session's phase.
+ * @param serviceUnavailable Whether nothing that needs the service can be started.
+ * @param hasAnalysis Whether the snapshot carries an analysis of the session.
+ * @returns The reason `FollowUp` states; read only while the entry is closed.
+ */
+function followUpUnavailableReason(
+  phase: SessionPhase,
+  serviceUnavailable: boolean,
+  hasAnalysis: boolean,
+): FollowUpUnavailableReason {
+  if (phase.ended) {
+    return 'ended';
+  }
+  if (phase.failed) {
+    return 'failed';
+  }
+  if (serviceUnavailable) {
+    return 'serviceUnavailable';
+  }
+  return hasAnalysis ? 'working' : 'awaitingResult';
 }
 
 /**
@@ -464,6 +578,25 @@ function addNotice(
  */
 function removeNotice(log: NoticeLog, id: string): NoticeLog {
   return { nextSeq: log.nextSeq, notices: log.notices.filter((notice) => notice.id !== id) };
+}
+
+/**
+ * The notice for a question the view withheld because the host would refuse it (see
+ * `isSubmittableQuestion`): one over the limit states the limit, a blank one says it is empty.
+ * Decided by length alone — the question is data and its wording is never read (AAP 0.5.4).
+ *
+ * @param length The withheld question's length in UTF-16 code units.
+ * @returns The notice's message and its next step.
+ */
+function withheldQuestionNotice(length: number): { message: string; hint: string } {
+  if (length > MAX_WEBVIEW_QUESTION_LENGTH) {
+    const limit = COUNT_FORMAT.format(MAX_WEBVIEW_QUESTION_LENGTH);
+    return {
+      message: `That question is longer than the ${limit}-character limit, so it was not sent.`,
+      hint: `Shorten it to ${limit} characters or fewer, then ask again.`,
+    };
+  }
+  return { message: BLANK_QUESTION_MESSAGE, hint: BLANK_QUESTION_HINT };
 }
 
 /**
@@ -639,22 +772,106 @@ function StageFailureNotice(props: StageFailureNoticeProps): ReactElement {
 /** Props of {@link SessionEnd}. */
 interface SessionEndProps {
   readonly cleanup: SessionCleanupState;
+  /**
+   * The session's modification records (`WebviewState.modifications`): a partial cleanup names
+   * every record it did not restore from these, since the cleanup result itself lists conflicts
+   * only.
+   */
+  readonly modifications: readonly ModificationRecord[];
+  /**
+   * The journal's length as last counted (`WebviewState.modificationsTotal`); absent until the
+   * journal has been read. Only a list known to be complete may say that no file is outstanding.
+   */
+  readonly modificationsTotal: number | undefined;
   readonly ended: boolean;
   readonly ending: boolean;
   readonly onEnd: () => void;
 }
 
 /**
+ * One file in a cleanup list: its path, then — unless the service reported the backup missing —
+ * "Original saved at" with the backup path and its "Copy path" control. Both paths are shown in
+ * full, wrapped across lines rather than ellipsized, so the reader can read, select and copy the
+ * exact value they need to restore a file by hand.
+ */
+function CleanupFileEntry(props: {
+  readonly file: string;
+  readonly backupPath: string | undefined;
+  readonly status?: ModificationRecord['status'] | undefined;
+  readonly pathId: string;
+}): ReactElement {
+  const { file, backupPath, status, pathId } = props;
+  const path = (
+    <Code size="sm" wrap className="dgv-cleanup__conflict-file">
+      {file}
+    </Code>
+  );
+  return (
+    <Stack gap={1}>
+      {status === undefined ? (
+        path
+      ) : (
+        <Stack direction="horizontal" gap={2} wrap align="center">
+          {path}
+          <Badge tone={MODIFICATION_STATUS_TONE[status]} variant="soft">
+            {modificationStatusLabel(status)}
+          </Badge>
+        </Stack>
+      )}
+      {backupPath === undefined || backupPath.trim() === '' ? null : (
+        <>
+          <Text size="xs" tone="secondary">
+            {BACKUP_LABEL}
+          </Text>
+          <Code size="sm" wrap id={pathId} className="dgv-cleanup__conflict-file">
+            {backupPath}
+          </Code>
+          <CopyPathButton
+            path={backupPath}
+            accessibleLabel={copyBackupPathLabel(file)}
+            targetId={pathId}
+          />
+        </>
+      )}
+    </Stack>
+  );
+}
+
+/**
  * The "End session" control and the cleanup outcome it produces. The outcome stays on screen
- * after the session ends — reversibility is a product guarantee, not a toast (AAP 0.5.1, 0.5.5) —
- * and a conflict or partial cleanup lists every file left untouched with the backup its original
- * is preserved in.
+ * after the session ends — reversibility is a product guarantee, not a toast (AAP 0.5.1, 0.5.5).
+ *
+ * A conflict or partial cleanup lists every file left untouched, from the result's conflicts,
+ * with the backup its original is preserved in. A partial cleanup also names every other record
+ * that is not `reverted` — the files it could not restore — with its status and backup. When the
+ * complete journal shows that nothing is outstanding, the partial sentence says that every file
+ * was restored instead of pointing at files, because the unfinished step was not a file restore.
+ * Each list spans the cleanup column's full width, and every path wraps with a "Copy path"
+ * control beside the backup.
  */
 function SessionEnd(props: SessionEndProps): ReactElement {
-  const { cleanup, ended, ending, onEnd } = props;
+  const { cleanup, modifications, modificationsTotal, ended, ending, onEnd } = props;
+  const idPrefix = useId();
   const presentation = describeCleanup(cleanup.status);
   const listConflicts =
     (cleanup.status === 'conflict' || cleanup.status === 'partial') && cleanup.conflicts.length > 0;
+  const conflicted = new Set(cleanup.conflicts.map((conflict) => conflict.recordId));
+  const unrestored =
+    cleanup.status === 'partial'
+      ? modifications.filter((record) => record.status !== 'reverted' && !conflicted.has(record.id))
+      : [];
+  const journalComplete =
+    modificationsTotal !== undefined && modificationsTotal <= modifications.length;
+  const nothingOutstanding =
+    cleanup.status === 'partial' &&
+    journalComplete &&
+    cleanup.conflicts.length === 0 &&
+    unrestored.length === 0;
+  const message = nothingOutstanding
+    ? modifications.length === 0
+      ? PARTIAL_NO_FILES_MESSAGE
+      : PARTIAL_FILES_RESTORED_MESSAGE
+    : presentation.message;
   return (
     <div className="dgv-session-end">
       <div className="dgv-cleanup">
@@ -667,27 +884,33 @@ function SessionEnd(props: SessionEndProps): ReactElement {
           </Badge>
         </Stack>
         <Text as="p" size="sm" tone="secondary">
-          {presentation.message}
+          {message}
         </Text>
         {listConflicts ? (
           <ul className="dgv-cleanup__conflict" aria-label={CONFLICTS_LABEL}>
             {cleanup.conflicts.map((conflict: ModificationConflict, index) => (
               <li key={`${conflict.recordId}-${String(index)}`}>
-                <Stack gap={0}>
-                  <Code size="sm" className="dgv-cleanup__conflict-file" title={conflict.file}>
-                    {conflict.file}
-                  </Code>
-                  <Text size="xs" tone="secondary">
-                    {BACKUP_LABEL}
-                  </Text>
-                  <Code
-                    size="sm"
-                    className="dgv-cleanup__conflict-file"
-                    title={conflict.backupPath}
-                  >
-                    {conflict.backupPath}
-                  </Code>
-                </Stack>
+                <CleanupFileEntry
+                  file={conflict.file}
+                  backupPath={
+                    conflict.reason === 'backup-missing' ? undefined : conflict.backupPath
+                  }
+                  pathId={`${idPrefix}-conflict-${String(index)}`}
+                />
+              </li>
+            ))}
+          </ul>
+        ) : null}
+        {unrestored.length > 0 ? (
+          <ul className="dgv-cleanup__conflict" aria-label={UNRESTORED_LABEL}>
+            {unrestored.map((record, index) => (
+              <li key={record.id}>
+                <CleanupFileEntry
+                  file={record.file}
+                  backupPath={record.backupPath}
+                  status={record.status}
+                  pathId={`${idPrefix}-unrestored-${String(index)}`}
+                />
               </li>
             ))}
           </ul>
@@ -824,12 +1047,27 @@ export function App(): ReactElement {
    * are read here, in the event path, so the reducer stays pure. `openFile` waits on nothing and is
    * posted as composed. A message the host channel refused becomes a visible notice, and a refused
    * question or follow-up is reported to its form as failed so the typed text is kept.
+   *
+   * A question or follow-up the host's parser would refuse — blank, or longer than
+   * `MAX_WEBVIEW_QUESTION_LENGTH` — is never posted: the host answers such a frame with a notice
+   * and no `actionResult`, which would hold the form busy until the safety timeout. It is withheld
+   * instead, with a notice that says why: no request begins, so the form never turns busy and
+   * keeps the draft, and no failed outcome is published, because nothing was submitted and the
+   * form's "try again" hint would contradict the notice's "shorten it".
    */
   const send = useCallback((draft: WebviewToHostDraft): void => {
     if (!isWebviewRequestDraft(draft)) {
       if (!postToHost(draft)) {
         setNoticeLog((log) => addNotice(log, 'error', UNDELIVERED_MESSAGE, UNDELIVERED_HINT));
       }
+      return;
+    }
+    if (
+      (draft.type === 'askQuestion' || draft.type === 'askFollowUp') &&
+      !isSubmittableQuestion(draft.question)
+    ) {
+      const withheld = withheldQuestionNotice(draft.question.length);
+      setNoticeLog((log) => addNotice(log, 'error', withheld.message, withheld.hint));
       return;
     }
     const requestId = createRequestId();
@@ -983,6 +1221,15 @@ export function App(): ReactElement {
   // unreachable and not connected. Actions that need it are withheld rather than left to fail.
   const serviceUnavailable =
     connectionStatus === 'closed' || (!serviceReachable && connectionStatus !== 'open');
+  // What the Target and Follow-up sections can offer now, and why not when they cannot. Derived
+  // here, beside the phase and before any memoised value reads it, so every section of one render
+  // reads the same answer.
+  const pickAvailability = targetPickAvailability(session !== undefined, phase, serviceUnavailable);
+  const followUpClosedReason = followUpUnavailableReason(
+    phase,
+    serviceUnavailable,
+    state?.analysis !== undefined,
+  );
 
   // Guidance derived from the snapshot, for conditions no declared host message can fix: the
   // service is started by a contributed command, and binding happens in Chrome DevTools.
@@ -1134,6 +1381,7 @@ export function App(): ReactElement {
                   unavailable={serviceUnavailable}
                   pending={isPending(pendingActions, 'askQuestion')}
                   submission={pendingActions.outcomes.askQuestion}
+                  currentQuestion={session?.question}
                 />
               </Section>
             </div>
@@ -1143,13 +1391,14 @@ export function App(): ReactElement {
                 target={state.target}
                 onRequestTarget={requestTarget}
                 pending={isPending(pendingActions, 'requestTarget')}
+                pickAvailability={pickAvailability}
               />
             </Section>
 
             {session === undefined ? (
               <EmptyState
                 title={NO_SESSION_TITLE}
-                message={NO_SESSION_MESSAGE}
+                message={serviceUnavailable ? NO_SESSION_SERVICE_MESSAGE : NO_SESSION_MESSAGE}
                 action={noSessionActions}
               />
             ) : (
@@ -1189,11 +1438,13 @@ export function App(): ReactElement {
                   <Section title={MODIFICATIONS_SECTION_TITLE} variant="card">
                     <ModificationsList
                       modifications={state.modifications}
+                      conflicts={state.cleanup.conflicts}
                       onOpenFile={openModifiedFile}
                       pending={phase.instrumenting && state.modifications.length === 0}
                       total={state.modificationsTotal}
                       onLoadMore={loadModifications}
                       loadingMore={isPending(pendingActions, 'loadModifications')}
+                      awaitingPlan={phase.awaitingPlan}
                     />
                   </Section>
                 </div>
@@ -1211,6 +1462,7 @@ export function App(): ReactElement {
                       isPending(pendingActions, 'startCapture') ||
                       isPending(pendingActions, 'stopCapture')
                     }
+                    sessionStatus={session.status}
                   />
                 </Section>
 
@@ -1243,7 +1495,9 @@ export function App(): ReactElement {
                     <FollowUp
                       onSubmit={askFollowUp}
                       submission={pendingActions.outcomes.askFollowUp}
-                      enabled={phase.acceptsFollowUp}
+                      enabled={phase.acceptsFollowUp && !serviceUnavailable}
+                      unavailableReason={followUpClosedReason}
+                      asked={session.followUps}
                       pending={followUpPending}
                     />
                   </Section>
@@ -1252,6 +1506,8 @@ export function App(): ReactElement {
                 <Section title={SESSION_END_SECTION_TITLE} variant="card">
                   <SessionEnd
                     cleanup={state.cleanup}
+                    modifications={state.modifications}
+                    modificationsTotal={state.modificationsTotal}
                     ended={phase.ended}
                     ending={isPending(pendingActions, 'endSession')}
                     onEnd={endSession}

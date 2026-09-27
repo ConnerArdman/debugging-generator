@@ -18,6 +18,27 @@
  *     covered) opens immediately, because a reader who has tabbed to the trigger has already
  *     committed and a delay only reads as lag. Closing is symmetric - `onPointerLeave` and
  *     `onBlur` - and either one cancels a pending open.
+ *
+ *     A bubble whose description overflows its bounded height - the one that has to be scrolled to
+ *     be read - is HOVERABLE (WCAG 1.4.13): the pointer may leave the trigger for the bubble and
+ *     stay there, to read it or scroll it with the wheel, without the bubble closing under it.
+ *     Every other open bubble lets the pointer pass straight through it, because it already shows
+ *     everything it says, and a bubble that took the pointer would sit over the neighbouring
+ *     rows' triggers and chips of a dense table - keeping their own descriptions from opening and
+ *     swallowing the clicks meant for them. Which kind a bubble is, is measured on every placement
+ *     (see "A bounded bubble" below).
+ *
+ *     A hoverable bubble is a DOM descendant of the wrapper that listens for enter and leave, so a
+ *     pointer resting on it is still "inside"; what needs care is the gap between the two, which
+ *     belongs to neither. A pointer that leaves the trigger therefore closes the bubble at once
+ *     UNLESS the bubble is hoverable and the pointer is inside the hover corridor - the convex
+ *     hull of the trigger's box and the bubble's box, measured afresh on every move and every
+ *     scroll - in which case the bubble stays open for exactly as long as the pointer stays inside
+ *     that hull, and closes the moment it steps out of it, a scroll carries the hull away from it,
+ *     or it leaves the window. The corridor is spatial rather than a timer on purpose: a pointer
+ *     heading anywhere but the bubble closes it immediately, so sweeping across a dense table
+ *     never leaves a trail of lingering bubbles. A touch pointer, a pointer leaving the document
+ *     and a bubble with no rendered box (nothing a pointer could reach) all close at once.
  *   - `aria-describedby`. The trigger is cloned with the bubble's id MERGED into whatever
  *     description it already carried, never replacing it; see `mergeDescription` below. The
  *     bubble is mounted for the component's whole life, so the attribute never names an element
@@ -41,6 +62,24 @@
  *     moving focus away clears it.
  *   - No focus trap. Nothing here calls a focus method, nothing sets a tab index, and focus never
  *     enters the bubble - which is also why the bubble may hold no interactive content.
+ *
+ * ## A bounded bubble, and a click inside it
+ *
+ * A description can be far longer than a sentence - a whole parameterized statement, a redacted
+ * URL with every key it carried - so the stylesheet caps the open bubble's block size and lets it
+ * scroll. Every placement of an open bubble also measures whether its description overflows that
+ * box, and writes the answer as the `data-dg-scrollable` attribute (`markScrollable`, below): the
+ * stylesheet lets exactly the marked bubble take the pointer, and the hover guarantee above holds
+ * exactly that bubble open, which is what lets a pointer reach its scroll. The mark is removed
+ * whenever the bubble closes, and re-measured when the description changes.
+ *
+ * Because a marked bubble accepts the pointer, a click inside it would otherwise bubble up to
+ * whatever row or chart the trigger sits in and select or expand it, although the reader clicked
+ * a description rather than that row. The bubble therefore stops a click's propagation at its own
+ * edge - a description is never an action - and it does so for `click` only: a press still moves
+ * focus to the nearest focusable ancestor exactly as it would anywhere else, so the row that owns
+ * the trigger keeps its roving tab stop. An unmarked bubble never receives a click at all: it
+ * reaches the control beneath it.
  *
  * ## Inside a DataTable: `tabIndex={-1}`, reached by the grid's arrow keys
  *
@@ -74,7 +113,8 @@
  * `aria-describedby` names an element that exists. A description target referenced directly by
  * `aria-describedby` contributes its text even while hidden, so the trigger is described whether
  * or not a bubble is being shown. Open, the bubble drops `hidden` and takes `dg-is-open` plus the
- * placement variant; only the attribute and the class list ever change.
+ * placement variant (and, when it overflows, the measured `data-dg-scrollable` mark); only those
+ * attributes and the class list ever change.
  *
  * ## Controlled: a description its owner holds open (`open`, `describesTrigger`)
  *
@@ -147,8 +187,12 @@
  *   dg-tooltip__trigger      the trigger's inline box inside that wrapper, and the box measured
  *   dg-tooltip__bubble       the bubble: --dg-surface-overlay behind --dg-border-subtle,
  *                            --dg-text-primary, --dg-radius-md, --dg-shadow-2, the --dg-text-sm
- *                            type role, --dg-z-tooltip, and no pointer events of its own so it can
- *                            never take a pointer away from the trigger beneath it
+ *                            type role and --dg-z-tooltip; open, it is capped at a token block
+ *                            size inside the viewport, scrolling what does not fit, and lets the
+ *                            pointer pass through it
+ *   [data-dg-scrollable]     on the open bubble whose description overflows that capped box, and
+ *                            on no other: the one bubble that accepts the pointer (so it is
+ *                            hoverable, above). Written and removed by this file only
  *   dg-tooltip--top          the four placement variants; on the open bubble each states the gap
  *   dg-tooltip--bottom       to the trigger as a signed start margin on its axis
  *   dg-tooltip--start        `start` and `end` are the logical sides, so a right-to-left panel
@@ -168,8 +212,8 @@
  * for as long as it is mounted, so an offset rule may hang off the wrapper or off the bubble -
  * whichever the stylesheet finds clearer - without either needing a class this file does not write.
  *
- * No colour, length, stacking value or motion is written here: the two coordinates above are the
- * whole of this file's style output. Transition timing comes from the `--dg-motion-*` design tokens
+ * No colour, length, stacking value or motion is written here: the two coordinates above, and the
+ * measured `data-dg-scrollable` state, are the whole of this file's style output. Transition timing comes from the `--dg-motion-*` design tokens
  * in ../tokens/tokens.ts, consumed by ../styles/components.css and switched off by the
  * `prefers-reduced-motion` block in ../styles/base.css, and animating from TSX would escape that
  * block.
@@ -189,6 +233,8 @@ import {
 import type {
   FocusEvent as ReactFocusEvent,
   KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
   ReactElement,
   ReactNode,
 } from 'react';
@@ -239,7 +285,10 @@ function formatCoordinate(value: number): string {
  *      side, and would fit on the opposite side of the same axis, it flips.
  *   3. The result is clamped so the whole bubble stays inside the viewport, the same gap away from
  *      its edge as from the trigger (a bubble larger than the viewport is pinned at that gap from
- *      its start edge).
+ *      its start edge) - while any part of the trigger is inside the viewport. A trigger scrolled
+ *      wholly out of it takes its bubble along, unclamped: a bubble held open for keyboard focus
+ *      whose row the page scrolled away must not stay pinned over unrelated content, where - were
+ *      it a hoverable one - it would also take the clicks meant for that content.
  *
  * The cross axis aligns the bubble with the trigger's start edge (top and bottom) or its top edge
  * (start and end), which is where a reader's eye already is.
@@ -295,12 +344,163 @@ function positionBubble(
   // against a window edge never sits flush with it.
   const clamp = (value: number, extent: number, available: number): number =>
     Math.min(Math.max(value, gap), Math.max(available - extent - gap, gap));
+  // Whether any part of the trigger is on screen. Only then is the bubble held inside the viewport;
+  // otherwise it is placed against its trigger as measured, and leaves with it.
+  const triggerShown =
+    trigger.bottom > 0 &&
+    trigger.top < viewportBlock &&
+    triggerEnd > 0 &&
+    triggerStart < viewportInline;
 
-  const block = clamp(blockFor(side), size.height, viewportBlock);
-  const inline = clamp(inlineFor(side), size.width, viewportInline);
+  const block = triggerShown ? clamp(blockFor(side), size.height, viewportBlock) : blockFor(side);
+  const inline = triggerShown
+    ? clamp(inlineFor(side), size.width, viewportInline)
+    : inlineFor(side);
 
   bubble.style.setProperty('--dgc-tooltip-block', formatCoordinate(block - marginBlock));
   bubble.style.setProperty('--dgc-tooltip-inline', formatCoordinate(inline - marginInline));
+}
+
+/**
+ * The attribute that marks an open bubble whose description overflows its capped box. The
+ * stylesheet lets exactly the marked bubble take the pointer (`.dg-tooltip__bubble.dg-is-open
+ * [data-dg-scrollable]` in ../styles/components.css), and `handlePointerLeave` holds exactly the
+ * marked bubble open across the hover corridor.
+ */
+const SCROLLABLE_ATTRIBUTE = 'data-dg-scrollable';
+
+/**
+ * Writes whether an open bubble's description overflows the box the stylesheet caps it at - on
+ * either axis, since a preformatted value can be wider than the bubble as well as taller - as the
+ * {@link SCROLLABLE_ATTRIBUTE} mark. Called on every placement, so a scroll, a resize or a new
+ * description re-measures it; a DOM without layout reports no overflow, so there the bubble is
+ * never marked.
+ *
+ * Only an overflowing bubble has anything a pointer must reach: the rest show their whole
+ * description where they are, and leaving them pointer-transparent is what keeps them from sitting
+ * over - and taking the pointer and the clicks of - the neighbouring rows of a dense table.
+ *
+ * @param bubble The open, placed bubble element.
+ */
+function markScrollable(bubble: HTMLElement): void {
+  const overflows =
+    bubble.scrollHeight > bubble.clientHeight || bubble.scrollWidth > bubble.clientWidth;
+
+  if (overflows) {
+    bubble.setAttribute(SCROLLABLE_ATTRIBUTE, '');
+  } else {
+    bubble.removeAttribute(SCROLLABLE_ATTRIBUTE);
+  }
+}
+
+/** Whether a bubble is marked as overflowing, and therefore accepts the pointer. */
+function acceptsPointer(bubble: HTMLElement): boolean {
+  return bubble.hasAttribute(SCROLLABLE_ATTRIBUTE);
+}
+
+/** A point in viewport coordinates, in CSS pixels - where a pointer event says the pointer is. */
+interface ViewportPoint {
+  readonly x: number;
+  readonly y: number;
+}
+
+/** The four corners of a box, in viewport coordinates. */
+function cornersOf(box: DOMRect): ViewportPoint[] {
+  return [
+    { x: box.left, y: box.top },
+    { x: box.right, y: box.top },
+    { x: box.right, y: box.bottom },
+    { x: box.left, y: box.bottom },
+  ];
+}
+
+/**
+ * The turn from `a` through `b` to `c`: positive for one rotational sense, negative for the other
+ * and zero when the three are collinear. Only its sign is ever read, and only against itself, so
+ * whether the viewport's block axis points down or up never matters.
+ */
+function turn(a: ViewportPoint, b: ViewportPoint, c: ViewportPoint): number {
+  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+/**
+ * Appends a point to one chain of the hull, first dropping every earlier point that no longer
+ * makes a strict turn in the chain's sense. Collinear and repeated points are dropped too, so the
+ * hull never carries a zero-length edge.
+ */
+function appendToHull(chain: ViewportPoint[], point: ViewportPoint): void {
+  for (;;) {
+    const last = chain.at(-1);
+    const beforeLast = chain.at(-2);
+    if (last === undefined || beforeLast === undefined || turn(beforeLast, last, point) > 0) {
+      break;
+    }
+    chain.pop();
+  }
+  chain.push(point);
+}
+
+/**
+ * The convex hull of a set of points (Andrew's monotone chain), every edge turning in the same
+ * sense, so a point is inside exactly when it is on the same side of every edge.
+ */
+function convexHull(points: readonly ViewportPoint[]): ViewportPoint[] {
+  const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+  const lower: ViewportPoint[] = [];
+  const upper: ViewportPoint[] = [];
+
+  for (const point of sorted) {
+    appendToHull(lower, point);
+  }
+  for (const point of [...sorted].reverse()) {
+    appendToHull(upper, point);
+  }
+  // Each chain ends on the point the other starts from.
+  lower.pop();
+  upper.pop();
+
+  return lower.concat(upper);
+}
+
+/**
+ * The hover corridor of an open bubble: the convex hull of the trigger's box and the bubble's box,
+ * which is every point a pointer can pass through on its way from one to the other - the gap
+ * between them included, whichever side the bubble flipped to and wherever the viewport clamp put
+ * it. Measured when it is asked for, never cached, because a scroll or a resize moves both boxes.
+ *
+ * @returns The hull, or `null` when the bubble has no rendered box: a bubble nothing can be seen
+ *   in is not somewhere a pointer can go, so there is no corridor to it.
+ */
+function hoverCorridor(anchor: HTMLElement, bubble: HTMLElement): readonly ViewportPoint[] | null {
+  const bubbleBox = bubble.getBoundingClientRect();
+
+  if (!(bubbleBox.width > 0 && bubbleBox.height > 0)) {
+    return null;
+  }
+
+  const hull = convexHull([...cornersOf(anchor.getBoundingClientRect()), ...cornersOf(bubbleBox)]);
+
+  return hull.length < 3 ? null : hull;
+}
+
+/** Whether a point is inside a convex hull or on its boundary. */
+function corridorContains(hull: readonly ViewportPoint[], point: ViewportPoint): boolean {
+  return hull.every((vertex, index) => {
+    const next = hull[(index + 1) % hull.length] ?? vertex;
+
+    return turn(vertex, next, point) >= 0;
+  });
+}
+
+/**
+ * The bubble's click handler: the click stops at the bubble, so reading - or selecting text in -
+ * a description never selects, expands or activates the row or chart the trigger sits in (see this
+ * module's header). Only a bubble marked as overflowing ever receives one; any other lets the
+ * pointer, and the click, through to what lies beneath it. Module scope, so every tooltip shares
+ * one stable handler.
+ */
+function containBubbleClick(event: ReactMouseEvent<HTMLSpanElement>): void {
+  event.stopPropagation();
 }
 
 /**
@@ -419,9 +619,11 @@ function mergeDescription(existing: string | undefined, tooltipId: string): stri
 
 /**
  * An accessible tooltip: a description that opens on hover after a short dwell, opens immediately
- * on keyboard focus, closes on leave, blur or Escape, and is in the accessibility tree exactly
- * while it is shown (closed, its bubble stays mounted but `hidden`, so the description resolves).
- * Given `open`, its owner decides instead (see this module's header).
+ * on keyboard focus, stays open while the pointer crosses onto a bubble too long to show whole
+ * (which is then hoverable and scrollable; any other lets the pointer pass through it), closes on
+ * leave, blur or Escape, and is in the
+ * accessibility tree exactly while it is shown (closed, its bubble stays mounted but `hidden`, so
+ * the description resolves). Given `open`, its owner decides instead (see this module's header).
  *
  * @example
  * ```tsx
@@ -494,10 +696,33 @@ export function Tooltip(props: TooltipProps): ReactElement {
   /** The bubble itself, the one element this file writes coordinates onto. */
   const bubbleRef = useRef<HTMLSpanElement | null>(null);
 
+  /**
+   * Removes the document listeners of a pointer crossing the hover corridor from the trigger to
+   * the bubble (see `handlePointerLeave`), or `undefined` while no crossing is under way. A ref: a
+   * crossing changes nothing on screen until it ends, and ending it closes the bubble through
+   * state.
+   */
+  const crossingRef = useRef<(() => void) | undefined>(undefined);
+
   // `disabled` is applied here rather than in each handler's result, so flipping it while the
   // bubble is open hides the bubble on the next render instead of stranding it. A defined `open`
   // overrides both: the owner alone decides.
   const isOpen = controlledOpen ?? (open && !disabled);
+
+  // Every opening starts at the top of the description. The closed bubble stays mounted, and a
+  // browser restores the scroll offset a box had when it is shown again, so without this a bubble
+  // a reader had scrolled to its end would reopen there - showing the tail of a statement first.
+  // Keyed on `isOpen` alone: a re-render while the bubble stays open (a new `content` element, a
+  // chart's hover state) must never pull the reader's scroll back. Declared before placement, so
+  // the offset is reset before the bubble is measured and painted.
+  useLayoutEffect(() => {
+    const bubble = bubbleRef.current;
+
+    if (isOpen && bubble !== null) {
+      bubble.scrollTop = 0;
+      bubble.scrollLeft = 0;
+    }
+  }, [isOpen]);
 
   // Placement of the open bubble, whoever opened it: hover, focus or a controlling owner all reach
   // the screen through this one path. A LAYOUT effect, so the coordinates are written after the
@@ -505,8 +730,9 @@ export function Tooltip(props: TooltipProps): ReactElement {
   // origin it occupies for that instant. It is re-placed on every scroll - in the capture phase on
   // the window, so a scroll of ANY container between the trigger and the page is heard, since
   // scroll events do not bubble - and on every resize, for as long as it stays open; `content`
-  // re-runs it because a new description is a new size. Closing removes the coordinates with the
-  // listeners.
+  // re-runs it because a new description is a new size. Every placement also re-measures whether
+  // the description overflows the capped box (`markScrollable`), which is what decides whether the
+  // bubble takes the pointer. Closing removes the coordinates and the mark with the listeners.
   useLayoutEffect(() => {
     const bubble = bubbleRef.current;
     const anchor = anchorRef.current;
@@ -517,6 +743,7 @@ export function Tooltip(props: TooltipProps): ReactElement {
 
     const place = () => {
       positionBubble(bubble, anchor, placement);
+      markScrollable(bubble);
     };
 
     place();
@@ -528,6 +755,7 @@ export function Tooltip(props: TooltipProps): ReactElement {
       window.removeEventListener('resize', place);
       bubble.style.removeProperty('--dgc-tooltip-block');
       bubble.style.removeProperty('--dgc-tooltip-inline');
+      bubble.removeAttribute(SCROLLABLE_ATTRIBUTE);
     };
   }, [content, isOpen, placement]);
 
@@ -539,21 +767,49 @@ export function Tooltip(props: TooltipProps): ReactElement {
     }
   }, []);
 
+  const endCrossing = useCallback(() => {
+    const stop = crossingRef.current;
+    if (stop !== undefined) {
+      crossingRef.current = undefined;
+      stop();
+    }
+  }, []);
+
   // Unmount cleanup, and nothing else: a timer that fires after unmount would set state on a gone
-  // component - a warning in a consumer and a flake in a test.
-  useEffect(() => cancelPendingOpen, [cancelPendingOpen]);
+  // component - a warning in a consumer and a flake in a test - and a crossing's document
+  // listeners would outlive the bubble they measure.
+  useEffect(
+    () => () => {
+      cancelPendingOpen();
+      endCrossing();
+    },
+    [cancelPendingOpen, endCrossing],
+  );
+
+  // A crossing only ever keeps an OPEN bubble open, so however the bubble closed - Escape, blur,
+  // `disabled`, the owner taking control - its listeners go with it.
+  useEffect(() => {
+    if (!isOpen) {
+      endCrossing();
+    }
+  }, [endCrossing, isOpen]);
 
   // The non-state half of the mode-switch reset above: a hover open still pending when the owner
-  // takes control is cancelled, and a suppression armed by an earlier Escape is cleared, since the
-  // leave or blur that would have cleared it goes unheard while the owner is in control. A LAYOUT
-  // effect, so a pending timer cannot fire between the switch's commit and this cancellation.
+  // takes control is cancelled, a crossing under way is ended, and a suppression armed by an
+  // earlier Escape is cleared, since the leave or blur that would have cleared it goes unheard
+  // while the owner is in control. A LAYOUT effect, so a pending timer cannot fire between the
+  // switch's commit and this cancellation.
   useLayoutEffect(() => {
     cancelPendingOpen();
+    endCrossing();
     suppressedRef.current = false;
-  }, [cancelPendingOpen, controlled]);
+  }, [cancelPendingOpen, controlled, endCrossing]);
 
   const handlePointerEnter = useCallback(() => {
-    if (disabled || suppressedRef.current) {
+    // Back on the trigger, or arrived on the bubble (a descendant of this wrapper): a crossing of
+    // the corridor, if one was under way, is complete.
+    endCrossing();
+    if (disabled || suppressedRef.current || isOpen) {
       return;
     }
     cancelPendingOpen();
@@ -561,13 +817,91 @@ export function Tooltip(props: TooltipProps): ReactElement {
       timerRef.current = undefined;
       setOpen(true);
     }, openDelayMs);
-  }, [cancelPendingOpen, disabled, openDelayMs]);
+  }, [cancelPendingOpen, disabled, endCrossing, isOpen, openDelayMs]);
 
-  const handlePointerLeave = useCallback(() => {
-    cancelPendingOpen();
-    suppressedRef.current = false;
-    setOpen(false);
-  }, [cancelPendingOpen]);
+  // Leaving the wrapper - the trigger, or the bubble inside it. The bubble closes at once unless it
+  // is open, marked as overflowing (the only bubble a pointer can rest on - every other one lets it
+  // through to the row beneath, see this module's header), and the pointer is still inside the
+  // hover corridor between the trigger and the bubble, which is where a pointer on its way to the
+  // bubble is. Then the bubble stays open while every further move stays inside the corridor, and
+  // closes on the first one that leaves it, on a scroll that carries the corridor away from where
+  // the pointer last was, or when the pointer leaves the window. A touch pointer cannot hover, and
+  // a pointer that left the document will send no move to judge, so both close at once. Leaving
+  // the document is read off the NATIVE event's `relatedTarget`, which is `null` exactly then:
+  // React's synthetic one stands in the window for any element React does not manage, so it
+  // cannot tell a pointer that left the page from one over a host's own markup.
+  const handlePointerLeave = useCallback(
+    (event: ReactPointerEvent<HTMLSpanElement>) => {
+      cancelPendingOpen();
+      endCrossing();
+      suppressedRef.current = false;
+
+      const anchor = anchorRef.current;
+      const bubble = bubbleRef.current;
+
+      if (
+        !isOpen ||
+        anchor === null ||
+        bubble === null ||
+        !acceptsPointer(bubble) ||
+        event.pointerType === 'touch' ||
+        event.nativeEvent.relatedTarget === null
+      ) {
+        setOpen(false);
+        return;
+      }
+
+      const corridor = hoverCorridor(anchor, bubble);
+
+      if (
+        corridor === null ||
+        !corridorContains(corridor, { x: event.clientX, y: event.clientY })
+      ) {
+        setOpen(false);
+        return;
+      }
+
+      const ownerDocument = anchor.ownerDocument;
+      const view = ownerDocument.defaultView;
+      // Where the pointer last was: a scroll moves the boxes without moving the pointer, and sends
+      // no pointer event to say where it is.
+      let pointer: ViewportPoint = { x: event.clientX, y: event.clientY };
+      const close = () => {
+        endCrossing();
+        setOpen(false);
+      };
+      // Re-measured on every judgement: a scroll during the crossing moves both boxes.
+      const judge = () => {
+        const current = hoverCorridor(anchor, bubble);
+        if (current === null || !corridorContains(current, pointer)) {
+          close();
+        }
+      };
+      const followMove = (move: PointerEvent) => {
+        pointer = { x: move.clientX, y: move.clientY };
+        judge();
+      };
+      const followExit = (out: PointerEvent) => {
+        if (out.relatedTarget === null) {
+          close();
+        }
+      };
+
+      ownerDocument.addEventListener('pointermove', followMove);
+      ownerDocument.addEventListener('pointerout', followExit);
+      // A scroll of any container, heard in the capture phase as placement hears it - and after
+      // placement has moved the bubble, since that listener was added when the bubble opened. A
+      // scroll that carries the corridor away from a still pointer closes the bubble at once,
+      // rather than leaving it open, over whatever scrolled in, until the pointer next moves.
+      view?.addEventListener('scroll', judge, true);
+      crossingRef.current = () => {
+        ownerDocument.removeEventListener('pointermove', followMove);
+        ownerDocument.removeEventListener('pointerout', followExit);
+        view?.removeEventListener('scroll', judge, true);
+      };
+    },
+    [cancelPendingOpen, endCrossing, isOpen],
+  );
 
   const handleFocus = useCallback(() => {
     if (disabled || suppressedRef.current) {
@@ -664,7 +998,9 @@ export function Tooltip(props: TooltipProps): ReactElement {
       </span>
       {/* Always mounted, so the trigger's description always resolves; `hidden` while closed, so
           no closed bubble is in the accessibility tree or found by a role query. `aria-hidden`
-          when it describes nothing, so a sentence the container already names is heard once. */}
+          when it describes nothing, so a sentence the container already names is heard once.
+          A click inside it stops here: a bubble marked as overflowing accepts the pointer so it
+          can be read and scrolled, and a description is never the row or chart beneath it. */}
       <span
         ref={bubbleRef}
         id={tooltipId}
@@ -675,6 +1011,7 @@ export function Tooltip(props: TooltipProps): ReactElement {
           'dg-tooltip__bubble',
           isOpen ? ['dg-is-open', PLACEMENT_CLASS[placement]] : 'dg-visually-hidden',
         )}
+        onClick={containBubbleClick}
       >
         {content}
       </span>

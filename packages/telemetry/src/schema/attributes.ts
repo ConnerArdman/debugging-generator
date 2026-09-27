@@ -41,6 +41,12 @@
  * specification names, so they follow the repository's own convention rather
  * than borrowing a dotted namespace they do not belong to.
  *
+ * **An ORM's own operation keys keep the ORM's spelling.** `model` and
+ * `method` on a `db.query` span are written by the ORM's tracing, not by this
+ * product and not by a semantic convention, and `../node/convert.ts` forwards
+ * them unchanged; declaring them under any other name would only add a second
+ * spelling for the converter to translate.
+ *
  * **Exactly one key keeps an underscore: `request_key`.** It is the name of
  * the `telemetry_events` store column and of the grouping key that duplicate
  * detection is computed from (AAP 0.4.2, 0.5.2). Camel-casing it here would
@@ -144,23 +150,56 @@ export const INTERACTION_ATTRIBUTE_KEYS = Object.freeze([
 ] as const);
 
 /**
- * `render` — one fiber that a React commit actually rendered.
+ * `render` — the fibers of one component that a React commit rendered for the
+ * same reason.
  *
  * Written by `../browser/react.ts` from the fiber hook's commit traversal,
  * with `changedProps` and `trigger` computed by `../browser/fiber-diff.ts`
  * (shallow prop comparison, own hook state, consumed context values).
- * `actualDuration` is the fiber's own reported render time and `selfTime` its
- * cost excluding descendants; `ownerChain` is the owner path up from the
- * rendered fiber, which is what lets the component-tree snapshot be rebuilt
+ *
+ * **One event may stand for several instances.** The agent coalesces the
+ * rendered fibers of one commit that share a component name, a phase, a
+ * trigger and the same sorted `changedProps` list into one event — the 48
+ * cards of a product grid re-rendered by one context tick are one event, not
+ * 48 — because one event per fiber is what made a busy page out-produce the
+ * transport. `instanceCount` says how many fibers the event stands for and is
+ * present only when that is more than one; an event without it is exactly one
+ * fiber, which is also how every event recorded before coalescing reads.
+ * Every consumer that counts renders therefore weights an event by
+ * `instanceCount` (default `1`) rather than counting events.
+ *
+ * `actualDuration` is React's reported render time — summed over the
+ * instances, like the event's own `duration` — and `selfTime` the summed cost
+ * excluding descendants. `maxInstanceDuration`, present with `instanceCount`,
+ * is the slowest single instance's `actualDuration`, which a sum cannot
+ * recover. `ownerChain` is the owner path up from the first instance in
+ * traversal order, which is what lets the component-tree snapshot be rebuilt
  * from a flat event list. `renderCount` is the running count for that
- * component within the capture, so a single event is enough to show how often
- * the component rendered.
+ * component within the capture, advanced by the event's instance count, so a
+ * single event is enough to show how often the component rendered.
  *
  * Read by `../aggregate/renders.ts` and the `renderTable` and `componentTree`
  * panel nodes: component, render count, total and average time, trigger and
  * changed props (AAP 0.6.2). `trigger` additionally drives the
  * `unchanged_render_count` and `render_trigger_unknown_count` metrics — see
  * {@link RENDER_TRIGGERS} for why those two are not the same thing.
+ *
+ * The two coalescing keys are appended after the original eight so that a
+ * reader binding the tuple positionally keeps its bindings.
+ *
+ * `changedContexts` names **which** consumed context changed on an update, so
+ * a `context` trigger is attributable rather than anonymous (AAP 0.8.2: the
+ * trigger reads "context change: ‹provider›"). Each entry is the display name
+ * of the component that renders the nearest provider of a changed context
+ * above the fiber — the component a developer opens to see where the value
+ * comes from — falling back to the context's own `displayName` when no
+ * provider component can be read. Names only, never the context value;
+ * deduplicated per render and bounded by {@link MAX_TRACKED_KEYS}. Absent on a
+ * mount and on an update whose consumed contexts did not change.
+ *
+ * Appended after the coalescing keys rather than inserted: consumers bind the
+ * leading keys of this tuple positionally, so its existing order is part of
+ * the contract.
  */
 export const RENDER_ATTRIBUTE_KEYS = Object.freeze([
   'component',
@@ -171,16 +210,33 @@ export const RENDER_ATTRIBUTE_KEYS = Object.freeze([
   'actualDuration',
   'ownerChain',
   'selfTime',
+  'instanceCount',
+  'maxInstanceDuration',
+  'changedContexts',
 ] as const);
+
+/**
+ * The most ancestor names a render's `ownerChain` attribute carries: 8.
+ *
+ * The producer (`../browser/react.ts`) stops its upward walk here, so a chain
+ * of exactly this length may have been **cut** before it reached the root of
+ * the page's tree. `../aggregate/renders.ts` needs to know that to rebuild a
+ * component tree from owner chains: a cut chain's farthest entry is not a
+ * root, and treating it as one repeats the same subtree under every ancestor
+ * the bound happened to stop at. Declared here, once, so the producer's bound
+ * and the reader's inference cannot drift apart.
+ */
+export const MAX_OWNER_CHAIN_LENGTH = 8;
 
 /**
  * `commit` — one React commit, the parent span of that commit's `render`
  * events.
  *
  * Written by `../browser/react.ts` in the fiber hook's commit callback.
- * `renderCount` here is the number of fibers the commit rendered (not a
- * per-component count), and `rootName` identifies the root that committed,
- * which distinguishes concurrent roots on one page.
+ * `renderCount` here is the number of rendered fibers the commit's `render`
+ * events stand for — the sum of their instance counts, not the number of
+ * events and not a per-component count — and `rootName` identifies the root
+ * that committed, which distinguishes concurrent roots on one page.
  *
  * Read by `../aggregate/renders.ts` (renders per commit) and the `timeline`
  * node, which draws a commit as the band its renders sit inside.
@@ -221,15 +277,28 @@ export const COMMIT_ATTRIBUTE_KEYS = Object.freeze(['phase', 'renderCount', 'roo
  * code never is, because a network error, an abort and a refused cross-origin
  * response all settle without one.
  *
- * Read by `../aggregate/requests.ts` (grouping, duplicate detection and the
- * pending state) and the `requestTable`, `waterfall` and `timeline` panel
- * nodes.
+ * `initiatorComponent` and `initiatorOwners` name the React component whose
+ * effect, event handler or render started the request, and the components
+ * that created it (its composite ancestors when the build records no
+ * creator), nearest first — display names only, never props or state. They
+ * are read from React's development renderer at the call, where it reports
+ * the fiber whose work is running, so two mounts of one component written by
+ * different components are told apart even though their stacks are identical
+ * frame for frame. A production renderer does not report one, and a
+ * request started after an `await` has no running fiber, so both keys are
+ * absent then — never a guess.
+ *
+ * Read by `../aggregate/requests.ts` (grouping, duplicate detection, the
+ * pending state and each occurrence's initiator label) and the `requestTable`,
+ * `waterfall` and `timeline` panel nodes.
  */
 export const FETCH_ATTRIBUTE_KEYS = Object.freeze([
   'http.method',
   'url',
   'http.status_code',
   'initiator',
+  'initiatorComponent',
+  'initiatorOwners',
   'request_key',
   'sameOrigin',
   'traceparentInjected',
@@ -256,6 +325,8 @@ export const XHR_ATTRIBUTE_KEYS = Object.freeze([
   'url',
   'http.status_code',
   'initiator',
+  'initiatorComponent',
+  'initiatorOwners',
   'request_key',
   'sameOrigin',
   'traceparentInjected',
@@ -516,8 +587,20 @@ export const FUNCTION_ATTRIBUTE_KEYS = Object.freeze([
  * consumer tells an ORM span from the driver span underneath it and avoids
  * counting one query twice.
  *
- * Read by `../aggregate/queries.ts` (grouping by normalised statement) and the
- * `queryTable`, `waterfall` and `flame` nodes.
+ * `model` and `method` are the ORM's own spelling of the operation a span
+ * stands for — the generated client's model delegate (`Cart`) and the
+ * delegate or client method (`findUnique`, `$transaction`) — as the ORM's
+ * tracing writes them on its operation and transaction spans. They are
+ * declared rather than merely forwarded because they are the one runtime fact
+ * that names the ORM call a driver statement came from: the service's source
+ * resolver matches them against the code graph's `prisma.<model>.<operation>`
+ * call sites, so the `pg` spans underneath an ORM operation resolve to the ORM
+ * call that issued them instead of to the only driver call site in reach.
+ * Neither carries statement text or data.
+ *
+ * Read by `../aggregate/queries.ts` (grouping by normalised statement), the
+ * `queryTable`, `waterfall` and `flame` nodes, and the service's source
+ * resolver.
  */
 export const DB_QUERY_ATTRIBUTE_KEYS = Object.freeze([
   'db.system',
@@ -526,6 +609,8 @@ export const DB_QUERY_ATTRIBUTE_KEYS = Object.freeze([
   'db.operation',
   'db.name',
   'db.client',
+  'model',
+  'method',
 ] as const);
 
 /**

@@ -12,7 +12,7 @@ import {
   type ReactElement,
 } from 'react';
 
-import { CartDrawer } from '@/components/cart/CartDrawer';
+import { CART_DIALOG_ID, CartDrawer } from '@/components/cart/CartDrawer';
 import {
   getServerSnapshot,
   getSnapshot,
@@ -131,7 +131,10 @@ import styles from './SiteHeader.module.css';
  * lines. The boolean that opens the sheet lives here because the control that sets it does;
  * everything else about that dialog - its role, its label, the focus it takes on the way in, the
  * focus it hands back on the way out, the trap while it is open, Escape, the scrim - belongs to
- * `CartDrawer`, and `onClose` does nothing but turn the boolean off.
+ * `CartDrawer`, and `onClose` does nothing but turn the boolean off. The control names the sheet it
+ * opens through `aria-controls`, using the id `CartDrawer` exports for its dialog, and only while
+ * that boolean is on: the sheet is not in the document while it is closed, and a reference to an
+ * element that is not there is a broken relationship rather than a missing one.
  *
  * The count is part of the control's accessible name, as hidden text inside the control, so the
  * name is "Cart with 12 items" rather than "Cart": a name is recomputed every time a reader reaches
@@ -237,8 +240,23 @@ const SEARCH_FIELD_ID = 'site-search-field';
  */
 const SEARCH_FORM_ID = 'site-search-form';
 
-/** The field's accessible name, and the placeholder that repeats it once the label is collapsed. */
-const SEARCH_LABEL = 'Search products';
+/**
+ * The field's accessible name, and the placeholder that repeats it once the label is collapsed.
+ *
+ * It names the store rather than its products because the catalog page carries a search field of
+ * its own, named for the listing it filters: two fields with one name on one page leave a reader
+ * who lists form controls, or who asks a voice assistant for "search products", unable to tell
+ * which is which. Each control on a page gets a name no other control there shares.
+ */
+const SEARCH_LABEL = 'Search the store';
+
+/**
+ * The compact disclosure control's accessible name. It opens with the control's visible word, so
+ * the name a reader hears begins with the name a reader sees, and goes on to say what the control
+ * reveals - the panel holding the search form - which is also what keeps it distinct from the
+ * field it discloses and from the form's submit control, both of which it shares a page with.
+ */
+const SEARCH_TOGGLE_LABEL = 'Search panel';
 
 /** The word on the submit control, and on the compact disclosure's control beside the cart. */
 const SEARCH_WORD = 'Search';
@@ -754,7 +772,7 @@ export function SiteHeader(props: Props): ReactElement {
               ref={toggle}
               variant="ghost"
               size="md"
-              aria-label={SEARCH_LABEL}
+              aria-label={SEARCH_TOGGLE_LABEL}
               aria-expanded={searchOpen}
               aria-controls={SEARCH_FORM_ID}
               onClick={() => {
@@ -771,12 +789,18 @@ export function SiteHeader(props: Props): ReactElement {
                 has to be the control's own padding and cannot be a box around it. The stylesheet's
                 rule is written to out-specify `Button.module.css`'s size padding - see the comment
                 there - and it travels through `clsx` for the reason the chip's own class does. */}
+            {/* `aria-controls` names the sheet only while the sheet exists. `CartDrawer` renders
+                nothing while it is closed, so a reference held at all times would point at an id
+                no element in the document carries - a broken relationship rather than a missing
+                one. The attribute therefore follows the same boolean that mounts the sheet, and
+                arrives in the same commit as the element it names. */}
             <Button
               className={clsx(styles.cartControl)}
               variant="ghost"
               size="md"
               aria-haspopup="dialog"
               aria-expanded={cartOpen}
+              aria-controls={cartOpen ? CART_DIALOG_ID : undefined}
               onClick={() => {
                 setCartOpen(true);
               }}

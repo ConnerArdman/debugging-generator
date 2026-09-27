@@ -18,7 +18,9 @@
  * 3. **Per-event stamping.** Identity is added, nothing else changes, the input
  *    is never touched, `ingestSeq` is left to the store, and the tier gate keeps
  *    a page from reporting server or database spans (and a dev server from
- *    reporting browser ones).
+ *    reporting browser ones). The one time test, `pre-capture`, drops the
+ *    page's replayed `navigation` and `paint` entries that ended before the
+ *    capture's recorded start — and nothing else, on no other kind or tier.
  * 4. **Failure discipline and privacy.** No input throws or rejects, every
  *    refusal is an `Err` carrying a closed-vocabulary code and a closed-
  *    vocabulary reason, and no rejected value — an event name, an attribute, a
@@ -1960,6 +1962,370 @@ describe('attributeBatch', () => {
     expect(batch.events).toStrictEqual([]);
     expect(batch.droppedTotal).toBe(0);
     expect(batch.producerMismatches).toBe(0);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The pre-capture rule — the page's replayed lifecycle entries
+ *
+ * The page agent observes `navigation` and `paint` with `buffered: true`, so
+ * the first batch after it is armed replays the load and first paints of a
+ * document that loaded before Start. Identity cannot tell them apart from the
+ * capture's own evidence; the capture's recorded start can. The rule is narrow
+ * on purpose: only those two entry families, only on the browser tier, only
+ * when the entry *ended* before Start — every other kind and tier keeps the
+ * identity-only contract, because their producer clocks can lag the wall
+ * clock after a system sleep.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** When the open capture of the pre-capture cases started, a minute past {@link BASE_TIME}. */
+const CAPTURE_STARTED_AT = BASE_TIME + 60_000;
+
+/** The kind of the page's navigation timing. */
+const NAVIGATION: TelemetryKind = 'navigation';
+
+/** The kind of every other performance entry the page agent reports. */
+const PERF_ENTRY: TelemetryKind = 'perf.entry';
+
+/** The `perf.entry` attribute naming the `PerformanceEntry` type, as the page agent writes it. */
+const ENTRY_TYPE_KEY = 'entry.type';
+
+/** A browser `navigation` event occupying `[startTime, startTime + duration]`. */
+function navigationEntry(startTime: number, duration: number): TelemetryEventIngress {
+  return makeIngress({
+    tier: 'browser',
+    kind: NAVIGATION,
+    name: 'navigation',
+    startTime,
+    duration,
+    attributes: { 'navigation.type': 'navigate' },
+  });
+}
+
+/** A browser `perf.entry` of `entryType` at `startTime`; a paint is an instant, as the agent emits it. */
+function perfEntry(
+  entryType: 'paint' | 'resource',
+  startTime: number,
+  duration = 0,
+): TelemetryEventIngress {
+  return makeIngress({
+    tier: 'browser',
+    kind: PERF_ENTRY,
+    name: entryType === 'paint' ? 'first-contentful-paint' : 'http://127.0.0.1:3000/asset.js',
+    startTime,
+    duration,
+    attributes: { [ENTRY_TYPE_KEY]: entryType },
+  });
+}
+
+/** A browser attribution whose open capture started at {@link CAPTURE_STARTED_AT}. */
+function windowedAttribution(overrides: Partial<IngestAttribution> = {}): IngestAttribution {
+  return browserAttribution({ captureStartedAt: CAPTURE_STARTED_AT, ...overrides });
+}
+
+/**
+ * A browser-origin scenario whose store row reports `startedAt` for the open
+ * capture — the real repository's `CaptureRecord.startedAt` — beside its id.
+ */
+function browserWorldStartedAt(startedAt: unknown): BrowserWorld {
+  const sessionId = newSessionId();
+  const captureId = newCaptureId();
+  const repo = fakeRepo({
+    bindings: [[TAB_ID, sessionId]],
+    sessions: [{ id: sessionId, projectRoot: PROJECT_ONE }],
+    getActiveCapture: (id) =>
+      ok(
+        id === sessionId
+          ? ({ capture: { id: captureId, startedAt } } as unknown as ActiveCaptureLike)
+          : undefined,
+      ),
+  });
+  const log = recordingLogger();
+  const attributor = createIngestAttributor({
+    sessions: repo,
+    logger: log.logger,
+    now: fixedClock,
+  });
+
+  return { sessionId, captureId, repo, log, attributor };
+}
+
+describe('attributeEvent: the pre-capture rule', () => {
+  it('builds lifecycle fixtures the strict ingress schema accepts', () => {
+    for (const event of [
+      navigationEntry(BASE_TIME, 380.5),
+      perfEntry('paint', BASE_TIME + 120.25),
+      perfEntry('resource', BASE_TIME + 40, 9.5),
+    ]) {
+      expect(isOk(parseTelemetryEventIngress(event))).toBe(true);
+    }
+  });
+
+  it('drops a navigation that ended before the capture started', () => {
+    const outcome = bareAttributor().attributeEvent(
+      navigationEntry(CAPTURE_STARTED_AT - 45_000, 342.5),
+      windowedAttribution(),
+    );
+
+    expectEventDrop(outcome, 'pre-capture');
+  });
+
+  it('drops a paint mark from before the capture started', () => {
+    const attributor = bareAttributor();
+    const attribution = windowedAttribution();
+
+    expectEventDrop(
+      attributor.attributeEvent(perfEntry('paint', CAPTURE_STARTED_AT - 44_000), attribution),
+      'pre-capture',
+    );
+    expectEventDrop(
+      attributor.attributeEvent(perfEntry('paint', CAPTURE_STARTED_AT - 0.001), attribution),
+      'pre-capture',
+    );
+  });
+
+  it('keeps a reload during the capture: its navigation and paints start inside the window', () => {
+    const attributor = bareAttributor();
+    const attribution = windowedAttribution();
+    const reload = navigationEntry(CAPTURE_STARTED_AT + 5_000.125, 512.75);
+    const paint = perfEntry('paint', CAPTURE_STARTED_AT + 5_210.5);
+
+    const kept = [reload, paint].map((event) =>
+      expectAttributed(attributor.attributeEvent(event, attribution)),
+    );
+
+    expect(kept.map((event) => event.id)).toStrictEqual([reload.id, paint.id]);
+    expect(kept.every((event) => event.captureId === attribution.captureId)).toBe(true);
+  });
+
+  it('keeps a navigation that started before the capture but ended inside it', () => {
+    const straddling = navigationEntry(CAPTURE_STARTED_AT - 200, 450);
+
+    expectAttributed(bareAttributor().attributeEvent(straddling, windowedAttribution()));
+  });
+
+  it('keeps a lifecycle entry whose end is exactly the capture start: only strictly earlier is dropped', () => {
+    const attributor = bareAttributor();
+    const attribution = windowedAttribution();
+
+    expectAttributed(
+      attributor.attributeEvent(navigationEntry(CAPTURE_STARTED_AT - 250, 250), attribution),
+    );
+    expectAttributed(
+      attributor.attributeEvent(perfEntry('paint', CAPTURE_STARTED_AT), attribution),
+    );
+  });
+
+  it('keeps a resource perf.entry from before the capture: only paint entries are lifecycle entries', () => {
+    const resource = perfEntry('resource', CAPTURE_STARTED_AT - 30_000, 9.5);
+
+    expectAttributed(bareAttributor().attributeEvent(resource, windowedAttribution()));
+  });
+
+  it('applies no time test to any other browser kind', () => {
+    const attributor = bareAttributor();
+    const attribution = windowedAttribution();
+    const lifecycle = new Set<TelemetryKind>([NAVIGATION, PERF_ENTRY]);
+    const others = TELEMETRY_KINDS.filter(
+      (kind) => !lifecycle.has(kind) && allowedTiersFor(kind).includes('browser'),
+    );
+
+    expect(others.length).toBeGreaterThan(0);
+    for (const kind of others) {
+      const early = makeIngress({
+        tier: 'browser',
+        kind,
+        startTime: CAPTURE_STARTED_AT - 600_000,
+        duration: 1,
+      });
+      expectAttributed(attributor.attributeEvent(early, attribution));
+    }
+  });
+
+  it('keeps server and db events from before the capture: the rule is browser-tier only', () => {
+    const attributor = bareAttributor();
+    const attribution = serverAttribution({ captureStartedAt: CAPTURE_STARTED_AT });
+
+    for (const tier of ['server', 'db'] as const) {
+      const early = makeIngress({ tier, startTime: CAPTURE_STARTED_AT - 600_000, duration: 1 });
+      expectAttributed(attributor.attributeEvent(early, attribution));
+    }
+  });
+
+  it('leaves a forged tier a tier-not-permitted drop whatever its times', () => {
+    const attributor = bareAttributor();
+    const forged = { ...navigationEntry(CAPTURE_STARTED_AT - 45_000, 1), tier: 'db' as const };
+
+    expectEventDrop(attributor.attributeEvent(forged, windowedAttribution()), 'tier-not-permitted');
+    expectEventDrop(
+      attributor.attributeEvent(
+        navigationEntry(CAPTURE_STARTED_AT - 45_000, 1),
+        serverAttribution({ captureStartedAt: CAPTURE_STARTED_AT }),
+      ),
+      'tier-not-permitted',
+    );
+  });
+
+  it('drops nothing when the attribution carries no readable capture start', () => {
+    const attributor = bareAttributor();
+    const early = navigationEntry(CAPTURE_STARTED_AT - 45_000, 342.5);
+    const unreadable = [
+      browserAttribution(),
+      windowedAttribution({ captureStartedAt: Number.NaN }),
+      windowedAttribution({ captureStartedAt: Number.POSITIVE_INFINITY }),
+      { ...browserAttribution(), captureStartedAt: 'yesterday' } as unknown as IngestAttribution,
+    ];
+
+    for (const attribution of unreadable) {
+      expectAttributed(attributor.attributeEvent(early, attribution));
+    }
+  });
+
+  it('keeps, and never throws for, a perf.entry whose attributes cannot be read', () => {
+    const attributes: Record<string, unknown> = {};
+    Object.defineProperty(attributes, ENTRY_TYPE_KEY, {
+      enumerable: true,
+      get(): never {
+        throw new Error(`unreadable ${SENTINEL}`);
+      },
+    });
+    const hostile = { ...perfEntry('paint', CAPTURE_STARTED_AT - 44_000), attributes };
+
+    expect(() => bareAttributor().attributeEvent(hostile, windowedAttribution())).not.toThrow();
+    expectAttributed(bareAttributor().attributeEvent(hostile, windowedAttribution()));
+  });
+
+  it('never mutates the entry it drops, nor rewrites the times of one it keeps', () => {
+    const attributor = bareAttributor();
+    const attribution = windowedAttribution();
+    const early = deepFreeze(navigationEntry(CAPTURE_STARTED_AT - 45_000.375, 342.625));
+    const straddling = deepFreeze(navigationEntry(CAPTURE_STARTED_AT - 0.125, 0.25));
+    const earlyBefore = structuredClone(early);
+    const straddlingBefore = structuredClone(straddling);
+
+    expectEventDrop(attributor.attributeEvent(early, attribution), 'pre-capture');
+    const kept = expectAttributed(attributor.attributeEvent(straddling, attribution));
+
+    expect(early).toStrictEqual(earlyBefore);
+    expect(straddling).toStrictEqual(straddlingBefore);
+    expect(Object.is(kept.startTime, straddlingBefore.startTime)).toBe(true);
+    expect(Object.is(kept.duration, straddlingBefore.duration)).toBe(true);
+    expect('ingestSeq' in kept).toBe(false);
+  });
+
+  it('counts the drops under pre-capture in a routine, content-free batch summary', () => {
+    const log = recordingLogger();
+    const attributor = bareAttributor(log.logger);
+    const attribution = windowedAttribution();
+    const navigation = navigationEntry(CAPTURE_STARTED_AT - 45_000, 342.5);
+    const firstPaint = perfEntry('paint', CAPTURE_STARTED_AT - 44_800);
+    const contentfulPaint = perfEntry('paint', CAPTURE_STARTED_AT - 44_790);
+    const render = makeIngress({
+      tier: 'browser',
+      kind: 'render',
+      startTime: CAPTURE_STARTED_AT + 1_250.5,
+      duration: 18.5,
+    });
+
+    const batch = attributor.attributeBatch(
+      [navigation, firstPaint, render, contentfulPaint],
+      attribution,
+    );
+
+    expect(batch.outcomes.map((outcome) => outcome.kind)).toStrictEqual([
+      'dropped',
+      'dropped',
+      'attributed',
+      'dropped',
+    ]);
+    expect(batch.events.map((event) => event.id)).toStrictEqual([render.id]);
+    expect(batch.droppedTotal).toBe(3);
+    for (const reason of DROP_REASONS) {
+      expect(batch.dropped[reason]).toBe(reason === 'pre-capture' ? 3 : 0);
+    }
+    for (const outcome of batch.outcomes) {
+      if (outcome.kind === 'dropped') {
+        observedReasons.add(outcome.reason);
+      }
+    }
+
+    const summaries = log.lines.filter((line) => line.message === 'telemetry batch attributed');
+    expect(summaries).toHaveLength(1);
+    // A replayed page load is the agent working as designed: debug, never a warning.
+    expect(summaries[0]?.level).toBe('debug');
+    expect(summaries[0]?.fields).toMatchObject({
+      events: 4,
+      attributed: 1,
+      dropped: 3,
+      droppedByReason: { 'pre-capture': 3 },
+    });
+    expect(log.text()).not.toContain('first-contentful-paint');
+  });
+
+  it('reports the reason under a window code, never an authorization one', () => {
+    expect(DROP_REASON_ERROR_CODES['pre-capture']).toBe('SESSION_INVALID_STATE');
+    expect(DROP_REASON_ERROR_CODES['pre-capture']).not.toBe('UNAUTHORIZED');
+  });
+});
+
+describe('resolveBatch: the open capture’s start', () => {
+  it('carries the capture row’s startedAt on a browser attribution', async () => {
+    const world = browserWorldStartedAt(CAPTURE_STARTED_AT);
+
+    const attribution = expectResolved(await world.attributor.resolveBatch(browserContext()));
+
+    expect(attribution).toStrictEqual({
+      sessionId: world.sessionId,
+      captureId: world.captureId,
+      captureStartedAt: CAPTURE_STARTED_AT,
+      origin: 'browser-agent',
+      tabId: TAB_ID,
+      projectRoot: PROJECT_ONE,
+      producerId: PRODUCER,
+      resolvedAt: FIXED_NOW,
+    });
+    // Read with the id, from the same single capture lookup.
+    expect(world.repo.calls.getActiveCapture).toStrictEqual([world.sessionId]);
+  });
+
+  it('omits it, rather than refusing the batch, when the row has no finite start', async () => {
+    for (const startedAt of [undefined, Number.NaN, 'yesterday']) {
+      const world = browserWorldStartedAt(startedAt);
+
+      const attribution = expectResolved(await world.attributor.resolveBatch(browserContext()));
+
+      expect(attribution).not.toHaveProperty('captureStartedAt');
+      expect(attribution.captureId).toBe(world.captureId);
+    }
+  });
+
+  it('never carries it on a server attribution, which reports no browser-tier event', async () => {
+    const world = serverWorld();
+
+    const attribution = expectResolved(
+      await world.attributor.resolveBatch(serverContext(PROJECT_ONE)),
+    );
+
+    expect(attribution).not.toHaveProperty('captureStartedAt');
+  });
+
+  it('drops the replayed page load and keeps the capture’s own evidence, end to end', async () => {
+    const world = browserWorldStartedAt(CAPTURE_STARTED_AT);
+    const navigation = navigationEntry(CAPTURE_STARTED_AT - 2_446.5, 342.5);
+    const paint = perfEntry('paint', CAPTURE_STARTED_AT - 2_100.25);
+    const render = makeIngress({
+      tier: 'browser',
+      kind: 'render',
+      startTime: CAPTURE_STARTED_AT + 850.125,
+      duration: 18.5,
+    });
+
+    const attribution = expectResolved(await world.attributor.resolveBatch(browserContext()));
+    const batch = world.attributor.attributeBatch([navigation, paint, render], attribution);
+
+    expect(batch.events.map((event) => event.id)).toStrictEqual([render.id]);
+    expect(batch.dropped['pre-capture']).toBe(2);
+    expect(batch.events[0]?.captureId).toBe(world.captureId);
   });
 });
 

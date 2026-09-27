@@ -91,8 +91,10 @@ import {
   type UnderstandRequestInput,
 } from '../context-builder.js';
 import {
+  CATEGORY_HINT_PRECEDENCE,
   GENERIC_SIGNAL_TERMS,
   QUESTION_STOP_WORDS,
+  SIGNAL_TERM_CATEGORIES,
   createUnderstandStage,
   splitCamelCase,
   tokenizeQuestion,
@@ -1057,10 +1059,22 @@ describe('the generic question tokenizer (AAP §0.5.4)', () => {
     /** The structural promises every result keeps, whatever the question. */
     function expectWellFormed(result: QuestionTokens): void {
       expect(Object.keys(result).sort(byCodeUnit)).toEqual([
+        'categoryHints',
         'identifierCandidates',
         'signalTerms',
         'tokens',
       ]);
+      // The hints are categories of signal terms, each once, in the closed
+      // vocabulary and nothing else: no signal term, no hint.
+      expect(Object.isFrozen(result.categoryHints)).toBe(true);
+      expect(new Set(result.categoryHints).size).toBe(result.categoryHints.length);
+      for (const hint of result.categoryHints) {
+        expect(CATEGORY_HINT_PRECEDENCE).toContain(hint);
+        expect(Object.values(SIGNAL_TERM_CATEGORIES)).toContain(hint);
+      }
+      if (result.signalTerms.length === 0) {
+        expect(result.categoryHints).toEqual([]);
+      }
       expect(Object.isFrozen(result)).toBe(true);
       const stopWords = new Set(QUESTION_STOP_WORDS);
       const signalTerms = new Set(GENERIC_SIGNAL_TERMS);
@@ -1127,6 +1141,7 @@ describe('the generic question tokenizer (AAP §0.5.4)', () => {
         tokens: [],
         identifierCandidates: [],
         signalTerms: [],
+        categoryHints: [],
       });
     });
 
@@ -1209,6 +1224,7 @@ describe('the generic question tokenizer (AAP §0.5.4)', () => {
         tokens: ['kestrel'],
         identifierCandidates: [],
         signalTerms: [],
+        categoryHints: [],
       });
     });
 
@@ -1263,10 +1279,15 @@ describe('the generic question tokenizer (AAP §0.5.4)', () => {
       ['punctuation only', '?!…,;:—()[]{}"\'/\\'],
       ['only stop words', 'Why is it that this is so, could you please?'],
       ['a single pasted run longer than any word', 'x'.repeat(10_000)],
-    ])('returns three empty lists for %s', (_label, question) => {
+    ])('returns four empty lists for %s', (_label, question) => {
       const result = tokenizeQuestion(question);
       expectWellFormed(result);
-      expect(result).toEqual({ tokens: [], identifierCandidates: [], signalTerms: [] });
+      expect(result).toEqual({
+        tokens: [],
+        identifierCandidates: [],
+        signalTerms: [],
+        categoryHints: [],
+      });
     });
 
     it.each([
@@ -1289,6 +1310,80 @@ describe('the generic question tokenizer (AAP §0.5.4)', () => {
         tokens: ['render', 'slow'],
         identifierCandidates: [],
         signalTerms: ['render', 'slow'],
+        categoryHints: ['rendering', 'performance'],
+      });
+    });
+
+    describe('category hints', () => {
+      it('maps generic signal terms only, into the closed problem-category vocabulary', () => {
+        expect(Object.isFrozen(SIGNAL_TERM_CATEGORIES)).toBe(true);
+        expect(Object.isFrozen(CATEGORY_HINT_PRECEDENCE)).toBe(true);
+        const terms = new Set(GENERIC_SIGNAL_TERMS);
+        for (const [term, category] of Object.entries(SIGNAL_TERM_CATEGORIES)) {
+          expect(terms.has(term), `"${term}" is a generic signal term`).toBe(true);
+          expect(CATEGORY_HINT_PRECEDENCE).toContain(category);
+        }
+        // Every category but the unclassified one can be hinted, each once.
+        expect([...CATEGORY_HINT_PRECEDENCE].sort(byCodeUnit)).toEqual(
+          PROBLEM_CATEGORIES.filter((category) => category !== 'other')
+            .slice()
+            .sort(byCodeUnit),
+        );
+        expect(new Set(CATEGORY_HINT_PRECEDENCE).size).toBe(CATEGORY_HINT_PRECEDENCE.length);
+      });
+
+      it.each([
+        ['Why is this button slow?', ['performance']],
+        ['Why is this component rendering so many times?', ['rendering']],
+        ['Why are these requests duplicated?', ['network']],
+        ['Why did this query run twice?', ['data']],
+        ['Why is the state stale?', ['state']],
+        ['Why does the page crash with an error?', ['error']],
+        ['Why is the total wrong?', ['correctness']],
+      ] as const)('hints %j as %j', (question, hints) => {
+        expect(tokenizeQuestion(question).categoryHints).toEqual(hints);
+      });
+
+      it('orders hints by how many distinct terms name them, then by precedence', () => {
+        // Two state terms against one request term.
+        expect(tokenizeQuestion('Why is state stale after the request?').categoryHints).toEqual([
+          'state',
+          'network',
+        ]);
+        // One term each: the more specific class of behaviour first.
+        expect(tokenizeQuestion('slow render').categoryHints).toEqual(['rendering', 'performance']);
+        expect(tokenizeQuestion('slow query').categoryHints).toEqual(['performance', 'data']);
+      });
+
+      it('hints only from signal words written as words, never from parts of an identifier', () => {
+        // `render` and `fetch` name what the code does here, not what went wrong.
+        const named = tokenizeQuestion('Why is renderLedgerGrid slow after fetchLedgerRows?');
+        expect(named.identifierCandidates).toEqual(['fetchLedgerRows', 'renderLedgerGrid']);
+        expect(named.signalTerms).toEqual(['fetch', 'render', 'slow']);
+        expect(named.categoryHints).toEqual(['performance']);
+        // Every signal term of the question is one of its words: all of them hint.
+        expect(tokenizeQuestion('Why does the grid render on every fetch?').categoryHints).toEqual([
+          'rendering',
+          'network',
+        ]);
+        // A snake-case identifier is an identifier too.
+        expect(tokenizeQuestion('why is render_queue_rows broken').categoryHints).toEqual([
+          'error',
+        ]);
+        // An identifier alone hints nothing.
+        expect(tokenizeQuestion('renderLedgerGrid').categoryHints).toEqual([]);
+      });
+
+      it('lets qualifiers strengthen nothing on their own', () => {
+        const result = tokenizeQuestion('Why does it happen twice, so many times, again?');
+        expect(result.signalTerms).toEqual(['again', 'many', 'times', 'twice']);
+        expect(result.categoryHints).toEqual([]);
+      });
+
+      it('hints identically for two wordings of one question', () => {
+        expect(tokenizeQuestion('this BUTTON — why so slow??').categoryHints).toEqual(
+          tokenizeQuestion('Why is this button slow?').categoryHints,
+        );
       });
     });
   });

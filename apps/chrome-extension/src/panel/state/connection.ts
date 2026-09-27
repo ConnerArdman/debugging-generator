@@ -28,7 +28,8 @@
  * {@link getPanelConnection}) and **must never acquire a port of their own**;
  * `../App.tsx` owns only the lifetime, through {@link startPanelConnection} and
  * the returned handle's `stop()`, reads the pill through
- * {@link usePanelConnection}, and reads the reload offer through
+ * {@link usePanelConnection} (and whether it has been observed yet through
+ * {@link usePanelConnectionObserved}), and reads the reload offer through
  * {@link usePanelReloadState}.
  *
  * ## Lifecycle
@@ -83,6 +84,23 @@
  * A suspended worker cannot push anything, so reading service death into
  * silence would show the developer a false failure. `connected` likewise comes
  * only from the worker, never from a local `connect()` that may be refused.
+ *
+ * Before anything has been observed, the store's initial `reconnecting` is an
+ * assumption rather than a report, so it is not presented as one:
+ * {@link usePanelConnectionObserved} stays `false` until the worker reports
+ * (a `connection` push, a snapshot answer, a settled handshake) or the panel
+ * sees that no worker answers (a lost port, no runtime), and `../App.tsx`
+ * shows a neutral "Connecting…" meanwhile — never "Reconnecting…", and never
+ * a body that the pairing dialog would then push down.
+ *
+ * ## Re-reading after the binding is confirmed
+ *
+ * A handshake whose session reads the service refused — they can reach it
+ * before the worker has re-bound the tab on a new connection, as after a
+ * re-pairing — is run again when the service's `session.bound` confirms this
+ * panel's binding, and the completed one dismisses the notice the failed one
+ * raised. The worker retries only transient read failures; this is the retry
+ * for the one refusal that a binding cures.
  *
  * ## What this module deliberately does not do
  *
@@ -146,6 +164,7 @@ import type {
   PanelReloadState,
   PanelSessionSnapshot,
   PortErrorPayload,
+  PortProtocolPush,
   PortPush,
   PortPushKind,
   PortRequestFrame,
@@ -166,6 +185,7 @@ import {
   setConnectionStatus,
   setLastError,
   setPickerActive,
+  subscribePanelStore,
   usePanelStoreSelector,
 } from './session-store';
 import type { PanelConnectionSlice, PanelSnapshot } from './session-store';
@@ -834,6 +854,28 @@ interface Controller {
   detachPort: (() => void) | undefined;
   /** A hydration handshake is in flight on the live port. */
   hydrating: boolean;
+  /**
+   * The connection state has been observed at least once — the worker reported
+   * it (a `connection` push, a snapshot answer, a settled handshake) or the
+   * panel saw for itself that no worker answers (a lost port, no runtime).
+   * Until then the pill shows a neutral "Connecting…" and the body waits; see
+   * {@link usePanelConnectionObserved}. Never cleared while the connection runs.
+   */
+  statusObserved: boolean;
+  /** The latest handshake did not complete; cleared by the next one that does. */
+  handshakeFailed: boolean;
+  /**
+   * The failure notice the latest failed handshake raised, if it raised one —
+   * dismissed by the handshake that later completes, unless something else has
+   * replaced it meanwhile.
+   */
+  handshakeError: ErrorPayload | undefined;
+  /**
+   * A `session.bound` confirming this panel's binding arrived while a
+   * handshake was in flight: if that handshake fails, it is run once more,
+   * because its reads may have gone out before the binding existed.
+   */
+  reboundDuringHandshake: boolean;
   /** Consecutive ports that closed before the worker said anything. */
   attempt: number;
   /** The pending reconnect, if one is scheduled. */
@@ -860,6 +902,12 @@ let reloadState: PanelReloadState = PANEL_RELOAD_NOT_NEEDED;
 
 /** The {@link usePanelReloadState} subscribers, notified when {@link reloadState} changes. */
 const reloadListeners = new Set<() => void>();
+
+/**
+ * The {@link usePanelConnectionObserved} subscribers, notified when the running
+ * connection first observes its state and when the connection is torn down.
+ */
+const observedListeners = new Set<() => void>();
 
 /*
  * ===========================================================================
@@ -1228,12 +1276,16 @@ function applyPush(live: Controller, push: PortPush): void {
       const before = currentBinding();
       applyRelayedMessage(push);
       resetIfBindingLost(before);
+      if (confirmsInspectedBinding(live, push)) {
+        rehydrateAfterRebind(live);
+      }
       return;
     }
     case 'connection':
       // The worker composed this status with `panelConnectionStatus()` from its
       // socket state, credential presence and health probe; it is stored as is.
       setConnectionStatus(push.state);
+      markStatusObserved(live);
       return;
     case 'binding': {
       const before = currentBinding();
@@ -1279,6 +1331,102 @@ function applySnapshot(live: Controller, answer: PanelSessionSnapshot): void {
   }
   applySessionSnapshot(snapshot);
   setReloadState(snapshot.reload ?? PANEL_RELOAD_NOT_NEEDED);
+  markStatusObserved(live);
+}
+
+/**
+ * Record that the running connection has observed its state, and tell
+ * {@link usePanelConnectionObserved}'s subscribers the first time.
+ */
+function markStatusObserved(live: Controller): void {
+  if (live.statusObserved) {
+    return;
+  }
+  live.statusObserved = true;
+  notifyObservedListeners();
+}
+
+/** Tell every {@link usePanelConnectionObserved} subscriber to read again. */
+function notifyObservedListeners(): void {
+  for (const listener of [...observedListeners]) {
+    listener();
+  }
+}
+
+/**
+ * Whether a relayed frame is a `session.bound` that leaves the store bound to
+ * exactly the tab and session it names — the service confirming the binding
+ * of the tab this panel shows, as it does after the worker re-binds the tab on
+ * a new connection (a re-pairing, a restart). Read after the frame is applied,
+ * so an announcement that unbinds never qualifies; inside DevTools the tab
+ * must also be the inspected one, so an announcement about any other tab never
+ * does either.
+ */
+function confirmsInspectedBinding(live: Controller, push: PortProtocolPush): boolean {
+  const message = push.message;
+  if (message.type !== 'session.bound') {
+    return false;
+  }
+  const binding = currentBinding();
+  return (
+    binding.kind === 'bound' &&
+    binding.tabId === message.payload.tabId &&
+    binding.sessionId === message.payload.sessionId &&
+    (live.inspectedTabId === undefined || binding.tabId === live.inspectedTabId)
+  );
+}
+
+/**
+ * Re-run a handshake that failed, now that the service has confirmed this
+ * panel's binding.
+ *
+ * The worker reads the bound session over HTTP on the panel's behalf, and the
+ * service answers those reads only for a session bound to the tab on the
+ * worker's current connection. After the worker reconnects under a new
+ * credential — a re-pairing after the service's credentials were rotated —
+ * the panel's handshake can reach the service before the worker has re-bound
+ * the tab, and is refused; the worker does not retry a refusal, and nothing
+ * else would ask again. The `session.bound` that confirms the re-binding is
+ * the moment those reads can succeed. A handshake still in flight when it
+ * arrives is marked instead, and run once more if it fails
+ * ({@link hydrate}). A handshake that completed needs nothing: the binding
+ * frame itself was applied.
+ */
+function rehydrateAfterRebind(live: Controller): void {
+  if (live.hydrating) {
+    live.reboundDuringHandshake = true;
+    return;
+  }
+  const port = live.port;
+  if (live.handshakeFailed && port !== undefined) {
+    live.logger.debug('Re-reading the panel snapshot after the binding was confirmed.');
+    void hydrate(live, port);
+  }
+}
+
+/** Whether two failure notices are the same notice (the store's own equality). */
+function sameErrorPayload(left: ErrorPayload | undefined, right: ErrorPayload): boolean {
+  return (
+    left !== undefined &&
+    left.code === right.code &&
+    left.message === right.message &&
+    left.ref === right.ref
+  );
+}
+
+/**
+ * Record a completed handshake: the next binding confirmation re-reads
+ * nothing, and the failure notice an earlier failed handshake raised is
+ * dismissed — only if it is still the notice on screen, so a failure some
+ * other request reported meanwhile is left for the developer to read.
+ */
+function recordHandshakeCompleted(live: Controller): void {
+  const raised = live.handshakeError;
+  live.handshakeFailed = false;
+  live.handshakeError = undefined;
+  if (raised !== undefined && sameErrorPayload(getPanelSnapshot().lastError, raised)) {
+    setLastError(undefined);
+  }
 }
 
 /**
@@ -1354,8 +1502,12 @@ function handshakePayload(live: Controller): PortRequestPayloads['session.snapsh
  * because a panel that silently never hydrates would present nothing as if it
  * were fine (AAP §0.5.5); a transport loss is only logged, because the next
  * port hydrates again and the pill already says `reconnecting`.
+ *
+ * @returns The notice it raised, so the handshake that later completes can
+ * dismiss it ({@link recordHandshakeCompleted}); `undefined` when it raised
+ * none.
  */
-function reportHydrationFailure(live: Controller, error: unknown): void {
+function reportHydrationFailure(live: Controller, error: unknown): ErrorPayload | undefined {
   const payload = refusedPayload(error) ?? unusableAnswerPayload(error);
   if (payload !== undefined) {
     live.logger.warn('The service worker did not answer the panel snapshot usably.', {
@@ -1364,17 +1516,19 @@ function reportHydrationFailure(live: Controller, error: unknown): void {
     });
     try {
       setLastError(payload);
+      return payload;
     } catch (cause) {
       live.logger.error('Recording the snapshot failure failed.', { error: errorName(cause) });
     }
-    return;
+    return undefined;
   }
   const reason = panelRequestFailureReason(error);
   if (reason === undefined) {
     live.logger.error('Applying the panel snapshot failed.', { error: errorName(error) });
-    return;
+    return undefined;
   }
   live.logger.debug('The panel snapshot did not complete.', { reason });
+  return undefined;
 }
 
 /**
@@ -1399,22 +1553,45 @@ function unusableAnswerPayload(error: unknown): ErrorPayload | undefined {
  * Run the handshake on `port`: request the snapshot and apply it if the port is
  * still the live one. At most one handshake per port is in flight. Never
  * rejects — every failure is recorded by {@link reportHydrationFailure}.
+ *
+ * However it settles on the live port, the connection's state counts as
+ * observed from then on, so the neutral "Connecting…" presentation lasts at
+ * most one handshake. A handshake that failed while a `session.bound`
+ * confirming this panel's binding arrived is run once more
+ * ({@link rehydrateAfterRebind}); one that completes dismisses the notice a
+ * failed one raised ({@link recordHandshakeCompleted}).
  */
 async function hydrate(live: Controller, port: PanelPortLike): Promise<void> {
   if (live.hydrating || live.port !== port) {
     return;
   }
   live.hydrating = true;
+  live.reboundDuringHandshake = false;
+  let failed = false;
   try {
     const snapshot = await dispatchRequest(live, 'session.snapshot', handshakePayload(live), {});
     if (live.port === port) {
       applySnapshot(live, snapshot);
+      recordHandshakeCompleted(live);
     }
   } catch (error) {
-    reportHydrationFailure(live, error);
+    failed = true;
+    const raised = reportHydrationFailure(live, error);
+    if (live.port === port) {
+      live.handshakeFailed = true;
+      live.handshakeError = raised;
+    }
   } finally {
     if (live.port === port) {
       live.hydrating = false;
+      markStatusObserved(live);
+      if (failed && live.reboundDuringHandshake) {
+        live.reboundDuringHandshake = false;
+        live.logger.debug(
+          'Re-reading the panel snapshot: the binding was confirmed mid-handshake.',
+        );
+        void hydrate(live, port);
+      }
     }
   }
 }
@@ -1441,6 +1618,10 @@ function createController(deps: PanelConnectionDeps): Controller {
     port: undefined,
     detachPort: undefined,
     hydrating: false,
+    statusObserved: false,
+    handshakeFailed: false,
+    handshakeError: undefined,
+    reboundDuringHandshake: false,
     attempt: 0,
     reconnectTimer: undefined,
   };
@@ -1567,6 +1748,9 @@ function handlePortLoss(live: Controller, port: PanelPortLike): void {
 
   rejectRequests('disconnected', (entry) => entry.port === port);
   writePortDownStatus(live.logger);
+  // A lost port is an observation in its own right: the pill's "Reconnecting…"
+  // now says what the panel saw, not what it assumed before anything answered.
+  markStatusObserved(live);
   // The offer was the worker's word about the tab this port was associated
   // with; a new port starts unassociated, so the offer is withdrawn until that
   // port's snapshot (or a `reload` push to it) states it afresh. A stale
@@ -1679,6 +1863,9 @@ function teardown(live: Controller): void {
   // No worker speaks for this panel any more, so nothing can be offered: a
   // later start hydrates the offer afresh from its snapshot.
   setReloadState(PANEL_RELOAD_NOT_NEEDED);
+  // The observation belonged to the connection that ended; a later start
+  // observes its own.
+  notifyObservedListeners();
   notifyDisconnect(live.logger, { reason: 'stopped', error: connectionLossError('stopped') });
   live.logger.debug('Stopped the panel connection.');
 }
@@ -1818,6 +2005,9 @@ export function startPanelConnection(deps: PanelConnectionDeps = {}): PanelConne
     if (live.runtime === undefined) {
       live.logger.warn('No extension runtime is available; the panel cannot reach the worker.');
       rejectRequests('unavailable', (entry) => entry.port === undefined);
+      // Nothing will ever report, so waiting for a report would wait forever:
+      // what the panel sees — no worker to reach — is the observation.
+      markStatusObserved(live);
     } else {
       openPort(live);
     }
@@ -1864,6 +2054,64 @@ function selectConnection(snapshot: PanelSnapshot): PanelConnectionSlice {
  */
 export function usePanelConnection(): PanelConnectionSlice {
   return usePanelStoreSelector(selectConnection);
+}
+
+/**
+ * Register a {@link usePanelConnectionObserved} subscriber: notified when the
+ * running connection first observes its state, when the connection is torn
+ * down, and on every store change — the store's connection slice is the other
+ * half of the answer. Module-scope, so React never re-subscribes.
+ */
+function subscribePanelConnectionObserved(listener: () => void): () => void {
+  observedListeners.add(listener);
+  const unsubscribeStore = subscribePanelStore(listener);
+  return () => {
+    observedListeners.delete(listener);
+    unsubscribeStore();
+  };
+}
+
+/**
+ * Whether the panel's connection state has been observed yet, read outside
+ * React.
+ *
+ * The store's connection slice starts as `reconnecting`, the in-progress state
+ * of its closed vocabulary — but before the first report that is an
+ * assumption, not an observation, and showing it would flash "Reconnecting…"
+ * at a developer whose worker is about to say "Not paired" or "Connected".
+ * The state counts as observed once the running connection has heard from the
+ * worker (a `connection` push, a snapshot answer, a settled handshake) or has
+ * seen for itself that no worker answers (a lost port, no extension runtime);
+ * or once the store's slice has changed at all (`lastChangeAt` is `0` until
+ * its first change), since only this module writes it and every write it
+ * makes is an observation. The second half also covers the one observation
+ * that changes nothing: a first report equal to the initial state.
+ *
+ * @returns `true` once observed; `false` before, and after a teardown until
+ * the store's slice says otherwise.
+ */
+export function getPanelConnectionObserved(): boolean {
+  return current?.statusObserved === true || getPanelSnapshot().connection.lastChangeAt !== 0;
+}
+
+/**
+ * Whether the panel's connection state has been observed yet (see
+ * {@link getPanelConnectionObserved}), for `../App.tsx`: until it has, the
+ * pill shows a neutral "Connecting…" instead of an assumed "Reconnecting…",
+ * and the body below the header waits — so the pairing dialog, when the first
+ * report says "Not paired", appears in the same commit as the body instead of
+ * being inserted above a body already painted, which would shift it.
+ *
+ * @returns `true` once observed.
+ *
+ * @example
+ * ```tsx
+ * const observed = usePanelConnectionObserved();
+ * <ConnectionStatus status={connection.status} pending={!observed} … />
+ * ```
+ */
+export function usePanelConnectionObserved(): boolean {
+  return useSyncExternalStore(subscribePanelConnectionObserved, getPanelConnectionObserved);
 }
 
 /*

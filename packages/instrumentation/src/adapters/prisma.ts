@@ -508,36 +508,51 @@ export const PRISMA_ADAPTER_LIMITS = Object.freeze({
 });
 
 /**
- * The wording defaults for the relaunch hint a missing preload is reported
+ * The published names behind the relaunch hint a missing preload is reported
  * with.
  *
  * Exported for the same reason {@link PRISMA_ADAPTER_LIMITS} is, and split from
- * it because these are *words and specifiers* rather than bounds. Both are
- * overridable through {@link PrismaAdapterOptions.relaunch}, which is how the
- * service supplies the exact command it would run without this adapter reading
- * the environment or naming a script path in this repository.
+ * it because these are *words and specifiers* rather than bounds. Neither
+ * appears in a default hint: without an injected
+ * {@link PrismaAdapterOptions.relaunch} — which is how `../registry.ts` builds
+ * this adapter — the hint is the "Debug Generator: Launch Dev Server" editor
+ * command naming the project root, because that is the one exact instruction
+ * this adapter can give without the preload's path, the ingest URL or a
+ * credential. The service supplies an exact hand-typed command through
+ * {@link PrismaAdapterOptions.relaunch} when it has one.
  */
 export const PRISMA_RELAUNCH_DEFAULTS = Object.freeze({
   /**
-   * The documented preload entry point, as a module specifier.
+   * The preload's published package subpath: the `./node/register` export of
+   * `@debuggen/telemetry`.
    *
-   * The published `./node/register` condition of `@debuggen/telemetry`, which
-   * is what `--import` loads into the dev-server process. A specifier rather
-   * than a path: a path would be correct only for the checkout it was written
-   * in, and this string is shown to a developer to paste.
+   * The name of record, never put in a default hint: a target project declares
+   * no `@debuggen/*` dependency (AAP §0.4.2), so `--import` of this specifier
+   * fails there with `ERR_MODULE_NOT_FOUND`, and a bare specifier carries none
+   * of the ingest variables the preload needs to report.
    */
   preloadSpecifier: '@debuggen/telemetry/node/register',
 
   /**
    * The script name a project's dev server is conventionally started by.
    *
-   * Used only as the last resort before the editor-command wording, and only
-   * together with the package manager `ProjectSummary` reports — the summary
-   * carries no script list, so this is a convention rather than a fact about
-   * the target, and an injected descriptor always wins over it.
+   * A convention rather than a fact about the target — `ProjectSummary`
+   * carries no script list — kept as published data for a caller composing
+   * its own {@link PrismaRelaunchDescriptor.command}. No default hint uses it:
+   * a command built from it would still lack a loadable preload and a
+   * credential.
    */
   devScript: 'dev',
 });
+
+/**
+ * The editor command every default hint names: the VS Code palette label of
+ * `debuggen.launchDevServer` (category "Debug Generator", title "Launch Dev
+ * Server" in `apps/vscode-extension/package.json`), spelled exactly as the
+ * palette shows it. The service it asks launches the dev server with its own
+ * preload path and a freshly minted ingest credential (AAP §0.5.6).
+ */
+const LAUNCH_DEV_SERVER_COMMAND_LABEL = 'Debug Generator: Launch Dev Server';
 
 /**
  * An exact relaunch instruction, supplied by the caller.
@@ -573,8 +588,9 @@ export interface PrismaRelaunchDescriptor {
  * The injected, fully-defaulted knobs {@link createPrismaAdapter} accepts.
  *
  * Every member is optional, and an adapter constructed with no options behaves
- * exactly as the shipped product does — {@link PRISMA_ADAPTER_LIMITS} and
- * {@link PRISMA_RELAUNCH_DEFAULTS} are those values.
+ * exactly as the shipped product does — {@link PRISMA_ADAPTER_LIMITS} are those
+ * values, and with no {@link PrismaAdapterOptions.relaunch} the relaunch hint
+ * is the "Debug Generator: Launch Dev Server" editor command.
  */
 export interface PrismaAdapterOptions {
   /**
@@ -1571,9 +1587,11 @@ function describeGap(
         `the dev-server preload for ${context.projectRoot} last reported ${String(seconds)}s ago, so Prisma query spans may already have stopped arriving`,
         PRISMA_ADAPTER_LIMITS.maxMessageLength,
       ),
-      hint: clampMessage(
-        `Restart the dev server for ${context.projectRoot} from the Debug Generator view in VS Code to reattach the preload.`,
-        PRISMA_ADAPTER_LIMITS.maxMessageLength,
+      hint: firstWholeHint(
+        [
+          `Restart the dev server for ${context.projectRoot} with "${LAUNCH_DEV_SERVER_COMMAND_LABEL}" in VS Code so its preload reconnects.`,
+        ],
+        `Restart this project's dev server with "${LAUNCH_DEV_SERVER_COMMAND_LABEL}" in VS Code so its preload reconnects.`,
       ),
     };
   }
@@ -1589,28 +1607,53 @@ function describeGap(
 }
 
 /**
+ * The first spelling that is already a valid hint as written — one line of
+ * single spaces, no control character, within
+ * {@link PRISMA_ADAPTER_LIMITS.maxMessageLength} — returned whole.
+ *
+ * How a hint naming a project root is fitted to its row: {@link clampMessage}
+ * would cut a long root or blank a control character inside one, and a hint
+ * naming a path that is not the project's is worse than one naming none. So
+ * each candidate is taken only if clamping would leave it untouched, and the
+ * root-free fallback — built from this module's own words — is used otherwise.
+ *
+ * @param candidates The instruction, from the most to the least specific.
+ * @param fallback The root-free spelling, far inside the bound.
+ * @returns The first untouched candidate, or the clamped fallback.
+ */
+function firstWholeHint(candidates: readonly string[], fallback: string): string {
+  const bound = PRISMA_ADAPTER_LIMITS.maxMessageLength;
+
+  for (const candidate of candidates) {
+    if (candidate.length <= bound && clampMessage(candidate, bound) === candidate) {
+      return candidate;
+    }
+  }
+
+  return clampMessage(fallback, bound);
+}
+
+/**
  * Composes the relaunch instruction, the most exact form available first.
  *
  * 1. **An injected descriptor.** The service owns the dev-server launcher, so
  *    when it supplies the command it would run, that command is the truth and
- *    this adapter does not second-guess it.
- * 2. **The documented preload specifier plus the target's own package
- *    manager**, which `ProjectSummary` reports as data. The summary carries no
- *    script list, so the conventional dev script name of
- *    {@link PRISMA_RELAUNCH_DEFAULTS} completes the line — a convention, stated
- *    as one, and overridable by (1).
- * 3. **The editor command**, for a target whose package manager could not be
- *    determined: there is no command line to hand over, and the one-click
- *    alternative is what remains.
+ *    this adapter does not second-guess it. It is emitted verbatim apart from
+ *    {@link clampMessage}'s shaping, with the project root appended when the
+ *    line does not already carry it.
+ * 2. **The editor command**, otherwise — which is how `../registry.ts` builds
+ *    this adapter: "Run "Debug Generator: Launch Dev Server" in VS Code for
+ *    ‹root›, …". The service that command asks launches the dev server with
+ *    its own preload path and a freshly minted credential, so it is exact.
+ *    Nothing is composed from {@link PRISMA_RELAUNCH_DEFAULTS}: the published
+ *    specifier cannot be resolved from a target project and a bare
+ *    `NODE_OPTIONS` line sets no credential, so such a command would fail or
+ *    run and report nothing (QA INT-F05).
  *
- * Whatever the route, the hint **names the project it is about**: a relaunch
- * command for another project is worse than none, so the project root is
- * appended when the composed line does not already carry it. The command sits
- * last on the line so it ends where a developer's selection naturally does.
- *
- * Nothing here reads the environment, and no path inside this repository is
- * named — the preload is identified by its published module specifier, which is
- * what `--import` resolves.
+ * Whatever the route, the hint **names the project it is about** whenever the
+ * root fits whole: a relaunch for another project is worse than none. The
+ * editor form degrades by dropping the root ({@link firstWholeHint}), never by
+ * cutting it. Nothing here reads the environment.
  *
  * @param context The session's context.
  * @param options The resolved options.
@@ -1621,23 +1664,23 @@ function relaunchHint(
   options: ResolvedPrismaAdapterOptions,
 ): string {
   const root = context.projectRoot;
-  const packageManager = context.projectSummary.packageManager;
   const injected = options.relaunch;
 
-  let composed: string;
-
   if (injected !== undefined) {
-    composed =
+    const composed =
       injected.note === undefined ? injected.command : `${injected.note}: ${injected.command}`;
-  } else if (packageManager === 'unknown') {
-    composed = `Start the dev server for ${root} from the Debug Generator view in VS Code, which attaches the Node preload for you.`;
-  } else {
-    composed = `Relaunch the dev server with the preload attached: cd ${root} && NODE_OPTIONS="--import ${PRISMA_RELAUNCH_DEFAULTS.preloadSpecifier}" ${packageManager} run ${PRISMA_RELAUNCH_DEFAULTS.devScript}`;
+    const addressed = composed.includes(root) ? composed : `${composed} (project: ${root})`;
+
+    return clampMessage(addressed, PRISMA_ADAPTER_LIMITS.maxMessageLength);
   }
 
-  const addressed = composed.includes(root) ? composed : `${composed} (project: ${root})`;
+  const effect =
+    "which starts this project's dev server with the preload and a fresh ingest credential";
 
-  return clampMessage(addressed, PRISMA_ADAPTER_LIMITS.maxMessageLength);
+  return firstWholeHint(
+    [`Run "${LAUNCH_DEV_SERVER_COMMAND_LABEL}" in VS Code for ${root}, ${effect}.`],
+    `Run "${LAUNCH_DEV_SERVER_COMMAND_LABEL}" in VS Code, ${effect}.`,
+  );
 }
 
 /**
@@ -2195,8 +2238,8 @@ function removeSignal(
  * project.
  *
  * @param options Injected, fully-defaulted knobs. See
- * {@link PrismaAdapterOptions}; the defaults are
- * {@link PRISMA_ADAPTER_LIMITS} and {@link PRISMA_RELAUNCH_DEFAULTS}.
+ * {@link PrismaAdapterOptions}; the defaults are {@link PRISMA_ADAPTER_LIMITS},
+ * and the relaunch hint names the editor command unless one is injected.
  * @returns The adapter.
  *
  * @example

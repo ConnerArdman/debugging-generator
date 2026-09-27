@@ -38,6 +38,12 @@
  *    long question can never push anything else out of the row. The clip is visual only: the full
  *    question stays in the accessibility tree, and it is also offered as the element's `title`.
  *
+ * A selected element adds one summary line to the controls, never a block: `TargetPicker` shows
+ * the target as a single clipped line and keeps its full descriptor behind a "Target details"
+ * disclosure, collapsed until the developer opens it. The controls group aligns its items on their
+ * first baseline, so while those details are open beneath the picker's controls, the connection
+ * pill and the capture controls stay on that first line rather than centring on the taller picker.
+ *
  * Every gap is a `SpaceStep` of the renderer's spacing scale, and every type role and colour comes
  * from a primitive's props, so this file writes no inline style, no length, no colour and no class
  * of its own. The one class name it uses is the renderer's global `dg-visually-hidden` utility
@@ -328,8 +334,10 @@ export function Header(props: HeaderProps): ReactElement {
           // Reading and keyboard order: the connection pill first — it frames every other
           // control — then the picker that chooses what to ask about, then the capture that
           // answers it. Each position stays fixed whether or not its neighbours are present, so a
-          // slot appearing never remounts the others.
-          <Stack direction="horizontal" gap={3} align="center" wrap>
+          // slot appearing never remounts the others. Baseline alignment keeps every control on
+          // the text line of the picker's first row, including while its target details are open
+          // beneath that row; while every control is one line tall it lines up as centring did.
+          <Stack direction="horizontal" gap={3} align="baseline" wrap>
             {showConnection ? connectionStatus : null}
             {showTargetPicker ? targetPicker : null}
             {showCaptureControls ? captureControls : null}

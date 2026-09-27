@@ -32,8 +32,16 @@
  *   code unit over the cap is dropped while one exactly at it is accepted.
  * - {@link MAX_CONTROL_TEXT_LENGTH} (2 048) — the per-field bound on the
  *   page-controlled text a control frame carries.
+ * - **Flow control** — between a `bridge.pause` and its `bridge.resume` the
+ *   batch threshold, the {@link FLUSH_INTERVAL_MS} timer and the bridge's
+ *   return post nothing, a bounded drain the pause is handed back into stops
+ *   before its next batch, and the ring keeps its bound and its loss
+ *   reporting; control frames and the terminal drains still travel; the
+ *   resume drains at once with the same per-turn bound; `bridge.ready` and
+ *   `bridge.gone` end a pause while a capture change and a reset do not; and
+ *   neither signal reaches a subscriber.
  *
- * **The channel, version 3.** Frames travel as `CustomEvent`s on a detached
+ * **The channel, version 4.** Frames travel as `CustomEvent`s on a detached
  * node the agent hands to the bridge exactly once, never on `window`, and a
  * frame counts as delivered only when the receiver acknowledges it with
  * `preventDefault()`. The cases assert the properties that design exists for:
@@ -47,7 +55,7 @@
  * - *how the node is disclosed* — once, to the first request, never
  *   unsolicited, never again (not from inside the answer, not after a reset);
  * - *what an accepted frame is* — a `detail` string within the cap that parses
- *   to a record with the bridge's tag, version 3 and an inbound type; anything
+ *   to a record with the bridge's tag, version 4 and an inbound type; anything
  *   else is dropped unacknowledged, and the payload a subscriber receives is a
  *   null-prototype record a polluted `Object.prototype` cannot reach into;
  * - *custody* — a claimed batch leaves the queue and advances `batchSeq`; an
@@ -155,6 +163,8 @@ import {
   emit,
   emitMany,
   flush,
+  FLUSH_INTERVAL_MS,
+  getFlowControlStats,
   getTransportStats,
   HANDSHAKE_OFFER_EVENT,
   HANDSHAKE_REQUEST_EVENT,
@@ -2804,5 +2814,307 @@ describe('the handshake', () => {
       stop();
       fresh.resetTransport();
     }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Flow control
+ * ---------------------------------------------------------------------------
+ */
+
+describe('flow control: bridge.pause and bridge.resume', () => {
+  /** The frames the case's own subscriber received, in order. */
+  let delivered: BridgeInboundMessage[] = [];
+
+  beforeEach(() => {
+    delivered = [];
+    unsubscribe?.();
+    unsubscribe = subscribe((message) => {
+      delivered.push(message);
+    });
+    expect(bridge.send('bridge.ready')).toBe(true);
+    bridge.clear();
+    delivered = [];
+  });
+
+  afterEach(() => {
+    // The pause is connection-scoped and survives the reset every case ends
+    // with, so a case never leaves the file's bridge holding the agent back.
+    bridge.send('bridge.gone');
+    expect(getFlowControlStats().paused).toBe(false);
+  });
+
+  /**
+   * A claim policy that runs `inside` during the first `telemetry.batch`
+   * dispatch, and claims every frame.
+   *
+   * @param inside What the bridge does from inside its listener.
+   * @returns The policy.
+   */
+  function insideFirstBatch(inside: () => void): FakeBridge['claim'] {
+    let done = false;
+    return (frame) => {
+      if (!done && frame.type === 'telemetry.batch') {
+        done = true;
+        inside();
+      }
+      return true;
+    };
+  }
+
+  /** The flush-timer delays the page's `setTimeout` was asked for since `spy` was installed. */
+  function flushTimersArmed(spy: { mock: { calls: unknown[][] } }): number {
+    return spy.mock.calls.filter((call) => call[1] === FLUSH_INTERVAL_MS).length;
+  }
+
+  it('acknowledges both signals, counts them, and hands neither to a subscriber', () => {
+    const before = getFlowControlStats();
+
+    expect(bridge.send('bridge.pause')).toBe(true);
+    expect(getFlowControlStats()).toEqual({
+      paused: true,
+      pauses: before.pauses + 1,
+      resumes: before.resumes,
+    });
+    expect(bridge.send('bridge.resume')).toBe(true);
+    expect(getFlowControlStats()).toEqual({
+      paused: false,
+      pauses: before.pauses + 1,
+      resumes: before.resumes + 1,
+    });
+
+    // `./agent.ts` is the subscriber in production: it never sees a resume, so
+    // a resume can never read as a reconnect and re-send `agent.ready`. The
+    // frames it does act on still reach it.
+    expect(bridge.send('agent.snapshot')).toBe(true);
+    expect(delivered.map((message) => message.type)).toEqual(['agent.snapshot']);
+    expect(bridge.frames).toEqual([]);
+  });
+
+  it('posts nothing on the batch threshold or the timer while paused, and keeps buffering', async () => {
+    const timers = vi.spyOn(globalThis, 'setTimeout');
+    bridge.send('bridge.pause');
+
+    emitRange(MAX_EVENTS_PER_BATCH * 3 + 1);
+    for (let turn = 0; turn < 3; turn += 1) {
+      await nextTurn();
+    }
+
+    expect(bridge.framesOfType('telemetry.batch')).toEqual([]);
+    expect(flushTimersArmed(timers)).toBe(0);
+    expect(getTransportStats()).toMatchObject({
+      buffered: MAX_EVENTS_PER_BATCH * 3 + 1,
+      dropped: 0,
+      sent: 0,
+      bridgeReady: true,
+    });
+  });
+
+  it('hands no drain to a task source while paused, however many events arrive', () => {
+    // The microtask fallback is the observable route: every drain this module
+    // hands off goes through the page's `queueMicrotask` once the channel is
+    // gone, and `beforeEach` has already closed any cached channel.
+    vi.stubGlobal('MessageChannel', undefined);
+    const microtasks = vi.spyOn(globalThis, 'queueMicrotask');
+    bridge.send('bridge.pause');
+
+    emitRange(MAX_EVENTS_PER_BATCH * 3);
+
+    // A drain handed off per event past the threshold would cost the page a
+    // task each, to find the agent held back every time.
+    expect(microtasks).not.toHaveBeenCalled();
+    expect(getTransportStats().buffered).toBe(MAX_EVENTS_PER_BATCH * 3);
+  });
+
+  it('clears a flush timer armed before the pause', () => {
+    const timers = vi.spyOn(globalThis, 'setTimeout');
+    const clears = vi.spyOn(globalThis, 'clearTimeout');
+    emitRange(1);
+    expect(flushTimersArmed(timers)).toBe(1);
+    const armed: unknown = timers.mock.results.find(
+      (_result, index) => timers.mock.calls[index]?.[1] === FLUSH_INTERVAL_MS,
+    )?.value;
+    expect(armed).toBeDefined();
+
+    bridge.send('bridge.pause');
+
+    expect(clears.mock.calls.map((call) => call[0])).toContain(armed);
+    expect(bridge.frames).toEqual([]);
+    expect(getTransportStats().buffered).toBe(1);
+  });
+
+  it('evicts the oldest past the cap while paused, and reports the loss once on the first batch after the resume', async () => {
+    const overflow = 37;
+    bridge.send('bridge.pause');
+
+    emitRange(MAX_BUFFERED_EVENTS + overflow);
+
+    expect(getTransportStats()).toMatchObject({
+      buffered: MAX_BUFFERED_EVENTS,
+      dropped: overflow,
+      sent: 0,
+    });
+    expect(bridge.frames).toEqual([]);
+
+    // The resume drains at once — bounded, like the bridge's return after an
+    // absence — and the rest follows turn by turn.
+    expect(bridge.send('bridge.resume')).toBe(true);
+    expect(batchViews()).toHaveLength(MAX_BATCHES_PER_DRAIN);
+    expect(getTransportStats().buffered).toBe(
+      MAX_BUFFERED_EVENTS - MAX_BATCHES_PER_DRAIN * MAX_EVENTS_PER_BATCH,
+    );
+
+    await drainToCompletion();
+
+    expect(runShapeOf(deliveredOrder())).toEqual(contiguousRun(overflow, MAX_BUFFERED_EVENTS));
+    const reported = batchViews().map((batch) => batch.droppedCount);
+    expect(reported).toHaveLength(MAX_BUFFERED_EVENTS / MAX_EVENTS_PER_BATCH);
+    expect(at(reported, 0, 'the reported drop counts')).toBe(overflow);
+    expect(reported.slice(1).every((count) => count === 0)).toBe(true);
+    expect(getTransportStats()).toMatchObject({ dropped: overflow, sent: MAX_BUFFERED_EVENTS });
+    expect(delivered).toEqual([]);
+  });
+
+  it('still carries control frames and performs the terminal flush while paused, and stays paused after it', () => {
+    bridge.send('bridge.pause');
+    emitRange(MAX_EVENTS_PER_BATCH * (MAX_BATCHES_PER_DRAIN + 1));
+
+    postControl('agent.ready', { url: PAGE_URL });
+    expect(bridge.frames.map((frame) => [frame.type, frame.claimed])).toEqual([
+      ['agent.ready', true],
+    ]);
+
+    // `pagehide`, a hidden document, capture stop: no later turn to wait for,
+    // so everything queued leaves now, unbounded.
+    flush();
+    expect(batchViews()).toHaveLength(MAX_BATCHES_PER_DRAIN + 1);
+    expect(deliveredOrder()).toEqual(
+      indexRange(0, MAX_EVENTS_PER_BATCH * (MAX_BATCHES_PER_DRAIN + 1)),
+    );
+
+    // The flush was not a resume: the next burst waits again.
+    bridge.clear();
+    emitRange(MAX_EVENTS_PER_BATCH, MAX_EVENTS_PER_BATCH * (MAX_BATCHES_PER_DRAIN + 1));
+    expect(getFlowControlStats().paused).toBe(true);
+    expect(getTransportStats().buffered).toBe(MAX_EVENTS_PER_BATCH);
+    expect(bridge.frames).toEqual([]);
+  });
+
+  it('delivers what a capture change finds queued under the capture it was recorded in, while paused', () => {
+    bridge.send('bridge.pause');
+    emitRange(3);
+
+    configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
+
+    expect(batchViews().map((batch) => [batch.captureId, batch.events.length])).toEqual([
+      [CAPTURE_A, 3],
+    ]);
+    expect(getTransportStats()).toMatchObject({ buffered: 0, dropped: 0, sent: 3 });
+    expect(getFlowControlStats().paused).toBe(true);
+  });
+
+  it('stops a bounded drain before its next batch when a pause is handed back from inside it', async () => {
+    bridge.send('bridge.gone');
+    emitRange(MAX_EVENTS_PER_BATCH * 3);
+    bridge.claim = insideFirstBatch(() => {
+      bridge.send('bridge.pause');
+    });
+
+    // The bridge's return starts a bounded drain; the pause arrives while the
+    // bridge holds its first batch.
+    bridge.send('bridge.ready');
+
+    expect(batchViews()).toHaveLength(1);
+    for (let turn = 0; turn < 3; turn += 1) {
+      await nextTurn();
+    }
+    expect(batchViews()).toHaveLength(1);
+    expect(getTransportStats().buffered).toBe(MAX_EVENTS_PER_BATCH * 2);
+
+    bridge.send('bridge.resume');
+    expect(deliveredOrder()).toEqual(indexRange(0, MAX_EVENTS_PER_BATCH * 3));
+    expect(batchViews().map((batch) => batch.batchSeq)).toEqual([0, 1, 2]);
+  });
+
+  it('never holds back the terminal flush a pause is handed back into', () => {
+    emitRange(MAX_EVENTS_PER_BATCH * 3);
+    bridge.claim = insideFirstBatch(() => {
+      bridge.send('bridge.pause');
+    });
+
+    flush();
+
+    expect(deliveredOrder()).toEqual(indexRange(0, MAX_EVENTS_PER_BATCH * 3));
+    expect(getFlowControlStats().paused).toBe(true);
+  });
+
+  it('ends a pause at bridge.ready, the next port, and at bridge.gone, the end of this one', async () => {
+    bridge.send('bridge.pause');
+    bridge.send('bridge.ready');
+    expect(getFlowControlStats().paused).toBe(false);
+
+    emitRange(MAX_EVENTS_PER_BATCH);
+    await drainToCompletion();
+    expect(deliveredOrder()).toEqual(indexRange(0, MAX_EVENTS_PER_BATCH));
+
+    bridge.send('bridge.pause');
+    bridge.send('bridge.gone');
+    expect(getFlowControlStats().paused).toBe(false);
+    emitRange(2, MAX_EVENTS_PER_BATCH);
+    expect(bridge.send('bridge.ready')).toBe(true);
+    expect(deliveredOrder()).toEqual(indexRange(0, MAX_EVENTS_PER_BATCH + 2));
+    expect(delivered.map((message) => message.type)).toEqual([
+      'bridge.ready',
+      'bridge.gone',
+      'bridge.ready',
+    ]);
+  });
+
+  it('keeps a pause through a capture change and a reset, which end a capture rather than the connection', () => {
+    bridge.send('bridge.pause');
+    configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
+    expect(getFlowControlStats().paused).toBe(true);
+
+    // The disarm path of `./agent.ts`, then the next capture's configuration
+    // relayed by the same bridge.
+    configureTransport({ enabled: false });
+    resetTransport();
+    expect(getFlowControlStats().paused).toBe(true);
+    unsubscribe = subscribe(() => undefined);
+    expect(bridge.send('agent.config')).toBe(true);
+    configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_A, enabled: true });
+
+    emitRange(MAX_EVENTS_PER_BATCH + 1);
+    flush();
+    bridge.clear();
+    emitRange(MAX_EVENTS_PER_BATCH, MAX_EVENTS_PER_BATCH + 1);
+    expect(getTransportStats()).toMatchObject({
+      buffered: MAX_EVENTS_PER_BATCH,
+      bridgeReady: true,
+    });
+    expect(bridge.frames).toEqual([]);
+
+    // The worker's resume is what lets the new capture's telemetry go.
+    bridge.send('bridge.resume');
+    expect(batchViews().map((batch) => [batch.captureId, batch.events.length])).toEqual([
+      [CAPTURE_A, MAX_EVENTS_PER_BATCH],
+    ]);
+  });
+
+  it('marks an absent bridge present on a pause without draining, and drains on the resume', () => {
+    bridge.send('bridge.gone');
+    emitRange(MAX_EVENTS_PER_BATCH + 50);
+
+    expect(bridge.send('bridge.pause')).toBe(true);
+    expect(getTransportStats()).toMatchObject({
+      bridgeReady: true,
+      buffered: MAX_EVENTS_PER_BATCH + 50,
+    });
+    expect(bridge.frames).toEqual([]);
+
+    expect(bridge.send('bridge.resume')).toBe(true);
+    expect(batchViews().map((batch) => batch.events.length)).toEqual([MAX_EVENTS_PER_BATCH, 50]);
+    expect(getTransportStats()).toMatchObject({ buffered: 0, sent: MAX_EVENTS_PER_BATCH + 50 });
   });
 });

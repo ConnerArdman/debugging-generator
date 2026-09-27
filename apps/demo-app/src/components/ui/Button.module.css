@@ -15,7 +15,9 @@
  *
  * Two classes are exported. `.root` is the control; `.label` is the optional span around its
  * text, which lets a long label truncate instead of widening the control while an inline status
- * indicator beside it stays whole.
+ * indicator beside it stays whole. `.label` also declares the one file-local property here,
+ * `--button-label-bleed`: the room its truncating clip leaves the glyphs above and below the
+ * one-em line box, which the shared token set has no step for.
  *
  * Geometry is deliberately state-independent. Padding, border width and font size are declared
  * once per size and are never restated by a hover, focus, active, disabled or busy rule, so a
@@ -59,7 +61,8 @@
   font-weight: 600;
   /* The line box is the text itself, so height comes from the padding pair, which is what keeps
    * the three sizes proportional. `sm` additionally carries a height floor - see Sizes below,
-   * where the reason it needs one is set out. */
+   * where the reason it needs one is set out. The glyphs reach past a one-em line box, so
+   * `.label` gives them a bleed that paints them without adding to this height. */
   line-height: 1;
   text-decoration: none;
   white-space: nowrap;
@@ -74,11 +77,26 @@
 
 /* The text. `min-width: 0` is what actually permits the truncation: without it a flex item
  * refuses to shrink below its content, and the control would widen instead of the label
- * clipping. */
+ * clipping.
+ *
+ * The bleed is what keeps every glyph whole inside that clip. `.root`'s `line-height: 1` makes
+ * this box exactly one em tall, but the font's glyphs are not: the descenders of g, p, q and y,
+ * and the accent over a capital, reach past the em - by about a sixth of an em on each side in
+ * the system sans - and the `overflow: hidden` the ellipsis depends on cut them off, so
+ * "Continue shopping" read as "shoppinq". `overflow` clips at the padding edge, not the content
+ * edge, so a quarter-em of block padding gives the glyphs room to paint, and the equal negative
+ * block margin takes that padding back out of layout: the flex line still sees a box one em
+ * tall, so the control's height and the text's position are what they were at every size. The
+ * inline direction carries no padding, so the ellipsis still falls at the content edge. The
+ * value is in `em` so it follows each size's type step. */
 .label {
+  --button-label-bleed: 0.25em;
+
   min-width: 0;
   flex: 0 1 auto;
   overflow: hidden;
+  margin-block: calc(-1 * var(--button-label-bleed, 0.25em));
+  padding-block: var(--button-label-bleed, 0.25em);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -252,18 +270,20 @@
   cursor: not-allowed;
 }
 
-/* The same state for a link, which has no `:disabled`. Removing pointer events is what stops an
- * anchor following its `href`; this is the only rule in the file that does so. */
+/* The same state without the native attribute: a link, which has no `:disabled`, and a busy
+ * control, which `Button.tsx` keeps focusable by writing `aria-disabled="true"` instead of
+ * `disabled` (a natively disabled element drops focus to `<body>`). Removing pointer events is
+ * what stops an anchor following its `href`; this is the only rule in the file that does so. A
+ * busy control's keyboard activation is refused by the component itself. */
 .root[aria-disabled='true'] {
   opacity: var(--ls-disabled-opacity, 0.55);
   cursor: not-allowed;
   pointer-events: none;
 }
 
-/* Working. Declared after `:disabled` and at the same specificity so the progress cursor wins
- * while the component holds the native `disabled` attribute for the duration. Pointer events
- * stay enabled: whether a second press is possible is the component's decision, taken with that
- * attribute, and not this file's. */
+/* Working. Declared after `[aria-disabled='true']` and at the same specificity so the progress
+ * cursor is the one this state states. Whether a second press is possible is the component's
+ * decision - it refuses every activation while busy - and not this file's. */
 .root[data-busy='true'] {
   cursor: progress;
 }

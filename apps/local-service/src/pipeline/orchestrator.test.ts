@@ -14,7 +14,7 @@
  * Every collaborator in `PipelineOrchestratorDeps` is an in-file double and
  * every one of the seven stages is substituted through the orchestrator's own
  * `StageOverrides` port, so no stage module runs, no store is opened, no
- * project is indexed, no server is started and no provider is called:
+ * project is indexed, no server is started and no network is reached:
  *
  * - the session manager **records** every call and applies it without any
  *   guard of its own, so a test observes what the orchestrator *asked for*
@@ -35,7 +35,11 @@
  *   only hands on are **tripwires**: any call is recorded, and a provider call
  *   fails the suite;
  * - time is an injected constant and every wait is a deferred promise, never a
- *   timer, so the suite is order-independent and deterministic.
+ *   timer, so the suite is order-independent and deterministic;
+ * - one section obtains the network-backed provider's own failure texts by
+ *   building that provider over an in-file client whose only call rejects —
+ *   no network, and the orchestrator is never handed it — and one asserts the
+ *   line the service's own logger writes, over a captured destination.
  *
  * Fixtures use invented, generic vocabulary only.
  */
@@ -62,7 +66,10 @@ import {
 } from '@debuggen/instrumentation';
 import {
   PROMPT_STAGES,
+  createAnthropicProvider,
+  isProviderFailureText,
   modelUnavailableMessage,
+  type AnthropicClientLike,
   type ModelProvider,
   type PromptLoader,
   type PromptStage,
@@ -99,6 +106,12 @@ import {
   type InstrumentationOutcome,
   type InstrumentationService,
 } from '../instrumentation/service.js';
+import {
+  DIAGNOSTIC_LOG_LEVELS,
+  LOG_ERROR_FIELD_KEY,
+  createServiceLogger,
+  scrubLogFields,
+} from '../logging.js';
 import type { PanelGenerationResult, PanelGenerator } from '../panels/generate.js';
 import type {
   RecordPlanInput,
@@ -106,7 +119,12 @@ import type {
   SessionPatch,
   StopCaptureOptions,
 } from '../sessions/manager.js';
-import type { ProgressRow, SessionProgress } from '../sessions/progress.js';
+import {
+  authorProductText,
+  isProductAuthoredText,
+  type ProgressRow,
+  type SessionProgress,
+} from '../sessions/progress.js';
 import {
   statusForStage,
   type SessionFailure,
@@ -1144,6 +1162,12 @@ interface HarnessOptions {
    * wiring of that installer rather than the fake's own call.
    */
   readonly builtStages?: readonly InstallingStage[];
+  /**
+   * The logger the orchestrator is given instead of the recording one — the
+   * service's own, over a captured destination, for a case that asserts the
+   * emitted line. `Harness.records` then stays empty.
+   */
+  readonly logger?: Logger;
 }
 
 /** The stages that install through the orchestrator's installer. */
@@ -1581,7 +1605,7 @@ function harness(options: HarnessOptions = {}): Harness {
   const deps: PipelineOrchestratorDeps = {
     // Read only by the default code-index loader, which an injected `codeIndex` replaces.
     config: { indexCacheDir: '/workspace/.suite-index-never-opened' } as ServiceConfig,
-    logger: recordingLogger(records),
+    logger: options.logger ?? recordingLogger(records),
     provider: tripwireProvider(),
     promptLoader: tripwires.promptLoader.value,
     contextBuilder: tripwires.contextBuilder.value,
@@ -3983,18 +4007,15 @@ describe('model boundary and privacy', () => {
         question: `Why did it run twice ${SENTINELS.followUp}?`,
       }),
     );
-    h.stages.followUp.mockResolvedValueOnce(
-      err(
-        subsystemError(
-          'MODEL_OUTPUT_INVALID',
-          `The decision was rejected ${SENTINELS.errorText}.`,
-          {
-            hint: `Ask again ${SENTINELS.errorText}.`,
-            stage: 'followup',
-          },
-        ),
-      ),
+    const rejected = subsystemError(
+      'MODEL_OUTPUT_INVALID',
+      `The decision was rejected ${SENTINELS.errorText}.`,
+      {
+        hint: `Ask again ${SENTINELS.errorText}.`,
+        stage: 'followup',
+      },
     );
+    h.stages.followUp.mockResolvedValueOnce(err(rejected));
     expectErr(
       await h.orchestrator.followUp({
         sessionId: SESSION_ID,
@@ -4013,9 +4034,13 @@ describe('model boundary and privacy', () => {
       expect(reached).toContain(sentinel);
     }
 
+    // Each record as the service writes it at its own level: the stage
+    // failure's error travels under the error field, which is reduced to its
+    // closed shape outside the diagnostic levels, and nothing else may quote
+    // a planted value.
     expect(h.records.length).toBeGreaterThan(0);
     for (const record of h.records) {
-      const line = JSON.stringify(record);
+      const line = asServiceWrites(record);
       for (const sentinel of Object.values(SENTINELS)) {
         expect(line).not.toContain(sentinel);
       }
@@ -4026,5 +4051,238 @@ describe('model boundary and privacy', () => {
     expect(failed.map((record) => record.fields)).toEqual([
       expect.objectContaining({ stage: 'followup', code: 'MODEL_OUTPUT_INVALID' }),
     ]);
+    // The error is the stage's own, and its unproven words are not beside it.
+    expect(failed[0]?.fields[LOG_ERROR_FIELD_KEY]).toBe(rejected);
+    expect(failed[0]?.fields).not.toHaveProperty('errorMessage');
+    expect(failed[0]?.fields).not.toHaveProperty('errorHint');
+  });
+});
+
+/* =================================================================================================
+ * 7b. The stage-failure record says why a stage failed, at the default level
+ * ============================================================================================== */
+
+/** The `msg` of the orchestrator's error record for a failed stage. */
+const STAGE_FAILED_MESSAGE = 'Pipeline stage failed; the session is filed as failed at that stage.';
+
+/**
+ * A recorded record as the service's logger writes it at the record's own
+ * level: its fields walked by `scrubLogFields`, which reduces whatever sits
+ * under the error field to the closed error shape at every level outside
+ * `DIAGNOSTIC_LOG_LEVELS`. The recording logger keeps raw values, so a privacy
+ * assertion is made against this rendering rather than against them.
+ */
+function asServiceWrites(record: LoggedRecord): string {
+  const diagnostics = (DIAGNOSTIC_LOG_LEVELS as readonly string[]).includes(record.level);
+  return JSON.stringify({
+    level: record.level,
+    msg: record.message,
+    ...scrubLogFields(record.fields, { diagnostics }),
+  });
+}
+
+/** The fields of every stage-failure error record the orchestrator logged. */
+function stageFailureFieldsOf(records: readonly LoggedRecord[]): LogFields[] {
+  return records
+    .filter((record) => record.level === 'error' && record.message === STAGE_FAILED_MESSAGE)
+    .map((record) => record.fields);
+}
+
+/**
+ * The failure the network-backed model provider really raises when its
+ * endpoint answers `status`: a provider built over an in-file client whose one
+ * call rejects the way the vendor's client does, so the message, the hint and
+ * the details are the provider's own rather than a copy of them. No network is
+ * reached — the client is the only transport the provider is given.
+ */
+async function providerRejection(status: number): Promise<DebuggenError> {
+  const refusal = Object.assign(new Error('the scripted endpoint refused the call'), { status });
+  const client: AnthropicClientLike = {
+    messages: { create: () => Promise.reject(refusal) },
+  };
+  const built = createAnthropicProvider({
+    config: { providerId: 'anthropic', model: 'suite-model-placeholder' },
+    client,
+  });
+  if (!built.ok) {
+    throw built.error;
+  }
+  const answered = await built.value.generateText({
+    prompt: 'Summarise the failing step.',
+    input: {},
+    metadata: { stage: 'understand', promptVersion: 'v001' },
+  });
+  if (answered.ok) {
+    throw new Error('The scripted endpoint answered; the provider was expected to fail.');
+  }
+  return answered.error;
+}
+
+/** Text no product builder wrote: a path, a SQL literal and a URL query value. */
+const LEAKY_MESSAGE =
+  "Could not read /home/dev/ledger/.cache/rows.json for SELECT * FROM accounts WHERE email = 'dev@example.test'.";
+const LEAKY_HINT =
+  'Retry https://api.example.test/v1/items?email=dev%40example.test once it answers.';
+/** Fragments of the leaky text, none of which a default-level line may quote. */
+const LEAKY_FRAGMENTS: readonly string[] = [
+  '/home/dev/ledger',
+  'dev@example.test',
+  'dev%40example.test',
+  'SELECT',
+];
+
+describe('the stage-failure record says why a stage failed, at the default level', () => {
+  it('carries the error, its message and its hint when the model boundary wrote them', async () => {
+    const h = harness();
+    const rejected = await providerRejection(401);
+    expect(rejected.details).toMatchObject({ condition: 'unauthorized', status: 401 });
+    expect(isProviderFailureText(rejected.hint)).toBe(true);
+    h.stages.understand.mockResolvedValueOnce(err(rejected));
+
+    expectErr(await h.orchestrator.run({ sessionId: SESSION_ID }));
+
+    const [fields, ...others] = stageFailureFieldsOf(h.records);
+    expect(others).toEqual([]);
+    expect(fields).toMatchObject({
+      subsystem: 'pipeline',
+      sessionId: SESSION_ID,
+      stage: 'understand',
+      code: 'MODEL_UNAVAILABLE',
+      errorMessage: modelUnavailableMessage('MODEL_UNAVAILABLE'),
+      errorHint: rejected.hint,
+    });
+    expect(fields?.[LOG_ERROR_FIELD_KEY]).toBe(rejected);
+  });
+
+  it('carries text a product builder registered, and the error’s closed details', async () => {
+    const h = harness();
+    const message = authorProductText('Could not enable React renders: the suite relay is closed.');
+    const hint = authorProductText('Open the suite relay, then run the session again.');
+    expect(isProductAuthoredText(message)).toBe(true);
+    const failure = new DebuggenError('INSTRUMENTATION_UNAVAILABLE', message, {
+      hint,
+      details: { stage: 'instrument', blockedSignal: 'react', unavailableCount: 1 },
+    });
+    h.instrumentation.install.mockResolvedValueOnce(err(failure));
+
+    expectErr(await h.orchestrator.run({ sessionId: SESSION_ID }));
+
+    const [fields, ...others] = stageFailureFieldsOf(h.records);
+    expect(others).toEqual([]);
+    expect(fields).toMatchObject({
+      stage: 'instrument',
+      code: 'INSTRUMENTATION_UNAVAILABLE',
+      errorMessage: message,
+      errorHint: hint,
+    });
+    expect(fields?.[LOG_ERROR_FIELD_KEY]).toBe(failure);
+    // The service keeps the closed-token details at the default level.
+    expect(scrubLogFields(fields ?? {})[LOG_ERROR_FIELD_KEY]).toMatchObject({
+      type: 'DebuggenError',
+      code: 'INSTRUMENTATION_UNAVAILABLE',
+      details: { blockedSignal: 'react', unavailableCount: 1 },
+    });
+  });
+
+  it('proves the message and the hint separately, and omits an unproven one', async () => {
+    const h = harness();
+    // The model boundary's sentence, with a hint no product builder wrote.
+    const unavailable = modelUnavailable();
+    expect(isProviderFailureText(unavailable.hint)).toBe(false);
+    h.stages.understand.mockResolvedValueOnce(err(unavailable));
+
+    expectErr(await h.orchestrator.run({ sessionId: SESSION_ID }));
+
+    const [fields] = stageFailureFieldsOf(h.records);
+    expect(fields).toMatchObject({
+      errorMessage: modelUnavailableMessage('MODEL_UNAVAILABLE'),
+      [LOG_ERROR_FIELD_KEY]: unavailable,
+    });
+    expect(fields).not.toHaveProperty('errorHint');
+  });
+
+  it('never carries unproven text that quotes a path, a SQL literal or a URL query value', async () => {
+    const h = harness();
+    const leaky = subsystemError('INTERNAL', LEAKY_MESSAGE, { hint: LEAKY_HINT });
+    h.stages.investigate.mockResolvedValueOnce(err(leaky));
+
+    expectErr(await h.orchestrator.run({ sessionId: SESSION_ID }));
+
+    const [fields, ...others] = stageFailureFieldsOf(h.records);
+    expect(others).toEqual([]);
+    expect(fields).toMatchObject({ stage: 'investigate', code: 'INTERNAL' });
+    expect(fields?.[LOG_ERROR_FIELD_KEY]).toBe(leaky);
+    expect(fields).not.toHaveProperty('errorMessage');
+    expect(fields).not.toHaveProperty('errorHint');
+    for (const record of h.records) {
+      const line = asServiceWrites(record);
+      for (const fragment of LEAKY_FRAGMENTS) {
+        expect(line, record.message).not.toContain(fragment);
+      }
+    }
+  });
+
+  it('writes the cause on the service’s own error line at the info level, without a stack', async () => {
+    const lines: string[] = [];
+    const logger = createServiceLogger({ logLevel: 'info' } as ServiceConfig, {
+      destination: { write: (line: string) => void lines.push(line) },
+    });
+    const h = harness({ logger });
+    const rejected = await providerRejection(401);
+    h.stages.understand.mockResolvedValueOnce(err(rejected));
+
+    expectErr(await h.orchestrator.run({ sessionId: SESSION_ID }));
+
+    const failedLines = lines.filter((line) => line.includes(STAGE_FAILED_MESSAGE));
+    expect(failedLines).toHaveLength(1);
+    const line = failedLines[0] ?? '';
+    const record = JSON.parse(line) as Record<string, unknown>;
+    expect(record).toMatchObject({
+      level: 50,
+      subsystem: 'pipeline',
+      sessionId: SESSION_ID,
+      stage: 'understand',
+      code: 'MODEL_UNAVAILABLE',
+      errorMessage: modelUnavailableMessage('MODEL_UNAVAILABLE'),
+      errorHint: rejected.hint,
+      [LOG_ERROR_FIELD_KEY]: {
+        type: 'DebuggenError',
+        code: 'MODEL_UNAVAILABLE',
+        details: { condition: 'unauthorized', status: 401 },
+      },
+    });
+    // The closed shape: no message, hint or stack under the error field, and
+    // no stack anywhere on the line.
+    const error = record[LOG_ERROR_FIELD_KEY] as Record<string, unknown>;
+    expect(error).not.toHaveProperty('message');
+    expect(error).not.toHaveProperty('hint');
+    expect(error).not.toHaveProperty('stack');
+    expect(line).not.toContain('"stack"');
+    expect(line).not.toContain('the scripted endpoint refused the call');
+  });
+
+  it('keeps unproven text off the service’s own error line at the info level', async () => {
+    const lines: string[] = [];
+    const logger = createServiceLogger({ logLevel: 'info' } as ServiceConfig, {
+      destination: { write: (line: string) => void lines.push(line) },
+    });
+    const h = harness({ logger });
+    h.stages.investigate.mockResolvedValueOnce(
+      err(subsystemError('INTERNAL', LEAKY_MESSAGE, { hint: LEAKY_HINT })),
+    );
+
+    expectErr(await h.orchestrator.run({ sessionId: SESSION_ID }));
+
+    const failedLines = lines.filter((line) => line.includes(STAGE_FAILED_MESSAGE));
+    expect(failedLines).toHaveLength(1);
+    const record = JSON.parse(failedLines[0] ?? '{}') as Record<string, unknown>;
+    expect(record).toMatchObject({ level: 50, stage: 'investigate', code: 'INTERNAL' });
+    expect(record).not.toHaveProperty('errorMessage');
+    expect(record).not.toHaveProperty('errorHint');
+    for (const emitted of lines) {
+      for (const fragment of LEAKY_FRAGMENTS) {
+        expect(emitted).not.toContain(fragment);
+      }
+    }
   });
 });

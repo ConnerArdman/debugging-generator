@@ -214,7 +214,7 @@ import { sessionBindPayloadSchema } from '../messages/binding.js';
 // context can be held to the very rules that payload applies.
 import { telemetryEventPayloadSchema } from '../messages/telemetry.js';
 import type { TelemetryEventPayload } from '../messages/telemetry.js';
-import { CLEANUP_STATUSES } from '../session-record.js';
+import { CLEANUP_STATUSES, MAX_QUESTION_LENGTH, questionSchema } from '../session-record.js';
 import { PROTOCOL_VERSION } from '../version.js';
 // The paged listings' contract, Section C.1 of `../http.ts`.
 import {
@@ -1341,6 +1341,104 @@ describe('the session bodies', () => {
     expect(
       sessionQuestionRequestSchema.safeParse({ attemptId: 'fua_4k2p9dq7m1zx0c3v' }).success,
     ).toBe(false);
+  });
+
+  describe('the one question rule, shared by both question bodies', () => {
+    /** Stands in for the developer's own words, which no refusal may repeat. */
+    const QUESTION_SENTINEL = 'do-not-echo-this-question';
+
+    /**
+     * Each body that carries a developer's question, parsed the way the service
+     * parses it: through the route table.
+     */
+    const QUESTION_BODIES = [
+      [
+        'session.create',
+        (question: string) =>
+          parseHttpRequest('session.create', { projectRoot: PROJECT_ROOT, question }),
+      ],
+      [
+        'session.question',
+        (question: string) => parseHttpRequest('session.question', { question }),
+      ],
+    ] as const;
+
+    it('exports the product question limit the record, the routes and the editor share', () => {
+      // One limit for the stored record, both request bodies and the VS Code
+      // webview's text areas; a change here is a deliberate, product-wide one.
+      expect(MAX_QUESTION_LENGTH).toBe(2000);
+      expect(questionSchema.safeParse('q'.repeat(MAX_QUESTION_LENGTH)).success).toBe(true);
+      expect(questionSchema.safeParse('q'.repeat(MAX_QUESTION_LENGTH + 1)).success).toBe(false);
+    });
+
+    it('accepts a question of exactly the limit and refuses one character more', () => {
+      for (const [operation, parse] of QUESTION_BODIES) {
+        const atLimit = parse('q'.repeat(MAX_QUESTION_LENGTH));
+        expect(atLimit.ok, operation).toBe(true);
+
+        const overLimit = parse('q'.repeat(MAX_QUESTION_LENGTH + 1));
+        expect(overLimit.ok, operation).toBe(false);
+        if (!overLimit.ok) {
+          expect(overLimit.error.code, operation).toBe('PROTOCOL_INVALID_MESSAGE');
+          // The refusal names the field and the bound, which is what makes it
+          // actionable.
+          expect(overLimit.error.message, operation).toContain('question');
+          expect(overLimit.error.message, operation).toContain(String(MAX_QUESTION_LENGTH));
+        }
+      }
+    });
+
+    it('refuses a whitespace-only question at the route, as the stored record would', () => {
+      // Before the bodies embedded the record's schema, `'  \n\t '` passed the
+      // route and failed only when the session was written, as a generic error.
+      for (const [operation, parse] of QUESTION_BODIES) {
+        const blank = parse('  \n\t ');
+        expect(blank.ok, operation).toBe(false);
+        if (!blank.ok) {
+          expect(blank.error.code, operation).toBe('PROTOCOL_INVALID_MESSAGE');
+          // The refusal names the field and the rule it broke, not a bare `custom`.
+          expect(blank.error.message, operation).toContain(
+            'question (custom label=non-blank-text-without-control-codes)',
+          );
+        }
+      }
+    });
+
+    it('refuses a control character but keeps tab and line breaks as prose', () => {
+      for (const [operation, parse] of QUESTION_BODIES) {
+        const bell = parse('Why does the bell \u0007 ring?');
+        expect(bell.ok, operation).toBe(false);
+        if (!bell.ok) {
+          expect(bell.error.message, operation).toContain(
+            'question (custom label=non-blank-text-without-control-codes)',
+          );
+        }
+        expect(parse('Why does \u001b[31m this turn red?').ok, operation).toBe(false);
+        expect(parse('First line\r\n\tSecond line').ok, operation).toBe(true);
+      }
+    });
+
+    it('never repeats the refused question in the error', () => {
+      const refused = [
+        `${QUESTION_SENTINEL}\u0007`,
+        QUESTION_SENTINEL.padEnd(MAX_QUESTION_LENGTH + 1, 'q'),
+      ];
+      for (const [operation, parse] of QUESTION_BODIES) {
+        for (const question of refused) {
+          const rejected = parse(question);
+          expect(rejected.ok, operation).toBe(false);
+          if (!rejected.ok) {
+            const exposed = JSON.stringify({
+              message: rejected.error.message,
+              hint: rejected.error.hint,
+              details: rejected.error.details,
+              payload: rejected.error.toPayload(),
+            });
+            expect(exposed, operation).not.toContain(QUESTION_SENTINEL);
+          }
+        }
+      }
+    });
   });
 
   it('accepts a session.question body with or without the attempt id that keys its idempotency', () => {

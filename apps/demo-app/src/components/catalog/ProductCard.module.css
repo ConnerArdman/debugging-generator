@@ -12,22 +12,26 @@
  * `var(--ls-NAME, <literal fallback>)`. `app/globals.css` declares the tokens once for the
  * application and each fallback mirrors the declaration there, so this module also renders
  * sensibly on its own. Geometry the token set does not model - the media ratio, the title clamp,
- * the accent width, the hairline, the stock layer, the grid tracks - is declared once on `.root`
- * as a file-local `--catalog-*` property whose own value is a `var(--ls-catalog-*, <literal>)`
- * lookup: a future global override has a name to target, descendants inherit the resolved value,
- * and no bare value is repeated at a use site.
+ * the accent width, the hairline, the grid tracks - is declared once on `.root` as a file-local
+ * `--catalog-*` property whose own value is a `var(--ls-catalog-*, <literal>)` lookup: a future
+ * global override has a name to target, descendants inherit the resolved value, and no bare value
+ * is repeated at a use site. The container-query widths further down are stated bare, because a
+ * query condition cannot read a custom property.
  *
- * Nothing here restyles a primitive's chrome, and nothing here animates: `Card` owns the tile's
- * hover elevation together with the reduced-motion treatment of that transition, so this file
- * introduces no transition of its own and needs no reduced-motion block.
+ * Nothing here restyles a primitive's chrome - its colour, border, radius or weight - and nothing
+ * here animates: `Card` owns the tile's hover elevation together with the reduced-motion treatment
+ * of that transition, so this file introduces no transition of its own and needs no reduced-motion
+ * block. Where the tile's width asks a primitive for less room - the add control's inline padding,
+ * the stock chip's compact step in a narrow artwork box - the rule that does it says why.
  */
 
 .root {
   /* File-local geometry, resolved once here and inherited by every element below. */
   --catalog-card-fill: var(--ls-catalog-card-fill, 100%);
   --catalog-media-ratio: var(--ls-catalog-media-ratio, 4 / 3);
+  --catalog-media-columns: var(--ls-catalog-media-columns, minmax(0, 1fr));
+  --catalog-media-rows: var(--ls-catalog-media-rows, auto minmax(0, 1fr));
   --catalog-body-columns: var(--ls-catalog-body-columns, minmax(0, 1fr));
-  --catalog-stock-layer: var(--ls-catalog-stock-layer, 1);
   --catalog-accent-width: var(--ls-catalog-accent-width, 2px);
   --catalog-hairline: var(--ls-catalog-hairline, 1px);
   --catalog-title-lines: var(--ls-catalog-title-lines, 2);
@@ -65,47 +69,92 @@
   outline-offset: var(--ls-space-1, 4px);
 }
 
+/*
+ * The artwork box. It holds the tile's 4:3 ratio at every width, so the tiles in a row stay the
+ * same height whatever their availability reads, and it stacks its two children in one column: the
+ * stock chip in a first row sized to the chip, and the artwork in a second row that takes the rest.
+ * The chip gets a row of its own rather than a place over the picture because the picture has no
+ * corner it can promise to leave empty - a drawing or a photograph can reach the top edge, and in
+ * the two-up grid on a phone the chip is nearly as wide as the box - so an overlay would always be
+ * covering something. Stacked, the chip stays inside the box it describes and the artwork is never
+ * under it.
+ *
+ * The explicit `minmax(0, 1fr)` column holds the track to the box: an implicit `auto` column would
+ * grow to the chip's single-line width and carry the artwork past the rounded corner with it. The
+ * box is also an inline-size container, so the chip's compact steps further down follow the width
+ * this box actually has - which the grid's column count decides - rather than the viewport's.
+ */
 .media {
-  position: relative;
+  display: grid;
+  grid-template-columns: var(--catalog-media-columns, minmax(0, 1fr));
+  grid-template-rows: var(--catalog-media-rows, auto minmax(0, 1fr));
+  container-type: inline-size;
   aspect-ratio: var(--catalog-media-ratio, 4 / 3);
   overflow: hidden;
+  gap: var(--ls-space-1, 4px);
   border-radius: var(--ls-radius-md, 8px);
   background: var(--ls-surface-sunken, #f8fafc);
 }
 
-/* The catalog artwork is 4:3, and so is its placeholder; `contain` keeps either undistorted in a
- * track that is narrower or wider than the box's own ratio. */
+/* The catalog artwork is 4:3, and so is its placeholder; `contain` keeps either undistorted in the
+ * row below the chip, which is wider than 4:3 once the chip has taken its share of the box. The
+ * image comes first in the markup, so its row is stated here rather than left to auto-placement. */
 .image {
+  grid-row: 2;
+  grid-column: 1;
   inline-size: var(--catalog-card-fill, 100%);
   block-size: var(--catalog-card-fill, 100%);
   object-fit: contain;
 }
 
-/* The stock indicator sits over the artwork, inset by one space step on both axes; the maximum
- * inline size is the media box less those two insets, so a long label wraps inside the box instead
- * of reaching past its rounded corner. */
+/*
+ * The stock chip, at the box's top-end corner and inset by one space step from the two edges it
+ * sits against; the matching inset on the start side keeps it off the far corner if a wording ever
+ * runs the chip the box's full width. Wider than the narrow boxes below, the chip keeps the size the
+ * product page shows it at: the longest wording the catalog prints, a four-digit low-stock count,
+ * fits on one line with both insets to spare, and `Badge` keeps it on that line.
+ */
 .stock {
-  position: absolute;
-  z-index: var(--catalog-stock-layer, 1);
-  inset-block-start: var(--ls-space-2, 8px);
-  inset-inline-end: var(--ls-space-2, 8px);
-  max-inline-size: calc(var(--catalog-card-fill, 100%) - var(--ls-space-4, 16px));
+  grid-row: 1;
+  grid-column: 1;
+  justify-self: end;
+  align-self: start;
+  margin-block-start: var(--ls-space-2, 8px);
+  margin-inline: var(--ls-space-2, 8px);
 }
 
-/* ...and the rule that makes the clamp above actually bind. The indicator is the shared stock
- * label, and that label's own stylesheet keeps a two-or-three-word status on one line - correct
- * wherever it is given room, and explicit that the component placing it is the one that owes it
- * that room. This card cannot always give it: a card in the narrowest grid is about as wide as
- * the longest in-stock label, and a flex item's automatic minimum size is its single-line width,
- * so without this rule the label would keep its full width, ignore the maximum above, and have
- * its count sliced mid-glyph by the artwork box's `overflow: hidden`. The label is the wrapper's
- * only child, so letting it shrink past that minimum and wrap keeps the whole count legible inside
- * the rounded corner at every card width, and changes nothing about the label on any other
- * surface. */
-.stock > * {
-  min-inline-size: 0;
-  max-inline-size: var(--catalog-card-fill, 100%);
-  white-space: normal;
+/*
+ * A narrow box - the two-up grid on a phone - is about as wide as that longest wording at the
+ * product page's size, so the chip takes the compact step `Badge` itself offers for a card corner:
+ * the smaller type and the inline padding pulled in one space step. The insets tighten to match,
+ * and every wording then fits on one line inside the box again.
+ *
+ * `StockBadge` asks `Badge` for its default `md` step, and `Badge` states that step as a class plus
+ * the size attribute, so the selector names the box, the chip's wrapper and that size: one
+ * specificity step above the rule it displaces, whichever order the two stylesheets load in.
+ */
+@container (max-width: 10rem) {
+  .stock {
+    margin-block-start: var(--ls-space-1, 4px);
+    margin-inline: var(--ls-space-1, 4px);
+  }
+
+  .media > .stock > [data-size='md'] {
+    padding-inline: var(--ls-space-1, 4px);
+    font-size: var(--ls-text-xs, 12px);
+  }
+}
+
+/*
+ * The narrowest box, the two-up grid at the smallest phone widths, where even the compact chip is
+ * a dot's width too wide. The leading dot repeats the tone that the chip's border and text already
+ * carry - it is `aria-hidden` decoration and the wording states the availability - so it is the
+ * part given up to keep the wording whole and on one line.
+ */
+@container (max-width: 8.25rem) {
+  .media > .stock > * > [aria-hidden='true'] {
+    display: none;
+  }
 }
 
 /*

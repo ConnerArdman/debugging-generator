@@ -6,7 +6,9 @@
  * disabled treatment, its inline busy indicator and the transition those states ride on. Nothing
  * here restates any of that. This module adds three things and stops: the accent that makes the
  * primary action of the checkout column the strongest control on the page, the full-width box the
- * column wants, and the caption line underneath.
+ * column wants, and the caption line underneath. The one primitive state it does replace is the
+ * disabled one, and only for the accent it adds: fading an amber fill leaves its label unreadable,
+ * so the unavailable control is drawn on a quiet ground instead (see that rule).
  *
  * Accent and the cascade. `Button.module.css` paints its fills through `[data-variant]` rules, so
  * a lone `.action` rule would either lose to them or tie and be settled by whichever of the two
@@ -81,6 +83,28 @@
   background-color: color-mix(in srgb, var(--ls-amber, #f59e0b) 82%, var(--ls-white, #ffffff));
   box-shadow: none;
   cursor: progress;
+}
+
+/*
+ * Unavailable - the order cannot be placed yet - and NOT in flight, which the rule above covers.
+ *
+ * The primitive's own `:disabled` treatment fades the whole control to 55% opacity, and over the
+ * amber accent that takes the ink label to about 2.6:1, well short of the 4.5:1 its text needs to
+ * be read at all. So this state draws its own quiet ground instead of fading the accent: full
+ * opacity, the sunken surface with the hairline border and the muted text colour, which measures
+ * 7.2:1 on that surface (the figure `app/globals.css` documents for the pair). It still reads as
+ * unavailable rather than as a secondary action: the accent - the one thing that marks this as
+ * the page's primary control - is gone, there is no lift, and the primitive's `not-allowed` cursor
+ * stands. No hover applies: the accent's hover rule above and the primitive's own both exclude
+ * `:disabled`. `[data-busy]` is the primitive's in-flight hook, and excluding it is what leaves the
+ * pending look above in charge while the order is being placed.
+ */
+.root .action[data-variant]:disabled:not([data-busy='true']) {
+  border-color: var(--ls-border, #cbd5e1);
+  background-color: var(--ls-surface-sunken, #f8fafc);
+  box-shadow: none;
+  color: var(--ls-text-muted, #475569);
+  opacity: 1;
 }
 
 /*

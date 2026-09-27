@@ -23,6 +23,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  MAX_QUESTION_LENGTH,
   analysisResultSchema,
   sessionRecordSchema,
   type AnalysisResult,
@@ -44,6 +45,7 @@ import {
   WEBVIEW_REQUEST_TYPES,
   WEBVIEW_TO_HOST_MESSAGE_TYPES,
   isHostToWebviewMessage,
+  isSubmittableQuestion,
   isWebviewRequestMessage,
   isWebviewRequestType,
   isWebviewToHostMessage,
@@ -942,6 +944,50 @@ describe('parseWebviewToHostMessage', () => {
           ok: false,
           rejection: { reason: 'invalid-payload', type },
         });
+      }
+    }
+  });
+
+  it('bounds a question by the protocol question limit, not a looser transport bound', () => {
+    // One limit end to end: the text areas' maxLength, this parser and the
+    // service's request schemas all read the protocol's constant, so a question
+    // the service would refuse cannot pass here and then fail there.
+    expect(MAX_WEBVIEW_QUESTION_LENGTH).toBe(MAX_QUESTION_LENGTH);
+    expect(MAX_WEBVIEW_QUESTION_LENGTH).toBe(2000);
+
+    for (const type of ['askQuestion', 'askFollowUp'] as const) {
+      const overLimit = 'q'.repeat(MAX_QUESTION_LENGTH + 1);
+      expect(
+        parseWebviewToHostMessage({ type, requestId: REQUEST_ID, question: overLimit }),
+      ).toEqual({ ok: false, rejection: { reason: 'invalid-payload', type } });
+      // The 2 010-character question the QA reproduction posted is refused here.
+      const reproduced = 'q'.repeat(2010);
+      expect(
+        parseWebviewToHostMessage({ type, requestId: REQUEST_ID, question: reproduced }).ok,
+      ).toBe(false);
+    }
+  });
+
+  it('shares one submittable-question predicate between the host parser and the view', () => {
+    const longest = 'q'.repeat(MAX_WEBVIEW_QUESTION_LENGTH);
+    const cases: readonly (readonly [string, boolean])[] = [
+      ['Why?', true],
+      ['  why?  ', true],
+      ['First line\nSecond line', true],
+      [longest, true],
+      [`${longest}q`, false],
+      ['', false],
+      [' \n\t ', false],
+    ];
+    for (const [question, submittable] of cases) {
+      expect(isSubmittableQuestion(question), JSON.stringify(question.slice(0, 16))).toBe(
+        submittable,
+      );
+      // The parser applies exactly this predicate to both question frames.
+      for (const type of ['askQuestion', 'askFollowUp'] as const) {
+        expect(parseWebviewToHostMessage({ type, requestId: REQUEST_ID, question }).ok).toBe(
+          submittable,
+        );
       }
     }
   });

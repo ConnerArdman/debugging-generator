@@ -39,7 +39,11 @@
  *   closes, in order, every socket the harness opened, the service, and every
  *   temporary directory; {@link Harness.assertNoLeaks} proves it. The project
  *   runs one file at a time in a forked worker, so a leaked handle stalls the
- *   gate — teardown here is part of the contract, not politeness.
+ *   gate — teardown here is part of the contract, not politeness. Vitest ends
+ *   that worker with `SIGTERM`, so no process `'exit'` handler ever runs there:
+ *   the stand-in dev CLI every harness of a file shares is removed by a
+ *   teardown too — the one that releases the last live harness (see
+ *   {@link standInDevServerCommand}).
  *
  * ## Model provider
  *
@@ -2330,8 +2334,37 @@ const STAND_IN_DEV_SERVER_SOURCE = [
   '',
 ].join('\n');
 
+/**
+ * The stand-in dev CLI's source: a supervisor that serves nothing and runs the
+ * server as a separate process, as `next dev` runs `next-server` — this very
+ * interpreter on {@link STAND_IN_DEV_SERVER_SEGMENTS}, with the inherited
+ * environment (so the launcher's `NODE_OPTIONS` preload reaches it) and the
+ * inherited stdio (so its address line reaches the launcher). The preload's
+ * process gate (`classifyPreloadProcess` in `@debuggen/telemetry`) keeps a
+ * `next dev` supervisor inert and installs in the process that serves, so the
+ * stand-in has to split the two exactly as the framework does. `SIGTERM` is
+ * forwarded, and the supervisor exits once the server has.
+ */
+const STAND_IN_DEV_CLI_SOURCE = [
+  'const { spawn } = require("node:child_process");',
+  'const { join } = require("node:path");',
+  'const server = spawn(process.execPath, [join(__dirname, "..", "server", "lib", "start-server.js")],',
+  ' { stdio: "inherit" });',
+  'server.on("error", () => { process.exit(1); });',
+  'server.on("exit", (code, signal) => { process.exit(code ?? (signal === null ? 1 : 0)); });',
+  'process.on("SIGTERM", () => { server.kill("SIGTERM"); });',
+  '',
+].join('\n');
+
 /** The framework CLI's path under a `node_modules` directory, as the launcher accepts it. */
 const STAND_IN_DEV_CLI_SEGMENTS = ['node_modules', 'next', 'dist', 'bin', 'next'] as const;
+
+/**
+ * The stand-in server's path under the stand-in package — where Next.js keeps
+ * the entry its dev CLI runs the server from — which the CLI source spells
+ * relative to its own directory.
+ */
+const STAND_IN_DEV_SERVER_SEGMENTS = ['dist', 'server', 'lib', 'start-server.js'] as const;
 
 /**
  * The stand-in package's own manifest. The CLI has no extension, so Node takes
@@ -2343,33 +2376,113 @@ const STAND_IN_DEV_CLI_MANIFEST = `${JSON.stringify({ name: 'next', private: tru
 /** The prefix of the private directory the stand-in CLI is written into. */
 const STAND_IN_DEV_CLI_PREFIX = 'debuggen-stand-in-dev-cli-';
 
-/** Where this process wrote the stand-in CLI, once written. */
-let standInDevCliPath: string | undefined;
+/** A written stand-in CLI: its private `mkdtemp` directory, and the CLI's path inside it. */
+interface StandInDevCli {
+  readonly root: string;
+  readonly path: string;
+}
+
+/**
+ * The stand-in CLI written and not yet handed to a release. `undefined` before
+ * the first {@link standInDevServerCommand}, and again from the moment the last
+ * live harness releases it — so a later call writes a fresh directory rather
+ * than returning one that release is about to remove.
+ */
+let writtenStandInDevCli: StandInDevCli | undefined;
+
+/**
+ * How many harnesses are live: {@link startHarness} takes one lease once its
+ * home exists and returns it exactly once, when that harness is released —
+ * by {@link Harness.stop} or by the release after a failed start.
+ */
+let liveHarnessLeases = 0;
+
+/** Whether the process-exit backstop is registered: at most once per module instance. */
+let standInExitBackstopRegistered = false;
+
+/**
+ * Registers, once, the backstop that removes a stand-in CLI still held when
+ * the process exits normally — plain Node, or a pool that lets its workers
+ * exit. It is only a backstop: under the `forks` pool Vitest ends the worker
+ * with `SIGTERM`, which runs no `'exit'` handler, so the removal that counts is
+ * the one {@link releaseStandInLease} hands to the last harness's release.
+ */
+function registerStandInExitBackstop(): void {
+  if (standInExitBackstopRegistered) {
+    return;
+  }
+  standInExitBackstopRegistered = true;
+  process.once('exit', () => {
+    const written = writtenStandInDevCli;
+    writtenStandInDevCli = undefined;
+    if (written !== undefined) {
+      rmSync(written.root, { recursive: true, force: true });
+    }
+  });
+}
 
 /**
  * The stand-in CLI's path, writing it on first use — synchronously, once per
- * process — into a private `mkdtemp` directory as
+ * lifetime of the live harnesses — into a private `mkdtemp` directory as
  * `<dir>/node_modules/next/dist/bin/next`, mode `0o644` (owned by this user
  * and writable by nobody else, which is what the launcher's trust check
- * requires of a framework CLI), beside the package's own `package.json`. The
- * directory is removed when the process exits.
+ * requires of a framework CLI), beside the package's own `package.json` and
+ * the server it runs, `dist/server/lib/start-server.js`.
+ *
+ * The directory belongs to the live harnesses, not to the process: the release
+ * that returns the last lease removes it (see {@link releaseStandInLease}). A
+ * directory written while no harness is live is removed by the next such
+ * release, and a write that fails part-way removes what it had created.
  */
 function standInDevCli(): string {
-  if (standInDevCliPath !== undefined) {
-    return standInDevCliPath;
+  if (writtenStandInDevCli !== undefined) {
+    return writtenStandInDevCli.path;
   }
   const root = mkdtempSync(join(realpathSync(tmpdir()), STAND_IN_DEV_CLI_PREFIX));
-  process.once('exit', () => {
-    rmSync(root, { recursive: true, force: true });
-  });
   const path = join(root, ...STAND_IN_DEV_CLI_SEGMENTS);
-  mkdirSync(join(path, '..'), { recursive: true });
-  writeFileSync(join(root, 'node_modules', 'next', 'package.json'), STAND_IN_DEV_CLI_MANIFEST, {
-    mode: 0o644,
-  });
-  writeFileSync(path, STAND_IN_DEV_SERVER_SOURCE, { mode: 0o644 });
-  standInDevCliPath = path;
+  const packageRoot = join(root, 'node_modules', 'next');
+  const serverPath = join(packageRoot, ...STAND_IN_DEV_SERVER_SEGMENTS);
+  try {
+    mkdirSync(join(path, '..'), { recursive: true });
+    mkdirSync(join(serverPath, '..'), { recursive: true });
+    writeFileSync(join(packageRoot, 'package.json'), STAND_IN_DEV_CLI_MANIFEST, { mode: 0o644 });
+    writeFileSync(serverPath, STAND_IN_DEV_SERVER_SOURCE, { mode: 0o644 });
+    writeFileSync(path, STAND_IN_DEV_CLI_SOURCE, { mode: 0o644 });
+  } catch (cause) {
+    rmSync(root, { recursive: true, force: true });
+    throw cause;
+  }
+  writtenStandInDevCli = Object.freeze({ root, path });
+  registerStandInExitBackstop();
   return path;
+}
+
+/** Takes one lease on the stand-in CLI for a harness whose home now exists. */
+function acquireStandInLease(): void {
+  liveHarnessLeases += 1;
+}
+
+/**
+ * Returns one lease. When it was the last, the stand-in CLI written so far is
+ * forgotten at once and its directory returned, for the caller's release to
+ * remove with its own directories — after its service's shutdown is
+ * confirmed, and so after the launcher has sent `SIGTERM` to every stand-in
+ * dev server that service started (a close that rejects or overruns retains
+ * it and reports it, like the rest). Removing it cannot disturb an earlier
+ * harness whose close is still pending: a stand-in child that is running has
+ * already read its script, and a closing service launches none.
+ *
+ * @returns The stand-in directory to remove, or `undefined` while another
+ *   harness is live or when none was written.
+ */
+function releaseStandInLease(): string | undefined {
+  liveHarnessLeases = Math.max(0, liveHarnessLeases - 1);
+  if (liveHarnessLeases > 0) {
+    return undefined;
+  }
+  const written = writtenStandInDevCli;
+  writtenStandInDevCli = undefined;
+  return written?.root;
 }
 
 /**
@@ -2377,17 +2490,25 @@ function standInDevCli(): string {
  * this very interpreter (`process.execPath`, so no `PATH` lookup happens in
  * the child's injected environment, and the service's own Node, which the
  * launcher's command policy accepts) running a few lines of Node that play
- * the framework's dev CLI — written once per process to a private
+ * the framework's dev CLI — written to a private
  * `node_modules/next/dist/bin/next` and run with `dev`, exactly as the
- * end-to-end sample app borrows a real `next` bin. They listen on an
- * ephemeral loopback port and print the address the way `next dev` does,
+ * end-to-end sample app borrows a real `next` bin. Like `next dev`, that CLI
+ * only supervises: it runs the server as a second process, where the preload
+ * installs (see {@link STAND_IN_DEV_CLI_SOURCE}). The server listens on an
+ * ephemeral loopback port and prints the address the way `next dev` does,
  * which is what the launcher waits for.
  *
  * `session.create` needs a dev-server URL (`DEV_SERVER_UNAVAILABLE` otherwise),
  * and the fixture projects are never installed or executed; this is how a suite
  * gives a session a live dev server through the real launcher, preload
  * attached, without running a byte of the fixture. The child answers every
- * request `200` and exits on `SIGTERM`, which the launcher sends at teardown.
+ * request `200` and exits on `SIGTERM`, which the launcher sends to the whole
+ * process group at teardown.
+ *
+ * Call it while a harness is live — every call then returns the same command
+ * until the last live harness is released, whose teardown removes the CLI's
+ * directory once its service has stopped; the first call after that writes a
+ * fresh one. A command obtained earlier must not outlive that release.
  *
  * @throws Error When the interpreter's path or the stand-in CLI's path
  * contains a single quote, which the launcher's POSIX-style tokenizer could
@@ -3034,13 +3155,18 @@ function watchDeferredRelease(release: HarnessRelease): void {
  * Teardown ({@link Harness.stop}, and the release after a failed start) removes
  * the directories only after the service's `close()` resolved; a close that
  * rejects or overruns retains them and reports each one (see
- * {@link releaseHarnessResources}).
+ * {@link releaseHarnessResources}). The release of the last live harness also
+ * removes the stand-in dev CLI, under the same rule (see
+ * {@link standInDevServerCommand}).
  *
  * @throws Error When the configuration is refused, the service does not start
  * within `HARNESS_TIMEOUTS.boot`, or the editor connection is not accepted.
  */
 export async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
   const home = await mkdtemp(join(realpathSync(tmpdir()), HOME_TEMP_PREFIX));
+  // Returned exactly once, by `releaseAll`, whichever path releases this harness.
+  acquireStandInLease();
+  let leaseReturned = false;
   const clients: HarnessWsClient[] = [];
   const rawSockets: HarnessRawSocket[] = [];
   const projects: FixtureProjectCopy[] = [];
@@ -3056,12 +3182,21 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   // becomes one line of the report, and a removal deferred behind a pending
   // service close is reported through `watchDeferredRelease` when it finishes.
   const releaseAll = async (keepDirectories = false): Promise<readonly string[]> => {
-    const release = await releaseHarnessResources({
-      clients,
-      rawSockets,
-      handle,
-      directories: keepDirectories ? [] : [...projects.map((copy) => copy.container), home],
-    });
+    // The lease is returned before anything is awaited, so a harness started
+    // while this release is under way writes a fresh stand-in CLI. The
+    // directory of the last lease joins the list even when this harness's own
+    // are handed to a late start's continuation: that start never reached a
+    // harness a suite could launch a stand-in dev server through.
+    let standInRoot: string | undefined;
+    if (!leaseReturned) {
+      leaseReturned = true;
+      standInRoot = releaseStandInLease();
+    }
+    const directories = keepDirectories ? [] : [...projects.map((copy) => copy.container), home];
+    if (standInRoot !== undefined) {
+      directories.push(standInRoot);
+    }
+    const release = await releaseHarnessResources({ clients, rawSockets, handle, directories });
     watchDeferredRelease(release);
     return release.problems;
   };

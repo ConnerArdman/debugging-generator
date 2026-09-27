@@ -154,9 +154,10 @@
 
 /* One line: description on the inline-start side, money on the inline-end side. `minmax(0, 1fr)`
  * is load-bearing - it lets the description track shrink below its content's intrinsic width, so
- * a long industrial product name is clamped by `.lineName` instead of pushing the money column
- * out of the card. Baseline alignment puts the money column's first figure on the name's first
- * baseline, so the row still reads as one line however many figures the column holds. */
+ * a long industrial product name wraps inside that track (see `.lineName`) instead of pushing the
+ * money column out of the card. Baseline alignment puts the money column's first figure on the
+ * name's first baseline, so the row still reads as one line however many figures the column
+ * holds. */
 .line {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -172,14 +173,13 @@
   gap: var(--ls-space-1, 4px);
 }
 
-/* Held to two lines. A receipt line names a product, not a paragraph, and a wrapping title three
- * lines deep would break the scan down the money column that makes this block readable. */
+/* The product name, printed in full however many lines it takes. A receipt is the record of what
+ * was bought, and a clamped name leaves the reader no way to read the rest of it - two products in
+ * a catalog of long industrial names routinely differ only in their last words, a grit or a size.
+ * The money column does not depend on the name's height: `.line` aligns it to the name's first
+ * baseline, so a longer name only makes its own row taller. `overflow-wrap: anywhere` breaks a
+ * name with no space in it, such as a part number, rather than letting it widen the card. */
 .lineName {
-  display: -webkit-box;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
   color: var(--ls-text, #0f172a);
   font-size: var(--ls-text-md, 15px);
   overflow-wrap: anywhere;
@@ -240,7 +240,7 @@
  * doing - `.root` is the size container that makes that possible.
  *
  * The threshold is 26rem because a line's money column carries the units at their captured price,
- * the line's discount and its settled amount, so the widest thing it holds beside a two-line
+ * the line's discount and its settled amount, so the widest thing it holds beside a wrapping
  * product name is a phrase rather than a single figure; below this width the two stop fitting side
  * by side.
  *

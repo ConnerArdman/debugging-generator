@@ -37,21 +37,53 @@
  *    between leaves a legitimately unreferenced file, and a concurrent install
  *    may be about to claim a younger one.
  * 3. **Index caches.** An entry of the code-index cache whose project has not
- *    been opened inside the window is deleted. A cache is a derived artifact:
- *    deleting one costs a re-index, never data.
+ *    been opened inside the window is deleted, and so — whatever its age — is
+ *    one nothing will read again: an entry written under an older envelope
+ *    version, and every entry of a project but its newest. A cache is a
+ *    derived artifact: deleting one costs a re-index, never data.
  *
- * Then, and only when the sweep deleted a session, the write-ahead log is
- * folded back into the database; `VACUUM` runs only when a caller asks for it
- * explicitly, because it rewrites the whole file and must never sit on the
- * start-up path.
+ * Then, and only when the sweep deleted something, the pages it freed are
+ * returned to the filesystem and the write-ahead log is folded back into the
+ * database (see "Returning space to the filesystem" below).
+ *
+ * ## Returning space to the filesystem
+ *
+ * A `DELETE` frees database pages but does not shrink the file: SQLite keeps
+ * them on its freelist for reuse. After a real sweep that deleted anything,
+ * the reclaim reads `PRAGMA auto_vacuum`, `page_size`, `page_count` and
+ * `freelist_count` and acts on the store's mode:
+ *
+ * - **`INCREMENTAL` (2)** — `PRAGMA incremental_vacuum` releases the freelist
+ *   in steps of {@link INCREMENTAL_VACUUM_STEP_PAGES}, yielding to the event
+ *   loop and checking the signal between steps, until the freelist is empty or
+ *   a step makes no progress.
+ * - **`NONE` (0)** — the store is converted **once**, `PRAGMA auto_vacuum =
+ *   INCREMENTAL` then `VACUUM`, which compacts it and makes every later sweep
+ *   take the incremental path. `VACUUM` rewrites the live data and blocks for
+ *   as long as that takes, so it runs only when the free share reaches
+ *   {@link VACUUM_CONVERSION_MIN_FREE_SHARE}, the free bytes reach
+ *   {@link VACUUM_CONVERSION_MIN_FREE_BYTES} and the live bytes stay within
+ *   {@link VACUUM_CONVERSION_MAX_LIVE_BYTES} (each tunable through
+ *   {@link RetentionOptions.reclaim}), and never inside a transaction.
+ *   Otherwise the pages stay reusable, and why is logged at `info`.
+ * - **`FULL` (1)** — nothing more: SQLite truncates the file at every commit.
+ *
+ * A `wal_checkpoint(TRUNCATE)` follows, so the file actually shrinks, and the
+ * report states the real shrink in {@link RetentionReport.databaseBytesReclaimed}.
+ * No reclaim runs in a dry run or after an abort, and a reclaim that fails is a
+ * {@link RetentionIssue}, never an `Err`: the purged rows are gone either way,
+ * and their pages are reused until the next sweep returns them.
  *
  * ## Where this runs
  *
  * `src/main.ts` runs start-up modification reconciliation first and this sweep
- * second, before the service accepts a client, and the editor command
- * `debuggen.purgeSessions` runs it on demand while the service serves —
- * **scoped** to the editor's workspace (see "Scoped sweeps" below), while the
- * start-up pass stays machine-wide. Because reconciliation has already moved
+ * second, and the editor command `debuggen.purgeSessions` runs it on demand
+ * while the service serves — **scoped** to the editor's workspace (see "Scoped
+ * sweeps" below), while the start-up pass stays machine-wide. The sweep holds
+ * the write lock for at most one bounded transaction at a time (see "Atomic per
+ * session, bounded per transaction") and stops at the next step boundary once
+ * {@link RetentionOptions.signal} is aborted, so it can run beside a serving
+ * service and be cut short by a shutdown. Because reconciliation has already moved
  * every `pending`, `applied` and `failed` record to `reverted` or `conflict`
  * by the time the start-up sweep runs, `conflict` is the realistic open state
  * here — which is why the conflict exemption is the rule that protects real
@@ -98,21 +130,65 @@
  * guarantee of this module holds unchanged in a scoped sweep, and the
  * machine-wide start-up sweep removes exactly what it removed before.
  *
- * ## Atomic per session
+ * ## Atomic per session, bounded per transaction
  *
- * Every rule that makes a session eligible is re-read, and the session deleted,
- * inside **one** `BEGIN IMMEDIATE` transaction: the row still exists, it is
- * still older than the cutoff, it is not active, its journal holds no open or
- * conflicting record — and then its row goes, and the cascade takes every
- * child row in the same statement. Nothing of a session is deleted before that
- * decision commits, so a session refreshed at any moment of the sweep either
- * keeps every row it had or loses the row and its evidence together, and a
- * failure anywhere in the cascade rolls the whole session back. The price is
- * that one session's cascade holds the write lock — and, `node:sqlite` being
- * synchronous, the event loop — for as long as it takes (about ten
- * microseconds per telemetry event); the sweep yields to the event loop after
- * every deleted session and between pages, so the hold is bounded by the
- * largest single session, never by the backlog.
+ * Every rule that makes a session eligible is re-read inside a `BEGIN
+ * IMMEDIATE` transaction before anything of it is deleted there: the row still
+ * exists, it is still older than the cutoff, it is not active, its journal
+ * holds no open or conflicting record, and the caller does not claim it.
+ * `node:sqlite` is synchronous, so such a transaction holds the event loop as
+ * well as the write lock, and what it may delete is bounded accordingly:
+ *
+ * - **A session of at most {@link DEFAULT_PURGE_BATCH_SIZE} telemetry events**
+ *   — the telemetry store's largest accepted write-lock hold — is decided and
+ *   deleted in **one** transaction: its row goes, and the cascade takes every
+ *   child row in the same statement. A session refreshed at any moment of the
+ *   sweep either keeps every row it had or loses the row and its evidence
+ *   together, and a failure anywhere in the cascade rolls the whole session
+ *   back.
+ * - **A larger session is drained.** Each transaction re-runs every check and
+ *   only then deletes one batch of its oldest events
+ *   (`DELETE_SESSION_BATCH_SQL`, {@link DEFAULT_PURGE_BATCH_SIZE} rows); the
+ *   sweep yields to the event loop between batches; and once no more than one
+ *   batch remains, the final transaction deletes the row with the cascade
+ *   exactly as above. The guarantee is narrower for such a session: one that
+ *   becomes ineligible part-way — refreshed, claimed as in use, a capture
+ *   opened, a conflict marked — keeps its row, plans, panels, analyses,
+ *   journal, backups and every event not yet drained, while the batches
+ *   already committed stay deleted, and the stop is logged at `warn` with the
+ *   session id and the drained count. A store failure in a later batch keeps
+ *   what the earlier ones committed too; it is reported as a
+ *   {@link RetentionIssue}, the sweep carries on with the next session, and the
+ *   next sweep resumes the drain.
+ *
+ * The sweep yields to the event loop after every deleted session, between
+ * drain batches and between pages, so the hold is bounded by one batch —
+ * never by the largest session, never by the backlog.
+ *
+ * ## The write-ahead log during a sweep
+ *
+ * A batch is short only if its commit is. By default SQLite folds the
+ * write-ahead log back into the database file inside whichever commit pushes
+ * the log past its threshold, and with `synchronous = NORMAL` that is where
+ * the `fsync` happens — on the event loop, for as long as the disk takes. A
+ * purge commits a batch every few hundred milliseconds and grows the log by
+ * tens of megabytes per batch, so on a busy disk nearly every commit paid for
+ * a checkpoint, and a single one held the service for seconds.
+ *
+ * A real sweep of a file-backed store therefore takes the checkpoint out of the
+ * commit while it deletes and reclaims: it suspends the connection's
+ * commit-time checkpoint (`./db.ts` {@link suspendAutoCheckpoint}) and, after
+ * every committed batch, every deleted session and every reclaim step, checks
+ * the log's size. Once the log reaches
+ * {@link RetentionOptions.walCheckpointBytes} — {@link RETENTION_WAL_CHECKPOINT_BYTES}
+ * by default — the sweep **waits** for a checkpoint run by a worker thread on
+ * a connection of its own (`./db.ts` {@link openWalCheckpointer}) before its
+ * next transaction. The wait is what bounds the log; the thread is what keeps
+ * the event loop free while it lasts. The connection's own threshold is
+ * restored when the sweep ends, however it ends. A checkpoint that fails
+ * restores it at once, and the rest of the sweep runs with SQLite's own
+ * checkpoints, as before. The in-memory store has no log and is unaffected;
+ * a dry run writes nothing and changes nothing.
  *
  * ## Bounded work
  *
@@ -158,15 +234,18 @@
  * inside the state root, an unusable clock. Every per-item problem (a backup
  * that cannot be removed, a planted link, a row that no longer parses) is
  * recorded in {@link RetentionReport.errors} and the sweep continues: the
- * guarantee is that one bad item never aborts the pass.
+ * guarantee is that one bad item never aborts the pass. An aborted
+ * {@link RetentionOptions.signal} is not an `Err` either: the sweep starts no
+ * further work, skips the database reclaim, and answers `Ok` with the counts
+ * so far and {@link RetentionReport.interrupted} set.
  *
  * ## Privacy
  *
  * Log records and the report carry counts, session ids, error codes and paths
  * **relative to `$DEBUGGEN_HOME`** only. No file content, no diff, no question
  * and no request-key secret is read into a log line or a report field; an
- * index-cache entry is parsed only for its `projectRoot`, which is compared and
- * never emitted.
+ * index-cache entry is parsed only for its `projectRoot` and its envelope
+ * version, which are compared and never emitted.
  *
  * @packageDocumentation
  */
@@ -176,6 +255,7 @@ import type { Stats } from 'node:fs';
 import { lstat, open, readdir, rm, rmdir, unlink } from 'node:fs/promises';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 
+import { INDEX_CACHE_SCHEMA_VERSION } from '@debuggen/code-analysis';
 import { isSessionStatus } from '@debuggen/protocol';
 import type { SessionStatus } from '@debuggen/protocol';
 import {
@@ -198,7 +278,8 @@ import type { Logger, Result, SessionId } from '@debuggen/shared';
 
 import { DEFAULT_RETENTION_DAYS } from '../config.js';
 import type { ServiceConfig } from '../config.js';
-import type { Store } from './db.js';
+import { openWalCheckpointer, suspendAutoCheckpoint } from './db.js';
+import type { AutoCheckpointSuspension, Store, WalCheckpointer } from './db.js';
 import { scanSessionBackupReferences } from './modifications-repo.js';
 import type { ModificationsRepo } from './modifications-repo.js';
 import type { PanelsRepo } from './panels-repo.js';
@@ -208,6 +289,7 @@ import type {
   RetentionCandidateCursor,
   SessionsRepo,
 } from './sessions-repo.js';
+import { DEFAULT_PURGE_BATCH_SIZE, DELETE_SESSION_BATCH_SQL } from './telemetry-repo.js';
 import type { TelemetryRepo } from './telemetry-repo.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -291,6 +373,73 @@ export const BACKUP_PROBE_BATCH_SIZE = 1_000;
  */
 export const MAX_REPORTED_ITEMS = 1_000;
 
+/**
+ * Whether a session holds more telemetry than one purge batch, read inside each
+ * of its deciding transactions. Binds the session id, then
+ * `DEFAULT_PURGE_BATCH_SIZE + 1`.
+ *
+ * The inner `LIMIT` bounds the read to one batch and one row of
+ * `idx_telemetry_events_session_id_start_time_ingest_seq`, however large the
+ * session: the answer is the session's event count when that is at most one
+ * batch, and `DEFAULT_PURGE_BATCH_SIZE + 1` otherwise — which is all the
+ * choice between one atomic cascade and one more drain batch needs, at the
+ * cost of one batch's worth of index entries rather than the whole session's.
+ * Exported so the suite explains the exact text the sweep runs.
+ */
+export const SESSION_TELEMETRY_PROBE_SQL = `SELECT COUNT(*) AS events FROM (
+  SELECT 1 FROM telemetry_events WHERE session_id = ? LIMIT ?
+)`;
+
+/**
+ * How many free pages one `PRAGMA incremental_vacuum` step releases at most:
+ * **2 048** — 8 MiB at the default 4 KiB page size.
+ *
+ * Each step is its own write transaction and holds the event loop while it
+ * moves pages, so the reclaim of a large purge is a sequence of short holds
+ * with a yield and a signal check between them, never one long one.
+ */
+export const INCREMENTAL_VACUUM_STEP_PAGES = 2_048;
+
+/**
+ * The smallest share of the database file that must be free before the
+ * one-time conversion `VACUUM` of a store without auto-vacuum runs: **0.25**.
+ * Below it the rewrite would cost more than the space is worth; the pages stay
+ * reusable. Tunable per call through {@link RetentionReclaimTuning.minFreeShare}.
+ */
+export const VACUUM_CONVERSION_MIN_FREE_SHARE = 0.25;
+
+/**
+ * The fewest free bytes worth the one-time conversion `VACUUM`: **8 MiB**. A
+ * small store freeing a few pages keeps them for reuse instead of being
+ * rewritten. Tunable per call through {@link RetentionReclaimTuning.minFreeBytes}.
+ */
+export const VACUUM_CONVERSION_MIN_FREE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The most live bytes the one-time conversion `VACUUM` will rewrite:
+ * **256 MiB**. `VACUUM` copies every live page and blocks the event loop and
+ * the write lock for as long as that takes — its cost is proportional to the
+ * live data, not to what was freed — so a store holding more keeps its free
+ * pages for reuse, and an explicit {@link RetentionOptions.vacuum} is the way
+ * to compact it. Tunable per call through
+ * {@link RetentionReclaimTuning.maxLiveBytes}.
+ */
+export const VACUUM_CONVERSION_MAX_LIVE_BYTES = 256 * 1024 * 1024;
+
+/**
+ * The write-ahead log size at which a real sweep waits for a background
+ * checkpoint before its next transaction: **32 MiB** (see "The write-ahead log
+ * during a sweep" in the module overview).
+ *
+ * One drain batch grows the log by a few tens of megabytes, so the log peaks
+ * near this bound plus one batch, and the sweep waits roughly once a batch.
+ * Lower waits more often for less each time; higher lets the log — and the
+ * final checkpoint of a sweep an abort cuts short, which runs on the event
+ * loop as the store closes — grow larger. Tunable per call through
+ * {@link RetentionOptions.walCheckpointBytes}.
+ */
+export const RETENTION_WAL_CHECKPOINT_BYTES = 32 * 1024 * 1024;
+
 /* -------------------------------------------------------------------------------------------------
  * Public types
  * ---------------------------------------------------------------------------------------------- */
@@ -313,8 +462,9 @@ export interface RetentionIssue {
    * What the problem is about: a session id for `session`, a path relative to
    * `$DEBUGGEN_HOME` for `backup` and `index-cache`, or the operation's name
    * (`sessions.listRetentionCandidates`, `modifications.scanSessionBackupReferences`,
-   * `sessions.list`, `sessions.getAccessTarget`, `checkpoint`, `vacuum`) for
-   * `database`.
+   * `sessions.list`, `sessions.getAccessTarget`, `reclaim` — reading the page
+   * counts —, `incremental_vacuum`, `auto_vacuum` — the one-time conversion —,
+   * `checkpoint`, `vacuum`) for `database`.
    */
   readonly target: string;
 
@@ -346,6 +496,41 @@ export interface RetentionIssue {
  */
 export type RetentionScope = (projectRoot: string) => boolean | Promise<boolean>;
 
+/**
+ * The gates of the one-time conversion `VACUUM` a store without auto-vacuum
+ * gets after a purge (see "Returning space to the filesystem" in the module
+ * overview). Every member is optional and defaults to its exported constant;
+ * the conversion runs only when all three gates pass. A store already in
+ * `INCREMENTAL` or `FULL` mode is not affected.
+ *
+ * @example Never rewrite more than 64 MiB of live data at start-up
+ * ```ts
+ * await runRetention(deps, { reclaim: { maxLiveBytes: 64 * 1024 * 1024 } });
+ * ```
+ */
+export interface RetentionReclaimTuning {
+  /**
+   * The free share of the file, `freelist_count / page_count`, that must be
+   * reached: a number in `[0, 1]`. Defaults to
+   * {@link VACUUM_CONVERSION_MIN_FREE_SHARE}.
+   */
+  readonly minFreeShare?: number | undefined;
+
+  /**
+   * The free bytes, `freelist_count × page_size`, that must be reached: a
+   * finite, non-negative number. Defaults to
+   * {@link VACUUM_CONVERSION_MIN_FREE_BYTES}.
+   */
+  readonly minFreeBytes?: number | undefined;
+
+  /**
+   * The live bytes, `(page_count − freelist_count) × page_size`, that must not
+   * be exceeded: a finite, non-negative number. Defaults to
+   * {@link VACUUM_CONVERSION_MAX_LIVE_BYTES}.
+   */
+  readonly maxLiveBytes?: number | undefined;
+}
+
 /** Tuning for one {@link runRetention} call. Every member is optional. */
 export interface RetentionOptions {
   /**
@@ -376,18 +561,67 @@ export interface RetentionOptions {
   /**
    * Compute and report without deleting anything. Every read the real sweep
    * performs is performed, no row is deleted, no file or directory is removed
-   * and no checkpoint or `VACUUM` runs; the report holds the counts the real
-   * sweep would have produced. Backs the tests and a "what would be purged"
-   * affordance. Defaults to `false`.
+   * and no reclaim, checkpoint or `VACUUM` runs; the report holds the counts
+   * the real sweep would have produced, with no database bytes reclaimed.
+   * Backs the tests and a "what would be purged" affordance. Defaults to
+   * `false`.
    */
   readonly dryRun?: boolean | undefined;
 
   /**
-   * Run `VACUUM` after the sweep. Defaults to **`false`**: `VACUUM` rewrites
-   * the whole database, holds the write lock for as long as that takes, and
-   * must never run on the start-up path. Ignored when {@link dryRun} is set.
+   * Run `VACUUM` after the sweep, whatever it deleted, and without the gates
+   * of {@link RetentionReclaimTuning}. Defaults to **`false`**: `VACUUM`
+   * rewrites the whole database and holds the write lock — and the event loop
+   * — for as long as that takes, so the start-up path never asks for it. The
+   * store is set to `auto_vacuum = INCREMENTAL` first, so the rewrite also
+   * converts a store without auto-vacuum and every later sweep releases its
+   * pages incrementally. Skipped when the reclaim's own one-time conversion
+   * already ran the `VACUUM`. Ignored when {@link dryRun} is set.
    */
   readonly vacuum?: boolean | undefined;
+
+  /**
+   * The gates of the one-time conversion `VACUUM` of a store without
+   * auto-vacuum. Absent, the exported defaults apply. See
+   * {@link RetentionReclaimTuning}.
+   */
+  readonly reclaim?: RetentionReclaimTuning | undefined;
+
+  /**
+   * The write-ahead log size, in bytes, at which the sweep waits for a
+   * background checkpoint before its next transaction: a finite, non-negative
+   * number. `0` waits whenever the log is not empty. Defaults to
+   * {@link RETENTION_WAL_CHECKPOINT_BYTES}; see "The write-ahead log during a
+   * sweep" in the module overview. Has no effect on a dry run or on the
+   * in-memory store.
+   */
+  readonly walCheckpointBytes?: number | undefined;
+
+  /**
+   * Stops the sweep early. Checked at every step boundary — before each
+   * candidate page, each session decision, each drain batch of a large
+   * session, each backup and index-cache entry, and each database reclaim
+   * step. Once it is aborted the sweep starts no new work, skips the database
+   * reclaim, and still answers `Ok` with the counts so far and
+   * {@link RetentionReport.interrupted} set; an abort never makes it throw or
+   * reject. Work already committed stays committed — at worst the drained
+   * batches of one large session (see "Atomic per session, bounded per
+   * transaction" in the module overview) — and the next sweep carries on
+   * where this one stopped.
+   *
+   * `src/main.ts` passes the signal its shutdown path aborts, so a stop never
+   * waits for a start-up sweep to finish.
+   *
+   * @example
+   * ```ts
+   * const controller = new AbortController();
+   * const sweeping = runRetention(deps, { signal: controller.signal });
+   * // … on shutdown:
+   * controller.abort();
+   * const swept = await sweeping; // Ok, with `interrupted: true`
+   * ```
+   */
+  readonly signal?: AbortSignal | undefined;
 }
 
 /**
@@ -410,7 +644,9 @@ export interface RetentionOmissions {
  * What one sweep removed — or, for a dry run, would have removed.
  *
  * Arrays are sorted, and the traversal order is fixed, so two sweeps over the
- * same state produce the same report apart from {@link durationMs}. Every list
+ * same state produce the same report apart from {@link durationMs} and
+ * {@link databaseBytesReclaimed} — with its share of {@link bytesReclaimed} —
+ * which follow the database file's page layout rather than its rows. Every list
  * holds at most {@link MAX_REPORTED_ITEMS} entries — the first ones the sweep
  * met, oldest session first — and {@link omitted} counts the rest; every count
  * is exact.
@@ -429,7 +665,13 @@ export interface RetentionReport {
   /** Their ids, sorted; see {@link omitted} for any beyond the cap. */
   readonly sessionIdsDeleted: readonly string[];
 
-  /** How many telemetry events those sessions held. */
+  /**
+   * How many telemetry events the sweep deleted: every event those sessions
+   * held, plus the batches drained from a large session that then stopped
+   * being eligible, was interrupted, or failed part-way (see "Atomic per
+   * session, bounded per transaction" in the module overview). Exact either
+   * way.
+   */
   readonly telemetryEventsDeleted: number;
 
   /** How many panels those sessions held. */
@@ -468,14 +710,38 @@ export interface RetentionReport {
   readonly sessionsRetainedActive: readonly string[];
 
   /**
-   * The bytes of the files removed from `$DEBUGGEN_HOME`, from their `lstat`
-   * sizes. Database pages freed by the purge are not included: SQLite reuses
-   * them, and only a `VACUUM` returns them to the filesystem.
+   * The bytes this sweep returned to the filesystem: the `lstat` sizes of the
+   * files it removed from `$DEBUGGEN_HOME`, plus
+   * {@link databaseBytesReclaimed}. A dry run counts the files it would have
+   * removed and no database bytes.
    */
   readonly bytesReclaimed?: number;
 
+  /**
+   * The bytes the session database file shrank by during this sweep:
+   * `max(0, (page_count at the start − page_count after the reclaim) ×
+   * page_size)`, reached on disk by the `wal_checkpoint(TRUNCATE)` that
+   * closes the reclaim. Non-zero only when the sweep deleted something and
+   * released the freed pages — `PRAGMA incremental_vacuum` on an incremental
+   * store, the one-time conversion `VACUUM` of a store without auto-vacuum —
+   * or when {@link RetentionOptions.vacuum} asked for a `VACUUM`. `0` for a
+   * dry run, a sweep interrupted before its reclaim, and a store whose freed
+   * pages stay reusable (see "Returning space to the filesystem" in the module
+   * overview). A signal aborted between two incremental steps keeps what the
+   * earlier steps released, and the store's close checkpoints it to disk.
+   */
+  readonly databaseBytesReclaimed?: number;
+
   /** How long the sweep took, in milliseconds of monotonic time. */
   readonly durationMs: number;
+
+  /**
+   * `true` only when {@link RetentionOptions.signal} stopped the sweep before
+   * it finished; the counts above are then what it had done so far, and the
+   * database reclaim did not run — or stopped between two of its steps.
+   * `false` for every sweep that ran to its end.
+   */
+  readonly interrupted?: boolean;
 
   /** Every per-item problem, in the order it was met, up to the cap. */
   readonly errors: readonly RetentionIssue[];
@@ -531,12 +797,15 @@ export interface RetentionDeps {
    * purged however old its last update.
    *
    * Asked inside the deleting transaction, after every other check, for a
-   * session that would otherwise be deleted; `true` retains it and reports it
-   * in {@link RetentionReport.sessionsRetainedActive}. Absent at start-up,
-   * where nothing is live yet. An on-demand purge run while the service
-   * serves should pass the session manager's view: the sessions repository's
-   * `update` inserts a row that is absent, so a manager writing back a session
-   * this sweep had deleted would resurrect its row without its evidence.
+   * session that would otherwise be deleted — for a large session, inside each
+   * of its drain transactions; `true` retains it and reports it in
+   * {@link RetentionReport.sessionsRetainedActive}. Absent, nothing is
+   * claimed — right only while no client can reach the service. A sweep run
+   * while the service serves — the on-demand purge, or a start-up sweep run
+   * once the service listens — should pass the session manager's view: the
+   * sessions repository's `update` inserts a row that is absent, so a manager
+   * writing back a session this sweep had deleted would resurrect its row
+   * without its evidence.
    * Synchronous, because the transaction it runs in is; a predicate that
    * throws is taken to mean "in use".
    */
@@ -647,6 +916,38 @@ FROM modifications WHERE session_id = ?`;
 /** `O_NOFOLLOW` where the platform defines it, so a metadata read never follows a link. */
 const OPEN_NO_FOLLOW_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
 
+/** The store's auto-vacuum mode: `0` none, `1` full, `2` incremental. Column `auto_vacuum`. */
+const AUTO_VACUUM_SQL = 'PRAGMA auto_vacuum';
+
+/** The database page size in bytes. Column `page_size`. */
+const PAGE_SIZE_SQL = 'PRAGMA page_size';
+
+/** The database size in pages, freelist included. Column `page_count`. */
+const PAGE_COUNT_SQL = 'PRAGMA page_count';
+
+/** How many pages sit unused on the freelist. Column `freelist_count`. */
+const FREELIST_COUNT_SQL = 'PRAGMA freelist_count';
+
+/**
+ * One bounded step of the incremental reclaim. A pragma argument cannot be a
+ * bound parameter, so the step size is spelled into the constant text once.
+ * Stepped to completion with `.all()`: a single step releases a single page.
+ */
+const INCREMENTAL_VACUUM_STEP_SQL = `PRAGMA incremental_vacuum(${String(INCREMENTAL_VACUUM_STEP_PAGES)})`;
+
+/**
+ * Selects incremental auto-vacuum. On a store that already holds tables it
+ * takes effect at the next `VACUUM`, which is why every `VACUUM` of this
+ * module runs right after it.
+ */
+const SET_AUTO_VACUUM_INCREMENTAL_SQL = 'PRAGMA auto_vacuum = INCREMENTAL';
+
+/** Rewrites the whole database compactly; refused by SQLite inside a transaction. */
+const VACUUM_SQL = 'VACUUM';
+
+/** `PRAGMA auto_vacuum` values, as SQLite numbers them. */
+const AUTO_VACUUM_MODE = Object.freeze({ none: 0, full: 1, incremental: 2 } as const);
+
 /* -------------------------------------------------------------------------------------------------
  * Internal shapes
  * ---------------------------------------------------------------------------------------------- */
@@ -664,6 +965,19 @@ interface SweepSettings {
   readonly vacuum: boolean;
   /** {@link RetentionOptions.scope}; `undefined` for a machine-wide sweep. */
   readonly scope: RetentionScope | undefined;
+  /** {@link RetentionOptions.signal}; `undefined` for a sweep nothing can stop. */
+  readonly signal: AbortSignal | undefined;
+  /** {@link RetentionOptions.reclaim} with every default applied. */
+  readonly reclaim: ReclaimGates;
+  /** {@link RetentionOptions.walCheckpointBytes} with its default applied. */
+  readonly walCheckpointBytes: number;
+}
+
+/** {@link RetentionReclaimTuning} with every default applied and validated. */
+interface ReclaimGates {
+  readonly minFreeShare: number;
+  readonly minFreeBytes: number;
+  readonly maxLiveBytes: number;
 }
 
 /** Everything one sweep's phases share. */
@@ -671,6 +985,41 @@ interface SweepContext {
   readonly deps: RetentionDeps;
   readonly settings: SweepSettings;
   readonly logger: Logger;
+  /** How the sweep keeps the write-ahead log bounded; see {@link SweepWal}. */
+  readonly wal: SweepWal;
+}
+
+/**
+ * The sweep's handle on the write-ahead log (see "The write-ahead log during a
+ * sweep" in the module overview): one per {@link runRetention} call, created
+ * before the first phase and closed after the last.
+ */
+interface SweepWal {
+  /**
+   * Runs `phase` with the connection's commit-time checkpoint suspended, when
+   * a background checkpointer is available for this store; otherwise runs it
+   * unchanged. The suspension ends when `phase` settles, however it settles.
+   * A dry run never suspends: it writes nothing.
+   */
+  during(phase: () => Promise<void>): Promise<void>;
+
+  /**
+   * Waits for a background checkpoint when the log has reached
+   * {@link SweepSettings.walCheckpointBytes} — or, with `force`, whenever it
+   * is not empty. Does nothing outside {@link during}, where SQLite's own
+   * checkpoints are in force. Stops waiting, without cancelling the
+   * checkpoint, when the signal aborts. Never rejects.
+   */
+  relieve(force?: boolean): Promise<void>;
+
+  /** Ends the checkpointer thread, when one was started. Never rejects. */
+  close(): Promise<void>;
+
+  /** Background checkpoints the sweep waited for, for the finish record. */
+  readonly checkpoints: number;
+
+  /** The longest of those waits, in milliseconds. */
+  readonly longestCheckpointMs: number;
 }
 
 /** {@link RetentionOmissions}, as the phases count them up. */
@@ -702,7 +1051,18 @@ interface SweepState {
   backupDirsDeleted: number;
   orphanBackupsDeleted: number;
   indexCachesDeleted: number;
+  /** The `lstat` bytes of the files removed; the report adds {@link databaseBytesReclaimed}. */
   bytesReclaimed: number;
+  /** Whether {@link RetentionOptions.signal} stopped the sweep; set once, never cleared. */
+  interrupted: boolean;
+  /**
+   * `PRAGMA page_count` as the sweep began — the baseline of
+   * {@link RetentionReport.databaseBytesReclaimed}. `undefined` in a dry run,
+   * or when it could not be read.
+   */
+  databasePagesAtStart: number | undefined;
+  /** {@link RetentionReport.databaseBytesReclaimed}, once the reclaim has measured it. */
+  databaseBytesReclaimed: number;
 }
 
 /**
@@ -732,7 +1092,7 @@ interface SessionCounts {
 type ActiveReason = 'in-flight' | 'capture-open' | 'in-use';
 
 /**
- * What the in-transaction evaluation of one candidate decided.
+ * What one in-transaction evaluation of a candidate decided.
  *
  * - `gone` — the row had already been deleted.
  * - `refreshed` — it was updated at or after the cutoff since it was listed
@@ -742,12 +1102,43 @@ type ActiveReason = 'in-flight' | 'capture-open' | 'in-use';
  * - `open-modifications` — its journal still describes a patched file.
  * - `deleted` — it was deleted (in a dry run: it would have been), with the
  *   counts the cascade removed.
+ * - `drained` — every check passed, but the session holds more than one purge
+ *   batch of telemetry, so this transaction deleted one batch of `events`
+ *   events and left the row for a later transaction. Never answered by a dry
+ *   run.
  */
 type SessionVerdict =
   | { readonly outcome: 'gone' | 'refreshed' | ActiveReason }
   | { readonly outcome: 'conflict'; readonly conflicts: number }
   | { readonly outcome: 'open-modifications'; readonly openRecords: number | undefined }
-  | { readonly outcome: 'deleted'; readonly counts: SessionCounts };
+  | { readonly outcome: 'deleted'; readonly counts: SessionCounts }
+  | { readonly outcome: 'drained'; readonly events: number };
+
+/** Why {@link decideSession} stopped draining a large session before its last transaction. */
+type HaltReason = 'interrupted' | 'store-closed';
+
+/**
+ * What {@link decideSession} came to over every transaction it ran for one
+ * candidate.
+ */
+interface SessionDecision {
+  /**
+   * The verdict of its last evaluation; `halted` when the signal or a closed
+   * store stopped a drain between batches; `failed` with the issue to record
+   * when the store refused a transaction.
+   */
+  readonly result:
+    | Exclude<SessionVerdict, { readonly outcome: 'drained' }>
+    | { readonly outcome: 'halted'; readonly reason: HaltReason }
+    | { readonly outcome: 'failed'; readonly error: DebuggenError };
+
+  /**
+   * How many telemetry events earlier drain batches committed deleted before
+   * that result — `0` for a session decided in one transaction, and for every
+   * dry run.
+   */
+  readonly drained: number;
+}
 
 /**
  * A `backups/<sessionId>` directory the orphan walk is judging, and what it
@@ -891,6 +1282,30 @@ function storeUsable(context: SweepContext, state: SweepState, phase: string): b
     ),
   );
   return false;
+}
+
+/** The step boundary at which {@link isInterrupted} found the signal aborted, for its log line. */
+type InterruptionPoint =
+  'candidate-page' | 'session' | 'drain-batch' | 'backup' | 'index-cache' | 'reclaim';
+
+/**
+ * Whether {@link RetentionOptions.signal} has stopped the sweep, checked at a
+ * step boundary. The first `true` marks the report interrupted and is logged
+ * once at `info`, naming the boundary; every later call answers `true`
+ * without logging. Reads only the signal's `aborted` flag — never its reason,
+ * which a caller may have filled with anything.
+ */
+function isInterrupted(context: SweepContext, state: SweepState, at: InterruptionPoint): boolean {
+  if (state.interrupted) {
+    return true;
+  }
+  const { signal } = context.settings;
+  if (signal?.aborted !== true) {
+    return false;
+  }
+  state.interrupted = true;
+  context.logger.info('retention sweep interrupted; the next sweep carries on from here', { at });
+  return true;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1382,6 +1797,21 @@ function resolveSettings(
     return err(invalidSetting('scope', 'a predicate over project roots'));
   }
 
+  const { signal } = options;
+  if (!isAbortSignalLike(signal)) {
+    return err(invalidSetting('signal', 'an AbortSignal'));
+  }
+
+  const reclaim = resolveReclaimGates(options.reclaim);
+  if (isErr(reclaim)) {
+    return reclaim;
+  }
+
+  const walCheckpointBytes = options.walCheckpointBytes ?? RETENTION_WAL_CHECKPOINT_BYTES;
+  if (!isByteCount(walCheckpointBytes)) {
+    return err(invalidSetting('walCheckpointBytes', 'a finite, non-negative number of bytes'));
+  }
+
   let now: number;
   try {
     now = (deps.now ?? nowEpochMs)();
@@ -1409,7 +1839,210 @@ function resolveSettings(
     dryRun: options.dryRun === true,
     vacuum: options.vacuum === true,
     scope,
+    signal,
+    reclaim: reclaim.value,
+    walCheckpointBytes,
   });
+}
+
+/** Whether `value` is a usable byte count: finite and non-negative. */
+function isByteCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * {@link RetentionOptions.reclaim} with every default applied, or the
+ * `CONFIG_INVALID` refusal of a member it cannot use: a share outside
+ * `[0, 1]`, or a byte count that is negative or not finite.
+ */
+function resolveReclaimGates(
+  tuning: RetentionReclaimTuning | undefined,
+): Result<ReclaimGates, DebuggenError> {
+  if (tuning === undefined) {
+    return ok({
+      minFreeShare: VACUUM_CONVERSION_MIN_FREE_SHARE,
+      minFreeBytes: VACUUM_CONVERSION_MIN_FREE_BYTES,
+      maxLiveBytes: VACUUM_CONVERSION_MAX_LIVE_BYTES,
+    });
+  }
+  if (typeof tuning !== 'object' || tuning === null) {
+    return err(invalidSetting('reclaim', 'an object of reclaim gates'));
+  }
+  const minFreeShare = tuning.minFreeShare ?? VACUUM_CONVERSION_MIN_FREE_SHARE;
+  if (typeof minFreeShare !== 'number' || !(minFreeShare >= 0 && minFreeShare <= 1)) {
+    return err(invalidSetting('reclaim.minFreeShare', 'a number from 0 to 1'));
+  }
+  const minFreeBytes = tuning.minFreeBytes ?? VACUUM_CONVERSION_MIN_FREE_BYTES;
+  if (!isByteCount(minFreeBytes)) {
+    return err(invalidSetting('reclaim.minFreeBytes', 'a finite, non-negative number of bytes'));
+  }
+  const maxLiveBytes = tuning.maxLiveBytes ?? VACUUM_CONVERSION_MAX_LIVE_BYTES;
+  if (!isByteCount(maxLiveBytes)) {
+    return err(invalidSetting('reclaim.maxLiveBytes', 'a finite, non-negative number of bytes'));
+  }
+  return ok({ minFreeShare, minFreeBytes, maxLiveBytes });
+}
+
+/**
+ * Whether `value` is absent or reads like an `AbortSignal` — an object whose
+ * `aborted` is a boolean, the one member the sweep reads. Structural rather
+ * than `instanceof`, so a signal from another realm or a polyfill is accepted.
+ */
+function isAbortSignalLike(value: unknown): value is AbortSignal | undefined {
+  return (
+    value === undefined ||
+    (typeof value === 'object' &&
+      value !== null &&
+      'aborted' in value &&
+      typeof value.aborted === 'boolean')
+  );
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The write-ahead log
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Awaits `work`, or stops waiting once `signal` aborts.
+ *
+ * The work itself is not cancelled — a checkpoint already running on the
+ * worker finishes there — but a shutdown no longer waits behind it. A signal
+ * that cannot be observed (a structural look-alike without
+ * `addEventListener`) is waited out, as a signal-less call is.
+ *
+ * @returns What `work` resolved to, or `undefined` when the signal aborted first.
+ */
+async function unlessAborted<T>(
+  work: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T | undefined> {
+  if (signal === undefined || typeof signal.addEventListener !== 'function') {
+    return work;
+  }
+  if (signal.aborted) {
+    return undefined;
+  }
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<undefined>((resolveAborted) => {
+    onAbort = () => {
+      resolveAborted(undefined);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([work, aborted]);
+  } finally {
+    if (onAbort !== undefined && typeof signal.removeEventListener === 'function') {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
+/**
+ * Creates the {@link SweepWal} of one sweep.
+ *
+ * Nothing is started here: the checkpointer is opened by the first
+ * {@link SweepWal.during}, and its thread by the first checkpoint the sweep
+ * actually waits for, so a start-up sweep with nothing to delete costs one
+ * pragma write and its restore.
+ *
+ * @param store The sweep's store.
+ * @param settings The sweep's settings: `dryRun`, `signal` and `walCheckpointBytes`.
+ * @param logger The sweep's logger. A checkpoint the sweep waited for is
+ * recorded at `debug` with its outcome, frame counts and duration; one that
+ * failed at `warn`, with the binding's reason, before the connection's own
+ * checkpoints are restored.
+ */
+function createSweepWal(store: Store, settings: SweepSettings, logger: Logger): SweepWal {
+  let checkpointer: WalCheckpointer | undefined;
+  let suspension: AutoCheckpointSuspension | undefined;
+  /** Set once background checkpoints are unavailable or have failed; never cleared. */
+  let unavailable = false;
+  let checkpoints = 0;
+  let longestCheckpointMs = 0;
+
+  const resume = (): void => {
+    suspension?.restore();
+    suspension = undefined;
+  };
+
+  const relieve = async (force = false): Promise<void> => {
+    if (suspension === undefined || checkpointer === undefined || store.isClosed) {
+      return;
+    }
+    const walBytes = checkpointer.walBytes();
+    if (walBytes === 0 || (!force && walBytes < settings.walCheckpointBytes)) {
+      return;
+    }
+    if (settings.signal?.aborted === true) {
+      return;
+    }
+
+    const outcome = await unlessAborted(checkpointer.checkpoint(), settings.signal);
+    if (outcome === undefined) {
+      return;
+    }
+    switch (outcome.status) {
+      case 'completed':
+      case 'busy':
+        checkpoints += 1;
+        longestCheckpointMs = Math.max(longestCheckpointMs, outcome.durationMs);
+        logger.debug('checkpointed the session store write-ahead log off the event loop', {
+          checkpoint: outcome.status,
+          busy: outcome.busy,
+          logFrames: outcome.logFrames,
+          checkpointedFrames: outcome.checkpointedFrames,
+          walBytes,
+          durationMs: Math.round(outcome.durationMs),
+        });
+        return;
+      case 'failed':
+        logger.warn(
+          'the background checkpoint of the session store failed; the sweep continues with the connection’s own checkpoints',
+          { checkpoint: outcome.status, checkpointReason: outcome.reason, walBytes },
+        );
+        unavailable = true;
+        resume();
+        return;
+      case 'no-wal':
+      case 'closed':
+        unavailable = true;
+        resume();
+        return;
+    }
+  };
+
+  return {
+    async during(phase: () => Promise<void>): Promise<void> {
+      if (settings.dryRun || unavailable || store.isClosed) {
+        await phase();
+        return;
+      }
+      checkpointer ??= openWalCheckpointer(store);
+      if (checkpointer === undefined) {
+        unavailable = true;
+        await phase();
+        return;
+      }
+      suspension = suspendAutoCheckpoint(store);
+      try {
+        await phase();
+      } finally {
+        resume();
+      }
+    },
+    relieve,
+    async close(): Promise<void> {
+      resume();
+      await checkpointer?.close();
+    },
+    get checkpoints(): number {
+      return checkpoints;
+    },
+    get longestCheckpointMs(): number {
+      return longestCheckpointMs;
+    },
+  };
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1547,8 +2180,36 @@ function announceDeleted(context: SweepContext, sessionId: SessionId): void {
 }
 
 /**
+ * Inside a deciding transaction whose checks all passed: deletes one batch of
+ * a session's oldest telemetry when it holds more than one batch, and answers
+ * how many events went.
+ *
+ * `0` means the session holds at most {@link DEFAULT_PURGE_BATCH_SIZE} events
+ * — its probe reads no further than one batch and one row, however large the
+ * session — so the caller deletes it whole with the cascade. A batch that
+ * deleted nothing answers `0` as well: the cascade is then the one statement
+ * certain to make progress, and it removes the rest atomically. A probe whose
+ * count column is unreadable is read as "at most one batch" for the same
+ * reason; the repository's full count that follows reports the corruption.
+ */
+function drainOneBatch(store: Store, sessionId: SessionId): number {
+  const probe = store
+    .statement(SESSION_TELEMETRY_PROBE_SQL)
+    .get(sessionId, DEFAULT_PURGE_BATCH_SIZE + 1);
+  const held = readInteger(probe?.['events']);
+  if (held === undefined || held <= DEFAULT_PURGE_BATCH_SIZE) {
+    return 0;
+  }
+  const { changes } = store
+    .statement(DELETE_SESSION_BATCH_SQL)
+    .run(sessionId, DEFAULT_PURGE_BATCH_SIZE);
+  return Number(changes);
+}
+
+/**
  * Evaluates one candidate against the database as it stands **now** and, when
- * `remove` is set and every check passes, deletes it.
+ * `remove` is set and every check passes, deletes it — or, for a session
+ * holding more than one purge batch of telemetry, one batch of it.
  *
  * Synchronous from its first read to the delete, so in a real sweep — where it
  * runs as the body of one `Store.transaction` — nothing can land between the
@@ -1569,15 +2230,22 @@ function announceDeleted(context: SweepContext, sessionId: SessionId): void {
  * 6. the caller does not claim it (`in-use`,
  *    {@link RetentionDeps.isSessionInUse}).
  *
- * Only then are the counts the report states read — telemetry, panels,
- * analyses and journal records, inside the same transaction, so they are
- * exactly what the cascade removes — and the row deleted, the schema's
- * `ON DELETE CASCADE` taking every child row in the same statement. In a dry
- * run the same reads run as plain reads and nothing is deleted.
+ * Only then, when `remove` is set, is the hold bounded: a session holding more
+ * than {@link DEFAULT_PURGE_BATCH_SIZE} telemetry events
+ * ({@link SESSION_TELEMETRY_PROBE_SQL}) loses one batch of its oldest events
+ * (`DELETE_SESSION_BATCH_SQL`) and nothing else, and the answer is `drained`:
+ * its row, plans, panels, analyses, journal and remaining events stay for a
+ * later transaction, which re-runs every check above first. A session of at
+ * most one batch — or the rest of a drained one — has the counts the report
+ * states read — telemetry, panels, analyses and journal records, inside the
+ * same transaction, so they are exactly what the cascade removes — and its
+ * row deleted, the schema's `ON DELETE CASCADE` taking every child row in the
+ * same statement. In a dry run the same checks and counts run as plain reads,
+ * the whole session is counted at once, and nothing is deleted.
  *
  * @throws Whatever the store throws, and the `DebuggenError` of a repository
  * read or delete that answered `Err` — thrown so the surrounding transaction
- * rolls back; {@link decideSession} turns either into a `Result`.
+ * rolls back; {@link decideSession} turns either into its `failed` result.
  */
 function evaluateSession(
   context: SweepContext,
@@ -1630,6 +2298,13 @@ function evaluateSession(
     return { outcome: 'in-use' };
   }
 
+  if (remove) {
+    const drained = drainOneBatch(store, sessionId);
+    if (drained > 0) {
+      return { outcome: 'drained', events: drained };
+    }
+  }
+
   const events = telemetry.countBySession(sessionId);
   if (isErr(events)) {
     throw events.error;
@@ -1677,28 +2352,86 @@ function decisionFailed(sessionId: SessionId, cause: unknown): DebuggenError {
 }
 
 /**
- * Decides one candidate: in a real sweep inside one `BEGIN IMMEDIATE`
- * transaction that deletes it when every check passes, and in a dry run as
- * plain reads that delete nothing.
- *
- * The transaction is what makes the purge atomic per session: no telemetry is
- * deleted ahead of it in separately committed batches, so a session refreshed
- * at any point keeps all of its evidence, and a failure anywhere in the
- * cascade — a trigger, a constraint, a full disk — rolls the whole session
- * back.
+ * The issue for a large session whose drain the store refused after earlier
+ * batches had committed. Always a fixed sentence, whatever the cause — which
+ * is kept as the error's `cause` and never quoted — so the report says what
+ * was kept and what was not; the cause's own code is kept when it has one.
  */
-function decideSession(
+function drainFailed(sessionId: SessionId, drained: number, cause: unknown): DebuggenError {
+  return new DebuggenError(
+    DebuggenError.is(cause) ? cause.code : 'STORE_ERROR',
+    `The retention purge of session ${sessionId} failed in the session store after ${String(drained)} of its telemetry events were deleted in bounded batches; its row and its remaining evidence were kept.`,
+    {
+      hint: 'The next start or purge resumes the purge of the session.',
+      details: {
+        subsystem: SUBSYSTEM,
+        component: COMPONENT,
+        sessionId,
+        operation: 'purge',
+        drainedEvents: drained,
+      },
+      cause,
+    },
+  );
+}
+
+/**
+ * Decides one candidate: in a real sweep through `BEGIN IMMEDIATE`
+ * transactions that each re-run every check before deleting anything, and in
+ * a dry run as one evaluation of plain reads that delete nothing.
+ *
+ * A session of at most {@link DEFAULT_PURGE_BATCH_SIZE} telemetry events takes
+ * one transaction, and its purge is atomic: a session refreshed at any point
+ * keeps all of its evidence, and a failure anywhere in the cascade — a
+ * trigger, a constraint, a full disk — rolls the whole session back.
+ *
+ * A larger one is drained, one committed batch per transaction with a yield
+ * to the event loop after each, until its final transaction deletes the row
+ * with the cascade. The guarantee for it is narrower, as the module overview's
+ * "Atomic per session, bounded per transaction" states: when a later
+ * transaction finds it ineligible (`refreshed`, `in-use`, `capture-open`, …),
+ * or the signal or a closed store stops the drain between batches (`halted`),
+ * or the store refuses a transaction (`failed`), the batches already committed
+ * stay deleted and everything else of the session stays; {@link SessionDecision.drained}
+ * says how many events that is.
+ */
+async function decideSession(
   context: SweepContext,
+  state: SweepState,
   sessionId: SessionId,
-): Result<SessionVerdict, DebuggenError> {
+): Promise<SessionDecision> {
   const { store } = context.deps;
-  try {
-    if (context.settings.dryRun) {
-      return ok(evaluateSession(context, sessionId, false));
+  const remove = !context.settings.dryRun;
+  let drained = 0;
+
+  for (;;) {
+    let verdict: SessionVerdict;
+    try {
+      verdict = remove
+        ? store.transaction((): SessionVerdict => evaluateSession(context, sessionId, true))
+        : evaluateSession(context, sessionId, false);
+    } catch (caught) {
+      const error =
+        drained === 0 ? decisionFailed(sessionId, caught) : drainFailed(sessionId, drained, caught);
+      return { result: { outcome: 'failed', error }, drained };
     }
-    return ok(store.transaction((): SessionVerdict => evaluateSession(context, sessionId, true)));
-  } catch (caught) {
-    return err(decisionFailed(sessionId, caught));
+    if (verdict.outcome !== 'drained') {
+      return { result: verdict, drained };
+    }
+
+    drained += verdict.events;
+    // Before the next batch: the log this one grew, folded in off the event
+    // loop once it is large enough to need it.
+    await context.wal.relieve();
+    // The batch just held the event loop; let queued work run before the next.
+    await yieldToEventLoop();
+    if (store.isClosed) {
+      // Reported once, by the candidate loop's own store check.
+      return { result: { outcome: 'halted', reason: 'store-closed' }, drained };
+    }
+    if (isInterrupted(context, state, 'drain-batch')) {
+      return { result: { outcome: 'halted', reason: 'interrupted' }, drained };
+    }
   }
 }
 
@@ -1743,7 +2476,10 @@ function retainActive(
  * exempts a conflict backup until the developer resolves the conflict, and the
  * journal row is what makes that backup interpretable — it names the file, the
  * hashes and the diff — so the row must outlive the window too. Everything
- * else is decided, atomically with the deletion, by {@link decideSession}.
+ * else is decided by {@link decideSession}: atomically with the deletion for a
+ * session of at most one purge batch of telemetry, batch by batch for a larger
+ * one — whose drained events count in the report however its decision ends,
+ * and whose stop part-way is logged at `warn` with its id and drained count.
  *
  * In a scoped sweep a session outside the scope is skipped before any of
  * that: nothing about it is read beyond its project root, and it appears in no
@@ -1774,14 +2510,32 @@ async function purgeCandidate(
     return false;
   }
 
-  const decided = decideSession(context, sessionId);
-  if (isErr(decided)) {
-    recordIssue(context, state, 'session', sessionId, decided.error);
-    return false;
+  const { result: verdict, drained } = await decideSession(context, state, sessionId);
+  // Committed drain batches are gone whatever the last transaction decided,
+  // so they count, exactly, in every branch below.
+  state.telemetryEventsDeleted += drained;
+  if (drained > 0 && verdict.outcome === 'halted') {
+    // The sweep itself was stopped — a shutdown's abort or the store closing —
+    // not the session: expected, so `info`, and the next sweep resumes it.
+    context.logger.info(
+      'the purge of a large session stopped part-way because the sweep was stopped; the next sweep carries on with it',
+      { sessionId, outcome: verdict.reason, drainedEvents: drained },
+    );
+  } else if (drained > 0 && verdict.outcome !== 'deleted') {
+    context.logger.warn(
+      'a large session stopped being eligible part-way through its purge; its row and remaining evidence were kept',
+      { sessionId, outcome: verdict.outcome, drainedEvents: drained },
+    );
   }
 
-  const verdict = decided.value;
   switch (verdict.outcome) {
+    case 'failed':
+      recordIssue(context, state, 'session', sessionId, verdict.error);
+      return false;
+    case 'halted':
+      // The signal or a closed store stopped the drain; the candidate loop
+      // stops at its next boundary and reports why.
+      return false;
     case 'deleted':
       state.sessionsDeleted += 1;
       reportId(state, 'sessionIdsDeleted', sessionId);
@@ -1859,6 +2613,11 @@ async function removePurgedBackups(
   const { home, dryRun } = context.settings;
 
   for (const sessionId of purged) {
+    // A directory left behind by an interrupted sweep has no row any more; the
+    // orphan rule of the next sweep removes its files.
+    if (isInterrupted(context, state, 'backup')) {
+      return;
+    }
     const directory = sessionBackupDirectory(context.settings, sessionId);
     if (directory === undefined) {
       recordIssue(
@@ -1920,8 +2679,9 @@ async function removePurgedBackups(
  * candidate of a page whatever happened to it, so a retained session is never
  * read twice and a deleted one cannot shift a later page; a session refreshed
  * mid-sweep simply stops matching the cutoff. The sweep yields to the event
- * loop after every deleted session — whose cascade held it — and between
- * pages.
+ * loop after every deleted session — whose cascade held it — between the drain
+ * batches of a large one, and between pages, and it stops before the next page
+ * or the next candidate once {@link RetentionOptions.signal} is aborted.
  *
  * A session holding an open record other than a conflict (which
  * reconciliation in `src/main.ts` normally settles before this sweep runs) is
@@ -1934,6 +2694,9 @@ async function purgeAgedSessions(context: SweepContext, state: SweepState): Prom
   let after: RetentionCandidateCursor | undefined;
 
   for (;;) {
+    if (isInterrupted(context, state, 'candidate-page')) {
+      return;
+    }
     if (!storeUsable(context, state, 'sessions.listRetentionCandidates')) {
       return;
     }
@@ -1953,12 +2716,16 @@ async function purgeAgedSessions(context: SweepContext, state: SweepState): Prom
 
     const purged: SessionId[] = [];
     for (const candidate of page.value) {
+      if (isInterrupted(context, state, 'session')) {
+        return;
+      }
       if (!storeUsable(context, state, 'sessions.delete')) {
         return;
       }
       if (await purgeCandidate(context, state, candidate)) {
         purged.push(candidate.id);
         if (!settings.dryRun) {
+          await context.wal.relieve();
           // The cascade just held the event loop; let queued work run.
           await yieldToEventLoop();
         }
@@ -2103,6 +2870,12 @@ async function judgeCandidates(
   }
 
   for (const candidate of candidates) {
+    if (isInterrupted(context, state, 'backup')) {
+      // What is left of the directory waits for the next sweep, which judges
+      // it again from the start.
+      directory.blocked = true;
+      return;
+    }
     if (conflicted.has(candidate.name) || referenced.has(candidate.name)) {
       continue;
     }
@@ -2156,6 +2929,10 @@ async function walkBackupDirectory(
   let batch: OrphanCandidate[] = [];
 
   for (const name of names) {
+    if (isInterrupted(context, state, 'backup')) {
+      directory.blocked = true;
+      break;
+    }
     const entryPath = joinPosix(path, name);
     const entry = relativeToHome(home, entryPath);
     let stats: Stats | undefined;
@@ -2247,6 +3024,9 @@ async function sweepOrphanBackups(context: SweepContext, state: SweepState): Pro
   const { settings } = context;
   const scoped = settings.scope !== undefined;
   const rootTarget = relativeToHome(settings.home, settings.backupsDir);
+  if (isInterrupted(context, state, 'backup')) {
+    return;
+  }
 
   const root = await inspectDirectory(settings.home, settings.backupsDir);
   if (root.kind === 'absent') {
@@ -2269,6 +3049,9 @@ async function sweepOrphanBackups(context: SweepContext, state: SweepState): Pro
   }
 
   for (const name of names) {
+    if (isInterrupted(context, state, 'backup')) {
+      return;
+    }
     const path = joinPosix(settings.backupsDir, name);
     if (dirnamePosix(path) !== settings.backupsDir || !isStrictlyWithin(settings.home, path)) {
       continue;
@@ -2375,26 +3158,60 @@ function projectRootsOf(document: unknown): string[] {
 }
 
 /**
- * Reads the project roots one cache document records.
- *
- * The entry format belongs to `@debuggen/code-analysis`, which keys a file by a
- * project hash and records the indexed root as `index.projectRoot`; a
- * top-level `projectRoot` is accepted as well so a format revision does not
- * silently turn every entry into an mtime-only one. The file is opened without
- * following a link, must still be the file the walk inspected, and must be no
- * larger than {@link MAX_INDEX_METADATA_BYTES}. The document's content is
- * never logged.
- *
- * @returns The roots it records — `[]` for a JSON document that records none —
- * or `undefined` when it could not be read: unreadable, replaced since the
- * walk, oversized, or not JSON. The machine-wide sweep reads both the same
- * way, sending the entry down the modification-time branch; a scoped sweep
- * tells them apart only to say why it kept an entry, and keeps it either way.
+ * What the sweep reads out of one cache document: the project roots it
+ * records and, when it is a code-index cache envelope, the envelope version it
+ * was written under.
  */
-async function readRecordedProjectRoots(
+interface IndexDocumentMetadata {
+  /** Every `projectRoot` the document records, at either level. */
+  readonly roots: readonly string[];
+  /**
+   * The envelope's `schemaVersion`, set only for a document that has the shape
+   * `@debuggen/code-analysis` writes — a finite top-level `schemaVersion` and
+   * an `index` object recording a `projectRoot`. `undefined` for any other
+   * document, which the supersession rules therefore never judge.
+   */
+  readonly envelopeVersion: number | undefined;
+}
+
+/** The {@link IndexDocumentMetadata} of a parsed cache document. */
+function indexDocumentMetadata(document: unknown): IndexDocumentMetadata {
+  const roots = projectRootsOf(document);
+  if (typeof document !== 'object' || document === null || Array.isArray(document)) {
+    return { roots, envelopeVersion: undefined };
+  }
+  const version = 'schemaVersion' in document ? document.schemaVersion : undefined;
+  const index = 'index' in document ? document.index : undefined;
+  const isEnvelope =
+    typeof version === 'number' &&
+    Number.isFinite(version) &&
+    typeof index === 'object' &&
+    index !== null &&
+    'projectRoot' in index &&
+    typeof index.projectRoot === 'string';
+  return { roots, envelopeVersion: isEnvelope ? version : undefined };
+}
+
+/**
+ * Reads what one cache document records: its project roots and, for a
+ * code-index cache envelope, its envelope version.
+ *
+ * The entry format belongs to `@debuggen/code-analysis`, which names a file by
+ * a project hash and records the indexed root as `index.projectRoot` and the
+ * envelope version as `schemaVersion`; a top-level `projectRoot` is accepted as
+ * well so a format revision does not silently turn every entry into an
+ * mtime-only one. The file is opened without following a link, must still be
+ * the file the walk inspected, and must be no larger than
+ * {@link MAX_INDEX_METADATA_BYTES}. The document's content is never logged.
+ *
+ * @returns What it records — no roots and no version for a JSON document that
+ * records neither — or `undefined` when it could not be read: unreadable,
+ * replaced since the walk, oversized, or not JSON.
+ */
+async function readIndexDocument(
   path: string,
   expected: Stats,
-): Promise<string[] | undefined> {
+): Promise<IndexDocumentMetadata | undefined> {
   if (expected.size > MAX_INDEX_METADATA_BYTES) {
     return undefined;
   }
@@ -2411,12 +3228,28 @@ async function readRecordedProjectRoots(
       return undefined;
     }
     const text = await handle.readFile({ encoding: 'utf8' });
-    return projectRootsOf(JSON.parse(text) as unknown);
+    return indexDocumentMetadata(JSON.parse(text) as unknown);
   } catch {
     return undefined;
   } finally {
     await handle?.close().catch(() => undefined);
   }
+}
+
+/**
+ * Reads the project roots one cache document records.
+ *
+ * @returns The roots it records — `[]` for a JSON document that records none —
+ * or `undefined` when it could not be read (see {@link readIndexDocument}).
+ * The machine-wide sweep reads both the same way, sending the entry down the
+ * modification-time branch; a scoped sweep tells them apart only to say why it
+ * kept an entry, and keeps it either way.
+ */
+async function readRecordedProjectRoots(
+  path: string,
+  expected: Stats,
+): Promise<readonly string[] | undefined> {
+  return (await readIndexDocument(path, expected))?.roots;
 }
 
 /** Whether any recorded root is one of the roots active inside the window. */
@@ -2425,19 +3258,41 @@ function isActiveRoot(roots: readonly string[], active: ReadonlySet<string>): bo
 }
 
 /**
- * Judges one file-shaped cache entry — the `<key>.json` files the cache
- * writes — and removes it unless it still belongs to a project active inside
- * the window.
+ * Removes one file-shaped cache entry the sweep has decided to remove — or,
+ * in a dry run, only counts it — through {@link removeFileWithin}, so every
+ * rule shares the containment, link and replacement checks.
+ */
+async function removeIndexFile(
+  context: SweepContext,
+  state: SweepState,
+  file: IndexFileCandidate,
+  root: NodeIdentity,
+): Promise<void> {
+  const { home, dryRun } = context.settings;
+  if (!dryRun) {
+    const removed = await removeFileWithin(home, file.path, root, identityOf(file.stats));
+    if (isErr(removed)) {
+      recordIssue(context, state, 'index-cache', relativeToHome(home, file.path), removed.error);
+      return;
+    }
+  }
+  state.indexCachesDeleted += 1;
+  state.bytesReclaimed += file.stats.size;
+}
+
+/**
+ * Judges one file-shaped cache entry by age — the rule every entry the
+ * supersession rules of {@link sweepIndexFiles} kept is still subject to — and
+ * removes it unless it still belongs to a project active inside the window.
  *
  * Two branches, in this order:
  *
- * 1. **Modification time.** An entry written at or after the cutoff is kept
- *    without being read: it was produced by an indexing run inside the window,
- *    which means its project was opened inside the window.
- * 2. **Recorded project root.** An older entry is read for the `projectRoot`
- *    it records, and kept when that root has a session updated inside the
- *    window — a cache hit does not rewrite the entry, so an actively used
- *    project's cache can be old on disk.
+ * 1. **Modification time.** An entry written at or after the cutoff is kept: it
+ *    was produced by an indexing run inside the window, which means its
+ *    project was opened inside the window.
+ * 2. **Recorded project root.** An older entry is kept when a `projectRoot` it
+ *    records has a session updated inside the window — a cache hit does not
+ *    rewrite the entry, so an actively used project's cache can be old on disk.
  *
  * Otherwise the entry is eligible. The fallback is safe because a cache is a
  * derived artifact: removing one that was still wanted costs one re-index on
@@ -2451,32 +3306,162 @@ async function sweepIndexFile(
   context: SweepContext,
   state: SweepState,
   active: ReadonlySet<string>,
-  path: string,
-  stats: Stats,
+  file: IndexFileCandidate,
   root: NodeIdentity,
 ): Promise<void> {
-  const { home, cutoff, dryRun } = context.settings;
-  if (stats.mtimeMs >= cutoff) {
+  if (file.stats.mtimeMs >= context.settings.cutoff) {
     return;
   }
   // An unreadable document records no root: the machine-wide sweep judges it
   // by age, and `cacheEntryInScope` keeps it from a scoped one.
-  const roots = path.endsWith(INDEX_ENTRY_EXTENSION)
-    ? ((await readRecordedProjectRoots(path, stats)) ?? [])
-    : [];
+  const roots = file.document?.roots ?? [];
   if (isActiveRoot(roots, active) || !(await cacheEntryInScope(context, roots))) {
     return;
   }
+  await removeIndexFile(context, state, file, root);
+}
 
-  if (!dryRun) {
-    const removed = await removeFileWithin(home, path, root, identityOf(stats));
-    if (isErr(removed)) {
-      recordIssue(context, state, 'index-cache', relativeToHome(home, path), removed.error);
-      return;
+/**
+ * One file-shaped cache entry as the walk saw it, with what its document
+ * records — `undefined` for a file that is not a `*.json` document or could
+ * not be read.
+ */
+interface IndexFileCandidate {
+  readonly path: string;
+  readonly stats: Stats;
+  readonly document: IndexDocumentMetadata | undefined;
+}
+
+/**
+ * Why a file-shaped entry was removed ahead of the age rule. Logged at
+ * `debug` with the entry's path relative to `$DEBUGGEN_HOME`, never with a
+ * project root.
+ *
+ * - `older-envelope` — written under an envelope version older than the one
+ *   `@debuggen/code-analysis` reads and writes now. The cache names entries
+ *   differently across such versions (version 2 named one file per file state,
+ *   version 3 names one per project), so no lookup ever reaches this file
+ *   again, and nothing but this sweep would remove it.
+ * - `superseded` — a current-version entry every project root of which a newer
+ *   current-version entry also records: an index of the same project written
+ *   under an identity the cache no longer asks for (an earlier indexer
+ *   version, say). The newest entry of each project is the one kept.
+ */
+type IndexSupersession = 'older-envelope' | 'superseded';
+
+/** Whether `candidate` was written after `held`, with the name breaking a tie so the order is total. */
+function isNewerEntry(candidate: IndexFileCandidate, held: IndexFileCandidate): boolean {
+  if (candidate.stats.mtimeMs !== held.stats.mtimeMs) {
+    return candidate.stats.mtimeMs > held.stats.mtimeMs;
+  }
+  return candidate.path > held.path;
+}
+
+/**
+ * The supersession rules over every file-shaped entry at once: which entry,
+ * if any, each file was superseded by, decided before any file is removed.
+ *
+ * Only documents with the envelope shape `@debuggen/code-analysis` writes are
+ * judged ({@link IndexDocumentMetadata.envelopeVersion}); anything else is left
+ * to the age rule alone. Among current-version envelopes, the newest entry
+ * recording each normalised project root is kept, and an entry is superseded
+ * only when *every* root it records is kept by a newer entry — so no project
+ * loses the last cache it has.
+ *
+ * @returns The supersession reason per candidate, positionally.
+ */
+function judgeSupersession(
+  files: readonly IndexFileCandidate[],
+): readonly (IndexSupersession | undefined)[] {
+  const newestByRoot = new Map<string, IndexFileCandidate>();
+  for (const file of files) {
+    if (file.document?.envelopeVersion !== INDEX_CACHE_SCHEMA_VERSION) {
+      continue;
+    }
+    for (const recorded of file.document.roots) {
+      const projectRoot = normalizePosix(recorded);
+      const held = newestByRoot.get(projectRoot);
+      if (held === undefined || isNewerEntry(file, held)) {
+        newestByRoot.set(projectRoot, file);
+      }
     }
   }
-  state.indexCachesDeleted += 1;
-  state.bytesReclaimed += stats.size;
+
+  return files.map((file): IndexSupersession | undefined => {
+    const version = file.document?.envelopeVersion;
+    if (version === undefined) {
+      return undefined;
+    }
+    if (version < INDEX_CACHE_SCHEMA_VERSION) {
+      return 'older-envelope';
+    }
+    if (version !== INDEX_CACHE_SCHEMA_VERSION || file.document === undefined) {
+      return undefined;
+    }
+    const { roots } = file.document;
+    const supersededEverywhere =
+      roots.length > 0 &&
+      roots.every((recorded) => {
+        const newest = newestByRoot.get(normalizePosix(recorded));
+        return newest !== undefined && newest !== file;
+      });
+    return supersededEverywhere ? 'superseded' : undefined;
+  });
+}
+
+/**
+ * Judges every file-shaped cache entry: first by supersession, then by age.
+ *
+ * Each `*.json` document is read once, whatever its age, because an entry the
+ * cache can no longer reach is recent as often as not — version 2 of the cache
+ * wrote a new file for every state of a project, so a project that was worked
+ * on today can own dozens. Two rules run ahead of the age rule
+ * ({@link judgeSupersession}):
+ *
+ * 1. an entry of an **older envelope version** is removed — no lookup names it
+ *    any more;
+ * 2. of the **current-version** entries recording one project, all but the
+ *    newest are removed.
+ *
+ * Both remove an entry even when its project is active inside the window,
+ * because the project's newest entry is what an active session reads, and in
+ * a scoped sweep both still require {@link cacheEntryInScope}. Every other
+ * entry — including the kept newest one — then faces {@link sweepIndexFile}'s
+ * age rule exactly as before. Removal goes through {@link removeIndexFile}, so
+ * containment, link refusal and the replaced-file check hold for every rule,
+ * and a dry run counts exactly what a real sweep removes.
+ */
+async function sweepIndexFiles(
+  context: SweepContext,
+  state: SweepState,
+  active: ReadonlySet<string>,
+  found: readonly { readonly path: string; readonly stats: Stats }[],
+  root: NodeIdentity,
+): Promise<void> {
+  const files: IndexFileCandidate[] = [];
+  for (const { path, stats } of found) {
+    const document = path.endsWith(INDEX_ENTRY_EXTENSION)
+      ? await readIndexDocument(path, stats)
+      : undefined;
+    files.push({ path, stats, document });
+  }
+
+  const supersession = judgeSupersession(files);
+  for (const [position, file] of files.entries()) {
+    const reason = supersession[position];
+    if (reason === undefined) {
+      await sweepIndexFile(context, state, active, file, root);
+      continue;
+    }
+    if (!(await cacheEntryInScope(context, file.document?.roots ?? []))) {
+      continue;
+    }
+    context.logger.debug('an index-cache entry was superseded', {
+      target: relativeToHome(context.settings.home, file.path),
+      reason,
+    });
+    await removeIndexFile(context, state, file, root);
+  }
 }
 
 /** One `*.json` document directly inside a directory-shaped cache entry, as the walk saw it. */
@@ -2664,17 +3649,23 @@ async function sweepIndexDirectory(
 }
 
 /**
- * Rule 2: removes the entries of the code-index cache whose project has not
- * been opened inside the window.
+ * Rule 2: removes the entries of the code-index cache that nothing will read
+ * again — those an older envelope version wrote, those a newer entry of the
+ * same project superseded — and those whose project has not been opened
+ * inside the window.
  *
  * Only the direct children of `indexCacheDir` are judged, and the walk never
- * leaves that directory: a link is reported and left, a file or a directory is
- * judged by {@link sweepIndexFile} or {@link sweepIndexDirectory}, and anything
- * else is ignored.
+ * leaves that directory: a link is reported and left, a directory is judged
+ * by {@link sweepIndexDirectory}, the files are judged together by
+ * {@link sweepIndexFiles} once the walk has seen them all, and anything else is
+ * ignored.
  */
 async function sweepIndexCaches(context: SweepContext, state: SweepState): Promise<void> {
   const { deps, settings } = context;
   const rootTarget = relativeToHome(settings.home, settings.indexCacheDir);
+  if (isInterrupted(context, state, 'index-cache')) {
+    return;
+  }
 
   const root = await inspectDirectory(settings.home, settings.indexCacheDir);
   if (root.kind === 'absent') {
@@ -2704,7 +3695,13 @@ async function sweepIndexCaches(context: SweepContext, state: SweepState): Promi
     return;
   }
 
+  // File-shaped entries are judged together once the walk has seen them all,
+  // because whether one is superseded depends on the others.
+  const files: { readonly path: string; readonly stats: Stats }[] = [];
   for (const name of names) {
+    if (isInterrupted(context, state, 'index-cache')) {
+      return;
+    }
     const path = joinPosix(settings.indexCacheDir, name);
     if (dirnamePosix(path) !== settings.indexCacheDir || !isStrictlyWithin(settings.home, path)) {
       continue;
@@ -2736,35 +3733,375 @@ async function sweepIndexCaches(context: SweepContext, state: SweepState): Promi
       continue;
     }
     if (stats.isFile()) {
-      await sweepIndexFile(context, state, active.value, path, stats, root.identity);
+      files.push({ path, stats });
     } else if (stats.isDirectory()) {
       await sweepIndexDirectory(context, state, active.value, path, stats, root.identity);
     }
   }
+  await sweepIndexFiles(context, state, active.value, files, root.identity);
 }
 
 /* -------------------------------------------------------------------------------------------------
  * Reclaiming database space
  * ---------------------------------------------------------------------------------------------- */
 
+/** What the four space pragmas read at one moment. */
+interface DatabaseSpace {
+  /** One of {@link AUTO_VACUUM_MODE}'s values, or whatever the store answered. */
+  readonly autoVacuum: number;
+  /** `PRAGMA page_size`. */
+  readonly bytesPerPage: number;
+  /** `PRAGMA page_count`: the file's pages, free ones included. */
+  readonly totalPages: number;
+  /** `PRAGMA freelist_count`. */
+  readonly freelistCount: number;
+}
+
+/** Why the conversion `VACUUM` of a store without auto-vacuum did not run. */
+type ConversionSkip =
+  'free-share-below-threshold' | 'free-bytes-below-minimum' | 'live-bytes-above-cap';
+
 /**
- * Folds the write-ahead log back into the database after a purge, and runs
- * `VACUUM` when the caller asked for it.
- *
- * The checkpoint runs only when this sweep deleted a session: it is cheap, but
- * a sweep that deleted nothing has nothing to reclaim, and the start-up path
- * with no candidates stays free of writes. `VACUUM` runs only on request, never
- * in a dry run, and never inside a caller's open transaction, where SQLite
- * refuses it.
+ * A reclaim step that failed, as a {@link RetentionIssue}'s error: a fixed
+ * sentence naming the operation, the engine's error kept only as the cause.
  */
-function reclaimDatabaseSpace(context: SweepContext, state: SweepState): void {
+function reclaimFailed(operation: string, message: string, cause?: unknown): DebuggenError {
+  return new DebuggenError('STORE_ERROR', message, {
+    hint: 'The purged rows are gone either way; SQLite reuses their pages, and the next sweep returns them to the filesystem.',
+    details: { subsystem: SUBSYSTEM, component: COMPONENT, operation },
+    cause,
+  });
+}
+
+/** One integer column of a pragma, or `undefined` when it does not read as one. */
+function readPragmaInteger(store: Store, sql: string, column: string): number | undefined {
+  return readInteger(store.statement(sql).get()?.[column]);
+}
+
+/**
+ * Reads one size pragma — `page_count` or `page_size` — recording a `reclaim`
+ * issue, and answering `undefined`, when it cannot be read as an integer.
+ *
+ * @param what What the pragma measures, for the issue's sentence ("size",
+ * "page size").
+ */
+function readSizePragma(
+  context: SweepContext,
+  state: SweepState,
+  sql: typeof PAGE_COUNT_SQL | typeof PAGE_SIZE_SQL,
+  what: string,
+): number | undefined {
+  const column = sql === PAGE_COUNT_SQL ? 'page_count' : 'page_size';
+  let value: number | undefined;
+  let cause: unknown;
+  try {
+    value = readPragmaInteger(context.deps.store, sql, column);
+  } catch (caught) {
+    cause = caught;
+  }
+  if (value === undefined) {
+    recordIssue(
+      context,
+      state,
+      'database',
+      'reclaim',
+      reclaimFailed('reclaim', `Could not read the ${what} of the session store.`, cause),
+    );
+  }
+  return value;
+}
+
+/**
+ * Reads the auto-vacuum mode and the page counts, recording a `reclaim` issue
+ * — and answering `undefined` — when any of them cannot be read.
+ */
+function readDatabaseSpace(context: SweepContext, state: SweepState): DatabaseSpace | undefined {
+  const { store } = context.deps;
+  let space: Partial<Record<keyof DatabaseSpace, number | undefined>>;
+  try {
+    space = {
+      autoVacuum: readPragmaInteger(store, AUTO_VACUUM_SQL, 'auto_vacuum'),
+      bytesPerPage: readPragmaInteger(store, PAGE_SIZE_SQL, 'page_size'),
+      totalPages: readPragmaInteger(store, PAGE_COUNT_SQL, 'page_count'),
+      freelistCount: readPragmaInteger(store, FREELIST_COUNT_SQL, 'freelist_count'),
+    };
+  } catch (caught) {
+    recordIssue(
+      context,
+      state,
+      'database',
+      'reclaim',
+      reclaimFailed('reclaim', 'Could not read the page counts of the session store.', caught),
+    );
+    return undefined;
+  }
+  const { autoVacuum, bytesPerPage, totalPages, freelistCount } = space;
+  if (
+    autoVacuum === undefined ||
+    bytesPerPage === undefined ||
+    totalPages === undefined ||
+    freelistCount === undefined
+  ) {
+    recordIssue(
+      context,
+      state,
+      'database',
+      'reclaim',
+      reclaimFailed('reclaim', 'The session store reported page counts that are not numbers.'),
+    );
+    return undefined;
+  }
+  return { autoVacuum, bytesPerPage, totalPages, freelistCount };
+}
+
+/**
+ * Releases an incremental store's freelist to the filesystem, one
+ * {@link INCREMENTAL_VACUUM_STEP_PAGES}-page step at a time.
+ *
+ * Every step is its own short write transaction, stepped to completion with
+ * `.all()`; between steps the sweep yields to the event loop and checks the
+ * signal, so a large freelist never becomes one long hold. The loop ends when
+ * the freelist is empty, when a step releases nothing — a reader pinning the
+ * pages, say; the next sweep tries again — or at the first failure, which is
+ * recorded as an `incremental_vacuum` issue.
+ */
+async function releaseIncrementally(
+  context: SweepContext,
+  state: SweepState,
+  space: DatabaseSpace,
+): Promise<void> {
+  const { store } = context.deps;
+  const freeAtStart = space.freelistCount;
+  let free = freeAtStart;
+  let steps = 0;
+
+  while (free > 0) {
+    if (isInterrupted(context, state, 'reclaim')) {
+      break;
+    }
+    if (!storeUsable(context, state, 'incremental_vacuum')) {
+      return;
+    }
+    let after: number | undefined;
+    try {
+      store.statement(INCREMENTAL_VACUUM_STEP_SQL).all();
+      after = readPragmaInteger(store, FREELIST_COUNT_SQL, 'freelist_count');
+    } catch (caught) {
+      recordIssue(
+        context,
+        state,
+        'database',
+        'incremental_vacuum',
+        reclaimFailed(
+          'incremental_vacuum',
+          'The incremental vacuum of the session store did not complete.',
+          caught,
+        ),
+      );
+      return;
+    }
+    steps += 1;
+    if (after === undefined || after >= free) {
+      context.logger.debug(
+        'the incremental vacuum released no more pages; the rest stay reusable',
+        {
+          freePages: after ?? free,
+          steps,
+        },
+      );
+      free = after ?? free;
+      break;
+    }
+    free = after;
+    await context.wal.relieve();
+    // The step just held the event loop; let queued work run before the next.
+    await yieldToEventLoop();
+  }
+
+  if (steps > 0) {
+    context.logger.info('released the purged database pages to the filesystem', {
+      mode: 'incremental',
+      freePagesBefore: freeAtStart,
+      freePagesAfter: free,
+      steps,
+    });
+  }
+}
+
+/**
+ * The first gate of {@link RetentionOptions.reclaim} a store without
+ * auto-vacuum fails, or `undefined` when the conversion `VACUUM` may run.
+ */
+function conversionSkip(space: DatabaseSpace, gates: ReclaimGates): ConversionSkip | undefined {
+  const freeShare = space.totalPages > 0 ? space.freelistCount / space.totalPages : 0;
+  if (freeShare < gates.minFreeShare) {
+    return 'free-share-below-threshold';
+  }
+  if (space.freelistCount * space.bytesPerPage < gates.minFreeBytes) {
+    return 'free-bytes-below-minimum';
+  }
+  if ((space.totalPages - space.freelistCount) * space.bytesPerPage > gates.maxLiveBytes) {
+    return 'live-bytes-above-cap';
+  }
+  return undefined;
+}
+
+/**
+ * Sets `auto_vacuum = INCREMENTAL` and runs `VACUUM`: the rewrite that
+ * compacts the store and, on a store without auto-vacuum, converts it so every
+ * later sweep releases its pages incrementally.
+ *
+ * Never inside a transaction — SQLite refuses `VACUUM` there, and the refusal
+ * is recorded instead of attempted. Every failure is recorded under `target`
+ * (`auto_vacuum` for the reclaim's own conversion, `vacuum` for
+ * {@link RetentionOptions.vacuum}).
+ *
+ * @returns Whether the `VACUUM` completed.
+ */
+function vacuumIncrementally(
+  context: SweepContext,
+  state: SweepState,
+  target: 'auto_vacuum' | 'vacuum',
+): boolean {
+  const { store } = context.deps;
+  if (!storeUsable(context, state, target)) {
+    return false;
+  }
+  if (store.db.isTransaction) {
+    recordIssue(
+      context,
+      state,
+      'database',
+      target,
+      new DebuggenError(
+        'STORE_ERROR',
+        'VACUUM was skipped because a transaction is open on the session store.',
+        {
+          hint:
+            target === 'vacuum'
+              ? 'Run the purge with vacuum outside any transaction.'
+              : 'The purged pages stay reusable; the next sweep run outside a transaction converts the store.',
+          details: { subsystem: SUBSYSTEM, component: COMPONENT, operation: target },
+        },
+      ),
+    );
+    return false;
+  }
+  try {
+    store.db.exec(SET_AUTO_VACUUM_INCREMENTAL_SQL);
+    store.db.exec(VACUUM_SQL);
+    return true;
+  } catch (caught) {
+    recordIssue(
+      context,
+      state,
+      'database',
+      target,
+      new DebuggenError('STORE_ERROR', 'VACUUM of the session store did not complete.', {
+        hint: 'The purged rows are gone either way; the space is reused by SQLite and returned on the next successful VACUUM.',
+        details: { subsystem: SUBSYSTEM, component: COMPONENT, operation: target },
+        cause: caught,
+      }),
+    );
+    return false;
+  }
+}
+
+/**
+ * Returns the pages this sweep's deletions freed, by the store's auto-vacuum
+ * mode (see "Returning space to the filesystem" in the module overview).
+ *
+ * @returns Whether a `VACUUM` ran — the conversion of a store without
+ * auto-vacuum — so a requested {@link RetentionOptions.vacuum} need not run a
+ * second one.
+ */
+async function releaseFreedPages(context: SweepContext, state: SweepState): Promise<boolean> {
+  if (!storeUsable(context, state, 'reclaim')) {
+    return false;
+  }
+  const space = readDatabaseSpace(context, state);
+  if (space === undefined) {
+    return false;
+  }
+
+  switch (space.autoVacuum) {
+    case AUTO_VACUUM_MODE.incremental:
+      await releaseIncrementally(context, state, space);
+      return false;
+    case AUTO_VACUUM_MODE.none: {
+      const skip = conversionSkip(space, context.settings.reclaim);
+      if (skip !== undefined) {
+        context.logger.info(
+          'the purged database pages stay reusable; the store file keeps its size',
+          {
+            reason: skip,
+            freePages: space.freelistCount,
+            totalPages: space.totalPages,
+            bytesPerPage: space.bytesPerPage,
+          },
+        );
+        return false;
+      }
+      const startedAt = performance.now();
+      const vacuumed = vacuumIncrementally(context, state, 'auto_vacuum');
+      if (vacuumed) {
+        context.logger.info(
+          'converted the session store to incremental auto-vacuum and compacted it',
+          {
+            freePages: space.freelistCount,
+            totalPages: space.totalPages,
+            bytesPerPage: space.bytesPerPage,
+            durationMs: performance.now() - startedAt,
+          },
+        );
+      }
+      return vacuumed;
+    }
+    default:
+      // FULL: SQLite already truncated the file at every commit.
+      return false;
+  }
+}
+
+/**
+ * Returns what the sweep freed to the filesystem, then folds the write-ahead
+ * log back into the database so the file actually shrinks, and measures the
+ * shrink.
+ *
+ * Runs after a real sweep that deleted anything — a session, or the drained
+ * batches of one — and after any sweep {@link RetentionOptions.vacuum} asks a
+ * `VACUUM` of; a sweep that deleted nothing has nothing to reclaim, so the
+ * start-up path with no candidates stays free of writes. Never in a dry run,
+ * and never once the signal is aborted (the caller checks before, and the
+ * incremental steps between steps). Every failure is a {@link RetentionIssue}
+ * with scope `database`.
+ *
+ * {@link RetentionReport.databaseBytesReclaimed} is `(page_count at the
+ * sweep's start − page_count now) × page_size`, floored at zero.
+ */
+async function reclaimDatabaseSpace(context: SweepContext, state: SweepState): Promise<void> {
   const { store } = context.deps;
   const { dryRun, vacuum } = context.settings;
   if (dryRun) {
     return;
   }
+  const deletedRows = state.sessionsDeleted > 0 || state.telemetryEventsDeleted > 0;
+  if (!deletedRows && !vacuum) {
+    return;
+  }
 
-  if (state.sessionsDeleted > 0) {
+  let vacuumed = false;
+  if (deletedRows) {
+    vacuumed = await releaseFreedPages(context, state);
+  }
+  if (vacuum && !vacuumed && !state.interrupted) {
+    vacuumIncrementally(context, state, 'vacuum');
+  }
+
+  if (!state.interrupted) {
+    // Whatever log is left is copied back off the event loop first, so the
+    // truncating checkpoint below has only the truncation left to do.
+    await context.wal.relieve(true);
     if (!storeUsable(context, state, 'checkpoint')) {
       return;
     }
@@ -2781,41 +4118,29 @@ function reclaimDatabaseSpace(context: SweepContext, state: SweepState): void {
     }
   }
 
-  if (!vacuum || !storeUsable(context, state, 'vacuum')) {
+  measureReclaimed(context, state);
+}
+
+/**
+ * Sets {@link SweepState.databaseBytesReclaimed} from the page count the sweep
+ * began with. Nothing is measured without that baseline or with a closed store;
+ * a read that fails is recorded as a `reclaim` issue and counts nothing.
+ */
+function measureReclaimed(context: SweepContext, state: SweepState): void {
+  const { store } = context.deps;
+  const before = state.databasePagesAtStart;
+  if (before === undefined || store.isClosed) {
     return;
   }
-  if (store.db.isTransaction) {
-    recordIssue(
-      context,
-      state,
-      'database',
-      'vacuum',
-      new DebuggenError(
-        'STORE_ERROR',
-        'VACUUM was skipped because a transaction is open on the session store.',
-        {
-          hint: 'Run the purge with vacuum outside any transaction.',
-          details: { subsystem: SUBSYSTEM, component: COMPONENT, operation: 'vacuum' },
-        },
-      ),
-    );
+  const after = readSizePragma(context, state, PAGE_COUNT_SQL, 'size');
+  if (after === undefined) {
     return;
   }
-  try {
-    store.db.exec('VACUUM');
-  } catch (caught) {
-    recordIssue(
-      context,
-      state,
-      'database',
-      'vacuum',
-      new DebuggenError('STORE_ERROR', 'VACUUM of the session store did not complete.', {
-        hint: 'The purged rows are gone either way; the space is reused by SQLite and returned on the next successful VACUUM.',
-        details: { subsystem: SUBSYSTEM, component: COMPONENT, operation: 'vacuum' },
-        cause: caught,
-      }),
-    );
+  const bytesPerPage = readSizePragma(context, state, PAGE_SIZE_SQL, 'page size');
+  if (bytesPerPage === undefined) {
+    return;
   }
+  state.databaseBytesReclaimed = Math.max(0, (before - after) * bytesPerPage);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -2841,8 +4166,10 @@ function toReport(cutoff: number, state: SweepState, durationMs: number): Retent
     indexCachesDeleted: state.indexCachesDeleted,
     sessionsRetainedForConflicts: [...state.sessionsRetainedForConflicts].sort(compareText),
     sessionsRetainedActive: [...state.sessionsRetainedActive].sort(compareText),
-    bytesReclaimed: state.bytesReclaimed,
+    bytesReclaimed: state.bytesReclaimed + state.databaseBytesReclaimed,
+    databaseBytesReclaimed: state.databaseBytesReclaimed,
     durationMs,
+    interrupted: state.interrupted,
     errors: state.errors.map((issue) => ({ ...issue })),
     omitted: { ...state.omitted },
   };
@@ -2852,10 +4179,11 @@ function toReport(cutoff: number, state: SweepState, durationMs: number): Retent
  * Runs one retention sweep over the session database and `$DEBUGGEN_HOME`.
  *
  * In order: aged sessions and their backup directories (Rule 1), orphan
- * backups (Rule 3), code-index caches (Rule 2), then a WAL checkpoint when a
- * session was deleted and `VACUUM` when {@link RetentionOptions.vacuum} asks
- * for it. See the module overview for each rule and for the containment
- * discipline every deletion follows.
+ * backups (Rule 3), code-index caches (Rule 2), then — when anything was
+ * deleted — the reclaim that returns the freed database pages to the
+ * filesystem, `VACUUM` when {@link RetentionOptions.vacuum} asks for it, and a
+ * WAL checkpoint so the file shrinks. See the module overview for each rule,
+ * for the reclaim, and for the containment discipline every deletion follows.
  *
  * The age basis of Rule 1 is **`sessions.updated_at`**, the session's last
  * activity — not `created_at` — so a long-running session is never purged
@@ -2871,22 +4199,31 @@ function toReport(cutoff: number, state: SweepState, durationMs: number): Retent
  * projects the scope admits (see "Scoped sweeps" in the module overview);
  * without it — the start-up pass — it is machine-wide.
  *
- * Asynchronous because of the filesystem work; the database work is
- * synchronous, one `BEGIN IMMEDIATE` transaction per candidate that decides
- * and deletes it atomically — the cascade removes its telemetry, panels,
- * analyses and journal in the same statement, or nothing of it at all. Work is
- * bounded: candidates come in indexed keyset pages, journal probes read one
- * session's records through an index and are batched, and the report's lists
- * are capped (see the module overview).
+ * Asynchronous because of the filesystem work and the yields; the database
+ * work is synchronous, in `BEGIN IMMEDIATE` transactions that each re-run a
+ * candidate's checks before deleting anything: one per session of at most
+ * {@link DEFAULT_PURGE_BATCH_SIZE} telemetry events, deciding and deleting it
+ * atomically — the cascade removes its telemetry, panels, analyses and journal
+ * in the same statement, or nothing of it at all — and one per batch for a
+ * larger session, whose final transaction runs that same cascade (see "Atomic
+ * per session, bounded per transaction" in the module overview). Work is
+ * bounded: candidates come in indexed keyset pages, no transaction deletes
+ * more than one batch of telemetry, journal probes read one session's records
+ * through an index and are batched, and the report's lists are capped.
+ *
+ * With {@link RetentionOptions.signal} aborted the sweep stops at its next
+ * step boundary and still answers `Ok`, with
+ * {@link RetentionReport.interrupted} set.
  *
  * @param deps The store, the four repositories, the resolved paths and window,
  * and optionally a logger and a clock.
- * @param options Window overrides, `dryRun`, `vacuum` and `scope`.
+ * @param options Window overrides, `dryRun`, `vacuum`, `reclaim`,
+ * `walCheckpointBytes`, `scope` and `signal`.
  * @returns `Ok` with the report — per-item problems are in
  * {@link RetentionReport.errors} — or `Err` only when the sweep cannot run at
  * all: `CONFIG_INVALID` for a configuration, option or clock it cannot use,
  * `STORE_ERROR` for a closed store, `INTERNAL` for a defect that escaped every
- * per-item guard.
+ * per-item guard. An aborted signal is never an `Err`.
  *
  * @example
  * ```ts
@@ -2923,7 +4260,8 @@ export async function runRetention(
     );
   }
 
-  const context: SweepContext = { deps, settings: settings.value, logger };
+  const wal = createSweepWal(deps.store, settings.value, logger);
+  const context: SweepContext = { deps, settings: settings.value, logger, wal };
   const state: SweepState = {
     sessionIdsDeleted: [],
     sessionsRetainedForConflicts: [],
@@ -2945,18 +4283,33 @@ export async function runRetention(
     orphanBackupsDeleted: 0,
     indexCachesDeleted: 0,
     bytesReclaimed: 0,
+    interrupted: false,
+    databasePagesAtStart: undefined,
+    databaseBytesReclaimed: 0,
   };
 
   try {
-    await purgeAgedSessions(context, state);
+    if (!settings.value.dryRun) {
+      // The baseline of `databaseBytesReclaimed`: read before anything is deleted.
+      state.databasePagesAtStart = readSizePragma(context, state, PAGE_COUNT_SQL, 'size');
+    }
+    // The two phases that write to the store run with the log kept bounded off
+    // the event loop; the two filesystem walks between them do not write it.
+    await wal.during(() => purgeAgedSessions(context, state));
     await sweepOrphanBackups(context, state);
     await sweepIndexCaches(context, state);
-    reclaimDatabaseSpace(context, state);
+    // An interrupted sweep leaves the reclaim to the store's close and to the
+    // next sweep: it must not start a rewrite on the way to a shutdown.
+    if (!isInterrupted(context, state, 'reclaim')) {
+      await wal.during(() => reclaimDatabaseSpace(context, state));
+    }
   } catch (caught) {
     // Every per-item operation above is guarded; reaching this is a defect.
     const error = DebuggenError.from(caught, 'INTERNAL');
     logger.error('retention sweep failed unexpectedly', { code: error.code });
     return err(error);
+  } finally {
+    await wal.close();
   }
 
   const report = toReport(settings.value.cutoff, state, performance.now() - startedAt);
@@ -2979,7 +4332,11 @@ export async function runRetention(
     sessionsRetainedActive:
       report.sessionsRetainedActive.length + report.omitted.sessionsRetainedActive,
     bytesReclaimed: report.bytesReclaimed,
+    databaseBytesReclaimed: report.databaseBytesReclaimed,
+    interrupted: state.interrupted,
     issues: report.errors.length + report.omitted.errors,
+    walCheckpoints: wal.checkpoints,
+    longestWalCheckpointMs: Math.round(wal.longestCheckpointMs),
     durationMs: report.durationMs,
   });
   return ok(report);

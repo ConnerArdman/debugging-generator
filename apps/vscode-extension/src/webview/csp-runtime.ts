@@ -19,6 +19,13 @@
  * mutated rather than replaced, so the setting holds whether this module or Zod's core happens to
  * evaluate first.
  *
+ * The Chrome extension applies the same setting in
+ * `apps/chrome-extension/src/shared/csp-runtime.ts`, and there it also has to be pinned into a
+ * chunk of its own, because its pages share Zod through a separate chunk that ES modules evaluate
+ * before the importing chunk's body. The webview needs no such pin: `vite.config.mts` emits it as
+ * one chunk (`codeSplitting: false`), and inside a single chunk modules evaluate in import order,
+ * so being `./main.tsx`'s first JavaScript import is enough.
+ *
  * @module apps/vscode-extension/src/webview/csp-runtime
  */
 

@@ -18,7 +18,11 @@
  *   two observations of one execution are neither — and this module does not
  *   second-guess it;
  * - every per-tier duration is an **interval union** computed by
- *   `unionDurationMs` / `subtractIntervalsDurationMs` in `./timeline.js`;
+ *   `unionDurationMs` / `subtractIntervalsDurationMs` in `./timeline.js`, and
+ *   the four duration metrics are scoped to the **interaction traces** whenever
+ *   the events hold an interaction (see {@link computeMetrics}), so a card
+ *   answers "where did the interaction's time go" rather than "how long did the
+ *   page run";
  * - the metric **vocabulary** — the ids, their units and the semantic groups
  *   over them — belongs to `../schema/attributes.js`, which states the
  *   division of labour explicitly: the ids live there, their values live here.
@@ -223,6 +227,17 @@ const SERVER_TIER: TelemetryTier = 'server';
 const DATABASE_TIER: TelemetryTier = 'db';
 
 /**
+ * The kind of the browser event a user interaction opens a trace with.
+ *
+ * A trace holding one is an **interaction trace**: the click, the requests it
+ * issued, the server and database spans those requests reached through
+ * `traceparent`, and the commits its continuation window attributed to it all
+ * share its `traceId` (AAP 0.4.2). No kind group names it on its own, so the
+ * member is spelled here, once.
+ */
+const INTERACTION_KIND: TelemetryKind = 'interaction';
+
+/**
  * The one member of the performance kind group whose events are long tasks.
  *
  * The group holds both performance kinds, and only this one is a long task, so
@@ -338,22 +353,22 @@ export const METRIC_DEFINITIONS: Readonly<Record<MetricId, MetricDefinition>> = 
   total_duration: metricDefinition(
     'total_duration',
     'Total duration',
-    'Wall-clock span of the events in scope: the latest end minus the earliest start.',
+    'Wall-clock time of the interactions in scope: the union of the extents of the traces that hold an interaction, so overlapping interactions are counted once; with no interaction in scope, the latest end minus the earliest start of every event.',
   ),
   frontend_duration: metricDefinition(
     'frontend_duration',
     'Frontend duration',
-    'Browser-tier time the server tier did not cover: the union of browser intervals minus the union of server intervals.',
+    'Browser-tier time the server tier did not cover: the union of browser intervals minus the union of server intervals, both taken within the interaction traces when the scope holds an interaction.',
   ),
   backend_duration: metricDefinition(
     'backend_duration',
     'Backend duration',
-    'Union of the server-tier intervals, so work that ran in parallel is counted once.',
+    'Union of the server-tier intervals, so work that ran in parallel is counted once; taken within the interaction traces when the scope holds an interaction.',
   ),
   database_duration: metricDefinition(
     'database_duration',
     'Database duration',
-    'Union of the database-tier intervals, so overlapping statements are counted once.',
+    'Union of the database-tier intervals, so overlapping statements are counted once; taken within the interaction traces when the scope holds an interaction.',
   ),
   render_count: metricDefinition(
     'render_count',
@@ -609,6 +624,17 @@ export interface CaptureCoverage {
  *   vocabularies, so no consumer indexes into a hole.
  * - `endTime >= startTime` and `durationMs === endTime - startTime` rounded;
  *   all three are `0` for an empty capture.
+ * - The window (`startTime`, `endTime`, `durationMs`) is the extent of **every**
+ *   summarised event, and this module never clamps it: the service attributes
+ *   to a capture only events that fall inside its window, and drops the
+ *   lifecycle entries a page buffered before the capture started
+ *   (`apps/local-service/src/telemetry/attribute.ts`), so the extent of the
+ *   events it hands in already sits inside the capture's
+ *   `[startedAt, stoppedAt]`. It is a different quantity from the
+ *   `total_duration` metric whenever the capture holds an interaction: that
+ *   metric covers the interaction traces alone (see {@link computeMetrics}),
+ *   so a background re-render outside every interaction widens the window
+ *   and not the interaction's total.
  * - `unavailableMetrics` lists exactly the ids whose `MetricValue.available`
  *   is `false`.
  * - Every array is a fresh array of plain objects: no `Map`, no `Set`, no
@@ -620,11 +646,15 @@ export interface CaptureSummary {
   readonly captureId: CaptureId;
   /** The session that owns the capture, when the caller named one. */
   readonly sessionId?: SessionId;
-  /** Earliest event start, in Unix epoch milliseconds; `0` when empty. */
+  /** Earliest start of any summarised event, in Unix epoch milliseconds; `0` when empty. */
   readonly startTime: number;
-  /** Latest event end, in Unix epoch milliseconds; `0` when empty. */
+  /** Latest end of any summarised event, in Unix epoch milliseconds; `0` when empty. */
   readonly endTime: number;
-  /** `endTime - startTime`, in milliseconds, clamped and rounded. */
+  /**
+   * `endTime - startTime`, in milliseconds, clamped and rounded: how long the
+   * summarised events span, which is not the `total_duration` metric when the
+   * capture holds an interaction.
+   */
   readonly durationMs: number;
   /** How many events the summary was computed from. */
   readonly eventCount: number;
@@ -937,6 +967,19 @@ interface TraceWindow {
 }
 
 /**
+ * One event's interval, filed under its tier with the trace it belongs to.
+ *
+ * The trace id is what lets the duration metrics be narrowed to the
+ * interaction traces after the single scan (see {@link measureDurations})
+ * without walking the events a second time. Structurally an {@link Interval},
+ * so the lists go straight into the interval helpers of `./timeline.js`.
+ */
+interface TracedInterval extends Interval {
+  /** The trace of the event the interval was taken from. */
+  readonly traceId: TraceId;
+}
+
+/**
  * One measured transfer size observed outside the request stream, and the
  * event it came from.
  *
@@ -969,14 +1012,19 @@ interface CaptureScan {
   readonly kindCounts: Record<TelemetryKind, number>;
   /** Distinct producers. */
   readonly producerIds: Set<ProducerId>;
-  /** Per-trace windows, for the primary-trace choice. */
+  /**
+   * Per-trace windows, for the primary-trace choice and for the extents of the
+   * interaction traces `total_duration` is the union of.
+   */
   readonly traceWindows: Map<TraceId, TraceWindow>;
+  /** The traces holding at least one interaction event: the duration scope. */
+  readonly interactionTraceIds: Set<TraceId>;
   /** Browser-tier intervals, for the frontend duration. */
-  readonly browserIntervals: Interval[];
+  readonly browserIntervals: TracedInterval[];
   /** Server-tier intervals, for the backend duration. */
-  readonly serverIntervals: Interval[];
+  readonly serverIntervals: TracedInterval[];
   /** Database-tier intervals, for the database duration. */
-  readonly databaseIntervals: Interval[];
+  readonly databaseIntervals: TracedInterval[];
   /** Request occurrences. */
   requestCount: number;
   /** Long tasks. */
@@ -1050,6 +1098,7 @@ function createScan(): CaptureScan {
     kindCounts: zeroFilledKindCounts(),
     producerIds: new Set<ProducerId>(),
     traceWindows: new Map<TraceId, TraceWindow>(),
+    interactionTraceIds: new Set<TraceId>(),
     browserIntervals: [],
     serverIntervals: [],
     databaseIntervals: [],
@@ -1065,9 +1114,10 @@ function createScan(): CaptureScan {
   };
 }
 
-/** Files one event's interval under its tier. */
+/** Files one event's interval under its tier, tagged with its trace. */
 function recordTierInterval(scan: CaptureScan, event: TelemetryEvent): void {
-  const interval = intervalOf(event);
+  const { start, end } = intervalOf(event);
+  const interval: TracedInterval = { start, end, traceId: event.traceId };
   if (event.tier === BROWSER_TIER) {
     scan.browserIntervals.push(interval);
     return;
@@ -1151,6 +1201,9 @@ function scanEvents(events: readonly TelemetryEvent[]): CaptureScan {
     recordTierInterval(scan, event);
     recordTransferSize(scan, event);
 
+    if (event.kind === INTERACTION_KIND) {
+      scan.interactionTraceIds.add(event.traceId);
+    }
     if (isRequestEvent(event)) {
       scan.requestCount += 1;
     }
@@ -1333,6 +1386,87 @@ function countMeasurement(value: number): Measurement {
   return { value: Math.trunc(clampNonNegative(finiteOrZero(value))) };
 }
 
+/** The four duration metrics' raw values, in milliseconds, before rounding. */
+interface DurationValues {
+  /** `total_duration`. */
+  readonly total: number;
+  /** `frontend_duration`. */
+  readonly frontend: number;
+  /** `backend_duration`. */
+  readonly backend: number;
+  /** `database_duration`. */
+  readonly database: number;
+}
+
+/**
+ * The four duration metrics, over the scope they are defined on.
+ *
+ * ## The duration scope
+ *
+ * A capture that holds an interaction is asked about that interaction, so when
+ * at least one `interaction` event is in scope the four durations are measured
+ * over the **interaction traces** alone — the traces holding one — and every
+ * other trace is left out of them:
+ *
+ * - `total_duration` is the **union** of those traces' extents (each trace's
+ *   earliest start to its latest end), so two interactions that overlapped
+ *   count their shared stretch once and the idle gap between two that did not
+ *   counts not at all;
+ * - each tier duration is the union of that tier's intervals **within** those
+ *   traces, and `frontend_duration` subtracts the server union taken within
+ *   the same traces.
+ *
+ * A page's background work — a re-render ticker, a poll, a navigation entry —
+ * belongs to no interaction's trace, and folding it in would report how long
+ * the capture ran as how long the interaction took — tens of seconds for a
+ * click that took one. The counts are **not** scoped: a background render is
+ * still a render the capture observed, so `render_count` and the other
+ * tallies stay over every event in scope.
+ *
+ * With no interaction in scope — an idle capture of background renders, a
+ * panel query filtered to a trace or a kind that holds none — the durations
+ * keep their capture-wide meaning: `total_duration` is the latest end minus
+ * the earliest start of every event, and the tier durations are unions over
+ * every event.
+ *
+ * Both branches keep the invariants `frontend + backend <= total` (every
+ * interval lies inside its own trace's extent) and `database <= backend`
+ * whenever the database spans nest inside server spans.
+ *
+ * @param scan The single pass over the events.
+ * @returns The raw values; {@link durationMeasurement} rounds each.
+ */
+function measureDurations(scan: CaptureScan): DurationValues {
+  const scope = scan.interactionTraceIds;
+  if (scope.size === 0) {
+    return {
+      total: scan.hasWindow ? scan.endTime - scan.startTime : 0,
+      frontend: subtractIntervalsDurationMs(scan.browserIntervals, scan.serverIntervals),
+      backend: unionDurationMs(scan.serverIntervals),
+      database: unionDurationMs(scan.databaseIntervals),
+    };
+  }
+
+  const extents: Interval[] = [];
+  for (const traceId of scope) {
+    // Every id in the scope was recorded by the scan that filed its window, so
+    // the lookup always succeeds; the guard only satisfies the type.
+    const traceWindow = scan.traceWindows.get(traceId);
+    if (traceWindow !== undefined) {
+      extents.push({ start: traceWindow.startTime, end: traceWindow.endTime });
+    }
+  }
+  const inScope = (interval: TracedInterval): boolean => scope.has(interval.traceId);
+  const serverIntervals = scan.serverIntervals.filter(inScope);
+
+  return {
+    total: unionDurationMs(extents),
+    frontend: subtractIntervalsDurationMs(scan.browserIntervals.filter(inScope), serverIntervals),
+    backend: unionDurationMs(serverIntervals),
+    database: unionDurationMs(scan.databaseIntervals.filter(inScope)),
+  };
+}
+
 /**
  * The `transferred_bytes` measurement, with the three coverage cases the
  * platform limitation forces (AAP 0.6.6):
@@ -1393,20 +1527,33 @@ function toMetricValue(id: MetricId, measurement: Measurement): MetricValue {
  * interaction's trace — for which `total_duration` is the interaction's wall
  * clock, exactly the figure a correlated timeline totals to.
  *
+ * Within that scope the four **durations** are narrowed once more: when the
+ * scope holds at least one `interaction` event they are measured over the
+ * traces holding one, and every other trace — background re-renders, polls,
+ * lifecycle entries — is left out of them; with no interaction in scope they
+ * cover every event. Every count stays over every event in scope. The whole
+ * rule, and why, is {@link measureDurations}; it is the single definition
+ * both this function and {@link computeCaptureSummary} publish, so a card, a
+ * stored summary and the headline written from it state one total.
+ *
  * ## How each metric is computed
  *
- * - `total_duration` — the latest `startTime + duration` minus the earliest
- *   `startTime`.
+ * - `total_duration` — with an interaction in scope, the **union** of the
+ *   interaction traces' extents (earliest start to latest `startTime +
+ *   duration` of each), so overlapping interactions count once and the gap
+ *   between two disjoint ones not at all; with none, the latest
+ *   `startTime + duration` minus the earliest `startTime` of every event.
  * - `backend_duration` / `database_duration` — the **interval union** of the
- *   server-tier and database-tier spans, selected by `event.tier`, so work
- *   that ran in parallel is counted once rather than summed.
+ *   server-tier and database-tier spans in the duration scope, selected by
+ *   `event.tier`, so work that ran in parallel is counted once rather than
+ *   summed.
  * - `frontend_duration` — the browser tier's union **minus** the server
- *   tier's: the page's time awaiting the server belongs to the backend, and
- *   counting it in both would make the parts exceed the whole. The invariants
- *   that follow are `frontend_duration + backend_duration <= total_duration`,
- *   and `database_duration <= backend_duration` whenever the database spans
- *   nest inside server spans, as they do when both tiers are captured
- *   together.
+ *   tier's, both within the duration scope: the page's time awaiting the
+ *   server belongs to the backend, and counting it in both would make the
+ *   parts exceed the whole. The invariants that follow are
+ *   `frontend_duration + backend_duration <= total_duration`, and
+ *   `database_duration <= backend_duration` whenever the database spans nest
+ *   inside server spans, as they do when both tiers are captured together.
  * - `render_count`, `unchanged_render_count`,
  *   `render_trigger_unknown_count` — from `summarizeRenderTriggers`. The
  *   classification is **not** recomputed here: `unchanged` requires
@@ -1486,13 +1633,12 @@ function metricValuesFrom(
   requestGroups: readonly RequestGroup[],
   queryGroups: readonly QueryGroup[],
 ): MetricValue[] {
+  const durations = measureDurations(scan);
   const measurements: Readonly<Record<MetricId, Measurement>> = {
-    total_duration: durationMeasurement(scan.hasWindow ? scan.endTime - scan.startTime : 0),
-    frontend_duration: durationMeasurement(
-      subtractIntervalsDurationMs(scan.browserIntervals, scan.serverIntervals),
-    ),
-    backend_duration: durationMeasurement(unionDurationMs(scan.serverIntervals)),
-    database_duration: durationMeasurement(unionDurationMs(scan.databaseIntervals)),
+    total_duration: durationMeasurement(durations.total),
+    frontend_duration: durationMeasurement(durations.frontend),
+    backend_duration: durationMeasurement(durations.backend),
+    database_duration: durationMeasurement(durations.database),
     render_count: countMeasurement(triggers.renderCount),
     unchanged_render_count: countMeasurement(triggers.unchangedRenderCount),
     render_trigger_unknown_count: countMeasurement(triggers.unknownTriggerCount),
@@ -1542,20 +1688,155 @@ function durationOf(event: TelemetryEvent): number {
 }
 
 /**
- * Most expensive span first, then by id.
+ * One event competing for a place in {@link CaptureSummary.topSpans}.
  *
- * The id tie-break is what makes the ranking a total order, so two processes
+ * The published duration is computed **once** per event and carried here,
+ * because `durationOf` goes through the product's decimal rounding policy
+ * (`roundMs`), which is far too costly to repeat inside every comparison of a
+ * capture of hundreds of thousands of events. `position` is the event's index
+ * in the scan, the last key of the ranking.
+ */
+interface SpanCandidate {
+  /** The event itself. */
+  readonly event: TelemetryEvent;
+  /** Its published duration, `durationOf(event)`. */
+  readonly durationMs: number;
+  /** Its index among the scanned events. */
+  readonly position: number;
+}
+
+/**
+ * Most expensive span first, then by id, then by position in the scan.
+ *
+ * The id tie-break is what makes the ranking reproducible, so two processes
  * summarising the same capture publish the same rows in the same positions —
  * without it, two equally slow spans could swap places between runs and a
- * reader could not tell a real change from a sort artefact.
+ * reader could not tell a real change from a sort artefact. The position
+ * breaks the one tie left, two events sharing a duration **and** an id, in
+ * input order: exactly what a stable sort of the events by duration and id
+ * yields, which is the ranking this module has always published.
+ *
+ * A strict total order, since no two candidates share a position.
  */
-function compareSpanCost(left: TelemetryEvent, right: TelemetryEvent): number {
-  const leftDuration = durationOf(left);
-  const rightDuration = durationOf(right);
-  if (leftDuration !== rightDuration) {
-    return leftDuration < rightDuration ? 1 : -1;
+function compareSpanCandidates(left: SpanCandidate, right: SpanCandidate): number {
+  if (left.durationMs !== right.durationMs) {
+    return left.durationMs < right.durationMs ? 1 : -1;
   }
-  return compareStrings(left.id, right.id);
+  const byId = compareStrings(left.event.id, right.event.id);
+  if (byId !== 0) {
+    return byId;
+  }
+  return left.position - right.position;
+}
+
+/**
+ * Restores the heap order of {@link selectTopSpans} upward from `index`.
+ *
+ * The heap keeps the candidate that ranks **last** at its root, so every
+ * parent ranks after (compares greater than) its children.
+ */
+function siftCandidateUp(heap: SpanCandidate[], index: number): void {
+  let child = index;
+  while (child > 0) {
+    const parent = (child - 1) >> 1;
+    const childCandidate = heap[child];
+    const parentCandidate = heap[parent];
+    if (
+      childCandidate === undefined ||
+      parentCandidate === undefined ||
+      compareSpanCandidates(childCandidate, parentCandidate) <= 0
+    ) {
+      return;
+    }
+    heap[child] = parentCandidate;
+    heap[parent] = childCandidate;
+    child = parent;
+  }
+}
+
+/** Restores the heap order of {@link selectTopSpans} downward from `index`. */
+function siftCandidateDown(heap: SpanCandidate[], index: number): void {
+  let parent = index;
+  for (;;) {
+    const left = parent * 2 + 1;
+    const right = left + 1;
+    let latest = parent;
+    const leftCandidate = heap[left];
+    const latestSoFar = heap[latest];
+    if (
+      leftCandidate !== undefined &&
+      latestSoFar !== undefined &&
+      compareSpanCandidates(leftCandidate, latestSoFar) > 0
+    ) {
+      latest = left;
+    }
+    const rightCandidate = heap[right];
+    const latestAfterLeft = heap[latest];
+    if (
+      rightCandidate !== undefined &&
+      latestAfterLeft !== undefined &&
+      compareSpanCandidates(rightCandidate, latestAfterLeft) > 0
+    ) {
+      latest = right;
+    }
+    if (latest === parent) {
+      return;
+    }
+    const parentCandidate = heap[parent];
+    const latestCandidate = heap[latest];
+    if (parentCandidate === undefined || latestCandidate === undefined) {
+      return;
+    }
+    heap[parent] = latestCandidate;
+    heap[latest] = parentCandidate;
+    parent = latest;
+  }
+}
+
+/**
+ * The `limit` most expensive events, ranked by {@link compareSpanCandidates}.
+ *
+ * A bounded selection rather than a sort of the whole capture: a heap of at
+ * most `limit` candidates whose root is the one that ranks last, so each event
+ * is either rejected against the root in one comparison or replaces it in
+ * `O(log limit)`. The whole pass is `O(n log limit)` — for the default ten
+ * rows, a linear scan — and each event's duration is rounded exactly once.
+ *
+ * The result is identical, element for element, to sorting every event by
+ * duration descending and id ascending with a stable sort and keeping the
+ * first `limit`: the comparator is that order with the input position as its
+ * final key, and a strict total order selects the same leading elements
+ * however they are found.
+ *
+ * @param events The scanned events, in scan order. Not modified.
+ * @param limit How many to keep; `0` keeps none.
+ * @returns A fresh array, most expensive first.
+ */
+function selectTopSpans(events: readonly TelemetryEvent[], limit: number): TelemetryEvent[] {
+  if (limit <= 0) {
+    return [];
+  }
+
+  const heap: SpanCandidate[] = [];
+  let position = 0;
+  for (const event of events) {
+    const candidate: SpanCandidate = { event, durationMs: durationOf(event), position };
+    position += 1;
+
+    if (heap.length < limit) {
+      heap.push(candidate);
+      siftCandidateUp(heap, heap.length - 1);
+      continue;
+    }
+
+    const lastKept = heap[0];
+    if (lastKept !== undefined && compareSpanCandidates(candidate, lastKept) < 0) {
+      heap[0] = candidate;
+      siftCandidateDown(heap, 0);
+    }
+  }
+
+  return heap.sort(compareSpanCandidates).map((candidate) => candidate.event);
 }
 
 /** Projects one event into the compact span shape. */
@@ -1599,10 +1880,19 @@ function toErrorSummary(event: TelemetryEvent): ErrorSummary {
  * the tree asks the `trace` panel-data source for it.
  *
  * Only the ranked top spans are looked up, so the map stays tiny however large
- * the capture is. The correlation itself is `O(n log n)` (see
- * `correlateEvents`), which is the cost of answering "did this span do the
- * work, or did it wait for something?" — the distinction the analysis stage
- * turns into two different findings.
+ * the capture is, and only the traces that hold them are correlated.
+ * `correlateEvents` groups by `traceId` and builds each group's tree from that
+ * group's events alone, and it orders the trees by a key of each tree's own
+ * (start, then id), so correlating the subset of traces that contain a target
+ * id yields the very trees — and visits them in the very order — that
+ * correlating the whole capture would, for every trace a target can be found
+ * in. Every trace holding an event whose id is a target is kept, so even two
+ * events sharing one id resolve to the same answer as a full correlation: the
+ * last tree visited wins in both. The cost is therefore one linear pass plus
+ * the `O(m log m)` correlation of the `m` events in those traces — the price
+ * of answering "did this span do the work, or did it wait for something?",
+ * the distinction the analysis stage turns into two different findings —
+ * instead of a correlation of every trace a busy page produced.
  *
  * @param events The capture's events, unmodified.
  * @param targets The event ids to answer for.
@@ -1617,7 +1907,17 @@ function collectSelfTimes(
     return selfTimes;
   }
 
-  for (const trace of correlateEvents(events).traces) {
+  const targetTraceIds = new Set<TraceId>();
+  for (const event of events) {
+    if (targets.has(event.id)) {
+      targetTraceIds.add(event.traceId);
+    }
+  }
+  // Input order is preserved, so each kept trace's group reaches the
+  // correlator exactly as it would inside the whole capture.
+  const targetTraces = events.filter((event) => targetTraceIds.has(event.traceId));
+
+  for (const trace of correlateEvents(targetTraces).traces) {
     walkTrace(trace, (node) => {
       if (targets.has(node.event.id)) {
         selfTimes.set(node.event.id, selfTimeOf(node));
@@ -1698,7 +1998,7 @@ function selectPrimaryTraceId(windows: ReadonlyMap<TraceId, TraceWindow>): Trace
  *
  * | Section | Order | Source |
  * | --- | --- | --- |
- * | `topSpans` | duration descending, then id | the event scan, with self time from one correlation |
+ * | `topSpans` | duration descending, then id | a bounded selection over the event scan, with self time from correlating the selected spans' traces |
  * | `topRenders` | render count descending | `aggregateRenders` (counts only) |
  * | `topRequests` | most redundant first | `aggregateRequests` |
  * | `topQueries` | total duration descending | `aggregateQueries` |
@@ -1759,7 +2059,7 @@ export function computeCaptureSummary(
     .filter((metric) => !metric.available)
     .map((metric) => metric.id);
 
-  const rankedSpans = [...scan.spans].sort(compareSpanCost).slice(0, topN);
+  const rankedSpans = selectTopSpans(scan.spans, topN);
   const selfTimes = collectSelfTimes(events, new Set(rankedSpans.map((event) => event.id)));
   const topSpans = rankedSpans.map((event) => toSpanSummary(event, selfTimes.get(event.id)));
 

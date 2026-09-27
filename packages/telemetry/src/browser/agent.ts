@@ -58,8 +58,9 @@
  * Then, in order: subscribe to the isolated-world bridge and announce
  * `agent.ready` (step 3); register the two flush hooks that get a capture's
  * tail out of a document that is going away (step 4); and stop (step 5). A
- * page the developer is merely browsing carries an installed hook, an inert
- * helper and two idle listeners, and nothing else.
+ * page the developer is merely browsing carries an installed hook — with a
+ * notice of React's registration until React has registered and been
+ * announced — an inert helper and two idle listeners, and nothing else.
  *
  * ## Dormant until armed, and disabled — not idled — afterwards
  *
@@ -121,8 +122,10 @@
  *   next `pageshow`, ending an element pick in flight as it does. No
  *   capture-scoped signal is affected.
  * - **Timers and the console.** The single React re-check is scheduled with
- *   the page's `setTimeout`, which is therefore handed a callback that can
- *   only re-check for React and re-announce `agent.ready`. When the service
+ *   the page's `setTimeout`, and the announcement React's registration prompts
+ *   is queued with the page's `queueMicrotask`; each is therefore handed a
+ *   callback that can only re-check for React and re-announce `agent.ready`.
+ *   When the service
  *   sets `debug: true`, {@link debugLog} writes through the page's
  *   `console.debug`, which receives a data summary of a decision already
  *   made — the ids it carries are the ones `__DEBUGGEN__.config` publishes.
@@ -245,10 +248,12 @@ import {
   attachReact,
   detachReact,
   detectReact,
+  flushPendingReactWork,
   hasReactResidue,
   isReactAttached,
   resetReactCounters,
   snapshotComponentTree,
+  watchReactRegistration,
 } from './react.js';
 import type { ComponentTreeNode } from './react.js';
 import {
@@ -427,10 +432,10 @@ export type HookName = (typeof HOOK_NAMES)[number];
  * application as a page without React for the rest of the session.
  *
  * One timer, one check, no interval: a poll in someone else's page is work the
- * agent has no right to schedule, and the case this covers — React
- * initialising a beat after the agent — resolves within the first paint. Every
- * inbound configuration re-checks as well, which covers a slower start without
- * any timer at all.
+ * agent has no right to schedule. It is the backstop, not the mechanism: React's
+ * registration is announced when it happens (see {@link watchForReact}), and
+ * every inbound configuration re-checks as well, which covers a start slower
+ * than this delay without any timer at all.
  */
 const REACT_RECHECK_DELAY_MS = 1000;
 
@@ -612,6 +617,24 @@ interface HookBinding {
 const NO_FLAGS: readonly HookFlag[] = Object.freeze([]);
 
 /**
+ * The React family's detach: drain the commits still waiting for their
+ * analysis, then detach.
+ *
+ * `./react.js` records a commit inside React's commit callback and analyses
+ * it in an idle slice, and its `detachReact()` *discards* whatever is still
+ * queued — a cleared hook emits nothing more (AAP 0.5.1). A configuration that
+ * drops the React family mid-capture would therefore lose the renders of the
+ * last few hundred milliseconds unless they are emitted first, while the
+ * transport still carries the capture that observed them. Both calls are
+ * total, so the pair is too; on the capture-stop and capture-change paths the
+ * queue has already been drained by then and the first call costs nothing.
+ */
+function drainAndDetachReact(): void {
+  flushPendingReactWork();
+  detachReact();
+}
+
+/**
  * The family table, keyed by {@link HookName}.
  *
  * Total by construction: a name added to {@link HOOK_NAMES} without an entry
@@ -691,7 +714,7 @@ const HOOK_BINDINGS: Readonly<Record<HookName, HookBinding>> = Object.freeze({
     scope: 'capture',
     requestedBy: Object.freeze(['react'] as const),
     attach: attachReact,
-    detach: detachReact,
+    detach: drainAndDetachReact,
     isAttached: isReactAttached,
     hasResidue: hasReactResidue,
   },
@@ -772,6 +795,13 @@ let announcedReactDetected = false;
 
 /** The single pending React re-check, if one is still outstanding. */
 let reactRecheckTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * Releases the hook's one-shot notice of React's registration (see
+ * {@link watchForReact}), while one is held — from install until React has
+ * been announced.
+ */
+let releaseReactWatch: (() => void) | undefined;
 
 /** Releases this module's bridge subscription; re-made after a transport reset. */
 let unsubscribeBridge: (() => void) | undefined;
@@ -1979,6 +2009,13 @@ function announceReady(): void {
     const reactDetected = reactIsRegistered();
     announcedReactDetected = reactDetected;
 
+    // React is announced from here on, so nothing is left to watch or re-check
+    // for: the notice and the timer are released rather than left to no-op.
+    if (reactDetected) {
+      stopWatchingForReact();
+      clearReactRecheck();
+    }
+
     postControl('agent.ready', {
       documentId: getDocumentId(),
       producerId: getProducerId(),
@@ -2013,11 +2050,80 @@ function announceReactIfNewlyDetected(): void {
 }
 
 /**
+ * Announce React the moment it registers with the hook.
+ *
+ * The first announcement is made at `document_start`, before the application's
+ * bundle has run, so `reactDetected: false` there is ordinarily a "not yet".
+ * The service judges the page by the latest announcement, and it may judge it
+ * any time after the tab binds, so the correction has to be announced when
+ * React registers — not a second after install, which is too early for a page
+ * whose client bundle is still compiling or loading, and not only when the
+ * service next sends a frame, which may come after the judgement.
+ *
+ * This subscribes to the hook's renderer-registration notice
+ * ({@link watchReactRegistration}): an event, not a poll, which React itself
+ * fires once per renderer and which carries no fiber, root or commit, so the
+ * dormant agent still observes nothing of the application. The notice is
+ * one-shot in effect: {@link announceReady} releases it as soon as it announces
+ * React, whatever prompted the announcement. A renderer that registered before
+ * the subscription is caught by the check made right after it, and a hook that
+ * cannot be subscribed to leaves the timer and the inbound frames to correct
+ * the claim, as before.
+ */
+function watchForReact(): void {
+  if (releaseReactWatch !== undefined || announcedReactDetected) {
+    return;
+  }
+  try {
+    releaseReactWatch = watchReactRegistration(onReactRegistered);
+  } catch {
+    releaseReactWatch = undefined;
+  }
+  announceReactIfNewlyDetected();
+}
+
+/**
+ * The registration notice's callback.
+ *
+ * It runs inside React's own `inject`, while `react-dom` initialises, so it
+ * does no work there: the announcement is queued as a microtask through the
+ * page's `queueMicrotask` — handed only {@link announceReactIfNewlyDetected},
+ * which re-reads the hook itself — and made directly only where no microtask
+ * can be queued.
+ */
+function onReactRegistered(): void {
+  try {
+    if (typeof queueMicrotask === 'function') {
+      queueMicrotask(announceReactIfNewlyDetected);
+      return;
+    }
+  } catch {
+    // Fall through: an announcement made now is late by nothing.
+  }
+  announceReactIfNewlyDetected();
+}
+
+/** Release the registration notice, if one is held. Idempotent; never throws. */
+function stopWatchingForReact(): void {
+  const release = releaseReactWatch;
+  releaseReactWatch = undefined;
+  if (release === undefined) {
+    return;
+  }
+  try {
+    release();
+  } catch {
+    // The handle is dropped either way, and the callback is idempotent.
+  }
+}
+
+/**
  * Schedule the single React re-check.
  *
  * One timer, never an interval, and never a second one: polling the page for a
- * renderer is work the agent has no right to schedule, and every inbound frame
- * re-checks anyway.
+ * renderer is work the agent has no right to schedule. It is the backstop for a
+ * hook whose registration notice could not be subscribed to
+ * ({@link watchForReact}); every inbound frame re-checks as well.
  */
 function scheduleReactRecheck(): void {
   if (reactRecheckTimer !== undefined || announcedReactDetected) {
@@ -2107,6 +2213,13 @@ function resubscribeToBridge(): void {
  * the document it describes. Both calls are idempotent, so the `pageshow` that
  * fires on an ordinary load changes nothing.
  *
+ * Both flushes are preceded by `./react.js`'s drain: that producer analyses
+ * each commit in an idle slice after it happens, and a document that is being
+ * hidden or unloaded may never give it another one, so the commits it has
+ * observed are turned into events first and leave with the flush. The drain is
+ * a no-op on an empty queue and outside a capture, so a dormant agent still
+ * pays nothing.
+ *
  * **Not `beforeunload`.** It blocks navigation, disqualifies the page from the
  * back/forward cache, and is precisely the kind of side effect an
  * instrumentation tool must not add to someone else's application.
@@ -2115,6 +2228,7 @@ function installFlushHooks(): void {
   try {
     if (typeof window !== 'undefined' && pageHideListener === undefined) {
       const listener = (): void => {
+        flushPendingReactWork();
         flush();
         detachDocumentHooks();
       };
@@ -2142,6 +2256,7 @@ function installFlushHooks(): void {
       const listener = (): void => {
         try {
           if (document.visibilityState === 'hidden') {
+            flushPendingReactWork();
             flush();
           }
         } catch {
@@ -2590,6 +2705,12 @@ function arm(config: ParsedAgentConfig): void {
     failedHooks = createNullRecord();
     reportedUnreleasedHooks = createNullRecord();
     componentTreeRefusalReported = false;
+    // Commits `./react.js` has observed but not yet analysed belong to the
+    // capture that has just ended: they are turned into events now, while the
+    // transport still stamps that capture and before any producer's counters
+    // reset — `resetReactCounters` below discards whatever is still queued,
+    // which after this drain is nothing. `flushPendingReactWork` never throws.
+    resetProducer('react', flushPendingReactWork);
     // Requests already on the wire belong to the capture that has just ended,
     // so they are reported to it first — as in-flight snapshots, while the
     // transport still stamps the outgoing capture (see step 1 of this
@@ -2706,7 +2827,11 @@ function arm(config: ParsedAgentConfig): void {
  * Return the agent to the dormant state it had before any capture.
  *
  * The order is AAP 0.5.1's cleanup sequence and each step depends on the one
- * before it:
+ * before it. It opens with `./react.js`'s drain ({@link flushPendingReactWork}):
+ * that producer analyses each commit in an idle slice after it happens, so the
+ * commits of the capture's last moments are turned into events before anything
+ * below reads the render counts, flushes or detaches — the detach discards a
+ * queue by design.
  *
  * 1. **The component-tree snapshot, if the capture authorised one** and while
  *    React is still attached and the transport still carries the ending
@@ -2744,9 +2869,10 @@ function arm(config: ParsedAgentConfig): void {
  * Afterwards this agent holds no observer, no patch, no bippy subscription, no
  * timer and no buffered event; `window.fetch` is the page's own function
  * again. What remains is exactly the dormant state of the opening sequence —
- * the installed hook, the inert helper, element description, the bridge
- * subscription and the flush listeners — none of which observes the
- * developer's application.
+ * the installed hook (with its notice of React's registration while React has
+ * not registered, see {@link watchForReact}), the inert helper, element
+ * description, the bridge subscription and the flush listeners — none of which
+ * observes the developer's application.
  *
  * Returning to dormant is the transition a page would most like to prevent
  * (or to force), so every step before the reset stands in its own guard and
@@ -2756,6 +2882,12 @@ function arm(config: ParsedAgentConfig): void {
  */
 function disarm(): void {
   const wasArmed = armedCaptureId !== undefined;
+
+  // Step 0: the commits `./react.js` observed and has not yet analysed become
+  // events first, while the capture is still live — so the snapshot's render
+  // counts include them and the flush below takes them. Its `detachReact()`
+  // later discards anything still queued, which after this is nothing.
+  attempt(flushPendingReactWork);
 
   attempt(() => {
     maybeEmitComponentTreeSnapshot('capture-stop', treeBounds);
@@ -3327,7 +3459,8 @@ function bootstrap(): void {
     // A capture then loses only the events queued in its final flush window.
   }
 
-  // React may initialise a beat after this: one re-check, no interval.
+  // React usually initialises after this: its registration with the hook is
+  // announced when it happens, and one re-check, no interval, backs that up.
   try {
     scheduleReactRecheck();
   } catch {
@@ -3335,11 +3468,20 @@ function bootstrap(): void {
     // corrects the claim as soon as the service says anything.
   }
 
+  try {
+    watchForReact();
+  } catch {
+    // The re-check above and every inbound frame still correct the claim.
+  }
+
   // Step 5 — dormant. No listener on the developer's application, no observer,
   // no patch, no bippy subscription and no buffered event until an
-  // `agent.config` arms one. The agent version and the recorded `readyState`
-  // are reported here rather than on the wire: `agent.ready`'s payload is the
-  // exact five fields of AAP 0.4.2 (see {@link announceReady}).
+  // `agent.config` arms one. The one thing held on the hook is the notice of
+  // React's registration, which carries no fiber, root or commit and is
+  // released once React is announced (see {@link watchForReact}). The agent
+  // version and the recorded `readyState` are reported here rather than on the
+  // wire: `agent.ready`'s payload is the exact five fields of AAP 0.4.2 (see
+  // {@link announceReady}).
   debugLog('installed', {
     agentVersion: AGENT_VERSION,
     installedBeforeReact,

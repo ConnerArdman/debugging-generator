@@ -136,6 +136,7 @@ import {
   COMPONENT_TREE_ATTRIBUTE_KEYS,
   COMPONENT_TREE_EVENT_NAME,
   LOG_ATTRIBUTE_KEYS,
+  MAX_OWNER_CHAIN_LENGTH,
   MAX_PREVIEW_LENGTH,
   MAX_TRACKED_KEYS,
   RENDER_ATTRIBUTE_KEYS,
@@ -203,7 +204,9 @@ const [MOUNT_PHASE, UPDATE_PHASE] = RENDER_PHASES;
 
 /**
  * The render event's attribute keys. The eighth (`selfTime`) is not read by
- * the module under test, so it is deliberately left unbound.
+ * the module under test, so it is deliberately left unbound; the ninth and
+ * tenth are the coalescing weight and the slowest instance's duration, and the
+ * eleventh names the providers of the contexts that changed.
  */
 const [
   COMPONENT_KEY,
@@ -213,6 +216,10 @@ const [
   TRIGGER_KEY,
   ACTUAL_DURATION_KEY,
   OWNER_CHAIN_KEY,
+  ,
+  INSTANCE_COUNT_KEY,
+  MAX_INSTANCE_DURATION_KEY,
+  CHANGED_CONTEXTS_KEY,
 ] = RENDER_ATTRIBUTE_KEYS;
 
 /** The commit event's three declared attribute keys. */
@@ -522,6 +529,11 @@ interface RenderAttributeParts {
   readonly changedProps?: unknown;
   readonly ownerChain?: unknown;
   readonly actualDuration?: unknown;
+  /** The coalescing weight: how many fibers the event stands for. */
+  readonly instanceCount?: unknown;
+  /** The slowest of those fibers, in milliseconds. */
+  readonly maxInstanceDuration?: unknown;
+  readonly changedContexts?: unknown;
 }
 
 /**
@@ -556,6 +568,15 @@ function renderAttributes(parts: RenderAttributeParts): Record<string, unknown> 
   }
   if (parts.actualDuration !== undefined) {
     bag[ACTUAL_DURATION_KEY] = parts.actualDuration;
+  }
+  if (parts.instanceCount !== undefined) {
+    bag[INSTANCE_COUNT_KEY] = parts.instanceCount;
+  }
+  if (parts.maxInstanceDuration !== undefined) {
+    bag[MAX_INSTANCE_DURATION_KEY] = parts.maxInstanceDuration;
+  }
+  if (parts.changedContexts !== undefined) {
+    bag[CHANGED_CONTEXTS_KEY] = parts.changedContexts;
   }
   return bag;
 }
@@ -1928,6 +1949,7 @@ describe('render occurrences', () => {
         phase: UPDATE_PHASE,
         reportedRenderCount: 12,
         changedProps: ['alpha'],
+        changedContexts: ['ProviderShell'],
       }),
     });
 
@@ -1945,6 +1967,7 @@ describe('render occurrences', () => {
       trigger: STATE_TRIGGER,
       renderCount: 12,
       changedPropKeys: ['alpha'],
+      changedContexts: ['ProviderShell'],
       source: CODE_GRAPH_LOCATION,
     });
   });
@@ -1984,6 +2007,466 @@ describe('render occurrences', () => {
       expect(Object.hasOwn(occurrence, OCCURRENCE_REPORTED_COUNT_FIELD)).toBe(false);
     },
   );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Coalesced render events
+ *
+ * The page agent emits one `render` event per group of fibers that rendered
+ * alike in one commit, with `instanceCount` and `maxInstanceDuration`
+ * (`../browser/react.ts`, PERF-F08). Every count must weigh such an event by
+ * the fibers it stands for, so the totals a coalesced capture produces are the
+ * totals the per-fiber capture it replaced would have produced.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('coalesced render events', () => {
+  /** How many cards the catalog-shaped fixture re-renders per commit. */
+  const CARDS = 48;
+
+  /** The per-card durations: all 1 ms except one slow 3 ms card. */
+  const cardDurations: readonly number[] = Array.from({ length: CARDS }, (_unused, index) =>
+    index === 7 ? 3 : 1,
+  );
+
+  /** The props every card sees change: the inline callback. */
+  const CARD_CHANGED_PROPS = ['onSelect'];
+
+  /** One event per card, as a capture recorded before coalescing existed. */
+  function perFiberEvents(): readonly TelemetryEvent[] {
+    return cardDurations.map((duration, index) =>
+      makeRenderEvent({
+        at: index + 1,
+        startTime: EPOCH_BASE + 100 + index,
+        duration,
+        attributes: renderAttributes({
+          component: DEFAULT_COMPONENT,
+          trigger: PROPS_TRIGGER,
+          phase: UPDATE_PHASE,
+          changedProps: CARD_CHANGED_PROPS,
+        }),
+      }),
+    );
+  }
+
+  /** The same commit's cards as the agent now emits them: one weighted event. */
+  function coalescedEvents(): readonly TelemetryEvent[] {
+    return [
+      makeRenderEvent({
+        at: 1,
+        startTime: EPOCH_BASE + 100,
+        duration: cardDurations.reduce((sum, duration) => sum + duration, 0),
+        attributes: renderAttributes({
+          component: DEFAULT_COMPONENT,
+          trigger: PROPS_TRIGGER,
+          phase: UPDATE_PHASE,
+          changedProps: CARD_CHANGED_PROPS,
+          reportedRenderCount: CARDS,
+          instanceCount: CARDS,
+          maxInstanceDuration: Math.max(...cardDurations),
+        }),
+      }),
+    ];
+  }
+
+  /**
+   * A stat's totals, without the per-event list, its truncation flag and the
+   * latest start — which a coalesced event knows only to the commit, because
+   * it starts at its earliest instance (see `RenderStat.lastStartTime`).
+   */
+  function totalsOf(stat: RenderStat): Readonly<Record<string, unknown>> {
+    const totals: Record<string, unknown> = { ...stat };
+    for (const key of ['occurrences', 'occurrencesTruncated', 'lastStartTime'] as const) {
+      Reflect.deleteProperty(totals, key);
+    }
+    return totals;
+  }
+
+  it('counts a coalesced event as the renders it stands for, exactly as the per-fiber events did', () => {
+    const perFiber = onlyStat(aggregateRenders(perFiberEvents()));
+    const coalesced = onlyStat(aggregateRenders(coalescedEvents()));
+
+    expect(totalsOf(coalesced)).toStrictEqual(totalsOf(perFiber));
+    expect(coalesced.lastStartTime).toBe(EPOCH_BASE + 100);
+    expect(perFiber.lastStartTime).toBe(EPOCH_BASE + 100 + CARDS - 1);
+    expect(coalesced.renderCount).toBe(CARDS);
+    expect(coalesced.triggers[PROPS_TRIGGER]).toBe(CARDS);
+    expect(coalesced.phaseCounts[UPDATE_PHASE]).toBe(CARDS);
+    expect(coalesced.changedPropCounts).toStrictEqual({ onSelect: CARDS });
+    expect(coalesced.totalDurationMs).toBe(50);
+    expect(coalesced.averageDurationMs).toBe(roundMs(50 / CARDS));
+    // The slowest card, never the 50 ms the whole group took.
+    expect(coalesced.maxDurationMs).toBe(3);
+  });
+
+  it('weighs the trigger metrics, so unchanged and unknown renders keep their counts', () => {
+    const events = [
+      makeRenderEvent({
+        at: 1,
+        attributes: renderAttributes({
+          component: DEFAULT_COMPONENT,
+          trigger: UNCHANGED_TRIGGER,
+          phase: UPDATE_PHASE,
+          instanceCount: 12,
+          maxInstanceDuration: 1,
+        }),
+      }),
+      makeRenderEvent({
+        at: 2,
+        attributes: renderAttributes({
+          component: DEFAULT_COMPONENT,
+          trigger: UNKNOWN_TRIGGER,
+          phase: UPDATE_PHASE,
+          instanceCount: 5,
+          maxInstanceDuration: 1,
+        }),
+      }),
+      makeRenderEvent({
+        at: 3,
+        attributes: renderAttributes({ component: OTHER_COMPONENT, trigger: STATE_TRIGGER }),
+      }),
+    ];
+
+    const summary = summarizeRenderTriggers(events);
+
+    expect(summary.renderCount).toBe(18);
+    expect(summary.unchangedRenderCount).toBe(12);
+    expect(summary.unknownTriggerCount).toBe(5);
+    expect(summary.byTrigger[STATE_TRIGGER]).toBe(1);
+    expect(summary.componentCount).toBe(2);
+    expect(statFor(aggregateRenders(events), DEFAULT_COMPONENT).unchangedRenderCount).toBe(12);
+  });
+
+  it('orders components by weighted renders, so one busy group outranks a few single renders', () => {
+    const events = [
+      makeRenderEvent({
+        at: 1,
+        attributes: renderAttributes({ component: OTHER_COMPONENT, trigger: PROPS_TRIGGER }),
+      }),
+      makeRenderEvent({
+        at: 2,
+        attributes: renderAttributes({ component: OTHER_COMPONENT, trigger: PROPS_TRIGGER }),
+      }),
+      makeRenderEvent({
+        at: 3,
+        attributes: renderAttributes({
+          component: 'ZetaCard',
+          trigger: PROPS_TRIGGER,
+          instanceCount: 10,
+          maxInstanceDuration: 1,
+        }),
+      }),
+    ];
+
+    expect(aggregateRenders(events).map((stat) => stat.component)).toStrictEqual([
+      'ZetaCard',
+      OTHER_COMPONENT,
+    ]);
+  });
+
+  it('exposes the weight on the occurrence of a coalesced event, and only there', () => {
+    const events = [
+      ...coalescedEvents(),
+      makeRenderEvent({
+        at: 2,
+        startTime: EPOCH_BASE + 200,
+        attributes: renderAttributes({
+          component: DEFAULT_COMPONENT,
+          trigger: PROPS_TRIGGER,
+          phase: UPDATE_PHASE,
+          changedProps: ['sku'],
+        }),
+      }),
+    ];
+
+    const stat = onlyStat(aggregateRenders(events));
+    const [group, single] = stat.occurrences;
+
+    expect(stat.occurrences).toHaveLength(2);
+    expect(stat.occurrencesTruncated).toBe(false);
+    expect(stat.renderCount).toBe(CARDS + 1);
+    expect(group?.instanceCount).toBe(CARDS);
+    expect(group?.maxInstanceDurationMs).toBe(3);
+    expect(group?.durationMs).toBe(50);
+    expect(group?.renderCount).toBe(CARDS);
+    // A single-fiber occurrence keeps the pre-coalescing shape exactly.
+    expect(single === undefined ? [] : Object.keys(single)).not.toContain('instanceCount');
+    expect(single === undefined ? [] : Object.keys(single)).not.toContain('maxInstanceDurationMs');
+    // An untruncated list's weights add up to the component's count.
+    expect(
+      stat.occurrences.reduce((sum, occurrence) => sum + (occurrence.instanceCount ?? 1), 0),
+    ).toBe(stat.renderCount);
+  });
+
+  it.each([
+    ['zero', 0],
+    ['a negative', -3],
+    ['a fraction', 2.5],
+    ['NaN', Number.NaN],
+    ['infinity', Number.POSITIVE_INFINITY],
+    ['past the safe-integer range', Number.MAX_SAFE_INTEGER + 2],
+    ['a numeric string', '12'],
+    ['null', null],
+    ['an object', { count: 12 }],
+    ['one', 1],
+  ])('reads an instanceCount that is %s as a single render', (_label, instanceCount) => {
+    const stat = onlyStat(
+      aggregateRenders([
+        makeRenderEvent({
+          at: 1,
+          duration: 4,
+          attributes: renderAttributes({
+            component: DEFAULT_COMPONENT,
+            trigger: PROPS_TRIGGER,
+            instanceCount,
+            maxInstanceDuration: 1,
+          }),
+        }),
+      ]),
+    );
+
+    expect(stat.renderCount).toBe(1);
+    expect(stat.triggers[PROPS_TRIGGER]).toBe(1);
+    // A single render's slowest instance is itself: the attribute is ignored.
+    expect(stat.maxDurationMs).toBe(4);
+    expect(Object.keys(onlyOccurrence(stat))).not.toContain('instanceCount');
+  });
+
+  it.each([
+    ['absent', undefined, 9],
+    ['larger than the summed duration', 50, 9],
+    ['negative', -2, 0],
+    ['not a number', 'slow', 9],
+    ['within the sum', 4.5, 4.5],
+  ])(
+    'bounds a maxInstanceDuration that is %s by the event it came with',
+    (_label, maxInstanceDuration, expected) => {
+      const stat = onlyStat(
+        aggregateRenders([
+          makeRenderEvent({
+            at: 1,
+            duration: 9,
+            attributes: renderAttributes({
+              component: DEFAULT_COMPONENT,
+              trigger: PROPS_TRIGGER,
+              instanceCount: 3,
+              ...(maxInstanceDuration === undefined ? {} : { maxInstanceDuration }),
+            }),
+          }),
+        ]),
+      );
+
+      expect(stat.renderCount).toBe(3);
+      expect(stat.maxDurationMs).toBe(expected);
+      expect(onlyOccurrence(stat).maxInstanceDurationMs).toBe(expected);
+    },
+  );
+
+  it('annotates component-tree nodes with weighted counts on every construction route', () => {
+    const commit = makeCommitEvent({ at: 1 });
+    const chained = [
+      commit,
+      makeRenderEvent({
+        at: 2,
+        duration: 12,
+        parentSpanId: commit.spanId,
+        attributes: renderAttributes({
+          component: 'ProductCard',
+          trigger: PROPS_TRIGGER,
+          ownerChain: ['CatalogGrid'],
+          instanceCount: 12,
+          maxInstanceDuration: 1,
+        }),
+      }),
+      makeRenderEvent({
+        at: 3,
+        parentSpanId: commit.spanId,
+        attributes: renderAttributes({
+          component: 'CatalogGrid',
+          trigger: STATE_TRIGGER,
+        }),
+      }),
+    ];
+
+    const fromChains = requireSnapshot(buildComponentTreeSnapshot(chained));
+    expect(fromChains.origin).toBe(OWNER_CHAINS_ORIGIN);
+    expect(nodeFor(fromChains, 'ProductCard').renderCount).toBe(12);
+    expect(nodeFor(fromChains, 'ProductCard').totalDurationMs).toBe(12);
+    expect(nodeFor(fromChains, 'CatalogGrid').renderCount).toBe(1);
+
+    // Without chains the listing is flat and ordered by the weighted counts.
+    const flat = requireSnapshot(
+      buildComponentTreeSnapshot([
+        commit,
+        makeRenderEvent({
+          at: 2,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({ component: 'AlphaPane', trigger: PROPS_TRIGGER }),
+        }),
+        makeRenderEvent({
+          at: 3,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({ component: 'AlphaPane', trigger: PROPS_TRIGGER }),
+        }),
+        makeRenderEvent({
+          at: 4,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({
+            component: 'ZetaCard',
+            trigger: PROPS_TRIGGER,
+            instanceCount: 7,
+            maxInstanceDuration: 1,
+          }),
+        }),
+      ]),
+    );
+    expect(flat.origin).toBe(FLAT_ORIGIN);
+    expect(flat.roots.map((node) => [node.component, node.renderCount])).toStrictEqual([
+      ['ZetaCard', 7],
+      ['AlphaPane', 2],
+    ]);
+  });
+
+  it('passes a coalesced event through the ingress schema with both new keys declared', () => {
+    const [event] = coalescedEvents();
+
+    expect(event === undefined ? false : isTelemetryEvent(event)).toBe(true);
+    expect(attributeKeysFor(RENDER_KIND)).toContain(INSTANCE_COUNT_KEY);
+    expect(attributeKeysFor(RENDER_KIND)).toContain(MAX_INSTANCE_DURATION_KEY);
+    expect(ALL_ATTRIBUTE_KEYS).toContain(INSTANCE_COUNT_KEY);
+    expect(ALL_ATTRIBUTE_KEYS).toContain(MAX_INSTANCE_DURATION_KEY);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Context attribution and project declaration
+ * ---------------------------------------------------------------------------
+ */
+
+/** A location reached only through the owner chain: the component's owner, not itself. */
+const OWNER_CHAIN_LOCATION: SourceLocation = {
+  file: 'src/lib/owner-view.tsx',
+  line: 30,
+  column: 5,
+  symbol: 'OwnerView',
+  resolvedBy: 'react-owner',
+  confidence: DEFAULT_RESOLUTION_CONFIDENCE['react-owner'],
+};
+
+/** A context-triggered render naming the providers whose value changed. */
+function contextRender(at: number, changedContexts: unknown, component = DEFAULT_COMPONENT) {
+  return makeRenderEvent({
+    at,
+    attributes: renderAttributes({
+      component,
+      trigger: CONTEXT_TRIGGER,
+      phase: UPDATE_PHASE,
+      changedContexts,
+    }),
+  });
+}
+
+describe('changed contexts', () => {
+  it('names the providers behind the context renders, most frequent first, with counts', () => {
+    const stat = onlyStat(
+      aggregateRenders([
+        contextRender(1, ['ProviderB']),
+        contextRender(2, ['ProviderA', 'ProviderB']),
+        contextRender(3, ['ProviderB']),
+        contextRender(4, ['ProviderC']),
+        contextRender(5, ['ProviderA']),
+      ]),
+    );
+
+    // B three times; A and C tie on count and are then ordered by name.
+    expect(stat.changedContexts).toStrictEqual(['ProviderB', 'ProviderA', 'ProviderC']);
+    expect(stat.changedContextCounts).toStrictEqual({
+      ProviderB: 3,
+      ProviderA: 2,
+      ProviderC: 1,
+    });
+    // Attribution never reclassifies: every one of these is a context render.
+    expect(stat.triggers[CONTEXT_TRIGGER]).toBe(5);
+  });
+
+  it('deduplicates and sorts one render’s names and skips entries that are not names', () => {
+    const occurrence = onlyOccurrence(
+      onlyStat(aggregateRenders([contextRender(1, ['Zeta', 42, '', 'Alpha', 'Zeta', null])])),
+    );
+
+    expect(occurrence.changedContexts).toStrictEqual(['Alpha', 'Zeta']);
+  });
+
+  it('reports no names when the render carried none, or carried something else', () => {
+    const cases: readonly unknown[] = [undefined, 'ProviderA', { name: 'ProviderA' }, []];
+    for (const [index, changedContexts] of cases.entries()) {
+      const stat = onlyStat(aggregateRenders([contextRender(index + 1, changedContexts)]));
+      expect(stat.changedContexts).toStrictEqual([]);
+      expect(stat.changedContextCounts).toStrictEqual({});
+      expect(onlyOccurrence(stat).changedContexts).toStrictEqual([]);
+    }
+  });
+
+  it('caps the names of one render and of a whole component at the tracked-key bound', () => {
+    const wide = Array.from({ length: MAX_TRACKED_KEYS + 8 }, (_unused, index) =>
+      propKey('Provider', index),
+    );
+    const stat = onlyStat(
+      aggregateRenders([
+        contextRender(1, wide.slice(0, MAX_TRACKED_KEYS + 4)),
+        contextRender(2, wide.slice(MAX_TRACKED_KEYS)),
+      ]),
+    );
+
+    expect(stat.occurrences).toHaveLength(2);
+    for (const occurrence of stat.occurrences) {
+      expect(occurrence.changedContexts.length).toBeLessThanOrEqual(MAX_TRACKED_KEYS);
+    }
+    expect(stat.changedContexts).toHaveLength(MAX_TRACKED_KEYS);
+    expect(Object.keys(stat.changedContextCounts).sort()).toStrictEqual(
+      [...stat.changedContexts].sort(),
+    );
+  });
+});
+
+describe('project declaration', () => {
+  it('marks a component the code graph placed by its own declaration as the project’s', () => {
+    const stat = onlyStat(
+      aggregateRenders([makeRenderEvent({ at: 1, source: CODE_GRAPH_LOCATION })]),
+    );
+
+    expect(stat.declaredInProject).toBe(true);
+  });
+
+  it('marks a component placed only through its owner chain as outside the project', () => {
+    const stat = onlyStat(
+      aggregateRenders([makeRenderEvent({ at: 1, source: OWNER_CHAIN_LOCATION })]),
+    );
+
+    expect(stat.source).toStrictEqual(OWNER_CHAIN_LOCATION);
+    expect(stat.declaredInProject).toBe(false);
+  });
+
+  it('marks a component no route could place as outside the project', () => {
+    const stat = onlyStat(aggregateRenders([makeRenderEvent({ at: 1 })]));
+
+    expect(Object.hasOwn(stat, 'source')).toBe(false);
+    expect(stat.declaredInProject).toBe(false);
+  });
+
+  it('follows the most confident location when a component’s renders disagree', () => {
+    const stat = onlyStat(
+      aggregateRenders([
+        makeRenderEvent({ at: 1, source: OWNER_CHAIN_LOCATION }),
+        makeRenderEvent({ at: 2, source: CODE_GRAPH_LOCATION }),
+      ]),
+    );
+
+    expect(stat.source).toStrictEqual(CODE_GRAPH_LOCATION);
+    expect(stat.declaredInProject).toBe(true);
+  });
 });
 
 /*
@@ -2738,6 +3221,148 @@ describe('buildComponentTreeSnapshot', () => {
       ];
 
       expect(new Set(observed)).toStrictEqual(new Set(COMPONENT_TREE_ORIGINS));
+    });
+  });
+
+  describe('owner chains cut at the producer bound', () => {
+    /** One straight line of nesting, root first: `Level0` … `Level{depth - 1}`. */
+    function levelNames(depth: number): readonly string[] {
+      return Array.from({ length: depth }, (_unused, index) => `Level${String(index)}`);
+    }
+
+    /**
+     * A render of the component at `level` of that line, carrying the chain the
+     * producer records: its ancestors nearest first, at most the bound of them.
+     */
+    function lineRender(
+      at: number,
+      level: number,
+      names: readonly string[],
+      parentSpanId: SpanId,
+    ): TelemetryEvent {
+      const ancestors = names.slice(0, level).reverse().slice(0, MAX_OWNER_CHAIN_LENGTH);
+      return makeRenderEvent({
+        at,
+        parentSpanId,
+        attributes: renderAttributes({
+          component: requireDefined(names[level], 'the rendered level'),
+          trigger: CONTEXT_TRIGGER,
+          phase: UPDATE_PHASE,
+          ownerChain: ancestors,
+        }),
+      });
+    }
+
+    it('rebuilds one tree from chains that each start at a different ancestor', () => {
+      const depth = MAX_OWNER_CHAIN_LENGTH + 4;
+      const names = levelNames(depth);
+      const commit = makeCommitEvent({ at: 1 });
+      const events: TelemetryEvent[] = [commit];
+      // The shallowest render's chain reaches the root; every deeper one is cut
+      // by the bound and so starts one ancestor further down than the last.
+      for (let level = MAX_OWNER_CHAIN_LENGTH - 1; level < depth; level += 1) {
+        events.push(lineRender(level + 2, level, names, commit.spanId));
+      }
+
+      const snapshot = requireSnapshot(buildComponentTreeSnapshot(reordered(events)));
+
+      expect(snapshot.origin).toBe(OWNER_CHAINS_ORIGIN);
+      expect(snapshot.roots.map((node) => node.component)).toStrictEqual(['Level0']);
+      expect(snapshot.nodeCount).toBe(depth);
+      expect(snapshot.maxDepth).toBe(depth - 1);
+      // One position per component: no subtree repeated beneath a second root.
+      for (const name of names) {
+        expect(nodesFor(snapshot, name)).toHaveLength(1);
+      }
+      // Every cut chain found its place beneath the real root, so the
+      // reconstruction needs no caveat.
+      expect(snapshot.degraded).toBe(false);
+      expect(nodeFor(snapshot, requireDefined(names[depth - 1], 'the deepest level')).id).toBe(
+        `${COMPONENT_TREE_NODE_ID_PREFIX}${names.join('/')}`,
+      );
+    });
+
+    it('keeps a cut chain as a caveated root when two positions fit it equally', () => {
+      const commit = makeCommitEvent({ at: 1 });
+      const inner = Array.from(
+        { length: MAX_OWNER_CHAIN_LENGTH - 1 },
+        (_unused, index) => `Inner${String(index)}`,
+      );
+      const events = [
+        commit,
+        makeRenderEvent({
+          at: 2,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({
+            component: 'SharedBoundary',
+            trigger: PROPS_TRIGGER,
+            ownerChain: ['BranchA', 'ShellView'],
+          }),
+        }),
+        makeRenderEvent({
+          at: 3,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({
+            component: 'SharedBoundary',
+            trigger: PROPS_TRIGGER,
+            ownerChain: ['BranchB', 'ShellView'],
+          }),
+        }),
+        makeRenderEvent({
+          at: 4,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({
+            component: 'DeepLeaf',
+            trigger: PROPS_TRIGGER,
+            // Cut at the bound: the farthest ancestor is not the page's root.
+            ownerChain: [...[...inner].reverse(), 'SharedBoundary'],
+          }),
+        }),
+      ];
+
+      const snapshot = requireSnapshot(buildComponentTreeSnapshot(events));
+
+      // Both boundaries fit the cut chain equally, and a guess would read
+      // exactly like the truth, so it stays where the evidence left it.
+      expect(snapshot.roots.map((node) => node.component)).toStrictEqual([
+        'ShellView',
+        'SharedBoundary',
+      ]);
+      expect(nodesFor(snapshot, 'DeepLeaf')).toHaveLength(1);
+      expect(snapshot.degraded).toBe(true);
+      expect(snapshot.truncated).toBe(false);
+    });
+
+    it('never grafts a root that a whole chain ended at', () => {
+      const commit = makeCommitEvent({ at: 1 });
+      const events = [
+        commit,
+        makeRenderEvent({
+          at: 2,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({
+            component: 'LeafView',
+            trigger: PROPS_TRIGGER,
+            ownerChain: ['TopView'],
+          }),
+        }),
+        makeRenderEvent({
+          at: 3,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({
+            component: 'TopView',
+            trigger: PROPS_TRIGGER,
+            ownerChain: ['OuterView'],
+          }),
+        }),
+      ];
+
+      const snapshot = requireSnapshot(buildComponentTreeSnapshot(events));
+
+      // Two instances in two places: the chain that ended at the first one
+      // proves it is a root, whatever another instance sits beneath.
+      expect(snapshot.roots.map((node) => node.component)).toStrictEqual(['TopView', 'OuterView']);
+      expect(snapshot.degraded).toBe(false);
     });
   });
 

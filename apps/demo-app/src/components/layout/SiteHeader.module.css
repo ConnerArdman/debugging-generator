@@ -18,17 +18,20 @@
  * `:focus-visible` rule in globals.css.
  *
  * THE CONSTANT-HEIGHT INVARIANT (the rule every other decision here defers to)
- * `PageContainer.module.css` turns `--ls-header-height` into the top offset of the document's
- * single `<main>`, so this bar has to be exactly that tall on every route. Hence a fixed `height`
- * rather than a `min-height`, `flex: 0 0 auto` so the page column can never compress it, one row
- * and one row only, and a strip track that is bounded on both axes (`min-width: 0`,
- * `max-height: 100%`, `overflow: hidden`, a capped `max-width`). A route that made the bar taller
- * would tuck its own first line of content underneath it and shift the page mid-interaction.
+ * `PageContainer.module.css` turns `--ls-header-height` into the scroll margin of the document's
+ * single `<main>` - the distance a "Skip to content" jump leaves between the top of the viewport
+ * and the first line of the route - so this bar has to be exactly that tall on every route. Hence
+ * a fixed `height` rather than a `min-height`, `flex: 0 0 auto` so the page column can never
+ * compress it, one row and one row only, and a strip track that is bounded on both axes
+ * (`min-width: 0`, `max-height: 100%`, `overflow: hidden`, a capped `max-width`). A route that made
+ * the bar taller would push everything under it down mid-interaction and park a skip-link jump
+ * underneath it.
  *
  * It is also why the phone-width search is a panel taken out of flow rather than a second row: an
  * absolutely positioned box hanging off the bar's bottom edge adds nothing to the bar's height,
- * whether it is open or closed, so the offset `PageContainer` applies stays correct at every width
- * and in every state of the disclosure.
+ * whether it is open or closed, so the page below never moves when the disclosure opens and the
+ * scroll margin `PageContainer` applies stays correct at every width and in every state of the
+ * disclosure.
  *
  * WIDTH CONDITIONS
  * Three, all at the end of the file, none of them redefining the row: 960px steps the gutter with
@@ -69,7 +72,7 @@
   --header-ring-offset: 2px;
 
   /* Everything else resolves through a shared token. The gutter is the same value
-   * `PageContainer.module.css` uses for the page gutter (and takes the same step at the same
+   * `PageContainer.module.css` uses for the page gutter (and takes the same step at the same 960px
    * breakpoint below), so the brand lines up with the left edge of page content. The two maxima
    * are fractions of the page measure - 400px and 300px at the declared 1200px - so neither the
    * field nor the strip can crowd the other out. */
@@ -87,9 +90,9 @@
    * same two tokens the primitive and this file already read, so it moves with the scale. */
   --header-chip-clearance: calc(var(--ls-space-4, 16px) + var(--ls-space-3, 12px));
 
-  /* Sticky, never fixed: the bar stays in the page column that `<body>` lays out, which is what
-   * `PageContainer`'s offset is measured against. `inset-block-start` is the logical form of
-   * `top`. */
+  /* Sticky, never fixed: the bar stays in the page column that `<body>` lays out, so it takes its
+   * own height in flow and the navigation row and the page start below it without any offset of
+   * their own. `inset-block-start` is the logical form of `top`. */
   position: sticky;
   inset-block-start: 0;
   /* The invariant: one fixed height, and a flex item the column cannot shrink. */
@@ -169,11 +172,12 @@
 /* The brand yields the bar's inline-start slot while the skip link is being read.
  *
  * The chip above is pinned at the gutter, inside the one 64px band the lockup occupies, and the
- * band's height is an invariant this file may not spend: `PageContainer.module.css` offsets the
- * document's `<main>` by `--ls-header-height`, so no row may be added and nothing may be shifted
- * down. The two elements are adjacent siblings inside `.inner` - `SiteHeader.tsx` renders the link
- * first, because it is the document's first tab stop - so the sibling combinator can say "only
- * while that link has focus", with no state for this file to track and nothing to reset.
+ * band's height is an invariant this file may not spend: `PageContainer.module.css` reads
+ * `--ls-header-height` as the scroll margin of the document's `<main>`, so no row may be added and
+ * nothing may be shifted down. The two elements are adjacent siblings inside `.inner` -
+ * `SiteHeader.tsx` renders the link first, because it is the document's first tab stop - so the
+ * sibling combinator can say "only while that link has focus", with no state for this file to
+ * track and nothing to reset.
  *
  * `opacity` and not `visibility: hidden` or `display: none`, which is the whole point of the rule:
  * a browser works out the next tab stop at the moment Tab is pressed, and either of those would
@@ -325,9 +329,9 @@
   pointer-events: none;
 }
 
-/* One width breakpoint for the page gutter, taking the same step at the same width as
- * `PageContainer.module.css`, so the brand keeps aligning with the left edge of page content on a
- * wide viewport. */
+/* One width breakpoint for the page gutter, taking the same step at the same 960px as
+ * `PageContainer.module.css` and `SiteFooter.module.css`, so the brand keeps aligning with the
+ * left edge of page content and of the footer columns on either side of it. */
 @media (min-width: 960px) {
   .root {
     --header-gutter: var(--ls-space-5, 24px);

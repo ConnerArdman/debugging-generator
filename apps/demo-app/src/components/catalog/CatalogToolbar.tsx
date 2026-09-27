@@ -159,11 +159,15 @@ export interface CatalogToolbarProps {
 /**
  * The `id` of the search field, and the stem of its hint's id. A literal, because `FormField`
  * needs the id before it renders and the value must be the same string on both sides of hydration.
+ *
+ * Exported for the one caller that has to find the field again: `CatalogGrid` returns focus to the
+ * control a reader used once the listing that control asked for is on screen, and it reaches this
+ * field by the id this file gives it rather than by a selector of its own.
  */
-const SEARCH_FIELD_ID = 'catalog-search-field';
+export const CATALOG_SEARCH_FIELD_ID = 'catalog-search-field';
 
-/** The `id` of the sort dropdown, for the same reason. */
-const SORT_FIELD_ID = 'catalog-sort-field';
+/** The `id` of the sort dropdown, a literal and exported for the same reasons. */
+export const CATALOG_SORT_FIELD_ID = 'catalog-sort-field';
 
 /** What the count line says while the listing it would describe is still being read. */
 const PENDING_COUNT = 'Updating results\u2026';
@@ -258,7 +262,7 @@ export function CatalogToolbar({
 
       <div className={styles.search}>
         <FormField
-          id={SEARCH_FIELD_ID}
+          id={CATALOG_SEARCH_FIELD_ID}
           label="Search products"
           hint="Search by product name or SKU"
         >
@@ -280,7 +284,7 @@ export function CatalogToolbar({
       </div>
 
       <div className={styles.sortField}>
-        <FormField id={SORT_FIELD_ID} label="Sort">
+        <FormField id={CATALOG_SORT_FIELD_ID} label="Sort">
           {({ id, describedBy }) => (
             <Select
               id={id}
@@ -305,7 +309,7 @@ export function CatalogToolbar({
       <p className={styles.count} aria-live="polite" aria-busy={pending ? 'true' : undefined}>
         {pending
           ? PENDING_COUNT
-          : `Showing ${formatQuantityLabel(visibleCount)} of ${formatQuantityLabel(totalCount)} products`}
+          : `Showing ${formatQuantityLabel(visibleCount)} of ${formatQuantityLabel(totalCount)} ${totalCount === 1 ? 'product' : 'products'}`}
       </p>
     </form>
   );

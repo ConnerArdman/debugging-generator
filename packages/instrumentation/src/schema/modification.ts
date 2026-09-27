@@ -62,7 +62,9 @@
  *                    otherwise                  → conflict
  * applied            hash === instrumentedHash  → restore from the backup
  *                    otherwise                  → conflict
- * conflict           retained, backup kept, re-reported
+ * conflict           hash === instrumentedHash  → restore from the backup (the edit was undone)
+ *                    hash === originalHash      → close the record (nothing was written)
+ *                    otherwise                  → retained, backup kept, re-reported
  * reverted           nothing to do
  * ```
  *
@@ -159,9 +161,11 @@ import type { Result } from '@debuggen/shared';
  *   the **backup is retained**, because reconciliation may still have to
  *   restore from it.
  * - `conflict` — the developer edited the file while it was instrumented, or a
- *   hash did not match where it had to. Terminal until the developer resolves
- *   it; the **backup is retained** and the file is left exactly as the
- *   developer left it.
+ *   hash did not match where it had to. The **backup is retained** and the
+ *   file is left exactly as the developer left it for as long as it diverges;
+ *   every cleanup or reconciliation pass judges it again, restoring it once the
+ *   file hashes to `instrumentedHash` (the edit was undone) and closing it once
+ *   it hashes to `originalHash`, either way ending `reverted`.
  *
  * Frozen because it is a module-level table read on every validation: a
  * mutation would widen or narrow what every process in the product accepts.
@@ -218,9 +222,11 @@ export const DEFAULT_MODIFICATION_STATUS: ModificationStatus = 'pending';
  * record, never off the session.
  *
  * `'conflict'` is deliberately included: a conflicting record is not finished
- * business. Its backup is retained and it is re-reported on every start until
- * the developer resolves it, which is the behaviour AAP §0.5.1 specifies for
- * the row and AAP §0.5.5 specifies for the message and its "Open diff" action.
+ * business. Every start judges it again — restored once its file hashes to
+ * `instrumentedHash` again, closed once it hashes to `originalHash` — and
+ * while the file still diverges its backup is retained and it is re-reported,
+ * which is the behaviour AAP §0.5.1 specifies for the row and AAP §0.5.5
+ * specifies for the message and its "Open diff" action.
  */
 export const OPEN_MODIFICATION_STATUSES = Object.freeze([
   'pending',

@@ -115,6 +115,7 @@ import {
   DB_INSTRUMENTATION_SCOPES,
   DB_SPAN_NAME_PREFIXES,
   DENIED_ATTRIBUTE_KEY_FAMILIES,
+  DRIVER_ROW_COUNT_ATTRIBUTE,
   EXCEPTION_EVENT_ATTRIBUTES,
   EXCEPTION_EVENT_NAME,
   FUNCTION_SPAN_MARKER_ATTRIBUTE,
@@ -126,6 +127,9 @@ import {
   NEXT_SPAN_TYPE_ATTRIBUTE,
   PASS_THROUGH_ATTRIBUTE_KEYS,
   NEXT_SPAN_TYPES,
+  readHandlerRoute,
+  readSpanLineage,
+  readStatementExecution,
   spanToIngressEvent,
 } from './convert.js';
 import type { ConvertContext, SeqAllocator } from './convert.js';
@@ -2911,5 +2915,213 @@ describe('spanToIngressEvent: the failure contract', () => {
       expect(payload).not.toContain('"received"');
       expect(payload).not.toContain('"input"');
     }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * What the processor hands over from a span's relatives
+ *
+ * `./exporter.ts` knows things about a span its own attributes cannot tell:
+ * that its recorded parent is never emitted, which route its handler ran, and
+ * the row count a nested execution observed. These cases pin what the
+ * conversion does with each, and what it refuses.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A span id no fixture otherwise uses. */
+const RECORDED_PARENT_SPAN_ID = '1'.repeat(16);
+
+/** The nearest emitted ancestor a processor would name instead. */
+const EMITTED_ANCESTOR_SPAN_ID = '2'.repeat(16);
+
+/** The framework's request span before it is renamed: the method alone, no route. */
+function unlabelledRequestSpan(fixture: SpanFixture = {}): ReadableSpan {
+  return makeSpan({
+    kind: SpanKind.SERVER,
+    name: REQUEST_METHOD,
+    attributes: {
+      [NEXT_SPAN_TYPE_ATTRIBUTE]: NEXT_SPAN_TYPES.request,
+      'http.method': REQUEST_METHOD,
+      'http.target': `${REQUEST_ROUTE}?page=2&sort=name`,
+    },
+    ...fixture,
+  });
+}
+
+describe('the parent a processor records in place of one it never emits', () => {
+  it('records the supplied ancestor', () => {
+    const span = routeHandlerSpan({ parentSpanId: RECORDED_PARENT_SPAN_ID });
+
+    const event = convertOk(span, { ...makeContext(), parentSpanId: EMITTED_ANCESTOR_SPAN_ID });
+
+    expect(event.parentSpanId).toBe(EMITTED_ANCESTOR_SPAN_ID);
+    expect(ingressRejection(event)).toBeNull();
+  });
+
+  it('makes the span a trace root for null', () => {
+    const event = convertOk(routeHandlerSpan({ parentSpanId: RECORDED_PARENT_SPAN_ID }), {
+      ...makeContext(),
+      parentSpanId: null,
+    });
+
+    expect(hasKey(event, 'parentSpanId')).toBe(false);
+    expect(ingressRejection(event)).toBeNull();
+  });
+
+  it('keeps the recorded parent when the override is absent or unusable', () => {
+    const spanId = '3'.repeat(16);
+    for (const override of [undefined, 'not-a-span-id', ALL_ZERO_SPAN_ID, spanId]) {
+      const event = convertOk(routeHandlerSpan({ spanId, parentSpanId: RECORDED_PARENT_SPAN_ID }), {
+        ...makeContext(),
+        parentSpanId: override,
+      });
+      expect(event.parentSpanId, String(override)).toBe(RECORDED_PARENT_SPAN_ID);
+    }
+  });
+});
+
+describe('a request span that resolved no route of its own', () => {
+  it('takes the route its handler reported, as its name and as both route keys', () => {
+    const event = convertOk(unlabelledRequestSpan(), {
+      ...makeContext(),
+      routeHint: REQUEST_ROUTE,
+    });
+
+    expect(event.name).toBe(`${REQUEST_METHOD} ${REQUEST_ROUTE}`);
+    expect(event.attributes['http.route']).toBe(REQUEST_ROUTE);
+    expect(event.attributes['next.route']).toBe(REQUEST_ROUTE);
+    expect(ingressRejection(event)).toBeNull();
+  });
+
+  it('is labelled by its path, never its query, when no route is known anywhere', () => {
+    const event = convertOk(unlabelledRequestSpan());
+
+    expect(event.name).toBe(`${REQUEST_METHOD} ${REQUEST_ROUTE}`);
+    expect(event.name).not.toContain('?');
+    expect(event.name).not.toContain('page');
+  });
+
+  it("never lets a hint replace the framework's own route or name", () => {
+    const event = convertOk(serverRequestSpan(), {
+      ...makeContext(),
+      routeHint: '/somewhere/else',
+    });
+
+    expect(event.name).toBe(`${REQUEST_METHOD} ${REQUEST_ROUTE}`);
+    expect(event.attributes['http.route']).toBe(REQUEST_ROUTE);
+  });
+
+  it('refuses a hint that is not an absolute path pattern', () => {
+    for (const routeHint of ['relative/path', '/with?query=1', '/with space', '/with#fragment']) {
+      const event = convertOk(
+        unlabelledRequestSpan({ attributes: { 'http.method': REQUEST_METHOD } }),
+        {
+          ...makeContext(),
+          routeHint,
+        },
+      );
+      expect(event.name, routeHint).toBe(REQUEST_METHOD);
+      expect(hasKey(event, 'attributes') && event.attributes['http.route'], routeHint).toBeFalsy();
+    }
+  });
+
+  it('ignores a route hint on any other kind', () => {
+    const event = convertOk(serverFetchSpan(), { ...makeContext(), routeHint: REQUEST_ROUTE });
+
+    expect(event.attributes['http.route']).toBeUndefined();
+  });
+});
+
+describe('row counts', () => {
+  it("translates the driver's convention key into db.rowCount, consuming it", () => {
+    const event = convertOk(
+      dbQuerySpan({
+        attributes: {
+          'db.system': DB_SYSTEM,
+          'db.statement': DB_STATEMENT,
+          [DRIVER_ROW_COUNT_ATTRIBUTE]: 9,
+        },
+      }),
+    );
+
+    expect(event.attributes['db.rowCount']).toBe(9);
+    expect(event.attributes[DRIVER_ROW_COUNT_ATTRIBUTE]).toBeUndefined();
+    expect(ingressRejection(event)).toBeNull();
+  });
+
+  it('records an inherited count only on a database span that reported none', () => {
+    const withoutCount = dbQuerySpan({
+      attributes: { 'db.system': DB_SYSTEM, 'db.statement': DB_STATEMENT },
+    });
+
+    expect(
+      convertOk(withoutCount, { ...makeContext(), inheritedRowCount: 5 }).attributes['db.rowCount'],
+    ).toBe(5);
+    // A count of its own is the span's evidence and is kept.
+    expect(
+      convertOk(dbQuerySpan(), { ...makeContext(), inheritedRowCount: 5 }).attributes[
+        'db.rowCount'
+      ],
+    ).toBe(3);
+    // Not a count at all.
+    for (const inheritedRowCount of [-1, 1.5, Number.NaN]) {
+      const event = convertOk(withoutCount, { ...makeContext(), inheritedRowCount });
+      expect(event.attributes['db.rowCount'], String(inheritedRowCount)).toBeUndefined();
+    }
+    // Another kind has no rows.
+    expect(
+      convertOk(serverFetchSpan(), { ...makeContext(), inheritedRowCount: 5 }).attributes[
+        'db.rowCount'
+      ],
+    ).toBeUndefined();
+  });
+});
+
+describe('the readers the processor uses on started and ended spans', () => {
+  it('reads a span lineage with the same validation the event applies', () => {
+    const spanId = '4'.repeat(16);
+
+    expect(
+      readSpanLineage(routeHandlerSpan({ spanId, parentSpanId: RECORDED_PARENT_SPAN_ID })),
+    ).toEqual({
+      spanId,
+      parentSpanId: RECORDED_PARENT_SPAN_ID,
+    });
+    expect(readSpanLineage(routeHandlerSpan({ spanId }))).toEqual({
+      spanId,
+      parentSpanId: undefined,
+    });
+    expect(readSpanLineage(routeHandlerSpan({ spanId: ALL_ZERO_SPAN_ID }))).toBeNull();
+    expect(readSpanLineage(makeSpanWithThrowingMember('spanContext'))).toBeNull();
+  });
+
+  it('reads a statement execution in either spelling, and nothing from a span without one', () => {
+    expect(readStatementExecution(dbQuerySpan())).toEqual({ statement: DB_STATEMENT, rowCount: 3 });
+    expect(
+      readStatementExecution(
+        dbQuerySpan({
+          attributes: { 'db.query.text': DB_STATEMENT, [DRIVER_ROW_COUNT_ATTRIBUTE]: 2 },
+        }),
+      ),
+    ).toEqual({ statement: DB_STATEMENT, rowCount: 2 });
+    expect(
+      readStatementExecution(dbQuerySpan({ attributes: { 'db.statement': DB_STATEMENT } })),
+    ).toEqual({ statement: DB_STATEMENT, rowCount: undefined });
+    expect(
+      readStatementExecution(dbQuerySpan({ attributes: { 'db.system': DB_SYSTEM } })),
+    ).toBeNull();
+    expect(readStatementExecution(makeSpanWithThrowingMember('attributes'))).toBeNull();
+  });
+
+  it("reads a route handler's route, refusing anything that is not a path pattern", () => {
+    expect(readHandlerRoute(routeHandlerSpan())).toBe(REQUEST_ROUTE);
+    expect(
+      readHandlerRoute(routeHandlerSpan({ attributes: { 'http.route': REQUEST_ROUTE } })),
+    ).toBe(REQUEST_ROUTE);
+    expect(
+      readHandlerRoute(routeHandlerSpan({ attributes: { 'next.route': 'relative' } })),
+    ).toBeUndefined();
+    expect(readHandlerRoute(makeSpanWithThrowingMember('attributes'))).toBeUndefined();
   });
 });

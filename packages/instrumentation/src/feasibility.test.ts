@@ -1005,6 +1005,63 @@ describe('the symbol', () => {
     expect(refusal.hint).toContain('KilnController.normalizeRampRate');
     expectReadableRefusal(refusal);
   });
+
+  it('explains a database call site spelled as a target, naming the function that makes it', () => {
+    const refusal = refusalFor({ file: FILES.metrics, symbol: 'pool.query' });
+
+    // A call is not a declaration: the refusal says what the name is and which
+    // function holds it, and offers the runtime database hook instead of a
+    // search for declarations of a name that only ever occurs as a call.
+    expect(refusal.code).toBe('symbol-not-found');
+    expect(refusal.reason).toContain("declares nothing named 'pool.query'");
+    expect(refusal.reason).toContain('a database call site at line 62');
+    expect(refusal.reason).toContain("inside 'readCycleTotals'");
+    expect(refusal.hint).toContain("Plan a 'db-query-tracking' action");
+    expect(refusal.hint).toContain("'readCycleTotals'");
+    expect(refusal.hint).not.toContain('The code index declares');
+    expectReadableRefusal(refusal);
+  });
+
+  it('points a runtime database action at the function that makes the call', () => {
+    const refusal = refusalFor({
+      file: FILES.metrics,
+      symbol: 'client.query',
+      type: 'db-query-tracking',
+      mode: 'runtime',
+    });
+
+    expect(refusal.code).toBe('symbol-not-found');
+    expect(refusal.reason).toContain("inside 'collectCycleSamples'");
+    // The action already is the runtime hook, so the hint corrects its subject
+    // rather than recommending the type it already has.
+    expect(refusal.hint).toContain("'collectCycleSamples'");
+    expect(refusal.hint).toContain("as the subject of this 'db-query-tracking' action");
+    expect(refusal.hint).not.toContain('Plan a');
+    expectReadableRefusal(refusal);
+  });
+
+  it('explains a request call site spelled as a target, pointing at request tracking', () => {
+    const refusal = refusalFor({ file: FILES.form, symbol: 'fetch' });
+
+    expect(refusal.code).toBe('symbol-not-found');
+    expect(refusal.reason).toContain('a request call site at line 14');
+    expect(refusal.reason).toContain("inside 'handleFiringSubmit'");
+    expect(refusal.hint).toContain("Plan a 'fetch-tracking' action");
+    expect(refusal.hint).toContain("'handleFiringSubmit'");
+    expectReadableRefusal(refusal);
+  });
+
+  it('names only declarations as near misses, never a call site in another file', () => {
+    const refusal = refusalFor({ file: FILES.cones, symbol: 'pool.query' });
+
+    // The file makes no such call, so the ordinary refusal applies — and its
+    // hint must not present another file's call sites as declarations.
+    expect(refusal.code).toBe('symbol-not-found');
+    expect(refusal.reason).toContain("declares no addressable symbol named 'pool.query'");
+    expect(refusal.hint).not.toContain(`${FILES.metrics}:62`);
+    expect(refusal.hint).not.toContain(`${FILES.metrics}:84`);
+    expectReadableRefusal(refusal);
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------

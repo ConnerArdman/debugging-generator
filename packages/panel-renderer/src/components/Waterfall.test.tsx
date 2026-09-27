@@ -37,6 +37,12 @@
  * that Previous/Next rows and the keyboard move the window, and that expansion
  * and the single tab stop survive every move.
  *
+ * "Durations that are not measurements" holds the display apart from the
+ * geometry: a negative, `null` or `NaN` duration in a malformed record is drawn
+ * at zero so its bar still marks where the call began, but it is printed and
+ * described as {@link NOT_AVAILABLE_LABEL}, never as the measured `0.00 ms` —
+ * the fastest call of the capture — that the drawn value would read as.
+ *
  * ## The privacy cases, and why they are byte-comparisons
  *
  * A redacted URL and a parameterized statement arrive in their final display
@@ -132,14 +138,18 @@ import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions
 import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
 import { DESIGN_TOKENS, cssVarName } from '../tokens/tokens';
 import type { DesignTokens, TokenKey } from '../tokens/tokens';
+import { httpStatusColorVar, kindColorVar } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
+  collapseWhitespace,
   formatBytes,
   formatCount,
   formatDuration,
   formatDurationCompact,
   formatKindLabel,
+  formatShare,
   formatTierLabel,
+  oneLinePreview,
 } from '../utils/format';
 import { Waterfall } from './Waterfall';
 
@@ -1510,7 +1520,7 @@ describe('Waterfall rows', () => {
     expect(descriptionAt(1)).not.toContain(`starts ${formatDuration(620)} into the window`);
 
     // The axis spans the drawn calls: first start to last end, 180 ms.
-    expect(screen.getByRole('img').getAttribute('aria-label')).toBe(
+    expect(axisGraphic().getAttribute('aria-label')).toBe(
       `Time axis spanning ${formatDurationCompact(180)} from the first call`,
     );
 
@@ -3132,6 +3142,77 @@ describe('Waterfall failure and state styling', () => {
     expect(fineRow.classList.contains('dg-is-error')).toBe(false);
   });
 
+  it('colours each response class as the request table does, and draws a failed bar in its outcome colour', async () => {
+    // One call per response class the product distinguishes, including a 500
+    // an older browser producer reported as `ok`: the code wins, so it still
+    // reads as the server failure it was.
+    const cases = [
+      { ordinal: 95, name: 'example.moved', code: 301, status: 'ok', tone: 'info', failed: false },
+      {
+        ordinal: 96,
+        name: 'example.missing',
+        code: 404,
+        status: 'error',
+        tone: 'warning',
+        failed: true,
+      },
+      {
+        ordinal: 97,
+        name: 'example.broken',
+        code: 500,
+        status: 'ok',
+        tone: 'danger',
+        failed: true,
+      },
+      {
+        ordinal: 98,
+        name: 'example.found',
+        code: 200,
+        status: 'ok',
+        tone: 'success',
+        failed: false,
+      },
+    ] as const;
+    const events = cases.map((entry, index) =>
+      makeEvent({
+        id: eventIdFor(entry.ordinal),
+        spanId: spanIdFor(entry.ordinal),
+        kind: 'fetch',
+        tier: 'browser',
+        name: entry.name,
+        startTime: BASE_START_MS + index * 50,
+        duration: 30,
+        status: entry.status,
+        attributes: { 'http.method': REQUEST_METHOD, 'http.status_code': entry.code },
+      }),
+    );
+    const stub = resolvingProvider(events);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    for (const entry of cases) {
+      const row = rowLabelled(entry.name);
+      const chip = within(row).getByText(String(entry.code));
+      // The shared tone table: a redirect is informational, a client error a
+      // warning, a server error a danger — the request table's own reading.
+      expect(chip.classList.contains(`dg-badge--${entry.tone}`), `${entry.name} chip`).toBe(true);
+      expect(row.classList.contains('dg-is-error'), `${entry.name} edge`).toBe(entry.failed);
+
+      // The row carries its colour, so the bar (which inherits it) and the
+      // failed edge cannot disagree: a failure in its outcome token, anything
+      // else in its kind's.
+      const expected = entry.failed ? httpStatusColorVar(entry.code) : kindColorVar('fetch');
+      expect(row.style.getPropertyValue('--dgc-bar-color'), `${entry.name} colour`).toBe(expected);
+      const bar = row.querySelector<HTMLElement>('.dg-waterfall__bar');
+      expect(bar?.style.getPropertyValue('--dgc-bar-color')).toBe('');
+      // No response code in the "Error" word when the code already says it.
+      expect(within(row).queryByText(ERROR_BADGE)).toBeNull();
+    }
+    expect(httpStatusColorVar(404)).not.toBe(httpStatusColorVar(500));
+  });
+
   it('paints the failed and re-attached row states from tokens, beneath the selected state', () => {
     const orphan = ruleOf('.dg-waterfall__row.dg-is-orphan');
     const failed = ruleOf('.dg-waterfall__row.dg-is-error');
@@ -3139,7 +3220,11 @@ describe('Waterfall failure and state styling', () => {
 
     expect(orphan.body).toContain('border-inline-start-color: var(--dg-warning);');
     expect(orphan.body).toContain('border-inline-start-style: dashed;');
-    expect(failed.body).toContain('border-inline-start-color: var(--dg-danger);');
+    // The failed edge is the row's outcome colour — the value its bar is drawn
+    // in — with the danger token as the fallback.
+    expect(failed.body).toContain(
+      'border-inline-start-color: var(--dgc-bar-color, var(--dg-danger));',
+    );
 
     // Equal specificity, so source order decides: selection's accent edge must
     // come last to win over both.
@@ -3474,6 +3559,190 @@ describe('Waterfall calls still in flight', () => {
     expect(isDrawnPending(settledRow, 70)).toBe(false);
     expect(within(settledRow).getByText('200')).toBeTruthy();
     expect(settledRow.getAttribute('aria-label') ?? '').toContain('status 200');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Durations that are not measurements
+ *
+ * A malformed record can carry a duration no clock produced: a negative value,
+ * `null` where the schema promises a number, or `NaN`. The bar is still drawn
+ * — at zero, so it marks where the call began — but the figure a reader is
+ * shown is the unavailable label: printing the drawn zero would report a
+ * corrupt measurement as the fastest call of the capture.
+ * ---------------------------------------------------------------------------
+ */
+
+/** What a row's description says about a duration that was not measured. */
+const UNMEASURED_TOOK = `took ${NOT_AVAILABLE_LABEL}`;
+
+/** The measured-zero text the drawn value would print as. */
+const MEASURED_ZERO = formatDuration(0);
+
+/**
+ * A duration as a malformed record delivers it: `null` where the schema
+ * promises a number, which only a boundary the schema did not guard can let
+ * through — exactly the input this view must still render honestly.
+ */
+const NULL_DURATION = null as unknown as number;
+
+/**
+ * The duration cell of a row, obtained from the row the case already named.
+ *
+ * @param row The row.
+ * @returns Its duration cell.
+ */
+function durationCellOf(row: HTMLElement): HTMLElement {
+  const cell = row.querySelector<HTMLElement>('.dg-duration-cell');
+  if (cell === null) {
+    throw new Error('the row drew no duration cell');
+  }
+  return cell;
+}
+
+/**
+ * Asserts a row states its duration as unavailable in every form it prints
+ * one: the cell reads the label, takes the unavailable state and no severity
+ * step, and the description says "took n/a" — never the measured zero.
+ *
+ * @param row The row.
+ */
+function expectUnmeasured(row: HTMLElement): void {
+  const cell = durationCellOf(row);
+  expect(cell.textContent).toBe(NOT_AVAILABLE_LABEL);
+  expect(cell.classList.contains('dg-is-unavailable')).toBe(true);
+  for (const step of ['fast', 'normal', 'slow', 'critical']) {
+    expect(cell.classList.contains(`dg-duration-cell--${step}`)).toBe(false);
+  }
+  const description = row.getAttribute('aria-label') ?? '';
+  expect(description).toContain(UNMEASURED_TOOK);
+  expect(description).not.toContain(`took ${MEASURED_ZERO}`);
+  // Its bar is still drawn, so the row keeps marking where the call began.
+  expect(row.querySelector('.dg-waterfall__bar')).not.toBeNull();
+}
+
+describe('Waterfall durations that are not measurements', () => {
+  it('prints and describes a negative, null or NaN duration as unavailable, and a measured one as measured', async () => {
+    const urls = {
+      negative: 'http://127.0.0.1:3000/example/negative?page=?',
+      absent: 'http://127.0.0.1:3000/example/absent?page=?',
+      notANumber: 'http://127.0.0.1:3000/example/not-a-number?page=?',
+      noise: 'http://127.0.0.1:3000/example/noise?page=?',
+      measured: 'http://127.0.0.1:3000/example/measured?page=?',
+    } as const;
+    const call = (ordinal: number, url: string, offsetMs: number, duration: number) =>
+      makeEvent({
+        id: eventIdFor(ordinal),
+        spanId: spanIdFor(ordinal),
+        kind: 'fetch',
+        tier: 'browser',
+        name: 'example.call',
+        startTime: BASE_START_MS + offsetMs,
+        duration,
+        attributes: { 'http.method': 'GET', url, 'http.status_code': 200 },
+        seq: ordinal,
+        ingestSeq: ordinal,
+      });
+    const stub = resolvingProvider([
+      call(151, urls.negative, 10, -5),
+      call(152, urls.absent, 20, NULL_DURATION),
+      call(153, urls.notANumber, 25, Number.NaN),
+      // Below zero only by floating-point noise: the zero it is.
+      call(154, urls.noise, 28, -0.0004),
+      call(155, urls.measured, 30, 250),
+    ]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(5);
+
+    expectUnmeasured(rowLabelled(urls.negative));
+    expectUnmeasured(rowLabelled(urls.absent));
+    expectUnmeasured(rowLabelled(urls.notANumber));
+
+    const noiseRow = rowLabelled(urls.noise);
+    expect(durationCellOf(noiseRow).textContent).toBe(MEASURED_ZERO);
+    expect(noiseRow.getAttribute('aria-label') ?? '').toContain(`took ${MEASURED_ZERO}`);
+
+    const measuredRow = rowLabelled(urls.measured);
+    expect(durationCellOf(measuredRow).textContent).toBe(formatDuration(250));
+    expect(measuredRow.getAttribute('aria-label') ?? '').toContain(`took ${formatDuration(250)}`);
+  });
+
+  it('states a call still in flight with no measured duration as pending, without a lower bound on nothing', async () => {
+    const url = 'http://127.0.0.1:3000/example/in-flight-unmeasured?page=?';
+    const inFlight = makeEvent({
+      id: eventIdFor(156),
+      spanId: spanIdFor(156),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.in-flight-call',
+      startTime: BASE_START_MS,
+      duration: -5,
+      attributes: { 'http.method': 'GET', url, inFlight: true },
+    });
+    const stub = resolvingProvider([inFlight]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const row = rowLabelled(url);
+    // Still pending: the badge and the sentence about the missing response.
+    expect(within(row).getByText(PENDING_BADGE).textContent).toBe(PENDING_BADGE);
+    expect(row.getAttribute('aria-label') ?? '').toContain(IN_FLIGHT_SENTENCE);
+    // But no "at least" qualifies a figure there is none of.
+    expect(within(row).queryByText(LOWER_BOUND_WORDS)).toBeNull();
+    expect(row.getAttribute('aria-label') ?? '').not.toContain(`took ${LOWER_BOUND_WORDS}`);
+    expectUnmeasured(row);
+  });
+
+  it('prints a group extent as unavailable when one of its calls has no measured end, and each call as what it was', async () => {
+    const measured = settledOccurrence(157, 0, 120);
+    const corrupt = { ...settledOccurrence(158, 200, 0), durationMs: -5 };
+    const group = makeRequestGroup([measured, corrupt]);
+    const stub = groupsProvider([group]);
+    const user = userEvent.setup();
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const [groupRow] = drawnRows();
+    if (groupRow === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    // The corrupt call's end is unknown, so the group's is too.
+    expectUnmeasured(groupRow);
+
+    await user.click(within(groupRow).getByRole('button', { name: EXPAND_NAME }));
+    const [, measuredRow, corruptRow] = drawnRows();
+    if (measuredRow === undefined || corruptRow === undefined) {
+      throw new Error('the occurrence rows were not drawn');
+    }
+    expect(durationCellOf(measuredRow).textContent).toBe(formatDuration(120));
+    expect(measuredRow.getAttribute('aria-label') ?? '').toContain(`took ${formatDuration(120)}`);
+    expectUnmeasured(corruptRow);
+  });
+
+  it('keeps printing a group extent whose every call was measured', async () => {
+    const group = makeRequestGroup([
+      settledOccurrence(159, 0, 120),
+      settledOccurrence(160, 200, 50),
+    ]);
+    const stub = groupsProvider([group]);
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const [groupRow] = drawnRows();
+    if (groupRow === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    // First start to last end: 0 to 250 ms.
+    expect(durationCellOf(groupRow).textContent).toBe(formatDuration(250));
+    expect(groupRow.getAttribute('aria-label') ?? '').toContain(`took ${formatDuration(250)}`);
   });
 });
 
@@ -4503,9 +4772,13 @@ interface DrawnTickLabel {
   readonly anchor: string;
 }
 
-/** The axis graphic. */
+/**
+ * The axis graphic: the one image named as the time axis. Every row's timing
+ * bar is an image too, named by where it sits in the window, so the axis is
+ * found by its name rather than by being the only image.
+ */
 function axisGraphic(): SVGSVGElement {
-  const graphic = screen.getByRole('img');
+  const graphic = screen.getByRole('img', { name: /^Time axis spanning / });
   if (!(graphic instanceof SVGSVGElement)) {
     throw new Error('the time axis is not an svg element');
   }
@@ -4694,7 +4967,7 @@ describe('Waterfall time axis', () => {
     await screen.findByRole('tree', { name: TREE_NAME });
 
     expect(drawnTickLabels()).toEqual(before);
-    expect(screen.getByRole('img').getAttribute('aria-label')).toBe(
+    expect(axisGraphic().getAttribute('aria-label')).toBe(
       `Time axis spanning ${formatDurationCompact(180)} from the first call`,
     );
   });
@@ -4705,13 +4978,17 @@ describe('Waterfall time axis', () => {
  * The axis floor and the scroll viewport
  *
  * The tick set is fitted to a design strip, so it is legible only on a strip
- * at least that wide. The stylesheet guarantees it: the row grid floors the
- * time track at a token-derived minimum, and a panel narrower than a row's
- * resulting minimum scrolls the axis and the rows together in one viewport
- * instead of squeezing the track. happy-dom applies no stylesheet, so these
- * cases hold the two halves of that guarantee as contracts rather than as
- * measurements: the floor as the stylesheet declares it, resolved through the
- * token table in every theme, and the elements the rendered viewport holds.
+ * at least that wide. The stylesheet guarantees it: the chart's one grid — the
+ * scroll viewport's — floors the time track at a token-derived minimum, and a
+ * panel narrower than the grid's minimum scrolls the axis and the rows
+ * together in that viewport instead of squeezing the track. The same grid is
+ * what keeps every row's track in register with the axis: the axis row, the
+ * tree, every child group and every row adopt its tracks as subgrids, so no
+ * row sizes a duration column of its own and no indent narrows a track.
+ * happy-dom applies no stylesheet, so these cases hold that guarantee as
+ * contracts rather than as measurements: the tracks and floors as the
+ * stylesheet declares them, resolved through the token table in every theme,
+ * and the elements the rendered viewport holds.
  * ---------------------------------------------------------------------------
  */
 
@@ -4724,8 +5001,25 @@ const VIEWPORT_CLASS = 'dg-waterfall__viewport';
  */
 const TOKEN_TRACK = /^minmax\(var\((--dg-[a-z0-9-]+)\), var\((--dg-[a-z0-9-]+)\)\)$/u;
 
-/** A track that may give way entirely, whose share is a token: `minmax(0, var(<share token>))`. */
-const FLOORLESS_TOKEN_TRACK = /^minmax\(0, var\((--dg-[a-z0-9-]+)\)\)$/u;
+/**
+ * A track floored by its items' own declared minimums, whose share is a token:
+ * `minmax(auto, var(<share token>))`.
+ */
+const ITEM_FLOORED_TOKEN_TRACK = /^minmax\(auto, var\((--dg-[a-z0-9-]+)\)\)$/u;
+
+/** A reference to one token, `var(<token>)`, capturing its name. */
+const TOKEN_REFERENCE = /^var\((--dg-[a-z0-9-]+)\)$/u;
+
+/** A token value written as a whole number of characters, e.g. `8ch`. */
+const CH_VALUE = /^(\d+)ch$/u;
+
+/** The containers that must adopt the chart grid's tracks, besides the rows. */
+const SUBGRID_CONTAINERS = [
+  '.dg-waterfall__row',
+  '.dg-waterfall__rows',
+  '.dg-waterfall__children',
+  '.dg-waterfall__child-rows',
+] as const;
 
 /** The form an extent token's value takes: a multiple of a space token, `calc(<token> * n)`. */
 const SPACE_MULTIPLE = /^calc\(var\((--dg-[a-z0-9-]+)\) \* (\d+)\)$/u;
@@ -4757,6 +5051,20 @@ function rulesSelecting(selector: string): string[] {
 }
 
 /**
+ * The viewport's own rule — the chart grid every row adopts — as opposed to
+ * the shared scroll-container rule that also selects it.
+ *
+ * @returns The rule body that declares the viewport's `display`.
+ */
+function chartGridRule(): string {
+  const own = rulesSelecting(`.${VIEWPORT_CLASS}`).filter((body) =>
+    /(?:^|;)\s*display:\s*grid;/u.test(body),
+  );
+  expect(own).toHaveLength(1);
+  return own[0] ?? '';
+}
+
+/**
  * The value of one declaration in a rule body, failing when it is absent.
  *
  * @param body The text between a rule's braces.
@@ -4771,9 +5079,14 @@ function declaredValue(body: string, property: string): string {
   return match[1].trim();
 }
 
+/** A bracketed set of grid line names in a template, e.g. `[full-start]`. */
+const LINE_NAMES = /\[[^\]]*\]/gu;
+
 /**
  * The top-level tracks of a `grid-template-columns` value: split on the spaces
- * outside any function, so `minmax(0, var(--dg-waterfall-label-share))` stays one track.
+ * outside any function, so `minmax(0, var(--dg-waterfall-label-share))` stays
+ * one track. Line names (`[full-start]`) name the lines between tracks and are
+ * not tracks, so they are dropped first.
  *
  * @param template The declared template.
  * @returns The tracks, in order.
@@ -4782,7 +5095,7 @@ function topLevelTracks(template: string): string[] {
   const tracks: string[] = [];
   let depth = 0;
   let current = '';
-  for (const char of template) {
+  for (const char of template.replace(LINE_NAMES, ' ')) {
     if (char === '(') {
       depth += 1;
     } else if (char === ')') {
@@ -4884,20 +5197,29 @@ describe('Waterfall axis floor and scroll viewport', () => {
   });
 
   it('floors the time track at the design strip in every theme, from a space token', () => {
-    const [rowRule, ...otherRowRules] = rulesSelecting('.dg-waterfall__row');
-    expect(otherRowRules).toHaveLength(0);
+    // The chart's tracks are declared once, by the viewport's own rule (the
+    // other rule selecting it is the shared scroll-container helper).
+    const own = chartGridRule();
     // The template may be laid out over several lines; a track boundary is
-    // any run of whitespace outside a function.
+    // any run of whitespace outside a function, and the two line names that
+    // bracket the tracks for `grid-column: full` are not tracks.
     const tracks = topLevelTracks(
-      declaredValue(rowRule ?? '', 'grid-template-columns').replace(/\s+/gu, ' '),
-    );
+      declaredValue(own, 'grid-template-columns').replace(/\s+/gu, ' '),
+    ).filter((track) => !/^\[[a-z-]+\]$/u.test(track));
 
-    // Label, time and duration: the label track may still give way, the time
-    // track may not.
+    // Label, time and duration. The label track is floored by what its rows
+    // declare (`auto`), the time track by a token, and the duration track is
+    // as wide as the widest figure in the chart.
     expect(tracks).toHaveLength(3);
-    const label = FLOORLESS_TOKEN_TRACK.exec(tracks[0] ?? '');
+    // The first and last lines are named, which is what a row — and a row's
+    // full-value detail — spans (`grid-column: full`).
+    const template = declaredValue(own, 'grid-template-columns').replace(/\s+/gu, ' ');
+    expect(template.startsWith('[full-start] ')).toBe(true);
+    expect(template.endsWith(' [full-end]')).toBe(true);
+    expect(template.match(LINE_NAMES)).toEqual(['[full-start]', '[full-end]']);
+    const label = ITEM_FLOORED_TOKEN_TRACK.exec(tracks[0] ?? '');
     const [, labelShareName = ''] = label ?? [];
-    expect(label, 'the label track has no floor').not.toBeNull();
+    expect(label, 'the label track is floored by its rows').not.toBeNull();
     expect(tracks[2]).toBe('max-content');
     const time = TOKEN_TRACK.exec(tracks[1] ?? '');
     const [, floorName = '', barShareName = ''] = time ?? [];
@@ -4934,26 +5256,492 @@ describe('Waterfall axis floor and scroll viewport', () => {
     }
   });
 
-  it('declares the viewport a scroll container whose one column is never narrower than a row', () => {
+  it('shares one set of tracks between the axis and every row, at every nesting depth', () => {
+    // Every container between the viewport and a row, and the row itself,
+    // adopts the chart grid's tracks and spans all of them: a row never sizes
+    // a duration column of its own, and a child group's indent insets only the
+    // label column's content.
+    for (const selector of SUBGRID_CONTAINERS) {
+      const bodies = rulesSelecting(selector).filter((body) =>
+        /(?:^|;)\s*display:\s*grid;/u.test(body),
+      );
+      expect(bodies, `${selector} has one grid rule`).toHaveLength(1);
+      const [body = ''] = bodies;
+      expect(declaredValue(body, 'grid-template-columns'), selector).toBe('subgrid');
+      expect(declaredValue(body, 'grid-column'), selector).toBe('full');
+    }
+
+    // The row declares no template of its own besides the subgrid, and its
+    // column gap is the chart grid's, so no subgrid offsets an item against
+    // the track it sits in.
+    const [rowRule, ...otherRowRules] = rulesSelecting('.dg-waterfall__row');
+    expect(otherRowRules).toHaveLength(0);
+    expect(declaredValue(rowRule ?? '', 'gap')).toBe(declaredValue(chartGridRule(), 'column-gap'));
+  });
+
+  it('keeps a readable run of every label and never lets the name column reach the track', async () => {
+    // The name column and the label slot share one floor, a `ch` token of
+    // positive width in every theme: the label track is never narrower than
+    // that plus a row's inset, and the label never narrower than that either.
+    const [name, ...otherNameRules] = rulesSelecting('.dg-waterfall__name');
+    expect(otherNameRules).toHaveLength(0);
+    const floor = TOKEN_REFERENCE.exec(declaredValue(name ?? '', 'min-inline-size'));
+    const [, floorName = ''] = floor ?? [];
+    expect(floor, 'the name column is floored by a token').not.toBeNull();
+    for (const theme of Object.keys(DESIGN_TOKENS) as (keyof DesignTokens)[]) {
+      const characters = CH_VALUE.exec(DESIGN_TOKENS[theme][tokenKeyOf(floorName)]);
+      expect(Number(characters?.[1] ?? 0), `${theme}: the label floor`).toBeGreaterThan(0);
+    }
+    const [slot, ...otherSlotRules] = rulesSelecting('.dg-waterfall__label-slot');
+    expect(otherSlotRules).toHaveLength(0);
+    expect(declaredValue(slot ?? '', 'min-inline-size')).toBe(`var(${floorName})`);
+    // A zero basis that grows into what the chips leave on its line.
+    expect(declaredValue(slot ?? '', 'flex')).toBe('auto');
+    expect(declaredValue(slot ?? '', 'flex-basis')).toBe('0');
+
+    // In the DOM: the name column wraps, so a chip that does not fit beside the
+    // floored label moves to another line instead of over the time track, and
+    // the label slot carries no inline declaration that could override the
+    // floor. The source chip is the column's last item, so it wraps first.
+    renderComponent(makeNode(), {
+      provider: resolvingProvider([...CHAIN, LONE_CALL, LATER_CALL]).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree', { name: TREE_NAME });
+    let sourceChips = 0;
+    for (const row of drawnRows()) {
+      const column = row.querySelector<HTMLElement>('.dg-waterfall__name');
+      expect(column?.classList.contains('dg-stack--wrap')).toBe(true);
+      const labelSlot = column?.querySelector<HTMLElement>('.dg-waterfall__label-slot');
+      expect(labelSlot).not.toBeNull();
+      expect(labelSlot?.getAttribute('style') ?? null).toBeNull();
+      const items = Array.from(column?.querySelector('.dg-stack__items')?.children ?? []);
+      // The chip is the item itself or, with its tooltip, the item's content.
+      const sourceChip = items.findIndex(
+        (item) =>
+          item.classList.contains('dg-source-link') ||
+          item.querySelector('.dg-source-link') !== null,
+      );
+      if (sourceChip !== -1) {
+        sourceChips += 1;
+        expect(sourceChip).toBe(items.length - 1);
+      }
+    }
+    // The browser request resolved to source, so the ordering is exercised.
+    expect(sourceChips).toBeGreaterThan(0);
+  });
+
+  it('declares the viewport a scroll container that owns the chart grid', () => {
     const bodies = rulesSelecting(`.${VIEWPORT_CLASS}`);
     // The shared scroll-container rule, and the component's own.
     expect(bodies).toHaveLength(2);
     const scrolling = bodies.filter((body) => /(?:^|;)\s*overflow:\s*auto;/u.test(body));
     expect(scrolling).toHaveLength(1);
-    const own = bodies.find((body) => !scrolling.includes(body)) ?? '';
+    const own = chartGridRule();
     expect(declaredValue(own, 'display')).toBe('grid');
-    expect(declaredValue(own, 'grid-template-columns')).toBe(
-      'minmax(min-content, var(--dg-column-share-default))',
-    );
-    // That share is the whole of the viewport's spare width, in every theme.
-    for (const theme of Object.keys(DESIGN_TOKENS) as (keyof DesignTokens)[]) {
-      expect(DESIGN_TOKENS[theme].columnShareDefault, theme).toBe('1fr');
-    }
+    // The tracks are bracketed by the line names every subgrid spans by.
+    const template = declaredValue(own, 'grid-template-columns').replace(/\s+/gu, ' ');
+    expect(template.startsWith('[full-start] ')).toBe(true);
+    expect(template.endsWith(' [full-end]')).toBe(true);
+    expect(declaredValue(own, 'column-gap')).toBe('var(--dg-space-2)');
     expect(declaredValue(own, 'min-inline-size')).toBe('0');
 
-    // The axis strip takes the track's floor from the row grid, not a minimum
+    // The axis strip takes the track's floor from the chart grid, not a minimum
     // of its own that could size the column differently from the bars' track.
     const [strip] = rulesSelecting('.dg-waterfall__axis-strip');
     expect(declaredValue(strip ?? '', 'min-inline-size')).toBe('0');
+  });
+});
+
+describe('Waterfall timing bar accessible names', () => {
+  it("names each row's timing bar as an image stating where it sits in the window and how much of it the call spans", async () => {
+    const urls = {
+      first: 'http://127.0.0.1:3000/example/first?page=?',
+      second: 'http://127.0.0.1:3000/example/second?page=?',
+      unmeasured: 'http://127.0.0.1:3000/example/unmeasured?page=?',
+    } as const;
+    const call = (ordinal: number, url: string, offsetMs: number, duration: number) =>
+      makeEvent({
+        id: eventIdFor(ordinal),
+        spanId: spanIdFor(ordinal),
+        kind: 'fetch',
+        tier: 'browser',
+        name: 'example.call',
+        startTime: BASE_START_MS + offsetMs,
+        duration,
+        attributes: { 'http.method': 'GET', url, 'http.status_code': 200 },
+        seq: ordinal,
+        ingestSeq: ordinal,
+      });
+    // The window runs from the first call's start to the second call's end:
+    // 0 → 200 ms.
+    const stub = resolvingProvider([
+      call(171, urls.first, 0, 100),
+      call(172, urls.unmeasured, 20, -5),
+      call(173, urls.second, 50, 150),
+    ]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const windowText = formatDuration(200);
+
+    const barOf = (url: string): HTMLElement => {
+      const bar = rowLabelled(url).querySelector<HTMLElement>('.dg-waterfall__bar');
+      if (bar === null) {
+        throw new Error(`the row for ${url} drew no bar`);
+      }
+      return bar;
+    };
+
+    const first = barOf(urls.first);
+    expect(first.getAttribute('role')).toBe('img');
+    expect(first.getAttribute('aria-hidden')).toBeNull();
+    expect(first.getAttribute('aria-label')).toBe(
+      `Timing bar starting ${formatDuration(0)} into the ${windowText} window, spanning ${formatDuration(
+        100,
+      )}, ${formatShare(100, 200)} of it`,
+    );
+
+    expect(barOf(urls.second).getAttribute('aria-label')).toBe(
+      `Timing bar starting ${formatDuration(50)} into the ${windowText} window, spanning ${formatDuration(
+        150,
+      )}, ${formatShare(150, 200)} of it`,
+    );
+
+    // A duration that was not measured is said to be so, never given the zero
+    // its bar is drawn at.
+    const unmeasured = barOf(urls.unmeasured).getAttribute('aria-label') ?? '';
+    expect(unmeasured).toBe(
+      `Timing bar starting ${formatDuration(20)} into the ${windowText} window; its duration was not measured (${NOT_AVAILABLE_LABEL})`,
+    );
+    expect(unmeasured).not.toContain(`spanning ${formatDuration(0)}`);
+
+    // Every bar is reachable by role, beside the one axis image.
+    expect(screen.getAllByRole('img', { name: /^Timing bar starting / })).toHaveLength(3);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The whole of a long value
+ *
+ * A row cuts its label to a 120-code-point preview, and its accessible name
+ * bounds the label too. The whole redacted URL or parameterized statement is
+ * still reachable: whole in the description bubble, and whole — exactly as it
+ * arrived — in the full-value detail an abbreviated row expands into, by
+ * ArrowRight or by its disclosure button, children or not.
+ * ---------------------------------------------------------------------------
+ */
+
+/** How much of a label a row shows before eliding it. */
+const ROW_LABEL_PREVIEW = 120;
+
+/** How much of a label a row's accessible name repeats. */
+const ROW_NAME_LABEL_PREVIEW = 400;
+
+/** The words at the very end of the long statement, which only the whole value holds. */
+const LONG_STATEMENT_TAIL = 'example-end-of-statement';
+
+/**
+ * A parameterized statement past both bounds and laid out over lines, as a
+ * producer reports a long one: literals already replaced, `$1` kept.
+ */
+const LONG_STATEMENT = [
+  'SELECT',
+  Array.from(
+    { length: 40 },
+    (_, at) => `  COALESCE(example_ledger.column_${String(at)}, ?) AS column_${String(at)}`,
+  ).join(',\n'),
+  'FROM example_ledger',
+  'WHERE tenant_id = $1 AND recorded_at > ?',
+  `LIMIT ? /* ${LONG_STATEMENT_TAIL} */`,
+].join('\n');
+
+/** A redacted URL past the row's preview, with a tail only the whole value holds. */
+const LONG_URL = `http://127.0.0.1:3000/example/${'segment/'.repeat(24)}resource?page=?&tail=?`;
+
+/** Controls a full-value detail must never hold: it is text, not a focus stop. */
+const FOCUSABLE_SELECTOR = 'a[href], button, input, select, textarea, [tabindex]';
+
+/** A top-level statement whose text is {@link LONG_STATEMENT}. */
+const LONG_STATEMENT_EVENT = makeEvent({
+  id: eventIdFor(161),
+  spanId: spanIdFor(161),
+  kind: 'db.query',
+  tier: 'db',
+  name: 'example.long-statement',
+  startTime: BASE_START_MS + 10,
+  duration: 320,
+  attributes: { 'db.system': 'postgresql', 'db.statement': LONG_STATEMENT, 'db.rowCount': 3 },
+  seq: 5,
+  ingestSeq: 5,
+});
+
+/**
+ * The full-value detail a row describes itself with, or `null` while it shows
+ * none: the element its `aria-describedby` names, which must sit inside it.
+ *
+ * @param row The row.
+ * @returns The detail element, when the row is described by one.
+ */
+function fullValueDetail(row: HTMLElement): HTMLElement | null {
+  const id = row.getAttribute('aria-describedby');
+  if (id === null) {
+    expect(row.querySelector('.dg-waterfall__detail')).toBeNull();
+    return null;
+  }
+  const detail = document.getElementById(id);
+  expect(detail).not.toBeNull();
+  expect(detail?.classList.contains('dg-waterfall__detail')).toBe(true);
+  expect(detail !== null && row.contains(detail)).toBe(true);
+  return detail;
+}
+
+/**
+ * The description bubble of a row whose name bounds its label: the one
+ * `role="tooltip"` in the row whose text opens with the whole label.
+ *
+ * @param row The row.
+ * @param label The row's whole label.
+ * @returns The bubble.
+ */
+function wholeLabelBubble(row: HTMLElement, label: string): HTMLElement {
+  const bubbles = within(row)
+    .queryAllByRole('tooltip', { hidden: true })
+    .filter((bubble) => (bubble.textContent ?? '').startsWith(`${collapseWhitespace(label)} · `));
+  expect(bubbles).toHaveLength(1);
+  const [bubble] = bubbles;
+  if (bubble === undefined) {
+    throw new Error('the row has no bubble carrying its whole label');
+  }
+  return bubble;
+}
+
+describe('Waterfall full values', () => {
+  it('keeps the whole of an abbreviated statement one hover, one focus or one key away', async () => {
+    const stub = resolvingProvider([LONG_STATEMENT_EVENT]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // The row shows the preview, and its name repeats a longer but still
+    // bounded one: the tail is in neither.
+    const shown = oneLinePreview(LONG_STATEMENT, ROW_LABEL_PREVIEW);
+    expect(shown.endsWith('…')).toBe(true);
+    const row = rowLabelled(shown);
+    const name = row.getAttribute('aria-label') ?? '';
+    expect(name.startsWith(`${oneLinePreview(LONG_STATEMENT, ROW_NAME_LABEL_PREVIEW)} · `)).toBe(
+      true,
+    );
+    expect(name).not.toContain(LONG_STATEMENT_TAIL);
+    expect(name).toContain(`${formatCount(3)} rows touched`);
+
+    // The bubble carries the whole statement, whitespace folded onto one line,
+    // followed by the same facts the name states.
+    const bubble = wholeLabelBubble(row, LONG_STATEMENT);
+    expect(bubble.textContent ?? '').toContain(LONG_STATEMENT_TAIL);
+    expect(bubble.textContent ?? '').toContain(`${formatCount(3)} rows touched`);
+
+    // A leaf, and still expandable: its disclosure names the full value, never
+    // nested calls it does not have, and is out of the Tab order.
+    expect(row.getAttribute('aria-expanded')).toBe('false');
+    expect(fullValueDetail(row)).toBeNull();
+    const call = `${shown} (${formatKindLabel('db.query')})`;
+    const show = within(row).getByRole('button', { name: `Show the full statement of ${call}` });
+    expect(EXPAND_NAME.test(show.getAttribute('aria-label') ?? '')).toBe(false);
+    expect(show.getAttribute('tabindex')).toBe('-1');
+    expect(show.getAttribute('aria-expanded')).toBe('false');
+    expect(show.hasAttribute('aria-controls')).toBe(false);
+
+    // The keyboard: Tab onto the row, ArrowRight opens the detail, focus stays.
+    await user.tab();
+    expect(document.activeElement).toBe(row);
+    await user.keyboard('{ArrowRight}');
+    const opened = rowLabelled(shown);
+    expect(document.activeElement).toBe(opened);
+    expect(opened.getAttribute('aria-expanded')).toBe('true');
+    expect(opened.classList.contains('dg-is-expanded')).toBe(true);
+    expect(spies.onExpand).toHaveBeenCalledTimes(1);
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, LONG_STATEMENT_EVENT.id, true);
+
+    // The detail: the heading word, then the statement byte for byte — its
+    // lines kept, nothing folded, nothing cut — as monospaced text with no
+    // control in it.
+    const detail = fullValueDetail(opened);
+    if (detail === null) {
+      throw new Error('the expanded row shows no full-value detail');
+    }
+    const value = detail.querySelector('code');
+    expect(value?.textContent).toBe(LONG_STATEMENT);
+    expect(value?.classList.contains('dg-code--wrap')).toBe(true);
+    expect(detail.textContent).toBe(`Statement${LONG_STATEMENT}`);
+    expect(detail.querySelectorAll(FOCUSABLE_SELECTOR)).toHaveLength(0);
+    const hide = within(opened).getByRole('button', { name: `Hide the full statement of ${call}` });
+    expect(hide.getAttribute('aria-expanded')).toBe('true');
+    expect(hide.getAttribute('aria-controls')).toBe(detail.id);
+
+    // The description the keyboard revealed stays open, above the label, so
+    // it never covers the detail below it.
+    const held = wholeLabelBubble(opened, LONG_STATEMENT);
+    expect(isShown(held)).toBe(true);
+    expect(held.classList.contains('dg-tooltip--top')).toBe(true);
+
+    // A leaf has no child to step into: a second ArrowRight moves nothing.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(rowLabelled(shown));
+    expect(spies.onExpand).toHaveBeenCalledTimes(1);
+
+    // ArrowLeft closes it again, and the row is described by nothing.
+    await user.keyboard('{ArrowLeft}');
+    const closed = rowLabelled(shown);
+    expect(document.activeElement).toBe(closed);
+    expect(closed.getAttribute('aria-expanded')).toBe('false');
+    expect(fullValueDetail(closed)).toBeNull();
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, LONG_STATEMENT_EVENT.id, false);
+    expect(isShown(wholeLabelBubble(closed, LONG_STATEMENT))).toBe(true);
+    expect(wholeLabelBubble(closed, LONG_STATEMENT).classList.contains('dg-tooltip--bottom')).toBe(
+      true,
+    );
+
+    // The pointer's route is the disclosure button, both ways.
+    await user.click(
+      within(closed).getByRole('button', { name: `Show the full statement of ${call}` }),
+    );
+    expect(fullValueDetail(rowLabelled(shown))?.querySelector('code')?.textContent).toBe(
+      LONG_STATEMENT,
+    );
+    await user.click(
+      within(rowLabelled(shown)).getByRole('button', {
+        name: `Hide the full statement of ${call}`,
+      }),
+    );
+    expect(fullValueDetail(rowLabelled(shown))).toBeNull();
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('offers no full-value disclosure for a label the row already shows whole', async () => {
+    // Laid out over lines, but short: folding its whitespace is all the row
+    // does to it, so there is nothing more to show.
+    const folded = 'SELECT id\n  FROM example_ledger\n WHERE tenant_id = $1';
+    const foldedEvent = makeEvent({
+      ...LONG_STATEMENT_EVENT,
+      attributes: { 'db.system': 'postgresql', 'db.statement': folded, 'db.rowCount': 1 },
+    });
+    const stub = resolvingProvider([foldedEvent, LONE_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    for (const label of [collapseWhitespace(folded), LONE_CALL.name]) {
+      const row = rowLabelled(label);
+      expect(row.hasAttribute('aria-expanded')).toBe(false);
+      expect(within(row).queryByRole('button', { name: /^Show the full / })).toBeNull();
+      expect(fullValueDetail(row)).toBeNull();
+      // The name and the bubble carry one sentence.
+      expect(descriptionBubble(row)?.textContent).toBe(row.getAttribute('aria-label'));
+    }
+
+    // ArrowRight on such a leaf opens nothing.
+    await user.tab();
+    await user.keyboard('{ArrowRight}');
+    expect(fullValueDetail(rowLabelled(collapseWhitespace(folded)))).toBeNull();
+    expect(spies.onExpand).not.toHaveBeenCalled();
+  });
+
+  it('opens the whole of a long URL with its nested calls, in one expanded state', async () => {
+    const request = makeEvent({
+      ...REQUEST_EVENT,
+      attributes: { ...REQUEST_ATTRIBUTES, url: LONG_URL },
+    });
+    const stub = resolvingProvider([request, SERVER_EVENT]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const shown = oneLinePreview(LONG_URL, ROW_LABEL_PREVIEW);
+    const row = rowLabelled(shown);
+    expect(wholeLabelBubble(row, LONG_URL).textContent ?? '').toContain('&tail=?');
+    // The disclosure keeps naming the nested call it opens.
+    await user.click(
+      within(row).getByRole('button', {
+        name: `Expand the ${formatCount(1)} nested call inside ${REQUEST_METHOD} ${shown} (${formatKindLabel('fetch')})`,
+      }),
+    );
+
+    // One expansion: the child group and the detail, both controlled by it.
+    const opened = rowLabelled(shown);
+    expect(drawnRows()).toHaveLength(2);
+    const groupId = opened.getAttribute('aria-owns');
+    expect(groupId).not.toBeNull();
+    const detail = fullValueDetail(opened);
+    if (detail === null || groupId === null) {
+      throw new Error('the expanded row shows its children or its detail only');
+    }
+    expect(detail.textContent).toBe(`URL${LONG_URL}`);
+    const collapse = within(opened).getByRole('button', { name: COLLAPSE_NAME });
+    expect(collapse.getAttribute('aria-controls')).toBe(`${groupId} ${detail.id}`);
+    expect(spies.onExpand).toHaveBeenCalledTimes(1);
+
+    // Closing the row closes both.
+    await user.click(collapse);
+    expect(drawnRows()).toHaveLength(1);
+    expect(fullValueDetail(rowLabelled(shown))).toBeNull();
+  });
+
+  it('shows a long grouped URL once, on the group row, and never lets an occurrence collapse the group', async () => {
+    const group: RequestGroup = {
+      ...makeRequestGroup([settledOccurrence(162, 0, 120), settledOccurrence(163, 200, 90)]),
+      url: LONG_URL,
+    };
+    const stub = groupsProvider([group]);
+    const user = userEvent.setup();
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const [groupRow] = drawnRows();
+    if (groupRow === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    await user.click(within(groupRow).getByRole('button', { name: EXPAND_NAME }));
+
+    // The group row shows the whole URL; its occurrences carry the same URL,
+    // so none of them offers a detail — or a disclosure — of its own.
+    const [openedGroup, ...occurrences] = drawnRows();
+    expect(occurrences).toHaveLength(2);
+    if (openedGroup === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    expect(fullValueDetail(openedGroup)?.textContent).toBe(`URL${LONG_URL}`);
+    expect(document.querySelectorAll('.dg-waterfall__detail')).toHaveLength(1);
+    for (const occurrence of occurrences) {
+      expect(occurrence.hasAttribute('aria-expanded')).toBe(false);
+      expect(
+        within(occurrence).queryAllByRole('button', { name: /^(?:Show|Hide) the full / }),
+      ).toHaveLength(0);
+      expect(fullValueDetail(occurrence)).toBeNull();
+    }
+
+    // ArrowRight on the first occurrence — whose record id is the group row's
+    // — leaves the group open.
+    const [firstOccurrence] = occurrences;
+    if (firstOccurrence === undefined) {
+      throw new Error('the occurrence rows were not drawn');
+    }
+    firstOccurrence.focus();
+    await user.keyboard('{ArrowRight}');
+    expect(drawnRows()).toHaveLength(3);
+    expect(drawnRows()[0]?.getAttribute('aria-expanded')).toBe('true');
   });
 });

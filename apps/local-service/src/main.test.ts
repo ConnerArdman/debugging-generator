@@ -47,7 +47,7 @@
  * `os.tmpdir()` is on macOS.
  */
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
 import { createBackupStore, createModificationRecord } from '@debuggen/instrumentation';
@@ -192,6 +192,27 @@ const handles: ServiceHandle[] = [];
 const sockets: WebSocket[] = [];
 
 /**
+ * Every container {@link makeStateRoot} ever created in this file — unlike
+ * `roots`, never spliced by `afterEach`.
+ *
+ * A test that exceeds its timeout keeps running after Vitest has moved on: its
+ * `afterEach` has already spliced and removed `roots`, and a `startService` the
+ * late body calls afterwards re-creates the removed container — its state root
+ * is created with every missing ancestor — and holds it open. Only this record
+ * still names that container when the file-level `afterAll` runs, so it is what
+ * lets the file remove every temporary directory it created, whatever its
+ * tests did after their deadline.
+ */
+const createdContainers: string[] = [];
+
+/**
+ * The {@link start} calls still in flight, so the file-level `afterAll` can
+ * wait for a late test body's start to settle — and its handle to be
+ * registered — before it releases the handles and removes the containers.
+ */
+const pendingStarts = new Set<Promise<unknown>>();
+
+/**
  * A fresh, symlink-free temporary directory and the state root inside it. The
  * state root is a *child* of the `mkdtemp` directory so `ensureSecureDir` is
  * exercised on a component it creates, as on a developer's first run.
@@ -199,23 +220,34 @@ const sockets: WebSocket[] = [];
 function makeStateRoot(): { readonly container: string; readonly stateRoot: string } {
   const container = mkdtempSync(join(realpathSync(tmpdir()), 'debuggen-main-test-'));
   roots.push(container);
+  createdContainers.push(container);
   return { container, stateRoot: join(container, 'home') };
 }
 
 /** Starts the service against `stateRoot` on an ephemeral port. */
-async function start(
+function start(
   stateRoot: string,
   extra: Omit<StartServiceOptions, 'env'> = {},
 ): ReturnType<typeof startService> {
-  const started = await startService({
-    env: {},
-    ...extra,
-    overrides: { debuggenHome: stateRoot, port: 0, logLevel: 'silent', ...extra.overrides },
-  });
-  if (isOk(started)) {
-    handles.push(started.value);
-  }
-  return started;
+  const starting = (async () => {
+    const started = await startService({
+      env: {},
+      ...extra,
+      overrides: { debuggenHome: stateRoot, port: 0, logLevel: 'silent', ...extra.overrides },
+    });
+    if (isOk(started)) {
+      handles.push(started.value);
+    }
+    return started;
+  })();
+  pendingStarts.add(starting);
+  // Both reactions only deregister, so this derived promise always fulfils;
+  // the caller still observes a rejection through `starting` itself.
+  const settled = (): void => {
+    pendingStarts.delete(starting);
+  };
+  void starting.then(settled, settled);
+  return starting;
 }
 
 /** Starts the service and fails the test when it does not start. */
@@ -440,16 +472,45 @@ async function connectEditor(
   return { frames, closed };
 }
 
-afterEach(async () => {
+/**
+ * Terminates every registered socket, closes every registered handle, then
+ * removes `containers` — in that order, because a closing service still writes
+ * into its state root (the store folds its write-ahead log back on close). The
+ * containers are removed even if a close rejects, which `ServiceHandle.close`
+ * promises never to do; the rejection would still fail the hook.
+ */
+async function releaseRegistered(containers: readonly string[]): Promise<void> {
   for (const socket of sockets.splice(0)) {
     socket.terminate();
   }
-  for (const handle of handles.splice(0)) {
-    await handle.close();
+  try {
+    for (const handle of handles.splice(0)) {
+      await handle.close();
+    }
+  } finally {
+    for (const container of containers) {
+      rmSync(container, { recursive: true, force: true });
+    }
   }
-  for (const root of roots.splice(0)) {
-    rmSync(root, { recursive: true, force: true });
-  }
+}
+
+afterEach(async () => {
+  await releaseRegistered(roots.splice(0));
+});
+
+/**
+ * The file-level backstop behind `afterEach`: a test body that outlives its
+ * timeout keeps registering sockets, handles and containers after its
+ * `afterEach` has run, and nothing else would release what it registers once
+ * the file's last test is done. Starts still in flight are awaited first, so
+ * their handles are registered and closed too; then every container this file
+ * ever created is removed — `force` makes the ones `afterEach` already removed
+ * a no-op.
+ */
+afterAll(async () => {
+  await Promise.allSettled(pendingStarts);
+  roots.splice(0);
+  await releaseRegistered(createdContainers.splice(0));
 });
 
 describe('startService — the state tree, the store and the editor credential', () => {
@@ -473,7 +534,8 @@ describe('startService — the state tree, the store and the editor credential',
     expect(editorToken(stateRoot).length).toBeGreaterThan(0);
     expect(handle.startup.editorCredentialCreated).toBe(true);
     expect(handle.startup.reconciliation.status).toBe('clean');
-    expect(handle.startup.retention).toBeDefined();
+    // The start-up sweep runs in the background once the service listens.
+    expect(await handle.startup.retention).toBeDefined();
 
     const db = new DatabaseSync(databasePath, { readOnly: true });
     try {
@@ -594,10 +656,32 @@ describe('startService — the state tree, the store and the editor credential',
     expect(() => lstatSync(stateRoot)).toThrow();
   });
 
+  it('refuses a missing prompts directory before touching the filesystem, naming DEBUGGEN_PROMPTS_DIR', async () => {
+    const { container, stateRoot } = makeStateRoot();
+
+    for (const promptsDir of [join(container, 'absent-prompts'), container]) {
+      const refused = await start(stateRoot, { overrides: { promptsDir } });
+      expect(isErr(refused)).toBe(true);
+      if (isErr(refused)) {
+        expect(refused.error.code).toBe('CONFIG_INVALID');
+        expect(refused.error.message).toContain('DEBUGGEN_PROMPTS_DIR');
+        expect(`${refused.error.message} ${refused.error.hint ?? ''}`).not.toContain(
+          'createPromptLoader',
+        );
+      }
+      // Refused like any other configuration key: no state root, no
+      // credential, no store.
+      expect(() => lstatSync(stateRoot)).toThrow();
+    }
+  });
+
   it('refuses a broken prompt tree and releases the store it had opened', async () => {
     const { container, stateRoot } = makeStateRoot();
     const emptyPrompts = join(container, 'prompts');
     mkdirSync(emptyPrompts, { recursive: true });
+    // A manifest is present, so the read-only check of step 1 passes and the
+    // tree's contents are refused at step 9, after the store has opened.
+    writeFileSync(join(emptyPrompts, 'manifest.json'), '{}');
 
     const refused = await start(stateRoot, { overrides: { promptsDir: emptyPrompts } });
     expect(isErr(refused)).toBe(true);
@@ -623,6 +707,9 @@ describe('startService — the state tree, the store and the editor credential',
       `prompts?access_token=${urlSentinel} WHERE card = '${sqlSentinel}'`,
     );
     mkdirSync(promptsDir, { recursive: true });
+    // Present but invalid, so the refusal comes from the prompt loader at step
+    // 9, after the logger exists.
+    writeFileSync(join(promptsDir, 'manifest.json'), '{}');
     const records: string[] = [];
     const destination = {
       write(record: string): void {
@@ -665,6 +752,98 @@ describe('startService — the state tree, the store and the editor credential',
     );
     expect(ordinaryText).not.toContain(urlSentinel);
     expect(ordinaryText).not.toContain(sqlSentinel);
+  });
+});
+
+describe('startService — the state tree refusal names the directory and its fix', () => {
+  it('names the mode of a too-open state root, the required 0700 and chmod 700, and leaves it as it was', async () => {
+    const { stateRoot } = makeStateRoot();
+    mkdirSync(stateRoot);
+    chmodSync(stateRoot, 0o755);
+
+    const refused = await start(stateRoot);
+
+    expect(isErr(refused)).toBe(true);
+    if (isErr(refused)) {
+      expect(refused.error.code).toBe('FS_UNSAFE_PATH');
+      expect(refused.error.message).toContain(stateRoot);
+      expect(refused.error.message).toContain('0755');
+      expect(refused.error.message).toContain('0700');
+      expect(refused.error.hint).toContain(`chmod 700 ${stateRoot}`);
+      expect(refused.error.hint).toContain('DEBUGGEN_HOME');
+      expect(refused.error.hint).not.toContain('allow this account to write');
+      expect(refused.error.details?.['reason']).toBe('group-or-other-permissions');
+    }
+    // Refused, never repaired: the developer decides what the directory holds.
+    expect(modeOf(stateRoot)).toBe(0o755);
+    expect(() => lstatSync(join(stateRoot, SESSIONS_DATABASE_FILE_NAME))).toThrow();
+  });
+});
+
+/** Sixty days, well past the default thirty-day retention window. */
+const AGED_BY_MS = 60 * 86_400_000;
+
+describe('startService — the start-up retention sweep runs once the service listens', () => {
+  it('serves before the sweep starts and purges an aged session in the background', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const projectRoot = join(container, 'project');
+    mkdirSync(projectRoot);
+
+    // A previous process left one resting session behind, last touched long ago.
+    const first = await started(stateRoot);
+    const aged = await storeSessionOf(first, projectRoot);
+    for (const handle of handles.splice(0)) {
+      await handle.close();
+    }
+    const db = new DatabaseSync(join(stateRoot, SESSIONS_DATABASE_FILE_NAME));
+    try {
+      db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?').run(
+        Date.now() - AGED_BY_MS,
+        aged.id,
+      );
+    } finally {
+      db.close();
+    }
+
+    const destination = capturingDestination();
+    const second = unwrap(
+      await start(stateRoot, { overrides: { logLevel: 'info' }, loggerOptions: { destination } }),
+    );
+
+    // The handle exists — the port is open — before any purge work ran.
+    expect(
+      parsedRecords(destination.records).some((r) => r['msg'] === 'retention sweep finished'),
+    ).toBe(false);
+    const answered = (await health(second.url)) as Record<string, unknown>;
+    expect(typeof answered['protocolVersion']).toBe('string');
+
+    const report = await second.startup.retention;
+    expect(report?.sessionIdsDeleted).toEqual([aged.id]);
+    expect(report?.interrupted).toBe(false);
+    expect(unwrap(second.manager.get(aged.id))).toBeUndefined();
+  });
+
+  it('stops the sweep when the service stops, and settles it before the store closes', async () => {
+    const { stateRoot } = makeStateRoot();
+    const destination = capturingDestination();
+    const handle = unwrap(
+      await start(stateRoot, { overrides: { logLevel: 'info' }, loggerOptions: { destination } }),
+    );
+
+    await handle.close();
+
+    const report = await handle.startup.retention;
+    expect(report?.interrupted).toBe(true);
+    expect(report?.errors).toEqual([]);
+    const messages = parsedRecords(destination.records).map((r) => r['msg']);
+    const stopped = messages.indexOf(
+      'the start-up retention sweep was stopped by the shutdown; the next start sweeps again',
+    );
+    const closed = messages.indexOf(
+      'the session store checkpointed its write-ahead log and closed',
+    );
+    expect(stopped).toBeGreaterThanOrEqual(0);
+    expect(closed).toBeGreaterThan(stopped);
   });
 });
 
@@ -937,27 +1116,44 @@ describe('startService — the state root stays outside every project', () => {
     const post = (path: string, body: unknown): Promise<Response> =>
       fetch(`${handle.url}${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
     const sessionRefusal = { code: 'FS_UNSAFE_PATH', message: STATE_HOME_OVERLAP_MESSAGE };
+    // Every refusal also names the correlation ref its log record carries —
+    // the same value the `x-debuggen-ref` header announces — so the body is
+    // the refusal plus exactly that ref and nothing else.
+    const refusalOf = async (response: Response): Promise<unknown> => {
+      const ref = response.headers.get('x-debuggen-ref');
+      expect(ref).toEqual(expect.stringMatching(/\S/));
+      const body: unknown = await response.json();
+      expect(body).toMatchObject({ ref });
+      return body;
+    };
 
     const created = await post('/sessions', {
       projectRoot: container,
       question: 'Why is it slow?',
     });
     expect(created.status).toBe(400);
-    expect(await created.json()).toEqual(sessionRefusal);
+    expect(await refusalOf(created)).toEqual({
+      ...sessionRefusal,
+      ref: created.headers.get('x-debuggen-ref'),
+    });
 
     const stored = await storeSessionOf(handle, container);
     const asked = await post(`/sessions/${stored.id}/question`, {
       question: 'And the second render?',
     });
     expect(asked.status).toBe(400);
-    expect(await asked.json()).toEqual(sessionRefusal);
+    expect(await refusalOf(asked)).toEqual({
+      ...sessionRefusal,
+      ref: asked.headers.get('x-debuggen-ref'),
+    });
 
     for (const path of ['/dev-server/launch', '/dev-server/credential']) {
       const refused = await post(path, { projectRoot: container });
       expect(refused.status).toBe(400);
-      expect(await refused.json()).toEqual({
+      expect(await refusalOf(refused)).toEqual({
         code: 'FS_UNSAFE_PATH',
         message: `${STATE_HOME_OVERLAP_MESSAGE} ${STATE_HOME_OVERLAP_HINT}`,
+        ref: refused.headers.get('x-debuggen-ref'),
       });
     }
 
@@ -2823,7 +3019,16 @@ const QUIET_LOGGERS: ServiceLoggers = {
   server: noopLogger,
 };
 
-describe('releaseParts — one deadline for the whole stop', () => {
+// An explicit 30 s per test, above the project's 20 s. The tests here run
+// `releaseParts` under a 1.2 s stop budget, and 'leaves no credential of an
+// unresponsive launched child valid for the next start' also boots the composed
+// service twice — HTTP, WebSocket, store migration and crash recovery each
+// time — and stops the first boot through a real `ServiceHandle.close`, whose
+// own budget is `SHUTDOWN_BUDGET.totalMs` (8 s). That test normally takes
+// about 1.1 s but took 5.25 s at a load average of 7-9, failing the 5 s
+// default; 30 s keeps that headroom under heavier contention while a genuinely
+// hung start or stop still fails.
+describe('releaseParts — one deadline for the whole stop', { timeout: 30_000 }, () => {
   // A scaled-down budget with the production shape: the reserves are held back
   // for the launcher and the final steps, the pipeline is capped.
   const budget: ShutdownBudget = {

@@ -750,13 +750,51 @@ function entitySeed(entity: ProblemEntity): unknown {
   }
 }
 
+/** The separator of a route pattern's path segments. */
+const ROUTE_SEGMENT_SEPARATOR = '/';
+
 /**
- * The seed queries of a run, derived from the validated understanding alone:
- * the entities in the producer's order (most relevant first), then the search
- * hints as name lookups. Each candidate is validated with
- * `parseCodeToolRequest`; one that does not parse is simply not proposed (a
- * seed is the stage's own suggestion, so dropping it costs the model nothing),
- * and duplicates of an already-proposed normalised request are skipped.
+ * The names a route entity accounts for: the route itself and each of its
+ * path segments. A search hint among them is derived from the project's route
+ * inventory rather than pointing at anything more specific than the route.
+ *
+ * @param entities The understanding's entities.
+ * @returns The route names and their segments.
+ */
+function routeDerivedNames(entities: readonly ProblemEntity[]): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const entity of entities) {
+    if (entity.kind !== 'route') {
+      continue;
+    }
+    names.add(entity.name);
+    for (const segment of entity.name.split(ROUTE_SEGMENT_SEPARATOR)) {
+      if (segment.length > 0) {
+        names.add(segment);
+      }
+    }
+  }
+  return names;
+}
+
+/**
+ * The seed queries of a run, derived from the validated understanding alone,
+ * most specific first, so a declaration the understanding named or a hint
+ * that points past the route inventory is never crowded out by it:
+ *
+ * 1. the entities that name something specific — declarations, files,
+ *    data-layer operations, the current URL — in the producer's order;
+ * 2. the search hints that are not derived from a route entity, as name
+ *    lookups;
+ * 3. the route entities (the project's route inventory), in the producer's
+ *    order;
+ * 4. the search hints a route entity accounts for (see
+ *    {@link routeDerivedNames}), as name lookups.
+ *
+ * Each candidate is validated with `parseCodeToolRequest`; one that does not
+ * parse is simply not proposed (a seed is the stage's own suggestion, so
+ * dropping it costs the model nothing), and duplicates of an already-proposed
+ * normalised request are skipped.
  *
  * Wording-invariant by construction (AAP §0.5.4): nothing here reads the
  * question, only the schema-validated artifact.
@@ -771,9 +809,13 @@ function seedRequests(
   limits: CodeToolLimits,
   max: number,
 ): readonly CodeToolRequest[] {
+  const routeNames = routeDerivedNames(understanding.entities);
+  const nameLookup = (hint: string): unknown => ({ tool: 'findByName', name: hint });
   const candidates: unknown[] = [
-    ...understanding.entities.map(entitySeed),
-    ...understanding.searchHints.map((hint) => ({ tool: 'findByName', name: hint })),
+    ...understanding.entities.filter((entity) => entity.kind !== 'route').map(entitySeed),
+    ...understanding.searchHints.filter((hint) => !routeNames.has(hint)).map(nameLookup),
+    ...understanding.entities.filter((entity) => entity.kind === 'route').map(entitySeed),
+    ...understanding.searchHints.filter((hint) => routeNames.has(hint)).map(nameLookup),
   ];
   const seeds: CodeToolRequest[] = [];
   const seen = new Set<string>();
@@ -1319,7 +1361,10 @@ function distinctHead(names: Iterable<string>): readonly string[] {
  *
  * Every class is passed explicitly — even empty — because an explicit array is
  * authoritative there, so no row is ever derived from a name the question
- * merely mentioned. The shortlist supplies each row's origin file.
+ * merely mentioned. Each finding's origin file is the file of the node or
+ * route that evidenced it (`origins`), first one kept per name: a data-layer
+ * call site is located by the graph but is no symbol of the shortlist, which
+ * supplies the origin of any name the evidence does not.
  */
 function findingsOf(investigation: CodeInvestigation, evidence: Evidence): InvestigationFindings {
   const shortlist = new Map<string, Set<string>>();
@@ -1332,34 +1377,35 @@ function findingsOf(investigation: CodeInvestigation, evidence: Evidence): Inves
     const symbols = shortlist.get(node.file);
     return symbols !== undefined && (symbols.has('') || symbols.has(node.name));
   };
+  const fileOnShortlist = (located: { readonly file: string }): boolean =>
+    shortlist.has(located.file);
   const nodesOfKind = (kind: string): readonly EvidenceNode[] =>
     evidence.nodes.filter((node) => node.kind === kind);
 
+  const components = nodesOfKind('component').filter(onShortlist);
+  const handlers = nodesOfKind('handler').filter(onShortlist);
+  const routes = [
+    ...evidence.routes
+      .filter(fileOnShortlist)
+      .map((route) => ({ name: route.routePath, file: route.file })),
+    ...nodesOfKind('api-route').filter(fileOnShortlist),
+  ];
+  const databaseCalls = nodesOfKind('db-call').filter(fileOnShortlist);
+
+  const origins = new Map<string, string>();
+  for (const located of [...components, ...handlers, ...routes, ...databaseCalls]) {
+    if (!origins.has(located.name)) {
+      origins.set(located.name, located.file);
+    }
+  }
+
   return {
-    components: distinctHead(
-      nodesOfKind('component')
-        .filter(onShortlist)
-        .map((node) => node.name),
-    ),
-    eventHandlers: distinctHead(
-      nodesOfKind('handler')
-        .filter(onShortlist)
-        .map((node) => node.name),
-    ),
-    routes: distinctHead([
-      ...evidence.routes
-        .filter((route) => shortlist.has(route.file))
-        .map((route) => route.routePath),
-      ...nodesOfKind('api-route')
-        .filter((node) => shortlist.has(node.file))
-        .map((node) => node.name),
-    ]),
-    databaseDependencies: distinctHead(
-      nodesOfKind('db-call')
-        .filter((node) => shortlist.has(node.file))
-        .map((node) => node.name),
-    ),
+    components: distinctHead(components.map((node) => node.name)),
+    eventHandlers: distinctHead(handlers.map((node) => node.name)),
+    routes: distinctHead(routes.map((route) => route.name)),
+    databaseDependencies: distinctHead(databaseCalls.map((node) => node.name)),
     relevantFiles: investigation.relevantFiles,
+    origins,
   };
 }
 

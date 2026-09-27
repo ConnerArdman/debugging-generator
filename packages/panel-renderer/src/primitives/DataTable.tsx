@@ -36,23 +36,29 @@
  *   Virtualized with `@tanstack/react-virtual`. This is the only module in the package that
  *   imports it. Long lists render a window of rows inside the shared
  *   `dg-virtual-viewport`/`dg-virtual-canvas`/`dg-virtual-row` triplet, and real measured heights
- *   replace the estimate after first paint. The panel-data route caps a result at 5 000 rows, which
- *   is both why virtualization here buys smoothness rather than survival and why the state before
- *   the first measurement is bounded rather than whole - see the section on it below.
+ *   replace the estimate after first paint. The window always holds the active row as well,
+ *   wherever it is, so the row that has focus never unmounts under a scroll and a key that moves
+ *   the active row far away renders its target at once. The panel-data route caps a result at
+ *   5 000 rows, which is both why virtualization here buys smoothness rather than survival and why
+ *   the state before the first measurement is bounded rather than whole - see the section on it
+ *   below.
  *
  *   Keyboard-navigable. A roving `tabIndex` makes the whole grid a single Tab stop - the active
  *   row - and the keyboard reaches everything else from there: Arrow keys, Home, End and
  *   PageUp/PageDown move the active row, Enter and Space activate it, Arrow Right/Left expand and
- *   collapse it, and the same keys move focus onto the controls inside a row, its open detail and
- *   the header. See the keyboard section below for the full key map and the one obligation it
- *   places on every caller.
+ *   collapse it, Tab walks the controls of the active row and its open detail, and the arrow keys
+ *   move focus onto those controls and the header's too. A visually hidden description tells
+ *   assistive technology how. See the keyboard section below for the full key map and the one
+ *   obligation it places on every caller.
  *
  * ## The ARIA structure, and why it is shaped this way
  *
  *   div.dg-data-table                     the block
  *     div.dg-data-table__caption          the accessible name, visually hidden unless asked for
+ *     div.dg-visually-hidden              the keyboard description, while rows exist
  *     div.dg-virtual-viewport             the SCROLL CONTAINER, and deliberately ROLE-LESS
- *       div[role=grid]                    named by the caption, exact aria-rowcount/aria-colcount
+ *       div[role=grid]                    named by the caption, described by the keyboard
+ *                                         description, exact aria-rowcount/aria-colcount
  *         div[role=rowgroup].__head
  *           div[role=row]                   aria-rowindex=1
  *             div[role=columnheader]         aria-colindex, aria-sort, one per column
@@ -95,18 +101,22 @@
  * the DOM, so `aria-controls` never names a missing element. The row keeps the `dg-is-expanded`
  * class, which is appearance rather than semantics.
  *
- * ## The keyboard model: one Tab stop, and the arrow keys for everything inside
+ * ## The keyboard model: one Tab stop, and one row's controls behind it
  *
- * This is the APG grid pattern. Tab enters the grid on ONE element and the next Tab leaves it;
- * that element is the active row (`tabIndex={0}`, every other row `-1`). A grid whose cells each
- * add Tab stops of their own makes a reader press Tab through every chip, badge and toggle of
- * every rendered row just to get past one table.
+ * This is the APG grid pattern. Tab enters the grid on ONE element: the active row (`tabIndex={0}`,
+ * every other row `-1`). From there Tab walks the controls of THAT row only - its cells, then its
+ * open detail - and the Tab after its last control leaves the grid. A row's actions are therefore
+ * reachable by the key a reader tries first, while passing a grid of a thousand rows still costs
+ * one row's worth of stops. A grid whose cells each added Tab stops of their own would make a
+ * reader press Tab through every chip, badge and toggle of every rendered row just to get past one
+ * table.
  *
  * THE CALLER'S OBLIGATION: every focusable control a `cell` or `renderExpandedRow` renders carries
- * `tabIndex={-1}`. It stays focusable - by pointer, and by the keys below - and it leaves the Tab
- * order. The header's sort controls follow the same rule, applied here: they are `tabIndex={-1}`
- * whenever at least one data row renders, because ArrowUp from the first row reaches them, and
- * they keep their default while the result is empty, when there is no row to arrive through.
+ * `tabIndex={-1}`. It stays focusable - by pointer, and by the keys below, Tab in the active row
+ * included - and it leaves the document's Tab order, so no other row's controls become stops. The
+ * header's sort controls follow the same rule, applied here: they are `tabIndex={-1}` whenever at
+ * least one data row renders, because ArrowUp from the first row reaches them, and they keep their
+ * default while the result is empty, when there is no row to arrive through.
  *
  * On a data row:
  *
@@ -117,6 +127,10 @@
  *   Enter / Space              activate the row (`onRowActivate`). With no `onRowActivate`, Enter
  *                              moves into the row instead and Space keeps its native meaning.
  *   F2                         move into the row: focus its first control.
+ *   Tab                        move into the row the same way. A row with no control leaves Tab
+ *                              to the browser, which leaves the grid.
+ *   Shift+Tab                  the browser's: it leaves the grid backwards, since every row and
+ *                              control before the active row is out of the Tab order.
  *   ArrowRight                 expand a collapsed expandable row; otherwise move into the row.
  *   ArrowLeft                  collapse an expanded row; otherwise nothing.
  *
@@ -130,14 +144,19 @@
  *   Escape                     back to the row. A key something inside already consumed is not
  *                              answered, so the first Escape on an open `Tooltip` trigger closes
  *                              the bubble and only the second returns to the row.
- *   Enter, Space, Tab, others  the control's own. A key pressed on a control never activates the
+ *   Tab / Shift+Tab            the next / previous control of the scope. Shift+Tab from the first
+ *                              control returns to the row. Tab from the last is the browser's, and
+ *                              leaves the grid: nothing after it in the grid is a Tab stop.
+ *   Enter, Space, others       the control's own. A key pressed on a control never activates the
  *                              row.
  *
  *   Two kinds of control keep their keys. A text or choice widget - `input`, `textarea`, `select`,
  *   a contenteditable host, `role` textbox, combobox, slider or spinbutton - uses the arrows and
- *   Home/End itself and gets only Escape from the grid. An element that actually scrolls along a
- *   key's axis - a focusable code block whose content overflows it - keeps that axis's keys, so it
- *   still scrolls. A key a control has already `preventDefault`-ed is left to that control.
+ *   Home/End itself and gets only Escape and Tab from the grid; Tab moves no caret, so a field
+ *   takes its place in the row's Tab sequence like any other control. An element that actually
+ *   scrolls along a key's axis - a focusable code block whose content overflows it - keeps that
+ *   axis's keys, so it still scrolls. A key a control has already `preventDefault`-ed is left to
+ *   that control.
  *
  * On a header control:
  *
@@ -146,10 +165,21 @@
  *   ArrowDown / Escape         back to the active row.
  *   Enter / Space              native, so a sort control still sorts.
  *
- * Shift+Tab from a control inside the active row lands on that row, which precedes it in document
- * order. That is the documented behaviour rather than a trap: the next Shift+Tab leaves the grid.
- * Focus landing on a control by any route - an arrow key or a pointer click - moves the roving
- * stop to that control's row, so Tab back into the grid returns to where the reader last was.
+ * Tab and Shift+Tab therefore trace one path with no trap in it: in on the active row, forward
+ * across its controls and out, or back across them to the row and out. Every Tab that would leave
+ * the row's scope is left to the browser - never prevented - and so is a Tab with Alt, Control or
+ * Meta held, a Tab an input method is composing with, and a Tab whose next stop inside the row is
+ * a Tab stop of the document's own (the active row of a grid nested in a cell): this table never
+ * skips past a stop the browser would visit. Focus landing on a control by any route - Tab, an
+ * arrow key or a pointer click - moves the roving stop to that control's row, so Tab back into the
+ * grid returns to where the reader last was.
+ *
+ * The key map is announced as well as documented. The grid's `aria-describedby` names a visually
+ * hidden sentence - `dg-visually-hidden`, beside the caption and outside the grid, which accepts
+ * only rows and rowgroups - naming the keys that move between rows, what Enter does in THIS table
+ * (activate the row, or move into it), whether Right arrow expands, and how Tab, F2 and Escape
+ * reach a row's controls and leave them. It is generic product copy chosen by the props, and it is
+ * rendered only while rows exist, since an empty grid has no row to operate.
  *
  * A control is reachable when it matches `a[href], button, input, select, textarea, [tabindex]`,
  * is not disabled, and does not sit inside `[hidden]`, `[inert]` or `[aria-hidden="true"]`. That
@@ -318,7 +348,8 @@
  * virtualize or handle keys itself.
  */
 
-import { useVirtualizer } from '@tanstack/react-virtual';
+import { defaultRangeExtractor, useVirtualizer } from '@tanstack/react-virtual';
+import type { Range } from '@tanstack/react-virtual';
 import { clsx } from 'clsx';
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type {
@@ -716,10 +747,10 @@ export interface DataTableColumn<Row> {
    *
    * EVERY FOCUSABLE CONTROL A CELL RENDERS CARRIES `tabIndex={-1}` - a `Button`, a `SourceLink`
    * (through its `tabIndex` prop), a `Tooltip` trigger, a focusable `Code` block. The grid body is
-   * one Tab stop, the active row, and this component's arrow keys are what reach the controls
-   * inside it (see this module's header for the keys). A control left at its default is an extra
-   * Tab stop in every rendered row, which is exactly the tab sequence the grid pattern exists to
-   * avoid.
+   * one Tab stop, the active row, and this component's own keys are what reach the controls
+   * inside it - Tab and Shift+Tab across the active row's controls, and the arrow keys (see this
+   * module's header for the keys). A control left at its default is an extra Tab stop in every
+   * rendered row, which is exactly the tab sequence the grid pattern exists to avoid.
    *
    * An expand toggle in a cell also carries `aria-expanded={meta.expanded}` and
    * `aria-controls={meta.detailRowId}`; see {@link DataTableCellMeta}.
@@ -918,9 +949,9 @@ export interface DataTableProps<Row> {
    * `aria-controls={meta.detailRowId}`.
    *
    * Like a cell, every focusable control the detail renders carries `tabIndex={-1}`. The detail
-   * row belongs to its data row for keyboard purposes: once the row is open, the arrow keys that
-   * move across the data row's controls continue into the detail's, and Escape from any of them
-   * returns to the data row.
+   * row belongs to its data row for keyboard purposes: once the row is open, the Tab and arrow keys
+   * that move across the data row's controls continue into the detail's, and Escape from any of
+   * them returns to the data row.
    *
    * @param row The expanded row.
    * @param index Its index in `rows`.
@@ -1173,6 +1204,71 @@ const DETAIL_ROW_ID_INFIX = '-detail-';
 
 /** The generic copy an unqualified empty table shows. Names nothing from any inspected project. */
 const DEFAULT_EMPTY_MESSAGE = 'No rows to display.';
+
+/** The suffix of the keyboard description's id, after the same stem as the caption's. */
+const KEYBOARD_DESCRIPTION_ID_SUFFIX = '-keys';
+
+/**
+ * The sentences of the keyboard description the grid's `aria-describedby` names - generic product
+ * copy, true of every table this primitive renders. Which of them apply, and which keys the last
+ * one lists, is chosen by {@link describeKeyboard} from what the table can do.
+ */
+const KEYBOARD_ROW_KEYS =
+  'Up and Down arrows move between rows; Home and End go to the first and last row.';
+const KEYBOARD_ACTIVATE = 'Enter or Space activates the row.';
+const KEYBOARD_EXPAND = 'Right arrow expands the row and Left arrow collapses it.';
+const KEYBOARD_CONTROLS =
+  "Tab moves through the row's controls, when it has any, and then leaves the table; Escape returns to the row.";
+
+/**
+ * Joins key names into one spoken list: `F2`, `Enter or F2`, `Enter, F2 or Right arrow`.
+ *
+ * @param keys The key names, in the order they are spoken; never empty.
+ * @returns The list.
+ */
+function listKeys(keys: readonly string[]): string {
+  const last = keys.at(-1) ?? '';
+  const rest = keys.slice(0, -1);
+
+  return rest.length === 0 ? last : `${rest.join(', ')} or ${last}`;
+}
+
+/**
+ * The keyboard description of a table: how to move between its rows, what Enter does in it, whether
+ * Right arrow expands, and how a row's controls are reached and left - so a reader of assistive
+ * technology hears the route to a row's actions instead of having to discover it.
+ *
+ * The keys it names are exactly the ones the handlers answer. Enter moves into a row only when the
+ * row activates nothing, and Right arrow only when it expands nothing, so each is listed with F2 -
+ * the way in that always works - only then.
+ *
+ * @param activates Whether Enter and Space activate a row (`onRowActivate` was supplied).
+ * @param expands Whether Right and Left arrow expand and collapse a row (`renderExpandedRow` and
+ *   `onRowToggle` were both supplied).
+ * @returns The description, as sentences joined by spaces.
+ *
+ * @example
+ * describeKeyboard(false, true);
+ * // '… Right arrow expands the row and Left arrow collapses it. Tab moves through the row's
+ * //  controls, when it has any, and then leaves the table; Escape returns to the row. Enter or F2
+ * //  also moves into them.'
+ */
+function describeKeyboard(activates: boolean, expands: boolean): string {
+  const entryKeys = [...(activates ? [] : ['Enter']), 'F2', ...(expands ? [] : ['Right arrow'])];
+  const sentences = [KEYBOARD_ROW_KEYS];
+
+  if (activates) {
+    sentences.push(KEYBOARD_ACTIVATE);
+  }
+
+  if (expands) {
+    sentences.push(KEYBOARD_EXPAND);
+  }
+
+  sentences.push(KEYBOARD_CONTROLS, `${listKeys(entryKeys)} also moves into them.`);
+
+  return sentences.join(' ');
+}
 
 /** One data row, with every index and flag the render needs already resolved. */
 interface DataTableRowModel<Row> {
@@ -1534,6 +1630,137 @@ function previousControl(controls: readonly HTMLElement[], from: Element): HTMLE
 }
 
 /**
+ * Whether `later` comes after `earlier` in document order. A descendant counts as after its
+ * ancestor, as it does in the browser's sequential focus order.
+ *
+ * @param earlier The reference node.
+ * @param later The node asked about.
+ * @returns `true` when `later` follows `earlier`.
+ */
+function follows(earlier: Node, later: Node): boolean {
+  return (earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+}
+
+/**
+ * Whether an element is a stop of the DOCUMENT'S Tab order: a non-negative `tabIndex`, not
+ * disabled, and not inside `[hidden]`, `[inert]` or `[aria-hidden="true"]`.
+ *
+ * Unlike {@link isNavigable} it asks nothing about which grid the element belongs to, and that is
+ * its purpose: the active row of a grid nested in a cell is such a stop, and it is the one kind a
+ * row's own Tab sequence must not skip. DOM-only, like every reachability rule of this module.
+ *
+ * @param element The candidate.
+ * @returns `true` when the browser's own Tab would stop on it.
+ */
+function isDocumentTabStop(element: HTMLElement): boolean {
+  return (
+    element.tabIndex >= 0 &&
+    !element.matches(':disabled') &&
+    element.closest(UNREACHABLE_ANCESTOR_SELECTOR) === null
+  );
+}
+
+/**
+ * Whether a stop of the document's Tab order lies strictly between two elements of a row's scope.
+ *
+ * By contract the only such stops inside a row are the active row of a grid nested in one of its
+ * cells (or its detail) and a control a caller left at its default `tabIndex`. The browser's Tab
+ * would visit either before the destination this table picked, so the table leaves that Tab to the
+ * browser rather than skip the stop.
+ *
+ * @param scopes The row and its open detail, in document order; `undefined` entries are skipped.
+ * @param earlier The start of the span, exclusive.
+ * @param later The end of the span, exclusive.
+ * @returns `true` when a document Tab stop sits between the two.
+ */
+function hasTabStopBetween(
+  scopes: readonly (Element | undefined)[],
+  earlier: Element,
+  later: Element,
+): boolean {
+  for (const scope of scopes) {
+    if (scope === undefined) {
+      continue;
+    }
+
+    for (const candidate of scope.querySelectorAll(NAVIGABLE_DESCENDANT_SELECTOR)) {
+      if (
+        candidate instanceof HTMLElement &&
+        isDocumentTabStop(candidate) &&
+        follows(earlier, candidate) &&
+        follows(candidate, later)
+      ) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Answers Tab and Shift+Tab pressed inside a data row's scope - on the row itself, or on a control
+ * in its cells or its open detail row. See this module's header for the model: Tab from the row
+ * reaches its first control and walks the rest in document order, Shift+Tab walks back to the row.
+ *
+ * Focus is moved, and `preventDefault` called, only for a move that stays inside the scope. Every
+ * other Tab is the browser's: Tab after the last control and Shift+Tab from the row, which leave
+ * the grid because nothing else in it is a Tab stop; a chord; a Tab an input method is composing
+ * with; and a Tab whose next stop is one of the document's own (see {@link hasTabStopBetween}).
+ * That is what keeps the sequence free of a trap. Text fields take part like any other control:
+ * Tab moves no caret, so nothing is taken from them.
+ *
+ * Module-level rather than a hook: it reads the DOM the event names and no component state.
+ *
+ * @param event The key event, whose key is `Tab`.
+ * @param target The element the key was pressed on: the row, or a control in its scope.
+ * @param scope The data row it belongs to, with its open detail.
+ * @param grid This table's grid element, so no control of a nested grid is chosen.
+ */
+function answerTab(
+  event: ReactKeyboardEvent<HTMLDivElement>,
+  target: Element,
+  scope: BodyScope,
+  grid: Element,
+): void {
+  // A chord belongs to the browser or the platform - switching tabs, windows or panes - and a Tab
+  // that confirms a composition belongs to the input method.
+  if (event.altKey || event.ctrlKey || event.metaKey || event.nativeEvent.isComposing) {
+    return;
+  }
+
+  const scopes = [scope.row, scope.detail];
+  const controls = navigablesIn(scopes, grid);
+
+  // Forwards, every control follows the row in document order, so from the row this is its first
+  // control and from a control the next one; after the last there is none. Backwards from a
+  // control it is the previous control, or the row from the first; from the row itself it is
+  // nothing, and the browser leaves the grid.
+  const backwards = event.shiftKey;
+  const onRow = target === scope.row;
+  const destination = backwards
+    ? onRow
+      ? undefined
+      : (previousControl(controls, target) ?? scope.row)
+    : nextControl(controls, target);
+
+  if (destination === undefined) {
+    return;
+  }
+
+  const between = backwards
+    ? hasTabStopBetween(scopes, destination, target)
+    : hasTabStopBetween(scopes, target, destination);
+
+  if (between) {
+    return;
+  }
+
+  event.preventDefault();
+  destination.focus();
+}
+
+/**
  * Whether an element is a text or choice widget, which keeps its own arrow keys and Home/End.
  *
  * @param element The focused element.
@@ -1738,6 +1965,50 @@ function resolveFlowRowRange(
 }
 
 /**
+ * The virtualizer's window with one row guaranteed in it: `indexes` - what the default extractor
+ * yields, the rows in view plus the overscan, ascending - with `row` inserted in order when it is
+ * not already there.
+ *
+ * It is how the ACTIVE ROW stays mounted under virtualization, which the keyboard model depends
+ * on twice over. A key that moves the active row (Home, End, PageUp/PageDown) renders its target in
+ * the commit the key causes, before the scroll it asked for has moved the window, so the focus
+ * effect hands focus from the origin row to the target directly; and a focused row the reader
+ * scrolls out of view stays in the DOM, positioned at its own offset outside the visible band,
+ * instead of unmounting and dropping focus to the document body. One extra row, absolutely
+ * positioned like every other, costs neither the scroll range nor the measurement: the wrapper
+ * carries `data-index` and the measurement ref like any row of the window.
+ *
+ * The result stays ascending and free of duplicates, so rows keep their document order - which is
+ * row order, and what the ARIA row indices and the arrow keys' positional lookups assume.
+ *
+ * @param indexes The window's row indices, ascending and unique.
+ * @param row The row to keep, or a negative index when there is none (no rows).
+ * @returns A new array: the window, with `row` in it.
+ *
+ * @example
+ * withRowInWindow([40, 41, 42], 3);  // [3, 40, 41, 42]
+ * withRowInWindow([40, 41, 42], 41); // [40, 41, 42]
+ * withRowInWindow([40, 41, 42], 90); // [40, 41, 42, 90]
+ */
+function withRowInWindow(indexes: readonly number[], row: number): number[] {
+  if (row < 0) {
+    return [...indexes];
+  }
+
+  const at = indexes.findIndex((index) => index >= row);
+
+  if (at === -1) {
+    return [...indexes, row];
+  }
+
+  if (indexes[at] === row) {
+    return [...indexes];
+  }
+
+  return [...indexes.slice(0, at), row, ...indexes.slice(at)];
+}
+
+/**
  * Where one row sits against the scroll container, in the container's own scroll coordinates -
  * the input to {@link revealOffsetFor}. Every field is a measurement read off the live layout (or
  * the virtualizer's own row measurements), never a style value.
@@ -1917,6 +2188,11 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   const canToggle = canExpand && onRowToggle !== undefined;
   const selectionInUse = selectedRowKey !== undefined;
 
+  // The keyboard description the grid is described by while rows exist: which keys it names
+  // follows from what this table's rows can do, so it states exactly the map the handlers answer.
+  const keyboardDescriptionId = `${id ?? generatedId}${KEYBOARD_DESCRIPTION_ID_SUFFIX}`;
+  const keyboardDescription = describeKeyboard(onRowActivate !== undefined, canToggle);
+
   // One pass over the rows produces every derived structure the render needs: the row models with
   // their exact ARIA indices, the key lookup, and the grid's row count. Expanded detail rows
   // occupy row indices of their own, so the running total of expanded rows before a given row is
@@ -1986,6 +2262,30 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   );
   const virtualizationEnabled = virtualization.enabled;
 
+  // Resolved BEFORE the virtualizer, because its window is built around this row (see the range
+  // extractor below). It depends on nothing the virtualizer measures - the reader's navigation, the
+  // selection and the row count - so the order costs nothing.
+  const selectedIndex =
+    selectedRowKey === undefined || selectedRowKey === null
+      ? undefined
+      : indexByKey.get(selectedRowKey);
+  const activeIndex = resolveActiveIndex(navigatedIndex, selectedIndex, rowCount);
+
+  // The virtualizer's window, with the ACTIVE ROW always in it. The default extractor yields the
+  // rows in view plus the overscan; the active row - the roving tab stop, and the row that holds
+  // focus whenever focus is in the body - is added wherever it is (see `withRowInWindow`). Without
+  // it, two things lose the reader's focus: Home, End or PageUp/PageDown scroll the window away in
+  // a later commit and unmount the focused ORIGIN row before the focus effect can reach the target,
+  // and a reader who scrolls the viewport unmounts the row they are standing on for good. With it,
+  // the target of a key renders in the very commit the key causes - so focus moves row to row with
+  // nothing in between - and a focused row never leaves the DOM while it is the active one.
+  // Memoized on the active row, so the virtualizer recomputes its indexes only when the window or
+  // that row actually changes.
+  const rangeExtractor = useCallback(
+    (range: Range): number[] => withRowInWindow(defaultRangeExtractor(range), activeIndex),
+    [activeIndex],
+  );
+
   // Called unconditionally, whatever the mode: a hook behind a condition is a rules-of-hooks
   // violation, and an instance that exists but drives nothing costs one object.
   //
@@ -2020,6 +2320,7 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
     // Measurements follow the row's identity rather than its position, so a re-sort or a re-page
     // does not attribute one row's measured height to another.
     getItemKey: (index) => models[index]?.key ?? index,
+    rangeExtractor,
   });
 
   const virtualItems = virtualizer.getVirtualItems();
@@ -2035,12 +2336,6 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   // for every row in that state, and why neither is the default.
   const isVirtualized = virtualizationEnabled && virtualItems.length > 0 && viewportHeight > 0;
 
-  const selectedIndex =
-    selectedRowKey === undefined || selectedRowKey === null
-      ? undefined
-      : indexByKey.get(selectedRowKey);
-  const activeIndex = resolveActiveIndex(navigatedIndex, selectedIndex, rowCount);
-
   // Resolved after `activeIndex` because the window is anchored on it, and before the tab stop
   // below because the tab stop depends on which rows this range puts in the DOM.
   const flowRange = resolveFlowRowRange(virtualization, rowCount, activeIndex);
@@ -2049,18 +2344,18 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   // canvas's scroll range, which has to describe all the rows even while only some are rendered.
   const flowRangeIsWindowed = !isVirtualized && flowRange.end - flowRange.start < rowCount;
 
-  // The roving tab stop has to EXIST in the DOM whenever rows are rendered, and under
-  // virtualization the active row can sit far outside the rendered window - scroll a long table
-  // away from row one and every rendered row would carry `tabIndex={-1}`, leaving the body
-  // unreachable by Tab. While the active row is outside the window, the topmost rendered row
-  // takes the tab stop instead; the key handlers read the origin row's own index, so navigation
+  // The roving tab stop has to EXIST in the DOM whenever rows are rendered, or the grid body is
+  // unreachable by Tab. Both paths keep it there by construction: the range extractor adds the
+  // active row to every virtual window, and the flow range is anchored on it. Should a window
+  // ever arrive without it all the same, the topmost rendered row takes the tab stop instead, so
+  // the body stays reachable; the key handlers read the origin row's own index, so navigation
   // continues from wherever the reader actually entered.
   //
   // ONE PREDICATE for "is the active row in the DOM?", asked of whichever path is rendering: the
-  // virtual items when the virtualizer drives the render, the flow range when it does not. The
-  // flow range is anchored on `activeIndex` and `resolveFlowRowRange` keeps the anchor inside it,
-  // so on that path the answer is `true` whenever rows exist; it is still computed rather than
-  // assumed, because it is also what the focus effect below waits on and the two must agree.
+  // virtual items when the virtualizer drives the render, the flow range when it does not. On
+  // both paths the answer is `true` whenever rows exist; it is still computed rather than assumed,
+  // because it is also what the focus effect below and `moveActiveRow` wait on, and the three must
+  // agree.
   const activeIsRendered = isVirtualized
     ? virtualItems.some((item) => item.index === activeIndex)
     : activeIndex >= flowRange.start && activeIndex < flowRange.end;
@@ -2192,10 +2487,10 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   // whichever row the roving fallback above happens to name after a scroll.
   //
   // Focus on a control INSIDE a row - a chip in a cell, a control in the open detail - counts as
-  // focus on that row, so the roving stop, which is the row Tab returns to, follows an arrow key
-  // or a pointer click into a cell as well. The row's own `tabIndex` is left alone meanwhile, which
-  // is what makes Shift+Tab from the control land on its row. Focus in the header, or inside a
-  // grid nested in a cell, changes nothing.
+  // focus on that row, so the roving stop, which is the row Tab returns to, follows Tab, an arrow
+  // key or a pointer click into a cell as well. The row's own `tabIndex` is left alone meanwhile,
+  // so the row stays the grid's one Tab stop while a control inside it holds focus. Focus in the
+  // header, or inside a grid nested in a cell, changes nothing.
   const handleFocus = useCallback((event: ReactFocusEvent<HTMLDivElement>): void => {
     const target = event.target;
     const grid = event.currentTarget;
@@ -2216,8 +2511,8 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   }, []);
 
   // Keys pressed ON a data row. See this module's header for the map; `preventDefault` is called
-  // only for the keys actually handled, so Tab still leaves the body and every unhandled key keeps
-  // its meaning.
+  // only for the keys actually handled, so every unhandled key keeps its meaning. Tab never reaches
+  // this map: the dispatcher below hands it to `answerTab` first.
   const handleRowKey = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>, scope: BodyScope, grid: Element): void => {
       const originIndex = scope.index;
@@ -2392,8 +2687,8 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
           event.preventDefault();
           moveActiveRow(scope.index - PAGE_JUMP_ROWS);
           return;
-        // Enter, Space, Tab and every other key are the control's own: a key pressed on a control
-        // never activates the row.
+        // Enter, Space and every other key are the control's own: a key pressed on a control never
+        // activates the row. Tab never reaches this map: the dispatcher hands it to `answerTab`.
         default:
           return;
       }
@@ -2473,6 +2768,17 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
       }
 
       const scope = resolveBodyScope(target, grid);
+
+      // Tab first, and on the row exactly as on a control: one sequence runs across both, and a
+      // text field takes part in it as well, which is why this precedes every per-target map.
+      // A Tab something inside already consumed is its own; a Tab in the header is the browser's.
+      if (event.key === 'Tab') {
+        if (scope !== undefined && !event.defaultPrevented) {
+          answerTab(event, target, scope, grid);
+        }
+
+        return;
+      }
 
       if (scope !== undefined && target === scope.row) {
         handleRowKey(event, scope, grid);
@@ -2826,6 +3132,14 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
       >
         {caption}
       </Text>
+      {/* The keyboard description: never painted - `dg-visually-hidden` takes it out of the flow
+          and the layout - and outside the grid, which accepts only rows and rowgroups. An empty
+          grid has no row to operate, so it is neither rendered nor referenced then. */}
+      {rowCount === 0 ? null : (
+        <Text as="div" id={keyboardDescriptionId} size="sm" className="dg-visually-hidden">
+          {keyboardDescription}
+        </Text>
+      )}
       <div className="dg-virtual-viewport" ref={viewportRef}>
         {/* The grid, and nothing between it and the rowgroups: `grid` accepts only `row` and
             `rowgroup` children, which is why the scroll container above carries no role. */}
@@ -2833,6 +3147,7 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
           ref={gridRef}
           role="grid"
           aria-labelledby={captionId}
+          aria-describedby={rowCount === 0 ? undefined : keyboardDescriptionId}
           aria-rowcount={ariaRowCount}
           aria-colcount={columnCount}
           style={gridStyle}

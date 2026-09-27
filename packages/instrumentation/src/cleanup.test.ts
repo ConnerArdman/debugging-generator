@@ -66,8 +66,8 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { DebuggenError, err, isErr, ok } from '@debuggen/shared';
-import type { Result } from '@debuggen/shared';
+import { DebuggenError, createConsoleLogger, err, isErr, ok } from '@debuggen/shared';
+import type { LogRecord, Result } from '@debuggen/shared';
 import { sha256Hex } from '@debuggen/shared/node';
 import type {
   AtomicCreateVerdict,
@@ -1222,8 +1222,8 @@ describe('a developer edit on top of an instrumented file', () => {
     expectFileBytes(patched.path, edited);
     expect(existsSync(world.backupPathOf(patched.record.originalHash))).toBe(true);
 
-    // Already in `conflict`, so the retained row moves nowhere: closing a
-    // conflict is the developer's decision, not a pass's.
+    // Already in `conflict` and the edit is still there, so the retained row
+    // moves nowhere: a conflict stays open for as long as it diverges.
     expect(world.journal.row(patched.record.id).status).toBe('conflict');
     expect(world.journal.transitions(mark)).toEqual([]);
   });
@@ -1723,6 +1723,272 @@ describe('a chain of plan versions over one file', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * A conflict whose file comes back to a recorded digest
+ * ---------------------------------------------------------------------------
+ */
+
+describe('a conflict whose file comes back to a recorded digest', () => {
+  /** A second copy of {@link TARGET_FILE}, so two records share one original. */
+  const TWIN_FILE = 'src/server/cycle-planner-twin.ts';
+
+  /** The ids of a pass's list, in the order the pass reported them. */
+  const ids = (records: readonly ModificationRecord[]): string[] =>
+    records.map((record) => record.id);
+
+  it('is restored once the developer undoes the edit, and its backup is deleted after the restore verified', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    developerEdits(patched.path);
+
+    const first = await cleanupSession(world.sessionId, world.context);
+
+    expect(first.status).toBe('conflict');
+    expect(world.journal.row(patched.record.id).status).toBe('conflict');
+
+    // The developer undoes the edit: the file is byte-identical to what the
+    // patch wrote, so it hashes to `instrumentedHash` again.
+    writeFileSync(patched.path, patched.instrumentedBytes);
+    expect(digestOf(patched.path)).toBe(patched.record.instrumentedHash);
+
+    world.watch(TARGET_FILE);
+    world.resetLog();
+
+    const mark = world.mark();
+    const second = await cleanupSession(world.sessionId, world.context);
+
+    expect(second.status).toBe('clean');
+    expect(second.conflicts).toEqual([]);
+    expect(second.skipped).toEqual([]);
+    expect(second.failures).toEqual([]);
+    expect(only(second.restored, 'restored record').id).toBe(patched.record.id);
+    expect(only(second.restored, 'restored record').status).toBe('reverted');
+
+    // The same conditional write as for any applied record: only while the file
+    // still holds the instrumented bytes, and with the recorded original.
+    expectFileBytes(patched.path, patched.originalBytes);
+    const write = only(world.log.writes, 'conditional write');
+    expect(write.expectedHash).toBe(patched.record.instrumentedHash);
+    expect(write.contentHash).toBe(patched.record.originalHash);
+
+    // `conflict → reverted`, and the backup deleted only once the file held the
+    // original again.
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: patched.record.id, status: 'reverted' },
+    ]);
+    const removal = only(world.removals, 'backup deletion');
+    expect(removal.restoredContentHash).toBe(patched.record.originalHash);
+    expect(removal.watchedDigest).toBe(patched.record.originalHash);
+    expect(existsSync(world.backupPathOf(patched.record.originalHash))).toBe(false);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+
+  it('is restored by a start-up reconciliation when the edit was undone while no service ran', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    developerEdits(patched.path);
+
+    const first = await reconcileModifications(world.context);
+
+    expect(first.status).toBe('conflict');
+    expect(ids(first.retained)).toEqual([patched.record.id]);
+
+    writeFileSync(patched.path, patched.instrumentedBytes);
+    world.resetLog();
+
+    const mark = world.mark();
+    const second = await reconcileModifications(world.context);
+
+    expect(second.status).toBe('clean');
+    expect(second.examined).toBe(1);
+    expect(ids(second.restored)).toEqual([patched.record.id]);
+    expect(second.closed).toEqual([]);
+    expect(second.retained).toEqual([]);
+    expect(second.conflicts).toEqual([]);
+    expectFileBytes(patched.path, patched.originalBytes);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: patched.record.id, status: 'reverted' },
+    ]);
+    expect(existsSync(world.backupPathOf(patched.record.originalHash))).toBe(false);
+  });
+
+  it('is closed without a write once the developer puts the original back by hand', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    developerEdits(patched.path);
+    expect((await cleanupSession(world.sessionId, world.context)).status).toBe('conflict');
+
+    writeFileSync(patched.path, patched.originalBytes);
+    world.resetLog();
+
+    const mark = world.mark();
+    const second = await cleanupSession(world.sessionId, world.context);
+
+    expect(second.status).toBe('clean');
+    expect(only(second.restored, 'closed record').id).toBe(patched.record.id);
+    expect(second.conflicts).toEqual([]);
+
+    // Nothing to write: the file already is the original. The hash comparison
+    // that closed the record is the verification its backup's deletion needs.
+    expectNothingWritten(world.log);
+    expectFileBytes(patched.path, patched.originalBytes);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: patched.record.id, status: 'reverted' },
+    ]);
+    expect(only(world.removals, 'backup deletion').restoredContentHash).toBe(
+      patched.record.originalHash,
+    );
+    expect(existsSync(world.backupPathOf(patched.record.originalHash))).toBe(false);
+  });
+
+  it('is restored by restoreModification on its own, as for any record whose file is ours', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    world.journal.arrange({ ...world.journal.row(patched.record.id), status: 'conflict' });
+
+    const outcome = expectOk(
+      await restoreModification(world.journal.row(patched.record.id), world.context),
+      'a restore of a conflict whose file holds the patch',
+    );
+
+    expect(outcome.kind).toBe('restored');
+    expect(outcome.record.status).toBe('reverted');
+    expect(outcome.backup).toBe('deleted');
+    expectFileBytes(patched.path, patched.originalBytes);
+  });
+
+  it('resumes the reverse walk through the earlier links once the edit on the head is undone', async () => {
+    const world = makeWorld();
+    const pristine = readFileSync(world.pathOf(OTHER_FILE));
+    const [first, second, third] = await patchThreeLinks(world);
+
+    developerEdits(third.path);
+
+    const blocked = await cleanupSession(world.sessionId, world.context);
+
+    expect(blocked.status).toBe('conflict');
+    expect(world.journal.row(third.record.id).status).toBe('conflict');
+    expect(world.journal.row(second.record.id).status).toBe('applied');
+    expect(world.journal.row(first.record.id).status).toBe('applied');
+
+    writeFileSync(third.path, third.instrumentedBytes);
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('clean');
+    expect(ids(outcome.restored)).toEqual([third.record.id, second.record.id, first.record.id]);
+
+    // Each link still verified against its own `instrumentedHash` before its
+    // own backup was written.
+    expect(world.log.writes.map((write) => write.expectedHash)).toEqual([
+      third.record.instrumentedHash,
+      second.record.instrumentedHash,
+      first.record.instrumentedHash,
+    ]);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: third.record.id, status: 'reverted' },
+      { recordId: second.record.id, status: 'reverted' },
+      { recordId: first.record.id, status: 'reverted' },
+    ]);
+    expectFileBytes(world.pathOf(OTHER_FILE), pristine);
+
+    for (const link of [first, second, third]) {
+      expect(existsSync(world.backupPathOf(link.record.originalHash))).toBe(false);
+    }
+  });
+
+  it('keeps a backup it shares with a restored record while its own edit is still there', async () => {
+    const world = makeWorld();
+    cpSync(world.pathOf(TARGET_FILE), world.pathOf(TWIN_FILE));
+
+    const target = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const twin = await patchSymbol(world, { file: TWIN_FILE, symbol: TARGET_SYMBOL });
+    const digest = target.record.originalHash;
+
+    expect(twin.record.originalHash).toBe(digest);
+    expect(twin.outcome.backup.reused).toBe(true);
+
+    // The twin was edited and the watcher marked it, as a live session would.
+    const edited = developerEdits(twin.path);
+    world.journal.arrange({ ...world.journal.row(twin.record.id), status: 'conflict' });
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('conflict');
+    expect(ids(outcome.restored)).toEqual([target.record.id]);
+    expect(only(outcome.conflicts, 'conflict report').recordId).toBe(twin.record.id);
+    expectFileBytes(target.path, target.originalBytes);
+    expectFileBytes(twin.path, edited);
+
+    // The one copy both records share is the copy the conflict points at.
+    expect(world.removals).toEqual([]);
+    expectFileBytes(world.backupPathOf(digest), target.originalBytes);
+    expect(world.journal.row(twin.record.id).status).toBe('conflict');
+  });
+
+  it('deletes a backup it shares with another record only once both are restored', async () => {
+    // What the twin held at each deletion of the shared copy, sampled before
+    // the store acts. Patching deletes no backup, so only the pass fills it.
+    const twinAtRemoval: (string | undefined)[] = [];
+    const world = makeWorld({
+      afterBackupRemoval: (_removal, projectRoot): void => {
+        const path = join(projectRoot, TWIN_FILE);
+
+        twinAtRemoval.push(existsSync(path) ? digestOf(path) : undefined);
+      },
+    });
+    cpSync(world.pathOf(TARGET_FILE), world.pathOf(TWIN_FILE));
+
+    const target = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const twin = await patchSymbol(world, { file: TWIN_FILE, symbol: TARGET_SYMBOL });
+    const digest = target.record.originalHash;
+
+    expect(twin.record.originalHash).toBe(digest);
+
+    // Edited, marked by the watcher, then undone.
+    developerEdits(twin.path);
+    world.journal.arrange({ ...world.journal.row(twin.record.id), status: 'conflict' });
+    writeFileSync(twin.path, twin.instrumentedBytes);
+
+    world.watch(TARGET_FILE);
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('clean');
+    expect(new Set(ids(outcome.restored))).toEqual(new Set([target.record.id, twin.record.id]));
+    expectFileBytes(target.path, target.originalBytes);
+    expectFileBytes(twin.path, twin.originalBytes);
+    const transitions = world.journal.transitions(mark);
+    expect(transitions).toHaveLength(2);
+    expect(transitions).toEqual(
+      expect.arrayContaining([
+        { recordId: target.record.id, status: 'reverted' },
+        { recordId: twin.record.id, status: 'reverted' },
+      ]),
+    );
+
+    // Every deletion of the shared copy came after both restores verified:
+    // both files already held the original when the store was asked.
+    expect(world.removals.length).toBeGreaterThan(0);
+    for (const removal of world.removals) {
+      expect(removal.restoredContentHash).toBe(digest);
+      expect(removal.watchedDigest).toBe(digest);
+    }
+    expect(twinAtRemoval).toEqual(world.removals.map(() => digest));
+    expect(existsSync(world.backupPathOf(digest))).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * A file whose records do not form a single chain
  * ---------------------------------------------------------------------------
  */
@@ -2134,8 +2400,11 @@ interface ReconcileCase {
  * `pending` and `failed` share the three-way reading — the write may or may not
  * have landed — while `applied` is restore-only, because for that record the
  * write is known to have landed and content that is no longer ours means
- * something outside this product changed the file. `conflict` is retained and
- * re-reported, and `reverted` is finished business that is not even read.
+ * something outside this product changed the file. `conflict` is judged again
+ * (AAP §0.5.1): retained and re-reported while the file still diverges,
+ * restored once it holds the instrumented content again, and closed without a
+ * write once it holds the original. `reverted` is finished business that is not
+ * even read.
  */
 const RECONCILE_CASES: readonly ReconcileCase[] = Object.freeze([
   {
@@ -2259,16 +2528,28 @@ const RECONCILE_CASES: readonly ReconcileCase[] = Object.freeze([
     backupKept: true,
   },
   {
-    name: 'a record in conflict whose file is still instrumented is still not written to',
+    name: 'a record in conflict whose file holds the patch again is restored from its backup',
     status: 'conflict',
     file: 'instrumented',
-    disposition: 'retained',
-    outcome: 'conflict',
-    recordEndsAs: 'conflict',
+    disposition: 'restored',
+    outcome: 'clean',
+    recordEndsAs: 'reverted',
+    wrote: true,
+    conflictReason: undefined,
+    fileEndsAs: 'original',
+    backupKept: false,
+  },
+  {
+    name: 'a record in conflict whose file holds the original is closed without a write',
+    status: 'conflict',
+    file: 'original',
+    disposition: 'closed',
+    outcome: 'clean',
+    recordEndsAs: 'reverted',
     wrote: false,
-    conflictReason: 'content-changed',
+    conflictReason: undefined,
     fileEndsAs: 'unchanged',
-    backupKept: true,
+    backupKept: false,
   },
   {
     name: 'a reverted record is not acted on, and not even read',
@@ -2475,6 +2756,154 @@ describe('the reconciliation table', () => {
     expectNoFileSystemAccess(world.log);
     expectFileBytes(patched.path, patched.instrumentedBytes);
     expect(world.journal.row(patched.record.id).status).toBe('applied');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The session backup directory after a start-up reconciliation
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the backup directory of a reconciled session', () => {
+  it('is removed once the pass reverts every open record of the session, as session.end does', async () => {
+    const world = makeWorld();
+    const target = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const other = await patchSymbol(world, { file: OTHER_FILE, symbol: OTHER_SYMBOL });
+
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+
+    const outcome = await reconcileModifications(world.context);
+
+    expect(outcome.status).toBe('clean');
+    expect(outcome.restored).toHaveLength(2);
+    expectFileBytes(target.path, target.originalBytes);
+    expectFileBytes(other.path, other.originalBytes);
+
+    // Every backup deleted as its restore verified, and then the emptied
+    // directory itself.
+    expect(world.removals.map((removal) => removal.restoredContentHash).sort()).toEqual(
+      [target.record.originalHash, other.record.originalHash].sort(),
+    );
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+    expect(existsSync(join(world.debuggenHome, 'backups'))).toBe(true);
+  });
+
+  it('is removed when the pass only closed records, nothing having been written', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    // The crash between the journal append and the rename: `pending`, and the
+    // file still the original.
+    writeFileSync(patched.path, patched.originalBytes);
+    world.journal.arrange({ ...world.journal.row(patched.record.id), status: 'pending' });
+    world.resetLog();
+
+    const outcome = await reconcileModifications(world.context);
+
+    expect(outcome.status).toBe('clean');
+    expect(outcome.closed.map((record) => record.id)).toEqual([patched.record.id]);
+    expectNothingWritten(world.log);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+
+  it('is kept whole while any record of the session is still in conflict', async () => {
+    const world = makeWorld();
+    const target = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const other = await patchSymbol(world, { file: OTHER_FILE, symbol: OTHER_SYMBOL });
+
+    developerEdits(other.path);
+
+    const outcome = await reconcileModifications(world.context);
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.restored.map((record) => record.id)).toEqual([target.record.id]);
+    expect(outcome.retained.map((record) => record.id)).toEqual([other.record.id]);
+
+    // The restored record's backup is gone; the conflict's is exactly where the
+    // report points, inside the directory that was therefore kept.
+    expect(existsSync(world.backupPathOf(target.record.originalHash))).toBe(false);
+    expectFileBytes(world.backupPathOf(other.record.originalHash), other.originalBytes);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+  });
+
+  it('is removed for the session the pass settled and kept for the one it could not place', async () => {
+    const world = makeWorld();
+    const foreign = nextSessionId('foreign');
+    const settled = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const unplaced = await patchSymbol(world, {
+      file: OTHER_FILE,
+      symbol: OTHER_SYMBOL,
+      sessionId: foreign,
+    });
+    const foreignDirectory = world.storeFor(foreign).sessionDirectory;
+
+    // Only the context's own session can be placed; the foreign one is skipped
+    // with a failure, exactly as a session whose row is gone would be.
+    const scopeFor = (record: ModificationRecord): Result<RecordScope> =>
+      record.sessionId === world.sessionId
+        ? ok({ projectRoot: world.projectRoot, backups: world.backups })
+        : err(new DebuggenError('SESSION_NOT_FOUND', 'The suite cannot place this session.'));
+
+    const outcome = await reconcileModifications(world.context, { scopeFor });
+
+    expect(outcome.status).toBe('partial');
+    expect(outcome.restored.map((record) => record.id)).toEqual([settled.record.id]);
+    expect(outcome.skipped.map((record) => record.id)).toEqual([unplaced.record.id]);
+
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+    expect(existsSync(foreignDirectory)).toBe(true);
+    expectFileBytes(join(foreignDirectory, unplaced.record.originalHash), unplaced.originalBytes);
+    expectFileBytes(unplaced.path, unplaced.instrumentedBytes);
+  });
+
+  it('is left alone by a pass that reverted nothing of the session', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    developerEdits(patched.path);
+
+    const first = await reconcileModifications(world.context);
+    const second = await reconcileModifications(world.context);
+
+    expect([first.status, second.status]).toEqual(['conflict', 'conflict']);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+    expectFileBytes(world.backupPathOf(patched.record.originalHash), patched.originalBytes);
+  });
+
+  it('is only a warning when the store cannot remove it: the pass stays clean and never throws', async () => {
+    const records: LogRecord[] = [];
+    const logger = createConsoleLogger({
+      level: 'trace',
+      sink: (record) => {
+        records.push(record);
+      },
+    });
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const refusing: BackupStore = {
+      ...world.backups,
+      removeSessionDirectory: () => Promise.reject(new Error('The suite refuses to list it.')),
+    };
+
+    const outcome = await reconcileModifications({
+      ...world.context,
+      backups: refusing,
+      logger,
+    });
+
+    expect(outcome.status).toBe('clean');
+    expect(outcome.failures).toEqual([]);
+    expectFileBytes(patched.path, patched.originalBytes);
+    expect(existsSync(world.backupPathOf(patched.record.originalHash))).toBe(false);
+
+    const warning = records.find(
+      (record) =>
+        record.level === 'warn' &&
+        record.message === 'the session backup directory was not removed',
+    );
+    expect(warning?.fields['sessionId']).toBe(world.sessionId);
+    expect(warning?.fields['directory']).toBe(world.backups.sessionDirectory);
   });
 });
 

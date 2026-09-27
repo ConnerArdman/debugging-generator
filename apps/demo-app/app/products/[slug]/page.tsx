@@ -41,9 +41,10 @@
  * A slug that is not a slug and a slug no product owns are the same thing to a reader - they
  * followed a link to a product that is not there - so both answer with `app/not-found.tsx`, under
  * that page's own "Page not found" title. Anything else is an infrastructure fault, and it renders
- * this page's own notice with one sentence a buyer can act on, under this page's ordinary title.
- * The two are kept apart deliberately: "there is nothing at this address" is a statement about the
- * address, and an unreachable database is not.
+ * this page's own notice with one sentence a buyer can act on, titled - in the tab and in the
+ * notice's `<h1>` alike - "This product could not be loaded". A product that was read is titled
+ * with its own name. The two are kept apart deliberately: "there is nothing at this address" is a
+ * statement about the address, and an unreachable database is not.
  *
  * WHERE "IS THERE A PRODUCT HERE?" IS DECIDED
  * In two places, for the two halves of the answer.
@@ -59,8 +60,8 @@
  * The document is decided by `generateMetadata`, because Next.js resolves a page's metadata as one
  * unit. Ask the render alone, and the answer arrives after the loading boundary has flushed the
  * shell: a `notFound()` thrown from the render swaps the markup for `app/not-found.tsx` while the
- * tab still says `Product details`. Raised while the metadata is being resolved, the same call
- * makes Next.js resolve that unit under the not-found convention instead, so the tab, the
+ * tab still carries this page's own title. Raised while the metadata is being resolved, the same
+ * call makes Next.js resolve that unit under the not-found convention instead, so the tab, the
  * `next-error` marker and `robots: noindex` all describe what the reader is actually looking at.
  *
  * This file's own `notFound()` calls are the render's guarantee rather than a copy of the proxy's
@@ -75,6 +76,14 @@
  * The render keeps its own parse and its own failure path all the same - it is the code that types
  * the slug and the code that answers an infrastructure fault - and the two never disagree, because
  * both read the product through one memoized call and therefore see one outcome per request.
+ *
+ * THE HEAD CARRIES A DESCRIPTION
+ * Every head this file answers for a product - the product's own, and the failure notice's -
+ * carries {@link PAGE_DESCRIPTION}, the snippet a search engine shows under the title. Next.js
+ * resolves the metadata for a search crawler or an audit (its HTML-limited bots, Lighthouse among
+ * them) before it sends the document, so they read the title and the description from `<head>`;
+ * an ordinary browser receives the same tags with the streamed page, once the product read that
+ * titles the tab has answered.
  */
 
 import type { Metadata } from 'next';
@@ -120,17 +129,32 @@ interface Props {
 }
 
 /**
- * The tab's title for a product that exists. Short on purpose: the store's name belongs to the
- * root layout, which declares it once as the `'%s · Lumen Supply'` template every nested route
- * inherits, so this reads `Product details · Lumen Supply` in the browser.
+ * The tab's title for a product whose record carries no name to title it with.
  *
- * It titles the page rather than the product, so every product page carries the same tab title.
- * A slug no product owns is not titled from here at all: `proxy.ts` rewrites its address to the
- * not-found route before this file runs, and one that reaches this file anyway is answered by
- * `generateMetadata` with `notFound()` - either way `app/not-found.tsx` supplies its own "Page not
- * found".
+ * A product that exists is titled with its own name - the same words as the page's `<h1>` - so a
+ * reader with a dozen product tabs open, a bookmark list and a browser history can tell them
+ * apart; the store's name follows from the root layout's `'%s · Lumen Supply'` template, which
+ * every nested route inherits. This generic title is only what a blank name falls back to, so the
+ * tab never reads as the bare suffix. A read that failed is titled with the failure notice's own
+ * heading instead (see `generateMetadata`), and a slug no product owns is not titled from here at
+ * all: `proxy.ts` rewrites its address to the not-found route before this file runs, and one that
+ * reaches this file anyway is answered by `generateMetadata` with `notFound()` - either way
+ * `app/not-found.tsx` supplies its own "Page not found".
  */
 const PAGE_TITLE = 'Product details';
+
+/**
+ * The description this route writes into the document head - the snippet a search engine shows
+ * under the title, and the one a crawler or an audit reads from `<head>`.
+ *
+ * It describes the page rather than the product, so it needs nothing from the read and is the same
+ * on every product page. It replaces the root layout's store-wide description for this route with
+ * what a buyer finds on it - the specifications, the current price and the units in stock - and
+ * what they can do there.
+ */
+const PAGE_DESCRIPTION =
+  'See the specifications, current price and units in stock for this industrial supply item, ' +
+  'and add the quantity you need to your cart.';
 
 /**
  * The product for one slug, read at most once per request.
@@ -153,7 +177,8 @@ const PAGE_TITLE = 'Product details';
  * and wrapping the call in an async function turns that into a rejected promise, which the two
  * callers already handle. A rejection is memoized exactly as a value is, so the render replays the
  * rejection `generateMetadata` saw rather than retrying the read - which is precisely what the
- * notice path needs: metadata keeps the page's title, the render answers the failure.
+ * notice path needs: metadata titles the tab with the notice's heading, the render answers the
+ * failure, and the two cannot disagree about which of them happened.
  */
 const PRODUCT_FOR_SLUG = cache(async (slug: string): Promise<ProductDetail> =>
   loadProductDetail({ slug, origin: storefrontOrigin() }),
@@ -178,10 +203,14 @@ const PRODUCT_FOR_SLUG = cache(async (slug: string): Promise<ProductDetail> =>
  *     under the `200` the loading boundary has already sent;
  *   - anything else that goes wrong reading the product - an unreachable database, a driver
  *     refusal, an address this deployment cannot establish - is not a statement about the address
- *     and must not be dressed up as one. It is caught here and the page's ordinary title is
- *     returned, leaving the render below to answer with its "could not be loaded" notice rather
- *     than reporting a product that exists as missing;
- *   - a product that exists is titled {@link PAGE_TITLE}.
+ *     and must not be dressed up as one. It is caught here and titled {@link FAILURE_TITLE}, the
+ *     heading of the "could not be loaded" notice the render below answers with, so the tab says
+ *     what the page says rather than reporting a product that exists as missing;
+ *   - a product that exists is titled with its own name, the words its `<h1>` prints, or with
+ *     {@link PAGE_TITLE} when that name is blank.
+ *
+ * Both heads for a page this route draws carry {@link PAGE_DESCRIPTION}; the not-found page
+ * supplies its own.
  *
  * Nothing about the failure is logged here. The render below logs the same rejection once, with
  * the failure's kind only, and this pass would otherwise report every infrastructure fault twice.
@@ -193,8 +222,12 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     notFound();
   }
 
+  // Declared before the read so the title below is chosen outside the `try`, for the same reason
+  // the render declares its product there: the catch is for the read and for nothing else.
+  let product: ProductDetail | null = null;
+
   try {
-    await PRODUCT_FOR_SLUG(requested.data.slug);
+    product = await PRODUCT_FOR_SLUG(requested.data.slug);
   } catch (error) {
     // Called from the catch rather than from inside the `try`: `notFound()` signals by throwing,
     // and its control-flow error raised inside the block would be swallowed right here, leaving a
@@ -204,13 +237,25 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
     }
   }
 
-  return { title: PAGE_TITLE };
+  if (product === null) {
+    return { title: FAILURE_TITLE, description: PAGE_DESCRIPTION };
+  }
+
+  // The name exactly as the `<h1>` prints it. Only a blank one is replaced, because a tab titled
+  // with nothing would read as the store's suffix alone.
+  return {
+    title: product.name.trim().length > 0 ? product.name : PAGE_TITLE,
+    description: PAGE_DESCRIPTION,
+  };
 }
 
 /** The catalog's name, as the first breadcrumb and as the way out of the notice below. */
 const CATALOG_LABEL = 'Catalog';
 
-/** The heading of the notice shown when the product could not be read. */
+/**
+ * The heading of the notice shown when the product could not be read - the page's `<h1>` in that
+ * state - and, for the same reason, the tab's title `generateMetadata` returns for it.
+ */
 const FAILURE_TITLE = 'This product could not be loaded';
 
 /**
@@ -289,13 +334,16 @@ export default async function ProductDetailPage({ params }: Props): Promise<Reac
 
   // Nothing was read, so nothing about the product is asserted: the notice is the whole page. A
   // partially drawn product page would print an empty frame, a blank price and a disabled control,
-  // each of which states something the server never answered.
+  // each of which states something the server never answered. Because the notice is the page, its
+  // headline is the page's `<h1>` - the route's one heading in this state, painted by `Alert` in
+  // the page-title role - rather than a paragraph that would leave the page with no title at all.
   if (product === null) {
     return (
       <div className="ls-notice">
         <Alert
           tone="warning"
           title={FAILURE_TITLE}
+          titleAs="h1"
           actions={
             <div className="ls-actions">
               <Link href="/">{CATALOG_LABEL}</Link>

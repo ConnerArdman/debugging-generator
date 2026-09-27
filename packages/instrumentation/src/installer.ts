@@ -35,10 +35,30 @@
  *   patched no file returns `Err`, which the service turns into
  *   `instrumentation.failed`; a gap in an adapter's `unavailable` never fails
  *   an install on its own.
+ * - **A target instrumented already is a gap, not a failure.** Several
+ *   sessions may be open on one project, and the second to plan a symbol the
+ *   first has patched finds the file holding the first one's patch; a
+ *   declaration can also carry the span helper already. The patch layer
+ *   refuses both and stops its batch, which reaches this module as
+ *   {@link InstallResult.failure}. When `describeTargetYield` from
+ *   `./patch/patcher.ts` words that refusal and nothing was written for it —
+ *   no record on the failure, none applied or appended by that ask, exactly
+ *   one action named — the action is reported as an
+ *   {@link UnavailableSignal} whose reason names the holding session, and the
+ *   same adapter is asked again without it. A set-aside patch is reported
+ *   under `'functions'` (Function timing) whatever its action type, because
+ *   the edit only ever supplied the named function span; the request and
+ *   route-handler spans a set-aside patched `server-span` was also asking
+ *   for come from the dev-server preload, not from the edit, so they stay
+ *   armed as its runtime residue (see {@link installPlan}, "Aggregation").
+ *   The session then continues with whatever else it can enable — runtime
+ *   hooks and that residue, when every patch target is held — instead of
+ *   failing outright.
  * - **How far a failed install is unwound.** An adapter that fails part-way —
  *   it rejects, returns something that is not an install result, or returns a
  *   result carrying {@link InstallResult.failure} because an accepted action
- *   could not be completed — fails the whole install. A follow-up's delta
+ *   could not be completed, other than the target set aside above — fails the
+ *   whole install. A follow-up's delta
  *   arrives as a new plan version, and AAP §0.4.2 requires that such a failure
  *   reverse-restores the records *this call* applied, including the record
  *   journaled for the failed attempt, and leaves the earlier plan versions'
@@ -110,6 +130,7 @@ import { restoreModification } from './cleanup.js';
 import type { CleanupFailure, RestoreOutcome } from './cleanup.js';
 import { checkFeasibility } from './feasibility.js';
 import type { InfeasibleAction } from './feasibility.js';
+import { PATCH_TARGET_HELD_REASON, describeTargetYield } from './patch/patcher.js';
 import type { AdapterRegistry } from './registry.js';
 import type {
   ModificationConflict,
@@ -158,9 +179,11 @@ const INSTALL_PHASES: readonly InstrumentationMode[] = Object.freeze(['runtime',
  * installed at all.
  *
  * Only reached for a gap this module discovers *before* an adapter is asked —
- * a feasibility refusal, an unresolvable adapter id, an unknown install mode.
- * Once an adapter has been asked, the gap it reports carries the adapter's own
- * signal name, which is finer than anything a table here could be.
+ * a feasibility refusal, an unresolvable adapter id, an unknown install mode —
+ * and for a target set aside as instrumented already whose action is not in
+ * `patch` mode (a set-aside patch is {@link SET_ASIDE_PATCH_SIGNAL}). Once an
+ * adapter has been asked, the gap it reports carries the adapter's own signal
+ * name, which is finer than anything a table here could be.
  *
  * Kept inside the closed {@link CaptureSignal} vocabulary on purpose: the
  * service cross-references a reported gap with the plan and with the readiness
@@ -208,6 +231,24 @@ const CAPTURE_SIGNAL_BY_ACTION_TYPE = {
 function signalForActionType(type: InstrumentationActionType): CaptureSignal | (string & {}) {
   return CAPTURE_SIGNAL_BY_ACTION_TYPE[type] ?? type;
 }
+
+/**
+ * The signal a `patch`-mode target set aside as instrumented already is
+ * reported under: `'functions'`, the signal whose label reads "Function
+ * timing".
+ *
+ * Deliberately not {@link signalForActionType}'s answer. What a patch adds to
+ * the capture is the one span its edit wraps around the named symbol — for a
+ * `server-span` just as for a `function-timing` — while the incoming-request
+ * and route-handler spans a `server-span` also asks for are produced by the
+ * dev-server preload from the framework's own tracer, with or without the
+ * edit. Naming the gap `'routeHandlers'` would therefore tell the developer
+ * that route-handler spans are unavailable when they are not, and would make
+ * the service withhold a signal the capture still collects; the residue
+ * {@link installPlan} derives for a set-aside `server-span` is what keeps
+ * those spans armed.
+ */
+const SET_ASIDE_PATCH_SIGNAL: CaptureSignal = 'functions';
 
 /**
  * Orders two ids or names by code unit, without a locale.
@@ -330,6 +371,31 @@ export interface InstallPlanOptions {
    * into an adapter-level failure.
    */
   readonly skipFeasibility?: boolean | undefined;
+
+  /**
+   * Whether a session is known to be on **another** project than this install's.
+   *
+   * `ModificationJournal.listOpen` answers every open record of every session
+   * on every project, and a record names only a project-relative file. The
+   * patch layer's hold check (`PATCH_TARGET_HELD_REASON` in
+   * `./patch/patcher.ts`) matches another session's record by that file and by
+   * the digest of the bytes the file holds, which decides *whether* a file is
+   * held exactly — but not *by whom* when two copies of one project (two
+   * worktrees of a repository) were patched the same way: both then hold the
+   * same bytes under the same relative path, and the session named could be
+   * the other copy's, whose cleanup releases nothing here.
+   *
+   * The caller knows the project of every session it installed, so the
+   * journal the adapters are handed lists open records **without** those of a
+   * session this predicate answers `true` for. Answer `false` for a session
+   * whose project is unknown: leaving its records out could let a second patch
+   * be layered over a file it holds, which is what the hold check prevents.
+   * Only the adapters' view is narrowed — the baseline, the rollback and every
+   * other journal operation of this module see the journal as it is.
+   *
+   * Absent — the default — every open record is listed.
+   */
+  readonly sessionOnAnotherProject?: ((sessionId: string) => boolean) | undefined;
 }
 
 /**
@@ -510,13 +576,29 @@ interface AdapterLookup {
  *    returned.
  * 5. **Runtime groups, then patch groups.** Within each phase, groups install
  *    in the adapters' registration order and each group's actions are ordered
- *    by id, so two installs of the same plan install identically.
+ *    by id, so two installs of the same plan install identically. An adapter
+ *    whose answer is a target instrumented already, with nothing written for
+ *    it, is asked again without that action — see "What counts as failure" —
+ *    so one group may be asked more than once, at most once per action plus
+ *    once, with the cancellation signal checked before each further ask.
  * 6. **Aggregation.** `applied` is concatenated in application order,
  *    `runtimeHooks` is de-duplicated with first-occurrence order kept,
- *    `unavailable` is concatenated, and the two producer configurations are
+ *    `unavailable` is concatenated — a group's set-aside targets before the
+ *    gaps its kept answer reported — and the two producer configurations are
  *    computed by `./schema/readiness.ts`'s derivations from the actions of the
- *    adapters that actually enabled something, then widened by those adapters'
- *    own contributions.
+ *    adapters that actually enabled something, minus every action set aside,
+ *    then widened by those adapters' own contributions. One addition reaches
+ *    the preload's signal set and nothing else: the **runtime residue** of
+ *    every set-aside `patch`-mode `server-span` — a copy of the action in
+ *    `runtime` mode — so `deriveServerAgentSignals` arms the incoming-request
+ *    and route-handler spans such an action asked for without naming its
+ *    symbol in `functions`, because nobody patched it. The residue never
+ *    reaches `deriveAgentHookConfig`: a server span arms nothing in the page.
+ *    It is sound because the preload is attached whenever a target is set
+ *    aside — a patch adapter refuses to patch anything, and so meets no held
+ *    target, until its preload gate has passed (`./adapters/nextjs.ts`) — and
+ *    it is what keeps a second session on a project with no database signal
+ *    from losing every server-tier span to the first session's patch.
  *
  * ## What counts as failure
  *
@@ -533,14 +615,21 @@ interface AdapterLookup {
  *   the install's revision cannot account for. The error carries
  *   `'SESSION_INVALID_STATE'` with `details.reason` `'plan-version-conflict'`
  *   and the revisions the journal holds.
- * - **Nothing at all could be enabled** — no modification applied and no
- *   runtime hook armed. The error carries `'INSTRUMENTATION_UNAVAILABLE'` and a
- *   `hint` naming the most actionable blocked signal, because the service turns
- *   it into `instrumentation.failed`. Before it is returned the journal is
- *   listed once more: should it hold a record this call appended — which only
- *   an adapter writing past its context's journal could leave unnoticed until
- *   here — the install is unwound as an unreported modification instead, so
- *   the sentence "no file was modified" is never said over a patched file.
+ * - **Nothing at all could be enabled** — no modification applied, no runtime
+ *   hook armed and no preload signal armed by a set-aside target's runtime
+ *   residue. The error carries `'INSTRUMENTATION_UNAVAILABLE'` and a `hint`
+ *   naming the most actionable blocked signal, because the service turns it
+ *   into `instrumentation.failed`. Its `details.heldTargets` lists, as
+ *   `{ file, symbol, owningSessionId }`, every target set aside because
+ *   another session holds its file (at most {@link MAX_REPORTED_ITEMS}, with
+ *   `details.heldTargetCount` the full number) — structured facts read from
+ *   the patch layer's refusal, so the service can word its own public hint
+ *   naming the session to end rather than quote a gap's text. Before it is
+ *   returned the journal is listed once more: should it hold a record this
+ *   call appended — which only an adapter writing past its context's journal
+ *   could leave unnoticed until here — the install is unwound as an
+ *   unreported modification instead, so the sentence "no file was modified"
+ *   is never said over a patched file.
  * - **An adapter failed part-way** — it rejected, returned something that is
  *   not an install result, returned a result carrying
  *   {@link InstallResult.failure} because an action it accepted for install
@@ -554,11 +643,38 @@ interface AdapterLookup {
  *   context's signal is aborted), and nothing that adapter armed or contributed
  *   is aggregated.
  *
+ * **One reported failure is not a failure: a target instrumented already.**
+ * A `PATCH_UNSUPPORTED` refusal that `describeTargetYield` (`./patch/patcher.ts`)
+ * words — the file holds another session's patch
+ * (`details.reason: 'held-by-another-session'`), or the declaration already
+ * carries the span helper (`'already-instrumented'`) — is a signal this
+ * session cannot enable, provided it is a clean one: the failure carries no
+ * record and no conflict report, the answer applied no record, the ledger saw
+ * that ask append none, the failure names exactly one of the actions the
+ * adapter was asked about, and the install has not been cancelled. Then that
+ * action is reported as an {@link UnavailableSignal} — under `'functions'`
+ * (Function timing) for a `patch`-mode action, whose edit only ever supplied
+ * the named function span, and under the signal named from its type
+ * otherwise; the reason naming the file and the session holding it; the hint
+ * naming the session to end — and the same adapter is asked again without it.
+ * A group left with no action contributes its gaps and nothing else. A
+ * set-aside `patch`-mode `server-span` still contributes its runtime residue
+ * to the preload's signal set (step 6). A refusal met after the same ask applied a
+ * record stays fatal, because that record is this call's to unwind; the patch
+ * layer checks a batch for held targets before it attempts any, so a held
+ * target is reported clean.
+ *
  * Everything else returns `Ok`, including an install with a long `unavailable`
  * list: partial capability is the graceful-degradation path of AAP §0.5.5, and
  * the developer is told "Continuing with: ‹enabled list›" rather than shown a
  * dead session. A gap an adapter reports in `unavailable` — a preload that is
- * absent or silent, a hook installed after React — never fails an install.
+ * absent or silent, a hook installed after React — never fails an install, and
+ * neither does a target set aside as instrumented already, unless nothing else
+ * was enabled: an install left with no hook armed, no file modified and no
+ * residue arming a preload signal — every target a held `function-timing`, for
+ * instance — is the "nothing at all could be enabled" failure above, whose
+ * hint is then the set-aside target's own and whose `details.heldTargets`
+ * names the holder.
  *
  * ## Rollback: what "left at its previous plan version" means
  *
@@ -655,6 +771,21 @@ interface AdapterLookup {
  *   delta: { previousPlanVersion: plan.planVersion, actionIds: addedActionIds },
  * });
  * ```
+ *
+ * @example A second session planning a target the first session has patched
+ * ```ts
+ * const installed = await installPlan(plan, secondSessionContext, { adapters: registry });
+ *
+ * // Ok: the runtime hooks are armed, nothing is patched, and the held target
+ * // is reported rather than failing the session —
+ * // installed.value.unavailable[0] is
+ * //   { signal: 'functions',
+ * //     reason: 'app/api/cart/route.ts is already instrumented by session ses_…',
+ * //     hint: 'End session ses_… — its cleanup restores app/api/cart/route.ts — then ask again to time POST in this session.' }
+ * // and 'POST' is absent from installed.value.serverSignals.functions. Had the
+ * // held target been a `server-span`, the gap would read the same and
+ * // serverSignals.http and .routeHandlers would still be true (its residue).
+ * ```
  */
 export async function installPlan(
   plan: InstrumentationPlan,
@@ -730,7 +861,7 @@ export async function installPlan(
   // install's ledger, so each record appended through it is known the moment
   // the journal accepts it — independently of what the adapter reports and of
   // whether the journal can be listed again later.
-  const ledger = createInstallLedger(context.journal);
+  const ledger = createInstallLedger(context.journal, options.sessionOnAnotherProject);
   const tracking: InstallTracking = { baseline, ledger };
   const adapterContext: InstrumentationContext = { ...context, journal: ledger.journal };
 
@@ -741,6 +872,9 @@ export async function installPlan(
   const agentContributions: Partial<AgentHookConfig>[] = [];
   const serverContributions: Partial<ServerAgentSignals>[] = [];
   const tiers = new Map<string, ActionTier>();
+  // Every target set aside as instrumented already, in the order met: the
+  // source of the preload residue and of the holder facts a failure carries.
+  const setAside: TargetYield[] = [];
 
   for (const phase of INSTALL_PHASES) {
     for (const group of grouping.groups) {
@@ -761,11 +895,9 @@ export async function installPlan(
       }
 
       const appendsBefore = ledger.count();
-      let raw: InstallResult;
+      const answer = await askAdapterGroup(group, adapterContext, context, ledger, logger);
 
-      try {
-        raw = await group.adapter.install(group.actions, adapterContext);
-      } catch (caught) {
+      if (answer.kind === 'rejected') {
         // A rejection carries no records, but the adapter may have journaled
         // — and written — before it rejected: `unwind` recovers those from the
         // ledger and the journal, so its edit is reversed too.
@@ -775,15 +907,13 @@ export async function installPlan(
             adapterId: group.adapter.id,
             planVersion,
             previousPlanVersion,
-            cause: caught,
+            cause: answer.cause,
             tracking,
           }),
         );
       }
 
-      const reported = readInstallResult(raw);
-
-      if (reported === undefined) {
+      if (answer.kind === 'invalid') {
         // Likewise: a value that is not an install result says nothing about
         // what was written, so the ledger and the journal say it instead.
         return err(
@@ -797,17 +927,17 @@ export async function installPlan(
         );
       }
 
-      const failure = reported.failure;
-
-      if (failure !== undefined) {
+      if (answer.kind === 'failed') {
         // The fatal channel: an action this adapter accepted could not be
         // completed. Nothing it armed or contributed is aggregated, and every
         // record this call applied — the earlier groups', this adapter's own,
         // the one it journaled for the failed attempt, and any the journal
         // holds that it did not mention — is reverse-restored, last write
         // first, before the error returns.
+        const { failure } = answer;
+
         return err(
-          await unwind(rollbackSetOf(applied, reported.applied, failure.record), context, {
+          await unwind(rollbackSetOf(applied, answer.reported.applied, failure.record), context, {
             reason: isAborted(context) ? 'aborted' : 'action-failed',
             adapterId: group.adapter.id,
             planVersion,
@@ -818,6 +948,48 @@ export async function installPlan(
           }),
         );
       }
+
+      if (answer.kind === 'aborted') {
+        // Cancelled between two asks of this adapter, after a target it could
+        // not instrument was set aside: nothing of this group's was applied,
+        // so what is unwound is the earlier groups' records, exactly as for a
+        // cancellation noticed between groups.
+        return err(
+          await unwind(applied, context, {
+            reason: 'aborted',
+            adapterId: group.adapter.id,
+            planVersion,
+            previousPlanVersion,
+            tracking,
+          }),
+        );
+      }
+
+      if (answer.kind === 'emptied') {
+        // Every action of this group targets something already instrumented.
+        // The group contributes its gaps — one per set-aside target, then what
+        // its last answer reported, such as a silent preload — and its
+        // set-aside targets, whose residue is derived below; no hook, no
+        // record, no installed action.
+        unavailable.push(...answer.yielded.map((target) => target.gap), ...answer.unavailable);
+        setAside.push(...answer.yielded);
+
+        logger.debug(
+          'an adapter had nothing left to install once its instrumented targets were set aside',
+          {
+            sessionId: context.sessionId,
+            planVersion,
+            adapter: group.adapter.id,
+            mode: group.mode,
+            yielded: answer.yielded.length,
+            unavailable: answer.unavailable.length,
+          },
+        );
+
+        continue;
+      }
+
+      const { raw, reported, actions } = answer;
 
       // An ordinary result is only as good as its `applied` list: a record this
       // adapter appended and did not report would be missing from what the
@@ -841,7 +1013,11 @@ export async function installPlan(
 
       perAdapter.push(raw);
       applied.push(...reported.applied);
-      unavailable.push(...reported.unavailable);
+      // The set-aside targets first, in the order they were met, then what the
+      // answer that was kept reported. A set-aside ask's own gaps are not
+      // carried: the ask after it reports them again.
+      unavailable.push(...answer.yielded.map((target) => target.gap), ...reported.unavailable);
+      setAside.push(...answer.yielded);
 
       for (const hook of reported.runtimeHooks) {
         hooks.add(hook);
@@ -849,12 +1025,15 @@ export async function installPlan(
 
       const tier = reported.enabled ? tierOfResult(raw) : 'unknown';
 
+      // `actions`, not `group.actions`: a target set aside above was never
+      // installed, so it must not reach the derivations — a function timing
+      // that did would ask the preload to wrap a symbol nobody patched.
       if (reported.enabled) {
-        for (const action of group.actions) {
+        for (const action of actions) {
           tiers.set(action.id, tier);
         }
 
-        installedActions.push(...group.actions);
+        installedActions.push(...actions);
 
         if (raw.agentHooks !== undefined) {
           agentContributions.push(raw.agentHooks);
@@ -870,7 +1049,8 @@ export async function installPlan(
         planVersion,
         adapter: group.adapter.id,
         mode: group.mode,
-        actions: group.actions.length,
+        actions: actions.length,
+        yielded: answer.yielded.length,
         applied: reported.applied.length,
         runtimeHooks: reported.runtimeHooks.length,
         unavailable: reported.unavailable.length,
@@ -894,17 +1074,21 @@ export async function installPlan(
   const resolver: ActionTierResolver = {
     tierOf: (action: InstrumentationAction): ActionTier => tiers.get(action.id) ?? 'unknown',
   };
+  // The residue joins the preload derivation only: see `runtimeResidueOf`.
+  const residue = runtimeResidueOf(setAside);
   const agentHooks = mergeAgentHooks(
     deriveAgentHookConfig(installedActions, { tiers: resolver }),
     agentContributions,
   );
   const serverSignals = mergeServerSignals(
-    deriveServerAgentSignals(installedActions, { tiers: resolver }),
+    deriveServerAgentSignals([...installedActions, ...residue], { tiers: resolver }),
     serverContributions,
   );
   const runtimeHooks = [...hooks];
+  const residueArmsServer =
+    residue.length > 0 && armsAnyServerSignal(deriveServerAgentSignals(residue));
 
-  if (applied.length === 0 && runtimeHooks.length === 0) {
+  if (applied.length === 0 && runtimeHooks.length === 0 && !residueArmsServer) {
     // A failed install, so the journal is consulted before the error is
     // composed: a record this call appended past the adapters' journal would
     // otherwise stay in the project under an error that says no file was
@@ -930,6 +1114,7 @@ export async function installPlan(
       feasible: candidates.length,
       adapters: lookup.count,
       journalReread: leftovers.reread,
+      heldTargets: setAside.flatMap((target) => (target.held === undefined ? [] : [target.held])),
     });
 
     logger.error(error.message, {
@@ -949,6 +1134,8 @@ export async function installPlan(
     runtimeHooks,
     unavailable: unavailable.map((gap) => gap.signal).slice(0, MAX_REPORTED_ITEMS),
     adapters: perAdapter.map((result) => result.adapterId),
+    setAside: setAside.length,
+    residue: residue.length,
   });
 
   return ok({
@@ -1724,10 +1911,13 @@ function readFailure(value: unknown): FailureReading {
 /**
  * Reads one adapter's result, or reports that it is not one.
  *
- * A result carrying a failure is read leniently: only its `applied` records
- * matter — they are the adapter's share of the rollback set — and every other
- * member is ignored, as the contract states, so a malformed hook list beside a
- * real failure does not cost the rollback the records the adapter did return.
+ * A result carrying a failure is read leniently: its `applied` records matter
+ * — they are the adapter's share of the rollback set — and so do its usable
+ * gaps, which {@link askAdapterGroup} carries when the failure turns out to be
+ * a target set aside rather than a failed install. Every other member is
+ * ignored, as the contract states, so a malformed hook list beside a real
+ * failure does not cost the rollback the records the adapter did return, and
+ * a malformed gap list costs nothing but those gaps.
  *
  * @param value What the adapter returned.
  * @returns What it contributes, or `undefined` when the value is not an install
@@ -1755,7 +1945,7 @@ function readInstallResult(value: InstallResult): ReportedInstall | undefined {
     return {
       applied: (applied ?? []).filter(isRecordLike),
       runtimeHooks: [],
-      unavailable: [],
+      unavailable: (asList(candidate.unavailable) ?? []).filter(isUnavailableLike),
       enabled: false,
       failure: failure.failure,
     };
@@ -1777,6 +1967,339 @@ function readInstallResult(value: InstallResult): ReportedInstall | undefined {
     unavailable: unavailable.filter(isUnavailableLike),
     enabled: records.length > 0 || hooks.length > 0,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Asking one adapter, and setting aside a target instrumented already
+//
+// AAP §0.5.5 says a signal that cannot be enabled is reported and the capture
+// proceeds with the rest. A patch target that is already instrumented — its
+// file holds another session's patch, or its declaration already carries the
+// span helper — is exactly that: nothing is broken, the signal is simply not
+// this session's to enable. The patch layer reports such a target as a
+// failure because it stops its batch there, so this module tells the two
+// apart and, for a target it can set aside safely, asks the adapter again
+// without it.
+// ---------------------------------------------------------------------------
+
+/**
+ * Who holds a target set aside because another session's instrumented bytes
+ * are in its file — the element of the nothing-enabled error's
+ * `details.heldTargets`.
+ *
+ * Identifiers only, each a non-blank single-line string read from the patch
+ * layer's structured refusal (`details.file`, `details.symbol`,
+ * `details.owningSessionId`), never parsed out of a gap's sentences: the
+ * service composes its own public hint from these, so it must be able to
+ * validate each fact on its own.
+ */
+interface HeldTarget {
+  /** The held file, project-relative POSIX, as the refusal names it. */
+  readonly file: string;
+
+  /** The symbol this session wanted to instrument in it. */
+  readonly symbol: string;
+
+  /** The session whose instrumented bytes the file holds. */
+  readonly owningSessionId: string;
+}
+
+/** A target set aside: the action, the gap it is reported as, and who holds it. */
+interface TargetYield {
+  /** The action that was set aside, exactly one of the list the adapter was asked about. */
+  readonly action: InstrumentationAction;
+
+  /** The gap reported in its place. */
+  readonly gap: UnavailableSignal;
+
+  /**
+   * The holder, when the refusal was {@link PATCH_TARGET_HELD_REASON} and its
+   * details carry every fact as usable text; `undefined` for a declaration
+   * that already carries the span helper, which no other session holds.
+   */
+  readonly held: HeldTarget | undefined;
+}
+
+/**
+ * How asking one group's adapter ended, as {@link installPlan} acts on it.
+ *
+ * - `'answered'` — an ordinary result, for the actions that remained once
+ *   every set-aside target was dropped.
+ * - `'emptied'` — every action was set aside; the group contributes its gaps
+ *   and its set-aside targets' residue, and nothing else.
+ * - `'failed'` — the fatal channel, for a failure that is not a target to set
+ *   aside.
+ * - `'rejected'` and `'invalid'` — the adapter rejected, or returned something
+ *   that is not an install result.
+ * - `'aborted'` — the install was cancelled between two asks.
+ */
+type GroupAnswer =
+  | {
+      readonly kind: 'answered';
+      readonly raw: InstallResult;
+      readonly reported: ReportedInstall;
+      readonly actions: readonly InstrumentationAction[];
+      readonly yielded: readonly TargetYield[];
+    }
+  | {
+      readonly kind: 'emptied';
+      readonly yielded: readonly TargetYield[];
+      readonly unavailable: readonly UnavailableSignal[];
+    }
+  | {
+      readonly kind: 'failed';
+      readonly reported: ReportedInstall;
+      readonly failure: ReportedFailure;
+    }
+  | { readonly kind: 'rejected'; readonly cause: unknown }
+  | { readonly kind: 'invalid' }
+  | { readonly kind: 'aborted' };
+
+/**
+ * Asks one group's adapter to install its actions, setting aside every target
+ * that turns out to be instrumented already, and says how it ended.
+ *
+ * The adapter is asked with the group's actions. An answer carrying a failure
+ * that {@link cleanTargetYield} accepts — a target instrumented already, for
+ * which nothing was applied, journaled or recorded — becomes a gap, and the
+ * same adapter is asked again with that one action removed. Anything else is
+ * returned for {@link installPlan} to aggregate or unwind exactly as before.
+ *
+ * Bounded by the group's size: every ask after the first follows a set-aside
+ * that removed exactly one action, and a list emptied that way is not asked
+ * about at all, so an adapter is asked at most once per action plus once. The
+ * cancellation signal is checked before each further ask.
+ *
+ * A set-aside ask's own gaps are dropped rather than carried, because the ask
+ * after it reports them again; only when nothing is left to ask about are the
+ * last ask's gaps kept — a preload that has gone quiet is still worth saying.
+ *
+ * @param group The adapter and the actions it claims in this phase.
+ * @param adapterContext The context adapters are handed, journal wrapped in the ledger.
+ * @param context The session's own context, for the cancellation signal and ids.
+ * @param ledger The install's ledger, which shows whether an ask appended anything.
+ * @param logger The context's logger.
+ * @returns How the group ended.
+ */
+async function askAdapterGroup(
+  group: AdapterGroup,
+  adapterContext: InstrumentationContext,
+  context: InstrumentationContext,
+  ledger: InstallLedger,
+  logger: Logger,
+): Promise<GroupAnswer> {
+  let actions: readonly InstrumentationAction[] = group.actions;
+  const yielded: TargetYield[] = [];
+
+  for (;;) {
+    const appendsBefore = ledger.count();
+    let raw: InstallResult;
+
+    try {
+      raw = await group.adapter.install(actions, adapterContext);
+    } catch (caught) {
+      return { kind: 'rejected', cause: caught };
+    }
+
+    const reported = readInstallResult(raw);
+
+    if (reported === undefined) {
+      return { kind: 'invalid' };
+    }
+
+    const failure = reported.failure;
+
+    if (failure === undefined) {
+      return { kind: 'answered', raw, reported, actions, yielded };
+    }
+
+    const set = cleanTargetYield(
+      failure,
+      reported,
+      ledger.appendedSince(appendsBefore),
+      actions,
+      context,
+    );
+
+    if (set === undefined) {
+      return { kind: 'failed', reported, failure };
+    }
+
+    yielded.push(set);
+    actions = actions.filter((candidate) => candidate.id !== set.action.id);
+
+    // Identifiers and codes only: the gap's own sentences name a file, and
+    // they reach the developer through the result rather than the log.
+    logger.info('a planned target is instrumented already; installing the rest without it', {
+      sessionId: context.sessionId,
+      planVersion: context.planVersion,
+      adapter: group.adapter.id,
+      actionId: set.action.id,
+      signal: set.gap.signal,
+      code: failure.error.code,
+      reason: failure.error.details?.['reason'],
+      owningSessionId: failure.error.details?.['owningSessionId'],
+      remaining: actions.length,
+    });
+
+    if (actions.length === 0) {
+      return { kind: 'emptied', yielded, unavailable: reported.unavailable };
+    }
+
+    if (isAborted(context)) {
+      return { kind: 'aborted' };
+    }
+  }
+}
+
+/**
+ * The target an adapter's failure sets aside, when it can be set aside
+ * safely, or `undefined` when the failure is a failure.
+ *
+ * All of the following must hold, because together they are what makes
+ * asking again equivalent to never having asked about that target:
+ *
+ * - `describeTargetYield` (`./patch/patcher.ts`) words the error: a
+ *   `PATCH_UNSUPPORTED` refusal because the target is instrumented already.
+ * - Nothing was written for it: the failure carries no record and no conflict
+ *   report, the answer applied no record, and the ledger saw this ask append
+ *   none. A refusal that came after an applied record stays fatal, because
+ *   that record is this call's to unwind.
+ * - The failure names exactly one action of the list the adapter was asked
+ *   about, so exactly that one is dropped.
+ * - The install has not been cancelled: a cancelled install unwinds.
+ *
+ * The gap is named {@link SET_ASIDE_PATCH_SIGNAL} for a `patch`-mode action —
+ * what is lost is the span its edit would have wrapped around the symbol, not
+ * the request or route-handler spans the preload keeps producing — and by
+ * {@link signalForActionType} for any other mode. The holder is read from the
+ * refusal's structured details by {@link heldTargetOf}.
+ *
+ * @param failure The adapter's reported failure.
+ * @param reported The answer it came in.
+ * @param appended The records the ledger saw this ask append.
+ * @param actions The actions the adapter was asked about.
+ * @param context The session's context, for the cancellation signal.
+ * @returns The action to drop, the gap to report and its holder, or
+ * `undefined`.
+ */
+function cleanTargetYield(
+  failure: ReportedFailure,
+  reported: ReportedInstall,
+  appended: readonly ModificationRecord[],
+  actions: readonly InstrumentationAction[],
+  context: InstrumentationContext,
+): TargetYield | undefined {
+  if (
+    isAborted(context) ||
+    failure.record !== undefined ||
+    failure.conflict !== undefined ||
+    reported.applied.length > 0 ||
+    appended.length > 0 ||
+    failure.actionId === undefined
+  ) {
+    return undefined;
+  }
+
+  const described = describeTargetYield(failure.error);
+
+  if (described === undefined) {
+    return undefined;
+  }
+
+  const named = actions.filter((candidate) => candidate.id === failure.actionId);
+  const [action] = named;
+
+  if (action === undefined || named.length !== 1) {
+    return undefined;
+  }
+
+  return {
+    action,
+    gap: {
+      signal: action.mode === 'patch' ? SET_ASIDE_PATCH_SIGNAL : signalForActionType(action.type),
+      reason: described.reason,
+      hint: described.hint,
+    },
+    held: heldTargetOf(failure.error),
+  };
+}
+
+/**
+ * The holder facts of a refusal because another session holds the target's
+ * file, or `undefined` for any other refusal or for details that cannot be
+ * trusted as identifiers.
+ *
+ * Only `details.reason` equal to {@link PATCH_TARGET_HELD_REASON} qualifies,
+ * and each of `file`, `symbol` and `owningSessionId` must be a non-blank
+ * single-line string ({@link isSingleLineText}); one that is not drops the
+ * whole entry rather than carrying a partial one, because the service words a
+ * sentence from all three.
+ *
+ * @param error The patch layer's refusal.
+ * @returns The holder, or `undefined`.
+ */
+function heldTargetOf(error: DebuggenError): HeldTarget | undefined {
+  const details = error.details;
+
+  if (details?.['reason'] !== PATCH_TARGET_HELD_REASON) {
+    return undefined;
+  }
+
+  const file = details['file'];
+  const symbol = details['symbol'];
+  const owningSessionId = details['owningSessionId'];
+
+  if (!isSingleLineText(file) || !isSingleLineText(symbol) || !isSingleLineText(owningSessionId)) {
+    return undefined;
+  }
+
+  return { file, symbol, owningSessionId };
+}
+
+/**
+ * Whether a value is text a one-line fact can carry: a non-blank string with
+ * no control character and no line or paragraph separator — the same test the
+ * patch layer applies before it words a set-aside target.
+ *
+ * @param value Any value.
+ * @returns `true` for usable single-line text.
+ */
+function isSingleLineText(value: unknown): value is string {
+  return isNonEmptyString(value) && !/[\p{Cc}\u2028\u2029]/u.test(value);
+}
+
+/**
+ * The runtime residue of the targets set aside: a `runtime`-mode copy of every
+ * set-aside `patch`-mode `server-span`, in the order met.
+ *
+ * A patched `server-span` asks for two things. The span its edit wraps around
+ * the handler is lost with the edit; the incoming-request and route-handler
+ * spans are produced by the dev-server preload from the framework's own
+ * tracer and need no edit at all. Handing `deriveServerAgentSignals` the copy
+ * in `runtime` mode arms exactly the second half — it adds a symbol to
+ * `functions` only for a `patch`-mode action — so the preload is still asked
+ * for the spans the capture can have, and not to wrap a symbol nobody patched.
+ *
+ * Sound because a target is only ever set aside after its adapter's preload
+ * gate passed: a patch adapter with no preload attached reports its signals
+ * as gaps and patches nothing (`./adapters/nextjs.ts`), so it never reaches
+ * the refusal that sets a target aside. Nothing else leaves a residue: a
+ * `function-timing` asked for its named span only, and an action already in
+ * `runtime` mode that was set aside is one its adapter declined to arm, so
+ * arming it here would overrule that adapter.
+ *
+ * Never fed to `deriveAgentHookConfig`: a server span arms nothing in the
+ * page, and the page agent's configuration is derived from installed actions
+ * alone.
+ *
+ * @param setAside Every target set aside, in the order met.
+ * @returns The residue actions.
+ */
+function runtimeResidueOf(setAside: readonly TargetYield[]): InstrumentationAction[] {
+  return setAside
+    .filter((target) => target.action.type === 'server-span' && target.action.mode === 'patch')
+    .map((target): InstrumentationAction => ({ ...target.action, mode: 'runtime' }));
 }
 
 // ---------------------------------------------------------------------------
@@ -2281,10 +2804,20 @@ function recordOfAnswer(answer: unknown): ModificationRecord | undefined {
  * and a record the journal persisted despite refusing is still found by the
  * second listing.
  *
+ * `listOpen` is the one answer the ledger may narrow: with
+ * {@link InstallPlanOptions.sessionOnAnotherProject}, the records of every
+ * session that predicate places on another project are left out, so the
+ * patch layer's hold check names a holder on this install's project. An `err`
+ * answer, and every other method's answer, is returned untouched.
+ *
  * @param journal The session's journal.
+ * @param sessionOnAnotherProject The caller's project predicate, when it gave one.
  * @returns The ledger.
  */
-function createInstallLedger(journal: ModificationJournal): InstallLedger {
+function createInstallLedger(
+  journal: ModificationJournal,
+  sessionOnAnotherProject?: (sessionId: string) => boolean,
+): InstallLedger {
   const order: string[] = [];
   const latest = new Map<string, ModificationRecord>();
 
@@ -2320,7 +2853,16 @@ function createInstallLedger(journal: ModificationJournal): InstallLedger {
       },
       listBySession: (sessionId: string): Promise<Result<ModificationRecord[]>> =>
         journal.listBySession(sessionId),
-      listOpen: (): Promise<Result<ModificationRecord[]>> => journal.listOpen(),
+      listOpen: (): Promise<Result<ModificationRecord[]>> =>
+        sessionOnAnotherProject === undefined
+          ? journal.listOpen()
+          : journal
+              .listOpen()
+              .then((answer) =>
+                isErr(answer)
+                  ? answer
+                  : ok(answer.value.filter((record) => !sessionOnAnotherProject(record.sessionId))),
+              ),
     },
     count: (): number => order.length,
     appendedSince: (start: number): ModificationRecord[] =>
@@ -2974,6 +3516,13 @@ interface NothingEnabledFacts {
    * journal — stands behind "no file was modified".
    */
   readonly journalReread: JournalReread;
+
+  /**
+   * Every target set aside because another session holds its file, in the
+   * order met — reported as `details.heldTargets` (bounded by
+   * {@link MAX_REPORTED_ITEMS}) and `details.heldTargetCount`.
+   */
+  readonly heldTargets: readonly HeldTarget[];
 }
 
 /**
@@ -3001,6 +3550,11 @@ function mostActionableGap(
  * sentence for the blocked signal and the hint carries that signal's own
  * recovery action, because the service renders both into
  * `instrumentation.failed`.
+ *
+ * `details.heldTargets` carries the holders of the targets set aside because
+ * another session holds their files, as `{ file, symbol, owningSessionId }`
+ * copies — identifiers the service validates and words its own public hint
+ * from, since a gap's `hint` is adapter text it must not show.
  *
  * @param unavailable Every reported gap.
  * @param facts The counts that explain how the install reached this state.
@@ -3038,6 +3592,12 @@ function nothingEnabledError(
         hint: gap.hint,
       })),
       unavailableCount: unavailable.length,
+      heldTargets: facts.heldTargets.slice(0, MAX_REPORTED_ITEMS).map((held) => ({
+        file: held.file,
+        symbol: held.symbol,
+        owningSessionId: held.owningSessionId,
+      })),
+      heldTargetCount: facts.heldTargets.length,
     },
   });
 }

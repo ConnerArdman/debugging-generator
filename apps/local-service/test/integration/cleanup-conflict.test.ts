@@ -154,23 +154,29 @@ const REASON = vocabulary(MODIFICATION_CONFLICT_REASONS);
  * a reader can follow the scenario.
  */
 const QUESTIONS = Object.freeze({
-  /** One route handler timing (`app/api/trail-report/route.ts` → `GET`). */
+  /**
+   * Timings along the report's request path, one per file: the route handler, the service loader
+   * and the database helper the investigation walks to from `/api/trail-report`.
+   */
   routeLatency: 'Why is the trail report slow to load?',
-  /** One database helper timing (`src/server/db/pool.ts`). */
+  /** The same three files, the named database helper ranked first. */
   queryLatency: 'Why is queryTrailConditionReports slow?',
-  /** Timings across two files: the route handler and a chain of two in the service module. */
+  /** Timings across two files: the database helper and a chain of two in the service module. */
   twoTierLatency: 'Why does summarizeConditions take so long in loadTrailReport and GET?',
 });
 
 /**
  * Real, patchable symbols of the corpus, in the order the crash rows try them. A crash row is
  * injected into a file its session's plan did not already patch, so the interrupted write sequence
- * starts from the file's original bytes, exactly as a first install would.
+ * starts from the file's original bytes, exactly as a first install would. The list ends with the
+ * card's click handler, on the page side of the request, which a plan timing every server file of
+ * the request path still leaves pristine.
  */
 const CRASH_TARGETS: readonly { readonly file: string; readonly symbol: string }[] = Object.freeze([
   { file: 'src/server/services/trail-report.service.ts', symbol: 'loadTrailReport' },
   { file: 'src/server/db/pool.ts', symbol: 'queryTrailConditionReports' },
   { file: 'app/api/trail-report/route.ts', symbol: 'GET' },
+  { file: 'src/components/TrailCard.tsx', symbol: 'handleShowReport' },
 ]);
 
 /** The telemetry fixture that carries a capture from `capturing` to `generated`. */
@@ -1163,6 +1169,83 @@ describe('cleanup-conflict within one service lifetime', () => {
       );
       expect(payload.conflicts).toHaveLength(1);
     });
+
+    it('restores a file whose edit was undone before the end, as though it had never been edited', async () => {
+      const project = await harness.copyFixtureProject();
+      const driven = await driveSession(harness, project.root, QUESTIONS.routeLatency, {
+        tabId: nextTabId(),
+      });
+      const home = harness.config.debuggenHome;
+      const { editor, devtools } = driven;
+      const [file, records] = [...recordsByFile(driven.records).entries()][0]!;
+      const record = chainHead(records);
+      const path = projectFile(project.root, file);
+      // The installer's own bytes, read back before the developer touches the file.
+      const instrumentedBytes = await readFile(path);
+
+      const marks = { editor: editor.received.length, devtools: devtools?.received.length ?? 0 };
+      await editInPlace(path, developerLine());
+      await expectOneConflictNotice(harness, driven, record, marks);
+
+      // The developer undoes the edit: the file holds exactly what the installer wrote. The watcher
+      // released the file when it marked the record, so the record stays `conflict` until cleanup
+      // judges it again.
+      await writeFile(path, instrumentedBytes);
+      expect(await hashOf(project.root, file)).toBe(record.instrumentedHash);
+      await sleep(QUIET_PERIOD_MS);
+      expect((await journalRecord(harness, record.id)).status).toBe(MODIFICATION.conflict);
+
+      const endMarks = {
+        editor: editor.received.length,
+        devtools: devtools?.received.length ?? 0,
+      };
+      expect(await endSession(harness, driven.sessionId)).toBe(CLEANUP.clean);
+
+      // Byte-identical to the pre-session corpus (SHA-256 per file), no marker anywhere.
+      await assertTreeUnchanged(project.root, project.snapshot);
+      for (const [restoredFile, fileRecords] of recordsByFile(driven.records)) {
+        expect(await hashOf(project.root, restoredFile)).toBe(project.snapshot.get(restoredFile));
+        expect(await hashOf(project.root, restoredFile)).toBe(chainRoot(fileRecords).originalHash);
+        await expectNoMarkers(project.root, restoredFile);
+      }
+
+      // Every row `reverted` — the conflicted one through `conflict → reverted` — and every backup,
+      // the one the conflict notice pointed at included, deleted after its restore verified,
+      // together with the session's backup directory.
+      for (const candidate of driven.records) {
+        const after = await journalRecord(harness, candidate.id);
+        expect(after.status).toBe(MODIFICATION.reverted);
+        expect(await exists(after.backupPath)).toBe(false);
+      }
+      expect(await exists(join(home, 'backups', driven.sessionId))).toBe(false);
+
+      // The recorded verdict and the one report each user interface receives.
+      const ended = await currentSession(harness, driven.sessionId);
+      expect(ended.status).toBe(SESSION.ended);
+      expect(ended.cleanup.status).toBe(CLEANUP.clean);
+      expect(ended.cleanup.conflicts).toEqual([]);
+      const report = await waitFor(
+        editor,
+        'cleanup.completed',
+        (message, index) =>
+          index >= endMarks.editor && message.payload.sessionId === driven.sessionId,
+      );
+      expect(parsedCleanupPayload(report)).toEqual({
+        sessionId: driven.sessionId,
+        status: CLEANUP.clean,
+        conflicts: [],
+      });
+      expect(cleanupReports(editor, driven.sessionId)).toHaveLength(1);
+      if (devtools !== undefined) {
+        await waitFor(
+          devtools,
+          'cleanup.completed',
+          (message, index) =>
+            index >= endMarks.devtools && message.payload.sessionId === driven.sessionId,
+        );
+        expect(cleanupReports(devtools, driven.sessionId)).toHaveLength(1);
+      }
+    });
   });
 });
 
@@ -1397,6 +1480,9 @@ describe('cleanup-conflict across a service restart', () => {
       expect(await hashOf(capturing.projectRoot, file)).toBe(chainRoot(records).originalHash);
       await expectNoMarkers(capturing.projectRoot, file);
     }
+    // Nothing of the capturing session is open any more, so its emptied backup directory is
+    // removed, exactly as `session.end` removes it.
+    expect(await exists(join(home, 'backups', capturing.sessionId))).toBe(false);
 
     // failed, hashing to `instrumentedHash` → restored from the backup.
     const restoredCrash = await journalRecord(second, failedWritten.record.id);
@@ -1418,11 +1504,34 @@ describe('cleanup-conflict across a service restart', () => {
       expect(await sha256OfFile(after.backupPath)).toBe(after.originalHash);
     }
 
+    // applied and untouched beside a conflict → restored all the same: one edited file never
+    // holds back the rest of its session.
+    const beside: readonly (readonly [DrivenSession, string])[] = [
+      [failed, appliedEditedWhileDown.record.file],
+      [generated, watchedConflict.record.file],
+    ];
+    for (const [session, editedFile] of beside) {
+      for (const [file, records] of recordsByFile(session.records)) {
+        if (file === editedFile) {
+          continue;
+        }
+        for (const record of records) {
+          expect((await journalRecord(second, record.id)).status).toBe(MODIFICATION.reverted);
+        }
+        expect(await hashOf(session.projectRoot, file)).toBe(chainRoot(records).originalHash);
+        await expectNoMarkers(session.projectRoot, file);
+      }
+    }
+
     // conflict → retained, its backup kept, and re-reported.
     const retained = await journalRecord(second, watchedConflict.record.id);
     expect(retained.status).toBe(MODIFICATION.conflict);
     expect(await hashOf(generated.projectRoot, retained.file)).toBe(watchedConflict.editedHash);
     expect(await sha256OfFile(retained.backupPath)).toBe(retained.originalHash);
+    // A session that still holds a conflict keeps its backup directory, and the original in it.
+    for (const sessionId of [failed.sessionId, generated.sessionId]) {
+      expect(await exists(join(home, 'backups', sessionId))).toBe(true);
+    }
 
     // reverted → untouched: the rows are exactly as the first lifetime left them.
     expect(await journalOf(second, ended.sessionId)).toEqual(revertedBefore);
@@ -1443,17 +1552,37 @@ describe('cleanup-conflict across a service restart', () => {
         failed: 0,
       }),
     });
+    // `failed`: every installed record outside the file edited while down is restored, and so is
+    // the crash row; `generated`: every installed record outside the watched file is restored, and
+    // the watched record and the crash row edited while down are the two conflicts. Each edited
+    // file carries exactly one record, so each is exactly one conflict.
+    const recordsOutside = (records: readonly ModificationRecord[], file: string): number =>
+      records.filter((record) => record.file !== file).length;
+    expect(recordsByFile(failed.records).get(appliedEditedWhileDown.record.file)).toHaveLength(1);
+    expect(recordsByFile(generated.records).get(watchedConflict.record.file)).toHaveLength(1);
+    const failedRestored = recordsOutside(failed.records, appliedEditedWhileDown.record.file) + 1;
     expect(summaries[failed.sessionId]).toMatchObject({
-      restored: 1,
+      restored: failedRestored,
       closed: 0,
       conflicts: 1,
-      status: aggregateCleanupStatus({ restored: 1, conflicts: 1, skipped: 0, failed: 0 }),
+      status: aggregateCleanupStatus({
+        restored: failedRestored,
+        conflicts: 1,
+        skipped: 0,
+        failed: 0,
+      }),
     });
+    const generatedRestored = recordsOutside(generated.records, watchedConflict.record.file);
     expect(summaries[generated.sessionId]).toMatchObject({
-      restored: 0,
+      restored: generatedRestored,
       closed: 0,
       conflicts: 2,
-      status: aggregateCleanupStatus({ restored: 0, conflicts: 2, skipped: 0, failed: 0 }),
+      status: aggregateCleanupStatus({
+        restored: generatedRestored,
+        conflicts: 2,
+        skipped: 0,
+        failed: 0,
+      }),
     });
     expect(report.status).toBe(CLEANUP.conflict);
 
@@ -1526,8 +1655,10 @@ describe('cleanup-conflict across a service restart', () => {
     // and every record of it restored — a resting session that ages out like any other. Nothing is
     // retained as active: at start-up no session is in a pipeline stage or holds an open window
     // (an in-flight session is retained however old it is; `../../src/store/retention.test.ts`).
-    const retention = third.service.startup.retention;
+    // The sweep runs in the background once the service listens, so its report is awaited.
+    const retention = await third.service.startup.retention;
     expect(retention).toBeDefined();
+    expect(retention?.interrupted).toBe(false);
     expect([...(retention?.sessionIdsDeleted ?? [])].sort()).toEqual(
       [capturing.sessionId, ended.sessionId].sort(),
     );
@@ -1589,6 +1720,11 @@ describe('a retained conflict re-reported across restarts', () => {
   let driven: DrivenSession;
   /** The one record of it this block follows, as the installer journaled it. */
   let record: ModificationRecord;
+  /**
+   * The session's records in every other file. They are never edited, so the first start after
+   * the stop restores them and only the followed record stays open from then on.
+   */
+  let alongside: readonly ModificationRecord[];
   /** The bytes the installer wrote into that record's file. */
   let instrumentedBytes: Buffer;
   /** The session as the previous lifetime left it in the store. */
@@ -1666,19 +1802,31 @@ describe('a retained conflict re-reported across restarts', () => {
 
   /**
    * What every start of this block must show whatever the report says: the start re-examined the
-   * one open record and reported it, the record stays `conflict`, and the file holds exactly the
-   * bytes the developer left — never the original.
+   * followed record — plus, on the first start, the untouched records beside it, which it
+   * restores — and reported it, the record stays `conflict`, and the file holds exactly the bytes
+   * the developer left — never the original.
    */
-  const expectRetained = async (lifetime: Harness, fileHash: string): Promise<void> => {
+  const expectRetained = async (
+    lifetime: Harness,
+    fileHash: string,
+    restored: readonly ModificationRecord[] = [],
+  ): Promise<void> => {
     const reconciliation = lifetime.service.startup.reconciliation;
-    expect(reconciliation.scanned).toBe(1);
+    expect(reconciliation.scanned).toBe(1 + restored.length);
     expect(reconciliation.bySession[driven.sessionId]).toMatchObject({
-      scanned: 1,
+      scanned: 1 + restored.length,
       conflicts: 1,
-      restored: 0,
+      restored: restored.length,
       closed: 0,
       status: CLEANUP.conflict,
     });
+    for (const [file, records] of recordsByFile(restored)) {
+      for (const each of records) {
+        expect((await journalRecord(lifetime, each.id)).status).toBe(MODIFICATION.reverted);
+      }
+      expect(await hashOf(driven.projectRoot, file)).toBe(chainRoot(records).originalHash);
+      await expectNoMarkers(driven.projectRoot, file);
+    }
     expect((await journalRecord(lifetime, record.id)).status).toBe(MODIFICATION.conflict);
     expect(await hashOf(driven.projectRoot, record.file)).toBe(fileHash);
     expect(fileHash).not.toBe(record.originalHash);
@@ -1700,16 +1848,22 @@ describe('a retained conflict re-reported across restarts', () => {
     expect(await exists(home)).toBe(false);
   });
 
-  it('leaves one patched record behind when it stops', async () => {
+  it('leaves its patched records behind when it stops', async () => {
     const first = await startLifetime();
     const project = await ownedCopy();
     driven = await driveSession(first, project.root, QUESTIONS.routeLatency);
 
-    // The route-latency plan times one handler: one record in one file, and that record id is
-    // what every later start must keep reporting, so every start's counts are exactly one.
-    expect(driven.records).toHaveLength(1);
-    record = chainHead(driven.records);
-    expect(record.status).toBe(MODIFICATION.applied);
+    // The route-latency plan times the request path, one record per file. The first file's record
+    // is the one this block follows: its id is what every later start must keep reporting, and
+    // once the first start has restored the untouched rest, every start's counts are exactly one.
+    expect(driven.records.length).toBeGreaterThan(0);
+    for (const each of driven.records) {
+      expect(each.status).toBe(MODIFICATION.applied);
+    }
+    const [followedFile, followedRecords] = [...recordsByFile(driven.records).entries()][0]!;
+    expect(followedRecords).toHaveLength(1);
+    record = chainHead(followedRecords);
+    alongside = driven.records.filter((each) => each.file !== followedFile);
     instrumentedBytes = await readFile(projectFile(driven.projectRoot, record.file));
     expect(await hashOf(driven.projectRoot, record.file)).toBe(record.instrumentedHash);
     expect(await sha256OfFile(record.backupPath)).toBe(record.originalHash);
@@ -1724,7 +1878,7 @@ describe('a retained conflict re-reported across restarts', () => {
     expect(editedHash).not.toBe(record.instrumentedHash);
 
     const second = await startLifetime(resumeAt);
-    await expectRetained(second, editedHash);
+    await expectRetained(second, editedHash, alongside);
     const conflict = await carriedConflict(second);
     expect(conflict.reason).toBe(REASON['content-changed']);
     expect(conflict.actualHash).toBe(editedHash);
@@ -1777,5 +1931,299 @@ describe('a retained conflict re-reported across restarts', () => {
     expect(storedSession(fifth, driven.sessionId)).toEqual(before);
 
     await stopLifetime(fifth);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Across a restart: a conflict undone while the service was down
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A conflict describes the file as it was when the divergence was seen, so a start-up
+ * reconciliation judges it again (AAP §0.5.1): the session below is ended while the developer's
+ * edit is on the file — cleanup keeps the edit and the backup and reports `conflict` — and the
+ * developer then undoes the edit while no service runs. The next start finds the file holding the
+ * instrumented bytes again and restores it from the backup exactly as it would an `applied` record.
+ */
+describe('a conflict undone while the service was down', () => {
+  /** The caller-owned `$DEBUGGEN_HOME` every lifetime of this block shares, as a crash leaves it. */
+  let home: string;
+  /** Caller-owned project copies, so `Harness.stop()` leaves them for the next lifetime. */
+  const projects: FixtureProjectCopy[] = [];
+  /** Every lifetime started, for teardown. */
+  const lifetimes: Harness[] = [];
+  /** The session ended in conflict whose edit is undone while no service runs. */
+  let undone: DrivenSession;
+  /** Its copy of the fixture project. */
+  let undoneProject: FixtureProjectCopy;
+  /** The record the live watcher marked `conflict`. */
+  let conflicted: ModificationRecord;
+  /** Where the next lifetime's clock resumes, so every stamp it writes is later than the last. */
+  let resumeAt: number;
+
+  /** A project copy that survives a `Harness.stop()`. */
+  const ownedCopy = async (): Promise<FixtureProjectCopy> => {
+    const copy = await copyFixtureProject();
+    projects.push(copy);
+    return copy;
+  };
+
+  /** One service lifetime over the shared home, its clock seeded at `seedMs` when given. */
+  const startLifetime = async (seedMs?: number): Promise<Harness> => {
+    const lifetime = await startHarness({
+      env: { DEBUGGEN_HOME: home },
+      fixtureProject: false,
+      now: seedMs === undefined ? undefined : createHarnessClock(seedMs).now,
+    });
+    lifetimes.push(lifetime);
+    expect(lifetime.config.debuggenHome).toBe(home);
+    return lifetime;
+  };
+
+  /**
+   * Stops a lifetime the way a crash would find it — live sessions open, journal untouched — and
+   * moves the next lifetime's clock past this one.
+   */
+  const stopLifetime = async (lifetime: Harness): Promise<void> => {
+    resumeAt = lifetime.now() + 60_000;
+    await lifetime.service.close({ liveSessions: 'retain' });
+    expect(await lifetime.stop()).toEqual({ clean: true, problems: [] });
+    await lifetime.assertNoLeaks();
+  };
+
+  beforeAll(async () => {
+    home = await mkdtemp(join(realpathSync(tmpdir()), SHARED_HOME_PREFIX));
+  });
+
+  afterAll(async () => {
+    for (const lifetime of lifetimes) {
+      await lifetime.stop();
+    }
+    for (const project of projects) {
+      await project.dispose();
+      expect(await exists(project.container)).toBe(false);
+    }
+    await rm(home, { recursive: true, force: true });
+    expect(await exists(home)).toBe(false);
+  });
+
+  it('ends a session in conflict, keeping the edit and the backup, and the edit is undone while it is down', async () => {
+    const first = await startLifetime();
+    undoneProject = await ownedCopy();
+    undone = await driveSession(first, undoneProject.root, QUESTIONS.routeLatency);
+    const [file, records] = [...recordsByFile(undone.records).entries()][0]!;
+    conflicted = chainHead(records);
+    const path = projectFile(undoneProject.root, conflicted.file);
+    expect(conflicted.file).toBe(file);
+    // The installer's own bytes, read back before the developer touches the file.
+    const instrumentedBytes = await readFile(path);
+
+    await editInPlace(path, developerLine());
+    await recordReaches(first, conflicted.id, MODIFICATION.conflict);
+    const editedHash = await hashOf(undoneProject.root, file);
+
+    // The edit is still there at the end: kept, its original kept, the conflict reported.
+    expect(await endSession(first, undone.sessionId)).toBe(CLEANUP.conflict);
+    expect(await hashOf(undoneProject.root, file)).toBe(editedHash);
+    expect((await journalRecord(first, conflicted.id)).status).toBe(MODIFICATION.conflict);
+    expect(await sha256OfFile(conflicted.backupPath)).toBe(conflicted.originalHash);
+    const ended = storedSession(first, undone.sessionId);
+    expect(ended?.status).toBe(SESSION.ended);
+    expect(ended?.cleanup.status).toBe(CLEANUP.conflict);
+    expect(ended?.cleanup.conflicts.map((conflict) => conflict.recordId)).toEqual([conflicted.id]);
+
+    await stopLifetime(first);
+
+    // While no service runs, the developer undoes the edit: the instrumented bytes are back.
+    await writeFile(path, instrumentedBytes);
+    expect(await hashOf(undoneProject.root, file)).toBe(conflicted.instrumentedHash);
+  });
+
+  it('restores the undone conflict from its backup on the next start and records the session clean', async () => {
+    const second = await startLifetime(resumeAt);
+    const report = second.service.startup.reconciliation;
+
+    expect(report.errors).toEqual([]);
+    expect(report.bySession[undone.sessionId]).toMatchObject({
+      scanned: 1,
+      restored: 1,
+      closed: 0,
+      conflicts: 0,
+      skipped: 0,
+      failed: 0,
+      status: CLEANUP.clean,
+    });
+
+    // `conflict → reverted`: the file byte-identical to the pre-session corpus, no marker left,
+    // the backup the conflict pointed at deleted once the restore verified.
+    const after = await journalRecord(second, conflicted.id);
+    expect(after.status).toBe(MODIFICATION.reverted);
+    await assertTreeUnchanged(undoneProject.root, undoneProject.snapshot);
+    expect(await hashOf(undoneProject.root, conflicted.file)).toBe(conflicted.originalHash);
+    await expectNoMarkers(undoneProject.root, conflicted.file);
+    expect(await exists(after.backupPath)).toBe(false);
+    // Nothing of the session is open any more, so its emptied backup directory goes as well.
+    expect(await exists(join(home, 'backups', undone.sessionId))).toBe(false);
+
+    // The ended session now carries the clean verdict, over the route a client reopens as well.
+    const stored = storedSession(second, undone.sessionId);
+    expect(stored?.status).toBe(SESSION.ended);
+    expect(stored?.cleanup.status).toBe(CLEANUP.clean);
+    expect(stored?.cleanup.conflicts).toEqual([]);
+    await second.editor(undone.projectRoot);
+    const reopened = await second
+      .http()
+      .request('session.get', { params: { id: undone.sessionId } });
+    if (isErr(reopened)) {
+      throw new Error(
+        `session.get was refused (${reopened.error.code}): ${reopened.error.message}`,
+      );
+    }
+    expect(reopened.value.cleanup).toEqual(stored?.cleanup);
+
+    await stopLifetime(second);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Across a restart: an instrumented session the service never ended
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A service killed while a session is instrumented leaves every patch on disk and every original
+ * in `$DEBUGGEN_HOME/backups/<sessionId>/`. The next start's reconciliation restores the files and
+ * deletes the backups (AAP §0.5.1); with nothing of the session left open it also removes the
+ * emptied directory, exactly as `session.end` does, rather than leaving it for retention.
+ */
+describe('an instrumented session the service never ended', () => {
+  /** The caller-owned `$DEBUGGEN_HOME` every lifetime of this block shares, as a crash leaves it. */
+  let home: string;
+  /** Caller-owned project copies, so `Harness.stop()` leaves them for the next lifetime. */
+  const projects: FixtureProjectCopy[] = [];
+  /** Every lifetime started, for teardown. */
+  const lifetimes: Harness[] = [];
+  /** The session left `ready`, its patches applied, when the first lifetime stops. */
+  let abandoned: DrivenSession;
+  /** Its copy of the fixture project. */
+  let abandonedProject: FixtureProjectCopy;
+  /** Where the next lifetime's clock resumes, so every stamp it writes is later than the last. */
+  let resumeAt: number;
+
+  /** A project copy that survives a `Harness.stop()`. */
+  const ownedCopy = async (): Promise<FixtureProjectCopy> => {
+    const copy = await copyFixtureProject();
+    projects.push(copy);
+    return copy;
+  };
+
+  /** One service lifetime over the shared home, its clock seeded at `seedMs` when given. */
+  const startLifetime = async (seedMs?: number): Promise<Harness> => {
+    const lifetime = await startHarness({
+      env: { DEBUGGEN_HOME: home },
+      fixtureProject: false,
+      now: seedMs === undefined ? undefined : createHarnessClock(seedMs).now,
+    });
+    lifetimes.push(lifetime);
+    expect(lifetime.config.debuggenHome).toBe(home);
+    return lifetime;
+  };
+
+  /**
+   * Stops a lifetime the way a crash would find it — live sessions open, journal untouched — and
+   * moves the next lifetime's clock past this one.
+   */
+  const stopLifetime = async (lifetime: Harness): Promise<void> => {
+    resumeAt = lifetime.now() + 60_000;
+    await lifetime.service.close({ liveSessions: 'retain' });
+    expect(await lifetime.stop()).toEqual({ clean: true, problems: [] });
+    await lifetime.assertNoLeaks();
+  };
+
+  beforeAll(async () => {
+    home = await mkdtemp(join(realpathSync(tmpdir()), SHARED_HOME_PREFIX));
+  });
+
+  afterAll(async () => {
+    for (const lifetime of lifetimes) {
+      await lifetime.stop();
+    }
+    for (const project of projects) {
+      await project.dispose();
+      expect(await exists(project.container)).toBe(false);
+    }
+    await rm(home, { recursive: true, force: true });
+    expect(await exists(home)).toBe(false);
+  });
+
+  it('leaves a ready session with every patch applied and every original backed up when it stops', async () => {
+    const first = await startLifetime();
+    abandonedProject = await ownedCopy();
+    abandoned = await driveSession(first, abandonedProject.root, QUESTIONS.twoTierLatency, {
+      tabId: 501,
+    });
+    expect(abandoned.session.status).toBe(SESSION.ready);
+    expect(abandoned.records.length).toBeGreaterThan(1);
+
+    for (const record of abandoned.records) {
+      expect((await journalRecord(first, record.id)).status).toBe(MODIFICATION.applied);
+      expect(await sha256OfFile(record.backupPath)).toBe(record.originalHash);
+    }
+    for (const [file, records] of recordsByFile(abandoned.records)) {
+      expect(await hashOf(abandonedProject.root, file)).toBe(chainHead(records).instrumentedHash);
+    }
+    expect((await backupEntries(home, abandoned.sessionId)).sort()).toEqual(
+      [...new Set(abandoned.records.map((record) => record.originalHash))].sort(),
+    );
+
+    expect(storedSession(first, abandoned.sessionId)?.status).toBe(SESSION.ready);
+
+    // The service goes away without ending the session, as a crash or a killed process would.
+    await stopLifetime(first);
+  });
+
+  it('restores every file on the next start and removes the emptied backup directory, as session.end does', async () => {
+    const second = await startLifetime(resumeAt);
+    const report = second.service.startup.reconciliation;
+
+    expect(report.errors).toEqual([]);
+    expect(report.bySession[abandoned.sessionId]).toMatchObject({
+      scanned: abandoned.records.length,
+      restored: abandoned.records.length,
+      closed: 0,
+      conflicts: 0,
+      skipped: 0,
+      failed: 0,
+      status: CLEANUP.clean,
+    });
+
+    // Every record reverted and its backup deleted; every file byte-identical to the pre-session
+    // corpus, with no marker left.
+    for (const record of abandoned.records) {
+      const after = await journalRecord(second, record.id);
+      expect(after.status).toBe(MODIFICATION.reverted);
+      expect(await exists(after.backupPath)).toBe(false);
+    }
+    await assertTreeUnchanged(abandonedProject.root, abandonedProject.snapshot);
+    for (const [file, records] of recordsByFile(abandoned.records)) {
+      expect(await hashOf(abandonedProject.root, file)).toBe(chainRoot(records).originalHash);
+      await expectNoMarkers(abandonedProject.root, file);
+    }
+
+    // The session's backup directory is gone with its last original; the backups root, which
+    // other sessions share, stays.
+    expect(await exists(join(home, 'backups', abandoned.sessionId))).toBe(false);
+    expect(await exists(join(home, 'backups'))).toBe(true);
+
+    // With its patches removed the interrupted session cannot capture, so the start fails it.
+    expect(second.service.startup.interruptedSessions.failed).toEqual([
+      expect.objectContaining({
+        sessionId: abandoned.sessionId,
+        status: SESSION.ready,
+        reason: 'instrumentation-removed',
+      }),
+    ]);
+    expect(storedSession(second, abandoned.sessionId)?.status).toBe(SESSION.failed);
+
+    await stopLifetime(second);
   });
 });

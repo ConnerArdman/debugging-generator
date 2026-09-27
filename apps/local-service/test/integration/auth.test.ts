@@ -95,6 +95,7 @@ import {
   READ_PROOF_HEADER,
   SESSION_PURGE_MAX_REPORTED_SESSIONS,
   WS_CLOSE_UNAUTHORIZED,
+  WS_PATH,
   buildPath,
   clientHelloPayloadSchema,
   errorCodeSchema,
@@ -136,6 +137,7 @@ import {
   PAIRING_CODE_TTL_MS,
   PAIRING_LOCKOUT_MS,
   PAIRING_MAX_FAILURES,
+  REFUSAL_LOG_BURST,
   identifyProjectRoot,
 } from '../../src/server/auth.js';
 import type {
@@ -244,6 +246,13 @@ const PROJECT_FILE = 'src/components/TrailCard.tsx';
  * its lease, which the scope test waits for before it looks.
  */
 const CONNECTION_CLOSED_LOG = 'a WebSocket connection closed';
+
+/**
+ * The record `src/server/ws.ts` files for every upgrade it refuses for its
+ * `Origin`: at `warn` with the origin's `scheme://host` for the first
+ * `REFUSAL_LOG_BURST` of a minute, at `debug` past them.
+ */
+const UPGRADE_ORIGIN_REFUSED_LOG = 'refused a WebSocket upgrade from a refused origin';
 
 /**
  * The debug record the service's agent-readiness ledger (`src/main.ts`) writes,
@@ -1429,14 +1438,35 @@ describe('origin policy', () => {
  * ---------------------------------------------------------------------------------------------- */
 
 describe('WebSocket handshake', () => {
-  it('refuses an upgrade from a web origin before any WebSocket exists', async () => {
-    for (const origin of webOrigins()) {
+  it('refuses an upgrade from a web origin before any WebSocket exists, and files it naming the origin', async () => {
+    // The first web-origin upgrades this service refuses, so the whole burst
+    // of the upgrade gate's refusal log is still unspent.
+    expect(harness.logger.withMessage(UPGRADE_ORIGIN_REFUSED_LOG)).toEqual([]);
+    const mark = harness.logger.records.length;
+    const origins = webOrigins();
+    for (const origin of origins) {
       const raw = harness.rawSocket({ origin });
       expect(await raw.waitForOpen(), `an upgrade from ${origin} opened`).toBe(false);
       expect(raw.upgradeStatus, origin).toBe(AUTH_FAILURE_REASONS['forbidden-origin'].status);
       expect(raw.frames).toEqual([]);
       // No socket ever existed, so there was no WebSocket close handshake to carry a code.
       expect(raw.closes.map((record) => record.code)).not.toContain(WS_CLOSE_UNAUTHORIZED);
+    }
+
+    // Each refusal is filed with its origin — `http://evil.example` first, at
+    // `warn` — the first burst at `warn` and the rest at `debug`, never with
+    // the request target.
+    expect(origins[0]).toBe('http://evil.example');
+    const filed = logsSince(mark, UPGRADE_ORIGIN_REFUSED_LOG);
+    expect(filed.map((record) => record.fields['origin'])).toEqual(origins);
+    expect(filed.map((record) => record.level)).toEqual(
+      origins.map((_origin, index) => (index < REFUSAL_LOG_BURST ? 'warn' : 'debug')),
+    );
+    expect(filed[0]?.fields).toMatchObject({ status: 403, suppressed: 0 });
+    for (const record of filed) {
+      expect(record.line.includes(WS_PATH), 'a refusal record names the request target').toBe(
+        false,
+      );
     }
   });
 
@@ -3999,5 +4029,258 @@ describe('the revocation fence across a stalled request body', () => {
   it('keeps every credential the fence saw out of the store and the log', async () => {
     await assertNoPlaintextAtRest();
     assertNothingLogged();
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The request media type
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The status of a body sent under a media type other than JSON. */
+const UNSUPPORTED_MEDIA_TYPE_STATUS = 415;
+
+/** The two editor operations the media-type rule is proven on over the wire. */
+type MediaTypeOperation = 'pair.start' | 'session.purge';
+
+/** The empty JSON object both operations declare, as the bytes a client sends. */
+const EMPTY_OBJECT_BYTES = new TextEncoder().encode('{}');
+
+/**
+ * Sends `operation` with the editor credential, carrying exactly the
+ * `Content-Type` named — none at all when `undefined` — and `body` as bytes,
+ * so the platform adds no media type of its own (a string body would be sent
+ * as `text/plain`). {@link Harness.rawFetch} cannot express the header's
+ * absence: it labels every body JSON. The reply passes the same CORS and leak
+ * checks as every {@link fetchRaw} reply.
+ */
+async function sendWithMediaType(
+  operation: MediaTypeOperation,
+  contentType: string | undefined,
+  body: Uint8Array | undefined,
+): Promise<RawFetchResponse> {
+  const headers: Record<string, string> = {
+    [AUTHORIZATION_HEADER]: formatBearer(harness.editorToken),
+  };
+  if (contentType !== undefined) {
+    headers['content-type'] = contentType;
+  }
+  const response = await fetch(new URL(buildPath(operation), harness.url), {
+    method: HTTP_ROUTES[operation].method,
+    headers,
+    ...(body === undefined ? {} : { body }),
+    signal: AbortSignal.timeout(HARNESS_TIMEOUTS.request),
+  });
+  const text = await response.text();
+  let json: unknown;
+  try {
+    json = text.length === 0 ? undefined : JSON.parse(text);
+  } catch {
+    json = undefined;
+  }
+  const reply: RawFetchResponse = {
+    status: response.status,
+    headers: response.headers,
+    text,
+    json,
+  };
+  expectNoCorsGrant(reply);
+  expect(leaksIn(reply.text), `a ${String(reply.status)} reply echoes a secret`).toEqual([]);
+  inspectedResponses += 1;
+  return reply;
+}
+
+/** The media types a JSON body is refused under, the header's absence included. */
+const REFUSED_MEDIA_TYPES: readonly (readonly [string, string | undefined])[] = [
+  ['text/plain', 'text/plain'],
+  ['a form encoding', 'application/x-www-form-urlencoded'],
+  ['no Content-Type at all', undefined],
+];
+
+/** The media types a JSON body is read under. */
+const ACCEPTED_MEDIA_TYPES: readonly string[] = [
+  'application/json',
+  'application/json; charset=utf-8',
+];
+
+/** Asserts the guard's `415`: protocol's error body, the transport's code, no-store. */
+function expectUnsupportedMediaType(response: RawFetchResponse, label: string): void {
+  expect(response.status, `${label}: status`).toBe(UNSUPPORTED_MEDIA_TYPE_STATUS);
+  const parsed = httpErrorResponseSchema.safeParse(response.json);
+  if (!parsed.success) {
+    throw new Error(`${label}: the 415 body is not protocol's error shape.`);
+  }
+  expect(parsed.data.code, `${label}: code`).toBe(INVALID_BODY_CODE);
+  expect(response.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
+}
+
+describe('the request media type', () => {
+  it('refuses a pairing request whose JSON body is not sent as JSON with 415, and mints no code', async () => {
+    for (const [label, contentType] of REFUSED_MEDIA_TYPES) {
+      const codesBefore = readRows(SELECT_PAIRING_CODES);
+      const logMark = harness.logger.records.length;
+
+      const response = await sendWithMediaType('pair.start', contentType, EMPTY_OBJECT_BYTES);
+
+      expectUnsupportedMediaType(response, `pair.start as ${label}`);
+      expect(pairStartResponseSchema.safeParse(response.json).success).toBe(false);
+      expect(readRows(SELECT_PAIRING_CODES)).toEqual(codesBefore);
+      expect(logsSince(logMark, PAIRING_CODE_ISSUED_LOG)).toEqual([]);
+    }
+  });
+
+  it('mints a code for the same body sent as JSON', async () => {
+    for (const contentType of ACCEPTED_MEDIA_TYPES) {
+      const logMark = harness.logger.records.length;
+
+      const response = await sendWithMediaType('pair.start', contentType, EMPTY_OBJECT_BYTES);
+
+      expect(response.status, contentType).toBe(200);
+      const parsed = pairStartResponseSchema.safeParse(response.json);
+      if (!parsed.success) {
+        throw new Error(`pair.start as ${contentType}: the reply does not satisfy its schema.`);
+      }
+      track('pairing code', parsed.data.code);
+      expect(pairingCodeStored(parsed.data.code)).toBe(true);
+      expect(logsSince(logMark, PAIRING_CODE_ISSUED_LOG)).toHaveLength(1);
+    }
+  });
+
+  it('refuses a purge whose body is not sent as JSON with 415, before a sweep runs', async () => {
+    const before = await heldSessionIds();
+    for (const [label, contentType] of REFUSED_MEDIA_TYPES) {
+      const logMark = harness.logger.records.length;
+
+      const response = await sendWithMediaType('session.purge', contentType, EMPTY_OBJECT_BYTES);
+
+      expectUnsupportedMediaType(response, `session.purge as ${label}`);
+      expect(logsSince(logMark, PURGE_REQUEST_LOG)).toEqual([]);
+      expect(logsSince(logMark, RETENTION_SWEEP_LOG)).toEqual([]);
+    }
+    expect(await heldSessionIds()).toEqual(before);
+  });
+
+  it('runs a purge sent as JSON, and a bodiless purge that carries no Content-Type', async () => {
+    const requests: readonly (readonly [string, string | undefined, Uint8Array | undefined])[] = [
+      ...ACCEPTED_MEDIA_TYPES.map(
+        (contentType) => [contentType, contentType, EMPTY_OBJECT_BYTES] as const,
+      ),
+      ['no body and no Content-Type', undefined, undefined],
+    ];
+    for (const [label, contentType, body] of requests) {
+      const logMark = harness.logger.records.length;
+
+      const response = await sendWithMediaType('session.purge', contentType, body);
+
+      expect(response.status, label).toBe(200);
+      expect(sessionContentDeleted(purgeReportOf(response))).toEqual(NOTHING_DELETED);
+      expect(logsSince(logMark, PURGE_REQUEST_LOG)).toHaveLength(1);
+    }
+  });
+
+  it('keeps every code the media-type checks minted out of the store and the log', async () => {
+    await assertNoPlaintextAtRest();
+    assertNothingLogged();
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * What a refused request tells the developer
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The response header every reply carries its correlation ref in. */
+const REF_HEADER = 'x-debuggen-ref';
+
+/** The `info` record the HTTP surface files for every request it answered with a failure. */
+const FAILURE_ANSWERED_LOG = 'Answered an HTTP request with a failure';
+
+/** The `warn` record the access boundary files for every HTTP request it refuses. */
+const HTTP_REFUSAL_LOG = 'refused an HTTP request';
+
+/** The record the HTTP surface's origin guard files for every web origin it refuses. */
+const ORIGIN_REFUSED_LOG = 'Refused a request from an origin this service never serves';
+
+/** A well-formed session id no session of this service holds. */
+const UNKNOWN_SESSION_ID = 'ses_doesnotexist0000';
+
+/**
+ * Asserts that a failure reply names one ref in its body and its header, and
+ * that the HTTP surface filed exactly one `info` failure record under it since
+ * `mark`, with the reply's status and code. Returns the ref.
+ */
+function expectCorrelatedFailure(response: RawFetchResponse, mark: number, label: string): string {
+  const parsed = httpErrorResponseSchema.safeParse(response.json);
+  if (!parsed.success) {
+    throw new Error(`${label}: the failure body is not protocol's error shape.`);
+  }
+  const { ref } = parsed.data;
+  if (ref === undefined) {
+    throw new Error(`${label}: the failure body names no ref.`);
+  }
+  expect(response.headers.get(REF_HEADER), `${label}: the ref header`).toBe(ref);
+  const filed = logsSince(mark, FAILURE_ANSWERED_LOG).filter(
+    (record) => record.fields['ref'] === ref,
+  );
+  expect(filed, `${label}: the failure record`).toHaveLength(1);
+  expect(filed[0]?.level).toBe('info');
+  expect(filed[0]?.fields['status']).toBe(response.status);
+  expect(filed[0]?.fields['errorCode']).toBe(parsed.data.code);
+  return ref;
+}
+
+describe('what a refused request tells the developer', () => {
+  it('names one ref in the body, the header and the records of every kind of HTTP failure', async () => {
+    let mark = harness.logger.records.length;
+    const unauthenticated = await fetchRaw('session.list', { token: null });
+    expect(unauthenticated.status).toBe(AUTH_FAILURE_REASONS['missing-credential'].status);
+    const refusalRef = expectCorrelatedFailure(unauthenticated, mark, 'a missing credential');
+    // The access boundary's own warn record is filed under the same ref.
+    const refusals = logsSince(mark, HTTP_REFUSAL_LOG);
+    expect(refusals.map((record) => [record.level, record.fields['ref']])).toEqual([
+      ['warn', refusalRef],
+    ]);
+
+    mark = harness.logger.records.length;
+    const unknown = await fetchRaw(targetFor('session.get', UNKNOWN_SESSION_ID));
+    expect(unknown.status).toBe(404);
+    expect(refusalShape(unknown).code).toBe('SESSION_NOT_FOUND');
+    expectCorrelatedFailure(unknown, mark, 'an unknown session');
+
+    mark = harness.logger.records.length;
+    const malformed = await fetchRaw('session.create', { body: '{bad' });
+    expect(malformed.status).toBe(INVALID_BODY_STATUS);
+    expectCorrelatedFailure(malformed, mark, 'a body that is not JSON');
+
+    mark = harness.logger.records.length;
+    const incomplete = await fetchRaw('session.create', { body: {} });
+    expect(incomplete.status).toBe(INVALID_BODY_STATUS);
+    expectCorrelatedFailure(incomplete, mark, 'a body missing its fields');
+
+    // A success names its ref in the header only.
+    const answered = await fetchRaw('health', { token: null });
+    expect(answered.status).toBe(200);
+    expect(answered.headers.get(REF_HEADER)).toMatch(/^msg_[0-9a-z]{16}$/u);
+  });
+
+  it("names the web origin it refused, and the ref of the refusal, in the origin guard's record", async () => {
+    const origin = STATIC_WEB_ORIGINS[0];
+    const mark = harness.logger.records.length;
+
+    const response = await fetchRaw('health', {
+      token: null,
+      origin: `${origin}/zz-page?zz-query=1`,
+    });
+    const refused = expectRefusal(response, 'forbidden-origin');
+
+    expect(refused.ref).toMatch(/^msg_[0-9a-z]{16}$/u);
+    // The guard mints the ref of its own refusal: body and header agree.
+    expect(response.headers.get(REF_HEADER)).toBe(refused.ref);
+    const filed = logsSince(mark, ORIGIN_REFUSED_LOG);
+    expect(filed).toHaveLength(1);
+    // Filed at `warn` within the burst of a minute, at `debug` past it (the
+    // origin-policy suite refused many before this); the record is the same.
+    expect(['warn', 'debug']).toContain(filed[0]?.level);
+    expect(filed[0]?.fields).toMatchObject({ origin, ref: refused.ref, status: 403 });
+    expect(filed[0]?.line.includes('zz-page')).toBe(false);
+    expect(filed[0]?.line.includes('zz-query')).toBe(false);
   });
 });

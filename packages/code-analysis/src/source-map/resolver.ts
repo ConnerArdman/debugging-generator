@@ -129,6 +129,35 @@
  * rather than a type error; in behaviour it is required, and the session's
  * `devServerUrl` (AAP 0.2.3) is what to pass.
  *
+ * ## Frames of a hot-updated module
+ *
+ * Most frames are **chunk-relative**: V8 reports the line and column in the
+ * chunk file, and the chunk's map — an index map, for Turbopack — is read in
+ * those absolute coordinates. One kind is not. When Turbopack's dev runtime
+ * applies a hot update it `eval`s each changed module's factory with a
+ * `//# sourceURL` of `<chunk>.js?id=<module id>`, so the frames of that
+ * module's code — for this product, typically a file an instrumentation patch
+ * just rewrote — carry the chunk's URL plus that one query parameter and
+ * positions **relative to the evaluated module**. Read against the chunk's map
+ * those positions land in whatever module happens to open the chunk, usually
+ * a dependency, and the frame would be refused as not project source.
+ *
+ * Such a frame is therefore recognised by its URL ({@link moduleRelativeChunkOf})
+ * and mapped differently ({@link resolveModuleRelativeFrame}):
+ *
+ * | Step | What happens |
+ * | --- | --- |
+ * | map | the chunk's map, from the URL without the query — the chunk as served now, which contains the updated module |
+ * | coordinates | each project section's own map, the line moved up by Turbopack's three-line module prelude |
+ * | acceptance | a segment must **start** at the position, and the location must pass every check an ordinary frame's does |
+ * | choice | one distinct answer; else the one in a file known to be re-evaluated ({@link ResolveStackOptions.reevaluatedFiles}); else the one whose section names the frame's function; else nothing |
+ *
+ * A chunk whose map is not an index map is not Turbopack's, so a frame with
+ * such a query there is mapped chunk-relative like any other. The per-module
+ * map a Next.js dev server can serve is not used: that endpoint is one
+ * framework's, and it needs the module id, which is redacted before a stack
+ * reaches this module.
+ *
  * ## Dependencies
  *
  * `@debuggen/shared` and `@debuggen/shared/node` are the only `@debuggen/*`
@@ -179,7 +208,13 @@ import {
 } from '@debuggen/shared';
 import type { LogFields, Logger, SourceLocation } from '@debuggen/shared';
 import { readFileNoFollow } from '@debuggen/shared/node';
-import { AnyMap, TraceMap, originalPositionFor, sourceContentFor } from '@jridgewell/trace-mapping';
+import {
+  AnyMap,
+  TraceMap,
+  originalPositionFor,
+  sourceContentFor,
+  traceSegment,
+} from '@jridgewell/trace-mapping';
 import type { EncodedSourceMap, SectionedSourceMap } from '@jridgewell/trace-mapping';
 
 import { fetchSourceMap, isSectionedSourceMap } from './fetch-map.js';
@@ -257,6 +292,14 @@ export interface StackFrame {
   /** The **1-based** column in the generated chunk, as V8 reports it. */
   readonly column: number;
 }
+
+/**
+ * The files a dev server re-evaluated, as {@link ResolveStackOptions.reevaluatedFiles}
+ * takes them: the project-relative paths, or a function that produces them when
+ * first needed.
+ */
+export type ReevaluatedFiles =
+  readonly string[] | (() => readonly string[] | PromiseLike<readonly string[]>);
 
 /**
  * Everything {@link resolveStack} and {@link resolveStackFrame} need.
@@ -350,6 +393,26 @@ export interface ResolveStackOptions {
   readonly maxMaps?: number | undefined;
 
   /**
+   * The project-relative POSIX paths of files the caller knows a dev server
+   * re-evaluated in a hot update while the stack was captured — for this
+   * product, the files an instrumentation patch in force at the time wrote.
+   *
+   * Consulted for a **module-relative** frame only (see "Frames of a
+   * hot-updated module" in the module overview), and only to choose between
+   * two or more module sections of its chunk that each map the frame exactly:
+   * the frame ran in the module that was re-evaluated. It is never a reason to
+   * accept a location on its own, and a frame no candidate section maps is
+   * skipped whatever it lists. At most {@link MAX_REEVALUATED_FILES} entries
+   * are read; entries that are not strings are ignored.
+   *
+   * Either the list itself or a function producing it. A function is called at
+   * most once per call, and only when a frame actually needs the tie-breaker,
+   * so a caller whose list costs a read — a modification journal — pays for it
+   * only then. A function that throws or rejects reads as no list.
+   */
+  readonly reevaluatedFiles?: ReevaluatedFiles | undefined;
+
+  /**
    * A caller's cancellation signal — a session ending, a panel interaction
    * superseded.
    *
@@ -408,6 +471,47 @@ const MAX_SECTION_DEPTH = 16;
  * identifier is a wrong answer rather than a short one.
  */
 const MAX_SYMBOL_LENGTH = 128;
+
+/**
+ * How many {@link ResolveStackOptions.reevaluatedFiles} entries are read.
+ *
+ * The list is a tie-breaker between a handful of module sections, so a session
+ * that patched more files than this has no use for the rest, and a caller's
+ * list — which may come from a journal of any length — cannot make one frame's
+ * resolution walk it without bound.
+ */
+const MAX_REEVALUATED_FILES = 256;
+
+/**
+ * The one query key Turbopack's dev runtime puts on the `//# sourceURL` of a
+ * module it re-evaluates in a hot update: `<chunk>.js?id=<module id>`.
+ *
+ * The runtime applies an update by `eval`-ing each changed module's factory
+ * with that `sourceURL` and an inline map of its own, so V8 reports frames of
+ * the re-evaluated code against the chunk's URL plus this query, at positions
+ * **relative to the evaluated module** rather than to the chunk. The value is
+ * the module id (and is redacted to `?` before a stack reaches this module in
+ * this product), so only the key is recognised. See "Frames of a hot-updated
+ * module" in the module overview.
+ */
+const TURBOPACK_MODULE_QUERY_KEY = 'id';
+
+/**
+ * How many lines of an evaluated Turbopack module precede the first line its
+ * section of the chunk's map describes.
+ *
+ * Turbopack writes every ECMAScript module entry of a chunk as three lines of
+ * runtime prelude — the module id and factory head
+ * (`"<id>", ((__turbopack_context__) => {`), `"use strict";` and a blank line
+ * — followed by the module's code, and a chunk's index map starts that
+ * module's section exactly there, at the header's line plus three. A hot
+ * update evaluates the same entry text, so module-relative line `L` is line
+ * `L - 3` of the section's own map. Checked against the chunks of a Next.js
+ * 16 (Turbopack) dev server: every ECMAScript project module's section starts
+ * three lines below its header, and the probed hot-update frames map to a
+ * segment start at exactly this offset and at no neighbouring one.
+ */
+const TURBOPACK_MODULE_PRELUDE_LINES = 3;
 
 /** Line terminators a source file may use, in any combination. */
 const LINE_BREAK = /\r\n|\n|\r/;
@@ -550,6 +654,12 @@ interface ResolverSettings {
   readonly readSourceFile: (absPath: string) => string | undefined;
   readonly maxFrames: number;
   readonly maxMaps: number;
+
+  /**
+   * {@link ResolveStackOptions.reevaluatedFiles}, read at most once per call —
+   * on first use — and memoised; never rejects.
+   */
+  readonly reevaluatedFiles: () => Promise<ReadonlySet<string>>;
   readonly signal: AbortSignal | undefined;
   readonly logger: Logger;
 }
@@ -572,6 +682,26 @@ interface LoadedMap {
    * source order. A `null` entry is one the producer withheld.
    */
   readonly authoredSources: readonly (string | null)[];
+
+  /**
+   * The document the tracer was built from, kept for the one reading the
+   * flattened tracer cannot give: a sectioned document's sections one by one
+   * ({@link moduleSectionsFor}). Treated as read-only, like every document.
+   */
+  readonly document: SourceMapDocument;
+}
+
+/**
+ * One top-level section of a chunk's index map, loaded on its own: the unit a
+ * module-relative frame is mapped in (see "Frames of a hot-updated module" in
+ * the module overview).
+ */
+interface ModuleSection {
+  /** The section's own map, in the section's own (unshifted) coordinates. */
+  readonly loaded: LoadedMap;
+
+  /** The section's `names`, for matching a frame's function name against it. */
+  readonly names: ReadonlySet<string>;
 }
 
 /**
@@ -587,6 +717,13 @@ interface LoadedMap {
 interface ResolutionBudget {
   readonly maps: Map<string, LoadedMap | undefined>;
   readonly contentLines: Map<string, readonly string[] | undefined>;
+
+  /**
+   * The project module sections of each chunk a module-relative frame pointed
+   * into, keyed by chunk URL: built once per chunk per call, because a stack's
+   * frames of one hot-updated module all land in the same chunk.
+   */
+  readonly moduleSections: Map<string, readonly ModuleSection[]>;
   remaining: number;
 
   /**
@@ -638,6 +775,7 @@ function normalizeOptions(options: ResolveStackOptions): ResolverSettings {
   const given: Partial<ResolveStackOptions> = typeof bag === 'object' && bag !== null ? bag : {};
 
   const origin = typeof given.devServerOrigin === 'string' ? given.devServerOrigin.trim() : '';
+  const logger = given.logger ?? noopLogger;
 
   return {
     projectRoot: typeof given.projectRoot === 'string' ? given.projectRoot : '',
@@ -648,8 +786,9 @@ function normalizeOptions(options: ResolveStackOptions): ResolverSettings {
     readSourceFile: given.readSourceFile ?? readProjectFile,
     maxFrames: positiveIntegerOr(given.maxFrames, DEFAULT_MAX_FRAMES),
     maxMaps: positiveIntegerOr(given.maxMaps, DEFAULT_MAX_MAPS),
+    reevaluatedFiles: reevaluatedFilesReader(given.reevaluatedFiles, logger),
     signal: given.signal,
-    logger: given.logger ?? noopLogger,
+    logger,
   };
 }
 
@@ -690,6 +829,7 @@ function newBudget(settings: ResolverSettings): ResolutionBudget {
   return {
     maps: new Map(),
     contentLines: new Map(),
+    moduleSections: new Map(),
     remaining: settings.maxMaps,
     canonicalRoot: undefined,
   };
@@ -698,6 +838,62 @@ function newBudget(settings: ResolverSettings): ResolutionBudget {
 /** `value` when it is a positive safe integer, otherwise `fallback`. */
 function positiveIntegerOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * {@link ResolveStackOptions.reevaluatedFiles}, read defensively: the string
+ * entries of an array, trimmed, non-empty, at most
+ * {@link MAX_REEVALUATED_FILES} of them. Anything else reads as none.
+ */
+function reevaluatedFilesOf(value: unknown): ReadonlySet<string> {
+  const files = new Set<string>();
+  if (!Array.isArray(value)) {
+    return files;
+  }
+
+  for (const entry of (value as readonly unknown[]).slice(0, MAX_REEVALUATED_FILES)) {
+    if (typeof entry === 'string') {
+      const file = entry.trim();
+      if (file.length > 0) {
+        files.add(file);
+      }
+    }
+  }
+
+  return files;
+}
+
+/**
+ * {@link ResolveStackOptions.reevaluatedFiles} as a read made at most once,
+ * on first use: a list is read as it is; a function is called then, its answer
+ * awaited, and a throw or a rejection read as no list, noted at `debug`. The
+ * memo is this call's, since settings are built per call.
+ */
+function reevaluatedFilesReader(
+  value: unknown,
+  logger: Logger,
+): () => Promise<ReadonlySet<string>> {
+  let read: Promise<ReadonlySet<string>> | undefined;
+
+  const readOnce = async (): Promise<ReadonlySet<string>> => {
+    if (typeof value !== 'function') {
+      return reevaluatedFilesOf(value);
+    }
+    try {
+      const produced: unknown = await (value as () => unknown)();
+      return reevaluatedFilesOf(produced);
+    } catch (error) {
+      logger.debug('The re-evaluated files could not be read; no tie-breaker is applied', {
+        reason: describeError(error),
+      });
+      return new Set<string>();
+    }
+  };
+
+  return () => {
+    read ??= readOnce();
+    return read;
+  };
 }
 
 /**
@@ -1126,10 +1322,10 @@ function createLoadedMap(document: SourceMapDocument, logger: Logger): LoadedMap
         });
         return undefined;
       }
-      return { tracer: new AnyMap(sectioned), authoredSources };
+      return { tracer: new AnyMap(sectioned), authoredSources, document };
     }
 
-    return { tracer: new TraceMap(plainInputFor(document)), authoredSources };
+    return { tracer: new TraceMap(plainInputFor(document)), authoredSources, document };
   } catch (error) {
     logger.debug('Source map could not be decoded; frame skipped', {
       reason: describeError(error),
@@ -1751,12 +1947,21 @@ function identifierAt(text: string, column: number): string | undefined {
  *    enables;
  * 6. the symbol, in its precedence order;
  * 7. conversion 2 of 2 and validation against the shared schema.
+ *
+ * A frame of a hot-updated Turbopack module is module-relative rather than
+ * chunk-relative, and takes {@link resolveModuleRelativeFrame} instead of
+ * steps 1–3; steps 4–7 ({@link locationFor}) are the same for both.
  */
 async function resolveMappedFrame(
   frame: StackFrame,
   settings: ResolverSettings,
   budget: ResolutionBudget,
 ): Promise<SourceLocation | undefined> {
+  const moduleChunk = moduleRelativeChunkOf(frame.url);
+  if (moduleChunk !== undefined) {
+    return resolveModuleRelativeFrame(frame, moduleChunk, settings, budget);
+  }
+
   const loaded = await loadedMapFor(frame.url, settings, budget);
   if (loaded === undefined) {
     return undefined;
@@ -1775,6 +1980,25 @@ async function resolveMappedFrame(
     return undefined;
   }
 
+  return locationFor(loaded, frame.url, position, settings, budget);
+}
+
+/**
+ * Steps 4–7 of {@link resolveMappedFrame} for a position one map reported: the
+ * project-relative path, the content and the position check it enables, the
+ * symbol, and conversion 2 of 2 with schema validation. Every failure is a
+ * skip, explained at `debug` (or by `normalizeSourcePath`).
+ *
+ * @param loaded The map that reported `position` — a chunk's, or one section's.
+ * @param chunkUrl The chunk the map belongs to; keys the content memo.
+ */
+function locationFor(
+  loaded: LoadedMap,
+  chunkUrl: string,
+  position: MappedPosition,
+  settings: ResolverSettings,
+  budget: ResolutionBudget,
+): SourceLocation | undefined {
   const projectSource = projectFileFor(loaded, position.source, settings);
   if (projectSource === undefined) {
     // Not project source: a dependency, a bundler internal, or a path that
@@ -1783,7 +2007,7 @@ async function resolveMappedFrame(
   }
   const { file, source } = projectSource;
 
-  const lines = contentLinesFor(loaded.tracer, frame.url, source, file, settings, budget);
+  const lines = contentLinesFor(loaded.tracer, chunkUrl, source, file, settings, budget);
 
   if (lines !== undefined && !positionWithinContent(lines, position.line, position.column)) {
     settings.logger.debug(
@@ -1826,6 +2050,268 @@ async function resolveMappedFrame(
   }
 
   return parsed.value;
+}
+
+// ---------------------------------------------------------------------------
+// Frames of a hot-updated module
+// ---------------------------------------------------------------------------
+
+/**
+ * The chunk a **module-relative** frame belongs to, or `undefined` for an
+ * ordinary chunk-relative one.
+ *
+ * A module-relative frame is one Turbopack's dev runtime produced by
+ * re-evaluating a module in a hot update: its URL is a `.js` chunk URL whose
+ * query is exactly one {@link TURBOPACK_MODULE_QUERY_KEY} parameter, whatever
+ * its value (the module id, or `?` once redacted), and it has no fragment. The
+ * chunk is that URL with the query removed — the URL the chunk and its map are
+ * served at, and the key its map is loaded under once per call however many
+ * frames point into it.
+ */
+function moduleRelativeChunkOf(url: string): string | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return undefined;
+  }
+
+  if (parsed.hash.length > 0 || !parsed.pathname.endsWith('.js')) {
+    return undefined;
+  }
+
+  const keys = [...parsed.searchParams.keys()];
+  if (keys.length !== 1 || keys[0] !== TURBOPACK_MODULE_QUERY_KEY) {
+    return undefined;
+  }
+
+  parsed.search = '';
+  return parsed.href;
+}
+
+/**
+ * The `names` of a document, in the order a flattened tracer would hold them;
+ * empty past {@link MAX_SECTION_DEPTH}, like every walk of a sectioned map.
+ */
+function namesOf(document: SourceMapDocument, depth: number): readonly string[] {
+  if (!isSectionedSourceMap(document)) {
+    return document.names ?? [];
+  }
+
+  if (depth >= MAX_SECTION_DEPTH) {
+    return [];
+  }
+
+  return document.sections.flatMap((section) => namesOf(section.map, depth + 1));
+}
+
+/**
+ * The top-level sections of a chunk's index map that describe project source,
+ * each loaded as a map of its own, built at most once per chunk per call.
+ *
+ * A section is kept only when at least one of its sources normalises into the
+ * project ({@link projectFileFor}): a module-relative frame can only be given a
+ * location in project source, so a dependency's section is never traced, and
+ * its refusals are `normalizeSourcePath`'s own `trace` records. A section whose
+ * map cannot be decoded is dropped, like any undecodable map.
+ */
+function moduleSectionsFor(
+  chunkUrl: string,
+  loaded: LoadedMap,
+  settings: ResolverSettings,
+  budget: ResolutionBudget,
+): readonly ModuleSection[] {
+  const held = budget.moduleSections.get(chunkUrl);
+  if (held !== undefined) {
+    return held;
+  }
+
+  const sections: ModuleSection[] = [];
+  if (isSectionedSourceMap(loaded.document)) {
+    for (const section of loaded.document.sections) {
+      const sectionMap = createLoadedMap(section.map, settings.logger);
+      if (sectionMap === undefined) {
+        continue;
+      }
+
+      const describesProject = sectionMap.tracer.resolvedSources.some(
+        (source) => projectFileFor(sectionMap, source, settings) !== undefined,
+      );
+      if (describesProject) {
+        sections.push({ loaded: sectionMap, names: new Set(namesOf(section.map, 0)) });
+      }
+    }
+  }
+
+  budget.moduleSections.set(chunkUrl, sections);
+  return sections;
+}
+
+/**
+ * Whether a mapping segment **starts** at a generated position — the position
+ * a V8 frame reports for a call or a property access it is paused at.
+ *
+ * `originalPositionFor` answers with the nearest segment at or before a
+ * position, which for a position in the wrong module is simply some earlier
+ * segment of that module. Requiring an exact start is what lets a
+ * module-relative position be tried against every candidate section: a real
+ * frame lands on a segment start in the module it ran in, and a section it did
+ * not run in almost never has one at the same line and column.
+ *
+ * @param line The 1-based generated line, in the section's own coordinates.
+ * @param needleColumn The 0-based column, after {@link toNeedleColumn}.
+ */
+function startsSegmentAt(tracer: TraceMap, line: number, needleColumn: number): boolean {
+  try {
+    // `traceSegment` takes a 0-based line, unlike `originalPositionFor`.
+    const segment = traceSegment(tracer, line - 1, needleColumn);
+    return segment !== null && segment[0] === needleColumn;
+  } catch {
+    return false;
+  }
+}
+
+/** A location one module section gave a module-relative frame, and that section's names. */
+interface ModuleCandidate {
+  readonly location: SourceLocation;
+  readonly names: ReadonlySet<string>;
+}
+
+/**
+ * The one location a module-relative frame may be given, or `undefined`.
+ *
+ * Candidates that agree on file, line and column are one answer. More than one
+ * distinct answer is narrowed, in order, by:
+ *
+ * 1. {@link ResolveStackOptions.reevaluatedFiles} — the frame ran in a module
+ *    the dev server re-evaluated, and a file the caller knows was re-evaluated
+ *    is that module;
+ * 2. the frame's function name among a section's `names` — the generated name
+ *    of a frame is the authored one in a dev build, and a module that does not
+ *    name it did not run it.
+ *
+ * A step that leaves exactly one answer decides; one that leaves none is not
+ * applied. Whatever is still ambiguous afterwards is skipped rather than
+ * guessed: a wrong chip at `source-map` confidence opens the developer's
+ * editor on code that never ran, and three other resolution routes remain.
+ */
+async function chooseModuleCandidate(
+  candidates: readonly ModuleCandidate[],
+  frame: StackFrame,
+  settings: ResolverSettings,
+): Promise<SourceLocation | undefined> {
+  const distinct: ModuleCandidate[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const { file, line, column } = candidate.location;
+    const key = `${file}:${String(line)}:${String(column)}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      distinct.push(candidate);
+    }
+  }
+
+  if (distinct.length <= 1) {
+    return distinct[0]?.location;
+  }
+
+  // Read only now: most frames have one answer, and the list may cost a read.
+  const reevaluatedFiles = await settings.reevaluatedFiles();
+  let pool: readonly ModuleCandidate[] = distinct;
+  const reevaluated = pool.filter((candidate) => reevaluatedFiles.has(candidate.location.file));
+  if (reevaluated.length === 1) {
+    return reevaluated[0]?.location;
+  }
+  if (reevaluated.length > 1) {
+    pool = reevaluated;
+  }
+
+  const fn = frame.fn;
+  if (fn !== undefined) {
+    const named = pool.filter((candidate) => candidate.names.has(fn));
+    if (named.length === 1) {
+      return named[0]?.location;
+    }
+  }
+
+  settings.logger.debug('A hot-updated module frame maps into several project modules; skipped', {
+    candidates: distinct.length,
+    reevaluatedCandidates: reevaluated.length,
+  });
+  return undefined;
+}
+
+/**
+ * Resolves a module-relative frame — one of a module Turbopack re-evaluated in
+ * a hot update — against the sections of its chunk's map.
+ *
+ * The chunk's map is loaded as for any frame, from the chunk URL without the
+ * module query, and describes the chunk as the dev server serves it now: the
+ * rebuilt chunk, which contains the updated module. The frame's position is
+ * relative to the evaluated module, so it is mapped in each project section's
+ * *own* coordinates, {@link TURBOPACK_MODULE_PRELUDE_LINES} lines up, and a
+ * section answers only where a segment starts exactly there
+ * ({@link startsSegmentAt}); the answers then pass every check an ordinary
+ * frame's does ({@link locationFor}) and one is chosen
+ * ({@link chooseModuleCandidate}).
+ *
+ * A chunk whose map is not an index map is not a Turbopack chunk — its query is
+ * the application's own — so its frame is mapped like any other,
+ * chunk-relative.
+ */
+async function resolveModuleRelativeFrame(
+  frame: StackFrame,
+  chunkUrl: string,
+  settings: ResolverSettings,
+  budget: ResolutionBudget,
+): Promise<SourceLocation | undefined> {
+  const loaded = await loadedMapFor(chunkUrl, settings, budget);
+  if (loaded === undefined) {
+    return undefined;
+  }
+
+  // Conversion 1 of 2, as for every frame: the needle column is 0-based.
+  const needleColumn = toNeedleColumn(frame.column);
+
+  if (!isSectionedSourceMap(loaded.document)) {
+    const position = mappedPositionFor(loaded.tracer, frame.line, needleColumn, settings.logger);
+    return position === undefined
+      ? undefined
+      : locationFor(loaded, chunkUrl, position, settings, budget);
+  }
+
+  const line = frame.line - TURBOPACK_MODULE_PRELUDE_LINES;
+  if (line < 1) {
+    settings.logger.debug('Hot-updated module frame lies in the module prelude; frame skipped', {
+      line: frame.line,
+    });
+    return undefined;
+  }
+
+  const sections = moduleSectionsFor(chunkUrl, loaded, settings, budget);
+  const candidates: ModuleCandidate[] = [];
+  for (const section of sections) {
+    if (!startsSegmentAt(section.loaded.tracer, line, needleColumn)) {
+      continue;
+    }
+
+    const position = mappedPositionFor(section.loaded.tracer, line, needleColumn, settings.logger);
+    const location =
+      position === undefined
+        ? undefined
+        : locationFor(section.loaded, chunkUrl, position, settings, budget);
+    if (location !== undefined) {
+      candidates.push({ location, names: section.names });
+    }
+  }
+
+  const chosen = await chooseModuleCandidate(candidates, frame, settings);
+  settings.logger.debug('Mapped a hot-updated module frame against its chunk sections', {
+    projectSections: sections.length,
+    candidates: candidates.length,
+    resolved: chosen !== undefined,
+  });
+  return chosen;
 }
 
 /**

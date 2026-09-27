@@ -126,6 +126,7 @@ import {
   type ContextBuilder,
   type ContextBuilderDeps,
   type ContextBuilderStage,
+  type FollowUpDeclarationCandidate,
   type PipelineCodeHandles,
   type PipelineStageContext,
   type StageRequestBuild,
@@ -1636,6 +1637,102 @@ describe('dual payload', () => {
     );
     expect(build.request.input['tokens']).toEqual(['export', 'toolbar']);
     expect(build.request.input['currentUrl']).toBe(CURRENT_URL);
+  });
+
+  describe('follow-up hints and named declarations', () => {
+    /** A graph-resolved declaration as `stages/followup.ts` hands it over. */
+    function declaration(index: number): FollowUpDeclarationCandidate {
+      return {
+        file: `src/server/ledger-part-${String(index)}.ts`,
+        symbol: `loadLedgerPart${String(index)}`,
+        kind: 'server-function',
+        score: 1,
+      };
+    }
+
+    it('places the hints and the declarations beside the artifact sections, never the question', () => {
+      const { builder } = builderFixture(committedLibrary());
+      const { context } = stageContext({ followUpQuestion: FOLLOW_UP_QUESTION });
+      const build = expectOk(
+        builder.buildFollowUpRequest({
+          context,
+          followUpQuestion: FOLLOW_UP_QUESTION,
+          understanding: UNDERSTANDING,
+          plan: INSTALLED_PLAN,
+          questionHints: { identifierCandidates: ['loadLedgerPart0'] },
+          candidates: [declaration(0)],
+        }),
+      );
+
+      expect(Object.keys(build.request.input).sort()).toEqual(
+        ['candidates', 'identifierCandidates', 'plan', 'understanding'].sort(),
+      );
+      expect(build.request.input['identifierCandidates']).toEqual(['loadLedgerPart0']);
+      expect(build.request.input['candidates']).toEqual([declaration(0)]);
+      expect(JSON.stringify(build.request.input)).not.toContain(QUESTION_SENTINEL);
+      expect(build.truncated).toEqual([]);
+    });
+
+    it('drops a declaration it cannot vouch for, caps the rest and reports only the cuts', () => {
+      const { builder } = builderFixture(committedLibrary());
+      const { context } = stageContext();
+      const kept = Array.from({ length: CONTEXT_LIMITS.maxListItems }, (_, index) =>
+        declaration(index),
+      );
+
+      // An unsafe path and a non-finite score are not declarations the graph
+      // vouched for: they are dropped without being reported as a cut.
+      const unvouched = expectOk(
+        builder.buildFollowUpRequest({
+          context,
+          followUpQuestion: FOLLOW_UP_QUESTION,
+          candidates: [
+            { ...declaration(0), file: '../outside/ledger.ts' },
+            { ...declaration(1), file: '/abs/ledger.ts' },
+            { ...declaration(2), score: Number.NaN },
+          ],
+        }),
+      );
+      expect(unvouched.request.input['candidates']).toBeUndefined();
+      expect(unvouched.truncated).toEqual([]);
+
+      // A blank or over-length name would name a declaration the graph does not
+      // hold, and a list past the cap loses its tail: each is reported.
+      const cut = expectOk(
+        builder.buildFollowUpRequest({
+          context,
+          followUpQuestion: FOLLOW_UP_QUESTION,
+          candidates: [
+            { ...declaration(900), symbol: '   ' },
+            { ...declaration(901), kind: cycle('k', CONTEXT_LIMITS.maxStringChars + 1) },
+            ...kept,
+            declaration(CONTEXT_LIMITS.maxListItems),
+          ],
+        }),
+      );
+      expect(cut.request.input['candidates']).toEqual(kept);
+      expect(cut.truncated).toEqual(['candidates']);
+    });
+
+    it('refuses hints that would shadow a follow-up context section, before anything is built', () => {
+      const { builder } = builderFixture(committedLibrary());
+      const { context } = stageContext();
+      for (const reserved of ['plan', 'candidates', 'captureSummary']) {
+        const error = expectErr(
+          builder.buildFollowUpRequest({
+            context,
+            followUpQuestion: FOLLOW_UP_QUESTION,
+            questionHints: { [reserved]: ['loadLedgerPart0'], identifierCandidates: [] },
+          }),
+        );
+        expect(error.code).toBe('INTERNAL');
+        expect(error.details).toMatchObject({
+          stage: 'followup',
+          invalidKeys: [],
+          reservedKeys: [reserved],
+        });
+      }
+    });
   });
 
   it('renders the absent marker for a missing element and page, and null for a missing section', () => {

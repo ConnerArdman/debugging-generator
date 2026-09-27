@@ -114,8 +114,12 @@
  *     (imported here as `DependencyGraphNodeSpec`, exactly as the component
  *     aliases it) and the telemetry *datum* for one participant (imported
  *     unaliased alongside `DependencyGraphData` and `DependencyGraphEdge`).
- *     Both arrive as types only; the one runtime import from
- *     `@debuggen/telemetry` is the aggregate itself, for the contract case.
+ *     Both arrive as types only. The runtime imports from `@debuggen/telemetry`
+ *     are the aggregate itself and the vocabularies it is built over
+ *     (`TELEMETRY_KINDS`, `KIND_ALLOWED_TIERS`, `DEPENDENCY_NODE_ROLES`,
+ *     `DEPENDENCY_RENDER_REASONS`), for the contract cases: the component may
+ *     read none of them at runtime, so the suite is what proves its own
+ *     tables agree with them.
  *
  * @see ./DependencyGraph for the component, its four states and its class contract.
  * @see ../host/DataProvider for the seam the stubs below implement.
@@ -135,7 +139,14 @@ import type {
 import { catalogEntryFor } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
-import { buildDependencyGraph, correlateTrace } from '@debuggen/telemetry';
+import {
+  DEPENDENCY_NODE_ROLES,
+  DEPENDENCY_RENDER_REASONS,
+  KIND_ALLOWED_TIERS,
+  TELEMETRY_KINDS,
+  buildDependencyGraph,
+  correlateTrace,
+} from '@debuggen/telemetry';
 import type {
   DependencyGraphData,
   DependencyGraphEdge,
@@ -177,7 +188,7 @@ import {
   layoutDependencyGraph,
   resolveGraphLayering,
 } from '../utils/scale';
-import type { GraphLayering } from '../utils/scale';
+import type { GraphLayering, GraphRowPlan } from '../utils/scale';
 import type * as ScaleModule from '../utils/scale';
 import { DependencyGraph } from './DependencyGraph';
 import { FlameChart } from './FlameChart';
@@ -187,19 +198,29 @@ import { FlameChart } from './FlameChart';
  * The layering call record
  *
  * `../utils/scale` is mocked with its own implementation: every export behaves
- * exactly as shipped, and the two layering entry points additionally record
- * what they were called with, so the layering-once case can prove the component
- * resolves one layering per payload and hands that very object to the layout.
+ * exactly as shipped, and the layering, row-planning and layout entry points
+ * additionally record what they were called with, so the layering-once case
+ * can prove the component resolves one layering and plans one set of rows per
+ * payload, and hands those very objects to the layout.
  * ---------------------------------------------------------------------------
  */
 
-/** What the component asked of the two layering entry points since the last reset. */
+/** What the component asked of the scale module's graph entry points since the last reset. */
 interface ScaleCallRecord {
   /** Every layering `resolveGraphLayering` returned, in call order. */
   readonly resolved: GraphLayering[];
 
   /** The `layering` argument of every `layoutDependencyGraph` call, in call order. */
   readonly supplied: (GraphLayering | undefined)[];
+
+  /** The `layering` argument of every `planGraphRows` call, in call order. */
+  readonly planned: (GraphLayering | undefined)[];
+
+  /** Every plan `planGraphRows` returned, in call order. */
+  readonly plans: GraphRowPlan[];
+
+  /** The `plan` argument of every `layoutDependencyGraph` call, in call order. */
+  readonly suppliedPlans: (GraphRowPlan | undefined)[];
 }
 
 /**
@@ -210,7 +231,13 @@ interface ScaleCallRecord {
  * restores every mock, and this record must not depend on what that does to a
  * spy.
  */
-const scaleCalls = vi.hoisted<ScaleCallRecord>(() => ({ resolved: [], supplied: [] }));
+const scaleCalls = vi.hoisted<ScaleCallRecord>(() => ({
+  resolved: [],
+  supplied: [],
+  planned: [],
+  plans: [],
+  suppliedPlans: [],
+}));
 
 vi.mock('../utils/scale', async (importOriginal) => {
   const actual = await importOriginal<typeof ScaleModule>();
@@ -221,18 +248,34 @@ vi.mock('../utils/scale', async (importOriginal) => {
     return layering;
   };
 
-  const layoutDependencyGraph: typeof actual.layoutDependencyGraph = (data, options, layering) => {
-    scaleCalls.supplied.push(layering);
-    return actual.layoutDependencyGraph(data, options, layering);
+  const planGraphRows: typeof actual.planGraphRows = (data, options, layering) => {
+    scaleCalls.planned.push(layering);
+    const plan = actual.planGraphRows(data, options, layering);
+    scaleCalls.plans.push(plan);
+    return plan;
   };
 
-  return { ...actual, resolveGraphLayering, layoutDependencyGraph };
+  const layoutDependencyGraph: typeof actual.layoutDependencyGraph = (
+    data,
+    options,
+    layering,
+    plan,
+  ) => {
+    scaleCalls.supplied.push(layering);
+    scaleCalls.suppliedPlans.push(plan);
+    return actual.layoutDependencyGraph(data, options, layering, plan);
+  };
+
+  return { ...actual, resolveGraphLayering, planGraphRows, layoutDependencyGraph };
 });
 
 /** Empties {@link scaleCalls}, so a case reads only the calls its own render made. */
 function resetScaleCalls(): void {
   scaleCalls.resolved.length = 0;
   scaleCalls.supplied.length = 0;
+  scaleCalls.planned.length = 0;
+  scaleCalls.plans.length = 0;
+  scaleCalls.suppliedPlans.length = 0;
 }
 
 /*
@@ -423,6 +466,7 @@ type ParticipantOverrides = Partial<
   readonly layer?: number | undefined;
   readonly eventId?: DependencyGraphNode['eventId'] | undefined;
   readonly traceId?: DependencyGraphNode['traceId'] | undefined;
+  readonly roles?: DependencyGraphNode['roles'] | undefined;
 };
 
 /**
@@ -450,6 +494,7 @@ function makeParticipant(overrides: ParticipantOverrides = {}): DependencyGraphN
     layer,
     eventId,
     traceId,
+    roles,
   } = overrides;
 
   return {
@@ -465,6 +510,7 @@ function makeParticipant(overrides: ParticipantOverrides = {}): DependencyGraphN
     ...(layer === undefined ? {} : { layer }),
     ...(eventId === undefined ? {} : { eventId }),
     ...(traceId === undefined ? {} : { traceId }),
+    ...(roles === undefined ? {} : { roles }),
   };
 }
 
@@ -483,6 +529,8 @@ type EdgeOverrides = {
   readonly totalDurationMs?: number | undefined;
   readonly inferredCount?: DependencyGraphEdge['inferredCount'] | undefined;
   readonly ambiguousCount?: DependencyGraphEdge['ambiguousCount'] | undefined;
+  readonly renderTriggers?: DependencyGraphEdge['renderTriggers'] | undefined;
+  readonly contexts?: DependencyGraphEdge['contexts'] | undefined;
 };
 
 /**
@@ -500,6 +548,8 @@ function makeEdge(from: string, to: string, overrides: EdgeOverrides = {}): Depe
     totalDurationMs = 12,
     inferredCount,
     ambiguousCount,
+    renderTriggers,
+    contexts,
   } = overrides;
 
   return {
@@ -510,6 +560,8 @@ function makeEdge(from: string, to: string, overrides: EdgeOverrides = {}): Depe
     totalDurationMs,
     ...(inferredCount === undefined ? {} : { inferredCount }),
     ...(ambiguousCount === undefined ? {} : { ambiguousCount }),
+    ...(renderTriggers === undefined ? {} : { renderTriggers }),
+    ...(contexts === undefined ? {} : { contexts }),
   };
 }
 
@@ -1857,6 +1909,36 @@ describe('DependencyGraph rendering', () => {
       '4',
     ]);
   });
+
+  it("names every participant's time as a sum, and says how it differs from the metric cards", async () => {
+    const stub = resolvingProvider(chainGraph());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    const metaOf = (label: string): string =>
+      shapeNamed(label).parentElement?.querySelector(':scope > text.dg-dependency-graph__node-meta')
+        ?.textContent ?? '';
+
+    // On the canvas, `Σ` marks the time as a sum, before the record count.
+    expect(metaOf(DATASTORE_LABEL)).toBe(`Σ ${formatDurationCompact(640)} · ×2`);
+    expect(metaOf(HANDLER_LABEL)).toBe(`Σ ${formatDurationCompact(18)}`);
+
+    // In the title and the grid, in words.
+    const summed = `Records 2 · Summed ${formatDurationCompact(640)} · Slowest ${formatDurationCompact(420)}`;
+    expect(titleOfShape(shapeNamed(DATASTORE_LABEL))).toContain(summed);
+    expect(within(rowNamed(DATASTORE_LABEL)).getByRole('rowheader').textContent).toContain(summed);
+    expect(screen.getByRole('columnheader', { name: 'Summed time' })).toBeDefined();
+    expect(screen.queryByRole('columnheader', { name: 'Total time' })).toBeNull();
+
+    // And one note under the grid, always, says what a sum is and why it can
+    // exceed the wall-clock durations the metric cards report.
+    const note = screen.getByText(/is the sum of its records' durations/);
+    expect(note.textContent).toBe(
+      `A participant's time (Σ, "Summed") is the sum of its records' durations, so records that overlapped are each counted in full and a participant's time can exceed the wall-clock tier durations the metric cards report.`,
+    );
+    expect(note.closest('.dg-dependency-graph__note')).not.toBeNull();
+  });
 });
 
 describe('DependencyGraph participant detail', () => {
@@ -1898,7 +1980,7 @@ describe('DependencyGraph participant detail', () => {
     expect(label.closest('.dg-tooltip')).toBeNull();
 
     const tier = node.tier === undefined ? '' : `${formatTierLabel(node.tier)} · `;
-    const metrics = `Records ${String(node.count)} · Total ${formatDurationCompact(node.totalDurationMs)} · Slowest ${formatDurationCompact(node.maxDurationMs)}`;
+    const metrics = `Records ${String(node.count)} · Summed ${formatDurationCompact(node.totalDurationMs)} · Slowest ${formatDurationCompact(node.maxDurationMs)}`;
     const header = within(row).getByRole('rowheader');
     expect(header.textContent).toBe(`${node.label}${tier}${metrics}`);
     expect(header.querySelector('[role="tooltip"]')).toBeNull();
@@ -2499,6 +2581,15 @@ describe('DependencyGraph layering', () => {
     expect(resolved?.computed).toBe(true);
     expect(scaleCalls.supplied[0]).toBe(resolved);
 
+    // The rows are planned once too, from that same layering, and the layout
+    // draws that very plan — the one the column gap was sized from — rather
+    // than planning its own.
+    expect(scaleCalls.planned).toHaveLength(1);
+    expect(scaleCalls.planned[0]).toBe(resolved);
+    expect(scaleCalls.plans).toHaveLength(1);
+    expect(scaleCalls.suppliedPlans).toHaveLength(1);
+    expect(scaleCalls.suppliedPlans[0]).toBe(scaleCalls.plans[0]);
+
     // And the drawing is that layering.
     expect(reading()).toEqual(
       CANONICAL_LABELS.map((label, index) => ({ label, layer: CANONICAL_LAYERS[index] })),
@@ -2751,6 +2842,7 @@ describe('DependencyGraph deterministic geometry', () => {
     expect(drawnGeometry()).toEqual(first);
     expect(scaleCalls.resolved).toHaveLength(1);
     expect(scaleCalls.supplied).toHaveLength(1);
+    expect(scaleCalls.plans).toHaveLength(1);
 
     // Fresh mounts of the same data in other orders — reversed, and rotated —
     // are the same graph, so they draw the same picture to the last attribute.
@@ -2765,6 +2857,279 @@ describe('DependencyGraph deterministic geometry', () => {
       await renderGraph(repeatedChain(LARGE_COUNT, order));
       expect(drawnGeometry()).toEqual(first);
     }
+  });
+});
+
+describe('DependencyGraph row bound and count placement', () => {
+  /** The inset the canvas keeps on every side: half the participant outline's stroke. */
+  const INSET = 1;
+
+  /** The clear space a count label keeps from a box: the clearance plus the outline's reach. */
+  const REACH = 4 + INSET;
+
+  /** The distance from one row's top to the next row's. */
+  const ROW_PITCH = DEFAULT_GRAPH_NODE_HEIGHT + DEFAULT_GRAPH_ROW_GAP;
+
+  /** The participant a fan starts at. */
+  const FAN_SOURCE = makeParticipant({
+    id: 'dep:function|browser|example.fan.source',
+    label: 'example.fan.source',
+    spanIds: [spanIdFor(90)],
+    totalDurationMs: 900,
+    layer: 0,
+  });
+
+  /** The label of a fan's `index`-th target: `example.fan.07`. */
+  function fanLabel(index: number): string {
+    return `example.fan.${String(index).padStart(2, '0')}`;
+  }
+
+  /** A fan's `index`-th target; the earlier the index, the costlier. */
+  function fanTarget(index: number): DependencyGraphNode {
+    return makeParticipant({
+      id: `dep:function|browser|${fanLabel(index)}`,
+      label: fanLabel(index),
+      spanIds: [spanIdFor(100 + index)],
+      totalDurationMs: 500 - index,
+      layer: 1,
+    });
+  }
+
+  /**
+   * One participant calling `size` others in the next column; the relationship
+   * to the `index`-th ran `index + 2` times, so every one carries a count.
+   */
+  function fanGraph(
+    size: number,
+    edge: (index: number) => EdgeOverrides = (index) => ({ count: index + 2 }),
+  ): DependencyGraphData {
+    const targets = Array.from({ length: size }, (_, index) => fanTarget(index));
+    return makeGraph({
+      nodes: [FAN_SOURCE, ...targets],
+      edges: targets.map((target, index) => makeEdge(FAN_SOURCE.id, target.id, edge(index))),
+    });
+  }
+
+  /** The vertical centre of row `row`, where its connectors anchor. */
+  function rowCentre(row: number): number {
+    return row * ROW_PITCH + DEFAULT_GRAPH_NODE_HEIGHT / 2;
+  }
+
+  /** Renders a payload, waits for the grid and returns the action spies. */
+  async function renderGraph(data: DependencyGraphData): Promise<ActionSpies> {
+    const spies = makeActions();
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(data).provider,
+      actions: spies.actions,
+    });
+    await screen.findByRole('grid');
+    return spies;
+  }
+
+  /** The overflow box's shape. */
+  function overflowShape(): Element {
+    const shape = canvas().querySelector('[data-overflow] > rect');
+    if (shape === null) {
+      throw new Error('the canvas drew no overflow box');
+    }
+    return shape;
+  }
+
+  /** The metrics line drawn in a shape's box. */
+  function metaOf(shape: Element): string {
+    return (
+      shape.parentElement?.querySelector(':scope > text.dg-dependency-graph__node-meta')
+        ?.textContent ?? ''
+    );
+  }
+
+  /** The note under the grid that counts the labels left off the picture, if any. */
+  function suppressedNote(): HTMLElement | null {
+    return screen.queryByText(/relationship counts? (?:is|are) not drawn on the picture/);
+  }
+
+  it('draws a column taller than the row bound as its five costliest participants and one overflow box', async () => {
+    await renderGraph(fanGraph(20));
+
+    // Five targets in boxes of their own, costliest first, and one box for the
+    // other fifteen — every box with exactly one label.
+    expect(canvasLabels()).toEqual([
+      FAN_SOURCE.label,
+      ...[0, 1, 2, 3, 4].map(fanLabel),
+      '+15 more',
+    ]);
+    expect(nodeShapes()).toHaveLength(7);
+
+    // Targets 5 to 19 took 495 down to 481 ms: 7,320 ms summed.
+    const gatheredTotal = formatDurationCompact(7320);
+    const overflow = overflowShape();
+    expect(overflow.getAttribute('y')).toBe(String(5 * ROW_PITCH));
+    expect(metaOf(overflow)).toBe(`Σ ${gatheredTotal}`);
+    expect(titleOfShape(overflow)).toBe(
+      `15 participants gathered here: ${[5, 6, 7, 8, 9].map(fanLabel).join(', ')} and 10 more · Summed time ${gatheredTotal}. Each is listed in the table below.`,
+    );
+
+    // It stands for no one class: the base class alone, no colour of its own —
+    // its only inline declaration hands the pointer back to the browser, since
+    // it selects nothing.
+    expect([...overflow.classList]).toEqual(['dg-dependency-graph__node']);
+    expect((overflow as SVGElement).style.getPropertyValue('--dgc-node-color')).toBe('');
+    expect((overflow as SVGElement).style.cursor).toBe('auto');
+    expect((overflow as SVGElement).style.length).toBe(1);
+
+    // Six rows tall, whatever the column holds, so the viewport cuts no box.
+    expect(canvasFrame().height).toBe(
+      6 * DEFAULT_GRAPH_NODE_HEIGHT + 5 * DEFAULT_GRAPH_ROW_GAP + 2 * INSET,
+    );
+
+    // One curve per drawn pair of boxes, the gathered relationships merged
+    // into the last, whose count is their sum: 7 + 8 + … + 21.
+    expect(edgeCurves()).toHaveLength(6);
+    expectCurvesBetweenColumns();
+    expect(edgeCountLabels().map((label) => label.textContent)).toEqual([
+      '×2',
+      '×3',
+      '×4',
+      '×5',
+      '×6',
+      '×210',
+    ]);
+
+    // The grid still lists every participant, in its own column, and every
+    // relationship on its own.
+    expect(dataRows()).toHaveLength(21);
+    expect(statedLayers().slice(6)).toEqual(Array.from({ length: 15 }, () => '2'));
+    expect(relationshipChips(rowNamed(FAN_SOURCE.label))).toHaveLength(20);
+
+    // And the text alternative says what was gathered.
+    expect(canvas().getAttribute('aria-label')).toContain(
+      'In 1 layer that holds more than 6 participants, the 5 that took the most time are drawn in boxes of their own and the other 15 participants are gathered into one summary box at its foot.',
+    );
+  });
+
+  it('keeps the overflow box inert, and marks it as where a gathered participant selected in the grid is drawn', async () => {
+    const spies = await renderGraph(fanGraph(20));
+    const user = userEvent.setup();
+
+    // Not a control: there is no one participant a click could select or open,
+    // and it does not hover with the participant boxes' hand.
+    expect((overflowShape() as SVGElement).style.cursor).toBe('auto');
+    expect((shapeNamed(fanLabel(0)) as SVGElement).style.getPropertyValue('cursor')).toBe('');
+    await user.click(overflowShape());
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(dataRows().some((row) => row.getAttribute('aria-selected') === 'true')).toBe(false);
+
+    await user.click(rowNamed(fanLabel(12)));
+    expect(rowNamed(fanLabel(12)).getAttribute('aria-selected')).toBe('true');
+    expect(overflowShape().classList.contains('dg-is-selected')).toBe(true);
+    expect(nodeShapes().filter((shape) => shape.classList.contains('dg-is-selected'))).toEqual([
+      overflowShape(),
+    ]);
+
+    // Selecting a participant drawn in its own box moves the mark there.
+    await user.click(rowNamed(fanLabel(1)));
+    expect(overflowShape().classList.contains('dg-is-selected')).toBe(false);
+    expect(shapeNamed(fanLabel(1)).classList.contains('dg-is-selected')).toBe(true);
+  });
+
+  it('draws each count of a fan beside the participant it reaches, and leaves no note', async () => {
+    await renderGraph(fanGraph(4));
+
+    const targetLeft = DEFAULT_GRAPH_NODE_WIDTH + DEFAULT_GRAPH_COLUMN_GAP;
+    const labels = edgeCountLabels();
+    expect(labels).toHaveLength(4);
+    for (const [row, label] of labels.entries()) {
+      const advance = estimateTextWidth(label.textContent ?? '', DEFAULT_LABEL_FONT_SIZE);
+      expect(label.getAttribute('data-placement')).toBe('near-target');
+      expect(Number(label.getAttribute('x'))).toBeCloseTo(targetLeft - REACH - advance / 2);
+      expect(Number(label.getAttribute('y'))).toBe(rowCentre(row));
+    }
+    expect(suppressedNote()).toBeNull();
+  });
+
+  it('keeps a lone count centred in its gap', async () => {
+    await renderGraph(chainGraph());
+
+    expect(
+      edgeCountLabels().map((label) => [label.textContent, label.getAttribute('data-placement')]),
+    ).toEqual([['×2', 'midpoint']]);
+    expect(suppressedNote()).toBeNull();
+  });
+
+  it('says how many counts fit nowhere on the picture, while the table keeps every one', async () => {
+    const stacked = (label: string): DependencyGraphNode =>
+      makeParticipant({ id: `dep:function|browser|${label}`, label, layer: 0 });
+    const [upper, middle, lower] = [
+      stacked('example.stack.a'),
+      stacked('example.stack.b'),
+      stacked('example.stack.c'),
+    ];
+
+    // One relationship between two boxes of one column: the row gap is
+    // shorter than a label, so its count is not drawn.
+    await renderGraph(
+      makeGraph({ nodes: [upper, middle], edges: [makeEdge(upper.id, middle.id, { count: 3 })] }),
+    );
+    expect(edgeCountLabels()).toHaveLength(0);
+    expect(suppressedNote()?.textContent).toBe(
+      '1 relationship count is not drawn on the picture where it would overlap; the table lists every count.',
+    );
+    expect(relationshipChips(rowNamed(upper.label)).map((chip) => chip.textContent)).toEqual([
+      `→ ${middle.label} ×3`,
+    ]);
+
+    cleanup();
+    await renderGraph(
+      makeGraph({
+        nodes: [upper, middle, lower],
+        edges: [
+          makeEdge(upper.id, middle.id, { count: 3 }),
+          makeEdge(middle.id, lower.id, { count: 4 }),
+        ],
+      }),
+    );
+    expect(suppressedNote()?.textContent).toBe(
+      '2 relationship counts are not drawn on the picture where they would overlap; the table lists every count.',
+    );
+  });
+
+  it('marks a merged connector with the least certain lineage among the relationships it stands for', async () => {
+    const mergedCurve = (): Element => {
+      const curve = canvas().querySelector('path[data-connector="0:0>1:5"]');
+      if (curve === null) {
+        throw new Error('the canvas drew no connector to the overflow box');
+      }
+      return curve;
+    };
+
+    // Targets 5, 6 and 7 are gathered; one of their relationships was inferred.
+    await renderGraph(
+      fanGraph(8, (index) => ({
+        count: index + 2,
+        ...(index === 6 ? { inferredCount: index + 2 } : {}),
+      })),
+    );
+    expect(mergedCurve().classList.contains('dg-is-inferred')).toBe(true);
+
+    // An ambiguous one among them outweighs the inferred one.
+    cleanup();
+    await renderGraph(
+      fanGraph(8, (index) => ({
+        count: index + 2,
+        ...(index === 6 ? { inferredCount: index + 2 } : {}),
+        ...(index === 7 ? { inferredCount: index + 2, ambiguousCount: 1 } : {}),
+      })),
+    );
+    expect(mergedCurve().classList.contains('dg-is-ambiguous')).toBe(true);
+    expect(mergedCurve().classList.contains('dg-is-inferred')).toBe(false);
+
+    // A drawn box's own connector keeps its own state.
+    expect(
+      canvas()
+        .querySelector('path[data-connector="0:0>1:0"]')
+        ?.classList.contains('dg-is-inferred'),
+    ).toBe(false);
   });
 });
 
@@ -3479,6 +3844,339 @@ describe('DependencyGraph relationships', () => {
   });
 });
 
+describe('DependencyGraph render cascade', () => {
+  /** The component whose own state changed and started the pass. */
+  const TRIGGER = makeParticipant({
+    id: 'dep:function|browser|example.trigger',
+    kind: 'function',
+    label: 'example.trigger',
+    spanIds: [spanIdFor(31)],
+    count: 3,
+    totalDurationMs: 30,
+    layer: 0,
+    roles: ['trigger'],
+  });
+
+  /** A component that provided the changed value and read another; roles out of order on purpose. */
+  const PROVIDER = makeParticipant({
+    id: 'dep:function|browser|example.provider',
+    kind: 'function',
+    label: 'example.provider',
+    spanIds: [spanIdFor(32)],
+    count: 5,
+    totalDurationMs: 50,
+    layer: 1,
+    roles: ['consumer', 'provider'],
+  });
+
+  /** A component that re-rendered because a context it reads changed. */
+  const CONSUMER = makeParticipant({
+    id: 'dep:function|browser|example.consumer',
+    kind: 'function',
+    label: 'example.consumer',
+    spanIds: [spanIdFor(33)],
+    count: 5,
+    totalDurationMs: 20,
+    layer: 2,
+    roles: ['consumer'],
+  });
+
+  /** A component that only re-rendered because its parent did: no role. */
+  const LEAF = makeParticipant({
+    id: 'dep:function|browser|example.leaf',
+    kind: 'function',
+    label: 'example.leaf',
+    spanIds: [spanIdFor(34)],
+    count: 480,
+    totalDurationMs: 12,
+    layer: 3,
+  });
+
+  /** The cascade's relationships, each declaring why its callee rendered. */
+  const CASCADE_EDGES: readonly DependencyGraphEdge[] = [
+    makeEdge(TRIGGER.id, PROVIDER.id, { count: 5, renderTriggers: { props: 5 } }),
+    makeEdge(PROVIDER.id, CONSUMER.id, {
+      count: 5,
+      inferredCount: 5,
+      renderTriggers: { context: 5 },
+      contexts: ['example.context'],
+    }),
+    makeEdge(CONSUMER.id, LEAF.id, {
+      count: 480,
+      renderTriggers: { props: 240, unchanged: 240 },
+    }),
+    makeEdge(TRIGGER.id, LEAF.id, { count: 5, renderTriggers: { mount: 3 } }),
+  ];
+
+  /** The cascade as a payload. */
+  function cascadeGraph(): DependencyGraphData {
+    return makeGraph({ nodes: [LEAF, CONSUMER, PROVIDER, TRIGGER], edges: CASCADE_EDGES });
+  }
+
+  /** The metrics line drawn in a participant's box, found through its label. */
+  function metaOfShape(label: string): string {
+    const metas = Array.from(canvas().querySelectorAll('text.dg-dependency-graph__node-meta'));
+    return metas[canvasLabels().indexOf(label)]?.textContent ?? '';
+  }
+
+  /** The role words a row's class cell shows, in document order. */
+  function rolesOfRow(label: string): string[] {
+    return Array.from(
+      cellOf(rowNamed(label), CLASS_COLUMN).querySelectorAll<HTMLElement>('[data-role]'),
+    ).map((chip) => chip.textContent ?? '');
+  }
+
+  /**
+   * The text of the relationship chip a row carries toward `target`, found by
+   * the relationship id {@link makeEdge} gives it.
+   */
+  function chipTo(label: string, target: DependencyGraphNode): string {
+    const chip = relationshipChips(rowNamed(label)).find((candidate) =>
+      (candidate.getAttribute('data-edge-id') ?? '').endsWith(`=>${target.id}`),
+    );
+    if (chip === undefined) {
+      throw new Error(`"${label}" rendered no relationship chip toward "${target.label}"`);
+    }
+    return chip.textContent ?? '';
+  }
+
+  it('names every role after the class chip, in the vocabulary order, and nothing for a component with none', async () => {
+    const stub = resolvingProvider(cascadeGraph());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    // The class chip stays first and keeps its colour; each role follows as a
+    // chip of its own, in the aggregate's order whatever order it arrived in.
+    const providerClass = cellOf(rowNamed(PROVIDER.label), CLASS_COLUMN);
+    expect(providerClass.querySelector('[data-kind]')?.textContent).toBe('Function');
+    expect(rolesOfRow(PROVIDER.label)).toEqual(['provider', 'consumer']);
+    expect(rolesOfRow(TRIGGER.label)).toEqual(['trigger']);
+    expect(rolesOfRow(CONSUMER.label)).toEqual(['consumer']);
+
+    // A component that re-rendered only because its parent did played no role.
+    expect(rolesOfRow(LEAF.label)).toEqual([]);
+    expect(cellOf(rowNamed(LEAF.label), CLASS_COLUMN).textContent).toBe('Function');
+
+    // The role chips carry no colour of their own: a role is never drawn as a
+    // participant class or a span kind.
+    for (const chip of providerClass.querySelectorAll<HTMLElement>('[data-role]')) {
+      expect(chip.getAttribute('style')).toBeNull();
+    }
+  });
+
+  it('lists roles in the order the telemetry vocabulary declares them', async () => {
+    const everything = makeParticipant({
+      ...TRIGGER,
+      roles: DEPENDENCY_NODE_ROLES.toReversed(),
+    });
+    const stub = resolvingProvider(makeGraph({ nodes: [everything], edges: [] }));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    expect(rolesOfRow(TRIGGER.label)).toEqual([...DEPENDENCY_NODE_ROLES]);
+    expect(titleOfShape(shapeNamed(TRIGGER.label))).toContain(
+      `Roles: ${DEPENDENCY_NODE_ROLES.join(', ')}`,
+    );
+    // Provider first when a box has room for one role.
+    expect(metaOfShape(TRIGGER.label).startsWith('provider · ')).toBe(true);
+  });
+
+  it('ignores a role outside the closed vocabulary rather than inventing a word for it', async () => {
+    const odd = makeParticipant({
+      ...CONSUMER,
+      roles: ['consumer', 'example-role'] as unknown as DependencyGraphNode['roles'],
+    });
+    const stub = resolvingProvider(makeGraph({ nodes: [odd], edges: [] }));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    expect(rolesOfRow(CONSUMER.label)).toEqual(['consumer']);
+    expect(screen.queryByText(/example-role/)).toBeNull();
+  });
+
+  it('prefixes each box with its primary role and names every role in its title', async () => {
+    const stub = resolvingProvider(cascadeGraph());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    // Provider outranks consumer, and the box of a component with no role
+    // carries its metrics alone.
+    expect(metaOfShape(PROVIDER.label).startsWith('provider · ')).toBe(true);
+    expect(metaOfShape(TRIGGER.label).startsWith('trigger · ')).toBe(true);
+    expect(metaOfShape(CONSUMER.label).startsWith('consumer · ')).toBe(true);
+    expect(metaOfShape(LEAF.label)).not.toMatch(/^(?:trigger|provider|consumer) · /u);
+
+    expect(titleOfShape(shapeNamed(PROVIDER.label))).toContain('Roles: provider, consumer');
+    expect(titleOfShape(shapeNamed(TRIGGER.label))).toContain('Role: trigger');
+    expect(titleOfShape(shapeNamed(LEAF.label))).not.toMatch(/Roles?:/u);
+  });
+
+  it('keeps a role and its weight whole when the full box line runs past its box, dropping the summed time first', async () => {
+    const heavy = makeParticipant({
+      ...CONSUMER,
+      count: 9087,
+      totalDurationMs: 2100,
+      maxDurationMs: 61,
+    });
+    const stub = resolvingProvider(makeGraph({ nodes: [heavy], edges: [] }));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    // "consumer · Σ 2.1 s · ×9,087" is wider than the box less its text
+    // insets, so the box names the role and the weight whole — the count a
+    // render question is about — rather than cutting the count off.
+    const full = `consumer · Σ ${formatDurationCompact(2100)} · ×9,087`;
+    expect(estimateTextWidth(full, DEFAULT_LABEL_FONT_SIZE)).toBeGreaterThan(
+      DEFAULT_GRAPH_NODE_WIDTH - 2 * 4,
+    );
+    const meta = metaOfShape(CONSUMER.label);
+    expect(meta).toBe('consumer · ×9,087');
+    expect(estimateTextWidth(meta, DEFAULT_LABEL_FONT_SIZE)).toBeLessThanOrEqual(
+      DEFAULT_GRAPH_NODE_WIDTH - 2 * 4,
+    );
+
+    // Nothing is lost: the title and the grid carry the summed time.
+    expect(titleOfShape(shapeNamed(CONSUMER.label))).toContain(
+      `Summed ${formatDurationCompact(2100)}`,
+    );
+    expect(within(rowNamed(CONSUMER.label)).getByRole('rowheader').textContent).toContain(
+      'Records 9,087',
+    );
+  });
+
+  it('cuts the full box line with an ellipsis only when no shorter whole line fits, keeping it whole in the title', async () => {
+    const enormous = makeParticipant({
+      ...CONSUMER,
+      count: 1_000_000_000_000,
+      totalDurationMs: 2100,
+      maxDurationMs: 61,
+    });
+    const stub = resolvingProvider(makeGraph({ nodes: [enormous], edges: [] }));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    // Neither "consumer · ×1,000,000,000,000" nor the metrics alone fit, so the
+    // full line is cut, never exceeding the box less its text insets.
+    const meta = metaOfShape(CONSUMER.label);
+    expect(meta.startsWith('consumer · ')).toBe(true);
+    expect(meta.endsWith('…')).toBe(true);
+    expect(estimateTextWidth(meta, DEFAULT_LABEL_FONT_SIZE)).toBeLessThanOrEqual(
+      DEFAULT_GRAPH_NODE_WIDTH - 2 * 4,
+    );
+    expect(titleOfShape(shapeNamed(CONSUMER.label))).toContain('Records 1,000,000,000,000');
+  });
+
+  it('defines the three roles under the grid whenever a role is shown, and not otherwise', async () => {
+    const cascade = resolvingProvider(cascadeGraph());
+    const view = renderComponent(makeNode(), {
+      provider: cascade.provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('grid');
+
+    const note = screen.getByText(/^A trigger is a component whose own state changed/u);
+    expect(note.closest('.dg-dependency-graph__note')).not.toBeNull();
+    expect(note.textContent).toBe(
+      'A trigger is a component whose own state changed, which started a render pass. A provider is a component that re-rendered above a context consumer in the same commit, which is where the changed context value came from. A consumer is a component that re-rendered because a context value it reads changed.',
+    );
+    view.unmount();
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(chainGraph()).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('grid');
+    expect(screen.queryByText(/^A trigger is a component/u)).toBeNull();
+  });
+
+  it('says on each chip why the callee rendered and which contexts changed', async () => {
+    const stub = resolvingProvider(cascadeGraph());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    // One reason accounting for every record: the word alone.
+    expect(chipTo(TRIGGER.label, PROVIDER)).toBe(`→ ${PROVIDER.label} ×5 (props)`);
+    // One reason for only some of them: the word and its count.
+    expect(chipTo(TRIGGER.label, LEAF)).toBe(`→ ${LEAF.label} ×5 (mount 3)`);
+    // Several reasons: each with its count, in the contract's order.
+    expect(chipTo(CONSUMER.label, LEAF)).toBe(`→ ${LEAF.label} ×480 (props 240 · unchanged 240)`);
+    // The contexts that changed, then how the relationship was known.
+    expect(chipTo(PROVIDER.label, CONSUMER)).toBe(
+      `→ ${CONSUMER.label} ×5 (context) (context: example.context) (inferred)`,
+    );
+    expect(screen.queryByText(/render reasons or contexts/u)).toBeNull();
+  });
+
+  it('lists render reasons in the order the telemetry vocabulary declares them', async () => {
+    const everyReason = Object.fromEntries(
+      DEPENDENCY_RENDER_REASONS.toReversed().map((reason) => [reason, 1]),
+    ) as DependencyGraphEdge['renderTriggers'];
+    const edge = makeEdge(TRIGGER.id, PROVIDER.id, {
+      count: DEPENDENCY_RENDER_REASONS.length,
+      renderTriggers: everyReason,
+    });
+    const stub = resolvingProvider(makeGraph({ nodes: [TRIGGER, PROVIDER], edges: [edge] }));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    expect(chipTo(TRIGGER.label, PROVIDER)).toBe(
+      `→ ${PROVIDER.label} ×${String(DEPENDENCY_RENDER_REASONS.length)} (${DEPENDENCY_RENDER_REASONS.map((reason) => `${reason} 1`).join(' · ')})`,
+    );
+  });
+
+  it('withholds render reasons or contexts that do not add up, and says so', async () => {
+    const edges = [
+      // More renders than the relationship stands for.
+      makeEdge(INTERACTION.id, HANDLER.id, { count: 5, renderTriggers: { context: 7 } }),
+      // A reason outside the vocabulary.
+      makeEdge(HANDLER.id, REQUEST.id, {
+        renderTriggers: { because: 1 } as unknown as DependencyGraphEdge['renderTriggers'],
+      }),
+      // A reason with no render behind it.
+      makeEdge(REQUEST.id, ROUTE.id, { renderTriggers: { props: 0 } }),
+      // A blank context label.
+      makeEdge(ROUTE.id, DATASTORE.id, { count: 2, contexts: [' '] }),
+    ];
+    const stub = resolvingProvider(
+      makeGraph({ nodes: [INTERACTION, HANDLER, REQUEST, ROUTE, DATASTORE], edges }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    expect(chipTo(INTERACTION_LABEL, HANDLER)).toBe(`→ ${HANDLER_LABEL} ×5`);
+    expect(chipTo(HANDLER_LABEL, REQUEST)).toBe(`→ ${REQUEST_LABEL}`);
+    expect(chipTo(REQUEST_LABEL, ROUTE)).toBe(`→ ${ROUTE_LABEL}`);
+    expect(chipTo(ROUTE_LABEL, DATASTORE)).toBe(`→ ${DATASTORE_LABEL} ×2`);
+
+    const note = screen.getByText(/render reasons or contexts/u);
+    expect(note.closest('.dg-dependency-graph__note')).not.toBeNull();
+    expect(note.textContent).toBe(
+      '4 relationships declared render reasons or contexts that do not match their records, which are not shown.',
+    );
+  });
+
+  it('states a single relationship with an inconsistent render cause in the singular', async () => {
+    const edge = makeEdge(INTERACTION.id, HANDLER.id, { renderTriggers: { state: 2 } });
+    const stub = resolvingProvider(makeGraph({ nodes: [INTERACTION, HANDLER], edges: [edge] }));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    expect(screen.getByText(/render reasons or contexts/u).textContent).toBe(
+      '1 relationship declared render reasons or contexts that do not match its records, which are not shown.',
+    );
+  });
+});
+
 describe('DependencyGraph aggregate contract', () => {
   /** Monotonic ordinal behind the captured events' ids, span ids, times and sequences. */
   let ordinal = 100;
@@ -3512,6 +4210,123 @@ describe('DependencyGraph aggregate contract', () => {
       ...over,
     };
   }
+
+  /**
+   * The relationship of the real graph a chip stands for, by the id the chip
+   * carries.
+   *
+   * @param graph The graph the aggregate built.
+   * @param chip A relationship chip obtained from the grid.
+   */
+  function edgeWithId(graph: DependencyGraphData, chip: HTMLElement): DependencyGraphEdge {
+    const edge = graph.edges.find(
+      (candidate) => candidate.id === chip.getAttribute('data-edge-id'),
+    );
+    if (edge === undefined) {
+      throw new Error('the chip names a relationship the aggregate did not build');
+    }
+    return edge;
+  }
+
+  /**
+   * What a chip says about why its callee rendered and which contexts changed,
+   * spelled out from what the aggregate declared on the relationship: nothing
+   * when it declared nothing, one reason's word when it accounts for every
+   * record, otherwise each reason and its count in the vocabulary's order,
+   * then the contexts. An oracle written from the contract rather than read
+   * back from the component, so the chips are checked against whatever the
+   * aggregate records for these events.
+   *
+   * @param edge The relationship as the aggregate built it.
+   */
+  function renderCauseSuffixOf(edge: DependencyGraphEdge): string {
+    const tallies = DEPENDENCY_RENDER_REASONS.flatMap((reason) => {
+      const count = edge.renderTriggers?.[reason];
+      return count === undefined ? [] : [{ reason, count }];
+    });
+    const [only] = tallies;
+    const why =
+      only === undefined
+        ? ''
+        : tallies.length === 1 && only.count === edge.count
+          ? ` (${only.reason})`
+          : ` (${tallies.map(({ reason, count }) => `${reason} ${formatCount(count)}`).join(' · ')})`;
+    const contexts = edge.contexts ?? [];
+    return contexts.length === 0 ? why : `${why} (context: ${contexts.join(', ')})`;
+  }
+
+  it('draws every participant class and span colour in a legend colour of its own', async () => {
+    // One event of every kind the telemetry domain declares, each in a tier its
+    // kind may be reported in and each the child of the one before, so every
+    // kind reaches the real aggregate and the chain keeps every column short.
+    const events: TelemetryEvent[] = [];
+    for (const kind of TELEMETRY_KINDS) {
+      const [tier] = KIND_ALLOWED_TIERS[kind];
+      const parent = events.at(-1);
+      events.push(
+        capturedEvent({
+          kind,
+          name: `example.${kind}`,
+          ...(tier === undefined ? {} : { tier }),
+          ...(parent === undefined ? {} : { parentSpanId: parent.spanId }),
+        }),
+      );
+    }
+
+    const graph = buildDependencyGraph(events);
+    expect(new Set(graph.nodes.flatMap((node) => node.spanKinds ?? []))).toEqual(
+      new Set(TELEMETRY_KINDS),
+    );
+
+    const { container } = renderComponent(makeNode(), {
+      provider: resolvingProvider(graph).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('grid');
+
+    // Every participant is drawn in its own box, so every stroke is read.
+    expect(nodeShapes()).toHaveLength(graph.nodes.length);
+
+    const legend = legendOf(container);
+    const chipColour = (chip: HTMLElement): string =>
+      chip.style.getPropertyValue('--dgc-badge-color').trim();
+    const chips = Array.from(legend.querySelectorAll<HTMLElement>('.dg-badge'));
+    const colours = chips.map(chipColour);
+
+    // No two key entries share a colour: a reader can tell every class and
+    // every span-kind family apart by colour as well as by word. Every kind is
+    // present, so the key holds span-colour entries beyond the six classes.
+    expect(chips.length).toBeGreaterThan(KINDS.length);
+    expect(colours.every((colour) => colour !== '')).toBe(true);
+    expect(new Set(colours).size).toBe(colours.length);
+
+    const classColours = new Map(
+      Array.from(legend.querySelectorAll<HTMLElement>('[data-kind]')).map((chip) => [
+        chip.getAttribute('data-kind') ?? '',
+        chipColour(chip),
+      ]),
+    );
+    expect([...classColours.keys()]).toEqual(KINDS);
+
+    // A participant is stroked in its own class's colour, or in a span colour
+    // the key names that belongs to no class: never in another class's colour.
+    for (const shape of nodeShapes()) {
+      const kind = KINDS.find((candidate) =>
+        shape.classList.contains(`dg-dependency-graph__node--${candidate}`),
+      );
+      if (kind === undefined) {
+        throw new Error('a participant box carries no class modifier');
+      }
+      if (!(shape instanceof SVGElement)) {
+        throw new Error('a participant box is not an SVG element');
+      }
+      const stroke = shape.style.getPropertyValue('--dgc-node-color').trim();
+      expect(colours).toContain(stroke);
+      if (stroke !== classColours.get(kind)) {
+        expect([...classColours.values()]).not.toContain(stroke);
+      }
+    }
+  });
 
   it('selects, withholds and marks exactly what the real aggregate produced', async () => {
     // A page event that issued one request and reached one function twice; a
@@ -3580,7 +4395,9 @@ describe('DependencyGraph aggregate contract', () => {
     if (inferredChip === undefined) {
       throw new Error('the request participant rendered no relationship chip');
     }
-    expect(inferredChip.textContent).toBe('→ example.view (inferred)');
+    expect(inferredChip.textContent).toBe(
+      `→ example.view${renderCauseSuffixOf(edgeWithId(graph, inferredChip))} (inferred)`,
+    );
     expect(inferredChip.classList.contains('dg-is-inferred')).toBe(true);
     expect(inferredChip.classList.contains('dg-is-ambiguous')).toBe(false);
 
@@ -3643,7 +4460,9 @@ describe('DependencyGraph aggregate contract', () => {
     if (ambiguousChip === undefined) {
       throw new Error('the chosen request rendered no relationship chip');
     }
-    expect(ambiguousChip.textContent).toBe('→ example.view (inferred, 1 ambiguous)');
+    expect(ambiguousChip.textContent).toBe(
+      `→ example.view${renderCauseSuffixOf(edgeWithId(graph, ambiguousChip))} (inferred, 1 ambiguous)`,
+    );
     expect(ambiguousChip.classList.contains('dg-is-ambiguous')).toBe(true);
     expect(ambiguousChip.classList.contains('dg-is-inferred')).toBe(false);
     expect(ambiguousChip.classList.contains('dg-badge--warning')).toBe(true);
@@ -4042,7 +4861,12 @@ describe('DependencyGraph shared selection', () => {
       </SelectionHost>,
     );
 
-    expect(await screen.findAllByRole('img')).toHaveLength(2);
+    // Both canvases are drawn: the graph's picture, and the flame chart's
+    // figure, whose frames are named images of their own.
+    await screen.findByRole('figure');
+    expect(
+      (await screen.findAllByRole('img')).filter((element) => element instanceof SVGSVGElement),
+    ).toHaveLength(1);
     await screen.findByRole('grid');
     await screen.findByRole('tree');
 

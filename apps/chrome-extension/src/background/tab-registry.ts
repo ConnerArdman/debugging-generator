@@ -35,7 +35,10 @@
  *    be reported, so it is handed over as the tab id alone
  *    ({@link TabRegistry.handleUnreportableNavigation}) and, for a bound tab,
  *    takes the cross-origin branch without the report: the URL never leaves
- *    the worker.
+ *    the worker. A tab that later commits a document on the very origin it
+ *    left is no longer away ({@link TabRegistry.handleReturnedNavigation}):
+ *    its "Tab left ‹origin›" state is withdrawn, and `service-worker.ts`
+ *    announces the tab again so the service can bind it.
  * 3. DevTools closing, the tab closing and the session ending all send
  *    `session.unbind`.
  * 4. Every `session.unbind` is owed until the service has it: the intent is
@@ -927,6 +930,22 @@ export interface TabRegistry {
    * tab id.
    */
   readonly handleUnreportableNavigation: (tabId: TabId) => Promise<NavigationDecision>;
+
+  /**
+   * Handle a committed navigation of a tab this registry holds no binding
+   * for, whose new document's HTTP(S) origin is `origin` (`undefined` when it
+   * has none). A tab showing "Tab left ‹origin›" that has come back to the
+   * very origin it left is no longer away: its `tab-left` state is forgotten
+   * and its panels are pushed `unbound`, so the notice never outlives the
+   * departure it describes. Whether the tab binds again is the service's
+   * answer to the worker's next `session.bind`, which records the binding
+   * through {@link applyBound}. Nothing is sent and no listener is notified —
+   * no binding changed.
+   *
+   * @returns `true` when a `tab-left` state was withdrawn; `false` for a bound
+   * tab, a tab that is not away, or one still away from the origin it left.
+   */
+  readonly handleReturnedNavigation: (tabId: TabId, origin: string | undefined) => Promise<boolean>;
 
   /**
    * End a tab's binding because DevTools closed, the tab closed or the session
@@ -2695,6 +2714,27 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
     }
 
     const previous = cache.get(bound.tabId);
+    // The service announces a kept same-origin navigation as the binding now
+    // stands (`bound`) — only a new page-agent document proves a reload — so an
+    // establishment may also be the late answer to a `tab.navigated` this
+    // worker has since ended the binding over: a same-origin commit followed by
+    // one off the origin before the service answered. Such a frame finds no
+    // record, no bind of the tab in flight, and the unbind that navigation
+    // wrote ahead still pending for the same session. Recording it would
+    // resurrect the binding — and let the capture's re-arm reach the document
+    // on the other origin — until the service's drop arrived, and would retire
+    // that unbind as superseded; so it is ignored, as a late `navigated` frame
+    // is (see `refreshNavigated`).
+    if (previous === undefined && !reservedBindTabs.has(bound.tabId)) {
+      const owed = tombstones.get(bound.tabId);
+      if (owed?.cause === CAUSE_NAVIGATED_AWAY && owed.sessionId === bound.sessionId) {
+        logger.debug('Ignored a late establishment of a binding this worker ended on navigation', {
+          tabId: bound.tabId,
+          sessionId: bound.sessionId,
+        });
+        return ok({ kind: 'ignored', reason });
+      }
+    }
     const sameBinding = previous !== undefined && previous.sessionId === bound.sessionId;
     const record = makeRecord({
       tabId: bound.tabId,
@@ -3006,6 +3046,40 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
       return { kind: 'not-bound', tabId, reported: false };
     }
     return leaveOrigin(current, undefined, false);
+  }
+
+  /**
+   * Withdraw the `tab-left` state of an unbound tab that navigated back to the
+   * origin it left. See {@link TabRegistry.handleReturnedNavigation}. Runs
+   * inside the queue.
+   */
+  async function returnToOrigin(tabId: TabId, origin: string | undefined): Promise<boolean> {
+    if (!isTabId(tabId) || origin === undefined) {
+      return false;
+    }
+    await ensureHydrated();
+    if (cache.has(tabId)) {
+      return false;
+    }
+    const departure = departures.get(tabId);
+    if (departure?.kind !== 'tab-left' || departure.origin !== origin) {
+      return false;
+    }
+    departures.delete(tabId);
+    try {
+      notify(tabId, bindingPush(UNBOUND_STATE));
+    } catch (cause) {
+      logger.warn('Binding state could not be pushed to the panel', {
+        tabId,
+        code: DebuggenError.from(cause, 'INTERNAL').code,
+      });
+    }
+    logger.info('Tab returned to the origin it left; its tab-left notice was withdrawn', {
+      tabId,
+      sessionId: departure.sessionId,
+      origin,
+    });
+    return true;
   }
 
   /**
@@ -3347,6 +3421,9 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
   const handleUnreportableNavigation = (tabId: TabId): Promise<NavigationDecision> =>
     exclusive(() => navigateUnreportable(tabId));
 
+  const handleReturnedNavigation = (tabId: TabId, origin: string | undefined): Promise<boolean> =>
+    exclusive(() => returnToOrigin(tabId, origin));
+
   const unbind = (tabId: TabId, cause: TabUnbindCause): Promise<TabBindingRecord | undefined> =>
     exclusive(() => {
       if (!isTabId(tabId)) {
@@ -3452,6 +3529,7 @@ export function createTabRegistry(deps: TabRegistryDeps): TabRegistry {
     applyBound,
     handleNavigated,
     handleUnreportableNavigation,
+    handleReturnedNavigation,
     unbind,
     flushPendingUnbinds,
     handleSessionEnded,

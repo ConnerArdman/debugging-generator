@@ -42,7 +42,12 @@
  *      has no reason to carry: a database connection URL
  *      ({@link SERVICE_DATABASE_URL_KEY_NAMES}), which AAP §0.5.2 forbids
  *      capturing at all and which no content rule recognises once it carries
- *      no credentials.
+ *      no credentials. A sensitive name masks its value whole unless the
+ *      value is a *descriptor* that cannot hold a secret — a boolean, a
+ *      measured number or a file location under a compound name
+ *      (`anthropicApiKeyPresent`, `requestKeysComputed`, `authFilePath`; see
+ *      {@link isSecretDescriptorField}) — so a record still says whether and
+ *      where a credential is configured without ever carrying one.
  *    The message string is scrubbed too: it is cheap and it catches a
  *    credential interpolated into text by a library.
  *
@@ -68,7 +73,10 @@
  *    `{ "type": "NonError" }`, never its own text.
  * 3. **Standardise the bindings.** {@link LOG_BINDING_KEYS} fixes the names
  *    the eleven subsystems bind (`subsystem`, `sessionId`, `captureId`,
- *    `client`) so the output of a whole session is greppable.
+ *    `client`) so the output of a whole session is greppable, and each key
+ *    appears once per record — a re-bound or per-call key replaces the bound
+ *    value rather than repeating it (see {@link createServiceLogger}) — so a
+ *    filter on it matches what the record means.
  * 4. **Never throw.** A log call runs where a caller is already handling a
  *    failure, so a logger that throws there skips whatever the caller does
  *    next. {@link guardLogger} wraps every logger this module builds — and is
@@ -730,14 +738,20 @@ function isDatabaseUrlKey(key: string): boolean {
  * cover.
  *
  * The telemetry predicate matches a sensitive *term* anywhere in the folded
- * name, so `key`, `envKey` and `cacheKey` are all masked. That is deliberate
- * and is not loosened here: this checkpoint must never be more permissive
- * than the ingest one, and over-masking a diagnostic costs a reader one
- * indirection while under-masking costs a credential. A subsystem that needs
- * a *name-like* value to stay readable should choose a field name that does
- * not fold onto a sensitive term — `setting` or `variable` rather than
- * `envKey` — and the product's own identifiers (`sessionId`, `traceId`,
- * `spanId`, `request_key`) are already exempt by name upstream.
+ * name, so `key`, `envKey`, `cacheKey`, `authFilePath` and
+ * `requestKeysComputed` all match it. The predicate itself is not loosened
+ * here — this checkpoint must never be more permissive than the ingest one —
+ * but a match is not the whole decision: {@link isSecretDescriptorField}
+ * narrows it at the *value*, so a boolean, a measured number or a location
+ * that merely *describes* a credential (whether one is configured, how many
+ * keys were computed, where the credential file lives) stays readable, while
+ * every value that could *be* one stays masked. A string under any head word
+ * other than a location (`tokenHash`, `credentialId`, `cacheKey`) is still
+ * masked whole; a subsystem that needs such a value readable should choose a
+ * field name that does not fold onto a sensitive term — `setting` or
+ * `variable` rather than `envKey` — and the product's own identifiers
+ * (`sessionId`, `traceId`, `spanId`, `request_key`) are already exempt by name
+ * upstream.
  *
  * {@link isDatabaseUrlKey} is the third source and the reason this predicate
  * is not simply the telemetry one: a database URL is sensitive by name but
@@ -751,6 +765,112 @@ function isSensitiveLogKey(key: string): boolean {
     matchesFolded(key, SERVICE_SENSITIVE_FOLDED) ||
     isDatabaseUrlKey(key)
   );
+}
+
+/**
+ * The head words that make a string field a *location* — the file or
+ * directory something lives at — rather than a value: `authFilePath`,
+ * `credentialDir`, `tokenCacheDirectory`.
+ *
+ * A path names where a credential is kept, never the credential, and the
+ * operator reading a start-up record needs it to find that file. It is still
+ * scrubbed by content (see {@link isSecretDescriptorField}), so a path that
+ * embeds a credential-shaped segment is masked there.
+ */
+export const LOG_LOCATION_HEAD_WORDS: readonly string[] = Object.freeze([
+  'path',
+  'dir',
+  'directory',
+]);
+
+/**
+ * Head words that name a credential's *own value* rather than a fact about
+ * it, so a number under them is never exempted from the sensitive-name mask:
+ * `authCode: 482913` and `tokenPin: 7731` are one-time codes and PINs, which
+ * are routinely numeric, and `secretValue: 5` is the secret whatever its type.
+ *
+ * Checked in addition to the telemetry vocabulary, which does not contain
+ * these words because they are innocent on their own (`code` is the
+ * product's `DebuggenError` code). They matter only under a name that is
+ * already sensitive, and a measured fact about such a value carries its own
+ * head word — `authCodeLength`, `tokenPinAttempts` — and is exempt as usual.
+ */
+export const LOG_SECRET_VALUE_HEAD_WORDS: readonly string[] = Object.freeze([
+  'value',
+  'code',
+  'pin',
+  'passcode',
+  'otp',
+]);
+
+/**
+ * Whether a value under a sensitive name is a **descriptor** of a secret — a
+ * value that cannot hold the secret itself — and is therefore exempt from the
+ * name rule of {@link isSensitiveLogKey}.
+ *
+ * The name rule masks by *what a field is called*, and a diagnostic about a
+ * credential is naturally called after it: `anthropicApiKeyPresent`,
+ * `requestKeysComputed`, `authFilePath`. Masking those tells an operator
+ * nothing — not even whether a key is configured — and protects nothing, so
+ * the rule is gated by the value's type:
+ *
+ * - A **boolean** is always exempt. One bit cannot hold a credential.
+ * - A **finite number** is exempt when the key's last dotted segment has at
+ *   least two words ({@link keyWords}) and its head (last) word is a measure
+ *   rather than the value: the head is not itself sensitive
+ *   (`isSensitiveKeyName`) and not one of {@link LOG_SECRET_VALUE_HEAD_WORDS}.
+ *   So `requestKeysComputed`, `tokenCount`, `credentialIssuedAt`,
+ *   `cliCredentialLeaseMs` and `keyGeneration` are exempt, while `token: 5`
+ *   (one word), `apiKey: 5` and `sessionKey: 5` (head `key`) and
+ *   `authCode: 482913` (head `code`) are not.
+ * - A **string** is exempt when its head word is one of
+ *   {@link LOG_LOCATION_HEAD_WORDS}, under the same two-word rule. It is not
+ *   emitted verbatim: the caller scrubs it as ordinary unnamed text, so the
+ *   content rules — provider-key prefixes, bearer credentials, JWTs, PEM
+ *   blocks, credentialed connection strings — still apply to it, and inside
+ *   exception text so does {@link redactDiagnosticText}.
+ * - **Nothing else** is exempt: `null`, `undefined`, a non-finite number, a
+ *   `bigint`, a symbol and every container keep the name mask, so wrapping a
+ *   credential in an object still cannot carry it past the rule, and a string
+ *   under any other head (`tokenHash`, `credentialId`, `apiKeyValue`,
+ *   `cacheKey`) stays masked whole.
+ *
+ * For a number or a string, two name rules are never narrowed: the log-layer
+ * names of {@link SERVICE_SENSITIVE_KEY_NAMES} (a pairing code *is* the
+ * capability, and can be all digits) and the database URL names of
+ * {@link isDatabaseUrlKey}; only a boolean passes under them, because it
+ * carries one bit whatever it is called. The body, error-field and
+ * SQL-statement rules are separate predicates that {@link scrubValue} and
+ * {@link closedDetailValue} apply regardless of this one. Layer 1 is
+ * unaffected too: pino still censors every exact path of
+ * {@link SERVICE_LOG_REDACT_PATHS} (`token`, `apiKey`, `pairingCode`, …)
+ * whatever its value, so the exemption reaches only the compound names that
+ * list does not declare.
+ *
+ * @param key The field name as the caller wrote it.
+ * @param value The field value, of any type; only its type is inspected.
+ * @returns `true` when the sensitive-name mask must not be applied.
+ */
+function isSecretDescriptorField(key: string, value: unknown): boolean {
+  if (typeof value === 'boolean') {
+    return true;
+  }
+  const measured = typeof value === 'number' && Number.isFinite(value);
+  if (!measured && typeof value !== 'string') {
+    return false;
+  }
+  const words = keyWords(lastSegmentOf(key));
+  const head = words[words.length - 1];
+  if (words.length < 2 || head === undefined) {
+    return false;
+  }
+  if (isSensitiveKeyName(head) || LOG_SECRET_VALUE_HEAD_WORDS.includes(head)) {
+    return false;
+  }
+  if (matchesFolded(key, SERVICE_SENSITIVE_FOLDED) || isDatabaseUrlKey(key)) {
+    return false;
+  }
+  return measured || LOG_LOCATION_HEAD_WORDS.includes(head);
 }
 
 /** Whether a field under this name carries a SQL statement. */
@@ -822,7 +942,8 @@ export function scrubLogMessage(message: string): string {
  * an exception escaping a log call, and a bag that refuses enumeration
  * altogether comes back carrying {@link FIELDS_UNREADABLE_KEY}. The result is
  * also safe for pino to receive: prototype-derived names are renamed and the
- * top-level object keeps a prototype, which pino's `child()` requires.
+ * top-level object keeps a prototype, which pino's `child()` requires of a
+ * bindings object a direct caller hands it.
  *
  * Bounded three ways, using the redaction layer's own constants so this
  * checkpoint cannot be looser than the ingest one: at most
@@ -921,7 +1042,8 @@ function readProperty(source: object, key: string): unknown {
  * with `Object.create(null)` so that a source key named `__proto__` becomes an
  * ordinary own property instead of reaching `Object.prototype`'s setter, which
  * would change the destination's prototype and drop the field. The **top**
- * record cannot use a null prototype: pino's `child()` calls
+ * record cannot use a null prototype: it is an exported result a caller may
+ * hand to pino's `child()` as bindings, and pino calls
  * `bindings.hasOwnProperty(...)` on the object it is handed and throws
  * ("bindings.hasOwnProperty is not a function") when the prototype is absent.
  * It is a plain object instead, and {@link reserveKey} renames the
@@ -1058,9 +1180,14 @@ function isErrorFieldKey(key: string): boolean {
  *
  * Name beats type: a denied name masks the value whatever shape it has, which
  * is the only ordering that cannot be defeated by wrapping a credential in an
- * object. The error field is a name rule of the same kind: whatever sits
- * there is a thrown value and takes the closed error shape, so a thrown
- * string cannot travel as ordinary text.
+ * object. The one narrowing is {@link isSecretDescriptorField}: a boolean, a
+ * measured number or a location string under a compound sensitive name
+ * describes a credential and cannot hold one, so it skips the sensitive-name
+ * mask — and only that rule — and is then treated like any other value, the
+ * location string scrubbed by content. A container is never a descriptor, so
+ * the wrapping defence is intact. The error field is a name rule of the same
+ * kind as the mask: whatever sits there is a thrown value and takes the
+ * closed error shape, so a thrown string cannot travel as ordinary text.
  */
 function scrubValue(
   key: string,
@@ -1082,7 +1209,7 @@ function scrubValue(
     if (isMaskedBodyKey(key)) {
       return LOG_MARKERS.redacted;
     }
-    if (isSensitiveLogKey(key)) {
+    if (isSensitiveLogKey(key) && !isSecretDescriptorField(key, value)) {
       return maskSensitiveValue(key, value);
     }
     if (isSqlStatementKey(key)) {
@@ -1824,7 +1951,9 @@ function addClosedDetails(error: Error, result: LogFields, budget: ScrubBudget):
  * One flat pass, never a walk: an entry is kept only when its key matches
  * {@link CLOSED_DETAIL_KEY_PATTERN}, the key is not one the record walk would
  * mask, drop or normalise (a sensitive, database-URL, body, SQL-statement or
- * error-field name), and its value is a finite number, a boolean or a
+ * error-field name — a sensitive name narrowed by
+ * {@link isSecretDescriptorField} exactly as the walk narrows it), and its
+ * value is a finite number, a boolean or a
  * {@link isClosedDetailToken closed token}. A nested object or array is never
  * descended into, so nothing it holds — however deep — can surface; it is
  * counted as one omitted entry. A non-object `details` (which
@@ -1885,14 +2014,17 @@ function closeDetails(details: unknown, budget: ScrubBudget): ClosedDetails | ty
  * entry must be omitted. The key is judged first — by grammar, then by every
  * name rule the record walk applies — so a closed token under `token`,
  * `password`, `databaseUrl`, `body` or `sql` is withheld like any other value
- * under that name.
+ * under that name. The sensitive-name rule is narrowed by
+ * {@link isSecretDescriptorField} as it is in the walk, so a descriptor such
+ * as `apiKeyPresent: true` or `credentialLeaseMs: 900` is kept while
+ * `tokenHash: 'abc'` and `authCode: 482913` are withheld.
  */
 function closedDetailValue(key: string, value: unknown): string | number | boolean | undefined {
   if (
     !isClosedDetailKey(key) ||
     isErrorFieldKey(key) ||
     isMaskedBodyKey(key) ||
-    isSensitiveLogKey(key) ||
+    (isSensitiveLogKey(key) && !isSecretDescriptorField(key, value)) ||
     isSqlStatementKey(key)
   ) {
     return undefined;
@@ -2192,49 +2324,80 @@ function createPinoLogger(
   return destination === undefined ? pino(options) : pino(options, destination);
 }
 
+/** The bindings of a logger that has none: the root, unless options seed it. */
+const NO_BINDINGS: Readonly<LogFields> = Object.freeze({});
+
 /**
  * Wraps a pino instance as a shared `Logger`.
  *
- * This is the argument flip, and the only place it happens. Three properties
+ * This is the argument flip, and the only place it happens. These properties
  * of the wrapper matter:
  *
  * - **Gate before work.** A call below the threshold returns before scrubbing,
  *   so a `trace` call in a hot ingest loop costs one integer comparison rather
  *   than a walk of its fields.
- * - **No empty merge object.** With no fields, pino is called with the message
- *   alone, so the record has no vestigial `{}`.
- * - **Children stay `Logger`s.** `child` wraps pino's child in this same
- *   adapter, so nothing pino-shaped escapes this module. Binding precedence
- *   is pino's: a per-call field and a child binding of the same name both
- *   appear, with the per-call value last, which is last-wins for any JSON
- *   reader and matches the shared contract's *per-call > child > parent*.
+ * - **No empty merge object.** With no bindings and no fields left after
+ *   scrubbing, pino is called with the message alone, so the record has no
+ *   vestigial `{}`.
+ * - **One key per record, precedence per-call > child > parent.** The adapter
+ *   carries its accumulated bindings itself instead of delegating them to
+ *   pino's `child()`, because pino writes the parent's bindings, then the
+ *   child's, then the call's merge object, and never de-duplicates them: a
+ *   `subsystem` re-bound by a nested subsystem logger, a `sessionId` bound by
+ *   two session loggers, or a per-call `stage` beside a bound one would each
+ *   appear twice in one line, possibly with contradictory values, and a reader
+ *   filtering on the key would see whichever its parser kept. Here `child`
+ *   returns an adapter over the *same* root pino instance with
+ *   `{ ...bindings, ...next }`, and each record is written with
+ *   `{ ...bindings, ...fields }` in one pino call. Each key therefore appears
+ *   once: a re-bound key keeps the position it was first bound at and takes
+ *   the nearest value — the call's over the child's, the child's over the
+ *   parent's — which is the shared contract's *per-call > child > parent*.
+ * - **Children stay `Logger`s.** `child` wraps the same pino instance in this
+ *   same adapter, so nothing pino-shaped escapes this module, and every record
+ *   of the tree — bindings included — passes pino's Layer-1 `redact` paths on
+ *   the merged object it is written with.
  * - **The level decides the error shape.** A record's fields are scrubbed
  *   with `diagnostics` on only when the record is written at one of the
  *   {@link DIAGNOSTIC_LOG_LEVELS}, so an error's redacted message and stack,
  *   and a `DebuggenError`'s redacted hint and full details, appear in a
  *   `debug`/`trace` record and never in an `info`, `warn`, `error` or
- *   `fatal` one. Child bindings are scrubbed without it: a binding
- *   is stamped on records of every level, so it can only take the shape safe
- *   at all of them.
+ *   `fatal` one. Bindings are scrubbed once, when the child is created, and
+ *   without it: a binding is stamped on records of every level, so it can
+ *   only take the shape safe at all of them.
+ *
+ * The merged record is a fresh object per call, so the stored bindings —
+ * frozen, and shared by every record of the logger and by its children — are
+ * never handed to pino themselves and no record can change them. The cost is
+ * one shallow copy of a handful of keys per emitted record; records below the
+ * threshold never reach it.
+ *
+ * @param pinoLogger The root pino instance every logger of the tree writes to.
+ * @param level The threshold, shared by the whole tree.
+ * @param bindings Scrubbed bindings stamped on every record; frozen by the caller.
  */
-function createAdapter(pinoLogger: PinoLogger, level: LogLevelSetting): Logger {
+function createAdapter(
+  pinoLogger: PinoLogger,
+  level: LogLevelSetting,
+  bindings: Readonly<LogFields> = NO_BINDINGS,
+): Logger {
+  const bound = Object.keys(bindings).length > 0;
+
   const emit = (target: LogLevel, message: string, fields?: LogFields): void => {
     if (!isLevelEnabled(level, target)) {
       return;
     }
     const safeMessage = scrubLogMessage(message);
-    if (fields === undefined) {
+    const safeFields =
+      fields === undefined
+        ? undefined
+        : scrubLogFields(fields, { diagnostics: DIAGNOSTIC_LOG_LEVELS.includes(target) });
+    const called = safeFields !== undefined && Object.keys(safeFields).length > 0;
+    if (!bound && !called) {
       pinoLogger[target](safeMessage);
       return;
     }
-    const safeFields = scrubLogFields(fields, {
-      diagnostics: DIAGNOSTIC_LOG_LEVELS.includes(target),
-    });
-    if (Object.keys(safeFields).length === 0) {
-      pinoLogger[target](safeMessage);
-      return;
-    }
-    pinoLogger[target](safeFields, safeMessage);
+    pinoLogger[target](called ? { ...bindings, ...safeFields } : { ...bindings }, safeMessage);
   };
 
   const logger: Logger = {
@@ -2257,10 +2420,24 @@ function createAdapter(pinoLogger: PinoLogger, level: LogLevelSetting): Logger {
     fatal: (message, fields) => {
       emit('fatal', message, fields);
     },
-    child: (bindings) => createAdapter(pinoLogger.child(scrubLogFields(bindings)), level),
+    child: (next) => createAdapter(pinoLogger, level, mergeBindings(bindings, next)),
   };
 
   return Object.freeze(logger);
+}
+
+/**
+ * The bindings of a child: the parent's, then `next` scrubbed, as one frozen
+ * object in which a key `next` re-binds keeps its position and takes `next`'s
+ * value (*child > parent*).
+ *
+ * `next` is scrubbed once, here, and without diagnostics — a binding is
+ * stamped on records of every level — so a sensitive binding is masked when
+ * the child is created and every record of the child carries the masked
+ * value. `parent` is already scrubbed and is copied, never re-walked.
+ */
+function mergeBindings(parent: Readonly<LogFields>, next: LogFields): Readonly<LogFields> {
+  return Object.freeze({ ...parent, ...scrubLogFields(next) });
 }
 
 /**
@@ -2538,6 +2715,13 @@ export function guardLogger(logger: Logger, policy: LogFailurePolicy = {}): Logg
  * reports `'silent'`, which is what a caller inspecting the threshold expects
  * either way.
  *
+ * Every logger of the returned tree writes each key once per record. Root
+ * bindings (`options.bindings`), each child's bindings and a call's fields are
+ * merged into one object before pino sees it, with precedence *per-call >
+ * child > parent*: a re-bound `subsystem`, a `sessionId` bound twice or a
+ * per-call `stage` replaces the value it overrides instead of appearing beside
+ * it.
+ *
  * @param config The validated service configuration; its `logLevel` is the
  *   threshold unless `options.level` overrides it.
  * @param options Test and embedding seams; see {@link ServiceLoggerOptions}.
@@ -2554,10 +2738,12 @@ export function createServiceLogger(
   }
 
   const root = options.pinoLogger ?? createPinoLogger(level, options.destination);
-  const bindings = options.bindings;
-  const bound = bindings === undefined ? root : root.child(scrubLogFields(bindings));
+  // Root bindings are the adapter's initial bindings rather than a pino child,
+  // so a child re-binding one of them replaces it instead of repeating it.
+  const bindings =
+    options.bindings === undefined ? NO_BINDINGS : mergeBindings(NO_BINDINGS, options.bindings);
 
-  return guardLogger(createAdapter(bound, level), options.failurePolicy);
+  return guardLogger(createAdapter(root, level, bindings), options.failurePolicy);
 }
 
 /**

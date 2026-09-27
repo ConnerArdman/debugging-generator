@@ -4,18 +4,26 @@
  * 1. The renderer stylesheet is the first import: the `@debuggen/panel-renderer` JS
  *    barrel never imports its CSS. It is the panel's only styling act — no inline
  *    styles and no `<style>` block, because every value resolves to a renderer token.
- * 2. The theme store's resolved theme is applied to the document root before
+ * 2. `../shared/csp-runtime` is the first JavaScript import: it switches Zod to its
+ *    jitless path before any schema exists, so the extension CSP raises no `eval`
+ *    issue on panel load.
+ * 3. The theme store's resolved theme is applied to the document root before
  *    `createRoot`, so the first paint uses the right token set; the extension CSP
  *    rules out doing this with an inline script in the page. Resolution falls back
  *    to dark when `chrome.devtools` is absent, as when the page opens directly as an
  *    extension page, so this module adds no `chrome.*` access.
- * 3. {@link ThemedApp} mounts into `#root` inside `StrictMode`; a missing mount
+ * 4. {@link ThemedApp} mounts into `#root` inside `StrictMode`; a missing mount
  *    element throws an `Error` naming the id rather than leaving a blank DevTools tab.
  *
  * @module apps/chrome-extension/src/panel/main
  */
 
 import '@debuggen/panel-renderer/styles.css';
+
+// ORDER IS LOAD-BEARING: the first JavaScript import, evaluated before every module
+// that builds a Zod schema. vite.config.ts pins it into its own chunk, imported ahead
+// of the shared Zod chunk, and fails the build if that order is ever lost.
+import '../shared/csp-runtime';
 
 import { StrictMode, useLayoutEffect, useSyncExternalStore } from 'react';
 import type { ReactElement } from 'react';

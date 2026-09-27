@@ -39,7 +39,16 @@
  *
  * The rest of the module — the per-kind key registry, the value vocabularies
  * and the two privacy bounds — is guarded by `./event.test.ts` alongside the
- * event schema those declarations are validated through.
+ * event schema those declarations are validated through. Two exceptions are
+ * pinned here. The first is the **order** of the render kind's key tuple,
+ * because `../aggregate/renders.ts` binds those keys by position and the
+ * coalescing keys (`instanceCount`, `maxInstanceDuration`, PERF-F08) and then
+ * `changedContexts` were appended after the original eight on that condition. The second is the
+ * caller evidence at the end of this file: the keys that name *which code*
+ * issued a request or a statement (`initiatorComponent`, `initiatorOwners`,
+ * and an ORM operation's `model` and `method`). Their position and ownership
+ * are a contract between a producer and the service's source resolver and
+ * request aggregate that no schema check expresses, so it is pinned here.
  */
 
 import { readFileSync } from 'node:fs';
@@ -50,16 +59,25 @@ import { describe, expect, it } from 'vitest';
 
 import {
   BYTE_METRIC_IDS,
+  COMMON_ATTRIBUTE_KEYS,
   COUNT_METRIC_IDS,
+  DB_QUERY_ATTRIBUTE_KEYS,
   DURATION_METRIC_IDS,
+  FETCH_ATTRIBUTE_KEYS,
+  KIND_ATTRIBUTE_KEYS,
   METRIC_ID_UNITS,
   METRIC_IDS,
   METRIC_UNITS,
+  RENDER_ATTRIBUTE_KEYS,
+  SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
+  XHR_ATTRIBUTE_KEYS,
+  attributeKeysFor,
   isMetricId,
   metricUnitFor,
   type MetricId,
   type MetricUnit,
 } from './attributes.js';
+import { RENDER_KINDS, TELEMETRY_KINDS } from './kinds.js';
 
 /**
  * The fourteen ids of AAP §0.2.3, in the order that section lists them.
@@ -364,5 +382,84 @@ describe('consumer assignability', () => {
 
     expect(firstId).toBe('total_duration');
     expect(Array.isArray(METRIC_IDS)).toBe(true);
+  });
+});
+
+describe('the render attribute keys', () => {
+  it('keeps the original eight in place, then the two coalescing keys, then the changed contexts', () => {
+    // Written out as data: `../aggregate/renders.ts` and its suite bind these
+    // by position, so a reorder must fail here rather than there, silently.
+    expect([...RENDER_ATTRIBUTE_KEYS]).toStrictEqual([
+      'component',
+      'phase',
+      'renderCount',
+      'changedProps',
+      'trigger',
+      'actualDuration',
+      'ownerChain',
+      'selfTime',
+      'instanceCount',
+      'maxInstanceDuration',
+      'changedContexts',
+    ]);
+    expect(Object.isFrozen(RENDER_ATTRIBUTE_KEYS)).toBe(true);
+  });
+
+  it('is the tuple exactly one render-group kind declares', () => {
+    const declaring = RENDER_KINDS.filter(
+      (kind) => attributeKeysFor(kind) === RENDER_ATTRIBUTE_KEYS,
+    );
+
+    expect(declaring).toHaveLength(1);
+  });
+});
+
+describe('caller evidence keys', () => {
+  /** The keys `../browser/fetch.ts` writes beside the call-site stack. */
+  const COMPONENT_KEYS = ['initiatorComponent', 'initiatorOwners'] as const;
+
+  /** The keys an ORM's tracing writes on its operation and transaction spans. */
+  const ORM_OPERATION_KEYS = ['model', 'method'] as const;
+
+  it('declares the component that started a request immediately after the stack, on both request kinds', () => {
+    // The two request tuples mirror each other key for key, so the aggregate
+    // types its reads against one of them; the component keys follow the
+    // `initiator` they qualify.
+    for (const keys of [FETCH_ATTRIBUTE_KEYS, XHR_ATTRIBUTE_KEYS]) {
+      const at = keys.indexOf('initiator');
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect(keys.slice(at, at + 3)).toStrictEqual(['initiator', ...COMPONENT_KEYS]);
+    }
+    expect([...XHR_ATTRIBUTE_KEYS]).toStrictEqual([...FETCH_ATTRIBUTE_KEYS]);
+  });
+
+  it('declares the ORM operation keys on the database kind, in the ORM’s own spelling', () => {
+    expect(DB_QUERY_ATTRIBUTE_KEYS.slice(-ORM_OPERATION_KEYS.length)).toStrictEqual([
+      ...ORM_OPERATION_KEYS,
+    ]);
+    expect(attributeKeysFor('db.query')).toEqual(expect.arrayContaining([...ORM_OPERATION_KEYS]));
+  });
+
+  it('declares each caller key on exactly the kinds that carry it', () => {
+    for (const kind of TELEMETRY_KINDS) {
+      const declared = KIND_ATTRIBUTE_KEYS[kind];
+      const isRequest = kind === 'fetch' || kind === 'xhr';
+
+      for (const key of COMPONENT_KEYS) {
+        expect(declared.includes(key)).toBe(isRequest);
+      }
+    }
+    expect(KIND_ATTRIBUTE_KEYS['db.query']).toEqual(
+      expect.arrayContaining([...ORM_OPERATION_KEYS]),
+    );
+  });
+
+  it('leaves every caller key to its producer: none is assigned, or overwritten, at ingest', () => {
+    // Ingest strips producer-supplied values of the service-assigned keys, so
+    // a caller key in that group would never reach the aggregate or resolver.
+    for (const key of [...COMPONENT_KEYS, ...ORM_OPERATION_KEYS]) {
+      expect(SERVICE_ASSIGNED_ATTRIBUTE_KEYS).not.toContain(key);
+      expect(COMMON_ATTRIBUTE_KEYS).not.toContain(key);
+    }
   });
 });

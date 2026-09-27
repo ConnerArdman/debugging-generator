@@ -82,10 +82,12 @@
   user-select: none;
 }
 
-/* The one-line answer to "what is missing here". The component picks the element - a region with
- * no heading of its own gets a real heading level, a block inside a section that already has one
- * gets a paragraph - so the margin reset and the type role are stated here rather than left to
- * whichever element turns up. */
+/* The one-line answer to "what is missing here". The element is a heading level - `h2` by default,
+ * `h3` inside a section, card or dialog that already has its own `h2`, `h1` where the block is the
+ * whole page - and each of those carries a different size in the element rules of app/globals.css.
+ * So the margin reset, colour, size, weight and line height are all stated here rather than left
+ * to whichever element turns up: this class outranks those element rules, and the block reads the
+ * same at every level. */
 .heading {
   margin: 0;
   color: var(--ls-text, #0f172a);

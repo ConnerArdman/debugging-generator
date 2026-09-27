@@ -57,6 +57,11 @@
  * turns back into that summary. Progress rows live in the service's
  * `session_progress` table rather than on the record, so a reopened session
  * shows exactly the rows the service chooses to send — none are invented.
+ * The service re-sends that stored history on every `GET /sessions/:id` (a
+ * reopen, a resync after a reconnect, an end's detail read), each replayed
+ * frame under a new envelope id but with the `ts` it was first sent with, so
+ * {@link ExtensionState.applyProgress} applies a frame it has already applied
+ * at most once and a replay adds only what this window missed.
  *
  * ## One whole record, and list rows for everything else
  *
@@ -154,8 +159,9 @@
  * const state = new ExtensionState({ serviceUrl, provider });
  * context.subscriptions.push(state);
  * state.onDidChange((snapshot) => view.postState(snapshot));
- * client.on('session.updated', (payload) => state.applySessionRecord(payload.session));
- * client.on('session.progress', (payload) => state.applyProgress(payload));
+ * client.on('session.updated', (message) => state.applySessionRecord(message.payload.session));
+ * // The envelope's `ts` is the frame's identity across the service's replays.
+ * client.on('session.progress', (message) => state.applyProgress(message.payload, message.ts));
  *
  * // Starting a session: frames of the new session that beat the HTTP answer
  * // are held, then replayed once the answered record is adopted.
@@ -379,7 +385,8 @@ const INSTRUMENTATION_STAGE = 'instrument' satisfies ProgressStage;
 
 /**
  * How far along its lifecycle a modification record's status is, for
- * {@link ExtensionState.applyModificationJournal}: a record is journaled
+ * {@link ExtensionState.applyModificationJournal} and for the merge of a
+ * session record's `modifications` (`mergeModifications`): a record is journaled
  * `pending`, becomes `applied` once written, ends `failed` or `conflict` when
  * it could not be written or restored, and `reverted` once restored — which
  * is closed for good. An answer is never allowed to move a held record back.
@@ -421,6 +428,49 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
  * sections as their summaries and mounts their rows only on demand.
  */
 const MAX_PROGRESS_ENTRIES = 1_000;
+
+/**
+ * The most `session.progress` frame identities the store remembers for the
+ * active session, so that a frame the service replays is applied at most once
+ * (see {@link ExtensionState.applyProgress}).
+ *
+ * Four times {@link MAX_PROGRESS_ENTRIES}: a replay carries at most the 500
+ * most recent stored rows, and the store holds at most that many rows, so
+ * every frame a replay can still carry is remembered — including frames whose
+ * rows compaction has already dropped — with room for several in-place
+ * settlements per row. Past the bound the oldest identity is forgotten first
+ * (first in, first out), which keeps the memory bounded however long a session
+ * lives. Each identity is one short string.
+ */
+const MAX_APPLIED_PROGRESS_FRAMES = 4 * MAX_PROGRESS_ENTRIES;
+
+/**
+ * The opening of AAP §0.5.5's degradation sentence, "Could not enable
+ * ‹signal›: ‹reason›. Continuing with: ‹enabled list›." — the wording the
+ * service's ✕ progress rows and this editor's degradation notice share.
+ *
+ * `src/extension.ts` composes its notice from it, and
+ * {@link ExtensionState.applyProgress} reads it so that a later `done` row
+ * named exactly after the signal — the service correcting its readiness —
+ * supersedes the ✕ row it corrects instead of standing beside it. It is the
+ * product's own vocabulary, never a project's (AAP §0.5.4).
+ *
+ * @example
+ * ```ts
+ * `${DEGRADATION_SENTENCE_LEAD} ${label}: ${reason}.`; // "Could not enable Server spans: …."
+ * ```
+ */
+export const DEGRADATION_SENTENCE_LEAD = 'Could not enable';
+
+/**
+ * A character that continues a word in any script: a letter, a combining mark
+ * or a digit. Used by {@link extendsAtWordBoundary}.
+ */
+const WORD_CONTINUATION = /[\p{L}\p{M}\p{N}]/u;
+
+/** The UTF-16 low-surrogate range: a code unit that can only close a surrogate pair. */
+const LOW_SURROGATE_FIRST = 0xdc00;
+const LOW_SURROGATE_LAST = 0xdfff;
 
 /**
  * Bounds a progress list to {@link MAX_PROGRESS_ENTRIES} without losing any
@@ -519,6 +569,177 @@ function boundProgress(rows: readonly ProgressEntry[]): readonly ProgressEntry[]
     keep.add(index);
   }
   return [header, ...rest.filter((_, index) => keep.has(index))];
+}
+
+/**
+ * The identity of one `session.progress` frame across the service's replays,
+ * or `undefined` when the frame carries no usable send time.
+ *
+ * The service stamps a row's envelope when it first sends it and re-sends the
+ * stored row with that same `ts` (and a new envelope id) on every replay, so
+ * the send time together with the row's content names the frame; the content
+ * is part of the identity because several rows are routinely sent within one
+ * millisecond. An absent detail and an empty one are the same identity.
+ *
+ * @param payload The frame's payload.
+ * @param sentAt The envelope's `ts`, in epoch milliseconds, when known.
+ * @returns A compact key, or `undefined` for a missing or non-finite time.
+ */
+function progressFrameIdentity(
+  payload: SessionProgressPayload,
+  sentAt: number | undefined,
+): string | undefined {
+  if (sentAt === undefined || !Number.isFinite(sentAt)) {
+    return undefined;
+  }
+  return JSON.stringify([
+    sentAt,
+    payload.stage,
+    payload.status,
+    payload.message,
+    payload.detail ?? '',
+  ]);
+}
+
+/**
+ * Whether one progress message extends the other at a word boundary: the
+ * longer one starts with the whole shorter one, and the character right after
+ * that does not continue the shorter one's last word — it is not a letter, a
+ * combining mark or a digit of any script, nor the second half of a surrogate
+ * pair the shorter one would split.
+ *
+ * This is how a settling row names the row it settles when the service words
+ * the two differently: a failed stage reports "‹title› failed: ‹summary›"
+ * under its "‹title›" header, and a degradation notice first announced as
+ * "Could not enable ‹signal›: ‹reason›. Continuing with: ‹list›." is closed by
+ * "Could not enable ‹signal›: ‹reason›.". Equal messages are not an extension.
+ *
+ * @example
+ * ```ts
+ * extendsAtWordBoundary('Preparing instrumentation', 'Preparing instrumentation failed: …'); // true
+ * extendsAtWordBoundary('Found cart', 'Found cartItems');                                  // false
+ * ```
+ */
+function extendsAtWordBoundary(a: string, b: string): boolean {
+  const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
+  if (shorter.length === 0 || shorter.length === longer.length || !longer.startsWith(shorter)) {
+    return false;
+  }
+  const next = longer.codePointAt(shorter.length);
+  if (next === undefined || (next >= LOW_SURROGATE_FIRST && next <= LOW_SURROGATE_LAST)) {
+    return false;
+  }
+  return !WORD_CONTINUATION.test(String.fromCodePoint(next));
+}
+
+/**
+ * Whether `message` is the AAP §0.5.5 sentence reporting that `label` could
+ * not be enabled: {@link DEGRADATION_SENTENCE_LEAD}, one space, `label`, then
+ * `:` (a reason follows) or `.` (none does). The `:`/`.` requirement keeps a
+ * label that merely begins another signal's label from matching it.
+ *
+ * @param message A held row's message.
+ * @param label The message of an incoming `done` row.
+ */
+function reportsUnavailable(message: string, label: string): boolean {
+  const opening = `${DEGRADATION_SENTENCE_LEAD} ${label}`;
+  if (!message.startsWith(opening)) {
+    return false;
+  }
+  const next = message.charAt(opening.length);
+  return next === ':' || next === '.';
+}
+
+/**
+ * Where an incoming progress row lands in `held`: the index of the row it
+ * replaces in place, or `-1` when it is appended. Only rows of the incoming
+ * stage's **latest episode** — the last contiguous run of that stage's rows —
+ * are ever candidates, so no row of another episode or stage is touched. The
+ * rules, in order (the first that applies decides):
+ *
+ * 1. **No run of the stage yet** — appended.
+ * 2. **A new episode** — a `running` row whose stage's latest run is not the
+ *    tail of the list (a stage header opening again after other stages
+ *    reported, as a follow-up's second `plan` does) is appended, leaving the
+ *    earlier episode exactly as it was.
+ * 3. **Same message** — the row with the same message in the run is replaced,
+ *    whatever its status: a header moving from `running` to `done`, or a
+ *    `done` row re-announced.
+ * 4. **Settlement** — a `done` or `failed` row replaces the run's newest
+ *    `running` row whose message it extends, or is extended by, at a word
+ *    boundary ({@link extendsAtWordBoundary}): the header a failed stage's
+ *    "‹title› failed: ‹summary›" closes, the notice a ✕ row closes.
+ * 5. **Correction** — a `done` row whose message is exactly a signal's label
+ *    replaces the run's newest `failed` or `running` row reporting that signal
+ *    unavailable ({@link reportsUnavailable}): the service corrected its
+ *    readiness, and the ✕ it sent is superseded rather than kept beside the ✓.
+ * 6. **Otherwise** — appended.
+ *
+ * Pure: it reads `held` and the incoming row's stage, status and message only.
+ *
+ * @param held The held rows, in arrival order.
+ * @param incoming The row about to be applied.
+ * @returns The index to replace, or `-1` to append.
+ */
+function progressLandingIndex(
+  held: readonly ProgressEntry[],
+  incoming: Pick<ProgressEntry, 'stage' | 'status' | 'message'>,
+): number {
+  let episodeLast = held.length - 1;
+  while (episodeLast >= 0 && held[episodeLast]?.stage !== incoming.stage) {
+    episodeLast -= 1;
+  }
+  if (episodeLast < 0) {
+    return -1;
+  }
+  if (episodeLast !== held.length - 1 && incoming.status === 'running') {
+    return -1;
+  }
+  let episodeFirst = episodeLast;
+  while (episodeFirst > 0 && held[episodeFirst - 1]?.stage === incoming.stage) {
+    episodeFirst -= 1;
+  }
+
+  for (let index = episodeFirst; index <= episodeLast; index += 1) {
+    if (held[index]?.message === incoming.message) {
+      return index;
+    }
+  }
+  if (incoming.status === 'running') {
+    return -1;
+  }
+  for (let index = episodeLast; index >= episodeFirst; index -= 1) {
+    const row = held[index];
+    if (row?.status === 'running' && extendsAtWordBoundary(row.message, incoming.message)) {
+      return index;
+    }
+  }
+  if (incoming.status === 'done') {
+    for (let index = episodeLast; index >= episodeFirst; index -= 1) {
+      const row = held[index];
+      if (
+        row !== undefined &&
+        row.status !== 'done' &&
+        reportsUnavailable(row.message, incoming.message)
+      ) {
+        return index;
+      }
+    }
+  }
+  return -1;
+}
+
+/**
+ * The rows of a session that has ended, as the view keeps them: every row but
+ * those still `running`. See {@link ExtensionState.applySessionRecord}.
+ *
+ * @param rows The held rows; not mutated.
+ * @returns `rows` itself when none is running, otherwise a new frozen list.
+ */
+function withoutRunningRows(rows: readonly ProgressEntry[]): readonly ProgressEntry[] {
+  return rows.some((row) => row.status === 'running')
+    ? Object.freeze(rows.filter((row) => row.status !== 'running'))
+    : rows;
 }
 
 /**
@@ -665,6 +886,70 @@ function supersedes(
   return incoming.updatedAt >= held.updatedAt;
 }
 
+/**
+ * The suffix that closes the detail of a stage failure's `failed` row:
+ * `(error code: ‹CODE›, ref: ‹ref›)`, anchored at the end of the detail.
+ *
+ * The service composes every stage failure's row in one place
+ * (`projectFailure` in `apps/local-service/src/sessions/progress.ts`): the
+ * message is `‹stage title› failed: ‹summary›` and the detail is
+ * `‹hint› (error code: ‹CODE›, ref: ‹ref›)`, or the suffix alone when the
+ * failure has no hint. `‹CODE›` comes from the closed `DEBUGGEN_ERROR_CODES`
+ * vocabulary — upper-case letters, digits and underscores, starting with a
+ * letter — and `‹ref›` is a diagnostic id with no whitespace or parentheses.
+ * A `failed` row that is not a stage failure, such as a signal that could not
+ * be enabled ("Could not enable ‹signal›: ‹reason›."), carries no such suffix,
+ * which is what tells the two apart.
+ */
+const STAGE_FAILURE_DETAIL_SUFFIX = /\(error code: ([A-Z][A-Z0-9_]*), ref: [^\s()]+\)\s*$/u;
+
+/**
+ * What separates a stage's title from its failure summary in the message of
+ * the stage's `failed` row (`‹stage title› failed: ‹summary›`); see
+ * {@link STAGE_FAILURE_DETAIL_SUFFIX}. The stage's header row carries the title
+ * alone, so a `running` header row whose message is that prefix is the stage
+ * starting again.
+ */
+const STAGE_FAILURE_TITLE_SEPARATOR = ' failed: ';
+
+/** The parts of a stage failure its `failed` row's detail carries. */
+interface StageFailureDetail {
+  /** The code the suffix names. */
+  readonly code: string;
+  /** The service's next step: the detail before the suffix, when it is not blank. */
+  readonly hint?: string;
+}
+
+/**
+ * Reads the stage failure a `failed` row's detail reports, when it reports one.
+ *
+ * @param detail The row's detail, as received.
+ * @returns The code and, when the service sent one, the hint; `undefined` for
+ *   a detail that does not end in {@link STAGE_FAILURE_DETAIL_SUFFIX} — the
+ *   row then is not a stage failure.
+ *
+ * @example
+ * ```ts
+ * parseStageFailureDetail('Retry the step. (error code: INTERNAL, ref: msg_0123456789abcdef)');
+ * // → { code: 'INTERNAL', hint: 'Retry the step.' }
+ * parseStageFailureDetail('(error code: INTERNAL, ref: msg_0123456789abcdef)');
+ * // → { code: 'INTERNAL' }
+ * parseStageFailureDetail('Could not enable Server spans: no preload.'); // → undefined
+ * ```
+ */
+function parseStageFailureDetail(detail: string | undefined): StageFailureDetail | undefined {
+  if (detail === undefined) {
+    return undefined;
+  }
+  const match = STAGE_FAILURE_DETAIL_SUFFIX.exec(detail);
+  const code = match?.[1];
+  if (match === null || code === undefined) {
+    return undefined;
+  }
+  const hint = detail.slice(0, match.index).trim();
+  return hint.length > 0 ? { code, hint } : { code };
+}
+
 // ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
@@ -704,6 +989,13 @@ export class ExtensionState implements vscode.Disposable {
   private sessionValue: SessionRecord | undefined;
   private sessionEndpointValue: string | undefined;
   private progressValue: readonly ProgressEntry[] = Object.freeze([]);
+  /**
+   * The identities of the progress frames applied to the active session, in
+   * the order applied, at most {@link MAX_APPLIED_PROGRESS_FRAMES}; see
+   * {@link applyProgress}. Kept apart from the rows, so it survives their
+   * compaction and every merge of the same session.
+   */
+  private readonly appliedProgressFrames = new Set<string>();
   private relevantFilesValue: readonly RelevantFile[] = Object.freeze([]);
   private modificationsValue: readonly ModificationRecord[] = Object.freeze([]);
   private modificationsTotalValue: number | undefined;
@@ -1212,6 +1504,15 @@ export class ExtensionState implements vscode.Disposable {
    * documentation for the merge rules that keep a push-established fact from
    * regressing when a record arrives out of order.
    *
+   * An `ended` record of the active session also resolves its progress: the
+   * rows still `running` are dropped. From the end on, the store ignores every
+   * `running` frame of the session ({@link applyProgress}), so a reopened
+   * ended session never shows a spinner; dropping the ones left over from the
+   * live run makes the view of a session that ended while being watched the
+   * same as the view of that session reopened later. Only `running` rows go —
+   * each is an announcement the pipeline can no longer complete — while every
+   * `done` and `failed` row stays, and nothing is added (AAP §0.5.4).
+   *
    * Only a record that becomes the active session is cloned and kept. Any
    * other record contributes its list row alone — a fresh projection that
    * shares nothing with `session` — so a frequently re-broadcast session the
@@ -1348,7 +1649,9 @@ export class ExtensionState implements vscode.Disposable {
    * ({@link hasAcknowledgedEnd}): the records the service broadcast before its
    * end — cleanup recorded on a session not yet `ended` — may arrive later and
    * with a newer `updatedAt`, and none of them replaces this one. The
-   * capture window is closed. The cleanup state takes the answered status,
+   * capture window is closed, and the progress rows still `running` are
+   * dropped, exactly as an `ended` record drops them (see
+   * {@link applySessionRecord}). The cleanup state takes the answered status,
    * keeping the conflicts already reported for this session and stamping
    * `completedAt` with the host clock unless the answer is `pending`; a
    * finished cleanup `cleanup.completed` already reported is never regressed to
@@ -1369,6 +1672,7 @@ export class ExtensionState implements vscode.Disposable {
     this.sessionValue = record;
     this.acknowledgeEnd(record);
     this.refreshListedSession(record);
+    this.progressValue = withoutRunningRows(this.progressValue);
     const capture = this.captureValue;
     if (capture.active) {
       this.captureValue = Object.freeze({ ...capture, active: false });
@@ -1505,10 +1809,13 @@ export class ExtensionState implements vscode.Disposable {
    * {@link adoptSession} calls it inside the same batch as the adoption, so
    * listeners never see the empty state in between.
    *
-   * Clears the session and its owning endpoint, its progress rows, relevant
+   * Clears the session and its owning endpoint, its progress rows and the
+   * identities of the progress frames applied to it, relevant
    * files, modifications and their counted total, instrumentation report,
    * analysis, panel summary, target, capture window and failure; a new
-   * session never inherits the previous session's target.
+   * session never inherits the previous session's target, and a session
+   * adopted again later is replayed into an empty list rather than refused as
+   * already applied.
    * Keeps the connection, provider, service URL and {@link sessionList};
    * keeps the pairing code, which belongs to the Chrome extension rather than
    * to any session; and keeps the previous session's cleanup status visible
@@ -1522,6 +1829,7 @@ export class ExtensionState implements vscode.Disposable {
     this.sessionValue = undefined;
     this.sessionEndpointValue = undefined;
     this.progressValue = Object.freeze([]);
+    this.appliedProgressFrames.clear();
     this.relevantFilesValue = Object.freeze([]);
     this.modificationsValue = Object.freeze([]);
     this.modificationsTotalValue = undefined;
@@ -1550,12 +1858,43 @@ export class ExtensionState implements vscode.Disposable {
    *   is `running` — a stage header opening again after other stages reported —
    *   the row is appended, so the second episode lands after the stages that
    *   preceded it and the first episode's rows are left exactly as they were.
-   * - **Otherwise** the row with the same `message` inside that run is
+   * - **The same message:** the row with the same `message` inside that run is
    *   replaced in place: `running` becoming `done` or `failed` keeps its
    *   position, and a `done` row the service re-announces for a run that is no
-   *   longer the tail is replaced, never duplicated. A replaced row keeps the
-   *   receipt time it first arrived with (`ts`), which is its identity in the
-   *   view. A row with no such match is appended.
+   *   longer the tail is replaced, never duplicated.
+   * - **A settlement worded differently:** a `done` or `failed` row replaces
+   *   the run's newest `running` row when one message extends the other at a
+   *   word boundary — "‹title› failed: ‹summary›" settles its "‹title›"
+   *   header, and the ✕ "Could not enable ‹signal›: ‹reason›." settles the
+   *   notice "Could not enable ‹signal›: ‹reason›. Continuing with: ‹list›.",
+   *   so each step and each signal is one row. An equal message always wins
+   *   over an extension.
+   * - **A correction:** a `done` row whose message is exactly a signal's label
+   *   replaces the run's newest `failed` or `running` row reporting that signal
+   *   unavailable ({@link DEGRADATION_SENTENCE_LEAD}), so the ✓ the service
+   *   sends once it corrects its readiness supersedes the stale ✕.
+   * - **Otherwise** the row is appended.
+   *
+   * A replaced row keeps its position and the receipt time it first arrived
+   * with (`ts`), which is its identity in the view, and takes the frame's
+   * status, message and detail. No rule reaches outside the stage's latest
+   * run, so no row of another episode or stage is ever touched; the rules are
+   * {@link progressLandingIndex}'s.
+   *
+   * **Replays are idempotent.** The service re-sends a session's stored rows
+   * on every `GET /sessions/:id` — each under a new envelope id, but with the
+   * envelope `ts` it was first sent with. Given that send time (`sentAt`), the
+   * store remembers the frame's identity — send time, stage, status, message
+   * and detail — for the active session, at most
+   * {@link MAX_APPLIED_PROGRESS_FRAMES} of them, oldest forgotten first; a
+   * frame whose identity it already holds changes nothing and notifies no
+   * one. A frame this window missed live has an identity the store does not
+   * hold, so the replay that carries it applies it once under the rules
+   * above, and a genuinely new frame — a follow-up's next episode — carries a
+   * new send time and applies as always. The identities survive compaction
+   * and every merge or re-adoption of the same session, and are cleared only
+   * when another session becomes active ({@link resetSession}). A frame
+   * without a send time is applied exactly as the rules say, every time.
    *
    * Receipt times are unique and increase along the list: a frame received in
    * the same millisecond as the newest row (or after the clock stepped back)
@@ -1571,27 +1910,39 @@ export class ExtensionState implements vscode.Disposable {
    * the held list once (and compacts only past the bound).
    *
    * Progress of any session other than the active one is not applied (it is
-   * held while a {@link SessionCreationWindow} is open, and stamped when
-   * replayed). A `running` row of a session acknowledged as ended
-   * ({@link hasAcknowledgedEnd}) is a delayed frame that would show the
-   * session working again, and is ignored; its `done` and `failed` rows still
-   * apply.
+   * held while a {@link SessionCreationWindow} is open, together with its send
+   * time, and stamped when replayed). A `running` row of a session
+   * acknowledged as ended ({@link hasAcknowledgedEnd}) is a delayed frame that
+   * would show the session working again, and is ignored; its `done` and
+   * `failed` rows still apply.
+   *
+   * @param payload The frame's payload.
+   * @param sentAt The frame's envelope `ts`, in epoch milliseconds: its
+   *   identity across the service's replays. Omitted, the frame is applied
+   *   without replay de-duplication.
    *
    * @example
    * ```ts
    * // … generate-panel ✓ · followup ✓ · then a second plan episode:
-   * state.applyProgress({ sessionId, stage: 'plan', status: 'running', message });
+   * state.applyProgress({ sessionId, stage: 'plan', status: 'running', message }, sentAt);
    * // → appended after the follow-up row; the first plan row is untouched.
+   * state.applyProgress({ sessionId, stage: 'plan', status: 'running', message }, sentAt);
+   * // → the same frame replayed: nothing changes.
    * ```
    */
-  applyProgress(payload: SessionProgressPayload): void {
+  applyProgress(payload: SessionProgressPayload, sentAt?: number): void {
     if (
       this.isDisposed ||
       !this.admitsFrame(payload.sessionId, payload, (held) => {
-        this.applyProgress(held);
+        this.applyProgress(held, sentAt);
       }) ||
       (payload.status === 'running' && this.isLiveFrameOfEndedSession(payload.sessionId))
     ) {
+      return;
+    }
+    const identity = progressFrameIdentity(payload, sentAt);
+    if (identity !== undefined && this.appliedProgressFrames.has(identity)) {
+      // Already applied: a replay of stored history, which adds nothing.
       return;
     }
     const held = this.progressValue;
@@ -1608,28 +1959,7 @@ export class ExtensionState implements vscode.Disposable {
       ts: receivedAt,
     });
 
-    // The stage's latest episode: the last contiguous run of its rows.
-    let episodeLast = held.length - 1;
-    while (episodeLast >= 0 && held[episodeLast]?.stage !== entry.stage) {
-      episodeLast -= 1;
-    }
-    let replaceAt = -1;
-    if (episodeLast >= 0) {
-      let episodeFirst = episodeLast;
-      while (episodeFirst > 0 && held[episodeFirst - 1]?.stage === entry.stage) {
-        episodeFirst -= 1;
-      }
-      const opensNewEpisode = episodeLast !== held.length - 1 && entry.status === 'running';
-      if (!opensNewEpisode) {
-        for (let index = episodeFirst; index <= episodeLast; index += 1) {
-          if (held[index]?.message === entry.message) {
-            replaceAt = index;
-            break;
-          }
-        }
-      }
-    }
-
+    const replaceAt = progressLandingIndex(held, entry);
     let rows: ProgressEntry[];
     const replaced = replaceAt === -1 ? undefined : held[replaceAt];
     if (replaced === undefined) {
@@ -1639,6 +1969,9 @@ export class ExtensionState implements vscode.Disposable {
       // The row keeps the time it first arrived: that time is its identity in the
       // view, so a row moving from running to done is updated, never remounted.
       rows[replaceAt] = Object.freeze({ ...entry, ts: replaced.ts });
+    }
+    if (identity !== undefined) {
+      this.rememberProgressFrame(identity);
     }
     this.progressValue = Object.freeze(boundProgress(rows));
     this.markChanged();
@@ -1949,6 +2282,112 @@ export class ExtensionState implements vscode.Disposable {
     this.markChanged();
   }
 
+  /**
+   * Records the stage failure a `session.progress` row reports, and clears it
+   * when the failed stage starts again. The host calls it right after
+   * {@link applyProgress} for every `session.progress` frame.
+   *
+   * ## Why a progress row
+   *
+   * The service reports every stage failure — of any pipeline stage, of the
+   * session manager, of cleanup — as one `failed` `session.progress` row,
+   * written as part of the session's transition into `failed` and sent before
+   * the `session.updated` that carries that status
+   * (`apps/local-service/src/sessions/manager.ts`). Only the instrumentation
+   * stage also has a message of its own (`instrumentation.failed`, see
+   * {@link applyInstrumentationFailed}); for every other stage, and for a
+   * reopened session, whose record has no failure field, the row is the only
+   * carrier of the failing stage (AAP §0.5.5).
+   *
+   * ## The carrier format
+   *
+   * A stage failure's row reads `‹stage title› failed: ‹summary›`, with the
+   * detail `‹hint› (error code: ‹CODE›, ref: ‹ref›)` or the suffix alone (see
+   * {@link STAGE_FAILURE_DETAIL_SUFFIX}). The anchored suffix is what
+   * identifies a stage failure: a `failed` row without it — a signal that
+   * could not be enabled, say — is a finding of a stage that carried on, and
+   * changes nothing here.
+   *
+   * ## What each status does
+   *
+   * - **`failed`, with the suffix:** the row's stage, the suffix's code, the
+   *   row's message and the hint — the detail before the suffix, omitted when
+   *   blank — become {@link failure} through {@link setStageFailure}. Gated
+   *   exactly like the other frame mutators: a row of another session is not
+   *   applied (while a {@link SessionCreationWindow} is open it is held and
+   *   replayed on adoption), and a row of a session acknowledged as ended
+   *   ({@link hasAcknowledgedEnd}) is a delayed frame that would offer a retry
+   *   on a session that can no longer change, and is ignored.
+   * - **`running`, the failed stage's header row, for the active session:**
+   *   the stage has started again (a retry), so the failure is cleared. Every
+   *   stage opens with a header row whose message is its title, and the
+   *   failure's message begins with that title followed by
+   *   {@link STAGE_FAILURE_TITLE_SEPARATOR}, which is how the header is told
+   *   apart from the other `running` rows a stage sends — a conflict notice
+   *   or a reload request of the instrumentation stage arrives as a `running`
+   *   row of that stage without the stage having started again. Any other
+   *   `running` row, or one of another session or of an ended session,
+   *   changes nothing and is never held.
+   * - **`done`:** no effect. A stage that succeeds after a retry cleared its
+   *   failure when it started.
+   *
+   * Every effect depends only on the row and on the rows before it, so
+   * replaying a session's stored history in order to the active session — as
+   * the service does on reopen and on every (re)bind — ends in the state the
+   * live frames left: a failure that was retried is set and cleared again, one
+   * that was not is set again. `running` rows are deliberately not held: a
+   * creation window's bound ({@link MAX_HELD_FRAMES}) is sized for the frames
+   * {@link applyProgress} already holds, so a replay that reaches a session
+   * before it is adopted re-sets a failed stage's failure without the header
+   * row of a later retry clearing it; an analysis ({@link applyAnalysis}) or
+   * the stage's next start does.
+   *
+   * @param payload A `session.progress` payload, as received.
+   *
+   * @example
+   * ```ts
+   * client.on(MESSAGE_TYPE.SESSION_PROGRESS, (message) => {
+   *   state.applyProgress(message.payload);
+   *   state.applyProgressFailure(message.payload);
+   * });
+   * ```
+   */
+  applyProgressFailure(payload: SessionProgressPayload): void {
+    if (this.isDisposed) {
+      return;
+    }
+    if (payload.status === 'failed') {
+      const reported = parseStageFailureDetail(payload.detail);
+      if (
+        reported === undefined ||
+        !this.admitsFrame(payload.sessionId, payload, (held) => {
+          this.applyProgressFailure(held);
+        }) ||
+        this.isLiveFrameOfEndedSession(payload.sessionId)
+      ) {
+        return;
+      }
+      this.setStageFailure({
+        stage: payload.stage,
+        code: reported.code,
+        message: payload.message,
+        ...(reported.hint !== undefined ? { hint: reported.hint } : {}),
+      });
+      return;
+    }
+    if (payload.status === 'running') {
+      const failure = this.failureValue;
+      if (
+        failure?.stage === payload.stage &&
+        failure.message.startsWith(`${payload.message}${STAGE_FAILURE_TITLE_SEPARATOR}`) &&
+        this.isActiveSession(payload.sessionId) &&
+        !this.isLiveFrameOfEndedSession(payload.sessionId)
+      ) {
+        this.clearStageFailure();
+      }
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Snapshot
   // -------------------------------------------------------------------------
@@ -2068,6 +2507,23 @@ export class ExtensionState implements vscode.Disposable {
   }
 
   /**
+   * Remembers the identity of a progress frame just applied to the active
+   * session (see {@link applyProgress}), forgetting the oldest one first once
+   * {@link MAX_APPLIED_PROGRESS_FRAMES} are held. A `Set` iterates in
+   * insertion order, so its first member is always the oldest.
+   */
+  private rememberProgressFrame(identity: string): void {
+    const applied = this.appliedProgressFrames;
+    applied.add(identity);
+    if (applied.size > MAX_APPLIED_PROGRESS_FRAMES) {
+      const oldest = applied.values().next();
+      if (oldest.done !== true) {
+        applied.delete(oldest.value);
+      }
+    }
+  }
+
+  /**
    * Adopts `session` and replays, in arrival order and inside the same batch,
    * the held frames that name it; frames of any other session are discarded.
    * Each replayed frame goes through its public mutator, which now finds its
@@ -2094,10 +2550,14 @@ export class ExtensionState implements vscode.Disposable {
   /**
    * Makes `record` — owned, of the active session or of the session being
    * adopted — the held record and re-derives every member it can supply, under
-   * the merge rules of the module documentation.
+   * the merge rules of the module documentation. An `ended` record also drops
+   * the progress rows still `running` (see {@link applySessionRecord}).
    */
   private deriveFromRecord(record: SessionRecord): void {
     this.sessionValue = record;
+    if (record.status === 'ended') {
+      this.progressValue = withoutRunningRows(this.progressValue);
+    }
     this.relevantFilesValue = record.relevantFiles;
     this.modificationsValue = this.mergeModifications(record.modifications);
     this.analysisValue = this.newerAnalysis(record.analyses.at(-1), this.analysisValue);
@@ -2209,19 +2669,44 @@ export class ExtensionState implements vscode.Disposable {
 
   /**
    * The record's modification journal, followed by any record the store holds
-   * that the journal does not list yet.
+   * that the journal does not list yet, with no held record moved back along
+   * its lifecycle.
    *
    * The journal is append-only — a modification changes status but is never
    * removed — so a held record missing from an incoming journal means the
-   * incoming record predates the `instrumentation.ready` that reported it. For
-   * a current record the result is exactly `record.modifications`.
+   * incoming record predates the `instrumentation.ready` that reported it. A
+   * status only moves forward (`pending` → `applied` → `failed` | `conflict` →
+   * `reverted`), so where the store holds a record further along than the
+   * incoming entry of the same id — a `reverted` that
+   * {@link applyModificationJournal} took from `GET /sessions/:id/modifications`
+   * after cleanup, say, and a record sent before cleanup that still says
+   * `applied` — the held record is kept, exactly as
+   * {@link applyModificationJournal} keeps it. An entry at the same rank or
+   * further along replaces the held one. For a current record the result is
+   * exactly `record.modifications`.
    */
   private mergeModifications(
     journal: readonly ModificationRecord[],
   ): readonly ModificationRecord[] {
-    const listed = new Set(journal.map((modification) => modification.id));
-    const unlisted = this.modificationsValue.filter((held) => !listed.has(held.id));
-    return unlisted.length === 0 ? journal : Object.freeze([...journal, ...unlisted]);
+    const held = new Map(this.modificationsValue.map((record) => [record.id, record]));
+    const listed = new Set<string>();
+    let keptAhead = 0;
+    const merged = journal.map((incoming) => {
+      listed.add(incoming.id);
+      const kept = held.get(incoming.id);
+      if (
+        kept !== undefined &&
+        MODIFICATION_STATUS_RANK[kept.status] > MODIFICATION_STATUS_RANK[incoming.status]
+      ) {
+        keptAhead += 1;
+        return kept;
+      }
+      return incoming;
+    });
+    const unlisted = this.modificationsValue.filter((record) => !listed.has(record.id));
+    return keptAhead === 0 && unlisted.length === 0
+      ? journal
+      : Object.freeze([...merged, ...unlisted]);
   }
 
   /**

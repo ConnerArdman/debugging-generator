@@ -1094,23 +1094,59 @@ describe('normalizeSourcePath — non-ASCII names', () => {
 });
 
 // ---------------------------------------------------------------------------
-// How a rejection is reported: once, at `debug`, and never louder.
+// How a rejection is reported: once, at `trace` when expected and `debug`
+// otherwise, and never louder.
 // ---------------------------------------------------------------------------
 
 describe('normalizeSourcePath — rejection reporting', () => {
-  it('explains a rejection once, at debug level', () => {
+  it('explains an unplaceable source once, at debug level', () => {
     const { calls, logger } = recordingLogger();
 
-    expect(
-      normalizeSourcePath(
-        'webpack://_N_E/./node_modules/react/cjs/react.development.js',
-        options({ logger }),
-      ),
-    ).toBeUndefined();
+    expect(normalizeSourcePath('/etc/passwd', options({ logger }))).toBeUndefined();
 
     expect(calls.map((call) => call.level)).toEqual(['debug']);
     expect(calls.map((call) => call.message.length > 0)).toEqual([true]);
-    expect(calls.map((call) => typeof call.fields?.['reason'])).toEqual(['string']);
+    expect(calls.map((call) => call.fields?.['reason'])).toEqual(['outside-project-root']);
+  });
+
+  it('explains an expected rejection once, at trace level, so the debug log stays readable', () => {
+    // One record per framework frame of every resolved stack: at `debug` these
+    // would bury the records a reader needs.
+    const expected: readonly (readonly [string, string])[] = [
+      ['webpack://_N_E/./node_modules/react/cjs/react.development.js', 'excluded-segment'],
+      ['webpack-internal:///./src/x.ts', 'bundler-internal'],
+      ['webpack://_N_E/./[next]/entry/page-loader.js', 'bundler-namespace'],
+      // Three slashes make Turbopack's runtime namespace an absolute path.
+      ['turbopack:///[turbopack]/browser/runtime/base/dev-base.ts', 'outside-project-root'],
+      // A workspace installs its dependencies above the member's root.
+      [
+        'file:///home/dev/node_modules/.pnpm/next@16.3.6/node_modules/next/dist/client/index.js',
+        'outside-project-root',
+      ],
+    ];
+
+    for (const [source, reason] of expected) {
+      const { calls, logger } = recordingLogger();
+
+      expect(normalizeSourcePath(source, options({ logger }))).toBeUndefined();
+
+      expect(
+        calls.map((call) => [call.level, call.fields?.['reason']]),
+        source,
+      ).toEqual([['trace', reason]]);
+    }
+  });
+
+  it('keeps a path outside the root that is not a dependency at debug level', () => {
+    const { calls, logger } = recordingLogger();
+
+    expect(
+      normalizeSourcePath('file:///home/dev/other-app/src/secrets.ts', options({ logger })),
+    ).toBeUndefined();
+
+    expect(calls.map((call) => [call.level, call.fields?.['reason']])).toEqual([
+      ['debug', 'outside-project-root'],
+    ]);
   });
 
   it('never logs above debug, whatever the rejection', () => {
@@ -1130,7 +1166,7 @@ describe('normalizeSourcePath — rejection reporting', () => {
     }
 
     expect(calls).toHaveLength(rejected.length);
-    expect(new Set(calls.map((call) => call.level))).toEqual(new Set(['debug']));
+    expect(new Set(calls.map((call) => call.level))).toEqual(new Set(['trace', 'debug']));
   });
 
   it('logs nothing when a source resolves', () => {

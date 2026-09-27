@@ -35,6 +35,14 @@
  * punctuation between them. Emitting a glyph here *and* styling one in with a pseudo-element
  * would paint two.
  *
+ * A TRUNCATED CRUMB CAN STILL BE READ IN FULL
+ * `BreadcrumbTrail.module.css` ends a crumb longer than a whole line in an ellipsis - a long
+ * industrial product name on its own detail page is the usual case - so every crumb, link or text,
+ * carries its full label as a `title` as well: the words the ellipsis cut off are one pointer hover
+ * away instead of nowhere. The stylesheet decides truncation at layout time and this component
+ * cannot see it, so the title is on every crumb rather than guessed at. The accessible name is
+ * still the crumb's own text, which the ellipsis never shortens for a screen reader.
+ *
  * A TRAIL OF ONE IS NOT A TRAIL
  * Fewer than two entries render nothing at all. A lone crumb states where the reader is, which
  * the page's own heading already does, and an empty `<nav>` would add a landmark to the
@@ -165,12 +173,17 @@ export function BreadcrumbTrail(props: Props): ReactElement | null {
               {current || crumb.href === undefined ? (
                 // `aria-current` is the current page's alone. An earlier entry reaches this
                 // branch only when it has no destination, and announcing it as the current page
-                // would misstate where the reader is.
-                <span className={styles.current} aria-current={current ? 'page' : undefined}>
+                // would misstate where the reader is. `title` carries the full label for a crumb
+                // the stylesheet has ended in an ellipsis.
+                <span
+                  className={styles.current}
+                  aria-current={current ? 'page' : undefined}
+                  title={crumb.label}
+                >
                   {crumb.label}
                 </span>
               ) : (
-                <Link href={crumb.href} className={styles.link}>
+                <Link href={crumb.href} className={styles.link} title={crumb.label}>
                   {crumb.label}
                 </Link>
               )}

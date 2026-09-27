@@ -192,7 +192,14 @@ import type {
 import { z } from 'zod';
 import type { ZodError, ZodType } from 'zod';
 
-import { DebuggenError, err, noopLogger, ok, tryCatch } from '@debuggen/shared';
+import {
+  DEBUGGEN_ERROR_CODES,
+  DebuggenError,
+  err,
+  noopLogger,
+  ok,
+  tryCatch,
+} from '@debuggen/shared';
 import type { DebuggenErrorCode, LogFields, Logger, Result } from '@debuggen/shared';
 
 import { modelUnavailableMessage } from '../provider.js';
@@ -460,6 +467,88 @@ const SCHEMA_RENDER_HINT =
 /** Remediation for a client pinned to a route it cannot serve. */
 const PARSE_ROUTE_HINT =
   'This provider is pinned to the schema-constrained route and the client it was given offers none. Leave the structured-output mode at its default so the tool route can serve the call, or supply a client with a parse capability.';
+
+/**
+ * Every remediation above, in declaration order: the complete set of hints a
+ * failure of this provider can carry, since each one is attached by name and
+ * none is ever composed from a runtime value. Read only by
+ * {@link providerFailureTexts}.
+ */
+const PROVIDER_FAILURE_HINTS: readonly string[] = Object.freeze([
+  MISSING_API_KEY_HINT,
+  MISSING_MODEL_HINT,
+  INVALID_BUDGET_HINT,
+  INVALID_BASE_URL_HINT,
+  UNSUPPORTED_TEMPERATURE_HINT,
+  UNAUTHORIZED_HINT,
+  RATE_LIMIT_HINT,
+  SERVER_ERROR_HINT,
+  UNREACHABLE_HINT,
+  REFUSED_HINT,
+  ABORTED_HINT,
+  CLOSED_HINT,
+  NO_TEXT_HINT,
+  SCHEMA_RENDER_HINT,
+  PARSE_ROUTE_HINT,
+]);
+
+/** The memoised answer of {@link providerFailureTexts}; built on first use. */
+let knownFailureTexts: ReadonlySet<string> | undefined;
+
+/**
+ * The fixed texts {@link isProviderFailureText} recognises: every
+ * {@link PROVIDER_FAILURE_HINTS} entry, and AAP §0.5.5's sentence as
+ * `modelUnavailableMessage` builds it for each code of the closed
+ * `DEBUGGEN_ERROR_CODES` vocabulary — every message {@link unavailableFailure}
+ * can raise, and the one `../factory.ts` raises for an unusable configuration.
+ *
+ * Built on the first call rather than at module evaluation, so no imported
+ * binding is read while the package's module graph is still loading: the
+ * discipline this file keeps for `modelUnavailableMessage` (see
+ * {@link unavailableFailure}), and why this set stays correct whatever import
+ * edge a later edit adds. Module-private, so no caller can add to it.
+ */
+function providerFailureTexts(): ReadonlySet<string> {
+  knownFailureTexts ??= new Set<string>([
+    ...PROVIDER_FAILURE_HINTS,
+    ...DEBUGGEN_ERROR_CODES.map((code) => modelUnavailableMessage(code)),
+  ]);
+  return knownFailureTexts;
+}
+
+/**
+ * Whether `text` is, character for character, one of this package's own fixed
+ * failure texts: a remediation hint the network-backed provider attaches to a
+ * failure, or AAP §0.5.5's "Model provider unavailable (‹code›)…" sentence for
+ * a code of the closed vocabulary.
+ *
+ * The proof a host needs before it writes a failure's own words where free
+ * text may not go — the local service's default-level log, whose records must
+ * never quote a path, a statement or a credential. Each of these texts is a
+ * repository constant or is built from one and a closed code, so none can
+ * carry a runtime value, and nothing about a credential appears in any of
+ * them. A message or hint that came from anywhere else — a scripted provider,
+ * a dependency's exception, text a caller composed — answers `false` however
+ * closely it resembles one of them.
+ *
+ * The comparison is exact: no trimming, no case folding, no prefix or
+ * substring match. Total and non-throwing: a non-string, an empty string and
+ * every other value answer `false`.
+ *
+ * @param text A failure's message or hint, of any type.
+ * @returns `true` only for a string equal to one of the fixed texts.
+ *
+ * @example Gating a failure's words before a default-level log record
+ * ```ts
+ * log.error('Pipeline stage failed.', {
+ *   code: error.code,
+ *   ...(isProviderFailureText(error.hint) ? { errorHint: error.hint } : {}),
+ * });
+ * ```
+ */
+export function isProviderFailureText(text: unknown): text is string {
+  return typeof text === 'string' && text.length > 0 && providerFailureTexts().has(text);
+}
 
 // ---------------------------------------------------------------------------
 // The transport seam

@@ -739,47 +739,178 @@ function emptyCaptureInput(): JsonObject {
   };
 }
 
+/**
+ * The telemetry-kind vocabulary a capture summary's `kindCounts` tally is
+ * zero-filled over: `TELEMETRY_KINDS` of `@debuggen/telemetry`, restated for the
+ * import-boundary reason this file's header gives for its schema mirrors.
+ */
+const TELEMETRY_KIND_NAMES: readonly string[] = [
+  'interaction',
+  'render',
+  'commit',
+  'fetch',
+  'xhr',
+  'navigation',
+  'perf.longtask',
+  'perf.entry',
+  'error',
+  'state',
+  'http.server',
+  'route.handler',
+  'function',
+  'db.query',
+  'http.client',
+  'server.error',
+  'log',
+];
+
+/** The `file` and `symbol` of a targetless runtime action (`TARGETLESS_FILE`/`TARGETLESS_SYMBOL`). */
+const TARGETLESS_FILE = '.';
+const TARGETLESS_SYMBOL = '*';
+
+/** One resolved action of an installed plan, in the `InstrumentationAction` shape the service stores. */
+function installedAction(
+  id: string,
+  file: string,
+  symbol: string,
+  type: string,
+  mode: 'runtime' | 'patch',
+): JsonObject {
+  return {
+    id,
+    file,
+    symbol,
+    type,
+    adapter: mode === 'patch' ? 'patch-adapter' : 'runtime-adapter',
+    mode,
+    rationale: 'Installed by the first plan version.',
+  };
+}
+
+/**
+ * The first plan version's actions, as `buildPlanInput` shapes a plan: a
+ * targetless runtime hook per needed runtime signal, a runtime action on a
+ * handler the investigation shortlisted, and one patch on a route handler.
+ */
+const INSTALLED_PLAN_TARGETS: readonly JsonObject[] = [
+  installedAction(
+    'act_hook_interactions',
+    TARGETLESS_FILE,
+    TARGETLESS_SYMBOL,
+    'interaction-tracking',
+    'runtime',
+  ),
+  installedAction(
+    'act_hook_renders',
+    TARGETLESS_FILE,
+    TARGETLESS_SYMBOL,
+    'react-render-tracking',
+    'runtime',
+  ),
+  installedAction('act_press', PRESS_FILE, PRESS_SYMBOL, 'interaction-tracking', 'runtime'),
+  installedAction('act_route', ROUTE_FILE, ROUTE_SYMBOL, 'server-span', 'patch'),
+];
+
+/** The first plan version with a targetless runtime hook for every runtime signal a capture can need. */
+const FULLY_HOOKED_PLAN_TARGETS: readonly JsonObject[] = [
+  ...INSTALLED_PLAN_TARGETS,
+  installedAction(
+    'act_hook_fetch',
+    TARGETLESS_FILE,
+    TARGETLESS_SYMBOL,
+    'fetch-tracking',
+    'runtime',
+  ),
+  installedAction(
+    'act_hook_queries',
+    TARGETLESS_FILE,
+    TARGETLESS_SYMBOL,
+    'db-query-tracking',
+    'runtime',
+  ),
+  installedAction('act_hook_perf', TARGETLESS_FILE, TARGETLESS_SYMBOL, 'perf-tracking', 'runtime'),
+  installedAction(
+    'act_hook_state',
+    TARGETLESS_FILE,
+    TARGETLESS_SYMBOL,
+    'state-tracking',
+    'runtime',
+  ),
+];
+
 /** How the follow-up context may be varied. */
 interface FollowUpOptions {
-  /** Signals the new question needs. */
+  /** The capture signals the stored understanding asked for (`signalsNeeded`). */
   readonly wantedSignals?: readonly string[];
 
-  /** Signals the stored capture already carries. */
-  readonly capturedSignals?: readonly string[];
+  /** Events per telemetry kind the stored capture recorded; every other kind is counted zero. */
+  readonly recordedKinds?: Readonly<Record<string, number>>;
 
   /** Actions the installed plan already applied, which are never re-emitted. */
   readonly installedTargets?: readonly JsonObject[];
 
-  /** Code-graph candidates a delta action could be attached to. */
+  /** Declarations the follow-up's wording named, resolved through the code graph. */
   readonly candidates?: readonly JsonObject[];
-
-  /** Action types the adapters claim. */
-  readonly claimedActionTypes?: readonly string[];
 }
 
-/** The structured context of the follow-up stage. */
+/**
+ * The structured context of the follow-up stage, in the shape
+ * `ContextBuilder.buildFollowUpRequest` assembles it: the stored understanding,
+ * the installed plan with every resolved action, the latest analysis and the
+ * latest capture summary as `computeCaptureSummary` shapes it — a `kindCounts`
+ * tally zero-filled over every telemetry kind, the event total, the metric
+ * list and the bounded sections — plus the graph-resolved `candidates` when the
+ * follow-up's wording named a declaration. No adapter catalog travels, so every
+ * action type is claimable.
+ */
 function followUpInput(options: FollowUpOptions = {}): JsonObject {
-  const claimed = options.claimedActionTypes ?? [
-    'interaction-tracking',
-    'db-query-tracking',
-    'react-render-tracking',
-  ];
-  const installed = options.installedTargets ?? [
-    { file: PRESS_FILE, symbol: PRESS_SYMBOL, type: 'interaction-tracking' },
-  ];
+  const recorded = options.recordedKinds ?? { render: 8, commit: 2 };
+  const kindCounts: Record<string, number> = {};
+  let eventCount = 0;
+  for (const kind of TELEMETRY_KIND_NAMES) {
+    const count = recorded[kind] ?? 0;
+    kindCounts[kind] = count;
+    eventCount += count;
+  }
+  const renderCount = recorded['render'] ?? 0;
   return {
-    signalsNeeded: [...(options.wantedSignals ?? ['interaction', 'db.query', 'render'])],
-    candidates: [...(options.candidates ?? [PRESS_CANDIDATE, STORE_CANDIDATE, TILE_CANDIDATE])],
-    adapterCatalog: [{ id: 'runtime-adapter', actionTypes: [...claimed], mode: 'runtime' }],
-    captureSummary: { capturedSignals: [...(options.capturedSignals ?? ['render'])] },
-    plan: { instrumentationTargets: [...installed] },
-    aggregates: {
-      renders: [
-        { component: TILE_SYMBOL, renderCount: 8, evidence: [RENDER_EVENT] },
-        { component: WIDGET_SYMBOL, renderCount: 2, evidence: ['ev-render-02'] },
-      ],
-      metrics: { render_count: 10 },
+    understanding: {
+      category: 'slow-interaction',
+      signalsNeeded: [...(options.wantedSignals ?? ['interactions', 'pg', 'prisma', 'react'])],
+      entities: [],
+      searchHints: [],
     },
+    plan: {
+      planVersion: 1,
+      objective: 'Measure the slow interaction.',
+      capture: ['interactions', 'react'],
+      instrumentationTargets: [...(options.installedTargets ?? INSTALLED_PLAN_TARGETS)],
+    },
+    captureSummary: {
+      captureId: 'cap-follow-01',
+      eventCount,
+      kindCounts,
+      metrics: [
+        {
+          id: 'render_count',
+          label: 'Renders',
+          unit: 'count',
+          available: true,
+          value: renderCount,
+        },
+        { id: 'error_count', label: 'Errors', unit: 'count', available: true, value: 0 },
+      ],
+      topSpans: [],
+      topRenders:
+        renderCount > 0 ? [{ component: TILE_SYMBOL, renderCount, evidence: [RENDER_EVENT] }] : [],
+      topRequests: [],
+      topQueries: [],
+      errors: [],
+      truncated: false,
+      unavailableMetrics: [],
+    },
+    analysis: { observed: [], likelyCauses: [] },
+    ...(options.candidates !== undefined ? { candidates: [...options.candidates] } : {}),
   };
 }
 
@@ -847,9 +978,18 @@ function toolCallInput(options: ToolCallOptions = {}): JsonObject {
 /**
  * An evidence reference: `@debuggen/panel-schema`'s `EventRef`, whose only
  * spelling is the `{ eventId }` record — a bare id is rejected there, so it is
- * rejected here, whatever spelling the capture context used.
+ * rejected here, whatever spelling the capture context used. Strict like the
+ * original, with its optional coordinates and display sugar: a reference to an
+ * event the capture describes with its own record carries a `kind` and a
+ * bounded, non-blank `label`.
  */
-const evidenceRefMirror = z.strictObject({ eventId: z.string().min(1) });
+const evidenceRefMirror = z.strictObject({
+  eventId: z.string().min(1),
+  traceId: z.string().min(1).optional(),
+  spanId: z.string().min(1).optional(),
+  kind: z.string().min(1).optional(),
+  label: z.string().min(1).max(200).regex(/\S/).optional(),
+});
 
 /** `SourceLocation` as a panel or a hypothesis carries it. */
 const sourceLocationMirror = z.object({
@@ -1440,11 +1580,11 @@ describe('property 2: input-derived — one context field moves, the answer fiel
     expect(layoutTypes(moved)).toContain('timeline');
   });
 
-  it('followup: signals the capture already carries remove the need for another capture', async () => {
+  it('followup: kinds the capture already recorded remove the need for another capture', async () => {
     const base = await answerFor('followup', followUpInput());
     const moved = await answerFor(
       'followup',
-      followUpInput({ capturedSignals: ['render', 'interaction', 'db.query'] }),
+      followUpInput({ recordedKinds: { render: 8, commit: 2, interaction: 1, 'db.query': 3 } }),
     );
 
     expect(base.needsNewCapture).toBe(true);
@@ -1629,6 +1769,217 @@ describe('property 2: input-derived — one context field moves, the answer fiel
       expect(entityNames(answer).slice(0, 2)).toEqual([WIDGET_SYMBOL, FORM_SYMBOL]);
       expect(asArray(answer.entities)).toContainEqual({ kind: 'file', name: FORM_FILE });
     });
+
+    /** The service's understand context with the tokenizer's lexical category hints. */
+    function hintedUnderstandInput(hints: readonly string[]): JsonObject {
+      return { ...serviceUnderstandInput('prisma'), categoryHints: [...hints] };
+    }
+
+    it('classifies the service context by the lexical category hint it carries', async () => {
+      for (const category of ['performance', 'rendering', 'network', 'data', 'state', 'error']) {
+        const answer = await closedAnswer(closedUnderstanding, hintedUnderstandInput([category]));
+        expect(answer.category).toBe(category);
+      }
+      // The strongest hint leads; a later one never overrides it.
+      const both = await closedAnswer(
+        closedUnderstanding,
+        hintedUnderstandInput(['state', 'network']),
+      );
+      expect(both.category).toBe('state');
+    });
+
+    it('asks a render question for the page signals it needs, and for no server tier', async () => {
+      const rendering = await closedAnswer(
+        closedUnderstanding,
+        hintedUnderstandInput(['rendering']),
+      );
+      const state = await closedAnswer(closedUnderstanding, hintedUnderstandInput(['state']));
+
+      // The same project summary that asks an unclassified question for route,
+      // handler and driver spans (above) asks a page-observed one for renders,
+      // the component tree and hook-state transitions instead.
+      for (const answer of [rendering, state]) {
+        expect(answer.signalsNeeded).toEqual(['componentTree', 'fetch', 'perf', 'react', 'state']);
+      }
+    });
+
+    it('keeps the project-derived signals of a timing or request question, adding its own', async () => {
+      const unhinted = await closedAnswer(closedUnderstanding, serviceUnderstandInput('prisma'));
+      const performance = await closedAnswer(
+        closedUnderstanding,
+        hintedUnderstandInput(['performance']),
+      );
+      const network = await closedAnswer(closedUnderstanding, hintedUnderstandInput(['network']));
+      const error = await closedAnswer(closedUnderstanding, hintedUnderstandInput(['error']));
+
+      expect(performance.signalsNeeded).toEqual(unhinted.signalsNeeded);
+      expect(network.signalsNeeded).toEqual(unhinted.signalsNeeded);
+      expect(error.signalsNeeded).toEqual(
+        [...asArray(unhinted.signalsNeeded).map(asString), 'errors'].sort(),
+      );
+    });
+
+    /** The hinted service context with a selected element and a summary that counts event handlers. */
+    function pointedUnderstandInput(hints: readonly string[], selected: boolean): JsonObject {
+      const base = serviceUnderstandInput('prisma');
+      return {
+        ...base,
+        categoryHints: [...hints],
+        projectSummary: {
+          projectName: 'sample',
+          databaseAccess: { style: 'prisma', callSiteCount: 2 },
+          routes: [{ routePath: '/api/items', file: 'app/api/items/route.ts' }],
+          counts: { apiCalls: 1, apiRoutes: 1, dbCalls: 2, components: 3, handlers: 4 },
+        },
+        ...(selected
+          ? {
+              target: {
+                selector: 'main .tile',
+                tagName: 'div',
+                componentChain: [TILE_SYMBOL],
+                url: 'http://127.0.0.1:3000/',
+              },
+            }
+          : {}),
+      };
+    }
+
+    it('needs an interaction only for input-reproduced classes asked about a selected element', async () => {
+      const signalsOf = async (hints: readonly string[], selected: boolean) =>
+        asArray(
+          (await closedAnswer(closedUnderstanding, pointedUnderstandInput(hints, selected)))
+            .signalsNeeded,
+        );
+
+      // A slow, failing or query-heavy element is reproduced by acting on it.
+      for (const hint of ['performance', 'data', 'error']) {
+        expect(await signalsOf([hint], true)).toContain('interactions');
+        // Event handlers in the project make no question about the whole page an interaction question.
+        expect(await signalsOf([hint], false)).not.toContain('interactions');
+      }
+      // Renders, state and requests repeat while the page is idle, whatever element was selected.
+      for (const hint of ['rendering', 'state', 'network']) {
+        const signals = await signalsOf([hint], true);
+        expect(signals).not.toContain('interactions');
+        expect(signals).toContain('react');
+      }
+      // An unclassified question keeps the project-shaped interaction signal it always had.
+      expect(await signalsOf([], false)).toContain('interactions');
+    });
+
+    it('still observes interactions in a latency plan whose question did not demand one', async () => {
+      const observed = await answerFor('plan', {
+        ...planInput({
+          category: 'performance',
+          candidates: [],
+          withoutFlows: true,
+          claimedActionTypes: EVERY_ACTION_TYPE,
+          availableSignals: ['interactions', 'react', 'perf', 'http'],
+        }),
+        signalsNeeded: ['react', 'perf', 'http'],
+      });
+      const idle = await answerFor('plan', {
+        ...planInput({
+          category: 'rendering',
+          candidates: [],
+          withoutFlows: true,
+          claimedActionTypes: EVERY_ACTION_TYPE,
+          availableSignals: ['interactions', 'react', 'perf', 'state', 'componentTree'],
+        }),
+        signalsNeeded: ['react', 'perf', 'state', 'componentTree'],
+      });
+
+      expect(reportedActionTypes(asArray(observed.instrumentationTargets))).toContain(
+        'interaction-tracking',
+      );
+      expect(asArray(observed.capture)).toContain('interactions');
+      expect(reportedActionTypes(asArray(idle.instrumentationTargets))).not.toContain(
+        'interaction-tracking',
+      );
+    });
+
+    it('answers identically for hints the tokenizer read from two wordings of one question', async () => {
+      const first = await answerFor('understand', hintedUnderstandInput(['rendering']));
+      const second = await answerFor('understand', {
+        ...hintedUnderstandInput(['rendering']),
+        tokens: ['component', 'renders', 'often'],
+        signalTerms: ['renders'],
+      });
+      expect(canonical(second)).toBe(canonical(first));
+    });
+
+    /** Every action type a plan may carry, claimed by one catalog entry. */
+    const EVERY_ACTION_TYPE = [...INSTRUMENTATION_ACTION_TYPES];
+
+    /** A planning context for `category` whose candidates span the page, a route and a store. */
+    function categoryPlanInput(category: string, signalsNeeded: readonly string[]): JsonObject {
+      return {
+        ...planInput({
+          category,
+          candidates: [TILE_CANDIDATE, ROUTE_CANDIDATE, STORE_CANDIDATE],
+          claimedActionTypes: EVERY_ACTION_TYPE,
+          availableSignals: [
+            'interactions',
+            'react',
+            'componentTree',
+            'state',
+            'fetch',
+            'perf',
+            'http',
+            'routeHandlers',
+            'prisma',
+            'functions',
+          ],
+        }),
+        signalsNeeded: [...signalsNeeded],
+      };
+    }
+
+    it('plans a render question with page runtime hooks only, including hook-state tracking', async () => {
+      const plan = await answerFor(
+        'plan',
+        categoryPlanInput('rendering', ['interactions', 'react', 'componentTree', 'state', 'perf']),
+      );
+      const targets = asArray(plan.instrumentationTargets).map(asObject);
+      const types = reportedActionTypes(targets);
+
+      expect(types).toContain('react-render-tracking');
+      expect(types).toContain('state-tracking');
+      // Nothing server-side is rewritten or spanned to answer a render question.
+      for (const excluded of ['function-timing', 'server-span', 'db-query-tracking']) {
+        expect(types).not.toContain(excluded);
+      }
+      for (const target of targets) {
+        expect([ROUTE_FILE, STORE_FILE]).not.toContain(target.file);
+      }
+      expect(asArray(plan.capture)).toEqual(expect.arrayContaining(['state', 'componentTree']));
+    });
+
+    it('plans a request question without rewriting a route handler or server function', async () => {
+      const plan = await answerFor(
+        'plan',
+        categoryPlanInput('network', ['interactions', 'react', 'fetch', 'perf']),
+      );
+      const targets = asArray(plan.instrumentationTargets).map(asObject);
+
+      expect(reportedActionTypes(targets)).toContain('fetch-tracking');
+      expect(reportedActionTypes(targets)).not.toContain('function-timing');
+      expect(targets.filter((target) => target.file === ROUTE_FILE)).toEqual([]);
+    });
+
+    it('still plans server spans and function timing for a timing question', async () => {
+      const plan = await answerFor(
+        'plan',
+        categoryPlanInput('performance', ['interactions', 'react', 'http', 'routeHandlers']),
+      );
+      const targets = asArray(plan.instrumentationTargets).map(asObject);
+      const onRoute = targets.filter((target) => target.file === ROUTE_FILE);
+
+      expect(onRoute.length).toBeGreaterThan(0);
+      expect(reportedActionTypes(onRoute)).toEqual(
+        expect.arrayContaining([expect.stringMatching(/^(server-span|function-timing)$/)]),
+      );
+    });
   });
 
   describe('graceful degradation', () => {
@@ -1684,6 +2035,279 @@ describe('property 2: input-derived — one context field moves, the answer fiel
       expect(asString(degraded.title).length).toBeGreaterThan(0);
       expect(undefinedPaths(degraded)).toEqual([]);
     });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * follow-up decisions over the context the service sends
+ *
+ * The follow-up stage hands the provider the stored understanding, the
+ * installed plan (every resolved action, targetless runtime hooks included) and
+ * the latest capture summary exactly as the telemetry package computes it. The
+ * decision's two paths are only reachable if the rules read that shape, so each
+ * case below is built from {@link followUpInput} and moves one thing a real
+ * session moves: the kinds the capture recorded, or the hooks the plan armed.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Answers a follow-up context, unwrapped to the decision's two fields. */
+async function decisionFor(input: JsonObject): Promise<{
+  readonly needsNewCapture: unknown;
+  readonly additionalActions: readonly Record<string, unknown>[];
+}> {
+  const answer = await answerFor('followup', input);
+  return {
+    needsNewCapture: answer.needsNewCapture,
+    additionalActions: asArray(answer.additionalActions).map((entry) => asObject(entry)),
+  };
+}
+
+describe('followup: decisions over the service-shaped capture summary', () => {
+  /** The eight signals a slow checkout's understanding asks for. */
+  const CHECKOUT_SIGNALS: readonly string[] = [
+    'fetch',
+    'http',
+    'interactions',
+    'perf',
+    'pg',
+    'prisma',
+    'react',
+    'routeHandlers',
+  ];
+
+  /** A capture that recorded every one of those signals under its telemetry kind. */
+  const CHECKOUT_KINDS: Readonly<Record<string, number>> = {
+    interaction: 1,
+    fetch: 2,
+    'http.server': 1,
+    'route.handler': 1,
+    'perf.entry': 2,
+    'db.query': 3,
+    render: 8,
+    commit: 2,
+  };
+
+  it('answers from the existing evidence when the recorded kinds cover every wanted signal', async () => {
+    const decision = await decisionFor(
+      followUpInput({
+        wantedSignals: CHECKOUT_SIGNALS,
+        recordedKinds: CHECKOUT_KINDS,
+        installedTargets: FULLY_HOOKED_PLAN_TARGETS,
+      }),
+    );
+    expect(decision).toEqual({ needsNewCapture: false, additionalActions: [] });
+  });
+
+  it('asks for a new capture when one wanted kind was never recorded', async () => {
+    const withoutPerf = Object.fromEntries(
+      Object.entries(CHECKOUT_KINDS).filter(([kind]) => kind !== 'perf.entry'),
+    );
+    const decision = await decisionFor(
+      followUpInput({
+        wantedSignals: CHECKOUT_SIGNALS,
+        recordedKinds: withoutPerf,
+        installedTargets: FULLY_HOOKED_PLAN_TARGETS,
+      }),
+    );
+    expect(decision.needsNewCapture).toBe(true);
+    // The perf hook is already armed by the plan, so the genuine gap asks for a
+    // new capture and adds no action of a type already installed.
+    expect(decision.additionalActions).toEqual([]);
+  });
+
+  it('counts the sibling signals of a hook that recorded evidence as captured', async () => {
+    const perfOnly = await decisionFor(
+      followUpInput({ wantedSignals: ['errors', 'perf'], recordedKinds: { 'perf.entry': 2 } }),
+    );
+    expect(perfOnly).toEqual({ needsNewCapture: false, additionalActions: [] });
+
+    const rendersOnly = await decisionFor(
+      followUpInput({ wantedSignals: ['componentTree', 'react'], recordedKinds: { render: 3 } }),
+    );
+    expect(rendersOnly).toEqual({ needsNewCapture: false, additionalActions: [] });
+
+    const serverOnly = await decisionFor(
+      followUpInput({
+        wantedSignals: ['http', 'routeHandlers'],
+        recordedKinds: { 'http.server': 1 },
+      }),
+    );
+    expect(serverOnly).toEqual({ needsNewCapture: false, additionalActions: [] });
+  });
+
+  it('never lets a signal more than one producer reports vouch for a sibling', async () => {
+    // A server error proves the preload was live, not that the page's
+    // performance observers were armed.
+    const decision = await decisionFor(
+      followUpInput({
+        wantedSignals: ['errors', 'perf'],
+        recordedKinds: { 'server.error': 1 },
+      }),
+    );
+    expect(decision.needsNewCapture).toBe(true);
+    expect(decision.additionalActions).toEqual([
+      expect.objectContaining({
+        file: TARGETLESS_FILE,
+        symbol: TARGETLESS_SYMBOL,
+        type: 'perf-tracking',
+      }),
+    ]);
+  });
+
+  it('arms a runtime hook the plan never installed with exactly one targetless action', async () => {
+    const decision = await decisionFor(
+      followUpInput({ wantedSignals: ['react', 'state'], recordedKinds: { render: 8 } }),
+    );
+    expect(decision.needsNewCapture).toBe(true);
+    expect(decision.additionalActions).toHaveLength(1);
+    expect(decision.additionalActions[0]).toMatchObject({
+      file: TARGETLESS_FILE,
+      symbol: TARGETLESS_SYMBOL,
+      type: 'state-tracking',
+    });
+  });
+
+  it('adds nothing for a gap whose runtime hook the plan already installs', async () => {
+    const decision = await decisionFor(
+      followUpInput({ wantedSignals: ['interactions', 'react'], recordedKinds: { render: 8 } }),
+    );
+    expect(decision).toEqual({ needsNewCapture: true, additionalActions: [] });
+  });
+
+  it('attaches a gap only a wrapped declaration collects to the candidates that support it', async () => {
+    const decision = await decisionFor(
+      followUpInput({
+        wantedSignals: ['functions', 'react'],
+        recordedKinds: { render: 8 },
+        candidates: [PRESS_CANDIDATE],
+      }),
+    );
+    expect(decision.needsNewCapture).toBe(true);
+    expect(decision.additionalActions).toEqual([
+      expect.objectContaining({ file: PRESS_FILE, symbol: PRESS_SYMBOL, type: 'function-timing' }),
+    ]);
+  });
+
+  it('treats a summary that counts no event as an empty capture', async () => {
+    const decision = await decisionFor(followUpInput({ wantedSignals: [], recordedKinds: {} }));
+    expect(decision).toEqual({ needsNewCapture: true, additionalActions: [] });
+  });
+
+  /** A declaration the follow-up's wording named, as the stage resolves it through `findByName`. */
+  function namedDeclaration(file: string, symbol: string, kind: string): JsonObject {
+    return { file, symbol, kind, score: 1 };
+  }
+
+  /** A helper declared beside the route handler the first plan version already patched. */
+  const HELPER_SYMBOL = 'formatTallyRows';
+
+  /** A context whose capture covers every wanted signal, so only a named declaration can move it. */
+  function coveredWith(candidates: readonly JsonObject[]): JsonObject {
+    return followUpInput({
+      wantedSignals: CHECKOUT_SIGNALS,
+      recordedKinds: CHECKOUT_KINDS,
+      installedTargets: FULLY_HOOKED_PLAN_TARGETS,
+      candidates,
+    });
+  }
+
+  it('times a named server function in an already instrumented file with exactly one action', async () => {
+    const decision = await decisionFor(
+      coveredWith([namedDeclaration(ROUTE_FILE, HELPER_SYMBOL, 'server-function')]),
+    );
+    expect(decision.needsNewCapture).toBe(true);
+    expect(decision.additionalActions).toHaveLength(1);
+    expect(decision.additionalActions[0]).toMatchObject({
+      file: ROUTE_FILE,
+      symbol: HELPER_SYMBOL,
+      type: 'function-timing',
+    });
+  });
+
+  it('times a named plain function and wraps a named route handler in a server span', async () => {
+    const plain = await decisionFor(
+      coveredWith([namedDeclaration(STORE_FILE, STORE_SYMBOL, 'symbol')]),
+    );
+    expect(plain.needsNewCapture).toBe(true);
+    expect(plain.additionalActions).toEqual([
+      expect.objectContaining({ file: STORE_FILE, symbol: STORE_SYMBOL, type: 'function-timing' }),
+    ]);
+
+    const route = await decisionFor(
+      coveredWith([namedDeclaration(STORE_FILE, 'handleTallyExport', 'api-route')]),
+    );
+    expect(route.additionalActions).toEqual([
+      expect.objectContaining({
+        file: STORE_FILE,
+        symbol: 'handleTallyExport',
+        type: 'server-span',
+      }),
+    ]);
+  });
+
+  it('adds nothing for a named declaration an installed timing already wraps', async () => {
+    const decision = await decisionFor(
+      coveredWith([namedDeclaration(ROUTE_FILE, ROUTE_SYMBOL, 'api-route')]),
+    );
+    expect(decision).toEqual({ needsNewCapture: false, additionalActions: [] });
+  });
+
+  it('adds nothing for a named declaration a runtime hook already observes', async () => {
+    for (const candidate of [
+      namedDeclaration(TILE_FILE, TILE_SYMBOL, 'component'),
+      namedDeclaration(PRESS_FILE, PRESS_SYMBOL, 'event-handler'),
+      namedDeclaration(STORE_FILE, STORE_SYMBOL, 'db-call'),
+    ]) {
+      expect(await decisionFor(coveredWith([candidate]))).toEqual({
+        needsNewCapture: false,
+        additionalActions: [],
+      });
+    }
+  });
+
+  it('adds nothing for a named route path or a timing the catalog does not claim', async () => {
+    const routePath = await decisionFor(
+      coveredWith([namedDeclaration(ROUTE_FILE, '/tally/rows', 'api-route')]),
+    );
+    expect(routePath).toEqual({ needsNewCapture: false, additionalActions: [] });
+
+    const unclaimed = await decisionFor({
+      ...coveredWith([namedDeclaration(ROUTE_FILE, HELPER_SYMBOL, 'server-function')]),
+      adapterCatalog: [
+        { id: 'runtime-adapter', actionTypes: ['react-render-tracking'], mode: 'runtime' },
+      ],
+    });
+    expect(unclaimed).toEqual({ needsNewCapture: false, additionalActions: [] });
+  });
+
+  it('names one declaration with one answer, however the follow-up is worded', async () => {
+    const input = coveredWith([namedDeclaration(ROUTE_FILE, HELPER_SYMBOL, 'server-function')]);
+    const stageCase = STAGE_CASES.find((entry) => entry.stage === 'followup');
+    if (stageCase === undefined) {
+      throw new Error('no stage case is declared for followup');
+    }
+    const first = okValue(await stageCase.call(requestFor('followup', input, { variant: 'a' })));
+    const second = okValue(
+      await stageCase.call(
+        requestFor('followup', input, { variant: 'how-long-does-that-helper-take-to-run' }),
+      ),
+    );
+    expect(canonical(second.raw)).toBe(canonical(first.raw));
+    expect(asArray(asObject(first.raw).additionalActions)).toHaveLength(1);
+  });
+
+  it('decides identically however the zero-filled tally is ordered', async () => {
+    const input = followUpInput({ wantedSignals: CHECKOUT_SIGNALS, recordedKinds: CHECKOUT_KINDS });
+    const summary = asObject(input.captureSummary);
+    const tally = asObject(summary.kindCounts);
+    const reversed: Record<string, unknown> = {};
+    for (const kind of Object.keys(tally).reverse()) {
+      reversed[kind] = tally[kind];
+    }
+    const reordered: JsonObject = {
+      ...input,
+      captureSummary: { ...(summary as JsonObject), kindCounts: reversed as JsonObject },
+    };
+    expect(canonical(await decisionFor(reordered))).toBe(canonical(await decisionFor(input)));
   });
 });
 
@@ -2283,6 +2907,225 @@ describe('property 4b: service-shaped captures still compose disjoint panels', (
     expect(duplicated).toContain('renderTable');
     expect(duplicated).toContain('requestTable');
     expect(duplicated).not.toContain('componentTree');
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * property 4c — the question's category composes the panel
+ *
+ * The service frames a panel context with the understanding its session settled
+ * on (`apps/local-service/src/panels/generate.ts`): the category the
+ * understanding stage classified, never the question. The category names the
+ * lens, so one question composes one panel whatever the capture incidentally
+ * holds, and falls back to the evidence lens only when that lens has nothing
+ * to show.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A panel context framed by the understanding and, optionally, the selected target. */
+function framedPanelInput(
+  input: JsonObject,
+  category: string,
+  componentChain?: readonly string[],
+): JsonObject {
+  return {
+    ...input,
+    understanding: { category, signalsNeeded: ['react'] },
+    ...(componentChain === undefined ? {} : { target: { componentChain: [...componentChain] } }),
+  };
+}
+
+/** Whether a structured-context container is a list; `Array.isArray` does not narrow a readonly one. */
+function isJsonList(value: JsonObject | readonly JsonValue[]): value is readonly JsonValue[] {
+  return Array.isArray(value);
+}
+
+/** A fixture's nested object, narrowed to a structured-context object; anything else fails the test. */
+function jsonObjectOf(value: JsonValue | undefined): JsonObject {
+  if (typeof value !== 'object' || value === null || isJsonList(value)) {
+    throw new Error(`expected an object, received ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+/** A service-shaped panel context with fields of its capture replaced. */
+function withCapture(input: JsonObject, fields: JsonObject): JsonObject {
+  return { ...input, capture: { ...jsonObjectOf(input.capture), ...fields } };
+}
+
+/** The service-shaped render capture, with hook-state transitions recorded too. */
+function serviceStatefulRenderPanelInput(): JsonObject {
+  const base = serviceRenderPanelInput();
+  return {
+    ...withCapture(base, { kindCounts: { render: 880, commit: 6, navigation: 1, state: 12 } }),
+    populatedSources: { ...jsonObjectOf(base.populatedSources), stateTransitions: 12 },
+  };
+}
+
+/** A service-shaped capture's context with its per-tier tally replaced. */
+function withTierCounts(input: JsonObject, tierCounts: JsonObject): JsonObject {
+  return withCapture(input, { tierCounts });
+}
+
+/** The first layout node of `type`, failing the test when there is none. */
+function nodeOfType(answer: Record<string, unknown>, type: string): Record<string, unknown> {
+  const node = layoutNodes(answer).find((candidate) => candidate.type === type);
+  if (node === undefined) {
+    throw new Error(`expected a ${type} node in ${layoutTypes(answer).join(', ')}`);
+  }
+  return node;
+}
+
+/** A node's kinds filter, in either authoring spelling, or `undefined`. */
+function filterKinds(node: Record<string, unknown>): unknown {
+  const query = node.query === undefined ? undefined : asObject(node.query);
+  const filter = node.filter ?? query?.filter;
+  return filter === undefined ? undefined : asObject(filter).kinds;
+}
+
+describe('property 4c: the understanding category composes the panel', () => {
+  it('composes one lens for one category, whatever the capture incidentally holds', async () => {
+    const captures = [serviceRenderPanelInput(), serviceLatencyPanelInput({ requestCount: 3 })];
+
+    for (const capture of captures) {
+      const timing = layoutTypes(
+        await answerFor('generate-panel', framedPanelInput(capture, 'performance')),
+      );
+      expect(timing).toContain('timeline');
+      expect(timing).toContain('table');
+      for (const body of ['componentTree', 'stateTransitions', 'dependencyGraph', 'eventLog']) {
+        expect(timing).not.toContain(body);
+      }
+
+      const component = layoutTypes(
+        await answerFor('generate-panel', framedPanelInput(capture, 'rendering')),
+      );
+      for (const body of ['renderTable', 'componentTree', 'dependencyGraph', 'eventLog']) {
+        expect(component).toContain(body);
+      }
+      for (const body of TIMING_BODIES) {
+        expect(component).not.toContain(body);
+      }
+    }
+  });
+
+  it('reads a symptom-level category through the class it belongs to', async () => {
+    const symptom = await answerFor(
+      'generate-panel',
+      framedPanelInput(serviceLatencyPanelInput(), 'excessive-renders'),
+    );
+    const classified = await answerFor(
+      'generate-panel',
+      framedPanelInput(serviceLatencyPanelInput(), 'rendering'),
+    );
+    expect(layoutTypes(symptom)).toEqual(layoutTypes(classified));
+  });
+
+  it('falls back to the evidence lens when the category’s lens has nothing to show', async () => {
+    // The idealised latency capture holds no render, component, state or event material.
+    const unframed = await answerFor('generate-panel', latencyPanelInput());
+    const framed = await answerFor(
+      'generate-panel',
+      framedPanelInput(latencyPanelInput(), 'rendering'),
+    );
+    expect(layoutTypes(framed)).toEqual(layoutTypes(unframed));
+    expect(layoutTypes(framed)).toContain('queryTable');
+  });
+
+  it('lays out the render panel for a rendering question: renders, tree, state and a filtered log', async () => {
+    const answer = await answerFor(
+      'generate-panel',
+      framedPanelInput(serviceStatefulRenderPanelInput(), 'rendering', [TILE_SYMBOL]),
+    );
+    const types = layoutTypes(answer);
+
+    for (const body of COMPONENT_BODIES) {
+      expect(types).toContain(body);
+    }
+    expect(types).toContain('sourceLink');
+    for (const id of RENDER_CARD_IDS) {
+      expect(metricCardIds(answer)).toContain(id);
+    }
+    // The event log reads the renders and the state transitions, not every event.
+    expect(filterKinds(nodeOfType(answer, 'eventLog'))).toEqual(['render', 'state']);
+    expect(asString(answer.title)).toBe(`Render activity — ${TILE_SYMBOL}`);
+  });
+
+  it('narrows the render panel’s event log to the kinds the capture recorded', async () => {
+    const answer = await answerFor(
+      'generate-panel',
+      framedPanelInput(serviceRenderPanelInput(), 'rendering'),
+    );
+    expect(filterKinds(nodeOfType(answer, 'eventLog'))).toEqual(['render']);
+    expect(layoutTypes(answer)).not.toContain('stateTransitions');
+    expect(asString(answer.title)).toBe('Render activity');
+  });
+
+  it('plots a request question’s requests against the renders, across every trace', async () => {
+    const input = serviceLatencyPanelInput({ requestCount: 3 });
+    const kindCounts = jsonObjectOf(jsonObjectOf(input.capture).kindCounts);
+    const answer = await answerFor(
+      'generate-panel',
+      framedPanelInput(withCapture(input, { kindCounts: { ...kindCounts, commit: 5 } }), 'network'),
+    );
+    const types = layoutTypes(answer);
+
+    const timeline = nodeOfType(answer, 'timeline');
+    const query = timeline.query === undefined ? timeline : asObject(timeline.query);
+    // A flat axis of requests and commits in start order — not one trace's tree.
+    expect(query.source).toBe('spans');
+    expect(query.sort).toBe('start_asc');
+    expect(filterKinds(timeline)).toEqual(['fetch', 'commit']);
+    expect(asObject(query.filter ?? {}).traceId).toBeUndefined();
+
+    for (const body of ['requestTable', 'renderTable', 'metricCards', 'sourceLink']) {
+      expect(types).toContain(body);
+    }
+    for (const body of ['flame', 'queryTable', 'componentTree', 'stateTransitions']) {
+      expect(types).not.toContain(body);
+    }
+    expect(metricCardIds(answer)).toContain('request_count');
+    for (const id of DURATION_CARD_IDS) {
+      expect(metricCardIds(answer)).not.toContain(id);
+    }
+    expect(asString(answer.title)).toBe('Network requests');
+  });
+
+  it('draws the request axis of a request question over the request kinds alone when no commit was recorded', async () => {
+    const answer = await answerFor(
+      'generate-panel',
+      framedPanelInput(serviceLatencyPanelInput({ requestCount: 3 }), 'network'),
+    );
+    expect(filterKinds(nodeOfType(answer, 'timeline'))).toEqual(['fetch']);
+  });
+
+  it('titles a timing panel by its category and names the tiers it has nothing to show for', async () => {
+    const silent = withTierCounts(serviceRenderPanelInput(), { browser: 900, server: 0, db: 0 });
+    const timing = await answerFor('generate-panel', framedPanelInput(silent, 'performance'));
+    const component = await answerFor('generate-panel', framedPanelInput(silent, 'rendering'));
+    const untallied = await answerFor(
+      'generate-panel',
+      framedPanelInput(serviceRenderPanelInput(), 'performance'),
+    );
+
+    expect(asString(timing.title)).toBe('Latency');
+    expect(asString(timing.summary)).toContain(
+      'No server or database telemetry was recorded, so the views show no work in those tiers.',
+    );
+    // A component panel covers no tier, and a capture without a tally claims nothing.
+    expect(asString(component.summary)).not.toContain('telemetry was recorded');
+    expect(asString(untallied.summary)).not.toContain('telemetry was recorded');
+  });
+
+  it('frames a panel identically for the same category, whatever else the framing carries', async () => {
+    const first = await answerFor(
+      'generate-panel',
+      framedPanelInput(serviceLatencyPanelInput(), 'performance'),
+    );
+    const second = await answerFor('generate-panel', {
+      ...framedPanelInput(serviceLatencyPanelInput(), 'performance'),
+      understanding: { category: 'performance', signalsNeeded: ['http', 'react', 'perf'] },
+    });
+    expect(canonical(second)).toBe(canonical(first));
   });
 });
 
@@ -3025,6 +3868,72 @@ const ROUTE_TRACE: JsonObject = {
   to: { kind: 'db-call' },
 };
 
+/** The click handler the widget binds, as the code graph names a `handler` node. */
+const WIDGET_HANDLER_NAME = 'handleKestrelClick';
+const WIDGET_HANDLER_NODE = graphNode('handler', WIDGET_HANDLER_NAME, WIDGET_FILE);
+const FORM_NODE = graphNode('component', FORM_SYMBOL, FORM_FILE);
+
+/** The trace through the widget's event handlers, proposed when its own calls reach no route. */
+const HANDLER_TRACE: JsonObject = {
+  tool: 'pathBetween',
+  from: { name: WIDGET_SYMBOL, kind: 'component' },
+  to: { kind: 'api-route' },
+  edgeKinds: ['handles', 'calls', 'routes-to'],
+};
+
+/** The lookup of the handler the widget binds. */
+const HANDLER_BINDING: JsonObject = {
+  tool: 'pathBetween',
+  from: { name: WIDGET_SYMBOL, kind: 'component' },
+  to: { kind: 'handler' },
+  edgeKinds: ['handles'],
+};
+
+/** The form's component-to-route trace. */
+const FORM_TRACE: JsonObject = {
+  tool: 'pathBetween',
+  from: { name: FORM_SYMBOL, kind: 'component' },
+  to: { kind: 'api-route' },
+  edgeKinds: ['calls', 'routes-to'],
+};
+
+/** The trace from a resolved route back to the component whose code issues its request. */
+const CALLER_TRACE: JsonObject = {
+  tool: 'pathBetween',
+  from: { file: ROUTE_FILE, kind: 'api-route' },
+  to: { kind: 'component' },
+  edgeKinds: ['routes-to', 'calls', 'handles'],
+  direction: 'both',
+};
+
+/** A run of the log the executor refused, in the shape the investigate stage records it. */
+function refusedRun(index: number, request: JsonObject, code: string): JsonObject {
+  return {
+    index,
+    request,
+    outcome: {
+      ok: false,
+      error: { name: 'DebuggenError', __isDebuggenError__: true, code, details: {} },
+    },
+  };
+}
+
+/** A `routeForUrl` run resolving the traced route's URL to a module of `kind`. */
+function routeLookupRun(index: number, kind: string, file: string): JsonObject {
+  return executedRun(
+    index,
+    { tool: 'routeForUrl', url: TRACED_ROUTE_NAME },
+    {
+      routePath: TRACED_ROUTE_NAME,
+      router: 'app',
+      kind,
+      file,
+      methods: ['GET'],
+      node: graphNode('api-route', TRACED_ROUTE_NAME, file),
+    },
+  );
+}
+
 /** One successful run of the query log, in the shape the investigate stage records it. */
 function executedRun(index: number, request: JsonObject, payload: JsonValue): JsonObject {
   const found = Array.isArray(payload) ? payload.length > 0 : true;
@@ -3090,6 +3999,8 @@ interface TraceContextOptions {
   readonly remainingQueries: number;
   /** The understanding's component entities; the owner chain, innermost first, by default. */
   readonly components?: readonly string[];
+  /** The seed turn's runs; {@link SEED_RUN} alone by default. */
+  readonly seeds?: readonly JsonObject[];
 }
 
 /** The candidates the context builder projects from a query log: every code node a payload named. */
@@ -3129,7 +4040,7 @@ function projectedCandidates(runs: readonly JsonObject[]): JsonObject[] {
 /** The structured context of one investigate turn. */
 function traceContext(options: TraceContextOptions): JsonObject {
   const components = options.components ?? [WIDGET_SYMBOL, FORM_SYMBOL];
-  const runs = [SEED_RUN, ...options.runs];
+  const runs = [...(options.seeds ?? [SEED_RUN]), ...options.runs];
   return {
     understanding: {
       category: 'slow-interaction',
@@ -3154,6 +4065,7 @@ const investigateReplyMirror = z.union([
           from: z.record(z.string(), z.string()),
           to: z.record(z.string(), z.string()),
           edgeKinds: z.array(z.string().min(1)).optional(),
+          direction: z.enum(['out', 'both']).optional(),
         }),
       )
       .min(1),
@@ -3226,16 +4138,184 @@ describe('investigate follow-ups: the selected element is followed to its route 
     ).toBe(true);
   });
 
-  it('proposes nothing when the understanding names no component, or no budget remains', async () => {
-    const unnamed = await investigateReply(
+  it('follows the component the log found by exactly the name looked up when the understanding names none', async () => {
+    const reply = await investigateReply(
       traceContext({ runs: [], remainingQueries: 8, components: [] }),
+    );
+
+    expect(reply.queries).toEqual([COMPONENT_TRACE]);
+  });
+
+  it('proposes nothing when there is nothing to follow, or no budget remains', async () => {
+    // A lookup whose matches only resemble the name asked for, and a URL resolved to a page.
+    const unmatched = await investigateReply(
+      traceContext({ runs: [], remainingQueries: 8, components: [], seeds: [DECOY_RUN] }),
+    );
+    const page = await investigateReply(
+      traceContext({
+        runs: [],
+        remainingQueries: 8,
+        components: [],
+        seeds: [routeLookupRun(0, 'page', ROUTE_FILE)],
+      }),
     );
     const exhausted = await investigateReply(traceContext({ runs: [], remainingQueries: 0 }));
 
-    for (const reply of [unnamed, exhausted]) {
+    for (const reply of [unmatched, page, exhausted]) {
       expect(reply.queries).toBeUndefined();
       expect(asArray(reply.relevantFiles).length).toBeGreaterThan(0);
     }
+  });
+
+  it('traces a component through the handlers it binds when its own calls reach no route', async () => {
+    const unreached = executedRun(1, COMPONENT_TRACE, null);
+    const throughHandler = executedRun(2, HANDLER_TRACE, {
+      nodes: [WIDGET_NODE, WIDGET_HANDLER_NODE, TRACED_ROUTE_NODE],
+      edges: [],
+      depth: 2,
+    });
+
+    const handlerTurn = await investigateReply(
+      traceContext({ runs: [unreached], remainingQueries: 7 }),
+    );
+    expect(handlerTurn.queries).toEqual([HANDLER_TRACE]);
+
+    const routeTurn = await investigateReply(
+      traceContext({ runs: [unreached, throughHandler], remainingQueries: 6 }),
+    );
+    expect(routeTurn.queries).toEqual([ROUTE_TRACE]);
+
+    // The handler lies on a traced path already, so no binding lookup follows.
+    const final = await investigateReply(
+      traceContext({ runs: [unreached, throughHandler, ROUTE_TRACE_RUN], remainingQueries: 5 }),
+    );
+    expect(final.queries).toBeUndefined();
+    const relevant = asArray(final.relevantFiles).map((entry) => asObject(entry));
+    expect(
+      relevant.some((entry) => entry.file === WIDGET_FILE && entry.symbol === WIDGET_HANDLER_NAME),
+    ).toBe(true);
+    const flows = asArray(final.flows).map((flow) => asString(flow));
+    expect(
+      flows.some((flow) => flow.includes(WIDGET_HANDLER_NAME) && flow.includes(TRACED_ROUTE_NAME)),
+    ).toBe(true);
+  });
+
+  it('looks up the handler of a control that delegates its request to its form, never the form’s', async () => {
+    const seeds = [
+      SEED_RUN,
+      executedRun(1, { tool: 'findByName', name: FORM_SYMBOL }, [FORM_NODE]),
+    ];
+    const widgetUnreached = executedRun(2, COMPONENT_TRACE, null);
+    const formReached = executedRun(3, FORM_TRACE, {
+      nodes: [FORM_NODE, TRACED_ROUTE_NODE],
+      edges: [],
+      depth: 1,
+    });
+    const binding = executedRun(5, HANDLER_BINDING, {
+      nodes: [WIDGET_NODE, WIDGET_HANDLER_NODE],
+      edges: [],
+      depth: 1,
+    });
+
+    const formTurn = await investigateReply(
+      traceContext({ seeds, runs: [widgetUnreached], remainingQueries: 6 }),
+    );
+    expect(formTurn.queries).toEqual([FORM_TRACE]);
+
+    const routeTurn = await investigateReply(
+      traceContext({ seeds, runs: [widgetUnreached, formReached], remainingQueries: 5 }),
+    );
+    expect(routeTurn.queries).toEqual([ROUTE_TRACE]);
+
+    const bindingTurn = await investigateReply(
+      traceContext({
+        seeds,
+        runs: [widgetUnreached, formReached, ROUTE_TRACE_RUN],
+        remainingQueries: 4,
+      }),
+    );
+    expect(bindingTurn.queries).toEqual([HANDLER_BINDING]);
+
+    const final = await investigateReply(
+      traceContext({
+        seeds,
+        runs: [widgetUnreached, formReached, ROUTE_TRACE_RUN, binding],
+        remainingQueries: 3,
+      }),
+    );
+    expect(final.queries).toBeUndefined();
+    const relevant = asArray(final.relevantFiles).map((entry) => asObject(entry));
+    expect(
+      relevant.some((entry) => entry.file === WIDGET_FILE && entry.symbol === WIDGET_HANDLER_NAME),
+    ).toBe(true);
+  });
+
+  it('follows the routes the log resolved both ways when no component was followed', async () => {
+    const seeds = [routeLookupRun(0, 'route-handler', ROUTE_FILE)];
+    const first = await investigateReply(
+      traceContext({ seeds, runs: [], remainingQueries: 8, components: [] }),
+    );
+    expect(first.queries).toEqual([ROUTE_TRACE, CALLER_TRACE]);
+
+    // The caller trace walked every hop against its edge's direction: the flow read backwards.
+    const reversedHop = { kind: 'calls', traversedAgainstDirection: true };
+    const callers = executedRun(2, CALLER_TRACE, {
+      nodes: [TRACED_ROUTE_NODE, WIDGET_HANDLER_NODE, WIDGET_NODE],
+      edges: [reversedHop, { ...reversedHop, kind: 'handles' }],
+      undirected: true,
+      depth: 2,
+    });
+    const final = await investigateReply(
+      traceContext({
+        seeds,
+        runs: [ROUTE_TRACE_RUN, callers],
+        remainingQueries: 6,
+        components: [],
+      }),
+    );
+    expect(final.queries).toBeUndefined();
+    const files = asArray(final.relevantFiles).map((entry) => asString(asObject(entry).file));
+    expect(files).toContain(WIDGET_FILE);
+    expect(files).toContain(STORE_FILE);
+    const flows = asArray(final.flows).map((flow) => asString(flow));
+    const upstream = flows.find((flow) => flow.includes(WIDGET_SYMBOL));
+    expect(upstream).toBeDefined();
+    expect(upstream?.indexOf(WIDGET_SYMBOL)).toBeLessThan(
+      upstream?.indexOf(TRACED_ROUTE_NAME) ?? -1,
+    );
+
+    // A path mixing both directions relates its endpoints without being a flow.
+    const mixed = executedRun(2, CALLER_TRACE, {
+      nodes: [TRACED_ROUTE_NODE, WIDGET_HANDLER_NODE, WIDGET_NODE],
+      edges: [reversedHop, { kind: 'calls', traversedAgainstDirection: false }],
+      undirected: true,
+      depth: 2,
+    });
+    const unrelated = await investigateReply(
+      traceContext({ seeds, runs: [ROUTE_TRACE_RUN, mixed], remainingQueries: 6, components: [] }),
+    );
+    const mixedFlows = asArray(unrelated.flows).map((flow) => asString(flow));
+    expect(mixedFlows.some((flow) => flow.includes(WIDGET_SYMBOL))).toBe(false);
+  });
+
+  it('bounds the resolved routes it follows and stops once a path query was refused for budget', async () => {
+    const seeds = [0, 1, 2, 3].map((n) =>
+      routeLookupRun(n, 'route-handler', `src/routes/tally/handler-${String(n)}.ts`),
+    );
+    const bounded = await investigateReply(
+      traceContext({ seeds, runs: [], remainingQueries: 8, components: [] }),
+    );
+    const proposed = asArray(bounded.queries).map((query) => asObject(asObject(query).from));
+    expect(proposed).toHaveLength(6);
+    expect(proposed.some((from) => from.file === 'src/routes/tally/handler-3.ts')).toBe(false);
+
+    const refused = await investigateReply(
+      traceContext({
+        runs: [refusedRun(1, COMPONENT_TRACE, 'RATE_LIMITED')],
+        remainingQueries: 7,
+      }),
+    );
+    expect(refused.queries).toBeUndefined();
   });
 
   it('proposes the same follow-ups however the question is worded', async () => {
@@ -3362,5 +4442,128 @@ describe('plan: a shortlist led by components still spends its patches where the
     expect(
       targets.filter((target) => target.type === 'function-timing').map((target) => target.symbol),
     ).toEqual(expect.arrayContaining([ROUTE_SYMBOL, STORE_SYMBOL]));
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * the function-timing target filter: patches follow the investigation's flows
+ *
+ * The planning context carries the shortlist without graph kinds, but it carries
+ * the grounded flows the investigation walked, in downstream order. A route step
+ * splits each flow into its page side and its server side, so the few patch
+ * slots left after the runtime hooks are reserved go to the server-side
+ * functions no runtime hook times, and never to the data-layer call site a
+ * database walk ends at.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A second server-side function behind the route, called by the first. */
+const QUEUE_FILE = 'src/services/tally-queue.ts';
+const QUEUE_SYMBOL = 'drainTallyQueue';
+
+/** The data-layer call site a database walk ends at: a call, never a declaration. */
+const CALL_SITE_SYMBOL = 'db.select';
+
+/** The route path the flows pass through. */
+const ROUTE_PATH = '/tally/rows';
+
+/**
+ * A plan context whose shortlist ranks a page-side request helper and a call
+ * site above the server-side functions, with the flows the investigation
+ * grounded: the page side reaching the route, and the route reaching the
+ * data layer through two service functions.
+ */
+function flowPlanInput(flows: readonly string[]): JsonObject {
+  return {
+    understanding: {
+      category: 'slow-interaction',
+      signalsNeeded: ['interactions', 'react', 'fetch', 'http', 'routeHandlers', 'functions', 'pg'],
+      entities: [{ kind: 'component', name: FORM_SYMBOL, file: FORM_FILE }],
+      searchHints: [],
+    },
+    investigation: {
+      relevantFiles: [
+        shortlisted(FORM_FILE, FORM_SYMBOL, 1),
+        shortlisted(PRESS_FILE, PRESS_SYMBOL, 0.9),
+        shortlisted(QUEUE_FILE, CALL_SITE_SYMBOL, 0.9),
+        shortlisted(QUEUE_FILE, QUEUE_SYMBOL, 0.4),
+        shortlisted(STORE_FILE, STORE_SYMBOL, 0.4),
+      ],
+      flows: [...flows],
+    },
+    adapterCatalog: [
+      {
+        id: 'runtime-adapter',
+        actionTypes: [
+          'interaction-tracking',
+          'react-render-tracking',
+          'fetch-tracking',
+          'perf-tracking',
+          'db-query-tracking',
+        ],
+        mode: 'runtime',
+        signals: ['interactions', 'react', 'componentTree', 'fetch', 'perf', 'pg'],
+      },
+      {
+        id: 'patch-adapter',
+        actionTypes: ['server-span', 'function-timing'],
+        mode: 'patch',
+        signals: ['http', 'routeHandlers', 'functions'],
+      },
+    ],
+  };
+}
+
+/** The flows a targeted walk grounds: component → page helper → route, then route → services → call site. */
+const WALKED_FLOWS = [
+  `${FORM_SYMBOL} → ${PRESS_SYMBOL} → ${ROUTE_PATH}`,
+  `${ROUTE_PATH} → ${STORE_SYMBOL} → ${QUEUE_SYMBOL} → ${CALL_SITE_SYMBOL}`,
+] as const;
+
+/** The symbols the plan asks to time, in plan order. */
+async function timedSymbols(input: JsonObject): Promise<readonly unknown[]> {
+  const plan = await answerFor('plan', input);
+  return asArray(plan.instrumentationTargets)
+    .map(asObject)
+    .filter((target) => target.type === 'function-timing')
+    .map((target) => target.symbol);
+}
+
+describe('plan: the function-timing target filter follows the investigation flows', () => {
+  it('times the server-side functions behind the route, nearest the route first', async () => {
+    const timed = await timedSymbols(flowPlanInput(WALKED_FLOWS));
+
+    expect(timed.slice(0, 2)).toEqual([STORE_SYMBOL, QUEUE_SYMBOL]);
+  });
+
+  it('never asks to time the data-layer call site a database walk ends at', async () => {
+    const timed = await timedSymbols(flowPlanInput(WALKED_FLOWS));
+
+    expect(timed).not.toContain(CALL_SITE_SYMBOL);
+  });
+
+  it('gives a page-side function a patch slot only after every server-side one', async () => {
+    const timed = await timedSymbols(flowPlanInput(WALKED_FLOWS));
+    const page = timed.indexOf(PRESS_SYMBOL);
+
+    if (page !== -1) {
+      expect(page).toBeGreaterThan(timed.indexOf(QUEUE_SYMBOL));
+    }
+  });
+
+  it('reads the flows structurally: the other arrow spelling places the same steps', async () => {
+    const ascii = WALKED_FLOWS.map((flow) => flow.replaceAll(' → ', ' -> '));
+
+    expect(await timedSymbols(flowPlanInput(ascii))).toEqual(
+      await timedSymbols(flowPlanInput(WALKED_FLOWS)),
+    );
+  });
+
+  it('keeps the ranked order when no flow passes a route', async () => {
+    const timed = await timedSymbols(flowPlanInput([]));
+
+    // Without flows nothing is placed, so the filter changes nothing: the
+    // ranked shortlist decides (score, then path), and the two best-ranked
+    // entries are considered before the service functions.
+    expect(timed.slice(0, 2)).toEqual([CALL_SITE_SYMBOL, PRESS_SYMBOL]);
   });
 });

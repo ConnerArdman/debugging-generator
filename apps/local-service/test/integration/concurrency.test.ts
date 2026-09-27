@@ -32,27 +32,42 @@
  *   itself may import (never `panel-renderer`), the service's own modules and
  *   the harness. No `zod`, no DOM types.
  *
- * ## Why one session per pair plans without a patch
+ * ## Two sessions, one patch target
  *
  * The deterministic provider plans the same actions for every question on the
  * sample project, and one of them is a `function-timing` patch of the project's
- * route handler. The patch layer refuses to wrap a target another open session
- * already instrumented (`PATCH_UNSUPPORTED`, reason `already-instrumented`), and
- * the installer stops at that refusal, so a second deterministic session on the
- * same project would be filed `failed` and could never ask for a capture at
- * all. {@link createPlanQueue} therefore answers the plan stage of the second
- * session of each pair with a runtime-only authoring payload — validated by the
- * planner's own authoring schema like any model output — while the first
- * session plans, patches and (on `session.end`) cleans up through the real
- * deterministic pipeline.
+ * route handler. The second session to plan it while the first is open finds
+ * the file holding the first session's instrumented bytes: the patch layer
+ * refuses the target before anything is backed up or written
+ * (`PATCH_UNSUPPORTED`, reason `held-by-another-session`), and the installer
+ * sets it aside as a Function-timing gap naming the holder and installs the
+ * rest of the plan (AAP §0.5.5). Every session here therefore plans through
+ * the real deterministic pipeline: the second of each pair (`'deterministic-held'`
+ * in {@link openSession}) reaches `ready` with no modification of its own, and
+ * its `instrumentation.ready` names the holding session in one `unavailable`
+ * entry per held patch target.
+ *
+ * {@link createPlanQueue} is kept for the one plan no question produces: a
+ * plan of nothing but the held patch targets (session F). With nothing else
+ * to enable, its install is the nothing-enabled failure, and the suite proves
+ * the developer is told why — `instrumentation.failed` and the failed progress
+ * row carry the service's own hint naming the holding session and the held
+ * file — and that a new tab bound by origin goes to a live session, never to
+ * the failed one.
  *
  * ## The narrative
  *
  * The tests run in declaration order over one harness and build on each
  * other's state, exactly as a developer's sessions would: session A (the
- * deterministic owner) and session B (runtime-only) share the harness's copy of
- * the sample project; session C lives on a second copy; sessions D and E are
- * opened on the first copy once A has ended, for the races — and are then
+ * deterministic owner, which patches) and session B (deterministic, its patch
+ * target held by A) share the harness's copy of the sample project; session C
+ * lives on a second copy, and its patch — byte-for-byte A's — stands for the
+ * rest of the suite, so the holder every held-target assertion names is proven
+ * to be the session on the same copy (the service scopes the patch layer's
+ * hold lookup to the install's project); session F
+ * fails on the first copy while A still holds its patch; sessions D and E are
+ * opened on the first copy once A has ended — D
+ * patches, E's patch target is held by D — for the races, and are then
  * reused, both back in `ready`, for the store-failure checks.
  *
  * ## Injected store failures
@@ -71,11 +86,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import {
-  DISABLED_SERVER_AGENT_SIGNALS,
-  TARGETLESS_FILE,
-  TARGETLESS_SYMBOL,
-} from '@debuggen/instrumentation';
+import { DISABLED_SERVER_AGENT_SIGNALS } from '@debuggen/instrumentation';
 import type { InstrumentationPlanInput } from '@debuggen/instrumentation';
 import { parseInstrumentationPlanInput } from '@debuggen/instrumentation/schema';
 import { createDeterministicProvider } from '@debuggen/model-provider';
@@ -92,6 +103,7 @@ import { isErr, newEventId, newId, newProducerId, newTraceId, ok } from '@debugg
 import type { DebuggenError, Result } from '@debuggen/shared';
 import type { TelemetryEventIngress } from '@debuggen/telemetry';
 
+import { sessionOnAnotherProjectThan } from '../../src/instrumentation/service.js';
 import { HTTP_ERROR_STATUS_BY_CODE } from '../../src/server/http.js';
 import {
   SESSION_REQUEST_DIAGNOSTIC_MESSAGE,
@@ -155,22 +167,20 @@ const DOCUMENT_ID_PREFIX = 'doc';
 /** The first inspected tab id; every session gets the next one. */
 const FIRST_TAB_ID = 7_100;
 
+/** The signal a held patch target is reported under: Function timing. */
+const HELD_PATCH_SIGNAL = 'functions' as const;
+
+/** The code of an install that could enable nothing at all (AAP §0.5.5). */
+const NOTHING_ENABLED_CODE = 'INSTRUMENTATION_UNAVAILABLE' as const;
+
 /**
- * A runtime-only plan in the authoring shape a model returns: interaction,
- * request and database signals, every action targetless, so installing it
- * edits no file and it can coexist with a sibling session's patch.
- * `db-query-tracking` is what makes the capture collect server-tier
- * telemetry, so arming it sends a `server-agent.config`.
+ * The hint the service words for a target another session holds — the exact
+ * sentence of `withHeldTargetHint` in `src/instrumentation/service.ts`,
+ * restated here so a changed wording is a deliberate change of this suite.
  */
-const RUNTIME_ONLY_PLAN: InstrumentationPlanInput = {
-  objective: 'Observe the interaction, its requests and its database queries without editing code',
-  capture: ['click event timing', 'fetch calls', 'database query spans'],
-  instrumentationTargets: [
-    { file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL, type: 'interaction-tracking' },
-    { file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL, type: 'fetch-tracking' },
-    { file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL, type: 'db-query-tracking' },
-  ],
-};
+function heldTargetHint(file: string, owningSessionId: string): string {
+  return `${file} is already instrumented by session ${owningSessionId}. End that session — its cleanup restores the file — then ask again.`;
+}
 
 /** Every telemetry row one trace left in the store, in ingest order. */
 const ROWS_BY_TRACE_SQL =
@@ -212,7 +222,8 @@ interface PlanQueue {
 
 /**
  * Wraps the real deterministic provider so the suite can decide, per session,
- * whether its plan is the deterministic one or {@link RUNTIME_ONLY_PLAN}.
+ * whether its plan is the deterministic one or one the suite authors — the
+ * patch-only plan of the session that fails on a held target.
  *
  * Honours the provider contract exactly as the harness's scripted fake does:
  * one attempt per call, never a throw or a rejection, and no repair loop of its
@@ -274,8 +285,16 @@ interface ProjectUnderTest {
   readonly serverAgentToken: string;
 }
 
-/** Which planner answers a new session's plan stage. */
-type PlanSource = 'deterministic' | 'runtime-only';
+/**
+ * What a new session's deterministic plan meets when it installs:
+ *
+ * - `'deterministic'` — a project no other open session has patched, so its
+ *   patch targets are applied.
+ * - `'deterministic-held'` — a project whose patch targets another open
+ *   session holds, so each is set aside as a Function-timing gap naming that
+ *   session and nothing of this session's is written.
+ */
+type PlanSource = 'deterministic' | 'deterministic-held';
 
 /** A session in `ready`, with a bound DevTools tab whose page agent reported. */
 interface SessionUnderTest {
@@ -343,12 +362,27 @@ async function prepareProject(root: string): Promise<ProjectUnderTest> {
  * the session, and the page agent of that tab reports a document whose React
  * hook was installed first — the readiness gate's two browser preconditions.
  *
- * @throws Error When the session is filed anything but `ready`.
+ * For `'deterministic-held'`, the project editor's `instrumentation.ready` for
+ * the session must report one Function-timing gap per patch target of its
+ * plan, each naming `holderId` and the target's file, and the editor must have
+ * received no `instrumentation.failed` for it.
+ *
+ * @param project The project to open the session on.
+ * @param plan What its deterministic plan meets when it installs.
+ * @param holderId The session holding the project's patch targets; required
+ * for `'deterministic-held'` and refused otherwise.
+ * @throws Error When the session is filed anything but `ready`, or `holderId`
+ * does not fit `plan`.
  */
-async function openSession(project: ProjectUnderTest, plan: PlanSource): Promise<SessionUnderTest> {
-  if (plan === 'runtime-only') {
-    planQueue.enqueue(RUNTIME_ONLY_PLAN);
+async function openSession(
+  project: ProjectUnderTest,
+  plan: PlanSource,
+  holderId?: string,
+): Promise<SessionUnderTest> {
+  if ((plan === 'deterministic-held') !== (holderId !== undefined)) {
+    throw new Error(`openSession(${plan}) was given the wrong holder: ${String(holderId)}.`);
   }
+  const editor = await harness.editor(project.root);
   const created = await harness.createSession({ projectRoot: project.root, question: QUESTION });
 
   const tabId = nextTabId;
@@ -389,14 +423,10 @@ async function openSession(project: ProjectUnderTest, plan: PlanSource): Promise
     throw new Error(`Session ${created.id} was filed "${reached.status}" instead of "ready".`);
   }
   expect(planQueue.pending()).toBe(0);
-  const actions = reached.plans.at(-1)?.instrumentationTargets ?? [];
-  if (plan === 'runtime-only') {
-    expect(actions.map((action) => action.mode)).toEqual(
-      RUNTIME_ONLY_PLAN.instrumentationTargets.map(() => 'runtime'),
-    );
-    expect(reached.modifications).toEqual([]);
-  } else {
+  if (holderId === undefined) {
     expect(reached.modifications.some((record) => record.status === 'applied')).toBe(true);
+  } else {
+    await expectHeldTargetsReported(editor, reached, holderId);
   }
 
   return Object.freeze({
@@ -406,6 +436,49 @@ async function openSession(project: ProjectUnderTest, plan: PlanSource): Promise
     devtools: client,
     devtoolsToken: credential.token,
   });
+}
+
+/**
+ * Proves a session planned on a project another session holds went on without
+ * the held targets instead of failing: nothing of its own was written, the
+ * project editor's `instrumentation.ready` for it reports every patch target
+ * of its plan as a Function-timing gap naming the holder and the target's
+ * file, and the editor received no `instrumentation.failed` for it.
+ */
+async function expectHeldTargetsReported(
+  editor: HarnessWsClient,
+  record: SessionRecord,
+  holderId: string,
+): Promise<void> {
+  expect(record.modifications).toEqual([]);
+  const patchTargets = (record.plans.at(-1)?.instrumentationTargets ?? []).filter(
+    (action) => action.mode === 'patch',
+  );
+  expect(patchTargets.length).toBeGreaterThan(0);
+
+  const ready = await waitFor(
+    editor,
+    'instrumentation.ready',
+    (message) => message.payload.sessionId === record.id,
+  );
+  expect(ready.payload.applied).toEqual([]);
+  const held = ready.payload.unavailable.filter((gap) => gap.reason.includes(holderId));
+  expect(held).toHaveLength(patchTargets.length);
+  for (const target of patchTargets) {
+    const reason = `${target.file} is already instrumented by session ${holderId}`;
+    const gap = held.find((entry) => entry.reason === reason);
+    expect(gap?.signal, reason).toBe(HELD_PATCH_SIGNAL);
+    expect(gap?.hint, reason).toContain(holderId);
+  }
+
+  await editor.flush();
+  expect(
+    editor.received.filter(
+      (message) =>
+        isMessageOfType(message, 'instrumentation.failed') &&
+        message.payload.sessionId === record.id,
+    ),
+  ).toEqual([]);
 }
 
 /**
@@ -490,6 +563,29 @@ function storedSession(sessionId: string): SessionRecord {
     throw new Error(`Session ${sessionId} could not be read from the store.`);
   }
   return read.value;
+}
+
+/**
+ * The instrumented digests two sessions' applied records share for the same
+ * project-relative file — non-empty exactly when a file of one session's copy
+ * holds the bytes of a file of the other's, which is what makes a holder
+ * ambiguous to a lookup that matches by path and digest alone.
+ */
+function identicalPatchDigests(firstId: string, secondId: string): string[] {
+  const appliedOf = (sessionId: string): Map<string, string> =>
+    new Map(
+      storedSession(sessionId)
+        .modifications.filter((record) => record.status === 'applied')
+        .map((record) => [
+          `${record.file}\u0000${record.instrumentedHash}`,
+          record.instrumentedHash,
+        ]),
+    );
+  const first = appliedOf(firstId);
+  return [...appliedOf(secondId).keys()].flatMap((key) => {
+    const digest = first.get(key);
+    return digest === undefined ? [] : [digest];
+  });
 }
 
 /** The manager's single answer to "who captures this project?". */
@@ -662,13 +758,20 @@ describe('one capture per project root, across the real service boundary', () =>
   let primary: ProjectUnderTest;
   /** A second, independent copy: session C. */
   let secondary: ProjectUnderTest;
-  /** The deterministic session that captures first. */
+  /**
+   * The deterministic session on the second copy. Its patch is byte-for-byte
+   * A's — one fixture, one deterministic transform — and it stands for the
+   * rest of the suite, so every held-target assertion on the primary copy also
+   * proves the holder named is the session on that copy, never C.
+   */
+  let sessionC: SessionUnderTest;
+  /** The deterministic session that patches the primary copy and captures first. */
   let sessionA: SessionUnderTest;
-  /** The runtime-only session that asks second. */
+  /** The deterministic session that asks second, its patch target held by A. */
   let sessionB: SessionUnderTest;
   /** Opened on the primary copy once A has ended and restored its patch. */
   let sessionD: SessionUnderTest;
-  /** D's runtime-only rival in the race, reused with D by the store-failure checks. */
+  /** D's rival in the race, its patch target held by D; reused with D by the store-failure checks. */
   let sessionE: SessionUnderTest;
   let captureA: string;
   let captureB: string;
@@ -676,7 +779,6 @@ describe('one capture per project root, across the real service boundary', () =>
   const uiClients: HarnessWsClient[] = [];
 
   beforeAll(async () => {
-    expect(isErr(parseInstrumentationPlanInput(RUNTIME_ONLY_PLAN))).toBe(false);
     planQueue = createPlanQueue();
     harness = await startHarness({ provider: planQueue.provider });
 
@@ -686,7 +788,7 @@ describe('one capture per project root, across the real service boundary', () =>
     uiClients.push(await harness.editor(primary.root), await harness.editor(secondary.root));
 
     sessionA = await openSession(primary, 'deterministic');
-    sessionB = await openSession(primary, 'runtime-only');
+    sessionB = await openSession(primary, 'deterministic-held', sessionA.id);
     uiClients.push(sessionA.devtools, sessionB.devtools);
     expect(sessionB.projectRoot).toBe(sessionA.projectRoot);
   });
@@ -767,7 +869,7 @@ describe('one capture per project root, across the real service boundary', () =>
   });
 
   it('scopes ownership to the project root: a session on another project captures alongside', async () => {
-    const sessionC = await openSession(secondary, 'deterministic');
+    sessionC = await openSession(secondary, 'deterministic');
     uiClients.push(sessionC.devtools);
     const primaryMark = primary.serverAgent.received.length;
     const secondaryMark = secondary.serverAgent.received.length;
@@ -800,6 +902,60 @@ describe('one capture per project root, across the real service boundary', () =>
     expect(stoppedC.value.summary.captureId).toBe(captureC);
     expect(ownerOf(secondary.root)).toBeUndefined();
     expect(ownerOf(primary.root)).toEqual({ sessionId: sessionA.id, captureId: captureA });
+
+    // C's patch of its copy is byte-for-byte A's patch of the primary copy —
+    // one fixture, one deterministic transform — so each copy's file now
+    // holds the same instrumented digest under the same relative path. C is
+    // left standing: the patch layer's hold check matches by path and digest,
+    // and only the service's project scoping keeps it from naming C as the
+    // holder of the primary copy's file, which the tests below assert.
+    await harness.waitForSession(
+      sessionC.id,
+      (record) => record.status !== 'capturing' && record.status !== 'analyzing',
+    );
+    expect(identicalPatchDigests(sessionA.id, sessionC.id).length).toBeGreaterThan(0);
+    expect(ownerOf(primary.root)).toEqual({ sessionId: sessionA.id, captureId: captureA });
+  });
+
+  it("scopes the patch layer's hold lookup to the install's project while two copies hold identical patches", async () => {
+    // The journal lists open records by session id, so which of A's and C's
+    // identical records a path-and-digest match meets last is an accident of
+    // two random ids. The service hands the installer a predicate that leaves
+    // out the records of sessions it installed on another project, which is
+    // what makes the holder named deterministic; an unknown session is kept.
+    expect(identicalPatchDigests(sessionA.id, sessionC.id).length).toBeGreaterThan(0);
+    const listed = await harness.repos.modifications.listOpen();
+    if (isErr(listed)) {
+      throw new Error(`The open records could not be listed (${listed.error.code}).`);
+    }
+    const knownProjects = new Map([
+      [sessionA.id, primary.root],
+      [sessionC.id, secondary.root],
+    ]);
+    const holdersSeenFrom = (
+      projectRoot: string,
+      projectOf: (sessionId: string) => string | undefined,
+    ): Set<string> => {
+      const elsewhere = sessionOnAnotherProjectThan(projectRoot, projectOf);
+      return new Set(
+        listed.value
+          .filter((record) => !elsewhere(record.sessionId))
+          .map((record) => record.sessionId),
+      );
+    };
+
+    expect(new Set(listed.value.map((record) => record.sessionId))).toEqual(
+      new Set([sessionA.id, sessionC.id]),
+    );
+    expect(holdersSeenFrom(primary.root, (id) => knownProjects.get(id))).toEqual(
+      new Set([sessionA.id]),
+    );
+    expect(holdersSeenFrom(secondary.root, (id) => knownProjects.get(id))).toEqual(
+      new Set([sessionC.id]),
+    );
+    expect(holdersSeenFrom(primary.root, () => undefined)).toEqual(
+      new Set([sessionA.id, sessionC.id]),
+    );
   });
 
   it('names the single owner in server-agent.config and attributes server-tier telemetry to its capture', async () => {
@@ -844,6 +1000,135 @@ describe('one capture per project root, across the real service boundary', () =>
     expect(storedEventCount()).toBe(storedBefore);
     expect(rowsOfTrace(browserBatch.traceId)).toEqual([]);
     expect(ownerOf(primary.root)).toEqual({ sessionId: sessionA.id, captureId: captureA });
+  });
+
+  it('fails a plan of nothing but held patch targets with a hint naming the holder, and binds a new tab to a live session instead', async () => {
+    const editor = await harness.editor(primary.root);
+    const holder = storedSession(sessionA.id);
+    const heldTargets = (holder.plans.at(-1)?.instrumentationTargets ?? []).filter(
+      (action) => action.mode === 'patch',
+    );
+    if (heldTargets.length === 0) {
+      throw new Error(`Session ${sessionA.id} holds no patch target to plan against.`);
+    }
+    const appliedBefore = holder.modifications
+      .filter((record) => record.status === 'applied')
+      .map((record) => record.id);
+    expect(appliedBefore.length).toBeGreaterThan(0);
+
+    // A's own patch targets, and nothing else: every one is held, so nothing
+    // at all can be enabled. The authoring schema admits the plan like any
+    // model output.
+    const patchOnly: InstrumentationPlanInput = {
+      objective: 'Time the functions another session has already instrumented',
+      capture: ['function timing'],
+      instrumentationTargets: heldTargets.map(({ file, symbol, type }) => ({ file, symbol, type })),
+    };
+    expect(isErr(parseInstrumentationPlanInput(patchOnly))).toBe(false);
+    planQueue.enqueue(patchOnly);
+
+    const created = await harness.createSession({ projectRoot: primary.root, question: QUESTION });
+    const reached = await harness.waitForSession(
+      created.id,
+      (record) => record.status === 'failed' || record.status === 'ready',
+    );
+    expect(reached.status).toBe('failed');
+    expect(planQueue.pending()).toBe(0);
+    expect(reached.modifications).toEqual([]);
+
+    // Both surfaces say why, in the service's own words: the held file and
+    // the session to end. The message stays the code's fixed copy. C's patch
+    // of the second copy — the same bytes under the same relative path — still
+    // stands, so naming A rather than C is the service's project scoping at
+    // work, not an accident of which record the journal lists last.
+    expect(identicalPatchDigests(sessionA.id, sessionC.id).length).toBeGreaterThan(0);
+    // The hint names one of the held files — the installer lists what it set
+    // aside in its own install order (adapter, then action id), not the plan's,
+    // and the ids are minted afresh for this plan — and always the holder, A.
+    const heldHints = heldTargets.map((target) => heldTargetHint(target.file, sessionA.id));
+    const failedFrame = await waitFor(
+      editor,
+      'instrumentation.failed',
+      (message) => message.payload.sessionId === created.id,
+    );
+    expect(failedFrame.payload.error.code).toBe(NOTHING_ENABLED_CODE);
+    const reportedHint = failedFrame.payload.error.hint;
+    expect(heldHints).toContain(reportedHint);
+    const expectedHint = String(reportedHint);
+    expect(expectedHint).not.toContain(sessionC.id);
+    for (const target of heldTargets) {
+      expect(failedFrame.payload.error.message).not.toContain(target.file);
+    }
+    const progress = harness.repos.sessions.listProgress(created.id);
+    if (isErr(progress)) {
+      throw new Error(`The progress of ${created.id} could not be read (${progress.error.code}).`);
+    }
+    const failedRows = progress.value.filter((row) => row.status === 'failed');
+    expect(failedRows).toHaveLength(1);
+    const failedDetail = String(failedRows[0]?.detail);
+    expect(
+      failedDetail.startsWith(`${expectedHint} (error code: ${NOTHING_ENABLED_CODE}, ref: msg_`),
+      failedDetail,
+    ).toBe(true);
+    await editor.flush();
+    expect(
+      editor.received.filter(
+        (message) =>
+          isMessageOfType(message, 'instrumentation.ready') &&
+          message.payload.sessionId === created.id,
+      ),
+    ).toEqual([]);
+
+    // The holder is untouched: A still captures, its records still applied.
+    const holderAfter = storedSession(sessionA.id);
+    expect(holderAfter.status).toBe('capturing');
+    expect(
+      holderAfter.modifications
+        .filter((record) => record.status === 'applied')
+        .map((record) => record.id),
+    ).toEqual(appliedBefore);
+    expect(ownerOf(primary.root)).toEqual({ sessionId: sessionA.id, captureId: captureA });
+
+    // A new tab on the origin, bound without a session id, goes to a live
+    // session — never to the failed one, however recently it was updated.
+    const tabId = nextTabId;
+    nextTabId += 1;
+    const { client } = await harness.connectDevtools({ tabId });
+    uiClients.push(client);
+    const byOrigin = await harness.bindTab(client, {
+      tabId,
+      url: primary.devServerUrl,
+      origin: primary.origin,
+    });
+    if (isErr(byOrigin)) {
+      throw new Error(`session.bind by origin was refused (${byOrigin.error.code}).`);
+    }
+    const boundId = byOrigin.value.payload.sessionId;
+    expect(boundId).not.toBe(created.id);
+    expect(storedSession(boundId).status).not.toBe('failed');
+    const displaced = [sessionA, sessionB].find((session) => session.id === boundId);
+    if (displaced === undefined) {
+      throw new Error(`The new tab bound to ${boundId}, not to a session on the primary project.`);
+    }
+
+    // One tab per session: give the displaced session its own tab back, by
+    // name, so the tests after this one see the bindings they were given.
+    // The flush lets the announcement that its tab was replaced arrive first,
+    // so it cannot be mistaken for the answer to the re-bind.
+    await displaced.devtools.flush();
+    const restored = await harness.bindTab(displaced.devtools, {
+      tabId: displaced.tabId,
+      url: primary.devServerUrl,
+      origin: primary.origin,
+      sessionId: displaced.id,
+    });
+    if (isErr(restored)) {
+      throw new Error(`Re-binding ${displaced.id} was refused (${restored.error.code}).`);
+    }
+    // An establishment — reason `bound`, or absent — never the replacement notice.
+    expect(restored.value.payload.sessionId).toBe(displaced.id);
+    expect([undefined, 'bound']).toContain(restored.value.payload.reason);
+    expect(storedSession(displaced.id).boundTab?.tabId).toBe(displaced.tabId);
   });
 
   it("releases ownership when the owner's session ends, and names the next owner", async () => {
@@ -937,7 +1222,7 @@ describe('one capture per project root, across the real service boundary', () =>
   });
 
   it('lets exactly one of two concurrent capture.start requests win', async () => {
-    sessionE = await openSession(primary, 'runtime-only');
+    sessionE = await openSession(primary, 'deterministic-held', sessionD.id);
     uiClients.push(sessionE.devtools);
     const contenders = [sessionD, sessionE] as const;
 

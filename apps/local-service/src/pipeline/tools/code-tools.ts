@@ -2259,7 +2259,12 @@ export interface CodeToolsOptions {
   readonly handles: PipelineCodeHandles;
   /** Tighter stage limits; resolved with {@link resolveCodeToolLimits} against the engine's own. */
   readonly limits?: Partial<CodeToolLimits> | undefined;
-  /** Receives one structural `debug` record per call; `noopLogger` when absent. */
+  /**
+   * Receives one structural `debug` record per call and one summary record per
+   * {@link CodeTools.runCodeTools} batch; `noopLogger` when absent. The stage
+   * passes its session- and stage-bound logger, so every record carries those
+   * bindings.
+   */
   readonly logger?: Logger | undefined;
   /** Cancels the stage: once aborted, every call is refused without delegation. */
   readonly signal?: AbortSignal | undefined;
@@ -2292,7 +2297,9 @@ export interface CodeTools extends CodeToolMethods {
   /**
    * Runs a batch sequentially and deterministically, one {@link CodeToolRun} per
    * input in order. Once the budget is spent the remaining entries are budget
-   * rejections rather than a shorter array.
+   * rejections rather than a shorter array. The batch closes with one summary
+   * record — requests, delegated and rejected calls, per-tool calls and
+   * `pathBetween` searches tried and found — on the injected logger.
    */
   readonly runCodeTools: (requests: readonly unknown[]) => Promise<readonly CodeToolRun[]>;
   /** A fresh, frozen snapshot of the live budget. */
@@ -2305,6 +2312,41 @@ export interface CodeTools extends CodeToolMethods {
 interface RunOutcome {
   readonly request?: CodeToolRequest | undefined;
   readonly outcome: CodeToolOutcome;
+}
+
+/** The message of the one `debug` record every call emits. */
+const CALL_LOG = 'code tool call';
+
+/** The message of the one `debug` record that closes every `runCodeTools` batch. */
+const BATCH_LOG = 'code tool batch';
+
+/**
+ * The counters a {@link CodeTools.runCodeTools} batch reports as deltas: read
+ * once before the batch and once after it, so the summary counts exactly the
+ * batch's own calls whatever ran through the instance before it.
+ */
+interface CallTally {
+  readonly callsUsed: number;
+  readonly callsRejected: number;
+  readonly pathBetweenFound: number;
+  readonly perTool: Readonly<Record<CodeToolName, number>>;
+}
+
+/**
+ * The per-tool difference between two tallies, with every tool present — a
+ * fixed shape, so a log query can read `perTool.<tool>` without a missing-key
+ * case.
+ *
+ * @param after The tally at the end of the batch.
+ * @param before The tally at its start.
+ * @returns The calls each tool delegated in between.
+ */
+function perToolDelta(after: CallTally, before: CallTally): Record<CodeToolName, number> {
+  const delta: Record<CodeToolName, number> = { ...after.perTool };
+  for (const tool of CODE_TOOL_NAMES) {
+    delta[tool] -= before.perTool[tool];
+  }
+  return delta;
 }
 
 /**
@@ -2321,6 +2363,17 @@ interface RunOutcome {
  * delegation — malformed, cancelled, over budget, or an excerpt with no loaded
  * project — consumes nothing and is counted in `callsRejected` instead.
  *
+ * **Log records.** Every call emits one `debug` record, {@link CALL_LOG}, with
+ * the tool, the outcome and — for a delegated call — `found`, the result sizes
+ * and the argument sizes. A `pathBetween` record also carries the stage's
+ * running `pathBetweenTried` (searches delegated) and `pathBetweenFound`
+ * (searches that returned a path), so the stage's last such record is its
+ * aggregate: the query engine logs each miss only at `trace`, through a
+ * project-scoped logger with no session. Every {@link CodeTools.runCodeTools}
+ * batch closes with one {@link BATCH_LOG} record of its own per-tool counts.
+ * All of it goes through the injected logger, and so carries the session and
+ * stage bindings the stage gave that logger.
+ *
  * @param options The handles, and optionally tighter limits, a logger and a signal.
  * @returns The frozen tools.
  */
@@ -2334,6 +2387,12 @@ export function createCodeTools(options: CodeToolsOptions): CodeTools {
   let callsUsed = 0;
   let callsRejected = 0;
   let excerptsUsed = 0;
+  /**
+   * Delegated `pathBetween` calls that returned a path. A log counter only: it
+   * feeds the call and batch records and plays no part in the budget. Its
+   * companion, searches tried, is `perTool.pathBetween`.
+   */
+  let pathBetweenFound = 0;
   const perTool: Record<CodeToolName, number> = {
     findByName: 0,
     findSymbol: 0,
@@ -2373,14 +2432,31 @@ export function createCodeTools(options: CodeToolsOptions): CodeTools {
    */
   let droppedRecords = 0;
 
-  const log = (fields: LogFields): void => {
+  const record = (message: string, fields: LogFields): void => {
     try {
-      logger.debug('code tool call', droppedRecords === 0 ? fields : { ...fields, droppedRecords });
+      logger.debug(message, droppedRecords === 0 ? fields : { ...fields, droppedRecords });
       droppedRecords = 0;
     } catch {
       droppedRecords += 1;
     }
   };
+
+  const log = (fields: LogFields): void => {
+    record(CALL_LOG, fields);
+  };
+
+  /** The stage's running search tallies, carried by `pathBetween` call records only. */
+  const pathTallies = (tool: CodeToolName): LogFields =>
+    tool === 'pathBetween' ? { pathBetweenTried: perTool.pathBetween, pathBetweenFound } : {};
+
+  /** The counters a batch summary is computed from, as a frozen copy. */
+  const tally = (): CallTally =>
+    Object.freeze({
+      callsUsed,
+      callsRejected,
+      pathBetweenFound,
+      perTool: Object.freeze({ ...perTool }),
+    });
 
   const refuse = (tool: CodeToolName | undefined, failure: CodeToolRejection): CodeToolOutcome => {
     callsRejected += 1;
@@ -2532,7 +2608,13 @@ export function createCodeTools(options: CodeToolsOptions): CodeTools {
       shaped = await Promise.resolve(dispatch(request, clamped));
     } catch {
       account(tool);
-      log({ tool, ok: false, code: CODE_TOOL_REJECTION_CODES.internal, callsUsed });
+      log({
+        tool,
+        ok: false,
+        code: CODE_TOOL_REJECTION_CODES.internal,
+        callsUsed,
+        ...pathTallies(tool),
+      });
       return Object.freeze(
         err(
           rejection('internal', 'The query engine failed while executing this tool.', {
@@ -2544,10 +2626,14 @@ export function createCodeTools(options: CodeToolsOptions): CodeTools {
     }
 
     account(tool);
+    if (tool === 'pathBetween' && shaped.result.found) {
+      pathBetweenFound += 1;
+    }
     const size = measureArguments(request);
     log({
       tool,
       ok: true,
+      found: shaped.result.found,
       returned: shaped.result.returned,
       total: shaped.result.total,
       truncated: shaped.result.truncated,
@@ -2555,6 +2641,7 @@ export function createCodeTools(options: CodeToolsOptions): CodeTools {
       argumentCount: size.count,
       argumentChars: size.chars,
       callsUsed,
+      ...pathTallies(tool),
     });
     return Object.freeze(ok(shaped.result));
   };
@@ -2601,12 +2688,27 @@ export function createCodeTools(options: CodeToolsOptions): CodeTools {
 
   const runCodeTools = async (requests: readonly unknown[]): Promise<readonly CodeToolRun[]> => {
     const batch: readonly unknown[] = isListValue(requests) ? requests : EMPTY_LIST;
+    const before = tally();
     const runs: CodeToolRun[] = [];
     for (let index = 0; index < batch.length; index += 1) {
       const { request, outcome } = await runOne(batch[index]);
       const run: CodeToolRun = { index, ...(request !== undefined ? { request } : {}), outcome };
       runs.push(Object.freeze(run));
     }
+
+    // One record for the whole batch, counting only its own calls: the
+    // aggregate the per-call records would otherwise have to be summed into.
+    const after = tally();
+    const perToolCalls = perToolDelta(after, before);
+    record(BATCH_LOG, {
+      requests: batch.length,
+      delegated: after.callsUsed - before.callsUsed,
+      rejected: after.callsRejected - before.callsRejected,
+      perTool: perToolCalls,
+      pathBetweenTried: perToolCalls.pathBetween,
+      pathBetweenFound: after.pathBetweenFound - before.pathBetweenFound,
+      callsUsed: after.callsUsed,
+    });
     return Object.freeze(runs);
   };
 

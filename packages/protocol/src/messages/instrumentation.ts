@@ -24,15 +24,32 @@
  * `instrumentation.ready` is what a developer *sees* about the edits this
  * product made to their working tree. The same payload feeds the editor's
  * modification list with its diff view and the DevTools panel's session summary
- * (AAP §0.5.1), and it is the only channel through which the three facts of an
- * install reach a human: which files were patched, which runtime hooks came up,
- * and which signals did not. A record dropped at this boundary is an edit the
- * developer does not know about; a record admitted with a malformed hash is an
- * edit whose reversal cannot be verified. So nothing here is lenient, nothing is
- * repaired, and every one of the three arrays is required — an install that
- * patched no file sends an empty `applied`, never an absent one, because "no
- * files were touched" is a fact worth transmitting and "the producer forgot the
- * field" is not the same fact.
+ * (AAP §0.5.1), and it is the channel through which the three facts of an
+ * install first reach a human: which files were patched, which runtime hooks
+ * came up, and which signals did not. A record dropped at this boundary is an
+ * edit the developer does not know about; a record admitted with a malformed
+ * hash is an edit whose reversal cannot be verified. So nothing here is
+ * lenient, nothing is repaired, and every one of the three arrays is required —
+ * an install that patched no file sends an empty `applied`, never an absent
+ * one, because "no files were touched" is a fact worth transmitting and "the
+ * producer forgot the field" is not the same fact.
+ *
+ * ## `applied` is this install's records — for a follow-up, the delta
+ *
+ * `applied` lists exactly the records the install being reported wrote: every
+ * record of a session's first install, only plan version *n + 1*'s records when
+ * a follow-up installs its delta, and `[]` when the delta patches nothing (a
+ * runtime-only delta, or a follow-up plan that adds no action) — "the installer
+ * applies only the delta" (AAP §0.4.2), and the report says what it applied.
+ * Records an earlier plan version applied were announced by that version's
+ * `instrumentation.ready` and are never re-listed, so a record is attributed to
+ * the plan version that wrote it. The session's whole journal, with each
+ * record's live status, is `SessionRecord.modifications` and
+ * `GET /sessions/:id/modifications`; a consumer merges `applied` into the
+ * journal it holds by record id rather than replacing that journal with it.
+ * `runtimeHooks` and `unavailable` are the install's report too; a delta that
+ * installs nothing runs no installer, so for it they restate the session's
+ * current hooks and gaps.
  *
  * The journal is not restated to achieve that. `modificationRecordSchema` is
  * imported from `@debuggen/instrumentation`, the package that owns the record —
@@ -532,10 +549,13 @@ export type InstrumentationPlanPayload = z.infer<typeof instrumentationPlanPaylo
  * and hands both user interfaces their entire picture of what happened.
  *
  * Sent when installation finishes and the session reaches "Ready to capture".
- * The three arrays are the whole report and are read together: the patches that
- * were applied to files, the runtime hooks that came up, and the signals that
- * did not. A developer looking at the editor's modification list or the panel's
- * session summary is looking at exactly this payload (AAP §0.5.1).
+ * The three arrays are the whole report of one install and are read together:
+ * the patches that install applied to files, the runtime hooks that came up,
+ * and the signals that did not. A developer looking at the editor's
+ * modification list or the panel's session summary is looking at these
+ * records merged, by id, into the session's journal (AAP §0.5.1): after a
+ * follow-up, `applied` holds only the delta, and the records of earlier plan
+ * versions stay in `SessionRecord.modifications` (see the module header).
  *
  * **All three arrays are required and may be empty**, and the distinction
  * carries meaning in both directions:
@@ -560,6 +580,11 @@ export const instrumentationReadyPayloadSchema = z.strictObject({
   /**
    * The modification records this install produced, in the order they were
    * applied — which is the order cleanup must reverse.
+   *
+   * Only this install's: on a follow-up, the delta's records — each carrying
+   * the new `planVersion` — and `[]` when the delta patches nothing. A record an
+   * earlier plan version applied is never repeated here; the whole journal is
+   * `SessionRecord.modifications` / `GET /sessions/:id/modifications`.
    *
    * Each element is a journal entry the store already holds: the record is
    * appended before the write and marked `applied` after the atomic rename
@@ -596,8 +621,11 @@ export const instrumentationReadyPayloadSchema = z.strictObject({
    *
    * The graceful-degradation channel of AAP §0.5.5, rendered as "Could not
    * enable ‹signal›: ‹reason›. Continuing with: ‹enabled list›." — where the
-   * enabled list is composed from {@link runtimeHooks} and {@link applied}
-   * rather than transmitted a second time.
+   * enabled list is composed from {@link runtimeHooks} and the session's
+   * applied records rather than transmitted a second time. Those records are
+   * {@link applied} merged into the journal the consumer holds: after a
+   * follow-up, `applied` alone is only the delta, while every earlier plan
+   * version's patches are still in place.
    */
   unavailable: z.array(unavailableSignalSchema).max(MAX_ARRAY_LENGTH, {
     error: `expected at most ${String(MAX_ARRAY_LENGTH)} unavailable signals`,
@@ -784,7 +812,7 @@ export function parseInstrumentationReadyPayload(
       'PROTOCOL_INVALID_MESSAGE',
       'Invalid instrumentation ready payload',
       parsed.error.issues,
-      'This payload carries a session id and three required arrays, each of which may be empty: the applied modification records, the runtime hook labels that came up, and the signals that could not be enabled with their reason and hint.',
+      'This payload carries a session id and three required arrays, each of which may be empty: the modification records this install applied (for a follow-up, only the delta), the runtime hook labels that came up, and the signals that could not be enabled with their reason and hint.',
     ),
   );
 }

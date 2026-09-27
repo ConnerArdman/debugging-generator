@@ -25,9 +25,10 @@
  *    a server component to a client component and from a route handler to the
  *    browser.
  * 4. **A bound both sides must hold to travels with the shapes.** The module is
- *    types with one exception, {@link MAX_SHIPMENT_UNITS}, and the exception is
- *    the point: a request the browser may not send and a request the server
- *    refuses are the same rule, and a rule stated twice is a rule that drifts.
+ *    types with two exceptions, {@link MAX_SHIPMENT_UNITS} and
+ *    {@link MAX_PAYMENT_CENTS}, and the exceptions are the point: a request one
+ *    side may not send and a request the other side refuses are the same rule,
+ *    and a rule stated twice is a rule that drifts.
  *    A bound is admitted here only when both sides must act on the figure
  *    itself; a *shape* - what a postal code looks like, what an email is - stays
  *    each surface's own, because a shape is checked where a value arrives and
@@ -550,6 +551,29 @@ export interface CheckoutResult {
  * another route is refused there too.
  */
 export const MAX_SHIPMENT_UNITS = 500;
+
+/**
+ * The largest amount, in US cents, the store's payment processor authorizes in
+ * one payment: 100 000 000 cents, which is $1,000,000.00.
+ *
+ * Like {@link MAX_SHIPMENT_UNITS} it is a refusal rather than a cap - an order
+ * above it is not charged in part - and it is published here because three
+ * surfaces have to agree on it, and a surface that guessed it wrong would turn
+ * a refusal that says what to change into one that says nothing. The stand-in
+ * processor's body schema bounds `amountCents` by it (`@/server/validation/
+ * mocks`); the payment service refuses a larger amount itself, before anything
+ * is sent (`@/server/services/payment.service`), so the checkout answers with
+ * the validation failure it is and returns the cart to its session untouched
+ * rather than reporting a processor that turned the request away; and the
+ * checkout form names the figure in the copy it shows for that answer, so a
+ * buyer is told to reduce the order rather than to try again.
+ *
+ * The browser does not gate on it before submitting, because it cannot: the
+ * amount charged is the total the server prices - promotions, freight and all
+ * - when the order is placed, which no figure on the page is guaranteed to
+ * equal.
+ */
+export const MAX_PAYMENT_CENTS = 100_000_000;
 
 /**
  * A destination address. `line2` holds `null` rather than being absent when the

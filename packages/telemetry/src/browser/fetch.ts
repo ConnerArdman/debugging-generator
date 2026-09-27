@@ -26,6 +26,10 @@
  *    the call-site stack as its `initiator` so the service can map it back to
  *    TypeScript through
  *    `packages/code-analysis/src/source-map/{fetch-map,resolver,normalize}.ts`.
+ *    The span is an OpenTelemetry HTTP **client** span, and its status follows
+ *    that convention: `error` for an answer of 400 or above and for a request
+ *    that got no answer at all, `ok` for any other answer (see
+ *    {@link statusForResponse}).
  * 4. **Drives the continuation handshake**: the request is registered with
  *    `./continuation.ts` when it starts and settled when it finishes, which is
  *    what lets the React commit that renders the response stay in the
@@ -131,14 +135,16 @@
  * {@link hasFetchResidue} is how `./agent.ts` learns that anything is still
  * outstanding.
  *
- * ## Imports: four page modules and two vocabularies
+ * ## Imports: five page modules and two vocabularies
  *
  * `packages/telemetry/esbuild.agent.mjs` bundles this file into the IIFE
  * injected into the developer's page at `document_start` and hard-fails on any
  * input resolving to a Node builtin, `@debuggen/protocol`,
  * `@debuggen/shared/node` or `zod`. The imports below are therefore the whole
  * list and are a constraint rather than a coincidence: ids, transport,
- * interaction and continuation for behaviour, and the two dependency-free
+ * interaction, continuation and initiator-owner (the React component that
+ * started a request, read without installing anything) for behaviour, and the
+ * two dependency-free
  * schema vocabularies for the kind and attribute-key spellings — type-only, so
  * no vocabulary object reaches the page bundle at runtime.
  * `@opentelemetry/instrumentation-fetch` is deliberately not used: AAP 0.3.2
@@ -161,6 +167,7 @@ import {
   settleContinuation,
 } from './continuation.js';
 import { formatTraceparent, newSpanId } from './ids.js';
+import { captureInitiatorOwner, type InitiatorOwner } from './initiator-owner.js';
 import { isTracedContext, resolveEventContext, type EventContext } from './interaction.js';
 import {
   emit,
@@ -261,6 +268,15 @@ const KEY_STATUS_CODE: DeclaredRequestKey = 'http.status_code';
 /** The call-site stack, for the source-map resolution route. */
 const KEY_INITIATOR: DeclaredRequestKey = 'initiator';
 
+/** The React component whose work started the request, when React reported one. */
+const KEY_INITIATOR_COMPONENT: DeclaredRequestKey = 'initiatorComponent';
+
+/**
+ * The components that created {@link KEY_INITIATOR_COMPONENT} (its composite
+ * ancestors when the build records no creator), nearest first.
+ */
+const KEY_INITIATOR_OWNERS: DeclaredRequestKey = 'initiatorOwners';
+
 /** Whether the request went to `location.origin`. */
 const KEY_SAME_ORIGIN: DeclaredRequestKey = 'sameOrigin';
 
@@ -320,6 +336,21 @@ const KEY_IN_FLIGHT: DeclaredRequestKey = 'inFlight';
  * more than that.
  */
 const IN_FLIGHT_STATUS: TelemetryStatus = 'unset';
+
+/**
+ * The lowest response status code that makes a request span an `error`.
+ *
+ * The OpenTelemetry HTTP semantic conventions set span status Error on a
+ * `CLIENT` span for every 4xx and 5xx answer — the caller asked for something
+ * and did not get it — and leave 1xx–3xx alone. A browser `fetch` / XHR span
+ * is the client side of the exchange, so a 404 and a 500 are both failures
+ * here; the same conventions leave a 4xx unset on a `SERVER` span, whose
+ * status belongs to the Node tracer rather than to this module.
+ * `../aggregate/requests.ts` counts a failed occurrence by the same floor, so
+ * the span status and the request table never disagree about a request that
+ * carries a code.
+ */
+const HTTP_CLIENT_ERROR_STATUS_FLOOR = 400;
 
 /**
  * `Response.type` for a `fetch` that fulfilled: `basic`, `cors`, `opaque`,
@@ -675,6 +706,8 @@ interface RequestRecord {
   readonly skipReason: SkipReason | undefined;
   /** The captured call-site stack, when the host produced one. */
   readonly initiator: string | undefined;
+  /** The React component that started the request, when the renderer reported one. */
+  readonly initiatorOwner: InitiatorOwner | undefined;
   /** Whether a pending continuation is outstanding for this span. */
   continuation: boolean;
   /** Whether this record has been accounted for. */
@@ -695,10 +728,23 @@ interface RequestOutcome {
    */
   readonly settledAt: number;
   /**
-   * `ok` for a completed request, including 4xx and 5xx; `error` for one that
-   * failed; `unset` for an in-flight snapshot, which has done neither yet.
+   * The span status, by the OpenTelemetry HTTP client convention: `ok` for an
+   * answer below 400 (an opaque answer, which exposes no code, included);
+   * `error` for an answer of 400 or above and for a request that got no answer
+   * — a network error, a timeout, a refusal or an abort; `unset` for an
+   * in-flight snapshot, which has neither yet. See {@link statusForResponse}.
    */
   readonly status: TelemetryStatus;
+  /**
+   * Whether the server's answer arrived: a `fetch` that fulfilled, or an XHR
+   * that reached `loadend` with a status code and no terminal failure event.
+   *
+   * Deliberately separate from {@link status}, which the client convention
+   * makes `error` for a 500 that nonetheless arrived. Anything that
+   * needs the answer itself — the clock sample of {@link sampleServerClock}
+   * reads its `Date` header — asks this, never the status.
+   */
+  readonly responded: boolean;
   /** The response status code, when there was one. */
   readonly statusCode: number | undefined;
   /** Whether the application aborted the request. */
@@ -1814,6 +1860,7 @@ function beginRequest(input: {
   readonly injected: boolean;
   readonly skipReason: SkipReason | undefined;
   readonly initiator: string | undefined;
+  readonly initiatorOwner: InitiatorOwner | undefined;
 }): RequestRecord {
   const record: RequestRecord = {
     generation,
@@ -1831,6 +1878,7 @@ function beginRequest(input: {
     injected: input.injected,
     skipReason: input.skipReason,
     initiator: input.initiator,
+    initiatorOwner: input.initiatorOwner,
     continuation: false,
     settled: false,
     terminal: undefined,
@@ -1904,6 +1952,10 @@ function buildAttributes(record: RequestRecord, outcome: RequestOutcome): Record
   if (record.initiator !== undefined) {
     attributes[KEY_INITIATOR] = record.initiator;
   }
+  if (record.initiatorOwner !== undefined) {
+    attributes[KEY_INITIATOR_COMPONENT] = record.initiatorOwner.component;
+    attributes[KEY_INITIATOR_OWNERS] = [...record.initiatorOwner.owners];
+  }
   if (outcome.statusCode !== undefined) {
     attributes[KEY_STATUS_CODE] = outcome.statusCode;
   }
@@ -1965,6 +2017,7 @@ function emitInFlightSnapshot(record: RequestRecord, observedAt: number): void {
   const outcome: RequestOutcome = {
     settledAt: observedAt,
     status: IN_FLIGHT_STATUS,
+    responded: false,
     statusCode: undefined,
     aborted: false,
     responseType: undefined,
@@ -2005,10 +2058,12 @@ function emitInFlightSnapshot(record: RequestRecord, observedAt: number): void {
  * in-flight counter it was holding is released by whichever boundary ended its
  * generation rather than here.
  *
- * The continuation is settled for **both** outcomes. A network error is still
- * a response arriving, and the React work that renders the failure belongs to
- * the request that failed exactly as a successful render belongs to the
- * request that succeeded.
+ * The continuation is settled for **every** outcome, whatever its status: an
+ * answer below 400, an answer of 400 or above — `error` by the client
+ * convention, yet an answer the page goes on to render — and a request that
+ * got no answer at all. The React work that renders a failure belongs to the
+ * request that failed exactly as a successful render belongs to the request
+ * that succeeded, so nothing here reads {@link RequestOutcome.status}.
  */
 function settleRequest(record: RequestRecord, outcome: RequestOutcome): void {
   try {
@@ -2083,14 +2138,44 @@ function abandonRequest(record: RequestRecord): void {
 }
 
 /**
+ * The span status of a request whose answer arrived.
+ *
+ * The OpenTelemetry HTTP client convention, which is what a browser request
+ * span is: `error` for a status code of {@link HTTP_CLIENT_ERROR_STATUS_FLOOR}
+ * or above, `ok` below it. A 500 is therefore an `error` even though the
+ * exchange completed — the panel's status badge, the waterfall's tint and the
+ * capture's failure count all read the span status, and a failed request that
+ * read as `OK` beside its server span's `Error` is exactly the contradiction
+ * this rule removes. The code itself is still written as `http.status_code`,
+ * so nothing distinguishing a 404 from a 503 is lost.
+ *
+ * An answer without a code — an `opaque` (`no-cors`) or `opaqueredirect`
+ * response, whose status is `0` by specification, or one whose `status` could
+ * not be read — is `ok`: it arrived, and nothing observable says it failed.
+ *
+ * @param statusCode The answer's status code, when one was observed.
+ * @returns `error` for a code of 400 or above, otherwise `ok`.
+ *
+ * @example
+ * statusForResponse(200);       // 'ok'
+ * statusForResponse(304);       // 'ok'
+ * statusForResponse(404);       // 'error'
+ * statusForResponse(500);       // 'error'
+ * statusForResponse(undefined); // 'ok' — an opaque answer
+ */
+function statusForResponse(statusCode: number | undefined): TelemetryStatus {
+  return statusCode !== undefined && statusCode >= HTTP_CLIENT_ERROR_STATUS_FLOOR ? 'error' : 'ok';
+}
+
+/**
  * What a fulfilled `fetch` reports.
  *
- * `status: 'ok'` for **every** response the network produced, including 4xx
- * and 5xx: the request completed, and its failure is carried by
- * `http.status_code`, where an analysis can read it as an application outcome
- * rather than as a transport failure. `status` and `type` are plain property
- * reads; the body is never touched, and the response is returned to the
- * application exactly as it arrived.
+ * A fulfilled `fetch` always **responded** — the network produced an answer —
+ * and its status is {@link statusForResponse}'s judgement of that answer's
+ * code: `ok` below 400, `error` at 400 and above, with the code carried as
+ * `http.status_code` either way. `status` and `type` are plain property reads;
+ * the body is never touched, and the response is returned to the application
+ * exactly as it arrived.
  */
 function responseOutcome(response: Response): RequestOutcome {
   let statusCode: number | undefined;
@@ -2115,7 +2200,8 @@ function responseOutcome(response: Response): RequestOutcome {
 
   return {
     settledAt: nowEpochMs(),
-    status: 'ok',
+    status: statusForResponse(statusCode),
+    responded: true,
     statusCode,
     aborted: false,
     responseType,
@@ -2125,15 +2211,17 @@ function responseOutcome(response: Response): RequestOutcome {
 /**
  * What a rejected `fetch` reports.
  *
- * A network failure, a CORS refusal and an abort all arrive here. The reason
- * itself is not transported (see {@link isAbortError}); only whether it was an
- * abort, which is the one distinction that changes how a reader should judge
- * the request.
+ * A network failure, a CORS refusal and an abort all arrive here: no answer
+ * arrived, so the request has not **responded** and its event is an `error`
+ * with no status code. The reason itself is not transported (see
+ * {@link isAbortError}); only whether it was an abort, which is the one
+ * distinction that changes how a reader should judge the request.
  */
 function rejectionOutcome(error: unknown): RequestOutcome {
   return {
     settledAt: nowEpochMs(),
     status: 'error',
+    responded: false,
     statusCode: undefined,
     aborted: isAbortError(error),
     responseType: undefined,
@@ -2144,11 +2232,13 @@ function rejectionOutcome(error: unknown): RequestOutcome {
  * What a settled `XMLHttpRequest` reports.
  *
  * `xhr.status` is `0` for a network error, a timeout, an abort and a
- * cross-origin refusal, which is exactly the set that makes the event an
- * `error`; any other status means the exchange completed and is reported as
- * `ok` with its code, 4xx and 5xx included. The terminal event seen before
- * `loadend` refines that judgement — it is the only thing that can tell an
- * abort from a network error.
+ * cross-origin refusal, which is exactly the set in which no answer arrived:
+ * such an XHR has not **responded** and is an `error` with no code. Any other
+ * status means the answer arrived, and it is judged exactly as a fulfilled
+ * `fetch` is, by {@link statusForResponse} — `ok` below 400, `error` at 400 and
+ * above, with its code either way. The terminal event seen before `loadend`
+ * refines the first judgement — it is the only thing that can tell an abort
+ * from a network error.
  */
 function xhrOutcome(xhr: XMLHttpRequest, record: RequestRecord): RequestOutcome {
   let statusCode: number | undefined;
@@ -2165,11 +2255,12 @@ function xhrOutcome(xhr: XMLHttpRequest, record: RequestRecord): RequestOutcome 
   }
 
   const terminal = record.terminal;
-  const failed = terminal !== undefined || statusCode === undefined;
+  const responded = terminal === undefined && statusCode !== undefined;
 
   return {
     settledAt: nowEpochMs(),
-    status: failed ? 'error' : 'ok',
+    status: responded ? statusForResponse(statusCode) : 'error',
+    responded,
     statusCode,
     aborted: terminal === 'abort',
     responseType: undefined,
@@ -2185,8 +2276,11 @@ function xhrOutcome(xhr: XMLHttpRequest, record: RequestRecord): RequestOutcome 
  * anything about the dev server's clock, so a sample is taken only when all of
  * these hold:
  *
- * - **The exchange completed** (`status: 'ok'`). A rejected `fetch`, and an
- *   XHR that errored, timed out or was aborted, has no server answer to read.
+ * - **The answer arrived** ({@link RequestOutcome.responded}). A rejected
+ *   `fetch`, and an XHR that errored, timed out or was aborted, has no server
+ *   answer to read. The span status is deliberately not the test: a 500 is an
+ *   `error` span, yet the dev server produced it just now and its `Date` is as
+ *   good a clock reading as a 200's.
  * - **The request and its response are both same-origin.** `record.sameOrigin`
  *   judges the URL the application asked for; the response's own final URL is
  *   judged too, because a redirect can answer a same-origin request from
@@ -2222,7 +2316,7 @@ function sampleServerClock(
   response: { readonly url: () => unknown; readonly header: (name: string) => unknown },
 ): void {
   try {
-    if (!record.sameOrigin || outcome.status !== 'ok') {
+    if (!record.sameOrigin || !outcome.responded) {
       return;
     }
 
@@ -2295,6 +2389,7 @@ function planFetch(input: RequestInfo | URL, init: RequestInit | undefined): Fet
   const context = resolveEventContext(startedAt);
   const spanId = newSpanId();
   const initiator = captureInitiatorStack();
+  const initiatorOwner = captureInitiatorOwner();
 
   let callInput: RequestInfo | URL = input;
   let callInit: RequestInit | undefined = init;
@@ -2340,6 +2435,7 @@ function planFetch(input: RequestInfo | URL, init: RequestInit | undefined): Fet
     injected,
     skipReason,
     initiator,
+    initiatorOwner,
   });
 
   return { record, callInput, callInit };
@@ -2560,6 +2656,7 @@ function planXhr(xhr: XMLHttpRequest, setHeader: XhrSetRequestHeaderFn): Request
   const context = resolveEventContext(startedAt);
   const spanId = newSpanId();
   const initiator = captureInitiatorStack();
+  const initiatorOwner = captureInitiatorOwner();
 
   let injected = false;
   let skipReason = eligibility(context, resolved);
@@ -2595,6 +2692,7 @@ function planXhr(xhr: XMLHttpRequest, setHeader: XhrSetRequestHeaderFn): Request
     injected,
     skipReason,
     initiator,
+    initiatorOwner,
   });
 }
 

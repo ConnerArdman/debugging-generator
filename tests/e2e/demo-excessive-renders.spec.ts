@@ -106,7 +106,11 @@ import type {
   SessionTracker,
   TrackedFileSnapshot,
 } from './helpers/fixtures';
-import { waitForStreamedContent, withEditorAnnouncement } from './helpers/demo-app';
+import {
+  waitForOrderableCheckout,
+  waitForStreamedContent,
+  withEditorAnnouncement,
+} from './helpers/demo-app';
 
 // ---------------------------------------------------------------------------
 // The questions, the targets and the demo's observable surface
@@ -382,6 +386,19 @@ function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
 function stringAttribute(event: TelemetryEvent, key: string): string | undefined {
   const value: unknown = event.attributes[key];
   return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * How many fiber renders one render event stands for.
+ *
+ * The page agent coalesces the fibers of one component that rendered alike in
+ * one commit into a single event carrying `instanceCount` (present only when
+ * greater than one), so an event counts as that many renders and as one when
+ * the attribute is absent — the rule the render statistics are computed by.
+ */
+function instancesOf(event: TelemetryEvent): number {
+  const value: unknown = event.attributes['instanceCount'];
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 ? value : 1;
 }
 
 /** The whole number a rendered figure shows (`1,234` → `1234`), or `NaN` when it shows none. */
@@ -775,8 +792,10 @@ async function openCheckoutPage(page: Page, baseUrl: string): Promise<void> {
   const control = placeOrderControl(page);
   await expect(control, `"${PLACE_ORDER_SELECTOR}" must match exactly one control.`).toHaveCount(1);
   await expect(control).toHaveAccessibleName(PLACE_ORDER_NAME);
-  // Enabled once the cart has been read and the shipping quote has settled.
-  await expect(control).toBeEnabled({ timeout: E2E_TIMEOUTS.pageReady });
+  // The control is enabled as soon as the cart is orderable, and a press made while the shipping
+  // quote is still in flight is refused by the form's own validation, so wait for an orderable
+  // form rather than an enabled button.
+  await waitForOrderableCheckout(page, E2E_TIMEOUTS.pageReady);
 }
 
 /**
@@ -1518,12 +1537,15 @@ test.describe('demo defect 2 — excessive renders on the idle catalog', () => {
       expectHexId(traceId, 32, `the traceId ${traceId} the captured renders carry`);
     }
 
+    // The statistics count fiber renders: each event weighs its instanceCount,
+    // because the agent coalesces the cards that re-render alike in a commit.
     const cardRenders = renders.filter(
       (event) => stringAttribute(event, 'component') === CARD_COMPONENT,
     );
-    expect(cardRenders.length, `the ${CARD_COMPONENT} statistics count its render events`).toBe(
-      expectRenderStat(stats, CARD_COMPONENT).renderCount,
-    );
+    expect(
+      cardRenders.reduce((total, event) => total + instancesOf(event), 0),
+      `the ${CARD_COMPONENT} statistics count the renders its events stand for`,
+    ).toBe(expectRenderStat(stats, CARD_COMPONENT).renderCount);
 
     // The point of the defect: nobody touched the page while it rendered.
     for (const kind of INPUT_KINDS) {

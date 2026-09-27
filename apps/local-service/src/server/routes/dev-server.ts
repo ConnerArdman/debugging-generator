@@ -121,8 +121,10 @@
  * the exact relaunch command reaches VS Code when a dev server already runs
  * without the preload — the hint `detect.ts`'s `buildRelaunchHint` produced,
  * token-free by construction, never composed, reformatted or templated here.
- * A hint that quotes the dev server's own output (a spawn failure, an early
- * exit, a readiness timeout — the errors whose details carry `outputTail`) is
+ * The launcher keeps a failed start's output in the service log (its redacted
+ * last lines, logged with the failure's warning) and its hints are fixed text
+ * that say so. An error whose details nevertheless carry an `outputTail` —
+ * a hint that could quote the dev server's own output — has that hint
  * **not** forwarded: the output stays in the service log, and the response
  * says so. Access-boundary refusals are rendered by `../auth.ts`'s own
  * `authErrorResponse`; a store or internal failure is answered `500` with a
@@ -277,8 +279,10 @@ const LOGGABLE_REASON = /^[a-z][a-z0-9-]{0,63}$/;
 
 /**
  * Said in place of a hint that quotes the dev server's output. The launcher
- * streams every output line (scrubbed of the credential) into the service log
- * under `subsystem: "dev-server"`, which is where the developer reads it.
+ * logs a failed start's last output lines, redacted, with that failure's
+ * warning under `subsystem: "dev-server"`, which is where the developer reads
+ * them; its own hints never quote them, so this sentence stands in only for
+ * an error that carries a `details.outputTail`.
  */
 const OUTPUT_WITHHELD_SENTENCE =
   "The dev server's last output is in the Debug Generator service log.";
@@ -538,11 +542,12 @@ function describedStatusOf(error: DebuggenError): DevServerFailureStatus | undef
 
 /**
  * Whether an error's hint may quote the dev server's own output. The launcher
- * attaches the scrubbed tail to exactly those errors' `details.outputTail` and
- * appends its last non-blank lines to their hint; a tail of blank lines only
- * leaves the hint as the launcher's constant text, which may be forwarded.
- * Anything else under that key — including a value that is not an array of
- * strings — is treated as quoting output.
+ * logs a failed start's redacted tail and never places it in an error, so its
+ * errors carry no `details.outputTail` and their constant hints are
+ * forwarded. This is the boundary's own guard for any error that does: a tail
+ * of blank lines only leaves the hint forwardable; anything else under that
+ * key — including a value that is not an array of strings — is treated as
+ * quoting output.
  *
  * @param error The failure.
  * @returns `true` when the hint must not be forwarded.

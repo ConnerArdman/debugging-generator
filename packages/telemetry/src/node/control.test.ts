@@ -100,13 +100,24 @@ import { createRequire } from 'node:module';
 
 import {
   context,
+  createContextKey,
+  diag,
+  DiagLogLevel,
   propagation,
+  ROOT_CONTEXT,
   SpanKind,
   SpanStatusCode,
   trace,
   TraceFlags,
 } from '@opentelemetry/api';
-import type { Context, SpanContext, Tracer, TracerOptions } from '@opentelemetry/api';
+import type {
+  Context,
+  ContextManager,
+  DiagLogger,
+  SpanContext,
+  Tracer,
+  TracerOptions,
+} from '@opentelemetry/api';
 import { isWrapped } from '@opentelemetry/instrumentation';
 import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
 import { resourceFromAttributes } from '@opentelemetry/resources';
@@ -143,8 +154,11 @@ import {
   CONTROL_MESSAGE_TYPES,
   DB_SOURCE_SIGNALS,
   DebuggenCaptureSampler,
+  hasGlobalContextManager,
   INSTRUMENTATION_ROLES,
   NO_SIGNALS,
+  OUTBOUND_PROPAGATION_INSTRUMENTATION_NAME,
+  providerRegistrationConfig,
   resolveFunctionAllowList,
   ServerAgentControl,
   SIGNAL_KINDS,
@@ -2561,6 +2575,27 @@ describe('the two database signals, which share one kind', () => {
     expect(orm.disableCount).toBe(1);
     expect(harness.control.stats().enabledDbSources).toEqual([DB_CLIENT_VALUES.driver]);
   });
+
+  it('switches the outgoing-request trace-context hook with the fetch signal', async () => {
+    const outbound = new RecordingInstrumentation({
+      instrumentationName: OUTBOUND_PROPAGATION_INSTRUMENTATION_NAME,
+    });
+    expect(classifyInstrumentation(outbound)).toBe(INSTRUMENTATION_ROLES.outbound);
+    expect(wantsInstrumentation(INSTRUMENTATION_ROLES.outbound, onlySignal('fetch'))).toBe(true);
+    expect(wantsInstrumentation(INSTRUMENTATION_ROLES.outbound, HTTP_ONLY_SIGNALS)).toBe(false);
+
+    const harness = createHarness({ instrumentations: [outbound] });
+
+    // A capture that wants no outgoing requests writes no trace context onto
+    // them: the hook arrived enabled and is removed.
+    await harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS);
+    expect(outbound.disableCount).toBe(1);
+    expect(outbound.enableCount).toBe(0);
+
+    await harness.arm(CAPTURE_B, { ...HTTP_ONLY_SIGNALS, fetch: true });
+    expect(outbound.enableCount).toBe(1);
+    expect(outbound.disableCount).toBe(1);
+  });
 });
 
 /*
@@ -3607,7 +3642,199 @@ describe('the ingest endpoint refusing the credential', () => {
  * ---------------------------------------------------------------------------
  */
 
+/**
+ * Collect every OpenTelemetry diagnostic at `error` while `body` runs, then
+ * remove the collector again whatever `body` did.
+ *
+ * `error` is the level `@opentelemetry/api` reports a refused global
+ * registration at ("Attempted duplicate registration of API: …", with a
+ * stack), so an empty result means no registration this module made was
+ * refused. The collector is the process's `diag` logger only for the duration.
+ *
+ * @param body The work to observe.
+ * @returns The messages the API reported, in order.
+ */
+async function diagnosticErrorsDuring(body: () => Promise<void>): Promise<string[]> {
+  const errors: string[] = [];
+  const ignore = (): void => undefined;
+  const collector: DiagLogger = {
+    error: (message: string): void => {
+      errors.push(message);
+    },
+    warn: ignore,
+    info: ignore,
+    debug: ignore,
+    verbose: ignore,
+  };
+  diag.setLogger(collector, DiagLogLevel.ERROR);
+  try {
+    await body();
+  } finally {
+    diag.disable();
+  }
+  return errors;
+}
+
+/**
+ * A context manager a host registered itself, which carries context like the
+ * SDK's but is not the SDK's — or, with `throwOnWith`, one that is broken.
+ */
+class HostContextManager implements ContextManager {
+  /** The context of the callback currently running inside `with`, if any. */
+  #current: Context = ROOT_CONTEXT;
+
+  /** Whether `with` refuses, standing in for a manager that is broken. */
+  readonly #throwOnWith: boolean;
+
+  /**
+   * @param throwOnWith Make every `with` throw.
+   */
+  constructor(throwOnWith = false) {
+    this.#throwOnWith = throwOnWith;
+  }
+
+  active(): Context {
+    return this.#current;
+  }
+
+  with<A extends unknown[], F extends (...args: A) => ReturnType<F>>(
+    target: Context,
+    fn: F,
+    thisArg?: ThisParameterType<F>,
+    ...args: A
+  ): ReturnType<F> {
+    if (this.#throwOnWith) {
+      throw new Error('the host context manager refused');
+    }
+    const previous = this.#current;
+    this.#current = target;
+    try {
+      return fn.call(thisArg, ...args);
+    } finally {
+      this.#current = previous;
+    }
+  }
+
+  bind<T>(_target: Context, value: T): T {
+    return value;
+  }
+
+  enable(): this {
+    return this;
+  }
+
+  disable(): this {
+    this.#current = ROOT_CONTEXT;
+    return this;
+  }
+}
+
+describe('the context-manager probe and the registration options', () => {
+  it('finds no context manager while only the API default is in place', () => {
+    expect(hasGlobalContextManager()).toBe(false);
+  });
+
+  it('finds one once register() has installed the SDK default, and none after it is removed', async () => {
+    const provider = new NodeTracerProvider();
+    provider.register({ propagator: null });
+
+    expect(hasGlobalContextManager()).toBe(true);
+    // Synchronous and self-cleaning: the probe leaves no context active.
+    expect(context.active()).toBe(ROOT_CONTEXT);
+
+    context.disable();
+    expect(hasGlobalContextManager()).toBe(false);
+    await provider.shutdown();
+  });
+
+  it('finds a context manager the host registered, and treats a broken one as present', () => {
+    expect(context.setGlobalContextManager(new HostContextManager())).toBe(true);
+    expect(hasGlobalContextManager()).toBe(true);
+
+    context.disable();
+    expect(context.setGlobalContextManager(new HostContextManager(true))).toBe(true);
+    expect(hasGlobalContextManager()).toBe(true);
+  });
+
+  it('asks register() for the SDK default only when no context manager is global', () => {
+    const fresh = providerRegistrationConfig();
+    expect('contextManager' in fresh).toBe(false);
+    expect(fresh.propagator?.fields()).toContain('traceparent');
+
+    expect(context.setGlobalContextManager(new HostContextManager())).toBe(true);
+    const keeping = providerRegistrationConfig();
+    expect(keeping.contextManager).toBeNull();
+    expect(keeping.propagator?.fields()).toContain('traceparent');
+  });
+});
+
 describe('a capture that follows a teardown', () => {
+  it('keeps the context manager the first capture installed instead of offering the API a duplicate', async () => {
+    const harness = createHarness();
+    const carriedKey = createContextKey('control-test-carried-across-rearm');
+    let carried: unknown;
+
+    const errors = await diagnosticErrorsDuring(async () => {
+      expect(hasGlobalContextManager()).toBe(false);
+      await harness.arm(CAPTURE_A, ALL_SIGNALS);
+      expect(hasGlobalContextManager()).toBe(true);
+
+      // A value set through the first capture's manager, read back after the
+      // teardown and the re-arm on the far side of several awaits. It survives
+      // only if the manager carrying it is still the global one: a replacement
+      // would hold its own, empty `AsyncLocalStorage`.
+      carried = await context.with(
+        ROOT_CONTEXT.setValue(carriedKey, 'set-before-the-teardown'),
+        async () => {
+          await harness.control.disable();
+          await expect(harness.arm(CAPTURE_B, ALL_SIGNALS)).resolves.toMatchObject({
+            armed: true,
+            changed: true,
+          });
+          return context.active().getValue(carriedKey);
+        },
+      );
+    });
+
+    // What the API prints, with a stack, when `register()` offers a second
+    // context manager: once per re-arm before the registration options kept
+    // the existing one.
+    expect(errors.filter((message) => message.includes('duplicate registration'))).toEqual([]);
+    expect(errors).toEqual([]);
+    expect(carried).toBe('set-before-the-teardown');
+    expect(harness.providerBuilds()).toBe(2);
+
+    // And the kept manager still does its job for the second capture: a span
+    // records, is active inside `context.with`, and propagates.
+    const span = trace.getTracer(TRACER_NAME, TRACER_VERSION).startSpan(SPAN_NAME);
+    expect(span.isRecording()).toBe(true);
+    const active = trace.setSpan(context.active(), span);
+    expect(context.with(active, () => trace.getActiveSpan())).toBe(span);
+    const carrier: Record<string, string> = {};
+    propagation.inject(active, carrier);
+    expect(carrier.traceparent).toMatch(TRACEPARENT_PATTERN);
+    span.end();
+    expect(harness.spans.onStartCount).toBe(1);
+  });
+
+  it('keeps a context manager the host registered before the first capture', async () => {
+    const host = new HostContextManager();
+    expect(context.setGlobalContextManager(host)).toBe(true);
+    const harness = createHarness();
+    const hostKey = createContextKey('control-test-host-context');
+
+    const errors = await diagnosticErrorsDuring(async () => {
+      await harness.arm(CAPTURE_A, ALL_SIGNALS);
+    });
+
+    expect(errors).toEqual([]);
+    // Still the host's: a value set through `context.with` is what the host's
+    // own manager reports as active inside the callback.
+    expect(
+      context.with(ROOT_CONTEXT.setValue(hostKey, 'host'), () => host.active().getValue(hostKey)),
+    ).toBe('host');
+  });
+
   it('rebuilds the provider, re-registers the propagator and re-enables the instrumentations', async () => {
     const driver = new RecordingInstrumentation();
     const orm = new RecordingInstrumentation();

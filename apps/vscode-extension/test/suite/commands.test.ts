@@ -2063,16 +2063,26 @@ describe('session lifecycle (commands.test)', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * A question whose deterministic plan patches exactly the fixture's route
- * handler — the plan `apps/local-service/test/integration/cleanup-conflict.test.ts`
- * drives against the same fixture — and that file, POSIX-relative.
+ * The question each case's first session asks, and the fixture's route
+ * handler, POSIX-relative.
+ *
+ * The deterministic planner places function-timing targets along the
+ * investigation's whole flow, so on this fixture the plan of a server
+ * question patches several files — the route handler, the service it calls
+ * and the database pool — beside its runtime hooks. The cases therefore take
+ * the patched files from the session's own plan ({@link waitForPatched})
+ * rather than naming them; the route handler is named because it is among
+ * them, and it is the file the developer-edit case edits.
  */
 const ROUTE_QUESTION = 'Why is the trail report slow to load?';
 const ROUTE_FILE = 'app/api/trail-report/route.ts';
 
-/** A question whose deterministic plan patches exactly the fixture's database pool, and that file. */
+/**
+ * The question of a case's second session. On this fixture its plan patches
+ * the files {@link ROUTE_QUESTION}'s does, so beside a live first session
+ * every one of them is held by that session.
+ */
 const POOL_QUESTION = 'Why is queryTrailConditionReports slow?';
-const POOL_FILE = 'src/server/db/pool.ts';
 
 /**
  * Budget of one real-service case: up to two services, several patch and
@@ -2135,12 +2145,34 @@ function sampleProjectFixture(): string {
 const STAND_IN_DEV_CLI_SEGMENTS = ['node_modules', 'next', 'dist', 'bin', 'next'] as const;
 
 /**
+ * The stand-in server's path beside that CLI — where Next.js keeps the entry
+ * its dev CLI runs the server from — which the CLI's source spells relative to
+ * its own directory.
+ */
+const STAND_IN_DEV_SERVER_SEGMENTS = [
+  'node_modules',
+  'next',
+  'dist',
+  'server',
+  'lib',
+  'start-server.js',
+] as const;
+
+/**
  * The dev server command the service's launcher runs for the scratch project:
  * the stand-in of `apps/local-service/test/integration/harness.ts`, which
  * prints the `Local:` line the launcher detects and answers every request with
  * `ok`, run by the suite's Node ({@link resolveNodeExecutable}) — never by
  * `process.execPath`, which is Electron in the extension host. That Node also
  * runs the service, so the launcher's policy accepts it as the service's own.
+ *
+ * Like `next dev`, the CLI only supervises: it runs the server as a second
+ * process ({@link STAND_IN_DEV_SERVER_SEGMENTS}) with the inherited
+ * environment and stdio, forwards `SIGTERM`, and exits once the server has.
+ * The dev-server preload keeps a `next dev` supervisor inert and installs in
+ * the process that serves (`classifyPreloadProcess` in `@debuggen/telemetry`),
+ * so a stand-in serving from the CLI's own process would never report a
+ * preload, and a session would never be patched.
  *
  * The launcher runs only a package-manager script, `next dev`, or the
  * service's Node running a framework's dev CLI from a `node_modules`
@@ -2158,7 +2190,7 @@ function standInDevServerCommand(): string {
   if (node.includes("'")) {
     throw new Error(`The test Node path ${node} contains a single quote and cannot be quoted.`);
   }
-  const source = [
+  const serverSource = [
     `const marker = "${STAND_IN_MARKER}";`,
     'const server = require("node:http").createServer((request, response) => {',
     ' response.end("ok"); });',
@@ -2167,15 +2199,28 @@ function standInDevServerCommand(): string {
     'process.on("SIGTERM", () => { server.close(() => process.exit(0)); });',
     '',
   ].join('\n');
+  const cliSource = [
+    `const marker = "${STAND_IN_MARKER}";`,
+    'const { spawn } = require("node:child_process");',
+    'const { join } = require("node:path");',
+    'const server = spawn(process.execPath, [join(__dirname, "..", "server", "lib", "start-server.js")],',
+    ' { stdio: "inherit" });',
+    'server.on("error", () => { process.exit(1); });',
+    'server.on("exit", (code, signal) => { process.exit(code ?? (signal === null ? 1 : 0)); });',
+    'process.on("SIGTERM", () => { server.kill("SIGTERM"); });',
+    '',
+  ].join('\n');
   const dir = createScratchDir(`${STAND_IN_MARKER}-`);
   const manifest = writeFixtureFile(
     dir,
     'node_modules/next/package.json',
     `${JSON.stringify({ name: 'next', private: true, type: 'commonjs' })}\n`,
   );
-  const cli = writeFixtureFile(dir, STAND_IN_DEV_CLI_SEGMENTS.join('/'), source);
+  const server = writeFixtureFile(dir, STAND_IN_DEV_SERVER_SEGMENTS.join('/'), serverSource);
+  const cli = writeFixtureFile(dir, STAND_IN_DEV_CLI_SEGMENTS.join('/'), cliSource);
   // `writeFileSync` applies the process umask; pin the mode the trust check reads.
   fs.chmodSync(manifest, 0o644);
+  fs.chmodSync(server, 0o644);
   fs.chmodSync(cli, 0o644);
   if (cli.includes("'")) {
     throw new Error(
@@ -2770,7 +2815,7 @@ async function openRealHarness(services: readonly RealService[]): Promise<RealHa
     [],
     'the scratch copy is not byte-identical to the committed fixture',
   );
-  assert.ok(snapshot.has(ROUTE_FILE) && snapshot.has(POOL_FILE), 'the fixture lost a patched file');
+  assert.ok(snapshot.has(ROUTE_FILE), 'the fixture lost the route handler the cases patch');
 
   const logs: LogEntry[] = [];
   const logger = recordingLogger(logs);
@@ -3127,17 +3172,42 @@ async function readJournal(
 }
 
 /**
+ * The files `sessionId`'s installed plan patches, read from the service
+ * `debuggen.serviceUrl` names: the `file` of every `patch`-mode action of the
+ * last of the record's `plans` (the list is append-only, so the last is the
+ * one installed), each once, in ascending order.
+ */
+async function plannedPatchFiles(h: RealHarness, sessionId: string): Promise<string[]> {
+  const record = unwrap(await h.real.getSession(sessionId));
+  const plan = record.plans.at(-1);
+  assert.ok(plan !== undefined, `session ${sessionId} has no plan`);
+  return sorted(
+    new Set(
+      plan.instrumentationTargets
+        .filter((action) => action.mode === 'patch')
+        .map((action) => action.file),
+    ),
+  );
+}
+
+/** A session the real installer patched, as {@link waitForPatched} proved it. */
+interface PatchedSession {
+  /** Its journal, in applied order. */
+  readonly records: readonly ModificationRecord[];
+  /** The files its plan patches — exactly the files its journal records — ascending. */
+  readonly files: readonly string[];
+}
+
+/**
  * Waits until the real installer has patched `sessionId`: its
  * `instrumentation.ready` was pushed and its journal holds only applied
- * records — then proves each is real: the plan's files exactly, recorded from
- * the snapshot's bytes, and the file on disk now hashing to the record's
- * instrumented hash, which differs from the original.
+ * records — then proves each is real: exactly the files its installed plan
+ * patches ({@link plannedPatchFiles}, never a list the case names, since the
+ * plan is the planner's to decide), each recorded from the snapshot's bytes,
+ * and the file on disk now hashing to the record's instrumented hash, which
+ * differs from the original.
  */
-async function waitForPatched(
-  h: RealHarness,
-  sessionId: string,
-  files: readonly string[],
-): Promise<readonly ModificationRecord[]> {
+async function waitForPatched(h: RealHarness, sessionId: string): Promise<PatchedSession> {
   const records = await waitFor(
     async () => {
       if (!h.frames.some((f) => f.type === 'instrumentation.ready' && f.sessionId === sessionId)) {
@@ -3150,9 +3220,10 @@ async function waitForPatched(
     },
     { timeoutMs: PATCH_TIMEOUT_MS, intervalMs: 100, message: `session ${sessionId} to be patched` },
   );
+  const files = await plannedPatchFiles(h, sessionId);
   assert.deepEqual(
-    sorted(records.map((record) => record.file)),
-    sorted(files),
+    sorted(new Set(records.map((record) => record.file))),
+    files,
     `session ${sessionId} patched other files than its plan names`,
   );
   for (const record of records) {
@@ -3168,13 +3239,21 @@ async function waitForPatched(
       `${record.file} on disk is not the instrumented file its record describes`,
     );
   }
-  return records;
+  return { records, files };
 }
 
-/** The statuses of `sessionId`'s journal at the service `debuggen.serviceUrl` names. */
+/**
+ * The `file:status` of every record of `sessionId`'s journal at the service
+ * `debuggen.serviceUrl` names, in ascending order. Not in journal order: the
+ * journal lists records by the time of their latest transition (`appliedAt` is
+ * refreshed on every status move), so once a cleanup ran, several records are
+ * listed in the order they were restored or found in conflict — and records
+ * moved within the same millisecond in append order — rather than the order
+ * they were applied in.
+ */
 async function journalStatuses(h: RealHarness, sessionId: string): Promise<string[]> {
   const records = await readJournal(h, sessionId);
-  return records.map((record) => `${record.file}:${record.status}`);
+  return sorted(records.map((record) => `${record.file}:${record.status}`));
 }
 
 /**
@@ -3216,31 +3295,47 @@ function lastPostedState(
 /**
  * Puts the store in the state the view offers Retry of `instrument` for.
  *
- * The real service reports a failure at that stage on its own — with no page
- * agent for a bound tab, every browser-side signal's step is pushed as a
- * `failed` `instrument` row, while the server-side patches stay applied — but
- * it has no route that fails an instrumented session outright (only its
- * in-process manager does, which is what the service integration suites
- * drive). So the case waits for the service's genuine failed row and then
- * delivers what the service would push for a failed stage: an
- * `instrumentation.failed` carrying that row's sentence, and the session's
- * record marked `failed` — both parsed by the protocol's own schemas and
- * applied through the store's public mutators, exactly where
- * `subscribeInbound` would apply them. The patches on disk are the real
- * installer's, untouched.
+ * The real service holds the session at that stage on its own: with no Chrome
+ * tab bound, every browser-side signal's step is listed as a waiting
+ * `instrument` row — `running`, its detail saying what it waits for and what
+ * to do — and never as a failed one, while the server-side patches stay
+ * applied and the session stays `instrumenting`. The service has no route
+ * that fails an instrumented session outright (only its in-process manager
+ * does, which is what the service integration suites drive). So the case
+ * waits for the service's genuine waiting row and then delivers what the
+ * service would push were that stage to fail: an `instrumentation.failed`
+ * carrying that row's sentence, and the session's record marked `failed` —
+ * both parsed by the protocol's own schemas and applied through the store's
+ * public mutators, exactly where `subscribeInbound` would apply them. The
+ * patches on disk are the real installer's, untouched.
  */
 async function failAtInstrument(
   h: RealHarness,
   sessionId: string,
   patched: readonly string[],
 ): Promise<void> {
-  const failedRow = await waitFor(
-    () => h.state.progress.find((row) => row.stage === 'instrument' && row.status === 'failed'),
+  const waitingRow = await waitFor(
+    () =>
+      h.state.progress.find(
+        (row) =>
+          row.stage === 'instrument' &&
+          row.status === 'running' &&
+          row.detail !== undefined &&
+          row.detail.length > 0,
+      ),
     {
       timeoutMs: PATCH_TIMEOUT_MS,
-      message: `the service to report a failed instrument step of ${sessionId}`,
+      message: `the service to hold a browser-side instrument step of ${sessionId} waiting for the page`,
     },
-  );
+  ).catch((cause: unknown) => {
+    const instrumentRows = h.state.progress
+      .filter((row) => row.stage === 'instrument')
+      .map((row) => `${row.status} ${row.message}`);
+    throw new Error(
+      `${describeFailure(cause)}; session status ${String(h.state.activeSession?.status)}, instrument rows ${JSON.stringify(instrumentRows)}`,
+      { cause },
+    );
+  });
   const record = h.state.activeSession;
   assert.equal(record?.id, sessionId, 'the failing session is not the one in view');
   h.state.applyInstrumentationFailed(
@@ -3249,7 +3344,7 @@ async function failAtInstrument(
         sessionId,
         error: {
           code: 'AGENT_NOT_READY',
-          message: failedRow.message,
+          message: waitingRow.detail ?? waitingRow.message,
           hint: 'Open the app in Chrome with the Debug Generator panel, then retry.',
         },
       }),
@@ -3463,21 +3558,34 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assert.ok(s1 !== undefined, 'S1 was not adopted');
     const endpointA = h.state.activeSessionEndpoint;
     assert.equal(h.labelOf(endpointA), 'A', 'S1 is not owned by service A');
-    const s1Records = await waitForPatched(h, s1, [ROUTE_FILE]);
+    const { records: s1Records, files: s1Files } = await waitForPatched(h, s1);
+    const s1Patched = s1Files.join(', ');
 
-    // S2: a second live session, created beside S1 and never adopted.
+    // S2: a second live session, created beside S1 and never adopted. S1 holds
+    // every file S2's plan patches, so the service sets each of those targets
+    // aside as held (the concurrent-sessions contract) and installs S2's
+    // runtime hooks alone: S2 is live with an empty journal, and the tree
+    // carries S1's patches and nothing else.
     const s2 = unwrap(
       await h.real.createSession(
         { projectRoot: h.project, question: POOL_QUESTION },
         { timeoutMs: SESSION_CREATE_TIMEOUT_MS },
       ),
     ).id;
-    await waitForPatched(h, s2, [POOL_FILE]);
+    await waitFor(
+      () => h.frames.some((f) => f.type === 'instrumentation.ready' && f.sessionId === s2),
+      { timeoutMs: PATCH_TIMEOUT_MS, intervalMs: 100, message: `session ${s2} to be live` },
+    );
+    const s2Planned = await plannedPatchFiles(h, s2);
+    assert.ok(
+      s2Planned.length > 0 && s2Planned.every((file) => s1Files.includes(file)),
+      `every file S2's plan patches must be held by S1; S2 plans ${JSON.stringify(s2Planned)}, S1 holds ${JSON.stringify(s1Files)}`,
+    );
+    assert.deepEqual(await journalStatuses(h, s2), [], 'S2 must not patch a file S1 holds');
     assert.equal(h.state.activeSessionId, s1, 'S2 must not have replaced S1 in the store');
-    assert.deepEqual(h.differing(), sorted([ROUTE_FILE, POOL_FILE]));
+    assert.deepEqual(h.differing(), s1Files, "only S1's patches may differ from the snapshot");
 
     // Reopen S2 and accept ending S1.
-    const bothPatched = sorted([ROUTE_FILE, POOL_FILE]).join(', ');
     h.answers.confirm = true;
     const handoff = h.timeline.length;
     await reopenSession(h.ctx, s2);
@@ -3491,13 +3599,13 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assert.deepEqual(
       renderTimeline(h, h.timeline.slice(handoff)),
       [
-        `send get:${s2} @A [${bothPatched}]`,
-        `answer get:${s2} @A ok [${bothPatched}]`,
-        `send end:${s1} @A [${bothPatched}]`,
-        // Answered clean with S1's file already byte-identical to the snapshot…
-        `answer end:${s1} @A ok:clean [${POOL_FILE}]`,
+        `send get:${s2} @A [${s1Patched}]`,
+        `answer get:${s2} @A ok [${s1Patched}]`,
+        `send end:${s1} @A [${s1Patched}]`,
+        // Answered clean with every file of S1 already byte-identical to the snapshot…
+        `answer end:${s1} @A ok:clean []`,
         // …and only then does S2 become the active session.
-        `active ${s2} [${POOL_FILE}]`,
+        `active ${s2} []`,
       ],
       'the handoff must end S1 at A, restored, before S2 becomes active',
     );
@@ -3505,7 +3613,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assert.equal(h.state.activeSessionEndpoint, endpointA, 'S2 must be owned by service A');
     assert.deepEqual(
       await journalStatuses(h, s1),
-      s1Records.map((record) => `${record.file}:reverted`),
+      sorted(s1Records.map((record) => `${record.file}:reverted`)),
       "S1's modification records must be reverted",
     );
     assert.deepEqual(h.executed, [SESSION_VIEW_FOCUS, SESSION_VIEW_FOCUS]);
@@ -3525,8 +3633,10 @@ describe('session lifecycle against a real service (commands.test)', () => {
       unsettledCreates: 0,
       unowned: [],
     });
+    // S2 patched nothing, so its end restores nothing: the tree is the
+    // snapshot's before the end is sent and after it is answered.
     assert.deepEqual(renderTimeline(h, h.timeline.slice(shutdown)), [
-      `send end:${s2} @A [${POOL_FILE}]`,
+      `send end:${s2} @A []`,
       `answer end:${s2} @A ok:clean []`,
     ]);
     assert.deepEqual(
@@ -3541,7 +3651,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
       'deactivation must send exactly one request: the end of S2 at A',
     );
     assert.deepEqual(h.differing(), [], 'the project must equal its snapshot after deactivation');
-    assert.deepEqual(await journalStatuses(h, s2), [`${POOL_FILE}:reverted`]);
+    assert.deepEqual(await journalStatuses(h, s2), [], 'S2 must end with an empty journal');
     assertQuestionsNeverLogged(h, [ROUTE_QUESTION, POOL_QUESTION]);
   });
 
@@ -3554,8 +3664,8 @@ describe('session lifecycle against a real service (commands.test)', () => {
     await startSession(h.ctx, { question: ROUTE_QUESTION });
     const s1 = h.state.activeSessionId;
     assert.ok(s1 !== undefined, 'S1 was not adopted');
-    const s1Records = await waitForPatched(h, s1, [ROUTE_FILE]);
-    await failAtInstrument(h, s1, [ROUTE_FILE]);
+    const { records: s1Records, files: s1Files } = await waitForPatched(h, s1);
+    await failAtInstrument(h, s1, s1Files);
 
     const retry = h.timeline.length;
     await retryFromWebview(h, 'instrument');
@@ -3568,7 +3678,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assert.deepEqual(
       renderTimeline(h, events.slice(0, 3)),
       [
-        `send end:${s1} @A [${ROUTE_FILE}]`,
+        `send end:${s1} @A [${s1Files.join(', ')}]`,
         `answer end:${s1} @A ok:clean []`,
         // The replacement is requested only now, with every file of S1 — and
         // of the project — byte-identical to the snapshot.
@@ -3583,7 +3693,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     );
     assert.deepEqual(
       await journalStatuses(h, s1),
-      s1Records.map((record) => `${record.file}:reverted`),
+      sorted(s1Records.map((record) => `${record.file}:reverted`)),
     );
     assert.equal(
       h.state.activeSession?.question,
@@ -3606,11 +3716,16 @@ describe('session lifecycle against a real service (commands.test)', () => {
     await startSession(h.ctx, { question: ROUTE_QUESTION });
     const s1 = h.state.activeSessionId;
     assert.ok(s1 !== undefined, 'S1 was not adopted');
-    const [patch] = await waitForPatched(h, s1, [ROUTE_FILE]);
-    assert.ok(patch !== undefined);
-    await failAtInstrument(h, s1, [ROUTE_FILE]);
+    const { records: s1Records, files: s1Files } = await waitForPatched(h, s1);
+    const patch = s1Records.find((record) => record.file === ROUTE_FILE);
+    assert.ok(
+      patch !== undefined,
+      `S1's plan must patch ${ROUTE_FILE}, the file the developer edits`,
+    );
+    await failAtInstrument(h, s1, s1Files);
 
-    // The developer keeps working in the instrumented file.
+    // The developer keeps working in one instrumented file; S1's other patched
+    // files are left as the installer wrote them.
     const edited = projectFile(h.project, ROUTE_FILE);
     const developerBytes = Buffer.concat([
       fs.readFileSync(edited),
@@ -3627,8 +3742,9 @@ describe('session lifecycle against a real service (commands.test)', () => {
       [],
       'a conflicted cleanup must stop the Retry before POST /sessions',
     );
+    // The end restores every patched file but the edited one, which it keeps.
     assert.deepEqual(renderTimeline(h, events.slice(0, 2)), [
-      `send end:${s1} @A [${ROUTE_FILE}]`,
+      `send end:${s1} @A [${s1Files.join(', ')}]`,
       `answer end:${s1} @A ok:conflict [${ROUTE_FILE}]`,
     ]);
     // The notice's details come from the owner, in whichever order they answer.
@@ -3684,7 +3800,15 @@ describe('session lifecycle against a real service (commands.test)', () => {
       ]),
       [[ROUTE_FILE, 'content-changed', backup]],
     );
-    assert.deepEqual(await journalStatuses(h, s1), [`${ROUTE_FILE}:conflict`]);
+    assert.deepEqual(
+      await journalStatuses(h, s1),
+      sorted(
+        s1Records.map(
+          (record) => `${record.file}:${record.file === ROUTE_FILE ? 'conflict' : 'reverted'}`,
+        ),
+      ),
+      'the edited file is in conflict, and every other patched file is reverted',
+    );
     assert.equal(lastPostedState(h)?.session?.id, s1);
     assertQuestionsNeverLogged(h, [ROUTE_QUESTION]);
   });
@@ -3700,7 +3824,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     const s1 = h.state.activeSessionId;
     assert.ok(s1 !== undefined, 'S1 was not adopted');
     assert.equal(h.labelOf(h.state.activeSessionEndpoint), 'A', 'S1 is not owned by service A');
-    await waitForPatched(h, s1, [ROUTE_FILE]);
+    const { files: s1Files } = await waitForPatched(h, s1);
 
     // The developer points debuggen.serviceUrl at B, which serves the same
     // project with the same editor credential but has never seen S1.
@@ -3708,7 +3832,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assert.equal(h.labelOf(h.real.baseUrl), 'B', 'the client did not follow the setting');
     await waitForSocketOpen(h, serviceB);
     await launchStandInDevServer(h, serviceB);
-    assert.deepEqual(h.differing(), [ROUTE_FILE], 'S1 must still be patched after the switch');
+    assert.deepEqual(h.differing(), s1Files, 'S1 must still be patched after the switch');
 
     const start = h.timeline.length;
     const wireAtStart = h.wire.length;
@@ -3717,7 +3841,11 @@ describe('session lifecycle against a real service (commands.test)', () => {
     const events = h.timeline.slice(start);
     assert.deepEqual(
       renderTimeline(h, events.slice(0, 3)),
-      [`send end:${s1} @A [${ROUTE_FILE}]`, `answer end:${s1} @A ok:clean []`, 'send create @B []'],
+      [
+        `send end:${s1} @A [${s1Files.join(', ')}]`,
+        `answer end:${s1} @A ok:clean []`,
+        'send create @B []',
+      ],
       'the start at B must end S1 at its owner A, restored, before it creates anything; ' +
         `failure notices: ${JSON.stringify(h.failures.map((failure) => `${failure.error.code}: ${failure.error.message}`))}`,
     );
@@ -3752,11 +3880,11 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assert.ok(s1 !== undefined, 'S1 was not adopted');
     const endpointA = h.state.activeSessionEndpoint;
     assert.equal(h.labelOf(endpointA), 'A', 'S1 is not owned by service A');
-    await waitForPatched(h, s1, [ROUTE_FILE]);
+    const { files: s1Files } = await waitForPatched(h, s1);
 
     h.switchServiceUrl(serviceB);
     await waitForSocketOpen(h, serviceB);
-    assert.deepEqual(h.differing(), [ROUTE_FILE], 'S1 must still be patched after the switch');
+    assert.deepEqual(h.differing(), s1Files, 'S1 must still be patched after the switch');
 
     // Deactivation's session work, with debuggen.serviceUrl naming B.
     const shutdown = h.timeline.length;
@@ -3770,7 +3898,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
 
     assert.deepEqual(
       renderTimeline(h, h.timeline.slice(shutdown)),
-      [`send end:${s1} @A [${ROUTE_FILE}]`, `answer end:${s1} @A ok:clean []`],
+      [`send end:${s1} @A [${s1Files.join(', ')}]`, `answer end:${s1} @A ok:clean []`],
       'deactivation must end S1 at its owner A, and the end must restore it',
     );
     assert.deepEqual(report, {
@@ -3803,8 +3931,8 @@ describe('session lifecycle against a real service (commands.test)', () => {
     assert.ok(s1 !== undefined, 'S1 was not adopted');
     const endpointA = h.state.activeSessionEndpoint;
     assert.equal(h.labelOf(endpointA), 'A', 'S1 is not owned by service A');
-    await waitForPatched(h, s1, [ROUTE_FILE]);
-    assert.deepEqual(h.differing(), [ROUTE_FILE], 'S1 must be patched before deactivation');
+    const { files: s1Files } = await waitForPatched(h, s1);
+    assert.deepEqual(h.differing(), s1Files, 'S1 must be patched before deactivation');
 
     // deactivate(): the gate and the routine; then, before any await, what
     // the extension host disposes right after deactivate() returns its
@@ -3837,7 +3965,7 @@ describe('session lifecycle against a real service (commands.test)', () => {
     });
     assert.deepEqual(
       renderTimeline(h, h.timeline.slice(shutdown)),
-      [`send end:${s1} @A [${ROUTE_FILE}]`, `answer end:${s1} @A ok:clean []`],
+      [`send end:${s1} @A [${s1Files.join(', ')}]`, `answer end:${s1} @A ok:clean []`],
       'deactivation must end S1 at A, and the end must restore it',
     );
     assert.deepEqual(

@@ -241,12 +241,16 @@ const READ_OPEN_FLAGS =
  * The recovery instruction attached to every configuration failure about the
  * directory itself.
  *
- * Names *both* channels, in precedence order, because a developer hitting this
- * has no way to tell from the outside which one was meant to apply.
+ * Names only what a developer can change: the variable and what the directory
+ * it points at must contain. This hint is read in a log line and in the two
+ * user interfaces, never in code, so it does not name the `promptsDir` option
+ * or this module's factory. Those belong to the host process. The local
+ * service, the one host, resolves the option from this same variable, so the
+ * variable is the one setting that reaches this module either way.
  */
 const DIRECTORY_HINT =
-  `Pass 'promptsDir' to createPromptLoader(), or set ${PROMPTS_DIR_ENV_VAR} to the ` +
-  'directory that holds the versioned prompt files and their manifest.';
+  `Set ${PROMPTS_DIR_ENV_VAR} to the directory that holds the versioned prompt files and ` +
+  `their ${MANIFEST_FILE_NAME}.`;
 
 /** Characters kept when an untrusted value is quoted in an error message. */
 const MAX_REPORTED_LENGTH = 120;
@@ -584,8 +588,8 @@ function containmentFailure(details: Readonly<Record<string, unknown>>): Debugge
     'The prompt file resolved to a location outside the prompts directory and was not read.',
     {
       hint:
-        'Remove the symbolic link that leads out of the prompts directory, or point the loader ' +
-        'at the directory that genuinely holds the prompt files.',
+        'Remove the symbolic link that leads out of the prompts directory, or set ' +
+        `${PROMPTS_DIR_ENV_VAR} to the directory that genuinely holds the prompt files.`,
       details,
     },
   );
@@ -675,7 +679,7 @@ export interface PromptLoader {
    * resolved to absolute but not followed through symbolic links, and it is
    * **not** validated at construction time — the empty string means neither
    * resolution channel supplied one, in which case every method returns a
-   * configuration error naming both channels.
+   * configuration error whose hint names `DEBUGGEN_PROMPTS_DIR`.
    */
   readonly promptsDir: string;
 
@@ -1189,7 +1193,9 @@ function rejectVersion(version: unknown): DebuggenError | undefined {
  *    pointing at the copy, so the service finds its prompts in a layout it
  *    could not have computed.
  * 3. **nothing.** With neither channel supplied, every method returns a
- *    `CONFIG_INVALID` failure whose hint names both.
+ *    `CONFIG_INVALID` failure whose hint names `DEBUGGEN_PROMPTS_DIR`: the
+ *    setting a developer can change. The option is the host's own API, and
+ *    the text a developer reads never names it.
  *
  * The absent third channel is the deliberate part. A path derived from
  * `process.cwd()` or from this module's own URL would be wrong in at least one

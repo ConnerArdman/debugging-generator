@@ -26,6 +26,11 @@
  *    because the normal caller of that result is a module evaluation that
  *    awaits nothing.
  *
+ * And one about *where* it installs: `NODE_OPTIONS` reaches every Node process
+ * of a launch, so the package-manager shim, the Next.js dev CLI supervisor and
+ * the TypeScript CLI are recognised from their command lines and get neither an
+ * installation nor a log line, leaving exactly one in the process that serves.
+ *
  * The credential is asserted absent from every log line and every reported
  * reason on every path.
  *
@@ -54,19 +59,26 @@
 
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 
+import { AsyncLocalStorage } from 'node:async_hooks';
+import * as diagnosticsChannel from 'node:diagnostics_channel';
 import type { EventEmitter } from 'node:events';
 
 import {
   context,
   createContextKey,
   diag,
+  DiagLogLevel,
   propagation,
   ProxyTracerProvider,
   ROOT_CONTEXT,
   trace,
+  TraceFlags,
 } from '@opentelemetry/api';
+import type { Context, ContextManager, Span as ApiSpan } from '@opentelemetry/api';
+import { W3CTraceContextPropagator } from '@opentelemetry/core';
 import { isWrapped } from '@opentelemetry/instrumentation';
 import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
+import type { PgResponseHookInformation } from '@opentelemetry/instrumentation-pg';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { ATTR_SERVICE_INSTANCE_ID, ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
 
@@ -74,7 +86,12 @@ import { ID_PREFIXES } from '@debuggen/shared';
 import type { LogFields, Logger, LogLevel, LogLevelSetting } from '@debuggen/shared';
 
 import { PRELOAD_ENV_KEYS, PRODUCER_ID, TRACER_VERSION } from './config.js';
-import { NO_SIGNALS, ServerAgentControl } from './control.js';
+import { DRIVER_ROW_COUNT_ATTRIBUTE } from './convert.js';
+import {
+  NO_SIGNALS,
+  OUTBOUND_PROPAGATION_INSTRUMENTATION_NAME,
+  ServerAgentControl,
+} from './control.js';
 import type {
   ControlSocket,
   ControlSocketCloseEvent,
@@ -82,12 +99,22 @@ import type {
   ToggleableInstrumentation,
 } from './control.js';
 import {
+  injectOutboundTraceContext,
+  classifyPreloadProcess,
   installPreload,
+  OutboundTraceContextPropagation,
   preloadInstallation,
+  recordReturnedRows,
   SHUTDOWN_DEADLINE_MS,
   shutdownPreload,
+  UNDICI_REQUEST_CREATE_CHANNEL,
 } from './register.js';
-import type { InstalledPreload, PreloadInstallation } from './register.js';
+import type {
+  InstalledPreload,
+  PreloadInstallation,
+  PreloadProcessKind,
+  RealPathResolver,
+} from './register.js';
 import * as spanHelperModule from './span-helper.js';
 
 /*
@@ -636,12 +663,262 @@ describe('installPreload() without a usable credential', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * The process gate: one installation per launch, in the process that serves
+ * ---------------------------------------------------------------------------
+ */
+
+/** The Node executable every synthesised command line starts with. */
+const NODE_EXECUTABLE = '/opt/node/bin/node';
+
+/** The fixture project's dependency directory; nothing here reads it. */
+const PROJECT_MODULES = `${PROJECT_ROOT}/node_modules`;
+
+/** The Next.js CLI entry a project's `node_modules/.bin/next` launcher runs. */
+const NEXT_CLI_ENTRY = `${PROJECT_MODULES}/next/dist/bin/next`;
+
+/** The script the Next.js dev CLI forks: the process that serves requests. */
+const NEXT_SERVER_ENTRY = `${PROJECT_MODULES}/next/dist/server/lib/start-server.js`;
+
+/** The TypeScript CLI Next.js runs as `tsc --showConfig`. */
+const TSC_ENTRY = `${PROJECT_MODULES}/typescript/bin/tsc`;
+
+/** corepack's `pnpm` shim, as the Node install's `bin/` symlink spells it. */
+const PNPM_SHIM_ENTRY = '/usr/local/bin/pnpm';
+
+/**
+ * A resolver for entry paths that exist nowhere: every lookup fails, so each
+ * case is judged on the spelling as given, exactly as for a deleted script.
+ */
+const unresolvable: RealPathResolver = (path) => {
+  throw new Error(`no such entry script: ${path}`);
+};
+
+/**
+ * A resolver that knows exactly one symbolic link.
+ *
+ * @param link The link path.
+ * @param target What it resolves to.
+ * @returns The resolver; every other path resolves to itself.
+ */
+function resolverWithLink(link: string, target: string): RealPathResolver {
+  return (path) => (path === link ? target : path);
+}
+
+/**
+ * A command line in `process.argv`'s shape.
+ *
+ * @param entry The entry script.
+ * @param args What follows it.
+ */
+function commandLine(entry: string, ...args: string[]): string[] {
+  return [NODE_EXECUTABLE, entry, ...args];
+}
+
+describe('classifyPreloadProcess()', () => {
+  it.each<[string, readonly string[], PreloadProcessKind]>([
+    [
+      "corepack's pnpm shim by its bin name",
+      commandLine(PNPM_SHIM_ENTRY, 'run', 'dev'),
+      'package-manager',
+    ],
+    [
+      "corepack's pnpm shim by its script path",
+      commandLine('/opt/node/lib/node_modules/corepack/dist/pnpm.js', 'dev'),
+      'package-manager',
+    ],
+    [
+      "corepack's pnpx shim",
+      commandLine('/opt/node/lib/node_modules/corepack/dist/pnpx.js'),
+      'package-manager',
+    ],
+    [
+      'corepack itself',
+      commandLine('/opt/node/lib/node_modules/corepack/dist/corepack.js', 'pnpm', 'dev'),
+      'package-manager',
+    ],
+    [
+      'standalone pnpm',
+      commandLine('/opt/pnpm/node_modules/pnpm/bin/pnpm.cjs', '--filter', 'web', 'dev'),
+      'package-manager',
+    ],
+    [
+      "npm's CLI",
+      commandLine('/opt/node/lib/node_modules/npm/bin/npm-cli.js', 'run', 'dev'),
+      'package-manager',
+    ],
+    ["npm's bin name", commandLine('/usr/local/bin/npm', 'run', 'dev'), 'package-manager'],
+    ["npx's CLI", commandLine('/opt/node/lib/node_modules/npm/bin/npx-cli.js'), 'package-manager'],
+    ["npx's bin name", commandLine('/usr/local/bin/npx', 'next', 'dev'), 'package-manager'],
+    [
+      'classic Yarn',
+      commandLine('/usr/lib/node_modules/yarn/bin/yarn.js', 'dev'),
+      'package-manager',
+    ],
+    ["classic Yarn's yarnpkg", commandLine('/usr/local/bin/yarnpkg', 'dev'), 'package-manager'],
+    [
+      'a Yarn Berry release',
+      commandLine(`${PROJECT_ROOT}/.yarn/releases/yarn-4.5.0.cjs`, 'dev'),
+      'package-manager',
+    ],
+    [
+      "npm's CLI on a Windows path",
+      commandLine('C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js', 'run', 'dev'),
+      'package-manager',
+    ],
+    ['the tsc launcher', commandLine(TSC_ENTRY, '--showConfig'), 'typescript-cli'],
+    [
+      'the tsserver launcher',
+      commandLine(`${PROJECT_MODULES}/typescript/bin/tsserver`),
+      'typescript-cli',
+    ],
+    ['lib/tsc.js', commandLine(`${PROJECT_MODULES}/typescript/lib/tsc.js`), 'typescript-cli'],
+    ['lib/_tsc.js', commandLine(`${PROJECT_MODULES}/typescript/lib/_tsc.js`), 'typescript-cli'],
+    [
+      'lib/tsserver.js',
+      commandLine(`${PROJECT_MODULES}/typescript/lib/tsserver.js`),
+      'typescript-cli',
+    ],
+    ['next dev', commandLine(NEXT_CLI_ENTRY, 'dev', '-p', '3000'), 'next-cli'],
+    ['a bare next, whose default command is dev', commandLine(NEXT_CLI_ENTRY), 'next-cli'],
+    ['next with options only', commandLine(NEXT_CLI_ENTRY, '-p', '3000'), 'next-cli'],
+    [
+      'next dev on a directory named build',
+      commandLine(NEXT_CLI_ENTRY, 'dev', 'build'),
+      'next-cli',
+    ],
+    [
+      'next start, which serves in-process',
+      commandLine(NEXT_CLI_ENTRY, 'start', '-p', '3000'),
+      'host',
+    ],
+    ['next build', commandLine(NEXT_CLI_ENTRY, 'build'), 'host'],
+    ['the forked Next.js dev server', commandLine(NEXT_SERVER_ENTRY), 'host'],
+    ["the project's own server script", commandLine(`${PROJECT_ROOT}/server.mjs`), 'host'],
+    ['a script inside a directory named npm', commandLine('/home/npm/app/server.js'), 'host'],
+    ['a script inside a directory named next', commandLine('/srv/next/index.js'), 'host'],
+    ['node -e, which has no entry script', [NODE_EXECUTABLE], 'host'],
+    ['an empty entry', [NODE_EXECUTABLE, ''], 'host'],
+  ])('classifies %s', (_label, argv, kind) => {
+    expect(classifyPreloadProcess(argv, unresolvable)).toBe(kind);
+  });
+
+  it('gates an entry that only its resolved path identifies', () => {
+    const launcher = `${PROJECT_MODULES}/.bin/serve-dev`;
+
+    expect(classifyPreloadProcess(commandLine(launcher, 'dev'), unresolvable)).toBe('host');
+    expect(
+      classifyPreloadProcess(
+        commandLine(launcher, 'dev'),
+        resolverWithLink(launcher, NEXT_CLI_ENTRY),
+      ),
+    ).toBe('next-cli');
+
+    const shim = '/usr/local/bin/pm';
+    expect(
+      classifyPreloadProcess(
+        commandLine(shim, 'dev'),
+        resolverWithLink(shim, '/opt/node/lib/node_modules/corepack/dist/pnpm.js'),
+      ),
+    ).toBe('package-manager');
+  });
+
+  it('judges the resolved path by the same command, so a linked next start stays the host', () => {
+    const launcher = `${PROJECT_MODULES}/.bin/serve`;
+
+    expect(
+      classifyPreloadProcess(
+        commandLine(launcher, 'start'),
+        resolverWithLink(launcher, NEXT_CLI_ENTRY),
+      ),
+    ).toBe('host');
+  });
+
+  it('does not resolve an entry its spelling already identifies', () => {
+    const resolve = vi.fn<RealPathResolver>((path) => path);
+
+    expect(classifyPreloadProcess(commandLine(PNPM_SHIM_ENTRY, 'dev'), resolve)).toBe(
+      'package-manager',
+    );
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it('treats the process running this suite as the host with the default resolver', () => {
+    expect(classifyPreloadProcess(process.argv)).toBe('host');
+  });
+});
+
+describe('installPreload() in a process that serves no requests', () => {
+  it.each<[string, readonly string[], string]>([
+    ['the package-manager shim', commandLine(PNPM_SHIM_ENTRY, 'run', 'dev'), 'package-manager'],
+    ['the Next.js dev CLI supervisor', commandLine(NEXT_CLI_ENTRY, 'dev'), 'Next.js dev CLI'],
+    ['the TypeScript CLI', commandLine(TSC_ENTRY, '--showConfig'), 'TypeScript compiler CLI'],
+  ])(
+    'installs nothing and writes nothing in %s, even with a valid credential',
+    async (_label, argv, named) => {
+      // `trace` is the level at which every other path would say something —
+      // including the OpenTelemetry diagnostics — so silence here is total.
+      const logger = new RecordingLogger('trace');
+      const fetchImpl = vi.fn<typeof fetch>();
+      const probeKey = createContextKey('register-test-gated-context-probe');
+
+      const result = install({
+        argv,
+        env: launchEnv(),
+        logger,
+        fetchImpl,
+        webSocketImpl: FakeControlSocket,
+      });
+
+      expect(result.status).toBe('inert');
+      if (result.status === 'installed') {
+        return;
+      }
+      expect(result.reason).toContain(named);
+      // Value-free: the reason names a kind of process, never its path.
+      expect(result.reason).not.toContain(argv[1] ?? '');
+      expect(result.reason).not.toContain(PRELOAD_TOKEN);
+
+      diag.warn('register-test diagnostic in a gated process');
+      expect(logger.entries).toEqual([]);
+
+      expect(sockets).toEqual([]);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(helperSlot()).toBeUndefined();
+      expect(prismaGlobalKeys()).toEqual([]);
+      expectNoGlobalTracing();
+      // Not even the context manager `register()` would have installed.
+      expect(
+        context.with(ROOT_CONTEXT.setValue(probeKey, 'carried'), () =>
+          context.active().getValue(probeKey),
+        ),
+      ).toBeUndefined();
+
+      await expect(result.shutdown()).resolves.toBeUndefined();
+    },
+  );
+
+  it('installs in the forked dev server that serves requests', () => {
+    const result = expectInstalled(
+      install({
+        argv: commandLine(NEXT_SERVER_ENTRY),
+        env: launchEnv(),
+        connect: false,
+        logger: new RecordingLogger(),
+      }),
+    );
+
+    expect(registeredDelegate()).toBe(result.provider);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * installPreload(): the active path and its teardown
  * ---------------------------------------------------------------------------
  */
 
 describe('installPreload() with a valid launch environment', () => {
-  it('registers the provider, the propagator, both instrumentations and the span helper', () => {
+  it('registers the provider, the propagator, the instrumentations and the span helper', () => {
     const logger = new RecordingLogger();
     const fetchImpl = vi.fn<typeof fetch>();
 
@@ -654,11 +931,16 @@ describe('installPreload() with a valid launch environment', () => {
     expect(registeredDelegate()).toBe(result.provider);
     expect(propagation.fields()).toContain('traceparent');
 
-    expect(result.instrumentations).toHaveLength(2);
+    // Prisma, pg and the outgoing-request trace-context hook, all enabled.
+    expect(result.instrumentations).toHaveLength(3);
     for (const instrumentation of result.instrumentations) {
       expect(instrumentation.isEnabled?.()).toBe(true);
     }
     expect(result.instrumentations.some((entry) => entry instanceof PgInstrumentation)).toBe(true);
+    expect(
+      result.instrumentations.some((entry) => entry instanceof OutboundTraceContextPropagation),
+    ).toBe(true);
+    expect(diagnosticsChannel.hasSubscribers(UNDICI_REQUEST_CREATE_CHANNEL)).toBe(true);
     expect(prismaGlobalKeys().length).toBeGreaterThan(0);
 
     const helper = helperSlot();
@@ -711,6 +993,8 @@ describe('installPreload() with a valid launch environment', () => {
     for (const instrumentation of result.instrumentations) {
       expect(instrumentation.isEnabled?.()).toBe(false);
     }
+    // The outgoing-request hook is a channel subscription, and it is gone too.
+    expect(diagnosticsChannel.hasSubscribers(UNDICI_REQUEST_CREATE_CHANNEL)).toBe(false);
     expect(prismaGlobalKeys()).toEqual([]);
     expect(helperSlot()).toBeUndefined();
     expectNoGlobalTracing();
@@ -758,6 +1042,48 @@ describe('installPreload() with a valid launch environment', () => {
     expectNoGlobalTracing();
   });
 
+  it('keeps a context manager already registered instead of offering the API a duplicate', async () => {
+    // A context manager already global when the preload registers: the SDK's
+    // default, left behind by an earlier registration whose provider is gone.
+    const earlier = new NodeTracerProvider();
+    earlier.register({ propagator: null });
+    trace.disable();
+    const probeKey = createContextKey('register-test-kept-context-probe');
+    const errors: string[] = [];
+    const ignore = (): void => undefined;
+    // `error` is the level the API reports a refused registration at. The
+    // preload's logger stays below `trace`, so this collector is not replaced.
+    diag.setLogger(
+      {
+        error: (message: string): void => {
+          errors.push(message);
+        },
+        warn: ignore,
+        info: ignore,
+        debug: ignore,
+        verbose: ignore,
+      },
+      DiagLogLevel.ERROR,
+    );
+
+    const carried = await context.with(ROOT_CONTEXT.setValue(probeKey, 'kept'), async () => {
+      const result = expectInstalled(
+        install({ env: launchEnv(), connect: false, logger: new RecordingLogger() }),
+      );
+      expect(registeredDelegate()).toBe(result.provider);
+      await Promise.resolve();
+      return context.active().getValue(probeKey);
+    });
+    diag.disable();
+
+    expect(errors.filter((message) => message.includes('duplicate registration'))).toEqual([]);
+    expect(errors).toEqual([]);
+    // Set through the earlier manager and still carried across an await after
+    // the preload registered: that manager is still the global one.
+    expect(carried).toBe('kept');
+    await earlier.shutdown();
+  });
+
   it('opens the control socket on the derived URL, sends the credential only there, and closes it', async () => {
     const logger = new RecordingLogger();
     const result = expectInstalled(
@@ -779,21 +1105,44 @@ describe('installPreload() with a valid launch environment', () => {
     expect(logger.text()).not.toContain(PRELOAD_TOKEN);
   });
 
-  it('routes OpenTelemetry diagnostics only at trace level, and unwires them on shutdown', async () => {
+  it('routes OpenTelemetry error, warn and info at trace level, and unwires them on shutdown', async () => {
     const logger = new RecordingLogger('trace');
     const result = expectInstalled(install({ env: launchEnv(), connect: false, logger }));
+    /** @returns The level `message` was recorded at, or `undefined` if it was not. */
+    const recordedLevel = (message: string): LogLevel | undefined =>
+      logger.entries.find((entry) => entry.message === message)?.level;
 
-    diag.debug('register-test diagnostic while installed');
-    expect(
-      logger.entries.some((entry) => entry.message === 'register-test diagnostic while installed'),
-    ).toBe(true);
+    diag.error('register-test diag error while installed');
+    diag.warn('register-test diag warn while installed');
+    diag.info('register-test diag info while installed');
+
+    expect(recordedLevel('register-test diag error while installed')).toBe('warn');
+    expect(recordedLevel('register-test diag warn while installed')).toBe('warn');
+    expect(recordedLevel('register-test diag info while installed')).toBe('debug');
 
     await result.shutdown();
-    diag.debug('register-test diagnostic after shutdown');
+    diag.warn('register-test diagnostic after shutdown');
 
+    expect(recordedLevel('register-test diagnostic after shutdown')).toBeUndefined();
+  });
+
+  it("drops OpenTelemetry's debug and verbose chatter even at trace level", () => {
+    const logger = new RecordingLogger('trace');
+    expectInstalled(install({ env: launchEnv(), connect: false, logger }));
+
+    diag.debug('register-test diag debug while installed');
+    diag.verbose('register-test diag verbose while installed');
+    // What the SDK's tracer says for every span the gating sampler declines,
+    // outside a capture — the per-request noise this threshold exists to drop.
+    const gated = trace.getTracer('register-test-probe').startSpan('outside-a-capture');
+    gated.end();
+
+    expect(gated.isRecording()).toBe(false);
     expect(
-      logger.entries.some((entry) => entry.message === 'register-test diagnostic after shutdown'),
-    ).toBe(false);
+      logger.entries.filter((entry) => entry.message.startsWith('register-test diag')),
+    ).toEqual([]);
+    expect(logger.text()).not.toContain('Recording is off');
+    expect(logger.text()).not.toContain('Registered a global');
   });
 
   it('leaves diagnostics alone below trace level', () => {
@@ -1286,3 +1635,298 @@ describe('the exit handlers of an installed evaluation', () => {
     });
   });
 });
+
+/*
+ * ---------------------------------------------------------------------------
+ * The row count and the outgoing-request trace context
+ * ---------------------------------------------------------------------------
+ */
+
+/** The trace a recording fixture span belongs to. */
+const OUTBOUND_TRACE_ID = 'a'.repeat(32);
+
+/** The recording fixture span's id: what an injected `traceparent` must name. */
+const OUTBOUND_SPAN_ID = 'b'.repeat(16);
+
+/** The local service's origin, which the hook must never write to. */
+const SERVICE_ORIGIN = 'http://127.0.0.1:43117';
+
+/** A span double that records one attribute write per call. */
+function attributeRecorder(): {
+  readonly span: ApiSpan;
+  readonly written: Record<string, unknown>;
+} {
+  const written: Record<string, unknown> = {};
+  const span = {
+    setAttribute(key: string, value: unknown): unknown {
+      written[key] = value;
+      return span;
+    },
+  };
+  return { span: span as unknown as ApiSpan, written };
+}
+
+/** A context whose active span is recording — a span a capture kept. */
+function recordingContext(): Context {
+  const spanContext = {
+    traceId: OUTBOUND_TRACE_ID,
+    spanId: OUTBOUND_SPAN_ID,
+    traceFlags: TraceFlags.SAMPLED,
+  };
+  const span = { spanContext: () => spanContext, isRecording: () => true };
+  return trace.setSpan(ROOT_CONTEXT, span as unknown as ApiSpan);
+}
+
+/** A context whose active span is not recording — outside a capture. */
+function nonRecordingContext(): Context {
+  return trace.setSpan(
+    ROOT_CONTEXT,
+    trace.wrapSpanContext({
+      traceId: OUTBOUND_TRACE_ID,
+      spanId: OUTBOUND_SPAN_ID,
+      traceFlags: TraceFlags.NONE,
+    }),
+  );
+}
+
+/** A stand-in for the request undici publishes, recording what was added. */
+function outgoingRequest(origin: string, headers: unknown = ['accept', '*/*']) {
+  const added: [string, string][] = [];
+  return {
+    added,
+    request: {
+      origin,
+      headers,
+      addHeader(name: string, value: string): void {
+        added.push([name, value]);
+      },
+    },
+  };
+}
+
+/** Run `body` with the W3C propagator registered globally, as the preload does. */
+function withPropagator<T>(body: () => T): T {
+  propagation.setGlobalPropagator(new W3CTraceContextPropagator());
+  try {
+    return body();
+  } finally {
+    propagation.disable();
+  }
+}
+
+describe('recordReturnedRows(), the pg response hook', () => {
+  it('records the driver row count under the convention key convert.ts translates', () => {
+    const { span, written } = attributeRecorder();
+
+    recordReturnedRows(span, { data: { rowCount: 12 } } as unknown as PgResponseHookInformation);
+
+    expect(written).toEqual({ [DRIVER_ROW_COUNT_ATTRIBUTE]: 12 });
+  });
+
+  it('records nothing for a statement the driver counts nothing for, or a malformed count', () => {
+    for (const rowCount of [null, undefined, -1, 1.5, Number.NaN, '3']) {
+      const { span, written } = attributeRecorder();
+      recordReturnedRows(span, { data: { rowCount } } as unknown as PgResponseHookInformation);
+      expect(written, String(rowCount)).toEqual({});
+    }
+  });
+
+  it('never throws, whatever the result object does', () => {
+    const { span, written } = attributeRecorder();
+    const hostile = {
+      get data(): never {
+        throw new Error('result getter failed');
+      },
+    };
+
+    // A getter typed `never` satisfies the hook's parameter type as it stands.
+    expect(() => {
+      recordReturnedRows(span, hostile);
+    }).not.toThrow();
+    expect(written).toEqual({});
+  });
+});
+
+describe('injectOutboundTraceContext()', () => {
+  it('writes the active span as the parent of a loopback request made inside a capture', () => {
+    const outgoing = outgoingRequest('http://localhost:4100');
+
+    const written = withPropagator(() =>
+      injectOutboundTraceContext(outgoing.request, SERVICE_ORIGIN, recordingContext()),
+    );
+
+    expect(written).toBe(true);
+    expect(outgoing.added).toEqual([
+      ['traceparent', `00-${OUTBOUND_TRACE_ID}-${OUTBOUND_SPAN_ID}-01`],
+    ]);
+  });
+
+  it('never sends trace context to a host other than this machine', () => {
+    const outgoing = outgoingRequest('https://payments.example.com');
+
+    const written = withPropagator(() =>
+      injectOutboundTraceContext(outgoing.request, SERVICE_ORIGIN, recordingContext()),
+    );
+
+    expect(written).toBe(false);
+    expect(outgoing.added).toEqual([]);
+  });
+
+  it("leaves the local service's own traffic alone", () => {
+    const outgoing = outgoingRequest(SERVICE_ORIGIN);
+
+    expect(
+      withPropagator(() =>
+        injectOutboundTraceContext(outgoing.request, SERVICE_ORIGIN, recordingContext()),
+      ),
+    ).toBe(false);
+    expect(outgoing.added).toEqual([]);
+  });
+
+  it('writes nothing outside a capture, where no span records', () => {
+    const outgoing = outgoingRequest('http://127.0.0.1:4100');
+
+    expect(
+      withPropagator(() =>
+        injectOutboundTraceContext(outgoing.request, SERVICE_ORIGIN, nonRecordingContext()),
+      ),
+    ).toBe(false);
+    expect(
+      withPropagator(() =>
+        injectOutboundTraceContext(outgoing.request, SERVICE_ORIGIN, ROOT_CONTEXT),
+      ),
+    ).toBe(false);
+    expect(outgoing.added).toEqual([]);
+  });
+
+  it('keeps a trace context the caller already set, in either header shape', () => {
+    for (const headers of [
+      ['Traceparent', '00-caller-owned-01', 'accept', '*/*'],
+      'accept: */*\r\ntraceparent: 00-caller-owned-01\r\n',
+    ]) {
+      const outgoing = outgoingRequest('http://127.0.0.1:4100', headers);
+      expect(
+        withPropagator(() =>
+          injectOutboundTraceContext(outgoing.request, SERVICE_ORIGIN, recordingContext()),
+        ),
+      ).toBe(false);
+      expect(outgoing.added).toEqual([]);
+    }
+  });
+
+  it('answers false rather than throwing for anything that is not a usable request', () => {
+    const throwing = {
+      origin: 'http://127.0.0.1:4100',
+      headers: [],
+      addHeader(): never {
+        throw new Error('addHeader failed');
+      },
+    };
+
+    withPropagator(() => {
+      for (const request of [
+        null,
+        'request',
+        {},
+        { origin: 'not a url', addHeader() {} },
+        throwing,
+      ]) {
+        expect(injectOutboundTraceContext(request, SERVICE_ORIGIN, recordingContext())).toBe(false);
+      }
+    });
+  });
+});
+
+describe('OutboundTraceContextPropagation', () => {
+  it('subscribes on construction and is removed completely by disable()', () => {
+    const hook = new OutboundTraceContextPropagation({ excludedOrigin: SERVICE_ORIGIN });
+    try {
+      expect(hook.isEnabled()).toBe(true);
+      expect(hook.instrumentationName).toBe(OUTBOUND_PROPAGATION_INSTRUMENTATION_NAME);
+      expect(diagnosticsChannel.hasSubscribers(UNDICI_REQUEST_CREATE_CHANNEL)).toBe(true);
+
+      hook.disable();
+      hook.disable();
+      expect(hook.isEnabled()).toBe(false);
+      expect(diagnosticsChannel.hasSubscribers(UNDICI_REQUEST_CREATE_CHANNEL)).toBe(false);
+
+      hook.enable();
+      hook.enable();
+      expect(hook.isEnabled()).toBe(true);
+    } finally {
+      hook.disable();
+    }
+  });
+
+  it('writes onto a request published on the channel inside a capture, and only then', () => {
+    // `context.with` carries a span only through a registered context manager.
+    // An earlier installation in this file may have left the preload's own
+    // AsyncLocalStorage manager behind; otherwise a minimal one stands in.
+    const manager = new AsyncLocalStorageStandIn();
+    const registered = context.setGlobalContextManager(manager);
+    const hook = new OutboundTraceContextPropagation({ excludedOrigin: SERVICE_ORIGIN });
+    const inside = outgoingRequest('http://127.0.0.1:4100');
+    const outside = outgoingRequest('http://127.0.0.1:4100');
+    const publish = (request: unknown): void => {
+      diagnosticsChannel.channel(UNDICI_REQUEST_CREATE_CHANNEL).publish({ request });
+    };
+    try {
+      withPropagator(() => {
+        context.with(recordingContext(), () => {
+          publish(inside.request);
+        });
+        publish(outside.request);
+      });
+    } finally {
+      hook.disable();
+      if (registered) {
+        context.disable();
+      }
+    }
+
+    expect(inside.added).toEqual([
+      ['traceparent', `00-${OUTBOUND_TRACE_ID}-${OUTBOUND_SPAN_ID}-01`],
+    ]);
+    expect(outside.added).toEqual([]);
+    expect(hook.injectedCount).toBe(1);
+  });
+});
+
+/**
+ * The smallest `ContextManager` that carries a context across a synchronous
+ * `with`, for the one case that publishes on the channel through the API.
+ */
+class AsyncLocalStorageStandIn implements ContextManager {
+  readonly #storage = new AsyncLocalStorage<Context>();
+
+  active(): Context {
+    return this.#storage.getStore() ?? ROOT_CONTEXT;
+  }
+
+  with<A extends unknown[], F extends (...args: A) => ReturnType<F>>(
+    activeContext: Context,
+    fn: F,
+    thisArg?: ThisParameterType<F>,
+    ...args: A
+  ): ReturnType<F> {
+    return this.#storage.run(activeContext, () => fn.apply(thisArg, args));
+  }
+
+  bind<T>(activeContext: Context, target: T): T {
+    if (typeof target !== 'function') {
+      return target;
+    }
+    const bound = (...args: unknown[]): unknown =>
+      this.with(activeContext, () => (target as (...inner: unknown[]) => unknown)(...args));
+    return bound as T;
+  }
+
+  enable(): this {
+    return this;
+  }
+
+  disable(): this {
+    this.#storage.disable();
+    return this;
+  }
+}

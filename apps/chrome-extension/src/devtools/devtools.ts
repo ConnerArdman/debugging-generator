@@ -98,6 +98,12 @@
  * @module apps/chrome-extension/src/devtools/devtools
  */
 
+// ORDER IS LOAD-BEARING: the first JavaScript import, evaluated before every module
+// that builds a Zod schema (`../shared/messages` does), so the extension CSP raises no
+// `eval` issue when DevTools opens. vite.config.ts pins it into its own chunk, imported
+// ahead of the shared Zod chunk, and fails the build if that order is ever lost.
+import '../shared/csp-runtime';
+
 import type { SelectedTarget } from '@debuggen/protocol';
 
 import {

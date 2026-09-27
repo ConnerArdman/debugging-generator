@@ -2173,42 +2173,40 @@ describe('install', () => {
     }
   });
 
-  it('arms nothing, and refuses nothing, when no page agent has reported', async () => {
+  it('arms its hooks and leaves the wait to readiness when no page agent has reported yet', async () => {
     const before = journalCallCount();
-    const { actions, result } = await installProposal(fixture, agentPresets(fixture).absent);
+    const presets = agentPresets(fixture);
+    const { actions, result } = await installProposal(fixture, presets.absent);
+    const healthy = await installProposal(fixture, presets.healthy);
 
     expect(actions.length).toBeGreaterThan(0);
 
-    // Degradation is data, not an error: the call resolves, the capture
-    // proceeds with whatever other adapters enabled, and only the installer
-    // judges "nothing at all".
+    // A session's plan usually installs before its tab binds, so an agent that
+    // has not reported yet is not a refusal: the hooks are armed exactly as on
+    // a reporting page, nothing is written, and no gap is claimed at install —
+    // a plan made of page hooks alone would otherwise fail before it could bind.
     expect(result.applied).toEqual([]);
-    expect(result.runtimeHooks).toEqual([]);
-    expect(result.agentHooks).toEqual({});
+    expect(result.runtimeHooks).toEqual(healthy.result.runtimeHooks);
+    expect(result.runtimeHooks.length).toBeGreaterThan(0);
+    expect(result.agentHooks).toEqual(healthy.result.agentHooks);
+    expect(result.unavailable).toEqual([]);
     expect(journalCallCount()).toBe(before);
 
-    // One entry per affected signal: a developer told that renders are
-    // unavailable while hearing nothing about the component tree would be left
-    // guessing about the half that was not mentioned.
-    expect(result.unavailable.length).toBe(REACT_ADAPTER_SIGNALS.length);
-    expect(result.unavailable.map((entry) => entry.signal).sort()).toEqual(
+    // The wait is readiness's: the gate stays closed, one row per signal, with
+    // the one action available — open the app with the panel on it.
+    const report = await readinessFor(fixture, presets.absent);
+    expect(report.ready).toBe(false);
+    expect(report.signals.map((row) => row.signal).sort()).toEqual(
       [...REACT_ADAPTER_SIGNALS].sort(),
     );
-
-    for (const entry of result.unavailable) {
-      expect(CAPTURE_SIGNALS as readonly string[]).toContain(entry.signal);
-      expect(entry.reason.trim()).toBe(entry.reason);
-      expect(entry.hint.trim()).toBe(entry.hint);
-      expect(entry.reason.length).toBeGreaterThan(24);
-      expect(entry.hint.length).toBeGreaterThan(24);
-      expect(entry.reason).not.toMatch(/[\r\n]/u);
-      expect(entry.hint).not.toMatch(/[\r\n]/u);
-
-      // The one action available: open the app with the panel on it.
-      expect(entry.hint.toLowerCase()).toContain('open the application');
-      expect(entry.hint).toMatch(/tab/iu);
-      expect(entry.hint).toMatch(/devtools/iu);
-      expect(entry.hint).toMatch(/panel/iu);
+    for (const row of report.signals) {
+      expect(row.status).toBe('unavailable');
+      const hint = must(row.hint, 'a hint');
+      expect(hint.toLowerCase()).toContain('open the application');
+      expect(hint).toMatch(/tab/iu);
+      expect(hint).toMatch(/devtools/iu);
+      expect(hint).toMatch(/panel/iu);
+      expect(must(row.reason, 'a reason')).not.toMatch(/[\r\n]/u);
     }
   });
 
@@ -2283,7 +2281,14 @@ describe('install', () => {
     const reasons: string[] = [];
     const hints: string[] = [];
 
-    for (const readiness of [presets.absent, presets.hookInstalledLate, presets.reactUndetected]) {
+    // No agent yet is reported by readiness, the other two by the install.
+    const waiting = must(
+      (await readinessFor(fixture, presets.absent)).signals[0],
+      'a readiness row',
+    );
+    reasons.push(must(waiting.reason, 'a reason'));
+    hints.push(must(waiting.hint, 'a hint'));
+    for (const readiness of [presets.hookInstalledLate, presets.reactUndetected]) {
       const { result } = await installProposal(fixture, readiness);
       const first = must(result.unavailable[0], 'an unavailable entry');
 
@@ -2575,21 +2580,21 @@ describe('readiness', () => {
     }
   });
 
-  it('agrees with install about which states can observe a commit', async () => {
+  it('agrees with install about which states can observe a commit, leaving only the wait for an agent to readiness', async () => {
     for (const [name, readiness] of presetEntries(fixture)) {
       const report = await readinessFor(fixture, readiness);
       const { result } = await installProposal(fixture, readiness);
       const arms = result.runtimeHooks.length > 0;
+      const admits = report.signals.every((row) => row.status !== 'unavailable');
 
-      expect(arms, `the '${name}' state`).toBe(ARMING_PRESETS.includes(name));
+      // Readiness admits a capture in exactly the states that observe a commit now.
+      expect(admits, `the '${name}' state`).toBe(ARMING_PRESETS.includes(name));
 
-      // Readiness and degradation are the same judgement asked at two moments,
-      // so the states whose rows block a capture and the states whose install
-      // arms nothing have to be the same states.
-      expect(
-        report.signals.every((row) => row.status !== 'unavailable'),
-        `the '${name}' state`,
-      ).toBe(arms);
+      // Install arms in each of those, and in the one state that is only a
+      // wait — no page agent has reported yet, which binding the tab ends — so
+      // a plan installed before its tab binds is not refused. A page whose
+      // agent reported an unobservable commit is refused at both moments.
+      expect(arms, `the '${name}' state`).toBe(admits || readiness.browserAgent === undefined);
     }
   });
 

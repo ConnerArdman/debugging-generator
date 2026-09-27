@@ -32,7 +32,7 @@
  * | `queries`          | `QueryGroup[]`          | `aggregateQueries`                                      |
  * | `stateTransitions` | `StateTransition[]`     | `aggregateStateTransitions`                             |
  * | `graph`            | `DependencyGraphData`   | `buildDependencyGraph`                                  |
- * | `metrics`          | `MetricValue[]`         | the capture summary when it covers every event, else `computeMetrics` |
+ * | `metrics`          | `MetricValue[]`         | the capture summary when it covers every event, else `computeMetrics`; above the ceiling, the summary with a coverage note |
  *
  * ## Paging (AAP 0.4.2)
  *
@@ -138,10 +138,16 @@
  * would present partial totals as the capture's. A scan that contradicts its
  * own count or budget is refused with `STORE_ERROR` (reason
  * `scan-inconsistent`) rather than trusted. The unfiltered `metrics` source is
- * held to the same rule: a capture summary is served only when it was computed
- * from every event the capture now holds (its `eventCount` equals the
+ * held to the same rule: a capture summary is served as it is only when it was
+ * computed from every event the capture now holds (its `eventCount` equals the
  * capture's stored count, read with `captureStamp`), and the values are
- * computed from the whole capture otherwise.
+ * computed from the whole capture otherwise. The one exception is a capture
+ * above the ceiling, which no read may aggregate: its metric cards answer from
+ * the stored summary — which the capture stage computes from the capture's
+ * first events up to this same ceiling — and every value carries a `note`
+ * stating how many of the capture's events it was computed from, so the cards
+ * say what they show instead of all failing, and never present a total of
+ * part of the capture as the capture's.
  *
  * A correlated tree is bounded separately, by {@link TRACE_NODE_BUDGET} nodes
  * in canonical pre-order, and a tree cut by it says so through its own
@@ -260,6 +266,7 @@ import type {
 import type { AnalysisSummarizer } from '../analysis/summarize.js';
 import { sessionLogger, subsystemLogger } from '../logging.js';
 import type { SessionsRepo, StoredCapture } from '../store/sessions-repo.js';
+import { parentFirstOrder } from '../store/telemetry-repo.js';
 import type {
   CaptureEventStamp,
   CaptureGeneration,
@@ -341,12 +348,21 @@ export type SortValue = number | string;
  *   order of every chain this module evaluates in memory.
  * - `utf8` — by the strings' UTF-8 bytes, which is SQLite's default `BINARY`
  *   collation: the order of a chain the store executes, stated here as data.
+ * - `natural` — the order a person reads a list of names in, for an in-memory
+ *   key naming something the reader scans by eye (see {@link compareNatural}):
+ *   a run of ASCII digits compares by its numeric value, so `Row2` precedes
+ *   `Row10`; every other character compares after a simple case fold, so
+ *   `alpha` precedes `Beta` rather than every lower-case name following every
+ *   upper-case one; and two strings still equal after both — they differ only
+ *   in letter case or in a digit run's leading zeros — fall back to code-unit
+ *   order, so distinct strings never tie.
  *
- * The two disagree only for a character above U+FFFF against one in
- * U+E000–U+FFFF. Neither is `localeCompare`, whose answer depends on the host's
- * locale and would let two machines page one capture differently.
+ * `utf16` and `utf8` disagree only for a character above U+FFFF against one in
+ * U+E000–U+FFFF. None of the three is `localeCompare` or `Intl.Collator`, whose
+ * answers depend on the host's locale and ICU data and would let two machines
+ * page one capture differently: each is a pure function of the two strings.
  */
-export type StringCollation = 'utf16' | 'utf8';
+export type StringCollation = 'utf16' | 'utf8' | 'natural';
 
 /**
  * The fields of `Row` a comparator can read: the required ones holding a
@@ -389,12 +405,16 @@ export interface FieldSortKey<Row> {
  * - `metricPosition` — a metric value's position in `METRIC_IDS`;
  * - `measuredMilliseconds`, `measuredCount` — a metric's value when it was
  *   measured and its unit is `milliseconds` (respectively `count`), none
- *   otherwise.
+ *   otherwise;
+ * - `parentFirstRank` — a record's position in the canonical parent-first
+ *   order of the ordered set (AAP 0.2.3): parent before child, then the flat
+ *   canonical chain. Unique per record, so it alone decides the order.
  *
  * A closed vocabulary, so a suite can hold every derived key to a derivation of
  * its own, written independently of the ones below.
  */
 export type DerivedSortKeyName =
+  | 'parentFirstRank'
   | 'nameGroupSize'
   | 'hookGroupSize'
   | 'hookComponent'
@@ -603,6 +623,85 @@ const FLAT_COUNT_DESC_CHAIN: SortChain<TelemetryEvent> = [
 ];
 
 /**
+ * The flat canonical chain the parent-first rank is taken over: the store's
+ * `CANONICAL_ORDER_BY` stated as keys — `startTime`, then `(producerId, seq)`
+ * (the producer id in UTF-8 byte order, as SQLite's `BINARY` collation
+ * compares it), then `ingestSeq`, which is unique, so the chain is total.
+ */
+const FLAT_CANONICAL_KEYS: readonly FieldSortKey<TelemetryEvent>[] = [
+  { field: 'startTime', direction: 'asc' },
+  { field: 'producerId', direction: 'asc', collation: 'utf8' },
+  { field: 'seq', direction: 'asc' },
+  { field: 'ingestSeq', direction: 'asc' },
+];
+
+/**
+ * `parentFirstRank`: each record's position in the canonical parent-first
+ * order of the ordered set.
+ *
+ * The records are ranked by {@link FLAT_CANONICAL_KEYS} — the store's
+ * `CANONICAL_ORDER_BY`, collation included — and put parent before child by
+ * the store's own `parentFirstOrder`, so this key and a parent-first store
+ * page describe one order through one implementation rather than two that
+ * could drift. `O(n log n)`.
+ */
+function parentFirstRanks(rows: readonly TelemetryEvent[]): readonly (SortValue | undefined)[] {
+  const flat = rows.map((row, index) => ({ row, index }));
+  flat.sort((left, right) => {
+    for (const key of FLAT_CANONICAL_KEYS) {
+      const order = compareValues(
+        left.row[key.field],
+        right.row[key.field],
+        key.collation ?? 'utf16',
+      );
+      if (order !== 0) {
+        return order;
+      }
+    }
+    return 0;
+  });
+
+  const ranks = new Array<SortValue | undefined>(rows.length).fill(undefined);
+  for (const [position, rank] of parentFirstOrder(flat.map((entry) => entry.row)).entries()) {
+    const entry = flat[rank];
+    if (entry !== undefined) {
+      ranks[entry.index] = position;
+    }
+  }
+  return ranks;
+}
+
+/**
+ * The `spans` source's `start_asc` chain: the canonical order of AAP 0.2.3 —
+ * parent before child, then {@link FLAT_CANONICAL_KEYS} — and the id that
+ * closes every chain.
+ *
+ * The rank is unique, so it alone decides; the keys behind it state the flat
+ * chain the rank is taken over, and the id is never reached. A chain that
+ * leads with this key is what makes the resolver ask the store for a
+ * parent-first page ({@link leadsParentFirst}).
+ */
+const SPANS_START_ASC_CHAIN: SortChain<TelemetryEvent> = [
+  { derived: 'parentFirstRank', direction: 'asc', evaluate: parentFirstRanks },
+  ...FLAT_CANONICAL_KEYS,
+  { field: 'id', direction: 'asc' },
+];
+
+/**
+ * Whether a flat source's chain is the canonical parent-first order, which the
+ * store answers only when asked (`TelemetryQuery.parentFirst`): read off the
+ * chain itself, so the table stays the one statement of what each sort means.
+ *
+ * @param chain The chain a flat source is ordered by.
+ * @returns `true` exactly when the chain leads with `parentFirstRank`.
+ */
+function leadsParentFirst(chain: SortChain<TelemetryEvent>): boolean {
+  const keys: readonly SortKey<TelemetryEvent>[] = chain;
+  const [first] = keys;
+  return first !== undefined && isDerivedKey(first) && first.derived === 'parentFirstRank';
+}
+
+/**
  * For every sortable source, the chain **every** sort orders it by.
  *
  * Total by type — a `Record` over the whole `DataQuerySort` vocabulary for each
@@ -621,17 +720,30 @@ export type SourceSortKeys = {
  *
  * - **`spans`, `events`** — ordered by the store, which is where filtering and
  *   paging of those sources happen; the chains state its orderings as data.
- *   `duration_desc` and `start_asc` are `PANEL_DURATION_DESC_ORDER_BY` and
- *   `PANEL_START_ASC_ORDER_BY` (`../store/telemetry-repo.ts`): duration
- *   descending or start ascending, then the event id. `count_desc` is the
- *   store's row ranking under the group key the resolver sends with the read
+ *   `duration_desc` is `PANEL_DURATION_DESC_ORDER_BY`
+ *   (`../store/telemetry-repo.ts`): duration descending, then the event id.
+ *   `start_asc` on `events` is `PANEL_START_ASC_ORDER_BY`: start ascending,
+ *   then the event id — a record log in the order things happened. `start_asc`
+ *   on `spans` is the canonical order of AAP 0.2.3, which the resolver asks the
+ *   store for (`TelemetryQuery.parentFirst`) because its chain leads with
+ *   `parentFirstRank`: parent before child — a span never precedes its parent
+ *   when both are in the filtered source, whatever the two producers' clocks
+ *   read — then `startTime`, then `(producerId, seq)`, then `ingestSeq`. The
+ *   rank is unique, so the id that closes the chain never decides there.
+ *   `count_desc` is the store's row ranking under the group key the resolver
+ *   sends with the read
  *   (`name`): each record ranked by how many records of the filtered source
  *   share its operation name — `COUNT(name) OVER (PARTITION BY name) DESC` —
  *   the most frequent operation first; then the name itself in UTF-8 byte
  *   order (SQLite's `BINARY` collation), which keeps one operation's records
  *   together and separates two equally frequent ones; then the event id.
  * - **`renders`** — most renders, most total render time, or earliest first
- *   render, then the `render:` id.
+ *   render; then the component name in `natural` order (see
+ *   {@link StringCollation}), so components that tie read as a person scans a
+ *   list of names — `Row2` before `Row10`, letter case not splitting the list
+ *   in two — rather than in the code-unit order of their ids; then the
+ *   `render:` id, which is the name behind a fixed prefix and so only restates
+ *   the order the name already made total.
  * - **`requests`** — largest group first, with the more redundant of two
  *   equally frequent groups ahead (duplicates are the finding this source
  *   exists for); or most total time; or earliest first occurrence; then the
@@ -668,10 +780,7 @@ export const SOURCE_SORT_KEYS: SourceSortKeys = Object.freeze({
       { field: 'duration', direction: 'desc' },
       { field: 'id', direction: 'asc' },
     ],
-    start_asc: [
-      { field: 'startTime', direction: 'asc' },
-      { field: 'id', direction: 'asc' },
-    ],
+    start_asc: SPANS_START_ASC_CHAIN,
     count_desc: FLAT_COUNT_DESC_CHAIN,
   },
   events: {
@@ -688,14 +797,17 @@ export const SOURCE_SORT_KEYS: SourceSortKeys = Object.freeze({
   renders: {
     count_desc: [
       { field: 'renderCount', direction: 'desc' },
+      { field: 'component', direction: 'asc', collation: 'natural' },
       { field: 'id', direction: 'asc' },
     ],
     duration_desc: [
       { field: 'totalDurationMs', direction: 'desc' },
+      { field: 'component', direction: 'asc', collation: 'natural' },
       { field: 'id', direction: 'asc' },
     ],
     start_asc: [
       { field: 'firstStartTime', direction: 'asc' },
+      { field: 'component', direction: 'asc', collation: 'natural' },
       { field: 'id', direction: 'asc' },
     ],
   },
@@ -806,11 +918,12 @@ export function effectiveSort(
 /**
  * Compares two values of one key.
  *
- * Numbers numerically; strings by UTF-16 code unit, or by UTF-8 bytes under
- * the `utf8` collation — never `localeCompare` (see {@link StringCollation}).
- * A number sorts before a string and a value of any other type after both;
- * neither case is reachable, because a field key admits only required number
- * or string fields and each derived key yields one type.
+ * Numbers numerically; strings by UTF-16 code unit, by UTF-8 bytes under the
+ * `utf8` collation, or in natural order under the `natural` one
+ * ({@link compareNatural}) — never `localeCompare` (see
+ * {@link StringCollation}). A number sorts before a string and a value of any
+ * other type after both; neither case is reachable, because a field key admits
+ * only required number or string fields and each derived key yields one type.
  */
 function compareValues(left: unknown, right: unknown, collation: StringCollation): number {
   if (typeof left === 'number' && typeof right === 'number') {
@@ -826,6 +939,9 @@ function compareValues(left: unknown, right: unknown, collation: StringCollation
     if (collation === 'utf8') {
       return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
     }
+    if (collation === 'natural') {
+      return compareNatural(left, right);
+    }
     return left < right ? -1 : 1;
   }
   return typeRank(left) - typeRank(right);
@@ -837,6 +953,166 @@ function typeRank(value: unknown): number {
     return 0;
   }
   return typeof value === 'string' ? 1 : 2;
+}
+
+/** The UTF-16 code units of the ASCII digits: the only digits natural order reads as a number. */
+const ASCII_DIGIT_ZERO = 0x30;
+const ASCII_DIGIT_NINE = 0x39;
+
+/** The ASCII upper-case letters, folded arithmetically, and the distance to their lower case. */
+const ASCII_UPPER_A = 0x41;
+const ASCII_UPPER_Z = 0x5a;
+const ASCII_CASE_OFFSET = 0x20;
+
+/** The first code point past ASCII, and the last one a single UTF-16 code unit holds. */
+const FIRST_NON_ASCII_CODE_POINT = 0x80;
+const LAST_SINGLE_UNIT_CODE_POINT = 0xffff;
+
+/** Whether a UTF-16 code unit is an ASCII digit, `0`–`9`. */
+function isAsciiDigit(codeUnit: number): boolean {
+  return codeUnit >= ASCII_DIGIT_ZERO && codeUnit <= ASCII_DIGIT_NINE;
+}
+
+/** The index just past the run of ASCII digits that starts at `start`. */
+function digitRunEnd(text: string, start: number): number {
+  let end = start;
+  while (end < text.length && isAsciiDigit(text.charCodeAt(end))) {
+    end += 1;
+  }
+  return end;
+}
+
+/**
+ * Compares two runs of ASCII digits by the whole numbers they write, without
+ * converting either: leading zeros are skipped, a run with more significant
+ * digits is the larger number, and two of equal length compare digit by digit.
+ * So a run too long for a `number` — a hash-like suffix, say — still compares
+ * exactly. Runs writing the same number (`7` and `007`) compare equal; the
+ * caller's final code-unit comparison separates them.
+ */
+function compareDigitRuns(
+  left: string,
+  leftStart: number,
+  leftEnd: number,
+  right: string,
+  rightStart: number,
+  rightEnd: number,
+): number {
+  let leftFirst = leftStart;
+  while (leftFirst < leftEnd - 1 && left.charCodeAt(leftFirst) === ASCII_DIGIT_ZERO) {
+    leftFirst += 1;
+  }
+  let rightFirst = rightStart;
+  while (rightFirst < rightEnd - 1 && right.charCodeAt(rightFirst) === ASCII_DIGIT_ZERO) {
+    rightFirst += 1;
+  }
+  const leftDigits = leftEnd - leftFirst;
+  const rightDigits = rightEnd - rightFirst;
+  if (leftDigits !== rightDigits) {
+    return leftDigits < rightDigits ? -1 : 1;
+  }
+  for (let offset = 0; offset < leftDigits; offset += 1) {
+    const leftDigit = left.charCodeAt(leftFirst + offset);
+    const rightDigit = right.charCodeAt(rightFirst + offset);
+    if (leftDigit !== rightDigit) {
+      return leftDigit < rightDigit ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+/**
+ * One code point under a simple, locale-independent case fold.
+ *
+ * An ASCII upper-case letter maps to its lower case arithmetically — the whole
+ * cost for the names a component tree holds. Any other code point maps to its
+ * lower-case form when that form is exactly one code point, and to itself
+ * otherwise, so the fold stays one-to-one and a comparison stays one code
+ * point against one. `String.prototype.toLowerCase` applies Unicode's default
+ * case mapping and, unlike `toLocaleLowerCase`, never reads the host's locale.
+ */
+function foldCodePoint(codePoint: number): number {
+  if (codePoint < FIRST_NON_ASCII_CODE_POINT) {
+    return codePoint >= ASCII_UPPER_A && codePoint <= ASCII_UPPER_Z
+      ? codePoint + ASCII_CASE_OFFSET
+      : codePoint;
+  }
+  const lower = String.fromCodePoint(codePoint).toLowerCase();
+  const folded = lower.codePointAt(0);
+  if (folded === undefined) {
+    return codePoint;
+  }
+  const foldedUnits = folded > LAST_SINGLE_UNIT_CODE_POINT ? 2 : 1;
+  return lower.length === foldedUnits ? folded : codePoint;
+}
+
+/**
+ * Compares two strings in natural order: the `natural` {@link StringCollation}.
+ *
+ * Each string is read as a sequence of tokens — a maximal run of ASCII digits,
+ * or a single code point — and the sequences compare token by token:
+ *
+ * - two digit runs by the numbers they write ({@link compareDigitRuns}), so
+ *   `Row2` precedes `Row10`;
+ * - otherwise by the tokens' first code points under {@link foldCodePoint}, so
+ *   `alpha` precedes `Beta`, and a digit — which no fold produces from any
+ *   other character — ranks against a letter or a symbol the same way whatever
+ *   run it opens;
+ * - a string that runs out first precedes the other (`Row` before `Row2`).
+ *
+ * Strings equal under all of that — `Row2` and `row2`, `Row7` and `Row007` —
+ * compare by UTF-16 code unit, so the order is total over distinct strings: a
+ * lexicographic order over one fixed token ranking, refined by code-unit
+ * order, and therefore transitive, which paging by offset relies on. Nothing
+ * here reads the host's locale or ICU data.
+ *
+ * @param left One string.
+ * @param right The other.
+ * @returns A negative number, zero (only for equal strings) or a positive number.
+ *
+ * @example
+ * ```ts
+ * ['Row10', 'row3', 'Row2', 'Beta', 'alpha'].sort(compareNatural);
+ * // ['alpha', 'Beta', 'Row2', 'row3', 'Row10']
+ * ```
+ */
+function compareNatural(left: string, right: string): number {
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    const leftUnit = left.charCodeAt(leftIndex);
+    const rightUnit = right.charCodeAt(rightIndex);
+    if (isAsciiDigit(leftUnit) && isAsciiDigit(rightUnit)) {
+      const leftEnd = digitRunEnd(left, leftIndex);
+      const rightEnd = digitRunEnd(right, rightIndex);
+      const order = compareDigitRuns(left, leftIndex, leftEnd, right, rightIndex, rightEnd);
+      if (order !== 0) {
+        return order;
+      }
+      leftIndex = leftEnd;
+      rightIndex = rightEnd;
+      continue;
+    }
+    const leftPoint = left.codePointAt(leftIndex) ?? leftUnit;
+    const rightPoint = right.codePointAt(rightIndex) ?? rightUnit;
+    const leftFolded = foldCodePoint(leftPoint);
+    const rightFolded = foldCodePoint(rightPoint);
+    if (leftFolded !== rightFolded) {
+      return leftFolded < rightFolded ? -1 : 1;
+    }
+    leftIndex += leftPoint > LAST_SINGLE_UNIT_CODE_POINT ? 2 : 1;
+    rightIndex += rightPoint > LAST_SINGLE_UNIT_CODE_POINT ? 2 : 1;
+  }
+  if (leftIndex < left.length) {
+    return 1;
+  }
+  if (rightIndex < right.length) {
+    return -1;
+  }
+  if (left === right) {
+    return 0;
+  }
+  return left < right ? -1 : 1;
 }
 
 /**
@@ -1742,6 +2018,36 @@ function orderMetrics(values: readonly MetricValue[]): MetricValue[] {
   return ordered;
 }
 
+/** A count as display text, digits grouped the same way on every host. */
+function formatCount(count: number): string {
+  return count.toLocaleString('en-US');
+}
+
+/**
+ * The note every metric value answered from a partial capture summary carries:
+ * how many of the capture's events the value was computed from. Counts only —
+ * a note is product prose a renderer shows verbatim.
+ *
+ * @param summarized The events the summary was computed from, its `eventCount`.
+ * @param stored The events the capture holds, its stamp's `count`.
+ */
+function partialCoverageNote(summarized: number, stored: number): string {
+  return `Based on the first ${formatCount(summarized)} of ${formatCount(stored)} captured events.`;
+}
+
+/**
+ * A summary's metric values, each carrying `note` after any note of its own
+ * (such as the same-origin caveat of `transferred_bytes`). Nothing else
+ * changes: an `available: false` value stays unavailable with no value, and
+ * the order is the summary's, which {@link orderMetrics} then fixes.
+ */
+function withCoverageNote(values: readonly MetricValue[], note: string): MetricValue[] {
+  return values.map((value) => ({
+    ...value,
+    note: value.note === undefined ? note : `${value.note} ${note}`,
+  }));
+}
+
 /**
  * The roots of a tree reduced to the nodes `keep` selects **and every ancestor
  * of one**, each surviving node otherwise unchanged.
@@ -2190,20 +2496,52 @@ function sharedAggregateInput(
 }
 
 /**
+ * The `metrics` value of events whose query groups are already in hand.
+ *
+ * `computeMetrics` reads its `query_count` off the query groups of its input,
+ * and aggregating them is most of its cost; handed the groups `queries`
+ * computed from the very same events, it skips that second aggregation. The
+ * value is identical: the groups' bounds cut sample lists only, never the
+ * execution counts `query_count` sums.
+ *
+ * @param events The metrics input — the same array the groups were computed from.
+ * @param queries The `queries` value of `events`.
+ * @returns What `AGGREGATE_COMPUTE.metrics(events)` returns.
+ */
+function metricsWithQueries(
+  events: readonly TelemetryEvent[],
+  queries: AggregateValues['queries'],
+): AggregateValues['metrics'] {
+  return computeMetrics(events, { precomputed: { queries } });
+}
+
+/**
  * Every aggregate source computed from one shared traversal: the bundle a
  * cold read of an every-kind source caches, one explicit property per source.
+ *
+ * When `queries` and `metrics` share one input — every filter that narrows by
+ * the trace alone, where both are the trace's whole slice — the metrics reuse
+ * the query groups ({@link metricsWithQueries}) rather than aggregate them a
+ * second time; under a narrower filter the two inputs differ and each is
+ * computed from its own.
  */
 function computeBundle(shared: SharedSlices): AggregateValues {
+  const queriesInput = sharedAggregateInput('queries', shared);
+  const metricsInput = sharedAggregateInput('metrics', shared);
+  const queries = AGGREGATE_COMPUTE.queries(queriesInput);
   return {
     renders: AGGREGATE_COMPUTE.renders(sharedAggregateInput('renders', shared)),
     componentTree: AGGREGATE_COMPUTE.componentTree(sharedAggregateInput('componentTree', shared)),
     requests: AGGREGATE_COMPUTE.requests(sharedAggregateInput('requests', shared)),
-    queries: AGGREGATE_COMPUTE.queries(sharedAggregateInput('queries', shared)),
+    queries,
     stateTransitions: AGGREGATE_COMPUTE.stateTransitions(
       sharedAggregateInput('stateTransitions', shared),
     ),
     graph: AGGREGATE_COMPUTE.graph(sharedAggregateInput('graph', shared)),
-    metrics: AGGREGATE_COMPUTE.metrics(sharedAggregateInput('metrics', shared)),
+    metrics:
+      queriesInput === metricsInput
+        ? metricsWithQueries(metricsInput, queries)
+        : AGGREGATE_COMPUTE.metrics(metricsInput),
   };
 }
 
@@ -2714,7 +3052,9 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
    *
    * The requested sort — or the source's default when none is named — reaches
    * the store unchanged, with {@link FLAT_SOURCE_GROUP_KEY} as the group
-   * `count_desc` ranks by (the other two sorts do not read it), so the store
+   * `count_desc` ranks by (the other two sorts do not read it), and with
+   * `parentFirst` exactly when the source's chain for that sort is the
+   * canonical parent-first order (`spans` under `start_asc`), so the store
    * applies exactly the chain {@link SOURCE_SORT_KEYS} states for the source.
    */
   const readEventRows = (
@@ -2730,12 +3070,16 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
       return ok(applyPage<TelemetryEvent>([], paging));
     }
 
+    const sort = effectiveSort(source, requested);
+    const chains: Readonly<Record<DataQuerySort, SortChain<TelemetryEvent>>> =
+      SOURCE_SORT_KEYS[source];
     const page = guarded('reading a page of events', () =>
       telemetry.query({
         sessionId: scope.sessionId,
         captureId,
         ...narrowing,
-        sort: effectiveSort(source, requested),
+        sort,
+        ...(leadsParentFirst(chains[sort]) ? { parentFirst: true } : {}),
         groupBy: FLAT_SOURCE_GROUP_KEY,
         limit: paging.limit,
         offset: paging.offset,
@@ -2909,14 +3253,24 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
   };
 
   /**
-   * The summary's metrics when it accounts for **every** event the capture now
-   * holds — its `eventCount` equals the capture's stored count, read here —
-   * and `undefined` otherwise.
+   * The summary's metrics when they may answer the unfiltered read, read
+   * against the capture's stored count, and `undefined` when the values must
+   * be computed from the capture's events instead:
    *
-   * A summary computed from part of the capture (the summarizer reads a
-   * bounded prefix) or before later events arrived does not account for all of
-   * them and is not used, so the metric cards never show totals of a prefix as
-   * the capture's.
+   * - **Every event covered** — the summary's `eventCount` equals the stored
+   *   count: its values, unchanged.
+   * - **A capture above the ceiling** — it holds more than
+   *   {@link MAX_AGGREGATE_INPUT_EVENTS} events, so computing its values would
+   *   be refused (`aggregate-input-too-large`): the summary's values, each
+   *   carrying a note stating how many of the capture's events they were
+   *   computed from ({@link partialCoverageNote}). The capture stage computes
+   *   the summary from the capture's first events up to this same ceiling, so
+   *   this is the most of the capture any read could describe, and the note
+   *   keeps a total of part of it from reading as the whole capture's.
+   * - **Otherwise** — a summary of part of a capture that fits the ceiling, or
+   *   one taken before later events arrived: `undefined`, so the values are
+   *   computed from every event and the cards never show totals of a prefix as
+   *   the capture's.
    */
   const coveringMetrics = (
     log: Logger,
@@ -2932,33 +3286,48 @@ export function createPanelDataResolver(deps: PanelDataResolverDeps): PanelDataR
     if (!stamp.ok) {
       return err(stamp.error);
     }
-    if (summary.eventCount !== stamp.value.count) {
-      log.debug('The capture summary does not cover every stored event; computing the metrics.', {
-        source,
-        summarized: summary.eventCount,
-        stored: stamp.value.count,
-      });
-      return ok(undefined);
+    const stored = stamp.value.count;
+    if (summary.eventCount === stored) {
+      return ok(summary.metrics);
     }
-    return ok(summary.metrics);
+    if (stored > MAX_AGGREGATE_INPUT_EVENTS) {
+      log.info(
+        'The capture holds more events than one view aggregates; the metrics are the stored summary’s, noted with its coverage.',
+        {
+          source,
+          summarized: summary.eventCount,
+          stored,
+          bound: MAX_AGGREGATE_INPUT_EVENTS,
+        },
+      );
+      return ok(withCoverageNote(summary.metrics, partialCoverageNote(summary.eventCount, stored)));
+    }
+    log.debug('The capture summary does not cover every stored event; computing the metrics.', {
+      source,
+      summarized: summary.eventCount,
+      stored,
+    });
+    return ok(undefined);
   };
 
   /**
-   * The metric values of the capture, before ordering, always describing every
-   * event of it.
+   * The metric values of the capture, before ordering, describing every event
+   * of it — or, for a capture above the ceiling, saying in each value's note
+   * how many of its events they describe.
    *
    * Filtered, the values computed over the events the filter selects — the
    * `metrics` value of the filter's bundle — because a summary describes the
    * whole capture and would silently ignore the filter.
    *
    * Unfiltered, a capture summary's values when one accounts for every stored
-   * event, and the values computed from the whole capture otherwise: the
-   * summary takes precedence. Whichever answers is cached as the entry's
-   * `unfilteredMetrics` under the capture's generation, so a repeated read is
-   * one generation read — it neither reloads the summary nor recounts the
-   * capture. After the summary settles, the generation, the coverage count
-   * and any computation are read in one synchronous turn, so the answer
-   * cached describes exactly the rows that generation names.
+   * event, its noted values when the capture is above the ceiling
+   * ({@link coveringMetrics}), and the values computed from the whole capture
+   * otherwise: the summary takes precedence. Whichever answers is cached as
+   * the entry's `unfilteredMetrics` under the capture's generation, so a
+   * repeated read is one generation read — it neither reloads the summary nor
+   * recounts the capture. After the summary settles, the generation, the
+   * coverage count and any computation are read in one synchronous turn, so
+   * the answer cached describes exactly the rows that generation names.
    */
   const metricValues = async (
     log: Logger,

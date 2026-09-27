@@ -32,6 +32,17 @@ import {
  * once by the root layout, so a notice raised anywhere in the application
  * appears in the same place, styled the same way, and is announced once.
  *
+ * TWO CONTEXTS: THE QUEUE, AND THE OPERATIONS ALONE
+ * What is published is split by who needs it. `useToastCenter()` reads the
+ * queue together with its operations, and its value changes whenever a notice
+ * arrives or retires - which is what the viewport, the one component that
+ * paints the queue, needs. `useToastActions()` reads the three operations and
+ * nothing else, from a context whose value never changes for the life of the
+ * provider, because each operation is itself stable. A component that only
+ * raises notices reads the second, and is handed nothing new when a notice
+ * elsewhere arrives or retires: the queue is not its concern. Both hooks throw
+ * outside the provider, for the reason `useToastCenter` gives.
+ *
  * Nothing here talks to the network or to the database: a notice is a local
  * statement about something that already happened elsewhere.
  */
@@ -88,6 +99,12 @@ export interface ToastCenter {
   readonly clearToasts: () => void;
 }
 
+/**
+ * The queue's three operations without the queue, as `useToastActions`
+ * publishes them. Each keeps the contract documented on {@link ToastCenter}.
+ */
+export type ToastActions = Pick<ToastCenter, 'showToast' | 'dismissToast' | 'clearToasts'>;
+
 export interface ToastProviderProps {
   readonly children: ReactNode;
   /** Lifetime for notices that do not ask for one, in milliseconds. */
@@ -130,6 +147,40 @@ export function useToastCenter(): ToastCenter {
   }
 
   return center;
+}
+
+/**
+ * The operations alone, or `null` outside a `<ToastProvider>` - which is the
+ * case `useToastActions` turns into an error. The value is one object for the
+ * life of the provider; see the header.
+ */
+const ToastActionsContext = createContext<ToastActions | null>(null);
+
+/**
+ * Reads the notification queue's operations, without the queue.
+ *
+ * For a component that raises or retires notices and never lists them: the
+ * value does not change as notices come and go, so such a component is not
+ * handed a new value every time the queue moves. Throws outside
+ * `<ToastProvider>`, exactly as `useToastCenter` does and for the same reason.
+ *
+ * @example A control that reports how its own action went.
+ * ```tsx
+ * const { showToast } = useToastActions();
+ * showToast({ tone: 'success', title: 'Saved' });
+ * ```
+ */
+export function useToastActions(): ToastActions {
+  const actions = useContext(ToastActionsContext);
+
+  if (actions === null) {
+    throw new Error(
+      'useToastActions must be called from a component inside <ToastProvider>. ' +
+        'The root layout mounts the provider around the whole application.',
+    );
+  }
+
+  return actions;
 }
 
 /**
@@ -225,10 +276,19 @@ export function ToastProvider({
     };
   }, [toasts]);
 
-  const value = useMemo<ToastCenter>(
-    () => ({ toasts, showToast, dismissToast, clearToasts }),
-    [toasts, showToast, dismissToast, clearToasts],
+  // The operations alone. All three are stable callbacks - `showToast` changes
+  // only if the mount's own `autoDismissMs` does - so this object keeps its
+  // identity as the queue moves, which is the whole point of the second context.
+  const actions = useMemo<ToastActions>(
+    () => ({ showToast, dismissToast, clearToasts }),
+    [showToast, dismissToast, clearToasts],
   );
 
-  return <ToastCenterContext.Provider value={value}>{children}</ToastCenterContext.Provider>;
+  const value = useMemo<ToastCenter>(() => ({ toasts, ...actions }), [toasts, actions]);
+
+  return (
+    <ToastActionsContext.Provider value={actions}>
+      <ToastCenterContext.Provider value={value}>{children}</ToastCenterContext.Provider>
+    </ToastActionsContext.Provider>
+  );
 }

@@ -18,6 +18,11 @@
  * unrelated events cannot be combined into one reference, a cited span the
  * port cannot look up fails closed, and a rejected analysis reaches the store
  * not at all.
+ *
+ * The third suite pins the stage's single source of evidence: one build call,
+ * whose summary — the one describing exactly the events the input aggregated —
+ * is what the fact candidates are derived from, what the stored metrics are
+ * taken from and what the result reports.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -38,7 +43,8 @@ import type {
 } from '@debuggen/protocol';
 import { DebuggenError, err, noopLogger, ok } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
-import type { CaptureSummary } from '@debuggen/telemetry';
+import { computeCaptureSummary } from '@debuggen/telemetry';
+import type { CaptureSummary, MetricValue, TelemetryEvent } from '@debuggen/telemetry';
 
 import {
   FACT_VERIFICATION_ISSUE_CODES,
@@ -53,7 +59,10 @@ import type {
   FactVerificationContext,
   FactVerificationReport,
 } from '../../analysis/facts.js';
-import type { AnalysisStageInputBuild } from '../../analysis/summarize.js';
+import type {
+  AnalysisStageInputBuild,
+  AnalysisStageInputRequest,
+} from '../../analysis/summarize.js';
 import type { PipelineCodeHandles, PipelineStageContext } from '../context-builder.js';
 import { ANALYSIS_BROADCAST_KINDS, createAnalyzeStage } from './analyze.js';
 import type { AnalyzeStageDeps } from './analyze.js';
@@ -143,10 +152,9 @@ function fakeProvider(): ModelProvider {
   };
 }
 
-function deps(
-  overrides: Partial<Pick<AnalyzeStageDeps, 'broadcaster' | 'facts'>> = {},
-): AnalyzeStageDeps {
-  const build = {
+/** The build the fake summarizer answers with: only the fields the stage passes along. */
+function fakeBuild(summary: CaptureSummary): AnalysisStageInputBuild {
+  return {
     input: { truncated: { sections: [] }, factCandidates: [] },
     stats: {
       eventsConsidered: 1,
@@ -158,7 +166,14 @@ function deps(
       sectionsTruncated: 0,
       droppedForBudget: 0,
     },
+    summary,
   } as unknown as AnalysisStageInputBuild;
+}
+
+function deps(
+  overrides: Partial<Pick<AnalyzeStageDeps, 'broadcaster' | 'facts' | 'summarizer'>> = {},
+): AnalyzeStageDeps {
+  const build = fakeBuild({ metrics: [] } as unknown as CaptureSummary);
   return {
     contextBuilder: {
       buildAnalyzeRequest: () =>
@@ -175,8 +190,7 @@ function deps(
         }),
     },
     provider: fakeProvider(),
-    summarizer: {
-      loadCaptureSummary: () => Promise.resolve(ok({ metrics: [] } as unknown as CaptureSummary)),
+    summarizer: overrides.summarizer ?? {
       buildStageInput: () => Promise.resolve(ok(build)),
     },
     facts: overrides.facts ?? {
@@ -810,5 +824,133 @@ describe('analysis facts: every citation resolves to one captured event', () => 
     expect(Object.keys(FACT_VERIFICATION_ISSUE_REASONS).sort()).toEqual(
       [...FACT_VERIFICATION_ISSUE_CODES].sort(),
     );
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * One event set: the stored metrics, the fact candidates and the result summary (AAP §0.8.4)
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Two persisted events of {@link CAPTURE_ID}: an interaction and the render it caused. */
+function consistencyEvents(): TelemetryEvent[] {
+  const shared = {
+    sessionId: SESSION_ID,
+    captureId: CAPTURE_ID,
+    traceId: '5c2f4e8a1b3d4f6a8c0e2a4b6d8f0a1c',
+    status: 'ok' as const,
+    producerId: 'producer-analyze-suite',
+  };
+  return [
+    {
+      ...shared,
+      id: 'evt-interaction-1',
+      spanId: '1a2b3c4d5e6f7a8b',
+      kind: 'interaction',
+      tier: 'browser',
+      name: 'click',
+      startTime: FIXED_EPOCH_MS,
+      duration: 12,
+      attributes: {},
+      seq: 1,
+      ingestSeq: 1,
+    },
+    {
+      ...shared,
+      id: 'evt-render-1',
+      spanId: '2b3c4d5e6f7a8b9c',
+      parentSpanId: '1a2b3c4d5e6f7a8b',
+      kind: 'render',
+      tier: 'browser',
+      name: 'LedgerRow',
+      startTime: FIXED_EPOCH_MS + 2,
+      duration: 3,
+      attributes: { component: 'LedgerRow', phase: 'update', trigger: 'props' },
+      seq: 2,
+      ingestSeq: 2,
+    },
+  ];
+}
+
+describe('analyze stage: the stored metrics, the fact candidates and the result describe one event set', () => {
+  it('builds once, derives the candidates from the build summary and stores that summary’s metrics', async () => {
+    const summary = computeCaptureSummary(consistencyEvents(), {
+      captureId: CAPTURE_ID,
+      sessionId: SESSION_ID,
+    });
+    const build = fakeBuild(summary);
+    const requests: AnalysisStageInputRequest[] = [];
+    const derivedFrom: CaptureSummary[] = [];
+    const storedMetrics: (readonly MetricValue[])[] = [];
+    const stage = createAnalyzeStage(
+      deps({
+        summarizer: {
+          buildStageInput: (request) => {
+            requests.push(request);
+            // The summarizer calls the derivation with the input it assembled and its summary.
+            const derived = request.options?.deriveFactCandidates?.({
+              input: build.input,
+              summary: build.summary,
+            });
+            expect(derived).toEqual([]);
+            return Promise.resolve(ok(build));
+          },
+        },
+        facts: {
+          candidatesFor: (source) => {
+            derivedFrom.push(source.summary);
+            return [];
+          },
+          verifyFindings: () => Promise.resolve(ok(FINDINGS)),
+          verificationReportFor: () => Promise.resolve(ok(VERIFICATION)),
+          acceptFindings: (findings, context) => {
+            expect(findings).toStrictEqual(FINDINGS);
+            storedMetrics.push(context.metrics);
+            return Promise.resolve(ok(STORED));
+          },
+        },
+      }),
+    );
+
+    const result = await stage.run(stageContext(), RUN_INPUT);
+
+    expect(result.ok).toBe(true);
+    // One build: the capture is read and aggregated once, the candidates derived inside it.
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.captureId).toBe(CAPTURE_ID);
+    expect(requests[0]?.options?.deriveFactCandidates).toBeTypeOf('function');
+    // The candidates, the stored metrics and the reported summary are the build's summary.
+    expect(derivedFrom).toHaveLength(1);
+    expect(derivedFrom[0]).toBe(summary);
+    expect(storedMetrics).toHaveLength(1);
+    expect(storedMetrics[0]).toBe(summary.metrics);
+    expect(result.ok && result.value.summary).toBe(summary);
+  });
+
+  it('fails the stage with the build error and stores nothing when the capture is empty', async () => {
+    let accepted = 0;
+    const empty = new DebuggenError(
+      'CAPTURE_EMPTY',
+      'No telemetry was captured. Interact with the page while capture is running, then Capture again.',
+    );
+    const stage = createAnalyzeStage(
+      deps({
+        summarizer: { buildStageInput: () => Promise.resolve(err(empty)) },
+        facts: {
+          candidatesFor: () => [],
+          verifyFindings: () => Promise.resolve(ok(FINDINGS)),
+          verificationReportFor: () => Promise.resolve(ok(VERIFICATION)),
+          acceptFindings: () => {
+            accepted += 1;
+            return Promise.resolve(ok(STORED));
+          },
+        },
+      }),
+    );
+
+    const result = await stage.run(stageContext(), RUN_INPUT);
+
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.error.code).toBe('CAPTURE_EMPTY');
+    expect(accepted).toBe(0);
   });
 });

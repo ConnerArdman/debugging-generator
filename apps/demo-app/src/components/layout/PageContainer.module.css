@@ -4,10 +4,11 @@
  * Imported by exactly one file, its sibling `PageContainer.tsx`
  * (`import styles from './PageContainer.module.css';`), which `app/layout.tsx` mounts once around
  * `{children}`. Every route therefore renders through these rules, which is why the file owns only
- * structure: the page measure, the page gutters, the top offset that keeps the sticky header off
- * the first line of content, and the vertical rhythm of the optional heading block. Page-specific
- * geometry belongs to the page's own component modules, and the header, nav and footer landmarks
- * are owned by `SiteHeader`, `SiteNav` and `SiteFooter`.
+ * structure: the page measure, the page gutters, the space between the navigation row and the
+ * first line of content, the scroll margin that keeps a skip-link jump clear of the sticky header,
+ * and the vertical rhythm of the optional heading block. Page-specific geometry belongs to the
+ * page's own component modules, and the header, nav and footer landmarks are owned by
+ * `SiteHeader`, `SiteNav` and `SiteFooter`.
  *
  * The class set is a closed contract with `PageContainer.tsx`, which consumes all eight and
  * nothing else:
@@ -27,20 +28,32 @@
  * Prettier normalises CSS colours and `pnpm format:check` is a blocking gate.
  *
  * Stacking and position are deliberately absent. The header's sticky behaviour and the drawer and
- * toast tiers live in their own modules; this file offsets content beneath the header with
- * padding and never competes for the same layer.
+ * toast tiers live in their own modules. The header is `position: sticky`, so it stays in the
+ * page column and already occupies its own `--ls-header-height` above the navigation row and this
+ * region; the top padding here is therefore one rhythm step measured from the navigation row,
+ * never the header's height, and the header only matters to this file where content is scrolled
+ * underneath it - the skip-link jump that `scroll-margin-block-start` below provides for.
  */
 
 .root {
-  /* The gutter is one property so that `.inner` reads it once and the breakpoint below is the
-   * only place it changes. */
+  /* The gutter is one property so that `.inner` reads it once and the gutter breakpoint below is
+   * the only place it changes. */
   --page-gutter: var(--ls-space-4, 16px);
 
-  /* The header's height plus one space step. Used twice, and it has to be the same value both
-   * times: as `padding-block-start` it keeps the first line of content clear of the sticky
-   * header, and as `scroll-margin-block-start` it stops an in-page jump to `#main` - the target
-   * of the header's "Skip to content" link - from parking that line underneath it. */
-  --page-offset: calc(var(--ls-header-height, 64px) + var(--ls-space-4, 16px));
+  /* The space between the navigation row's hairline and the first line of the route - a
+   * breadcrumb, a title or the content itself. One rhythm step, the same step the heading block
+   * leaves between its hairline and the content, so every route opens at the same distance under
+   * the navigation whether or not it renders a heading. It is not a header offset: the sticky
+   * header sits in the page column above the navigation row, so its height is already spent
+   * before this region starts, and adding it again here would leave an empty band of exactly that
+   * height under the navigation. */
+  --page-space-start: var(--ls-space-5, 24px);
+
+  /* The header's height plus one space step, used only as `scroll-margin-block-start`. An in-page
+   * jump to `#main` - the target of the header's "Skip to content" link - scrolls this region's
+   * top edge to the top of the viewport, where the sticky header then covers it; the margin parks
+   * that edge just below the header instead, so the first line of content is readable at once. */
+  --page-scroll-offset: calc(var(--ls-header-height, 64px) + var(--ls-space-4, 16px));
   --page-space-end: var(--ls-space-6, 32px);
 
   /* The three page measures. `default` is the shared page width the header, nav and footer also
@@ -83,9 +96,9 @@
    * the column. */
   flex: 1 1 auto;
   min-width: 0;
-  padding-block-start: var(--page-offset);
+  padding-block-start: var(--page-space-start);
   padding-block-end: var(--page-space-end);
-  scroll-margin-block-start: var(--page-offset);
+  scroll-margin-block-start: var(--page-scroll-offset);
 }
 
 /* `PageContainer.tsx` sets `tabIndex={-1}` on this element so the skip link can move focus into
@@ -191,15 +204,10 @@
   min-width: 0;
 }
 
-/* The file's only breakpoint. A custom property cannot be read inside a media query, so the
+/* The heading block's breakpoint. A custom property cannot be read inside a media query, so the
  * length here is a literal; it is 48rem - 768px at the default root size - which is where there
- * is room for the title and its actions on one line, and where the wider gutter starts to look
- * intentional rather than wasteful. */
+ * is room for the title and its actions on one line. */
 @media (min-width: 48rem) {
-  .root {
-    --page-gutter: var(--ls-space-6, 32px);
-  }
-
   /* A second, content-sized column for the actions. Dense packing is what lets them rise to the
    * title's row without the source order changing: every child names its column and leaves its
    * row to the grid, so the actions take the first row where the trailing column is free - the
@@ -230,5 +238,18 @@
   .actions {
     grid-column: 2;
     justify-self: end;
+  }
+}
+
+/* The gutter breakpoint, and the alignment contract the site chrome keeps with this file: the
+ * header (`SiteHeader.module.css`) and the footer (`SiteFooter.module.css`) cap themselves at the
+ * same `--ls-page-max` measure, start from the same `--ls-space-4` gutter and widen it to
+ * `--ls-space-5` at this same 960px, so the logo, the first line of every route and the footer
+ * columns share one left edge at every width. Written in `px` rather than `rem` because both of
+ * those files state it in `px`, and the three have to switch at the same viewport width whatever
+ * the reader's root font size is. */
+@media (min-width: 960px) {
+  .root {
+    --page-gutter: var(--ls-space-5, 24px);
   }
 }

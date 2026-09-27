@@ -135,7 +135,11 @@
  *     rendered panel; a second horizontal scroller inside it would hide
  *     controls behind a gesture nobody looks for. `dg-toolbar--wrap` goes one
  *     step further and lets the individual sections break internally as well,
- *     for the narrowest surfaces.
+ *     for the narrowest surfaces. The result indicators are the one section
+ *     whose width the DATA decides — a count, a paused note, a truncation
+ *     notice — so that section may also narrow to its row, and in the
+ *     `--wrap` form a long statement breaks onto a second line inside its
+ *     badge instead of standing wider than the bar.
  *   - A wrapper element is emitted only when its section has content, so the
  *     stylesheet never has to style — or reserve the gap around — an empty box.
  *   - Spacing is the block's `gap`, never a margin between siblings, which is
@@ -489,10 +493,11 @@ export interface ToolbarProps {
   compact?: boolean | undefined;
 
   /**
-   * Let the individual sections break internally as well, and let the search
-   * field span its row, for the narrowest surfaces. Defaults to `false`, where
-   * the bar breaks between sections and keeps each section's controls on one
-   * line.
+   * Let the individual sections break internally as well, let the search
+   * field span its row, and let a result indicator's text break inside its
+   * badge, for the narrowest surfaces. Defaults to `false`, where the bar
+   * breaks between sections, keeps each section's controls on one line and
+   * clips an indicator too long for its row at the badge's edge.
    *
    * Neither value ever produces a horizontal scroller: the bar wraps in both
    * (see the module note).

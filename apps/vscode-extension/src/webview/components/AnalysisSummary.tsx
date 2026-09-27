@@ -20,9 +20,34 @@
  * `AnalysisResult.observed` and `.likelyCauses` are the very `Fact[]` and
  * `Hypothesis[]` a panel summary holds — `@debuggen/protocol` composes the
  * panel schema's own element schemas and asserts the edge at compile time —
- * so the two arrays are handed to `SummaryHeader` as they arrived, with no cast
- * and no dependency on `@debuggen/panel-schema`, which this workspace may not
- * import (AAP 0.2.2).
+ * so both registers are handed to `SummaryHeader` in their own order and
+ * shape, with no cast and no dependency on `@debuggen/panel-schema`, which this
+ * workspace may not import (AAP 0.2.2).
+ *
+ * ## Line breaks in long statements
+ *
+ * A statement can quote a whole SQL statement shape, whose column list is one
+ * run of 80 characters or more with no space in it. The line breaker offers no
+ * break opportunity after `,`, `.` or `)` or before `(` when a letter or a
+ * quote is adjacent, so in a narrow sidebar such a run broke mid-identifier
+ * (`mo|vement_type`) under the head's `overflow-wrap`. The one display change
+ * this component makes is therefore invisible: inside a whitespace-free run of
+ * {@link LONG_RUN_MIN_LENGTH} characters or more, a U+200B ZERO WIDTH SPACE is
+ * inserted after each `,`, `.` and `)` and before each `(`, never at either end
+ * of the run and never in front of closing punctuation, so the run wraps
+ * between identifiers. Nothing else changes: a finding whose statement gains no
+ * break opportunity is handed on by reference, a changed one is a shallow copy
+ * with only `statement` replaced, and its evidence, confidence and suggested
+ * location are the analysis's own objects. The analysis itself is never
+ * mutated. Copying from the head removes the inserted characters again (see
+ * {@link stripBreakOpportunitiesOnCopy}), so a copied statement is the
+ * statement the analysis carries.
+ *
+ * The analysis's generation travels the same way: `analysisVersion`, and
+ * whether it `supersedes` an earlier analysis, become the head's `version`, so
+ * a follow-up's answer carries the same "Version n · Updates version n-1"
+ * indicator beside its title as the DevTools panel's head (AAP 0.4.2), drawn by
+ * `SummaryHeader` rather than by markup of this component's own.
  *
  * ## The four states, in precedence order
  *
@@ -36,6 +61,17 @@
  * A failure is therefore never presented as a successful analysis (AAP 0.5.5):
  * an error string never becomes an entry of the Observed region, and an error
  * outranks a stale analysis that may still be in state.
+ *
+ * ## Both registers always answer
+ *
+ * The head is the editor's only account of an analysis — the views that carry
+ * the evidence live in the DevTools panel — so both of its regions are always
+ * rendered here. `SummaryHeader` states an empty Observed register on its own;
+ * this component also passes `showEmptyCauses`, so an analysis that infers no
+ * cause keeps its "Likely cause" heading over `SummaryHeader`'s own muted
+ * sentence saying none was identified, instead of a head that reads as though
+ * its inference never arrived. The sentence is the design system's, not this
+ * file's, and it is never a list item, a confidence badge or a citation.
  *
  * ## The fallback banner
  *
@@ -62,8 +98,14 @@
  * ## Styling
  *
  * Two classes of `../styles.css`, both resolved against `--dg-*` tokens: the
- * `dgv-analysis` column and the `dgv-analysis__fallback` banner. No
- * `dg-summary-header*` block is restyled from here.
+ * `dgv-analysis` column and the `dgv-analysis__fallback` banner. The head's
+ * markup stays `SummaryHeader`'s. Its look inside this view is adjusted by that
+ * stylesheet's "Webview surface refinements" section, scoped under
+ * `.dgv-analysis`: the "Observed" and "Likely cause" headings take the large
+ * text role above the facts, the confidence badge is graded (high a solid
+ * accent, medium a tinted info chip, low a muted outline), and the inert
+ * evidence chips are drawn as neutral tags rather than the accent outline the
+ * DevTools panel gives its selectable chips.
  *
  * @example Wired from `App.tsx`, which owns the state and the host bridge
  * ```tsx
@@ -78,7 +120,7 @@
  * @module
  */
 
-import type { ReactElement } from 'react';
+import type { ClipboardEvent, ReactElement } from 'react';
 
 import {
   Badge,
@@ -148,6 +190,87 @@ const ROOT_CLASS = 'dgv-analysis';
 
 /** The element class of the fallback banner, from `../styles.css`. */
 const FALLBACK_CLASS = 'dgv-analysis__fallback';
+
+/**
+ * The invisible line-break opportunity inserted into a statement's display
+ * copy: U+200B ZERO WIDTH SPACE. It has no width and no glyph, and assistive
+ * technology does not announce it.
+ */
+const BREAK_OPPORTUNITY = '\u200B';
+
+/**
+ * The shortest whitespace-free run that receives break opportunities.
+ *
+ * Twenty characters of the 13 px fact role span roughly two thirds of the fact
+ * column in a 300 px sidebar, so a shorter run always fits on a line of its
+ * own and prose — "e.g.", "1,535.1", "f(x)" — is left exactly as written.
+ */
+const LONG_RUN_MIN_LENGTH = 20;
+
+/** A whitespace-free run of at least {@link LONG_RUN_MIN_LENGTH} characters. */
+const LONG_RUN = new RegExp(`\\S{${String(LONG_RUN_MIN_LENGTH)},}`, 'gu');
+
+/**
+ * The positions inside one run where a break opportunity is inserted, matched
+ * as zero-width positions:
+ *
+ * - after `,`, `.` or `)`, unless the run ends there or closing punctuation
+ *   follows — a line never starts with `.`, `,`, `;`, `:`, `!`, `?`, `)`, `]`,
+ *   `}` or `…`;
+ * - before `(`, unless the run starts there or another `(` precedes it.
+ *
+ * A position that qualifies both ways (`)(`) is matched once.
+ */
+const RUN_BREAK_POINT = /(?<=[,.)])(?=[^.,;:!?)\]}…])|(?<=[^(])(?=\()/gu;
+
+/**
+ * A statement's display copy, with break opportunities inside its long runs.
+ *
+ * @param statement The statement as the analysis carries it.
+ * @returns The same characters, with {@link BREAK_OPPORTUNITY} inserted at
+ *   every {@link RUN_BREAK_POINT} of every {@link LONG_RUN}; the input itself
+ *   when it has no such run.
+ */
+function withBreakOpportunities(statement: string): string {
+  return statement.replace(LONG_RUN, (run) => run.replace(RUN_BREAK_POINT, BREAK_OPPORTUNITY));
+}
+
+/**
+ * The display form of one fact or hypothesis.
+ *
+ * @param finding A finding of the analysis.
+ * @returns The finding itself when its statement gains no break opportunity;
+ *   otherwise a shallow copy whose `statement` is the display copy and whose
+ *   every other member — evidence, confidence, suggested location — is the
+ *   original's.
+ */
+function displayFinding<Finding extends { readonly statement: string }>(finding: Finding): Finding {
+  const statement = withBreakOpportunities(finding.statement);
+  return statement === finding.statement ? finding : { ...finding, statement };
+}
+
+/**
+ * Copies a selection from the head without the inserted break opportunities.
+ *
+ * Only a selection that contains {@link BREAK_OPPORTUNITY} is rewritten, and
+ * then as plain text; any other copy keeps the browser's default behaviour.
+ * Nothing is logged, and the clipboard receives exactly the selected text less
+ * those characters.
+ *
+ * @param event The copy event raised inside the analysis root.
+ */
+function stripBreakOpportunitiesOnCopy(event: ClipboardEvent<HTMLDivElement>): void {
+  const selection = event.currentTarget.ownerDocument.getSelection();
+  if (selection === null) {
+    return;
+  }
+  const selected = selection.toString();
+  if (!selected.includes(BREAK_OPPORTUNITY)) {
+    return;
+  }
+  event.clipboardData.setData('text/plain', selected.replaceAll(BREAK_OPPORTUNITY, ''));
+  event.preventDefault();
+}
 
 /**
  * Props of {@link AnalysisSummary}.
@@ -300,22 +423,28 @@ export function AnalysisSummary(props: AnalysisSummaryProps): ReactElement {
     );
   }
 
-  // The two registers, handed on by reference and together, exactly as the
-  // validated analysis supplied them — no headline, because an analysis has
-  // none and prose invented here would sit where a reader expects evidence.
+  // The two registers, together and in the validated analysis's own order —
+  // no headline, because an analysis has none and prose invented here would
+  // sit where a reader expects evidence. Each finding is its display form:
+  // itself, or a copy whose statement carries break opportunities.
   const summary: SummaryHeaderProps['summary'] = {
-    observed: analysis.observed,
-    likelyCauses: analysis.likelyCauses,
+    observed: analysis.observed.map(displayFinding),
+    likelyCauses: analysis.likelyCauses.map(displayFinding),
   };
 
   return (
-    <div className={className}>
+    <div className={className} onCopy={stripBreakOpportunitiesOnCopy}>
       {fallback ? <FallbackBanner /> : null}
       <SummaryHeader
         title={hasText(title) ? title : DEFAULT_TITLE}
         summary={summary}
+        version={{
+          current: analysis.analysisVersion,
+          supersedes: analysis.supersedes !== undefined,
+        }}
         headingLevel={HEAD_HEADING_LEVEL}
         openSource={onOpenSource}
+        showEmptyCauses
       />
     </div>
   );

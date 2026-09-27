@@ -50,14 +50,17 @@ import {
   DEFAULT_MAX_MAPS,
   INDEXER_VERSION,
   deriveRouteFromFile,
+  makeEdgeId,
   makeNodeId,
   matchRoute,
 } from '@debuggen/code-analysis';
 import type {
+  CodeEdge,
+  CodeEdgeKind,
   CodeMatch,
+  CodeNode,
   CodeNodeKind,
   CodeNodeOf,
-  CodePath,
   CodeQueries,
   CodeSymbolMatch,
   DbDriver,
@@ -132,6 +135,7 @@ import type { TelemetryEvent, TelemetryKind, TelemetryStatus } from '@debuggen/t
 
 import {
   CORROBORATION_CACHE_TTL_MS,
+  RESOLVE_YIELD_SLICE_MS,
   SOURCE_MAP_FAILURE_TTL_MS,
   SOURCE_MAP_SCOPE_IDLE_MS,
   SOURCE_RESOLUTION_MISS_REASONS,
@@ -217,6 +221,8 @@ const ATTR = Object.freeze({
   dbSystem: keyIn(DB_QUERY_ATTRIBUTE_KEYS, 'db.system'),
   dbClient: keyIn(DB_QUERY_ATTRIBUTE_KEYS, 'db.client'),
   dbOperation: keyIn(DB_QUERY_ATTRIBUTE_KEYS, 'db.operation'),
+  ormModel: keyIn(DB_QUERY_ATTRIBUTE_KEYS, 'model'),
+  ormMethod: keyIn(DB_QUERY_ATTRIBUTE_KEYS, 'method'),
 });
 
 /** The four patch `meta` keys, destructured from the one tuple `wrap-template.ts` declares. */
@@ -638,11 +644,15 @@ interface DbCallSpec {
   readonly symbol: string;
   readonly driver: DbDriver;
   readonly operation: string;
+  /** The model segment of a generated-client delegate call, as written in the source. */
+  readonly model?: string;
+  /** The last line of the call expression, when it spans several. */
+  readonly endLine?: number;
 }
 
 /** A database call-site node, exactly as the db-call extractor shapes one. */
 function dbCallNode(spec: DbCallSpec): CodeNodeOf<'db-call'> {
-  const { name, file, line, column, symbol, driver, operation } = spec;
+  const { name, file, line, column, symbol, driver, operation, model, endLine } = spec;
   return {
     id: makeNodeId({ kind: 'db-call', file, name, line, column }),
     kind: 'db-call',
@@ -650,10 +660,73 @@ function dbCallNode(spec: DbCallSpec): CodeNodeOf<'db-call'> {
     file,
     line,
     column,
+    ...(endLine === undefined ? {} : { endLine }),
     symbol,
-    data: { driver, operation, dynamic: false },
+    data: { driver, operation, ...(model === undefined ? {} : { model }), dynamic: false },
   };
 }
+
+/** A declared symbol's node, as the symbols extractor shapes one. */
+function symbolNode(declaration: Declaration): CodeNodeOf<'symbol'> {
+  const { name, file, line, column } = declaration;
+  return {
+    id: makeNodeId({ kind: 'symbol', file, name, line, column }),
+    kind: 'symbol',
+    name,
+    file,
+    line,
+    column,
+    symbol: name,
+  };
+}
+
+/** A React component's node spanning `declaration.line` to `endLine`, as the components extractor shapes one. */
+function componentNode(declaration: Declaration, endLine: number): CodeNodeOf<'component'> {
+  const { name, file, line, column } = declaration;
+  return {
+    id: makeNodeId({ kind: 'component', file, name, line, column }),
+    kind: 'component',
+    name,
+    file,
+    line,
+    column,
+    endLine,
+    data: { isClient: true, isDefaultExport: false, displayName: name },
+  };
+}
+
+/** An inline event handler's node spanning `declaration.line` to `endLine`. */
+function handlerNode(declaration: Declaration, endLine: number): CodeNodeOf<'handler'> {
+  const { name, file, line, column } = declaration;
+  return {
+    id: makeNodeId({ kind: 'handler', file, name, line, column }),
+    kind: 'handler',
+    name,
+    file,
+    line,
+    column,
+    endLine,
+    data: { event: 'click', boundTo: 'button', inline: true },
+  };
+}
+
+/** One edge of the hand-written graph, identified exactly as the indexer identifies one. */
+function edgeOf(kind: CodeEdgeKind, from: CodeNode, to: CodeNode): CodeEdge {
+  return {
+    id: makeEdgeId({ kind, from: from.id, to: to.id, line: to.line, column: to.column }),
+    kind,
+    from: from.id,
+    to: to.id,
+  };
+}
+
+/** The declarations and edges of a hand-written graph beyond its database call sites. */
+interface GraphStructure {
+  readonly nodes: readonly CodeNode[];
+  readonly edges: readonly CodeEdge[];
+}
+
+const NO_STRUCTURE: GraphStructure = Object.freeze({ nodes: [], edges: [] });
 
 /** The code-graph match `findByName` answers for a database call site. */
 function dbCallMatch(node: CodeNodeOf<'db-call'>): CodeMatch {
@@ -667,15 +740,22 @@ function dbCallMatch(node: CodeNodeOf<'db-call'>): CodeMatch {
   };
 }
 
-/** A real `CodeGraph` over a hand-written index: no ts-morph project, no file read. */
-function graphOf(nodes: readonly CodeNodeOf<'db-call'>[]): CodeGraph {
+/**
+ * A real `CodeGraph` over a hand-written index: no ts-morph project, no file
+ * read. The call sites come first, in the order given, so a case can permute
+ * them; `structure` adds the declarations and edges reachability walks.
+ */
+function graphOf(
+  dbCalls: readonly CodeNodeOf<'db-call'>[],
+  structure: GraphStructure = NO_STRUCTURE,
+): CodeGraph {
   return CodeGraph.fromIndex({
     schemaVersion: CODE_INDEX_SCHEMA_VERSION,
     projectRoot: PROJECT_ROOT,
     indexerVersion: INDEXER_VERSION,
     generatedAt: BASE_TIME,
-    nodes,
-    edges: [],
+    nodes: [...dbCalls, ...structure.nodes],
+    edges: structure.edges,
     files: [],
   });
 }
@@ -737,17 +817,10 @@ function routeQueryResult(
  * Fakes for every injected dependency
  * ---------------------------------------------------------------------------------------------- */
 
-interface PathFixture {
-  readonly from: { readonly file: string; readonly symbol?: string };
-  readonly to: string;
-  readonly depth: number;
-}
-
 interface QueryFixture {
   readonly matches?: readonly CodeMatch[];
   readonly symbols?: readonly CodeSymbolMatch[];
   readonly routes?: readonly RouteEntry[];
-  readonly paths?: readonly PathFixture[];
 }
 
 interface FakeQueries {
@@ -769,7 +842,8 @@ interface FakeQueries {
  * A `CodeQueries` over hand-built answers. `findByName` honours `exact`,
  * `kinds` and `limit` the way the real queries do; the methods the resolver
  * has no business calling (`whoCalls`, `handlersFor`, `componentsRendering`,
- * `excerpt`) answer nothing and are asserted unused.
+ * `pathBetween`, `excerpt`) answer nothing and are asserted unused — a query
+ * owner's reach is searched over the injected graph's own edges.
  */
 function fakeQueries(fixture: QueryFixture = {}): FakeQueries {
   const findByName = vi.fn<CodeQueries['findByName']>((name, options) => {
@@ -794,28 +868,7 @@ function fakeQueries(fixture: QueryFixture = {}): FakeQueries {
   );
   const handlersFor = vi.fn<CodeQueries['handlersFor']>(() => []);
   const componentsRendering = vi.fn<CodeQueries['componentsRendering']>(() => []);
-  const pathBetween = vi.fn<CodeQueries['pathBetween']>((from, to, options) => {
-    if (typeof from === 'string' || typeof to !== 'string') {
-      return undefined;
-    }
-    const found = (fixture.paths ?? []).find(
-      (path) => path.to === to && path.from.file === from.file && path.from.symbol === from.symbol,
-    );
-    if (found === undefined) {
-      return undefined;
-    }
-    if (options?.maxDepth !== undefined && found.depth > options.maxDepth) {
-      return undefined;
-    }
-    const path: CodePath = {
-      nodes: [],
-      edges: [],
-      depth: found.depth,
-      undirected: false,
-      truncated: false,
-    };
-    return path;
-  });
+  const pathBetween = vi.fn<CodeQueries['pathBetween']>(() => undefined);
   const excerpt = vi.fn<CodeQueries['excerpt']>(() => undefined);
 
   const spies = [
@@ -994,6 +1047,7 @@ function standardProject() {
     symbol: 'latestReading',
     driver: 'prisma',
     operation: 'findMany',
+    model: 'reading',
   });
   const auditCall = dbCallNode({
     name: 'pool.query',
@@ -1010,12 +1064,52 @@ function standardProject() {
     matches: [component, outerComponent, fnSymbol, ...dbCalls.map(dbCallMatch)],
     symbols: [fnSymbol, ...handlerSymbols],
     routes: [routeEntry],
-    paths: [
-      { from: fnEndpoint, to: readingsCall.id, depth: 2 },
-      { from: fnEndpoint, to: latestCall.id, depth: 3 },
-      { from: { file: PROJECT.routeFile, symbol: 'GET' }, to: readingsCall.id, depth: 3 },
-    ],
   });
+
+  // The calls behind those call sites: the function reaches the driver call
+  // in two hops and the generated-client call in three; the route's `GET`
+  // calls the function, so it reaches them in three and four. Nothing reaches
+  // the audit call.
+  const fnNode = symbolNode(PROJECT.fn);
+  const getNode = symbolNode({ name: 'GET', file: PROJECT.routeFile, line: 5, column: 23 });
+  const readingsFor = symbolNode({
+    name: 'readingsFor',
+    file: PROJECT.storeFile,
+    line: 10,
+    column: 23,
+  });
+  const summarize = symbolNode({
+    name: 'summarizeReadings',
+    file: PROJECT.fn.file,
+    line: 30,
+    column: 17,
+  });
+  const latestReading = symbolNode({
+    name: 'latestReading',
+    file: PROJECT.storeFile,
+    line: 28,
+    column: 23,
+  });
+  const writeAudit = symbolNode({
+    name: 'writeAudit',
+    file: PROJECT.auditFile,
+    line: 6,
+    column: 23,
+  });
+  // The dial component's declaration spans the lines its mapped frames land on.
+  const dialNode = componentNode(PROJECT.component, 40);
+  const structure: GraphStructure = {
+    nodes: [fnNode, getNode, readingsFor, summarize, latestReading, writeAudit, dialNode],
+    edges: [
+      edgeOf('calls', getNode, fnNode),
+      edgeOf('calls', fnNode, readingsFor),
+      edgeOf('queries', readingsFor, readingsCall),
+      edgeOf('calls', fnNode, summarize),
+      edgeOf('calls', summarize, latestReading),
+      edgeOf('queries', latestReading, latestCall),
+      edgeOf('queries', writeAudit, auditCall),
+    ],
+  };
   return {
     component,
     outerComponent,
@@ -1026,7 +1120,9 @@ function standardProject() {
     auditCall,
     dbCalls,
     fnEndpoint,
-    graph: graphOf(dbCalls),
+    declarations: { fnNode, getNode, readingsFor, summarize, latestReading, writeAudit },
+    structure,
+    graph: graphOf(dbCalls, structure),
     fake,
     routes: fakeRouteMap([routeEntry]),
   };
@@ -2059,14 +2155,9 @@ describe('SourceResolver.resolveEvent', () => {
         expect(outcome.route).toBe(ROUTE.codeGraph);
         expect(outcome.location).toEqual(dbCallMatch(project.readingsCall).location);
         expect(parents.getBySpanId).toHaveBeenCalledWith(SESSION, parent.spanId);
-        expect(project.fake.pathBetween).toHaveBeenCalledWith(
-          project.fnEndpoint,
-          project.readingsCall.id,
-          expect.objectContaining({ direction: 'out' }),
-        );
-        expect(project.fake.pathBetween.mock.calls.length).toBeLessThanOrEqual(
-          project.dbCalls.length,
-        );
+        // Reachability is searched over the graph's own edges, once, rather
+        // than asked of the pair query candidate by candidate.
+        expect(project.fake.pathBetween).not.toHaveBeenCalled();
         expect(project.fake.whoCalls).not.toHaveBeenCalled();
       });
 
@@ -2090,11 +2181,6 @@ describe('SourceResolver.resolveEvent', () => {
         );
         expect(outcome.location).toEqual(dbCallMatch(project.readingsCall).location);
         expect(project.fake.hasSymbol).toHaveBeenCalledWith(PROJECT.routeFile, 'GET');
-        expect(project.fake.pathBetween).toHaveBeenCalledWith(
-          { file: PROJECT.routeFile, symbol: 'GET' },
-          project.readingsCall.id,
-          expect.objectContaining({ direction: 'out' }),
-        );
       });
 
       it('takes the handler from the request span when the route handler span names no method', async () => {
@@ -2117,32 +2203,24 @@ describe('SourceResolver.resolveEvent', () => {
           ),
         );
         expect(outcome.location).toEqual(dbCallMatch(project.readingsCall).location);
-        expect(project.fake.pathBetween).toHaveBeenCalledWith(
-          { file: PROJECT.routeFile, symbol: 'GET' },
-          project.readingsCall.id,
-          expect.objectContaining({ direction: 'out' }),
-        );
-        expect(project.fake.pathBetween).not.toHaveBeenCalledWith(
-          { file: PROJECT.routeFile },
-          expect.anything(),
-          expect.anything(),
-        );
+        expect(project.fake.hasSymbol).toHaveBeenCalledWith(PROJECT.routeFile, 'GET');
       });
 
       it('keeps a method-less route handler as the owner when no ancestor names the handler', async () => {
+        // The route module alone seeds the search from every node it holds,
+        // so the call site its handler reaches first still answers.
         const project = standardProject();
         const handler = makeEvent({
           kind: KIND.routeHandler,
           attributes: { [ATTR.nextRoute]: PROJECT.routePath },
         });
-        await resolverFor(project, { events: fakeParents([handler]).port }).resolveEvent(
-          pgQuery(handler.spanId),
+        const outcome = await resolved(
+          resolverFor(project, { events: fakeParents([handler]).port }).resolveEvent(
+            pgQuery(handler.spanId),
+          ),
         );
-        expect(project.fake.pathBetween).toHaveBeenCalledWith(
-          { file: PROJECT.routeFile },
-          expect.any(String),
-          expect.objectContaining({ direction: 'out' }),
-        );
+        expect(outcome.location).toEqual(dbCallMatch(project.readingsCall).location);
+        expect(project.fake.hasSymbol).not.toHaveBeenCalledWith(PROJECT.routeFile, 'GET');
       });
 
       it('takes the call site the enclosing function issues directly without a path search', async () => {
@@ -2179,11 +2257,491 @@ describe('SourceResolver.resolveEvent', () => {
         );
         expect(outcome.reason).toBe(reason('index-unavailable'));
       });
+
+      describe('statements an ORM issued', () => {
+        /**
+         * The invented project with more generated-client call sites behind
+         * its function: `calibrate`'s transaction (lines 50–70), whose callback
+         * also updates a gauge through the outer client; `archiveReadings`'
+         * transaction, whose callback the index cannot see into; and a gauge
+         * lookup. The audit module looks gauges up the same way, out of the
+         * function's reach. The driver call `readingsFor` issues stays the
+         * only driver call site the function reaches.
+         */
+        const ormProject = () => {
+          const base = standardProject();
+          const { fnNode, writeAudit } = base.declarations;
+          const clientCall = (spec: Omit<DbCallSpec, 'driver'>): CodeNodeOf<'db-call'> =>
+            dbCallNode({ ...spec, driver: 'prisma' });
+          const calibrateTx = clientCall({
+            name: 'prisma.$transaction',
+            file: PROJECT.storeFile,
+            line: 50,
+            column: 12,
+            endLine: 70,
+            symbol: 'calibrate',
+            operation: '$transaction',
+          });
+          const gaugeUpdate = clientCall({
+            name: 'prisma.gauge.update',
+            file: PROJECT.storeFile,
+            line: 55,
+            column: 11,
+            symbol: 'calibrate',
+            operation: 'update',
+            model: 'gauge',
+          });
+          const archiveTx = clientCall({
+            name: 'prisma.$transaction',
+            file: PROJECT.storeFile,
+            line: 90,
+            column: 12,
+            endLine: 110,
+            symbol: 'archiveReadings',
+            operation: '$transaction',
+          });
+          const gaugeLookup = clientCall({
+            name: 'prisma.gauge.findUnique',
+            file: PROJECT.storeFile,
+            line: 120,
+            column: 10,
+            symbol: 'gaugeById',
+            operation: 'findUnique',
+            model: 'gauge',
+          });
+          const auditLookup = clientCall({
+            name: 'prisma.gauge.findUnique',
+            file: PROJECT.auditFile,
+            line: 14,
+            column: 10,
+            symbol: 'writeAudit',
+            operation: 'findUnique',
+            model: 'gauge',
+          });
+          const calibrate = symbolNode({
+            name: 'calibrate',
+            file: PROJECT.storeFile,
+            line: 48,
+            column: 23,
+          });
+          const archive = symbolNode({
+            name: 'archiveReadings',
+            file: PROJECT.storeFile,
+            line: 88,
+            column: 23,
+          });
+          const gaugeById = symbolNode({
+            name: 'gaugeById',
+            file: PROJECT.storeFile,
+            line: 118,
+            column: 23,
+          });
+          const dbCalls = [
+            ...base.dbCalls,
+            calibrateTx,
+            gaugeUpdate,
+            archiveTx,
+            gaugeLookup,
+            auditLookup,
+          ];
+          const structure: GraphStructure = {
+            nodes: [...base.structure.nodes, calibrate, archive, gaugeById],
+            edges: [
+              ...base.structure.edges,
+              edgeOf('calls', fnNode, calibrate),
+              edgeOf('queries', calibrate, calibrateTx),
+              edgeOf('queries', calibrate, gaugeUpdate),
+              edgeOf('calls', fnNode, archive),
+              edgeOf('queries', archive, archiveTx),
+              edgeOf('calls', fnNode, gaugeById),
+              edgeOf('queries', gaugeById, gaugeLookup),
+              edgeOf('queries', writeAudit, auditLookup),
+            ],
+          };
+          const project: Project = {
+            ...base,
+            dbCalls,
+            structure,
+            graph: graphOf(dbCalls, structure),
+            fake: fakeQueries({ matches: dbCalls.map(dbCallMatch), symbols: [base.fnSymbol] }),
+          };
+          return { project, calibrateTx, gaugeUpdate, archiveTx, gaugeLookup, auditLookup };
+        };
+
+        /** A function span standing for `symbol` of `file`: the owner of what it runs. */
+        const ownerSpan = (symbol: string, file: string): TelemetryEvent =>
+          makeEvent({
+            kind: KIND.function,
+            attributes: { [ATTR.symbol]: symbol, [ATTR.module]: file },
+          });
+
+        /** A query span of `client` below `parent`. */
+        const querySpan = (
+          client: DbDriver,
+          parent: TelemetryEvent | undefined,
+          attributes: Readonly<Record<string, unknown>> = {},
+        ): TelemetryEvent =>
+          makeEvent({
+            kind: KIND.dbQuery,
+            ...(parent === undefined ? {} : { parentSpanId: parent.spanId }),
+            attributes: { [ATTR.dbClient]: client, ...attributes },
+          });
+
+        /** The ORM's operation span: `method`, on `model` when it is a delegate method. */
+        const operationSpan = (
+          parent: TelemetryEvent | undefined,
+          model: string | undefined,
+          method: string,
+        ): TelemetryEvent =>
+          querySpan('prisma', parent, {
+            [ATTR.dbOperation]: 'operation',
+            [ATTR.ormMethod]: method,
+            ...(model === undefined ? {} : { [ATTR.ormModel]: model }),
+          });
+
+        /** The ORM's statement span below `operation`, and the driver's statement span below it. */
+        const statementSpans = (operation: TelemetryEvent, verb: string) => {
+          const orm = querySpan('prisma', operation, { [ATTR.dbOperation]: 'db_query' });
+          const driver = querySpan('pg', orm, {
+            [ATTR.dbSystem]: 'postgresql',
+            [ATTR.dbOperation]: verb,
+          });
+          return { orm, driver };
+        };
+
+        it('locates a driver statement under an ORM operation at the ORM call, never the driver call in reach', async () => {
+          const { project } = ormProject();
+          const owner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+          const operation = operationSpan(owner, 'Reading', 'findMany');
+          const { orm, driver } = statementSpans(operation, 'SELECT');
+          const resolver = resolverFor(project, {
+            events: fakeParents([owner, operation, orm]).port,
+          });
+
+          // The model is matched case-insensitively: the runtime reports the
+          // model's declared name, the source spells the delegate property.
+          for (const span of [driver, orm, operation]) {
+            const outcome = await resolved(resolver.resolveEvent(span));
+            expect(outcome.location).toEqual(dbCallMatch(project.latestCall).location);
+          }
+        });
+
+        it('keeps the driver call site for a driver statement no ORM span encloses', async () => {
+          const { project } = ormProject();
+          const owner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+          const raw = querySpan('pg', owner, { [ATTR.dbOperation]: 'SELECT' });
+          const outcome = await resolved(
+            resolverFor(project, { events: fakeParents([owner]).port }).resolveEvent(raw),
+          );
+          expect(outcome.location).toEqual(dbCallMatch(project.readingsCall).location);
+        });
+
+        it('narrows a model method to the call site its owner reaches', async () => {
+          const { project, gaugeLookup, auditLookup } = ormProject();
+          const fnOwner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+          const auditOwner = ownerSpan('writeAudit', PROJECT.auditFile);
+          const fromFn = operationSpan(fnOwner, 'Gauge', 'findUnique');
+          const fromAudit = operationSpan(auditOwner, 'Gauge', 'findUnique');
+          const resolver = resolverFor(project, {
+            events: fakeParents([fnOwner, auditOwner]).port,
+          });
+
+          expect((await resolved(resolver.resolveEvent(fromFn))).location).toEqual(
+            dbCallMatch(gaugeLookup).location,
+          );
+          expect((await resolved(resolver.resolveEvent(fromAudit))).location).toEqual(
+            dbCallMatch(auditLookup).location,
+          );
+          // Without an owner both call sites answer, and neither is chosen.
+          const orphan = operationSpan(undefined, 'Gauge', 'findUnique');
+          expect((await unresolved(resolver.resolveEvent(orphan))).reason).toBe(
+            reason('ambiguous'),
+          );
+        });
+
+        it('settles an orphan ORM operation by the one call site of its model and method', async () => {
+          const { project } = ormProject();
+          const outcome = await resolved(
+            resolverFor(project).resolveEvent(operationSpan(undefined, 'Reading', 'findMany')),
+          );
+          expect(outcome.location).toEqual(dbCallMatch(project.latestCall).location);
+        });
+
+        it('reports two reachable transactions as ambiguous rather than picking the nearer', async () => {
+          const { project, calibrateTx } = ormProject();
+          const fnOwner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+          const calibrateOwner = ownerSpan('calibrate', PROJECT.storeFile);
+          const acrossBoth = operationSpan(fnOwner, undefined, '$transaction');
+          const withinOne = operationSpan(calibrateOwner, undefined, '$transaction');
+          const begin = querySpan('pg', acrossBoth, { [ATTR.dbOperation]: 'BEGIN' });
+          const resolver = resolverFor(project, {
+            events: fakeParents([fnOwner, calibrateOwner, acrossBoth, withinOne]).port,
+          });
+
+          for (const span of [acrossBoth, begin]) {
+            expect((await unresolved(resolver.resolveEvent(span))).reason).toBe(
+              reason('ambiguous'),
+            );
+          }
+          expect((await resolved(resolver.resolveEvent(withinOne))).location).toEqual(
+            dbCallMatch(calibrateTx).location,
+          );
+        });
+
+        it('counts an operation inside a transaction only at call sites within that transaction', async () => {
+          const { project, gaugeUpdate } = ormProject();
+          const owner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+          const transaction = operationSpan(owner, undefined, '$transaction');
+          const update = operationSpan(transaction, 'Gauge', 'update');
+          const { orm, driver } = statementSpans(update, 'UPDATE');
+          const resolver = resolverFor(project, {
+            events: fakeParents([owner, transaction, update, orm]).port,
+          });
+          for (const span of [driver, orm, update]) {
+            expect((await resolved(resolver.resolveEvent(span))).location).toEqual(
+              dbCallMatch(gaugeUpdate).location,
+            );
+          }
+        });
+
+        describe('a transaction told apart by the operations recorded under it', () => {
+          /**
+           * `ormProject` with both reachable transactions updating a gauge:
+           * `calibrate`'s also reads a reading (line 60), `archiveReadings'`
+           * does not — so an update inside a transaction matches a call site
+           * in each, and only the operations its span recorded say which
+           * transaction ran.
+           */
+          const twoUpdatingTransactions = () => {
+            const built = ormProject();
+            const { project } = built;
+            const nodeNamed = (name: string): CodeNode => {
+              const node = project.structure.nodes.find((candidate) => candidate.name === name);
+              if (node === undefined) {
+                throw new Error(`the ORM project declares no ${name}`);
+              }
+              return node;
+            };
+            const calibrateRead = dbCallNode({
+              name: 'prisma.reading.findFirst',
+              file: PROJECT.storeFile,
+              line: 60,
+              column: 11,
+              symbol: 'calibrate',
+              operation: 'findFirst',
+              model: 'reading',
+              driver: 'prisma',
+            });
+            const archiveUpdate = dbCallNode({
+              name: 'prisma.gauge.update',
+              file: PROJECT.storeFile,
+              line: 95,
+              column: 11,
+              symbol: 'archiveReadings',
+              operation: 'update',
+              model: 'gauge',
+              driver: 'prisma',
+            });
+            const dbCalls = [...project.dbCalls, calibrateRead, archiveUpdate];
+            const structure: GraphStructure = {
+              nodes: project.structure.nodes,
+              edges: [
+                ...project.structure.edges,
+                edgeOf('queries', nodeNamed('calibrate'), calibrateRead),
+                edgeOf('queries', nodeNamed('archiveReadings'), archiveUpdate),
+              ],
+            };
+            const variant: Project = {
+              ...project,
+              dbCalls,
+              structure,
+              graph: graphOf(dbCalls, structure),
+              fake: fakeQueries({
+                matches: dbCalls.map(dbCallMatch),
+                symbols: [project.fnSymbol],
+              }),
+            };
+            return { ...built, project: variant, calibrateRead, archiveUpdate };
+          };
+
+          it('locates the transaction and the operations inside it from one batch', async () => {
+            const { project, calibrateTx, gaugeUpdate, calibrateRead } = twoUpdatingTransactions();
+            const owner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+            const transaction = operationSpan(owner, undefined, '$transaction');
+            const begin = querySpan('pg', transaction, { [ATTR.dbOperation]: 'BEGIN' });
+            const update = operationSpan(transaction, 'Gauge', 'update');
+            const read = operationSpan(transaction, 'Reading', 'findFirst');
+            const updateStatement = statementSpans(update, 'UPDATE');
+            const batch = [
+              owner,
+              transaction,
+              begin,
+              update,
+              read,
+              ...Object.values(updateStatement),
+            ];
+
+            const locatedAt = unwrapOk(await resolverFor(project).resolveEvents(batch), 'batch');
+
+            for (const span of [transaction, begin]) {
+              expect(locatedAt.get(span.id)).toEqual(dbCallMatch(calibrateTx).location);
+            }
+            for (const span of [update, updateStatement.orm, updateStatement.driver]) {
+              expect(locatedAt.get(span.id)).toEqual(dbCallMatch(gaugeUpdate).location);
+            }
+            expect(locatedAt.get(read.id)).toEqual(dbCallMatch(calibrateRead).location);
+          });
+
+          it('stays ambiguous when the batch holds no operation that tells the transactions apart', async () => {
+            const { project } = twoUpdatingTransactions();
+            const owner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+            const transaction = operationSpan(owner, undefined, '$transaction');
+            const update = operationSpan(transaction, 'Gauge', 'update');
+            const statement = statementSpans(update, 'UPDATE');
+
+            const locatedAt = unwrapOk(
+              await resolverFor(project).resolveEvents([owner, transaction, update, statement.orm]),
+              'batch',
+            );
+
+            // Both transactions update a gauge: nothing recorded settles which ran.
+            for (const span of [transaction, update, statement.orm]) {
+              expect(locatedAt.has(span.id)).toBe(false);
+            }
+          });
+
+          it('keeps every transaction when no body holds all the operations recorded under it', async () => {
+            // An operation written in a helper outside the callback's range is
+            // no evidence about the transactions, so neither is ruled out.
+            const { project } = twoUpdatingTransactions();
+            const owner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+            const transaction = operationSpan(owner, undefined, '$transaction');
+            const update = operationSpan(transaction, 'Gauge', 'update');
+            const elsewhere = operationSpan(transaction, 'Reading', 'count');
+
+            const locatedAt = unwrapOk(
+              await resolverFor(project).resolveEvents([owner, transaction, update, elsewhere]),
+              'batch',
+            );
+
+            for (const span of [transaction, update]) {
+              expect(locatedAt.has(span.id)).toBe(false);
+            }
+          });
+        });
+
+        it('answers with the enclosing transaction when the operation inside it has no call site', async () => {
+          // Neither an operation made through the transaction's own client nor
+          // a same-named call elsewhere is a call site of that operation.
+          const { project, calibrateTx } = ormProject();
+          const calibrateOwner = ownerSpan('calibrate', PROJECT.storeFile);
+          const fnOwner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+          const inCalibrate = operationSpan(calibrateOwner, undefined, '$transaction');
+          const inFn = operationSpan(fnOwner, undefined, '$transaction');
+          const resolver = resolverFor(project, {
+            events: fakeParents([calibrateOwner, fnOwner, inCalibrate, inFn]).port,
+          });
+
+          for (const [model, method] of [
+            ['Reading', 'deleteMany'],
+            ['Gauge', 'findUnique'],
+          ] as const) {
+            const operation = operationSpan(inCalibrate, model, method);
+            const statement = statementSpans(operation, 'SELECT');
+            const scoped = resolverFor(project, {
+              events: fakeParents([calibrateOwner, inCalibrate, operation, statement.orm]).port,
+            });
+            for (const span of [operation, statement.orm, statement.driver]) {
+              expect((await resolved(scoped.resolveEvent(span))).location).toEqual(
+                dbCallMatch(calibrateTx).location,
+              );
+            }
+          }
+          const underBoth = operationSpan(inFn, 'Reading', 'deleteMany');
+          expect((await unresolved(resolver.resolveEvent(underBoth))).reason).toBe(
+            reason('ambiguous'),
+          );
+        });
+
+        it('never falls back to a driver call site when the ORM recorded no operation', async () => {
+          const { project } = ormProject();
+          const fnOwner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+          const readerOwner = ownerSpan('latestReading', PROJECT.storeFile);
+          const acrossMany = querySpan('prisma', fnOwner, { [ATTR.dbOperation]: 'db_query' });
+          const withinOne = querySpan('prisma', readerOwner, { [ATTR.dbOperation]: 'db_query' });
+          const driverOfMany = querySpan('pg', acrossMany, { [ATTR.dbOperation]: 'SELECT' });
+          const driverOfOne = querySpan('pg', withinOne, { [ATTR.dbOperation]: 'SELECT' });
+          const resolver = resolverFor(project, {
+            events: fakeParents([fnOwner, readerOwner, acrossMany, withinOne]).port,
+          });
+
+          expect((await unresolved(resolver.resolveEvent(driverOfMany))).reason).toBe(
+            reason('ambiguous'),
+          );
+          expect((await resolved(resolver.resolveEvent(driverOfOne))).location).toEqual(
+            dbCallMatch(project.latestCall).location,
+          );
+        });
+
+        it('reads the ORM evidence on the walk to the owner, without extra hops', async () => {
+          const { project } = ormProject();
+          const owner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+          const operation = operationSpan(owner, 'Reading', 'findMany');
+          const { orm, driver } = statementSpans(operation, 'SELECT');
+          const parents = fakeParents([owner, operation, orm]);
+          await resolved(resolverFor(project, { events: parents.port }).resolveEvent(driver));
+          expect(parents.getBySpanId).toHaveBeenCalledTimes(3);
+        });
+
+        it("searches an owner's reach once for a whole batch", async () => {
+          const { project } = ormProject();
+          const owner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+          const operation = operationSpan(owner, 'Reading', 'findMany');
+          const first = statementSpans(operation, 'SELECT');
+          const second = statementSpans(operation, 'SELECT');
+          const outgoing = vi.spyOn(project.graph, 'outgoing');
+          const resolver = resolverFor(project);
+
+          await resolver.resolveEvents([owner, operation, first.orm]);
+          const single = outgoing.mock.calls.length;
+          outgoing.mockClear();
+          const located = unwrapOk(
+            await resolver.resolveEvents([
+              owner,
+              operation,
+              first.orm,
+              first.driver,
+              second.orm,
+              second.driver,
+            ]),
+            'batch',
+          );
+
+          expect(single).toBeGreaterThan(0);
+          expect(outgoing.mock.calls.length).toBe(single);
+          for (const span of [operation, first.orm, first.driver, second.orm, second.driver]) {
+            expect(located.get(span.id)).toEqual(dbCallMatch(project.latestCall).location);
+          }
+        });
+
+        it('proves nothing out of reach once the node budget cut the search short', async () => {
+          const { project, gaugeLookup } = ormProject();
+          const owner = ownerSpan(PROJECT.fn.name, PROJECT.fn.file);
+          const lookup = operationSpan(owner, 'Gauge', 'findUnique');
+          const events = fakeParents([owner]).port;
+
+          expect(
+            (await resolved(resolverFor(project, { events }).resolveEvent(lookup))).location,
+          ).toEqual(dbCallMatch(gaugeLookup).location);
+          const cut = resolverFor(project, { events, limits: { maxReachableNodes: 1 } });
+          expect((await unresolved(cut.resolveEvent(lookup))).reason).toBe(reason('ambiguous'));
+        });
+      });
     });
   });
 
   describe('route 4 — source-map', () => {
-    it('resolves a request initiator through the injected stack resolver, keeping its first location', async () => {
+    it('resolves a request initiator through the injected stack resolver, keeping its component frame', async () => {
       for (const kind of REQUEST_KINDS) {
         const project = standardProject();
         const fetchImpl = forbiddenFetch();
@@ -2198,8 +2756,11 @@ describe('SourceResolver.resolveEvent', () => {
         );
 
         expect(outcome.route).toBe(ROUTE.sourceMap);
+        // The frame is the component's, and so is the name it carries: the
+        // map's name at a call position is the callee, not the caller.
         expect(outcome.location).toEqual({
           ...first,
+          symbol: PROJECT.component.name,
           confidence: DEFAULT_RESOLUTION_CONFIDENCE[ROUTE.sourceMap],
         });
         expect(resolveStackImpl).toHaveBeenCalledTimes(1);
@@ -2268,6 +2829,140 @@ describe('SourceResolver.resolveEvent', () => {
         { route: ROUTE.sourceMap, outcome: 'rejected', reason: reason('outside-project') },
         { route: ROUTE.sourceMap, outcome: 'hit' },
       ]);
+    });
+
+    describe('the frame that initiated a request', () => {
+      /** The invented console's shared request helper, a feed loader, a hook and a panel with a click handler. */
+      const HELPER = {
+        name: 'consoleRequest',
+        file: 'src/lib/console-request.ts',
+        line: 10,
+        column: 23,
+      };
+      const LOADER = { name: 'loadGaugeFeed', file: 'src/lib/gauge-feed.ts', line: 5, column: 23 };
+      const HOOK = {
+        name: 'useGaugeFeed',
+        file: 'src/hooks/useGaugeFeed.ts',
+        line: 12,
+        column: 17,
+      };
+      const PANEL_FILE = 'src/components/GaugePanel.tsx';
+      const PANEL = { name: 'GaugePanel', file: PANEL_FILE, line: 4, column: 17 };
+
+      /**
+       * `standardProject` with the helper, loader and hook declared, and a
+       * panel component holding one inline click handler.
+       */
+      const initiatorProject = (): Project => {
+        const project = standardProject();
+        const hookNode: CodeNodeOf<'symbol'> = { ...symbolNode(HOOK), endLine: 48 };
+        const helperNode: CodeNodeOf<'symbol'> = { ...symbolNode(HELPER), endLine: 60 };
+        const loaderNode: CodeNodeOf<'symbol'> = { ...symbolNode(LOADER), endLine: 20 };
+        const panelNode = componentNode(PANEL, 80);
+        const clickNode = handlerNode(
+          { name: 'onClick', file: PANEL_FILE, line: 30, column: 20 },
+          33,
+        );
+        return {
+          ...project,
+          graph: graphOf(project.dbCalls, {
+            nodes: [
+              ...project.structure.nodes,
+              hookNode,
+              helperNode,
+              loaderNode,
+              panelNode,
+              clickNode,
+            ],
+            edges: project.structure.edges,
+          }),
+        };
+      };
+
+      /** The source-map outcome of a `kind` span whose stack maps to `frames`, innermost first. */
+      const initiatedAt = async (
+        frames: readonly SourceLocation[],
+        overrides: Partial<SourceResolverDeps> = {},
+        kind: TelemetryKind = KIND.fetch,
+      ): Promise<SourceLocation> => {
+        const stackAttribute = kind === KIND.error ? ATTR.errorStack : ATTR.initiator;
+        const outcome = await resolved(
+          resolverFor(initiatorProject(), {
+            resolveStackImpl: stackResolver(frames),
+            devServerOrigin: DEV_ORIGIN,
+            ...overrides,
+          }).resolveEvent(makeEvent({ kind, attributes: { [stackAttribute]: CHUNK_STACK } })),
+        );
+        expect(outcome.route).toBe(ROUTE.sourceMap);
+        return outcome.location;
+      };
+
+      it('passes over the shared request helper and its callers to the hook that started the request', async () => {
+        const hookFrame = mapped(HOOK.file, 30);
+        const location = await initiatedAt([
+          mapped(HELPER.file, 20),
+          mapped(HELPER.file, 41),
+          mapped(LOADER.file, 9),
+          hookFrame,
+        ]);
+        expect(location).toEqual({
+          ...hookFrame,
+          symbol: HOOK.name,
+          confidence: DEFAULT_RESOLUTION_CONFIDENCE[ROUTE.sourceMap],
+        });
+      });
+
+      it('takes an event handler frame as the initiator, named by the innermost declaration', async () => {
+        const location = await initiatedAt([mapped(HELPER.file, 20), mapped(PANEL_FILE, 31)]);
+        expect(location.file).toBe(PANEL_FILE);
+        expect(location.line).toBe(31);
+        // Inside both the panel and its handler: the handler is the narrower.
+        expect(location.symbol).toBe('onClick');
+      });
+
+      it('names a component frame outside every handler by the component', async () => {
+        const location = await initiatedAt([mapped(HELPER.file, 20), mapped(PANEL_FILE, 52)]);
+        expect(location.line).toBe(52);
+        expect(location.symbol).toBe(PANEL.name);
+      });
+
+      it('keeps the mapped name of a frame chosen without a declaration to name it', async () => {
+        const location = await initiatedAt([mapped(HELPER.file, 20), mapped(LOADER.file, 9)]);
+        expect(location.file).toBe(LOADER.file);
+        expect(location.symbol).toBe(mapped(LOADER.file, 9).symbol);
+      });
+
+      it('takes the nearest frame outside the module that called fetch when no frame is a component, handler or hook', async () => {
+        const location = await initiatedAt([
+          mapped(HELPER.file, 20),
+          mapped(HELPER.file, 41),
+          mapped(LOADER.file, 9),
+          mapped(PROJECT.fn.file, 21),
+        ]);
+        expect(location.file).toBe(LOADER.file);
+      });
+
+      it('keeps the innermost frame when every frame is in the module that called fetch', async () => {
+        const location = await initiatedAt([mapped(HELPER.file, 20), mapped(HELPER.file, 41)]);
+        expect(location.line).toBe(20);
+      });
+
+      it('without a code graph, still passes over the module that called fetch', async () => {
+        const location = await initiatedAt([mapped(HELPER.file, 20), mapped(HOOK.file, 30)], {
+          graph: undefined,
+        });
+        expect(location.file).toBe(HOOK.file);
+      });
+
+      it('keeps the innermost frame of a browser error stack, where it was thrown', async () => {
+        const location = await initiatedAt(
+          [mapped(HELPER.file, 20), mapped(HOOK.file, 30)],
+          {},
+          KIND.error,
+        );
+        expect(location.file).toBe(HELPER.file);
+        expect(location.line).toBe(20);
+      });
     });
 
     it('answers unmapped-frame when the stack resolver maps nothing', async () => {
@@ -2351,6 +3046,268 @@ describe('SourceResolver.resolveEvent', () => {
       for (const url of requested) {
         expect(url.startsWith(`${DEV_ORIGIN}/`)).toBe(true);
       }
+    });
+
+    describe('a frame of a module the dev server re-evaluated after a patch', () => {
+      /*
+       * Turbopack's dev runtime re-evaluates a hot-updated module — for this
+       * product, typically a file a patch just rewrote — with a `sourceURL` of
+       * `<chunk>.js?id=<module id>`, redacted to `?id=?` before a stack is
+       * stored, and that module's frames count lines and columns from the
+       * module, not from the chunk. Every case here runs the real stack
+       * resolver against a dev-server double serving one chunk and its index
+       * map; nothing but the injected `fetch` is reached.
+       */
+      const HOT_CHUNK_NAME = 'src_components_GaugeDial_tsx_0q7b3._.js';
+      const HOT_CHUNK = `${DEV_ORIGIN}/_next/static/chunks/${HOT_CHUNK_NAME}`;
+      const HOT_MAP = `${HOT_CHUNK}.map`;
+
+      /** The invented dial component: `fetch` starts at line 12, 0-based column 27. */
+      const DIAL_SOURCE: string = [
+        "'use client';",
+        '',
+        "import { useEffect, useState } from 'react';",
+        '',
+        '/** One gauge’s dial, polling its reading. Invented for this suite. */',
+        '',
+        `export function ${PROJECT.component.name}({ gaugeId }: { readonly gaugeId: string }) {`,
+        '  const [reading, setReading] = useState<number | undefined>(undefined);',
+        '',
+        '  async function refresh(): Promise<void> {',
+        '    setReading(undefined);',
+        '    const response = await fetch(readingsUrlFor(gaugeId));',
+        '    setReading(Number(await response.text()));',
+        '  }',
+        '',
+        '  useEffect(() => {',
+        '    void refresh();',
+        '  });',
+        '',
+        "  return <output onClick={() => void refresh()}>{reading ?? '…'}</output>;",
+        '}',
+        '',
+      ].join('\n');
+
+      /**
+       * The chunk's index map, shaped as Turbopack's dev server serves one
+       * (`sources` empty beside `sections`). Each section's segments, decoded,
+       * as `[generated column, source, original line, original column, name]`
+       * on 0-based lines relative to the section:
+       *
+       * - a dependency at offset 0: `[0,0,n,0]` on lines 0–14, and line 14 also
+       *   `[27,0,14,4,0]` — so the frame's position read **chunk-relative**
+       *   lands here, outside the project;
+       * - `GaugeDial` at offset 30: line 6 `[0,0,6,0] [16,0,6,16,0]` (the
+       *   declaration) and line 11 `[4,0,11,4] [27,0,11,27,1]` (the `fetch`
+       *   call);
+       * - the gauges module at offset 60: line 11 `[0,0,21,2]`, and when
+       *   `colliding` also `[27,0,21,24,1]` — a segment starting at the very
+       *   position the frame names, mapped to `samples.reduce` on line 22.
+       */
+      const hotChunkMap = (gauges: 'apart' | 'colliding'): string =>
+        JSON.stringify({
+          version: 3,
+          sources: [],
+          sections: [
+            {
+              offset: { line: 0, column: 0 },
+              map: {
+                version: 3,
+                sources: [`file://${PROJECT_ROOT}/node_modules/gauge-kit/dist/index.js`],
+                names: ['emit'],
+                mappings:
+                  'AAAA;AACA;AACA;AACA;AACA;AACA;AACA;AACA;AACA;AACA;AACA;AACA;AACA;AACA;AACA,2BAAIA',
+              },
+            },
+            {
+              offset: { line: 30, column: 0 },
+              map: {
+                version: 3,
+                sources: [`file://${PROJECT_ROOT}/${PROJECT.component.file}`],
+                sourcesContent: [DIAL_SOURCE],
+                names: [PROJECT.component.name, 'fetch'],
+                mappings: ';;;;;;AAMA,gBAAgBA;;;;;IAKZ,uBAAuBC',
+              },
+            },
+            {
+              offset: { line: 60, column: 0 },
+              map: {
+                version: 3,
+                sources: [`file://${PROJECT_ROOT}/${PROJECT.fn.file}`],
+                sourcesContent: [GAUGES_MODULE],
+                names: [PROJECT.fn.name, 'reduce'],
+                mappings: gauges === 'colliding' ? ';;;;;;;;;;;AAqBE,2BAAsBC' : ';;;;;;;;;;;AAqBE',
+              },
+            },
+          ],
+        });
+
+      /** The dev server: the chunk, whose directive names its map, and the map; anything else is a 404. */
+      function hotDevServer(gauges: 'apart' | 'colliding'): {
+        readonly fetchImpl: Mock<typeof fetch>;
+        readonly requested: string[];
+      } {
+        const requested: string[] = [];
+        const fetchImpl = vi.fn<typeof fetch>((input) => {
+          const url = input instanceof Request ? input.url : String(input);
+          requested.push(url);
+          if (url === HOT_CHUNK) {
+            return Promise.resolve(
+              new Response(`"use strict";\n//# sourceMappingURL=${HOT_CHUNK_NAME}.map\n`),
+            );
+          }
+          if (url === HOT_MAP) {
+            return Promise.resolve(new Response(hotChunkMap(gauges)));
+          }
+          return Promise.resolve(new Response('not found', { status: 404 }));
+        });
+        return { fetchImpl, requested };
+      }
+
+      /**
+       * A request initiator with one frame in `fn`, at section line 12 plus
+       * Turbopack's three-line module prelude and the 1-based form of column
+       * 27. `query` is the module query the frame's URL carries — redacted as
+       * stored, or `''` for the same position read as an ordinary frame.
+       */
+      const hotStack = (fn: string, query = '?id=?'): string =>
+        ['Error', `    at ${fn} (${HOT_CHUNK}${query}:15:28)`].join('\n');
+
+      /** The outcome for a fetch span initiated by `stack`, with the real stack resolver. */
+      const hotResolution = (
+        stack: string,
+        server: ReturnType<typeof hotDevServer>,
+        modifications: ModificationCorroborationPort,
+        logger?: Logger,
+      ): Promise<Result<SourceResolution, DebuggenError>> =>
+        resolverFor(standardProject(), {
+          fetchImpl: server.fetchImpl,
+          devServerOrigin: DEV_ORIGIN,
+          modifications,
+          ...(logger === undefined ? {} : { logger }),
+        }).resolveEvent(makeEvent({ kind: KIND.fetch, attributes: { [ATTR.initiator]: stack } }));
+
+      /** A source-map location at `where`, as route 4 answers one. */
+      const hotLocation = (where: {
+        readonly file: string;
+        readonly line: number;
+        readonly column: number;
+        readonly symbol: string;
+      }): SourceLocation => ({
+        ...where,
+        resolvedBy: ROUTE.sourceMap,
+        confidence: DEFAULT_RESOLUTION_CONFIDENCE[ROUTE.sourceMap],
+      });
+
+      /** The `fetch` call in `GaugeDial`, named after the component it is in. */
+      const DIAL_CALL = hotLocation({
+        file: PROJECT.component.file,
+        line: 12,
+        column: 28,
+        symbol: PROJECT.component.name,
+      });
+
+      /** The colliding segment's target in the gauges module, keeping the map's name. */
+      const GAUGES_CALL = hotLocation({
+        file: PROJECT.fn.file,
+        line: 22,
+        column: 25,
+        symbol: 'reduce',
+      });
+
+      /** A journal whose metadata read fails, as a closed store's does. */
+      const unreadableJournal = (): ModificationCorroborationPort => ({
+        listBySession: () =>
+          err(new DebuggenError('STORE_ERROR', 'The modification journal could not be read.')),
+        listPatchEvidence: () => ok([]),
+      });
+
+      it('maps it within its own module’s section, where read against the whole chunk it lands in a dependency', async () => {
+        const server = hotDevServer('apart');
+        const journal = fakeJournal([modification(PROJECT.component.file, 'applied')]);
+        const outcome = await resolved(hotResolution(hotStack('refresh'), server, journal.port));
+
+        expect(outcome.route).toBe(ROUTE.sourceMap);
+        expect(outcome.location).toEqual(DIAL_CALL);
+        expect(journal.listBySession, 'one answer needs no tie-breaker').not.toHaveBeenCalled();
+        // The chunk and its map are read at the chunk's own URL, without the module query.
+        expect([...new Set(server.requested)].sort()).toEqual([HOT_CHUNK, HOT_MAP].sort());
+
+        // The same position read as an ordinary, chunk-relative frame is the
+        // dependency's, and refused: what every hot-updated frame used to get.
+        const chunkRelative = await unresolved(
+          hotResolution(hotStack('refresh', ''), hotDevServer('apart'), fakeJournal([]).port),
+        );
+        expect(chunkRelative.reason).toBe(reason('unmapped-frame'));
+      });
+
+      it('takes the module a patch in force had rewritten when two project modules match the position, ahead of the frame’s name', async () => {
+        const cases: readonly (readonly [ModificationRecord, string, SourceLocation])[] = [
+          [modification(PROJECT.component.file, 'applied'), 'refresh', DIAL_CALL],
+          [modification(PROJECT.fn.file, 'applied'), 'refresh', GAUGES_CALL],
+          // Reverted since, but applied before the span started: in force when it ran.
+          [modification(PROJECT.fn.file, 'reverted'), 'refresh', GAUGES_CALL],
+          // The gauges section names the frame's function; the journal still decides.
+          [modification(PROJECT.component.file, 'applied'), PROJECT.fn.name, DIAL_CALL],
+        ];
+        for (const [record, fn, expected] of cases) {
+          const journal = fakeJournal([record]);
+          const outcome = await resolved(
+            hotResolution(hotStack(fn), hotDevServer('colliding'), journal.port),
+          );
+          expect(outcome.location).toEqual(expected);
+          expect(journal.listBySession).toHaveBeenCalledTimes(1);
+          expect(journal.listBySession).toHaveBeenCalledWith(SESSION);
+        }
+      });
+
+      it('skips the frame rather than guess when nothing tells the modules apart', async () => {
+        const afterTheSpan = BASE_TIME + 1_000_000_000;
+        const journals: readonly (readonly ModificationRecord[])[] = [
+          [],
+          [modification(PROJECT.storeFile, 'applied')],
+          [modification(PROJECT.component.file, 'reverted', afterTheSpan)],
+          [modification(PROJECT.component.file, 'applied', BASE_TIME - 1_000, OTHER_SESSION)],
+        ];
+        for (const records of journals) {
+          const journal = fakeJournal(records);
+          const outcome = await unresolved(
+            hotResolution(hotStack('refresh'), hotDevServer('colliding'), journal.port),
+          );
+          expect(outcome.reason).toBe(reason('unmapped-frame'));
+          expect(journal.listBySession).toHaveBeenCalledTimes(1);
+        }
+      });
+
+      it('falls back to the section naming the frame’s function, and an unreadable journal only removes the hint', async () => {
+        const named = await resolved(
+          hotResolution(hotStack(PROJECT.fn.name), hotDevServer('colliding'), fakeJournal([]).port),
+        );
+        expect(named.location).toEqual(GAUGES_CALL);
+
+        const entries: LogEntry[] = [];
+        const unreadable = await resolved(
+          hotResolution(
+            hotStack(PROJECT.fn.name),
+            hotDevServer('colliding'),
+            unreadableJournal(),
+            capturingLogger(entries),
+          ),
+        );
+        expect(unreadable.location).toEqual(GAUGES_CALL);
+        expect(entries).toContainEqual(
+          expect.objectContaining({
+            level: 'debug',
+            message:
+              'The modification journal could not be read; hot-updated frames get no tie-breaker',
+          }),
+        );
+
+        const skipped = await unresolved(
+          hotResolution(hotStack('refresh'), hotDevServer('colliding'), unreadableJournal()),
+        );
+        expect(skipped.reason).toBe(reason('unmapped-frame'));
+      });
     });
   });
 
@@ -3414,6 +4371,194 @@ describe('SourceResolver.resolveEvents — the worker pool and the budget', () =
     expect(project.fake.totalCalls()).toBe(0);
     expect(journal.listBySession).not.toHaveBeenCalled();
   });
+
+  it('yields the event loop during a CPU-bound batch, so its budget stops it within about one slice', async () => {
+    // Every query span's parent lies outside the batch, and the store port
+    // answers it synchronously after `ITEM_MS` of CPU — the shape of the real
+    // `node:sqlite` port. Nothing in the batch ever waits, so without a yield
+    // the budget's timer could not fire until every event had been resolved.
+    const ITEM_MS = 2;
+    const BUDGET_MS = 40;
+    const events = Array.from({ length: 400 }, () =>
+      makeEvent({
+        kind: KIND.dbQuery,
+        parentSpanId: newSpanId(),
+        attributes: { [ATTR.dbClient]: 'pg' },
+      }),
+    );
+    const unboundedMs = events.length * ITEM_MS;
+    let lookups = 0;
+    let spins = 0;
+    const slowParents: ParentEventPort = {
+      getBySpanId: () => {
+        lookups += 1;
+        const until = performance.now() + ITEM_MS;
+        while (performance.now() < until) {
+          spins += 1;
+        }
+        return ok(undefined);
+      },
+    };
+    const entries: LogEntry[] = [];
+    const budget = new AbortController();
+    let abortedAt = Number.POSITIVE_INFINITY;
+    const timer = setTimeout(() => {
+      abortedAt = performance.now();
+      budget.abort();
+    }, BUDGET_MS);
+
+    const startedAt = performance.now();
+    const page = await located(
+      resolverFor(standardProject(), {
+        events: slowParents,
+        logger: capturingLogger(entries),
+      }).resolveEvents(events, { budget: budget.signal }),
+    );
+    const settledAt = performance.now();
+    clearTimeout(timer);
+
+    // The budget fired during the batch and ended it: far fewer lookups than
+    // events, well before the unbounded run would have finished, and the
+    // overrun past the abort is about one slice plus the items in flight
+    // (the slack absorbs a loaded host's scheduling, not a missing yield).
+    expect(spins).toBeGreaterThan(0);
+    expect(Number.isFinite(abortedAt)).toBe(true);
+    expect(lookups).toBeLessThan(events.length / 2);
+    expect(settledAt - startedAt).toBeLessThan(unboundedMs / 2);
+    expect(settledAt - abortedAt).toBeLessThan(
+      2 * RESOLVE_YIELD_SLICE_MS + SOURCE_RESOLVE_LIMITS.maxConcurrentEvents * ITEM_MS + BUDGET_MS,
+    );
+    expect(page.size).toBe(0);
+    const summary = batchSummary(entries);
+    expect(summary).toMatchObject({ resolved: 0, unresolved: events.length });
+    expect(Number(summary?.['budgetExpired'])).toBe(events.length - lookups);
+  }, 10_000);
+});
+
+describe('SourceResolver.resolveEvents — one reachability search per owner', () => {
+  /** A `db.query` span under `parentSpanId` from the `client` driver. */
+  const queryUnder = (parentSpanId: string, client: string): TelemetryEvent =>
+    makeEvent({
+      kind: KIND.dbQuery,
+      parentSpanId,
+      attributes: { [ATTR.dbClient]: client, [ATTR.dbSystem]: 'postgresql' },
+    });
+
+  /**
+   * A batch of query spans under three owners — a function, a route handler
+   * whose method only its request span names, and a function the graph
+   * reaches nothing from — interleaved, with two drivers, and the owners'
+   * own spans in the batch as their parents.
+   */
+  function mixedBatch(project: Project): {
+    readonly owners: readonly TelemetryEvent[];
+    readonly queries: readonly TelemetryEvent[];
+  } {
+    const fn = makeEvent({
+      kind: KIND.function,
+      name: PROJECT.fn.name,
+      attributes: { [ATTR.symbol]: PROJECT.fn.name, [ATTR.module]: PROJECT.fn.file },
+    });
+    const request = makeEvent({
+      kind: KIND.httpServer,
+      attributes: { [ATTR.httpMethod]: 'GET', [ATTR.httpRoute]: PROJECT.routePath },
+    });
+    const handler = makeEvent({
+      kind: KIND.routeHandler,
+      parentSpanId: request.spanId,
+      attributes: { [ATTR.nextRoute]: PROJECT.routePath },
+    });
+    const isolated = makeEvent({
+      kind: KIND.function,
+      name: 'renderIsolatedPanel',
+      attributes: { [ATTR.symbol]: 'renderIsolatedPanel', [ATTR.module]: project.auditCall.file },
+    });
+    const queries: TelemetryEvent[] = [];
+    for (let round = 0; round < 8; round += 1) {
+      queries.push(
+        queryUnder(fn.spanId, 'pg'),
+        queryUnder(handler.spanId, 'pg'),
+        queryUnder(fn.spanId, 'prisma'),
+        queryUnder(isolated.spanId, 'pg'),
+        queryUnder(handler.spanId, 'prisma'),
+      );
+    }
+    return { owners: [fn, request, handler, isolated], queries };
+  }
+
+  /**
+   * Each event resolved on its own, with a fresh scope per call — what every
+   * event got before the batch shared its searches — keyed like a page.
+   */
+  async function individually(
+    events: readonly TelemetryEvent[],
+    overrides: Partial<SourceResolverDeps>,
+  ): Promise<{ readonly page: Map<string, SourceLocation>; readonly searches: number }> {
+    const project = standardProject();
+    const outgoing = vi.spyOn(project.graph, 'outgoing');
+    const resolver = resolverFor(project, overrides);
+    const page = new Map<string, SourceLocation>();
+    for (const event of events) {
+      const outcome = await settled(resolver.resolveEvent(event));
+      if (outcome.status === 'resolved') {
+        page.set(event.id, outcome.location);
+      }
+    }
+    return { page, searches: outgoing.mock.calls.length };
+  }
+
+  it.each([
+    { label: 'the whole call-site pool', limits: {} },
+    { label: 'a pool narrowed by driver first', limits: { maxDbCandidates: 2 } },
+  ])(
+    'answers a batch exactly as resolving each event alone does, searching once per owner — $label',
+    async ({ limits }) => {
+      const project = standardProject();
+      const { owners, queries } = mixedBatch(project);
+      const batch = [...owners, ...queries];
+      const parents = fakeParents(owners);
+
+      const expected = await individually(batch, { events: fakeParents(owners).port, limits });
+      const outgoing = vi.spyOn(project.graph, 'outgoing');
+      const page = await located(
+        resolverFor(project, { events: parents.port, limits }).resolveEvents(batch),
+      );
+
+      expect([...page.keys()]).toEqual([...expected.page.keys()]);
+      for (const [id, location] of expected.page) {
+        expect(page.get(id)).toEqual(location);
+      }
+      // Not vacuous: most query spans are placed, and the owner the graph
+      // reaches nothing from places none of its own.
+      const [, , , isolated] = owners;
+      const placedQueries = queries.filter((event) => page.has(event.id));
+      expect(placedQueries.length).toBeGreaterThanOrEqual(queries.length / 2);
+      expect(
+        queries.filter((event) => event.parentSpanId === isolated?.spanId && page.has(event.id)),
+      ).toEqual([]);
+
+      // One reach search per distinct owner across the batch — each a walk of
+      // the owner's outgoing edges — where the events alone searched once per
+      // query span.
+      expect(outgoing.mock.calls.length).toBeGreaterThan(0);
+      expect(expected.searches).toBeGreaterThan(outgoing.mock.calls.length * 3);
+      expect(parents.getBySpanId).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps each batch’s searches to itself', async () => {
+    const project = standardProject();
+    const { owners, queries } = mixedBatch(project);
+    const resolver = resolverFor(project, { events: fakeParents(owners).port });
+    const outgoing = vi.spyOn(project.graph, 'outgoing');
+
+    await located(resolver.resolveEvents([...owners, ...queries]));
+    const first = outgoing.mock.calls.length;
+    await located(resolver.resolveEvents([...owners, ...queries]));
+
+    expect(first).toBeGreaterThan(0);
+    expect(outgoing.mock.calls.length).toBe(first * 2);
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -4146,6 +5291,14 @@ describe('privacy', () => {
       source: patchStamp(PROJECT.fn),
       attributes: { [ATTR.symbol]: SENTINEL },
     }),
+    makeEvent({
+      kind: KIND.dbQuery,
+      attributes: {
+        [ATTR.dbClient]: 'prisma',
+        [ATTR.ormModel]: SENTINEL,
+        [ATTR.ormMethod]: SENTINEL,
+      },
+    }),
   ];
 
   it('logs ids, kinds, routes, reasons and counts only', async () => {
@@ -4360,7 +5513,7 @@ describe('determinism', () => {
       outcomes.push(
         await resolved(
           resolverFor(project, {
-            graph: graphOf(nodes),
+            graph: graphOf(nodes, project.structure),
             events: fakeParents([parent]).port,
           }).resolveEvent(query),
         ),

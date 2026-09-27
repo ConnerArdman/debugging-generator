@@ -224,6 +224,21 @@ export interface SourceLinkProps {
   label?: string | undefined;
 
   /**
+   * The whole caption a `label` stands for, when the caller had to shorten it
+   * to fit its column - a long component or operation name cut to a preview.
+   *
+   * It changes only the tooltip: the description then leads with this caption,
+   * `<caption> — <symbol-first location>`, so the value the chip abbreviates
+   * stays reachable by hover and by keyboard focus (the bubble is bounded and
+   * scrolls, see `../primitives/Tooltip`). A location whose own description
+   * already contains the caption - its symbol is the same name - keeps that
+   * description as it is. The visible text and the accessible name are
+   * unchanged - the name still leads with what is on screen (WCAG 2.5.3) - and
+   * it has no effect without a `label`.
+   */
+  labelDescription?: string | undefined;
+
+  /**
    * Show the location's `symbol` as its own run before the path. Defaults to
    * `true`, and has no effect when the location carries no symbol, when a
    * `label` was supplied, or when `compact` is set.
@@ -269,7 +284,7 @@ export interface SourceLinkProps {
  */
 export type SourceLinkTextInputs = Pick<
   SourceLinkProps,
-  'location' | 'label' | 'showSymbol' | 'compact'
+  'location' | 'label' | 'labelDescription' | 'showSymbol' | 'compact'
 >;
 
 /** Everything the chip shows and announces, derived from {@link SourceLinkTextInputs}. */
@@ -304,7 +319,7 @@ interface SourceLinkText {
  * @returns The runs, the target, the description and the abbreviation flag.
  */
 function deriveSourceLinkText(inputs: SourceLinkTextInputs): SourceLinkText {
-  const { location, label, showSymbol = true, compact = false } = inputs;
+  const { location, label, labelDescription, showSymbol = true, compact = false } = inputs;
 
   const lineResolved = isResolvedCoordinate(location.line);
   const positionResolved = lineResolved && isResolvedCoordinate(location.column);
@@ -319,8 +334,18 @@ function deriveSourceLinkText(inputs: SourceLinkTextInputs): SourceLinkText {
 
   // The description a tooltip shows: the shared helper's symbol-first form,
   // which is also what a row linking to the same place titles itself with, so
-  // the two cannot drift apart.
-  const description = positionResolved ? formatSourceTooltip(location) : target;
+  // the two cannot drift apart. A shortened label's whole caption leads it, so
+  // the value the chip abbreviates is never lost - unless the location's own
+  // description already carries it (a symbol of the same name), which would
+  // otherwise say it twice.
+  const locationDescription = positionResolved ? formatSourceTooltip(location) : target;
+  const description =
+    label !== undefined &&
+    labelDescription !== undefined &&
+    labelDescription.trim() !== '' &&
+    !locationDescription.includes(labelDescription)
+      ? `${labelDescription} — ${locationDescription}`
+      : locationDescription;
 
   // The visible path. Shortening belongs to the format helpers - this file joins
   // the line to whichever shape they returned and performs no other string work.
@@ -428,6 +453,7 @@ export function SourceLink(props: SourceLinkProps): ReactElement {
   const {
     location,
     label,
+    labelDescription,
     showSymbol = true,
     compact = false,
     className,
@@ -454,7 +480,13 @@ export function SourceLink(props: SourceLinkProps): ReactElement {
   // What the chip shows, and what it announces, from the same inputs through
   // the same derivation: the name is the exported rule's own answer, so a test
   // that names a chip with that helper names it exactly as this render does.
-  const textInputs: SourceLinkTextInputs = { location, label, showSymbol, compact };
+  const textInputs: SourceLinkTextInputs = {
+    location,
+    label,
+    labelDescription,
+    showSymbol,
+    compact,
+  };
   const { description, symbolText, chipText, abbreviated } = deriveSourceLinkText(textInputs);
   const accessibleName = sourceLinkAccessibleName(textInputs);
 

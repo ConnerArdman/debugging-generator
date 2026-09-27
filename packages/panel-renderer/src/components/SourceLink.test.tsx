@@ -574,6 +574,47 @@ describe('SourceLink tooltip wrapping', () => {
     expect(chip.getAttribute('aria-describedby')).toBeNull();
     expect(chip.closest('.dg-tooltip')).toBeNull();
   });
+
+  it("leads the description with a shortened label's whole caption", () => {
+    const location = makeLocation();
+    const wholeCaption = `${CALLER_LABEL} ${'and the rest of a long caption '.repeat(4)}end`;
+
+    render(
+      <SourceLink
+        location={location}
+        label={CALLER_LABEL}
+        labelDescription={wholeCaption}
+        onOpenSource={makeOpenSourceSpy()}
+      />,
+    );
+
+    // The chip shows the shortened label and is named by it exactly as without
+    // the whole caption; only the tooltip carries the rest of the value.
+    const chip = screen.getByRole('button', { name: LABEL_ACCESSIBLE_NAME });
+    const closed = screen.getByRole('tooltip', { hidden: true });
+
+    expect(closed.textContent).toBe(
+      `${wholeCaption} — ${LOCATION_SYMBOL} — ${formatSourceLocation(location)}`,
+    );
+    expect(chip.getAttribute('aria-describedby')).toBe(closed.getAttribute('id'));
+  });
+
+  it('ignores a whole caption when the chip shows no label', () => {
+    const location = makeLocation();
+
+    render(
+      <SourceLink
+        location={location}
+        labelDescription="A caption with no label to stand for"
+        onOpenSource={makeOpenSourceSpy()}
+      />,
+    );
+
+    expect(screen.getByRole('tooltip', { hidden: true }).textContent).toBe(
+      `${LOCATION_SYMBOL} — ${formatSourceLocation(location)}`,
+    );
+    expect(screen.getByRole('button', { name: ACCESSIBLE_NAME })).toBeDefined();
+  });
 });
 
 /**
@@ -1160,5 +1201,28 @@ describe('SummaryHeader beside its source chips', () => {
     // alone.
     expect(new Set(glyphs).size).toBe(3);
     expect(glyphs.every((markup) => markup.length > 0)).toBe(true);
+  });
+
+  it('labels every confidence badge and draws the three levels in three different fills', () => {
+    render(<SummaryHeader title="Example" summary={SUMMARY} />);
+
+    const causes = screen.getByRole('region', { name: 'Likely cause' });
+    const fills = (['high', 'medium', 'low'] as const).map((level) => {
+      const badge = within(causes).getByText(level);
+      // The badge's own text stays the level word; the visible label beside it
+      // says what the word ranks.
+      expect(badge.textContent).toBe(level);
+      const group = badge.closest('.dg-summary-header__confidence-group');
+      expect(group, level).not.toBeNull();
+      expect(group?.textContent).toBe(`Confidence${level}`);
+
+      return ['dg-badge--outline', 'dg-badge--soft', 'dg-badge--solid'].find((fill) =>
+        badge.classList.contains(fill),
+      );
+    });
+
+    // Rising prominence: a solid chip for a strong guess, an outline for a weak one.
+    expect(fills).toEqual(['dg-badge--solid', 'dg-badge--soft', 'dg-badge--outline']);
+    expect(within(causes).getAllByText('Confidence')).toHaveLength(3);
   });
 });

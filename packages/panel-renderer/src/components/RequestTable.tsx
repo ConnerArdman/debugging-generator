@@ -59,25 +59,66 @@
  * `PanelActions`. There is no socket, no `fetch` and no message name in this
  * file, and no transport detail reaches a column.
  *
- * Ordering and paging belong to the side that owns the capture: a sort change
- * is a **re-query** in the closed `DataQuerySort` vocabulary, never a local
- * re-order, and "load more" advances `offset` to exactly the `nextOffset` the
+ * Ordering and paging belong to the side that owns the capture: an ordering
+ * the service can apply is a **re-query** in the closed `DataQuerySort`
+ * vocabulary, and "load more" advances `offset` to exactly the `nextOffset` the
  * response reported, keeping the pages already received. It is offered only
  * when that offset moves forward from the page it answered, and never for a
  * count-only `limit: 0` query, whose every page is empty by request. An
  * authored `limit: 0` is sent as zero, never raised to one row, so the view
- * states the query's total without drawing a group. Two things are local and
- * are labelled as such wherever they are visible: the disclosure state of a
- * row, and the "duplicates only" toggle, which can only filter the groups
- * loaded so far because the query contract cannot express "duplicates only".
- * With no group loaded it is disabled (`disabled` and `aria-disabled`), and a
- * visible note it names as its description says why.
+ * states the query's total without drawing a group.
+ *
+ * The service orders groups in three ways, and each has a home the reader can
+ * see: most occurrences first is the Occurrences header, longest total
+ * duration first the Duration header (the service ranks that ordering by
+ * `totalDurationMs`, the figure the Duration cell states as its total), and
+ * earliest first — by a timestamp no column shows — the toolbar's select alone.
+ * Every other order (Transferred, and the reverse of Occurrences and Duration)
+ * is a **view order**: the groups already loaded are re-arranged here, stably,
+ * with the service's own position as the tie-break, exactly as `SpanTable` does for
+ * the orders its service cannot apply. Nothing is re-queried, and the page
+ * sequence "load more" follows stays in the service's order. The select and
+ * the header always name the same order — a view order appears in the select
+ * as its own option — and while the loaded groups are not the whole result the
+ * footer says the order covers only them. The request and caller columns are
+ * never ordered locally: ordering redacted URLs or caller labels against each
+ * other would be the very comparison this file refuses to make, and the status
+ * column holds a set of codes rather than one value.
+ *
+ * Three more things are local and are labelled as such wherever they are
+ * visible: the disclosure state of a row, the view order above, and the
+ * "duplicates only" toggle, which can only filter the groups loaded so far
+ * because the query contract cannot express "duplicates only". With no group
+ * loaded it is disabled (`disabled` and `aria-disabled`), and a visible note it
+ * names as its description says why.
+ *
+ * ## Selection and focus
+ *
+ * A group row takes part in the panel's one shared selection. Activating it —
+ * a click, or Enter or Space on the row — selects the group's representative
+ * occurrence, its canonically earliest issuance, which is one captured event
+ * with its own id, trace and span; the row never fabricates a coordinate of its
+ * own. The row that holds the panel's selected event, reported from this view
+ * or any other, carries `dg-is-selected` and `aria-selected="true"`, and the
+ * occurrence itself is marked inside the open detail as before. A group whose
+ * occurrence list came back empty has nothing to select, so activating it
+ * opens its detail, which says why.
+ *
+ * Once the reader has chosen an ordering the grid stays mounted through the
+ * re-query that follows, with its loading, error or empty state in the grid's
+ * empty slot, so the header control they used keeps its element and their
+ * focus; the toolbar is kept throughout. A retry that succeeds hands focus to
+ * the disclosure toggle of the first group the settled page brought, which
+ * carries the error state's successor focus key
+ * (`RETRY_SUCCESSOR_FOCUS_ATTRIBUTES`).
  *
  * ## Colour and spacing
  *
  * No colour value and no spacing value is written here. Status and grouping
  * tones resolve through `Badge` tones and the `.dg-request-table__status--*`
- * rules committed in `../styles/components.css`; duration emphasis is
+ * rules committed in `../styles/components.css`; which tone a response code or
+ * a span status takes is the shared decision of `../utils/color.ts`, the one
+ * the waterfall and the timeline read too; duration emphasis is
  * `DurationCell`'s `severity="auto"`; every gap comes from `Stack` or
  * `Toolbar`; and there is no inline `style` at all.
  *
@@ -91,7 +132,7 @@
  */
 
 import clsx from 'clsx';
-import { ChevronDown, ChevronRight, Copy, Hourglass, Globe } from 'lucide-react';
+import { ChevronDown, ChevronRight, CircleSlash, Copy, Hourglass, Globe } from 'lucide-react';
 import { useCallback, useId, useMemo, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
@@ -114,11 +155,10 @@ import type {
   RequestGroup,
   RequestGroupedBy,
   RequestOccurrence,
-  TelemetryStatus,
 } from '@debuggen/telemetry';
 
 import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
-import type { PanelEventRef } from '../host/PanelActions';
+import type { PanelEventRef, PanelSelection } from '../host/PanelActions';
 import { queryFailureProps, useQuery } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
@@ -128,13 +168,24 @@ import type { BadgeTone, BadgeVariant } from '../primitives/Badge';
 import { Button } from '../primitives/Button';
 import { Code } from '../primitives/Code';
 import { DataTable } from '../primitives/DataTable';
-import type { DataTableColumn, DataTableColumnWidth, DataTableSort } from '../primitives/DataTable';
+import type {
+  DataTableColumn,
+  DataTableColumnWidth,
+  DataTableSort,
+  DataTableSortDirection,
+} from '../primitives/DataTable';
 import { DurationCell } from '../primitives/DurationCell';
 import { EmptyState } from '../primitives/EmptyState';
-import { ErrorState, FOCUS_KEY_ATTRIBUTE } from '../primitives/ErrorState';
+import {
+  ErrorState,
+  FOCUS_KEY_ATTRIBUTE,
+  RETRY_SUCCESSOR_FOCUS_ATTRIBUTES,
+} from '../primitives/ErrorState';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
+import { HTTP_STATUS_CLASS_TONES, httpStatusClass, statusTone } from '../utils/color';
+import type { HttpStatusClass } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
   formatBytes,
@@ -165,10 +216,14 @@ import { SourceLink } from './SourceLink';
  * projects it: the method badge to `http.method`; the row header to `url` and
  * `path`; the status badges to `http.status_code` and `status`; the Pending
  * badges to `inFlight`, which the aggregate projects as the occurrence's
- * `pending` flag and the group's `pendingCount`; the occurrence,
+ * `pending` flag and the group's `pendingCount`; the "No status" badge to a
+ * settled occurrence's missing `http.status_code`, which the aggregate counts
+ * as the group's `noStatusCodeCount`; the occurrence,
  * duplicate and cluster counts to the `request_key` grouping over `startTime`;
- * the three duration cells to `duration`; the transfer cell to `transferSize`;
- * the caller chips to `initiator` and `source`; and an occurrence's selection to
+ * the duration cell's figures to `duration`; the transfer cell to `transferSize`;
+ * the caller chips to `source` and to the caller label the aggregate derives
+ * from `initiator`, `initiatorComponent` and `initiatorOwners` (the component
+ * that started the request and its owners); and an occurrence's selection to
  * `id`, `spanId` and `traceId`. Nothing outside the entry's `reads` is drawn,
  * and the entry's `telemetryKinds` (the request kinds) is what bounds the rows
  * to network calls.
@@ -261,8 +316,15 @@ const MIXED_GROUPING_LABEL = 'Mixed grouping';
 /** Toolbar note when the loaded rows are all fallback-grouped. */
 const FALLBACK_GROUPING_LABEL = 'Fallback grouping';
 
-/**
- * The classes of HTTP response status this view distinguishes.
+/*
+ * Response status classes
+ *
+ * The classification of a response code and the tone it reads in are NOT
+ * decided here: `../utils/color.ts` owns them (`httpStatusClass`,
+ * `HTTP_STATUS_CLASS_TONES`) for every view that prints a code — this table,
+ * the waterfall's status chip and the timeline — so one 404 can never read as
+ * a warning here and as a failure one view over. What stays here is the one
+ * thing only this table has: its stylesheet modifiers.
  *
  * A class describes a status code that was **reported**; it never stands for
  * the absence of one. An occurrence without a code is one of two different
@@ -273,67 +335,38 @@ const FALLBACK_GROUPING_LABEL = 'Fallback grouping';
  *     had started and had not settled when the capture ended. It is drawn as
  *     the textual "Pending" badge of {@link PENDING_TONE} and
  *     {@link PENDING_VARIANT}, at group and occurrence level alike.
- *   - **Settled without a code** — a network error, an abort or a refused
- *     cross-origin response. It is drawn as the unavailable label at group
- *     level and as its span status at occurrence level, and is never read as
- *     pending: only the producer's flag makes a request pending.
+ *   - **Settled without a code** — an abort, a network error, a refused
+ *     cross-origin response or an opaque one. It is counted per group as
+ *     `noStatusCodeCount` and drawn as the textual "No status" badge at group
+ *     level (see {@link renderNoStatusBadge}), so a row whose codes are all
+ *     successes and whose failure count is not zero shows, beside both, the
+ *     occurrences that explain the difference. At occurrence level it is its
+ *     span status. It is never read as pending: only the producer's flag
+ *     makes a request pending. Which of these were aborts the table does not
+ *     say: the producer's abort marker is not among the catalog's `reads`.
  */
-type StatusClass = 'ok' | 'redirect' | 'client-error' | 'server-error' | 'unknown';
-
-/** Lowest status code of each class, and the ceiling of the last one. */
-const STATUS_CLASS_FLOORS = Object.freeze({
-  ok: 200,
-  redirect: 300,
-  clientError: 400,
-  serverError: 500,
-  ceiling: 600,
-});
-
-/**
- * Badge tone per status class.
- *
- * Four classes rather than three: the committed `.dg-request-table__status--*`
- * rules in `../styles/components.css` distinguish a client error from a server
- * error, and the design system's own stylesheet is the authority on the tone a
- * status badge carries. A code outside every class — which the producer would
- * have to have reported as a non-integer or out-of-range value — is neutral,
- * exactly as an absent code is.
- */
-const STATUS_CLASS_TONES: Readonly<Record<StatusClass, BadgeTone>> = {
-  ok: 'success',
-  redirect: 'info',
-  'client-error': 'warning',
-  'server-error': 'danger',
-  unknown: 'neutral',
-};
 
 /**
  * The stylesheet's modifier class per status class, spelled out so every class
  * name this component can emit is greppable in this file.
  *
- * `unknown` has no modifier: the stylesheet defines none for it, and the base
- * chip class plus the neutral tone is the correct rendering. The pending state
- * is not a status class and has no modifier either, for the same reason: see
+ * Keyed by the shared {@link HttpStatusClass}, so the class a badge is drawn in
+ * and the tone `Badge` receives come from the same classification. The four
+ * outcome classes have a committed `.dg-request-table__status--*` rule in
+ * `../styles/components.css`, which distinguishes a client error from a server
+ * error exactly as the shared tone table does. `informational` and `unknown`
+ * have no modifier: the stylesheet defines none for them, and the base chip
+ * class plus their neutral tone is the correct rendering. The pending state is
+ * not a status class and has no modifier either, for the same reason: see
  * {@link PENDING_TONE}.
  */
-const STATUS_CLASS_MODIFIERS: Readonly<Record<StatusClass, string | undefined>> = {
-  ok: 'dg-request-table__status--ok',
+const STATUS_CLASS_MODIFIERS: Readonly<Record<HttpStatusClass, string | undefined>> = {
+  informational: undefined,
+  success: 'dg-request-table__status--ok',
   redirect: 'dg-request-table__status--redirect',
   'client-error': 'dg-request-table__status--client-error',
   'server-error': 'dg-request-table__status--server-error',
   unknown: undefined,
-};
-
-/**
- * Badge tone per span status, for a **settled** occurrence that reported no
- * status code. A pending occurrence also reports span status `unset`, but it is
- * drawn as the Pending badge instead, so `unset` here always means a request
- * that settled without the producer observing a code.
- */
-const SPAN_STATUS_TONES: Readonly<Record<TelemetryStatus, BadgeTone>> = {
-  unset: 'neutral',
-  ok: 'success',
-  error: 'danger',
 };
 
 /**
@@ -360,62 +393,163 @@ const PENDING_VARIANT: BadgeVariant = 'outline';
  */
 const SORT_LABELS: Readonly<Record<DataQuerySort, string>> = {
   count_desc: 'Most occurrences first',
-  duration_desc: 'Longest duration first',
+  duration_desc: 'Longest total duration first',
   start_asc: 'Earliest first',
 };
 
-/**
- * The ordering options of the toolbar's select, derived from the vocabulary so
- * the control offers exactly the orderings the contract can resolve.
- *
- * Typed as the toolbar's own option list (`ToolbarSelect['options']`) rather
- * than by naming the option type again: the shape belongs to the control, and
- * borrowing it keeps this file from carrying a second spelling of it.
- */
-const SORT_OPTIONS: ToolbarSelect['options'] = DATA_QUERY_SORTS.map((sort) => ({
-  value: sort,
-  label: SORT_LABELS[sort],
-}));
-
 /*
  * ---------------------------------------------------------------------------
- * Column identities
+ * Column identities, service orders and view orders
  *
- * Only the occurrence-count column maps to an ordering the contract can
- * express, so it is the only sortable header; see `TABLE_SORTS` below.
+ * Three figure columns are sortable. Two of their orders are the service's own
+ * — Occurrences most first (`count_desc`) and Duration longest total first
+ * (`duration_desc`) — and re-query; every other one is a view order over the
+ * groups loaded (see this module's header, "Data, interaction and paging").
  * ---------------------------------------------------------------------------
  */
 
 const COLUMN_KEY_REQUEST = 'request';
 const COLUMN_KEY_STATUS = 'status';
 const COLUMN_KEY_COUNT = 'count';
-const COLUMN_KEY_DUPLICATES = 'duplicates';
-const COLUMN_KEY_AVERAGE = 'averageDuration';
-const COLUMN_KEY_SLOWEST = 'maxDuration';
-const COLUMN_KEY_TOTAL = 'totalDuration';
+const COLUMN_KEY_DURATION = 'duration';
 const COLUMN_KEY_TRANSFERRED = 'transferred';
 const COLUMN_KEY_INITIATORS = 'initiators';
 
 /**
- * Which column, if any, the current ordering belongs to — the value the grid
- * reports as `aria-sort`.
- *
- * `duration_desc` and `start_asc` map to `null` deliberately. A group carries
- * three durations (average, slowest, total) and two timestamps, and the
- * contract does not say which one its duration ordering ranks by; claiming one
- * of them in `aria-sort` would state something this component cannot know. The
- * toolbar's select names the ordering instead, in the contract's own wording.
+ * The keys of the sortable columns: every figure column. Each orders by one
+ * figure per group — Occurrences by the count its duplicate badge qualifies,
+ * Duration by the total its cell states last, Transferred by the size.
+ * Declared as a tuple so the key type below is derived from it and a lookup
+ * keyed by it must name every sortable column.
  */
-const TABLE_SORTS: Readonly<Record<DataQuerySort, DataTableSort | null>> = {
-  count_desc: { key: COLUMN_KEY_COUNT, direction: 'desc' },
-  duration_desc: null,
-  start_asc: null,
-};
+const ORDER_COLUMN_KEYS = [COLUMN_KEY_COUNT, COLUMN_KEY_DURATION, COLUMN_KEY_TRANSFERRED] as const;
 
-/** The contract ordering a sortable column's header activates. */
-const COLUMN_SORTS: Readonly<Record<string, DataQuerySort | undefined>> = {
-  [COLUMN_KEY_COUNT]: 'count_desc',
-};
+/** The key of a sortable column. */
+type OrderColumnKey = (typeof ORDER_COLUMN_KEYS)[number];
+
+/**
+ * One column and one direction: what a header activation asks for and, when
+ * the service cannot apply it, the view order the loaded groups are arranged
+ * in. Assignable to {@link DataTableSort}, which is how it reaches the header's
+ * indicator and `aria-sort`.
+ */
+interface RequestOrder {
+  /** The column the groups are ordered by. */
+  readonly key: OrderColumnKey;
+
+  /** The direction that ordering runs in. */
+  readonly direction: DataTableSortDirection;
+}
+
+/**
+ * The visible header of each sortable column, which is also its sort control's
+ * accessible name and the first half of its view order's label in the select.
+ */
+const ORDER_COLUMN_HEADERS: Readonly<Record<OrderColumnKey, string>> = Object.freeze({
+  [COLUMN_KEY_COUNT]: 'Occurrences',
+  [COLUMN_KEY_DURATION]: 'Duration',
+  [COLUMN_KEY_TRANSFERRED]: 'Transferred',
+});
+
+/**
+ * How each column's two directions read, in the unit its figure is counted in:
+ * tallies are most or fewest, durations longest or shortest, sizes largest or
+ * smallest.
+ */
+const ORDER_DIRECTION_PHRASES: Readonly<
+  Record<OrderColumnKey, Readonly<Record<DataTableSortDirection, string>>>
+> = Object.freeze({
+  [COLUMN_KEY_COUNT]: { desc: 'most first', asc: 'fewest first' },
+  [COLUMN_KEY_DURATION]: { desc: 'longest total first', asc: 'shortest total first' },
+  [COLUMN_KEY_TRANSFERRED]: { desc: 'largest first', asc: 'smallest first' },
+});
+
+/**
+ * The name each column's order is reported under, as the first half of
+ * `<column>_<direction>` — see {@link orderReportOf}.
+ */
+const ORDER_REPORT_NAMES: Readonly<Record<OrderColumnKey, string>> = Object.freeze({
+  [COLUMN_KEY_COUNT]: 'count',
+  [COLUMN_KEY_DURATION]: 'total',
+  [COLUMN_KEY_TRANSFERRED]: 'transferred',
+});
+
+/**
+ * The one figure of a group each sortable column shows and orders by.
+ *
+ * A group with no exposed transfer size reads as `NaN`, which
+ * {@link compareFigures} places after every measured size in either direction:
+ * the column shows the unavailable label there, and a reversal must not bring
+ * the unmeasured groups to the top of a ranking of sizes.
+ */
+const ORDER_FIGURES: Readonly<Record<OrderColumnKey, (group: RequestGroup) => number>> =
+  Object.freeze({
+    [COLUMN_KEY_COUNT]: (group) => group.count,
+    [COLUMN_KEY_DURATION]: (group) => group.totalDurationMs,
+    [COLUMN_KEY_TRANSFERRED]: (group) => group.transferredBytes ?? Number.NaN,
+  });
+
+/**
+ * Which column and direction each service ordering is shown on — the value the
+ * grid reports as `aria-sort` while no view order is applied.
+ *
+ * `count_desc` ranks by the occurrence count and `duration_desc` by the summed
+ * duration of every occurrence (the `requests` chains of the panel-data
+ * resolver's `SOURCE_SORT_KEYS`), so each claims the column that shows the
+ * figure it ranks by. `start_asc` ranks by the first occurrence's start, which
+ * no column shows, so no header claims it and the select names it alone.
+ */
+const TABLE_SORTS: Readonly<Record<DataQuerySort, RequestOrder | null>> = Object.freeze({
+  count_desc: { key: COLUMN_KEY_COUNT, direction: 'desc' },
+  duration_desc: { key: COLUMN_KEY_DURATION, direction: 'desc' },
+  start_asc: null,
+});
+
+/**
+ * The value of the select's view-order option: outside the `DataQuerySort`
+ * vocabulary by construction, so it can never be mistaken for, or sent as, a
+ * service ordering.
+ */
+const VIEW_ORDER_OPTION_VALUE = 'view-order';
+
+/**
+ * The view-order option's label while no view order is applied, when it is
+ * shown disabled: it tells the reader that the column headers order the loaded
+ * groups, which the three service options cannot.
+ */
+const VIEW_ORDER_IDLE_LABEL = 'By a column header (loaded groups)';
+
+/** Closes the view-order option's label while one is applied. */
+const VIEW_ORDER_SCOPE_SUFFIX = '(loaded groups)';
+
+/**
+ * The three service orderings of the toolbar's select, derived from the
+ * vocabulary so the control offers exactly the orderings the contract can
+ * resolve.
+ */
+const SERVICE_SORT_OPTIONS = DATA_QUERY_SORTS.map((sort) => ({
+  value: sort,
+  label: SORT_LABELS[sort],
+}));
+
+/**
+ * The toolbar select's options while no view order is applied: the three
+ * service orderings, then the view-order option, disabled.
+ *
+ * The view-order option is always present so the set of choices is stable —
+ * the `Select` primitive's rule for a choice the current state cannot
+ * support — and so the select and the header always name the same order: a
+ * header that arranges the loaded groups makes that option the select's value,
+ * labelled with the order applied (see {@link sortOptionsFor}).
+ *
+ * Typed as the toolbar's own option list (`ToolbarSelect['options']`) rather
+ * than by naming the option type again: the shape belongs to the control, and
+ * borrowing it keeps this file from carrying a second spelling of it.
+ */
+const IDLE_SORT_OPTIONS: ToolbarSelect['options'] = Object.freeze([
+  ...SERVICE_SORT_OPTIONS,
+  { value: VIEW_ORDER_OPTION_VALUE, label: VIEW_ORDER_IDLE_LABEL, disabled: true },
+]);
 
 /**
  * The width ROLE of every column, handed to `DataTable` as each column's
@@ -435,26 +569,51 @@ const COLUMN_SORTS: Readonly<Record<string, DataQuerySort | undefined>> = {
  *     widest floor and the widest share of all the columns;
  *   - `status` is `status`: the code badges, the Pending badge and the failure
  *     count, which wrap onto another line rather than overflow;
- *   - `count` (Occurrences) and `duplicates` are `count`: integer tallies, the
- *     second with its compact duplicate badge;
- *   - the three durations and `transferred` are `quantity`: a formatted
- *     measurement with its unit (`999.99 ms`, `123.456 s`, a byte size);
- *   - `initiators` is `name`: the first caller's source chip and the overflow
- *     badge beside it.
+ *   - `count` (Occurrences) is `count`: the integer tally with, for a group
+ *     that has redundant occurrences, the compact duplicate badge beside it —
+ *     the room that role keeps for exactly such a badge;
+ *   - `duration` and `transferred` are `quantity`: a formatted measurement with
+ *     its unit (`999.99 ms`, `123.456 s`, a byte size). The duration column
+ *     states a group's average, slowest and total as one labelled figure per
+ *     line, or the one figure a lone occurrence has (see
+ *     {@link renderDurationCell});
+ *   - `initiators` is `label`, a HOLDING role: the first caller's slot and the
+ *     `+N` overflow badge beside it, on one line.
+ *
+ * Why the callers hold their floor rather than yield like the request. A caller
+ * is identified by its leading word — the function or component that issued
+ * the request — and the cell spends part of its width on the `+N` badge, which
+ * keeps its own width so the count stays whole. A truncating role (`name`)
+ * yields down to `--dg-column-yield` of its floor, and in a panel just too
+ * narrow for every floor that left the caller a few characters beside the
+ * badge (an `f…` no reader can place). The `label` floor keeps that leading
+ * word readable beside the badge at every panel width, with the caller's full
+ * text in its tooltip and every caller with a location a chip in the
+ * occurrence list. The cell stays one line — wrapping the badge under the
+ * caller would make multi-caller rows taller than their neighbours.
+ *
+ * Six columns, because the table is often drawn in one pane of a split. The
+ * duplicate count shares the occurrence count's cell and the three durations
+ * share one cell: separate, those four figures added four compact floors, and
+ * the sum of the floors was wider than a split pane, so the columns beyond the
+ * first few scrolled out of view and the request column — the only one allowed
+ * to narrow — was cut to a few characters of its URL. Folded, every figure a
+ * group carries is still in its row, the floors fit a split pane with the URL
+ * and caller columns at or above their yielded minimums, and a wide panel
+ * spends its spare width on the URL rather than on four columns of figures.
  *
  * Every role has a non-zero floor, because the floors are what the grid fits
  * or scrolls against: `DataTable` sums the columns' floors and minimums into
  * the grid's own width. A panel just too narrow for every floor narrows the
- * request (`text`) and initiator (`name`) columns, never below the
- * `--dg-column-yield` fraction of theirs, only as far as the table needs to
- * fit: the URL ellipsizes, the grouping chip moves under it and the caller
- * chip truncates, while every figure stays in view. A panel too narrow even
- * for that keeps every floor and scrolls horizontally with every column
- * readable, instead of squeezing the tracks until one cell paints over the
- * next.
- * Spare width goes mostly to the two columns whose values are text of
- * unbounded length — the request and its callers — so a wide panel shows URLs
- * and caller chips in full rather than widening columns of figures. A token
+ * request (`text`) column alone, never below the `--dg-column-yield` fraction
+ * of its floor, only as far as the table needs to fit: the URL ellipsizes and
+ * the grouping chip moves under it, while every figure and the caller stay in
+ * view. A panel too narrow even for that keeps every floor and scrolls
+ * horizontally with every column readable, instead of squeezing the tracks
+ * until one cell paints over the next.
+ * Spare width goes mostly to the request, whose URL is text of unbounded
+ * length, then to the callers, before any column of figures: a wide panel
+ * shows URLs and caller chips in full rather than widening the tallies. A token
  * floor and a ratio resolve identically in the header row and in every data
  * row, which keeps each column under its own heading.
  */
@@ -462,10 +621,9 @@ const COLUMN_WIDTHS = Object.freeze({
   request: 'text',
   status: 'status',
   count: 'count',
-  duplicates: 'count',
   duration: 'quantity',
   transferred: 'quantity',
-  initiators: 'name',
+  initiators: 'label',
 } satisfies Record<string, DataTableColumnWidth>);
 
 /*
@@ -481,6 +639,12 @@ const COLUMN_WIDTHS = Object.freeze({
 const EMPTY_GROUPS: readonly RequestGroup[] = Object.freeze([]);
 const EMPTY_IDS: readonly string[] = Object.freeze([]);
 const EMPTY_STATUSES: readonly ToolbarStatus[] = Object.freeze([]);
+
+/**
+ * What a disclosure toggle that is not the retry successor spreads in place of
+ * `RETRY_SUCCESSOR_FOCUS_ATTRIBUTES`: nothing.
+ */
+const NO_FOCUS_ATTRIBUTES: Readonly<Record<string, never>> = Object.freeze({});
 
 /*
  * ---------------------------------------------------------------------------
@@ -509,6 +673,17 @@ const DUPLICATES_UNAVAILABLE_NOTE =
   'No request groups are loaded, so there are no duplicates to filter.';
 const TRANSFER_UNAVAILABLE_NOTE =
   'No transfer size was exposed for this request, so none is shown rather than a misleading zero.';
+/**
+ * The labels of the duration cell's three figures for a group whose figures
+ * differ. Short, conventional abbreviations, because each sits beside its
+ * figure on one line of a `quantity` column; a reader hears them in the same
+ * order, label then figure, as one run of the cell's text.
+ */
+const DURATION_AVERAGE_LABEL = 'avg';
+const DURATION_SLOWEST_LABEL = 'max';
+const DURATION_TOTAL_LABEL = 'total';
+/** What the duplicate badge's figure counts, read after it and never drawn. */
+const DUPLICATE_BADGE_HIDDEN_LABEL = 'redundant';
 const ERROR_COUNT_LABEL = 'Occurrences that failed:';
 const ALL_STATUS_CODES_LABEL = 'All status codes observed:';
 const PENDING_LABEL = 'Pending';
@@ -521,6 +696,15 @@ const PENDING_SETTLED_ONLY_NOTE =
   'The status codes and failures shown describe the settled occurrences only.';
 const PENDING_OCCURRENCE_NOTE =
   'This request was still in flight when the capture ended, so no response and no status code were observed. The duration shown is the time elapsed until then, a lower bound on how long it took.';
+const NO_STATUS_LABEL = 'No status';
+const NO_STATUS_GROUP_LABEL = 'Settled without a status code:';
+const NO_STATUS_GROUP_NOTE =
+  'An aborted request, a network error, a refused cross-origin response and an opaque one all settle without a code to report, so none of them appears among the status codes.';
+const NO_STATUS_SINGLE_NOTE =
+  'This request settled without a status code: it was aborted, failed on the network, or answered with a response the page could not read.';
+const NO_STATUS_FAILURES_NOTE =
+  'Any of them that failed is counted among the failures shown beside this badge.';
+const NO_STATUS_SINGLE_FAILURE_NOTE = 'It failed, and it is the failure shown beside this badge.';
 const LOAD_MORE_LABEL = 'Load more';
 const LOAD_MORE_BUSY_LABEL = 'Loading more…';
 const EXPAND_LABEL = 'Show occurrences';
@@ -528,6 +712,13 @@ const COLLAPSE_LABEL = 'Hide occurrences';
 const NO_OCCURRENCES_NOTE = 'No individual occurrences were returned for this group.';
 const SELECT_OCCURRENCE_LABEL = 'Select the occurrence at';
 const OTHER_INITIATORS_LABEL = 'Also initiated by:';
+/** Introduces, in a component caller's tooltip, the components that created it. */
+const CREATED_BY_LABEL = 'Created by';
+/**
+ * Joins a creator chain in that tooltip, nearest first — the notation the
+ * aggregate's component labels use (`Rail ‹ Header`).
+ */
+const CREATOR_CHAIN_SEPARATOR = ' ‹ ';
 const OTHER_INITIATORS_SOURCE_NOTE =
   'Show the occurrences to open the source location recorded for each.';
 const OCCURRENCES_SHOWN_LABEL = 'Occurrences shown:';
@@ -567,36 +758,6 @@ const LOAD_MORE_FOCUS_ATTRIBUTES = {
  * request's URL with another's.
  * ---------------------------------------------------------------------------
  */
-
-/**
- * Classify one response status code.
- *
- * @param code The status code an occurrence reported.
- * @returns The class whose tone and stylesheet modifier the badge carries.
- */
-function classifyStatusCode(code: number): StatusClass {
-  if (!Number.isInteger(code)) {
-    return 'unknown';
-  }
-
-  if (code >= STATUS_CLASS_FLOORS.ok && code < STATUS_CLASS_FLOORS.redirect) {
-    return 'ok';
-  }
-
-  if (code >= STATUS_CLASS_FLOORS.redirect && code < STATUS_CLASS_FLOORS.clientError) {
-    return 'redirect';
-  }
-
-  if (code >= STATUS_CLASS_FLOORS.clientError && code < STATUS_CLASS_FLOORS.serverError) {
-    return 'client-error';
-  }
-
-  if (code >= STATUS_CLASS_FLOORS.serverError && code < STATUS_CLASS_FLOORS.ceiling) {
-    return 'server-error';
-  }
-
-  return 'unknown';
-}
 
 /**
  * The cluster with the most occurrences, or `undefined` for a group with none.
@@ -704,6 +865,59 @@ function describePending(group: RequestGroup, pendingCount: number): string {
 }
 
 /**
+ * How many of a group's occurrences settled without reporting a status code,
+ * as a count safe to print and compare.
+ *
+ * `noStatusCodeCount` is present only when at least one occurrence settled
+ * without a code, so its absence reads as zero — which is also what a group
+ * from an aggregate that predates the field reads as. A value that is not a
+ * positive integer, or one larger than the group's own count, cannot come from
+ * the aggregate and is read as zero rather than printed.
+ *
+ * @param group The group whose code-less occurrences are counted.
+ * @returns The count, or `0` when none was reported.
+ */
+function noStatusCodeCountOf(group: RequestGroup): number {
+  const { noStatusCodeCount } = group;
+
+  return noStatusCodeCount !== undefined &&
+    Number.isInteger(noStatusCodeCount) &&
+    noStatusCodeCount > 0 &&
+    noStatusCodeCount <= group.count
+    ? noStatusCodeCount
+    : 0;
+}
+
+/**
+ * Describe a group's code-less occurrences for the "No status" badge's
+ * tooltip, entirely from the group's own numbers: how many settled without a
+ * code, why a settled request has none, and — when the row shows a failure
+ * count — that those which failed are part of it, which is how the codes and
+ * the failure count beside them reconcile.
+ *
+ * @param group The group whose code-less occurrences are described.
+ * @param noStatusCount Its {@link noStatusCodeCountOf}, already computed and above zero.
+ * @returns One or more sentences, safe to show as plain text.
+ */
+function describeNoStatus(group: RequestGroup, noStatusCount: number): string {
+  if (group.count === 1) {
+    return group.errorCount > 0
+      ? `${NO_STATUS_SINGLE_NOTE} ${NO_STATUS_SINGLE_FAILURE_NOTE}`
+      : NO_STATUS_SINGLE_NOTE;
+  }
+
+  const sentences = [
+    `${NO_STATUS_GROUP_LABEL} ${formatCount(noStatusCount)} of ${formatCount(group.count)} occurrences.`,
+    NO_STATUS_GROUP_NOTE,
+  ];
+  if (group.errorCount > 0) {
+    sentences.push(NO_STATUS_FAILURES_NOTE);
+  }
+
+  return sentences.join(' ');
+}
+
+/**
  * The source location observed for one of a group's own initiator labels.
  *
  * A presentational lookup inside a single group, and explicitly **not** a
@@ -734,8 +948,45 @@ function locationForInitiator(group: RequestGroup, initiator: string): SourceLoc
 }
 
 /**
+ * The first occurrence a group attributes to one of its own initiator labels.
+ *
+ * The same presentational lookup as {@link locationForInitiator}: it answers
+ * how the aggregate derived the label (`initiatorBasis`) and which captured
+ * stack it was derived from (`initiatorStack`), both of which are the same for
+ * every occurrence carrying that label. `undefined` when the occurrence list was
+ * truncated below every occurrence carrying it.
+ *
+ * @param group The group whose occurrences are searched.
+ * @param initiator One entry of that group's `initiators`.
+ * @returns The first occurrence carrying the label, or `undefined`.
+ */
+function occurrenceForInitiator(
+  group: RequestGroup,
+  initiator: string,
+): RequestOccurrence | undefined {
+  return group.occurrences.find((occurrence) => occurrence.initiator === initiator);
+}
+
+/**
+ * Whether a label names the React component that started a request (with its
+ * owners), rather than a place in the code.
+ *
+ * Such a label is runtime evidence the source location cannot carry: two mounts
+ * of one component run the same line under different owners, so they share a
+ * location and are still two callers.
+ */
+function isComponentInitiator(group: RequestGroup, initiator: string): boolean {
+  return occurrenceForInitiator(group, initiator)?.initiatorBasis === 'component';
+}
+
+/** The three coordinates the editor opens, as one comparable key. */
+function locationKey(location: SourceLocation): string {
+  return `${location.file}:${String(location.line)}:${String(location.column)}`;
+}
+
+/**
  * The group's callers as its row presents them: `initiators` in the order
- * received, less every caller whose resolved source location is one an earlier
+ * received, less every caller whose resolved source location is one another
  * caller already names.
  *
  * Two labels for one place in the project - `fetchItemList` and
@@ -744,23 +995,45 @@ function locationForInitiator(group: RequestGroup, initiator: string): SourceLoc
  * exist and offered the same location twice. The comparison is the location's
  * file, line and column, the three coordinates the editor opens; a caller with
  * no resolved location has nothing to compare and is always kept, since the
- * labels themselves are already distinct. Display only: the group's membership,
- * counts and the `initiators` array itself are untouched, and every occurrence
- * still shows its own caller in the detail row (see
- * {@link renderOccurrenceInitiator}).
+ * labels themselves are already distinct.
+ *
+ * A component caller ({@link isComponentInitiator}) is never folded: two mounts
+ * of one component resolve to the same line and are two callers, which is the
+ * very finding this column exists to show (AAP 0.8.2). The location it names
+ * still counts as named, so a place-only label for that location — the same
+ * code, observed where the renderer reported no component — is folded into it
+ * wherever it appears in the order.
+ *
+ * Display only: the group's membership, counts and the `initiators` array
+ * itself are untouched, and every occurrence still shows its own caller in the
+ * detail row (see {@link renderOccurrenceInitiator}).
  *
  * @param group The group whose callers are listed.
  * @returns The callers to show, first one first.
  */
 function distinctInitiators(group: RequestGroup): readonly string[] {
   const seenLocations = new Set<string>();
-  const kept: string[] = [];
 
   for (const initiator of group.initiators) {
     const location = locationForInitiator(group, initiator);
 
+    if (location !== undefined && isComponentInitiator(group, initiator)) {
+      seenLocations.add(locationKey(location));
+    }
+  }
+
+  const kept: string[] = [];
+
+  for (const initiator of group.initiators) {
+    if (isComponentInitiator(group, initiator)) {
+      kept.push(initiator);
+      continue;
+    }
+
+    const location = locationForInitiator(group, initiator);
+
     if (location !== undefined) {
-      const key = `${location.file}:${String(location.line)}:${String(location.column)}`;
+      const key = locationKey(location);
 
       if (seenLocations.has(key)) {
         continue;
@@ -1012,6 +1285,276 @@ function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
 
 /*
  * ---------------------------------------------------------------------------
+ * Orders, selection and the retry successor
+ *
+ * Every function below is pure. The arrangement is the one place rows are
+ * re-ordered, and it compares one figure of each group — never a URL, a caller
+ * label or anything that would amount to grouping two requests.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Narrow a column key the grid reported back to a sortable column's key.
+ *
+ * @param key The key of the header that was activated.
+ * @returns The sortable column's key, or `undefined` for any other column.
+ */
+function orderColumnKeyOf(key: string): OrderColumnKey | undefined {
+  return ORDER_COLUMN_KEYS.find((candidate) => candidate === key);
+}
+
+/**
+ * The service ordering that applies a requested order, when the service can
+ * apply it.
+ *
+ * Exactly two column-and-direction pairs are service orders: Occurrences most
+ * first and Duration longest total first. Every other pair — the reverse of either
+ * included — yields `undefined` and becomes a view order over the groups
+ * loaded, so re-activating the sorted Occurrences header, which the grid
+ * proposes as a flip to ascending, arranges the loaded groups fewest first
+ * rather than silently doing nothing or re-querying for the same order.
+ *
+ * @param order The column and direction the reader asked for.
+ * @returns The ordering to request, or `undefined` when the service has none.
+ */
+function serviceSortFor(order: RequestOrder): DataQuerySort | undefined {
+  if (order.direction !== 'desc') {
+    return undefined;
+  }
+
+  if (order.key === COLUMN_KEY_COUNT) {
+    return 'count_desc';
+  }
+
+  return order.key === COLUMN_KEY_DURATION ? 'duration_desc' : undefined;
+}
+
+/**
+ * Whether an applied view order already is the order requested.
+ *
+ * @param applied The view order in force, or `null` for none.
+ * @param requested The order asked for.
+ * @returns `true` when both name the same column and direction.
+ */
+function isSameOrder(applied: RequestOrder | null, requested: RequestOrder): boolean {
+  return (
+    applied !== null && applied.key === requested.key && applied.direction === requested.direction
+  );
+}
+
+/** `1` for ascending, `-1` for descending: the factor a comparison is scaled by. */
+type OrderSign = 1 | -1;
+
+/**
+ * Compare two figures in the requested direction, with any value that is not a
+ * finite number placed after every finite one in either direction: such a
+ * value renders as the unavailable label, and a reversal must not bring the
+ * unmeasured groups to the top.
+ *
+ * @param left The first figure.
+ * @param right The second figure.
+ * @param sign The direction factor.
+ * @returns A negative number, zero or a positive number, as `Array#sort` expects.
+ */
+function compareFigures(left: number, right: number, sign: OrderSign): number {
+  const leftFinite = Number.isFinite(left);
+  const rightFinite = Number.isFinite(right);
+
+  if (!leftFinite || !rightFinite) {
+    if (leftFinite === rightFinite) {
+      return 0;
+    }
+
+    return leftFinite ? -1 : 1;
+  }
+
+  return sign * (left - right);
+}
+
+/**
+ * The groups arranged in a view order, as a new array.
+ *
+ * Stable by construction rather than by trusting the engine: groups that
+ * compare equal keep the position the service gave them, in both directions,
+ * so the service's own tie-break still decides among equals. The input is never
+ * mutated — it is the service-ordered sequence "load more" appends to.
+ *
+ * @example
+ * arrangeGroups(loaded, { key: 'averageDuration', direction: 'desc' });
+ * // the loaded groups, longest average first
+ *
+ * @param groups The groups to arrange, in the service's order.
+ * @param order The view order to arrange them in.
+ * @returns The same groups, re-arranged.
+ */
+function arrangeGroups(
+  groups: readonly RequestGroup[],
+  order: RequestOrder,
+): readonly RequestGroup[] {
+  const figureOf = ORDER_FIGURES[order.key];
+  const sign: OrderSign = order.direction === 'asc' ? 1 : -1;
+  const positioned = groups.map((group, position) => ({
+    group,
+    position,
+    figure: figureOf(group),
+  }));
+
+  positioned.sort((left, right) => {
+    const primary = compareFigures(left.figure, right.figure, sign);
+
+    return primary === 0 ? left.position - right.position : primary;
+  });
+
+  return positioned.map((entry) => entry.group);
+}
+
+/**
+ * The select's label for an applied view order: the column, the direction in
+ * that column's own unit, and the scope — "Duration: shortest total first
+ * (loaded groups)".
+ *
+ * @param order The view order in force.
+ * @returns The label.
+ */
+function viewOrderLabel(order: RequestOrder): string {
+  return `${ORDER_COLUMN_HEADERS[order.key]}: ${
+    ORDER_DIRECTION_PHRASES[order.key][order.direction]
+  } ${VIEW_ORDER_SCOPE_SUFFIX}`;
+}
+
+/**
+ * The toolbar select's options for the view order in force.
+ *
+ * The set is the same four choices in every state; only the last one's label
+ * and availability follow the view order, so the select can name the order a
+ * header applied while the list itself never reorders under the reader.
+ *
+ * @param viewOrder The view order in force, or `null` for none.
+ * @returns The options.
+ */
+function sortOptionsFor(viewOrder: RequestOrder | null): ToolbarSelect['options'] {
+  if (viewOrder === null) {
+    return IDLE_SORT_OPTIONS;
+  }
+
+  return [
+    ...SERVICE_SORT_OPTIONS,
+    { value: VIEW_ORDER_OPTION_VALUE, label: viewOrderLabel(viewOrder) },
+  ];
+}
+
+/**
+ * What the order in force is reported to the host as, through
+ * `PanelActions.onFilterChange(nodeId, { sort, … })`.
+ *
+ * A service ordering is reported in the data layer's own spelling
+ * (`count_desc`, `duration_desc`, `start_asc`); a view order as
+ * `<column>_<direction>` (`total_asc`, `count_asc`, …), the spelling
+ * `SpanTable` reports its view orders in, so a name outside the `DataQuerySort`
+ * vocabulary is, by construction, a view order.
+ *
+ * @param sort The service ordering the loaded groups were fetched in.
+ * @param viewOrder The view order applied over them, or `null` for none.
+ * @returns The report's `sort` value.
+ */
+function orderReportOf(sort: DataQuerySort, viewOrder: RequestOrder | null): string {
+  return viewOrder === null ? sort : `${ORDER_REPORT_NAMES[viewOrder.key]}_${viewOrder.direction}`;
+}
+
+/**
+ * The footer sentence added while a view order arranges groups that are not
+ * the whole result: without it a reader would take the first row under
+ * "Duration: longest total first" for the longest of the whole capture.
+ *
+ * @param loaded How many groups the view order arranged; positive.
+ * @returns The scope sentence.
+ */
+function describeViewOrderScope(loaded: number): string {
+  return `This order covers only the ${formatCount(loaded)} ${groupNounFor(
+    loaded,
+  )} loaded; the full result can be ordered only by occurrences, by total duration or by first start.`;
+}
+
+/**
+ * The key of the loaded group that holds the panel's selected event.
+ *
+ * A group stands for the selection when one of its own occurrences does — the
+ * one this view's row activation selects, one picked in the open detail, or the
+ * same event selected in any other view — matched as `matchesPanelSelection`
+ * matches everywhere. Only occurrences the group carries can match: a selection
+ * among occurrences the aggregate truncated away marks no row rather than a
+ * guessed one.
+ *
+ * @param groups The loaded groups, in the service's order: the first that
+ *   matches keeps the mark whichever order arranges them.
+ * @param selection The panel's selection, or `undefined` for none.
+ * @returns The matching group's id, or `null` when no loaded group holds it.
+ */
+function selectedGroupKeyOf(
+  groups: readonly RequestGroup[],
+  selection: PanelSelection | undefined,
+): string | null {
+  if (selection === undefined) {
+    return null;
+  }
+
+  const match = groups.find((group) =>
+    group.occurrences.some((occurrence) => matchesPanelSelection(selection, occurrence)),
+  );
+
+  return match === undefined ? null : match.id;
+}
+
+/**
+ * The occurrence a group row stands for when it is activated: its canonically
+ * earliest issuance, the first of the occurrences the aggregate carries.
+ *
+ * A group is not an event and never fabricates a coordinate, so the row selects
+ * a real captured occurrence — the one whose start is the group's
+ * `firstStartTime` — with that occurrence's own id, trace and span.
+ *
+ * @param group The activated group.
+ * @returns The occurrence, or `undefined` when the group carries none.
+ */
+function representativeOccurrenceOf(group: RequestGroup): RequestOccurrence | undefined {
+  return group.occurrences[0];
+}
+
+/**
+ * The group whose disclosure toggle takes over keyboard focus from a retry that
+ * succeeded: the first group of the settled page that is on screen.
+ *
+ * The error state's successor contract (`RETRY_SUCCESSOR_FOCUS_ATTRIBUTES` in
+ * `../primitives/ErrorState`), for both scopes this view retries in. After a
+ * failed first page the settled page is the whole table; after a failed
+ * further page it is the page appended below the groups already read, so
+ * focus lands on the first group that arrived rather than jumping back to the
+ * top. Only a page that settled successfully names one — while a page is in
+ * flight or has failed nothing is recovered, and the failure's own Retry must
+ * be the only keyed control in the node — and a group the duplicates filter
+ * hides is passed over for the next one shown.
+ *
+ * @param status The status of the current page.
+ * @param page The current page's groups.
+ * @param rows The groups on screen.
+ * @returns The id of the successor group, or `undefined` for none.
+ */
+function retrySuccessorKeyOf(
+  status: 'loading' | 'error' | 'success',
+  page: readonly RequestGroup[],
+  rows: readonly RequestGroup[],
+): string | undefined {
+  if (status !== 'success' || page.length === 0) {
+    return undefined;
+  }
+
+  const shown = new Set(rows.map((group) => group.id));
+
+  return page.find((group) => shown.has(group.id))?.id;
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Cell renderers
  *
  * Module-level and pure: each takes a group (and, for an occurrence, its
@@ -1056,6 +1599,34 @@ function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
 const GRID_CONTROL_TAB_INDEX = -1;
 
 /**
+ * One reported response code as a status chip, shared by the group row and the
+ * occurrence row so the two levels cannot drift apart.
+ *
+ * The code is classified once, by the shared `httpStatusClass`, and that one
+ * class supplies both the `Badge` tone (`HTTP_STATUS_CLASS_TONES`, the table
+ * the waterfall and the timeline read too) and this table's stylesheet
+ * modifier, so the colour of a 301, a 404 or a 500 is the same in every view
+ * of the panel.
+ *
+ * @param code The status code an occurrence reported.
+ * @returns The chip, keyed by the code so a list of distinct codes can hold it.
+ */
+function renderStatusCodeBadge(code: number): ReactNode {
+  const statusClass = httpStatusClass(code);
+
+  return (
+    <Badge
+      key={code}
+      tone={HTTP_STATUS_CLASS_TONES[statusClass]}
+      variant="outline"
+      className={clsx('dg-request-table__status', STATUS_CLASS_MODIFIERS[statusClass])}
+    >
+      {String(code)}
+    </Badge>
+  );
+}
+
+/**
  * The Pending badge, shared by the group row and the occurrence row so the two
  * levels cannot drift apart.
  *
@@ -1086,17 +1657,51 @@ function renderPendingBadge(label: string, note: string): ReactNode {
 }
 
 /**
+ * The "No status" badge: the group's occurrences that settled without a status
+ * code, on the base status chip in the neutral tone — reporting no code is not
+ * itself a failure, and the failures among them are the failure count's to
+ * show — with a glyph for "none" and the visible words carrying the state.
+ * The count is shown when the group holds more than one occurrence, like the
+ * Pending badge's, so "No status 2" beside a lone 200 and a failure count of 2
+ * reads without the tooltip.
+ *
+ * @param group The group whose code-less occurrences are shown.
+ * @param noStatusCount Its {@link noStatusCodeCountOf}, already computed and above zero.
+ * @returns The badge in its tooltip.
+ */
+function renderNoStatusBadge(group: RequestGroup, noStatusCount: number): ReactNode {
+  return (
+    <Tooltip content={describeNoStatus(group, noStatusCount)}>
+      <Badge
+        tone="neutral"
+        variant="outline"
+        className="dg-request-table__status"
+        icon={<CircleSlash className="dg-icon" />}
+        tabIndex={GRID_CONTROL_TAB_INDEX}
+      >
+        {group.count > 1 ? `${NO_STATUS_LABEL} ${formatCount(noStatusCount)}` : NO_STATUS_LABEL}
+      </Badge>
+    </Tooltip>
+  );
+}
+
+/**
  * The status cell: one badge per distinct code the group observed, with the
  * remainder summarised, a Pending badge when any occurrence was still in
- * flight, and a failure count when any occurrence failed.
+ * flight, a "No status" badge when any settled without a code, and a failure
+ * count when any occurrence failed.
+ *
+ * Together they account for every occurrence: each is pending, settled with
+ * one of the codes shown, or settled without one — so a failure count larger
+ * than the failing codes explain is never left unexplained beside them.
  *
  * The codes arrive distinct and ascending; nothing here re-derives them. An
  * absent code list is rendered as the unavailable label on a neutral badge,
- * never as a zero or a blank cell — except when every occurrence is pending,
- * where the Pending badge alone explains the missing codes and the unavailable
- * label beside it would claim a settled occurrence that reported none. When
- * only some occurrences are pending and no settled one reported a code either,
- * both badges are shown, because both things were observed.
+ * never as a zero or a blank cell — except when the Pending and "No status"
+ * badges between them already explain every missing code, where the
+ * unavailable label beside them would claim an occurrence the aggregate
+ * accounted for. A group from an aggregate that predates `noStatusCodeCount`
+ * reports no code-less occurrence, and keeps the unavailable label.
  *
  * The Pending badge shows the pending count when the group holds more than one
  * occurrence, so "Pending 2" on a row of five reads without the tooltip.
@@ -1108,26 +1713,15 @@ function renderStatusCell(group: RequestGroup): ReactNode {
   const shown = group.statusCodes.slice(0, MAX_STATUS_BADGES);
   const overflow = group.statusCodes.length - shown.length;
   const pendingCount = pendingCountOf(group);
-  const everyOccurrencePending = pendingCount > 0 && pendingCount >= group.count;
+  const noStatusCount = noStatusCodeCountOf(group);
+  const everyMissingCodeExplained =
+    (pendingCount > 0 || noStatusCount > 0) && pendingCount + noStatusCount >= group.count;
 
   let codeBadges: ReactNode;
 
   if (group.statusCodes.length > 0) {
-    codeBadges = shown.map((code) => {
-      const statusClass = classifyStatusCode(code);
-
-      return (
-        <Badge
-          key={code}
-          tone={STATUS_CLASS_TONES[statusClass]}
-          variant="outline"
-          className={clsx('dg-request-table__status', STATUS_CLASS_MODIFIERS[statusClass])}
-        >
-          {String(code)}
-        </Badge>
-      );
-    });
-  } else if (everyOccurrencePending) {
+    codeBadges = shown.map((code) => renderStatusCodeBadge(code));
+  } else if (everyMissingCodeExplained) {
     codeBadges = null;
   } else {
     codeBadges = (
@@ -1162,6 +1756,7 @@ function renderStatusCell(group: RequestGroup): ReactNode {
             describePending(group, pendingCount),
           )
         : null}
+      {noStatusCount > 0 ? renderNoStatusBadge(group, noStatusCount) : null}
       {group.errorCount > 0 ? (
         <Tooltip
           content={`${ERROR_COUNT_LABEL} ${formatCount(group.errorCount)} of ${formatCount(
@@ -1178,24 +1773,35 @@ function renderStatusCell(group: RequestGroup): ReactNode {
 }
 
 /**
- * The duplicates cell: the badged redundant count when the group has
- * duplicates, and the plain count when it does not.
+ * The occurrences cell: how many times the request occurred and, for a group
+ * with redundant occurrences, the duplicate badge beside that count.
  *
- * Both numbers come from the group as received. The badge's tooltip describes
- * the clusters the detector found, in that capture's own measurements.
+ * Both numbers come from the group as received. The badge carries the
+ * redundant count, the duplicate glyph and the warning tone the row's edge
+ * shares, and its tooltip names the figure and describes the clusters the
+ * detector found, in that capture's own measurements. A group without
+ * duplicates draws the count alone: a zero beside every ordinary count would
+ * be noise, and the badge's absence is the statement. The two share one cell
+ * because the badge is exactly what the `count` role keeps room for; the
+ * items wrap, so a badge that does not fit beside a long count moves under it
+ * instead of overflowing into the next column.
  *
- * @param group The group whose duplicate evidence is shown.
+ * @param group The group whose occurrence count and duplicate evidence are shown.
  * @returns The cell's content.
  */
-function renderDuplicatesCell(group: RequestGroup): ReactNode {
+function renderCountCell(group: RequestGroup): ReactNode {
   return (
     <Stack
       direction="horizontal"
       gap={1}
       align="center"
       justify="end"
+      wrap
       className="dg-request-table__duplicates"
     >
+      <Text size="sm" numeric>
+        {formatCount(group.count)}
+      </Text>
       {group.hasDuplicates ? (
         <Tooltip content={describeDuplicates(group)}>
           <Badge
@@ -1206,13 +1812,58 @@ function renderDuplicatesCell(group: RequestGroup): ReactNode {
             tabIndex={GRID_CONTROL_TAB_INDEX}
           >
             {formatCount(group.duplicateCount)}
+            {/* The column is headed "Occurrences", so the second figure in it
+                names itself to a reader who hears the cell without seeing the
+                glyph and the tone that set it apart. */}
+            <span className="dg-visually-hidden">{` ${DUPLICATE_BADGE_HIDDEN_LABEL}`}</span>
           </Badge>
         </Tooltip>
-      ) : (
-        <Text size="sm" tone="muted" numeric>
-          {formatCount(group.duplicateCount)}
-        </Text>
-      )}
+      ) : null}
+    </Stack>
+  );
+}
+
+/**
+ * The duration cell: a group's average, slowest and total durations.
+ *
+ * A group whose three figures are equal — one occurrence, the ordinary case —
+ * draws that one duration alone, since labelling one value three ways says
+ * nothing more. Otherwise each figure is a line of its own, its short label
+ * before it, in a fixed order (average, slowest, total), end-aligned so the
+ * figures compare down the column. Each figure is a `DurationCell` with
+ * `severity="auto"`, as each was when it had a column of its own; a line wraps
+ * its label above its figure rather than overflow a narrow column.
+ *
+ * The figures are the aggregate's as received — nothing is re-derived from the
+ * occurrences — and a pending occurrence's elapsed time is part of them, which
+ * the status cell's Pending note states.
+ *
+ * @param group The group whose durations are shown.
+ * @returns The cell's content.
+ */
+function renderDurationCell(group: RequestGroup): ReactNode {
+  const { averageDurationMs, maxDurationMs, totalDurationMs } = group;
+
+  if (averageDurationMs === maxDurationMs && maxDurationMs === totalDurationMs) {
+    return <DurationCell ms={averageDurationMs} severity="auto" size="sm" />;
+  }
+
+  const figures: readonly (readonly [label: string, ms: number])[] = [
+    [DURATION_AVERAGE_LABEL, averageDurationMs],
+    [DURATION_SLOWEST_LABEL, maxDurationMs],
+    [DURATION_TOTAL_LABEL, totalDurationMs],
+  ];
+
+  return (
+    <Stack direction="vertical" gap={0} className="dg-request-table__durations">
+      {figures.map(([label, ms]) => (
+        <Stack key={label} direction="horizontal" gap={1} align="baseline" justify="end" wrap>
+          <Text size="xs" tone="muted">
+            {label}
+          </Text>
+          <DurationCell ms={ms} severity="auto" size="sm" />
+        </Stack>
+      ))}
     </Stack>
   );
 }
@@ -1258,23 +1909,73 @@ function renderTransferredCell(group: RequestGroup): ReactNode {
  * path run. The clip is visual only; the whole label stays in the
  * accessibility tree.
  *
- * The label is no control and carries no tab index, so it cannot be mistaken
- * for the link beside it, and it is never the chip's caption (see
- * {@link renderInitiatorSlot}).
+ * The label is no control — plain code text, never a button and never the
+ * chip's caption (see {@link renderInitiatorSlot}) — so it cannot be mistaken
+ * for the link beside it. A component caller whose occurrence recorded the
+ * components that created it is, however, the trigger of a tooltip disclosing
+ * {@link callerDisclosure}: its label is often wider than the column
+ * (`RecommendationsRail ‹ ProductDetailPage` in a 200 px cell reads
+ * `Recommen…`), and the part a reader needs to tell two mounts apart is the
+ * part the ellipsis cuts. Such a trigger is `tabIndex={-1}` like every other
+ * trigger in the grid, reached by the grid's arrow keys (see
+ * {@link GRID_CONTROL_TAB_INDEX}), so the disclosure opens on focus as well as
+ * on hover. Any other label has nothing to disclose beyond its own text, which
+ * stays whole in the accessibility tree, so it stays plain text: a tooltip
+ * repeating it would only make a screen reader announce it twice.
  *
  * @param label The caller label, already reduced to one line.
  * @param chip The source chip for the caller's location.
+ * @param disclosure What the label's tooltip discloses, when there is more to
+ * say than the label.
  * @returns The slot.
  */
-function renderCallerBesideChip(label: string, chip: ReactNode): ReactNode {
+function renderCallerBesideChip(
+  label: string,
+  chip: ReactNode,
+  disclosure: string | undefined,
+): ReactNode {
   return (
     <Stack direction="horizontal" gap={1} align="center">
-      <Code size="sm" className="dg-truncate">
-        {label}
-      </Code>
+      {disclosure === undefined ? (
+        <Code size="sm" className="dg-truncate">
+          {label}
+        </Code>
+      ) : (
+        <Tooltip content={disclosure}>
+          <Code size="sm" className="dg-truncate" tabIndex={GRID_CONTROL_TAB_INDEX}>
+            {label}
+          </Code>
+        </Tooltip>
+      )}
       {chip}
     </Stack>
   );
+}
+
+/**
+ * The full text behind a component caller's label: the label and the whole
+ * chain of components that created the component, nearest first — the label
+ * names only as many of them as it takes to tell the group's mounts apart.
+ * `undefined` for any other caller, and for a component whose occurrence
+ * recorded no creator.
+ *
+ * @param label The caller label, as recorded.
+ * @param occurrence An occurrence the label was taken from, when there is one.
+ * @returns The tooltip text, or `undefined` when there is nothing to disclose.
+ */
+function callerDisclosure(
+  label: string,
+  occurrence: RequestOccurrence | undefined,
+): string | undefined {
+  if (occurrence?.initiatorBasis !== 'component') {
+    return undefined;
+  }
+  const owners = occurrence.initiatorOwners ?? [];
+  if (owners.length === 0) {
+    return undefined;
+  }
+  const chain = owners.map((owner) => oneLinePreview(owner)).join(CREATOR_CHAIN_SEPARATOR);
+  return `${oneLinePreview(label)}. ${CREATED_BY_LABEL} ${chain}.`;
 }
 
 /**
@@ -1300,10 +2001,16 @@ function renderCallerBesideChip(label: string, chip: ReactNode): ReactNode {
  *     (`sourceLinkAccessibleName`). The location is handed to the chip exactly
  *     as the occurrence carried it — the same object, unmodified — because it
  *     is what the click-to-source chain forwards.
+ *     A label the aggregate derived from that same location (`initiatorBasis`
+ *     `source`: the resolved symbol and `file:line`), or a label that is
+ *     exactly the location's symbol, is not repeated beside it — the chip
+ *     already reads exactly that.
  *   - A caller without one → its label as a tooltip trigger disclosing the
- *     caller's full text. The cell truncates it with CSS, which no string
- *     comparison can detect, so the tooltip is always attached rather than
- *     only when the text was shortened here.
+ *     caller's full text: the captured stack the label was reduced from
+ *     (`initiatorStack`) when there is one, the label itself otherwise. The
+ *     cell truncates it with CSS, which no string comparison can detect, so the
+ *     tooltip is always attached rather than only when the text was shortened
+ *     here.
  *
  * The chip and the trigger are `tabIndex={-1}`: the grid's arrow keys reach
  * them (see {@link GRID_CONTROL_TAB_INDEX}).
@@ -1314,11 +2021,12 @@ function renderCallerBesideChip(label: string, chip: ReactNode): ReactNode {
  */
 function renderInitiatorSlot(group: RequestGroup, initiator: string): ReactNode {
   const location = locationForInitiator(group, initiator);
+  const origin = occurrenceForInitiator(group, initiator);
   const label = oneLinePreview(initiator);
 
   if (location === undefined) {
     return (
-      <Tooltip content={initiator}>
+      <Tooltip content={origin?.initiatorStack ?? initiator}>
         <Code size="sm" className="dg-truncate" tabIndex={GRID_CONTROL_TAB_INDEX}>
           {label}
         </Code>
@@ -1326,15 +2034,25 @@ function renderInitiatorSlot(group: RequestGroup, initiator: string): ReactNode 
     );
   }
 
-  return renderCallerBesideChip(
-    label,
+  const chip = (
     <SourceLink
       location={location}
       showSymbol
       className="dg-request-table__initiator"
       tabIndex={GRID_CONTROL_TAB_INDEX}
-    />,
+    />
   );
+
+  // The chip leads with the location's symbol, so a label that is exactly that
+  // symbol — a component named alone at its own declaration — says nothing
+  // the chip does not already say.
+  const repeatsChip =
+    origin?.initiatorBasis === 'source' ||
+    (location.symbol !== undefined && initiator.trim() === location.symbol);
+
+  return repeatsChip
+    ? chip
+    : renderCallerBesideChip(label, chip, callerDisclosure(initiator, origin));
 }
 
 /**
@@ -1370,15 +2088,17 @@ function describeOtherInitiators(group: RequestGroup, others: readonly string[])
  * firing twice — so the number of callers is always visible: the first as its
  * slot ({@link renderInitiatorSlot}), and every further one counted by the `+N`
  * badge beside it. One line per row, never wrapped, so every row keeps the same
- * height and the first caller keeps a readable width; the full list is the
- * badge's description, and every caller with a location is a source chip in
- * the occurrence list.
+ * height; the first caller keeps a readable width because the column holds its
+ * `label` floor rather than yielding (see {@link COLUMN_WIDTHS}); the full list
+ * is the badge's description, and every caller with a location is a source chip
+ * in the occurrence list.
  *
  * The cell's stack therefore holds exactly one item, or two when the badge is
  * drawn. The badge is a tooltip trigger, `tabIndex={-1}` like every control in
- * the grid (see {@link GRID_CONTROL_TAB_INDEX}). Callers that resolve to a
- * location an earlier caller already names are folded into it first
- * ({@link distinctInitiators}), so no location is shown or counted twice.
+ * the grid (see {@link GRID_CONTROL_TAB_INDEX}). Place-only callers that
+ * resolve to a location another caller already names are folded into it first
+ * ({@link distinctInitiators}), so no location is counted as a second caller —
+ * while two components that share a line stay two callers.
  *
  * @param group The group whose callers are shown.
  * @returns The cell's content.
@@ -1454,29 +2174,21 @@ function renderOccurrence(
   selected: boolean,
 ): ReactNode {
   const offsetText = formatOffset(occurrence.startTime, group.firstStartTime);
-  const statusClass =
-    occurrence.statusCode === undefined ? undefined : classifyStatusCode(occurrence.statusCode);
 
   let statusBadge: ReactNode;
 
   if (occurrence.pending === true) {
     statusBadge = renderPendingBadge(PENDING_LABEL, PENDING_OCCURRENCE_NOTE);
-  } else if (statusClass === undefined || occurrence.statusCode === undefined) {
+  } else if (occurrence.statusCode === undefined) {
+    // The span status in the shared status tone, so a code-less failure reads
+    // in the same colour as the timeline's detail chip for the same span.
     statusBadge = (
-      <Badge tone={SPAN_STATUS_TONES[occurrence.status]} variant="soft">
+      <Badge tone={statusTone(occurrence.status)} variant="soft">
         {formatStatusLabel(occurrence.status)}
       </Badge>
     );
   } else {
-    statusBadge = (
-      <Badge
-        tone={STATUS_CLASS_TONES[statusClass]}
-        variant="outline"
-        className={clsx('dg-request-table__status', STATUS_CLASS_MODIFIERS[statusClass])}
-      >
-        {String(occurrence.statusCode)}
-      </Badge>
-    );
+    statusBadge = renderStatusCodeBadge(occurrence.statusCode);
   }
 
   // `gap` is the occurrence grid's own column gap, so the subgrid's gutters are
@@ -1529,8 +2241,11 @@ function renderOccurrence(
  *     which the chip already shows, so no occurrence prints its location
  *     twice. A label naming a DIFFERENT place is always shown, and always as
  *     text beside the chip rather than as its caption, so it cannot pass for
- *     the link. The location object is handed to the chip by reference and
- *     unmodified, because it is what the click-to-source chain forwards.
+ *     the link. A label the aggregate derived from this very location
+ *     (`initiatorBasis` `source`) is shown as its symbol alone, the part the
+ *     compact chip leaves out. The location object is handed to the chip by
+ *     reference and unmodified, because it is what the click-to-source chain
+ *     forwards.
  *   - A label and no location → the label as code, truncated to its column.
  *   - Neither → the unavailable label, muted, so the slot is never empty.
  *
@@ -1543,7 +2258,7 @@ function renderOccurrence(
  * @returns The slot's single element.
  */
 function renderOccurrenceInitiator(occurrence: RequestOccurrence): ReactNode {
-  const { initiator, source } = occurrence;
+  const { initiator, initiatorBasis, source } = occurrence;
 
   if (source !== undefined) {
     const chip = (
@@ -1554,10 +2269,15 @@ function renderOccurrenceInitiator(occurrence: RequestOccurrence): ReactNode {
         tabIndex={GRID_CONTROL_TAB_INDEX}
       />
     );
+    const caller = initiatorBasis === 'source' ? source.symbol : initiator;
 
-    return initiator === undefined || labelNamesLocation(initiator, source)
+    return caller === undefined || labelNamesLocation(caller, source)
       ? chip
-      : renderCallerBesideChip(oneLinePreview(initiator), chip);
+      : renderCallerBesideChip(
+          oneLinePreview(caller),
+          chip,
+          callerDisclosure(caller, initiatorBasis === 'source' ? undefined : occurrence),
+        );
   }
 
   if (initiator !== undefined) {
@@ -1585,10 +2305,10 @@ function renderOccurrenceInitiator(occurrence: RequestOccurrence): ReactNode {
  * Everything this view owns, held as one value so the page it renders, the
  * offset it asked for and the rows it carried forward can never disagree.
  *
- * Five of the six members change what is requested or what is shown, and the
- * sixth — `identity` — is what makes a stale set detectable: a node whose query
- * changed under the same node id gets a fresh view rather than an offset into
- * the result of the query it replaced.
+ * Every member but `identity` changes what is requested or what is shown;
+ * `identity` is what makes a stale set detectable: a node whose query changed
+ * under the same node id gets a fresh view rather than an offset into the
+ * result of the query it replaced.
  */
 interface RequestTableView {
   /** The identity of the node query this state belongs to. */
@@ -1626,6 +2346,20 @@ interface RequestTableView {
 
   /** Whether the local duplicates-only filter is engaged. */
   readonly duplicatesOnly: boolean;
+
+  /**
+   * The view order the loaded groups are arranged in, or `null` while they are
+   * shown in the service's order. Not part of the query: it changes how the
+   * loaded groups are arranged, never which groups are loaded.
+   */
+  readonly viewOrder: RequestOrder | null;
+
+  /**
+   * Whether the reader has chosen an ordering in this view — from the select or
+   * a header. From then on the grid stays mounted through every re-query, so
+   * the control they used keeps its element and their focus.
+   */
+  readonly ordered: boolean;
 }
 
 /**
@@ -1655,7 +2389,7 @@ function viewIdentityOf(node: RequestTableNode): string {
 
 /**
  * The view state a node opens with: the authored ordering and offset, nothing
- * carried, nothing expanded and no filter.
+ * carried, nothing expanded, no filter, no view order and no reader ordering.
  *
  * @param node The node being rendered.
  * @param identity Its {@link viewIdentityOf}, already computed by the caller.
@@ -1670,6 +2404,8 @@ function initialView(node: RequestTableNode, identity: string): RequestTableView
     carriedTotal: undefined,
     expanded: EMPTY_IDS,
     duplicatesOnly: false,
+    viewOrder: null,
+    ordered: false,
   };
 }
 
@@ -1725,8 +2461,8 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   const actions = usePanelActions();
 
   // The event the panel has selected — the host's shared selection, or this
-  // view's own last one when no host is mounted. An occurrence is the only item
-  // here that can stand for it, so it is the only item marked.
+  // view's own last one when no host is mounted. An occurrence stands for it,
+  // and so does the group row that holds that occurrence: both are marked.
   const { selection, markSelected } = useViewSelection();
 
   // Hoisted out of the callbacks below so their dependency lists name the one
@@ -1799,17 +2535,22 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   // The one local narrowing, and the reason the footer states its scope: the
   // query contract cannot express "duplicates only", so this predicate runs
   // over the groups loaded so far and nothing else. It reads `hasDuplicates`
-  // as received; it never compares two rows.
-  const rows = useMemo(
-    () => (active.duplicatesOnly ? loaded.filter((group) => group.hasDuplicates) : loaded),
-    [active.duplicatesOnly, loaded],
-  );
+  // as received; it never compares two rows. A view order then arranges what
+  // the narrowing kept, by one figure per group (see `arrangeGroups`); the
+  // service-ordered `loaded` sequence underneath is never re-ordered.
+  const rows = useMemo(() => {
+    const kept = active.duplicatesOnly ? loaded.filter((group) => group.hasDuplicates) : loaded;
+
+    return active.viewOrder === null ? kept : arrangeGroups(kept, active.viewOrder);
+  }, [active.duplicatesOnly, active.viewOrder, loaded]);
 
   const applySort = useCallback(
     (sort: DataQuerySort): void => {
       // A new ordering is a new result: the carried pages and the disclosure
       // set describe positions in the old one, so both are dropped and paging
-      // restarts at the authored offset.
+      // restarts at the authored offset. Any view order is dropped with them —
+      // the new result arrives in the order just asked for — and the reader has
+      // now chosen an ordering, which keeps the grid mounted from here on.
       setView((current) => ({
         ...current,
         sort,
@@ -1817,44 +2558,96 @@ export function RequestTable(props: RequestTableProps): ReactElement {
         carried: EMPTY_GROUPS,
         carriedTotal: undefined,
         expanded: EMPTY_IDS,
+        viewOrder: null,
+        ordered: true,
       }));
       reportFilter?.(node.id, { sort, duplicatesOnly: String(active.duplicatesOnly) });
     },
     [active.duplicatesOnly, baseOffset, node.id, reportFilter],
   );
 
+  const applyViewOrder = useCallback(
+    (viewOrder: RequestOrder | null): void => {
+      // Only the arrangement changes: the same groups stay loaded, nothing is
+      // re-queried, and paging continues in the service's order.
+      setView((current) => ({ ...current, viewOrder, ordered: true }));
+      reportFilter?.(node.id, {
+        sort: orderReportOf(active.sort, viewOrder),
+        duplicatesOnly: String(active.duplicatesOnly),
+      });
+    },
+    [active.duplicatesOnly, active.sort, node.id, reportFilter],
+  );
+
   const handleSortSelect = useCallback(
     (next: string): void => {
-      // The control's values come from the contract's own vocabulary, so this
-      // narrowing always succeeds; it is here because the select speaks strings
-      // and the query speaks the vocabulary.
-      if (isDataQuerySort(next)) {
-        applySort(next);
+      // The one value outside the contract's vocabulary is the view-order
+      // option, which is either the value already shown or disabled: choosing
+      // it asks for nothing. The narrowing is otherwise here because the select
+      // speaks strings and the query speaks the vocabulary.
+      if (!isDataQuerySort(next)) {
+        return;
       }
+
+      // The service ordering the loaded groups already arrived in: returning to
+      // it from a view order restores their order without a re-query.
+      if (next === active.sort) {
+        if (active.viewOrder !== null) {
+          applyViewOrder(null);
+        }
+        return;
+      }
+
+      applySort(next);
     },
-    [applySort],
+    [active.sort, active.viewOrder, applySort, applyViewOrder],
   );
 
   const handleTableSortChange = useCallback(
     (next: DataTableSort): void => {
-      const mapped = COLUMN_SORTS[next.key];
+      const key = orderColumnKeyOf(next.key);
 
-      // Only a column that maps to an ordering the contract can express asks
-      // for one. The contract has a single direction per ordering, so
-      // re-activating the active column's header requests the same ordering
-      // rather than an inverse the service could not resolve.
-      if (mapped !== undefined) {
-        applySort(mapped);
+      // A key this table never rendered as a sortable column: nothing to order by.
+      if (key === undefined) {
+        return;
       }
+
+      const requested: RequestOrder = { key, direction: next.direction };
+      const serviceSort = serviceSortFor(requested);
+
+      // An order the service cannot apply: arrange the loaded groups instead.
+      // The grid always proposes a change, so an unchanged view order is
+      // declined rather than reported twice.
+      if (serviceSort === undefined) {
+        if (!isSameOrder(active.viewOrder, requested)) {
+          applyViewOrder(requested);
+        }
+        return;
+      }
+
+      // The service ordering already applied: the loaded groups are in that
+      // order as they stand, so returning to it clears the view order without a
+      // re-query, and with no view order in force nothing changes at all.
+      if (serviceSort === active.sort) {
+        if (active.viewOrder !== null) {
+          applyViewOrder(null);
+        }
+        return;
+      }
+
+      applySort(serviceSort);
     },
-    [applySort],
+    [active.sort, active.viewOrder, applySort, applyViewOrder],
   );
 
   const handleDuplicatesToggle = useCallback((): void => {
     const duplicatesOnly = !active.duplicatesOnly;
 
     setView({ ...active, duplicatesOnly });
-    reportFilter?.(node.id, { sort: active.sort, duplicatesOnly: String(duplicatesOnly) });
+    reportFilter?.(node.id, {
+      sort: orderReportOf(active.sort, active.viewOrder),
+      duplicatesOnly: String(duplicatesOnly),
+    });
   }, [active, node.id, reportFilter]);
 
   const handleLoadMore = useCallback((): void => {
@@ -1889,7 +2682,8 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   const handleOccurrenceSelect = useCallback(
     (occurrence: RequestOccurrence): void => {
       // An occurrence is one captured event, so it can name one. The aggregate
-      // row above it is not, and never fabricates a coordinate to stand in.
+      // row is not, and never fabricates a coordinate to stand in: it selects
+      // one of its own occurrences through this same handler.
       const ref: PanelEventRef = {
         eventId: occurrence.eventId,
         spanId: occurrence.spanId,
@@ -1903,6 +2697,32 @@ export function RequestTable(props: RequestTableProps): ReactElement {
     },
     [markSelected, selectEvent],
   );
+
+  const handleRowActivate = useCallback(
+    (group: RequestGroup): void => {
+      const representative = representativeOccurrenceOf(group);
+
+      // Nothing to select: the aggregate carried no occurrence for this group.
+      // Opening the detail says so, rather than leaving the activation silent.
+      if (representative === undefined) {
+        handleRowToggle(group);
+        return;
+      }
+
+      handleOccurrenceSelect(representative);
+    },
+    [handleOccurrenceSelect, handleRowToggle],
+  );
+
+  // The loaded group that holds the panel's selected event, whichever view
+  // selected it. Matched against the service-ordered `loaded` sequence, so the
+  // mark stays on the same group whichever order arranges the rows, and passed
+  // to the grid even when it is `null`: rows are selectable, so every row
+  // reports `aria-selected`.
+  const selectedRowKey = useMemo(() => selectedGroupKeyOf(loaded, selection), [loaded, selection]);
+
+  // The group whose disclosure toggle a successful retry hands focus to.
+  const retrySuccessorKey = retrySuccessorKeyOf(status, page, rows);
 
   const columns = useMemo<readonly DataTableColumn<RequestGroup>[]>(
     () => [
@@ -1955,6 +2775,12 @@ export function RequestTable(props: RequestTableProps): ReactElement {
                 onClick={() => {
                   handleRowToggle(group);
                 }}
+                // The row's first control, named by the request it opens: where
+                // a successful retry hands focus when this is the first group
+                // the settled page brought (see `retrySuccessorKeyOf`).
+                {...(group.id === retrySuccessorKey
+                  ? RETRY_SUCCESSOR_FOCUS_ATTRIBUTES
+                  : NO_FOCUS_ATTRIBUTES)}
               />
               <Badge tone="neutral" variant="outline" className="dg-request-table__method">
                 {group.method}
@@ -1989,53 +2815,35 @@ export function RequestTable(props: RequestTableProps): ReactElement {
         width: COLUMN_WIDTHS.status,
         cell: (group) => renderStatusCell(group),
       },
+      // The three figure columns are sortable, each first-activated in the
+      // direction its figure is read by — largest first — which for
+      // Occurrences and Duration is the service's own ordering. The primitive
+      // proposes the flip on a second activation; see `handleTableSortChange`.
       {
         key: COLUMN_KEY_COUNT,
-        header: 'Occurrences',
+        header: ORDER_COLUMN_HEADERS[COLUMN_KEY_COUNT],
         align: 'end',
         width: COLUMN_WIDTHS.count,
-        // The one column whose ordering the contract can express.
         sortable: true,
         defaultSortDirection: 'desc',
-        cell: (group) => (
-          <Text size="sm" numeric>
-            {formatCount(group.count)}
-          </Text>
-        ),
+        cell: (group) => renderCountCell(group),
       },
       {
-        key: COLUMN_KEY_DUPLICATES,
-        header: 'Duplicates',
-        align: 'end',
-        width: COLUMN_WIDTHS.duplicates,
-        cell: (group) => renderDuplicatesCell(group),
-      },
-      {
-        key: COLUMN_KEY_AVERAGE,
-        header: 'Average',
+        key: COLUMN_KEY_DURATION,
+        header: ORDER_COLUMN_HEADERS[COLUMN_KEY_DURATION],
         align: 'end',
         width: COLUMN_WIDTHS.duration,
-        cell: (group) => <DurationCell ms={group.averageDurationMs} severity="auto" size="sm" />,
-      },
-      {
-        key: COLUMN_KEY_SLOWEST,
-        header: 'Slowest',
-        align: 'end',
-        width: COLUMN_WIDTHS.duration,
-        cell: (group) => <DurationCell ms={group.maxDurationMs} severity="auto" size="sm" />,
-      },
-      {
-        key: COLUMN_KEY_TOTAL,
-        header: 'Total',
-        align: 'end',
-        width: COLUMN_WIDTHS.duration,
-        cell: (group) => <DurationCell ms={group.totalDurationMs} severity="auto" size="sm" />,
+        sortable: true,
+        defaultSortDirection: 'desc',
+        cell: (group) => renderDurationCell(group),
       },
       {
         key: COLUMN_KEY_TRANSFERRED,
-        header: 'Transferred',
+        header: ORDER_COLUMN_HEADERS[COLUMN_KEY_TRANSFERRED],
         align: 'end',
         width: COLUMN_WIDTHS.transferred,
+        sortable: true,
+        defaultSortDirection: 'desc',
         cell: (group) => renderTransferredCell(group),
       },
       {
@@ -2045,7 +2853,7 @@ export function RequestTable(props: RequestTableProps): ReactElement {
         cell: (group) => renderInitiatorsCell(group),
       },
     ],
-    [handleRowToggle],
+    [handleRowToggle, retrySuccessorKey],
   );
 
   const renderExpandedRow = useCallback(
@@ -2079,18 +2887,21 @@ export function RequestTable(props: RequestTableProps): ReactElement {
     [handleOccurrenceSelect, selectEvent, selection],
   );
 
+  // The ordering select names the order on screen, as the header does: the
+  // service ordering, or — while a header arranges the loaded groups — the
+  // view-order option labelled with that arrangement.
   const selects = useMemo<readonly ToolbarSelect[]>(
     () => [
       {
         id: `${node.id}:sort`,
         label: SORT_CONTROL_LABEL,
         labelHidden: true,
-        value: active.sort,
-        options: SORT_OPTIONS,
+        value: active.viewOrder === null ? active.sort : VIEW_ORDER_OPTION_VALUE,
+        options: sortOptionsFor(active.viewOrder),
         onValueChange: handleSortSelect,
       },
     ],
-    [active.sort, handleSortSelect, node.id],
+    [active.sort, active.viewOrder, handleSortSelect, node.id],
   );
 
   // The local duplicates filter: a toggle, so it carries `aria-pressed` and the
@@ -2155,22 +2966,44 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   // it states does not change until a page lands.
   const footerTotal = total ?? (loadingMore || nextPageFailed ? active.carriedTotal : undefined);
 
+  // Every group the query matched is loaded: the service reported a total, the
+  // node starts at the first item, the loaded groups reach that total, and no
+  // further page is offered or in flight. Only then does a view order cover the
+  // whole result; anything less and the footer says what the order covers.
+  const wholeResultLoaded =
+    footerTotal !== undefined &&
+    baseOffset === DATA_QUERY_DEFAULT_OFFSET &&
+    loaded.length >= footerTotal &&
+    forwardNextOffset === undefined &&
+    !loadingMore;
+
   const footerNote = useMemo(() => {
-    const loadedNote =
+    const sentences = [
       footerTotal === undefined
         ? `${GROUPS_LOADED_LABEL} ${formatCount(loaded.length)}.`
-        : `${GROUPS_LOADED_LABEL} ${formatCount(loaded.length)} of ${formatCount(footerTotal)}.`;
+        : `${GROUPS_LOADED_LABEL} ${formatCount(loaded.length)} of ${formatCount(footerTotal)}.`,
+    ];
 
-    return active.duplicatesOnly
-      ? [
-          loadedNote,
-          `${DUPLICATES_MATCHED_LABEL} ${formatCount(rows.length)} of ${formatCount(
-            loaded.length,
-          )}.`,
-          DUPLICATES_ONLY_SCOPE_NOTE,
-        ].join(' ')
-      : loadedNote;
-  }, [active.duplicatesOnly, footerTotal, loaded.length, rows.length]);
+    if (active.duplicatesOnly) {
+      sentences.push(
+        `${DUPLICATES_MATCHED_LABEL} ${formatCount(rows.length)} of ${formatCount(loaded.length)}.`,
+        DUPLICATES_ONLY_SCOPE_NOTE,
+      );
+    }
+
+    if (active.viewOrder !== null && loaded.length > 0 && !wholeResultLoaded) {
+      sentences.push(describeViewOrderScope(loaded.length));
+    }
+
+    return sentences.join(' ');
+  }, [
+    active.duplicatesOnly,
+    active.viewOrder,
+    footerTotal,
+    loaded.length,
+    rows.length,
+    wholeResultLoaded,
+  ]);
 
   // What an empty settled page says. An empty page is not necessarily an empty
   // capture, so the copy names the absence the query and the reported counters
@@ -2233,47 +3066,74 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   // narrowing off. Its order control would reorder nothing and its toggle has
   // nothing to filter, so it would be a row of controls that cannot act. It
   // stays while a page is in flight or failed, so a re-query raised from it
-  // never removes it, and whenever the reader's own narrowing is in force, so
-  // that narrowing can be undone where it was made.
+  // never removes it; whenever the reader's own narrowing is in force, so that
+  // narrowing can be undone where it was made; and once the reader has chosen
+  // an ordering, so the select they used is never taken from under them.
   const toolbarShown = !(
     status === 'success' &&
     loaded.length === 0 &&
     forwardNextOffset === undefined &&
     !active.duplicatesOnly &&
+    !active.ordered &&
     emptyCopy === NOTHING_CAPTURED_COPY
   );
 
-  let body: ReactNode;
+  // What stands in for the groups while none is loaded, in the library's
+  // precedence: the first page resolving, a failure of the view's own query,
+  // or a page that settled empty. `undefined` once a group is loaded.
+  let inPlaceOfRows: ReactElement | undefined;
 
-  if (status === 'loading' && loaded.length === 0) {
-    body = (
-      <LoadingState variant="rows" label={LOADING_LABEL} className="dg-request-table__loading" />
-    );
-  } else if (status === 'error' && !nextPageFailed) {
-    // The package's one failure contract: title, the generic lead plus the
-    // provider's own cause, its hint and code, the query as `formatDataQuery`
-    // prints it, the settled announcement and the retry. With nothing carried
-    // this failure replaces the whole body, so it is the view's own; a failed
-    // further page is reported below its groups instead.
-    body = (
-      <ErrorState
-        {...queryFailureProps({ error, announcement, retry }, query)}
-        className="dg-request-table__error"
-      />
-    );
-  } else if (loaded.length === 0) {
-    // Reached only for a page that settled successfully with nothing carried
-    // before it. A forward next page keeps its control reachable instead of
-    // stranding the reader on a page the service says is followed by more.
-    body = (
-      <>
+  if (loaded.length === 0) {
+    if (status === 'loading') {
+      inPlaceOfRows = (
+        <LoadingState variant="rows" label={LOADING_LABEL} className="dg-request-table__loading" />
+      );
+    } else if (status === 'error') {
+      // The package's one failure contract: title, the generic lead plus the
+      // provider's own cause, its hint and code, the query as `formatDataQuery`
+      // prints it, the settled announcement and the retry. With nothing carried
+      // this failure stands for the whole body, so it is the view's own; a
+      // failed further page is reported below its groups instead.
+      inPlaceOfRows = (
+        <ErrorState
+          {...queryFailureProps({ error, announcement, retry }, query)}
+          className="dg-request-table__error"
+        />
+      );
+    } else {
+      // A page that settled successfully with nothing carried before it.
+      inPlaceOfRows = (
         <EmptyState
           title={emptyCopy.title}
           message={emptyCopy.message}
           icon={emptyCopy === NOTHING_CAPTURED_COPY ? <Globe className="dg-icon" /> : undefined}
           className="dg-request-table__empty"
         />
-        {forwardNextOffset === undefined ? null : footer}
+      );
+    }
+  }
+
+  // Where that state is drawn. Before the reader has chosen an ordering it
+  // replaces the grid, as on first load. Once they have, a re-query empties the
+  // loaded groups, and replacing the grid then would unmount the very header
+  // control they activated and drop their focus out of the view; so from then
+  // on the grid stays mounted, as the same element, with the state in its
+  // empty slot — outside its rows, where `DataTable` places it — and the new
+  // order already on the header's indicator.
+  const showGrid = loaded.length > 0 || active.ordered;
+
+  // A forward next page keeps its control reachable even from an empty page,
+  // instead of stranding the reader on a page the service says is followed by
+  // more.
+  const footerShown = loaded.length > 0 || forwardNextOffset !== undefined;
+
+  let body: ReactNode;
+
+  if (!showGrid) {
+    body = (
+      <>
+        {inPlaceOfRows}
+        {footerShown ? footer : null}
       </>
     );
   } else {
@@ -2289,17 +3149,19 @@ export function RequestTable(props: RequestTableProps): ReactElement {
           rowKey={(group) => group.id}
           caption={node.title ?? CATALOG_ENTRY.label}
           compact
-          sort={TABLE_SORTS[active.sort]}
+          sort={active.viewOrder ?? TABLE_SORTS[active.sort]}
           onSortChange={handleTableSortChange}
+          selectedRowKey={selectedRowKey}
+          onRowActivate={handleRowActivate}
           expandedRowKeys={active.expanded}
           onRowToggle={handleRowToggle}
           renderExpandedRow={renderExpandedRow}
-          // Reached only when groups were loaded and the local filter excluded
-          // every one of them, so it says that rather than claiming the capture
-          // held no requests.
-          empty={<EmptyState message={FILTERED_EMPTY_MESSAGE} />}
+          // With groups loaded, reached only when the local filter excluded
+          // every one of them, so it says that rather than claiming the
+          // capture held no requests; with none loaded, the state above.
+          empty={inPlaceOfRows ?? <EmptyState message={FILTERED_EMPTY_MESSAGE} />}
         />
-        {footer}
+        {footerShown ? footer : null}
         {/* The same contract in the page scope: its title and lead say only the
             next page failed and the groups above are unaffected, and its query
             is that page's, advanced offset and all. */}

@@ -99,16 +99,32 @@
  * It is the element that carries the tone in colour, and its text is what carries the tone in
  * words.
  *
- * Because either element can turn up here, this rule states every property `app/globals.css` sets
- * on `h1`-`h6`: margin, colour, size, weight and, for the same reason, the line height the box
- * itself uses. A class outranks those element rules, so the headline is painted identically
- * whichever element it is, and a page-level error reads exactly as the paragraph did. */
+ * Because any of those elements can turn up here, this rule states every property
+ * `app/globals.css` sets on `h1`-`h6`: margin, colour, size, weight and, for the same reason, the
+ * line height the box itself uses. A class outranks those element rules, so a paragraph, an `h2`
+ * and an `h3` are painted identically: those levels mark a message inside a region that has its
+ * own title, and a message reads at the box's own size. */
 .title {
   margin: 0;
   color: var(--alert-tone);
   font-size: var(--ls-text-sm, 13px);
   font-weight: 600;
   line-height: 1.45;
+}
+
+/* A title rendered as `h1` is the page's title - the notice has taken the whole route's place, as
+ * the error boundary and a product page whose read failed both do - so it is painted in the
+ * page-title role every other route's `<h1>` wears: the size, weight and leading `.ls-page-title`
+ * reads in `app/globals.css`, from the same tokens and with the same fallbacks. A 13px headline
+ * would be the one page title in the storefront that reads as a caption. The tone colour stays: it
+ * is still the element that carries the tone, and every status tone clears contrast at this size.
+ *
+ * The element-qualified selector outranks `.title` above by one type selector, so this rule wins
+ * the properties both declare without depending on the order the two appear in. */
+h1.title {
+  font-size: var(--ls-text-xl, 24px);
+  font-weight: 600;
+  line-height: var(--ls-leading-heading, 1.25);
 }
 
 /* The message itself: primary text colour at the box's own size, whatever the tone. Block rhythm

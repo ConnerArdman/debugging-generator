@@ -116,8 +116,10 @@ import {
 import { fingerprintDocumentId } from './document-fingerprint.js';
 import {
   DEFAULT_NAVIGATION_SETTLE_MS,
+  DEFAULT_REACT_SETTLE_MS,
   DEFAULT_RELOAD_WAIT_MS,
   MAX_NAVIGATION_SETTLE_MS,
+  MAX_REACT_SETTLE_MS,
   MAX_RELOAD_WAIT_MS,
   RELOAD_REQUEST_MESSAGE,
   collectObservedReadiness,
@@ -642,12 +644,17 @@ function fakeProgress(options: { readonly rejectEmit?: boolean } = {}): FakeProg
   return { progress: { emit, readyToCapture }, emit, readyToCapture };
 }
 
+/**
+ * Evaluates with the suite's clock and a short reload wait. The React re-check
+ * window is off unless a case sets it, so a report that found no React is
+ * judged as it stands; its own block below drives the window.
+ */
 async function evaluate(
   deps: Partial<EvaluateReadinessDeps> & Pick<EvaluateReadinessDeps, 'adapters' | 'agents'>,
   request: Partial<EvaluateReadinessRequest> & Pick<EvaluateReadinessRequest, 'plan'>,
 ): Promise<ReadinessVerdict> {
   const result = await evaluateReadiness(
-    { now: clock, reloadWaitMs: 20, ...deps },
+    { now: clock, reloadWaitMs: 20, reactSettleMs: 0, ...deps },
     { context: context(), ...request },
   );
 
@@ -1512,8 +1519,16 @@ describe('evaluateReadiness — blocking page conditions', () => {
   it('asks for a reload when no page agent reported, and re-evaluates once on the new document', async () => {
     const { progress, emit, readyToCapture } = fakeProgress();
     const agents = fakeAgents({ next: agentReady({ documentId: 'doc_second' }) });
+    // No settle window: the first-report wait (proven in its own block below)
+    // would otherwise take the report this case delivers after the reload.
     const verdict = await evaluate(
-      { adapters: registryOf(pageAdapter()), agents: agents.registry, progress, reloadWaitMs: 50 },
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        progress,
+        reloadWaitMs: 50,
+        navigationSettleMs: 0,
+      },
       { plan: plan([action('react-render-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
     );
 
@@ -1640,8 +1655,15 @@ describe('evaluateReadiness — blocking page conditions', () => {
     const reloadWaitMs = 40;
     const agents = fakeAgents({ next: 'never' });
     let settled = false;
+    // No settle window, so the port's first call is the reload wait on trial;
+    // the bounded first-report wait has its own case below.
     const pending = evaluate(
-      { adapters: registryOf(pageAdapter()), agents: agents.registry, reloadWaitMs },
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        reloadWaitMs,
+        navigationSettleMs: 0,
+      },
       { plan: plan([action('react-render-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
     ).then((verdict) => {
       settled = true;
@@ -1713,8 +1735,15 @@ describe('evaluateReadiness — blocking conditions (the buildBlockingConditions
   it('blocks when no agent.ready was relayed for the current document and names reload-page', async () => {
     const { progress, emit } = fakeProgress();
     const agents = fakeAgents();
+    // Neither a settle window nor a reload wait: the port is never asked.
     const verdict = await evaluate(
-      { adapters: registryOf(pageAdapter()), agents: agents.registry, progress, reloadWaitMs: 0 },
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        progress,
+        reloadWaitMs: 0,
+        navigationSettleMs: 0,
+      },
       { plan: plan([action('fetch-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
     );
 
@@ -1929,6 +1958,159 @@ describe('evaluateReadiness — blocking conditions (the buildBlockingConditions
     expect(verdict.remediations).toEqual([]);
     expect(readyToCapture).not.toHaveBeenCalled();
     expectNothingWritten();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// evaluateReadiness — a tab bound before its page agent reported
+// ---------------------------------------------------------------------------
+
+describe('evaluateReadiness — a tab bound before its page agent reported', () => {
+  const reactPlan = (): InstrumentationPlan =>
+    plan([action('react-render-tracking', PAGE_ADAPTER_ID)]);
+
+  it('waits for the first report within the settle window and judges it, asking for no reload', async () => {
+    const { progress, emit, readyToCapture } = fakeProgress();
+    const adapter = pageAdapter();
+    const agents = fakeAgents({ next: agentReady() });
+    const verdict = await evaluate(
+      { adapters: registryOf(adapter), agents: agents.registry, progress },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    // One wait, for any report of the bound tab, bounded by the settle window.
+    expect(agents.waitCalls).toHaveLength(1);
+    expect(agents.waitCalls[0]?.tabId).toBe(TAB_ID);
+    expect(agents.waitCalls[0]?.options.afterDocumentId).toBeUndefined();
+    expect(agents.waitCalls[0]?.options.timeoutMs).toBe(DEFAULT_NAVIGATION_SETTLE_MS);
+    // The report that arrived is what the adapters and the verdict judged.
+    expect(adapter.calls).toHaveLength(1);
+    expect(adapter.calls[0]?.readiness.browserAgent?.documentId).toBe('doc_first');
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.remediations).toEqual([]);
+    expect(verdict.reloadRequested).toBe(false);
+    expect('awaitingPageSignals' in verdict).toBe(false);
+    // No reload request for a report that was only in flight.
+    expect(emit).not.toHaveBeenCalled();
+    expect(readyToCapture).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads a first report from another origin as no page agent, and asks for the reload', async () => {
+    const { progress, emit } = fakeProgress();
+    const agents = fakeAgents({
+      next: agentReady({ documentId: 'doc_elsewhere', url: 'http://127.0.0.1:4999/elsewhere' }),
+    });
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, progress, reloadWaitMs: 0 },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(agents.waitCalls).toHaveLength(1);
+    expect(verdict.observed.browserAgent).toBeUndefined();
+    expect(verdict.satisfied).toBe(false);
+    expect(verdict.remediations).toEqual([{ kind: 'reload-page', tabId: TAB_ID }]);
+    expect(verdict.reloadRequested).toBe(true);
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(verdict)).not.toContain('doc_elsewhere');
+  });
+
+  it('bounds the first-report wait by the settle window, then asks for the reload and releases every timer', async () => {
+    useFakeTimeouts();
+    const { progress, emit } = fakeProgress();
+    const agents = fakeAgents({ next: 'never' });
+    let settled = false;
+    const pending = evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, progress, reloadWaitMs: 40 },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    ).then((verdict) => {
+      settled = true;
+      return verdict;
+    });
+
+    await agents.waitStarted;
+    // The settle window passes: the reload is not asked for before it has.
+    await vi.advanceTimersByTimeAsync(DEFAULT_NAVIGATION_SETTLE_MS - 1);
+    expect(settled).toBe(false);
+    expect(emit).not.toHaveBeenCalled();
+    // Both backstops are bounded graces, so everything is over well within this.
+    await vi.advanceTimersByTimeAsync(2_000);
+    const verdict = await pending;
+
+    expect(settled).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(agents.waitCalls.map((call) => call.options.timeoutMs)).toEqual([
+      DEFAULT_NAVIGATION_SETTLE_MS,
+      40,
+    ]);
+    expect(emit).toHaveBeenCalledTimes(1);
+    expect(verdict.reloadRequested).toBe(true);
+    expect(verdict.satisfied).toBe(false);
+    expect(verdict.remediations).toEqual([{ kind: 'reload-page', tabId: TAB_ID }]);
+  });
+
+  it('does not wait at all for a first report with a zero settle window or an aborted request', async () => {
+    const zero = fakeAgents({ next: agentReady() });
+    const unwaited = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: zero.registry,
+        navigationSettleMs: 0,
+        reloadWaitMs: 0,
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(zero.waitCalls).toEqual([]);
+    expect(unwaited.observed.browserAgent).toBeUndefined();
+    expect(unwaited.satisfied).toBe(false);
+
+    const aborted = fakeAgents({ next: agentReady() });
+    const controller = new AbortController();
+    controller.abort();
+    const cancelled = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: aborted.registry },
+      { plan: reactPlan(), boundTab: BOUND_TAB, signal: controller.signal },
+    );
+
+    expect(aborted.waitCalls).toEqual([]);
+    expect(cancelled.satisfied).toBe(false);
+  });
+
+  it('lists the signals the page gate holds back — a missing binding included — as awaiting the page', async () => {
+    const noAgent = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: fakeAgents().registry,
+        navigationSettleMs: 0,
+        reloadWaitMs: 0,
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+    const late = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: fakeAgents({ latest: agentReady({ installedBeforeReact: false }) }).registry,
+        reloadWaitMs: 0,
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+    const unbound = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: fakeAgents().registry },
+      { plan: reactPlan() },
+    );
+
+    for (const verdict of [noAgent, late, unbound]) {
+      expect(verdict.satisfied).toBe(false);
+      expect(verdict.blocking.length).toBeGreaterThan(0);
+      expect(verdict.awaitingPageSignals).toEqual(signalsOf(verdict.blocking));
+      expect(verdict.awaitingPageSignals).toEqual(verdict.plannedSignals);
+    }
+
+    // A missing binding is still remedied by binding a tab, never by a reload.
+    expect(unbound.remediations.map((remediation) => remediation.kind)).toEqual(['bind-tab']);
+    expect(unbound.reloadRequested).toBe(false);
+    expect(JSON.parse(JSON.stringify(noAgent))).toStrictEqual(noAgent);
   });
 });
 
@@ -2738,6 +2920,39 @@ describe('evaluateReadiness — over the service’s agent-ready ledger', () => 
     }
   });
 
+  it('waits for the first report of a tab bound before its page agent reported, and judges it without a reload request', async () => {
+    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock });
+
+    try {
+      expect(ledger.latestAgentReady(TAB_ID)).toBeUndefined();
+
+      const { progress, emit } = fakeProgress();
+      const adapter = pageAdapter();
+      const evaluation = startEvaluation(ledger, adapter, progress);
+
+      await nextTask();
+      expect(evaluation.answered()).toBe(false);
+      expect(adapter.calls).toHaveLength(0);
+
+      // The panel bound first; the page agent's report is relayed a moment later.
+      expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
+      const verdict = await evaluation.verdict;
+
+      expect(verdict.observed.browserAgent).toMatchObject({
+        documentId: 'doc_first',
+        observedAt: NOW,
+      });
+      expect(adapter.calls).toHaveLength(1);
+      expect(adapter.calls[0]?.readiness.browserAgent?.documentId).toBe('doc_first');
+      expect(verdict.satisfied).toBe(true);
+      expect(verdict.remediations).toEqual([]);
+      expect(verdict.reloadRequested).toBe(false);
+      expect(emit).not.toHaveBeenCalled();
+    } finally {
+      ledger.close();
+    }
+  });
+
   /**
    * The old document's report, relayed again after the reload was recorded —
    * the Chrome side re-relays the report it retained for a tab (on a new
@@ -3063,6 +3278,324 @@ describe('evaluateReadiness — page degradations', () => {
 });
 
 // ---------------------------------------------------------------------------
+// evaluateReadiness — a report taken before React registered
+// ---------------------------------------------------------------------------
+
+describe('evaluateReadiness — a report taken before React registered', () => {
+  /** The page agent's `document_start` answer: installed in time, React not registered yet. */
+  const notYet = (overrides: Partial<AgentReadyPayload> = {}): AgentReadyPayload =>
+    agentReady({ reactDetected: false, ...overrides });
+
+  const reactPlan = (): InstrumentationPlan =>
+    plan([action('react-render-tracking', PAGE_ADAPTER_ID)]);
+
+  /** One read of the bound tab's report before the window; each poll of the window is one more. */
+  const INITIAL_READS = 1;
+
+  /** The polling step `./readiness.ts` documents, restated so a changed cadence is noticed. */
+  const STEP_MS = 50;
+
+  it('judges the corrected report when the same document reports React inside the window', async () => {
+    const adapter = pageAdapter();
+    const agents = fakeAgents({
+      latestSequence: [notYet(), notYet(), agentReady()],
+      receivedAt: NOW,
+    });
+    const { progress, emit } = fakeProgress();
+
+    const verdict = await evaluate(
+      { adapters: registryOf(adapter), agents: agents.registry, progress, reactSettleMs: 1_000 },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.degraded).toEqual([]);
+    expect(verdict.blocking).toEqual([]);
+    expect(verdict.deliverableSignals).toEqual(['interactions', 'react', 'componentTree']);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+    expect(verdict.observed.browserAgent?.reactDetected).toBe(true);
+    // The adapters judged the corrected page, once.
+    expect(adapter.calls).toHaveLength(1);
+    expect(adapter.calls[0]?.readiness.browserAgent?.reactDetected).toBe(true);
+    // Two polls: the first still "not yet", the second the correction — no more.
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS + 2);
+    expect(agents.waitCalls).toEqual([]);
+    expect(verdict.reloadRequested).toBe(false);
+    expectNothingWritten(emit);
+  });
+
+  it('judges the report as it stands once the window lapses: a page without React degrades', async () => {
+    const settleMs = 3 * STEP_MS;
+    const agents = fakeAgents({ latest: notYet(), receivedAt: NOW });
+
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, reactSettleMs: settleMs },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(verdict.satisfied).toBe(true);
+    expect(signalsOf(verdict.degraded)).toEqual(['react', 'componentTree']);
+    expect(verdict.observed.browserAgent?.reactDetected).toBe(false);
+    expect(verdict.remediations).toEqual([]);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS + settleMs / STEP_MS);
+  });
+
+  it('measures the window from the report’s receipt, so an old report is judged at once', async () => {
+    const agents = fakeAgents({
+      latest: notYet(),
+      receivedAt: NOW - DEFAULT_REACT_SETTLE_MS,
+    });
+
+    const verdict = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        reactSettleMs: DEFAULT_REACT_SETTLE_MS,
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(signalsOf(verdict.degraded)).toEqual(['react', 'componentTree']);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS);
+  });
+
+  it('shortens the window by the time already passed since the report arrived', async () => {
+    const settleMs = 4 * STEP_MS;
+    const agents = fakeAgents({ latest: notYet(), receivedAt: NOW - 2 * STEP_MS });
+
+    await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, reactSettleMs: settleMs },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS + 2);
+  });
+
+  it('does not wait when no fiber-hook signal is planned', async () => {
+    const agents = fakeAgents({ latest: notYet(), receivedAt: NOW });
+
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, reactSettleMs: 1_000 },
+      { plan: plan([action('fetch-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
+    );
+
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.degraded).toEqual([]);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS);
+  });
+
+  it('does not wait for a late install, which the late-install gate judges whatever React’s state', async () => {
+    const agents = fakeAgents({
+      latest: notYet({ installedBeforeReact: false }),
+      receivedAt: NOW,
+    });
+
+    const verdict = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        reactSettleMs: 1_000,
+        reloadWaitMs: 0,
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(verdict.satisfied).toBe(false);
+    expect(signalsOf(verdict.blocking)).toEqual(verdict.plannedSignals);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS);
+  });
+
+  it('does not wait at all with reactSettleMs 0', async () => {
+    const agents = fakeAgents({ latest: notYet(), receivedAt: NOW });
+
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, reactSettleMs: 0 },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(signalsOf(verdict.degraded)).toEqual(['react', 'componentTree']);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS);
+  });
+
+  it('judges a newer document on the bound page that reports inside the window', async () => {
+    const agents = fakeAgents({
+      latestSequence: [
+        notYet(),
+        notYet({ documentId: 'doc_second', producerId: 'prd_second' }),
+        agentReady({ documentId: 'doc_second', producerId: 'prd_second' }),
+      ],
+      receivedAt: NOW,
+    });
+
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, reactSettleMs: 1_000 },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(verdict.satisfied).toBe(true);
+    expect(verdict.degraded).toEqual([]);
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_second');
+    expect(verdict.observed.browserAgent?.reactDetected).toBe(true);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS + 2);
+  });
+
+  it('keeps the settled report when the latest one leaves the binding', async () => {
+    const agents = fakeAgents({
+      latestSequence: [
+        notYet(),
+        agentReady({ documentId: 'doc_away', url: 'http://elsewhere.test/' }),
+      ],
+      receivedAt: NOW,
+    });
+
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, reactSettleMs: 1_000 },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+    expect(signalsOf(verdict.degraded)).toEqual(['react', 'componentTree']);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS + 1);
+  });
+
+  it('keeps the settled report when a newer document is not on the bound page', async () => {
+    const agents = fakeAgents({
+      latestSequence: [
+        notYet(),
+        agentReady({ documentId: 'doc_other_page', url: `${APP_ORIGIN}/elsewhere` }),
+      ],
+      receivedAt: NOW,
+    });
+
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, reactSettleMs: 1_000 },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+    expect(signalsOf(verdict.degraded)).toEqual(['react', 'componentTree']);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS + 1);
+  });
+
+  it('ends the window at once when the request aborts, judging the report as it stands', async () => {
+    const controller = new AbortController();
+    const agents = fakeAgents({ latest: notYet(), receivedAt: NOW });
+    const startedAt = performance.now();
+
+    setTimeout(() => {
+      controller.abort();
+    }, 2 * STEP_MS);
+
+    const verdict = await evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        reactSettleMs: MAX_REACT_SETTLE_MS,
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB, signal: controller.signal },
+    );
+
+    expect(performance.now() - startedAt).toBeLessThan(MAX_REACT_SETTLE_MS / 2);
+    expect(signalsOf(verdict.degraded)).toEqual(['react', 'componentTree']);
+    expect(verdict.observed.browserAgent?.reactDetected).toBe(false);
+  });
+
+  it('does not wait for an already-aborted request', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const agents = fakeAgents({ latest: notYet(), receivedAt: NOW });
+
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, reactSettleMs: 1_000 },
+      { plan: reactPlan(), boundTab: BOUND_TAB, signal: controller.signal },
+    );
+
+    expect(signalsOf(verdict.degraded)).toEqual(['react', 'componentTree']);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS);
+  });
+
+  it('clamps an oversized reactSettleMs to the ceiling, and leaves no timer behind', async () => {
+    useFakeTimeouts();
+    const agents = fakeAgents({ latest: notYet(), receivedAt: NOW });
+    let settled = false;
+    const pending = evaluate(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        reactSettleMs: MAX_REACT_SETTLE_MS * 6,
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    ).then((verdict) => {
+      settled = true;
+      return verdict;
+    });
+
+    await vi.advanceTimersByTimeAsync(MAX_REACT_SETTLE_MS - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const verdict = await pending;
+
+    expect(signalsOf(verdict.degraded)).toEqual(['react', 'componentTree']);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS + MAX_REACT_SETTLE_MS / STEP_MS);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('defaults the window to DEFAULT_REACT_SETTLE_MS when none is injected', async () => {
+    useFakeTimeouts();
+    const agents = fakeAgents({ latest: notYet(), receivedAt: NOW });
+    const pending = evaluateReadiness(
+      { adapters: registryOf(pageAdapter()), agents: agents.registry, now: clock },
+      { context: context(), plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    await vi.advanceTimersByTimeAsync(DEFAULT_REACT_SETTLE_MS);
+    const result = await pending;
+
+    if (isErr(result)) throw result.error;
+    expect(signalsOf(result.value.degraded)).toEqual(['react', 'componentTree']);
+    expect(agents.latestCalls).toHaveLength(INITIAL_READS + DEFAULT_REACT_SETTLE_MS / STEP_MS);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('gives the document reported after a one-click reload the same window', async () => {
+    const { progress, emit, readyToCapture } = fakeProgress();
+    const agents = fakeAgents({
+      latest: agentReady({ installedBeforeReact: false }),
+      next: 'deferred',
+      receivedAt: NOW,
+    });
+    const pending = evaluateReadiness(
+      {
+        adapters: registryOf(pageAdapter()),
+        agents: agents.registry,
+        progress,
+        now: clock,
+        reloadWaitMs: 1_000,
+        reactSettleMs: 1_000,
+      },
+      { context: context(), plan: reactPlan(), boundTab: BOUND_TAB },
+    );
+
+    await agents.waitStarted;
+    const reloaded = { documentId: 'doc_reloaded', producerId: 'prd_reloaded' } as const;
+    agents.settleWait(notYet(reloaded));
+    setTimeout(() => {
+      agents.replace(agentReady(reloaded));
+    }, 2 * STEP_MS);
+    const result = await pending;
+
+    if (isErr(result)) throw result.error;
+    expect(result.value.satisfied).toBe(true);
+    expect(result.value.degraded).toEqual([]);
+    expect(result.value.observed.browserAgent?.documentId).toBe('doc_reloaded');
+    expect(result.value.observed.browserAgent?.reactDetected).toBe(true);
+    expect(result.value.reloadRequested).toBe(true);
+    expect(readyToCapture).toHaveBeenCalledTimes(1);
+    expectNothingWritten(emit);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // evaluateReadiness — the dev-server preload
 // ---------------------------------------------------------------------------
 
@@ -3084,7 +3617,7 @@ describe('evaluateReadiness — server signals', () => {
     );
 
     expect(verdict.satisfied).toBe(true);
-    expect(signalsOf(verdict.degraded)).toEqual(['http', 'routeHandlers', 'functions']);
+    expect(signalsOf(verdict.degraded)).toEqual(['fetch', 'http', 'routeHandlers', 'functions']);
     for (const gap of verdict.degraded) {
       expect(gap.hint).toBe(devServer.relaunchHint);
     }
@@ -3113,7 +3646,7 @@ describe('evaluateReadiness — server signals', () => {
     );
 
     expect(verdict.satisfied).toBe(false);
-    expect(signalsOf(verdict.blocking)).toEqual(['http', 'routeHandlers', 'functions']);
+    expect(signalsOf(verdict.blocking)).toEqual(['fetch', 'http', 'routeHandlers', 'functions']);
     expect(verdict.degraded).toEqual([]);
   });
 
@@ -3127,7 +3660,7 @@ describe('evaluateReadiness — server signals', () => {
 
     expect(verdict.satisfied).toBe(false);
     expect(verdict.deliverableSignals).toEqual([]);
-    expect(signalsOf(verdict.blocking)).toEqual(['http', 'routeHandlers', 'functions']);
+    expect(signalsOf(verdict.blocking)).toEqual(['fetch', 'http', 'routeHandlers', 'functions']);
     expect(verdict.remediations).toEqual([
       {
         kind: 'relaunch-dev-server',
@@ -3176,7 +3709,7 @@ describe('evaluateReadiness — server signals', () => {
     );
 
     expect(verdict.satisfied).toBe(true);
-    expect(verdict.deliverableSignals).toEqual(['http', 'routeHandlers', 'functions']);
+    expect(verdict.deliverableSignals).toEqual(['fetch', 'http', 'routeHandlers', 'functions']);
     expect(verdict.remediations).toEqual([]);
   });
 
@@ -3299,7 +3832,7 @@ describe('evaluateReadiness — degradation-only conditions', () => {
     expect(relaunch?.hint).toBe(SENTINEL_RELAUNCH_HINT);
     expect(relaunch?.command).toBe(SENTINEL_RELAUNCH_COMMAND);
     expect(relaunch?.projectRoot).toBe(PROJECT_ROOT);
-    expect(signalsOf(verdict.degraded)).toEqual(['http', 'routeHandlers', 'functions']);
+    expect(signalsOf(verdict.degraded)).toEqual(['fetch', 'http', 'routeHandlers', 'functions']);
     for (const gap of verdict.degraded) {
       expect(gap.hint).toBe(SENTINEL_RELAUNCH_HINT);
     }
@@ -3350,7 +3883,12 @@ describe('evaluateReadiness — degradation-only conditions', () => {
     );
 
     expect(disconnected.satisfied).toBe(true);
-    expect(signalsOf(disconnected.degraded)).toEqual(['http', 'routeHandlers', 'functions']);
+    expect(signalsOf(disconnected.degraded)).toEqual([
+      'fetch',
+      'http',
+      'routeHandlers',
+      'functions',
+    ]);
     expect(remediationOf(disconnected, 'relaunch-dev-server')).toBeDefined();
     const staleReasons = new Set(stale.degraded.map((gap) => gap.reason));
     for (const gap of disconnected.degraded) {
@@ -3715,7 +4253,7 @@ describe('evaluateReadiness — adapter discovery', () => {
     expect(verdict.perAdapter.map((report) => report.adapterId)).toEqual(['db-one', 'db-two']);
     expect(unrelated.calls).toEqual([]);
     expect(declining.calls).toEqual([]);
-    expect(verdict.plannedSignals).toEqual(['http', 'routeHandlers', 'prisma', 'pg']);
+    expect(verdict.plannedSignals).toEqual(['fetch', 'http', 'routeHandlers', 'prisma', 'pg']);
     expect(verdict.satisfied).toBe(true);
   });
 
@@ -4291,7 +4829,7 @@ describe('the capture gate refusal — only product-authored wording reaches a c
     const generic = { projectRoot: PROJECT_ROOT, packageManager: 'pnpm' } as const;
     const preloadReason = verdict.blocking[0]?.reason ?? '';
 
-    expect(signalsOf(verdict.blocking)).toEqual(['http', 'routeHandlers', 'functions']);
+    expect(signalsOf(verdict.blocking)).toEqual(['fetch', 'http', 'routeHandlers', 'functions']);
     expect(isProductAuthoredText(preloadReason)).toBe(true);
 
     const refusal = await captureGateRefusal(verdict, planned);
@@ -4299,6 +4837,7 @@ describe('the capture gate refusal — only product-authored wording reaches a c
     expect(refusal.code).toBe('SERVER_AGENT_NOT_READY');
     expect(refusal.message).toBe(
       gateSentences([
+        { signal: 'fetch', reason: preloadReason },
         { signal: 'http', reason: preloadReason },
         { signal: 'routeHandlers', reason: preloadReason },
         { signal: 'functions', reason: preloadReason },

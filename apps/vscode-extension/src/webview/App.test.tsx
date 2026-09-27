@@ -18,23 +18,49 @@
  *     failed result restores the form with the draft and the retry hint, and an accepted result with
  *     no live updates still clears it;
  *   - a pending "Stop capture" is not re-enabled by the answer to "Pick element";
+ *   - the Capture card's copy follows the session status: a follow-up hint once generated,
+ *     "Session ended" once ended, and never "Capture becomes available once instrumentation is
+ *     ready." after the session has moved past instrumentation;
  *   - a pending follow-up survives End session and its `ended` snapshot, unrelated status changes
  *     and notices; only its own result settles it, keeping or clearing the draft accordingly;
  *   - opening a file while a question is pending settles nothing;
  *   - the safety timeout gives a request up at 150 s, not before, and its late result is ignored;
  *   - a request the host channel refused keeps the draft with the retry hint;
+ *   - a pending question stays on screen, read-only and focused, with a visible busy line;
+ *   - a question or follow-up over the protocol question limit is never posted: it is withheld at
+ *     once with a notice stating the limit, never the host's malformed-frame reply and its 150 s
+ *     wait, and the draft is kept without a misleading retry hint;
  *   - the snapshot's `modificationsTotal` reaches the modifications list as its shortfall warning,
- *     whose "Load all modifications" request stays pending until its own result.
+ *     whose "Load all modifications" request stays pending until its own result;
+ *   - the cleanup outcome lists a conflict's paths in full with "Copy path", hands the conflicts to
+ *     the modifications list, and names the files a partial cleanup did not restore;
+ *   - the copy follows the session: the question and every follow-up asked are shown verbatim,
+ *     the follow-ups with their outcome in words; "Pick element" is offered only to a running
+ *     session over a reachable service; the no-session, ended, failed and disconnected states say
+ *     why instead of offering a control the host would refuse; and file modifications say
+ *     "nothing modified yet" until the plan exists.
  *
  * Fixtures are realistic `SessionRecord`s and `WebviewState`s with neutral, synthetic wording
  * (AAP 0.5.4).
  */
-import type { SessionRecord, SessionStatus } from '@debuggen/protocol';
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import type {
+  AnalysisResult,
+  FollowUpRecord,
+  ModificationConflict,
+  ModificationRecord,
+  SelectedTarget,
+  SessionRecord,
+  SessionStatus,
+} from '@debuggen/protocol';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { isWebviewRequestMessage, parseWebviewToHostMessage } from '../webview-messages';
+import {
+  MAX_WEBVIEW_QUESTION_LENGTH,
+  isWebviewRequestMessage,
+  parseWebviewToHostMessage,
+} from '../webview-messages';
 import type {
   ActionResultStatus,
   HostToWebviewMessage,
@@ -237,6 +263,17 @@ const FOLLOW_UP_RETRY_HINT =
 const STOP_CAPTURE = 'Stop capture';
 const START_CAPTURE = 'Start capture';
 const CAPTURE_PENDING = 'Updating the capture';
+const CAPTURE_SECTION = 'Capture';
+const CAPTURE_UNAVAILABLE = 'Capture becomes available once instrumentation is ready.';
+const CAPTURE_ANALYZING =
+  'The capture is being analyzed. The result appears under Analysis when it is ready.';
+const CAPTURE_FOLLOW_UP_HINT =
+  'This capture has been analyzed. Ask a follow-up question below; if it needs new evidence, capture opens here again.';
+const CAPTURE_ENDED_TITLE = 'Session ended';
+const CAPTURE_ENDED_MESSAGE =
+  'Capture is closed for this session. Ask a new question to start another session.';
+const CAPTURE_FAILED =
+  'Capture is unavailable because the session failed. Retry the failed stage, or end the session and ask the question again.';
 const PICK_ELEMENT = 'Pick element';
 /** `TargetBadge`'s busy label: the request only asks the bound panel to enter picker mode. */
 const PICK_PENDING = 'Asking Chrome DevTools to enter picker mode';
@@ -245,6 +282,14 @@ const SESSION_ENDED = 'Session ended.';
 const LAUNCH_DEV_SERVER = 'Launch dev server';
 const PAIR_CHROME = 'Pair Chrome DevTools';
 const UNDELIVERED = 'That action could not be passed to the editor.';
+/** The limit as the view prints it, in the test run's own locale. */
+const LIMIT_TEXT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(
+  MAX_WEBVIEW_QUESTION_LENGTH,
+);
+const OVER_LIMIT_NOTICE = `That question is longer than the ${LIMIT_TEXT}-character limit, so it was not sent.`;
+const OVER_LIMIT_HINT = `Shorten it to ${LIMIT_TEXT} characters or fewer, then ask again.`;
+/** The host's reply to a frame its parser refuses; the view must never provoke it. */
+const MALFORMED_HINT_FRAGMENT = 'reinstall the extension';
 
 /** A text area found by its label. */
 function field(label: string): HTMLTextAreaElement {
@@ -291,9 +336,18 @@ function askFollowUp(text: string): void {
   fireEvent.click(button(FOLLOW_UP_SUBMIT));
 }
 
-/** Whether the question form is showing its pending state instead of the field. */
+/**
+ * Whether the question form is showing its pending state: the visible busy line beside the
+ * field, which stays on screen read-only with the submitted draft.
+ */
 function questionPending(): boolean {
-  return busy(QUESTION_PENDING) && screen.queryByLabelText(QUESTION_FIELD) === null;
+  const questionField = screen.queryByLabelText(QUESTION_FIELD);
+  return (
+    busy(QUESTION_PENDING) &&
+    questionField instanceof HTMLTextAreaElement &&
+    questionField.readOnly &&
+    !questionField.disabled
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -306,10 +360,11 @@ describe('App — request ids', () => {
 
     fireEvent.click(button(LAUNCH_DEV_SERVER));
     fireEvent.click(button(PAIR_CHROME));
-    fireEvent.click(button(PICK_ELEMENT));
     askQuestion('Why does the list take so long to appear?');
 
+    // A pick is asked of the running session's panel, so it is offered once a session exists.
     pushState(sessionState('ready', { relevantFiles: RELEVANT_FILES }));
+    fireEvent.click(button(PICK_ELEMENT));
     fireEvent.click(button(START_CAPTURE));
     fireEvent.click(button(RELEVANT_FILE));
     fireEvent.click(button(END_SESSION));
@@ -318,8 +373,8 @@ describe('App — request ids', () => {
     expect(requests.map((message) => message.type)).toEqual([
       'launchDevServer',
       'pairChrome',
-      'requestTarget',
       'askQuestion',
+      'requestTarget',
       'startCapture',
       'endSession',
     ]);
@@ -384,8 +439,11 @@ describe('App — asking a question', () => {
     });
 
     expect(questionPending()).toBe(true);
-    // Nothing on screen can raise a second question.
-    expect(screen.queryByRole('button', { name: QUESTION_SUBMIT })).toBeNull();
+    // Nothing on screen can raise a second question: the field is read-only and the submit
+    // control disabled, by pointer and by keyboard alike.
+    expect(button(QUESTION_SUBMIT).disabled).toBe(true);
+    fireEvent.click(button(QUESTION_SUBMIT));
+    fireEvent.keyDown(field(QUESTION_FIELD), { key: 'Enter', ctrlKey: true });
     expect(postedOf('askQuestion')).toHaveLength(1);
 
     // The new session's own snapshot is presentational too.
@@ -474,6 +532,65 @@ describe('App — asking a question', () => {
     channel.deliver = true;
     fireEvent.click(button(QUESTION_SUBMIT));
     expect(postedOf('askQuestion')).toHaveLength(2);
+    expect(questionPending()).toBe(true);
+  });
+
+  it('keeps the question visible, read-only and focused while a Ctrl+Enter submission is pending', () => {
+    mount(sessionState('generated'));
+    const question = 'Why does the list take so long to appear?';
+
+    const questionField = field(QUESTION_FIELD);
+    questionField.focus();
+    fireEvent.change(questionField, { target: { value: question } });
+    fireEvent.keyDown(questionField, { key: 'Enter', ctrlKey: true });
+
+    expect(postedOf('askQuestion')).toHaveLength(1);
+    expect(questionPending()).toBe(true);
+    expect(field(QUESTION_FIELD).value).toBe(question);
+    expect(document.activeElement).toBe(field(QUESTION_FIELD));
+    expect(screen.getByText(`${QUESTION_PENDING}…`)).toBeTruthy();
+
+    // The new session's snapshot arrives before the result; the field is not disabled under
+    // the caret.
+    pushState(sessionState('created', {}, { id: NEXT_SESSION_ID }));
+    expect(questionPending()).toBe(true);
+    expect(document.activeElement).toBe(field(QUESTION_FIELD));
+
+    answer('askQuestion', 'accepted');
+    expect(questionPending()).toBe(false);
+    expect(field(QUESTION_FIELD).value).toBe('');
+  });
+
+  it('never posts a question over the protocol limit, and withholds it at once with the limit stated', () => {
+    mount(webviewState());
+
+    // A real text area stops at its maxLength; a value set programmatically does
+    // not, which is the path this pre-flight guards. 2 010 characters is the QA
+    // reproduction.
+    const overLimit = 'q'.repeat(MAX_WEBVIEW_QUESTION_LENGTH + 10);
+    askQuestion(overLimit);
+
+    // Nothing reached the host, so no parser refusal and no 150 s wait.
+    expect(postedOf('askQuestion')).toEqual([]);
+    expect(channel.posted.filter(isWebviewRequestMessage)).toEqual([]);
+    expect(questionPending()).toBe(false);
+    expect(field(QUESTION_FIELD).value).toBe(overLimit);
+    // Nothing was submitted, so the form is not told a submission failed: its "try again" hint
+    // would contradict the notice's "shorten it".
+    expect(screen.queryByText(QUESTION_RETRY_HINT)).toBeNull();
+    expect(screen.getByText(OVER_LIMIT_NOTICE)).toBeTruthy();
+    expect(screen.getByText(OVER_LIMIT_HINT)).toBeTruthy();
+    expect(screen.queryByText(UNDELIVERED)).toBeNull();
+    expect(screen.queryByText(MALFORMED_HINT_FRAGMENT, { exact: false })).toBeNull();
+
+    // Shortened to the limit, the same draft is an ordinary pending request whose
+    // frame the host's parser accepts.
+    const atLimit = 'q'.repeat(MAX_WEBVIEW_QUESTION_LENGTH);
+    askQuestion(atLimit);
+    expect(postedOf('askQuestion')).toHaveLength(1);
+    const [sent] = postedOf('askQuestion');
+    expect(sent?.question).toHaveLength(MAX_WEBVIEW_QUESTION_LENGTH);
+    expect(parseWebviewToHostMessage(sent).ok).toBe(true);
     expect(questionPending()).toBe(true);
   });
 
@@ -582,6 +699,82 @@ describe('App — stopping a capture while picking a target', () => {
   });
 });
 
+describe('App — the Capture card follows the session status', () => {
+  /** The Capture card: the region its `Section` title names. */
+  function captureCard(): HTMLElement {
+    return screen.getByRole('region', { name: CAPTURE_SECTION });
+  }
+
+  /** The text of the card's `CaptureControls` block, below the section heading, in document order. */
+  function captureCopy(): string {
+    const block = captureCard().querySelector('.dgv-capture');
+    if (block === null) {
+      throw new Error('expected the Capture card to hold the capture controls block');
+    }
+    return block.textContent ?? '';
+  }
+
+  it('shows the follow-up hint rather than the instrumentation sentence once generated', () => {
+    mount(sessionState('generated'));
+
+    const card = within(captureCard());
+    expect(card.getByText(CAPTURE_FOLLOW_UP_HINT)).toBeTruthy();
+    expect(card.queryByText(CAPTURE_UNAVAILABLE)).toBeNull();
+    expect(card.queryAllByRole('button')).toEqual([]);
+    // The Follow-up card the hint points to takes the question.
+    expect(field(FOLLOW_UP_FIELD).disabled).toBe(false);
+  });
+
+  it('says "Session ended" rather than the instrumentation sentence once ended', () => {
+    const cleanCleanup = {
+      status: 'clean' as const,
+      completedAt: 1_758_000_050_000,
+      conflicts: [],
+    };
+    mount(sessionState('ended', { cleanup: cleanCleanup }, { cleanup: cleanCleanup }));
+
+    const card = within(captureCard());
+    expect(card.getByText(CAPTURE_ENDED_TITLE)).toBeTruthy();
+    expect(card.getByText(CAPTURE_ENDED_MESSAGE)).toBeTruthy();
+    expect(captureCopy()).toBe(`${CAPTURE_ENDED_TITLE}${CAPTURE_ENDED_MESSAGE}`);
+    expect(card.queryByText(CAPTURE_UNAVAILABLE)).toBeNull();
+    expect(card.queryAllByRole('button')).toEqual([]);
+    // The cleanup card keeps its own confirmation beside it.
+    expect(screen.getByText(SESSION_ENDED)).toBeTruthy();
+    // The new question the copy invites is accepted.
+    expect(field(QUESTION_FIELD).disabled).toBe(false);
+  });
+
+  it('explains the analysis and the failure in their own words', () => {
+    mount(sessionState('analyzing'));
+    expect(within(captureCard()).getByText(CAPTURE_ANALYZING)).toBeTruthy();
+    expect(within(captureCard()).queryByText(CAPTURE_UNAVAILABLE)).toBeNull();
+
+    pushState(sessionState('failed'));
+    expect(within(captureCard()).getByText(CAPTURE_FAILED)).toBeTruthy();
+    expect(within(captureCard()).queryByText(CAPTURE_UNAVAILABLE)).toBeNull();
+  });
+
+  it('keeps the instrumentation sentence while the pipeline is still preparing the capture', () => {
+    mount(sessionState('planning'));
+
+    expect(within(captureCard()).getByText(CAPTURE_UNAVAILABLE)).toBeTruthy();
+    expect(within(captureCard()).queryAllByRole('button')).toEqual([]);
+  });
+
+  it('walks from the controls to the follow-up hint to "Session ended" as snapshots arrive', () => {
+    mount(sessionState('ready'));
+    expect(within(captureCard()).getByRole('button', { name: START_CAPTURE })).toBeTruthy();
+
+    pushState(sessionState('generated'));
+    expect(captureCopy()).toBe(CAPTURE_FOLLOW_UP_HINT);
+
+    pushState(sessionState('ended'));
+    expect(captureCopy()).toBe(`${CAPTURE_ENDED_TITLE}${CAPTURE_ENDED_MESSAGE}`);
+    expect(postedOf('startCapture')).toEqual([]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // The follow-up
 // ---------------------------------------------------------------------------
@@ -679,6 +872,20 @@ describe('App — asking a follow-up', () => {
     expect(screen.queryByText(FOLLOW_UP_RETRY_HINT)).toBeNull();
     expect(postedOf('askFollowUp')).toHaveLength(1);
   });
+
+  it('never posts a follow-up over the protocol limit, and withholds it at once with the limit stated', () => {
+    mount(sessionState('generated'));
+
+    const overLimit = 'f'.repeat(MAX_WEBVIEW_QUESTION_LENGTH + 1);
+    askFollowUp(overLimit);
+
+    expect(postedOf('askFollowUp')).toEqual([]);
+    expect(busy(FOLLOW_UP_PENDING)).toBe(false);
+    expect(field(FOLLOW_UP_FIELD).value).toBe(overLimit);
+    expect(screen.queryByText(FOLLOW_UP_RETRY_HINT)).toBeNull();
+    expect(screen.getByText(OVER_LIMIT_NOTICE)).toBeTruthy();
+    expect(screen.queryByText(MALFORMED_HINT_FRAGMENT, { exact: false })).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -727,5 +934,369 @@ describe('App — loading the rest of the modification journal', () => {
     expect(screen.queryByText(SHORTFALL)).toBeNull();
     expect(screen.queryByRole('button', { name: LOAD_ALL })).toBeNull();
     expect(screen.getByText('No files were modified for this session.')).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The session cleanup outcome
+// ---------------------------------------------------------------------------
+
+describe('App — the session cleanup outcome', () => {
+  const EDITED_FILE = 'src/lib/edited/entry.ts';
+  const STUCK_FILE = 'src/lib/stuck/worker.ts';
+  const RESTORED_FILE = 'src/lib/restored/task.ts';
+  const BACKUP_ROOT = '/home/example/.debuggen/backups/ses_4k2p9dq7m1zx0c3v';
+  const COMPLETED_AT = 1_758_000_050_000;
+
+  /** One modification record with a distinct id, file and backup. */
+  function modification(
+    n: number,
+    file: string,
+    status: ModificationRecord['status'],
+  ): ModificationRecord {
+    const hash = String(n).repeat(64);
+    return {
+      id: `mod_${String(n).padStart(16, '0')}`,
+      sessionId: SESSION_ID,
+      planVersion: 1,
+      file,
+      originalHash: hash,
+      backupPath: `${BACKUP_ROOT}/${hash}`,
+      instrumentedHash: 'f'.repeat(64),
+      appliedAt: 1_758_000_010_000,
+      status,
+      diff: `--- a/${file}\n+++ b/${file}\n@@ -1,1 +1,1 @@\n-const a = 0;\n+const a = 1;\n`,
+    };
+  }
+
+  const edited = modification(1, EDITED_FILE, 'conflict');
+  const stuck = modification(2, STUCK_FILE, 'applied');
+  const restored = modification(3, RESTORED_FILE, 'reverted');
+
+  const conflict: ModificationConflict = {
+    recordId: edited.id,
+    sessionId: SESSION_ID,
+    file: EDITED_FILE,
+    reason: 'content-changed',
+    expectedHash: edited.instrumentedHash,
+    actualHash: 'e'.repeat(64),
+    backupPath: edited.backupPath,
+    detectedAt: 1_758_000_040_000,
+    message: `'${EDITED_FILE}' was changed after it was instrumented, so nothing was written to it.`,
+    diffs: {
+      instrumentedToCurrent: `--- a/${EDITED_FILE}\n+++ b/${EDITED_FILE}\n@@ -1,1 +1,1 @@\n-const a = 1;\n+const a = 2;\n`,
+    },
+  };
+
+  /** Mounts an ended session with `cleanup` and the given records. */
+  function mountEnded(
+    cleanupState: WebviewState['cleanup'],
+    modifications: readonly ModificationRecord[],
+    modificationsTotal?: number,
+  ): void {
+    mount(
+      sessionState(
+        'ended',
+        {
+          cleanup: cleanupState,
+          modifications: [...modifications],
+          ...(modificationsTotal === undefined ? {} : { modificationsTotal }),
+        },
+        { cleanup: cleanupState, modifications: [...modifications] },
+      ),
+    );
+  }
+
+  it('lists a conflict’s file and backup path in full, wrapped, with "Copy path"', () => {
+    mountEnded({ status: 'conflict', completedAt: COMPLETED_AT, conflicts: [conflict] }, [edited]);
+
+    const list = screen.getByRole('list', { name: 'Files left untouched' });
+    const codes = Array.from(list.querySelectorAll('code'));
+    expect(codes.map((code) => code.textContent)).toEqual([EDITED_FILE, edited.backupPath]);
+    for (const code of codes) {
+      // Wrapped, never ellipsized: the whole value can be read and selected.
+      expect(code.classList.contains('dg-code--wrap')).toBe(true);
+    }
+    expect(list.textContent ?? '').toContain('Original saved at');
+    // The same path is copyable from the modifications list too: one action, one name.
+    expect(
+      within(list).getByRole('button', {
+        name: `Copy path of the saved original of ${EDITED_FILE}`,
+      }).textContent,
+    ).toBe('Copy path');
+  });
+
+  it('passes the conflicts to the modifications list, whose "Open diff" shows the edit', () => {
+    mountEnded({ status: 'conflict', completedAt: COMPLETED_AT, conflicts: [conflict] }, [edited]);
+
+    const openDiff = button(`Open diff of your edit to ${EDITED_FILE}`);
+    fireEvent.click(openDiff);
+
+    expect(
+      screen.getByRole('region', {
+        name: `Diff of ${EDITED_FILE} (Your edit since instrumentation)`,
+      }).textContent,
+    ).toContain('+const a = 2;');
+  });
+
+  it('names every file a partial cleanup did not restore, with its status and backup', () => {
+    mountEnded(
+      { status: 'partial', completedAt: COMPLETED_AT, conflicts: [] },
+      [stuck, restored],
+      2,
+    );
+
+    const list = screen.getByRole('list', { name: 'Files not restored' });
+    expect(list.textContent ?? '').toContain(STUCK_FILE);
+    expect(list.textContent ?? '').toContain('Applied');
+    expect(list.textContent ?? '').toContain(stuck.backupPath);
+    expect(list.textContent ?? '').not.toContain(RESTORED_FILE);
+    expect(
+      within(list).getByRole('button', {
+        name: `Copy path of the saved original of ${STUCK_FILE}`,
+      }),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        'Some changes could not be restored automatically. Nothing was overwritten, and the originals are preserved.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('says every file was restored when the complete journal leaves nothing outstanding', () => {
+    mountEnded({ status: 'partial', completedAt: COMPLETED_AT, conflicts: [] }, [restored], 1);
+
+    expect(screen.queryByRole('list', { name: 'Files not restored' })).toBeNull();
+    expect(
+      screen.getByText(
+        'Every file the session changed was restored, but not every cleanup step could be confirmed. Nothing was overwritten.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('keeps the general partial sentence while the journal has not been counted', () => {
+    mountEnded({ status: 'partial', completedAt: COMPLETED_AT, conflicts: [] }, [restored]);
+
+    expect(screen.queryByRole('list', { name: 'Files not restored' })).toBeNull();
+    expect(
+      screen.getByText(
+        'Some changes could not be restored automatically. Nothing was overwritten, and the originals are preserved.',
+      ),
+    ).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Copy that follows the session
+// ---------------------------------------------------------------------------
+
+describe('App — copy that follows the session', () => {
+  const QUESTION = 'Why does the list take so long to appear?\nIt waits after every click.';
+  const QUESTION_LABEL = 'This session’s question';
+  const ASKED_LIST = 'Asked in this session';
+  const REPICK = 'Pick another element';
+
+  const NO_SESSION_MESSAGE =
+    'Ask a question about the behaviour you are debugging. Debug Generator investigates your code, instruments only what it needs, and reports each step here as it happens.';
+  const NO_SESSION_SERVICE_MESSAGE =
+    'The local Debug Generator service is not reachable, so no session can start yet. Once it is running, ask a question above: Debug Generator investigates your code, instruments only what it needs, and reports each step here as it happens.';
+
+  const FOLLOW_UP_AWAITING = 'Ask a follow-up once the first result is ready.';
+  const FOLLOW_UP_WORKING =
+    'The session is working on its latest question. Ask another follow-up once that result is ready.';
+  const FOLLOW_UP_ENDED =
+    'This session has ended, so it takes no more follow-ups. Ask a new question above to start another session.';
+  const FOLLOW_UP_FAILED =
+    'This session stopped at a failed stage, so it takes no follow-ups. Retry the stage, or ask a new question above.';
+  const FOLLOW_UP_SERVICE = 'Start the local Debug Generator service to ask a follow-up.';
+
+  const NOTHING_MODIFIED = 'No files were modified for this session.';
+  const NOTHING_MODIFIED_YET = /^No files have been modified yet\./;
+
+  const ANSWERED: FollowUpRecord = {
+    question: 'Why did that step run twice?',
+    askedAt: 1_758_000_040_000,
+    attemptId: 'fua_first',
+    attempt: 1,
+    needsNewCapture: false,
+    captureId: CAPTURE_ID,
+    analysisId: 'ana_second',
+    panelId: 'pnl_second',
+  };
+  const RE_ARMED: FollowUpRecord = {
+    question: 'Which view started the second request?',
+    askedAt: 1_758_000_060_000,
+    attemptId: 'fua_second',
+    attempt: 1,
+    needsNewCapture: true,
+    planVersion: 2,
+  };
+
+  const ANALYSIS: AnalysisResult = {
+    id: 'ana_first',
+    sessionId: SESSION_ID,
+    captureId: CAPTURE_ID,
+    analysisVersion: 1,
+    createdAt: 1_758_000_030_000,
+    observed: [],
+    likelyCauses: [],
+    metrics: [],
+  };
+
+  const TARGET: SelectedTarget = {
+    selector: 'main > section.pane > button[data-role="primary"]',
+    tagName: 'button',
+    text: 'Run the sample task',
+    componentChain: ['InnerTile', 'OuterFrame'],
+    url: 'http://localhost:3000/workspace?view=?',
+  };
+
+  const CLEAN_CLEANUP = { status: 'clean' as const, completedAt: 1_758_000_050_000, conflicts: [] };
+
+  /** A connection the client has given up on, to a service that did not answer. */
+  const DISCONNECTED: WebviewState['connection'] = {
+    status: 'closed',
+    serviceUrl: 'http://127.0.0.1:43117',
+    serviceReachable: false,
+    provider: 'deterministic',
+  };
+
+  /** A labelled section of the view, found by the group name `App` gives it. */
+  function group(name: string): HTMLElement {
+    return screen.getByRole('group', { name });
+  }
+
+  /** Every button whose accessible text mentions picking an element. */
+  function pickButtons(): HTMLElement[] {
+    return screen.queryAllByRole('button').filter((element) => /pick/i.test(element.textContent));
+  }
+
+  it('shows the session’s question verbatim in the Question section', () => {
+    mount(sessionState('investigating', {}, { question: QUESTION }));
+
+    const question = group('Question');
+    expect(within(question).getByText(QUESTION_LABEL)).toBeTruthy();
+    expect(question.querySelector('.dgv-asked__text')?.textContent).toBe(QUESTION);
+    // The form below stays inert mid-pipeline and its field empty: the question is shown, not
+    // copied into the draft.
+    expect(field(QUESTION_FIELD).value).toBe('');
+    expect(field(QUESTION_FIELD).disabled).toBe(true);
+  });
+
+  it('lists every follow-up asked, with its outcome in words, above the entry', () => {
+    mount(sessionState('generated', { analysis: ANALYSIS }, { followUps: [ANSWERED] }));
+
+    const followUp = group('Follow-up');
+    const list = within(followUp).getByRole('list', { name: ASKED_LIST });
+    const items = within(list).getAllByRole('listitem');
+    expect(items.map((item) => item.querySelector('.dgv-asked__text')?.textContent)).toEqual([
+      ANSWERED.question,
+    ]);
+    expect(within(items[0] as HTMLElement).getByText('Answered')).toBeTruthy();
+    // A generated session still takes another follow-up.
+    expect(field(FOLLOW_UP_FIELD).disabled).toBe(false);
+  });
+
+  it('while a follow-up re-arms a capture, lists it as needing one and says the session is working', () => {
+    mount(sessionState('ready', { analysis: ANALYSIS }, { followUps: [ANSWERED, RE_ARMED] }));
+
+    const followUp = group('Follow-up');
+    const items = within(within(followUp).getByRole('list', { name: ASKED_LIST })).getAllByRole(
+      'listitem',
+    );
+    expect(items.map((item) => item.querySelector('.dg-badge')?.textContent)).toEqual([
+      'Answered',
+      'Needs a new capture',
+    ]);
+    expect(within(followUp).getByText(FOLLOW_UP_WORKING)).toBeTruthy();
+    expect(within(followUp).queryByText(FOLLOW_UP_AWAITING)).toBeNull();
+    expect(screen.queryByLabelText(FOLLOW_UP_FIELD)).toBeNull();
+  });
+
+  it('says the first result is awaited before any analysis exists', () => {
+    mount(sessionState('ready'));
+
+    expect(within(group('Follow-up')).getByText(FOLLOW_UP_AWAITING)).toBeTruthy();
+  });
+
+  it('disconnected with no session: says no session can start yet and offers no pick', () => {
+    mount(webviewState({ connection: DISCONNECTED }));
+
+    expect(screen.getByText(NO_SESSION_SERVICE_MESSAGE)).toBeTruthy();
+    expect(screen.queryByText(NO_SESSION_MESSAGE)).toBeNull();
+    expect(pickButtons()).toEqual([]);
+    expect(screen.getByText('No target')).toBeTruthy();
+    expect(screen.getByText(/picking one needs the local debug generator service/i)).toBeTruthy();
+  });
+
+  it('connected with no session: explains what asking does and offers no pick yet', () => {
+    mount(webviewState());
+
+    expect(screen.getByText(NO_SESSION_MESSAGE)).toBeTruthy();
+    expect(screen.queryByText(NO_SESSION_SERVICE_MESSAGE)).toBeNull();
+    expect(pickButtons()).toEqual([]);
+    expect(screen.getByText(/once a session is running, "pick element"/i)).toBeTruthy();
+  });
+
+  it('ended: shows the target read-only, offers no pick and says the session takes no follow-ups', () => {
+    mount(
+      sessionState(
+        'ended',
+        { target: TARGET, analysis: ANALYSIS, cleanup: CLEAN_CLEANUP },
+        { followUps: [ANSWERED], cleanup: CLEAN_CLEANUP },
+      ),
+    );
+
+    expect(screen.queryByRole('button', { name: REPICK })).toBeNull();
+    expect(pickButtons()).toEqual([]);
+    expect(screen.getByText('Selected for this session, which has ended.')).toBeTruthy();
+    expect(screen.getByText(TARGET.selector)).toBeTruthy();
+
+    const followUp = group('Follow-up');
+    expect(within(followUp).getByText(FOLLOW_UP_ENDED)).toBeTruthy();
+    expect(within(followUp).queryByText(FOLLOW_UP_AWAITING)).toBeNull();
+    // What was asked stays listed after the end.
+    expect(within(followUp).getByText(ANSWERED.question)).toBeTruthy();
+    expect(screen.getByText(SESSION_ENDED)).toBeTruthy();
+  });
+
+  it('failed: offers no pick and says the failed session takes no follow-ups', () => {
+    mount(sessionState('failed'));
+
+    expect(pickButtons()).toEqual([]);
+    expect(
+      screen.getByText(/this session stopped at a failed stage; ask a new question/i),
+    ).toBeTruthy();
+    expect(within(group('Follow-up')).getByText(FOLLOW_UP_FAILED)).toBeTruthy();
+  });
+
+  it.each(['created', 'understanding', 'investigating', 'planning'] as const)(
+    '%s: says no file has been modified yet rather than none was',
+    (status) => {
+      mount(sessionState(status));
+
+      const modifications = group('File modifications');
+      expect(within(modifications).getByText(NOTHING_MODIFIED_YET)).toBeTruthy();
+      expect(within(modifications).queryByText(NOTHING_MODIFIED)).toBeNull();
+    },
+  );
+
+  it('generated: offers Pick element, then Pick another element once a target exists', () => {
+    mount(sessionState('generated'));
+
+    expect(button(PICK_ELEMENT).disabled).toBe(false);
+    expect(within(group('File modifications')).getByText(NOTHING_MODIFIED)).toBeTruthy();
+
+    pushState(sessionState('generated', { target: TARGET }));
+    fireEvent.click(button(REPICK));
+    expect(postedOf('requestTarget')).toHaveLength(1);
+  });
+
+  it('generated with the service unreachable: withholds the pick and the follow-up, saying why', () => {
+    mount(sessionState('generated', { connection: DISCONNECTED, analysis: ANALYSIS }));
+
+    expect(pickButtons()).toEqual([]);
+    expect(screen.queryByLabelText(FOLLOW_UP_FIELD)).toBeNull();
+    expect(within(group('Follow-up')).getByText(FOLLOW_UP_SERVICE)).toBeTruthy();
   });
 });

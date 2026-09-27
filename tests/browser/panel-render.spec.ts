@@ -10,7 +10,9 @@
  * dist`, loaded unpacked into a real Chromium — boots its React panel app,
  * receives a panel over the extension's own port contract, asks for each node's
  * data through its `DataProvider`, and draws every node type, its summary, its
- * source chips, its fallback banner and its theme. That is this file's subject.
+ * source chips, its fallback banner and its theme — and, for a panel whose
+ * nodes carry no titles, the catalogue-label heading every view is still
+ * named by. That is this file's subject.
  * The built manifest belongs to `apps/chrome-extension/test/manifest.test.ts`,
  * and the service-side click-to-source round trip to `source-navigation.spec.ts`.
  *
@@ -197,6 +199,13 @@ const FALLBACK_BANNER_PATTERN = /fallback view/i;
 /** `SummaryHeader.tsx`: the summary's two separately headed halves, facts apart from causes. */
 const OBSERVED_HEADING = 'Observed';
 const LIKELY_CAUSE_HEADING = 'Likely cause';
+
+/**
+ * `PanelHost.tsx`: the outline level of a layout's top-level nodes, directly
+ * below the panel title's level 2. An untitled container adds no level, so in a
+ * panel whose nodes carry no titles every view's heading sits here.
+ */
+const LAYOUT_HEADING_LEVEL = 3;
 
 /**
  * A node type name that is deliberately outside the vocabulary, for the
@@ -1030,6 +1039,19 @@ function resultSize(result: DataResult): number {
 }
 
 /**
+ * A copy of a validated spec with every node's title removed: the shape a
+ * generated panel arrives in when its author titled nothing. Titles are
+ * optional, so the copy is still a valid panel.
+ */
+function withoutTitles(spec: PanelSpec): PanelSpec {
+  const copy = structuredClone(spec);
+  walkPanelNodes(copy.layout, (node) => {
+    Reflect.deleteProperty(node, 'title');
+  });
+  return copy;
+}
+
+/**
  * A copy of a validated spec with one node's type replaced — deliberately
  * outside `validatePanelSpec`, for the invalid-specification test.
  */
@@ -1052,6 +1074,22 @@ function withNodeType(spec: PanelSpec, path: PanelNodePath, type: string): unkno
 /** Escape a literal for a `RegExp`. */
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * The accessible name a metric tile is expected to carry, as an anchored
+ * pattern: the tile's heading, then — for a tier duration only — the
+ * parenthesised line under the heading that says it is wall-clock time
+ * (`Database duration (wall clock: overlapping statements counted once)`),
+ * then `: ` and the figure the caller matches with `figure` (a regular
+ * expression source). The qualifier's wording is the renderer's own and is
+ * pinned by its unit tests; here it is required to be present on exactly the
+ * durations and absent on every other metric, so a count tile's name stays
+ * `Requests: 2`.
+ */
+function metricTileName(metric: { id: string; label: string }, figure: string): RegExp {
+  const qualifier = metric.id.endsWith('_duration') ? ' \\([^()]+\\)' : '';
+  return new RegExp(`^${escapeRegExp(metric.label)}${qualifier}: ${figure}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,7 +1173,9 @@ async function expectResultDrawn(
   switch (result.source) {
     case 'trace': {
       const spans = result.trace?.nodeCount ?? 0;
-      await expect(frame.getByRole('img').first(), `${what} draws a chart`).toBeVisible();
+      // A trace is drawn as a figure (the timeline's or the flame chart's
+      // canvas) whose bars and frames are named images.
+      await expect(frame.getByRole('figure').first(), `${what} draws a chart`).toBeVisible();
       await expect.poll(() => drawnItemCount(frame), `${what} draws every span`).toBe(spans);
       return;
     }
@@ -1197,15 +1237,18 @@ async function expectResultDrawn(
       for (const group of duplicated) {
         const row = rows.filter({ hasText: group.path });
         await expect(row).toHaveCount(1);
-        // Each cell leads with its number; a badge may add a described explanation after it.
+        // One cell carries both figures: the occurrence count, then — for a group
+        // with redundant occurrences — the duplicate badge beside it, which names
+        // itself as the redundant count.
         const occurrences = await cellInColumn(grid, row, 'Occurrences');
-        await expect(occurrences, `${what} counts every occurrence`).toHaveText(
-          new RegExp(`^${String(group.count)}(?!\\d)`),
-        );
-        const duplicates = await cellInColumn(grid, row, 'Duplicates');
-        await expect(duplicates, `${what} badges the duplicate count`).toHaveText(
-          new RegExp(`^${String(group.duplicateCount)}(?!\\d)`),
-        );
+        await expect(
+          occurrences.locator('.dg-stack__items > .dg-text').first(),
+          `${what} counts every occurrence`,
+        ).toHaveText(String(group.count));
+        await expect(
+          occurrences.locator('.dg-request-table__duplicate-badge'),
+          `${what} badges the duplicate count`,
+        ).toHaveText(new RegExp(`^${String(group.duplicateCount)}(?!\\d)`));
       }
       return;
     }
@@ -1244,20 +1287,17 @@ async function expectResultDrawn(
       for (const metric of shown) {
         if (!metric.available) {
           await expect(
-            frame.getByRole('listitem', { name: `${metric.label}: n/a`, exact: true }),
+            frame.getByRole('listitem', { name: metricTileName(metric, 'n/a$') }),
           ).toBeVisible();
         } else if (metric.unit === 'count' && metric.value !== undefined) {
           await expect(
             frame.getByRole('listitem', {
-              name: `${metric.label}: ${String(metric.value)}`,
-              exact: true,
+              name: metricTileName(metric, `${escapeRegExp(String(metric.value))}$`),
             }),
           ).toBeVisible();
         } else {
           await expect(
-            frame.getByRole('listitem', {
-              name: new RegExp(`^${escapeRegExp(metric.label)}: \\S`),
-            }),
+            frame.getByRole('listitem', { name: metricTileName(metric, '\\S') }),
           ).toBeVisible();
         }
       }
@@ -1453,6 +1493,68 @@ test.describe('panel-render: a stored PanelSpec in the built panel document', ()
     await expect(
       panel.main.getByRole('status').filter({ hasText: FALLBACK_BANNER_PATTERN }),
     ).toHaveCount(0);
+    await expectNoFailures(panel);
+  });
+
+  test('heads every untitled view with its catalogue label, and no untitled chip or container', async ({
+    openRenderedPanel,
+  }) => {
+    const spec = withoutTitles(buildCatalogPanelSpec());
+    expect(validatePanelSpec(spec).ok, 'the untitled copy is still a valid panel').toBe(true);
+    const nodes: { readonly node: PanelNode; readonly pathKey: string }[] = [];
+    walkPanelNodes(spec.layout, (node, path) => {
+      expect(node.title, `node ${path.join('.')} is untitled`).toBeUndefined();
+      nodes.push({ node, pathKey: path.join('.') });
+    });
+    const panel = await openRenderedPanel();
+    await panel.waitForConnected();
+    await panel.deliver(spec);
+    await expect(
+      panel.main.locator('[aria-busy="true"]'),
+      'every LoadingState resolved',
+    ).toHaveCount(0);
+
+    for (const { node, pathKey } of nodes) {
+      const entry = PANEL_NODE_CATALOG[node.type];
+      const frame = panel.frameOf(pathKey);
+      // The headings this node drew itself: those whose nearest node frame is
+      // its own, so a container is not credited with its children's.
+      const ownHeadings = await frame.evaluate((element) =>
+        [...element.querySelectorAll('h1, h2, h3, h4, h5, h6')]
+          .filter((heading) => heading.closest('[data-node-path]') === element)
+          .map((heading) => ({
+            level: Number(heading.tagName.slice(1)),
+            text: (heading.textContent ?? '').trim(),
+          })),
+      );
+      if (entry.kind === 'visualization' && entry.requiresQuery) {
+        // A view of captured evidence: one heading, reading the catalogue label
+        // at the layout's level, naming the region the view is drawn in.
+        expect(ownHeadings, `the untitled ${node.type} view is headed by its label`).toEqual([
+          { level: LAYOUT_HEADING_LEVEL, text: entry.label },
+        ]);
+        await expect(
+          frame.getByRole('region', { name: entry.label, exact: true }),
+          `the untitled ${node.type} view is a region named "${entry.label}"`,
+        ).toBeVisible();
+        await expect(
+          frame.getByRole('heading', {
+            level: LAYOUT_HEADING_LEVEL,
+            name: entry.label,
+            exact: true,
+          }),
+        ).toBeVisible();
+      } else {
+        // The source-link chip and the untitled containers name nothing.
+        expect(ownHeadings, `the untitled ${node.type} node draws no heading`).toEqual([]);
+        if (!entry.supportsChildren) {
+          await expect(
+            frame.getByRole('region'),
+            `the untitled ${node.type} leaf is no region`,
+          ).toHaveCount(0);
+        }
+      }
+    }
     await expectNoFailures(panel);
   });
 

@@ -41,11 +41,16 @@
  * exists for the tokenizer alone. Every comparison against question-derived
  * text in this file therefore lives in the tokenizer's helpers
  * ({@link splitCamelCase}, `questionWords`, `identifierCandidateOf`,
- * `isKeptToken`), and none of them maps a phrase to a category, a signal set,
- * a plan or a panel: they only cut text into words and filter words against
- * two vocabularies of ordinary English and generic debugging terms. The model
- * decides what the question means. The stage itself (`createUnderstandStage`)
- * never reads the question except to hand it, redacted, to the tokenizer.
+ * `isKeptToken`), and none of them maps a phrase to a signal set, a plan or a
+ * panel: they only cut text into words and filter words against two
+ * vocabularies of ordinary English and generic debugging terms. The one
+ * projection beyond filtering is `categoryHintsOf`, a table lookup of the
+ * already-filtered generic terms into the product's problem categories
+ * ({@link SIGNAL_TERM_CATEGORIES}) — the "pre-classified category hint" the
+ * rules-based provider echoes, since it reads the structured input alone. No
+ * application vocabulary is involved, and the model still decides what the
+ * question means. The stage itself (`createUnderstandStage`) never reads the
+ * question except to hand it, redacted, to the tokenizer.
  *
  * ## Wording invariance
  *
@@ -84,7 +89,7 @@
  */
 
 import { problemUnderstandingSchema } from '@debuggen/instrumentation';
-import type { ProblemUnderstanding } from '@debuggen/instrumentation';
+import type { ProblemCategory, ProblemUnderstanding } from '@debuggen/instrumentation';
 import { DEFAULT_MAX_REPAIRS, generateStructuredWithRepair } from '@debuggen/model-provider';
 import type { ModelProvider, PromptStage } from '@debuggen/model-provider';
 import type { ProgressStage } from '@debuggen/protocol';
@@ -362,8 +367,10 @@ export const QUESTION_STOP_WORDS: readonly string[] = Object.freeze([
  *
  * The tokenizer reports which of these words the question used, as
  * {@link QuestionTokens.signalTerms}. That is a filter, not a mapping: the
- * terms are handed on verbatim and no term selects a category, a capture
- * signal, a plan or a panel — the model decides what the question is about.
+ * terms are handed on verbatim and no term selects a capture signal, a plan or
+ * a panel — the model decides what the question is about. The class of
+ * behaviour a term names is hinted separately, through
+ * {@link SIGNAL_TERM_CATEGORIES}.
  * Every entry is a single lower-case ASCII word with no separator, no path
  * character and no case boundary, and none is specific to any application.
  * Inflections are listed individually because the tokenizer does no stemming.
@@ -499,6 +506,140 @@ export const GENERIC_SIGNAL_TERMS: readonly string[] = Object.freeze([
   'wrong',
 ]);
 
+/**
+ * The problem categories a signal term can hint at: the understanding
+ * vocabulary of `@debuggen/instrumentation`'s `PROBLEM_CATEGORIES`, less
+ * `'other'`, which is what an understanding with no hint reports and therefore
+ * never needs hinting.
+ */
+export type QuestionCategoryHint = Exclude<ProblemCategory, 'other'>;
+
+/**
+ * The class of runtime behaviour each generic signal term names (AAP §0.5.4).
+ *
+ * The tokenizer reads a question's {@link QuestionTokens.signalTerms} through
+ * this table into {@link QuestionTokens.categoryHints}: a *lexical* hint of
+ * the kind of problem the words describe — latency, rendering, requests,
+ * queries, state, failures, wrong results — never of which code is involved.
+ * Every key is a member of {@link GENERIC_SIGNAL_TERMS} and every value a
+ * product category, so the table carries no application vocabulary. Terms that
+ * qualify a behaviour rather than name one (`again`, `many`, `twice`,
+ * `repeated`, `duplicate`, `times`, `count`, `loop`) and terms whose class
+ * depends on what they are attached to (`call`, `client`, `effect`, `hook`,
+ * `load`, `update`, `time`) are deliberately absent: they strengthen whatever
+ * the question's other words name and select nothing on their own.
+ *
+ * The model is free to classify differently — it reads the question, not this
+ * table. The hint exists for the rules-based provider, which reads the
+ * structured input alone and echoes the hint it is given.
+ */
+export const SIGNAL_TERM_CATEGORIES: Readonly<Record<string, QuestionCategoryHint>> = Object.freeze(
+  {
+    api: 'network',
+    blocked: 'performance',
+    blocking: 'performance',
+    broken: 'error',
+    cache: 'network',
+    cached: 'network',
+    cpu: 'performance',
+    crash: 'error',
+    crashes: 'error',
+    database: 'data',
+    db: 'data',
+    delay: 'performance',
+    delayed: 'performance',
+    duration: 'performance',
+    endpoint: 'network',
+    error: 'error',
+    errors: 'error',
+    exception: 'error',
+    exceptions: 'error',
+    fail: 'error',
+    failed: 'error',
+    failing: 'error',
+    fails: 'error',
+    failure: 'error',
+    fast: 'performance',
+    fetch: 'network',
+    fetches: 'network',
+    fetching: 'network',
+    flicker: 'rendering',
+    flickering: 'rendering',
+    flickers: 'rendering',
+    freeze: 'performance',
+    freezes: 'performance',
+    frozen: 'performance',
+    hang: 'performance',
+    hangs: 'performance',
+    incorrect: 'correctness',
+    jank: 'performance',
+    lag: 'performance',
+    lagging: 'performance',
+    laggy: 'performance',
+    lags: 'performance',
+    latency: 'performance',
+    long: 'performance',
+    memo: 'rendering',
+    missing: 'correctness',
+    mount: 'rendering',
+    mounts: 'rendering',
+    network: 'network',
+    perf: 'performance',
+    performance: 'performance',
+    props: 'rendering',
+    queries: 'data',
+    query: 'data',
+    remount: 'rendering',
+    remounts: 'rendering',
+    render: 'rendering',
+    rendered: 'rendering',
+    rendering: 'rendering',
+    renders: 'rendering',
+    request: 'network',
+    requests: 'network',
+    rerender: 'rendering',
+    rerendered: 'rendering',
+    rerendering: 'rendering',
+    rerenders: 'rendering',
+    response: 'network',
+    responses: 'network',
+    retries: 'network',
+    retry: 'network',
+    slow: 'performance',
+    slower: 'performance',
+    slowly: 'performance',
+    slowness: 'performance',
+    speed: 'performance',
+    sql: 'data',
+    stale: 'state',
+    state: 'state',
+    stuck: 'performance',
+    timeout: 'performance',
+    timeouts: 'performance',
+    transaction: 'data',
+    unmount: 'rendering',
+    wrong: 'correctness',
+  },
+);
+
+/**
+ * The order two categories hinted by the same number of terms are reported in:
+ * the more specific class of behaviour first. A question about slow rendering is
+ * a rendering question, one about stale state after a failed call a state
+ * question, and one about slow requests or a slow query a latency question —
+ * latency views show the request and the query as well — so `performance`
+ * outranks the two classes it spans.
+ */
+export const CATEGORY_HINT_PRECEDENCE: readonly QuestionCategoryHint[] = Object.freeze([
+  'rendering',
+  'state',
+  'error',
+  'correctness',
+  'performance',
+  'network',
+  'data',
+]);
+
 /** Membership view of {@link QUESTION_STOP_WORDS}; private so the exported list stays the definition. */
 const STOP_WORD_SET: ReadonlySet<string> = new Set(QUESTION_STOP_WORDS);
 
@@ -604,8 +745,10 @@ const NO_PARTS: readonly string[] = Object.freeze([]);
  * de-duplicated, sorted by UTF-16 code unit and capped, so two questions that
  * differ only in word order, filler words, capitalisation or punctuation yield
  * deeply equal values. The object and its lists are frozen and survive a JSON
- * round trip unchanged. It carries lexical data only — no category, signal,
- * plan, panel or path.
+ * round trip unchanged. It carries lexical data only — no signal, plan, panel
+ * or path — and one lexical projection of it, {@link categoryHints}: the
+ * product categories its generic signal terms name, which the model is free to
+ * overrule and the rules-based provider echoes.
  */
 export interface QuestionTokens {
   /**
@@ -623,6 +766,16 @@ export interface QuestionTokens {
   readonly identifierCandidates: readonly string[];
   /** The members of {@link tokens} that are {@link GENERIC_SIGNAL_TERMS}, verbatim. */
   readonly signalTerms: readonly string[];
+  /**
+   * The categories the signal terms name through {@link SIGNAL_TERM_CATEGORIES},
+   * each once: the one list ordered by support rather than by code unit — the
+   * category named by the most distinct terms first, ties in
+   * {@link CATEGORY_HINT_PRECEDENCE} order — so its head is the best-supported
+   * hint. Only a term written as a word counts: a part of an identifier
+   * candidate (`render` in `renderList`) names code rather than behaviour.
+   * Empty when no such term names a category.
+   */
+  readonly categoryHints: readonly QuestionCategoryHint[];
 }
 
 /**
@@ -762,8 +915,37 @@ function sortedUnique(values: Iterable<string>): string[] {
 }
 
 /** The first `max` entries of an already-ordered list, frozen. */
-function frozenHead(values: readonly string[], max: number): readonly string[] {
+function frozenHead<T extends string>(values: readonly T[], max: number): readonly T[] {
   return Object.freeze(values.slice(0, max));
+}
+
+/**
+ * The categories a question's signal terms name, best supported first.
+ *
+ * A lookup of each term in {@link SIGNAL_TERM_CATEGORIES} — the terms are
+ * members of a closed vocabulary already, so nothing here reads the question —
+ * counted per category and ordered by descending count, then by
+ * {@link CATEGORY_HINT_PRECEDENCE}. Every category appears at most once, so the
+ * list can never exceed the precedence tuple.
+ *
+ * @param signalTerms The question's signal terms, in any order.
+ * @returns The hinted categories, ordered by support.
+ */
+function categoryHintsOf(signalTerms: readonly string[]): QuestionCategoryHint[] {
+  const support = new Map<QuestionCategoryHint, number>();
+  for (const term of signalTerms) {
+    const category = Object.hasOwn(SIGNAL_TERM_CATEGORIES, term)
+      ? SIGNAL_TERM_CATEGORIES[term]
+      : undefined;
+    if (category !== undefined) {
+      support.set(category, (support.get(category) ?? 0) + 1);
+    }
+  }
+  return CATEGORY_HINT_PRECEDENCE.filter((category) => support.has(category)).sort(
+    (left, right) =>
+      (support.get(right) ?? 0) - (support.get(left) ?? 0) ||
+      CATEGORY_HINT_PRECEDENCE.indexOf(left) - CATEGORY_HINT_PRECEDENCE.indexOf(right),
+  );
 }
 
 /**
@@ -777,25 +959,30 @@ function frozenHead(values: readonly string[], max: number): readonly string[] {
  * boundaries, lower-case the parts, drop stop words and fragments shorter than
  * two characters, de-duplicate, sort by code unit and cap. Signal terms are
  * selected from the full token set before the token list is capped, so a
- * generic debugging word is never lost to alphabetical order. Nothing is
- * mapped to a category, a signal, a plan or a panel; there is no stemming, no
- * synonym table and no application vocabulary.
+ * generic debugging word is never lost to alphabetical order. The signal terms
+ * written as words — not as parts of an identifier candidate — are then looked
+ * up in {@link SIGNAL_TERM_CATEGORIES} for the category hints; nothing is
+ * mapped to a signal, a plan or a panel, and there is no stemming, no synonym
+ * table and no application vocabulary.
  *
  * Pure and total: the same input always yields a deeply equal, frozen result;
  * the input is not modified; an empty, blank, punctuation-only or stop-word-only
  * question yields empty lists rather than an error.
  *
  * @param question The developer's question, verbatim.
- * @returns The question's tokens, identifier candidates and signal terms.
+ * @returns The question's tokens, identifier candidates, signal terms and
+ * category hints.
  *
  * @example
  * ```ts
  * tokenizeQuestion('Why is the <ComponentName> so SLOW?!').signalTerms; // ['slow']
+ * tokenizeQuestion('Why is the <ComponentName> so SLOW?!').categoryHints; // ['performance']
  * ```
  */
 export function tokenizeQuestion(question: string): QuestionTokens {
   const tokens = new Set<string>();
   const identifierCandidates = new Set<string>();
+  const hintTerms = new Set<string>();
 
   for (const word of questionWords(question)) {
     const candidate = identifierCandidateOf(word);
@@ -806,17 +993,27 @@ export function tokenizeQuestion(question: string): QuestionTokens {
       const token = part.toLowerCase();
       if (isKeptToken(token)) {
         tokens.add(token);
+        // A part of an identifier names code, not behaviour — a symbol spelled
+        // with a signal word describes what the code does, not what went
+        // wrong — so only a signal term written as a word hints a category.
+        if (candidate === undefined && SIGNAL_TERM_SET.has(token)) {
+          hintTerms.add(token);
+        }
       }
     }
   }
 
   const orderedTokens = sortedUnique(tokens);
+  const signalTerms = orderedTokens.filter((token) => SIGNAL_TERM_SET.has(token));
   return Object.freeze({
     tokens: frozenHead(orderedTokens, MAX_QUESTION_TOKENS),
     identifierCandidates: frozenHead(sortedUnique(identifierCandidates), MAX_IDENTIFIER_CANDIDATES),
-    signalTerms: frozenHead(
-      orderedTokens.filter((token) => SIGNAL_TERM_SET.has(token)),
-      MAX_SIGNAL_TERMS,
+    signalTerms: frozenHead(signalTerms, MAX_SIGNAL_TERMS),
+    // Hinted from every signal word the question used, before any list is
+    // capped, so a category is never lost to alphabetical order either.
+    categoryHints: frozenHead(
+      categoryHintsOf(sortedUnique(hintTerms)),
+      CATEGORY_HINT_PRECEDENCE.length,
     ),
   });
 }

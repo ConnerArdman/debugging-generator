@@ -130,7 +130,12 @@ import type {
   TraceTree,
 } from '@debuggen/telemetry';
 
-import { messageOf, waitForStreamedContent, withEditorAnnouncement } from './helpers/demo-app';
+import {
+  messageOf,
+  waitForOrderableCheckout,
+  waitForStreamedContent,
+  withEditorAnnouncement,
+} from './helpers/demo-app';
 import {
   E2E_TIMEOUTS,
   EDITOR_HOST_TIMEOUTS,
@@ -286,6 +291,14 @@ const NUMERIC_LITERAL_PATTERN = /(?<![\w$.])\d+(?:\.\d+)?(?![\w.])/;
 const READY_TO_CAPTURE_PATTERN = /^ready to capture$/i;
 
 /**
+ * The readiness gate's row for a page hook the install armed while no Chrome
+ * tab was bound yet (`buildInstrumentationRows` in
+ * `apps/local-service/src/sessions/progress.ts` adds one per unavailable
+ * readiness signal no `unavailable` entry already reported).
+ */
+const UNBOUND_TAB_ROW_PATTERN = /^Could not enable .+: no Chrome tab is bound to this session\.$/u;
+
+/**
  * The signal rows the instrument stage must report done for this question:
  * the server and database tiers the correlated trace below depends on, by the
  * labels the progress view shows (`docs/ARCHITECTURE.md`, "Progress from real
@@ -298,13 +311,14 @@ const READY_TO_CAPTURE_PATTERN = /^ready to capture$/i;
  */
 const ARMED_SIGNAL_LABELS = ['Server spans', 'Database tracing'] as const;
 
-/** The planning stages, in the order the pipeline runs them. */
-const PLANNING_STAGES = [
-  'understand',
-  'investigate',
-  'plan',
-  'instrument',
-] as const satisfies readonly ProgressStage[];
+/**
+ * The Step-8 groups the planning stages report in, in the order the pipeline
+ * runs them: the code investigation reports inside "Understanding problem"
+ * (`understand`) and instrumentation planning inside "Preparing
+ * instrumentation" (`instrument`), so these are the stages the planning rows
+ * carry (`apps/local-service/src/sessions/progress.ts`, `PROGRESS_STAGE_GROUPS`).
+ */
+const PLANNING_STAGES = ['understand', 'instrument'] as const satisfies readonly ProgressStage[];
 
 /** The stages after readiness; none of them may report a failure. */
 const LATER_STAGES = [
@@ -909,21 +923,32 @@ async function ensureCheckoutCart(page: Page, baseUrl: string): Promise<CartSnap
   return refilled;
 }
 
-/** Opens the checkout page and waits until "Place order" can be pressed. */
+/**
+ * Opens the checkout page and waits until "Place order" would place the order.
+ *
+ * The control is enabled once the cart has been read; the order is sendable
+ * only once the freight quote has also settled with a service chosen and the
+ * form names nothing outstanding ({@link waitForOrderableCheckout}) — a press
+ * before that runs the validation pass, which refuses it.
+ */
 async function openCheckoutPage(page: Page, baseUrl: string): Promise<void> {
   await page.goto(new URL(CHECKOUT_PAGE_PATH, baseUrl).href);
   await waitForStreamedContent(page);
   const control = page.locator(PLACE_ORDER_SELECTOR);
   await expect(control, `"${PLACE_ORDER_SELECTOR}" must match exactly one control.`).toHaveCount(1);
   await expect(control).toHaveAccessibleName(PLACE_ORDER_NAME);
-  // Enabled once the cart has been read and the shipping quote has settled.
   await expect(control).toBeEnabled({ timeout: E2E_TIMEOUTS.pageReady });
+  await waitForOrderableCheckout(page, E2E_TIMEOUTS.pageReady);
 }
 
 /**
  * The reproduction: the click a developer makes, then the page's own answer —
  * the confirmation headline, or the form's danger alert, whose text is the
- * failure. Both are waited on together so a failed order fails fast.
+ * failure. Both are waited on together so a failed order fails fast. The click
+ * is made once the form would send the order: the session's patches make the
+ * dev server rebuild under the open page, which can have it quote freight
+ * again, and a press while that quote is in flight is refused by the form
+ * without a request.
  */
 async function placeOrder(
   page: Page,
@@ -933,6 +958,7 @@ async function placeOrder(
 ): Promise<void> {
   const control = page.getByRole('button', { name: PLACE_ORDER_NAME, exact: true });
   await expect(control).toBeEnabled({ timeout: E2E_TIMEOUTS.pageReady });
+  await waitForOrderableCheckout(page, E2E_TIMEOUTS.pageReady);
   await control.click();
 
   const confirmation = page.getByRole('heading', { name: ORDER_CONFIRMED_HEADLINE, exact: true });
@@ -1471,6 +1497,9 @@ test.describe('slow checkout interaction', () => {
       target: { selector: PLACE_ORDER_SELECTOR },
       selectTargetVia: 'devtools-eval',
       selectBeforeQuestion: true,
+      // The pause before Start capture: the checkout is waited on until it
+      // would place the order, so the capture opens on a settled form.
+      beforeCapture: ({ appPage: page }) => waitForOrderableCheckout(page, E2E_TIMEOUTS.pageReady),
       interact: ({ appPage: page, captureId: openCapture }) =>
         placeOrder(page, service, editorClient, openCapture),
       tracker: sessions,
@@ -1768,24 +1797,33 @@ test.describe('slow checkout interaction', () => {
       failures.filter((row) => row.stage !== 'instrument').map(describeRow),
       'A pipeline stage reported a failure.',
     ).toEqual([]);
-    // An instrument-stage failure row is how an unavailable signal is reported.
+    // An instrument-stage failure row is how an unavailable signal is reported —
+    // by the install's own `unavailable` entries, or by the readiness gate for a
+    // page hook the install armed before the session's tab was bound, which the
+    // later "Ready to capture" row supersedes once the tab binds.
+    const reportedFailures = failures.filter((row) => !UNBOUND_TAB_ROW_PATTERN.test(row.message));
     expect(
-      failures.length,
+      reportedFailures.length,
       `More failed signal rows than unavailable signals: ${failures.map(describeRow).join('; ')}`,
     ).toBeLessThanOrEqual(instrumentation.unavailable.length);
 
     let previousFirst = -1;
     for (const stage of PLANNING_STAGES) {
       const rows = stages.filter((row) => row.stage === stage);
-      expect(rows.length, `The ${stage} stage reported no progress.`).toBeGreaterThan(0);
+      expect(rows.length, `The ${stage} group reported no progress.`).toBeGreaterThan(0);
       expect(
         rows.some((row) => row.status === 'done'),
-        `The ${stage} stage never completed: ${rows.map(describeRow).join('; ')}`,
+        `The ${stage} group never completed: ${rows.map(describeRow).join('; ')}`,
       ).toBe(true);
       const first = Math.min(...rows.map((row) => row.index));
-      expect(first, `The ${stage} stage started out of order.`).toBeGreaterThan(previousFirst);
+      expect(first, `The ${stage} group started out of order.`).toBeGreaterThan(previousFirst);
       previousFirst = first;
     }
+    // Investigation and planning report inside those groups; only a failure keeps its own stage.
+    expect(
+      stages.filter((row) => row.stage === 'investigate' || row.stage === 'plan').map(describeRow),
+      'An investigation or planning row left its Step-8 group.',
+    ).toEqual([]);
 
     const instrumentRows = stages.filter((row) => row.stage === 'instrument');
     const doneMessages = instrumentRows

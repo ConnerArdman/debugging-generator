@@ -2483,14 +2483,39 @@ describe('the propose→execute loop', () => {
       );
       const seeds = [
         { tool: 'findByName', name: CHART_COMPONENT },
-        { tool: 'routeForUrl', url: ROUTE_PATH },
         { tool: 'findByName', name: 'orbit' },
+        { tool: 'routeForUrl', url: ROUTE_PATH },
       ];
       expect(fixture.tools.executed).toStrictEqual(seeds);
       const first = turnInput(fixture, 1);
       expect(first.queryResults).toHaveLength(seeds.length);
       expect(first.remainingQueries).toBe(allowance - seeds.length);
       expect(result.toolRuns).toHaveLength(seeds.length);
+    });
+
+    it('seeds what the understanding names specifically before the route inventory crowds it out', async () => {
+      const inventory = Array.from({ length: 6 }, (_, n) => `/observatory/wing-${String(n)}`);
+      const understanding: ProblemUnderstanding = {
+        category: PROBLEM_CATEGORIES[0],
+        signalsNeeded: [CAPTURE_SIGNALS[0]],
+        // The route inventory leads, as an understanding without a selected element lists it.
+        entities: [
+          ...inventory.map((name) => ({ kind: 'route' as const, name })),
+          { kind: 'component', name: CHART_COMPONENT },
+        ],
+        // Hints the inventory accounts for (its routes and their segments), and two it does not:
+        // a route outside the inventory and a plain word.
+        searchHints: [ROUTE_PATH, 'wing-0', 'observatory', 'orbit', ...inventory],
+      };
+      const fixture = harness({ respond: queued(answer(VALID_INVESTIGATION)) });
+      expectOk(await fixture.run(stageContext().context, { understanding }));
+
+      expect(fixture.tools.executed).toStrictEqual([
+        { tool: 'findByName', name: CHART_COMPONENT },
+        { tool: 'findByName', name: ROUTE_PATH },
+        { tool: 'findByName', name: 'orbit' },
+        { tool: 'routeForUrl', url: inventory[0] },
+      ]);
     });
 
     it('derives the same seeds whatever the question’s wording', async () => {
@@ -3342,6 +3367,13 @@ describe('progress rows', () => {
       routes: [ROUTE_PATH],
       databaseDependencies: ['readingStore.query'],
       relevantFiles: VALID_INVESTIGATION.relevantFiles,
+      // Each finding located where the query result placed it — the call site too, which is no
+      // symbol of the shortlist.
+      origins: new Map([
+        [CHART_COMPONENT, CHART_FILE],
+        [ROUTE_PATH, SERVICE_FILE],
+        ['readingStore.query', SERVICE_FILE],
+      ]),
     });
     expect(findings?.entities).toBeUndefined();
   });

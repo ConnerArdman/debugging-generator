@@ -16,7 +16,9 @@
  * fails the build rather than degrading. The directive is the only thing that makes this a client
  * module. It holds no state, starts no effect, subscribes to nothing, reads no clock and draws no
  * random value, so the markup streamed for a failed route and the markup the browser produces
- * after hydration are the same, and there is nothing here that can re-render between them.
+ * after hydration are the same, and there is nothing here that can re-render between them. Its one
+ * reach into the document is the ref callback on its control, which moves focus only as that
+ * control enters or leaves the document and writes nothing into the markup.
  *
  * WHAT IT DELIBERATELY DOES NOT RENDER
  * The document element and its body belong to the root layout. A boundary that replaced the
@@ -71,11 +73,17 @@
  * is about to replace. That is the whole retry: two calls in one handler, no state of its own -
  * `startTransition` rather than `useTransition` precisely because this component keeps none.
  *
- * A successful retry unmounts this control along with the rest of the notice, so keyboard focus
- * returns to the document body and the next Tab starts from the top of the page. Moving it onto
- * the recovered content instead would mean holding state this component deliberately does without,
- * and reaching into markup that belongs to the route rather than to this boundary; the route
- * announcer tells a reader the view changed, and the reading order is unchanged either way.
+ * FOCUS STAYS IN THE DOCUMENT, WHICHEVER WAY THE RETRY GOES
+ * The reader pressed the control, so it holds focus, and it is given `holdRetryFocus` - the ref
+ * callback `ui/Retry` gives its own control - to keep that focus somewhere usable. A retry that
+ * succeeds unmounts this control with the rest of the notice; the callback's cleanup runs while the
+ * control is still in the document and moves focus to the page's `<main id="main">`, the landmark
+ * `PageContainer` renders with `tabIndex={-1}` outside this boundary, which is exactly where the
+ * recovered content begins, so the next Tab continues into it rather than from the top of the
+ * document. A retry that fails again renders the boundary afresh, and the new instance's control
+ * takes focus back onto itself in the same commit, so the reader is still on "Try again". Neither
+ * needs state here or any reach into the route's own markup: the landmark is the layout's, and the
+ * hand-off lives in the callback. The route announcer still tells a reader the view changed.
  *
  * The link beside the control leaves for the catalog, which is the answer when retrying keeps
  * failing. It is an anchor rather than a control wrapped in a link: a navigation is a link, and
@@ -89,6 +97,7 @@ import { startTransition } from 'react';
 
 import { Alert } from '@/components/ui/Alert';
 import { Button } from '@/components/ui/Button';
+import { holdRetryFocus } from '@/components/ui/Retry';
 
 /**
  * The props Next.js passes to an `error.tsx` boundary.
@@ -148,9 +157,11 @@ interface Props {
  *
  * The two controls sit in `Alert`'s `actions` slot, which is a wrapping row: the primary control
  * retries, and the anchor leaves. The anchor carries no class because a link's appearance belongs
- * to the module that renders it and this route has none - it inherits the body text colour, and
- * the focus ring every interactive element in the application shares comes from the
- * `:focus-visible` rule in `app/globals.css`.
+ * to the module that renders it and this route has none - so the element baseline in
+ * `app/globals.css` styles it as an in-content link: it keeps the notice's text colour and is
+ * underlined, with the line thickening under the pointer, so it reads as a link rather than as
+ * part of the message. The focus ring every interactive element in the application shares comes
+ * from the `:focus-visible` rule in the same file.
  *
  * The reference code is rendered only when Next.js supplied one, and `.ls-page-lede` is what makes
  * it read as the muted aside it is rather than as part of the message.
@@ -167,6 +178,7 @@ export default function StorefrontErrorBoundary({ error, reset }: Props) {
         actions={
           <>
             <Button
+              ref={holdRetryFocus}
               variant="primary"
               size="sm"
               onClick={() => {

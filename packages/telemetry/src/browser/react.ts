@@ -16,12 +16,16 @@
  * Two event kinds, one commit at a time:
  *
  * - **`commit`** — one event per React commit, the parent span of that
- *   commit's renders. Its `renderCount` attribute is how many fibers the
- *   commit actually rendered, which is the number a developer recognises as
- *   "this many components re-rendered when I typed one character".
- * - **`render`** — one event per composite fiber that rendered, carrying the
- *   component name, the phase, the running per-capture render count, the props
- *   that changed, and — for an update — **why** it rendered.
+ *   commit's renders. Its `renderCount` attribute is how many rendered fibers
+ *   the commit's `render` events stand for, which is the number a developer
+ *   recognises as "this many components re-rendered when I typed one
+ *   character".
+ * - **`render`** — one event per *group* of composite fibers that rendered in
+ *   the commit for the same reason: one component, one phase, one trigger and
+ *   one sorted list of changed props. It carries the component name, the
+ *   phase, the running per-capture render count, the props that changed, and —
+ *   for an update — **why** it rendered; `instanceCount` says how many fibers
+ *   it stands for when that is more than one (see "Coalescing" below).
  *
  * `../aggregate/renders.ts` turns those into the `renderTable` and
  * `componentTree` panel sources and into the `render_count`,
@@ -41,7 +45,7 @@
  * whose cause genuinely could not be determined, and would bury the handful of
  * real unknowns under every mount in the capture. A mount's cause is not in
  * doubt and the `phase` attribute already states it, so the key is omitted
- * entirely rather than set to anything. {@link buildRenderAttributes} is where
+ * entirely rather than set to anything. {@link buildGroupAttributes} is where
  * that happens.
  *
  * Which of the two a render is gets decided **per fiber**, from whether React
@@ -62,13 +66,17 @@
  * nothing else:
  *
  * - **`./fiber-diff.js`** reads props, hook state and consumed contexts and
- *   classifies the render. No field of a fiber that holds application data —
- *   `memoizedProps`, `memoizedState`, `dependencies` — is touched here; a
- *   second reader of those fields would be a second privacy boundary to audit,
- *   and there is exactly one (AAP 0.5.2).
+ *   classifies the render — `captureFiber` inside the commit, which records
+ *   the pointers, and `analyzeCapturedFiber` afterwards, which compares them.
+ *   No field of a fiber that holds application data — `memoizedProps`,
+ *   `memoizedState`, `dependencies` — is touched here; a second reader of
+ *   those fields would be a second privacy boundary to audit, and there is
+ *   exactly one (AAP 0.5.2).
  * - **`./state.js`** turns the hook and context changes that diff found into
  *   `state` events. This module hands them over and reads no hook itself.
- *   Emitting them from here as well would double the evidence.
+ *   Emitting them from here as well would double the evidence. Their values
+ *   are summarised only while that module is armed (`isStateAttached`), since
+ *   nothing else reads them.
  * - **`./interaction.js`** decides which trace a commit belongs to. Asked once
  *   per commit, never per fiber, so every render of one commit lands in one
  *   tree and the answer cannot change halfway through a traversal.
@@ -78,7 +86,9 @@
  *   `document_start` (see below), calls {@link attachReact} when a capture
  *   arms the React hook, {@link resetReactCounters} at the start of each
  *   capture, {@link snapshotComponentTree} when a capture stops, and
- *   {@link detachReact} when the hooks are cleared.
+ *   {@link detachReact} when the hooks are cleared — and
+ *   {@link flushPendingReactWork} before each of those terminal points, so no
+ *   observed commit is still waiting for an idle slice when its capture ends.
  *
  * ## `installRDTHook` is not called here, and that is the whole design
  *
@@ -97,7 +107,9 @@
  * DevTools extension alongside it. Unsubscribing the handlers is what AAP
  * 0.5.1 asks for ("bippy handlers unsubscribed via the function `instrument()`
  * returned"), and it is complete: after a detach this module observes nothing,
- * holds no counts and no fiber tree, and a commit costs one comparison.
+ * holds no counts, no fiber tree and no queued commit — the queue is
+ * *discarded*, never processed, and its scheduled idle callback cancelled and
+ * disarmed — and a commit costs one comparison.
  *
  * The one thing a detach may *not* do is throw away the means of finishing.
  * `instrument()`'s release is the only handle that can remove the handlers it
@@ -127,7 +139,7 @@
  *   and ignores what its callback returns, so there is no way to ask it to
  *   stop: bounding the *events* a commit produces would leave the *walk*
  *   unbounded on the developer's click path, which is a cost this file may not
- *   hand them. {@link collectRenders} therefore keeps an explicit stack, emits
+ *   hand them. {@link captureRenders} therefore keeps an explicit stack, emits
  *   a fiber when bippy's own `isCompositeFiber` and `didFiberRender` (React's
  *   `PerformedWork` flag) both hold, and descends into a fiber's children only
  *   when it has no `alternate` — everything below it is new — or its `child`
@@ -136,31 +148,75 @@
  *   nothing inside it rendered. That is the pruning React DevTools performs,
  *   and it is what keeps an update commit proportional to the subtree that
  *   changed rather than to the whole tree.
- * - Renders are collected into drafts and handed over in **one**
- *   {@link emitMany} call after the traversal: one capture gate, consecutive
- *   sequence numbers, and — the reason for the ordering — a commit event whose
- *   `renderCount` is the exact count rather than an estimate made before the
- *   work was done. The commit draft leads that batch, so the parent's sequence
- *   number precedes its children's.
- * - A commit is bounded twice: at {@link MAX_RENDERS_PER_COMMIT} render events
- *   and at {@link MAX_FIBER_VISITS_PER_COMMIT} fibers visited. A context
- *   provider that updates several times a second re-renders every one of its
- *   dozens of consumers on each tick; one pathological commit must not
- *   consume the transport's whole 5 000-event buffer, and — this is what the
- *   second bound buys — must not consume an unbounded slice of the commit
- *   phase either. The commit event says it was cut, and `renderedFiberCount`
- *   says how much of it was counted.
- * - Nothing here sorts, clones, stringifies or retains application values.
+ * - **Capture now, analyse later.** Inside the commit this module does only
+ *   what cannot wait: it resolves the trace, reads the root's timings, walks
+ *   the changed subtree and, per rendered component, records the phase, the
+ *   profiler's readings and the pointers `./fiber-diff.js`'s `captureFiber`
+ *   returns. Everything else — the prop, hook and context comparisons, the
+ *   names, the ancestry, the span ids, the attribute bags, the hand-off to the
+ *   transport and to `./state.js` — runs later, in idle time
+ *   (`requestIdleCallback` with a {@link IDLE_TIMEOUT_MS} deadline, a timer
+ *   where the host has none), a whole commit at a time and in commit order.
+ *   The QA measurement behind this split: doing all of it inside the commit
+ *   doubled click-to-next-frame latency on the demo storefront (PERF-F07).
+ *   Deferral is correct because React double-buffers fibers: the objects a
+ *   commit held are not rewritten when the alternate becomes the next render's
+ *   work in progress, and the capture holds those objects rather than the
+ *   fields that pointed at them (`./fiber-diff.ts` documents the one caveat —
+ *   an in-place mutation between commit and analysis shows in a preview, never
+ *   in a classification). The profiler's readings (`actualDuration`,
+ *   `actualStartTime`, the children's durations behind `selfTime`) *are*
+ *   rewritten when a fiber is reused, which is why they are read in the commit.
+ * - **The queue is bounded.** At most {@link MAX_PENDING_COMMITS} commits and
+ *   {@link MAX_PENDING_RENDERS} captured renders wait for idle time; past
+ *   either the backlog is worked off on the next task instead of the next idle
+ *   period, and past twice either the oldest commit is analysed inside the
+ *   commit callback — the cost the synchronous design always paid — so memory
+ *   stays bounded under any commit storm and nothing observed is dropped.
+ *   {@link flushPendingReactWork} empties the queue synchronously; `./agent.js`
+ *   calls it at every point where a capture's evidence must be complete.
+ * - **Coalescing.** The rendered fibers of one commit that share a component
+ *   name, a phase, a trigger and a sorted changed-prop list become **one**
+ *   `render` event: the demo's 48 memoised product cards re-rendered by one
+ *   context tick are one event, not 48. One event per fiber was what made a
+ *   busy page emit faster than the pipeline could ingest and lose a third to a
+ *   half of its capture at the producer (PERF-F08). The event's `startTime` is
+ *   the earliest instance's, its `duration` and `actualDuration` the sum of the
+ *   instances', `maxInstanceDuration` the slowest one's, and its `fiberId`,
+ *   `parentFiberId`, `key` and `ownerChain` the first instance's in traversal
+ *   order; `instanceCount` is present when the group has more than one member.
+ *   `state` transitions stay per instance, each parented to its group's span.
+ * - Renders are handed over in **one** {@link emitMany} call per commit: one
+ *   capture gate, consecutive sequence numbers, and — the reason for the
+ *   ordering — a commit event whose `renderCount` is the exact count rather
+ *   than an estimate made before the work was done. The commit draft leads
+ *   that batch, so the parent's sequence number precedes its children's. The
+ *   batch is emitted when the commit is analysed, so its sequence numbers can
+ *   follow those of events that happened after it; every event carries its
+ *   own `startTime`, which is what readers order by.
+ * - A commit is bounded twice: at {@link MAX_RENDERS_PER_COMMIT} rendered
+ *   fibers captured, and therefore at most that many render events, and at
+ *   {@link MAX_FIBER_VISITS_PER_COMMIT} fibers visited. A context provider
+ *   that updates several times a second re-renders every one of its dozens of
+ *   consumers on each tick; one pathological commit must not consume the
+ *   transport's whole 5 000-event buffer, and — this is what the second bound
+ *   buys — must not consume an unbounded slice of the commit phase either. The
+ *   commit event says it was cut, and `renderedFiberCount` says how much of it
+ *   was counted.
+ * - Nothing here sorts, clones, stringifies or retains application values
+ *   beyond the bounded queue, which holds references, never copies.
  *
  * ## Nothing here throws, ever
  *
  * A throw inside `onCommitFiberRoot` surfaces inside React's commit phase and
  * can break the developer's application — the one failure this product may
  * never cause. Every handler body sits inside a `try`/`catch`, and **each
- * per-fiber iteration has its own**, so a single hostile fiber costs itself and
- * not the rest of the commit. Failures are counted in {@link getReactStats}
- * and swallowed, which is the same contract `./transport.js`, `./state.js` and
- * `./perf.ts` keep.
+ * per-fiber iteration has its own** — in the commit walk and again in the
+ * deferred analysis — so a single hostile fiber costs itself and not the rest
+ * of the commit. The idle callback and {@link flushPendingReactWork} are
+ * guarded the same way, since a throw there would surface in the page's own
+ * task. Failures are counted in {@link getReactStats} and swallowed, which is
+ * the same contract `./transport.js`, `./state.js` and `./perf.ts` keep.
  *
  * Swallowed is not silent. Every one of those guards also calls
  * `./transport.js`'s {@link reportProducerFailure}, which posts a bounded
@@ -204,19 +260,27 @@ import {
   hasRDTHook,
   instrument,
   isCompositeFiber,
-  traverseFiber,
+  onRendererInject,
 } from 'bippy';
 import type { Fiber, FiberRoot } from 'bippy';
 
-import { analyzeFiber } from './fiber-diff.js';
-import type { ContextChange, FiberDiff, HookChange } from './fiber-diff.js';
+import { analyzeCapturedFiber, captureFiber, createSummaryMemo } from './fiber-diff.js';
+import type {
+  CapturedFiber,
+  CapturedFiberAnalysisOptions,
+  ContextAttribution,
+  ContextChange,
+  HookChange,
+  RenderAnalysis,
+} from './fiber-diff.js';
 import { newSpanId } from './ids.js';
 import { resolveEventContext } from './interaction.js';
 import type { EventContext } from './interaction.js';
-import { recordStateTransitions } from './state.js';
+import { isStateAttached, recordStateTransitions } from './state.js';
 import type { RecordTransitionsInput } from './state.js';
 import { emitMany, nowEpochMs, reportProducerFailure, toEpochMs } from './transport.js';
 import type { EventDraft } from './transport.js';
+import { MAX_OWNER_CHAIN_LENGTH, MAX_TRACKED_KEYS } from '../schema/attributes.js';
 import type {
   COMMIT_ATTRIBUTE_KEYS,
   RENDER_ATTRIBUTE_KEYS,
@@ -242,19 +306,23 @@ import type {
  */
 
 /**
- * The most `render` events one commit may produce: 500.
+ * The most rendered fibers one commit may report: 500 — and therefore the
+ * most `render` events it may produce, since each event stands for at least
+ * one of them.
  *
  * Chosen against the two numbers it sits between. The transport buffers 5 000
  * events for a whole capture (`MAX_BUFFERED_EVENTS` in `./transport.ts`), and
  * an excessive-render pattern re-renders dozens of list items several times a
  * second; 500 is an order of magnitude above any commit worth reading fiber by
  * fiber, and a tenth of the buffer, so one runaway commit cannot evict the
- * interaction, request and query evidence the same capture needs.
+ * interaction, request and query evidence the same capture needs. It is also
+ * what bounds one commit's share of the pending queue and one commit's
+ * deferred analysis, which is a single uninterrupted piece of work.
  *
  * A commit that reaches the bound still reports the truth about itself: the
  * `truncated` attribute says the list was cut and `renderedFiberCount` says
- * how many rendered fibers the walk counted. It bounds the *events*, not the
- * walk — {@link MAX_FIBER_VISITS_PER_COMMIT} is what bounds the walk.
+ * how many rendered fibers the walk counted. It bounds the *captured fibers*,
+ * not the walk — {@link MAX_FIBER_VISITS_PER_COMMIT} is what bounds the walk.
  */
 export const MAX_RENDERS_PER_COMMIT = 500;
 
@@ -308,8 +376,13 @@ export const MAX_FIBER_VISITS_PER_COMMIT = MAX_RENDERS_PER_COMMIT * MAX_VISITS_P
  * unambiguously in any real application while keeping a `render` event small —
  * and a deep tree costs the bound, not the event: the walk stops, it does not
  * fail.
+ *
+ * Declared once, as `MAX_OWNER_CHAIN_LENGTH` in `../schema/attributes.ts`, and
+ * re-exported here under this module's name: `../aggregate/renders.ts` infers
+ * from a chain of exactly this length that the walk was cut before the root,
+ * so the producer's bound and the reader's inference must be one number.
  */
-export const MAX_OWNER_CHAIN = 8;
+export const MAX_OWNER_CHAIN = MAX_OWNER_CHAIN_LENGTH;
 
 /**
  * Default node bound for {@link snapshotComponentTree}: 2 000.
@@ -329,6 +402,75 @@ export const MAX_TREE_NODES = 2000;
  * an unbounded walk.
  */
 export const MAX_TREE_DEPTH = 50;
+
+/**
+ * The most commits the pending queue holds before its backlog is worked off
+ * on the next task rather than in idle time: 32.
+ *
+ * The queue exists so the analysis of a commit runs after the frame it
+ * belongs to, not inside it. A page that commits faster than it idles — a
+ * burst of typing, a render loop — must not turn that deferral into an
+ * unbounded buffer of references into its fiber tree, so past this bound the
+ * scheduler stops waiting for idle time; past **twice** this bound the oldest
+ * commit is analysed inside the commit callback that would have exceeded it,
+ * which is the cost the synchronous design paid on every commit, now paid only
+ * by a storm. Nothing observed is dropped at either bound.
+ */
+export const MAX_PENDING_COMMITS = 32;
+
+/**
+ * The most captured rendered fibers the pending queue holds before its backlog
+ * is worked off on the next task: 2 000, four commits at
+ * {@link MAX_RENDERS_PER_COMMIT}. Twice this is the hard bound, with the same
+ * two-stage behaviour as {@link MAX_PENDING_COMMITS}.
+ *
+ * Counted separately from commits because the retained memory is per fiber:
+ * each captured render holds its fiber and six pointers `./fiber-diff.ts`
+ * reads, so a few very large commits bound the queue sooner than many small
+ * ones.
+ */
+export const MAX_PENDING_RENDERS = MAX_RENDERS_PER_COMMIT * 4;
+
+/**
+ * The longest a queued commit waits for idle time, in milliseconds: 200.
+ *
+ * `requestIdleCallback`'s `timeout`. On a page that never idles — the demo's
+ * shipping estimate ticks every 250 ms — this is what keeps a capture's
+ * evidence arriving at the transport's own cadence (`FLUSH_INTERVAL_MS`,
+ * 250 ms) rather than never; on a page that idles, the analysis runs well
+ * before it, in the gap after a frame.
+ */
+export const IDLE_TIMEOUT_MS = 200;
+
+/**
+ * The longest one slice of deferred work may run when the host gives it no
+ * idle deadline to respect, in milliseconds: 8.
+ *
+ * Applies to the timer fallback (a host without `requestIdleCallback`), to an
+ * idle callback that fired on its timeout (`didTimeout`, whose
+ * `timeRemaining()` is zero) and to the backlog task. Half a 60 Hz frame, so a
+ * slice that lands between two frames does not push the second one out. A
+ * slice always processes at least one whole commit, and commits are never
+ * split, so the bound is on how many commits a slice takes on, not a hard
+ * wall-clock cut.
+ */
+const SLICE_BUDGET_MS = 8;
+
+/**
+ * How long the timer fallback waits before its slice, in milliseconds: 16.
+ *
+ * A host without `requestIdleCallback` gives no signal that a frame has been
+ * produced; one frame's length is the cheapest approximation of "after the
+ * paint this commit was for" that does not also postpone the evidence.
+ */
+const FALLBACK_DELAY_MS = 16;
+
+/**
+ * The idle time below which a slice stops taking on another commit, in
+ * milliseconds: 1. Starting a commit's analysis with less than this left would
+ * overrun the idle period the browser offered.
+ */
+const MIN_IDLE_REMAINING_MS = 1;
 
 /*
  * ---------------------------------------------------------------------------
@@ -425,45 +567,79 @@ const KEY_COMPONENT: RenderAttributeKey = 'component';
 /** `mount` or `update`, from the traversal. */
 const KEY_PHASE: RenderAttributeKey = 'phase';
 
-/** Running count for this component within the capture, starting at 1. */
+/**
+ * Running count for this component within the capture, starting at 1 and
+ * advanced by the event's instance count.
+ */
 const KEY_RENDER_COUNT: RenderAttributeKey = 'renderCount';
 
 /** Names of the props that were not equal to the previous render's. */
 const KEY_CHANGED_PROPS: RenderAttributeKey = 'changedProps';
 
-/** Why the fiber rendered. Present on an update, absent on a mount. */
+/** Why the fibers rendered. Present on an update, absent on a mount. */
 const KEY_TRIGGER: RenderAttributeKey = 'trigger';
 
-/** React's own reported render time for the fiber, including descendants. */
+/**
+ * React's own reported render time, including descendants, summed over the
+ * event's instances.
+ */
 const KEY_ACTUAL_DURATION: RenderAttributeKey = 'actualDuration';
 
-/** The fiber's cost excluding its descendants. */
+/** The instances' cost excluding their descendants, summed. */
 const KEY_SELF_TIME: RenderAttributeKey = 'selfTime';
 
-/** Ancestor component names, nearest first. */
+/** Ancestor component names of the first instance, nearest first. */
 const KEY_OWNER_CHAIN: RenderAttributeKey = 'ownerChain';
+
+/**
+ * How many rendered fibers the event stands for; written only when more than
+ * one, so an event without it is exactly one fiber (see
+ * `../schema/attributes.ts`).
+ */
+const KEY_INSTANCE_COUNT: RenderAttributeKey = 'instanceCount';
+
+/**
+ * The slowest single instance's `actualDuration`; written with
+ * {@link KEY_INSTANCE_COUNT} when at least one instance was measured, because
+ * a sum cannot say whether one card was slow or all of them were.
+ */
+const KEY_MAX_INSTANCE_DURATION: RenderAttributeKey = 'maxInstanceDuration';
+
+/**
+ * Which consumed contexts changed, each named by the component that provides
+ * it. Present on an update whose consumed contexts changed and could be named;
+ * absent otherwise, and always absent on a mount.
+ */
+const KEY_CHANGED_CONTEXTS: RenderAttributeKey = 'changedContexts';
 
 /** `mount` or `update` for the commit as a whole. */
 const KEY_COMMIT_PHASE: CommitAttributeKey = 'phase';
 
-/** How many fibers this commit rendered — not a per-component count. */
+/**
+ * How many rendered fibers this commit's `render` events stand for — the sum
+ * of their instance counts. Not the number of events, and not a per-component
+ * count. Equal to {@link KEY_RENDERED_FIBER_COUNT} unless a bound cut the
+ * commit or a fiber could not be analysed.
+ */
 const KEY_COMMIT_RENDER_COUNT: CommitAttributeKey = 'renderCount';
 
 /** Which root committed, so concurrent roots on one page stay apart. */
 const KEY_ROOT_NAME: CommitAttributeKey = 'rootName';
 
 /**
- * The fiber's identity within this document (bippy's `getFiberId`).
+ * The fiber's identity within this document (bippy's `getFiberId`) — on a
+ * coalesced event, the first instance's.
  *
  * **Addition**, spelled `fiberId` — the same spelling `./state.ts` emits, so
  * the two producers describe one instance the same way. Two components with
  * the same display name are one row when grouped by `component`; this is what
- * distinguishes the last row of a list from the first.
+ * distinguishes the last row of a list from the first. The `state` events of
+ * a coalesced group carry each instance's own id.
  */
 const KEY_FIBER_ID = 'fiberId';
 
 /**
- * The fiber id of the nearest composite ancestor.
+ * The fiber id of the first instance's nearest composite ancestor.
  *
  * **Addition**, spelled `parentFiberId`. With {@link KEY_OWNER_CHAIN} it is
  * what lets `../aggregate/renders.ts` rebuild a `ComponentTreeSnapshot` from a
@@ -585,12 +761,16 @@ export interface ComponentTreeNode {
  * What this module has done since the last reset: cheap enough for a
  * diagnostics view and for `./agent.js`'s readiness frames to read often.
  *
- * - `commits` — commits observed. Stops growing after {@link detachReact},
- *   which is the observable form of a capture that has stopped observing.
- * - `renders` — `render` events handed to `./transport.js`.
- * - `truncatedCommits` — commits cut by {@link MAX_RENDERS_PER_COMMIT} or by
- *   {@link MAX_FIBER_VISITS_PER_COMMIT}. Non-zero means a panel's render list
- *   is incomplete for those commits, which the events themselves also say.
+ * - `commits` — commits observed, counted inside the commit callback. Stops
+ *   growing after {@link detachReact}, which is the observable form of a
+ *   capture that has stopped observing.
+ * - `renders` — `render` events handed to `./transport.js`: coalesced events,
+ *   not fibers, counted when a commit is analysed. A commit still waiting for
+ *   idle time is in `commits` and not yet in `renders`;
+ *   {@link flushPendingReactWork} makes the two agree.
+ * - `truncatedCommits` — analysed commits cut by {@link MAX_RENDERS_PER_COMMIT}
+ *   or by {@link MAX_FIBER_VISITS_PER_COMMIT}. Non-zero means a panel's render
+ *   list is incomplete for those commits, which the events themselves also say.
  * - `failures` — commit bodies, per-fiber iterations, teardown steps or a
  *   subscription release that failed and was swallowed. Never the page's fault
  *   to fix; a non-zero value is this module's bug report, and every one of
@@ -623,20 +803,22 @@ export interface ReactStats {
  * have been emitted.
  *
  * `./state.js` is called *after* the render batch rather than inside the
- * traversal so that a transition's sequence number follows the render it sits
+ * analysis so that a transition's sequence number follows the render it sits
  * inside; the alternative put children before parents in a raw event log
  * ordered by sequence. Only summaries travel in here — `./fiber-diff.js` has
  * already reduced every value to a type and a bounded preview — so holding
  * them for the length of one commit retains nothing of the application's data.
+ * One entry per *instance*, never per coalesced group: each instance's state
+ * is its own, and `renderSpanId` is the group's span it rendered under.
  */
 interface PendingTransitions {
   /** The component the transitions belong to. */
   readonly component: string;
   /** The fiber's identity, when one was resolved. */
   readonly fiberId: number | undefined;
-  /** The render span the transitions were observed in. */
+  /** The render span the transitions were observed in: the group's. */
   readonly renderSpanId: string;
-  /** The render's own start, in epoch milliseconds. */
+  /** The instance's own render start, in epoch milliseconds. */
   readonly startTime: number;
   /** The fiber's own state-bearing hooks that changed. */
   readonly hookChanges: readonly HookChange[];
@@ -644,15 +826,85 @@ interface PendingTransitions {
   readonly contextChanges: readonly ContextChange[] | undefined;
 }
 
-/** What one commit's traversal produced. */
-interface CommitTally {
-  /** The render drafts, in traversal order, bounded by the event bound. */
-  readonly drafts: EventDraft[];
-  /** The transitions to hand to `./state.js` once the drafts are away. */
-  readonly transitions: PendingTransitions[];
+/**
+ * One composite ancestor on the walk's current path: the fiber and the link
+ * above it.
+ *
+ * Built top-down while the commit walk descends — one small record per
+ * composite fiber whose children it queues — so a rendered fiber's ancestry is
+ * a pointer to its nearest composite ancestor's link rather than a walk up
+ * `return` pointers. That matters twice. The upward walk ran once per rendered
+ * fiber, inside the commit; the links cost one allocation per descended-into
+ * component and are shared by every child below it. And an upward walk run
+ * later, from an idle slice, would find `return` cleared on any fiber React
+ * deleted in between; the links record the path the commit actually had.
+ * Only the fiber is held — its name and id are resolved when the owner chain
+ * is built, from fields React does not clear on deletion (`elementType`,
+ * `type`) and from bippy's own id map.
+ */
+interface AncestorLink {
+  /** The composite ancestor. */
+  readonly fiber: Fiber;
+  /** The composite ancestor above it, or `undefined` at the top. */
+  readonly parent: AncestorLink | undefined;
+}
+
+/**
+ * What the commit callback records about one rendered composite fiber, for
+ * the analysis that runs later.
+ *
+ * Exactly the readings that would not survive until then, and references for
+ * everything that will: the profiler's numbers are rewritten when React reuses
+ * the fiber, so they are copied now; the fiber itself (for its name, id and
+ * key, which React does not rewrite), the ancestry link and
+ * `./fiber-diff.js`'s captured pointers are held.
+ */
+interface CapturedRender {
+  /** The fiber that rendered. */
+  readonly fiber: Fiber;
+  /** Its nearest composite ancestor on the walk's path. */
+  readonly parent: AncestorLink | undefined;
+  /** `mount` without an alternate, `update` with one. */
+  readonly phase: RenderPhase;
+  /** `actualStartTime` on the monotonic clock, when React recorded one. */
+  readonly relativeStart: number | undefined;
+  /** `actualDuration`, when React measured it. */
+  readonly actualDuration: number | undefined;
+  /** The fiber's cost excluding its direct children, from the same readings. */
+  readonly selfTime: number | undefined;
+  /** The pointers the prop, hook and context comparisons need. */
+  readonly inputs: CapturedFiber;
+}
+
+/**
+ * One observed commit, waiting in the pending queue for its analysis.
+ *
+ * Everything the commit event needs is resolved in the callback — its trace,
+ * span, timings, root name and the walk's counts — so the event describes the
+ * commit as it was, whenever it is emitted.
+ */
+interface PendingCommit {
+  /** The trace and parent resolved once, before the walk. */
+  readonly context: EventContext;
+  /** The commit event's span, which every render event nests under. */
+  readonly spanId: string;
+  /** When the callback ran, in epoch milliseconds: the fallback start. */
+  readonly observedAt: number;
+  /** The commit event's start: the root fiber's render start, or the fallback. */
+  readonly startTime: number;
+  /** React's measurement of the commit, or the time the callback took. */
+  readonly duration: number;
+  /** The renderer that committed, when it reported a usable id. */
+  readonly rendererId: number | undefined;
+  /** The scheduling priority, when it was a finite number. */
+  readonly priority: number | undefined;
+  /** Which root committed, when its container could be named. */
+  readonly rootName: string | undefined;
+  /** The captured renders, in traversal order, bounded per commit. */
+  readonly renders: readonly CapturedRender[];
   /**
    * How many composite fibers the walk found had rendered, counted past the
-   * event bound and therefore the true total for a walk that completed.
+   * capture bound and therefore the true total for a walk that completed.
    */
   readonly renderedFibers: number;
   /** How many of those were mounts, for the commit's phase summary. */
@@ -661,13 +913,67 @@ interface CommitTally {
   readonly truncated: boolean;
 }
 
-/** The ancestry of one rendered fiber, from a single upward walk. */
+/**
+ * The rendered fibers of one commit that one `render` event stands for.
+ *
+ * Grouped by component name, phase, trigger (for an update), the sorted
+ * changed-prop list and the changed-context names — the five things a render
+ * event states — so coalescing never merges two renders a reader would have
+ * told apart from their events.
+ */
+interface RenderGroup {
+  /** The component's display name. */
+  readonly component: string;
+  /** The phase every instance shares. */
+  readonly phase: RenderPhase;
+  /** The trigger every instance shares; absent for a mount, by the rule above. */
+  readonly trigger: RenderTrigger | undefined;
+  /** The changed-prop names every instance shares, already sorted. */
+  readonly changedProps: readonly string[];
+  /** The changed-context names every instance shares; empty for a mount. */
+  readonly changedContexts: readonly string[];
+  /** The first instance in traversal order, whose identity the event carries. */
+  readonly representative: CapturedRender;
+  /** The group's span, allocated when the group is formed. */
+  readonly spanId: string;
+  /** How many instances the group holds. */
+  instanceCount: number;
+  /** The earliest instance start, in epoch milliseconds. */
+  startTime: number;
+  /** Whether any instance carried a usable `actualDuration`. */
+  measured: boolean;
+  /** Summed `actualDuration` of the measured instances. */
+  totalDuration: number;
+  /** Summed self time of the measured instances. */
+  totalSelfTime: number;
+  /** The largest single `actualDuration`. */
+  maxDuration: number;
+}
+
+/** The ancestry of one rendered fiber, from its ancestor links. */
 interface Ancestry {
   /** Ancestor component names, nearest first, bounded by the owner cap. */
   readonly ownerChain: string[];
   /** The nearest composite ancestor's fiber id, when one was resolved. */
   readonly parentFiberId: number | undefined;
 }
+
+/**
+ * How the next slice of deferred work is scheduled, so it can be cancelled:
+ * an idle callback, or a timer (the fallback, and the backlog task).
+ */
+type ScheduledSlice =
+  | { readonly kind: 'idle'; readonly handle: number }
+  | { readonly kind: 'task'; readonly handle: ReturnType<typeof setTimeout> };
+
+/** The host's `requestIdleCallback`, as read off the page's global. */
+type RequestIdle = (
+  callback: (deadline: IdleDeadline) => void,
+  options?: IdleRequestOptions,
+) => number;
+
+/** The host's `cancelIdleCallback`. */
+type CancelIdle = (handle: number) => void;
 
 /** The profiling fields React writes on a fiber, read as untrusted values. */
 interface ProfiledFiber {
@@ -784,6 +1090,35 @@ let truncatedCommitCount = 0;
 
 /** Swallowed failures since the last reset. */
 let failureCount = 0;
+
+/**
+ * Observed commits waiting for their analysis, oldest first.
+ *
+ * Bounded by {@link MAX_PENDING_COMMITS} and {@link MAX_PENDING_RENDERS} (see
+ * their documentation for the two-stage behaviour), emptied by
+ * {@link flushPendingReactWork}, and **discarded** by {@link detachReact} and
+ * {@link resetReactCounters}: a queued commit holds references into the
+ * developer's fiber tree, and AAP 0.5.1's cleared hook holds none.
+ */
+let pendingCommits: PendingCommit[] = [];
+
+/** Captured renders across {@link pendingCommits}, for the render bound. */
+let pendingRenderCount = 0;
+
+/** The slice currently scheduled, when one is. */
+let scheduledSlice: ScheduledSlice | undefined;
+
+/**
+ * Advanced every time a slice is scheduled or cancelled; a slice runs only if
+ * it still carries the current value.
+ *
+ * The generation gate `./interaction.js` uses for its deferrals, for the same
+ * reason: a cancellation is a request to the page's own timer functions, which
+ * can have been replaced by anything, so the callback itself refuses to run
+ * once it has been superseded. That is what guarantees that a slice scheduled
+ * during one capture can never emit into the next, or after a detach.
+ */
+let sliceGeneration = 0;
 
 /*
  * ---------------------------------------------------------------------------
@@ -915,39 +1250,38 @@ function selfTimeOf(fiber: Fiber, actualDuration: number | undefined): number | 
 }
 
 /**
- * The ancestor component names and nearest composite parent of one fiber, from
- * a single upward walk.
+ * The ancestor component names and nearest composite parent of one rendered
+ * fiber, from the ancestor links the commit walk recorded.
  *
- * Both answers come from one traversal because they are the same walk asked
- * twice: the chain is the names, the parent id is the first entry's identity.
- * The walk stops as soon as the chain is full — `traverseFiber` treats a
- * `true` from the selector as "stop here" — so a deep tree costs
- * {@link MAX_OWNER_CHAIN} steps rather than its depth. Host fibers are stepped
- * over without being named: a `<div>` between two components is not a level of
- * the component tree.
+ * Both answers come from one pass because they are the same chain asked
+ * twice: the names are the chain, the parent id is the first link's identity.
+ * The pass stops as soon as the chain is full, so a deep tree costs
+ * {@link MAX_OWNER_CHAIN} steps rather than its depth. Host fibers never
+ * became links — a `<div>` between two components is not a level of the
+ * component tree — and neither did the rendered fiber itself, so the chain is
+ * exactly the composite fibers above it, nearest first: what an upward walk of
+ * `return` pointers over the committed tree reads. Called once per coalesced
+ * group, for its representative.
  */
-function ancestryOf(fiber: Fiber): Ancestry {
+function ancestryFrom(link: AncestorLink | undefined): Ancestry {
   const ownerChain: string[] = [];
   let parentFiberId: number | undefined;
 
   try {
-    traverseFiber(
-      fiber,
-      (node) => {
-        if (node === fiber || !isCompositeFiber(node)) {
-          return false;
-        }
-        if (ownerChain.length === 0) {
-          parentFiberId = fiberIdOf(node);
-        }
-        ownerChain.push(componentNameOf(node));
-        return ownerChain.length >= MAX_OWNER_CHAIN;
-      },
-      true,
-    );
+    for (
+      let current = link;
+      current !== undefined && ownerChain.length < MAX_OWNER_CHAIN;
+      current = current.parent
+    ) {
+      if (ownerChain.length === 0) {
+        parentFiberId = fiberIdOf(current.fiber);
+      }
+      ownerChain.push(componentNameOf(current.fiber));
+    }
   } catch {
-    // A malformed `return` chain costs this fiber its ancestry and nothing
-    // else; the render event is still worth emitting without it.
+    // Both readings are guarded already, so this is unreachable by
+    // construction; kept because a lost ancestry costs this group its
+    // `ownerChain` and nothing else — the event is still worth emitting.
   }
 
   return { ownerChain, parentFiberId };
@@ -1007,14 +1341,16 @@ function releaseRoot(): void {
 }
 
 /**
- * Bump and read the per-capture count for one component.
+ * Advance and read the per-capture count for one component.
  *
- * Incremented before the event is built, so the first render of a component in
+ * Advanced before the event is built, so the first render of a component in
  * a capture reports `1` rather than `0` — the number a developer counts the
- * same way.
+ * same way — and advanced by the event's instance count, so a group of 48
+ * cards moves the count by 48 and the attribute still reads "renders of this
+ * component so far in the capture", not "events so far".
  */
-function nextRenderCount(component: string): number {
-  const next = (componentRenderCounts.get(component) ?? 0) + 1;
+function nextRenderCount(component: string, instances: number): number {
+  const next = (componentRenderCounts.get(component) ?? 0) + instances;
   componentRenderCounts.set(component, next);
   return next;
 }
@@ -1049,9 +1385,40 @@ function mergeLineage(target: Record<string, unknown>, source: EventContext['att
  */
 
 /**
- * The attribute bag for one rendered fiber.
+ * The `changedContexts` list of one update: which consumed contexts changed,
+ * each named by the component that provides it.
  *
- * Three decisions are recorded here because each looks like an oversight to a
+ * `./fiber-diff.js` resolves the names — `provider`, the component rendering
+ * the nearest provider of the context, and `contextName`, the context's own
+ * `displayName` for when no provider component could be read. A change with
+ * neither is skipped: an unnamed entry says nothing a `context` trigger does
+ * not already say. De-duplicated in first-seen order, because one provider can
+ * supply several changed dependencies; at most {@link MAX_TRACKED_KEYS}
+ * entries, the bound every per-render key list shares; and each name cut to
+ * {@link MAX_COMPONENT_NAME_LENGTH}, exactly as a `component` attribute is, so
+ * an entry equals the `component` of that provider's own `render` event.
+ */
+function changedContextNames(changes: readonly ContextAttribution[]): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const change of changes) {
+    if (names.length >= MAX_TRACKED_KEYS) {
+      break;
+    }
+    const name = boundedString(change.provider ?? change.contextName, MAX_COMPONENT_NAME_LENGTH);
+    if (name === undefined || seen.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    names.push(name);
+  }
+  return names;
+}
+
+/**
+ * The attribute bag for one coalesced group of rendered fibers.
+ *
+ * Four decisions are recorded here because each looks like an oversight to a
  * reader who does not know the contract:
  *
  * - **`trigger` is written only for an update.** See the module
@@ -1059,53 +1426,67 @@ function mergeLineage(target: Record<string, unknown>, source: EventContext['att
  *   no previous fiber, and emitting it would inflate
  *   `render_trigger_unknown_count` with the one case nobody needs explained
  *   (AAP 0.2.3). This is the single most consequential line in the file for
- *   the excessive-render acceptance test.
- * - **`changedProps` is the plain key list.** `./fiber-diff.js` also produces
- *   the full transitions, with a summary of each end, and they are
- *   deliberately not lifted onto the render event: the names are what
- *   `../aggregate/renders.ts` and the `renderTable` read, and the values
- *   belong to the `state` events `./state.js` emits, where a single privacy
- *   boundary governs them.
+ *   the excessive-render acceptance test. A group never mixes the two phases,
+ *   so the rule holds per event exactly as it held per fiber.
+ * - **`changedProps` is the plain key list.** `./fiber-diff.js` compares the
+ *   prop values and reports their names; it composes no summary of them on
+ *   this path at all, because the names are what `../aggregate/renders.ts`
+ *   and the `renderTable` read, and the values of hooks and contexts belong to
+ *   the `state` events `./state.js` emits, where a single privacy boundary
+ *   governs them.
+ * - **`instanceCount` and `maxInstanceDuration` only for a real group.** An
+ *   event that stands for one fiber is written exactly as before coalescing
+ *   existed, so every reader that predates the two keys — and every event
+ *   recorded before them — reads a single-instance event correctly by
+ *   defaulting the weight to one.
+ * - **`changedContexts` is names only, and only for an update.** It says which
+ *   context a `context` trigger refers to — "context change: ‹provider›" (AAP
+ *   0.8.2) — by the providing component's name, never by the value, which
+ *   stays with the `state` events. A mount has no previous value to have
+ *   changed from, so it never carries the key; an update carries it whenever a
+ *   consumed context changed and could be named, including one whose trigger
+ *   is `props` because a prop changed too. The names are part of the group's
+ *   key, so every instance of a group shares them.
  * - **Every absent field is omitted rather than written as `null`.** Absence
  *   is how this product says "not observed", and the aggregates read it that
  *   way.
  */
-function buildRenderAttributes(
-  fiber: Fiber,
-  phase: RenderPhase,
-  component: string,
-  context: EventContext,
-  actualDuration: number | undefined,
-  diff: FiberDiff,
-  ancestry: Ancestry,
-  fiberId: number | undefined,
-): Record<string, unknown> {
+function buildGroupAttributes(group: RenderGroup, context: EventContext): Record<string, unknown> {
   const attributes: Record<string, unknown> = {
-    [KEY_COMPONENT]: component,
-    [KEY_PHASE]: phase,
-    [KEY_RENDER_COUNT]: nextRenderCount(component),
-    [KEY_CHANGED_PROPS]: [...diff.changedProps],
+    [KEY_COMPONENT]: group.component,
+    [KEY_PHASE]: group.phase,
+    [KEY_RENDER_COUNT]: nextRenderCount(group.component, group.instanceCount),
+    [KEY_CHANGED_PROPS]: [...group.changedProps],
   };
 
-  if (phase === 'update') {
-    // The classification is `./fiber-diff.js`'s; the annotation on the next
-    // line is the compile-time check that its vocabulary is still the
-    // catalog's, since the two are declared independently.
-    const trigger: RenderTrigger = diff.trigger;
-    attributes[KEY_TRIGGER] = trigger;
-  }
-
-  if (actualDuration !== undefined) {
-    attributes[KEY_ACTUAL_DURATION] = actualDuration;
-    const selfTime = selfTimeOf(fiber, actualDuration);
-    if (selfTime !== undefined) {
-      attributes[KEY_SELF_TIME] = selfTime;
+  if (group.phase === 'update' && group.trigger !== undefined) {
+    // The classification is `./fiber-diff.js`'s; the annotation on the field
+    // is the compile-time check that its vocabulary is still the catalog's,
+    // since the two are declared independently.
+    attributes[KEY_TRIGGER] = group.trigger;
+    if (group.changedContexts.length > 0) {
+      attributes[KEY_CHANGED_CONTEXTS] = [...group.changedContexts];
     }
   }
 
+  if (group.measured) {
+    attributes[KEY_ACTUAL_DURATION] = group.totalDuration;
+    attributes[KEY_SELF_TIME] = group.totalSelfTime;
+  }
+
+  if (group.instanceCount > 1) {
+    attributes[KEY_INSTANCE_COUNT] = group.instanceCount;
+    if (group.measured) {
+      attributes[KEY_MAX_INSTANCE_DURATION] = group.maxDuration;
+    }
+  }
+
+  const representative = group.representative;
+  const ancestry = ancestryFrom(representative.parent);
   if (ancestry.ownerChain.length > 0) {
     attributes[KEY_OWNER_CHAIN] = ancestry.ownerChain;
   }
+  const fiberId = fiberIdOf(representative.fiber);
   if (fiberId !== undefined) {
     attributes[KEY_FIBER_ID] = fiberId;
   }
@@ -1113,7 +1494,7 @@ function buildRenderAttributes(
     attributes[KEY_PARENT_FIBER_ID] = ancestry.parentFiberId;
   }
 
-  const key = keyOf(fiber);
+  const key = keyOf(representative.fiber);
   if (key !== undefined) {
     attributes[KEY_ELEMENT_KEY] = key;
   }
@@ -1139,12 +1520,21 @@ function buildRenderAttributes(
  * bound.
  *
  * @param fiber The fiber whose children are to be walked.
+ * @param link The nearest composite ancestor link the children sit under.
  * @param pending The walk's stack, pushed in place.
+ * @param pendingLinks The stack of the links for {@link pending}'s entries,
+ * pushed in step with it.
  * @param visitBudget How many more fibers the walk may hold and visit.
  * @returns `true` when the sibling list was longer than the budget, which is a
  * truncation the commit event has to report.
  */
-function queueCommitChildren(fiber: Fiber, pending: Fiber[], visitBudget: number): boolean {
+function queueCommitChildren(
+  fiber: Fiber,
+  link: AncestorLink | undefined,
+  pending: Fiber[],
+  pendingLinks: (AncestorLink | undefined)[],
+  visitBudget: number,
+): boolean {
   const children: Fiber[] = [];
   let child: Fiber | null = fiber.child;
   while (child !== null && children.length < visitBudget) {
@@ -1155,14 +1545,27 @@ function queueCommitChildren(fiber: Fiber, pending: Fiber[], visitBudget: number
     const entry = children[index];
     if (entry !== undefined) {
       pending.push(entry);
+      pendingLinks.push(link);
     }
   }
   return child !== null;
 }
 
+/** What one commit's walk recorded. */
+interface WalkResult {
+  /** The captured renders, in traversal order, bounded by the capture bound. */
+  readonly renders: CapturedRender[];
+  /** Rendered composite fibers counted, past the capture bound. */
+  readonly renderedFibers: number;
+  /** How many of those were mounts. */
+  readonly mounts: number;
+  /** Whether either per-commit bound stopped the walk or the list short. */
+  readonly truncated: boolean;
+}
+
 /**
- * One commit's traversal: a draft per rendered composite fiber, and the state
- * transitions to hand on afterwards.
+ * One commit's traversal, inside the commit: a {@link CapturedRender} per
+ * rendered composite fiber, for the analysis that runs later.
  *
  * The walk is product-owned, iterative and bounded on both axes, for the
  * reason the module documentation gives: bippy's `traverseRenderedFibers`
@@ -1185,40 +1588,42 @@ function queueCommitChildren(fiber: Fiber, pending: Fiber[], visitBudget: number
  *   alternate's (React reconciled them). Identical pointers mean React reused
  *   the subtree, so nothing in it rendered and there is nothing to find.
  *
+ * What it records per rendered fiber is only what the deferred analysis
+ * cannot read later (see {@link CapturedRender}): a handful of property reads,
+ * `./fiber-diff.js`'s `captureFiber` and, for a component whose children are
+ * walked, one {@link AncestorLink}. No comparison, name, id, span or event is
+ * built here.
+ *
  * Every per-fiber body is inside its own `try`, which is the point of the loop
- * being written this way: a component whose props throw from a getter, or a
- * fiber from a renderer this module has not seen, costs itself and is counted,
- * while the rest of the commit is still observed. A commit is the unit a
- * developer reads, and losing all of it to one bad fiber would be the failure
- * mode hardest to explain.
+ * being written this way: a fiber from a renderer this module has not seen
+ * costs itself and is counted, while the rest of the commit is still observed.
+ * A commit is the unit a developer reads, and losing all of it to one bad
+ * fiber would be the failure mode hardest to explain.
  */
-function collectRenders(
-  root: FiberRoot,
-  context: EventContext,
-  commitSpanId: string,
-  commitStart: number,
-): CommitTally {
-  const drafts: EventDraft[] = [];
-  const transitions: PendingTransitions[] = [];
+function captureRenders(rootFiber: Fiber | undefined): WalkResult {
+  const renders: CapturedRender[] = [];
   let renderedFibers = 0;
   let mounts = 0;
   let truncated = false;
 
-  const rootFiber = readRootFiber(root);
   if (rootFiber === undefined) {
     // A root React has torn down, or one mid-teardown: there is no tree to
     // walk, and the commit event is still worth emitting without renders.
-    return { drafts, transitions, renderedFibers, mounts, truncated };
+    return { renders, renderedFibers, mounts, truncated };
   }
 
   // Seeded with the committed tree's root fiber and never its siblings: a
   // `HostRoot` has none, and `readRootFiber` has already resolved whichever
-  // of the two shapes the hook was handed.
+  // of the two shapes the hook was handed. The link stack runs in step with
+  // the fiber stack: entry `i` of one is the nearest composite ancestor of
+  // entry `i` of the other.
   const pending: Fiber[] = [rootFiber];
+  const pendingLinks: (AncestorLink | undefined)[] = [undefined];
   let visits = 0;
 
   while (pending.length > 0) {
     const fiber = pending.pop();
+    const link = pendingLinks.pop();
     if (fiber === undefined) {
       break;
     }
@@ -1226,7 +1631,7 @@ function collectRenders(
     visits += 1;
     if (visits > MAX_FIBER_VISITS_PER_COMMIT) {
       // The walk's own bound, and the reason a commit costs the page a
-      // predictable amount: the event bound below stops drafts, this stops
+      // predictable amount: the capture bound below stops records, this stops
       // work. It is also what terminates a cyclic hand-built structure, which
       // is why this hot path carries no set of visited fibers.
       truncated = true;
@@ -1234,20 +1639,46 @@ function collectRenders(
     }
 
     try {
-      // The descent decision is taken before this fiber's own readings, which
-      // are the ones that can throw: two pointer comparisons cost nothing,
-      // and a subtree kept when one hostile fiber above it failed is evidence
-      // that would otherwise be lost for a reason the developer cannot see.
+      // Whether this fiber is a component decides the link its children sit
+      // under, so it is asked before they are queued — but a renderer bippy
+      // does not recognise throws here, and the descent decision must not be
+      // lost to that: a subtree kept when one hostile fiber above it failed is
+      // evidence that would otherwise be lost for a reason the developer
+      // cannot see. So the failure is held until the children are queued, and
+      // the fiber is stepped over like a host fiber in the meantime.
+      let composite = false;
+      let compositeFailure: { readonly error: unknown } | undefined;
+      try {
+        composite = isCompositeFiber(fiber);
+      } catch (error) {
+        compositeFailure = { error };
+      }
+
       const previous: Fiber | null = fiber.alternate ?? null;
       if (previous === null || fiber.child !== previous.child) {
+        const childLink: AncestorLink | undefined = composite ? { fiber, parent: link } : link;
         if (
-          queueCommitChildren(fiber, pending, MAX_FIBER_VISITS_PER_COMMIT - visits - pending.length)
+          queueCommitChildren(
+            fiber,
+            childLink,
+            pending,
+            pendingLinks,
+            MAX_FIBER_VISITS_PER_COMMIT - visits - pending.length,
+          )
         ) {
           truncated = true;
         }
       }
 
-      if (!isCompositeFiber(fiber) || !didFiberRender(fiber)) {
+      if (compositeFailure !== undefined) {
+        // Reported exactly as the per-fiber guard below reports, now that the
+        // children are safe on the stack.
+        failureCount += 1;
+        reportProducerFailure('react', 'commit-traversal', compositeFailure.error);
+        continue;
+      }
+
+      if (!composite || !didFiberRender(fiber)) {
         // Not a component, or a component React did not render in this commit:
         // either way there is no render to report, and its children have
         // already been queued above.
@@ -1264,8 +1695,8 @@ function collectRenders(
         mounts += 1;
       }
 
-      if (drafts.length >= MAX_RENDERS_PER_COMMIT) {
-        // Counting continues past the event bound so `renderedFiberCount` is
+      if (renders.length >= MAX_RENDERS_PER_COMMIT) {
+        // Counting continues past the capture bound so `renderedFiberCount` is
         // the true total rather than "at least the cap", which is the
         // difference between a reader concluding "500 components rendered" and
         // "8 000 did, and 500 are listed". The walk carries on under the visit
@@ -1274,56 +1705,18 @@ function collectRenders(
         continue;
       }
 
-      const component = componentNameOf(fiber);
-      const fiberId = fiberIdOf(fiber);
+      // The profiler's readings are copied now: React rewrites them when it
+      // next reuses this fiber, which can happen before the analysis runs.
       const actualDuration = durationValue((fiber as ProfiledFiber).actualDuration);
-      const relativeStart = finiteNumber((fiber as ProfiledFiber).actualStartTime);
-      const startTime =
-        relativeStart !== undefined && relativeStart > 0 ? toEpochMs(relativeStart) : commitStart;
-      const diff = analyzeFiber(fiber);
-      const ancestry = ancestryOf(fiber);
-      const spanId = newSpanId();
-
-      drafts.push({
-        traceId: context.traceId,
-        spanId,
-        // The commit, not the interaction: a render nests inside the commit
-        // that performed it, and the commit nests under the interaction. That
-        // is what makes the timeline's band-inside-band reading correct.
-        parentSpanId: commitSpanId,
-        kind: RENDER_KIND,
-        name: component,
-        startTime,
-        duration: actualDuration ?? 0,
-        attributes: buildRenderAttributes(
-          fiber,
-          phase,
-          component,
-          context,
-          actualDuration,
-          diff,
-          ancestry,
-          fiberId,
-        ),
-        status: OK_STATUS,
+      renders.push({
+        fiber,
+        parent: link,
+        phase,
+        relativeStart: finiteNumber((fiber as ProfiledFiber).actualStartTime),
+        actualDuration,
+        selfTime: selfTimeOf(fiber, actualDuration),
+        inputs: captureFiber(fiber),
       });
-
-      if (diff.hookChanges.length > 0 || diff.contextChanges.length > 0) {
-        transitions.push({
-          component,
-          fiberId,
-          renderSpanId: spanId,
-          startTime,
-          hookChanges: diff.hookChanges,
-          // Present when the dimension was read — an empty list then means
-          // "nothing changed" — and absent when it could not be evaluated,
-          // which is the distinction `./state.js` documents on its input.
-          contextChanges:
-            diff.contextChanges.length > 0 || diff.evaluable.context
-              ? diff.contextChanges
-              : undefined,
-        });
-      }
     } catch (error) {
       failureCount += 1;
       // One fiber's worth of the commit is missing from the render table, and
@@ -1333,31 +1726,31 @@ function collectRenders(
     }
   }
 
-  return { drafts, transitions, renderedFibers, mounts, truncated };
+  return { renders, renderedFibers, mounts, truncated };
 }
 
 /**
- * The commit event: the parent span of the renders collected under it.
+ * Everything the commit callback records about one commit: its trace and
+ * span, the root's timings and name, and the walk.
  *
- * Built **after** the traversal so `renderCount` is the exact number of render
- * events the commit produced. It still leads the emitted batch, so its
- * sequence number precedes its children's and a raw event log ordered by
- * sequence reads parent-first.
+ * The synchronous half of the commit's handling, and deliberately all of it
+ * that has to be: the trace is resolved once, before any fiber is visited, so
+ * an interaction window cannot close mid-traversal and split one commit
+ * across two traces; the root's profiler readings are rewritten by React's
+ * next render; and the walk reads the tree React holds *now*. The root name is
+ * two property reads on the container element, taken here so the queue does
+ * not have to hold the root.
  *
- * `startTime` is the root fiber's own render start rather than the instant this
- * callback ran: React invokes the hook *after* the render phase, so a
+ * `startTime` is the root fiber's own render start rather than the instant
+ * this callback ran: React invokes the hook *after* the render phase, so a
  * wall-clock reading here would place the commit after the renders it
  * contains, and the timeline would draw children starting before their parent.
  */
-function buildCommitDraft(
-  root: FiberRoot,
-  rendererId: number | undefined,
-  priority: unknown,
-  context: EventContext,
-  commitSpanId: string,
-  commitStart: number,
-  tally: CommitTally,
-): EventDraft {
+function captureCommit(rendererId: number, root: FiberRoot, priority: unknown): PendingCommit {
+  const context = resolveEventContext();
+  const spanId = newSpanId();
+  const observedAt = nowEpochMs();
+
   const rootFiber: Fiber | undefined = readRootFiber(root);
   const rootDuration =
     rootFiber === undefined
@@ -1368,56 +1761,272 @@ function buildCommitDraft(
       ? undefined
       : finiteNumber((rootFiber as ProfiledFiber).actualStartTime);
 
+  const walk = captureRenders(rootFiber);
+
+  return {
+    context,
+    spanId,
+    observedAt,
+    startTime: rootStart !== undefined && rootStart > 0 ? toEpochMs(rootStart) : observedAt,
+    // React's own measurement of the commit where it made one; otherwise the
+    // time this module spent observing it, which is an honest lower bound and
+    // is never negative.
+    duration: rootDuration ?? Math.max(0, nowEpochMs() - observedAt),
+    rendererId: finiteNumber(rendererId),
+    priority: finiteNumber(priority),
+    rootName: rootNameOf(root),
+    renders: walk.renders,
+    renderedFibers: walk.renderedFibers,
+    mounts: walk.mounts,
+    truncated: walk.truncated,
+  };
+}
+
+/**
+ * The commit event: the parent span of the render events built under it.
+ *
+ * Built **after** the render groups so `renderCount` is the exact number of
+ * fibers the commit's render events stand for. It still leads the emitted
+ * batch, so its sequence number precedes its children's and a raw event log
+ * ordered by sequence reads parent-first.
+ *
+ * @param commit The commit as the callback recorded it.
+ * @param reportedFibers The instances the emitted render events stand for.
+ */
+function buildCommitDraft(commit: PendingCommit, reportedFibers: number): EventDraft {
   const attributes: Record<string, unknown> = {
-    [KEY_COMMIT_RENDER_COUNT]: tally.drafts.length,
-    [KEY_RENDERED_FIBER_COUNT]: tally.renderedFibers,
+    [KEY_COMMIT_RENDER_COUNT]: reportedFibers,
+    [KEY_RENDERED_FIBER_COUNT]: commit.renderedFibers,
   };
 
-  if (tally.renderedFibers > 0) {
+  if (commit.renderedFibers > 0) {
     // A commit in which every rendered fiber was a mount is a mount; one that
     // updated anything is an update. A commit that rendered nothing — React
     // committing effects only — gets no phase, because neither value would be
     // true of it. Annotated so the summary is held to the same vocabulary as a
     // render's own phase.
-    const phaseSummary: RenderPhase = tally.mounts === tally.renderedFibers ? 'mount' : 'update';
+    const phaseSummary: RenderPhase = commit.mounts === commit.renderedFibers ? 'mount' : 'update';
     attributes[KEY_COMMIT_PHASE] = phaseSummary;
   }
-  if (rendererId !== undefined) {
-    attributes[KEY_RENDERER_ID] = rendererId;
+  if (commit.rendererId !== undefined) {
+    attributes[KEY_RENDERER_ID] = commit.rendererId;
   }
-  const rootName = rootNameOf(root);
-  if (rootName !== undefined) {
-    attributes[KEY_ROOT_NAME] = rootName;
+  if (commit.rootName !== undefined) {
+    attributes[KEY_ROOT_NAME] = commit.rootName;
   }
-  if (tally.truncated) {
+  if (commit.truncated) {
     attributes[KEY_TRUNCATED] = true;
   }
-  const priorityValue = finiteNumber(priority);
-  if (priorityValue !== undefined) {
-    attributes[KEY_PRIORITY] = priorityValue;
+  if (commit.priority !== undefined) {
+    attributes[KEY_PRIORITY] = commit.priority;
   }
 
-  mergeLineage(attributes, context.attributes);
+  mergeLineage(attributes, commit.context.attributes);
 
   const draft: EventDraft = {
-    traceId: context.traceId,
-    spanId: commitSpanId,
+    traceId: commit.context.traceId,
+    spanId: commit.spanId,
     kind: COMMIT_KIND,
     name: COMMIT_EVENT_NAME,
-    startTime: rootStart !== undefined && rootStart > 0 ? toEpochMs(rootStart) : commitStart,
-    // React's own measurement of the commit where it made one; otherwise the
-    // time this module spent observing it, which is an honest lower bound and
-    // is never negative.
-    duration: rootDuration ?? Math.max(0, nowEpochMs() - commitStart),
+    startTime: commit.startTime,
+    duration: commit.duration,
     attributes,
     status: OK_STATUS,
   };
 
-  if (context.parentSpanId !== undefined) {
-    draft.parentSpanId = context.parentSpanId;
+  if (commit.context.parentSpanId !== undefined) {
+    draft.parentSpanId = commit.context.parentSpanId;
   }
 
   return draft;
+}
+
+/**
+ * The key two instances of one commit must share to be one `render` event.
+ *
+ * Exactly the four things the event states about *why* its fibers rendered —
+ * component, phase, trigger and the sorted changed-prop names — so coalescing
+ * never merges two renders a reader could have told apart. Encoded as JSON so
+ * the key is unambiguous whatever a display name contains; `changedProps`
+ * arrives sorted from `./fiber-diff.js`, so two instances whose props changed
+ * in a different order still share a key.
+ */
+function groupKeyOf(
+  component: string,
+  phase: RenderPhase,
+  trigger: RenderTrigger | undefined,
+  changedProps: readonly string[],
+  changedContexts: readonly string[],
+): string {
+  return JSON.stringify([component, phase, trigger ?? null, changedProps, changedContexts]);
+}
+
+/** An instance's render start, in epoch milliseconds, or the commit's fallback. */
+function instanceStartOf(instance: CapturedRender, commit: PendingCommit): number {
+  const relative = instance.relativeStart;
+  return relative !== undefined && relative > 0 ? toEpochMs(relative) : commit.observedAt;
+}
+
+/**
+ * Folds one analysed instance into its group, creating the group on first
+ * sight, and queues the instance's state transitions under the group's span.
+ */
+function addToGroup(
+  groups: Map<string, RenderGroup>,
+  order: RenderGroup[],
+  transitions: PendingTransitions[],
+  commit: PendingCommit,
+  instance: CapturedRender,
+  analysis: RenderAnalysis,
+): void {
+  const component = componentNameOf(instance.fiber);
+  // The mount rule, applied before grouping so a group key can never carry a
+  // mount's artefactual `unknown` (see the module documentation).
+  const trigger: RenderTrigger | undefined =
+    instance.phase === 'update' ? analysis.trigger : undefined;
+  // Names only, and only for an update (see `buildGroupAttributes`).
+  const changedContexts =
+    instance.phase === 'update' ? changedContextNames(analysis.changedContexts) : [];
+  const key = groupKeyOf(
+    component,
+    instance.phase,
+    trigger,
+    analysis.changedProps,
+    changedContexts,
+  );
+  const startTime = instanceStartOf(instance, commit);
+
+  let group = groups.get(key);
+  if (group === undefined) {
+    group = {
+      component,
+      phase: instance.phase,
+      trigger,
+      changedProps: analysis.changedProps,
+      changedContexts,
+      representative: instance,
+      spanId: newSpanId(),
+      instanceCount: 0,
+      startTime,
+      measured: false,
+      totalDuration: 0,
+      totalSelfTime: 0,
+      maxDuration: 0,
+    };
+    groups.set(key, group);
+    order.push(group);
+  }
+
+  group.instanceCount += 1;
+  if (startTime < group.startTime) {
+    group.startTime = startTime;
+  }
+  if (instance.actualDuration !== undefined) {
+    group.measured = true;
+    group.totalDuration += instance.actualDuration;
+    group.totalSelfTime += instance.selfTime ?? 0;
+    if (instance.actualDuration > group.maxDuration) {
+      group.maxDuration = instance.actualDuration;
+    }
+  }
+
+  if (analysis.hookChanges.length > 0 || analysis.contextChanges.length > 0) {
+    transitions.push({
+      component,
+      fiberId: fiberIdOf(instance.fiber),
+      renderSpanId: group.spanId,
+      startTime,
+      hookChanges: analysis.hookChanges,
+      // Present when the dimension was read — an empty list then means
+      // "nothing changed" — and absent when it could not be evaluated, which
+      // is the distinction `./state.js` documents on its input.
+      contextChanges:
+        analysis.contextChanges.length > 0 || analysis.evaluable.context
+          ? analysis.contextChanges
+          : undefined,
+    });
+  }
+}
+
+/** One group as its `render` draft, nested under the commit's span. */
+function buildGroupDraft(commit: PendingCommit, group: RenderGroup): EventDraft {
+  return {
+    traceId: commit.context.traceId,
+    spanId: group.spanId,
+    // The commit, not the interaction: a render nests inside the commit that
+    // performed it, and the commit nests under the interaction. That is what
+    // makes the timeline's band-inside-band reading correct.
+    parentSpanId: commit.spanId,
+    kind: RENDER_KIND,
+    name: group.component,
+    startTime: group.startTime,
+    duration: group.measured ? group.totalDuration : 0,
+    attributes: buildGroupAttributes(group, commit.context),
+    status: OK_STATUS,
+  };
+}
+
+/**
+ * Analyses one queued commit and emits it: the deferred half of the commit's
+ * handling.
+ *
+ * Each captured instance is compared (`./fiber-diff.js`'s
+ * `analyzeCapturedFiber`, describing hook and context transitions only when
+ * `transitions` says `./state.js` will record them), named and folded into its
+ * group, inside its own `try`; the groups become render drafts in the order
+ * their first instances were walked; the commit draft is built last, so its
+ * `renderCount` is exact, and leads the one {@link emitMany} batch; the
+ * per-instance transitions follow.
+ *
+ * @param commit The commit, as the callback recorded it.
+ * @param options The analysis options for this pass: whether to describe
+ * transitions, and the pass's summary memo.
+ */
+function processCommit(commit: PendingCommit, options: CapturedFiberAnalysisOptions): void {
+  const groups = new Map<string, RenderGroup>();
+  const order: RenderGroup[] = [];
+  const transitions: PendingTransitions[] = [];
+
+  for (const instance of commit.renders) {
+    try {
+      addToGroup(
+        groups,
+        order,
+        transitions,
+        commit,
+        instance,
+        analyzeCapturedFiber(instance.inputs, options, instance.fiber),
+      );
+    } catch (error) {
+      failureCount += 1;
+      // One instance is missing from its group's count, and the report is what
+      // keeps that absence from reading as "this component did not render".
+      reportProducerFailure('react', 'commit-analysis', error);
+    }
+  }
+
+  const drafts: EventDraft[] = [];
+  let reportedFibers = 0;
+  for (const group of order) {
+    try {
+      drafts.push(buildGroupDraft(commit, group));
+      reportedFibers += group.instanceCount;
+    } catch (error) {
+      failureCount += 1;
+      reportProducerFailure('react', 'commit-analysis', error);
+    }
+  }
+
+  renderEventCount += drafts.length;
+  if (commit.truncated) {
+    truncatedCommitCount += 1;
+  }
+
+  // One hand-off: one capture gate, consecutive sequence numbers for the
+  // whole commit, and the commit event ahead of the renders it parents.
+  emitMany([buildCommitDraft(commit, reportedFibers), ...drafts]);
+
+  flushTransitions(commit.context, transitions);
 }
 
 /**
@@ -1499,6 +2108,304 @@ function flushTransitions(context: EventContext, pending: readonly PendingTransi
 
 /*
  * ---------------------------------------------------------------------------
+ * The pending queue and its scheduler
+ *
+ * Commits are analysed in arrival order, a whole commit at a time, from idle
+ * slices. Every entry point here is total: an idle callback or timer that
+ * threw would surface in the page's own task, and a flush that threw would
+ * surface in `./agent.js`'s capture-stop path.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The analysis options for one processing pass.
+ *
+ * Hook and context values are summarised only while `./state.js` is armed:
+ * `state` events are their only reader, and `recordStateTransitions` drops
+ * everything outside an armed capture anyway, so summarising them otherwise
+ * would compose and scrub previews nobody receives. The memo is per pass —
+ * one slice, or one flush — because a pass is synchronous: a value met twice
+ * in it is summarised identically both times, and the demo's cart context
+ * value is met by close to a hundred consumers per commit.
+ */
+function passOptions(): CapturedFiberAnalysisOptions {
+  let transitions = false;
+  try {
+    transitions = isStateAttached();
+  } catch {
+    // `isStateAttached` reads one module flag and cannot throw; guarded
+    // because a failure here must cost the transitions, never the renders.
+  }
+  return transitions ? { transitions, memo: createSummaryMemo() } : {};
+}
+
+/**
+ * {@link processCommit}, contained: a commit whose analysis or hand-off throws
+ * costs that commit, is counted and reported, and never stops the loop that
+ * is working off the rest of the queue — whether that loop is an idle slice,
+ * a drain or the commit callback's overflow path.
+ */
+function processCommitSafely(commit: PendingCommit, options: CapturedFiberAnalysisOptions): void {
+  try {
+    processCommit(commit, options);
+  } catch (error) {
+    failureCount += 1;
+    // The whole commit is missing: no commit event, no render events. The
+    // report is what keeps that absence from reading as a quiet page.
+    reportProducerFailure('react', 'commit-processing', error);
+  }
+}
+
+/** Takes the oldest queued commit off the queue, keeping the render count in step. */
+function takeOldestPending(): PendingCommit | undefined {
+  const commit = pendingCommits.shift();
+  if (commit !== undefined) {
+    pendingRenderCount = Math.max(0, pendingRenderCount - commit.renders.length);
+  }
+  return commit;
+}
+
+/** Whether the queue is past its soft bound, so the next slice should not wait for idle. */
+function isBacklogged(): boolean {
+  return pendingCommits.length > MAX_PENDING_COMMITS || pendingRenderCount > MAX_PENDING_RENDERS;
+}
+
+/** Whether the queue is past its hard bound, twice the soft one. */
+function isOverflowing(): boolean {
+  return (
+    pendingCommits.length > MAX_PENDING_COMMITS * 2 || pendingRenderCount > MAX_PENDING_RENDERS * 2
+  );
+}
+
+/** A monotonic reading for slice budgets, or `NaN` when the clock is unreadable. */
+function monotonicNow(): number {
+  try {
+    return performance.now();
+  } catch {
+    // A page that replaced `performance` with a throwing accessor gets
+    // one-commit slices: `NaN` fails every budget comparison.
+    return Number.NaN;
+  }
+}
+
+/**
+ * Whether a slice that began at `startedAt` may take on another commit.
+ *
+ * An idle deadline that has not timed out is the browser's own answer; every
+ * other slice — the timer fallback, the backlog task and an idle callback that
+ * fired on its `timeout` — is held to {@link SLICE_BUDGET_MS} of the monotonic
+ * clock. A clock that does not advance (a test's frozen clock) lets a slice
+ * finish the queue, which terminates because the queue is finite.
+ */
+function sliceHasTime(deadline: IdleDeadline | undefined, startedAt: number): boolean {
+  try {
+    if (deadline !== undefined && !deadline.didTimeout) {
+      return deadline.timeRemaining() > MIN_IDLE_REMAINING_MS;
+    }
+    return monotonicNow() - startedAt < SLICE_BUDGET_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Cancels the scheduled slice, if there is one, and disarms it whatever the
+ * cancellation does.
+ *
+ * The generation is advanced first, so a slice whose timer the page's
+ * `clearTimeout` failed to cancel still refuses to run (see
+ * {@link sliceGeneration}).
+ */
+function cancelScheduledSlice(): void {
+  sliceGeneration += 1;
+  const slice = scheduledSlice;
+  scheduledSlice = undefined;
+  if (slice === undefined) {
+    return;
+  }
+  try {
+    if (slice.kind === 'idle') {
+      const cancel = (globalThis as { cancelIdleCallback?: unknown }).cancelIdleCallback;
+      if (typeof cancel === 'function') {
+        (cancel as CancelIdle).call(globalThis, slice.handle);
+      }
+    } else {
+      clearTimeout(slice.handle);
+    }
+  } catch {
+    // The generation above has already disarmed the callback, so a
+    // cancellation the page's timer functions refused costs one no-op call.
+  }
+}
+
+/**
+ * Makes sure a slice is scheduled for the queued work.
+ *
+ * An idle callback with the {@link IDLE_TIMEOUT_MS} deadline normally, a timer
+ * where the host has no `requestIdleCallback` (or it throws), and a zero-delay
+ * task when `urgent` — the queue is past its soft bound — which also replaces
+ * a pending idle callback. A slice already scheduled at the requested urgency
+ * is left alone, so a burst of commits schedules one slice, not one each.
+ */
+function scheduleSlice(urgent: boolean): void {
+  if (scheduledSlice !== undefined) {
+    if (!urgent || scheduledSlice.kind === 'task') {
+      return;
+    }
+    cancelScheduledSlice();
+  }
+
+  sliceGeneration += 1;
+  const generation = sliceGeneration;
+
+  if (!urgent) {
+    try {
+      const request = (globalThis as { requestIdleCallback?: unknown }).requestIdleCallback;
+      if (typeof request === 'function') {
+        const handle = (request as RequestIdle).call(
+          globalThis,
+          (deadline) => {
+            runSlice(generation, deadline);
+          },
+          { timeout: IDLE_TIMEOUT_MS },
+        );
+        scheduledSlice = { kind: 'idle', handle };
+        return;
+      }
+    } catch {
+      // A page that broke `requestIdleCallback` gets the timer below instead.
+    }
+  }
+
+  try {
+    const handle = setTimeout(
+      () => {
+        runSlice(generation, undefined);
+      },
+      urgent ? 0 : FALLBACK_DELAY_MS,
+    );
+    scheduledSlice = { kind: 'task', handle };
+  } catch (error) {
+    // Nothing will run the queue on its own now; it is still bounded (the
+    // commit callback works off the oldest commit past the hard bound) and
+    // still drained at every terminal point, so no evidence is lost — but a
+    // capture whose renders arrive late is one the developer should know is
+    // degraded.
+    failureCount += 1;
+    reportProducerFailure('react', 'commit-schedule', error);
+  }
+}
+
+/**
+ * One slice of deferred work: whole commits, oldest first, while the slice
+ * has time — always at least one — and then another slice for whatever is
+ * left.
+ *
+ * @param generation The generation the slice was scheduled under; a slice
+ * that has been superseded or cancelled returns without touching anything.
+ * @param deadline The idle deadline, when the host provided one.
+ */
+function runSlice(generation: number, deadline: IdleDeadline | undefined): void {
+  try {
+    if (generation !== sliceGeneration) {
+      return;
+    }
+    scheduledSlice = undefined;
+
+    const options = passOptions();
+    const startedAt = monotonicNow();
+    let commit = takeOldestPending();
+    while (commit !== undefined) {
+      processCommitSafely(commit, options);
+      if (pendingCommits.length === 0 || !sliceHasTime(deadline, startedAt)) {
+        break;
+      }
+      commit = takeOldestPending();
+    }
+
+    if (pendingCommits.length > 0) {
+      scheduleSlice(isBacklogged());
+    }
+  } catch (error) {
+    failureCount += 1;
+    // A slice that failed part-way leaves the rest of the queue for the next
+    // slice or the next flush; the report is what says a commit went missing.
+    reportProducerFailure('react', 'commit-processing', error);
+    if (pendingCommits.length > 0 && scheduledSlice === undefined) {
+      scheduleSlice(true);
+    }
+  }
+}
+
+/**
+ * Analyses and emits every queued commit now, synchronously and in order.
+ *
+ * The deferred pipeline's drain. `./agent.js` calls it wherever a capture's
+ * evidence has to be complete before the next step — before a capture stops
+ * (so the component-tree snapshot's counts and the final transport flush
+ * include every observed commit), before `pagehide` and a hidden page's flush,
+ * before a capture change or reconfiguration resets the producers, and before
+ * {@link detachReact} when the React hook alone is being cleared.
+ * {@link snapshotComponentTree} calls it too, so a snapshot's render counts are
+ * never behind the events already observed.
+ *
+ * Idempotent and cheap on an empty queue; cancels the scheduled slice either
+ * way, since there is nothing left for it. Emits through `./transport.js`,
+ * which drops everything outside an armed capture — so a drain after the
+ * transport was disabled loses exactly what a synchronous emission at that
+ * moment would have lost, and a caller that wants the evidence drains first.
+ * Never throws.
+ *
+ * @example
+ * ```ts
+ * flushPendingReactWork(); // every observed commit is now in the transport's buffer
+ * flush();                 // ./transport.js: post it
+ * ```
+ */
+export function flushPendingReactWork(): void {
+  try {
+    cancelScheduledSlice();
+    if (pendingCommits.length === 0) {
+      return;
+    }
+    const options = passOptions();
+    for (let commit = takeOldestPending(); commit !== undefined; commit = takeOldestPending()) {
+      processCommitSafely(commit, options);
+    }
+  } catch (error) {
+    failureCount += 1;
+    reportProducerFailure('react', 'commit-processing', error);
+  }
+}
+
+/**
+ * Whether any observed commit is still waiting for its analysis.
+ *
+ * For diagnostics and tests: `false` after {@link flushPendingReactWork},
+ * {@link detachReact} and {@link resetReactCounters}, which is the observable
+ * form of "this module holds no reference into the page's fiber tree beyond
+ * the retained root". Cannot throw.
+ */
+export function hasPendingReactWork(): boolean {
+  return pendingCommits.length > 0 || scheduledSlice !== undefined;
+}
+
+/**
+ * Drops every queued commit unprocessed and cancels the scheduled slice.
+ *
+ * What a cleared hook and a new capture both require: a queued commit belongs
+ * to the capture that observed it, and a hook that has been cleared emits
+ * nothing more (AAP 0.5.1). Evidence a caller wants kept is drained with
+ * {@link flushPendingReactWork} *before* this runs.
+ */
+function discardPendingReactWork(): void {
+  cancelScheduledSlice();
+  pendingCommits = [];
+  pendingRenderCount = 0;
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Hook handlers
  *
  * The three callbacks bippy dispatches to. Each is total: a body that throws
@@ -1508,19 +2415,25 @@ function flushTransitions(context: EventContext, pending: readonly PendingTransi
  */
 
 /**
- * One React commit: emit the commit event and a render event per composite
- * fiber that rendered.
+ * One React commit: record it, and leave its analysis to an idle slice.
  *
- * The order of the four steps is the contract:
+ * The order of the steps is the contract:
  *
  * 1. Retain the root, so a snapshot taken later has a tree to walk even if
  *    this commit rendered nothing.
  * 2. Resolve the trace **once**, before any fiber is visited. Asking per fiber
- *    would let an interaction window close mid-traversal and split one commit
- *    across two traces.
- * 3. Traverse, building drafts under the per-commit bound.
- * 4. Emit the commit draft and the render drafts in one batch, then hand the
- *    state transitions on.
+ *    — or at analysis time — would let an interaction window close
+ *    mid-traversal and split one commit across two traces, or attribute it to
+ *    whatever happened next.
+ * 3. Walk the changed subtree, capturing each rendered component under the
+ *    per-commit bounds ({@link captureCommit}).
+ * 4. Queue the capture and make sure a slice is scheduled. Past the queue's
+ *    hard bound the oldest commit is analysed here and now, which is the cost
+ *    the synchronous design paid on every commit and bounds memory under any
+ *    storm.
+ *
+ * The analysis — comparisons, grouping, drafts, emission and the hand-off to
+ * `./state.js` — happens in {@link processCommit}.
  *
  * @param rendererId React's id for the renderer that committed.
  * @param root The fiber root that committed.
@@ -1541,31 +2454,22 @@ function onCommitFiberRoot(rendererId: number, root: FiberRoot, priority: unknow
     commitCount += 1;
     retainRoot(root);
 
-    const context = resolveEventContext();
-    const commitSpanId = newSpanId();
-    const commitStart = nowEpochMs();
+    const commit = captureCommit(rendererId, root, priority);
+    pendingCommits.push(commit);
+    pendingRenderCount += commit.renders.length;
 
-    const tally = collectRenders(root, context, commitSpanId, commitStart);
-    const commitDraft = buildCommitDraft(
-      root,
-      finiteNumber(rendererId),
-      priority,
-      context,
-      commitSpanId,
-      commitStart,
-      tally,
-    );
-
-    renderEventCount += tally.drafts.length;
-    if (tally.truncated) {
-      truncatedCommitCount += 1;
+    if (isOverflowing()) {
+      const options = passOptions();
+      while (isOverflowing()) {
+        const oldest = takeOldestPending();
+        if (oldest === undefined) {
+          break;
+        }
+        processCommitSafely(oldest, options);
+      }
     }
 
-    // One hand-off: one capture gate, consecutive sequence numbers for the
-    // whole commit, and the commit event ahead of the renders it parents.
-    emitMany([commitDraft, ...tally.drafts]);
-
-    flushTransitions(context, tally.transitions);
+    scheduleSlice(isBacklogged());
   } catch (error) {
     failureCount += 1;
     // The whole commit is missing: no commit event, no render events, and
@@ -1920,9 +2824,15 @@ export function attachReact(): void {
  *    because the release below failed — produces nothing. AAP 0.5.1 asks for a
  *    disabled hook, not an idle one, and this is the part of that guarantee
  *    that cannot fail.
- * 2. **Forget.** The counters, the per-component render counts and the
- *    retained fiber root, each in its own guard (see {@link detachStep}), so
- *    one failing step never skips the rest.
+ * 2. **Forget.** The counters, the pending queue, the per-component render
+ *    counts and the retained fiber root, each in its own guard (see
+ *    {@link detachStep}), so one failing step never skips the rest. The queue
+ *    is **discarded**, not processed: a detach is the hook being cleared, and
+ *    a cleared hook emits nothing more (AAP 0.5.1) — its scheduled slice is
+ *    cancelled and disarmed by generation, so not even a timer the page failed
+ *    to cancel can emit after this returns. `./agent.js` drains the queue with
+ *    {@link flushPendingReactWork} before it detaches, while the capture that
+ *    observed those commits can still receive them.
  * 3. **Release.** Call the function `instrument()` returned, which removes
  *    exactly the handlers {@link attachReact} registered (AAP 0.5.1). On
  *    success the handle is dropped and this module holds nothing at all.
@@ -1954,6 +2864,7 @@ export function detachReact(): void {
     truncatedCommitCount = 0;
     failureCount = 0;
   });
+  detachStep('discard-pending', discardPendingReactWork);
   detachStep('clear-counts', () => {
     componentRenderCounts.clear();
   });
@@ -2069,6 +2980,74 @@ export function detectReact(): boolean {
 }
 
 /**
+ * Be told when a React renderer registers with the DevTools hook — the moment
+ * {@link detectReact} turns true.
+ *
+ * Callable while dormant, for the same reason {@link detectReact} is: the
+ * `agent.ready` frame announced at `document_start` says `reactDetected:
+ * false` whenever the application's bundle has not run yet, which is the
+ * ordinary case, and the service judges the page by that frame. `./agent.js`
+ * uses this to announce the correction when React actually registers, rather
+ * than whenever something next happens to prompt a re-check.
+ *
+ * It observes nothing of the application. The listener rides on the hook's
+ * own renderer registry — bippy's `onRendererInject`, called from the hook's
+ * `inject`, which React calls once per renderer as `react-dom` initialises —
+ * and receives no fiber, no root and no commit. Nothing is patched here:
+ * `bippy/install-hook-only` already installed or patched the hook at
+ * `document_start`, and bippy re-patches a hook that replaces it.
+ *
+ * - **No hook, no subscription.** `hasRDTHook()` is asked first because
+ *   subscribing goes through bippy's `getRDTHook()`, which *installs* a hook
+ *   when none is present, and a notice must not change the page it watches.
+ *   `undefined` is returned, and the caller relies on its other re-checks.
+ * - **Never into React's `inject`.** The listener runs inside React's own
+ *   registration call, so whatever it throws is contained here.
+ * - **Only future registrations.** A renderer registered before the call is
+ *   not reported; ask {@link detectReact} right after subscribing.
+ *
+ * @param listener Called once per renderer that registers after this call.
+ * @returns Releases the listener, idempotently and without throwing; or
+ * `undefined` when no subscription was made.
+ *
+ * @example
+ * ```ts
+ * const release = watchReactRegistration(() => announce());
+ * if (detectReact()) { release?.(); announce(); }
+ * ```
+ */
+export function watchReactRegistration(listener: () => void): (() => void) | undefined {
+  try {
+    if (!hasRDTHook()) {
+      return undefined;
+    }
+
+    const unsubscribe = onRendererInject(() => {
+      try {
+        listener();
+      } catch {
+        // Contained: this runs inside React's registration call.
+      }
+    });
+    let released = false;
+
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      try {
+        unsubscribe();
+      } catch {
+        // The listener is dropped with the handle either way.
+      }
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * The component tree of the last committed root, as JSON-safe nodes.
  *
  * `./agent.js` emits this as a `log` event named `react.component-tree` when a
@@ -2082,6 +3061,12 @@ export function detectReact(): boolean {
  * fiber. The walk is iterative and bounded on both axes, so neither a deep
  * tree nor a malformed one can turn a snapshot into an unbounded traversal.
  *
+ * Queued commits are drained first ({@link flushPendingReactWork}): each
+ * node's `renderCount` is read from the per-capture counts, which advance when
+ * a commit is analysed, so a snapshot taken with commits still queued would
+ * report fewer renders than the capture observed — and fewer than its own
+ * `render` events, once those arrive.
+ *
  * @param options `maxNodes` (default {@link MAX_TREE_NODES}) and `maxDepth`
  * (default {@link MAX_TREE_DEPTH}) bound the result; a node where a bound
  * stopped the walk carries `truncated: true`.
@@ -2093,6 +3078,7 @@ export function snapshotComponentTree(options?: {
   maxDepth?: number;
 }): ComponentTreeNode | undefined {
   try {
+    flushPendingReactWork();
     const root = retainedRoot();
     if (root === undefined) {
       return undefined;
@@ -2131,9 +3117,19 @@ export function snapshotComponentTree(options?: {
  * capture beginning is not a reason to stop observing, and the tree React
  * currently holds is still the tree.
  *
+ * It **does** discard the pending queue. A commit still queued here was
+ * observed during the previous capture; analysed after this reset it would be
+ * counted into the new capture's render counts and — once `./agent.js`
+ * reconfigures the transport — stamped with the new capture's id, which is
+ * evidence from one capture presented as another's. `./agent.js` drains the
+ * queue with {@link flushPendingReactWork} before it resets, while the
+ * transport still carries the old capture, so the discard is the guarantee
+ * rather than the mechanism.
+ *
  * Cannot throw.
  */
 export function resetReactCounters(): void {
+  discardPendingReactWork();
   componentRenderCounts.clear();
   commitCount = 0;
   renderEventCount = 0;

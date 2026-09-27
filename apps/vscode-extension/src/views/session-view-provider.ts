@@ -273,7 +273,7 @@ const LOCAL_RESOURCE_ROOT = 'dist';
 /**
  * Where Vite writes the webview bundle, relative to the extension root.
  *
- * `vite.config.ts` emits it **unhashed and single-chunk** as exactly
+ * `vite.config.mts` emits it **unhashed and single-chunk** as exactly
  * `main.js` and `main.css` (`entryFileNames: 'main.js'`,
  * `assetFileNames: 'main.[ext]'`, `cssCodeSplit: false`), and `esbuild.mjs`
  * never touches `dist/webview`. Those filenames are a cross-file agreement: if

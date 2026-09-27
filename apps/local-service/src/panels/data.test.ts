@@ -55,9 +55,11 @@
  * store fake orders rows by the store's documented panel orderings (duration
  * descending, start ascending, or — for `count_desc` — the size of each row's
  * group under the requested group key, the key in UTF-8 byte order, then the
- * event id), written independently of `SOURCE_SORT_KEYS`; one assertion ties
- * the stated flat chains to the store's own `ORDER BY` clauses without opening
- * it.
+ * event id), and a parent-first read (`spans` under `start_asc`) parent before
+ * child over start, producer, sequence and arrival, all written independently
+ * of `SOURCE_SORT_KEYS` and of the store's own implementation; one assertion
+ * ties the stated flat chains to the store's own `ORDER BY` clauses without
+ * opening it.
  *
  * Identifiers are deterministic: minted from counters in the formats
  * `@debuggen/shared` mints (`ID_PREFIXES`, 32- and 16-character hex), with event
@@ -135,6 +137,7 @@ import type {
 } from '@debuggen/telemetry';
 
 import {
+  CANONICAL_ORDER_BY,
   PANEL_DURATION_DESC_ORDER_BY,
   PANEL_SECONDARY_ORDER_BY,
   PANEL_START_ASC_ORDER_BY,
@@ -599,6 +602,58 @@ function storeOrder(
   return byStartThenId;
 }
 
+/**
+ * The store's flat canonical chain (`CANONICAL_ORDER_BY`), written
+ * independently of the correlator's comparator: start ascending, the producer
+ * id in UTF-8 byte order, the producer's sequence number, then the arrival
+ * number — always distinct, so the chain is total.
+ */
+function byFlatCanonical(left: TelemetryEvent, right: TelemetryEvent): number {
+  return (
+    left.startTime - right.startTime ||
+    byUtf8Bytes(left.producerId, right.producerId) ||
+    left.seq - right.seq ||
+    left.ingestSeq - right.ingestSeq
+  );
+}
+
+/**
+ * A selection in the canonical parent-first order a parent-first store page
+ * (`TelemetryQuery.parentFirst`) answers, derived independently of the
+ * store's `parentFirstOrder`: repeatedly take the earliest row, in
+ * {@link byFlatCanonical} order, whose parent — the earliest row of its trace
+ * carrying the span id it names, the row itself excepted — has been taken or
+ * is not in the selection; when no row qualifies (a parent cycle), the
+ * earliest row left. Naive and quadratic, as the rule reads.
+ */
+function parentFirstSelection(selection: readonly TelemetryEvent[]): TelemetryEvent[] {
+  const flat = [...selection].sort(byFlatCanonical);
+  const parentOf = (event: TelemetryEvent): TelemetryEvent | undefined => {
+    if (event.parentSpanId === undefined) {
+      return undefined;
+    }
+    const parent = flat.find(
+      (candidate) => candidate.traceId === event.traceId && candidate.spanId === event.parentSpanId,
+    );
+    return parent === event ? undefined : parent;
+  };
+  const taken = new Set<TelemetryEvent>();
+  const ordered: TelemetryEvent[] = [];
+  while (ordered.length < flat.length) {
+    const next =
+      flat.find((event) => {
+        const parent = parentOf(event);
+        return !taken.has(event) && (parent === undefined || taken.has(parent));
+      }) ?? flat.find((event) => !taken.has(event));
+    if (next === undefined) {
+      break;
+    }
+    taken.add(next);
+    ordered.push(next);
+  }
+  return ordered;
+}
+
 /** Whether `event` matches every narrowing field a store read — a page or a scan — carries. */
 function matchesQuery(event: TelemetryEvent, query: TelemetryScanFilter): boolean {
   return (
@@ -673,8 +728,9 @@ function scanOf(selection: TelemetryEvent[], maxRows: number): TelemetryScan {
  *
  * It honours every narrowing field, all three panel orderings — `count_desc`
  * ranking rows by their group under `groupBy`, the store's default key
- * (`TELEMETRY_DEFAULT_GROUP_KEY`) when none is named — the store's own default
- * and ceiling for `limit`, and `offset`; its page omits `nextOffset` on the
+ * (`TELEMETRY_DEFAULT_GROUP_KEY`) when none is named — the parent-first order
+ * a `parentFirst` read asks for ({@link parentFirstSelection}), the store's own
+ * default and ceiling for `limit`, and `offset`; its page omits `nextOffset` on the
  * last page, as the real store's does. Its scan
  * is the whole selection in `start_time ASC, id ASC` order within the row
  * budget and nothing but the count past it. Its earliest trace is the trace of
@@ -723,9 +779,12 @@ function createFakeTelemetryRepo(events: readonly TelemetryEvent[]): FakeTelemet
         TELEMETRY_QUERY_MAX_LIMIT,
       );
       const selection = events.filter((event) => matchesQuery(event, query));
-      const rows = [...selection].sort(
-        storeOrder(query.sort, selection, query.groupBy ?? TELEMETRY_DEFAULT_GROUP_KEY),
-      );
+      const rows =
+        query.parentFirst === true
+          ? parentFirstSelection(selection)
+          : [...selection].sort(
+              storeOrder(query.sort, selection, query.groupBy ?? TELEMETRY_DEFAULT_GROUP_KEY),
+            );
       const page = rows.slice(offset, offset + limit);
       const following = offset + page.length;
       return ok({
@@ -1152,7 +1211,71 @@ function expectNoLeak(text: string): void {
  * ---------------------------------------------------------------------------------------------- */
 
 /** How a key compares strings, as the resolver's chains declare it. */
-type Collation = 'utf16' | 'utf8';
+type Collation = 'utf16' | 'utf8' | 'natural';
+
+/**
+ * One token of a string read in natural order, as this file reads it: a whole
+ * run of ASCII digits with the number it writes, or one code point folded to
+ * lower case where its lower case is a single code point.
+ */
+type NaturalToken =
+  | { readonly digits: true; readonly value: bigint; readonly first: number }
+  | { readonly digits: false; readonly folded: number };
+
+/**
+ * A string's natural-order tokens, found with a regular expression and
+ * `BigInt` rather than by the resolver's scanning — an independent reading of
+ * the `natural` collation, which the resolver's own comparator is held to.
+ */
+function naturalTokens(text: string): NaturalToken[] {
+  return (text.match(/[0-9]+|[\s\S]/gu) ?? []).map((token): NaturalToken => {
+    if (/^[0-9]+$/u.test(token)) {
+      return { digits: true, value: BigInt(token), first: token.codePointAt(0) ?? 0 };
+    }
+    const points = [...token.toLowerCase()];
+    const [only] = points;
+    const folded = points.length === 1 && only !== undefined ? only : token;
+    return { digits: false, folded: folded.codePointAt(0) ?? 0 };
+  });
+}
+
+/** The code point a token ranks by against a token of the other kind: a run's first digit. */
+function tokenCodePoint(token: NaturalToken): number {
+  return token.digits ? token.first : token.folded;
+}
+
+/**
+ * Natural order, read independently: digit runs by value, everything else by
+ * folded code point, a string that runs out first ahead, and code-unit order
+ * between strings natural order leaves equal.
+ */
+function byNaturalOrder(left: string, right: string): number {
+  const leftTokens = naturalTokens(left);
+  const rightTokens = naturalTokens(right);
+  const shared = Math.min(leftTokens.length, rightTokens.length);
+  for (let index = 0; index < shared; index += 1) {
+    const leftToken = leftTokens[index];
+    const rightToken = rightTokens[index];
+    if (leftToken === undefined || rightToken === undefined) {
+      throw new Error('a token vanished');
+    }
+    if (leftToken.digits && rightToken.digits) {
+      if (leftToken.value !== rightToken.value) {
+        return leftToken.value < rightToken.value ? -1 : 1;
+      }
+      continue;
+    }
+    const leftPoint = tokenCodePoint(leftToken);
+    const rightPoint = tokenCodePoint(rightToken);
+    if (leftPoint !== rightPoint) {
+      return leftPoint < rightPoint ? -1 : 1;
+    }
+  }
+  if (leftTokens.length !== rightTokens.length) {
+    return leftTokens.length < rightTokens.length ? -1 : 1;
+  }
+  return byCodeUnit(left, right);
+}
 
 /**
  * One key of a chain read generically, whatever the row type: a field of the
@@ -1186,8 +1309,9 @@ function fieldOf(row: object, field: string): unknown {
 }
 
 /**
- * Numbers numerically; strings by code unit, or by UTF-8 bytes under the
- * `utf8` collation; any other value is a fixture bug.
+ * Numbers numerically; strings by code unit, by UTF-8 bytes under the `utf8`
+ * collation, or in natural order under the `natural` one; any other value is a
+ * fixture bug.
  */
 function compareField(left: unknown, right: unknown, collation: Collation = 'utf16'): number {
   if (typeof left === 'number' && typeof right === 'number') {
@@ -1197,7 +1321,10 @@ function compareField(left: unknown, right: unknown, collation: Collation = 'utf
     return left < right ? -1 : 1;
   }
   if (typeof left === 'string' && typeof right === 'string') {
-    return collation === 'utf8' ? byUtf8Bytes(left, right) : byCodeUnit(left, right);
+    if (collation === 'utf8') {
+      return byUtf8Bytes(left, right);
+    }
+    return collation === 'natural' ? byNaturalOrder(left, right) : byCodeUnit(left, right);
   }
   throw new Error('a chain key holds a value that is neither a number nor a string');
 }
@@ -1242,6 +1369,17 @@ const INDEPENDENT_DERIVATIONS: Readonly<
     (rows: readonly object[], seeded: readonly TelemetryEvent[]) => DerivedValues
   >
 > = Object.freeze({
+  parentFirstRank: (rows, seeded) => {
+    // Each row's position when the answer's own events are put parent first:
+    // the lineage is the answer's, so a parent the filter left out is absent.
+    const order = parentFirstSelection(
+      seeded.filter((event) => rows.some((row) => fieldOf(row, 'id') === event.id)),
+    );
+    return rows.map((row) => {
+      const position = order.findIndex((event) => event.id === fieldOf(row, 'id'));
+      return position === -1 ? undefined : position;
+    });
+  },
   nameGroupSize: (rows) =>
     rows.map(
       (row) => rows.filter((other) => fieldOf(other, 'name') === fieldOf(row, 'name')).length,
@@ -1580,6 +1718,15 @@ describe('the fixture builders', () => {
         }
         const whole = await resolved(resolver, { source, sort, limit: DATA_QUERY_MAX_LIMIT });
         const rows = rowsOf(whole);
+        // The parent-first rank is a position, unique by construction, so it
+        // too leaves no tie for the id; what the fixture must tie on there is
+        // the start time the rank orders ready rows by, so the canonical
+        // tie-breakers behind it decide.
+        if ('derived' in primary && primary.derived === 'parentFirstRank') {
+          const starts = rows.map((row) => fieldOf(row, 'startTime'));
+          expect(new Set(starts).size).toBeLessThan(starts.length);
+          continue;
+        }
         const values =
           'derived' in primary
             ? INDEPENDENT_DERIVATIONS[primary.derived](rows, events)
@@ -1680,6 +1827,9 @@ const STORE_COLUMN_BY_FIELD: Readonly<Record<string, string>> = Object.freeze({
   startTime: 'start_time',
   duration: 'duration',
   name: 'name',
+  producerId: 'producer_id',
+  seq: 'seq',
+  ingestSeq: 'ingest_seq',
   id: 'id',
 });
 
@@ -1752,7 +1902,23 @@ describe('SOURCE_SORT_KEYS and DEFAULT_SORT_BY_SOURCE', () => {
     };
     for (const source of ['spans', 'events'] as const) {
       for (const sort of DATA_QUERY_SORTS) {
-        expect(orderByClause(chainFor(source, sort))).toBe(storeOrderBy[sort]);
+        const chain = chainFor(source, sort);
+        if (source === 'spans' && sort === 'start_asc') {
+          // Parent before child, which no `ORDER BY` states: the store's
+          // parent-first page, which ranks rows by its canonical chain — the
+          // keys behind the rank — and never reaches the closing id.
+          expect(chain[0]).toStrictEqual(
+            expect.objectContaining({ derived: 'parentFirstRank', direction: 'asc' }),
+          );
+          expect(orderByClause(chain.slice(1, -1))).toBe(CANONICAL_ORDER_BY);
+          expect(chain[2]).toStrictEqual({
+            field: 'producerId',
+            direction: 'asc',
+            collation: 'utf8',
+          });
+          continue;
+        }
+        expect(orderByClause(chain)).toBe(storeOrderBy[sort]);
       }
       // The key is compared as SQLite's `BINARY` collation compares it: by UTF-8 bytes.
       expect(chainFor(source, 'count_desc')[1]).toStrictEqual({
@@ -1800,6 +1966,23 @@ describe('SOURCE_SORT_KEYS and DEFAULT_SORT_BY_SOURCE', () => {
       'metrics count_desc',
     ]) {
       expect(reordered).toContain(pair);
+    }
+  });
+
+  it('breaks a renders tie by the component name in natural order, and no other source’s', () => {
+    for (const sort of DATA_QUERY_SORTS) {
+      const chain = chainFor('renders', sort);
+      expect(chain).toHaveLength(3);
+      expect(chain[1]).toStrictEqual({
+        field: 'component',
+        direction: 'asc',
+        collation: 'natural',
+      });
+    }
+    for (const source of SORTED_SOURCES.filter((sorted) => sorted !== 'renders')) {
+      for (const sort of DATA_QUERY_SORTS) {
+        expect(chainFor(source, sort).some((key) => key.collation === 'natural')).toBe(false);
+      }
     }
   });
 
@@ -2125,6 +2308,69 @@ describe('spans and events', () => {
       ...DATA_QUERY_SORTS,
     ]);
     expect(store.calls.every((call) => call.groupBy === 'name')).toBe(true);
+    // Only `spans` under `start_asc` — the canonical parent-first chain — asks
+    // for a parent-first page; every other read leaves the field out.
+    expect(store.calls.map((call) => call.parentFirst)).toStrictEqual([
+      ...DATA_QUERY_SORTS.map((sort) => (sort === 'start_asc' ? true : undefined)),
+      ...DATA_QUERY_SORTS.map(() => undefined),
+    ]);
+    expect(store.calls.filter((call) => 'parentFirst' in call)).toHaveLength(1);
+  });
+
+  it('orders spans under start_asc parent first, then by start, producer, sequence and arrival', async () => {
+    // The finding's reproduction, in one trace: a root A0; children A2
+    // (seq 2), B0 and A1 (seq 1) at one instant; B1, B0's child, 5 ms before
+    // them. Producer A's id sorts below B's; the rows arrive shuffled and
+    // their ids are permuted, so neither order could produce the answer.
+    const producerA: ProducerId = opaqueId(ID_PREFIXES.producer, 2);
+    const producerB: ProducerId = opaqueId(ID_PREFIXES.producer, 3);
+    expect(byUtf8Bytes(producerA, producerB)).toBeLessThan(0);
+    const trace = traceIdFor(3);
+    const spanOf = (ordinal: number): SpanId => hexId(9_000 + ordinal, SPAN_ID_WIDTH);
+    const emitted = (
+      producerId: ProducerId,
+      seq: number,
+      spanId: SpanId,
+      parentSpanId: SpanId | undefined,
+      offsetMs: number,
+    ): TelemetryEvent => ({
+      ...makeEvent({
+        traceId: trace,
+        spanId,
+        ...(parentSpanId !== undefined ? { parentSpanId } : {}),
+        startTime: at(offsetMs),
+      }),
+      producerId,
+      seq,
+    });
+    const b1 = emitted(producerB, 1, spanOf(4), spanOf(3), 15);
+    const a2 = emitted(producerA, 2, spanOf(2), spanOf(0), 20);
+    const a0 = emitted(producerA, 0, spanOf(0), undefined, 20);
+    const b0 = emitted(producerB, 0, spanOf(3), spanOf(0), 20);
+    const a1 = emitted(producerA, 1, spanOf(1), spanOf(0), 20);
+    // Another trace of the capture, earlier than all of them.
+    const elsewhere = makeEvent({ traceId: TRACE_OTHER, startTime: at(1) });
+    const events = [b1, a2, elsewhere, a0, b0, a1];
+    for (const event of events) {
+      expect(parseTelemetryEvent(event).ok).toBe(true);
+    }
+    const { resolver, store } = harness(events);
+    const query: DataQuery = { source: 'spans', filter: { traceId: trace }, sort: 'start_asc' };
+
+    const result = await resolved(resolver, query);
+
+    expect(rowIds(result)).toStrictEqual([a0.id, a1.id, a2.id, b0.id, b1.id]);
+    expect(result).toMatchObject({ source: 'spans', total: 5, nextOffset: null });
+    expect(store.calls[0]).toMatchObject({ traceId: trace, sort: 'start_asc', parentFirst: true });
+    // A walk one row at a time visits each row once, in the same order.
+    expect((await walkAll(resolver, query, 1)).ids).toStrictEqual(rowIds(result));
+
+    // The events log keeps its flat order: start, then the event id.
+    const log = await resolved(resolver, { ...query, source: 'events' });
+    expect(rowIds(log)).toStrictEqual(
+      [b1, a2, a0, b0, a1].sort(byStartThenId).map((event) => event.id),
+    );
+    expect(rowIds(log)[0]).toBe(b1.id);
   });
 
   it('pushes every filter field into the store, a kinds filter only narrowing the span kinds', async () => {
@@ -2279,6 +2525,120 @@ describe('renders', () => {
       expect(result.renders.map((row) => row.component)).toStrictEqual(['Charlie']);
       expect(result.total).toBe(1);
     }
+  });
+
+  it('breaks a tie between components by the numbers in their names: Row2 before Row10, under every sort', async () => {
+    // One render each at one instant and one duration, so every sort's primary
+    // key ties; `Row30` renders twice, so under the count and total-time sorts
+    // it leads and the others tie behind it.
+    const events = [
+      ...['Row20', 'Row2', 'Row10', 'Row3', 'Row1', 'Row02'].map((name) => renderEvent(name, 0, 1)),
+      renderEvent('Row30', 0, 1),
+      renderEvent('Row30', 5, 1),
+    ];
+    const { resolver } = harness(events);
+    // `Row02` and `Row2` write the same number; code-unit order separates them.
+    const tied = ['Row1', 'Row02', 'Row2', 'Row3', 'Row10', 'Row20'];
+    const expected: Readonly<Record<DataQuerySort, readonly string[]>> = {
+      count_desc: ['Row30', ...tied],
+      duration_desc: ['Row30', ...tied],
+      start_asc: [...tied, 'Row30'],
+    };
+    for (const sort of DATA_QUERY_SORTS) {
+      const whole = await resolved(resolver, {
+        source: 'renders',
+        sort,
+        limit: DATA_QUERY_MAX_LIMIT,
+      });
+      expect(whole.source).toBe('renders');
+      if (whole.source !== 'renders') {
+        continue;
+      }
+      expect(whole.renders.map((row) => row.component)).toStrictEqual(expected[sort]);
+      expectStrictChainOrder(whole.renders, chainFor('renders', sort), events);
+      for (const pageSize of [1, 2, 3]) {
+        const walk = await walkAll(resolver, { source: 'renders', sort }, pageSize);
+        expect(walk.ids).toStrictEqual(rowIds(whole));
+      }
+    }
+  });
+
+  it('folds letter case when it breaks a tie, so upper- and lower-case names interleave', async () => {
+    const names = ['Zeta', 'item', 'alpha', 'Item', 'Beta', 'gamma', 'Delta', 'eX', 'eG', 'Ew'];
+    const events = names.map((name) => renderEvent(name, 0, 1));
+    const { resolver } = harness(events);
+    // Not code-unit order, which lists every upper-case name before every
+    // lower-case one; names differing only in case stay adjacent, upper first.
+    const expected = ['alpha', 'Beta', 'Delta', 'eG', 'Ew', 'eX', 'gamma', 'Item', 'item', 'Zeta'];
+    expect([...names].sort(byCodeUnit)).not.toStrictEqual(expected);
+    for (const sort of DATA_QUERY_SORTS) {
+      const whole = await resolved(resolver, {
+        source: 'renders',
+        sort,
+        limit: DATA_QUERY_MAX_LIMIT,
+      });
+      expect(whole.source).toBe('renders');
+      if (whole.source !== 'renders') {
+        continue;
+      }
+      expect(whole.renders.map((row) => row.component)).toStrictEqual(expected);
+      for (const pageSize of [1, 4]) {
+        const walk = await walkAll(resolver, { source: 'renders', sort }, pageSize);
+        expect(walk.ids).toStrictEqual(rowIds(whole));
+      }
+    }
+  });
+
+  it('orders tied names by the same total, locale-free order an independent reading gives', async () => {
+    const names = [
+      'Row',
+      'Row1a',
+      'Row1A',
+      'Row01a',
+      'row 1',
+      'row-1',
+      'row_1',
+      '9Lives',
+      '10Lives',
+      'Stage12345678901234567890123',
+      'Stage12345678901234567890124',
+      'Stage000',
+      'Stage0',
+      'Émile',
+      'émile',
+      'Omega',
+      'Ωmega',
+      'ωmega',
+      'İndex',
+      'index',
+      '𝒜stral',
+      'Astral',
+    ];
+    const events = names.map((name) => renderEvent(name, 0, 1));
+    const { resolver } = harness(events);
+    const expected = [...names].sort(byNaturalOrder);
+    for (const sort of DATA_QUERY_SORTS) {
+      const whole = await resolved(resolver, {
+        source: 'renders',
+        sort,
+        limit: DATA_QUERY_MAX_LIMIT,
+      });
+      expect(whole.source).toBe('renders');
+      if (whole.source !== 'renders') {
+        continue;
+      }
+      expect(whole.renders.map((row) => row.component)).toStrictEqual(expected);
+      expectStrictChainOrder(whole.renders, chainFor('renders', sort), events);
+    }
+    // Spot checks the independent reading must itself honour.
+    expect(expected.indexOf('9Lives')).toBeLessThan(expected.indexOf('10Lives'));
+    expect(expected.indexOf('Row')).toBeLessThan(expected.indexOf('Row1a'));
+    expect(expected.indexOf('Stage12345678901234567890123')).toBeLessThan(
+      expected.indexOf('Stage12345678901234567890124'),
+    );
+    expect(expected.indexOf('Stage0') + 1).toBe(expected.indexOf('Stage000'));
+    expect(expected.indexOf('Émile') + 1).toBe(expected.indexOf('émile'));
+    expect(expected.indexOf('Ωmega') + 1).toBe(expected.indexOf('ωmega'));
   });
 });
 
@@ -2997,6 +3357,48 @@ describe('the shared traversal', () => {
         });
         expect(own.map((input) => input.aggregate)).toStrictEqual([source]);
         expect(shared.find((input) => input.aggregate === source)?.ids).toStrictEqual(own[0]?.ids);
+      }
+    },
+  );
+
+  it.each(EQUALITY_FILTERS)(
+    'answers the metrics of a traversal under %s exactly as a metrics read of its own does',
+    async (_label, filter) => {
+      // A statement observed twice — a driver span nested in the ORM's — so
+      // `query_count` depends on the duplicate rule, which a traversal that
+      // reuses its query groups for the metrics must keep.
+      const statement = 'SELECT z FROM rows WHERE id = $1';
+      const outer = queryEvent(statement, 99, 4);
+      const inner = makeEvent({
+        kind: 'db.query',
+        name: 'SELECT',
+        parentSpanId: outer.spanId,
+        startTime: at(99.5),
+        duration: 2,
+        attributes: { 'db.system': 'postgresql', 'db.statement': statement },
+        redacted: [STATEMENT_REDACTION_PATH],
+      });
+      const events = [...equalityFixture(), outer, inner];
+      const query: DataQuery = { source: 'metrics', ...optionalFilter(filter) };
+
+      // Cold `queries` first: the traversal computes every source, the metrics
+      // among them, and the metrics read is then answered from its bundle.
+      const { resolver, store } = harness(events);
+      await resolved(resolver, { source: 'queries', ...optionalFilter(filter) });
+      const scans = store.scans.length;
+      const shared = metricsOf(await resolved(resolver, query));
+      expect(store.scans).toHaveLength(scans);
+
+      const own = metricsOf(
+        await resolved(
+          harness(events, { telemetry: withoutSharedTraversal(createFakeTelemetryRepo(events)) })
+            .resolver,
+          query,
+        ),
+      );
+      expect(shared).toStrictEqual(own);
+      if (filter === undefined || filter.traceId !== undefined) {
+        expect(shared.find((metric) => metric.id === 'query_count')?.value).toBeGreaterThan(0);
       }
     },
   );
@@ -3830,6 +4232,173 @@ describe('metrics', () => {
     const fromLoaded = await resolved(loaded.resolver, { source: 'metrics' });
     expect(fromLoaded).toMatchObject({ source: 'metrics', metrics: expected });
     expect(loaded.store.scans.length).toBeGreaterThan(0);
+  });
+
+  /** A capture above the aggregate ceiling, by its stored count. */
+  const ABOVE_CEILING = MAX_AGGREGATE_INPUT_EVENTS + 1_234;
+
+  /**
+   * A telemetry port for a capture of `count` stored events whose every scan
+   * the store answers by the count alone — past the ceiling, no row — and
+   * which records how many scans it served.
+   */
+  function capturedAtCount(count: number): { readonly port: PanelTelemetryPort; scans(): number } {
+    let scans = 0;
+    return {
+      port: {
+        ...scriptedTelemetry((_filter, maxRows) => {
+          scans += 1;
+          return ok(countedScan(count, maxRows));
+        }),
+        captureStamp: () => ok({ count, maxIngestSeq: count }),
+      },
+      scans: () => scans,
+    };
+  }
+
+  /**
+   * The stored summary of a capture above the ceiling, as the capture stage
+   * computes it: from the capture's first {@link MAX_AGGREGATE_INPUT_EVENTS}
+   * events, its values reversed so the answer's order is proven to be the
+   * resolver's.
+   */
+  function partialSummary(): CaptureSummary {
+    return { ...reversedSummary(metricFixture()), eventCount: MAX_AGGREGATE_INPUT_EVENTS };
+  }
+
+  it('answers a capture above the ceiling from its stored summary, every value noted with the coverage', async () => {
+    const partial = partialSummary();
+    const telemetry = capturedAtCount(ABOVE_CEILING);
+    const { resolver, records } = harness([], {
+      telemetry: telemetry.port,
+      captures: [storedCapture(SESSION_A, CAPTURE_A1, { stopped: true, summary: partial })],
+    });
+
+    const result = await resolved(resolver, { source: 'metrics' });
+
+    // Nothing was scanned: the capture is too large for any read to aggregate.
+    expect(telemetry.scans()).toBe(0);
+    const note = 'Based on the first 250,000 of 251,234 captured events.';
+    // At least one value carries a note of its own, which the coverage note follows.
+    expect(partial.metrics.some((metric) => metric.note !== undefined)).toBe(true);
+    const byId = new Map(partial.metrics.map((metric) => [metric.id, metric]));
+    const metrics = metricsOf(result);
+    expect(metrics.map((metric) => metric.id)).toStrictEqual([...METRIC_IDS]);
+    expect(result).toMatchObject({ total: METRIC_IDS.length, nextOffset: null });
+    for (const metric of metrics) {
+      const summarized = byId.get(metric.id);
+      expect(summarized).toBeDefined();
+      // The summary's value, availability, label and unit, with the coverage
+      // note after any note of its own.
+      expect(metric).toStrictEqual({
+        ...summarized,
+        note: summarized?.note === undefined ? note : `${summarized.note} ${note}`,
+      });
+    }
+    // An unmeasured value stays unmeasured: noted, never given a number.
+    const unavailable = metrics.filter((metric) => !metric.available);
+    expect(unavailable.length).toBeGreaterThan(0);
+    expect(unavailable.every((metric) => !('value' in metric) && metric.note?.endsWith(note))).toBe(
+      true,
+    );
+    expect(
+      records.find((record) => record.fields['bound'] === MAX_AGGREGATE_INPUT_EVENTS)?.fields,
+    ).toMatchObject({
+      source: 'metrics',
+      summarized: MAX_AGGREGATE_INPUT_EVENTS,
+      stored: ABOVE_CEILING,
+    });
+
+    // A repeated read is the cached answer, the same noted values.
+    const again = await resolved(resolver, { source: 'metrics' });
+    expect(again).toStrictEqual(result);
+    expect(telemetry.scans()).toBe(0);
+  });
+
+  it('notes the loaded summary of a capture above the ceiling the same way, under any sort', async () => {
+    const partial = partialSummary();
+    const telemetry = capturedAtCount(ABOVE_CEILING);
+    const { resolver } = harness([], {
+      telemetry: telemetry.port,
+      summaries: { loadCaptureSummary: () => Promise.resolve(ok(partial)) },
+    });
+
+    for (const sort of [undefined, ...DATA_QUERY_SORTS]) {
+      const result = await resolved(resolver, {
+        source: 'metrics',
+        ...(sort === undefined ? {} : { sort }),
+      });
+      const metrics = metricsOf(result);
+      expect(metrics).toHaveLength(METRIC_IDS.length);
+      expect(
+        metrics.every((metric) =>
+          metric.note?.endsWith('Based on the first 250,000 of 251,234 captured events.'),
+        ),
+      ).toBe(true);
+    }
+    expect(telemetry.scans()).toBe(0);
+  });
+
+  it('still refuses the metrics of a capture above the ceiling that has no summary yet', async () => {
+    const telemetry = capturedAtCount(ABOVE_CEILING);
+    const { resolver } = harness([], { telemetry: telemetry.port });
+
+    const error = await refused(resolver, { source: 'metrics' });
+
+    expect(error.code).toBe('PANEL_INVALID');
+    expect(error.details).toMatchObject({
+      source: 'metrics',
+      total: ABOVE_CEILING,
+      bound: MAX_AGGREGATE_INPUT_EVENTS,
+      reason: 'aggregate-input-too-large',
+    });
+    expect(telemetry.scans()).toBeGreaterThan(0);
+  });
+
+  it('keeps a filtered read of a capture above the ceiling on its own slice, ignoring the summary', async () => {
+    const telemetry = capturedAtCount(ABOVE_CEILING);
+    let loads = 0;
+    const { resolver } = harness([], {
+      telemetry: telemetry.port,
+      summaries: {
+        loadCaptureSummary: () => {
+          loads += 1;
+          return Promise.resolve(ok(partialSummary()));
+        },
+      },
+    });
+
+    const error = await refused(resolver, { source: 'metrics', filter: { tier: 'db' } });
+
+    expect(loads).toBe(0);
+    expect(error.details).toMatchObject({ reason: 'aggregate-input-too-large' });
+  });
+
+  it('computes the values of a capture at the ceiling rather than noting a partial summary', async () => {
+    const events = metricFixture();
+    const expected = computeCaptureSummary(events, { captureId: CAPTURE_A1 }).metrics;
+    // A summary of part of the capture, whose values differ from the whole's.
+    const prefix: CaptureSummary = {
+      ...computeCaptureSummary(events.slice(0, 2), { captureId: CAPTURE_A1, sessionId: SESSION_A }),
+      eventCount: MAX_AGGREGATE_INPUT_EVENTS - 1,
+    };
+    expect(prefix.metrics).not.toStrictEqual(expected);
+    const store = createFakeTelemetryRepo(events);
+    // Exactly as many events as one read aggregates: the values are computed.
+    const atCeiling: PanelTelemetryPort = {
+      ...store,
+      captureStamp: () => ok({ count: MAX_AGGREGATE_INPUT_EVENTS, maxIngestSeq: 1 }),
+    };
+    const { resolver } = harness(events, {
+      telemetry: atCeiling,
+      captures: [storedCapture(SESSION_A, CAPTURE_A1, { stopped: true, summary: prefix })],
+    });
+
+    const result = await resolved(resolver, { source: 'metrics' });
+
+    expect(result).toMatchObject({ source: 'metrics', metrics: expected });
+    expect(metricsOf(result).some((metric) => metric.note?.startsWith('Based on'))).toBe(false);
+    expect(store.scans.length).toBeGreaterThan(0);
   });
 
   it('computes the values from the capture when no summary exists, or when the load fails', async () => {

@@ -366,6 +366,20 @@ type DownstreamFrameFixtures = {
 
 function downstreamFrames(): DownstreamFrameFixtures {
   return {
+    'bridge.pause': {
+      channel: EXTENSION_CHANNEL,
+      version: PORT_PROTOCOL_VERSION,
+      direction: 'downstream',
+      type: 'bridge.pause',
+      payload: {},
+    },
+    'bridge.resume': {
+      channel: EXTENSION_CHANNEL,
+      version: PORT_PROTOCOL_VERSION,
+      direction: 'downstream',
+      type: 'bridge.resume',
+      payload: {},
+    },
     'agent.config': {
       channel: EXTENSION_CHANNEL,
       version: PORT_PROTOCOL_VERSION,
@@ -1443,12 +1457,12 @@ afterEach(() => {
 });
 
 describe('page-channel mirror contract', () => {
-  it('keeps the literals the page agent transport publishes (version 3)', () => {
+  it('keeps the literals the page agent transport publishes (version 4)', () => {
     // `../src/shared/messages.ts` mirrors `packages/telemetry/src/browser/transport.ts`
     // and names this spec as the check that the copy still matches the owner.
     expect(AGENT_SOURCE_TAG).toBe('debuggen-agent');
     expect(BRIDGE_SOURCE_TAG).toBe('debuggen-bridge');
-    expect(PAGE_CHANNEL_VERSION).toBe(3);
+    expect(PAGE_CHANNEL_VERSION).toBe(4);
     expect(PAGE_HANDSHAKE_REQUEST_EVENT).toBe('debuggen-bridge-handshake');
     expect(PAGE_HANDSHAKE_OFFER_EVENT).toBe('debuggen-agent-handshake');
     expect(PAGE_AGENT_FRAME_EVENT).toBe('debuggen-agent-frame');
@@ -1463,6 +1477,8 @@ describe('page-channel mirror contract', () => {
     expect(BRIDGE_OUTBOUND_TYPES).toEqual([
       'bridge.ready',
       'bridge.gone',
+      'bridge.pause',
+      'bridge.resume',
       'agent.config',
       'agent.snapshot',
       'target.request',
@@ -2262,7 +2278,8 @@ describe('createContentBridge', () => {
       runtime.latestPort().emitDisconnect();
 
       expect(page.dispatchedTypes).toEqual([PAGE_HANDSHAKE_REQUEST_EVENT]);
-      expect(agent.rawReceived).toHaveLength(5);
+      // Every downstream type, and the bridge's own `bridge.ready` and `bridge.gone`.
+      expect(agent.rawReceived).toHaveLength(BRIDGE_DOWNSTREAM_MESSAGE_TYPES.length + 2);
       for (const detail of agent.rawReceived) {
         expect(typeof detail).toBe('string');
         const parsed: unknown = JSON.parse(String(detail));
@@ -3765,6 +3782,42 @@ describe('createContentBridge', () => {
 
       expect(bridge.getStats()).toMatchObject({ forwardedDown: 1, droppedDownUnrecognised: 4 });
       expect(agent.receivedTypes()).toEqual(['bridge.ready', 'target.request']);
+    });
+
+    it("relays the worker's flow-control signals from the current port only, and a new port starts the agent unpaused", () => {
+      const { bridge, runtime, agent } = startedHarness();
+      const first = runtime.latestPort();
+
+      first.emitMessage(downstreamFrames()['bridge.pause']);
+      expect(lastReceived(agent)).toEqual({
+        source: BRIDGE_SOURCE_TAG,
+        version: PAGE_CHANNEL_VERSION,
+        type: 'bridge.pause',
+        payload: {},
+      });
+      expect(bridge.getStats()).toMatchObject({ forwardedDown: 1, acknowledgedDown: 1 });
+      // A signal is the worker's to the agent: nothing goes back up the port.
+      expect(first.post).not.toHaveBeenCalled();
+
+      // The worker suspends; the next port's `bridge.ready` is what clears the
+      // agent's pause — the bridge holds none of its own to re-send.
+      first.emitDisconnect();
+      vi.advanceTimersByTime(BRIDGE_RECONNECT_BASE_MS);
+      const second = runtime.latestPort();
+      expect(second).not.toBe(first);
+
+      // A late signal from the superseded port is never applied.
+      first.emitMessage(downstreamFrames()['bridge.pause']);
+      second.emitMessage(downstreamFrames()['bridge.resume']);
+
+      expect(agent.receivedTypes()).toEqual([
+        'bridge.ready',
+        'bridge.pause',
+        'bridge.gone',
+        'bridge.ready',
+        'bridge.resume',
+      ]);
+      expect(bridge.getStats()).toMatchObject({ forwardedDown: 2, acknowledgedDown: 2 });
     });
 
     it('counts a frame the agent did not claim as delivered but not acknowledged', () => {

@@ -2013,7 +2013,12 @@ describe('E. privacy and read-only guarantees', () => {
       { tool: 'notATool', note: markers.symbol },
     ]);
 
-    expect(records.length).toBe(9);
+    // Nine call records and the one record that closes the batch.
+    expect(records.length).toBe(10);
+    expect(records.map((record) => record.message)).toStrictEqual([
+      ...Array.from({ length: 9 }, () => 'code tool call'),
+      'code tool batch',
+    ]);
     const serialized = JSON.stringify(records);
     for (const marker of Object.values(markers)) {
       expect(serialized).not.toContain(marker);
@@ -2026,17 +2031,31 @@ describe('E. privacy and read-only guarantees', () => {
       'ok',
       'code',
       'callsUsed',
+      'found',
       'returned',
       'total',
       'truncated',
       'bytes',
       'argumentCount',
       'argumentChars',
+      'pathBetweenTried',
+      'pathBetweenFound',
+      'requests',
+      'delegated',
+      'rejected',
+      'perTool',
     ]);
     for (const record of records) {
       expect(record.level).toBe('debug');
       for (const [key, value] of Object.entries(record.fields)) {
         expect(structural.has(key), key).toBe(true);
+        if (key === 'perTool') {
+          // The batch's per-tool counts: every tool name, each a count.
+          const counts = value as Readonly<Record<string, unknown>>;
+          expect(Object.keys(counts)).toStrictEqual([...CODE_TOOL_NAMES]);
+          expect(Object.values(counts).every((count) => Number.isInteger(count))).toBe(true);
+          continue;
+        }
         expect(['string', 'number', 'boolean']).toContain(typeof value);
         if (typeof value === 'string') {
           expect([...CODE_TOOL_NAMES, ...DEBUGGEN_ERROR_CODES]).toContain(value);
@@ -2055,6 +2074,10 @@ describe('E. privacy and read-only guarantees', () => {
     const tools = toolsFor(makeHarness(), { logger: throwing });
     expectResult(await tools.runCodeTool(VALID_REQUESTS.findByName), 'findByName');
     expectRejection(await tools.runCodeTool({ tool: 'findByName' }));
+    // The batch summary goes through the same guard as the call records.
+    const runs = await tools.runCodeTools([VALID_REQUESTS.pathBetween]);
+    expect(runs).toHaveLength(1);
+    expectResult(outcomeAt(runs, 0), 'pathBetween');
   });
 
   it('never calls a method outside the query surface', async () => {
@@ -2491,6 +2514,150 @@ describe('I. runCodeTools batches', () => {
     expect(snapshot.callsRemaining).toBe(0);
     expect(harness.totalQueryCalls()).toBe(accepted.length);
   });
+
+  it('closes a batch with one summary record, under the injected logger’s bindings', async () => {
+    const records: LogRecord[] = [];
+    const base = createConsoleLogger({
+      level: 'debug',
+      sink: (record) => {
+        records.push(record);
+      },
+    });
+    // What the investigate stage hands this module: a logger bound to the
+    // session and the stage.
+    const bindings = { sessionId: 'session-batch-summary', stage: 'investigate' };
+    const pathBetween = vi
+      .fn<CodeQueries['pathBetween']>()
+      .mockReturnValueOnce(stubPath())
+      .mockReturnValueOnce(undefined)
+      .mockReturnValueOnce(undefined);
+    const tools = toolsFor(makeHarness({ mocks: { pathBetween } }), {
+      logger: base.child(bindings),
+    });
+
+    await tools.runCodeTools([
+      VALID_REQUESTS.pathBetween,
+      VALID_REQUESTS.findByName,
+      VALID_REQUESTS.pathBetween,
+      { tool: 'findByName' },
+      VALID_REQUESTS.pathBetween,
+      VALID_REQUESTS.whoCalls,
+    ]);
+
+    const summaries = records.filter((record) => record.message === 'code tool batch');
+    expect(summaries).toHaveLength(1);
+    const summary = summaries[0];
+    expect(summary?.level).toBe('debug');
+    expect(summary?.fields).toStrictEqual({
+      ...bindings,
+      requests: 6,
+      delegated: 5,
+      rejected: 1,
+      perTool: {
+        findByName: 1,
+        findSymbol: 0,
+        whoCalls: 1,
+        routeForUrl: 0,
+        handlersFor: 0,
+        componentsRendering: 0,
+        pathBetween: 3,
+        excerpt: 0,
+      },
+      pathBetweenTried: 3,
+      pathBetweenFound: 1,
+      callsUsed: 5,
+    });
+    // The summary closes the batch: nothing is recorded after it.
+    expect(records.at(-1)).toBe(summary);
+
+    // Every record of the instance carries the session and the stage.
+    expect(records).toHaveLength(7);
+    for (const record of records) {
+      expect(record.fields).toMatchObject(bindings);
+    }
+
+    // Each search's own record says whether it found a path, with the stage's
+    // running tallies; no other tool's record carries them.
+    const calls = records.filter((record) => record.message === 'code tool call');
+    expect(
+      calls
+        .filter((record) => record.fields.tool === 'pathBetween')
+        .map((record) => [
+          record.fields.found,
+          record.fields.pathBetweenTried,
+          record.fields.pathBetweenFound,
+        ]),
+    ).toStrictEqual([
+      [true, 1, 1],
+      [false, 2, 1],
+      [false, 3, 1],
+    ]);
+    for (const record of calls.filter((entry) => entry.fields.tool !== 'pathBetween')) {
+      expect(record.fields).not.toHaveProperty('pathBetweenTried');
+      expect(record.fields).not.toHaveProperty('pathBetweenFound');
+    }
+  });
+
+  it('counts only its own calls in the summary, while the running tallies span the stage', async () => {
+    const records: LogRecord[] = [];
+    const logger = createConsoleLogger({
+      level: 'debug',
+      sink: (record) => {
+        records.push(record);
+      },
+    });
+    const pathBetween = vi
+      .fn<CodeQueries['pathBetween']>()
+      .mockReturnValueOnce(stubPath())
+      .mockReturnValueOnce(undefined);
+    const tools = toolsFor(makeHarness({ mocks: { pathBetween } }), { logger });
+
+    // One search before the batch, outside it, through the single-call entry
+    // point the investigate stage uses.
+    expectResult(await tools.runCodeTool(VALID_REQUESTS.pathBetween), 'pathBetween');
+    await tools.runCodeTools([VALID_REQUESTS.pathBetween]);
+
+    const [before, inBatch, summary] = records;
+    expect(before?.fields).toMatchObject({ found: true, pathBetweenTried: 1, pathBetweenFound: 1 });
+    expect(inBatch?.fields).toMatchObject({
+      found: false,
+      pathBetweenTried: 2,
+      pathBetweenFound: 1,
+    });
+    expect(summary?.message).toBe('code tool batch');
+    expect(summary?.fields).toMatchObject({
+      requests: 1,
+      delegated: 1,
+      rejected: 0,
+      pathBetweenTried: 1,
+      pathBetweenFound: 0,
+      callsUsed: 2,
+    });
+    expect(records).toHaveLength(3);
+  });
+
+  it('summarises an empty batch as zero calls', async () => {
+    const records: LogRecord[] = [];
+    const logger = createConsoleLogger({
+      level: 'debug',
+      sink: (record) => {
+        records.push(record);
+      },
+    });
+    const tools = toolsFor(makeHarness(), { logger });
+
+    await expect(tools.runCodeTools([])).resolves.toStrictEqual([]);
+
+    expect(records.map((record) => record.message)).toStrictEqual(['code tool batch']);
+    expect(records[0]?.fields).toMatchObject({
+      requests: 0,
+      delegated: 0,
+      rejected: 0,
+      pathBetweenTried: 0,
+      pathBetweenFound: 0,
+      callsUsed: 0,
+    });
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -2653,6 +2820,66 @@ describe('J. real wiring through createCodeQueries', () => {
       'routeForUrl',
     );
     expect(route).toMatchObject({ found: false, total: 0, returned: 0 });
+  });
+
+  it('leaves the engine’s miss at trace while the session-bound tool records count it', async () => {
+    const records: LogRecord[] = [];
+    const root = createConsoleLogger({
+      level: 'trace',
+      sink: (record) => {
+        records.push(record);
+      },
+    });
+    // The production wiring: the engine is built once per project with a
+    // project-scoped logger, the tools once per stage run with a logger bound to
+    // the session and the stage.
+    const { index, nodes } = syntheticIndex((built) =>
+      syntheticEdges(built).filter((edge) => edge.kind !== 'calls'),
+    );
+    const graph = CodeGraph.fromIndex(index);
+    const routeMap = routeMapFromIndex(index);
+    const queries = createCodeQueries(graph, {
+      routes: routeMap.entries,
+      logger: root.child({ subsystem: 'pipeline' }),
+    });
+    const handles: PipelineCodeHandles = {
+      graph,
+      queries,
+      routeMap,
+      projectSummary: stubProjectSummary(),
+    };
+    const bindings = { sessionId: 'session-real-wiring', stage: 'investigate' };
+    const tools = createCodeTools({ handles, logger: root.child(bindings) });
+
+    await tools.runCodeTools([
+      {
+        tool: 'pathBetween',
+        from: nodes.route.id,
+        to: { file: SYNTHETIC_SERVER_FILE, symbol: 'loadDelta' },
+      },
+    ]);
+
+    const miss = records.find(
+      (record) => record.message === 'pathBetween found no path within the bounds',
+    );
+    expect(miss?.level).toBe('trace');
+    expect(miss?.fields).not.toHaveProperty('sessionId');
+
+    const debug = records.filter((record) => record.level === 'debug');
+    expect(debug.map((record) => record.message)).toStrictEqual([
+      'code tool call',
+      'code tool batch',
+    ]);
+    for (const record of debug) {
+      expect(record.fields).toMatchObject(bindings);
+    }
+    expect(debug[0]?.fields).toMatchObject({
+      tool: 'pathBetween',
+      found: false,
+      pathBetweenTried: 1,
+      pathBetweenFound: 0,
+    });
+    expect(debug[1]?.fields).toMatchObject({ pathBetweenTried: 1, pathBetweenFound: 0 });
   });
 });
 

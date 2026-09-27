@@ -77,10 +77,17 @@
  *   `./agent.ts`'s cue to re-send `agent.ready`: control frames are never
  *   queued, so a dormant agent holds nothing.
  * - `bridge.gone` — the runtime port disconnected; buffering resumes.
+ * - `bridge.pause` — the service worker's lane for this tab has backed up:
+ *   hold telemetry back until `bridge.resume` (see **Flow control**). `{}`.
+ * - `bridge.resume` — the lane has drained: deliver again. `{}`.
  * - `agent.config` — the service's hook configuration for this tab, which
  *   `./agent.ts` reads and applies through {@link configureTransport}.
  * - `agent.snapshot` — a request for an on-demand component-tree snapshot.
  * - `target.request` — the panel entered element-picker mode.
+ *
+ * The two flow-control frames are this module's own: they are acknowledged
+ * like every accepted frame and are not delivered to {@link subscribe}
+ * handlers, because nothing outside the transport acts on them.
  *
  * **Inbound acceptance.** The node's listener accepts a frame only when its
  * `detail`, read through the captured `CustomEvent.prototype.detail` getter,
@@ -201,6 +208,43 @@
  * next capture: a capture change settles it into the cumulative totals, and a
  * reset, which has just zeroed them, into nothing.
  *
+ * ### Flow control
+ *
+ * Custody ends where the bridge's runtime port takes a batch, so the port's
+ * speed is not the service's: a page that produces faster than the local
+ * service stores would otherwise fill the service worker's per-tab lane
+ * until it overflows there. The worker therefore relays `bridge.pause` once
+ * its lane for this tab backs up and `bridge.resume` once it has drained, and
+ * between the two this module:
+ *
+ * - **posts no `telemetry.batch` of its own accord.** The batch threshold, the
+ *   {@link FLUSH_INTERVAL_MS} timer and the bridge's return schedule nothing,
+ *   and a bounded drain already running stops before its next batch.
+ * - **keeps buffering, within the same bound.** Events accumulate in the ring
+ *   of {@link MAX_BUFFERED_EVENTS}; past it the oldest is evicted and counted,
+ *   exactly as while the bridge is away, so the loss rides out as
+ *   `droppedCount` on the first batch after the resume.
+ * - **still carries every control frame**, and still performs the terminal
+ *   drains — {@link flush} (`pagehide`, a hidden document, capture stop, and
+ *   the flush `./agent.ts` runs on `bridge.ready`) and the capture change in
+ *   {@link configureTransport}. The signals are a hint about throughput, never
+ *   custody: a moment with no later turn delivers what it holds, and the
+ *   worker's own lane bound and loss reporting stay in force whatever the page
+ *   does.
+ *
+ * `bridge.resume` drains at once with the bounded drain the bridge's return
+ * uses ({@link MAX_BATCHES_PER_DRAIN} batches, the rest on later turns), and
+ * announces nothing: `./agent.ts` never sees either signal, so a resume is not
+ * a `bridge.ready` and re-sends no `agent.ready`.
+ *
+ * The pause belongs to the bridge's current runtime port — the worker records
+ * it per bridge connection — so it is cleared by that port's end and by a new
+ * one: `bridge.gone`, and every `bridge.ready`, which a reconnected bridge
+ * sends first. It is deliberately **not** cleared by a capture change or by
+ * {@link resetTransport}, which end a capture rather than a connection: the
+ * worker still holds this bridge paused, and its `bridge.resume` is what lets
+ * the next capture's telemetry go. {@link getFlowControlStats} reports it.
+ *
  * ## Invariants
  *
  * **1. No side effects at import time.** Module evaluation only *reads* the
@@ -245,10 +289,10 @@
  *   `MessageChannel` task instead of serialising a frame inside the click
  *   handler or React commit that produced the last event.
  * - **Every scheduled drain dispatches at most {@link MAX_BATCHES_PER_DRAIN}
- *   batches** and reschedules the remainder. That holds for all three
+ *   batches** and reschedules the remainder. That holds for all four
  *   non-terminal routes — the batch threshold, the {@link FLUSH_INTERVAL_MS}
- *   timer and the bridge returning after an absence — because each can find
- *   a full queue.
+ *   timer, the bridge returning after an absence and a `bridge.resume` —
+ *   because each can find a full queue.
  * - **Unbounded, synchronous draining is reserved for the terminal moments**
  *   with no later turn to rely on: {@link flush} (`pagehide` and capture stop)
  *   and the capture change in {@link configureTransport}, where the
@@ -405,11 +449,14 @@ export const BRIDGE_FRAME_EVENT = 'debuggen-bridge-frame';
  * or to the transport itself is a version bump, and both sides then simply
  * ignore each other until the page reloads.
  *
- * Version 3 is the channel the module overview describes: the private
- * channel node handed over by the handshake, frames as JSON strings, and
- * acknowledgement by `preventDefault()`.
+ * Version 4 is the channel the module overview describes: the private
+ * channel node handed over by the handshake, frames as JSON strings,
+ * acknowledgement by `preventDefault()` (all three since version 3), and the
+ * `bridge.pause` / `bridge.resume` flow control added in version 4. A version
+ * 3 bridge would never hold the agent back, and a version 3 agent would read
+ * the new frames as none of its own, so the two refuse each other outright.
  */
-export const CHANNEL_VERSION = 3;
+export const CHANNEL_VERSION = 4;
 
 /**
  * The most completed events held in memory while the bridge is away.
@@ -797,7 +844,30 @@ export type AgentOutboundType =
 
 /** The closed set of frame types the isolated-world bridge dispatches. */
 export type BridgeInboundType =
-  'bridge.ready' | 'bridge.gone' | 'agent.config' | 'agent.snapshot' | 'target.request';
+  | 'bridge.ready'
+  | 'bridge.gone'
+  | 'bridge.pause'
+  | 'bridge.resume'
+  | 'agent.config'
+  | 'agent.snapshot'
+  | 'target.request';
+
+/**
+ * Where the channel's flow control stands, from {@link getFlowControlStats}.
+ *
+ * Its own record rather than members of {@link TransportStats}, whose numbers
+ * describe the queue and the capture and are zeroed by {@link resetTransport}:
+ * these describe the bridge's connection, which a capture ending does not
+ * change (see "Flow control" in the module notes).
+ */
+export interface FlowControlStats {
+  /** Whether a `bridge.pause` holds telemetry back right now. */
+  paused: boolean;
+  /** `bridge.pause` frames accepted, cumulative for the document. */
+  pauses: number;
+  /** `bridge.resume` frames accepted, cumulative for the document. */
+  resumes: number;
+}
 
 /**
  * A frame as the page agent builds it; its JSON rendering, by
@@ -991,6 +1061,23 @@ let producerFailuresSuppressed = 0;
 
 /** Whether the bridge has announced itself and not gone away since. */
 let bridgeAvailable = false;
+
+/**
+ * Whether the bridge has asked the agent to hold its telemetry back: set by
+ * `bridge.pause`, cleared by `bridge.resume`, `bridge.ready` and
+ * `bridge.gone`. While it is set only the terminal drains post batches.
+ *
+ * Connection-scoped, like the worker's record of it, and so — unlike
+ * {@link bridgeAvailable} — left as it is by {@link resetTransport}; see
+ * "Flow control" in the module notes.
+ */
+let flowPaused = false;
+
+/** `bridge.pause` frames accepted, cumulative, for {@link getFlowControlStats}. */
+let flowPausesTotal = 0;
+
+/** `bridge.resume` frames accepted, cumulative, for the same. */
+let flowResumesTotal = 0;
 
 /** The armed flush timer, or `undefined` when none is pending. */
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -3121,10 +3208,12 @@ function clearFlushTimer(): void {
  * page lived. The buffer accumulates instead, and the arrival of
  * `bridge.ready` starts draining it at once — bounded like every other
  * non-terminal route, so a queue that waited out a long absence leaves over
- * consecutive turns rather than in one of them.
+ * consecutive turns rather than in one of them. Nothing is armed while the
+ * bridge holds the agent back either ({@link flowPaused}): its
+ * `bridge.resume` starts the drain.
  */
 function scheduleFlush(): void {
-  if (flushTimer !== undefined || !bridgeAvailable || ringCount === 0) {
+  if (flushTimer !== undefined || !bridgeAvailable || flowPaused || ringCount === 0) {
     return;
   }
 
@@ -3261,10 +3350,11 @@ function postDrainTask(): boolean {
  * one task rather than one per event. Nothing is scheduled while the bridge is
  * away — the queue accumulates and `bridge.ready` drains it — and a host that
  * accepts neither a channel message nor a microtask degrades to the coalescing
- * timer rather than to inline delivery.
+ * timer rather than to inline delivery. Nor is anything scheduled while the
+ * bridge holds the agent back ({@link flowPaused}); its `bridge.resume` drains.
  */
 function scheduleDrain(): void {
-  if (drainScheduled || !bridgeAvailable || ringCount === 0) {
+  if (drainScheduled || !bridgeAvailable || flowPaused || ringCount === 0) {
     return;
   }
 
@@ -3294,11 +3384,20 @@ function scheduleDrain(): void {
  * whatever is still queued if the bridge is still there, so the nested request
  * is honoured on the next task rather than lost.
  *
+ * **Held back by a pause, unless terminal.** While the bridge holds the agent
+ * back ({@link flowPaused}) a bounded drain posts nothing, and one that is
+ * running when a `bridge.pause` is handed back from inside its dispatch stops
+ * before its next batch; the rest waits for `bridge.resume`. The terminal
+ * drain of {@link flushNow} is never held back: it has no later turn to wait
+ * for (see "Flow control" in the module notes).
+ *
  * @param maxBatches How many batches this turn may dispatch.
  * `Number.POSITIVE_INFINITY` empties the queue, which is what the synchronous
  * callers want; a finite bound leaves the remainder to a rescheduled drain.
+ * @param terminal Whether this is the terminal drain of {@link flushNow}, which
+ * a pause does not hold back; every other route leaves it `false`.
  */
-function drainBatches(maxBatches: number): void {
+function drainBatches(maxBatches: number, terminal = false): void {
   clearFlushTimer();
 
   if (!bridgeAvailable || delivering) {
@@ -3308,7 +3407,10 @@ function drainBatches(maxBatches: number): void {
   delivering = true;
   try {
     let batches = 0;
-    while (ringCount > 0 && batches < maxBatches && bridgeAvailable) {
+    // The pause is read before every batch, so a `bridge.pause` handed back
+    // from inside a dispatch holds the next one back as surely as one that
+    // arrived before the drain began.
+    while (ringCount > 0 && batches < maxBatches && bridgeAvailable && (terminal || !flowPaused)) {
       const unclaimed = deliver(takeBatch(MAX_EVENTS_PER_BATCH));
       batches += 1;
       if (unclaimed.length > 0) {
@@ -3324,7 +3426,8 @@ function drainBatches(maxBatches: number): void {
     // The bound was reached with events still queued, a nested request was
     // deferred to this drain, or a batch was refused by a port the bridge has
     // since replaced: the rest travels on the next turn instead of extending
-    // this one. `scheduleDrain` does nothing while the bridge is away.
+    // this one. `scheduleDrain` does nothing while the bridge is away or holds
+    // the agent back.
     scheduleDrain();
   }
 }
@@ -3344,9 +3447,11 @@ function drainBatches(maxBatches: number): void {
  *   counted as lost.
  *
  * Every other route — the batch threshold, the flush timer, the bridge's
- * return — goes through {@link drainBatches} with
+ * return, a `bridge.resume` — goes through {@link drainBatches} with
  * {@link MAX_BATCHES_PER_DRAIN}, because each of those has a next turn and
- * none of them is worth a long task on someone else's page.
+ * none of them is worth a long task on someone else's page. For the same
+ * reason only this drain posts while the bridge holds the agent back: the
+ * moments it serves have no later turn to wait for.
  *
  * **Terminal means the loss travels too.** Loss otherwise rides out on the
  * next batch's `droppedCount`, and at a terminal moment there may be no next
@@ -3360,7 +3465,7 @@ function drainBatches(maxBatches: number): void {
  * later batch or this flush will carry the count.
  */
 function flushNow(): void {
-  drainBatches(Number.POSITIVE_INFINITY);
+  drainBatches(Number.POSITIVE_INFINITY, true);
   deliverLossReport();
 }
 
@@ -3937,13 +4042,15 @@ function deliverLossReport(): void {
 const BRIDGE_INBOUND_TYPES: readonly BridgeInboundType[] = [
   'bridge.ready',
   'bridge.gone',
+  'bridge.pause',
+  'bridge.resume',
   'agent.config',
   'agent.snapshot',
   'target.request',
 ];
 
 /**
- * Whether a value is one of the five frame types the bridge may send.
+ * Whether a value is one of the seven frame types the bridge may send.
  *
  * An indexed loop of strict comparisons rather than `Array.prototype.includes`:
  * the guard runs long after the page's scripts have, and a page that replaced
@@ -4113,6 +4220,14 @@ function acceptFrame(
  * {@link bridgeReadyGeneration}, including one that finds the bridge already
  * marked present — a reconnect the agent never saw a `bridge.gone` for.
  *
+ * **Flow control** (see the module notes). `bridge.pause` sets
+ * {@link flowPaused} and clears the flush timer; `bridge.resume` clears it and
+ * drains at once, bounded like the bridge's return; `bridge.ready` and
+ * `bridge.gone` clear it, being a new port and the end of one. Like every
+ * frame but `bridge.gone`, either signal is also evidence that the bridge is
+ * there. Both are consumed here: acknowledged, and delivered to no subscriber,
+ * so `./agent.ts` never mistakes a resume for a reconnect.
+ *
  * Subscribers are dispatched from a snapshot, so a handler that unsubscribes
  * (or subscribes) while being called does not disturb the iteration, and each
  * one is called inside its own guard: a subscriber that throws costs itself
@@ -4125,28 +4240,48 @@ function acceptFrame(
  * @param message The accepted frame.
  */
 function handleInbound(message: BridgeInboundMessage): void {
-  if (message.type === 'bridge.gone') {
+  const type = message.type;
+  if (type === 'bridge.gone') {
     bridgeAvailable = false;
+    // The pause was the departed port's; the next port starts unpaused.
+    flowPaused = false;
     clearFlushTimer();
   } else {
-    if (message.type === 'bridge.ready') {
+    if (type === 'bridge.ready') {
       bridgeReadyGeneration += 1;
+      // A new runtime port, for which the worker holds no pause.
+      flowPaused = false;
+    } else if (type === 'bridge.pause') {
+      flowPausesTotal += 1;
+      flowPaused = true;
+      // An armed timer could only find the agent held back.
+      clearFlushTimer();
+    } else if (type === 'bridge.resume') {
+      flowResumesTotal += 1;
+      flowPaused = false;
     }
-    if (!bridgeAvailable) {
-      bridgeAvailable = true;
+    const returning = !bridgeAvailable;
+    bridgeAvailable = true;
+    if (returning || type === 'bridge.resume') {
       try {
         // Bounded, and for the same reason the threshold path is: a queue that
-        // waited out a service-worker suspension holds up to
-        // {@link MAX_BUFFERED_EVENTS} events, and dispatching all twenty-five
-        // batches of them inside the bridge's one dispatch would be a long task
-        // on the page's main thread. The first batches still travel here —
-        // recovery stays immediate — and the remainder is rescheduled turn by
-        // turn.
+        // waited out a service-worker suspension, or a backed-up lane, holds
+        // up to {@link MAX_BUFFERED_EVENTS} events, and dispatching all
+        // twenty-five batches of them inside the bridge's one dispatch would
+        // be a long task on the page's main thread. The first batches still
+        // travel here — recovery stays immediate — and the remainder is
+        // rescheduled turn by turn. A `bridge.pause` that finds the bridge
+        // away marks it present and drains nothing.
         drainBatches(MAX_BATCHES_PER_DRAIN);
       } catch {
         // The queue survives a failed drain and the next one retries.
       }
     }
+  }
+
+  if (type === 'bridge.pause' || type === 'bridge.resume') {
+    // The transport's own frames: nothing outside this module acts on them.
+    return;
   }
 
   for (let link = snapshotSubscribers(); link !== undefined; link = link.next) {
@@ -5089,6 +5224,8 @@ export function configureTransport(config: TransportConfig): void {
  * A no-op while the bridge is away: the queue is kept and the arrival of
  * `bridge.ready` starts draining it. A flush that meets a batch the bridge
  * does not claim stops there, with that batch back at the front of the queue.
+ * A `bridge.pause` does not hold it back: every caller is a moment with no
+ * later turn to wait for (see "Flow control" in the module notes).
  */
 export function flush(): void {
   try {
@@ -5128,6 +5265,14 @@ export function flush(): void {
  * samples behind it stay valid for the next capture. Clearing it would only
  * leave that capture's first events without an offset until the page made
  * another same-origin request. See {@link clockOffset}.
+ *
+ * Nor is a `bridge.pause` ({@link flowPaused}) or its counts: the pause
+ * belongs to the bridge's runtime port, which a capture ending does not
+ * replace, and the worker that sent it still holds this bridge paused — only
+ * its `bridge.resume`, or the port's end or replacement, lets the next
+ * capture's telemetry go. Clearing it here would let a new capture post into
+ * a lane that is still backed up, and the worker would not ask again until
+ * that lane had drained. See "Flow control" in the module notes.
  *
  * Every step stands in its own guard (see {@link teardownStep}). The listener
  * removals go through the captured methods, so a page cannot refuse them the
@@ -5267,6 +5412,27 @@ export function getTransportStats(): TransportStats {
     bridgeReady: bridgeAvailable,
     serializationFailures: serializationFailureTotal,
     controlFramesDropped: controlFramesDroppedTotal,
+  };
+}
+
+/**
+ * A snapshot of the channel's flow control: whether the bridge holds the
+ * agent's telemetry back right now, and how many `bridge.pause` and
+ * `bridge.resume` frames this document has accepted.
+ *
+ * Its own function rather than members of {@link TransportStats}, whose
+ * numbers {@link resetTransport} zeroes with the capture: these describe the
+ * bridge's connection and survive a reset (see "Flow control" in the module
+ * notes). Events evicted while the agent was held back are in
+ * {@link TransportStats}'s `dropped`, like every other eviction.
+ *
+ * @returns A fresh snapshot.
+ */
+export function getFlowControlStats(): FlowControlStats {
+  return {
+    paused: flowPaused,
+    pauses: flowPausesTotal,
+    resumes: flowResumesTotal,
   };
 }
 
