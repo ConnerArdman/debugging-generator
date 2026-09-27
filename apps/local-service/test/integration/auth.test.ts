@@ -39,19 +39,26 @@
  * The editor's administrative operations are driven here too, because each is
  * an access-boundary event: `POST /credentials/rotate` (what
  * `debuggen.rotateServiceToken` calls) revokes every credential and closes every
- * socket, `POST /dev-server/credential` mints a server-agent credential, and
+ * socket, `POST /dev-server/credential` mints a server-agent credential,
+ * `POST /credentials/release` (what `scripts/dev-instrumented.mjs` calls once
+ * its dev server has exited) revokes one such credential and its sockets, and
  * `POST /sessions/purge` (what `debuggen.purgeSessions` calls) runs the
- * retention sweep. All three are rows of the route table, reachable by the
- * editor credential alone. The retention sweep's own rules — which aged
- * session goes, which conflict keeps one — belong to `src/store/retention.test.ts`.
+ * retention sweep. All four are rows of the route table, reachable by the
+ * editor credential alone. The launcher's lease bookkeeping behind a release —
+ * which supervised lease ends, why a launched child's own credential is never
+ * released — belongs to `src/dev-server/launcher.test.ts`, and the retention
+ * sweep's own rules — which aged session goes, which conflict keeps one — to
+ * `src/store/retention.test.ts`.
  *
  * The revocation fence is driven over a raw `node:http` connection, because
  * what it closes is a timing window no whole-request client can open: a
  * request authenticated by the middleware whose body is held back part-way
- * while a rotation lands on another connection. The body is released only
- * once the middleware has provably authenticated the request, observed by a
- * call-through spy on the service's own `authorizeHttpRequest` that changes
- * nothing it does.
+ * while a rotation, or a release, lands on another connection. The body is
+ * released only once the middleware has provably authenticated the request,
+ * observed by a call-through spy on the service's own `authorizeHttpRequest`
+ * that changes nothing it does. It is proven on every state-changing route
+ * whose effect follows a body read: the credential request, purge, rotation,
+ * pairing and release of the editor, and the server agent's ingest.
  *
  * ## Conventions
  *
@@ -65,9 +72,12 @@
  */
 
 import { randomBytes, randomInt, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rm, stat, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import type { IncomingHttpHeaders } from 'node:http';
+import { createServer as createTcpServer } from 'node:net';
+import type { AddressInfo, Server as TcpServer } from 'node:net';
+import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -108,10 +118,14 @@ import type {
   SessionPurgeResponse,
   SessionRecord,
 } from '@debuggen/protocol';
+import { createDeterministicProvider } from '@debuggen/model-provider';
+import type { ModelProvider, PromptStage } from '@debuggen/model-provider';
 import { isErr, newId, newPanelId, newProducerId, newSessionId } from '@debuggen/shared';
 import { SECURE_FILE_MODE, sha256Hex, sha256OfFile } from '@debuggen/shared/node';
 import type { TelemetryEventIngress } from '@debuggen/telemetry';
 
+import { startService } from '../../src/main.js';
+import type { ServiceHandle } from '../../src/main.js';
 import {
   AUTH_FAILURE_REASONS,
   AUTH_FILE_STAGE_SUFFIX,
@@ -122,6 +136,7 @@ import {
   PAIRING_CODE_TTL_MS,
   PAIRING_LOCKOUT_MS,
   PAIRING_MAX_FAILURES,
+  identifyProjectRoot,
 } from '../../src/server/auth.js';
 import type {
   AuthFailureReason,
@@ -130,14 +145,18 @@ import type {
 } from '../../src/server/auth.js';
 import { DEFAULT_OFFLINE_GRACE_MS } from '../../src/server/clients.js';
 import { UNIFORM_PAIRING_REFUSAL_REASONS } from '../../src/server/routes/pair.js';
-import type { TabBinding } from '../../src/store/sessions-repo.js';
+import { createSessionsRepo } from '../../src/store/sessions-repo.js';
+import type { ProgressEntry, TabBinding } from '../../src/store/sessions-repo.js';
 
 import {
   HARNESS_TIMEOUTS,
+  assertTreeUnchanged,
   chromeExtensionOrigin,
   newExtensionId,
   randomSecretLike,
   readTelemetryBatch,
+  snapshotTree,
+  standInDevServerCommand,
   startHarness,
   waitFor,
   waitUntil,
@@ -305,9 +324,19 @@ function paramsFor(operation: HttpOperationId, sessionId: string): Record<string
 }
 
 /**
+ * A `POST /credentials/release` body naming a well-formed credential this
+ * service never issued — tracked, so no reply, record or row may echo it.
+ */
+function unissuedReleaseBody(): { readonly token: string } {
+  const token = randomSecretLike('bearer').slice(formatBearer('').length);
+  return { token: track('unissued release token', token) };
+}
+
+/**
  * A body the operation's route accepts for its method: none for a `GET`, a
  * `DataQuery` for `panel.data`, the harness's own workspace folder for
- * `devServer.credential`, and `{}` for every other `POST` (the access boundary
+ * `devServer.credential`, a well-formed but unissued token for
+ * `credentials.release`, and `{}` for every other `POST` (the access boundary
  * answers before any body is read, so the body only matters where a request is
  * admitted). Called at test time, after `beforeAll` has set {@link projectA}.
  */
@@ -320,6 +349,8 @@ function requestBodyFor(operation: HttpOperationId): unknown {
       return { source: 'events' };
     case 'devServer.credential':
       return { projectRoot: projectA };
+    case 'credentials.release':
+      return unissuedReleaseBody();
     default:
       return {};
   }
@@ -949,11 +980,92 @@ function assertNothingLogged(): void {
 }
 
 /* -------------------------------------------------------------------------------------------------
+ * The plan-stage gate
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The pipeline stage whose provider call {@link PlanGate} can hold. */
+const PLAN_STAGE: PromptStage = 'plan';
+
+/** A plan-stage provider call {@link PlanGate} is holding. */
+interface HeldPlanCall {
+  /** The session the call plans for, as the orchestrator names it in the request. */
+  readonly sessionId: string | undefined;
+  /** Lets the call through to the deterministic planner. */
+  readonly release: () => void;
+}
+
+/**
+ * The real deterministic provider the suite runs on, with a gate in front of
+ * its plan stage. The gate is open unless a test holds it, so every session
+ * plans exactly as the deterministic provider plans. While it is held, each
+ * plan-stage call waits at the gate: the pipeline has indexed its project and
+ * has not yet installed anything, which is the window a test relinks a root in
+ * to prove the install refuses it.
+ *
+ * Honours the provider contract: one attempt per call, and never a throw or a
+ * rejection — a held call only resolves later, with the deterministic answer.
+ */
+interface PlanGate {
+  /** The provider handed to {@link startHarness}. */
+  readonly provider: ModelProvider;
+  /** Holds every plan-stage call from now until {@link PlanGate.release}. */
+  hold(): void;
+  /** The calls held since {@link PlanGate.hold}, oldest first. */
+  held(): readonly HeldPlanCall[];
+  /** Lets every held call through and opens the gate again. */
+  release(): void;
+}
+
+/** Builds the {@link PlanGate} around a fresh deterministic provider. */
+function createPlanGate(): PlanGate {
+  const created = createDeterministicProvider();
+  if (isErr(created)) {
+    throw new Error(`The deterministic provider could not be built: ${created.error.message}`, {
+      cause: created.error,
+    });
+  }
+  const base = created.value;
+  let holding = false;
+  const calls: HeldPlanCall[] = [];
+
+  const provider: ModelProvider = {
+    id: base.id,
+    generateText: (request) => base.generateText(request),
+    generateStructured: (schema, request) => {
+      if (!holding || request.metadata.stage !== PLAN_STAGE) {
+        return base.generateStructured(schema, request);
+      }
+      return new Promise<void>((resolve) => {
+        calls.push({ sessionId: request.metadata.sessionId, release: resolve });
+      }).then(() => base.generateStructured(schema, request));
+    },
+    callTools: (request, tools) => base.callTools(request, tools),
+  };
+
+  return {
+    provider,
+    hold: () => {
+      holding = true;
+    },
+    held: () => [...calls],
+    release: () => {
+      holding = false;
+      for (const call of calls.splice(0)) {
+        call.release();
+      }
+    },
+  };
+}
+
+/** The suite's plan-stage gate; open except inside the test that holds it. */
+const planGate = createPlanGate();
+
+/* -------------------------------------------------------------------------------------------------
  * Lifecycle
  * ---------------------------------------------------------------------------------------------- */
 
 beforeAll(async () => {
-  harness = await startHarness();
+  harness = await startHarness({ provider: planGate.provider });
   track('editor credential', harness.editorToken);
   projectA = harness.requireProject().root;
   projectB = (await harness.copyFixtureProject()).root;
@@ -1007,10 +1119,11 @@ describe('HTTP authentication', () => {
         `${operation} (${method}) without a credential`,
       );
     }
-    // The table is the service's whole surface: the credential, rotation and
-    // purge operations are rows of it, swept above like every other.
+    // The table is the service's whole surface: the credential, release,
+    // rotation and purge operations are rows of it, swept above like every other.
     for (const administrative of [
       'devServer.credential',
+      'credentials.release',
       'credentials.rotate',
       'session.purge',
     ] as const) {
@@ -2355,6 +2468,406 @@ describe('authorization by role and scope', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * The project root, re-proved where it is acted on
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The refusal of a root that is still in scope but no longer resolves to the
+ * directory it was admitted as: `reconfirmProjectRoot`'s and
+ * `reconfirmRootIdentity`'s constant sentence in `src/server/auth.ts`.
+ */
+const PROJECT_ROOT_MOVED_MESSAGE =
+  'The project root no longer resolves to the directory it was admitted as.';
+
+/** The warn record the launcher writes when a launch's confirmation refuses its root. */
+const LAUNCH_ROOT_UNCONFIRMED_LOG =
+  'The project root was not confirmed; no dev server was launched';
+
+/** The warn record the instrumentation service writes when an install's confirmation refuses its root. */
+const INSTALL_ROOT_UNCONFIRMED_LOG =
+  'The project root was not confirmed; no instrumentation was installed';
+
+/**
+ * The info record an earlier session manager wrote when it identified, at a
+ * session's first sink, a root no admission proof was handed over for. The
+ * manager now refuses such a sink instead (fail closed) and never writes it,
+ * so a session created over HTTP must never produce it.
+ */
+const ROOT_IDENTIFIED_WITHOUT_PROOF_LOG =
+  'the project root identity was established for a session this process did not admit';
+
+/**
+ * A fresh fixture copy reached through a symbolic link beside it. The editor
+ * announces and names the link, as a workspace opened through a link is, so
+ * the link can later be pointed at another directory without leaving the
+ * announced folder: scope alone would still admit it, and only the identity
+ * the root was admitted under tells the two directories apart.
+ */
+interface LinkedProject {
+  /** The link the editor announces and every request names. */
+  readonly link: string;
+  /** The fixture copy the link points at when the suite admits it. */
+  readonly root: string;
+  /** That copy's canonical path, by the native resolver the service uses. */
+  readonly canonicalRoot: string;
+}
+
+/**
+ * Copies the fixture and links it from inside the copy's own temporary
+ * container, so the harness removes the link with the copy.
+ */
+async function linkedProject(): Promise<LinkedProject> {
+  const copy = await harness.copyFixtureProject();
+  const link = join(copy.container, 'linked-project');
+  await symlink(copy.root, link, 'dir');
+  return { link, root: copy.root, canonicalRoot: await realpath(copy.root) };
+}
+
+/** Points `link` at `target`: the relink any process that can write beside the project can make. */
+async function relink(link: string, target: string): Promise<void> {
+  await rm(link, { force: true });
+  await symlink(target, link, 'dir');
+}
+
+/** Starts a TCP listener on an ephemeral loopback port and answers its address. */
+async function listenOnLoopback(server: TcpServer): Promise<number> {
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+  const address: AddressInfo | string | null = server.address();
+  if (address === null || typeof address === 'string') {
+    throw new Error('The loopback listener has no TCP address.');
+  }
+  return address.port;
+}
+
+/** The dev-server address the restart case's sessions record; nothing listens on it. */
+const RESTART_DEV_SERVER_URL = 'http://127.0.0.1:3000';
+
+/**
+ * Starts a standalone service over `stateRoot` on an ephemeral port, with the
+ * real clock: the process the restart case stops and starts again over one
+ * `$DEBUGGEN_HOME`, as `producer-replay.test.ts` does. Separate from the
+ * file's harness, whose service keeps running throughout.
+ */
+async function startStandaloneService(stateRoot: string): Promise<ServiceHandle> {
+  const started = await startService({
+    env: { DEBUGGEN_PROVIDER: 'deterministic' },
+    overrides: { debuggenHome: stateRoot, port: 0, logLevel: 'silent' },
+  });
+  if (isErr(started)) {
+    throw new Error(`startService failed: ${started.error.code}: ${started.error.message}`);
+  }
+  return started.value;
+}
+
+describe('the project root, re-proved where it is acted on (CWE-367)', () => {
+  it('refuses a launch whose root is relinked while the launcher reads the project, and spawns nothing', async () => {
+    const project = await linkedProject();
+    const elsewhere = await harness.copyFixtureProject();
+    const announcing = await harness.ws({ client: 'vscode', projectRoot: project.link });
+
+    // An address that never answers. The launcher's detection probes the
+    // requested address before it resolves the command, mints the child's
+    // credential and spawns; while that probe waits, the link is pointed at
+    // another copy of the project — the window between the route's checks and
+    // the spawn that a link swap would otherwise use.
+    let probes = 0;
+    const silent = createTcpServer((socket) => {
+      probes += 1;
+      void relink(project.link, elsewhere.root).finally(() => {
+        socket.destroy();
+      });
+    });
+    const port = await listenOnLoopback(silent);
+    try {
+      expect(announcing.authenticated).toBe(true);
+      const agentCredentialsBefore = digestsOf(credentialRowsOf('server-agent')).sort();
+      const unconfirmedBefore = harness.logger.withMessage(LAUNCH_ROOT_UNCONFIRMED_LOG).length;
+
+      const refusal = expectRefusal(
+        await fetchRaw('devServer.launch', {
+          body: {
+            projectRoot: project.link,
+            command: standInDevServerCommand(),
+            devServerUrl: `http://127.0.0.1:${String(port)}/`,
+          },
+        }),
+        'project-out-of-scope',
+        'a launch whose root was relinked while it was under way',
+      );
+      expect(refusal.message).toBe(PROJECT_ROOT_MOVED_MESSAGE);
+      expect(probes, 'the launcher probed the requested address').toBeGreaterThan(0);
+
+      // Refused by the launcher's last confirmation, immediately before the
+      // spawn: the credential minted for the child is revoked again, and no
+      // child was ever registered for the project.
+      const unconfirmed = harness.logger
+        .withMessage(LAUNCH_ROOT_UNCONFIRMED_LOG)
+        .slice(unconfirmedBefore);
+      expect(unconfirmed.map((record) => record.fields['stage'])).toEqual(['before-spawn']);
+      expect(digestsOf(credentialRowsOf('server-agent')).sort()).toEqual(agentCredentialsBefore);
+      const stopped = await fetchRaw('devServer.stop', { body: { projectRoot: project.link } });
+      expectSuccess(stopped, 'devServer.stop');
+      expect(stopped.json).toStrictEqual({ stopped: false });
+    } finally {
+      await new Promise<void>((resolve) => {
+        silent.close(() => {
+          resolve();
+        });
+      });
+      await announcing.close();
+    }
+  });
+
+  it('holds a session created through a link to the directory it was admitted as, and refuses the root once relinked', async () => {
+    const project = await linkedProject();
+    const elsewhere = await harness.copyFixtureProject();
+    const identifiedBefore = harness.logger.withMessage(ROOT_IDENTIFIED_WITHOUT_PROOF_LOG).length;
+
+    // Launched through the link: admitted, confirmed before detection and
+    // before the spawn, and spawned — the checks refuse nothing that did not move.
+    const launched = await harness.launchDevServer(project.link);
+    expect(isErr(launched), 'the launch through an unmoved link').toBe(false);
+    const session = await harness.createSession({ projectRoot: project.link, question: QUESTION });
+
+    // The session keeps the root as the editor spells it, while the canonical
+    // directory it was admitted as travels with it from the create request —
+    // handed over, not identified afterwards by the first sink.
+    expect(session.projectRoot).toBe(project.link);
+    const admitted = harness.manager.confirmProjectRoot(session.id);
+    if (isErr(admitted)) {
+      throw new Error(`The admitted root was refused (${admitted.error.code}).`);
+    }
+    expect(admitted.value).toStrictEqual({
+      projectRoot: project.link,
+      canonicalRoot: project.canonicalRoot,
+    });
+
+    // The pipeline indexed and installed in that directory: both sinks confirmed
+    // it and the session reached the readiness gate.
+    const settled = await harness.waitForSession(session.id, (record) =>
+      ['instrumenting', 'ready', 'failed'].includes(record.status),
+    );
+    expect(settled.status, 'the pipeline ran through its confirmed sinks').not.toBe('failed');
+    expect(harness.logger.withMessage(ROOT_IDENTIFIED_WITHOUT_PROOF_LOG)).toHaveLength(
+      identifiedBefore,
+    );
+
+    await relink(project.link, elsewhere.root);
+    try {
+      // The link still names the announced folder, so scope alone admits the
+      // session's requests …
+      expectSuccess(await fetchRaw(targetFor('session.get', session.id)), 'session.get');
+      // … but the root is no longer the directory the session was admitted
+      // as, so every sink that would act on it is refused.
+      const moved = harness.manager.confirmProjectRoot(session.id);
+      if (!isErr(moved)) {
+        throw new Error('A relinked project root was confirmed for a sink.');
+      }
+      expect(moved.error.code).toBe(AUTH_FAILURE_REASONS['project-out-of-scope'].code);
+      expect(moved.error.message).toBe(PROJECT_ROOT_MOVED_MESSAGE);
+    } finally {
+      // Pointed back before the session ends, so cleanup restores the
+      // directory that was instrumented.
+      await relink(project.link, project.root);
+    }
+    expectSuccess(
+      await fetchRaw(targetFor('session.end', session.id), { body: {} }),
+      'session.end',
+    );
+  });
+
+  it('fails a session whose root is relinked while its pipeline plans, at the install, and writes to neither directory', async () => {
+    const project = await linkedProject();
+    const elsewhere = await harness.copyFixtureProject();
+    const launched = await harness.launchDevServer(project.link);
+    expect(isErr(launched), 'the launch through an unmoved link').toBe(false);
+    const admittedBefore = await snapshotTree(project.root);
+    const elsewhereBefore = await snapshotTree(elsewhere.root);
+    const refusedBefore = harness.logger.withMessage(INSTALL_ROOT_UNCONFIRMED_LOG).length;
+
+    // The pipeline indexes the directory the session was admitted as, then
+    // waits at the gate in its plan stage — before anything is installed. The
+    // link is pointed at another copy of the project there: still inside the
+    // announced folder, so only the admitted identity tells the two apart.
+    let session: SessionRecord;
+    planGate.hold();
+    try {
+      session = await harness.createSession({ projectRoot: project.link, question: QUESTION });
+      const planning = session.id;
+      await waitUntil(
+        () => (planGate.held().some((call) => call.sessionId === planning) ? true : undefined),
+        'the session’s plan-stage call reached the gate',
+        HARNESS_TIMEOUTS.pipeline,
+      );
+      await relink(project.link, elsewhere.root);
+    } finally {
+      planGate.release();
+    }
+
+    // The install re-proves the root before its first act on it, and the
+    // session fails at the instrument stage with the manager's refusal: a
+    // stage-failure row, the only kind whose detail carries an error code. An
+    // install that went ahead instead reports each signal as an instrument-stage
+    // row — `done`, or `failed` without an error code for a signal that is
+    // unavailable with no bound tab — so the wait ends on either outcome.
+    const created = session.id;
+    const movedCode = `error code: ${AUTH_FAILURE_REASONS['project-out-of-scope'].code}`;
+    const progressRowsOf = (): readonly ProgressEntry[] => {
+      const listed = harness.repos.sessions.listProgress(created);
+      if (isErr(listed)) {
+        throw new Error(`listProgress failed (${listed.error.code})`);
+      }
+      return listed.value;
+    };
+    const detailOf = (entry: ProgressEntry): string => JSON.stringify(entry.detail ?? '');
+    const outcome = await waitUntil(
+      () => {
+        const rows = progressRowsOf();
+        if (
+          rows.some((entry) => entry.status === 'failed' && detailOf(entry).includes(movedCode))
+        ) {
+          return 'refused';
+        }
+        const installed = rows.some(
+          (entry) =>
+            entry.stage === 'instrument' &&
+            (entry.status === 'done' ||
+              (entry.status === 'failed' && !detailOf(entry).includes('error code:'))),
+        );
+        return installed ? 'installed' : undefined;
+      },
+      'the install settled',
+      HARNESS_TIMEOUTS.pipeline,
+    );
+    expect(outcome, 'the install of a session whose root was relinked').toBe('refused');
+    const settled = await harness.waitForSession(created, (record) => record.status === 'failed');
+    expect(settled.status).toBe('failed');
+    const failedRows = progressRowsOf().filter((entry) => entry.status === 'failed');
+    expect(new Set(failedRows.map((entry) => entry.stage))).toEqual(new Set(['instrument']));
+    expect(failedRows.every((entry) => detailOf(entry).includes(movedCode))).toBe(true);
+    const refused = harness.logger.withMessage(INSTALL_ROOT_UNCONFIRMED_LOG).slice(refusedBefore);
+    expect(refused.map((record) => record.fields['stage'])).toEqual(['before-state-root-check']);
+    expect(refused.map((record) => record.fields['code'])).toEqual([
+      AUTH_FAILURE_REASONS['project-out-of-scope'].code,
+    ]);
+
+    // Nothing was journaled, and neither directory was written: not the one
+    // the session was admitted as, nor the one the link leads to now.
+    const journaled = await harness.repos.modifications.listBySession(session.id);
+    if (isErr(journaled)) {
+      throw new Error(`listBySession failed (${journaled.error.code})`);
+    }
+    expect(journaled.value).toEqual([]);
+    await assertTreeUnchanged(project.root, admittedBefore);
+    await assertTreeUnchanged(elsewhere.root, elsewhereBefore);
+
+    await relink(project.link, project.root);
+    expectSuccess(
+      await fetchRaw(targetFor('session.end', session.id), { body: {} }),
+      'session.end',
+    );
+  });
+
+  it('holds a session to the identity stored with it across a restart, and refuses a root relinked while the service was down', async () => {
+    const container = await mkdtemp(join(await realpath(tmpdir()), 'debuggen-auth-restart-'));
+    const running: ServiceHandle[] = [];
+    try {
+      const stateRoot = join(container, 'home');
+      const project = join(container, 'project');
+      const elsewhere = join(container, 'elsewhere');
+      await mkdir(project);
+      await mkdir(elsewhere);
+      const canonicalProject = await realpath(project);
+      // Two links to one project: one stays put across the restart, the other
+      // is relinked while no service is running to see it.
+      const steady = join(container, 'linked-steady');
+      const relinked = join(container, 'linked-relinked');
+      await symlink(project, steady, 'dir');
+      await symlink(project, relinked, 'dir');
+
+      // The first process stores both sessions with the proof the create
+      // route hands over: the link's identity, taken where it leads now.
+      const first = await startStandaloneService(stateRoot);
+      running.push(first);
+      const createThrough = async (link: string): Promise<SessionRecord> => {
+        const admitted = identifyProjectRoot(link);
+        if (isErr(admitted)) {
+          throw new Error(`The linked project could not be identified (${admitted.error.code}).`);
+        }
+        const created = await first.manager.create({
+          projectRoot: link,
+          question: QUESTION,
+          devServerUrl: RESTART_DEV_SERVER_URL,
+          admittedRoot: admitted.value,
+        });
+        if (isErr(created)) {
+          throw new Error(`The session was refused (${created.error.code}).`);
+        }
+        return created.value;
+      };
+      const steadySession = await createThrough(steady);
+      const relinkedSession = await createThrough(relinked);
+
+      // Stopped as a killed process leaves it: `retain` keeps both sessions
+      // live for the next start. The link is pointed elsewhere while down.
+      running.splice(running.indexOf(first), 1);
+      await first.close({ liveSessions: 'retain' });
+      await relink(relinked, elsewhere);
+
+      const second = await startStandaloneService(stateRoot);
+      running.push(second);
+      const stored = createSessionsRepo({ store: second.store });
+
+      // Unmoved: confirmed as the canonical path stored with the session.
+      const confirmed = second.manager.confirmProjectRoot(steadySession.id);
+      if (isErr(confirmed)) {
+        throw new Error(`An unmoved root was refused after the restart (${confirmed.error.code}).`);
+      }
+      expect(confirmed.value).toStrictEqual({
+        projectRoot: steady,
+        canonicalRoot: canonicalProject,
+      });
+      const steadyIdentity = stored.getRootIdentity(steadySession.id);
+      expect(isErr(steadyIdentity) ? steadyIdentity.error.code : steadyIdentity.value).toBe(
+        canonicalProject,
+      );
+
+      // Relinked while the service was down: the restarted process holds the
+      // session to the stored identity, not to where the link leads now.
+      const moved = second.manager.confirmProjectRoot(relinkedSession.id);
+      if (!isErr(moved)) {
+        throw new Error('A root relinked while the service was down was confirmed for a sink.');
+      }
+      expect(moved.error.code).toBe(AUTH_FAILURE_REASONS['project-out-of-scope'].code);
+      expect(moved.error.message).toBe(PROJECT_ROOT_MOVED_MESSAGE);
+      const relinkedIdentity = stored.getRootIdentity(relinkedSession.id);
+      expect(isErr(relinkedIdentity) ? relinkedIdentity.error.code : relinkedIdentity.value).toBe(
+        canonicalProject,
+      );
+
+      // Relinked after the restart, the unmoved session is refused the same way.
+      await relink(steady, elsewhere);
+      const movedLater = second.manager.confirmProjectRoot(steadySession.id);
+      if (!isErr(movedLater)) {
+        throw new Error('A root relinked after the restart was confirmed for a sink.');
+      }
+      expect(movedLater.error.message).toBe(PROJECT_ROOT_MOVED_MESSAGE);
+    } finally {
+      for (const handle of running.splice(0)) {
+        await handle.close();
+      }
+      await rm(container, { recursive: true, force: true });
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
  * Retention on request
  * ---------------------------------------------------------------------------------------------- */
 
@@ -2706,6 +3219,279 @@ describe('rotation and revocation', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * Releasing a dev-server credential
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The record the launcher writes when a `devServer.credential` lease it
+ * supervises is revoked at its holder's request.
+ */
+const CLI_LEASE_RELEASED_LOG =
+  "The server-agent credential of a dev server started outside the service is revoked at its holder's request";
+
+/**
+ * The record the launcher writes when a release reached the access boundary's
+ * own `releaseServerAgentCredential` — a token it does not supervise — and
+ * that revoked one.
+ */
+const UNSUPERVISED_RELEASED_LOG = "Released a server-agent credential at its holder's request";
+
+/** The record the access boundary writes for every server-agent credential it revokes. */
+const SERVER_AGENT_REVOKED_LOG = 'revoked a server-agent credential';
+
+/**
+ * The record the launcher writes when the holder of a `devServer.credential`
+ * lease it supervises released it, but the revocation removed nothing — a
+ * rotation had already deleted the credential, or its lease had lapsed — so
+ * the release answered `released: false`.
+ */
+const CLI_LEASE_NOT_LIVE_LOG =
+  'The server-agent credential of a dev server started outside the service was no longer live when its holder released it; its supervision is over';
+
+/**
+ * The records a release that got past the revocation fence writes for what it
+ * found — a supervised lease, live or not, a launched child's own credential,
+ * a credential the access boundary released, or none it may release — so
+ * their absence proves the fence refused it first.
+ */
+const RELEASE_ACTION_LOGS: readonly string[] = [
+  CLI_LEASE_RELEASED_LOG,
+  CLI_LEASE_NOT_LIVE_LOG,
+  "A credential release named a launched dev server's own credential; it is left to that dev server's stop",
+  UNSUPERVISED_RELEASED_LOG,
+  "released a server-agent credential at its holder's request",
+  'a server-agent credential release found no releasable credential',
+];
+
+/**
+ * The records with any of the {@link RELEASE_ACTION_LOGS} messages the
+ * service's logger wrote after `mark` records.
+ */
+function releaseActionsSince(mark: number): readonly CapturedLogRecord[] {
+  return harness.logger.records
+    .slice(mark)
+    .filter((record) => RELEASE_ACTION_LOGS.includes(record.message));
+}
+
+/** How many rows the whole `telemetry_events` table holds, across every session. */
+function telemetryRowCount(): number {
+  const count = readRows('SELECT COUNT(*) AS count FROM telemetry_events')[0]?.['count'];
+  if (typeof count !== 'number') {
+    throw new Error('The telemetry_events row count could not be read.');
+  }
+  return count;
+}
+
+/**
+ * The `released` flag of a successful `POST /credentials/release` reply,
+ * after the shared success checks: the route's own strict response schema,
+ * `Cache-Control: no-store`, and nothing but that one flag in the body.
+ */
+function releasedFlagOf(response: RawFetchResponse): boolean {
+  expectSuccess(response, 'credentials.release');
+  expect(response.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
+  expect(bodyKeys(response)).toEqual(['released']);
+  const parsed = HTTP_ROUTES['credentials.release'].response.safeParse(response.json);
+  if (!parsed.success) {
+    throw new Error('The credential release reply does not satisfy its schema.');
+  }
+  return parsed.data.released;
+}
+
+/**
+ * How long the stand-in for a launched child's lease that the release suite
+ * issues stays valid: long enough to outlast the test on the harness clock,
+ * which moves only as the service reads it.
+ */
+const STAND_IN_LEASE_MS = 60_000;
+
+describe('releasing a dev-server credential', () => {
+  it('revokes a dev-server credential for the editor at once: its row, its socket and its ingest', async () => {
+    await harness.editor(projectA);
+    const token = await mintDevServerCredential(projectA);
+
+    // Live before the release: it ingests, and its control connection authenticates.
+    expect((await ingest(token, projectA)).status).toBe(202);
+    const socket = await harness.ws({ client: 'server-agent', projectRoot: projectA, token });
+    expect(socket.authenticated).toBe(true);
+    const closesBefore = socket.closes.length;
+    const logMark = harness.logger.records.length;
+
+    // The editor releases it, as `scripts/dev-instrumented.mjs` does once its dev server has exited.
+    expect(releasedFlagOf(await fetchRaw('credentials.release', { body: { token } }))).toBe(true);
+
+    // The row is gone, its socket was closed with the credential-refusal code,
+    // and it authenticates nothing more on either transport.
+    expect(storedDigests().has(sha256Hex(token))).toBe(false);
+    const closed = await socket.waitForClose(HARNESS_TIMEOUTS.message, closesBefore);
+    expect(closed.code).toBe(WS_CLOSE_UNAUTHORIZED);
+    expectRefusal(
+      await ingest(token, projectA),
+      'unknown-credential',
+      'ingest with a released credential',
+    );
+    await expectHelloRefused(hello('server-agent', token, { projectRoot: projectA }));
+
+    // The launcher ended its supervision and revoked it through the access
+    // boundary, which closed the one socket authenticated with it.
+    expect(logsSince(logMark, CLI_LEASE_RELEASED_LOG)).toHaveLength(1);
+    const revoked = logsSince(logMark, SERVER_AGENT_REVOKED_LOG);
+    expect(revoked).toHaveLength(1);
+    expect(revoked[0]?.fields['revoked']).toBe(true);
+    expect(revoked[0]?.fields['socketsClosed']).toBe(1);
+
+    // Releasing it again finds nothing live: the same success, `released: false`.
+    expect(releasedFlagOf(await fetchRaw('credentials.release', { body: { token } }))).toBe(false);
+    // One credential was released, and only that one: the editor still acts.
+    expectSuccess(await fetchRaw('session.list'), 'session.list');
+    await socket.close();
+  });
+
+  it('answers released: false for a supervised dev-server credential a rotation already removed', async () => {
+    const held = await announcedEditors();
+    const token = await mintDevServerCredential(projectA);
+    expect((await ingest(token, projectA)).status).toBe(202);
+
+    // The editor rotates every credential while the service still supervises
+    // this one: its row is gone, and nothing has told the launcher, whose
+    // lease for it runs on (no preload ever connected with it).
+    await rotateThroughRoute(harness.editorToken, held);
+    expect(storedDigests().has(sha256Hex(token))).toBe(false);
+    await adoptRotatedEditor();
+    const logMark = harness.logger.records.length;
+
+    // Its holder releases it with the replacement editor credential. The
+    // supervised lease is found and revoked, but the store no longer held the
+    // credential: this request removed nothing, and the reply says exactly that.
+    expect(releasedFlagOf(await fetchRaw('credentials.release', { body: { token } }))).toBe(false);
+    expect(logsSince(logMark, CLI_LEASE_RELEASED_LOG)).toEqual([]);
+    const notLive = logsSince(logMark, CLI_LEASE_NOT_LIVE_LOG);
+    expect(notLive).toHaveLength(1);
+    expect(notLive[0]?.fields['removed']).toBe(false);
+    expect(notLive[0]?.fields['lapsed']).toBe(false);
+    const revoked = logsSince(logMark, SERVER_AGENT_REVOKED_LOG);
+    expect(revoked).toHaveLength(1);
+    expect(revoked[0]?.fields['revoked']).toBe(false);
+    expectRefusal(
+      await ingest(token, projectA),
+      'unknown-credential',
+      'ingest with a credential a rotation removed before its release',
+    );
+
+    // The release ended its supervision: a repeat is answered by the access
+    // boundary's own release, which finds nothing either.
+    expect(releasedFlagOf(await fetchRaw('credentials.release', { body: { token } }))).toBe(false);
+    expect(logsSince(logMark, CLI_LEASE_NOT_LIVE_LOG)).toHaveLength(1);
+    expect(logsSince(logMark, UNSUPERVISED_RELEASED_LOG)).toEqual([]);
+    expectSuccess(await fetchRaw('session.list'), 'session.list');
+  });
+
+  it('answers released: false, and revokes nothing, for a token that names no live dev-server credential', async () => {
+    const devtools = harness.issueDevtoolsCredential();
+    track('devtools credential', devtools.token);
+    // A lease as the launcher issues one to a dev server it starts itself: only
+    // that dev server's exit or stop revokes it, never a caller naming its token.
+    const lease = harness.auth.issueServerAgentCredential({
+      projectRoot: projectA,
+      expiresAt: requireClock().peek() + STAND_IN_LEASE_MS,
+      lease: true,
+    });
+    if (isErr(lease)) {
+      throw new Error(`The stand-in lease was not issued (${lease.error.code}).`);
+    }
+    const leased = track('launched dev server lease', lease.value.token);
+    const digestsBefore = storedDigests();
+    const logMark = harness.logger.records.length;
+
+    const cases: readonly (readonly [string, { readonly token: string }])[] = [
+      ['an unissued credential', unissuedReleaseBody()],
+      ['a DevTools credential', { token: devtools.token }],
+      ['the editor credential itself', { token: harness.editorToken }],
+      ["a launched dev server's lease", { token: leased }],
+    ];
+    for (const [label, body] of cases) {
+      const response = await fetchRaw('credentials.release', { body });
+      expect(releasedFlagOf(response), label).toBe(false);
+    }
+
+    // Every credential stands and still authenticates; nothing was revoked.
+    expect(storedDigests()).toEqual(digestsBefore);
+    expectSuccess(await fetchRaw('session.list'), 'session.list');
+    expect((await ingest(leased, projectA)).status).toBe(202);
+    expect(logsSince(logMark, SERVER_AGENT_REVOKED_LOG)).toEqual([]);
+    expect(logsSince(logMark, CLI_LEASE_RELEASED_LOG)).toEqual([]);
+    expect(logsSince(logMark, UNSUPERVISED_RELEASED_LOG)).toEqual([]);
+  });
+
+  it('refuses a release from every credential but the editor’s, before its body is read', async () => {
+    const token = await mintDevServerCredential(projectA);
+    const devtools = harness.issueDevtoolsCredential();
+    track('devtools credential', devtools.token);
+    const logMark = harness.logger.records.length;
+
+    expectRefusal(
+      await fetchRaw('credentials.release', { token: null, body: { token } }),
+      'missing-credential',
+      'credentials.release without a credential',
+    );
+    expectRefusal(
+      await fetchRaw('credentials.release', { ...presenting(devtools), body: { token } }),
+      'role-not-permitted',
+      'devtools → credentials.release',
+    );
+    // A server agent cannot release even its own credential: its lifetime is
+    // its process's, ended by whoever started that process.
+    expectRefusal(
+      await fetchRaw('credentials.release', { token, body: { token } }),
+      'role-not-permitted',
+      'server-agent → credentials.release of its own credential',
+    );
+
+    // Nothing was released: the credential is stored, still ingests, and no release ran.
+    expect(storedDigests().has(sha256Hex(token))).toBe(true);
+    expect((await ingest(token, projectA)).status).toBe(202);
+    expect(releaseActionsSince(logMark)).toEqual([]);
+
+    expect(releasedFlagOf(await fetchRaw('credentials.release', { body: { token } }))).toBe(true);
+  });
+
+  it('refuses a release body that is not exactly { token }, in words that never carry the token', async () => {
+    const token = await mintDevServerCredential(projectA);
+    const logMark = harness.logger.records.length;
+
+    const bodies: readonly (readonly [string, unknown])[] = [
+      ['no body', undefined],
+      ['a body that is not JSON', 'not json'],
+      ['an empty object', {}],
+      ['the token beside an extra key', { token, projectRoot: projectA }],
+      ['the token beside a widening flag', { token, all: true }],
+      ['the token as a key', { [token]: true }],
+      ['the token under another name', { credential: token }],
+      ['the token inside an array', { token: [token] }],
+    ];
+    for (const [label, body] of bodies) {
+      const response = await fetchRaw('credentials.release', { body });
+      expect(response.status, label).toBe(INVALID_BODY_STATUS);
+      expect(refusalShape(response).code, label).toBe(INVALID_BODY_CODE);
+      expect(response.text.includes(token), `${label}: the refusal echoes the token`).toBe(false);
+      expect(response.headers.get(CACHE_CONTROL_HEADER), label).toContain(NO_STORE_DIRECTIVE);
+    }
+
+    // Nothing was released, and no record names the token.
+    expect(storedDigests().has(sha256Hex(token))).toBe(true);
+    expect(releaseActionsSince(logMark)).toEqual([]);
+    assertNothingLogged();
+
+    expect(releasedFlagOf(await fetchRaw('credentials.release', { body: { token } }))).toBe(true);
+  });
+
+  it('keeps every released credential out of replies, the log and the store', async () => {
+    await assertNoPlaintextAtRest();
+    assertNothingLogged();
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
  * The revocation fence across a stalled request body
  * ---------------------------------------------------------------------------------------------- */
 
@@ -2719,8 +3505,28 @@ const SERVER_AGENT_ISSUED_LOG = 'issued a server-agent credential';
 /** The record the access boundary writes once per completed rotation. */
 const ROTATION_LOG = 'rotated every service credential';
 
-/** The editor operations whose side effect the fence is proven on across a stalled body. */
-type StalledOperation = 'devServer.credential' | 'session.purge' | 'credentials.rotate';
+/** The record the access boundary writes for every pairing code it mints. */
+const PAIRING_CODE_ISSUED_LOG = 'issued a pairing code';
+
+/** The debug record the ingest route writes for every batch it answered `202`. */
+const INGEST_ANSWERED_LOG = 'telemetry ingest request answered';
+
+/** The debug record the ingest route writes when the fence refused a batch's credential. */
+const INGEST_FENCED_LOG =
+  'refused telemetry ingest for a credential retired while its body was read';
+
+/**
+ * The operations whose side effect the fence is proven on across a stalled
+ * body: the editor's credential request, purge, rotation, pairing and release,
+ * and the server agent's ingest (`telemetry.event`, `POST /telemetry/ingest`).
+ */
+type StalledOperation =
+  | 'devServer.credential'
+  | 'session.purge'
+  | 'credentials.rotate'
+  | 'credentials.release'
+  | 'pair.start'
+  | 'telemetry.event';
 
 /** A request whose body is held back part-way after the middleware authenticated it. */
 interface StalledRequest {
@@ -2891,6 +3697,29 @@ async function announcedEditors(): Promise<readonly HarnessWsClient[]> {
   return [await harness.editor(projectA), await harness.editor(projectB)];
 }
 
+/** The body a stalled `POST /telemetry/ingest` carries: the preload's batch, for `projectRoot`. */
+function ingestBodyFor(projectRoot: string): object {
+  return { projectRoot, events: [...serverEvents] };
+}
+
+/**
+ * Asserts that the fence — not the middleware, which had authenticated the
+ * request before its credential was retired — refused exactly one request
+ * after `mark` records: a `role` credential's, as no longer known.
+ */
+function expectOneFenceRefusal(mark: number, role: PrincipalRole): void {
+  const fenced = logsSince(mark, FENCE_REFUSAL_LOG);
+  expect(fenced).toHaveLength(1);
+  expect(fenced[0]?.fields['reason']).toBe('unknown-credential');
+  expect(fenced[0]?.fields['role']).toBe(role);
+}
+
+/** Whether a `pairing_codes` row keys on `code`'s digest — the code was minted and stored. */
+function pairingCodeStored(code: string): boolean {
+  const digest = sha256Hex(code);
+  return readRows(SELECT_PAIRING_CODES).some((row) => row['code_hash'] === digest);
+}
+
 describe('the revocation fence across a stalled request body', () => {
   it('completes a stalled credential request and a stalled purge whose credential stayed live', async () => {
     await announcedEditors();
@@ -2920,6 +3749,50 @@ describe('the revocation fence across a stalled request body', () => {
     expect(logsSince(logMark, PURGE_REQUEST_LOG)).toHaveLength(1);
     expect(logsSince(logMark, RETENTION_SWEEP_LOG)).toHaveLength(1);
     expect(logsSince(logMark, FENCE_REFUSAL_LOG)).toEqual([]);
+  });
+
+  it('completes a stalled pairing request, ingest batch and release whose credential stayed live', async () => {
+    await announcedEditors();
+    const logMark = harness.logger.records.length;
+
+    // pair.start: a code is minted, stored as its digest, and handed back once.
+    const pairing = await stallRequest('pair.start', {}, harness.editorToken);
+    const paired = await pairing.resume();
+    expect(paired.status, 'pair.start: status').toBe(200);
+    expect(paired.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
+    const issued = pairStartResponseSchema.safeParse(paired.json);
+    if (!issued.success) {
+      throw new Error('The pair.start reply does not satisfy its schema.');
+    }
+    const code = track('pairing code', issued.data.code);
+    expect(pairingCodeStored(code)).toBe(true);
+    expect(logsSince(logMark, PAIRING_CODE_ISSUED_LOG)).toHaveLength(1);
+
+    // telemetry.event: the batch reaches ingest, which stores exactly what it reports accepting.
+    const agentToken = await mintDevServerCredential(projectA);
+    const rowsBefore = telemetryRowCount();
+    const ingesting = await stallRequest('telemetry.event', ingestBodyFor(projectA), agentToken);
+    const ingested = await ingesting.resume();
+    expect(ingested.status, 'telemetry.event: status').toBe(202);
+    const report = telemetryIngestResponseSchema.safeParse(ingested.json);
+    if (!report.success) {
+      throw new Error('The ingest reply does not satisfy its schema.');
+    }
+    expect(telemetryRowCount() - rowsBefore).toBe(report.data.accepted);
+    expect(logsSince(logMark, INGEST_ANSWERED_LOG)).toHaveLength(1);
+
+    // credentials.release: the same credential is revoked by its holder's editor.
+    const releasing = await stallRequest(
+      'credentials.release',
+      { token: agentToken },
+      harness.editorToken,
+    );
+    expect(releasedFlagOf(await releasing.resume())).toBe(true);
+    expect(storedDigests().has(sha256Hex(agentToken))).toBe(false);
+    expect(logsSince(logMark, CLI_LEASE_RELEASED_LOG)).toHaveLength(1);
+
+    expect(logsSince(logMark, FENCE_REFUSAL_LOG)).toEqual([]);
+    expect(logsSince(logMark, INGEST_FENCED_LOG)).toEqual([]);
   });
 
   it('refuses a stalled credential request whose editor credential a rotation retired, and mints nothing', async () => {
@@ -3008,6 +3881,117 @@ describe('the revocation fence across a stalled request body', () => {
     expect(await sha256OfFile(harness.config.authFilePath)).toBe(authFileAfterRotation);
     expect(logsSince(logMark, ROTATION_LOG)).toEqual([]);
     expect(logsSince(logMark, FENCE_REFUSAL_LOG)).toHaveLength(1);
+
+    await adoptRotatedEditor();
+  });
+
+  it('refuses a stalled pairing request whose editor credential a rotation retired, and mints no code', async () => {
+    const held = await announcedEditors();
+    const retired = harness.editorToken;
+    const stalled = await stallRequest('pair.start', {}, retired);
+
+    // The rotation deletes every credential and every outstanding pairing code.
+    await rotateThroughRoute(retired, held);
+    const codesAfterRotation = readRows(SELECT_PAIRING_CODES);
+    const logMark = harness.logger.records.length;
+
+    const response = await stalled.resume();
+    const refusal = expectRefusal(
+      response,
+      'unknown-credential',
+      'a pairing request resumed after its credential was rotated',
+    );
+    expect(refusal.message).toBe(AUTH_FAILURE_REASONS['unknown-credential'].message);
+    expect(response.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
+    // No code in the reply, none stored behind it, and the minting never ran.
+    expect(pairStartResponseSchema.safeParse(response.json).success).toBe(false);
+    expect(bodyKeys(response)).not.toContain('expiresAt');
+    expect(readRows(SELECT_PAIRING_CODES)).toEqual(codesAfterRotation);
+    expect(logsSince(logMark, PAIRING_CODE_ISSUED_LOG)).toEqual([]);
+    expectOneFenceRefusal(logMark, 'vscode');
+
+    await adoptRotatedEditor();
+  });
+
+  it('refuses a stalled ingest batch whose server-agent credential a rotation retired, and stores nothing', async () => {
+    const held = await announcedEditors();
+    const agentToken = await mintDevServerCredential(projectA);
+    const stalled = await stallRequest('telemetry.event', ingestBodyFor(projectA), agentToken);
+    const rowsBefore = telemetryRowCount();
+
+    await rotateThroughRoute(harness.editorToken, held);
+    expect(storedDigests().has(sha256Hex(agentToken))).toBe(false);
+    const logMark = harness.logger.records.length;
+
+    const response = await stalled.resume();
+    expectRefusal(
+      response,
+      'unknown-credential',
+      'an ingest batch resumed after its credential was rotated',
+    );
+    // Nothing reached ingest: no count in the reply, no row stored, no batch answered.
+    expect(telemetryIngestResponseSchema.safeParse(response.json).success).toBe(false);
+    expect(telemetryRowCount()).toBe(rowsBefore);
+    expect(logsSince(logMark, INGEST_ANSWERED_LOG)).toEqual([]);
+    expect(logsSince(logMark, INGEST_FENCED_LOG)).toHaveLength(1);
+    expectOneFenceRefusal(logMark, 'server-agent');
+
+    await adoptRotatedEditor();
+  });
+
+  it('refuses a stalled ingest batch whose server-agent credential its holder released, and stores nothing', async () => {
+    await announcedEditors();
+    const agentToken = await mintDevServerCredential(projectA);
+    const stalled = await stallRequest('telemetry.event', ingestBodyFor(projectA), agentToken);
+    const rowsBefore = telemetryRowCount();
+
+    // The editor releases the credential, as `scripts/dev-instrumented.mjs` does
+    // once its dev server has exited, while the batch's body is still arriving.
+    expect(
+      releasedFlagOf(await fetchRaw('credentials.release', { body: { token: agentToken } })),
+    ).toBe(true);
+    expect(storedDigests().has(sha256Hex(agentToken))).toBe(false);
+    const logMark = harness.logger.records.length;
+
+    const response = await stalled.resume();
+    expectRefusal(
+      response,
+      'unknown-credential',
+      'an ingest batch resumed after its credential was released',
+    );
+    expect(telemetryIngestResponseSchema.safeParse(response.json).success).toBe(false);
+    expect(telemetryRowCount()).toBe(rowsBefore);
+    expect(logsSince(logMark, INGEST_ANSWERED_LOG)).toEqual([]);
+    expect(logsSince(logMark, INGEST_FENCED_LOG)).toHaveLength(1);
+    expectOneFenceRefusal(logMark, 'server-agent');
+
+    // A release retires one credential only: the editor that asked for it still acts.
+    expectSuccess(await fetchRaw('session.list'), 'session.list');
+  });
+
+  it('refuses a stalled release whose editor credential a rotation retired, and revokes nothing more', async () => {
+    const held = await announcedEditors();
+    const retired = harness.editorToken;
+    const target = await mintDevServerCredential(projectA);
+    const stalled = await stallRequest('credentials.release', { token: target }, retired);
+
+    await rotateThroughRoute(retired, held);
+    const digestsAfterRotation = storedDigests();
+    const logMark = harness.logger.records.length;
+
+    const response = await stalled.resume();
+    expectRefusal(
+      response,
+      'unknown-credential',
+      'a release resumed after its credential was rotated',
+    );
+    expect(response.headers.get(CACHE_CONTROL_HEADER)).toContain(NO_STORE_DIRECTIVE);
+    expect(bodyKeys(response)).not.toContain('released');
+    // The launcher was never asked: no release ran, and nothing more was revoked.
+    expect(storedDigests()).toEqual(digestsAfterRotation);
+    expect(releaseActionsSince(logMark)).toEqual([]);
+    expect(logsSince(logMark, SERVER_AGENT_REVOKED_LOG)).toEqual([]);
+    expectOneFenceRefusal(logMark, 'vscode');
 
     await adoptRotatedEditor();
   });

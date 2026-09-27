@@ -101,12 +101,13 @@
  * - `--dgc-split-weight` — a unitless positive factor, set inline on a
  *   `dg-split__pane` only when {@link SplitProps.weights} supplied a usable
  *   number for that pane's position. The stylesheet consumes it twice, both
- *   declared *after* the `flex` shorthand so they override it: as
- *   `flex-grow: var(--dgc-split-weight, 1)` and as the multiplier of the shared
- *   pane basis. Multiplying both is what makes a pane's size proportional to
- *   its weight rather than merely greedier for the leftover space, and the `1`
- *   fallback is what makes unweighted panes equal — a pane with no weight of
- *   its own renders exactly as it would if weights did not exist.
+ *   declared *after* the `flex` shorthand so they override it: as the grow
+ *   factor, scaled by `--dg-split-grow-scale`, and as the multiplier of the
+ *   shared pane basis (`--dg-split-pane-basis`). Multiplying both is what makes
+ *   a pane's size proportional to its weight rather than merely greedier for
+ *   the leftover space, and the fallback — the `--dg-split-pane-weight` token,
+ *   a weight of one — is what makes unweighted panes equal: a pane with no
+ *   weight of its own renders exactly as it would if weights did not exist.
  *
  * Two facts about those rules matter to anyone reading the markup below.
  * First, every variant class sits on the **block** and is resolved onto

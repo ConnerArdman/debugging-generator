@@ -17,6 +17,18 @@
  *   `chrome.storage.local` and no accessor is injected, the field is not
  *   rendered and the dialog behaves exactly as before.
  *
+ * And for the address mode, which changes the address of a panel that is
+ * already paired:
+ *
+ * - **The address alone.** No code field; the address field takes focus on
+ *   open and after a refusal; an edited address is saved in canonical form,
+ *   then `onAddressSaved` and `onClose` run — and `submitCode` never does.
+ * - **Only what needs saving is saved.** An untouched, usable address closes
+ *   the dialog without a write; an unusable saved value is rewritten, and a
+ *   blank field restores the default. A refusal stays on the field.
+ * - **No storage, no pretence.** Without an accessor the dialog says the
+ *   address cannot be changed from this page and offers "Cancel" alone.
+ *
  * **Harness.** Collected by the root `vitest.config.ts` into the
  * `chrome-extension` project (happy-dom). The accessor is the real
  * `createServiceEndpointAccessor` over an in-memory storage area, so the
@@ -26,8 +38,8 @@
  */
 
 import type { Result } from '@debuggen/shared';
-import { DebuggenError, err } from '@debuggen/shared';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { DebuggenError, err, ok } from '@debuggen/shared';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { Mock } from 'vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -37,7 +49,8 @@ import {
   createServiceEndpointAccessor,
   SERVICE_ENDPOINT_STORAGE_KEY,
 } from '../src/background/auth';
-import { PairDialog } from '../src/panel/components/PairDialog';
+import { PairDialog, resolveServiceEndpointAccessor } from '../src/panel/components/PairDialog';
+import type { PairDialogMode } from '../src/panel/components/PairDialog';
 import { DEFAULT_SERVICE_BASE_URL } from '../src/shared/messages';
 import { checkPairingCode } from '../src/shared/pairing-code';
 
@@ -92,19 +105,22 @@ interface DialogHarness {
   readonly write: Mock<ServiceEndpointAccessor['write']>;
   readonly submitCode: Mock<(code: string) => Promise<void>>;
   readonly onClose: Mock<() => void>;
+  readonly onAddressSaved: Mock<() => void>;
   readonly user: ReturnType<typeof userEvent.setup>;
 }
 
 /**
  * Render an open dialog over an accessor for `storage`, recording the order of
  * every save and submit. `accessor: 'platform'` injects none, so the dialog
- * resolves its default.
+ * resolves its default; `mode` is forwarded as given, so omitting it proves
+ * the default.
  */
 function renderDialog(
   options: {
     readonly stored?: unknown;
     readonly accessor?: 'injected' | 'platform';
     readonly write?: ServiceEndpointAccessor['write'];
+    readonly mode?: PairDialogMode;
   } = {},
 ): DialogHarness {
   const storage = createMemoryStorage(
@@ -121,16 +137,19 @@ function renderDialog(
     return Promise.resolve();
   });
   const onClose = vi.fn<() => void>();
+  const onAddressSaved = vi.fn<() => void>();
   const user = userEvent.setup();
   render(
     <PairDialog
       open
+      mode={options.mode}
       onClose={onClose}
       submitCode={submitCode}
+      onAddressSaved={onAddressSaved}
       serviceEndpoint={options.accessor === 'platform' ? undefined : { read: accessor.read, write }}
     />,
   );
-  return { storage, calls, write, submitCode, onClose, user };
+  return { storage, calls, write, submitCode, onClose, onAddressSaved, user };
 }
 
 function codeField(): HTMLElement {
@@ -324,5 +343,265 @@ describe('PairDialog: the service address field', () => {
 
     expect(h.onClose).toHaveBeenCalledTimes(1);
     expect(h.submitCode).not.toHaveBeenCalled();
+  });
+});
+
+/** The address mode's primary action at rest. */
+function saveButton(): HTMLElement {
+  return screen.getByRole('button', { name: 'Save address' });
+}
+
+/** A write that settles only when the case says so. */
+function deferredWrite(): {
+  readonly write: ServiceEndpointAccessor['write'];
+  readonly settle: (result: Result<string | undefined, DebuggenError>) => void;
+} {
+  let settle: (result: Result<string | undefined, DebuggenError>) => void = () => undefined;
+  const pending = new Promise<Result<string | undefined, DebuggenError>>((resolve) => {
+    settle = resolve;
+  });
+  return {
+    write: () => pending,
+    settle: (result) => {
+      settle(result);
+    },
+  };
+}
+
+describe('PairDialog: address mode', () => {
+  it('offers the address field alone, focused, and saves an edited address without submitting a code', async () => {
+    const h = renderDialog({ mode: 'address' });
+
+    expect(screen.getByRole('dialog', { name: 'Change the service address' })).toBeTruthy();
+    expect(screen.queryByRole('textbox', { name: /pairing code/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Pair' })).toBeNull();
+    expect(document.activeElement).toBe(addressField());
+    expect(addressField().placeholder).toBe(DEFAULT_SERVICE_BASE_URL);
+
+    await h.user.type(addressField(), ' http://localhost:20150/ ');
+    await h.user.click(saveButton());
+
+    await waitFor(() => {
+      expect(h.onClose).toHaveBeenCalledTimes(1);
+    });
+    expect(h.storage.items.get(SERVICE_ENDPOINT_STORAGE_KEY)).toBe('http://localhost:20150');
+    expect(h.calls).toEqual(['write']);
+    expect(h.submitCode).not.toHaveBeenCalled();
+    expect(h.onAddressSaved).toHaveBeenCalledTimes(1);
+    const [savedOrder] = h.onAddressSaved.mock.invocationCallOrder;
+    const [closedOrder] = h.onClose.mock.invocationCallOrder;
+    expect(savedOrder).toBeLessThan(closedOrder ?? Number.NaN);
+  });
+
+  it('is busy while the save is in flight, and saves once however often it is submitted', async () => {
+    const deferred = deferredWrite();
+    const h = renderDialog({ mode: 'address', write: deferred.write });
+
+    await h.user.type(addressField(), OTHER_SERVICE_URL);
+    await h.user.click(saveButton());
+
+    const busy = screen.getByRole('button', { name: 'Saving…' });
+    expect(busy instanceof HTMLButtonElement && busy.disabled).toBe(true);
+    expect(addressField().disabled).toBe(true);
+    const dialog = screen.getByRole('dialog');
+    expect(dialog.getAttribute('aria-busy')).toBe('true');
+    // Focus is parked on the dialog, so Escape still reaches it.
+    expect(document.activeElement).toBe(dialog);
+    const form = dialog.querySelector('form');
+    if (form === null) {
+      throw new Error('the address mode renders no form');
+    }
+    fireEvent.submit(form);
+    expect(h.write).toHaveBeenCalledTimes(1);
+    expect(h.onClose).not.toHaveBeenCalled();
+
+    deferred.settle(ok(OTHER_SERVICE_URL));
+
+    await waitFor(() => {
+      expect(h.onClose).toHaveBeenCalledTimes(1);
+    });
+    expect(h.onAddressSaved).toHaveBeenCalledTimes(1);
+    expect(h.submitCode).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unusable address on the field, with focus there, and saves nothing', async () => {
+    const h = renderDialog({ mode: 'address', stored: OTHER_SERVICE_URL });
+    await waitFor(() => {
+      expect(addressField().value).toBe(OTHER_SERVICE_URL);
+    });
+
+    await h.user.clear(addressField());
+    await h.user.type(addressField(), `${REFUSED_ADDRESS}{Enter}`);
+
+    await waitFor(() => {
+      expect(addressField().getAttribute('aria-invalid')).toBe('true');
+    });
+    expect(document.activeElement).toBe(addressField());
+    expect(screen.getByText(/must use http/i)).toBeTruthy();
+    expect(document.body.textContent).not.toContain(REFUSED_ADDRESS);
+    expect(h.storage.set).not.toHaveBeenCalled();
+    expect(h.storage.items.get(SERVICE_ENDPOINT_STORAGE_KEY)).toBe(OTHER_SERVICE_URL);
+    expect(h.onClose).not.toHaveBeenCalled();
+    expect(h.onAddressSaved).not.toHaveBeenCalled();
+    expect(saveButton()).toBeTruthy();
+
+    // The same refused value submitted again is refused again, focus included.
+    await h.user.click(saveButton());
+    await waitFor(() => {
+      expect(document.activeElement).toBe(addressField());
+    });
+    expect(addressField().getAttribute('aria-invalid')).toBe('true');
+    expect(h.write).toHaveBeenCalledTimes(2);
+    expect(h.storage.set).not.toHaveBeenCalled();
+  });
+
+  it('shows a save that storage refused, or an accessor that throws, on the field', async () => {
+    const refused: Result<string | undefined, DebuggenError> = err(
+      new DebuggenError(
+        'STORE_ERROR',
+        'The service address could not be saved in extension storage.',
+      ),
+    );
+    const refusing = renderDialog({ mode: 'address', write: () => Promise.resolve(refused) });
+
+    await refusing.user.type(addressField(), `${OTHER_SERVICE_URL}{Enter}`);
+
+    await waitFor(() => {
+      expect(addressField().getAttribute('aria-invalid')).toBe('true');
+    });
+    expect(screen.getByText(/could not be saved/i)).toBeTruthy();
+    expect(document.activeElement).toBe(addressField());
+    expect(refusing.onClose).not.toHaveBeenCalled();
+    cleanup();
+
+    const throwing = renderDialog({
+      mode: 'address',
+      write: () => Promise.reject(new Error('the accessor broke')),
+    });
+
+    await throwing.user.type(addressField(), `${OTHER_SERVICE_URL}{Enter}`);
+
+    await waitFor(() => {
+      expect(addressField().getAttribute('aria-invalid')).toBe('true');
+    });
+    expect(document.activeElement).toBe(addressField());
+    expect(throwing.onClose).not.toHaveBeenCalled();
+    expect(throwing.onAddressSaved).not.toHaveBeenCalled();
+  });
+
+  it('closes without writing when the address is untouched and usable', async () => {
+    const h = renderDialog({ mode: 'address', stored: OTHER_SERVICE_URL });
+    await waitFor(() => {
+      expect(addressField().value).toBe(OTHER_SERVICE_URL);
+    });
+
+    await h.user.click(saveButton());
+
+    expect(h.onClose).toHaveBeenCalledTimes(1);
+    expect(h.write).not.toHaveBeenCalled();
+    expect(h.onAddressSaved).not.toHaveBeenCalled();
+    expect(h.storage.items.get(SERVICE_ENDPOINT_STORAGE_KEY)).toBe(OTHER_SERVICE_URL);
+  });
+
+  it('says why a saved address is unusable, and restores the default when the field is saved blank', async () => {
+    const h = renderDialog({ mode: 'address', stored: 'http://[::1]:20150' });
+
+    await waitFor(() => {
+      expect(addressField().getAttribute('aria-invalid')).toBe('true');
+    });
+    expect(addressField().value).toBe('');
+    expect(document.activeElement).toBe(addressField());
+
+    await h.user.click(saveButton());
+
+    await waitFor(() => {
+      expect(h.onClose).toHaveBeenCalledTimes(1);
+    });
+    expect(h.calls).toEqual(['write']);
+    expect(h.storage.remove).toHaveBeenCalledWith(SERVICE_ENDPOINT_STORAGE_KEY);
+    expect(h.storage.items.has(SERVICE_ENDPOINT_STORAGE_KEY)).toBe(false);
+    expect(h.onAddressSaved).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps focus inside, returning it to the address field, and closes on Escape without saving', async () => {
+    const outside = document.createElement('button');
+    outside.textContent = 'Outside';
+    document.body.append(outside);
+    try {
+      const h = renderDialog({ mode: 'address' });
+
+      outside.focus();
+      expect(document.activeElement).toBe(addressField());
+
+      await h.user.type(addressField(), OTHER_SERVICE_URL);
+      await h.user.keyboard('{Escape}');
+
+      expect(h.onClose).toHaveBeenCalledTimes(1);
+      expect(h.write).not.toHaveBeenCalled();
+      expect(h.submitCode).not.toHaveBeenCalled();
+    } finally {
+      outside.remove();
+    }
+  });
+
+  it('says the address cannot be changed where the document has no chrome.storage, and offers Cancel alone', async () => {
+    expect(typeof (globalThis as { chrome?: unknown }).chrome).toBe('undefined');
+    const h = renderDialog({ mode: 'address', accessor: 'platform' });
+
+    const dialog = screen.getByRole('dialog', { name: 'Change the service address' });
+    expect(screen.queryByRole('textbox')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Save address' })).toBeNull();
+    const describedBy = dialog.getAttribute('aria-describedby') ?? '';
+    expect(document.getElementById(describedBy)?.textContent).toMatch(
+      /cannot be changed from this page/i,
+    );
+    // No field to take focus: the dialog element holds it, so Escape still works.
+    expect(document.activeElement).toBe(dialog);
+
+    const cancel = screen.getByRole('button', { name: 'Cancel' });
+    await h.user.tab();
+    expect(document.activeElement).toBe(cancel);
+
+    await h.user.click(cancel);
+    expect(h.onClose).toHaveBeenCalledTimes(1);
+    await h.user.keyboard('{Escape}');
+    expect(h.onClose).toHaveBeenCalledTimes(2);
+    expect(h.submitCode).not.toHaveBeenCalled();
+  });
+
+  it("uses this document's chrome.storage.local by default, resolved when the dialog opens", async () => {
+    const storage = createMemoryStorage({ [SERVICE_ENDPOINT_STORAGE_KEY]: OTHER_SERVICE_URL });
+    vi.stubGlobal('chrome', { storage: { local: storage } });
+    const h = renderDialog({ mode: 'address', accessor: 'platform' });
+
+    await waitFor(() => {
+      expect(addressField().value).toBe(OTHER_SERVICE_URL);
+    });
+    await h.user.clear(addressField());
+    await h.user.type(addressField(), 'http://localhost:20160{Enter}');
+
+    await waitFor(() => {
+      expect(h.onClose).toHaveBeenCalledTimes(1);
+    });
+    expect(storage.items.get(SERVICE_ENDPOINT_STORAGE_KEY)).toBe('http://localhost:20160');
+    expect(h.submitCode).not.toHaveBeenCalled();
+  });
+});
+
+describe('resolveServiceEndpointAccessor', () => {
+  it('answers undefined where the document has no chrome.storage.local', () => {
+    expect(resolveServiceEndpointAccessor()).toBeUndefined();
+    vi.stubGlobal('chrome', {});
+    expect(resolveServiceEndpointAccessor()).toBeUndefined();
+  });
+
+  it("builds an accessor over this document's chrome.storage.local, reading nothing until used", async () => {
+    const storage = createMemoryStorage({ [SERVICE_ENDPOINT_STORAGE_KEY]: OTHER_SERVICE_URL });
+    vi.stubGlobal('chrome', { storage: { local: storage } });
+
+    const accessor = resolveServiceEndpointAccessor();
+
+    expect(storage.get).not.toHaveBeenCalled();
+    expect(await accessor?.read()).toEqual(ok(OTHER_SERVICE_URL));
   });
 });

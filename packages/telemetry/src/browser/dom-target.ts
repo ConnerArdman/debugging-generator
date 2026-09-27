@@ -3,7 +3,7 @@
  * carrying its React component chain, plus the best-effort React-owner source
  * hints the service needs to turn that chain into a file and a line.
  *
- * Two product paths run through this module, and they have different budgets.
+ * Three product paths run through this module, and they have different budgets.
  *
  * 1. **"Use selected element"** (AAP 0.1.1, 0.4.2). The DevTools page evaluates
  *    an expression of the form `window.__DEBUGGEN__.describeTarget($0)` in the
@@ -20,6 +20,14 @@
  *    (`../schema/attributes.ts`). That call happens before the page's own
  *    handler runs, so everything here is bounded: no unbounded DOM walk, no
  *    unbounded string, no work that scales with the size of the document.
+ * 3. **"Pick element"**. A relayed `target.request` puts
+ *    the page into picker mode: the "Element picker" section below highlights
+ *    the element under the pointer and hands `./agent.ts` the element the
+ *    developer then clicks — consuming that click so the application never
+ *    sees it — or a cancellation (Escape, a cancel request, a newer request,
+ *    the bridge losing its worker port, the document going away).
+ *    `./agent.ts` describes the element with {@link describeElement} and
+ *    answers the request with it.
  *
  * ## Four invariants
  *
@@ -49,12 +57,17 @@
  * the thing the developer clicked is what makes a panel legible — but through
  * the budgeted walk of {@link harvestText}, never through `textContent`, whose
  * single read costs the whole subtree — and it is whitespace-collapsed and
- * passed through the redaction primitives before it leaves this module.
+ * passed through the redaction primitives before it leaves this module. The
+ * element picker also measures the hovered element with
+ * `getBoundingClientRect` — its geometry, not its content — to place the
+ * highlight, and the highlight it draws is never picked, described or read.
  *
  * **4. No side effects at import time and no module-scope DOM access.** Every
- * page global — `document`, `location`, `CSS` — is reached behind a
+ * page global — `window`, `document`, `location`, `CSS` — is reached behind a
  * `typeof` guard inside a function, so this module is importable by the Node
- * preload's program and by a test environment without a DOM.
+ * preload's program and by a test environment without a DOM. Nothing is
+ * registered with the page until a pick is started, and everything a pick
+ * registered is removed when it ends.
  *
  * ## Imports: exactly two modules
  *
@@ -715,13 +728,21 @@ export function ownerHintsFor(el: unknown): OwnerHints | undefined {
  * (AAP 0.1.1, 0.4.2) — so the capability is armed by the agent's opening
  * sequence and released when the document goes away, never by a capture.
  *
- * It is an explicit **no-resource** adapter: the four functions above are pure
- * reads of the page, this module installs no listener, observer, patch, timer
- * or subscription, and it caches nothing. Initialization is therefore a
- * prerequisite check — a host with no `document` cannot describe an element,
- * and saying so once is better than answering `undefined` forever — and
- * cleanup is the flag, which is what `./agent.ts` consults before it offers
- * `describeTarget` to the panel or answers a relayed `target.request`.
+ * While no pick is active it holds **no resource**: the four functions above
+ * are pure reads of the page, and this module installs no listener, observer,
+ * patch, timer or subscription and caches nothing. Initialization is therefore
+ * a prerequisite check — a host with no `document` cannot describe an element,
+ * and saying so once is better than answering `undefined` forever — and the
+ * flag is what `./agent.ts` consults before it offers `describeTarget` to the
+ * panel or arms a pick for a relayed `target.request`.
+ *
+ * The one resource the family ever holds is an **active pick** (see "Element
+ * picker" below): capture-phase listeners on `window` and one highlight
+ * element, registered by {@link startElementPick} and removed the moment the
+ * pick settles. Detaching ends an active pick as `'released'`, so a document
+ * that goes away takes its picker with it, and
+ * {@link hasElementPickResidue} reports anything the page would not let that
+ * teardown remove.
  *
  * **The predicate does not gate the four descriptor functions.**
  * `./interaction.ts` calls {@link describeElement} in the capture phase of the
@@ -770,14 +791,26 @@ export function attachDomTarget(): void {
  * Disarm element description.
  *
  * Called by `./agent.ts` when the document is going away (`pagehide`, the only
- * teardown a content script has). There is nothing to release — see this
- * section's note on the no-resource adapter — so this is exactly the flag,
- * which is what makes the agent stop offering `describeTarget`.
+ * teardown a content script has). The flag goes first, which is what makes the
+ * agent stop offering `describeTarget` and refuse to arm another pick. An
+ * active pick is then ended as `'released'` — its listeners and highlight
+ * removed, its `onSettled` callback told — so the request that armed it is
+ * answered rather than left waiting on a document that no longer exists. With
+ * no pick active, whatever an earlier pick's teardown could not remove is
+ * retried (see {@link hasElementPickResidue}).
  *
  * Safe to call when already detached, and cannot throw.
  */
 export function detachDomTarget(): void {
   attached = false;
+  try {
+    if (!cancelElementPick('released')) {
+      releasePickerResidue();
+    }
+  } catch {
+    // Both calls contain their own failures; this guard keeps "cannot throw"
+    // true structurally for the `pagehide` listener that calls this.
+  }
 }
 
 /**
@@ -794,15 +827,799 @@ export function isDomTargetAttached(): boolean {
 
 /*
  * ---------------------------------------------------------------------------
+ * Element picker
+ *
+ * "Pick element" — pressed in the DevTools panel, or relayed from
+ * VS Code as `target.request` — asks for **the element the
+ * developer clicks next**, on the page itself. `./agent.ts` receives the
+ * request over the bridge and calls {@link startElementPick}; this section
+ * does the rest and hands back exactly one {@link ElementPickOutcome}: the
+ * element, or why there is none.
+ *
+ * ## While a pick is active
+ *
+ * 1. **The picking gesture belongs to the picker.** Capture-phase listeners
+ *    on `window` — the first node of every capture path, so they run before
+ *    every listener the page registered on the document, on its React root or
+ *    on the element itself — consume each trusted event of
+ *    {@link ELEMENT_PICK_EVENT_TYPES} with `preventDefault()` and
+ *    `stopImmediatePropagation()`. The page's handlers do not run, focus does
+ *    not move, a form is not submitted and a link is not followed: picking a
+ *    submit button must not submit its form. The only listeners that can
+ *    still run first are capture-phase listeners already on `window` when the
+ *    pick began, because listeners on one node run in registration order: a
+ *    page's own, and `./interaction.ts`'s, which reads
+ *    {@link isElementPickActive} and records nothing. These listeners are
+ *    registered **non-passive**: unlike every observing listener in this
+ *    folder they change what the page does, and only for a gesture the
+ *    developer asked to spend on picking.
+ * 2. **A primary-button click picks.** The element is the first element of
+ *    `event.composedPath()` — inside an open shadow root that is the inner
+ *    element, not its host — or `event.target` when no path is readable. Other
+ *    buttons, `auxclick` and `contextmenu` are consumed without picking, so a
+ *    right-click neither picks nor opens the page's own context menu. A click
+ *    that resolves to no element is consumed and the pick stays active.
+ *    **The keyboard path.** Keys other than Escape pass through untouched, so
+ *    the developer can Tab to a control; Enter or Space on it then produces
+ *    the browser's own trusted click with `button === 0`, which picks exactly
+ *    as a pointer click does — and is consumed like one, so the control does
+ *    not activate.
+ * 3. **Escape cancels.** A trusted `keydown` whose `key` is `Escape` is
+ *    consumed and ends the pick as `'escape'`.
+ * 4. **Only the browser's own events count.** An event whose `isTrusted` is
+ *    not `true` — anything a page script dispatched — passes through
+ *    untouched: it neither picks, cancels nor moves the highlight, and it is
+ *    not suppressed, so a page can neither pick on the developer's behalf nor
+ *    stop a pick from happening.
+ * 5. **What will be picked is highlighted.** Passive capture-phase
+ *    `pointerover` and `mouseover` listeners track the element under the
+ *    pointer, and a passive `scroll` listener re-measures it, so one overlay
+ *    sits over its `getBoundingClientRect()`. The overlay is a single `div`,
+ *    created on the first hover, appended to `document.documentElement` and
+ *    marked `aria-hidden`. It is styled through CSSOM `style.setProperty` only
+ *    — never a `style` attribute string, which a page's `style-src` policy can
+ *    refuse — at `!important` priority so the page's own rules cannot move it,
+ *    with `pointer-events: none` so it is never hit-tested and never the
+ *    target of a gesture; it is also skipped explicitly wherever an element is
+ *    chosen. Its colours are the CSS system colour `Highlight`, the platform's
+ *    own selection colour, rather than a literal.
+ *
+ * ## How a pick ends
+ *
+ * Exactly once, with one outcome: `'picked'` on a primary click, or
+ * `'cancelled'` with `'escape'`, `'request'` ({@link cancelElementPick}, the
+ * panel's toggle), `'superseded'` (a newer {@link startElementPick}),
+ * `'relay-lost'` ({@link cancelElementPick} when the bridge's worker port
+ * goes, see {@link ElementPickCancelReason}) or `'released'`
+ * ({@link detachDomTarget}, on `pagehide`). Every ending runs the same
+ * teardown before the callback is told — the pick is cleared, every picker
+ * listener is removed and the overlay leaves the document — so the callback
+ * observes a page that is already back to normal.
+ *
+ * A pick never outlives the relay that armed it. The service worker that sent
+ * the `target.request` is the only party that can match the pick's answer to
+ * it, and it drops its record of the pick — telling the panel that picker mode
+ * is off — when the bridge's port to it closes. The bridge then reconnects to
+ * the same document, possibly to a restarted worker that never knew the pick.
+ * A pick left armed across that gap would consume the developer's next click
+ * while the panel shows picker mode off, so `./agent.ts` ends it as
+ * `'relay-lost'` the moment the bridge reports the port gone (`bridge.gone`),
+ * or — for a loss the bridge does not report — the moment it announces the
+ * next port (`bridge.ready`).
+ *
+ * Teardown follows `./interaction.ts`'s rules for a page that refuses a
+ * removal. The listeners are inert from the instant the pick is cleared,
+ * because each returns while no pick is active. Each removal stands in its own
+ * guard, a type is forgotten only once `removeEventListener` returned for it,
+ * and an overlay that will not leave is hidden and retained. Both are retried
+ * by the next teardown — a registration that survived is adopted by the next
+ * pick rather than duplicated — and reported by {@link hasElementPickResidue},
+ * which `./agent.ts` wires into this family's residue probe. Unlike that
+ * module this one cannot post a failure report, because its import rule
+ * admits no transport, so the residue probe is the whole of what it states.
+ *
+ * ## The page functions this section calls
+ *
+ * `window.addEventListener` and `window.removeEventListener`; on an event
+ * that reaches a picker listener, `composedPath`, and on a consumed one
+ * `preventDefault` and `stopImmediatePropagation`; `getBoundingClientRect` on
+ * the hovered element; and, for the overlay only, `document.createElement`,
+ * `setAttribute('aria-hidden', 'true')`, `style.setProperty`,
+ * `document.documentElement.appendChild`, `remove` and — when `remove` throws
+ * — `parentNode.removeChild`.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The event types an active pick consumes, each in the capture phase on
+ * `window` and only when trusted.
+ *
+ * The whole of a picking gesture, and nothing else. `pointerdown`/`mousedown`
+ * are what move focus and start a drag or a text selection;
+ * `pointerup`/`mouseup` and `click` are what activate a control (the click is
+ * also what picks); `dblclick`, `auxclick` and `contextmenu` are what a
+ * second press or another button would otherwise hand to the page. `keydown`
+ * is listed for Escape only — every other key passes through untouched, which
+ * is what keeps the keyboard path open (see the section note).
+ */
+export const ELEMENT_PICK_EVENT_TYPES = [
+  'pointerdown',
+  'pointerup',
+  'mousedown',
+  'mouseup',
+  'click',
+  'dblclick',
+  'auxclick',
+  'contextmenu',
+  'keydown',
+] as const;
+
+/**
+ * The event types that move the highlight, each in the capture phase on
+ * `window`, passive, and only when trusted.
+ *
+ * Never consumed: hovering is how the developer aims, and the page's own hover
+ * behaviour stays exactly as it is. `mouseover` beside `pointerover` covers a
+ * host without pointer events; `scroll` re-measures the hovered element, whose
+ * viewport position a scroll changes without any pointer event (a capture
+ * listener on `window` sees an element's `scroll`, which does not bubble, as
+ * well as the document's).
+ */
+export const ELEMENT_PICK_HOVER_EVENT_TYPES = ['pointerover', 'mouseover', 'scroll'] as const;
+
+/** Why a pick ended without an element. */
+export type ElementPickCancelReason =
+  /** The developer pressed Escape on the page. */
+  | 'escape'
+  /** {@link cancelElementPick} was called — the panel toggled picker mode off. */
+  | 'request'
+  /** A newer {@link startElementPick} took over. */
+  | 'superseded'
+  /**
+   * The isolated-world bridge lost the port to the service worker that armed
+   * the pick (`bridge.gone`, or a `bridge.ready` for a newer port), so no one
+   * is left who can match the pick's answer to the request that armed it: the
+   * worker has already ended its record of the pick and told the panel picker
+   * mode is off, and the port the bridge reconnects with may reach a
+   * restarted worker that never knew of it. Distinct from `'released'`: the
+   * document stays, and so does element description — only the pick ends.
+   */
+  | 'relay-lost'
+  /** The document went away ({@link detachDomTarget}, on `pagehide`). */
+  | 'released';
+
+/**
+ * How a pick ended — handed to the `onSettled` callback exactly once.
+ *
+ * `element` is the live DOM node the developer clicked. It is the callback's
+ * to describe (with {@link describeElement}) and never to keep: the
+ * descriptor is what leaves the page, the node never does.
+ */
+export type ElementPickOutcome =
+  | { readonly kind: 'picked'; readonly element: Element }
+  | { readonly kind: 'cancelled'; readonly reason: ElementPickCancelReason };
+
+/** One member of {@link ELEMENT_PICK_EVENT_TYPES}. */
+type PickEventType = (typeof ELEMENT_PICK_EVENT_TYPES)[number];
+
+/** One member of {@link ELEMENT_PICK_HOVER_EVENT_TYPES}. */
+type PickHoverEventType = (typeof ELEMENT_PICK_HOVER_EVENT_TYPES)[number];
+
+/** Any event type a picker listener is registered for. */
+type PickerEventType = PickEventType | PickHoverEventType;
+
+/** The pick in flight. */
+interface ActivePick {
+  /** Told the outcome once, after teardown. */
+  readonly onSettled: (outcome: ElementPickOutcome) => void;
+  /** The overlay this pick has shown, once the first hover placed it. */
+  overlay: HTMLElement | undefined;
+  /** The element under the pointer, which a `scroll` re-measures. */
+  hovered: Element | undefined;
+}
+
+/**
+ * Options of the consuming listeners — added and removed with the same object.
+ *
+ * `passive: false` is stated rather than defaulted: these listeners call
+ * `preventDefault`, which a passive listener's call cannot do, and Chrome
+ * already treats some listener types on `window` as passive unless told
+ * otherwise.
+ */
+const PICK_LISTENER_OPTIONS: AddEventListenerOptions = { capture: true, passive: false };
+
+/** Options of the highlight listeners, which only read. */
+const HOVER_LISTENER_OPTIONS: AddEventListenerOptions = { capture: true, passive: true };
+
+/** `MouseEvent.button` of the primary button — the only one that picks. */
+const PRIMARY_BUTTON = 0;
+
+/** `KeyboardEvent.key` of the one key the picker acts on. */
+const ESCAPE_KEY = 'Escape';
+
+/**
+ * Most entries of a composed path examined for the first element.
+ *
+ * The first entry is the target, which for a pointer event is an element, so
+ * the bound only matters to a path a page built to be long.
+ */
+const MAX_PICK_PATH_SCAN = 64;
+
+/** The overlay's priority on every declaration, so page rules cannot override it. */
+const OVERLAY_PRIORITY = 'important';
+
+/**
+ * The overlay's fixed declarations, applied through `style.setProperty`.
+ *
+ * `position: fixed` against the viewport matches `getBoundingClientRect`'s
+ * coordinate space; `pointer-events: none` keeps it out of hit-testing; the
+ * maximum 32-bit `z-index` keeps it above the page's own stacking;
+ * `box-sizing: border-box` and `margin: 0` make its box exactly the measured
+ * one; `display: block` shows again an overlay that a previous teardown could
+ * only hide. `Highlight` is a CSS system colour, so no colour literal is
+ * involved.
+ */
+const OVERLAY_DECLARATIONS: readonly (readonly [property: string, value: string])[] = [
+  ['display', 'block'],
+  ['position', 'fixed'],
+  ['pointer-events', 'none'],
+  ['z-index', '2147483647'],
+  ['box-sizing', 'border-box'],
+  ['margin', '0'],
+  ['border', '2px solid Highlight'],
+  ['background-color', 'color-mix(in srgb, Highlight 20%, transparent)'],
+];
+
+/** The pick in flight, or `undefined` — the gate every picker listener reads. */
+let activePick: ActivePick | undefined;
+
+/**
+ * Which picker event types this module **believes** are registered on
+ * `window`, with the same bookkeeping rule as `./interaction.ts`'s
+ * `registeredEventTypes`: added when `addEventListener` returned (or when it
+ * threw *and* the undoing removal threw too), deleted only once
+ * `removeEventListener` returned. The listener identities are module
+ * functions, so a registration that survived a teardown is the same one the
+ * next pick would add, and is adopted instead of duplicated.
+ */
+const registeredPickerTypes = new Set<PickerEventType>();
+
+/**
+ * The overlay element while a pick shows it, and afterwards only when the page
+ * would not let it leave the document (hidden, retained for the next teardown
+ * to retry and for the next pick to reuse).
+ */
+let overlayElement: HTMLElement | undefined;
+
+/**
+ * Start an interactive pick: from now on, the next trusted primary click on
+ * the page is the developer's choice of element.
+ *
+ * Called by `./agent.ts` for a relayed `target.request`. A pick already in
+ * flight is ended first as `'superseded'` — its callback is told before this
+ * pick is armed — so one document never has two picks and every request is
+ * answered.
+ *
+ * @param onSettled Called exactly once, after teardown, with the outcome —
+ * but only when this function returned `true`. It runs inside the page's
+ * dispatch of the gesture that ended the pick, and anything it throws is
+ * contained here.
+ * @returns `true` when the pick is armed. `false` — and `onSettled` is never
+ * called — when the family is not attached (no document, or released on
+ * `pagehide`), when there is no `window` to listen on, when the page refused
+ * one of the consuming listeners (a pick that cannot consume the whole gesture
+ * would let the application act on the click meant for picking), or when the
+ * superseded pick's own callback started a pick of its own, which is left in
+ * place. Never throws.
+ */
+export function startElementPick(onSettled: (outcome: ElementPickOutcome) => void): boolean {
+  let pick: ActivePick | undefined;
+  try {
+    if (!attached || typeof window === 'undefined' || typeof document === 'undefined') {
+      return false;
+    }
+    const previous = activePick;
+    if (previous !== undefined) {
+      settleElementPick(previous, { kind: 'cancelled', reason: 'superseded' });
+      if (activePick !== undefined) {
+        return false;
+      }
+    }
+
+    pick = { onSettled, overlay: undefined, hovered: undefined };
+    // Published before the first registration: a listener that fires while
+    // the rest are still being added finds its pick.
+    activePick = pick;
+
+    let consuming = true;
+    for (let index = 0; index < ELEMENT_PICK_EVENT_TYPES.length; index += 1) {
+      const type = ELEMENT_PICK_EVENT_TYPES[index];
+      if (
+        type !== undefined &&
+        !registerPickerListener(type, handlePickEvent, PICK_LISTENER_OPTIONS)
+      ) {
+        consuming = false;
+      }
+    }
+    if (!consuming) {
+      abandonPick(pick);
+      return false;
+    }
+
+    // A refused highlight listener costs the highlight, not the pick.
+    for (let index = 0; index < ELEMENT_PICK_HOVER_EVENT_TYPES.length; index += 1) {
+      const type = ELEMENT_PICK_HOVER_EVENT_TYPES[index];
+      if (type !== undefined) {
+        registerPickerListener(type, handleHoverEvent, HOVER_LISTENER_OPTIONS);
+      }
+    }
+    return true;
+  } catch {
+    // A host that breaks outside the per-step guards: the half-armed pick is
+    // unwound without telling its callback, and the caller answers for it.
+    if (pick !== undefined) {
+      abandonPick(pick);
+    }
+    return false;
+  }
+}
+
+/**
+ * End the pick in flight without an element.
+ *
+ * `./agent.ts` calls this for a `target.request` carrying `cancel: true` —
+ * the panel toggling picker mode off — and with `'relay-lost'` when the
+ * bridge's worker port goes; {@link detachDomTarget} calls it on `pagehide`.
+ * The pick's callback is told `{ kind: 'cancelled', reason }` after teardown.
+ *
+ * @param reason Why the pick ends; `'request'` unless the caller knows better.
+ * @returns `true` when a pick was active and has ended; `false` when there was
+ * none, in which case nothing was called. Never throws.
+ */
+export function cancelElementPick(reason: ElementPickCancelReason = 'request'): boolean {
+  try {
+    const pick = activePick;
+    if (pick === undefined) {
+      return false;
+    }
+    settleElementPick(pick, { kind: 'cancelled', reason });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether a pick is in flight.
+ *
+ * `./interaction.ts` reads this at the top of its capture-phase listener: the
+ * picking gesture is not an application interaction, so while this is `true`
+ * it opens no interaction window, mints no trace and emits nothing. Its
+ * listeners were usually registered before the picker's and therefore run
+ * first on the same event, which is why the check sits there rather than
+ * relying on this module's `stopImmediatePropagation`.
+ */
+export function isElementPickActive(): boolean {
+  return activePick !== undefined;
+}
+
+/**
+ * Whether the page still carries something an ended pick could not remove: a
+ * picker listener type still believed registered, or an overlay that would
+ * not leave the document.
+ *
+ * `false` while a pick is active — its listeners and overlay are the live
+ * picker, not residue — and `false` after every ordinary teardown. A read that
+ * could not complete answers `true`, because it cannot prove the page clean.
+ * Never throws.
+ */
+export function hasElementPickResidue(): boolean {
+  try {
+    if (activePick !== undefined) {
+      return false;
+    }
+    return registeredPickerTypes.size > 0 || overlayElement !== undefined;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * End a pick: clear the gate, remove every picker listener and the overlay,
+ * then tell the pick's callback.
+ *
+ * A no-op for a pick that is no longer the active one, which is what makes
+ * "exactly once" hold when an Escape and a cancel request race, or when the
+ * callback itself cancels.
+ */
+function settleElementPick(pick: ActivePick, outcome: ElementPickOutcome): void {
+  if (activePick !== pick) {
+    return;
+  }
+  abandonPick(pick);
+  try {
+    pick.onSettled(outcome);
+  } catch {
+    // The callback runs inside the page's dispatch of the ending gesture, or
+    // inside `pagehide`; its failure is the caller's to contain, never the
+    // page's to see.
+  }
+}
+
+/**
+ * Tear a pick down without telling its callback: the gate first, then the
+ * listeners, then the overlay.
+ *
+ * Shared by {@link settleElementPick} and by a {@link startElementPick} that
+ * could not arm, whose caller answers the request itself.
+ */
+function abandonPick(pick: ActivePick): void {
+  if (activePick === pick) {
+    activePick = undefined;
+  }
+  const overlay = pick.overlay;
+  pick.overlay = undefined;
+  pick.hovered = undefined;
+  releasePickerListeners();
+  if (overlay !== undefined) {
+    releaseOverlay(overlay);
+  }
+}
+
+/**
+ * Retry whatever an earlier teardown left on the page, while no pick is active.
+ *
+ * Called by {@link detachDomTarget} when there was no pick to end, so a
+ * document that is going away gets one more attempt at the residue
+ * {@link hasElementPickResidue} reports.
+ */
+function releasePickerResidue(): void {
+  if (activePick !== undefined) {
+    return;
+  }
+  if (registeredPickerTypes.size > 0) {
+    releasePickerListeners();
+  }
+  const overlay = overlayElement;
+  if (overlay !== undefined) {
+    releaseOverlay(overlay);
+  }
+}
+
+/**
+ * Register one picker listener, or adopt the registration an earlier teardown
+ * could not remove.
+ *
+ * @returns Whether a listener for `type` is on `window` now: `true` after a
+ * clean add or for an adopted registration; `false` when the add threw, in
+ * which case the exact inverse removal is attempted at once (a page wrapper can
+ * register and then throw) and the type is kept as believed-registered only
+ * when that removal threw as well.
+ */
+function registerPickerListener(
+  type: PickerEventType,
+  listener: (event: Event) => void,
+  options: AddEventListenerOptions,
+): boolean {
+  if (registeredPickerTypes.has(type)) {
+    return true;
+  }
+  try {
+    window.addEventListener(type, listener, options);
+    registeredPickerTypes.add(type);
+    return true;
+  } catch {
+    try {
+      window.removeEventListener(type, listener, options);
+    } catch {
+      registeredPickerTypes.add(type);
+    }
+    return false;
+  }
+}
+
+/**
+ * Remove every picker listener, one guarded removal per declared type.
+ *
+ * The sweep covers every declared type rather than the believed-registered
+ * set, for `./interaction.ts`'s reason: a removal for a type that was never
+ * registered is a specified no-op, and a registration the set never learned
+ * about must still come off the page.
+ */
+function releasePickerListeners(): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  for (let index = 0; index < ELEMENT_PICK_EVENT_TYPES.length; index += 1) {
+    const type = ELEMENT_PICK_EVENT_TYPES[index];
+    if (type !== undefined) {
+      removePickerListener(type, handlePickEvent, PICK_LISTENER_OPTIONS);
+    }
+  }
+  for (let index = 0; index < ELEMENT_PICK_HOVER_EVENT_TYPES.length; index += 1) {
+    const type = ELEMENT_PICK_HOVER_EVENT_TYPES[index];
+    if (type !== undefined) {
+      removePickerListener(type, handleHoverEvent, HOVER_LISTENER_OPTIONS);
+    }
+  }
+}
+
+/** Remove one picker listener; a refused removal keeps the type as residue. */
+function removePickerListener(
+  type: PickerEventType,
+  listener: (event: Event) => void,
+  options: AddEventListenerOptions,
+): void {
+  try {
+    window.removeEventListener(type, listener, options);
+    registeredPickerTypes.delete(type);
+  } catch {
+    // Retained: the listener is inert while no pick is active, the next
+    // teardown retries it, the next pick adopts it, and
+    // {@link hasElementPickResidue} names it.
+    registeredPickerTypes.add(type);
+  }
+}
+
+/**
+ * The capture-phase listener for every type in {@link ELEMENT_PICK_EVENT_TYPES}.
+ *
+ * Gated on the active pick, so a registration that outlived its pick passes
+ * every event through. Trusted events only: Escape cancels, every pointer and
+ * mouse event is consumed, and a primary-button `click` picks.
+ */
+function handlePickEvent(event: Event): void {
+  const pick = activePick;
+  if (pick === undefined) {
+    return;
+  }
+  try {
+    if (readProperty(event, 'isTrusted') !== true) {
+      return;
+    }
+    const type = readProperty(event, 'type');
+    if (type === 'keydown') {
+      if (readProperty(event, 'key') !== ESCAPE_KEY) {
+        return;
+      }
+      consumeEvent(event);
+      settleElementPick(pick, { kind: 'cancelled', reason: 'escape' });
+      return;
+    }
+    consumeEvent(event);
+    if (type !== 'click' || readProperty(event, 'button') !== PRIMARY_BUTTON) {
+      return;
+    }
+    const element = pickTargetOf(event);
+    if (element !== undefined) {
+      settleElementPick(pick, { kind: 'picked', element });
+    }
+  } catch {
+    // Never into the page's dispatch. The pick stays active, and Escape, a
+    // cancel request or `pagehide` still ends it.
+  }
+}
+
+/**
+ * The passive capture-phase listener for every type in
+ * {@link ELEMENT_PICK_HOVER_EVENT_TYPES}: follow the pointer, and re-measure
+ * on scroll. Reads only; never consumes.
+ */
+function handleHoverEvent(event: Event): void {
+  const pick = activePick;
+  if (pick === undefined) {
+    return;
+  }
+  try {
+    if (readProperty(event, 'isTrusted') !== true) {
+      return;
+    }
+    if (readProperty(event, 'type') === 'scroll') {
+      const hovered = pick.hovered;
+      if (hovered !== undefined) {
+        placeOverlay(pick, hovered);
+      }
+      return;
+    }
+    const element = pickTargetOf(event);
+    if (element !== undefined) {
+      pick.hovered = element;
+      placeOverlay(pick, element);
+    }
+  } catch {
+    // A highlight that could not move is cosmetic; the pick is unaffected.
+  }
+}
+
+/** `preventDefault` and `stopImmediatePropagation`, each in its own guard. */
+function consumeEvent(event: Event): void {
+  try {
+    event.preventDefault();
+  } catch {
+    // An event whose `preventDefault` was replaced still has its propagation
+    // stopped below, which is what keeps the page's handlers from running.
+  }
+  try {
+    event.stopImmediatePropagation();
+  } catch {
+    // The default action was already prevented above; nothing else to try.
+  }
+}
+
+/**
+ * The element an event is about: the first element of its composed path,
+ * falling back to its `target`, and never the overlay.
+ */
+function pickTargetOf(event: Event): Element | undefined {
+  try {
+    if (typeof readProperty(event, 'composedPath') === 'function') {
+      const path: unknown = event.composedPath();
+      const length = readProperty(path, 'length');
+      if (typeof length === 'number' && length > 0) {
+        const scanned = Math.min(length, MAX_PICK_PATH_SCAN);
+        for (let index = 0; index < scanned; index += 1) {
+          const node = readProperty(path, String(index));
+          if (isPickable(node)) {
+            return node;
+          }
+        }
+      }
+    }
+  } catch {
+    // An unreadable path falls back to the target below.
+  }
+  const target = readProperty(event, 'target');
+  return isPickable(target) ? target : undefined;
+}
+
+/** Whether a node can be picked: an element, and not the picker's own overlay. */
+function isPickable(node: unknown): node is Element {
+  return isElement(node) && node !== overlayElement;
+}
+
+/** A viewport box, in CSS pixels, as `getBoundingClientRect` measured it. */
+interface OverlayBox {
+  readonly top: number;
+  readonly left: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/**
+ * Put the overlay over an element: measure it, then create, restyle or
+ * re-attach the overlay as needed and move it there.
+ *
+ * An element that cannot be measured leaves the overlay where it was.
+ */
+function placeOverlay(pick: ActivePick, element: Element): void {
+  const box = boundingBoxOf(element);
+  if (box === undefined) {
+    return;
+  }
+  let overlay = pick.overlay;
+  if (overlay === undefined) {
+    overlay = overlayElement ?? createOverlay();
+    if (overlay === undefined) {
+      return;
+    }
+    overlayElement = overlay;
+    pick.overlay = overlay;
+    // Reapplied for an overlay a previous teardown could only hide.
+    styleOverlay(overlay);
+  }
+  setOverlayDeclaration(overlay, 'top', `${String(box.top)}px`);
+  setOverlayDeclaration(overlay, 'left', `${String(box.left)}px`);
+  setOverlayDeclaration(overlay, 'width', `${String(box.width)}px`);
+  setOverlayDeclaration(overlay, 'height', `${String(box.height)}px`);
+  if (readProperty(overlay, 'isConnected') !== true) {
+    try {
+      document.documentElement.appendChild(overlay);
+    } catch {
+      // A document that refuses the node shows no highlight; the pick works.
+    }
+  }
+}
+
+/** The element's viewport box, or `undefined` when it cannot be measured. */
+function boundingBoxOf(element: Element): OverlayBox | undefined {
+  try {
+    if (typeof readProperty(element, 'getBoundingClientRect') !== 'function') {
+      return undefined;
+    }
+    const rect: unknown = element.getBoundingClientRect();
+    const top = readProperty(rect, 'top');
+    const left = readProperty(rect, 'left');
+    const width = readProperty(rect, 'width');
+    const height = readProperty(rect, 'height');
+    if (
+      typeof top !== 'number' ||
+      typeof left !== 'number' ||
+      typeof width !== 'number' ||
+      typeof height !== 'number' ||
+      !Number.isFinite(top) ||
+      !Number.isFinite(left) ||
+      !Number.isFinite(width) ||
+      !Number.isFinite(height)
+    ) {
+      return undefined;
+    }
+    return { top, left, width: Math.max(0, width), height: Math.max(0, height) };
+  } catch {
+    return undefined;
+  }
+}
+
+/** A fresh, unattached, styled overlay, or `undefined` when none can be made. */
+function createOverlay(): HTMLElement | undefined {
+  try {
+    if (typeof document === 'undefined') {
+      return undefined;
+    }
+    const overlay = document.createElement('div');
+    overlay.setAttribute('aria-hidden', 'true');
+    styleOverlay(overlay);
+    return overlay;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Apply {@link OVERLAY_DECLARATIONS}. */
+function styleOverlay(overlay: HTMLElement): void {
+  for (let index = 0; index < OVERLAY_DECLARATIONS.length; index += 1) {
+    const declaration = OVERLAY_DECLARATIONS[index];
+    if (declaration !== undefined) {
+      setOverlayDeclaration(overlay, declaration[0], declaration[1]);
+    }
+  }
+}
+
+/** One CSSOM declaration on the overlay, guarded. */
+function setOverlayDeclaration(overlay: HTMLElement, property: string, value: string): void {
+  try {
+    overlay.style.setProperty(property, value, OVERLAY_PRIORITY);
+  } catch {
+    // A declaration the host refuses leaves the rest of the overlay intact.
+  }
+}
+
+/**
+ * Take the overlay out of the document; one that will not leave is hidden and
+ * kept in {@link overlayElement} as residue.
+ */
+function releaseOverlay(overlay: HTMLElement): void {
+  try {
+    overlay.remove();
+  } catch {
+    try {
+      overlay.parentNode?.removeChild(overlay);
+    } catch {
+      // Checked below: the overlay is still connected, so it is residue.
+    }
+  }
+  if (readProperty(overlay, 'isConnected') === true) {
+    setOverlayDeclaration(overlay, 'display', 'none');
+    overlayElement = overlay;
+    return;
+  }
+  if (overlayElement === overlay) {
+    overlayElement = undefined;
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Internal: guarded reads
  *
  * Everything below treats the page as a foreign object graph. A DOM accessor
  * can be overridden on a custom element's prototype, a `Proxy` can be revoked
  * between two reads, and a value from another realm shares no prototype with
  * this one — so nothing is reached with `instanceof`, no property is read
- * outside a guard, and the only page functions ever *called* are
+ * outside a guard, and outside the element picker (whose own section lists
+ * the calls it makes) the only page functions ever *called* are
  * `document.querySelectorAll` (there is no other way to check that a selector
- * resolves) and `CSS.escape`.
+ * resolves), `CSS.escape` and `CharacterData.substringData` (the bounded text
+ * read of {@link harvestText}).
  * ---------------------------------------------------------------------------
  */
 

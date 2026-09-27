@@ -1,6 +1,25 @@
 /**
  * `PairDialog` — the modal that takes the one-time pairing code shown in VS
- * Code and hands it to the service worker.
+ * Code and hands it to the service worker, and, in its address mode, changes
+ * the local service's address for a panel that is already paired.
+ *
+ * ## Modes
+ *
+ * - **`pair`** (the default) — the code field, the service address field, and
+ *   "Pair". The composition root opens it while the connection pill reads
+ *   "Not paired".
+ * - **`address`** — the service address field alone, and "Save address". The
+ *   composition root opens it from the pill's "Change service address…"
+ *   control while the pill reads "Reconnecting…" or "Service not running", so
+ *   a developer whose service moved to another port points the extension at
+ *   it without pairing again. The dialog saves the setting and closes; the
+ *   service worker follows the stored address as it changes and reconnects
+ *   the socket and every HTTP call there with the credential it already holds.
+ *   `submitCode` is never called in this mode.
+ *
+ * A mode holds for one open: the body is keyed by it, so a caller that
+ * switches modes gets a fresh dialog with empty fields rather than one mode's
+ * state carried into the other.
  *
  * ## Why this dialog exists
  *
@@ -38,7 +57,11 @@
  *   entered; a refused or unsaved address is shown on the field and the code
  *   is not submitted. A refusal never quotes the value (it may be a paste that
  *   carries anything); the field's own controlled `value` is the only place
- *   the text appears.
+ *   the text appears. In address mode saving that setting is all the dialog
+ *   does: no code is asked for and nothing is sent to the worker, which
+ *   learns of the new address from storage itself. Without an accessor the
+ *   address mode says the address cannot be changed from this page and
+ *   offers only "Cancel".
  * - The code lives in component state for exactly as long as the dialog is
  *   open. `PairDialog` renders nothing while closed, so closing unmounts the
  *   body and discards the typed text; a successful pairing clears it before
@@ -94,6 +117,25 @@
  *   never presented as success, and success is never inferred from anything
  *   but the resolved `submitCode` promise.
  *
+ * In address mode the same field-level states apply to the address alone:
+ *
+ * - **idle** — the address field (prefilled, placeholder and unusable-value
+ *   message exactly as above) and both actions are enabled. "Save address", or
+ *   `Enter` in the field, always answers: an edited address — or any value
+ *   while the saved one is unusable — is validated and saved; an untouched,
+ *   usable address is left alone and the dialog simply closes.
+ * - **saving** — the field and "Save address" are disabled, the action reads
+ *   "Saving…" and the dialog carries `aria-busy`, with the same double-submit
+ *   guard as a pairing submit.
+ * - **refused** (within idle) — the validator's or storage's refusal (a
+ *   throwing accessor included) is shown on the field as `invalid` plus its
+ *   error message, never quoting the value, and focus moves to the field.
+ *   Nothing is saved.
+ * - **saved** — {@link PairDialogProps.onAddressSaved}, then `onClose`. A
+ *   save is success only when the accessor's `write` resolved `ok`.
+ * - **unavailable** — with no accessor, a sentence saying the address cannot
+ *   be changed from this page, "Cancel", and no primary action.
+ *
  * ## Accessibility (AAP 0.6.4)
  *
  * - `role="dialog"` with `aria-modal="true"`, named by its level-2 `Heading`
@@ -105,11 +147,13 @@
  *   be neither focused, clicked nor reached by assistive technology. The
  *   dialog adds containment of its own on top: a document-level `focusin`
  *   listener (capture phase) returns focus that lands anywhere outside the
- *   dialog — moved there by script, say — to the code field, or to the dialog
- *   element while the field is disabled. That listener and the document-level
- *   `Escape` listener described below are added and removed by one symmetric
- *   effect, so a StrictMode replay leaves exactly one of each.
- * - Focus moves to the code field on open and, when the dialog is removed,
+ *   dialog — moved there by script, say — to the mode's field (the code field
+ *   when pairing, the address field in address mode), or to the dialog
+ *   element while that field is disabled or absent. That listener and the
+ *   document-level `Escape` listener described below are added and removed by
+ *   one symmetric effect, so a StrictMode replay leaves exactly one of each.
+ * - Focus moves to the mode's field on open — to the dialog element itself
+ *   when the address mode has no field to offer — and, when the dialog is removed,
  *   returns to the element that held it before the dialog opened (never the
  *   document body) — provided focus is still inside the dialog or was dropped
  *   to the body with its node, so a close never steals focus the developer
@@ -153,8 +197,8 @@
  * positioning primitive, and fixed positioning cannot be expressed through a
  * `--dg-*` token, so the dialog renders in document flow as a token-styled
  * card rather than floating over a scrim. Where it appears is the composition
- * root's decision (the panel renders it directly under its header while the
- * panel is not paired). Without a scrim, modality is enforced by the owner's
+ * root's decision (the panel renders it directly under its header while it is
+ * open, in either mode). Without a scrim, modality is enforced by the owner's
  * inert background together with this dialog's focus containment and
  * `Escape` handling, so the modal semantics above hold regardless of
  * placement.
@@ -176,6 +220,7 @@ import { DebuggenError, err, isErr } from '@debuggen/shared';
 import type {
   KeyboardEvent as ReactKeyboardEvent,
   ReactElement,
+  ReactNode,
   SubmitEvent as ReactSubmitEvent,
 } from 'react';
 import { useEffect, useId, useRef, useState } from 'react';
@@ -248,6 +293,27 @@ const RETRY_ACTION_LABEL = 'Try again';
 /** The key the dialog advertises for dismissal, rendered through `Kbd`. */
 const DISMISS_CHORD = ['Esc'] as const;
 
+/** The address mode's accessible name and visible title. */
+const ADDRESS_DIALOG_TITLE = 'Change the service address';
+
+/**
+ * The address mode's one-sentence instruction: what the address is, and that
+ * saving it keeps the pairing — the worker reconnects there with the
+ * credential it already holds, so no new code is needed.
+ */
+const ADDRESS_DIALOG_INSTRUCTION =
+  'Enter the loopback address the local Debug Generator service listens on; the extension reconnects to the saved address with its current pairing.';
+
+/** The address mode's sentence when this document has no extension storage to save to. */
+const ADDRESS_UNAVAILABLE_MESSAGE =
+  'The service address cannot be changed from this page: extension storage is not available to it.';
+
+/** The address mode's primary action at rest. */
+const SAVE_ADDRESS_ACTION_LABEL = 'Save address';
+
+/** The address mode's primary action while the address is being saved. */
+const SAVE_ADDRESS_ACTION_BUSY_LABEL = 'Saving…';
+
 /*
  * ===========================================================================
  * Types
@@ -260,6 +326,13 @@ const DISMISS_CHORD = ['Esc'] as const;
  * prop follows the contract if its field type ever changes.
  */
 type PairingCodeValue = PortRequestPayloads['pair.complete']['code'];
+
+/**
+ * What an open dialog is for: `'pair'` redeems a one-time code (saving an
+ * edited service address first), `'address'` saves the service address alone
+ * for a panel that is already paired. See this module's header.
+ */
+export type PairDialogMode = 'pair' | 'address';
 
 /**
  * Props of {@link PairDialog}.
@@ -276,9 +349,18 @@ export interface PairDialogProps {
   open: boolean;
 
   /**
-   * Asks the owner to close the dialog: raised by "Cancel", by `Escape`, and
-   * after a successful pairing. The owner controls visibility; this component
-   * never hides itself.
+   * What the dialog is for. Omitted, `'pair'`: the code and address fields
+   * and "Pair". `'address'` renders the address field and "Save address" only,
+   * and never calls `submitCode`. Changing it remounts the dialog's body, so
+   * no state crosses from one mode to the other.
+   */
+  mode?: PairDialogMode | undefined;
+
+  /**
+   * Asks the owner to close the dialog: raised by "Cancel", by `Escape`,
+   * after a successful pairing, and in address mode after the address was
+   * saved or when an untouched, usable address is submitted. The owner
+   * controls visibility; this component never hides itself.
    */
   onClose: () => void;
 
@@ -290,7 +372,8 @@ export interface PairDialogProps {
    * it to the `pair.complete` port request; resolve on `{ paired: true }` and
    * reject with the failure — ideally the `DebuggenError` the panel connection
    * produces, whose message, hint and code are shown as they are. Called only
-   * on an explicit submit or retry, never on a timer.
+   * on an explicit submit or retry in pair mode, never on a timer and never in
+   * address mode.
    */
   submitCode: (code: PairingCodeValue) => Promise<void>;
 
@@ -298,11 +381,22 @@ export interface PairDialogProps {
   onPaired?: (() => void) | undefined;
 
   /**
+   * Address mode only: raised after the accessor's `write` resolved `ok`,
+   * immediately before `onClose`. Not raised when the dialog was closed while
+   * the save was in flight (the setting is saved regardless, and the worker
+   * follows it from storage), nor when an untouched address closes the dialog
+   * without a write.
+   */
+  onAddressSaved?: (() => void) | undefined;
+
+  /**
    * Where the service address setting is read from and saved to. Omitted, the
-   * dialog uses `chrome.storage.local` through `../../background/auth`'s
-   * helpers when this document has it, and renders no address field when it
-   * does not. `write` validates (`parseServiceEndpoint`) before it stores; a
-   * blank value restores the default.
+   * dialog resolves {@link resolveServiceEndpointAccessor} when it opens:
+   * `chrome.storage.local` through `../../background/auth`'s helpers when this
+   * document has it — and, when it does not, no address field in pair mode and
+   * the "cannot be changed from this page" sentence in address mode. `write`
+   * validates (`parseServiceEndpoint`) before it stores; a blank value
+   * restores the default.
    */
   serviceEndpoint?: ServiceEndpointAccessor | undefined;
 
@@ -348,12 +442,26 @@ function textOr(value: string | undefined, fallback: string): string {
 }
 
 /**
- * The default {@link ServiceEndpointAccessor}: one over this document's
+ * The platform's {@link ServiceEndpointAccessor}: one over this document's
  * `chrome.storage.local`, or `undefined` where there is none (the panel page
- * opened outside the extension, a unit test's document). Read when called —
- * once per open — never at import.
+ * opened outside the extension, a unit test's document).
+ *
+ * Read when called, never at import, and reads no storage itself: the
+ * accessor it builds touches storage only when a member is called. The
+ * dialog calls it once per open when its owner injected no accessor; an owner
+ * that must know beforehand whether the address can be changed at all — to
+ * offer the "Change service address…" control only where it can — calls it
+ * too, and passes the result to the dialog so both work with the same
+ * setting.
+ *
+ * @returns The accessor, or `undefined` where this document has no
+ * `chrome.storage.local`.
+ *
+ * @example
+ * const [serviceEndpoint] = useState(() => resolveServiceEndpointAccessor());
+ * <PairDialog mode="address" serviceEndpoint={serviceEndpoint} … />
  */
-function platformServiceEndpoint(): ServiceEndpointAccessor | undefined {
+export function resolveServiceEndpointAccessor(): ServiceEndpointAccessor | undefined {
   if (typeof chrome === 'undefined') {
     return undefined;
   }
@@ -492,7 +600,8 @@ function listTabbable(container: HTMLElement): HTMLElement[] {
 }
 
 /**
- * Move focus to the code field, if it is present and enabled.
+ * Move focus to a field — the code field, or the address field — if it is
+ * present and enabled.
  *
  * `Input` exposes no `ref` — its rendered element varies — and documents
  * looking the control up by the `id` the caller supplied as the sanctioned
@@ -510,13 +619,14 @@ function focusField(doc: Document, fieldId: string): void {
 }
 
 /**
- * Return focus to the dialog after it landed outside: on the code field when it
- * is enabled, otherwise on the dialog element itself — where a submit parks
- * focus while the field is disabled — so `Escape` keeps reaching the dialog's
- * key handler.
+ * Return focus to the dialog after it landed outside, or on open: on the
+ * mode's field when it is enabled, otherwise on the dialog element itself —
+ * where a submit parks focus while the field is disabled, and where focus
+ * rests when the address mode has no field — so `Escape` keeps reaching the
+ * dialog's key handler.
  *
  * @param dialog The dialog element.
- * @param fieldId The id passed to the field.
+ * @param fieldId The id passed to the mode's field.
  */
 function returnFocusInside(dialog: HTMLElement, fieldId: string): void {
   const doc = dialog.ownerDocument;
@@ -579,21 +689,36 @@ function cycleFocus(event: ReactKeyboardEvent<HTMLDivElement>): void {
 type PairDialogBodyProps = Omit<PairDialogProps, 'open'>;
 
 /**
- * The open dialog. Mounted only while `open` is `true`, so its state — the
- * typed code and the attempt phase — begins empty on every open and is
- * discarded on every close.
+ * The open dialog. Mounted only while `open` is `true`, and keyed by its mode,
+ * so its state — the typed code, the address and the attempt phase — begins
+ * empty on every open and is discarded on every close.
  *
  * @param props Everything {@link PairDialog} received except `open`.
  * @returns The dialog.
  */
 function PairDialogBody(props: PairDialogBodyProps): ReactElement {
-  const { onClose, submitCode, onPaired, className, serviceEndpoint } = props;
+  const {
+    mode = 'pair',
+    onClose,
+    submitCode,
+    onPaired,
+    onAddressSaved,
+    className,
+    serviceEndpoint,
+  } = props;
+  const addressMode = mode === 'address';
 
   const baseId = useId();
   const headingId = `${baseId}-title`;
   const descriptionId = `${baseId}-description`;
   const fieldId = `${baseId}-code`;
   const addressFieldId = `${baseId}-service-address`;
+  /**
+   * The field focus goes to on open, is returned to by containment, and
+   * returns to after a refusal: the code field when pairing, the address field
+   * in address mode.
+   */
+  const focusTargetId = addressMode ? addressFieldId : fieldId;
 
   const [code, setCode] = useState('');
   const [phase, setPhase] = useState<PairPhase>(IDLE_PHASE);
@@ -609,7 +734,7 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
    * only when the caller supplied none.
    */
   const [platformEndpoint] = useState(() =>
-    serviceEndpoint === undefined ? platformServiceEndpoint() : undefined,
+    serviceEndpoint === undefined ? resolveServiceEndpointAccessor() : undefined,
   );
   /** The setting this open works with; without one, no address field is rendered. */
   const endpointAccessor = serviceEndpoint ?? platformEndpoint;
@@ -617,10 +742,11 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
   /** Why the address shown is unusable or could not be saved, when it is. */
   const [addressError, setAddressError] = useState<string | undefined>(undefined);
   /**
-   * Whether the address must be saved before the code is submitted: the
-   * developer edited it, or the saved one is unusable. An untouched, valid
-   * address is left alone, so a slow read can never be overwritten by a field
-   * that had not been prefilled yet.
+   * Whether the address must be saved — before the code is submitted, or, in
+   * address mode, before the dialog closes: the developer edited it, or the
+   * saved one is unusable. An untouched, valid address is left alone, so a
+   * slow read can never be overwritten by a field that had not been prefilled
+   * yet.
    */
   const addressNeedsSaveRef = useRef(false);
 
@@ -665,7 +791,7 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
       if (!dialog.isConnected || (target instanceof Node && dialog.contains(target))) {
         return;
       }
-      returnFocusInside(dialog, fieldId);
+      returnFocusInside(dialog, focusTargetId);
     };
 
     const closeOnEscapeOutside = (event: KeyboardEvent): void => {
@@ -690,7 +816,7 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
       doc.removeEventListener('focusin', containFocus, true);
       doc.removeEventListener('keydown', closeOnEscapeOutside, true);
     };
-  }, [fieldId, onClose]);
+  }, [focusTargetId, onClose]);
 
   // Focus in on open; focus back out on close. The opener is read before the
   // field is focused — never the document body, which is not a destination —
@@ -699,7 +825,10 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
   // close never takes focus from wherever the developer moved it. StrictMode's
   // replay removes no node, so it moves no focus: the field keeps it, and the
   // opener — inert behind the modal, so unable to take focus anyway — stays
-  // recorded for the real close.
+  // recorded for the real close. Focus goes in through `returnFocusInside`, so
+  // an address mode with no field to offer still puts focus in the dialog
+  // (on its element) rather than leaving it on the now-inert opener; with the
+  // field present and enabled, as it always is on open, that is the field.
   useEffect(() => {
     const dialog = dialogRef.current;
     if (dialog === null) {
@@ -712,7 +841,7 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
     }
 
     mountedRef.current = true;
-    focusField(doc, fieldId);
+    returnFocusInside(dialog, focusTargetId);
 
     return () => {
       mountedRef.current = false;
@@ -727,7 +856,7 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
         opener.focus();
       }
     };
-  }, [fieldId]);
+  }, [focusTargetId]);
 
   // After a failure the field is enabled again: return focus to it so the
   // developer can correct the code or paste a fresh one — but only when focus
@@ -883,6 +1012,66 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
     void redeem(candidate, address);
   }
 
+  /**
+   * Address mode: save one address and settle the phase from the answer.
+   *
+   * A refusal — the validator's, storage's, or a throwing accessor's, all
+   * settled into an `Err` by {@link settleAccessor} — returns the dialog to
+   * idle with the reason on the field, and nothing is saved. On success the
+   * field shows the canonical value that was stored, and the owner's
+   * callbacks run last, outside every refusal path, so a fault in them is
+   * never reported as a refused address.
+   *
+   * @param accessor The setting this open works with.
+   * @param enteredAddress The field's value when the save was asked for.
+   */
+  async function saveAddress(
+    accessor: ServiceEndpointAccessor,
+    enteredAddress: string,
+  ): Promise<void> {
+    const saved = await settleAccessor(() => accessor.write(enteredAddress));
+    inFlightRef.current = false;
+    if (isErr(saved)) {
+      if (mountedRef.current) {
+        setAddressError(describeAddressFailure(saved.error));
+        setPhase(IDLE_PHASE);
+      }
+      return;
+    }
+    addressNeedsSaveRef.current = false;
+    if (!mountedRef.current) {
+      // Closed while saving: the setting is stored regardless, and the worker
+      // follows it from storage; there is no dialog left to update.
+      return;
+    }
+    setAddress(saved.value ?? '');
+    setPhase(IDLE_PHASE);
+    onAddressSaved?.();
+    onClose();
+  }
+
+  /**
+   * Address mode's submit, from "Save address" or `Enter` in the field: save
+   * the address when it needs saving — the developer edited it, or the saved
+   * one is unusable — and otherwise just close, so an untouched, usable
+   * address is never rewritten. Never calls `submitCode`.
+   */
+  function submitAddress(): void {
+    if (inFlightRef.current || endpointAccessor === undefined) {
+      return;
+    }
+    if (!addressNeedsSaveRef.current) {
+      onClose();
+      return;
+    }
+    inFlightRef.current = true;
+    // Parked on the dialog element for the reason `submit` gives: the field
+    // and the action are about to be disabled.
+    dialogRef.current?.focus();
+    setPhase(SUBMITTING_PHASE);
+    void saveAddress(endpointAccessor, address);
+  }
+
   /** The developer edited the address: it is saved on the next submit. */
   function handleAddressChange(next: string): void {
     addressNeedsSaveRef.current = true;
@@ -892,6 +1081,10 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
 
   function handleSubmit(event: ReactSubmitEvent<HTMLFormElement>): void {
     event.preventDefault();
+    if (addressMode) {
+      submitAddress();
+      return;
+    }
     submit();
   }
 
@@ -914,6 +1107,105 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
     }
   }
 
+  // One address field for both modes, so the two can never word, validate or
+  // wire it differently.
+  const addressInput =
+    endpointAccessor === undefined ? null : (
+      <Input
+        id={addressFieldId}
+        label={SERVICE_ADDRESS_FIELD_LABEL}
+        hint={SERVICE_ADDRESS_FIELD_HINT}
+        placeholder={DEFAULT_SERVICE_BASE_URL}
+        value={address}
+        onValueChange={handleAddressChange}
+        disabled={submitting}
+        invalid={addressError !== undefined}
+        {...(addressError === undefined ? {} : { errorMessage: addressError })}
+        fullWidth
+        autoCapitalize="off"
+        autoCorrect="off"
+        spellCheck={false}
+      />
+    );
+
+  let title: string;
+  let instruction: string;
+  let content: ReactElement;
+  if (!addressMode) {
+    title = PAIR_DIALOG_TITLE;
+    instruction = PAIR_DIALOG_INSTRUCTION;
+    content = (
+      <form noValidate onSubmit={handleSubmit}>
+        <Stack gap={3}>
+          <Input
+            id={fieldId}
+            label={PAIRING_FIELD_LABEL}
+            hint={PAIRING_FIELD_HINT}
+            value={code}
+            onValueChange={setCode}
+            disabled={submitting}
+            required
+            fullWidth
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+            {...validationProps}
+          />
+
+          {addressInput}
+
+          {/* The retry re-submits the current value, so it is offered only
+              while that value is well-formed; an edited, ill-formed value
+              shows its own reason on the field instead. */}
+          {failure === undefined ? null : (
+            <ErrorState
+              title={FAILURE_TITLE}
+              message={failure.message}
+              hint={failure.hint}
+              code={failure.errorCode}
+              onRetry={check.valid ? submit : undefined}
+              retryLabel={RETRY_ACTION_LABEL}
+            />
+          )}
+
+          {renderDialogActions(
+            onClose,
+            // Disabled only while a submit is in flight: an ill-formed value
+            // must still reach `submit`, which says why it is refused, and a
+            // disabled default button would make `Enter` in the field
+            // silently do nothing.
+            <Button variant="primary" type="submit" disabled={submitting}>
+              {submitting ? PAIR_ACTION_BUSY_LABEL : PAIR_ACTION_LABEL}
+            </Button>,
+          )}
+        </Stack>
+      </form>
+    );
+  } else if (addressInput === null) {
+    // Nothing to save to: say so, and offer the way out alone.
+    title = ADDRESS_DIALOG_TITLE;
+    instruction = ADDRESS_UNAVAILABLE_MESSAGE;
+    content = renderDialogActions(onClose, null);
+  } else {
+    title = ADDRESS_DIALOG_TITLE;
+    instruction = ADDRESS_DIALOG_INSTRUCTION;
+    content = (
+      <form noValidate onSubmit={handleSubmit}>
+        <Stack gap={3}>
+          {addressInput}
+          {renderDialogActions(
+            onClose,
+            // Disabled only while a save is in flight, for the reason the
+            // pairing action gives: `Enter` in the field must always answer.
+            <Button variant="primary" type="submit" disabled={submitting}>
+              {submitting ? SAVE_ADDRESS_ACTION_BUSY_LABEL : SAVE_ADDRESS_ACTION_LABEL}
+            </Button>,
+          )}
+        </Stack>
+      </form>
+    );
+  }
+
   return (
     <div
       ref={dialogRef}
@@ -929,92 +1221,53 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
       <Section variant="card" gap={3}>
         <Stack gap={1}>
           <Heading level={2} id={headingId}>
-            {PAIR_DIALOG_TITLE}
+            {title}
           </Heading>
           <Text as="p" size="sm" tone="secondary" id={descriptionId}>
-            {PAIR_DIALOG_INSTRUCTION}
+            {instruction}
           </Text>
         </Stack>
 
-        <form noValidate onSubmit={handleSubmit}>
-          <Stack gap={3}>
-            <Input
-              id={fieldId}
-              label={PAIRING_FIELD_LABEL}
-              hint={PAIRING_FIELD_HINT}
-              value={code}
-              onValueChange={setCode}
-              disabled={submitting}
-              required
-              fullWidth
-              autoCapitalize="off"
-              autoCorrect="off"
-              spellCheck={false}
-              {...validationProps}
-            />
-
-            {endpointAccessor === undefined ? null : (
-              <Input
-                id={addressFieldId}
-                label={SERVICE_ADDRESS_FIELD_LABEL}
-                hint={SERVICE_ADDRESS_FIELD_HINT}
-                placeholder={DEFAULT_SERVICE_BASE_URL}
-                value={address}
-                onValueChange={handleAddressChange}
-                disabled={submitting}
-                invalid={addressError !== undefined}
-                {...(addressError === undefined ? {} : { errorMessage: addressError })}
-                fullWidth
-                autoCapitalize="off"
-                autoCorrect="off"
-                spellCheck={false}
-              />
-            )}
-
-            {/* The retry re-submits the current value, so it is offered only
-                while that value is well-formed; an edited, ill-formed value
-                shows its own reason on the field instead. */}
-            {failure === undefined ? null : (
-              <ErrorState
-                title={FAILURE_TITLE}
-                message={failure.message}
-                hint={failure.hint}
-                code={failure.errorCode}
-                onRetry={check.valid ? submit : undefined}
-                retryLabel={RETRY_ACTION_LABEL}
-              />
-            )}
-
-            <Stack direction="horizontal" gap={2} align="center" justify="between" wrap>
-              <Text size="xs" tone="muted">
-                Press <Kbd keys={DISMISS_CHORD} /> to cancel
-              </Text>
-              <Stack direction="horizontal" gap={2} align="center">
-                <Button variant="secondary" onClick={onClose}>
-                  {CANCEL_ACTION_LABEL}
-                </Button>
-                {/* Disabled only while a submit is in flight: an ill-formed
-                    value must still reach `submit`, which says why it is
-                    refused, and a disabled default button would make `Enter`
-                    in the field silently do nothing. */}
-                <Button variant="primary" type="submit" disabled={submitting}>
-                  {submitting ? PAIR_ACTION_BUSY_LABEL : PAIR_ACTION_LABEL}
-                </Button>
-              </Stack>
-            </Stack>
-          </Stack>
-        </form>
+        {content}
       </Section>
     </div>
   );
 }
 
 /**
+ * The dialog's bottom row, the same in every mode: the `Escape` hint, then
+ * "Cancel" and the mode's primary action, if it has one.
+ *
+ * A plain function rather than a component, so it adds no layer to the React
+ * tree and the rendered markup is exactly the row it returns.
+ *
+ * @param onCancel What "Cancel" raises — the owner's `onClose`.
+ * @param primary The mode's submit button, or `null` where the mode has none.
+ * @returns The row.
+ */
+function renderDialogActions(onCancel: () => void, primary: ReactNode): ReactElement {
+  return (
+    <Stack direction="horizontal" gap={2} align="center" justify="between" wrap>
+      <Text size="xs" tone="muted">
+        Press <Kbd keys={DISMISS_CHORD} /> to cancel
+      </Text>
+      <Stack direction="horizontal" gap={2} align="center">
+        <Button variant="secondary" onClick={onCancel}>
+          {CANCEL_ACTION_LABEL}
+        </Button>
+        {primary}
+      </Stack>
+    </Stack>
+  );
+}
+
+/**
  * The pairing dialog: takes the one-time code shown in VS Code and hands it to
- * the service worker through the injected `submitCode`.
+ * the service worker through the injected `submitCode` — or, in address mode,
+ * saves the local service's address for a panel that is already paired.
  *
  * Renders nothing while `open` is `false`. See this module's header for the
- * security boundary, the three states and the keyboard contract.
+ * modes, the security boundary, the states and the keyboard contract.
  *
  * @param props The props documented on {@link PairDialogProps}.
  * @returns The dialog, or `null` while closed.
@@ -1028,11 +1281,25 @@ function PairDialogBody(props: PairDialogBodyProps): ReactElement {
  *     await connection.request('pair.complete', { code });
  *   }}
  * />
+ *
+ * @example
+ * // Paired, from the pill's "Change service address…" control; the worker
+ * // follows the saved address and reconnects with its current pairing. The
+ * // accessor is resolved once, so its identity is stable across renders:
+ * const [serviceEndpoint] = useState(() => resolveServiceEndpointAccessor());
+ * <PairDialog
+ *   mode="address"
+ *   open={addressDialogOpen}
+ *   onClose={() => setAddressDialogOpen(false)}
+ *   submitCode={submitPairingCode}
+ *   serviceEndpoint={serviceEndpoint}
+ * />
  */
 export function PairDialog(props: PairDialogProps): ReactElement | null {
   const { open, ...body } = props;
   if (!open) {
     return null;
   }
-  return <PairDialogBody {...body} />;
+  // Keyed by mode, so a switch between modes while open starts a fresh body.
+  return <PairDialogBody key={body.mode ?? 'pair'} {...body} />;
 }

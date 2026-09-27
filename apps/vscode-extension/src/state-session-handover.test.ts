@@ -14,8 +14,9 @@
  * - **`applySessionEnded`.** The HTTP answer to `session.end` marks the active
  *   session ended without regressing a finished cleanup, and a later record
  *   from the service supersedes it.
- * - **`pendingTarget`.** Only an element selected while no session was active
- *   is the next question's target.
+ * - **The target.** It is the active session's record `target` and nothing
+ *   else: a newer record replaces or clears it, and neither a reset nor the
+ *   adoption of another session carries it over.
  * - **`applyModificationJournal`.** The journal read over HTTP merges without
  *   regressing a status, and its counted `total` is kept for the active
  *   session beside a list later pushes may extend, until another session
@@ -47,9 +48,9 @@ import type {
   InstrumentationReadyPayload,
   ModificationRecord,
   PanelGeneratedPayload,
+  SelectedTarget,
   SessionProgressPayload,
   SessionRecord,
-  TargetSelectedPayload,
 } from '@debuggen/protocol';
 
 import { ExtensionState, MAX_ACKNOWLEDGED_ENDS, MAX_HELD_FRAMES } from './state';
@@ -155,16 +156,13 @@ function payload<T>(members: Readonly<Record<string, unknown>>): T {
   return members as unknown as T;
 }
 
-/** The DevTools selection of an element, for `target.selected`. */
-function targetSelected(sessionId: string, selector: string): TargetSelectedPayload {
+/** An element picked in DevTools, as the service records it on a session's `target`. */
+function selectedTarget(selector: string): SelectedTarget {
   return {
-    sessionId,
-    target: {
-      selector,
-      tagName: 'button',
-      componentChain: ['Toolbar'],
-      url: 'http://127.0.0.1:3100/',
-    },
+    selector,
+    tagName: 'button',
+    componentChain: ['Toolbar'],
+    url: 'http://127.0.0.1:3100/',
   };
 }
 
@@ -314,7 +312,13 @@ describe('the creation window', () => {
     const creation = state.beginSessionCreation();
     expect(state.sessionCreationPending).toBe(true);
 
-    state.applySessionRecord(sessionRecord('S2', { status: 'instrumenting', updatedAt: T0 + 2 }));
+    state.applySessionRecord(
+      sessionRecord('S2', {
+        status: 'instrumenting',
+        updatedAt: T0 + 2,
+        target: selectedTarget('#save'),
+      }),
+    );
     state.applyProgress(progressRow('S2', 'Understanding the question'));
     state.applyInstrumentationPlan(
       payload<InstrumentationPlanPayload>({ sessionId: 'S2', plan: { planVersion: 1 } }),
@@ -349,7 +353,6 @@ describe('the creation window', () => {
         panel: { title: 'Render timing', panelVersion: 1 },
       }),
     );
-    state.applyTargetSelected(targetSelected('S2', '#save'));
     state.applyCleanupCompleted(
       payload<CleanupCompletedPayload>({ sessionId: 'S2', status: 'clean', conflicts: [] }),
     );
@@ -374,8 +377,8 @@ describe('the creation window', () => {
       panelVersion: 1,
       fallback: false,
     });
+    // The replayed record, newer than the answer, is where the target comes from.
     expect(state.target?.selector).toBe('#save');
-    expect(state.pendingTarget).toBeUndefined();
     expect(state.cleanup.status).toBe('clean');
   });
 
@@ -736,7 +739,6 @@ describe('terminal stickiness of ended sessions', () => {
       }),
     );
     state.applyProgress(progressRow('S1', 'Still working'));
-    state.applyTargetSelected(targetSelected('S1', '#late'));
 
     expect(state.captureState.active).toBe(false);
     expect(state.activeSession?.plans).toEqual([]);
@@ -744,7 +746,6 @@ describe('terminal stickiness of ended sessions', () => {
     expect(state.runtimeHooks).toEqual([]);
     expect(state.failure).toBeUndefined();
     expect(state.progress).toEqual([]);
-    expect(state.target).toBeUndefined();
 
     state.applyProgress({
       ...progressRow('S1', 'Cleanup finished'),
@@ -1109,29 +1110,103 @@ describe('applyModificationJournal', () => {
 });
 
 // ---------------------------------------------------------------------------
-// pendingTarget
+// The target
 // ---------------------------------------------------------------------------
 
-describe('pendingTarget', () => {
-  it('is the element selected while no session is active', () => {
-    state.applyTargetSelected(targetSelected('S0', '#pick'));
-
-    expect(state.pendingTarget?.selector).toBe('#pick');
-  });
-
-  it("is never the active session's own target", () => {
-    state.adoptSession(sessionRecord('S1'), ENDPOINT);
-    state.applyTargetSelected(targetSelected('S1', '#own'));
+describe('the target', () => {
+  it("is the adopted session's record target, in the snapshot too", () => {
+    state.adoptSession(sessionRecord('S1', { target: selectedTarget('#own') }), ENDPOINT);
 
     expect(state.target?.selector).toBe('#own');
-    expect(state.pendingTarget).toBeUndefined();
+    expect(state.toWebviewState().target?.selector).toBe('#own');
   });
 
-  it('is superseded once a session is adopted', () => {
-    state.applyTargetSelected(targetSelected('S0', '#pick'));
+  it('follows the newest record of the active session, and a record without one clears it', () => {
+    state.adoptSession(sessionRecord('S1', { target: selectedTarget('#first') }), ENDPOINT);
 
+    state.applySessionRecord(
+      sessionRecord('S1', { updatedAt: T0 + 1, target: selectedTarget('#second') }),
+    );
+    expect(state.target?.selector).toBe('#second');
+
+    // An answer older than the record held changes nothing, its target included.
+    state.applySessionRecord(sessionRecord('S1', { target: selectedTarget('#stale') }));
+    expect(state.target?.selector).toBe('#second');
+
+    state.applySessionRecord(sessionRecord('S1', { updatedAt: T0 + 2 }));
+    expect(state.target).toBeUndefined();
+    expect(Object.hasOwn(state.toWebviewState(), 'target')).toBe(false);
+  });
+
+  it('keeps the target against a late targetless record stamped at the same updatedAt', () => {
     state.adoptSession(sessionRecord('S1'), ENDPOINT);
 
-    expect(state.pendingTarget).toBeUndefined();
+    // The service recorded the pick in the same millisecond as the snapshot a
+    // `GET /sessions/:id` was still carrying: the record with the target
+    // arrives first over the socket, the targetless answer ties with it.
+    state.applySessionRecord(
+      sessionRecord('S1', { updatedAt: T0 + 1, target: selectedTarget('#picked') }),
+    );
+    state.applySessionRecord(sessionRecord('S1', { updatedAt: T0 + 1, status: 'capturing' }));
+
+    // The tie is still applied as a record; only the target it lacks is kept.
+    expect(state.activeSession?.status).toBe('capturing');
+    expect(state.target?.selector).toBe('#picked');
+    expect(state.toWebviewState().target?.selector).toBe('#picked');
+
+    // A strictly newer record without a target still clears it.
+    state.applySessionRecord(sessionRecord('S1', { updatedAt: T0 + 2 }));
+    expect(state.target).toBeUndefined();
+  });
+
+  it('takes a different target from a record stamped at the same updatedAt', () => {
+    state.adoptSession(
+      sessionRecord('S1', { updatedAt: T0 + 1, target: selectedTarget('#first') }),
+      ENDPOINT,
+    );
+
+    state.applySessionRecord(
+      sessionRecord('S1', { updatedAt: T0 + 1, target: selectedTarget('#second') }),
+    );
+
+    expect(state.target?.selector).toBe('#second');
+  });
+
+  it('is never set by a record of a session that is not active', () => {
+    state.applySessionRecord(sessionRecord('S1', { target: selectedTarget('#elsewhere') }));
+    expect(state.target).toBeUndefined();
+
+    state.adoptSession(sessionRecord('S2', { target: selectedTarget('#own') }), ENDPOINT);
+    state.applySessionRecord(
+      sessionRecord('S3', { updatedAt: T0 + 9, target: selectedTarget('#other-window') }),
+    );
+    expect(state.target?.selector).toBe('#own');
+  });
+
+  it('is cleared by resetSession', () => {
+    state.adoptSession(sessionRecord('S1', { target: selectedTarget('#own') }), ENDPOINT);
+
+    state.resetSession();
+
+    expect(state.target).toBeUndefined();
+    expect(Object.hasOwn(state.toWebviewState(), 'target')).toBe(false);
+  });
+
+  it('is not carried into another adopted session whose record names none', () => {
+    state.adoptSession(sessionRecord('S1', { target: selectedTarget('#own') }), ENDPOINT);
+
+    state.adoptSession(sessionRecord('S2'), ENDPOINT);
+
+    expect(state.activeSessionId).toBe('S2');
+    expect(state.target).toBeUndefined();
+  });
+
+  it('is kept when the end is acknowledged, from the record the store already held', () => {
+    state.adoptSession(sessionRecord('S1', { target: selectedTarget('#own') }), ENDPOINT);
+
+    state.applySessionEnded('S1', { cleanup: 'clean' });
+
+    expect(state.activeSession?.status).toBe('ended');
+    expect(state.target?.selector).toBe('#own');
   });
 });

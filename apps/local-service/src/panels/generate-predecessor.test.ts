@@ -1,8 +1,8 @@
 /**
  * The expected-predecessor contract of the panel generator (`./generate.ts`): a
  * generation told which panel it must supersede is answered on that panel or
- * not at all (AAP §0.4.2, Follow-up row: `panelVersion n + 1` with
- * `supersedes` naming panel `n`).
+ * not at all — the panel it stores is `panelVersion n + 1`, with `supersedes`
+ * naming panel `n`.
  *
  * `../../test/integration/followup.test.ts` drives the follow-up stage's own
  * pre-check end to end against the real store. This suite pins the

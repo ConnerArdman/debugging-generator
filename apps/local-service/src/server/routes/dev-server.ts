@@ -42,12 +42,23 @@
  *    the native absolute form; elsewhere it is a relative path). The
  *    normalised root is the one the scope is checked against **and** the one
  *    the launcher is handed, so what was authorized is what is acted on;
- * 4. the **scope** — `requireProjectScope`: an editor credential acts only on
- *    projects under the workspace folders its connections announced in
- *    `client.hello`. A project outside them is refused with `403`. A launch
- *    or a credential request is then refused `400 FS_UNSAFE_PATH` when the
- *    canonical project root is, contains or lies inside the canonical
- *    `$DEBUGGEN_HOME` (AAP §0.4.2); a stop is never refused for it;
+ * 4. the **scope** — an editor credential acts only on projects under the
+ *    workspace folders its connections announced in `client.hello`, on disk
+ *    as well as in spelling. A project outside them is refused with `403`. A
+ *    stop or a credential request, which acts on no project file, checks it
+ *    once with `requireProjectScope`. A launch spawns in the directory after
+ *    many awaits, so it is admitted with `admitProjectRoot`, which keeps the
+ *    canonical path the root was admitted under; `reconfirmProjectRoot`
+ *    re-proves that identity at the launch's fence (step 6) and, handed to the
+ *    launcher as `confirmProjectRoot`, again immediately before detection
+ *    reads the project and immediately before the child is spawned — in the
+ *    canonical root — so a link on the path retargeted after admission is
+ *    refused `403` rather than followed (CWE-367). A launch or a credential
+ *    request is then refused `400 FS_UNSAFE_PATH` when the canonical project
+ *    root is, contains or lies inside the canonical `$DEBUGGEN_HOME`, because
+ *    session data and backups live outside every target project — for a
+ *    launch, judged on the canonical path it was admitted under; a stop is
+ *    never refused for it;
  * 5. for a launch that names a `sessionId`, the **session** — it must exist
  *    (`404`), belong to exactly the launched project and not have ended
  *    (`409`). Only then is the child tied to it: the launcher stops a child
@@ -59,7 +70,8 @@
  *    live once the body has been read. A rotation (`POST /credentials/rotate`)
  *    or an expiry that retired it while the body was in flight is refused
  *    `401` (`unknown-credential` / `expired-credential`), so a retired editor
- *    credential can neither launch, stop nor mint.
+ *    credential can neither launch, stop nor mint. A launch's fence also
+ *    re-proves its admitted project root (step 4).
  *
  * The role is checked before the body is read, so a caller without the editor
  * role learns nothing about dev servers.
@@ -165,12 +177,15 @@ import type { SessionManager } from '../../sessions/manager.js';
 import {
   AUTH_FAILURE_REASONS,
   OPERATION_ROLES,
+  admitProjectRoot,
   authErrorResponse,
   authFailureStatus,
+  reconfirmProjectRoot,
   requireProjectScope,
   requireRole,
 } from '../auth.js';
 import type {
+  AdmittedProjectRoot,
   AuthFailureReason,
   AuthService,
   AuthenticatedOperation,
@@ -344,7 +359,7 @@ export interface DevServerRoutesDeps {
    * `requireProjectOutsideStateHome` of `../../config.ts` — with
    * `400 FS_UNSAFE_PATH` before the launcher is called, so no preload is
    * attached to, and no credential minted for, a project whose working tree
-   * would hold the service's private state (AAP §0.4.2; CWE-200).
+   * would hold the service's private state (CWE-200).
    * `devServer.stop` is not checked: stopping only ends a process and revokes
    * its credential, and must stay possible. Declared by the same name and type
    * as `./sessions.ts`'s field, so `../http.ts`'s aggregate carries one value to
@@ -1227,10 +1242,13 @@ function authorize(
 }
 
 /**
- * The project-root step of every handler: the requested root, normalised by
- * {@link normalizeRequestedProjectRoot}, inside the principal's announced
- * scope (`requireProjectScope`). The returned spelling is the one the scope
- * was checked in and the one the launcher must be handed.
+ * The project-root step of a stop and of a credential request: the requested
+ * root, normalised by {@link normalizeRequestedProjectRoot}, inside the
+ * principal's announced scope (`requireProjectScope`). The returned spelling
+ * is the one the scope was checked in and the one the launcher must be
+ * handed. Neither operation acts on the project's files, so the scope is
+ * checked once; a launch, which spawns in the directory, is admitted by
+ * {@link admittedLaunchRoot} instead.
  *
  * @param c The request context.
  * @param principal The authorized principal.
@@ -1257,6 +1275,104 @@ function scopedProjectRoot(
   return ok(normalized.value);
 }
 
+/** A launch's project root: the spelling it is handed on in, and the proof it was admitted with. */
+interface AdmittedLaunchRoot {
+  /**
+   * The root normalised by {@link normalizeRequestedProjectRoot}: the spelling
+   * the session check compares and the launcher is handed — its registry key,
+   * credential scope and `DEBUGGEN_PROJECT_ROOT`.
+   */
+  readonly projectRoot: string;
+  /**
+   * What `admitProjectRoot` returned: the root and the canonical path it was
+   * admitted under, which {@link requireAdmittedRootUnchanged} and the
+   * launcher's confirmation re-prove before the launch acts on it.
+   */
+  readonly admitted: AdmittedProjectRoot;
+}
+
+/**
+ * The project-root step of a launch: the requested root, normalised by
+ * {@link normalizeRequestedProjectRoot}, admitted to the principal's announced
+ * scope by `admitProjectRoot` — the rule `requireProjectScope` applies, on
+ * disk as well as in spelling — which also returns the canonical path the
+ * root was admitted under.
+ *
+ * A launch acts on the directory only after many awaits (the state-root
+ * check, the launcher's detection and credential minting), so that identity
+ * is kept: the handler re-proves it at its fence
+ * ({@link requireAdmittedRootUnchanged}) and hands the launcher the same
+ * re-proof, which it runs immediately before detection reads the project and
+ * again immediately before it spawns the child in the canonical root. A link
+ * on the path retargeted after admission is refused rather than followed.
+ *
+ * @param c The request context.
+ * @param principal The authorized principal.
+ * @param projectRoot The root the body named.
+ * @param label The route, for the log.
+ * @param deps The resolved dependencies.
+ * @returns The normalised root and its admission, or the response that
+ * refuses the request (`403` for a root outside the principal's scope).
+ */
+function admittedLaunchRoot(
+  c: Context<ServerEnv>,
+  principal: Principal,
+  projectRoot: string,
+  label: RouteLabel,
+  deps: ResolvedDeps,
+): Result<AdmittedLaunchRoot, Response> {
+  const normalized = normalizeRequestedProjectRoot(projectRoot, deps.platform);
+  if (isErr(normalized)) {
+    return err(answerFailure(c, normalized.error, label, deps.log));
+  }
+  const admitted = admitProjectRoot(principal, normalized.value);
+  if (isErr(admitted)) {
+    return err(answerFailure(c, admitted.error, label, deps.log));
+  }
+  return ok({ projectRoot: normalized.value, admitted: admitted.value });
+}
+
+/**
+ * The project-root half of a launch's fence: the admitted root must still be
+ * in the principal's scope and still resolve to the canonical path it was
+ * admitted under (`reconfirmProjectRoot`). Synchronous, and called beside
+ * {@link requireLive} with no `await` between it and the launcher call.
+ *
+ * A root that moved — a link on its path retargeted since admission, inside
+ * the workspace or out of it — or left the scope is refused `403` by
+ * `authErrorResponse` through {@link answerFailure}. A check that throws is
+ * answered `500`: the fence fails closed, and the thrown value is not kept.
+ *
+ * @param c The request context.
+ * @param principal The principal the root was admitted for.
+ * @param admitted What `admitProjectRoot` returned for the root.
+ * @param label The route, for the log.
+ * @param deps The resolved dependencies.
+ * @returns `ok`, or the response that refuses the request.
+ */
+function requireAdmittedRootUnchanged(
+  c: Context<ServerEnv>,
+  principal: Principal,
+  admitted: AdmittedProjectRoot,
+  label: RouteLabel,
+  deps: ResolvedDeps,
+): Result<void, Response> {
+  let still: Result<AdmittedProjectRoot, DebuggenError>;
+  try {
+    still = reconfirmProjectRoot(principal, admitted);
+  } catch {
+    still = err(
+      new DebuggenError('INTERNAL', DEV_SERVER_UNAVAILABLE_MESSAGE, {
+        details: { reason: 'project-root-check-threw' },
+      }),
+    );
+  }
+  if (isErr(still)) {
+    return err(answerFailure(c, still.error, label, deps.log));
+  }
+  return ok(undefined);
+}
+
 /**
  * The state-root step of a launch and of a credential request: the project
  * root must not be, contain or lie inside `$DEBUGGEN_HOME` (see
@@ -1271,7 +1387,9 @@ function scopedProjectRoot(
  * root no check is made.
  *
  * @param c The request context.
- * @param projectRoot The normalised, scope-checked project root.
+ * @param projectRoot The project root to judge: for a launch, the canonical
+ * path it was admitted under; for a credential request, the normalised,
+ * scope-checked root.
  * @param label The route, for the log.
  * @param deps The resolved dependencies.
  * @returns `ok`, or the response that refuses the request.
@@ -1403,24 +1521,20 @@ function createLaunchHandler(deps: ResolvedDeps): DevServerRouteHandler {
     if (isErr(request)) {
       return answerBodyRejection(c, request.error, LAUNCH, log);
     }
-    const projectRoot = scopedProjectRoot(
-      c,
-      principal.value,
-      request.value.projectRoot,
-      LAUNCH,
-      deps,
-    );
-    if (isErr(projectRoot)) {
-      return projectRoot.error;
+    const root = admittedLaunchRoot(c, principal.value, request.value.projectRoot, LAUNCH, deps);
+    if (isErr(root)) {
+      return root.error;
     }
-    const apart = await keepApartFromStateHome(c, projectRoot.value, LAUNCH, deps);
+    const { projectRoot, admitted } = root.value;
+    // Judged on the directory actually admitted, not on the links of its spelling.
+    const apart = await keepApartFromStateHome(c, admitted.canonicalRoot, LAUNCH, deps);
     if (isErr(apart)) {
       return apart.error;
     }
     const { command, sessionId } = request.value;
     let owner: SessionRecord | undefined;
     if (sessionId !== undefined) {
-      const found = sessionForLaunch(deps.manager, sessionId, projectRoot.value);
+      const found = sessionForLaunch(deps.manager, sessionId, projectRoot);
       if (isErr(found)) {
         return answerFailure(c, found.error, LAUNCH, log);
       }
@@ -1440,13 +1554,21 @@ function createLaunchHandler(deps: ResolvedDeps): DevServerRouteHandler {
     const devServerUrl = requestedUrl ?? recordedUrl;
 
     // The fence of initiation: nothing between it and the launcher call awaits.
+    // The credential must still be live, and the root still the directory it
+    // was admitted as; the launcher re-proves the root once more immediately
+    // before it spawns, and spawns in the canonical root.
     const live = requireLive(c, principal.value, LAUNCH, deps);
     if (isErr(live)) {
       return live.error;
     }
+    const unchanged = requireAdmittedRootUnchanged(c, principal.value, admitted, LAUNCH, deps);
+    if (isErr(unchanged)) {
+      return unchanged.error;
+    }
     const launched = await delegate(() =>
       launcher.launch({
-        projectRoot: projectRoot.value,
+        projectRoot,
+        confirmProjectRoot: () => reconfirmProjectRoot(principal.value, admitted),
         ...(command === undefined ? {} : { command }),
         ...(sessionId === undefined ? {} : { sessionId }),
         ...(devServerUrl === undefined ? {} : { devServerUrl }),

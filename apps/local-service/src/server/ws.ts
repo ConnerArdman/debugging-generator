@@ -126,7 +126,14 @@
  * worker's own `chrome.alarms` keepalive). Every pong and every frame refreshes
  * the connection's `lastSeenAt` in the registry, which is the server agent's
  * heartbeat for readiness; a connection that misses a whole interval is
- * terminated.
+ * terminated. Those pings are WebSocket control frames, which a browser script
+ * never sees, so a client that must prove its own socket still reaches a live
+ * service — the MV3 service worker, whose platform hides them — sends
+ * protocol's application-level `client.ping` instead. Any authenticated
+ * connection may send one; it is answered on arrival, in the connection's frame
+ * order, with one `service.pong` to the sender alone whose `ref` is the ping's
+ * own `id`, and it has no other effect. A ping whose `id` is longer than a
+ * pong's `ref` may be is refused with `error`, so no ping goes unanswered.
  *
  * **Disconnects are routine.** A closed socket's registration is marked
  * offline in the client registry — frames addressed to it are dropped, its
@@ -163,19 +170,20 @@
  * tab its payload names acts for that tab, and a single-tab connection speaks
  * for its hello's tab only, so a payload naming another tab is refused
  * (`TAB_NOT_BOUND`) before its handler runs. The rows above the last name
- * nine message types, which are the whole inbound vocabulary; the last row
+ * ten message types, which are the whole inbound vocabulary; the last row
  * covers every other type:
  *
  * | Inbound message | Who may send it | Routed to |
  * | --- | --- | --- |
  * | `client.hello` | the first frame of every connection; a second one is refused | `AuthService.authorizeHello` |
+ * | `client.ping` | any authenticated connection — `vscode`, `devtools` or `server-agent` — with no session, tab or scope check | answered here with one `service.pong` to the sender alone, `ref` = the ping's `id`; nothing else happens |
  * | `session.bind`, `tab.navigated`, `session.unbind` | `devtools`, each for the tab its payload names — on a single-tab connection only its hello's tab | `./routes/binding.ts`, which owns the binding rules |
  * | `telemetry.event` | `devtools` (the service worker relaying the page agent), for its acting tab's live binding | `./routes/telemetry.ts`, which owns the relayed-tab rule |
  * | `agent.ready` | `devtools`, for the tab its payload names — on a single-tab connection only its hello's tab — when no other credential has bound it | the injected {@link AgentReadinessPort} |
  * | `target.selected` | `devtools`, for the session bound to its acting tab, and only for an element of the document that tab currently shows | the injected {@link TargetSelectionPort} |
  * | `source.open` | `devtools` for the session bound to its acting tab; `vscode` within its announced workspace | the injected {@link SourceOpenPort}, which contains the path and forwards it to the session's editors; the sender is answered with `source.result` |
  * | `source.result` | `vscode`, answering a `source.open` the service forwarded to it, within its announced workspace | {@link SourceOpenPort.acceptEditorResult}, which settles the forward; the outcome is relayed to the original sender as `source.result` |
- * | every service push (`session.updated`, `agent.config`, `server-agent.config`, `panel.generated`, `target.request`, …) and the reply-only `error` | nobody — a client cannot spoof a service push or send an `error` | refused with `error` |
+ * | every service push (`session.updated`, `agent.config`, `server-agent.config`, `panel.generated`, `target.request`, `service.pong`, …) and the reply-only `error` | nobody — a client cannot spoof a service push or send an `error` | refused with `error` |
  *
  * `target.request` is one of those pushes, and this module never emits it.
  * The service sends it in answer to the editor's
@@ -194,11 +202,13 @@
  * `error` whose `ref` is the refused frame's id, which is how the sending panel
  * retracts the selection it showed as pending — and never reaches the session.
  *
- * A `server-agent` connection sends nothing after its hello: it posts telemetry
- * over HTTP and only receives `server-agent.config`, so every frame it sends is
- * refused by the role guards above. The page agent owns no socket; its
- * `agent.ready` and telemetry batches arrive on the tab's `devtools` connection
- * and are attributed to that connection's principal.
+ * A `server-agent` connection sends nothing after its hello but `client.ping`:
+ * it posts telemetry over HTTP and receives only `server-agent.config`, the
+ * `service.pong` answering its own ping and the `error` answering a refused
+ * frame, so every other frame it sends is refused by the role guards above.
+ * The page agent owns no socket; its `agent.ready` and telemetry batches arrive
+ * on the tab's `devtools` connection and are attributed to that connection's
+ * principal.
  *
  * **Replay on connect.** A producer connection — `server-agent`, or the
  * `devtools` connection that relays the page agent — is announced to the
@@ -256,8 +266,17 @@
  * ```ts
  * const clients = createClientRegistry({ logger });
  * const auth = unwrap(createAuthService({ store, config, logger, revoker: clients }));
- * const binding = createBindingRoutes({ clients, sessions, manager, reopener, arming, logger });
- * const telemetry = createTelemetryRoutes({ ingest, bindings: clients, logger });
+ * const ledger = createAgentReadyLedger({ logger });
+ * const binding = createBindingRoutes({
+ *   clients,
+ *   sessions,
+ *   manager,
+ *   reopener,
+ *   arming,
+ *   navigations: ledger,
+ *   logger,
+ * });
+ * const telemetry = createTelemetryRoutes({ ingest, bindings: clients, auth, logger });
  * const ws = unwrap(
  *   createWsServer({ auth, clients, binding, telemetry, readiness, targets, sourceOpen, logger }),
  * );
@@ -455,19 +474,20 @@ export const MAX_WS_MESSAGE_BYTES = MAX_TELEMETRY_INGEST_REQUEST_BODY_BYTES;
 const LOG_SUBSYSTEM = 'server.ws';
 
 /*
- * The three message types this module names outside its exhaustive switch
- * (the hello, the `error` reply and the `source.result` answer), and the three
- * roles it names. The message types are protocol's own `MESSAGE_TYPE`
- * constants — the one place each wire name is spelled, and the same constants
- * the switch in `route` is labelled with — which keep their literal types, so
- * `isMessageOfType` and `createEnvelope` still narrow. The roles are literals
- * checked by `satisfies` against `./auth.ts`'s role vocabulary. Either way a
- * rename upstream is a compile error here rather than a silent mismatch on the
- * wire.
+ * The four message types this module names outside its exhaustive switch
+ * (the hello, the `error` reply, the `source.result` answer and the
+ * `service.pong` answer), and the three roles it names. The message types are
+ * protocol's own `MESSAGE_TYPE` constants — the one place each wire name is
+ * spelled, and the same constants the switch in `route` is labelled with —
+ * which keep their literal types, so `isMessageOfType` and `createEnvelope`
+ * still narrow. The roles are literals checked by `satisfies` against
+ * `./auth.ts`'s role vocabulary. Either way a rename upstream is a compile
+ * error here rather than a silent mismatch on the wire.
  */
 const HELLO_TYPE = MESSAGE_TYPE.CLIENT_HELLO;
 const ERROR_REPLY_TYPE = MESSAGE_TYPE.ERROR;
 const SOURCE_RESULT_TYPE = MESSAGE_TYPE.SOURCE_RESULT;
+const SERVICE_PONG_TYPE = MESSAGE_TYPE.SERVICE_PONG;
 const DEVTOOLS_ROLE = 'devtools' satisfies PrincipalRole;
 const EDITOR_ROLE = 'vscode' satisfies PrincipalRole;
 const SERVER_AGENT_ROLE = 'server-agent' satisfies PrincipalRole;
@@ -615,6 +635,8 @@ const SOURCE_OPEN_REFUSED_MESSAGE =
   'The Debug Generator local service refused to open this source location. Its log holds the reason.';
 const SOURCE_OPEN_UNANSWERABLE_MESSAGE =
   'The source.open frame id is longer than its source.result answer can reference, so the location was not opened. Send the request under a protocol message id.';
+const PING_UNANSWERABLE_MESSAGE =
+  'The client.ping frame id is longer than its service.pong answer can reference. Send the ping under a protocol message id.';
 const HANDLER_FAILURE_MESSAGE =
   'The Debug Generator local service failed unexpectedly while handling this frame. Its log holds the reason under this ref.';
 const UNREPORTABLE_FAILURE_MESSAGE =
@@ -2508,6 +2530,11 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       case MESSAGE_TYPE.CLIENT_HELLO:
         return refusal('PROTOCOL_INVALID_MESSAGE', SECOND_HELLO_MESSAGE);
 
+      case MESSAGE_TYPE.CLIENT_PING:
+        // Every authenticated role, deliberately unguarded: the answer proves
+        // the socket, and proving it needs no permission.
+        return answerPing(client, message);
+
       case MESSAGE_TYPE.AGENT_READY:
         return routeAgentReady(client, message);
 
@@ -2592,11 +2619,53 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       case MESSAGE_TYPE.PANEL_GENERATED:
       case MESSAGE_TYPE.TARGET_REQUEST:
       case MESSAGE_TYPE.CLEANUP_COMPLETED:
+      case MESSAGE_TYPE.SERVICE_PONG:
         return refusal('PROTOCOL_INVALID_MESSAGE', SERVICE_PUSH_MESSAGE);
 
       default:
         return assertNever(message, 'Unhandled protocol message type');
     }
+  }
+
+  /**
+   * `client.ping`: answered with one `service.pong` to the sender alone, whose
+   * `ref` is the ping's own `id`, for every authenticated role — the editor,
+   * the DevTools service worker and the dev-server preload alike. No role
+   * guard, no session, tab or scope check, and no effect beyond the reply: the
+   * frame's arrival already refreshed the connection's `lastSeenAt`
+   * ({@link enqueueFrame}), as every frame does.
+   *
+   * The answer is built with `createEnvelope` and verified with `parseMessage`
+   * before it leaves, as {@link answerSourceOpen} verifies its own. An envelope
+   * `id` may be longer than a pong's `ref` may be; such a ping is refused with
+   * `PROTOCOL_INVALID_MESSAGE` through the normal `error` reply, under the ref
+   * {@link processFrame} resolves for it, so no ping is left to its sender's
+   * deadline and the sender is never handed a frame it would refuse.
+   *
+   * A pong that could not be delivered — the sender went offline between its
+   * frame and the answer — is logged at debug and the ping is not refused, since
+   * there is nobody left to tell. An answered ping is not logged at all: a
+   * heartbeat sends one every interval, so a record per ping would bury every
+   * other record of the connection.
+   */
+  function answerPing(
+    client: RegisteredClient,
+    message: MessageByType<'client.ping'>,
+  ): Result<void, DebuggenError> {
+    const pong = createEnvelope(SERVICE_PONG_TYPE, { ref: message.id });
+    if (isErr(parseMessage(pong))) {
+      return refusal('PROTOCOL_INVALID_MESSAGE', PING_UNANSWERABLE_MESSAGE);
+    }
+    const receipt = clients.sendToClient(client.id, pong);
+    if (isErr(receipt)) {
+      log.debug('a service.pong answer could not be delivered', {
+        clientId: client.id,
+        [LOG_BINDING_KEYS.client]: client.kind,
+        type: SERVICE_PONG_TYPE,
+        code: receipt.error.code,
+      });
+    }
+    return ok(undefined);
   }
 
   /**

@@ -60,6 +60,22 @@
  * cancelled operation drops its session's hold the same way, and
  * {@link PipelineOrchestrator.dispose} releases everything still loaded.
  *
+ * ## The project root's identity
+ *
+ * Indexing and installing act on the developer's project long after the
+ * `session.create` request that admitted its root answered, and a symbolic
+ * link on the root's path can be retargeted in between — even to another
+ * directory inside the workspace (CWE-367). So every index load re-proves the
+ * root through `SessionManager.confirmProjectRoot`, synchronously and
+ * immediately before the load, and indexes the **canonical root the manager
+ * confirmed** — whose excerpts are what the stages show the model — never the
+ * spelled root; the handles are held, shared and released under that
+ * canonical root. Every install the plan and follow-up stages ask for carries
+ * the same confirmation (`InstallRequest.confirmProjectRoot`), which the
+ * instrumentation service runs before it first acts on the root and again
+ * immediately before the installer, so every patch is written inside the
+ * confirmed directory too. A refusal fails the stage that needed the root.
+ *
  * ## What is deliberately not repeated here
  *
  * - The plan stage records the plan (`recordPlan`) and installs it; the
@@ -112,7 +128,16 @@ import type {
   SessionRecord,
   SessionStatus,
 } from '@debuggen/protocol';
-import { DebuggenError, err, nowEpochMs, normalizePosix, ok } from '@debuggen/shared';
+import {
+  DebuggenError,
+  err,
+  isAbsolutePosix,
+  isWindowsAbsolute,
+  nowEpochMs,
+  normalizePosix,
+  ok,
+  toPosix,
+} from '@debuggen/shared';
 import type { Logger, Result } from '@debuggen/shared';
 import type { CaptureSummary } from '@debuggen/telemetry';
 
@@ -129,7 +154,8 @@ import type {
   InstrumentationOutcome,
   InstrumentationService,
 } from '../instrumentation/service.js';
-import { sessionLogger, subsystemLogger } from '../logging.js';
+import { describeException, sessionLogger, subsystemLogger } from '../logging.js';
+import type { ExceptionDescription } from '../logging.js';
 import type { PanelGenerator } from '../panels/generate.js';
 import { placeFollowUpAttempt } from '../sessions/manager.js';
 import type { SessionBroadcaster, SessionManager, SessionPatch } from '../sessions/manager.js';
@@ -278,7 +304,16 @@ export type PipelineOperation = (typeof PIPELINE_OPERATIONS)[number];
  *   recorded a problem understanding;
  * - `orchestrator-disposed` — the service is shutting down;
  * - `aborted` — the operation was cancelled (the shape every pipeline layer
- *   uses: code `INTERNAL`, `details.reason: "aborted"`).
+ *   uses: code `INTERNAL`, `details.reason: "aborted"`);
+ * - `project-root-confirmation-threw` — `SessionManager.confirmProjectRoot`
+ *   threw instead of answering, so the project was not indexed;
+ * - `project-root-confirmation-invalid` — it answered a canonical root that is
+ *   not an absolute path;
+ * - `confirmed-root-mismatch` — the identity it confirmed names another root
+ *   than the one the operation read from the session.
+ *
+ * The manager's own refusals of a root — a root that now resolves elsewhere
+ * (`PATH_OUTSIDE_PROJECT`), an ended session — pass through unchanged.
  */
 export const PIPELINE_REFUSAL_REASONS = Object.freeze([
   'pipeline-busy',
@@ -287,6 +322,9 @@ export const PIPELINE_REFUSAL_REASONS = Object.freeze([
   'missing-understanding',
   'orchestrator-disposed',
   'aborted',
+  'project-root-confirmation-threw',
+  'project-root-confirmation-invalid',
+  'confirmed-root-mismatch',
 ] as const);
 
 /** One `details.reason` of {@link PIPELINE_REFUSAL_REASONS}. */
@@ -309,7 +347,11 @@ export interface CodeIndexPort {
   /**
    * Loads — or returns the cached — handles of a project.
    *
-   * @param projectRoot The absolute project root.
+   * @param projectRoot The absolute project root. The orchestrator passes the
+   * canonical root `SessionManager.confirmProjectRoot` confirmed for the
+   * session immediately before the call — every symbolic link resolved — never
+   * the session's spelled root, and keys its holds and `invalidate` calls by
+   * that same canonical root.
    * @param options `refresh: true` discards any cached handles and re-indexes
    * (the on-disk index cache still spares unchanged files); `signal` cancels.
    * @returns The handles, or the indexer's typed failure. Never rejects.
@@ -702,13 +744,21 @@ const INDEX_FAILED_LOG = 'Code index could not be loaded for a pipeline run.';
  * ({@link PipelineOrchestrator.releaseSession}), so the bound caps what stays
  * resident while sessions are live, not what lingers after they end.
  *
+ * The loader indexes whatever root it is given. The orchestrator gives it the
+ * canonical root the session manager has just confirmed, with no `await`
+ * between the confirmation and the call, so the project is opened in the
+ * directory that was proven rather than through a link on the session's
+ * spelled root retargeted since admission.
+ *
  * @param options The configuration, logger and memory bound.
  * @returns The loader.
  *
  * @example
  * ```ts
  * const codeIndex = createCodeIndexLoader({ config, logger });
- * const handles = await codeIndex.load(session.projectRoot, { refresh: true, signal });
+ * const confirmed = sessions.confirmProjectRoot(sessionId);
+ * if (!confirmed.ok) return confirmed;
+ * const handles = await codeIndex.load(confirmed.value.canonicalRoot, { refresh: true, signal });
  * ```
  */
 export function createCodeIndexLoader(options: CodeIndexLoaderOptions): CodeIndexPort {
@@ -898,6 +948,55 @@ function isCancellation(error: DebuggenError): boolean {
   return error.details?.['reason'] === 'aborted';
 }
 
+/** Why an answer of `SessionManager.confirmProjectRoot` could not stand as a confirmation. */
+type RootConfirmationFailure = Extract<
+  PipelineRefusalReason,
+  | 'project-root-confirmation-threw'
+  | 'project-root-confirmation-invalid'
+  | 'confirmed-root-mismatch'
+>;
+
+/**
+ * The refusal of an index load whose project-root confirmation could not stand
+ * as one: `INTERNAL`, because it is a defect of the confirmation rather than
+ * anything the developer did. Constant sentences that name no path, and no
+ * cause, so a thrown value's text never reaches a progress row or a record.
+ */
+function rootConfirmationError(sessionId: string, reason: RootConfirmationFailure): DebuggenError {
+  return new DebuggenError(
+    'INTERNAL',
+    'The project root could not be confirmed, so the project was not indexed.',
+    {
+      hint: 'Start the session again from the project folder in VS Code; the service log holds the reason.',
+      details: { reason, sessionId },
+    },
+  );
+}
+
+/** The spelling two project roots are compared in: POSIX separators, normalised. */
+function rootKey(projectRoot: string): string {
+  return normalizePosix(toPosix(projectRoot));
+}
+
+/** Whether `value` is a non-empty absolute path, POSIX or Windows-style. */
+function isAbsoluteRoot(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0) {
+    return false;
+  }
+  const posix = toPosix(value);
+  return isAbsolutePosix(posix) || isWindowsAbsolute(posix);
+}
+
+/**
+ * A member of a confirmation's answer, read structurally: the answer is the
+ * manager's, and a double or a future implementation may not honour the type.
+ */
+function confirmedMember(value: unknown, member: 'projectRoot' | 'canonicalRoot'): unknown {
+  return typeof value === 'object' && value !== null && member in value
+    ? (value as Readonly<Record<string, unknown>>)[member]
+    : undefined;
+}
+
 /**
  * Whether `error` is a refusal of the request itself — a state the session
  * does not admit, or a session that does not exist — rather than a failure of
@@ -1056,6 +1155,14 @@ const MIRROR_FAILED_LOG =
 const CODE_RELEASE_FAILED_LOG =
   'The code-index handles of a project could not be released; the loader keeps them until it evicts them.';
 
+/**
+ * Warn record of a project-root confirmation this module could not accept.
+ * Fields: error code, reason, and a thrown value's closed exception class —
+ * never a path. The session manager logs its own refusals.
+ */
+const ROOT_UNCONFIRMED_LOG =
+  'The project root could not be confirmed for indexing; the project was not indexed.';
+
 /** Warn record of prompt versions that could not be stored or read. Fields: error code. */
 const PROMPT_VERSIONS_LOG = 'The prompt versions of a pipeline run could not be recorded.';
 
@@ -1123,7 +1230,11 @@ interface ActiveOperation {
   log: Logger;
   /** When the operation started, by the injected clock. */
   readonly startedAt: number;
-  /** The project whose code handles the operation loaded, if it loaded any. */
+  /**
+   * The project whose code handles the operation loaded, if it loaded any: the
+   * canonical root the session manager confirmed for the load (see
+   * `loadCode`), normalised — the key every hold and release uses.
+   */
   projectRoot: string | undefined;
   /**
    * Whether {@link PipelineOrchestrator.releaseSession} released the session
@@ -1241,12 +1352,23 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
    * manager emits it when the failure moves the session to `failed`. Its
    * `restoreArming` is the follow-up stage's compensation seam: an installed
    * delta that cannot be kept returns the arming state to the previous version.
+   *
+   * Every install it forwards carries the session manager's re-proof of the
+   * request's session root (`InstallRequest.confirmProjectRoot`), which the
+   * service runs before it first acts on the root and again immediately before
+   * the installer, and whose canonical root the patch layer writes inside — so
+   * a link retargeted since the session was admitted redirects no patch. A
+   * stage's own confirmation is replaced: the manager's is the proof.
    */
   const quietInstaller: Pick<InstrumentationService, 'buildContext' | 'install' | 'restoreArming'> =
     Object.freeze({
       buildContext: (input) => instrumentation.buildContext(input),
       install: (request: InstallRequest) =>
-        instrumentation.install({ ...request, reportStageFailure: false }),
+        instrumentation.install({
+          ...request,
+          reportStageFailure: false,
+          confirmProjectRoot: () => sessions.confirmProjectRoot(request.sessionId),
+        }),
       restoreArming: (input) => instrumentation.restoreArming(input),
     } satisfies Pick<InstrumentationService, 'buildContext' | 'install' | 'restoreArming'>);
 
@@ -1477,20 +1599,97 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
   }
 
   /**
+   * Re-proves, synchronously, that the session's project root still resolves
+   * to the directory it was admitted under, and answers that canonical root.
+   *
+   * The manager's own refusal — a root that now resolves elsewhere, an ended
+   * or unknown session — is returned unchanged; the manager has logged it. A
+   * throw, an answer whose canonical root is not an absolute path, or an
+   * identity that names another root than `projectRoot` (the root the
+   * operation read from the session) is refused here as `INTERNAL`
+   * ({@link rootConfirmationError}), logged by code and reason alone; a thrown
+   * value is not kept.
+   *
+   * @param op The operation about to index the project.
+   * @param projectRoot The session's root, as the operation read it.
+   * @returns The confirmed canonical root, or the refusal.
+   */
+  function confirmCodeRoot(
+    op: ActiveOperation,
+    projectRoot: string,
+  ): Result<string, DebuggenError> {
+    let answer: ReturnType<SessionManager['confirmProjectRoot']>;
+    let thrown: ExceptionDescription | undefined;
+    try {
+      answer = sessions.confirmProjectRoot(op.sessionId);
+    } catch (caught) {
+      thrown = describeException(caught);
+      answer = err(rootConfirmationError(op.sessionId, 'project-root-confirmation-threw'));
+    }
+    if (!answer.ok) {
+      if (thrown !== undefined) {
+        op.log.warn(ROOT_UNCONFIRMED_LOG, {
+          code: answer.error.code,
+          reason: 'project-root-confirmation-threw',
+          ...thrown,
+        });
+      }
+      return answer;
+    }
+
+    let refusal: RootConfirmationFailure | undefined;
+    const canonicalRoot = confirmedMember(answer.value, 'canonicalRoot');
+    const confirmedRoot = confirmedMember(answer.value, 'projectRoot');
+    if (!isAbsoluteRoot(canonicalRoot)) {
+      refusal = 'project-root-confirmation-invalid';
+    } else if (
+      typeof confirmedRoot !== 'string' ||
+      rootKey(confirmedRoot) !== rootKey(projectRoot)
+    ) {
+      refusal = 'confirmed-root-mismatch';
+    } else {
+      return ok(canonicalRoot);
+    }
+
+    const error = rootConfirmationError(op.sessionId, refusal);
+    op.log.warn(ROOT_UNCONFIRMED_LOG, { code: error.code, reason: refusal });
+    return err(error);
+  }
+
+  /**
    * Loads the project's code handles through the index port, for the whole
    * operation, and records the session's hold on them so its next operation
    * reuses them. A hold recorded for a session released while this operation
    * was in flight is dropped again when the operation settles (see
    * {@link execute}).
+   *
+   * The one indexing chokepoint — `run`, `completeCapture` and `followUp` all
+   * load through it — so it is where the root is re-proved: immediately before
+   * the load, {@link confirmCodeRoot} asks the session manager whether the
+   * session's root still resolves to the directory it was admitted under, and
+   * the port is then asked, with no `await` in between, for the handles of
+   * that **canonical** root — the directory whose excerpts the stages show the
+   * model — never the spelled root, whose links may have been retargeted
+   * since. The operation's `projectRoot`, and with it the session's hold and
+   * every later release and invalidation, is that canonical root too. A
+   * refusal loads nothing and is returned for the caller to file as the
+   * stage's failure.
    */
   async function loadCode(
     op: ActiveOperation,
     projectRoot: string,
     refresh: boolean,
   ): Promise<Result<PipelineCodeHandles, DebuggenError>> {
-    op.projectRoot = normalizePosix(projectRoot);
+    const confirmed = confirmCodeRoot(op, projectRoot);
+    if (!confirmed.ok) {
+      return confirmed;
+    }
+    const canonicalRoot = confirmed.value;
+    op.projectRoot = normalizePosix(canonicalRoot);
+    // `settle` invokes the port in this same turn, so nothing runs between the
+    // proof above and the load it guards.
     const loadedCode = await settle(() =>
-      codeIndex.load(projectRoot, { signal: op.signal, refresh }),
+      codeIndex.load(canonicalRoot, { signal: op.signal, refresh }),
     );
     if (loadedCode.ok) {
       loadedRoots.add(op.projectRoot);

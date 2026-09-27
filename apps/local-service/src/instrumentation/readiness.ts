@@ -69,10 +69,13 @@
  * The page gate judges the bound tab's *current* document, and the registry
  * cannot say which that is: the relaying layer replaces a tab's report only
  * when a new document's `agent.ready` arrives, and a navigation by itself
- * clears nothing. What does follow every committed same-origin navigation is
- * the binding — the binding route mirrors the new URL onto the session
- * record's `boundTab`, which is what this module receives, and the capture
- * stage re-evaluates readiness at capture start with the fresh record. So
+ * clears nothing. What does follow every committed navigation is the binding
+ * route. It records the navigation's time in the registry
+ * ({@link BrowserAgentRegistry.latestNavigationAt}) — which is how a reload or
+ * a load of the same URL marks the stored report as possibly left behind — and,
+ * for a same-origin navigation, mirrors the new URL onto the session record's
+ * `boundTab`, which is what this module receives; the capture stage
+ * re-evaluates readiness at capture start with the fresh record. So
  * {@link evaluateReadiness} is the "before capture" check, and it judges
  * currency itself:
  *
@@ -83,12 +86,15 @@
  * | as above, and a new document reports from another origin | no page agent for the current document |
  * | as above, and nothing new reports within the bound | a same-document navigation: the report is kept |
  *
- * A mismatch alone never blocks. `tab.navigated` carries no document id, and a
- * history-API navigation moves the binding's URL within one document whose
- * agent never announces itself again; only a replacement document that
- * actually reports supersedes the stored one. Telling a replacement that never
- * reports apart from a history-API navigation needs the navigation's own
- * document identity, which no port carries today. The wait is bounded
+ * A mismatch alone never blocks. `tab.navigated` carries no document id — the
+ * service worker derives commits from `chrome.tabs.onUpdated`, which names
+ * none, and `chrome.webNavigation` is outside the extension's permission set
+ * — and a history-API navigation moves the binding's URL
+ * within one document whose agent never announces itself again; only a
+ * replacement document that actually reports supersedes the stored one.
+ * Telling a replacement that never reports apart from a history-API
+ * navigation needs the navigation's own document identity, which no port
+ * carries today. The wait is bounded
  * ({@link DEFAULT_NAVIGATION_SETTLE_MS}, at most
  * {@link MAX_NAVIGATION_SETTLE_MS}, `0` for none), skipped for an already
  * aborted request, and backstopped like the reload wait. The collection
@@ -399,10 +405,12 @@ export interface WaitForAgentReadyOptions {
  * The relayed page-agent facts, per tab — the consumer-declared port this
  * module reads browser readiness through.
  *
- * Satisfied structurally by the service's client registry
- * (`../server/clients.ts`), which receives every `agent.ready` the Chrome
- * service worker relays under a tab's connection (AAP §0.4.2). Declared here,
- * where it is consumed, following the precedent of `ServerAgentPresence` in
+ * Satisfied structurally by `../main.ts`'s agent-ready ledger, which is written
+ * from two sides: the WebSocket router (`../server/ws.ts`) stores every
+ * `agent.ready` the Chrome service worker relays under a tab's connection,
+ * and the binding route (`../server/routes/binding.ts`) stamps
+ * every `tab.navigated` it accepts. Declared here, where it is consumed,
+ * following the precedent of `ServerAgentPresence` in
  * `../dev-server/detect.ts`, so this module builds and tests without the
  * transport layer.
  */
@@ -440,16 +448,21 @@ export interface BrowserAgentRegistry {
   latestAgentReadyAt?(tabId: number): number | undefined;
 
   /**
-   * When the binding last recorded a committed navigation of `tabId`, in epoch
-   * milliseconds — every same-origin `tab.navigated` the binding keeps,
-   * including a reload and a navigation that leaves the URL unchanged, which
-   * the binding's URL alone cannot show. Optional: without it, readiness can
-   * tell that a report may be stale only from the binding's URL.
+   * When the tab last committed a navigation, in epoch milliseconds, as the
+   * binding route (`../server/routes/binding.ts`) recorded it: every
+   * `tab.navigated` it accepts for the tab — kept, dropped, or of a tab not
+   * yet bound — including a reload and a load of the same URL, which the
+   * binding's URL alone cannot show. The service's ledger always implements
+   * it; optional for other implementations (a test double, for instance),
+   * without which readiness can tell that a report may be stale only from the
+   * binding's URL.
    *
    * Compared with the report's receipt time ({@link latestAgentReadyAt}): a
    * report received before the latest navigation describes a document the tab
    * may have left, so it is not trusted on sight (see "The current document" in
-   * the module overview).
+   * the module overview). The ledger stamps a navigation strictly after the
+   * report it follows and a report no earlier than the navigation it follows,
+   * so the comparison holds when both land within one millisecond.
    */
   latestNavigationAt?(tabId: number): number | undefined;
 }

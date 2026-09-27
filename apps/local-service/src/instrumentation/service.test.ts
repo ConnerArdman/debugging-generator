@@ -211,6 +211,8 @@ const SESSION_ID = 'ses_servicesuite0001';
 const OTHER_SESSION_ID = 'ses_servicesuite0002';
 const CAPTURE_ID = 'cap_servicesuite0001';
 const PROJECT_ROOT = '/work/sample-project';
+/** Where {@link PROJECT_ROOT} was admitted to resolve: the directory behind a link on its path. */
+const CANONICAL_PROJECT_ROOT = '/volumes/work/sample-project';
 const TAB_ID = 11;
 const NOW = 1_800_000_000_000;
 const APP_ORIGIN = 'http://127.0.0.1:20271';
@@ -2676,6 +2678,9 @@ describe('buildContext', () => {
       h.service.buildContext({
         sessionId: SESSION_ID,
         projectRoot: PROJECT_ROOT,
+        // Optional upstream, and stamped only when given: given here so that
+        // every declared field is present.
+        canonicalProjectRoot: CANONICAL_PROJECT_ROOT,
         plan,
         code: h.code,
         readiness: observed,
@@ -3897,8 +3902,8 @@ describe('releaseInterruptedCapture', () => {
 
 // ---------------------------------------------------------------------------
 // The state root stays outside the project, re-checked at the patch sink
-// (AAP §0.4.2, CWE-200): the routes check before a session exists, but the
-// pipeline installs later, so every install checks again before it writes.
+// (CWE-200): the routes check before a session exists, but the pipeline
+// installs later, so every install checks again before it writes.
 // ---------------------------------------------------------------------------
 
 describe('the state root stays outside the project at the patch sink', () => {
@@ -4034,6 +4039,302 @@ describe('the state root stays outside the project at the patch sink', () => {
     }
     expect(h.installer.calls).toHaveLength(0);
     expect(framesOf(allMessages(h), 'instrumentation.failed')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The project root's identity is re-proved at the patch sink (CWE-367): an
+// install whose request carries a confirmation re-proves the root before its
+// first act on it and again immediately before the installer, and installs
+// inside the confirmed canonical root.
+// ---------------------------------------------------------------------------
+
+describe('the project root is re-proved at the patch sink', () => {
+  /** The log message of a refused confirmation. */
+  const UNCONFIRMED_LOG = 'The project root was not confirmed; no instrumentation was installed';
+
+  /** The access boundary's refusal of a root that now resolves elsewhere: no path in it. */
+  function movedRefusal(): DebuggenError {
+    return new DebuggenError(
+      'PATH_OUTSIDE_PROJECT',
+      'The project root no longer resolves to the directory it was admitted as.',
+      {
+        hint: 'Start a new session from the folder in VS Code.',
+        details: { reason: 'project-out-of-scope' },
+      },
+    );
+  }
+
+  /** A confirmation that answers `canonicalRoot` and marks each call in `sequence`. */
+  function confirming(
+    sequence: string[],
+    canonicalRoot: string = CANONICAL_PROJECT_ROOT,
+  ): NonNullable<InstallRequest['confirmProjectRoot']> {
+    return () => {
+      sequence.push('confirm');
+      return ok({ canonicalRoot });
+    };
+  }
+
+  /**
+   * The harness's preload presence, marking in `sequence` every time the
+   * readiness facts ask for it — the first read `collectReadinessEvidence`
+   * makes of the project's producers.
+   */
+  function markingServerAgents(sequence: string[]): ServerAgentReadinessSource {
+    const present = createServerAgents();
+    return {
+      hasServerAgentForProject: (projectRoot) => {
+        sequence.push('readiness');
+        return present.hasServerAgentForProject(projectRoot);
+      },
+    };
+  }
+
+  /** A second service over `h`'s doubles, with `overrides` applied to its deps. */
+  function serviceOver(
+    h: Harness,
+    overrides: Partial<InstrumentationServiceDeps>,
+  ): InstrumentationDriver {
+    return createInstrumentationService({ ...h.deps, ...overrides });
+  }
+
+  /** The `warn` records of refused confirmations. */
+  function unconfirmedRecords(h: Harness): LogEntry[] {
+    return h.log.filter((entry) => entry.level === 'warn' && entry.message === UNCONFIRMED_LOG);
+  }
+
+  it('installs inside the confirmed canonical root, keeping the spelled root everywhere else', async () => {
+    const h = createHarness();
+
+    const outcome = await h.service.install(
+      installRequest(h, buildPlan(), { confirmProjectRoot: confirming(h.sequence) }),
+    );
+
+    expect(isOk(outcome)).toBe(true);
+    const { context } = first(h.installer.calls);
+    expect(context.canonicalProjectRoot).toBe(CANONICAL_PROJECT_ROOT);
+    expect(context.projectRoot).toBe(PROJECT_ROOT);
+    expect(h.sequence.filter((entry) => entry === 'confirm')).toHaveLength(2);
+    expect(framesOf(allMessages(h), 'instrumentation.ready')).toHaveLength(1);
+    expect(unconfirmedRecords(h)).toEqual([]);
+  });
+
+  it('judges the state-root separation on the confirmed canonical root, not the spelled one', async () => {
+    const h = createHarness();
+    // The spelled root lies apart from the state root; the directory it was
+    // confirmed to resolve to is the state root's parent.
+    const service = serviceOver(h, { config: serviceConfig(join(h.home, 'state')) });
+
+    const outcome = await service.install(
+      installRequest(h, buildPlan(), { confirmProjectRoot: confirming(h.sequence, h.home) }),
+    );
+
+    expect(isErr(outcome)).toBe(true);
+    if (isErr(outcome)) {
+      expect(outcome.error.code).toBe('FS_UNSAFE_PATH');
+      expect(outcome.error.details).toMatchObject({
+        reason: STATE_HOME_OVERLAP_REASON,
+        relation: 'home-inside-project',
+      });
+    }
+    expect(h.sequence.filter((entry) => entry === 'confirm')).toHaveLength(1);
+    expect(h.installer.calls).toHaveLength(0);
+    expect(h.journal.writes).toEqual([]);
+    expect(readdirSync(h.home)).toEqual([]);
+  });
+
+  it('refuses the install when the root moved while the readiness facts were collected', async () => {
+    const h = createHarness();
+    const moved = movedRefusal();
+    let calls = 0;
+    const confirmProjectRoot = (): Result<{ readonly canonicalRoot: string }> => {
+      calls += 1;
+      return calls === 1 ? ok({ canonicalRoot: CANONICAL_PROJECT_ROOT }) : err(moved);
+    };
+
+    const outcome = await h.service.install(installRequest(h, buildPlan(), { confirmProjectRoot }));
+
+    expect(calls).toBe(2);
+    expect(isErr(outcome)).toBe(true);
+    if (isErr(outcome)) {
+      expect(outcome.error.code).toBe('PATH_OUTSIDE_PROJECT');
+      expect(outcome.error.message).toBe(moved.message);
+      expect(outcome.error.details).toMatchObject({ reason: 'project-out-of-scope' });
+      expect(outcome.error.cause).toBe(moved);
+    }
+    expect(h.installer.calls).toHaveLength(0);
+    expect(h.journal.writes).toEqual([]);
+    const failed = framesOf(allMessages(h), 'instrumentation.failed');
+    expect(failed).toHaveLength(1);
+    expect(first(failed).payload.error.code).toBe('PATH_OUTSIDE_PROJECT');
+    expect(framesOf(allMessages(h), 'instrumentation.ready')).toEqual([]);
+    expect(progressCalls(h, 'stageFailed')).toHaveLength(1);
+    // The watcher bracket still closes, and the refusal is logged by code and reason only.
+    expect(bracketOf(h.sequence)).toEqual(['suspend', 'watchSession', 'resume']);
+    expect(unconfirmedRecords(h).map((entry) => entry.fields)).toEqual([
+      { stage: 'before-install', code: 'PATH_OUTSIDE_PROJECT', reason: 'project-out-of-scope' },
+    ]);
+  });
+
+  it('refuses the install before collecting any readiness fact when the first confirmation refuses', async () => {
+    const h = createHarness();
+    const service = serviceOver(h, { serverAgents: markingServerAgents(h.sequence) });
+    const moved = movedRefusal();
+    let calls = 0;
+
+    const outcome = await service.install(
+      installRequest(h, buildPlan(), {
+        confirmProjectRoot: () => {
+          calls += 1;
+          return err(moved);
+        },
+      }),
+    );
+
+    expect(calls).toBe(1);
+    expect(isErr(outcome) && outcome.error.code).toBe('PATH_OUTSIDE_PROJECT');
+    expect(h.sequence).not.toContain('readiness');
+    expect(h.installer.calls).toHaveLength(0);
+    expect(h.journal.writes).toEqual([]);
+    expect(first(framesOf(allMessages(h), 'instrumentation.failed')).payload.error.code).toBe(
+      'PATH_OUTSIDE_PROJECT',
+    );
+    expect(unconfirmedRecords(h).map((entry) => entry.fields)).toEqual([
+      {
+        stage: 'before-state-root-check',
+        code: 'PATH_OUTSIDE_PROJECT',
+        reason: 'project-out-of-scope',
+      },
+    ]);
+  });
+
+  it.each([
+    {
+      kind: 'throws',
+      reason: 'project-root-confirmation-threw',
+      confirm: (): Result<{ readonly canonicalRoot: string }> => {
+        throw new Error('/private/leaked/sample-project could not be read');
+      },
+      logged: { errorClass: 'Error' },
+    },
+    {
+      kind: 'answers a relative canonical root',
+      reason: 'project-root-confirmation-invalid',
+      confirm: (): Result<{ readonly canonicalRoot: string }> =>
+        ok({ canonicalRoot: 'leaked/sample-project' }),
+      logged: {},
+    },
+    {
+      kind: 'answers an empty canonical root',
+      reason: 'project-root-confirmation-invalid',
+      confirm: (): Result<{ readonly canonicalRoot: string }> => ok({ canonicalRoot: '' }),
+      logged: {},
+    },
+  ])(
+    'fails closed as INTERNAL when the confirmation $kind, keeping nothing it carried',
+    async ({ reason, confirm, logged }) => {
+      const h = createHarness();
+
+      const outcome = await h.service.install(
+        installRequest(h, buildPlan(), { confirmProjectRoot: confirm }),
+      );
+
+      expect(isErr(outcome)).toBe(true);
+      if (isErr(outcome)) {
+        expect(outcome.error.code).toBe('INTERNAL');
+        expect(outcome.error.details).toMatchObject({ reason });
+        expect(outcome.error.message).not.toMatch(/leaked/u);
+      }
+      expect(h.installer.calls).toHaveLength(0);
+      expect(h.journal.writes).toEqual([]);
+      expect(first(framesOf(allMessages(h), 'instrumentation.failed')).payload.error.code).toBe(
+        'INTERNAL',
+      );
+      expect(unconfirmedRecords(h).map((entry) => entry.fields)).toEqual([
+        { stage: 'before-state-root-check', code: 'INTERNAL', reason, ...logged },
+      ]);
+      // Neither a frame nor a log record carries the path the confirmation held.
+      expect(JSON.stringify(allMessages(h))).not.toMatch(/leaked/u);
+      expect(JSON.stringify(h.log.map((entry) => entry.fields))).not.toMatch(/leaked/u);
+    },
+  );
+
+  it('makes the second confirmation the last act before the installer, with no await in between', async () => {
+    const h = createHarness();
+    const service = serviceOver(h, { serverAgents: markingServerAgents(h.sequence) });
+    let calls = 0;
+
+    const outcome = await service.install(
+      installRequest(h, buildPlan(), {
+        confirmProjectRoot: () => {
+          calls += 1;
+          const call = String(calls);
+          h.sequence.push(`confirm:${call}`);
+          // A microtask queued by the proof runs at the next `await`: had the
+          // service awaited anything between the proof and the installer, it
+          // would be marked before the installer.
+          queueMicrotask(() => h.sequence.push(`microtask:${call}`));
+          return ok({ canonicalRoot: CANONICAL_PROJECT_ROOT });
+        },
+      }),
+    );
+
+    expect(isOk(outcome)).toBe(true);
+    const upToInstaller = h.sequence.slice(0, h.sequence.indexOf('installer') + 1);
+    expect(upToInstaller.filter((entry) => entry !== 'readiness')).toEqual([
+      'suspend',
+      'confirm:1',
+      'microtask:1',
+      'confirm:2',
+      'installer',
+    ]);
+    // The readiness facts were collected between the two proofs.
+    const readinessAt = upToInstaller.indexOf('readiness');
+    expect(readinessAt).toBeGreaterThan(upToInstaller.indexOf('confirm:1'));
+    expect(readinessAt).toBeLessThan(upToInstaller.indexOf('confirm:2'));
+    expect(h.sequence.indexOf('microtask:2')).toBeGreaterThan(h.sequence.indexOf('installer'));
+  });
+
+  it('hands the installer no canonical root when the request carries no confirmation', async () => {
+    const h = createHarness();
+
+    const outcome = await h.service.install(installRequest(h, buildPlan()));
+
+    expect(isOk(outcome)).toBe(true);
+    const { context } = first(h.installer.calls);
+    expect(Object.hasOwn(context, 'canonicalProjectRoot')).toBe(false);
+    expect(context.projectRoot).toBe(PROJECT_ROOT);
+  });
+
+  it('builds a context with the canonical root normalised, and refuses a relative one', () => {
+    const h = createHarness();
+    const input = {
+      sessionId: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      plan: buildPlan(),
+      code: h.code,
+      readiness: {},
+    };
+
+    const normalised = unwrap(
+      h.service.buildContext({
+        ...input,
+        canonicalProjectRoot: '\\volumes\\work\\nested\\..\\sample-project\\',
+      }),
+    );
+    expect(normalised.canonicalProjectRoot).toBe(CANONICAL_PROJECT_ROOT);
+
+    const refused = h.service.buildContext({
+      ...input,
+      canonicalProjectRoot: 'volumes/work/sample-project',
+    });
+    expect(isErr(refused)).toBe(true);
+    if (isErr(refused)) {
+      expect(refused.error.code).toBe('INTERNAL');
+      expect(refused.error.details).toMatchObject({ field: 'canonicalProjectRoot' });
+    }
+    expect(readdirSync(h.home)).toEqual([]);
   });
 });
 

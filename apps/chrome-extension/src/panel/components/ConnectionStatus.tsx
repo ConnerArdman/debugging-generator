@@ -8,15 +8,25 @@
  * `PANEL_CONNECTION_LABELS`, plus whatever that state needs next to it:
  *
  *   connected            the pill only;
- *   reconnecting         the pill only — the worker is already retrying (AAP 0.5.5), so there is
- *                        nothing for the developer to do;
+ *   reconnecting         the pill — the worker is already retrying — and, when the
+ *                        composition root supplies `onRequestAddressChange`, a "Change service
+ *                        address…" control for a service that now listens elsewhere;
  *   not-paired           the pill and a "Pair…" control that asks the composition root to open
  *                        `PairDialog` (AAP 0.5.6);
  *   service-not-running  the pill and a visible recovery line (AAP 0.7.3, "Service not running
  *                        with the start command"): always the VS Code action, named by its
  *                        command-palette title "Debug Generator: Start Local Service", and, when
  *                        the composition root supplies one, the shell command that starts the
- *                        local service, rendered verbatim through `Code` so it can be copied.
+ *                        local service, rendered verbatim through `Code` so it can be copied —
+ *                        then, when `onRequestAddressChange` is supplied, the same "Change
+ *                        service address…" control.
+ *
+ * The address control asks the composition root to open `PairDialog` in its address mode, so a
+ * paired developer whose service moved to another port points the extension at it without
+ * pairing again. It is offered only in the two states where the worker cannot reach the service:
+ * connected, the address is evidently right; not paired, the pairing dialog carries the address
+ * field itself. The composition root supplies the callback only where the address can be saved
+ * (the panel document has extension storage), so the control is never offered to do nothing.
  *
  * When the inspected tab navigated away from the session's origin (a `tab-left` binding), the
  * notice built by `formatTabLeftMessage(origin)` is rendered beside the pill. Every state also
@@ -29,10 +39,10 @@
  * The status labels and the "Tab left ‹origin›" sentence are imported from
  * `../../shared/messages` and never re-authored here: the service worker's connection pushes and
  * `panelConnectionStatus()` speak the same vocabulary, and a second copy would drift from it. The
- * only copy in this file is generic product vocabulary — the pairing control's label, the
- * service-down recovery sentence and the tooltip hints — naming VS Code commands by their
- * contributed titles and nothing from any inspected application (AAP 0.5.4). The start-service
- * action is named by its full command-palette title, category plus title as
+ * only copy in this file is generic product vocabulary — the pairing and address controls'
+ * labels, the service-down recovery sentence and the tooltip hints — naming VS Code commands by
+ * their contributed titles and nothing from any inspected application. The
+ * start-service action is named by its full command-palette title, category plus title as
  * `apps/vscode-extension/package.json` contributes them, which is the string a developer types
  * into the palette. `../../shared/messages` exports no start-command constant, so the shell
  * command arrives as the optional `serviceStartCommand` prop; when it is absent or blank the
@@ -59,9 +69,14 @@
  *   live region, outside it, as plain text in document order: the region announces the change to
  *   "Service not running", and the remedy is there to be read without being spoken again on
  *   every status push.
- * - **The pairing control is a real button.** A renderer `Button` (`type="button"`) with
- *   `aria-haspopup="dialog"` and, when the owner reports it, `aria-expanded` for the dialog's
- *   visibility. Every focus shows the renderer's token ring from its global `:focus-visible` rule.
+ * - **The pairing and address controls are real buttons.** Each is a renderer `Button`
+ *   (`type="button"`) with `aria-haspopup="dialog"` and, when the owner reports it,
+ *   `aria-expanded` for its dialog's visibility. Every focus shows the renderer's token ring from
+ *   its global `:focus-visible` rule. The address control sits outside the live region and after
+ *   the recovery line, never inside either, so a status push does not re-announce it and the
+ *   recovery sentence reads exactly as it does without it. It keeps one position in the tree
+ *   across "Reconnecting…" and "Service not running", so a developer focused on it while the
+ *   state flips keeps focus.
  *
  * ## Design-system compliance (AAP 0.6.2, 0.6.4)
  *
@@ -78,7 +93,9 @@
  * opens a port or socket, performs a request or touches a `chrome.*` API, so it renders unchanged
  * when the panel page is opened directly with `chrome.devtools` undefined. Pairing is only an
  * intent callback: the one-time code is typed into `PairDialog`, the credential is kept by the
- * service worker in `chrome.storage.local`, and neither ever passes through this file.
+ * service worker in `chrome.storage.local`, and neither ever passes through this file. Changing
+ * the service address is an intent callback too: the address is typed into and saved by
+ * `PairDialog`, and never passes through this file either.
  *
  * @example Wiring from the composition root, with the shell command the developer can run
  * instead of the VS Code action (omit `serviceStartCommand` and the line names the VS Code
@@ -92,10 +109,13 @@
  *   serviceStartCommand="node apps/local-service/dist/main.js"
  *   pairingDialogOpen={pairOpen}
  *   onRequestPairing={() => setPairOpen(true)}
+ *   addressDialogOpen={addressOpen}
+ *   onRequestAddressChange={() => setAddressOpen(true)}
  * />
  * // In the service-not-running state this renders, beside the "Service not running" pill:
  * // Start it from VS Code with Debug Generator: Start Local Service, or run
  * // `node apps/local-service/dist/main.js` from the Debug Generator repository root.
+ * // [Change service address…]
  * ```
  *
  * @module apps/chrome-extension/src/panel/components/ConnectionStatus
@@ -116,6 +136,12 @@ import type { PanelConnectionSlice } from '../state/session-store';
 
 /** The label of the control that asks the composition root to open the pairing dialog. */
 const PAIR_ACTION_LABEL = 'Pair…';
+
+/**
+ * The label of the control that asks the composition root to open the pairing dialog in its
+ * address mode. The ellipsis says the control opens a dialog rather than acting at once.
+ */
+const ADDRESS_ACTION_LABEL = 'Change service address…';
 
 /**
  * The command-palette title of the VS Code command that starts the local service
@@ -142,6 +168,12 @@ const SERVICE_NAME = 'the local Debug Generator service';
 
 /** The contributed title of the VS Code command that issues a one-time pairing code. */
 const PAIR_COMMAND_TITLE = '“Pair Chrome DevTools Panel”';
+
+/**
+ * The tooltip sentence that names the address control, appended to the `reconnecting` and
+ * `service-not-running` hints only while the control is rendered.
+ */
+const ADDRESS_CHANGE_HINT = `If the service now listens at another address, choose ${ADDRESS_ACTION_LABEL} to enter it; this panel keeps its pairing.`;
 
 /** The message of the render-time guard for a status outside the imported vocabulary. */
 const UNHANDLED_STATUS_MESSAGE = 'Unhandled panel connection status';
@@ -199,6 +231,21 @@ export interface ConnectionStatusProps {
    * `aria-expanded`. Omitted, the control announces only that it opens a dialog.
    */
   pairingDialogOpen?: boolean | undefined;
+
+  /**
+   * Raised by the "Change service address…" control, rendered in the `reconnecting` and
+   * `service-not-running` states only while this is supplied. The composition root opens
+   * `PairDialog` in its address mode; supply it only where the address can be saved, so the
+   * control never opens a dialog that cannot do its job. Omitted, nothing is rendered for it.
+   */
+  onRequestAddressChange?: (() => void) | undefined;
+
+  /**
+   * Whether the address dialog is currently open, reflected as the address control's
+   * `aria-expanded`. Omitted, the control announces only that it opens a dialog. Ignored while
+   * the control is not rendered.
+   */
+  addressDialogOpen?: boolean | undefined;
 
   /**
    * The shell command that starts the local service, shown verbatim (surrounding whitespace
@@ -267,24 +314,29 @@ function bindingNotice(binding: PanelBindingState | undefined): string | undefin
  *
  * For `service-not-running` the hint restates the visible recovery line — the same palette
  * title, and the shell command only when that line shows one — so the two never disagree; the
- * line, not the hint, is what carries the remedy (see {@link renderRecoveryAction}).
+ * line, not the hint, is what carries the remedy (see {@link renderRecoveryAction}). For
+ * `reconnecting` and `service-not-running` the hint names the "Change service address…" control
+ * only while that control is rendered beside the pill, for the same reason.
  *
  * @param status The pill's state.
  * @param serviceUrl The service base URL the worker is trying, when known and non-blank.
  * @param hasStartCommand Whether the recovery line beside the pill shows a shell command.
- * @returns One or two plain sentences; never interactive content.
+ * @param addressChangeOffered Whether the address control is rendered beside the pill.
+ * @returns One to three plain sentences; never interactive content.
  */
 function describeStatus(
   status: PanelConnectionStatus,
   serviceUrl: string | undefined,
   hasStartCommand: boolean,
+  addressChangeOffered: boolean,
 ): string {
   const service = serviceUrl === undefined ? SERVICE_NAME : `${SERVICE_NAME} at ${serviceUrl}`;
+  const addressRemedy = addressChangeOffered ? ` ${ADDRESS_CHANGE_HINT}` : '';
   switch (status) {
     case 'connected':
       return `This panel is connected to ${service}.`;
     case 'reconnecting':
-      return `The connection to ${service} dropped. The extension is retrying automatically; no action is needed unless this persists.`;
+      return `The connection to ${service} dropped. The extension is retrying automatically; no action is needed unless this persists.${addressRemedy}`;
     case 'not-paired':
       return `This panel is not paired with the local service yet. Run ${PAIR_COMMAND_TITLE} in VS Code, then choose ${PAIR_ACTION_LABEL} and enter the one-time code it shows.`;
     case 'service-not-running': {
@@ -292,7 +344,7 @@ function describeStatus(
       const remedy = hasStartCommand
         ? `${action}, or run the command shown beside this status from the Debug Generator repository root`
         : action;
-      return `${capitalize(service)} is not answering. ${remedy}; this panel reconnects automatically once it is up.`;
+      return `${capitalize(service)} is not answering. ${remedy}; this panel reconnects automatically once it is up.${addressRemedy}`;
     }
     default:
       return assertNever(status, UNHANDLED_STATUS_MESSAGE);
@@ -370,12 +422,61 @@ function renderRecoveryAction(
   }
 }
 
+/**
+ * Whether a status offers the "Change service address…" control: only while the worker cannot
+ * reach the service. `connected` proves the address right, and `not-paired` has the pairing
+ * dialog, which carries the address field itself.
+ *
+ * @param status The pill's state.
+ * @returns `true` for `reconnecting` and `service-not-running`.
+ */
+function offersAddressChange(status: PanelConnectionStatus): boolean {
+  switch (status) {
+    case 'reconnecting':
+    case 'service-not-running':
+      return true;
+    case 'connected':
+    case 'not-paired':
+      return false;
+    default:
+      return assertNever(status, UNHANDLED_STATUS_MESSAGE);
+  }
+}
+
+/**
+ * The "Change service address…" control, rendered after the recovery line and outside the live
+ * region, so the sentence and the status announcement are exactly what they are without it.
+ *
+ * @param onRequestAddressChange The address intent callback.
+ * @param addressDialogOpen The address dialog's visibility, when the owner reports it.
+ * @returns The control.
+ */
+function renderAddressAction(
+  onRequestAddressChange: () => void,
+  addressDialogOpen: boolean | undefined,
+): ReactElement {
+  return (
+    <Button
+      variant="secondary"
+      size="sm"
+      aria-haspopup="dialog"
+      aria-expanded={addressDialogOpen}
+      onClick={() => {
+        onRequestAddressChange();
+      }}
+    >
+      {ADDRESS_ACTION_LABEL}
+    </Button>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
 /**
- * The panel's connection pill, the binding notice beside it, and the state's recovery affordance.
+ * The panel's connection pill, the binding notice beside it, the state's recovery affordance and,
+ * while the service cannot be reached, the control that changes its address.
  *
  * @param props See {@link ConnectionStatusProps}.
  * @returns The header's connection cluster.
@@ -386,6 +487,8 @@ export function ConnectionStatus(props: ConnectionStatusProps): ReactElement {
     binding,
     onRequestPairing,
     pairingDialogOpen,
+    onRequestAddressChange,
+    addressDialogOpen,
     serviceStartCommand,
     serviceUrl,
     className,
@@ -397,7 +500,16 @@ export function ConnectionStatus(props: ConnectionStatusProps): ReactElement {
 
   const notice = bindingNotice(binding);
   const startCommand = visibleText(serviceStartCommand);
-  const hint = describeStatus(status, visibleText(serviceUrl), startCommand !== undefined);
+  const addressChange =
+    onRequestAddressChange !== undefined && offersAddressChange(status)
+      ? onRequestAddressChange
+      : undefined;
+  const hint = describeStatus(
+    status,
+    visibleText(serviceUrl),
+    startCommand !== undefined,
+    addressChange !== undefined,
+  );
 
   return (
     <Stack direction="horizontal" gap={2} align="center" wrap className={className}>
@@ -422,6 +534,9 @@ export function ConnectionStatus(props: ConnectionStatusProps): ReactElement {
         </div>
       </Tooltip>
       {renderRecoveryAction(status, onRequestPairing, pairingDialogOpen, startCommand)}
+      {/* Its own slot, after the recovery line whatever that renders, so the control keeps its
+          place in the tree — and its focus — across "Reconnecting…" and "Service not running". */}
+      {addressChange === undefined ? null : renderAddressAction(addressChange, addressDialogOpen)}
     </Stack>
   );
 }

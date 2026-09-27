@@ -1542,7 +1542,10 @@ describe('DependencyGraph rendering', () => {
     // layer and total-time figures take the compact roles, the class chip a
     // label, and the participant, its relationships and its source the
     // identifier role — so the participant label and the relationship chips,
-    // which wrap their full text, keep a floor wide enough for an identifier.
+    // which wrap their full text, take the identifier role's track: its full
+    // floor wherever the panel has room and, only when narrowing makes the grid
+    // fit a panel too narrow for every floor, as little as the yielded fraction
+    // of it.
     const roles: readonly DataTableColumnWidth[] = [
       'status',
       'name',
@@ -1555,20 +1558,30 @@ describe('DependencyGraph rendering', () => {
 
     // None of them is a floorless `minmax(0, …)`, which would let the
     // participant label collapse to a few characters per line in a narrow
-    // panel: every track opens on a column-floor token, and no track carries a
-    // number of its own.
+    // panel: every track opens on a column-floor token — the readable floor
+    // itself, or a clamp that opens on that floor scaled by the
+    // `--dg-column-yield` token a truncating role can give way to — and no
+    // track carries a number of its own.
     for (const track of tracks) {
-      expect(track).toMatch(/^(?:minmax\()?var\(--dg-column-min-[a-z]+\)/u);
-      expect(track).not.toMatch(/\d/u);
+      expect(track).toMatch(
+        /^(?:minmax\()?(?:var\(--dg-column-min-[a-z]+\)|clamp\(calc\(var\(--dg-column-min-[a-z]+\) \* var\(--dg-column-yield\)\))/u,
+      );
+      // A token's own name may carry a digit (`--dg-space-2`); what the track
+      // writes around its references may not.
+      expect(track.replace(/var\(--[a-z0-9-]+\)/gu, '')).not.toMatch(/\d/u);
     }
 
-    // One floor per column reaches the grid's own minimum inline size, which
-    // is what turns a too-narrow panel into a horizontal scroll.
+    // One minimum and one readable floor per column reach the grid's own sums,
+    // which decide whether a too-narrow panel truncates the identifier columns
+    // to fit or keeps every floor and scrolls.
     const minimumInline = grid.style.getPropertyValue('--dgc-min-inline').trim();
     expect(minimumInline).toBe(
       `calc(${roles.map((role) => DATA_TABLE_COLUMN_TRACKS[role].minimum).join(' + ')})`,
     );
     expect(minimumInline.match(/var\(--dg-column-min-[a-z]+\)/gu)).toHaveLength(tracks.length);
+    expect(grid.style.getPropertyValue('--dgc-readable-inline').trim()).toBe(
+      `calc(${roles.map((role) => DATA_TABLE_COLUMN_TRACKS[role].floor).join(' + ')})`,
+    );
   });
 
   it('draws one shape and one row per participant, and one curve per relationship', async () => {
@@ -3701,7 +3714,7 @@ describe('DependencyGraph lineage styling', () => {
 
     const ambiguous = declarationsOf('.dg-dependency-graph__edge.dg-is-ambiguous');
     expect(ambiguous).toContain('stroke: var(--dg-warning)');
-    expect(ambiguous).toContain('stroke-dasharray: 4 3');
+    expect(ambiguous).toContain('stroke-dasharray: var(--dg-stroke-dash-dashed)');
 
     // The measured curve keeps the connector token alone, which the token
     // suite measures in every theme.

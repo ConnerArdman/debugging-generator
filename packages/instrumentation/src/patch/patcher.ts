@@ -13,7 +13,8 @@
  * ## The sequence, which is the specification
  *
  * ```text
- * 0. resolve the target inside projectRoot        (lexically, then canonically)
+ * 0. resolve the target inside the working root   (lexically, then canonically)
+ *    — the admitted canonical root when one is given, re-proven canonical
  * 1. read the original bytes + inode   → originalHash
  * 1a. confirm the baseline the patch assumes      (./conflict.js decides)
  * 2. build the patched content         → instrumentedHash  (nothing written yet)
@@ -39,6 +40,19 @@
  *   a directory component replaced in between redirects everything after it to
  *   somewhere nothing validated. Checking a third time would have the same
  *   flaw; not re-resolving the path does not.
+ *
+ *   The root those resolutions start from matters as much. The session spells
+ *   its project root the way the editor handed it over, often through a link,
+ *   and resolving that spelling afresh on every attempt pins whatever it names
+ *   *now*: a link retargeted between the service admitting the root and this
+ *   sequence running redirects the whole patch into a directory nobody
+ *   admitted (CWE-367). So when the service supplies the canonical path it
+ *   admitted the root under ({@link PatcherOptions.canonicalRoot}), the
+ *   sequence works inside that path rather than the spelling, and before
+ *   pinning it re-proves — synchronously, with nothing awaited in between —
+ *   that the path still resolves to itself. A component replaced by a link
+ *   since admission breaks that fixed point, and the patch is refused before a
+ *   byte is read.
  * - Step 5 is **conditional**. Between step 1's read and the install sit a
  *   parse, a transform, two digests, a durable backup and a journal append, and
  *   a developer can save the same file in that time. An unconditional rename
@@ -124,6 +138,7 @@
  * ```ts
  * const patcher = createPatcher({
  *   projectRoot,
+ *   canonicalRoot, // the path the service admitted projectRoot under, when it holds one
  *   sessionId,
  *   planVersion: 1,
  *   backups: createBackupStore({ debuggenHome, sessionId }),
@@ -284,7 +299,8 @@ const PATCHABLE_ACTION_TYPES: readonly InstrumentationActionType[] = Object.free
  *
  * - `'resolve-target'` — the action is a patch target, its path is inside the
  *   project as text, and it is still inside the project once every directory
- *   component has been canonicalised. Nothing has been read.
+ *   component has been canonicalised. When an admitted canonical root was
+ *   supplied, that root still resolves to itself. Nothing has been read.
  * - `'read-original'` — the bytes and the inode they came from are in memory,
  *   hashed as `originalHash`, and decoded to text that provably re-encodes to
  *   those exact bytes.
@@ -545,8 +561,9 @@ export interface FunctionTimingTransformObject {
  *
  * A long-lived caller passes its `FunctionTimingPatcher` so the in-memory
  * ts-morph project is shared across every file of one install; a suite passes a
- * function. When neither is supplied, a patcher is built over
- * {@link PatcherOptions.projectRoot} with syntax verification left on.
+ * function. When neither is supplied, a patcher is built over the root the
+ * sequence works inside ({@link Patcher.projectRoot}) with syntax verification
+ * left on.
  */
 export type FunctionTimingSource = FunctionTimingTransform | FunctionTimingTransformObject;
 
@@ -583,6 +600,54 @@ export interface PatchContext extends ConflictDetectionContext {
  * environment and no database is opened: both are ports.
  */
 export interface PatcherOptions extends PatchContext {
+  /**
+   * The canonical path {@link PatcherOptions.projectRoot} was admitted under —
+   * every symbolic link resolved, as the service's `realpathSync.native`
+   * reported it when it admitted the root — for a caller that holds one.
+   *
+   * Given, the patcher **works inside it**. It is the root every target is
+   * canonicalised and contained inside, the root the pin is taken from, the
+   * project root the transform and the conflict detector are handed, and the
+   * value {@link Patcher.projectRoot} reports. `projectRoot` is still required
+   * and validated, but it no longer steers a read or a write: a spelled root
+   * that is a symbolic link, retargeted after admission, cannot redirect a
+   * patch into a directory nobody admitted (CWE-367).
+   *
+   * Every attempt re-proves it in step 0, synchronously after the target is
+   * resolved and before the pin is taken: the canonical path must still resolve
+   * to itself. A directory component replaced by a symbolic link since
+   * admission breaks that fixed point, and the attempt is refused with
+   * `PATH_OUTSIDE_PROJECT` (`details.reason: 'project-root-moved'`) before
+   * anything is read, backed up or journaled.
+   *
+   * The fixed point is compared rather than "the spelled root still resolves to
+   * this path" because the two resolvers disagree about casing: JavaScript's
+   * `realpathSync` can keep the caller's spelling of a component — a lower-case
+   * Windows drive letter handed over by an editor, for one — where
+   * `realpathSync.native` reports the filesystem's own. The canonical path
+   * resolving to itself holds whichever resolver produced it.
+   *
+   * Absolute POSIX or drive-rooted (`X:/`) once normalised, exactly like
+   * `projectRoot`, or {@link createPatcher} throws `CONFIG_INVALID`
+   * (`canonical-root-not-absolute`). Omitted, every attempt resolves
+   * `projectRoot` itself and works inside whatever it resolves to.
+   *
+   * @example
+   * ```ts
+   * // `admitted` is the `{ projectRoot, canonicalRoot }` pair the service's
+   * // admission gate returned for this session's root.
+   * const patcher = createPatcher({
+   *   projectRoot: admitted.projectRoot,
+   *   canonicalRoot: admitted.canonicalRoot,
+   *   sessionId,
+   *   planVersion,
+   *   backups,
+   *   journal,
+   * });
+   * ```
+   */
+  readonly canonicalRoot?: string | undefined;
+
   /**
    * The session every record and backup belongs to.
    *
@@ -885,7 +950,11 @@ export interface Patcher {
   /** The plan version every record is stamped with. */
   readonly planVersion: number;
 
-  /** The project root every target is resolved inside, POSIX. */
+  /**
+   * The project root every target is resolved inside, POSIX: the admitted
+   * {@link PatcherOptions.canonicalRoot} when one was supplied, otherwise
+   * {@link PatcherOptions.projectRoot}, normalised.
+   */
   readonly projectRoot: string;
 
   /**
@@ -968,17 +1037,36 @@ export interface Patcher {
  * @throws {DebuggenError} `STORE_ERROR` when the backup store belongs to a
  * different session — it would file this session's originals in another
  * session's directory, and the conflict detector refuses the mismatch too —
- * and `CONFIG_INVALID` when `planVersion` is not a positive integer or
- * `projectRoot` is not an absolute path.
+ * and `CONFIG_INVALID` when `planVersion` is not a positive integer, when
+ * `projectRoot` is not an absolute path, or when a supplied `canonicalRoot` is
+ * not one (`canonical-root-not-absolute`).
  */
 export function createPatcher(options: PatcherOptions): Patcher {
   const projectRoot = normalizePosix(toPosix(options.projectRoot));
 
-  if (!projectRoot.startsWith('/') && !/^[A-Za-z]:\//.test(projectRoot)) {
+  if (!isAbsoluteRoot(projectRoot)) {
     throw new DebuggenError('CONFIG_INVALID', 'A patcher must be given an absolute project root.', {
       hint: "Pass the session's resolved projectRoot, or a directory from fs.mkdtemp in a test.",
       details: { reason: 'project-root-not-absolute' },
     });
+  }
+
+  // Normalised exactly as `projectRoot` is, so the fixed-point comparison of
+  // step 0 compares two strings built by the same rules.
+  const canonicalRoot =
+    options.canonicalRoot === undefined
+      ? undefined
+      : normalizePosix(toPosix(options.canonicalRoot));
+
+  if (canonicalRoot !== undefined && !isAbsoluteRoot(canonicalRoot)) {
+    throw new DebuggenError(
+      'CONFIG_INVALID',
+      'A patcher must be given an absolute canonical project root.',
+      {
+        hint: 'Pass the canonical path the service admitted the project root under, or omit canonicalRoot.',
+        details: { reason: 'canonical-root-not-absolute' },
+      },
+    );
   }
 
   if (!Number.isInteger(options.planVersion) || options.planVersion < 1) {
@@ -1007,7 +1095,18 @@ export function createPatcher(options: PatcherOptions): Patcher {
     );
   }
 
-  return new SequencedPatcher(projectRoot, options);
+  return new SequencedPatcher(canonicalRoot ?? projectRoot, canonicalRoot, options);
+}
+
+/**
+ * Whether a normalised root is absolute: POSIX-rooted, or drive-rooted (`X:/`)
+ * for a Windows path that {@link toPosix} has already turned forward-slashed.
+ *
+ * One rule for both roots {@link createPatcher} accepts, so the spelled root
+ * and the admitted canonical root can never be held to different standards.
+ */
+function isAbsoluteRoot(root: string): boolean {
+  return root.startsWith('/') || /^[A-Za-z]:\//.test(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,6 +1190,15 @@ class SequencedPatcher implements Patcher {
   readonly #context: PatchContext;
 
   /**
+   * The admitted canonical root, when the caller supplied one.
+   *
+   * The same string as {@link SequencedPatcher.projectRoot} whenever it is
+   * present; held apart because its presence is what obliges step 0 to prove,
+   * on every attempt, that the root still resolves to itself.
+   */
+  readonly #canonicalRoot: string | undefined;
+
+  /**
    * The `(file, symbol)` pairs this instance has already journaled a record
    * for, so one plan version cannot patch the same symbol twice.
    */
@@ -1102,8 +1210,16 @@ class SequencedPatcher implements Patcher {
   /** Every conflict this instance detected, in detection order. */
   readonly #conflicts: ModificationConflict[] = [];
 
-  constructor(projectRoot: string, options: PatcherOptions) {
+  /**
+   * @param projectRoot The normalised root the sequence works inside: the
+   * admitted canonical root when there is one, the spelled root otherwise.
+   * @param canonicalRoot The normalised admitted canonical root, or `undefined`
+   * when the caller supplied none.
+   * @param options Everything else, as {@link createPatcher} validated it.
+   */
+  constructor(projectRoot: string, canonicalRoot: string | undefined, options: PatcherOptions) {
     this.projectRoot = projectRoot;
+    this.#canonicalRoot = canonicalRoot;
     this.sessionId = options.sessionId;
     this.planVersion = options.planVersion;
     this.#backups = options.backups;
@@ -1362,11 +1478,31 @@ class SequencedPatcher implements Patcher {
       // the canonical pair, so a `src/vendor` that links to `/etc` is refused
       // *here* — before a byte is read, a backup is written or a record is
       // journaled (CWE-22). Every later step uses the canonical path it
-      // returns, never the lexical one.
+      // returns, never the lexical one. The root it starts from is the root
+      // this patcher works inside: the admitted canonical root when the caller
+      // supplied one, so a spelled root retargeted since admission is never
+      // consulted at all.
       const resolved = resolveRealPathWithinProject(this.projectRoot, file, this.#files.realPath);
 
       if (isErr(resolved)) {
         return await failed(unresolvableTarget(resolved.error, file));
+      }
+
+      // The admitted root must still be the directory it was admitted as, and
+      // this is where that is proven: synchronously after the resolution above
+      // and before the pin below, with nothing awaited in between, so no other
+      // task of this process runs inside the window. The canonical path has to
+      // resolve to itself. A directory on the way to it replaced by a symbolic
+      // link since admission makes it resolve somewhere else — and the pin
+      // would then faithfully hold that somewhere else — so the attempt stops
+      // here, before a byte is read, a backup is written or a record is
+      // journaled. A link planted after this comparison is still refused: the
+      // pin opens every component with `O_NOFOLLOW`.
+      if (
+        this.#canonicalRoot !== undefined &&
+        normalizePosix(toPosix(resolved.value.projectRoot)) !== this.#canonicalRoot
+      ) {
+        return await failed(projectRootMoved(file, symbol));
       }
 
       // Contained, but reached through a link that stays inside the project:
@@ -2428,6 +2564,30 @@ function unresolvableTarget(error: DebuggenError, file: string): DebuggenError {
     details: { reason: 'file-not-found', file, errno },
     cause: error,
   });
+}
+
+/**
+ * The refusal of an attempt whose admitted canonical root no longer resolves to
+ * itself: a directory on the way to the project was replaced by a symbolic
+ * link — typically moved aside, with the link planted where it stood — after
+ * the service admitted the root. A directory that is simply gone is not this
+ * refusal: its resolution fails, and {@link unresolvableTarget} reports it.
+ *
+ * `PATH_OUTSIDE_PROJECT` — the code the service's own re-check of an admitted
+ * root answers with — because a patch through the replacement would land in a
+ * directory nobody admitted. The message and hint name no path, since an error
+ * may be logged and forwarded to either user interface; the details carry only
+ * the target's project-relative path and symbol.
+ */
+function projectRootMoved(file: string, symbol: string): DebuggenError {
+  return new DebuggenError(
+    'PATH_OUTSIDE_PROJECT',
+    'The project root no longer resolves to the directory it was admitted as, so nothing was patched.',
+    {
+      hint: 'A folder on the way to the project was replaced by a link after the session started. Put the folder back, or start a new session for the project where it now lives.',
+      details: { reason: 'project-root-moved', file, symbol },
+    },
+  );
 }
 
 /**

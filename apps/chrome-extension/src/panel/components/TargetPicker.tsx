@@ -13,6 +13,13 @@
  * state of its own — which is precisely what makes the two routes agree: the
  * toggle shows the same pressed state whichever of them turned it on.
  *
+ * While picker mode is on, the inspected page's agent waits for the
+ * developer's next click on an element there, which becomes the session's
+ * target; Escape pressed in the page cancels it. When that pick ends — an
+ * element picked, Escape, or the page going away — the worker says so and the
+ * store turns `pickRequested` off, so the toggle releases here without any
+ * press. Pressing the toggle again while it is on cancels the pick.
+ *
  * ## What happens on a click, and what does not happen here
  *
  * - "Pick element" calls `onPick`; "Use selected element" calls
@@ -133,7 +140,7 @@ const PICK_LABEL = 'Pick element';
 
 /** What the toggle does, shown in its tooltip while DevTools is available. */
 const PICK_DESCRIPTION =
-  "Turns picker mode on or off. While it is on, the element you select next in the Elements panel becomes the session's target.";
+  "Turns picker mode on or off. While it is on, the next element you click in the inspected page becomes the session's target; press Esc in the page to cancel.";
 
 /** The one-shot control's name. */
 const USE_SELECTED_LABEL = 'Use selected element';
@@ -160,7 +167,8 @@ const BUSY_ANNOUNCEMENT = 'Updating the session target.';
 const PICKER_ON_LABEL = 'Picker on';
 
 /** Announced politely when picker mode turns on, whichever route turned it on. */
-const PICKER_ON_ANNOUNCEMENT = 'Picker mode on. Select an element in the Elements panel.';
+const PICKER_ON_ANNOUNCEMENT =
+  'Picker mode on. Click an element in the inspected page, or press Escape there to cancel.';
 
 /** Shown in place of a descriptor while the session has no target. */
 const NO_TARGET_LABEL = 'No element selected';
@@ -220,8 +228,10 @@ export interface TargetPickerProps {
 
   /**
    * Whether picker mode is on — because the developer pressed "Pick element"
-   * or because the service sent `target.request`. Rendered as the toggle's
-   * `aria-pressed` and pressed surface, and as the "Picker on" badge.
+   * or because the service sent `target.request` — and stays on until the
+   * inspected page's pick ends (an element clicked, Escape, the page gone) or
+   * the toggle is pressed again. Rendered as the toggle's `aria-pressed` and
+   * pressed surface, and as the "Picker on" badge.
    */
   pickerActive: boolean;
 

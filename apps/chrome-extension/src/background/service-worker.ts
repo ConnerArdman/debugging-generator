@@ -112,8 +112,10 @@ import type {
   PanelBindingState,
   PanelReloadState,
   PanelSessionSnapshot,
+  PortPickerPush,
   PortPush,
   PortReloadPush,
+  PortRequestId,
   PortRequestPayloads,
   PortResponsePayloads,
   RelayedProtocolMessage,
@@ -154,6 +156,7 @@ import {
   SERVICE_ENDPOINT_STORAGE_KEY,
 } from './auth';
 import type {
+  BridgeConnection,
   DevtoolsConnection,
   PanelConnection,
   ProtocolSend,
@@ -283,6 +286,92 @@ const PICKER_UNAVAILABLE_MESSAGE =
  */
 const STALE_SELECTION_MESSAGE =
   'The page changed before the element was reported, so it was not selected. Pick it again.';
+
+/**
+ * The interactive pick this worker generation armed in one tab's page and the
+ * page agent has not answered yet. The agent answers every armed pick exactly
+ * once — the clicked element, or `null` for Escape, a hidden page, a cancel or
+ * a newer pick — so the record lives from the arming `target.request` to that
+ * one `target.described`, or until the document holding the pick goes away.
+ *
+ * The record is also the only authority for an answer's element: a non-null
+ * `target.described` becomes a target only when it answers this record — its
+ * `requestId`, on its `connectionId` — while the record stands uncancelled,
+ * and only for its `sessionId` ({@link PagePickVerdict}). A pick never
+ * outlives the bridge connection that armed it (the page agent ends its pick
+ * when the bridge's worker port closes, and {@link releasePagePick} drops the
+ * record with that connection), so an answer no record matches is never one
+ * this worker should honour.
+ */
+interface ArmedPagePick {
+  /** The arming `target.request`'s id; the agent echoes it on its answer. */
+  readonly requestId: PortRequestId;
+  /** The bridge connection the request went to: the document holding the pick. */
+  readonly connectionId: WorkerConnectionId;
+  /**
+   * The session the pick was armed for — the `target.pick` request's, which
+   * the panel scope check tied to the tab's binding at that moment. The
+   * picked element may become that session's target and no other's: when
+   * the tab is bound to another session by the time the answer is forwarded,
+   * the element is dropped.
+   */
+  readonly sessionId: SessionId;
+  /**
+   * Whether the pick was since cancelled in the page: the panel left picker
+   * mode or submitted "Use selected element", or the tab's binding to the
+   * pick's session went away, or the tab's last panel closed. The panel then
+   * already shows picker mode off — it asked for that and was answered
+   * `active: false`, it turned picker mode off with the confirmed selection,
+   * it reset its session state with the binding, or it is gone — so the
+   * cancelled pick's answer ends nothing on screen and pushes nothing: a push
+   * then could only arrive after the panel turned picker mode on again, and
+   * would switch the new activation off. Nor does that answer select: an
+   * element clicked after the pick was cancelled is not the developer's pick.
+   */
+  readonly cancelled: boolean;
+}
+
+/** What ended a page pick, for the log line of the `picker` push that says so. */
+type PagePickEnd = 'answered' | 'bridge-gone';
+
+/**
+ * Why a page pick's non-null answer was not forwarded as the session's target
+ * — the code it is logged by (never the descriptor):
+ *
+ * - `unarmed` — this worker generation holds no pick for the tab: none was
+ *   armed, or the one armed was already answered or ended with its bridge.
+ * - `superseded` — the answer names an older pick than the recorded one: a
+ *   pick cancelled or replaced before the current one was armed.
+ * - `cancelled` — it answers the recorded pick, which was cancelled first.
+ * - `unidentified` — it names no `requestId`, so it cannot be matched to the
+ *   pick that armed it.
+ * - `other-connection` — it arrived on another bridge connection than the one
+ *   the pick was armed on, so another document answered.
+ * - `rebound` — it answers the live pick, but by the time it could be sent the
+ *   tab was bound to another session than the one the pick was armed for.
+ */
+type PagePickDropReason =
+  'unarmed' | 'superseded' | 'cancelled' | 'unidentified' | 'other-connection' | 'rebound';
+
+/**
+ * What one `target.described` answer may do with its element, decided
+ * synchronously when it arrives from the tab's pick record
+ * (`settlePagePick`): `select` for the one answer to the live pick, carrying
+ * the session the pick was armed for, or `drop` with the reason.
+ */
+type PagePickVerdict =
+  | { readonly kind: 'select'; readonly sessionId: SessionId }
+  | { readonly kind: 'drop'; readonly reason: Exclude<PagePickDropReason, 'rebound'> };
+
+/**
+ * A page pick's answer on its way to the service: the attribution of the
+ * agent's `target.described` frame, checked again once the binding is read,
+ * and the session the pick was armed for, which that binding must still name.
+ */
+interface AnsweredPagePick {
+  readonly bridge: BridgeMessageContext;
+  readonly sessionId: SessionId;
+}
 
 /**
  * How much sooner than a panel request's own deadline an HTTP call to the
@@ -2587,33 +2676,276 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   }
 
   /**
+   * Per tab, the page pick this worker generation armed and the page agent has
+   * not answered yet ({@link ArmedPagePick}). Worker-generation memory like the
+   * lanes: a revived worker holds none, and an answer to a pick it does not
+   * hold is read as that pick ending — never as a selection
+   * ({@link settlePagePick}).
+   */
+  const pagePicks = new Map<TabId, ArmedPagePick>();
+
+  /**
    * Put a tab's page into picker mode — the one implementation behind
    * `target.pick`, which the panel sends for its own "Pick element" and for
    * the service's relayed `target.request` alike (the panel is the only
    * arming authority, so a request is armed once).
    *
    * Picker mode is the page agent's picker and nothing else: the request goes
-   * through the ISOLATED-world bridge, and the element the developer then
-   * clicks arrives as `target.described`, forwarded as `target.selected`.
+   * through the ISOLATED-world bridge and arms one interactive pick in the
+   * page. The next element the developer clicks there is consumed by the
+   * agent — the page never sees that click — and arrives as `target.described`
+   * with this request's id, forwarded as `target.selected`; Escape in the page
+   * (or the page being hidden) ends the pick without one. Either way the
+   * answer ends picker mode in the panel ({@link settlePagePick}).
    * DevTools is never asked on this path — describing the Elements panel's
    * `$0` here would submit whatever happens to be selected there (often a
    * default element) before the developer picked anything; `$0` is "Use
    * selected element", the panel's explicit second control (AAP §0.7.3).
-   * Synchronous: it only posts on a port that already exists.
+   * Synchronous: it only posts on a port that already exists, and records the
+   * armed pick against the bridge connection it went to and the session it
+   * was armed for ({@link pagePicks}) — the one session the picked element
+   * may become the target of.
    *
    * @param tabId The bound tab.
+   * @param sessionId The session the `target.pick` request named, which the
+   *   panel scope check found bound to `tabId`.
    * @returns Whether the page agent's bridge took the request; `false` when no
    *   page agent is connected for the tab (an origin outside the host
    *   permissions, or a document that predates the extension).
    */
-  function armElementPicker(tabId: TabId): boolean {
-    return hub.sendToBridge(tabId, {
+  function armElementPicker(tabId: TabId, sessionId: SessionId): boolean {
+    const requestId = newPortRequestId();
+    const sent = hub.sendToBridge(tabId, {
       channel: EXTENSION_CHANNEL,
       version: PORT_PROTOCOL_VERSION,
       direction: 'downstream',
       type: 'target.request',
-      payload: { requestId: newPortRequestId() },
+      payload: { requestId },
     });
+    if (!sent) {
+      return false;
+    }
+    // Read after the send, synchronously: the bridge the frame was posted to
+    // is the tab's current one, and the hub holds exactly one per tab.
+    const connectionId = currentBridgeConnectionId(tabId);
+    if (connectionId === undefined) {
+      // Unreachable while the send succeeded; without a record the pick's
+      // answer is still read as its end (`settlePagePick`), so nothing sticks
+      // — and, answering no record, it selects nothing.
+      pagePicks.delete(tabId);
+    } else {
+      // A pick recorded before is superseded in the page, which answers it
+      // with its own, older id — an answer `settlePagePick` then ignores.
+      pagePicks.set(tabId, { requestId, connectionId, sessionId, cancelled: false });
+    }
+    log.debug('Picker mode armed in the page.', { tabId });
+    return true;
+  }
+
+  /** The connection id of a tab's current content-script bridge, when one is attached. */
+  function currentBridgeConnectionId(tabId: TabId): WorkerConnectionId | undefined {
+    return hub
+      .listConnections()
+      .find((connection) => connection.role === PORT_CONTENT_BRIDGE && connection.tabId === tabId)
+      ?.connectionId;
+  }
+
+  /**
+   * Tell a tab's panels that its page pick is over, so their picker mode — the
+   * pressed "Pick element" toggle and its "Picker on" badge — ends with it. No
+   * panel attached is normal: a panel that opens later hydrates with picker
+   * mode off.
+   */
+  function pushPickerEnded(tabId: TabId, cause: PagePickEnd): void {
+    const push: PortPickerPush = {
+      channel: EXTENSION_CHANNEL,
+      version: PORT_PROTOCOL_VERSION,
+      direction: 'push',
+      kind: 'picker',
+      state: { active: false },
+    };
+    const panels = hub.pushToPanels(tabId, push);
+    log.debug('Picker mode ended in the page.', { tabId, cause, panels });
+  }
+
+  /**
+   * Settle a tab's pick bookkeeping for one `target.described` answer, end
+   * picker mode in its panels when the answer ends the pick they may show on,
+   * and decide whether the answer's element may be forwarded at all.
+   *
+   * Called synchronously when the answer arrives, while the hub's dispatch
+   * still vouches for its bridge: every later event — a cancel, a re-arm, a
+   * rebind — then applies to the record after this answer, never to it.
+   *
+   * Picker mode in the panel:
+   *
+   * - **An answer to an older pick** — its id is not the recorded pick's, so
+   *   it answers one that was cancelled or superseded before the current pick
+   *   was armed — ends nothing: the current pick is still armed in the page.
+   * - **An answer to the recorded pick** (or one naming no id) ends it: the
+   *   record is dropped, and picker mode is pushed off unless the panel had
+   *   already left it and cancelled the pick ({@link ArmedPagePick.cancelled}).
+   * - **An answer with no record** also pushes picker mode off. This worker
+   *   generation armed nothing it still holds — the worker was revived, or the
+   *   pick already ended — but the page just answered, so its pick has ended
+   *   and "off" is the true state. A panel already off ignores it.
+   *
+   * The verdict on the element: `select` only for the answer to the recorded,
+   * uncancelled pick — the answer's `requestId` is the record's, and it
+   * arrived on the bridge connection the pick was armed on — carrying the
+   * session the pick was armed for. Every other answer is dropped with its
+   * {@link PagePickDropReason}: a pick this worker did not arm, or one already
+   * cancelled or superseded, is not the developer's pick for any session, so
+   * its element is never forwarded to whatever the tab is bound to now.
+   *
+   * @param context The attribution of the bridge frame carrying the answer.
+   * @param requestId The id the answer echoes, when it carries one.
+   * @returns Whether the answer's element may be forwarded, and for which session.
+   */
+  function settlePagePick(
+    context: BridgeMessageContext,
+    requestId: PortRequestId | undefined,
+  ): PagePickVerdict {
+    const { tabId } = context;
+    const pick = pagePicks.get(tabId);
+    if (pick === undefined) {
+      pushPickerEnded(tabId, 'answered');
+      return { kind: 'drop', reason: 'unarmed' };
+    }
+    if (requestId !== undefined && requestId !== pick.requestId) {
+      log.debug('An answer to an earlier page pick was ignored.', { tabId });
+      return { kind: 'drop', reason: 'superseded' };
+    }
+    pagePicks.delete(tabId);
+    if (pick.cancelled) {
+      return { kind: 'drop', reason: 'cancelled' };
+    }
+    pushPickerEnded(tabId, 'answered');
+    if (requestId === undefined) {
+      return { kind: 'drop', reason: 'unidentified' };
+    }
+    if (pick.connectionId !== context.connectionId) {
+      return { kind: 'drop', reason: 'other-connection' };
+    }
+    return { kind: 'select', sessionId: pick.sessionId };
+  }
+
+  /**
+   * A content-script bridge left: when it carried the tab's recorded pick, the
+   * document holding that pick is gone (a navigation, a reload, a closed tab or
+   * a bridge superseded by the next document), so the pick is dropped and —
+   * unless the panel had already cancelled it, or the worker itself is being
+   * torn down — picker mode is pushed off. Another connection's departure
+   * leaves the record alone: it never held this pick.
+   */
+  function releasePagePick(event: PortClosedEvent<BridgeConnection>): void {
+    const { tabId, connectionId } = event.connection;
+    const pick = pagePicks.get(tabId);
+    if (pick === undefined || pick.connectionId !== connectionId) {
+      return;
+    }
+    pagePicks.delete(tabId);
+    if (pick.cancelled || disposed || event.reason === 'disposed') {
+      return;
+    }
+    pushPickerEnded(tabId, 'bridge-gone');
+  }
+
+  /**
+   * Send a tab's page a `target.request { cancel: true }` and settle the
+   * recorded pick's bookkeeping for it: a recorded pick is kept, marked
+   * cancelled, until the agent's answer to it arrives ({@link settlePagePick})
+   * — so that answer is told apart from one to a pick armed after it — or is
+   * dropped when no bridge took the cancel, since no document is then left to
+   * answer it.
+   *
+   * @param tabId The tab whose page pick is cancelled.
+   * @returns Whether a bridge took the cancel, and whether a pick was recorded.
+   */
+  function sendPickCancel(tabId: TabId): { readonly sent: boolean; readonly recorded: boolean } {
+    const sent = hub.sendToBridge(tabId, {
+      channel: EXTENSION_CHANNEL,
+      version: PORT_PROTOCOL_VERSION,
+      direction: 'downstream',
+      type: 'target.request',
+      payload: { requestId: newPortRequestId(), cancel: true },
+    });
+    const pick = pagePicks.get(tabId);
+    if (pick !== undefined) {
+      if (sent) {
+        pagePicks.set(tabId, { ...pick, cancelled: true });
+      } else {
+        pagePicks.delete(tabId);
+      }
+    }
+    return { sent, recorded: pick !== undefined };
+  }
+
+  /**
+   * A tab lost its session's binding — the tab was unbound (a session end
+   * included), left its session's origin, was closed, or is now bound to
+   * another session. Any pick armed there belonged to the session that left,
+   * and the page would otherwise keep consuming the developer's next click
+   * for it, so it is cancelled in the page. Nothing is pushed: the panel
+   * resets its session-scoped state, picker mode included, on that same
+   * binding change, and the cancelled pick's answer ends nothing on screen
+   * and selects nothing ({@link ArmedPagePick.cancelled}).
+   *
+   * The cancel is sent whether or not this worker generation holds a record
+   * of a pick there: the record is worker-generation memory (a revived worker
+   * remembers nothing), so its absence does not prove the page holds no pick.
+   * With no pick active the page ignores the cancel, and with no bridge
+   * attached nothing is sent.
+   *
+   * @param tabId The tab whose binding changed.
+   */
+  function cancelPickWithBinding(tabId: TabId): void {
+    const { sent, recorded } = sendPickCancel(tabId);
+    log.debug('The page pick was cancelled with its binding.', {
+      tabId,
+      cancelSent: sent,
+      recorded,
+    });
+  }
+
+  /**
+   * Leave picker mode for the panel's session: cancel the page pick of the
+   * session's tab with a `target.request { cancel: true }` ({@link sendPickCancel}).
+   *
+   * The cancel is sent whether or not this worker generation armed a pick
+   * there: a revived worker remembers nothing, and the page may still hold the
+   * pick an earlier generation armed. The agent ends only a pick it holds and
+   * answers it with that pick's own id; with none active it posts nothing.
+   *
+   * Never rejects: leaving picker mode must always succeed in the panel, so a
+   * session outside the panel's scope, a page with no bridge, or a failed
+   * lookup only leaves nothing to cancel, and is logged by code.
+   *
+   * @param sessionId The session the panel names.
+   * @param context The panel request's context, which scopes the tab.
+   */
+  async function cancelElementPick(
+    sessionId: SessionId,
+    context: PortRequestContext,
+  ): Promise<void> {
+    try {
+      const tab = await resolveSessionTab(sessionId, context);
+      if (!tab.ok) {
+        log.debug('Picker mode left with no page pick to cancel.', {
+          sessionId,
+          errorCode: tab.error.code,
+        });
+        return;
+      }
+      const tabId = tab.value;
+      const { sent, recorded } = sendPickCancel(tabId);
+      log.debug('Picker mode left.', { tabId, sessionId, cancelSent: sent, recorded });
+    } catch (cause: unknown) {
+      log.warn('The page pick could not be cancelled.', {
+        sessionId,
+        error: errorName(cause),
+      });
+    }
   }
 
   const requestHandlers: PortRequestHandlers = {
@@ -2699,15 +3031,18 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
 
     'target.pick': async (payload, context) => {
       if (!payload.enabled) {
-        // The agent's pick is one request and one answer; leaving picker mode
-        // has nothing to cancel.
+        // The page's pick consumes the developer's next click until it is
+        // answered, so leaving picker mode cancels it in the page — and is
+        // answered inactive whatever the cancel found: leaving picker mode
+        // never fails in the panel.
+        await cancelElementPick(payload.sessionId, context);
         return ok({ active: false });
       }
       const tab = await resolveSessionTab(payload.sessionId, context);
       if (!tab.ok) {
         return tab;
       }
-      if (armElementPicker(tab.value)) {
+      if (armElementPicker(tab.value, payload.sessionId)) {
         return ok({ active: true });
       }
       log.info('Picker mode could not be armed.', {
@@ -2723,6 +3058,20 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       if (!scope.ok) {
         return scope;
       }
+      // "Use selected element" confirms a target, and the panel leaves picker
+      // mode with it; a page pick left armed would consume the developer's
+      // next ordinary click and could replace the target just confirmed. So
+      // the tab's page pick is cancelled first — posted synchronously, before
+      // anything of the selection is sent — whether or not this worker
+      // generation recorded one: a revived worker remembers nothing, and a
+      // cancel with no active pick is a no-op in the page. The cancelled
+      // pick's answer then selects nothing (`ArmedPagePick.cancelled`).
+      const { sent: cancelSent, recorded } = sendPickCancel(scope.value);
+      log.debug('The page pick was cancelled for a confirmed selection.', {
+        tabId: scope.value,
+        cancelSent,
+        recorded,
+      });
       // Answered on the service's verdict, never on the send: a refusal or a
       // lost frame is a failure, so the panel withdraws its optimistic target
       // and says why.
@@ -2918,25 +3267,39 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
    * of the tab are told here. A frame the closed socket refused outright is
    * only logged: the connection pill already shows that state.
    *
-   * @param bridge The attribution of the agent's `target.described` frame,
-   *   checked again after the registry read; absent for the Elements panel's
-   *   selection, which arrives from the DevTools page rather than a bridge.
+   * A page pick's element is the target of the session the pick was armed for
+   * and of no other: when the binding read here names another session — the
+   * tab was rebound while the answer waited — the element is dropped and
+   * logged by code, never sent for the session that now holds the tab.
+   *
+   * @param pick The page pick the agent's `target.described` answered: its
+   *   frame's attribution, checked again after the registry read, and the
+   *   session it was armed for, which the binding must still name. Absent for
+   *   the Elements panel's selection, which arrives from the DevTools page
+   *   rather than a bridge and is the bound session's by construction.
    */
   async function forwardSelectedTarget(
     tabId: TabId,
     target: SelectedTarget,
     source: 'agent' | 'devtools',
-    bridge?: BridgeMessageContext,
+    pick?: AnsweredPagePick,
   ): Promise<void> {
     const binding = await registry.getBinding(tabId);
     // An agent's descriptor must still come from the tab's current document
     // once the registry has answered: the bridge may have been superseded
     // while it read.
-    if (bridge !== undefined && isStaleBridgeFrame('target.described', bridge)) {
+    if (pick !== undefined && isStaleBridgeFrame('target.described', pick.bridge)) {
       return;
     }
     if (binding === undefined) {
       log.debug('A selected element on an unbound tab was not forwarded.', { tabId, source });
+      return;
+    }
+    if (pick !== undefined && binding.sessionId !== pick.sessionId) {
+      log.info('A picked element that answers no live pick was dropped.', {
+        tabId,
+        reason: 'rebound' satisfies PagePickDropReason,
+      });
       return;
     }
     const { sessionId } = binding;
@@ -3869,7 +4232,7 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       if (sent.ok) {
         if (loss > 0) {
           // The tab and the counts only: the capture id is page-supplied and
-          // is never echoed into a log (AAP §0.5.2).
+          // is never echoed into a log.
           log.info(forwardedLossMessage(job), {
             tabId,
             dropped: loss,
@@ -4135,9 +4498,34 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
       enqueueTelemetryBatch(tabId, payload);
     },
 
+    /**
+     * The page agent's answer to one armed pick: the element the developer
+     * clicked, or `null` when the pick ended without one.
+     *
+     * Every armed pick is answered exactly once, and that answer is what ends
+     * picker mode in the panel — so it is settled first, synchronously while
+     * the hub's dispatch still vouches for this bridge, and before a `null`
+     * answer returns ({@link settlePagePick}). The same synchronous step
+     * decides whether the element may be forwarded at all: only the answer to
+     * the tab's live, uncancelled pick, on the connection it was armed on, is
+     * a selection, and only for the session that pick was armed for. Any other
+     * element — a cancelled, superseded or unknown pick's — is dropped here and
+     * logged by its reason code, never by the descriptor. A forwarded element
+     * still passes the stale-document checks after the waits below, and
+     * `forwardSelectedTarget` drops it when the tab has meanwhile been bound
+     * to another session.
+     */
     'target.described': async (payload, context) => {
+      const verdict = settlePagePick(context, payload.requestId);
       if (payload.target === null) {
-        log.debug('The page agent had no element to describe.', { tabId: context.tabId });
+        log.debug('The page pick ended without an element.', { tabId: context.tabId });
+        return;
+      }
+      if (verdict.kind === 'drop') {
+        log.info('A picked element that answers no live pick was dropped.', {
+          tabId: context.tabId,
+          reason: verdict.reason,
+        });
         return;
       }
       // The tab's readiness is recorded by the `agent.ready` handler, in the
@@ -4159,7 +4547,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         await dropStaleSelection(context.tabId, stale);
         return;
       }
-      await forwardSelectedTarget(context.tabId, payload.target, 'agent', context);
+      await forwardSelectedTarget(context.tabId, payload.target, 'agent', {
+        bridge: context,
+        sessionId: verdict.sessionId,
+      });
     },
 
     'agent.error': (payload, context) => reportAgentError(context, payload),
@@ -4864,10 +5255,14 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   }
 
   /**
-   * A panel left. While the tab's DevTools page (or another panel) remains,
-   * this is only the panel document reloading, and changes nothing; with
-   * neither left and a binding recorded, DevTools closed without its page
-   * reporting it, so the tab is unbound the same way.
+   * A panel left. With the tab's last panel gone, the tab's page pick is
+   * cancelled: a reopened or reloaded panel document starts with picker mode
+   * off, so a pick left armed would consume the developer's next ordinary
+   * click with no panel showing picker mode on. While the tab's DevTools page
+   * (or another panel) remains, this is otherwise only the panel document
+   * reloading, and changes nothing more; with neither left and a binding
+   * recorded, DevTools closed without its page reporting it, so the tab is
+   * unbound the same way.
    */
   async function handlePanelClosed(event: PortClosedEvent<PanelConnection>): Promise<void> {
     untabbedPanels.delete(event.connection.connectionId);
@@ -4878,9 +5273,18 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
     const connections = hub.listConnections();
     // A hydration reads for the tab's panels; with the last one detached its
     // reads — and its pending retry — have no recipient, so they are
-    // cancelled rather than left to run.
+    // cancelled rather than left to run. So is the page pick, sent whether or
+    // not this worker generation recorded one, before any unbind below: no
+    // panel is left showing picker mode for it, and a cancel with no active
+    // pick is a no-op in the page.
     if (!hasPanels(tabId)) {
       cancelHydration(tabId, 'panel-detached');
+      const { sent, recorded } = sendPickCancel(tabId);
+      log.debug('The page pick was cancelled with the last panel of its tab.', {
+        tabId,
+        cancelSent: sent,
+        recorded,
+      });
     }
     const stillInspected = connections.some(
       (connection) =>
@@ -4943,6 +5347,9 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
           tabId: event.connection.tabId,
           reason: event.reason,
         });
+        // A pick armed in the document this bridge served can no longer be
+        // answered, so picker mode ends with it.
+        releasePagePick(event);
         refreshReloadOffer(event.connection.tabId, 'bridge disconnected');
       },
     },
@@ -5227,7 +5634,10 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
   // Binding changes and committed navigations
   // -------------------------------------------------------------------------
 
-  /** Keep the page agent in step with the tab's binding. */
+  /**
+   * Keep the page agent — its configuration and any pick armed there — in step
+   * with the tab's binding.
+   */
   function handleBindingChange(change: TabBindingChange): void {
     switch (change.kind) {
       case 'recorded':
@@ -5236,6 +5646,8 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
           change.previous.sessionId !== change.current?.sessionId
         ) {
           agent.disarm(change.tabId, 'displaced');
+          // A pick armed for the displaced session must not select for the new one.
+          cancelPickWithBinding(change.tabId);
         }
         // An `agent.ready` that reached the service before the binding existed
         // was attributed to no session; re-relay it so the readiness gate sees
@@ -5251,6 +5663,8 @@ export function createWorker(env: WorkerEnvironment): DebugGeneratorWorker {
         if (reason !== undefined) {
           agent.disarm(change.tabId, reason);
         }
+        // Disarming does not end a pick in the page; the pick is cancelled there.
+        cancelPickWithBinding(change.tabId);
         // An unbound tab is never offered a reload; withdraw a standing offer.
         refreshReloadOffer(change.tabId, 'binding removed');
         return;

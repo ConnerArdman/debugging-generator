@@ -672,7 +672,8 @@ export interface ServiceClient extends ServiceClientDisposable {
 
   /**
    * Opens the WebSocket, or resumes one the protocol client stopped retrying
-   * (after a refused credential, once the developer has rotated or restarted).
+   * (after a refused credential, once the developer has restarted the service
+   * or `auth.json` was read again).
    * Idempotent while connecting or open, never throws and never waits: with
    * the service absent the connection simply stays on the reconnect curve and
    * activation proceeds (AAP §0.5.5).
@@ -739,7 +740,9 @@ export interface ServiceClient extends ServiceClientDisposable {
    * Subscribes to the refused-credential signal (close code 4401, AAP §0.5.6):
    * raised when the service refused the editor credential and re-reading
    * `auth.json` produced no different token, so nothing will retry until the
-   * developer acts — `debuggen.rotateServiceToken`, or restarting the service.
+   * developer acts. The remedy is restarting the service, which re-issues the
+   * editor credential in `auth.json` as it starts; `debuggen.rotateServiceToken`
+   * cannot repair it, because rotation needs a credential the service accepts.
    * Deliberately separate from {@link ServiceClient.onStateChange}: the state
    * stays one of the four literals (`closed`).
    *
@@ -2844,7 +2847,7 @@ class ExtensionServiceClient implements ServiceClient {
       this.#logger.warn('the editor credential could not be read again', describeThrown(thrown));
       return err(
         new DebuggenError('UNAUTHORIZED', 'The editor credential could not be read again', {
-          hint: 'Check that the Debug Generator service is running, then run "Debug Generator: Rotate Service Token".',
+          hint: 'Restart the Debug Generator service so it re-issues the editor credential in auth.json as it starts, then try again.',
         }),
       );
     }

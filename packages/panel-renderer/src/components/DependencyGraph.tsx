@@ -455,8 +455,9 @@ const KIND_LEGEND_ORDER: readonly DependencyGraphNode['kind'][] = Object.freeze(
 /**
  * Half the participant outline's width, as the canvas inset.
  *
- * `components.css` strokes a participant box with `stroke-width: 2`, and SVG
- * centres a stroke on the path, so the outline of a box at the canvas origin
+ * `components.css` strokes a participant box with the emphasis stroke token
+ * (`--dg-stroke-width-emphasis`, two user units), and SVG centres a stroke on
+ * the path, so the outline of a box at the canvas origin
  * would lose its outer half to the viewport edge. Insetting the `viewBox` by
  * half the stroke keeps every outline whole without moving a single box.
  */
@@ -1546,10 +1547,13 @@ function SourceCell({ row }: { readonly row: ParticipantRow }): ReactElement {
  * - **Source** is `name`, the role of a source-location chip.
  *
  * Every role track is a floor and a ratio, so it resolves identically in the
- * header and in every row, and `DataTable` sums the floors into the grid's
- * minimum width: a panel narrower than their sum scrolls the table
- * horizontally instead of squeezing the participant label a few characters
- * per line.
+ * header and in every row, and `DataTable` sums the columns' floors and
+ * minimums into the grid's width. A panel just too narrow for the full floors
+ * therefore narrows the three `name` columns, never below the fraction of
+ * their floor a truncating role can give up (`--dg-column-yield`), only as far
+ * as the table needs to fit, which lets their chips wrap onto an extra line;
+ * a panel too narrow even for that keeps every floor and scrolls the table
+ * horizontally instead of squeezing the participant label any further.
  */
 const PARTICIPANT_COLUMNS: readonly DataTableColumn<ParticipantRow>[] = Object.freeze([
   {

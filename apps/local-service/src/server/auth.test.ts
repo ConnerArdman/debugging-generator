@@ -90,6 +90,7 @@ import {
   DEBUGGEN_ERROR_CODES,
   DebuggenError,
   createConsoleLogger,
+  err,
   isErr,
   isOk,
   newSessionId,
@@ -123,14 +124,17 @@ import {
   classifyOrigin,
   createAuthMiddleware,
   createAuthService,
+  identifyProjectRoot,
   isAllowedOrigin,
   reconfirmProjectRoot,
+  reconfirmRootIdentity,
   requireBoundSession,
   requireProjectScope,
   requireRole,
   requireSessionAccess,
   resolveActingTab,
   roleForClientKind,
+  unrecordedProjectRootIdentity,
 } from './auth.js';
 import type {
   AuthFailureReason,
@@ -2264,9 +2268,11 @@ describe('role and scope authorization', () => {
       'session.end',
       // A panel enters picker mode on its own; only the editor asks the bound tab to.
       'target.request',
-      // The administrative operations: purging history, minting a credential, rotating all.
+      // The administrative operations: purging history, minting or releasing a
+      // credential, rotating all.
       'session.purge',
       'devServer.credential',
+      'credentials.release',
       'credentials.rotate',
     ] as const) {
       expectRefusal(authorize(operation, devtools, origin), 'role-not-permitted', [devtools]);
@@ -2317,8 +2323,10 @@ describe('role and scope authorization', () => {
       'session.get',
       'panel.data',
       'pair.start',
-      // A server agent can neither mint another credential nor purge or rotate anything.
+      // A server agent can neither mint nor release a credential — its own
+      // included — nor purge or rotate anything.
       'devServer.credential',
+      'credentials.release',
       'session.purge',
       'credentials.rotate',
     ] as const) {
@@ -2623,6 +2631,168 @@ describe('role and scope authorization', () => {
       unlinkSync(root);
       symlinkSync(join(workspace, 'packages', 'web'), root, 'dir');
       expect(expectOk(reconfirmProjectRoot(principal, admitted))).toBe(admitted);
+    });
+
+    /** The refusal both re-proofs answer a root that resolves elsewhere with. */
+    const MOVED_MESSAGE =
+      'The project root no longer resolves to the directory it was admitted as.';
+    const MOVED_HINT =
+      'The project folder, or a link on its path, was moved or relinked after it was admitted. Start a new session, or launch the dev server again, from the folder in VS Code.';
+
+    /** The refusal of a root whose canonical path cannot be established without a principal. */
+    const UNRESOLVABLE_MESSAGE = 'Where the project root leads on disk could not be established.';
+
+    it('identifies a root without a principal: its canonical path, a missing tail kept, frozen', () => {
+      const { workspace, outside } = linkedTree();
+      const packaged = realpathSync.native(join(workspace, 'packages', 'web'));
+
+      const cases: readonly (readonly [string, string, string])[] = [
+        [workspace, workspace, realpathSync.native(workspace)],
+        [join(workspace, 'web'), join(workspace, 'web'), packaged],
+        [join(workspace, 'web', 'src'), join(workspace, 'web', 'src'), join(packaged, 'src')],
+        // A tail that does not exist yet is kept as spelled beneath the link's target.
+        [
+          join(workspace, 'web', 'not-created-yet'),
+          join(workspace, 'web', 'not-created-yet'),
+          join(packaged, 'not-created-yet'),
+        ],
+        // Normalised exactly as admission normalises: separators, dot segments, a trailing slash.
+        [`${workspace}/packages/../web/./`, join(workspace, 'web'), packaged],
+        // No scope is judged: an outward link is identified as where it leads.
+        [join(workspace, 'external'), join(workspace, 'external'), realpathSync.native(outside)],
+      ];
+      for (const [given, projectRoot, canonicalRoot] of cases) {
+        const identity = expectOk(identifyProjectRoot(given));
+        expect(identity).toStrictEqual({ projectRoot, canonicalRoot });
+        expect(Object.isFrozen(identity)).toBe(true);
+      }
+
+      // Where admission succeeds, both proofs agree on the identity.
+      const principal = editorAnnouncing(workspace);
+      const root = join(workspace, 'web');
+      expect(expectOk(identifyProjectRoot(root))).toStrictEqual(
+        expectOk(admitProjectRoot(principal, root)),
+      );
+    });
+
+    it('refuses to identify a relative, dangling, looping or unreadable root', () => {
+      const { workspace, outside } = linkedTree();
+
+      for (const relative of ['relative/root', '', './shop']) {
+        const refused = expectRefusal(identifyProjectRoot(relative), 'project-out-of-scope');
+        expect(refused.message).toBe('A project root must be an absolute path.');
+      }
+
+      const dangling = join(workspace, 'dangling');
+      symlinkSync(join(outside, 'created-later'), dangling, 'dir');
+      const loopA = join(workspace, 'loop-a');
+      const loopB = join(workspace, 'loop-b');
+      symlinkSync(loopB, loopA, 'dir');
+      symlinkSync(loopA, loopB, 'dir');
+
+      for (const unresolvable of [dangling, join(dangling, 'app'), loopA, join(loopB, 'src')]) {
+        const refused = expectRefusal(identifyProjectRoot(unresolvable), 'project-out-of-scope', [
+          unresolvable,
+        ]);
+        expect(refused.message).toBe(UNRESOLVABLE_MESSAGE);
+      }
+
+      // What a real tree cannot stage as root: a component that cannot be read.
+      const unreadable = failingResolver('EACCES');
+      const refused = expectRefusal(
+        identifyProjectRoot(join(workspace, 'packages'), unreadable.resolve),
+        'project-out-of-scope',
+      );
+      expect(refused.message).toBe(UNRESOLVABLE_MESSAGE);
+      expect(unreadable.calls).toEqual([join(workspace, 'packages')]);
+    });
+
+    it('reconfirms an identity without a principal only while the root still resolves to the same directory', () => {
+      const { workspace, outside } = linkedTree();
+      const root = join(workspace, 'web');
+      const elsewhereInside = join(workspace, 'packages', 'api');
+      mkdirSync(elsewhereInside, { recursive: true });
+      const identified = expectOk(identifyProjectRoot(root));
+      const admitted = expectOk(admitProjectRoot(editorAnnouncing(workspace), root));
+
+      // The same object, unchanged, whichever proof took it.
+      expect(expectOk(reconfirmRootIdentity(identified))).toBe(identified);
+      expect(expectOk(reconfirmRootIdentity(admitted))).toBe(admitted);
+
+      // Retargeted inside the workspace, and then outside it: both are moves,
+      // refused on identity alone, with a message and hint that name no path.
+      for (const target of [elsewhereInside, outside]) {
+        unlinkSync(root);
+        symlinkSync(target, root, 'dir');
+        for (const proof of [identified, admitted]) {
+          const moved = expectRefusal(reconfirmRootIdentity(proof), 'project-out-of-scope', [
+            root,
+            target,
+            proof.canonicalRoot,
+          ]);
+          expect(moved.message).toBe(MOVED_MESSAGE);
+          expect(moved.hint).toBe(MOVED_HINT);
+        }
+      }
+
+      // Left dangling, where it leads can no longer be established.
+      unlinkSync(root);
+      symlinkSync(join(outside, 'created-later'), root, 'dir');
+      expect(
+        expectRefusal(reconfirmRootIdentity(identified), 'project-out-of-scope', [root]).message,
+      ).toBe(UNRESOLVABLE_MESSAGE);
+
+      // Pointed back where it was identified, it is the same directory again.
+      unlinkSync(root);
+      symlinkSync(join(workspace, 'packages', 'web'), root, 'dir');
+      expect(expectOk(reconfirmRootIdentity(identified))).toBe(identified);
+      expect(expectOk(reconfirmRootIdentity(admitted))).toBe(admitted);
+    });
+
+    it('refuses a moved root with one message and hint from the scoped and the principal-free re-proof alike', () => {
+      const { workspace } = linkedTree();
+      const principal = editorAnnouncing(workspace);
+      const root = join(workspace, 'web');
+      const elsewhereInside = join(workspace, 'packages', 'api');
+      mkdirSync(elsewhereInside, { recursive: true });
+      const admitted = expectOk(admitProjectRoot(principal, root));
+
+      unlinkSync(root);
+      symlinkSync(elsewhereInside, root, 'dir');
+      const scoped = expectRefusal(
+        reconfirmProjectRoot(principal, admitted),
+        'project-out-of-scope',
+        [root, elsewhereInside],
+      );
+      const principalFree = expectRefusal(reconfirmRootIdentity(admitted), 'project-out-of-scope', [
+        root,
+        elsewhereInside,
+      ]);
+
+      expect(scoped.message).toBe(MOVED_MESSAGE);
+      expect(scoped.hint).toBe(MOVED_HINT);
+      expect(principalFree.toPayload()).toStrictEqual(scoped.toPayload());
+    });
+
+    /** The refusal a sink answers for a session whose root has no recorded admitted identity. */
+    const UNRECORDED_MESSAGE = "No admitted identity is recorded for this session's project root.";
+
+    it('refuses a session with no recorded identity with one constant, path-free refusal that points to a new session', () => {
+      const refused = expectRefusal(err(unrecordedProjectRootIdentity()), 'project-out-of-scope');
+
+      expect(refused.code).toBe('PATH_OUTSIDE_PROJECT');
+      expect(refused.details).toStrictEqual({ reason: 'project-out-of-scope' });
+      expect(refused.message).toBe(UNRECORDED_MESSAGE);
+      expect(refused.hint).toMatch(/Start a new session from the folder in VS Code\.$/u);
+      // It takes nothing, so no path can reach it: neither sentence names one.
+      expect(`${refused.message} ${refused.hint ?? ''}`).not.toMatch(/[/\\]/u);
+
+      // A fresh error on every call, always the same refusal, and distinct from
+      // the moved and unresolvable refusals a re-proof answers.
+      const again = unrecordedProjectRootIdentity();
+      expect(again).not.toBe(refused);
+      expect(again.toPayload()).toStrictEqual(refused.toPayload());
+      expect([MOVED_MESSAGE, UNRESOLVABLE_MESSAGE]).not.toContain(refused.message);
     });
 
     it('admits a link that stays inside the workspace, and a tail that does not exist yet', () => {
@@ -3604,6 +3774,202 @@ describe('the revocation fence', () => {
     );
     expect(refusalLines).toHaveLength(digests.length);
     expectNoLeak(lines, digests);
+  });
+});
+
+/* =================================================================================================
+ * Releasing a POST /dev-server/credential credential
+ * ============================================================================================== */
+
+/** One call the service made to close the connections of one credential. */
+interface CredentialCloseCall {
+  readonly tokenHash: string;
+  readonly code: number;
+}
+
+/**
+ * A {@link RecordingRevoker} that can also close one credential's connections,
+ * as the client registry does, recording each such call.
+ */
+class CredentialClosingRevoker extends RecordingRevoker {
+  readonly credentialCloses: CredentialCloseCall[] = [];
+
+  closeCredential(tokenHash: string, code: number): number {
+    this.credentialCloses.push({ tokenHash, code });
+    return 1;
+  }
+}
+
+describe('releasing a POST /dev-server/credential credential', () => {
+  /** A second service over the harness store and clock, whose revoker records per-credential closes. */
+  function releasingService(): {
+    readonly auth: AuthService;
+    readonly revoker: CredentialClosingRevoker;
+  } {
+    const revoker = new CredentialClosingRevoker(OPEN_SOCKETS);
+    const auth = createService({
+      store: harness.store,
+      config: harness.config,
+      clock: harness.clock,
+      revoker,
+    });
+    return { auth, revoker };
+  }
+
+  /**
+   * The credential `POST /dev-server/credential` mints through the launcher:
+   * scoped to one project, bounded by its first lease, and not a lease of a
+   * launched child.
+   */
+  function cliCredential(auth: AuthService, projectRoot: string = projectPath('alpha')): string {
+    const issued = expectOk(
+      auth.issueServerAgentCredential({ projectRoot, expiresAt: harness.clock.now + 300_000 }),
+    );
+    return remember(issued.token);
+  }
+
+  /** A launched child's credential: a lease this service holds. */
+  function launchedChildLease(auth: AuthService): string {
+    const issued = expectOk(
+      auth.issueServerAgentCredential({
+        projectRoot: projectPath('alpha'),
+        expiresAt: harness.clock.now + 60_000,
+        lease: true,
+      }),
+    );
+    return remember(issued.token);
+  }
+
+  it('deletes a live, unleased credential, closes exactly its sockets, and answers false the second time', () => {
+    const { auth, revoker } = releasingService();
+    const released = cliCredential(auth);
+    const staying = cliCredential(auth);
+    const principal = asServerAgent(expectOk(authorize('telemetry.event', released)));
+
+    expect(expectOk(auth.releaseServerAgentCredential(released))).toBe(true);
+
+    const digests = credentialRows().map((row) => row['token_hash']);
+    expect(digests).not.toContain(sha256Hex(released));
+    expect(digests).toContain(sha256Hex(staying));
+    expect(revoker.credentialCloses).toEqual([
+      { tokenHash: sha256Hex(released), code: WS_CLOSE_UNAUTHORIZED },
+    ]);
+    // One credential's sockets, never every socket.
+    expect(revoker.calls).toEqual([]);
+    expectRefusal(authorize('telemetry.event', released), 'unknown-credential', [released]);
+    expectRefusal(auth.requireLiveCredential(principal), 'unknown-credential', [released]);
+    // The project's other dev server keeps its credential.
+    expect(asServerAgent(expectOk(authorize('telemetry.event', staying))).tokenHash).toBe(
+      sha256Hex(staying),
+    );
+
+    // Already released: nothing more is deleted or closed.
+    expect(expectOk(auth.releaseServerAgentCredential(released))).toBe(false);
+    expect(revoker.credentialCloses).toHaveLength(1);
+  });
+
+  it('releases an unleased credential issued without an expiry just the same', () => {
+    const { auth, revoker } = releasingService();
+    const unbounded = remember(
+      expectOk(auth.issueServerAgentCredential({ projectRoot: projectPath('alpha') })).token,
+    );
+
+    expect(expectOk(auth.releaseServerAgentCredential(unbounded))).toBe(true);
+    expectRefusal(authorize('telemetry.event', unbounded), 'unknown-credential', [unbounded]);
+    expect(revoker.credentialCloses).toHaveLength(1);
+  });
+
+  it("never touches a launched child's lease, which only the launcher revokes", () => {
+    const { auth, revoker } = releasingService();
+    const leased = launchedChildLease(auth);
+    const before = rowFor(leased);
+    expect(storedScope(before)).toMatchObject({ kind: 'project', leaseHolder: process.pid });
+
+    expect(expectOk(auth.releaseServerAgentCredential(leased))).toBe(false);
+
+    expect(rowFor(leased)).toEqual(before);
+    expect(revoker.credentialCloses).toEqual([]);
+    expectOk(authorize('telemetry.event', leased));
+    // The launcher's own door still revokes it.
+    expect(expectOk(auth.revokeServerAgentCredential(leased))).toBe(true);
+    expectRefusal(authorize('telemetry.event', leased), 'unknown-credential', [leased]);
+  });
+
+  it('never deletes an editor or a DevTools credential', () => {
+    const { auth, revoker } = releasingService();
+    const editor = editorToken();
+    const devtools = pairDevtools();
+    const rowsBefore = credentialRows();
+
+    for (const token of [editor, devtools]) {
+      expect(expectOk(auth.releaseServerAgentCredential(token))).toBe(false);
+    }
+
+    expect(credentialRows()).toEqual(rowsBefore);
+    expect(revoker.credentialCloses).toEqual([]);
+    expectOk(authorize('session.list', editor));
+    expectOk(authorize('panel.data', devtools, extensionOrigin(EXTENSION_ID)));
+  });
+
+  it('answers false, and changes nothing, for a malformed, unknown, expired or unreadable credential', () => {
+    const { auth, revoker } = releasingService();
+    const expiring = remember(
+      expectOk(
+        auth.issueServerAgentCredential({
+          projectRoot: projectPath('alpha'),
+          expiresAt: harness.clock.now + 1_000,
+        }),
+      ).token,
+    );
+    const unreadable = cliCredential(auth);
+    harness.store.db
+      .prepare('UPDATE credentials SET scope = ? WHERE token_hash = ?')
+      .run(JSON.stringify({ kind: 'workspace' }), sha256Hex(unreadable));
+    harness.clock.advance(1_000);
+    const unknown = remember(cryptoRandomBytes(CREDENTIAL_TOKEN_BYTES).toString('base64url'));
+    const oversized = 'x'.repeat((clientHelloPayloadSchema.shape.token.maxLength ?? 0) + 1);
+    const rowsBefore = credentialRows();
+
+    for (const token of ['', oversized, unknown, expiring, unreadable]) {
+      expect(expectOk(auth.releaseServerAgentCredential(token))).toBe(false);
+    }
+
+    // The expired row is left to the expiry sweep; nothing else was there to delete.
+    expect(credentialRows()).toEqual(rowsBefore);
+    expect(revoker.credentialCloses).toEqual([]);
+  });
+
+  it('reports a store it cannot reach as STORE_ERROR, never as a release', () => {
+    const { auth, revoker } = releasingService();
+    const token = cliCredential(auth);
+    harness.store.close();
+
+    expectFailure(auth.releaseServerAgentCredential(token), 'STORE_ERROR');
+    expect(revoker.credentialCloses).toEqual([]);
+  });
+
+  it('keeps the token and its digest out of every log record', () => {
+    const firstLine = capturedLogLines.length;
+    const { auth } = releasingService();
+    const released = cliCredential(auth);
+    const leased = launchedChildLease(auth);
+
+    expect(expectOk(auth.releaseServerAgentCredential(released))).toBe(true);
+    expect(expectOk(auth.releaseServerAgentCredential(leased))).toBe(false);
+
+    const lines = capturedLogLines.slice(firstLine);
+    expect(
+      lines.filter((line) =>
+        line.includes("released a server-agent credential at its holder's request"),
+      ),
+    ).toHaveLength(1);
+    expect(lines.filter((line) => line.includes('found no releasable credential'))).toHaveLength(1);
+    expectNoLeak(lines, [
+      ...fragmentsOf(released),
+      ...fragmentsOf(leased),
+      sha256Hex(released),
+      sha256Hex(leased),
+    ]);
   });
 });
 

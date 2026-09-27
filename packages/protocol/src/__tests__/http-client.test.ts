@@ -16,12 +16,12 @@
  *   canonical output, and every rule it enforces is checked for its refusal. A
  *   client built on a refused base URL — a public name, a private or unspecified
  *   address, a look-alike host, embedded credentials, a path, a query, a
- *   fragment — must still construct, and every one of the twenty-one operations
+ *   fragment — must still construct, and every one of the twenty-two operations
  *   must then fail locally: the transport is never called, the credential
  *   provider is never asked, no `authorization` header exists, and the raw value
  *   (seeded with a unique marker) appears nowhere, because it may carry a pasted
  *   credential (CWE-200, CWE-918).
- * - **The credential itself.** Sixteen operations carry
+ * - **The credential itself.** Twenty operations carry
  *   `authorization: Bearer <token>`; `health` and `pair.complete` never do, even
  *   when a credential is configured. A credential may be a string,
  *   a synchronous or asynchronous provider, may throw, reject or be absent, and
@@ -46,7 +46,7 @@
  *   and unconformant bodies map by status; a `409` on `capture.start` names the
  *   owning session; a transport that throws, rejects or fails mid-body is
  *   `TRANSPORT_DISCONNECTED`.
- * - **Cancellation (R1-F07).** Under fake timers: a credential provider that
+ * - **Cancellation.** Under fake timers: a credential provider that
  *   never settles ends at the timeout, and its late credential never reaches the
  *   transport; a caller abort before or during credential resolution, during the
  *   request or during the body read ends the call with `details.cancelled`; a
@@ -120,6 +120,12 @@ const MARKER = 'zq9leakmarker';
 /** A one-time pairing code, which is a capability and must never be echoed. */
 const PAIRING_CODE = 'PAIR2X7Q';
 
+/**
+ * The server-agent credential a `credentials.release` call names in its body,
+ * which is a credential and must never be echoed or logged.
+ */
+const SERVER_AGENT_TOKEN = 'tok-server-agent-1';
+
 /** The session every session-scoped route is called for. */
 const SESSION_ID = 'ses_4k2p9dq7m1zx0c3v';
 
@@ -183,6 +189,7 @@ const VALID_REQUESTS: { readonly [O in HttpOperation]: HttpRequestBody<O> } = {
   'pair.start': {},
   'pair.complete': { code: PAIRING_CODE },
   'credentials.rotate': {},
+  'credentials.release': { token: SERVER_AGENT_TOKEN },
 };
 
 /** The path parameters every operation declares, keyed by operation. */
@@ -208,6 +215,7 @@ const VALID_PARAMS: { readonly [O in HttpOperation]: HttpPathParams<O> } = {
   'pair.start': {},
   'pair.complete': {},
   'credentials.rotate': {},
+  'credentials.release': {},
 };
 
 /** A valid `GET /health` reply. */
@@ -222,7 +230,7 @@ const EMPTY_SESSION_PAGE = { sessions: [], total: 0, limit: 100, offset: 0, next
 /** The two operations that are called without a credential. */
 const EXEMPT_OPERATIONS = HTTP_OPERATIONS.filter((operation) => isAuthExemptOperation(operation));
 
-/** The nineteen operations that must carry one. */
+/** The twenty operations that must carry one. */
 const PROTECTED_OPERATIONS = HTTP_OPERATIONS.filter(
   (operation) => !isAuthExemptOperation(operation),
 );
@@ -1011,7 +1019,7 @@ describe('HttpClient — the bearer credential', () => {
 
   it('names exactly health and pair.complete as exempt', () => {
     expect([...EXEMPT_OPERATIONS].sort()).toEqual(['health', 'pair.complete']);
-    expect(PROTECTED_OPERATIONS).toHaveLength(19);
+    expect(PROTECTED_OPERATIONS).toHaveLength(20);
   });
 
   it.each(PROTECTED_OPERATIONS)('%s carries authorization: Bearer <token>', async (operation) => {
@@ -1836,7 +1844,7 @@ describe('HttpClient — a transport that fails', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Cancellation (R1-F07)
+// Cancellation
 // ---------------------------------------------------------------------------
 
 describe('HttpClient — cancellation is established before the credential is resolved', () => {

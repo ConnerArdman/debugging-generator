@@ -29,10 +29,12 @@
  * `pending` is this row's own report that this row's mutation is in flight, deliberately not the
  * context's `syncStatus`, which is global to the cart and cannot say which line is changing. It
  * dims the row through `data-busy`, announces itself through `aria-busy`, holds the stepper with
- * its `busy` prop and holds the remove button with `disabled`, so those four states cannot drift
- * apart. It covers the request for the whole life of that request: it is set before the call goes
- * out and cleared in `finally` once the provider has settled, whether the cart came back changed
- * or the write was refused, so no failure can strand the row in a busy state it has no way out of.
+ * its `busy` prop - which writes `disabled` on the stepper's two buttons and its field - and holds
+ * the remove button with `aria-disabled`, for the focus reason given at that button, so those four
+ * states cannot drift apart. It covers the request for the whole life of that request: it is set
+ * before the call goes out and cleared in `finally` once the provider has settled, whether the
+ * cart came back changed or the write was refused, so no failure can strand the row in a busy
+ * state it has no way out of.
  *
  * WHAT ACTUALLY STOPS A SECOND WRITE IS THE LATCH, NOT `pending`
  * "The same line cannot be committed twice while the server is still deciding" is `mutating`, a
@@ -43,11 +45,12 @@
  * answers 404 because the first has already removed it. A ref is written the instant the first
  * press is handled, so the second sees the latch whatever React has or has not committed by then.
  *
- * `pending` and the `disabled` it drives are presentation on top of that: they dim the row, hold
- * the controls and say why, and they are the only thing a shopper can see. They are kept because a
- * held control is the right feedback for a press that will do nothing, not because the guarantee
- * rests on them - React writes `disabled` at commit, tens of milliseconds after the press, and a
- * double-click inside that window is an ordinary thing for a mouse to produce.
+ * `pending` and the attributes it drives - `disabled` inside the stepper, `aria-disabled` on the
+ * remove button - are presentation on top of that: they dim the row, hold the controls and say
+ * why, and they are the only thing a shopper can see. They are kept because a held control is the
+ * right feedback for a press that will do nothing, not because the guarantee rests on them - React
+ * writes both attributes at commit, tens of milliseconds after the press, and a double-click
+ * inside that window is an ordinary thing for a mouse to produce.
  *
  * WHY THERE IS NO STOCK BADGE
  * `.meta` was drawn wide enough for an availability chip beside the unit price, and the cart's own

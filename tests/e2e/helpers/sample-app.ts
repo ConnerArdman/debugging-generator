@@ -39,7 +39,9 @@
  *   <node> <repo>/apps/demo-app/node_modules/next/dist/bin/next dev --webpack --port <port>
  * ```
  *
- * Each part was measured on this repository (Next.js 16.3.5):
+ * Each part was measured on this repository, with the `next` version the demo and the fixture both
+ * pin ({@link resolveBorrowedNext} refuses a fixture pin that differs from the demo's installed
+ * `next`):
  *
  * - **`--webpack`.** The fixture's `next.config.ts` pins `turbopack.root` to its own directory,
  *   which is also the boundary Turbopack resolves packages within. A `next` that lives outside it

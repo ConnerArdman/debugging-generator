@@ -18,8 +18,9 @@
  * - **Never restamped.** A retried batch resends the byte-identical body even
  *   when the failed attempt's answer moved the estimate.
  * - **Nothing else changes.** `startTime` and `duration` equal an unsampled
- *   event's; the request keeps exactly its two headers and its two body keys;
- *   the one new key is on the events.
+ *   event's; the request keeps exactly its two headers and its three body
+ *   keys (no `droppedCount` when nothing was lost); the one new key is on the
+ *   events.
  * - **Process scope.** The estimate survives a capture change and a
  *   `shutdown()`/`reopen()` cycle.
  *
@@ -629,7 +630,10 @@ describe('the preload clock offset', () => {
         'Authorization',
         'Content-Type',
       ]);
+      // The capture the batch was recorded in rides beside the events, and no
+      // `droppedCount` travels when nothing was lost.
       expect(Object.keys(asRecord(JSON.parse(bodyTextOf(call)), 'the body')).sort()).toEqual([
+        'armedCaptureId',
         'events',
         'projectRoot',
       ]);

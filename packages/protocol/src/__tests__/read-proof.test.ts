@@ -4,7 +4,9 @@
  * `POST /pair/complete` response carries beside the credential, the
  * `client.hello` payload in `../messages/agent.ts` (which carries none), and
  * the HTTP client that returns the proof from pairing and sends it on reads
- * (`../client/http-client.ts`) — AAP §0.5.6.
+ * (`../client/http-client.ts`) — the part of the service's access boundary
+ * that admits a DevTools read only from the caller that redeemed the pairing
+ * code.
  *
  * Chrome sends a DevTools `GET` without an `Origin`, and an `Origin` is only a
  * claim any local process holding the credential can write. So the service
@@ -160,6 +162,7 @@ const PATH_PARAMS: { readonly [O in HttpOperation]: HttpPathParams<O> } = {
   'pair.start': {},
   'pair.complete': {},
   'credentials.rotate': {},
+  'credentials.release': {},
 };
 
 // ---------------------------------------------------------------------------

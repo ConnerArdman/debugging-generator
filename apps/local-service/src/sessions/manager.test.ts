@@ -1,8 +1,9 @@
 /**
  * Tests for `./manager.ts`'s follow-up ladder: {@link SessionManager.appendFollowUp},
  * {@link placeFollowUpAttempt} and {@link SessionManager.recordFollowUpOutcome};
- * and for how {@link SessionManager.end} stores `ended` with the tab binding's
- * removal.
+ * for how {@link SessionManager.end} stores `ended` with the tab binding's
+ * removal; and for how {@link SessionManager.confirmProjectRoot} holds the
+ * pipeline's sinks to the identity a session's root was admitted under.
  *
  * The promise under test is that a Retry of a failed follow-up never leaves a
  * duplicate behind — on the record's ladder **or** in the store's `followups`
@@ -40,6 +41,21 @@
  *    session removes a row an earlier build left behind, and answers the
  *    store's error when it cannot.
  * 9. **Privacy**: no log record carries the question.
+ * 10. **The project root's identity**: a session created with an admission
+ *    proof is stored with its canonical path and confirmed as that proof while
+ *    its root resolves to it, and refused once a link on the root is
+ *    retargeted, even inside the same tree; a proof for another root, or one
+ *    the store cannot record, refuses the create with nothing stored; a
+ *    session with no recorded identity is refused at every sink and never
+ *    identified. Across a restart — the store closed and reopened on the same
+ *    file, a new manager over it — a session is held to the identity stored
+ *    with it: confirmed while its root is unmoved, refused when the link was
+ *    retargeted while the service was down, refused (fail closed) when the
+ *    store holds no identity for it, and refused with the store's error when
+ *    that identity cannot be read. An unknown id, an unreadable record and an
+ *    ended session are refused, the ended one's identity released. These cases
+ *    stage real symbolic links in the case's sandbox, and no log record names
+ *    a path.
  *
  * The store is the real one — `openStore` against a file in a private `mkdtemp`
  * sandbox, never `:memory:` — and so are the sessions repository and the
@@ -54,7 +70,15 @@
  * is opened and no case depends on another having run.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -74,7 +98,15 @@ import type {
   SessionRecord,
   SessionStatus,
 } from '@debuggen/protocol';
-import { isErr, newAnalysisId, newCaptureId, newId, newPanelId, unwrap } from '@debuggen/shared';
+import {
+  isErr,
+  newAnalysisId,
+  newCaptureId,
+  newId,
+  newPanelId,
+  newSessionId,
+  unwrap,
+} from '@debuggen/shared';
 import type {
   DebuggenError,
   LogFields,
@@ -85,6 +117,8 @@ import type {
 } from '@debuggen/shared';
 import { SECURE_DIR_MODE } from '@debuggen/shared/node';
 
+import { identifyProjectRoot } from '../server/auth.js';
+import type { AdmittedProjectRoot } from '../server/auth.js';
 import { openStore } from '../store/db.js';
 import type { Store } from '../store/db.js';
 import { createSessionsRepo } from '../store/sessions-repo.js';
@@ -1163,6 +1197,397 @@ describe('end removes the tab binding in the transaction that stores `ended`', (
 
     expect(unwrap(await h.manager.end(session.id)).session).toEqual(ended);
     expect(boundInStore(session.id)).toBeUndefined();
+  });
+});
+
+describe('confirmProjectRoot holds every sink to the identity the root was admitted under', () => {
+  /** The refusal the access boundary answers a root that now resolves elsewhere with. */
+  const MOVED_MESSAGE = 'The project root no longer resolves to the directory it was admitted as.';
+  const MOVED_HINT =
+    'The project folder, or a link on its path, was moved or relinked after it was admitted. Start a new session, or launch the dev server again, from the folder in VS Code.';
+
+  /** The refusal a sink is answered for a session with no recorded identity (fail closed). */
+  const UNRECORDED_MESSAGE = "No admitted identity is recorded for this session's project root.";
+  const UNRECORDED_HINT =
+    'This session was stored without a record of the directory its project root was admitted as, so it can no longer be indexed or instrumented. Start a new session from the folder in VS Code.';
+
+  /** The `warn` record of every refused confirmation. */
+  const REFUSED_LOG = 'the project root could not be confirmed for a sink';
+
+  /** The `debug` record of an identity released with its session. */
+  const RELEASED_LOG = 'the project root identity of the session was released';
+
+  /**
+   * A real tree in the case's canonical sandbox: the session's root is `web`,
+   * a symbolic link to `packages/web`; `packages/api` is another directory
+   * inside the same tree for the link to be retargeted to.
+   */
+  function linkedRoot(): {
+    readonly root: string;
+    readonly target: string;
+    readonly elsewhere: string;
+  } {
+    const tree = join(h.root, 'shop');
+    const target = join(tree, 'packages', 'web');
+    const elsewhere = join(tree, 'packages', 'api');
+    mkdirSync(target, { recursive: true });
+    mkdirSync(elsewhere, { recursive: true });
+    const root = join(tree, 'web');
+    symlinkSync(target, root, 'dir');
+    return { root, target, elsewhere };
+  }
+
+  /** Points the link at `to`, as a process that can write inside the workspace could. */
+  function retarget(link: string, to: string): void {
+    unlinkSync(link);
+    symlinkSync(to, link, 'dir');
+  }
+
+  /** Creates a session on `projectRoot`, handed `admittedRoot` when one is given. */
+  async function createOn(
+    projectRoot: string,
+    admittedRoot?: AdmittedProjectRoot,
+  ): Promise<Result<SessionRecord, DebuggenError>> {
+    h.tick();
+    return h.manager.create({
+      projectRoot,
+      question: SESSION_QUESTION,
+      devServerUrl: DEV_SERVER_URL,
+      provider: { id: 'deterministic' },
+      ...(admittedRoot === undefined ? {} : { admittedRoot }),
+    });
+  }
+
+  /** Asserts `result` is a refusal with `code`, and answers it. */
+  function refusal<T>(
+    result: Result<T, DebuggenError>,
+    code: DebuggenError['code'],
+  ): DebuggenError {
+    if (!isErr(result)) {
+      throw new Error(`expected a ${code} refusal, got Ok`);
+    }
+    expect(result.error.code).toBe(code);
+    return result.error;
+  }
+
+  /** The records the manager logged with `message` for `sessionId`. */
+  function logged(message: string, sessionId: SessionId): readonly CapturedLog[] {
+    return h.logs.filter((log) => log.message === message && log.fields['sessionId'] === sessionId);
+  }
+
+  /**
+   * Asserts that no log record names the project tree {@link linkedRoot}
+   * builds. (The store logs its own database path, which sits in the same
+   * sandbox, so the sandbox itself is not the needle.)
+   */
+  function expectNoPathLogged(): void {
+    expect(JSON.stringify(h.logs)).not.toContain(join(h.root, 'shop'));
+  }
+
+  /** Every identity row the case's store holds, by session id. */
+  function storedIdentities(): readonly Record<string, unknown>[] {
+    return h.store.db
+      .prepare('SELECT session_id, canonical_root FROM session_root_identities ORDER BY session_id')
+      .all();
+  }
+
+  it('answers the admitted identity synchronously while the root resolves to it, and refuses a retargeted root', async () => {
+    const { root, target, elsewhere } = linkedRoot();
+    const admitted = unwrap(identifyProjectRoot(root));
+    const session = unwrap(await createOn(root, admitted));
+
+    const answer = h.manager.confirmProjectRoot(session.id);
+    // A plain Result, not a promise: the sink acts in the turn it was proven in.
+    expect(answer).not.toBeInstanceOf(Promise);
+    const confirmed = unwrap(answer);
+    expect(confirmed).toBe(admitted);
+    expect(confirmed.canonicalRoot).toBe(target);
+    // Stored with the session at create, not established at the first sink.
+    expect(unwrap(h.sessions.getRootIdentity(session.id))).toBe(target);
+
+    // Retargeted to another directory inside the same tree after the session
+    // was admitted: a scope check would still pass, the identity does not.
+    retarget(root, elsewhere);
+    const moved = refusal(h.manager.confirmProjectRoot(session.id), 'PATH_OUTSIDE_PROJECT');
+    expect(moved.message).toBe(MOVED_MESSAGE);
+    expect(moved.hint).toBe(MOVED_HINT);
+    expect(moved.details).toEqual({ reason: 'project-out-of-scope' });
+    expect(
+      logged(REFUSED_LOG, session.id).map((log) => [log.level, log.fields['code']] as const),
+    ).toEqual([['warn', 'PATH_OUTSIDE_PROJECT']]);
+
+    // Pointed back where it was admitted, it is the same directory again.
+    retarget(root, target);
+    expect(unwrap(h.manager.confirmProjectRoot(session.id))).toBe(admitted);
+    expectNoPathLogged();
+  });
+
+  it('refuses a create handed a proof for another root, storing and announcing nothing', async () => {
+    const { root, elsewhere } = linkedRoot();
+    const foreign = unwrap(identifyProjectRoot(elsewhere));
+
+    const mismatch = refusal(await createOn(root, foreign), 'INTERNAL');
+
+    expect(mismatch.details).toEqual({ reason: 'admitted-root-mismatch' });
+    expect(unwrap(h.manager.list())).toEqual([]);
+    expect(storedIdentities()).toEqual([]);
+    expect(h.frames).toEqual([]);
+    expectNoPathLogged();
+
+    // A proof for the same root in another spelling names it, and is accepted.
+    const admitted = unwrap(identifyProjectRoot(root));
+    const session = unwrap(await createOn(`${root}/./`, admitted));
+    expect(session.projectRoot).toBe(root);
+    expect(unwrap(h.manager.confirmProjectRoot(session.id))).toBe(admitted);
+
+    // A proof the caller could still change is recorded as a frozen copy, so
+    // mutating it after the create moves nothing the sinks are held to.
+    const mutable: { projectRoot: string; canonicalRoot: string } = { ...admitted };
+    const held = unwrap(await createOn(root, mutable));
+    mutable.canonicalRoot = elsewhere;
+    const recorded = unwrap(h.manager.confirmProjectRoot(held.id));
+    expect(recorded).toStrictEqual(admitted);
+    expect(Object.isFrozen(recorded)).toBe(true);
+    // The stored identity is that same, unmutated copy.
+    expect(unwrap(h.sessions.getRootIdentity(held.id))).toBe(admitted.canonicalRoot);
+  });
+
+  it('refuses a create whose identity the store cannot record, storing, caching and announcing nothing', async () => {
+    const { root } = linkedRoot();
+    const trigger = 'manager_suite_refuse_root_identity';
+    h.store.db.exec(
+      `CREATE TEMP TRIGGER ${trigger} BEFORE INSERT ON session_root_identities
+       BEGIN SELECT RAISE(ABORT, 'injected identity write failure'); END`,
+    );
+
+    let refused: DebuggenError;
+    try {
+      refused = refusal(await createOn(root, unwrap(identifyProjectRoot(root))), 'STORE_ERROR');
+    } finally {
+      h.store.db.exec(`DROP TRIGGER IF EXISTS temp.${trigger}`);
+    }
+
+    // The session went with its identity: neither is stored, nothing announced.
+    expect(refused.details).toMatchObject({ reason: 'store-failed' });
+    expect(unwrap(h.manager.list())).toEqual([]);
+    expect(storedIdentities()).toEqual([]);
+    expect(h.frames).toEqual([]);
+    expectNoPathLogged();
+  });
+
+  it('refuses every sink of a session created without a proof, and never identifies its root', async () => {
+    const { root } = linkedRoot();
+    const session = unwrap(await createOn(root));
+
+    // The root resolves exactly where it did at create; with no identity
+    // recorded for it, that is still no proof.
+    for (let sink = 0; sink < 2; sink += 1) {
+      const refused = refusal(h.manager.confirmProjectRoot(session.id), 'PATH_OUTSIDE_PROJECT');
+      expect(refused.message).toBe(UNRECORDED_MESSAGE);
+      expect(refused.hint).toBe(UNRECORDED_HINT);
+      expect(refused.details).toEqual({ reason: 'project-out-of-scope' });
+    }
+
+    // Nothing was stored or cached in its place: each sink asked again, and
+    // each refusal was logged by its code only.
+    expect(unwrap(h.sessions.getRootIdentity(session.id))).toBeUndefined();
+    expect(
+      logged(REFUSED_LOG, session.id).map((log) => [log.level, log.fields['code']] as const),
+    ).toEqual([
+      ['warn', 'PATH_OUTSIDE_PROJECT'],
+      ['warn', 'PATH_OUTSIDE_PROJECT'],
+    ]);
+    expectNoPathLogged();
+  });
+
+  describe('across a restart, over the same store file', () => {
+    /** One restarted process: its own store handle on the case's file, and the repository and manager over it. */
+    interface Restarted {
+      readonly store: Store;
+      readonly sessions: SessionsRepo;
+      readonly manager: SessionManager;
+    }
+
+    /** The store handles the restarts opened, closed after each case. */
+    const reopened: Store[] = [];
+
+    afterEach(() => {
+      for (const store of reopened.splice(0)) {
+        if (!store.isClosed) {
+          store.close();
+        }
+      }
+    });
+
+    /**
+     * Restarts the service over the case's store, as a process restart does:
+     * the first handle is closed, the same database file is opened again, and
+     * a new repository, progress emitter and manager are built over it and
+     * hydrated. Nothing held in memory crosses over — only the file does.
+     */
+    async function restart(): Promise<Restarted> {
+      const databasePath = h.store.path;
+      h.store.close();
+
+      const logger = createCapturingLogger(h.logs);
+      const store = unwrap(openStore({ databasePath, logger }));
+      reopened.push(store);
+      const now = (): number => h.now();
+      const sessions = createSessionsRepo({ store, logger, now });
+      const broadcaster = createRecordingBroadcaster([]);
+      const progress = createSessionProgress({ sessions, broadcaster, logger, now });
+      const manager = createSessionManager({ sessions, broadcaster, progress, logger, now });
+      unwrap(await manager.hydrate());
+
+      return { store, sessions, manager };
+    }
+
+    /** Creates a session on the linked root, handed the proof the create route hands over. */
+    async function admittedSession(root: string): Promise<SessionRecord> {
+      return unwrap(await createOn(root, unwrap(identifyProjectRoot(root))));
+    }
+
+    it('confirms an unmoved root as the canonical path stored with the session', async () => {
+      const { root, target } = linkedRoot();
+      const session = await admittedSession(root);
+
+      const restarted = await restart();
+      const confirmed = unwrap(restarted.manager.confirmProjectRoot(session.id));
+
+      expect(confirmed).toStrictEqual({ projectRoot: root, canonicalRoot: target });
+      expect(Object.isFrozen(confirmed)).toBe(true);
+      expect(unwrap(restarted.sessions.getRootIdentity(session.id))).toBe(target);
+      // Cached from the store: the next sink is answered with the same object.
+      expect(unwrap(restarted.manager.confirmProjectRoot(session.id))).toBe(confirmed);
+      expect(logged(REFUSED_LOG, session.id)).toEqual([]);
+      expectNoPathLogged();
+    });
+
+    it('refuses a root whose link was retargeted while the service was down', async () => {
+      const { root, target, elsewhere } = linkedRoot();
+      const session = await admittedSession(root);
+
+      // Retargeted inside the same tree before the next process starts: no
+      // process was running to see it, and a scope check would still pass.
+      retarget(root, elsewhere);
+      const restarted = await restart();
+
+      const moved = refusal(
+        restarted.manager.confirmProjectRoot(session.id),
+        'PATH_OUTSIDE_PROJECT',
+      );
+      expect(moved.message).toBe(MOVED_MESSAGE);
+      expect(moved.hint).toBe(MOVED_HINT);
+      expect(moved.details).toEqual({ reason: 'project-out-of-scope' });
+      // Held to the stored identity, never to where the link leads now.
+      expect(unwrap(restarted.sessions.getRootIdentity(session.id))).toBe(target);
+      refusal(restarted.manager.confirmProjectRoot(session.id), 'PATH_OUTSIDE_PROJECT');
+
+      // Pointed back where it was admitted, it is the same directory again.
+      retarget(root, target);
+      expect(unwrap(restarted.manager.confirmProjectRoot(session.id)).canonicalRoot).toBe(target);
+      expect(
+        logged(REFUSED_LOG, session.id).map((log) => [log.level, log.fields['code']] as const),
+      ).toEqual([
+        ['warn', 'PATH_OUTSIDE_PROJECT'],
+        ['warn', 'PATH_OUTSIDE_PROJECT'],
+      ]);
+      expectNoPathLogged();
+    });
+
+    it('fails closed for a session the store holds no identity for, as a store written before identities were recorded holds it', async () => {
+      const { root } = linkedRoot();
+      const session = await admittedSession(root);
+      // What a build before schema version 6 left behind: the session, admitted
+      // by a process that kept its proof in memory, and no identity row.
+      h.store.db
+        .prepare('DELETE FROM session_root_identities WHERE session_id = ?')
+        .run(session.id);
+
+      const restarted = await restart();
+
+      // The root is unmoved, and still refused: nothing proves it is.
+      for (let sink = 0; sink < 2; sink += 1) {
+        const refused = refusal(
+          restarted.manager.confirmProjectRoot(session.id),
+          'PATH_OUTSIDE_PROJECT',
+        );
+        expect(refused.message).toBe(UNRECORDED_MESSAGE);
+        expect(refused.hint).toBe(UNRECORDED_HINT);
+        expect(refused.details).toEqual({ reason: 'project-out-of-scope' });
+      }
+      expect(unwrap(restarted.sessions.getRootIdentity(session.id))).toBeUndefined();
+      expect(
+        logged(REFUSED_LOG, session.id).map((log) => [log.level, log.fields['code']] as const),
+      ).toEqual([
+        ['warn', 'PATH_OUTSIDE_PROJECT'],
+        ['warn', 'PATH_OUTSIDE_PROJECT'],
+      ]);
+      expectNoPathLogged();
+    });
+
+    it('refuses with the store’s error when the stored identity cannot be read, and caches nothing', async () => {
+      const { root, target } = linkedRoot();
+      const session = await admittedSession(root);
+      const restarted = await restart();
+
+      // A real read failure on the restarted connection: the table the
+      // repository reads is renamed away for the duration of the sink.
+      restarted.store.db.exec('ALTER TABLE session_root_identities RENAME TO identities_away');
+      let failed: DebuggenError;
+      try {
+        failed = refusal(restarted.manager.confirmProjectRoot(session.id), 'STORE_ERROR');
+      } finally {
+        restarted.store.db.exec('ALTER TABLE identities_away RENAME TO session_root_identities');
+      }
+
+      expect(failed.details).toMatchObject({ reason: 'store-failed' });
+      expect(
+        logged(REFUSED_LOG, session.id).map((log) => [log.level, log.fields['code']] as const),
+      ).toEqual([['warn', 'STORE_ERROR']]);
+
+      // Nothing was cached in the refusal's place: once readable, the stored
+      // identity holds the sink again.
+      expect(unwrap(restarted.manager.confirmProjectRoot(session.id)).canonicalRoot).toBe(target);
+      expectNoPathLogged();
+    });
+  });
+
+  it('answers SESSION_NOT_FOUND for an unknown id, and passes a store failure through', async () => {
+    const unknown = newSessionId();
+    refusal(h.manager.confirmProjectRoot(unknown), 'SESSION_NOT_FOUND');
+    expect(
+      logged('the project root could not be confirmed for a sink', unknown).map(
+        (log) => log.fields['code'],
+      ),
+    ).toEqual(['SESSION_NOT_FOUND']);
+
+    const { root } = linkedRoot();
+    const session = unwrap(await createOn(root, unwrap(identifyProjectRoot(root))));
+    // A stored document the repository can no longer read back.
+    h.store.db.prepare('UPDATE sessions SET record = ? WHERE id = ?').run('{', session.id);
+    refusal(h.manager.confirmProjectRoot(session.id), 'STORE_ERROR');
+    expectNoPathLogged();
+  });
+
+  it('refuses an ended session with SESSION_INVALID_STATE, its identity released at the end', async () => {
+    const { root } = linkedRoot();
+    const admitted = unwrap(identifyProjectRoot(root));
+    const session = unwrap(await createOn(root, admitted));
+    expect(unwrap(h.manager.confirmProjectRoot(session.id))).toBe(admitted);
+
+    h.tick();
+    expect(unwrap(await h.manager.end(session.id)).session.status).toBe('ended');
+
+    expect(
+      logged(RELEASED_LOG, session.id).map((log) => [log.level, log.fields['operation']] as const),
+    ).toEqual([['debug', 'end']]);
+    const ended = refusal(h.manager.confirmProjectRoot(session.id), 'SESSION_INVALID_STATE');
+    expect(ended.details).toMatchObject({ reason: 'session-ended' });
+    // Nothing was left to release: the entry went with the end.
+    expect(unwrap(await h.manager.end(session.id)).session.status).toBe('ended');
+    expect(logged(RELEASED_LOG, session.id)).toHaveLength(1);
+    expectNoPathLogged();
   });
 });
 

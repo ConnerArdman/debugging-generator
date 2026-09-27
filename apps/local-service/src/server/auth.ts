@@ -33,7 +33,7 @@
  * | --- | --- | --- | --- |
  * | `vscode` (editor) | the machine user; acts on projects under the workspace folders its live connections announced in `client.hello` | {@link AuthService.ensureEditorCredential}, written to `auth.json` | until rotation |
  * | `devtools` | the Chrome extension id that redeemed a pairing code | {@link AuthService.completePairing} | until rotation |
- * | `server-agent` | exactly one `projectRoot` | {@link AuthService.issueServerAgentCredential}, called by the dev-server launcher | until the launched process exits or is stopped ({@link AuthService.revokeServerAgentCredential}, that one credential only), and never past its expiry: a launched child's credential is a lease the launcher renews ({@link AuthService.renewServerAgentCredential}) only while the child runs |
+ * | `server-agent` | exactly one `projectRoot` | {@link AuthService.issueServerAgentCredential}, called by the dev-server launcher | until the launched process exits or is stopped ({@link AuthService.revokeServerAgentCredential}, that one credential only), and never past its expiry: a launched child's credential is a lease the launcher renews ({@link AuthService.renewServerAgentCredential}) only while the child runs; a `POST /dev-server/credential` credential may also be released early by its holder ({@link AuthService.releaseServerAgentCredential}) |
  *
  * The page agent (`client: 'agent'` in protocol's `CLIENT_KINDS`) holds no
  * credential and no socket of its own: the Chrome service worker relays its
@@ -886,7 +886,7 @@ export const AUTH_FAILURE_REASONS = Object.freeze({
     code: 'UNAUTHORIZED',
     status: 401,
     message: 'The stored record for the presented credential is not valid, so it is refused.',
-    hint: 'Rotate the service credentials from VS Code (Debug Generator: Rotate Service Token).',
+    hint: 'If VS Code’s own credential was refused, restart the service from VS Code (Debug Generator: Start Local Service), which re-mints it; otherwise rotate the service credentials from VS Code (Debug Generator: Rotate Service Token).',
   },
   'role-not-permitted': {
     code: 'UNAUTHORIZED',
@@ -1074,14 +1074,18 @@ export type AuthenticatedOperation = Exclude<HttpOperationId, AuthExemptOperatio
  * {@link requireSessionAccess}.
  *
  * - The editor controls sessions, dev servers and pairing.
- * - The three administrative operations are the editor's alone:
+ * - The four administrative operations are the editor's alone:
  *   `session.purge` (the on-demand retention sweep behind
  *   `debuggen.purgeSessions`), `devServer.credential` (a project-scoped
  *   server-agent credential for a dev server the caller starts itself, as
- *   `scripts/dev-instrumented.mjs` requests one) and `credentials.rotate`
- *   (the revocation behind `debuggen.rotateServiceToken`). Each acts on state
- *   no DevTools client or server agent may reach: every session's history,
- *   the minting of a credential, and every credential at once.
+ *   `scripts/dev-instrumented.mjs` requests one), `credentials.release` (that
+ *   credential's early revocation, which the same script requests as its dev
+ *   server exits) and `credentials.rotate` (the revocation behind
+ *   `debuggen.rotateServiceToken`). Each acts on state no DevTools client or
+ *   server agent may reach: every session's history, the minting or
+ *   revocation of a credential, and every credential at once. A server agent
+ *   in particular cannot release even its own credential: its lifetime is its
+ *   process's, ended by whoever started that process.
  * - A DevTools client reads and captures only through the session its tab is
  *   bound to, and can never create, question or end a session.
  * - A server agent may only post telemetry for its project.
@@ -1106,6 +1110,7 @@ export const OPERATION_ROLES = Object.freeze({
   'devServer.credential': ['vscode'],
   'pair.start': ['vscode'],
   'credentials.rotate': ['vscode'],
+  'credentials.release': ['vscode'],
 } as const satisfies Readonly<Record<AuthenticatedOperation, readonly PrincipalRole[]>>);
 
 /** {@link isAuthExemptOperation} as a type guard over the operation vocabulary. */
@@ -1928,6 +1933,36 @@ export interface AuthService {
   revokeServerAgentCredential(token: string): Result<boolean, DebuggenError>;
 
   /**
+   * Releases one `POST /dev-server/credential` credential at its holder's
+   * request — the store half of `POST /credentials/release`, which
+   * `scripts/dev-instrumented.mjs` calls as the dev server it started exits
+   * (a server-agent credential expires when its process exits).
+   *
+   * Narrower than {@link revokeServerAgentCredential}, on purpose: in one
+   * store transaction the row is read by the token's digest and deleted
+   * **only** when it is a live `server-agent` credential scoped to a project
+   * and is **not a lease** — a credential with a `leaseHolder` belongs to a
+   * child the dev-server launcher started and supervises, and only that
+   * launcher revokes it, so a caller that learned a launched child's token
+   * cannot end its telemetry through this door. An expired row is not live
+   * and is left to the expiry sweep. Only when a row is deleted are the
+   * sockets authenticated with it closed with `WS_CLOSE_UNAUTHORIZED`.
+   *
+   * Synchronous from entry to commit, so a caller that has just passed
+   * {@link requireLiveCredential} reaches the store with nothing interleaved.
+   * The token is hashed and dropped: it is never logged, stored or put in an
+   * error.
+   *
+   * @param token The plaintext credential to release.
+   * @returns `true` when a credential was deleted by this call; `false` when
+   *   none was — a malformed, unknown, expired, lapsed or rotated-away token,
+   *   another role's credential, or a launched child's lease all answer the
+   *   same — and the store's own failure (`STORE_ERROR`) when the transaction
+   *   could not run.
+   */
+  releaseServerAgentCredential(token: string): Result<boolean, DebuggenError>;
+
+  /**
    * Revokes every server-agent **lease** whose holder process is gone — what
    * the service runs on start, before it serves (AAP §0.5.6: a launched
    * child's credential stops working when its process exits or is stopped).
@@ -2032,10 +2067,11 @@ export interface AuthService {
    * A principal is a snapshot. {@link createAuthMiddleware} resolves it once,
    * before the handler runs, and a handler that reads a request body then
    * awaits the client for as long as the client takes to send it. A rotation
-   * ({@link rotateAll}), a revocation ({@link revokeServerAgentCredentials})
-   * or an expiry can retire the credential inside that gap, and acting on the
-   * snapshot afterwards would let a credential that no longer exists mint a
-   * credential, run a sweep or rotate again — exactly what AAP §0.5.6's
+   * ({@link rotateAll}), a revocation ({@link revokeServerAgentCredentials}),
+   * a release ({@link releaseServerAgentCredential}) or an expiry can retire
+   * the credential inside that gap, and acting on the snapshot afterwards
+   * would let a credential that no longer exists mint a credential, run a
+   * sweep or rotate again — exactly what the service's
    * revocation boundary forbids.
    *
    * Every route therefore calls this **between reading its body and its side
@@ -3249,6 +3285,57 @@ class CredentialAuthority implements AuthService {
     return ok(revoked.value.deleted);
   }
 
+  releaseServerAgentCredential(token: string): Result<boolean, DebuggenError> {
+    if (!presentedCredentialSchema.safeParse(token).success) {
+      // A value of the wrong shape was never issued, so nothing live has it.
+      return ok(false);
+    }
+
+    const tokenHash = sha256Hex(token);
+    const now = this.#now();
+    const released = this.#guard('release-server-agent-credential', () =>
+      this.#store.transaction((): { readonly deleted: boolean; readonly projectRoot?: string } => {
+        const raw: unknown = this.#store.statement(SQL.selectCredential).get(tokenHash);
+        const row = credentialRowSchema.safeParse(raw);
+        if (!row.success || row.data.role !== 'server-agent') {
+          // Absent, unreadable or another role's row: only a server-agent
+          // credential is ever released here.
+          return { deleted: false };
+        }
+        const scope = parseStoredScope(row.data.scope);
+        if (scope?.kind !== 'project' || scope.leaseHolder !== undefined) {
+          // A scope this module did not write, or a launched child's lease,
+          // which the launcher supervising that child alone revokes.
+          return { deleted: false };
+        }
+        if (row.data.expires_at !== null && row.data.expires_at <= now) {
+          // Already refused on its own; the expiry sweep removes the row.
+          return { deleted: false };
+        }
+        this.#store.statement(SQL.deleteCredentialOfRole).run(tokenHash, 'server-agent');
+        const projectRoot = normalizeRoot(scope.projectRoot);
+        return projectRoot === undefined ? { deleted: true } : { deleted: true, projectRoot };
+      }),
+    );
+    if (isErr(released)) {
+      return released;
+    }
+    if (!released.value.deleted) {
+      // Nothing changed, so nothing is closed: a launched child's lease, or
+      // any other row left in place, keeps its connections.
+      this.#logger.debug('a server-agent credential release found no releasable credential');
+      return ok(false);
+    }
+    const socketsClosed = this.#closeConnectionsOf(tokenHash);
+    this.#logger.info("released a server-agent credential at its holder's request", {
+      socketsClosed,
+      ...(released.value.projectRoot === undefined
+        ? {}
+        : { projectRoot: released.value.projectRoot }),
+    });
+    return ok(true);
+  }
+
   revokeOrphanedServerAgentLeases(): Result<number, DebuggenError> {
     const revoked = this.#guard('revoke-orphaned-server-agent-leases', () =>
       this.#store.transaction((): number => {
@@ -4132,13 +4219,30 @@ export function requireRole(
  *
  * The canonical check is true at the moment it runs, not afterwards: a link
  * created or retargeted inside the workspace after this returns is not seen
- * here. What bounds that residue is downstream — the next request on the
- * session re-runs this check through {@link requireSessionAccess}, and the
- * patcher re-derives the containment of every file it writes from the
- * project's own canonical root (`resolveRealPathWithinProject`). A caller that
- * acts on the root after an `await` keeps the identity the root was admitted
- * under with {@link admitProjectRoot} and re-proves it with
- * {@link reconfirmProjectRoot} immediately before it acts.
+ * here. The next request on the session re-runs this check through
+ * {@link requireSessionAccess}, and the patcher re-derives the containment of
+ * every file it writes from the project's own canonical root
+ * (`resolveRealPathWithinProject`). Every sink that acts on a root after an
+ * `await` also re-proves the identity the root was admitted under —
+ * synchronously, immediately before it acts — so a link retargeted in
+ * between, even to another directory inside the workspace, is refused rather
+ * than followed:
+ *
+ * - `session.create` (`routes/sessions.ts`) admits the root with
+ *   {@link admitProjectRoot} and re-proves it with {@link reconfirmProjectRoot}
+ *   before the session is stored, handing the proof to `SessionManager.create`,
+ *   which stores its canonical path with the new session, in the same
+ *   transaction;
+ * - `dev-server.launch` (`routes/dev-server.ts`) admits the root, re-proves it
+ *   at its fence, and hands the launcher (`dev-server/launcher.ts`) a
+ *   confirmation it runs immediately before spawning the child in the
+ *   canonical root;
+ * - the pipeline's indexing and patching run after the create request has
+ *   answered and hold no principal, so they re-prove identity only, through
+ *   `SessionManager.confirmProjectRoot` and {@link reconfirmRootIdentity},
+ *   against the identity stored with the session — which survives a restart,
+ *   and whose absence refuses the sink — and index and patch inside the
+ *   canonical root it returns.
  *
  * @param principal The authenticated principal.
  * @param projectRoot The requested project root, as the caller sent it.
@@ -4174,25 +4278,51 @@ export function requireProjectScope(
 }
 
 /**
- * A project root an editor principal was admitted to act on, and the canonical
- * identity it was admitted under.
+ * A project root and the canonical identity it was admitted under: the
+ * directory every later act on the root must still find there.
  *
- * {@link requireProjectScope} answers whether a root is in scope when it runs.
- * A caller that acts on the root only after an `await` — spawning a dev server
- * in it, indexing or patching it — keeps this value from
- * {@link admitProjectRoot} and passes it to {@link reconfirmProjectRoot},
- * synchronously, immediately before it acts: a link on the path retargeted in
- * between, even to another directory inside the workspace, is then refused
- * rather than followed.
+ * {@link requireProjectScope} answers whether a root is in scope when it runs;
+ * this value is what keeps that answer usable after an `await`. It is taken by
+ * {@link admitProjectRoot} (an editor principal: scope and identity) or by
+ * {@link identifyProjectRoot} (no principal: identity only), and re-proved —
+ * synchronously, immediately before the act — by {@link reconfirmProjectRoot}
+ * or {@link reconfirmRootIdentity}. A link on the path retargeted in between,
+ * even to another directory inside the workspace, is then refused rather than
+ * followed, and the act runs in {@link AdmittedProjectRoot.canonicalRoot}, the
+ * directory that was proven, never through the links of the spelled root
+ * again.
+ *
+ * | Sink | Proof taken | Re-proved immediately before it acts | Acts in |
+ * | --- | --- | --- | --- |
+ * | `session.create` (`routes/sessions.ts`) | {@link admitProjectRoot} | {@link reconfirmProjectRoot}, before the session is stored; the proof is handed to `SessionManager.create`, which stores it with the session | — (it stores the session) |
+ * | `dev-server.launch` (`routes/dev-server.ts`, `dev-server/launcher.ts`) | {@link admitProjectRoot} | {@link reconfirmProjectRoot} at the route's fence, then a confirmation the launcher runs immediately before spawning | the canonical root |
+ * | indexing and patching (the session pipeline) | the proof the session was created with, persisted with it | `SessionManager.confirmProjectRoot` → {@link reconfirmRootIdentity} (no principal after the request) | the canonical root |
+ *
+ * The proof outlives the process that took it: the session manager stores its
+ * canonical path with the session, in the transaction that inserts it
+ * (`session_root_identities`, schema version 6), so a session read back from
+ * the store after a restart is held to the directory it was admitted as — a
+ * link retargeted while the service was down is refused like any other. A
+ * session with no recorded identity (stored by a build that predates the
+ * record, or created without a proof) is refused at every sink with
+ * {@link unrecordedProjectRootIdentity} instead of being identified after the
+ * fact. Scope for a session is re-run by {@link requireSessionAccess} on
+ * every request that names it.
  *
  * @example
  * ```ts
+ * // A request handler, holding the principal throughout.
  * const admitted = admitProjectRoot(principal, body.projectRoot);
  * if (isErr(admitted)) return answer(admitted.error);
  * await prepare(admitted.value.projectRoot);
  * const still = reconfirmProjectRoot(principal, admitted.value);
  * if (isErr(still)) return answer(still.error);
  * spawnIn(still.value.canonicalRoot); // no await between the two
+ *
+ * // A background sink, long after the request answered.
+ * const root = sessionManager.confirmProjectRoot(sessionId); // reconfirmRootIdentity
+ * if (isErr(root)) return fail(root.error);
+ * indexIn(root.value.canonicalRoot); // no await between the two
  * ```
  */
 export interface AdmittedProjectRoot {
@@ -4205,6 +4335,133 @@ export interface AdmittedProjectRoot {
 /** The refusal of a root whose canonical path changed after it was admitted. */
 const PROJECT_ROOT_MOVED_MESSAGE =
   'The project root no longer resolves to the directory it was admitted as.';
+
+/**
+ * What the developer does about {@link PROJECT_ROOT_MOVED_MESSAGE}. It names no
+ * path: the refusal reaches response bodies, progress rows and logs, and the
+ * developer knows which folder they opened.
+ */
+const PROJECT_ROOT_MOVED_HINT =
+  'The project folder, or a link on its path, was moved or relinked after it was admitted. Start a new session, or launch the dev server again, from the folder in VS Code.';
+
+/**
+ * The refusal of a root whose canonical path cannot be established when no
+ * principal is in hand ({@link identifyProjectRoot}). One constant sentence
+ * for every cause — a dangling link, a link loop, a folder that cannot be
+ * read — so the answer is no probe of which one it was.
+ */
+const PROJECT_ROOT_UNRESOLVABLE_MESSAGE =
+  'Where the project root leads on disk could not be established.';
+
+/** What the developer does about {@link PROJECT_ROOT_UNRESOLVABLE_MESSAGE}. */
+const PROJECT_ROOT_UNRESOLVABLE_HINT =
+  'Check that the project folder and every link on its path still exist and can be read, then start a new session from the folder in VS Code.';
+
+/**
+ * The refusal of a session whose root has no recorded admitted identity
+ * ({@link unrecordedProjectRootIdentity}). One constant sentence that names no
+ * path: it reaches response bodies, progress rows and logs.
+ */
+const PROJECT_ROOT_UNRECORDED_MESSAGE =
+  "No admitted identity is recorded for this session's project root.";
+
+/** What the developer does about {@link PROJECT_ROOT_UNRECORDED_MESSAGE}. */
+const PROJECT_ROOT_UNRECORDED_HINT =
+  'This session was stored without a record of the directory its project root was admitted as, so it can no longer be indexed or instrumented. Start a new session from the folder in VS Code.';
+
+/**
+ * The refusal a sink that holds no principal answers for a session whose
+ * project root has **no recorded admitted identity**: `PATH_OUTSIDE_PROJECT`
+ * (`project-out-of-scope`, 403), with a constant, path-free message and a hint
+ * to start a new session from the folder in VS Code.
+ *
+ * `SessionManager.confirmProjectRoot` answers it — failing closed — when a
+ * session reaches a sink with neither an in-memory proof nor one stored with
+ * it: a session stored by a build that predates the persisted identity, or
+ * created without a proof. Identifying the root then, with
+ * {@link identifyProjectRoot}, would accept whatever its links lead to at that
+ * moment — a link retargeted while the service was down included — so the
+ * sink is refused instead of being handed a canonical root nobody admitted.
+ *
+ * @returns A new refusal on every call, so a caller may attach it as it wishes.
+ *
+ * @example
+ * ```ts
+ * const recorded = sessions.getRootIdentity(sessionId);
+ * if (isErr(recorded)) return err(recorded.error);
+ * if (recorded.value === undefined) return err(unrecordedProjectRootIdentity());
+ * ```
+ */
+export function unrecordedProjectRootIdentity(): DebuggenError {
+  return authFailure(
+    'project-out-of-scope',
+    PROJECT_ROOT_UNRECORDED_MESSAGE,
+    PROJECT_ROOT_UNRECORDED_HINT,
+  );
+}
+
+/**
+ * The identity of a root {@link normalizeRoot} already accepted: the root as
+ * given and its {@link canonicalRoot}, frozen, or `undefined` when the
+ * canonical path cannot be established. The one construction both
+ * {@link admitProjectRoot} and {@link identifyProjectRoot} return.
+ */
+function identityOf(
+  root: string,
+  resolveRealPath: RealPathResolver,
+): AdmittedProjectRoot | undefined {
+  const canonical = canonicalRoot(root, resolveRealPath);
+  return canonical === undefined
+    ? undefined
+    : Object.freeze({ projectRoot: root, canonicalRoot: canonical });
+}
+
+/**
+ * The canonical identity of a project root, with no principal and no scope:
+ * the root normalised exactly as {@link requireProjectScope} normalises it,
+ * and its canonical path — every symbolic link in the part that exists
+ * resolved, a tail that does not exist yet kept as spelled beneath its longest
+ * existing ancestor.
+ *
+ * This is the half of {@link admitProjectRoot} a sink that holds no principal
+ * can still run. It judges **no scope** and is never a substitute for
+ * admission: a root a request names is admitted with {@link admitProjectRoot}
+ * or {@link requireProjectScope}. Nor does it ever stand in for a proof a
+ * session lacks: a session with no recorded identity is refused with
+ * {@link unrecordedProjectRootIdentity}, because identifying its root after the
+ * fact would accept wherever a relinked path leads by then.
+ * {@link reconfirmRootIdentity} calls it to re-establish an admitted identity.
+ *
+ * Refused in exactly the cases {@link admitProjectRoot}'s own normalising and
+ * canonicalising steps refuse the same root: a root that is not an absolute
+ * local path (relative, empty, a NUL, a network share), and a root whose
+ * canonical path cannot be established — a dangling link, a link loop,
+ * `EACCES`, `ENOTDIR`, a drive-rooted path on a host that is not Windows. A
+ * missing tail is not a failure.
+ *
+ * @param projectRoot The root, as the session or the caller holds it.
+ * @param resolveRealPath The canonicaliser, `realpathSync.native` by default;
+ * injected by tests. It follows the {@link RealPathResolver} contract.
+ * @returns The root and its canonical path, frozen, or `PATH_OUTSIDE_PROJECT`
+ * (`project-out-of-scope`, 403).
+ */
+export function identifyProjectRoot(
+  projectRoot: string,
+  resolveRealPath: RealPathResolver = resolveHostRealPath,
+): Result<AdmittedProjectRoot, DebuggenError> {
+  const root = normalizeRoot(projectRoot);
+  if (root === undefined) {
+    return refuse('project-out-of-scope', 'A project root must be an absolute path.');
+  }
+  const identity = identityOf(root, resolveRealPath);
+  return identity === undefined
+    ? refuse(
+        'project-out-of-scope',
+        PROJECT_ROOT_UNRESOLVABLE_MESSAGE,
+        PROJECT_ROOT_UNRESOLVABLE_HINT,
+      )
+    : ok(identity);
+}
 
 /**
  * {@link requireProjectScope}'s editor rule, returning what the root was judged
@@ -4244,16 +4501,34 @@ export function admitProjectRoot(
   if (claimingFolders.length === 0) {
     return refuse('project-out-of-scope');
   }
-  const canonicalProjectRoot = canonicalRoot(root, resolveRealPath);
-  if (canonicalProjectRoot === undefined) {
+  // Resolved only now, after the lexical check: no root outside every
+  // announced folder is ever resolved.
+  const identity = identityOf(root, resolveRealPath);
+  if (identity === undefined) {
     return refuse('project-out-of-scope');
   }
   return claimingFolders.some((folder) => {
     const canonicalFolder = canonicalRoot(folder, resolveRealPath);
-    return canonicalFolder !== undefined && isWithin(canonicalFolder, canonicalProjectRoot);
+    return canonicalFolder !== undefined && isWithin(canonicalFolder, identity.canonicalRoot);
   })
-    ? ok(Object.freeze({ projectRoot: root, canonicalRoot: canonicalProjectRoot }))
+    ? ok(identity)
     : refuse('project-out-of-scope');
+}
+
+/**
+ * `admitted`, when `canonicalNow` — the root's canonical path as it was just
+ * established again — names the directory it was admitted under; the moved
+ * refusal otherwise. The one identity comparison {@link reconfirmProjectRoot}
+ * and {@link reconfirmRootIdentity} share, so both refuse a moved root with the
+ * same message and hint.
+ */
+function confirmSameIdentity(
+  admitted: AdmittedProjectRoot,
+  canonicalNow: string,
+): Result<AdmittedProjectRoot, DebuggenError> {
+  return sameRoot(canonicalNow, admitted.canonicalRoot)
+    ? ok(admitted)
+    : refuse('project-out-of-scope', PROJECT_ROOT_MOVED_MESSAGE, PROJECT_ROOT_MOVED_HINT);
 }
 
 /**
@@ -4264,13 +4539,17 @@ export function admitProjectRoot(
  * since — inside the workspace or out of it — is refused instead of followed.
  *
  * Synchronous, and meant to run with no `await` between it and the act it
- * guards; the residue is then the time a synchronous call takes.
+ * guards; the residue is then the time a synchronous call takes. For a sink
+ * that holds no principal, {@link reconfirmRootIdentity} re-proves the
+ * identity alone.
  *
  * @param principal The principal the root was admitted for.
  * @param admitted What {@link admitProjectRoot} returned.
  * @param resolveRealPath The canonicaliser, `realpathSync.native` by default.
  * @returns `admitted`, unchanged, or `PATH_OUTSIDE_PROJECT`
- * (`project-out-of-scope`, 403).
+ * (`project-out-of-scope`, 403): the scope refusal of {@link admitProjectRoot},
+ * or, when the root is still in scope but resolves elsewhere, the moved
+ * refusal.
  */
 export function reconfirmProjectRoot(
   principal: Principal,
@@ -4278,12 +4557,44 @@ export function reconfirmProjectRoot(
   resolveRealPath: RealPathResolver = resolveHostRealPath,
 ): Result<AdmittedProjectRoot, DebuggenError> {
   const again = admitProjectRoot(principal, admitted.projectRoot, resolveRealPath);
-  if (isErr(again)) {
-    return again;
-  }
-  return sameRoot(again.value.canonicalRoot, admitted.canonicalRoot)
-    ? ok(admitted)
-    : refuse('project-out-of-scope', PROJECT_ROOT_MOVED_MESSAGE);
+  return isErr(again) ? again : confirmSameIdentity(admitted, again.value.canonicalRoot);
+}
+
+/**
+ * Re-proves, with no principal, that an admitted root still resolves to the
+ * canonical path it was admitted under — the check a background sink runs
+ * synchronously, immediately before it acts, so a link on the path retargeted
+ * since, inside the workspace or out of it, is refused instead of followed.
+ *
+ * It exists beside {@link reconfirmProjectRoot} because the session pipeline's
+ * indexing and patching act long after the `session.create` request that
+ * admitted the root has answered, and hold no principal to re-run the scope
+ * with. They need not: scope was proven at admission, and
+ * {@link requireSessionAccess} re-runs it on every later request that names
+ * the session. What can change unseen between admission and a background act
+ * is where the root's links lead, and that is exactly what this re-proves.
+ * Reached through `SessionManager.confirmProjectRoot`, which holds each session
+ * to the proof recorded with it — in memory, and in the session store across a
+ * restart — and refuses a session with none
+ * ({@link unrecordedProjectRootIdentity}).
+ *
+ * Synchronous, and meant to run with no `await` between it and the act it
+ * guards; the act then runs in the returned
+ * {@link AdmittedProjectRoot.canonicalRoot}.
+ *
+ * @param admitted What {@link admitProjectRoot} or {@link identifyProjectRoot}
+ * returned for the root.
+ * @param resolveRealPath The canonicaliser, `realpathSync.native` by default.
+ * @returns `admitted` (the same object), or `PATH_OUTSIDE_PROJECT`
+ * (`project-out-of-scope`, 403): the moved refusal when the canonical path
+ * changed, {@link identifyProjectRoot}'s when it can no longer be established.
+ */
+export function reconfirmRootIdentity(
+  admitted: AdmittedProjectRoot,
+  resolveRealPath: RealPathResolver = resolveHostRealPath,
+): Result<AdmittedProjectRoot, DebuggenError> {
+  const again = identifyProjectRoot(admitted.projectRoot, resolveRealPath);
+  return isErr(again) ? again : confirmSameIdentity(admitted, again.value.canonicalRoot);
 }
 
 /**

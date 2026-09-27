@@ -26,9 +26,12 @@
  * products in the same order, and the strip a buyer sees does not reshuffle
  * itself between visits.
  *
- * Importing this module opens no connection and reads no configuration - the
- * client in `@/server/db/prisma` connects on its first query - so a page that
- * imports it still builds and type-checks against a machine with no database.
+ * Importing this module opens no connection and reads no configuration other
+ * than `DATABASE_URL`, which `@/server/db/pool` reads to build the pool the
+ * client in `@/server/db/prisma` queries through. Neither connects until the
+ * first query, and an absent `DATABASE_URL` surfaces only there, so a page that
+ * imports this module still builds and type-checks against a machine with no
+ * database.
  */
 
 import type { RecommendationItem } from '@/lib/types';

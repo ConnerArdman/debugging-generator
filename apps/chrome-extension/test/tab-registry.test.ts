@@ -565,8 +565,8 @@ function payloadTabId(payload: unknown): TabId | undefined {
 /**
  * The local service's side of the bindings, as far as the registry can
  * observe it: the bindings the service holds for this worker's tabs, which it
- * keeps across a dropped socket and a worker restart alike (AAP §0.5.5), and
- * which it never lists back to the worker.
+ * keeps across a dropped socket and a worker restart alike, and which it never
+ * lists back to the worker.
  *
  * {@link attach} makes it the harness's transport. While `connected`, each
  * frame is applied as the service applies it — a `session.unbind` ends the

@@ -10,15 +10,16 @@
  * than a convenience, because the two copies can only ever disagree at run
  * time, in the process that receives the body.
  *
- * ## Twenty-one routes, and where their names come from
+ * ## Twenty-two routes, and where their names come from
  *
  * Six of the operation keys are the documented operation names, preserved
  * character for character: `session.create`, `session.question`,
  * `session.end`, `capture.start`, `capture.stop` and `telemetry.event`. They
  * are **HTTP operations, not WebSocket message types**. Nothing in this file
  * may enter the envelope's discriminated union, and the
- * twenty-six WebSocket message types — `client.hello`, `session.created`,
- * `session.updated`, `session.progress`, `session.bind`, `session.bound`,
+ * twenty-eight WebSocket message types — `client.hello`, `client.ping`,
+ * `service.pong`, `session.created`, `session.updated`, `session.progress`,
+ * `session.bind`, `session.bound`,
  * `tab.navigated`, `session.unbind`, `target.request`, `target.selected`,
  * `instrumentation.plan`, `instrumentation.ready`, `instrumentation.failed`,
  * `capture.started`, `capture.stopped`, `agent.ready`, `agent.config`,
@@ -37,14 +38,16 @@
  *   tab, and to it alone. The editor holds no connection to that tab, and the
  *   service is the one process that knows which tab is bound, so the request is
  *   a conventional HTTP call and the push stays the service-only message
- *   `./messages/target.ts` defines — the vocabulary keeps its twenty-six types.
+ *   `./messages/target.ts` defines — the vocabulary keeps its twenty-eight types.
  *
- * Three routes serve administrative operations, and they are declared here so
+ * Four routes serve administrative operations, and they are declared here so
  * that no process has to define a route of its own to reach them:
  * `devServer.credential` (`POST /dev-server/credential`, the server-agent
  * credential `scripts/dev-instrumented.mjs` requests with the editor
- * credential), `credentials.rotate` (`POST /credentials/rotate`, the
- * revocation `debuggen.rotateServiceToken` performs) and `session.purge`
+ * credential), `credentials.release` (`POST /credentials/release`, how that
+ * script revokes the same credential when its dev server exits),
+ * `credentials.rotate` (`POST /credentials/rotate`, the revocation
+ * `debuggen.rotateServiceToken` performs) and `session.purge`
  * (`POST /sessions/purge`, the retention sweep `debuggen.purgeSessions` runs on
  * demand). A route the service registered outside this table would be a route
  * no client could discover and no test could enumerate, so none may exist.
@@ -54,10 +57,12 @@
  * `./messages/capture.ts` the four capture bodies and the embedded capture
  * summary, `./messages/binding.ts` the Chrome tab-id rule the target-request
  * reply carries, `./messages/error.ts` the one error body both transports
- * share, and `./session-record.ts` the `SessionRecord` and the cleanup
- * vocabulary. This module adds what only a route can have: its method, its
- * path, its parameters, whether it is exempt from authentication, and its
- * response.
+ * share, `./messages/telemetry.ts` the delivery context and loss-only rule the
+ * ingest body shares with the WebSocket batch (with the identifier rule behind
+ * the body's own `lossReportId`), and `./session-record.ts` the
+ * `SessionRecord` and the cleanup vocabulary. This module adds what only a
+ * route can have: its method, its path, its parameters, whether it is exempt
+ * from authentication, and its response.
  *
  * ## Patterns are for the server; `buildPath` is for the client
  *
@@ -168,6 +173,12 @@ import {
   sessionEndRequestSchema,
   sessionQuestionRequestSchema,
 } from './messages/session.js';
+import {
+  armedCaptureIdSchema,
+  droppedCountSchema,
+  lossReportIdSchema,
+  requireLossReportForEmptyBatch,
+} from './messages/telemetry.js';
 import {
   cleanupStatusSchema,
   sessionCleanupSchema,
@@ -2099,10 +2110,43 @@ export function formatListPageQuery(
 //
 // A required route, not a stray one: the Node preload posts its server spans
 // here as `telemetry.event`, with its server-agent credential and a
-// `{ projectRoot, events: TelemetryEventIngress[] }` body;
-// `apps/local-service/src/server/routes/telemetry.ts` serves it; and
-// `docs/ARCHITECTURE.md` section 4.3 lists it among the HTTP routes. Deleting
-// it would leave the preload nowhere to post, so the table below carries it.
+// `{ projectRoot, events: TelemetryEventIngress[], armedCaptureId?, droppedCount?,
+// lossReportId? }` body; `apps/local-service/src/server/routes/telemetry.ts`
+// serves it; and `docs/ARCHITECTURE.md` section 4.3 lists it among the HTTP
+// routes. Deleting it would leave the preload nowhere to post, so the table
+// below carries it.
+//
+// The first two optional fields are the same delivery context the WebSocket
+// payload of `telemetry.event` carries, embedded from `./messages/telemetry.ts`
+// rather than restated, so both transports refuse the same values in the same
+// words:
+//
+// - `armedCaptureId` is the capture the preload was armed for
+//   (`server-agent.config`) when it recorded the batch. It is refusal-only: the
+//   service still attributes by the credential's project scope and that
+//   project's open capture window, and reads the field solely to refuse a batch
+//   naming a different capture — a batch retried across a capture stop and
+//   start, whose spans belong to the window that has closed.
+// - `droppedCount` is how many spans the preload discarded for that capture
+//   since its previous loss report, which the service adds to the capture's
+//   ledger so the summary can say its server evidence is incomplete.
+//
+// A third optional field is this transport's alone:
+//
+// - `lossReportId` is the producer-chosen identity of the body's loss report,
+//   stable across every retry of the same report. The preload sends the same
+//   serialized body again after a timeout or a retryable failure, so a report
+//   the service recorded but whose reply was lost arrives again; the service
+//   applies a report at most once per capture and `lossReportId`. It identifies
+//   a report, never a session or a capture, and authorizes nothing. It is
+//   accepted only beside a `droppedCount` above zero — a body reporting no
+//   loss has no report to name — and its identifier rule is embedded from
+//   `./messages/telemetry.ts` like the other two.
+//
+// `events` may be empty only beside a `droppedCount` above zero: a loss-only
+// report, which is how a loss reaches the ledger when no later batch will carry
+// it. Every other empty batch is refused, by the same object-level check the
+// WebSocket payload applies.
 //
 // Note which side of the wire reads this definition. `@debuggen/telemetry` sits
 // BELOW this package in the layering and may not import it, so the Node preload
@@ -2112,8 +2156,70 @@ export function formatListPageQuery(
 // ---------------------------------------------------------------------------
 
 /**
- * The `telemetry.event` ingest body: which project the spans belong to, and the
- * spans.
+ * What a `lossReportId` on a body that reports no loss is answered with.
+ *
+ * Constant, so the refusal states the rule and never the identifier received.
+ */
+const LOSS_REPORT_ID_RULE =
+  'expected lossReportId only beside a droppedCount above zero: it names a loss report, and a body that reports no loss carries none';
+
+/**
+ * The label a `lossReportId` without a loss is refused under.
+ *
+ * Rendered by `describeZodIssues` as
+ * `lossReportId (custom label=loss-report-id-requires-loss)`: the rule that
+ * failed, and no received value. It passes the renderer's name gate, so it is
+ * shown verbatim.
+ */
+const LOSS_REPORT_ID_LABEL = 'loss-report-id-requires-loss';
+
+/**
+ * Refuses an ingest body whose `lossReportId` names no loss.
+ *
+ * The identity exists so that the service applies a retried loss report once. A
+ * body without a `droppedCount` above zero reports nothing to apply, so an
+ * identity on it is a producer bug, refused rather than silently ignored.
+ *
+ * Whether the field is admissible depends on `droppedCount`, so this is a check
+ * on the object: it keeps the `ZodObject` and its `.shape`, as
+ * `requireLossReportForEmptyBatch` does. It runs only on an otherwise valid
+ * body — a malformed `lossReportId` or `droppedCount` is reported by its own
+ * issue, and an event-less body without a loss by the loss-only rule — so it
+ * never piles a derived issue on top of another. The message is constant and
+ * `input` is left empty, so the rejection never carries the identifier sent.
+ *
+ * @param parsed The body's parse state, whose `value` is the parsed body.
+ */
+function requireLossForLossReportId(
+  parsed: z.core.ParsePayload<{
+    readonly droppedCount?: number | undefined;
+    readonly lossReportId?: string | undefined;
+  }>,
+): void {
+  if (parsed.issues.length > 0) {
+    return;
+  }
+
+  const { droppedCount, lossReportId } = parsed.value;
+
+  if (lossReportId === undefined || (droppedCount !== undefined && droppedCount > 0)) {
+    return;
+  }
+
+  parsed.issues.push({
+    code: 'custom',
+    path: ['lossReportId'],
+    message: LOSS_REPORT_ID_RULE,
+    params: { label: LOSS_REPORT_ID_LABEL },
+    // Left empty on purpose: a rejection never carries what was received.
+    input: undefined,
+  });
+}
+
+/**
+ * The `telemetry.event` ingest body: which project the spans belong to, the
+ * spans, and optionally the capture they were recorded for, the spans lost on
+ * the way, and the identity of that loss report.
  *
  * The **ingress** event schema, never the persisted one. `sessionId`, `captureId`
  * and `ingestSeq` are assigned by `apps/local-service/src/telemetry/ingest.ts`
@@ -2128,29 +2234,89 @@ export function formatListPageQuery(
  * exactly one project (AAP §0.5.6): the service accepts the batch only when the
  * field matches the credential's scope, which is what stops one project's dev
  * server from posting spans into another project's session.
+ *
+ * **`armedCaptureId` is refusal-only.** It names the capture the preload was
+ * armed for by `server-agent.config` when it recorded the batch. The service
+ * still attributes the batch by the credential's project scope and that
+ * project's open capture window, and uses this value solely to refuse a batch
+ * that names a *different* capture — one retried across a capture stop and
+ * start, which would otherwise land in the next capture. Naming the open
+ * capture adds no authority over omitting the field, and naming another can
+ * only discard the preload's own batch, so the field can never choose a session
+ * or a capture.
+ *
+ * **`droppedCount` is a loss report.** It counts the spans the preload
+ * discarded for that capture since its previous loss report; absent means none
+ * were reported. The service adds it to the capture's ledger, so a summary with
+ * missing server evidence says so instead of looking whole.
+ *
+ * **`lossReportId` makes a retried loss report count once.** It is a
+ * producer-chosen identity for this body's loss report, stable across every
+ * retry of the same report: the preload sends the same serialized body again
+ * after a timeout or a retryable failure, so a report the service recorded but
+ * whose reply was lost arrives again, and the service applies a report at most
+ * once per capture and `lossReportId`. It identifies a report — never a session
+ * or a capture — and never authorizes anything. It is accepted only beside a
+ * `droppedCount` above zero, by `requireLossForLossReportId` under the
+ * `lossReportId` path; the WebSocket payload has no such field, because the
+ * HTTP transport is the one that retries a body in place.
+ *
+ * **An event-less body is a loss-only report.** `events` may be empty only when
+ * `droppedCount` is above zero — what the preload sends when no later batch
+ * will carry its loss. Any other empty batch is refused under the `events` path
+ * by `requireLossReportForEmptyBatch`, the check the WebSocket payload applies.
+ * Both cross-field rules are checks on the object rather than field
+ * constraints, so the schema stays a `ZodObject` whose `.shape` the service
+ * reads structurally — the `events` bound, the `projectRoot` field schema and
+ * each optional field.
+ *
+ * `armedCaptureId` and `droppedCount` are the WebSocket payload's own factories
+ * (`armedCaptureIdSchema`, `droppedCountSchema` in `./messages/telemetry.ts`),
+ * so a server batch is refused for exactly what a browser batch is, in the
+ * same words; `lossReportId` is `lossReportIdSchema` from the same module, the
+ * identifier rule `armedCaptureId` applies.
  */
-export const telemetryIngestRequestSchema = z.strictObject({
-  /** The project whose dev server produced these spans. */
-  projectRoot: projectRootSchema(),
+export const telemetryIngestRequestSchema = z
+  .strictObject({
+    /** The project whose dev server produced these spans. */
+    projectRoot: projectRootSchema(),
 
-  /**
-   * The batch, each element validated as a producer's event.
-   *
-   * Non-empty — an empty batch costs a request, a parse and a log line to say
-   * nothing, which is a producer bug worth naming — and bounded by
-   * {@link MAX_INGEST_EVENTS_PER_REQUEST}.
-   */
-  events: z
-    .array(telemetryEventIngressSchema)
-    .min(1, { error: 'expected at least one telemetry event: an empty batch is a no-op' })
-    .max(MAX_INGEST_EVENTS_PER_REQUEST, {
+    /**
+     * The batch, each element validated as a producer's event.
+     *
+     * Bounded by {@link MAX_INGEST_EVENTS_PER_REQUEST}, and empty only beside a
+     * loss report — the first object-level check below, since whether it may be
+     * empty depends on `droppedCount`.
+     */
+    events: z.array(telemetryEventIngressSchema).max(MAX_INGEST_EVENTS_PER_REQUEST, {
       error: `expected at most ${String(
         MAX_INGEST_EVENTS_PER_REQUEST,
       )} telemetry events in one request`,
     }),
-});
 
-/** The validated `POST /telemetry/ingest` request body. */
+    /**
+     * The capture the preload was armed for when it recorded these spans.
+     * Refusal-only context: never used to choose a session or a capture.
+     */
+    armedCaptureId: armedCaptureIdSchema().optional(),
+
+    /** Spans the preload discarded for that capture since its previous loss report. */
+    droppedCount: droppedCountSchema().optional(),
+
+    /**
+     * The identity of this body's loss report, stable across its retries; only
+     * beside a `droppedCount` above zero. Identifies a report, never a session
+     * or a capture, and authorizes nothing.
+     */
+    lossReportId: lossReportIdSchema().optional(),
+  })
+  .check(requireLossReportForEmptyBatch)
+  .check(requireLossForLossReportId);
+
+/**
+ * The validated `POST /telemetry/ingest` request body: `projectRoot`, `events`,
+ * and the optional `armedCaptureId`, `droppedCount` and `lossReportId`.
+ */
 export type TelemetryIngestRequest = z.infer<typeof telemetryIngestRequestSchema>;
 
 /**
@@ -2336,8 +2502,12 @@ export type DevServerCredentialRequest = z.infer<typeof devServerCredentialReque
  * connection authenticated with it is online, revokes it shortly after that
  * connection is gone (the dev server exited) or when no preload connected
  * with it before `expiresAt`, and a lease nothing renews stops being accepted
- * at its end. Nothing rides along with the token: a role or a scope echoed
- * here would be a client's word for what it was granted.
+ * at its end. The holder need not wait for any of that: it may release the
+ * credential early through `credentials.release`
+ * ({@link credentialsReleaseRequestSchema}), which is what
+ * `scripts/dev-instrumented.mjs` does as its dev server exits. Nothing rides
+ * along with the token: a role or a scope echoed here would be a client's word
+ * for what it was granted.
  */
 export const devServerCredentialResponseSchema = z.strictObject({
   /** The bearer credential for the Node preload, `DEBUGGEN_TOKEN`. */
@@ -2508,11 +2678,13 @@ export const httpErrorResponseSchema = errorPayloadSchema;
 export type HttpErrorResponse = z.infer<typeof httpErrorResponseSchema>;
 
 // ---------------------------------------------------------------------------
-// Section H2 — credential rotation
+// Section H2 — credential rotation and release
 //
-// `POST /credentials/rotate`. The revocation half of the access boundary:
-// pairing (Section H) and the dev-server routes (Section G) mint credentials,
-// and this route withdraws every one of them at once.
+// `POST /credentials/rotate` and `POST /credentials/release`. The revocation
+// half of the access boundary: pairing (Section H) and the dev-server routes
+// (Section G) mint credentials, the rotation withdraws every one of them at
+// once, and the release withdraws the one server-agent credential its holder
+// names.
 // ---------------------------------------------------------------------------
 
 /**
@@ -2558,6 +2730,73 @@ export const credentialsRotateResponseSchema = z.strictObject({
 
 /** The validated `POST /credentials/rotate` response body. */
 export type CredentialsRotateResponse = z.infer<typeof credentialsRotateResponseSchema>;
+
+/**
+ * The `POST /credentials/release` request: the one server-agent credential to
+ * revoke now, named by its own plaintext token.
+ *
+ * The route exists for the holder of a {@link devServerCredentialResponseSchema}
+ * credential — `scripts/dev-instrumented.mjs`, which requested it with the
+ * editor credential for a dev server it started itself — to revoke it the
+ * moment that dev server exits, instead of leaving it to authenticate until
+ * the service's supervision notices the preload is gone (a
+ * server-agent credential expires when its process exits). Which credential
+ * may call it — the editor's alone — is the service's role table (Section A),
+ * never anything this body says.
+ *
+ * The token is the only possible key. The service stores credentials only as
+ * SHA-256 digests, and the plaintext is what the holder already has, so naming
+ * it grants nothing new: a caller that does not hold a credential cannot name
+ * it. Shape only, like every token field here ({@link MAX_OPAQUE_TOKEN_LENGTH});
+ * the service hashes the value and compares digests, and never logs, echoes
+ * or stores the plaintext. Strict, so a field that tried to widen the release
+ * — a project, a role, "all" — is refused rather than ignored.
+ *
+ * @example
+ * ```ts
+ * const body: CredentialsReleaseRequest = { token: leasedToken };
+ * await client.request('credentials.release', { body });
+ * ```
+ */
+export const credentialsReleaseRequestSchema = z.strictObject({
+  /** The plaintext server-agent credential `POST /dev-server/credential` handed out. */
+  token: opaqueTokenSchema(),
+});
+
+/** The validated `POST /credentials/release` request body. */
+export type CredentialsReleaseRequest = z.infer<typeof credentialsReleaseRequestSchema>;
+
+/**
+ * The `POST /credentials/release` response: whether **this call** revoked a
+ * live credential. The flag reports what the request did, not the state the
+ * named token is in afterwards.
+ *
+ * - `true` — this call found a live credential minted by
+ *   `POST /dev-server/credential` under that token and removed it: it
+ *   authenticates nothing more, and every socket opened with it was closed
+ *   with `WS_CLOSE_UNAUTHORIZED` (4401, `./messages/agent.ts`).
+ * - `false` — this call released nothing. Either no such credential was live
+ *   for it to remove — already revoked by the service's supervision, lapsed,
+ *   rotated away (even while the service still supervised it) or never
+ *   issued — or the token names a credential this route never touches: the
+ *   credential of a dev server the service launched itself, which stays live
+ *   until the service revokes it when that dev server exits or is stopped.
+ *   So `false` is not proof that the token no longer authenticates. Every one
+ *   of those answers the same, so the reply is no oracle for which
+ *   credentials exist. It is still a success, not an error: a holder
+ *   releasing the credential its own dev server ran with, once that dev
+ *   server has exited, asks for nothing more than the release this call
+ *   either made or found already made.
+ *
+ * No credential, role or scope travels back: the reply is one flag.
+ */
+export const credentialsReleaseResponseSchema = z.strictObject({
+  /** Whether a live `POST /dev-server/credential` credential was revoked by this call. */
+  released: z.boolean({ error: 'expected a boolean released flag' }),
+});
+
+/** The validated `POST /credentials/release` response body. */
+export type CredentialsReleaseResponse = z.infer<typeof credentialsReleaseResponseSchema>;
 
 // ---------------------------------------------------------------------------
 // Section I — `DataResult`: what a panel-data query answers
@@ -3079,7 +3318,7 @@ export function parseDataResult(value: unknown): Result<DataResult, DebuggenErro
 // ---------------------------------------------------------------------------
 // Section J — the route table
 //
-// Twenty-one entries, keyed by operation id, and the single definition of the
+// Twenty-two entries, keyed by operation id, and the single definition of the
 // service's HTTP surface (AAP §0.9.1). `as const satisfies` is load-bearing
 // twice over: `as const` keeps every key, method, pattern and `authExempt` flag
 // a literal type, which is what lets `HttpOperationId`, the mapped body helpers
@@ -3097,12 +3336,12 @@ export function parseDataResult(value: unknown): Result<DataResult, DebuggenErro
  * in the order the sections above declare them: sessions (the retention purge
  * among them), captures, the target request, panels, modifications, telemetry
  * ingest, dev server (the server-agent credential among them), health and
- * pairing, and credential rotation.
+ * pairing, and credential rotation and release.
  *
  * Read by `apps/local-service/src/server/http.ts` to register handlers and to
  * apply its bearer and origin middleware, by `./client/http-client.ts` to build
  * and validate a call, and by `packages/protocol/src/__tests__/http.test.ts`,
- * which pins all twenty-one `(operation, method, pattern)` triples literally so
+ * which pins all twenty-two `(operation, method, pattern)` triples literally so
  * that adding, renaming or re-pathing a route is a deliberate edit in two
  * places rather than an accident in one.
  */
@@ -3318,7 +3557,8 @@ export const HTTP_ROUTES = {
   /**
    * `POST /dev-server/credential` — mint a project-scoped server-agent
    * credential for a dev server the caller starts itself
-   * (`scripts/dev-instrumented.mjs`, with the editor credential).
+   * (`scripts/dev-instrumented.mjs`, with the editor credential). The holder
+   * may release it early through `credentials.release`.
    */
   'devServer.credential': {
     operation: 'devServer.credential',
@@ -3387,6 +3627,27 @@ export const HTTP_ROUTES = {
     request: credentialsRotateRequestSchema,
     response: credentialsRotateResponseSchema,
   },
+
+  /**
+   * `POST /credentials/release` — revoke one `devServer.credential`
+   * credential now, named by its token (editor credential only): what
+   * `scripts/dev-instrumented.mjs` calls as the dev server it started exits.
+   *
+   * `released` says what this call did: `true` when it removed a live
+   * credential, and `{ released: false }`, never an error, when it released
+   * nothing — no such credential was live under that token, or the token is a
+   * launched child's own credential, which only the service revokes and which
+   * stays live (Section H2).
+   */
+  'credentials.release': {
+    operation: 'credentials.release',
+    method: 'POST',
+    pattern: '/credentials/release',
+    params: [],
+    authExempt: false,
+    request: credentialsReleaseRequestSchema,
+    response: credentialsReleaseResponseSchema,
+  },
 } as const satisfies Readonly<Record<string, HttpRouteDefinition>>;
 
 // ---------------------------------------------------------------------------
@@ -3427,13 +3688,14 @@ export const HTTP_OPERATIONS = [
   'pair.start',
   'pair.complete',
   'credentials.rotate',
+  'credentials.release',
 ] as const satisfies readonly (keyof typeof HTTP_ROUTES)[];
 
 /**
  * One of {@link HTTP_OPERATIONS}: the canonical operation-id type of the HTTP
  * surface.
  *
- * Derived from the tuple, so it is exactly the twenty-one table keys and can
+ * Derived from the tuple, so it is exactly the twenty-two table keys and can
  * neither gain nor lose a member without the tuple and the table changing in
  * the same edit. It is the type every helper below is generic over, and the key
  * type of the one structure that must name every route:
@@ -3463,7 +3725,7 @@ export type HttpOperationId = (typeof HTTP_OPERATIONS)[number];
  * either is assignable to the other in both directions and the suite proves the
  * two identical. `./client/http-client.ts`'s single `request(operation, …)`
  * method is generic over this name, which is what makes one method fully typed
- * for twenty-one routes; new code may use either spelling.
+ * for twenty-two routes; new code may use either spelling.
  */
 export type HttpOperation = HttpOperationId;
 
@@ -3745,6 +4007,11 @@ export function credentialsRotatePath(): string {
   return buildPath('credentials.rotate');
 }
 
+/** `/credentials/release` — for `credentials.release`. */
+export function credentialsReleasePath(): string {
+  return buildPath('credentials.release');
+}
+
 // ---------------------------------------------------------------------------
 // Section N — validation over the table
 //
@@ -3911,7 +4178,7 @@ export type PanelResponsesDifferInNullability = [
 ];
 
 /**
- * The two administrative requests carry no field at all.
+ * The rotation and purge requests carry no field at all.
  *
  * Rotation is all or nothing and the retention window is configuration, so a
  * key added to either body would be a caller choosing what survives the
@@ -3922,6 +4189,16 @@ export type PanelResponsesDifferInNullability = [
 export type AdministrativeRequestsCarryNoField = [
   AssertTrue<Identical<HttpRequestBody<'credentials.rotate'>, Record<string, never>>>,
   AssertTrue<Identical<HttpRequestBody<'session.purge'>, Record<string, never>>>,
+];
+
+/**
+ * A release names exactly one credential, by its token, and nothing else — no
+ * project, role or wildcard that could widen it past the one credential its
+ * holder already has — and answers with one flag.
+ */
+export type CredentialsReleaseNamesOneCredential = [
+  AssertTrue<Identical<keyof HttpRequestBody<'credentials.release'>, 'token'>>,
+  AssertTrue<Identical<HttpResponseBody<'credentials.release'>, { released: boolean }>>,
 ];
 
 /**

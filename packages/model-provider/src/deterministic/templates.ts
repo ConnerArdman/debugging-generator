@@ -148,6 +148,24 @@ export const LABEL_MAX_LENGTH = 120;
 /** Fixed marker appended by {@link truncateLabel} when it shortens a label. */
 export const TRUNCATION_MARKER = '…';
 
+/**
+ * Longest sentence a likely-cause frame emits, in characters: **300**.
+ *
+ * It is the bound `@debuggen/panel-schema` puts on every `Fact.statement` and
+ * `Hypothesis.statement` (`MAX_STATEMENT_LENGTH`), which the analyze stage's
+ * schema enforces on this provider's output. This package depends on
+ * `@debuggen/shared` alone, so the number is restated here rather
+ * than imported; `apps/local-service/src/analysis/deterministic-statements.test.ts`
+ * validates this provider's analysis against the real schema and fails if a
+ * statement built to this bound is ever refused by it.
+ *
+ * The cap is what {@link fitStatement} fits a frame's labels to: a cause frame's
+ * fixed wording is long enough that labels at {@link LABEL_MAX_LENGTH} alone
+ * would push it past the schema, and a statement the schema rejects fails the
+ * whole analyze stage rather than just the one sentence.
+ */
+export const STATEMENT_MAX_LENGTH = 300;
+
 /** Separator between two steps of a rendered flow path. */
 export const FLOW_PATH_SEPARATOR = ' → ';
 
@@ -279,6 +297,43 @@ export function truncateLabel(value: string, maxLength: number = LABEL_MAX_LENGT
   }
   const keep = Math.max(0, cap - TRUNCATION_MARKER.length);
   return `${value.slice(0, keep).trimEnd()}${TRUNCATION_MARKER}`;
+}
+
+/**
+ * Renders a frame whose interpolated labels are shortened, all to one shared
+ * cap, just enough for the sentence to fit {@link STATEMENT_MAX_LENGTH}.
+ *
+ * Labels arrive already cleaned and capped at {@link LABEL_MAX_LENGTH}. A frame
+ * that fits as it stands is returned byte for byte, so the common case reads
+ * exactly as before. Otherwise the longest labels are cut first: the shared
+ * cap falls from the longest label's length by the overflow divided among the
+ * labels still at the cap, and every label longer than the cap is truncated
+ * with {@link TRUNCATION_MARKER}, so what remains of each is its beginning —
+ * the directory of a call site, the start of a statement. The cap strictly
+ * decreases on every pass, so the loop ends; should the fixed wording alone
+ * ever outgrow the bound, the sentence itself is truncated as the last resort,
+ * which keeps the output within the schema instead of failing the stage.
+ *
+ * @param labels Every cleaned label the frame interpolates.
+ * @param frame Builds the sentence, passing each of those labels through the
+ * `fit` it is handed.
+ * @returns One sentence of at most {@link STATEMENT_MAX_LENGTH} characters.
+ */
+function fitStatement(
+  labels: readonly string[],
+  frame: (fit: (label: string) => string) => string,
+): string {
+  let sentence = frame((label) => label);
+  let cap = labels.reduce((longest, label) => Math.max(longest, label.length), 0);
+  while (sentence.length > STATEMENT_MAX_LENGTH && cap > TRUNCATION_MARKER.length) {
+    const overflow = sentence.length - STATEMENT_MAX_LENGTH;
+    const current = cap;
+    const atCap = Math.max(1, labels.filter((label) => label.length >= current).length);
+    cap = Math.max(TRUNCATION_MARKER.length, cap - Math.ceil(overflow / atCap));
+    const limit = cap;
+    sentence = frame((label) => truncateLabel(label, limit));
+  }
+  return truncateLabel(sentence, STATEMENT_MAX_LENGTH);
 }
 
 /**
@@ -1220,6 +1275,11 @@ export function errorCountFact(count: number): string {
  * confidence wording — `./rules.ts` attaches the numeric `confidence` to the
  * hypothesis, and the renderer displays these sentences under a separate
  * "likely cause" heading from the observed facts above.
+ *
+ * Their fixed wording is long, so each is rendered through
+ * {@link fitStatement}: its labels are shortened just enough for the sentence
+ * to stay within {@link STATEMENT_MAX_LENGTH}, the bound the analyze stage's
+ * schema enforces on a hypothesis statement.
  * ---------------------------------------------------------------------------------------------- */
 
 /**
@@ -1229,7 +1289,8 @@ export function errorCountFact(count: number): string {
  * @param windowMs The window they occurred within, in milliseconds.
  * @param callSiteLabel A `file:line` label for the call site they came from. A
  * blank value falls back to {@link UNRESOLVED_CALL_SITE_LABEL}.
- * @returns One sentence suitable for a hypothesis `statement`.
+ * @returns One sentence suitable for a hypothesis `statement`, at most
+ * {@link STATEMENT_MAX_LENGTH} characters.
  */
 export function duplicateRequestCause(
   count: number,
@@ -1238,7 +1299,11 @@ export function duplicateRequestCause(
 ): string {
   const callSite = sanitizeLabel(callSiteLabel, UNRESOLVED_CALL_SITE_LABEL);
   const counted = countLabel(count, IDENTICAL_REQUEST_NOUN);
-  return `Repeated identical requests from a single call site — ${counted} from ${callSite} within ${formatDurationMs(windowMs)} ms — match the pattern of an effect that re-runs after each render, which is what happens when a value in its dependency list is rebuilt on every render instead of being reused.`;
+  return fitStatement(
+    [callSite],
+    (fit) =>
+      `Repeated identical requests from a single call site — ${counted} from ${fit(callSite)} within ${formatDurationMs(windowMs)} ms — match the pattern of an effect that re-runs after each render, which is what happens when a value in its dependency list is rebuilt on every render instead of being reused.`,
+  );
 }
 
 /**
@@ -1256,12 +1321,17 @@ export function duplicateRequestCause(
  * @param unchangedCount How many of its renders had unchanged inputs — the
  * subset the opening clause has already qualified, which is why the count is
  * rendered with the plain render noun rather than restating the condition.
- * @returns One sentence suitable for a hypothesis `statement`.
+ * @returns One sentence suitable for a hypothesis `statement`, at most
+ * {@link STATEMENT_MAX_LENGTH} characters.
  */
 export function unchangedInputRenderCause(componentLabel: string, unchangedCount: number): string {
   const component = sanitizeLabel(componentLabel, UNNAMED_COMPONENT_LABEL);
   const counted = countLabel(unchangedCount, METRIC_COUNT_NOUNS.render_count);
-  return `Renders with unchanged inputs — ${counted} of ${component} — match the pattern of a context value that changes on its own schedule, or of a callback whose identity is rebuilt on each render, either of which re-renders a consumer whose own props and state did not change.`;
+  return fitStatement(
+    [component],
+    (fit) =>
+      `Renders with unchanged inputs — ${counted} of ${fit(component)} — match the pattern of a context value that changes on its own schedule, or of a callback whose identity is rebuilt on each render, either of which re-renders a consumer whose own props and state did not change.`,
+  );
 }
 
 /**
@@ -1278,7 +1348,8 @@ export function unchangedInputRenderCause(componentLabel: string, unchangedCount
  * @param tierLabel Wording from {@link telemetryTierLabel} for the tier the
  * operation was recorded in, when the capture attributed one. A blank value is
  * treated as absent.
- * @returns One sentence suitable for a hypothesis `statement`.
+ * @returns One sentence suitable for a hypothesis `statement`, at most
+ * {@link STATEMENT_MAX_LENGTH} characters.
  */
 export function dominantSpanCause(
   operationLabel: string,
@@ -1288,8 +1359,11 @@ export function dominantSpanCause(
 ): string {
   const operation = sanitizeLabel(operationLabel, UNNAMED_OPERATION_LABEL);
   const tier = optionalLabel(tierLabel);
-  const subject = tier === undefined ? operation : `${operation}, recorded in the ${tier} tier,`;
-  return `One operation covers most of the interaction: ${subject} accounts for ${formatDurationMs(durationMs)} ms of the ${formatDurationMs(totalDurationMs)} ms total, which concentrates the measured time in a single step rather than spreading it across the tiers the trace spans.`;
+  return fitStatement(tier === undefined ? [operation] : [operation, tier], (fit) => {
+    const subject =
+      tier === undefined ? fit(operation) : `${fit(operation)}, recorded in the ${fit(tier)} tier,`;
+    return `One operation covers most of the interaction: ${subject} accounts for ${formatDurationMs(durationMs)} ms of the ${formatDurationMs(totalDurationMs)} ms total, which concentrates the measured time in a single step rather than spreading it across the tiers the trace spans.`;
+  });
 }
 
 /**
@@ -1300,7 +1374,8 @@ export function dominantSpanCause(
  * back to {@link UNNAMED_STATEMENT_LABEL}.
  * @param callerLabel A `file:line` label for the code that issued them, when
  * resolved. A blank value is treated as absent.
- * @returns One sentence suitable for a hypothesis `statement`.
+ * @returns One sentence suitable for a hypothesis `statement`, at most
+ * {@link STATEMENT_MAX_LENGTH} characters.
  */
 export function repeatedQueryShapeCause(
   count: number,
@@ -1310,8 +1385,10 @@ export function repeatedQueryShapeCause(
   const statement = sanitizeLabel(statementLabel, UNNAMED_STATEMENT_LABEL);
   const caller = optionalLabel(callerLabel);
   const counted = `${countLabel(count, METRIC_COUNT_NOUNS.query_count)} of the same shape`;
-  const origin = caller === undefined ? counted : `${counted} from ${caller}`;
-  return `A statement repeated inside one interaction — ${origin} (${statement}) — matches the pattern of a lookup made once per item rather than once for the whole set.`;
+  return fitStatement(caller === undefined ? [statement] : [statement, caller], (fit) => {
+    const origin = caller === undefined ? counted : `${counted} from ${fit(caller)}`;
+    return `A statement repeated inside one interaction — ${origin} (${fit(statement)}) — matches the pattern of a lookup made once per item rather than once for the whole set.`;
+  });
 }
 
 /* -------------------------------------------------------------------------------------------------

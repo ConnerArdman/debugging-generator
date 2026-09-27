@@ -664,7 +664,10 @@ export function readFixtureJson<T = unknown>(name: string): T {
 /**
  * Reads a telemetry batch fixture as schema-parsed ingress events, ready to be
  * spread into `{ events }` (a `telemetry.event` frame) or
- * `{ projectRoot, events }` (`POST /telemetry/ingest`).
+ * `{ projectRoot, events }` (`POST /telemetry/ingest`). Both bodies may also
+ * carry the optional delivery context — `armedCaptureId`, the capture the
+ * producer was armed for, and `droppedCount`, its loss report — which a
+ * fixture batch never holds.
  *
  * @throws Error When `name` is not an indexed batch or the batch drifted.
  */

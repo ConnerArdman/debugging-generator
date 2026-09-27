@@ -18,7 +18,7 @@
  * | Method | `POST` |
  * | URL | {@link PreloadConfig.ingestUrl} **verbatim** |
  * | Headers | `Content-Type: application/json`, `Authorization: Bearer <token>` — and no others |
- * | Body | `{ projectRoot, events }`, `events` being {@link TelemetryEventIngress}[] |
+ * | Body | `{ projectRoot, events, armedCaptureId, droppedCount?, lossReportId? }`: `events` is {@link TelemetryEventIngress}[] of one capture (empty only in a loss report), `armedCaptureId` that capture, `droppedCount` the count of the loss report the post carries, a positive integer and omitted when there is none, and `lossReportId` that report's stable identity, present exactly when `droppedCount` is |
  * | Timeout | {@link INGEST_TIMEOUT_MS}, enforced with an abort signal that also bounds reading the answer |
  * | Redirects | refused (`redirect: 'error'`) |
  * | Answer | the status decides; only a `2xx` body — `{ accepted, rejected? }` — is read, at most {@link MAX_ACKNOWLEDGEMENT_BYTES} of it |
@@ -43,7 +43,9 @@
  * ingress schema is strict, so a single extra key fails a whole batch. This
  * module therefore posts the objects `./convert.ts` produced with exactly one
  * addition, the schema's optional `clockOffsetMs` (next section), and nothing
- * else.
+ * else. The capture a batch was recorded in travels once, beside the events,
+ * as the body's `armedCaptureId` — never on an event (*One capture per post,
+ * and the loss it reports*).
  *
  * ## The clock offset
  *
@@ -86,14 +88,19 @@
  *    Group 1). A span is not merely left unsent — it is never converted.
  * 2. **A span belonging to a capture that has been replaced is dropped.**
  *    `onStart` stamps every span with the capture and generation in force when
- *    it started, and `onEnd` rejects a stamp that is no longer current. This
- *    rule exists because an ingest event carries **no capture id**: the service
- *    assigns `sessionId`, `captureId` and `ingestSeq` on arrival, so a span
- *    from capture A exported after capture B was armed would be *stored under
- *    B*. Attribution cannot be corrected downstream, which is why it is
- *    enforced here, and why `./control.ts` flushes the outgoing capture before
- *    it arms the next one — that is what gets A's finished spans out while A is
- *    still the capture the service has open.
+ *    it started, and `onEnd` rejects a stamp that is no longer current. The
+ *    service assigns `sessionId`, `captureId` and `ingestSeq` on arrival and
+ *    reads a batch's `armedCaptureId` only to refuse a batch naming a capture
+ *    other than the one it has open, so a span of capture A posted under A's
+ *    name after capture B was armed would be refused there. This rule is the
+ *    defence in depth in front of that refusal, and the only defence against
+ *    what the service cannot see: a capture re-armed **under the same id**,
+ *    where only the generation tells the earlier window's work from the new
+ *    one's. The stamp also scopes the event's sequence, so the number a span
+ *    is given belongs to the capture it ran in. Attribution cannot be corrected
+ *    downstream, which is why `./control.ts` flushes the outgoing capture
+ *    before it arms the next one — that is what gets A's finished spans out
+ *    while A is still the capture the service has open.
  * 3. **A signal the capture did not ask for is dropped.** The span is
  *    classified with {@link classifySpan} and offered to the gate, which
  *    answers on three axes, because one kind is not one signal: the kind
@@ -119,10 +126,10 @@
  *
  * The buffer is capped at {@link MAX_BUFFERED_EVENTS}. At the cap the
  * **oldest** events are dropped — during a reproduction the newest evidence is
- * the relevant evidence — and the loss is counted so a capture can be reported
- * as thinned rather than silently wrong. One warning is written per flush
- * window, never one per event: a flood of lines in someone else's terminal is
- * itself a defect.
+ * the relevant evidence — and the loss is counted and reported to the service
+ * (next section) so a capture is recorded as thinned rather than silently
+ * wrong. One warning is written per flush window, never one per event: a flood
+ * of lines in someone else's terminal is itself a defect.
  *
  * Drains are serialised on a promise chain, so one batch is in flight at a
  * time and a batch is never posted twice. A batch is taken out of the buffer
@@ -131,15 +138,78 @@
  * starts at {@link RECONNECT_MIN_MS}, doubles under a
  * {@link RECONNECT_MAX_MS} ceiling and carries ±25 % jitter
  * ({@link computeIngestBackoffMs}) so several attached dev servers do not
- * retry in lockstep after the service restarts, and then dropped
- * and counted. Re-queuing would let one unsendable batch cycle forever and
- * starve the evidence behind it; losing dev-time telemetry is acceptable,
- * degrading the developer's dev server never is.
+ * retry in lockstep after the service restarts, and then dropped,
+ * counted and reported as its capture's loss. Re-queuing would let one
+ * unsendable batch cycle forever and starve the evidence behind it; losing
+ * dev-time telemetry is acceptable, degrading the developer's dev server never
+ * is.
  *
  * A `2xx` ends a batch's attempts whatever its body says. It is the service's
  * decision about those bytes, and sending them again gets the same decision —
  * so a batch the service received and stored nothing of is counted as refused
- * rather than retried, and never as delivered (next section).
+ * rather than retried, and never as delivered (*What is read of an answer*).
+ *
+ * ## One capture per post, and the loss it reports
+ *
+ * Every buffered event keeps the capture it was recorded in — the capture its
+ * span was stamped with, which rule 2 has proved is the one in force when it
+ * ended — and every post names that capture as `armedCaptureId`. A post never
+ * mixes captures: a drain takes the contiguous run of the oldest event's
+ * capture, up to {@link BATCH_MAX_EVENTS}, and since captures only ever move
+ * forward, the old capture's events all precede the new one's. The body is
+ * serialised once, so a batch retried across a capture stop and start still
+ * names the capture it was recorded in on every attempt, and the service
+ * refuses it whole rather than storing it under the next capture.
+ *
+ * Evidence this processor loses is reported, not only counted. A per-capture
+ * ledger, at most {@link MAX_LOSS_LEDGER_CAPTURES} captures in arming order,
+ * is credited with the events the buffer cap evicted, the events of a batch
+ * that failed every attempt or was refused outright, and those of a batch that
+ * could not be serialised. A failed batch's events are credited
+ * conservatively: a request that timed out may have been stored by the
+ * service before its answer was lost, so for such a batch the count is an
+ * upper bound. Only the figure can overstate — the events themselves are
+ * idempotent in the store, so a batch that did arrive is held once.
+ *
+ * Loss travels as a *report* with a stable identity. The first post for a
+ * capture with unreported loss mints a random `lossReportId` and moves the
+ * capture's whole pending count into that report, and the body carries it as
+ * `droppedCount` beside `lossReportId`; every retry of the post sends the same
+ * bytes. A `2xx` delivers the report, whatever the acknowledgement says. Any
+ * other end — the attempts exhausted, a permanent refusal — leaves it exactly
+ * as it was, and the capture's next post resends the same id and the same
+ * count rather than handing the count back to be re-reported under a new
+ * name. That is what makes retries and resends safe: the service applies a
+ * report at most once per capture and id, so a report it recorded before
+ * answering `5xx`, or whose `2xx` never arrived, is not counted twice. Loss
+ * recorded while a report is outstanding — the failed batch's own events among
+ * it — waits beside the report and becomes a new one, under a new id, only
+ * once the outstanding report is delivered: a capture holds at most one report
+ * at a time, and a count is never folded into a report that has already been
+ * sent.
+ *
+ * A capture with loss pending and no buffered event left gets loss-only
+ * reports, `{ projectRoot, events: [], armedCaptureId, droppedCount, lossReportId }`,
+ * at the end of a drain: its outstanding report first, then one for the loss
+ * recorded behind it. Never in a drain where a batch has just failed, because
+ * the transport is down or refusing and the report would only fail with it;
+ * and never on a timer of its own, because a service that is away must not be
+ * polled: the next event, the flush `./control.ts` makes on every stop and
+ * re-arm, or the shutdown drain carries it. The report names the ledger's
+ * capture, never the gate's — `./control.ts` clears the gate before its
+ * disable-path flush.
+ *
+ * What is not loss is not reported: spans a drop rule refused (by design, and
+ * a replaced capture's would be refused by the service anyway), events the
+ * service received and did not store (it already knows), and evidence
+ * discarded after the credential was refused (nothing can be posted again).
+ * Loss that can no longer be reported is abandoned and counted rather than
+ * held for a post that cannot happen: the oldest capture's when the ledger
+ * passes its bound, and all of it when the credential is refused or when
+ * `shutdown()` finishes. The one exception is a report riding on a post still
+ * in flight, which that post settles: reported on a `2xx`, and otherwise
+ * abandoned unless its capture's entry survived and a reopened processor can
+ * still resend it.
  *
  * ## What is read of an answer
  *
@@ -171,7 +241,7 @@
  *   instead of {@link DebuggenSpanProcessorStats.postedBatches}.
  * - **Tolerant of silence.** A `2xx` whose body is absent, empty, oversized,
  *   unreadable or not an acknowledgement is an answer that says nothing about
- *   counts. The batch is counted as posted in full, as every `2xx` once was,
+ *   counts. The batch is counted as posted in full,
  *   and also on {@link DebuggenSpanProcessorStats.unacknowledgedBatches}, so the
  *   assumption is visible rather than silent.
  * - **Never repeated.** The body is not logged, echoed or attached to an
@@ -245,7 +315,7 @@
  * ```
  */
 
-import { nowEpochMs } from '@debuggen/shared';
+import { newSpanId, nowEpochMs } from '@debuggen/shared';
 import type { Logger } from '@debuggen/shared';
 import type { Context, Span } from '@opentelemetry/api';
 import type { ReadableSpan, SpanProcessor } from '@opentelemetry/sdk-trace-base';
@@ -282,8 +352,9 @@ import type { ConvertContext, DatabaseSpanSource, SeqAllocator } from './convert
  * ingest timeout, backoff envelope. The four constants below are *derived*
  * from it rather than invented, so a change to the envelope moves them too and
  * no tunable in this file stands on its own. What follows them — the two
- * status tables and the acknowledgement's byte bound — describes the ingest
- * contract rather than the envelope, and says so where it is declared.
+ * status tables, the acknowledgement's byte bound, the loss ledger's capture
+ * bound and its per-capture report bound — describes the ingest contract
+ * rather than the envelope, and says so where it is declared.
  * ---------------------------------------------------------------------------
  */
 
@@ -383,6 +454,35 @@ export const AUTH_REJECTED_STATUSES: ReadonlySet<number> = new Set([401, 403]);
  */
 export const MAX_ACKNOWLEDGEMENT_BYTES = 4 * 1024;
 
+/**
+ * Captures the loss ledger holds unreported loss for at once.
+ *
+ * Only the newest one or two entries can ever be delivered: the service
+ * accepts a post only while it names the project's open capture, and captures
+ * move forward, never back. An older entry lives on only because the flush
+ * `./control.ts` makes on a stop or re-arm may still reach the service before
+ * it moves on. Eight is several stop/re-arm cycles during one outage of the
+ * service with room to spare, while the ledger stays eight short ids and
+ * counts however long the dev server runs. Past the bound the oldest capture —
+ * the one certain to be closed — has its pending loss, both its outstanding
+ * report and what waits behind it, moved to
+ * {@link DebuggenSpanProcessorStats.abandonedLossEvents}.
+ *
+ * Exported so the suite drives the real bound rather than a copy of it.
+ */
+export const MAX_LOSS_LEDGER_CAPTURES = 8;
+
+/**
+ * Loss-only reports one drain sends for one capture, at most.
+ *
+ * Not a tunable but the shape of a ledger entry: a capture holds at most one
+ * outstanding report and the loss recorded behind it, so emptying it takes the
+ * outstanding report and then one new report for the rest. Stopping there is
+ * what keeps a drain finite even if loss keeps arriving while its reports are
+ * on the wire; whatever arrives is the next drain's.
+ */
+const LOSS_REPORTS_PER_CAPTURE = 2;
+
 /*
  * ---------------------------------------------------------------------------
  * Contracts
@@ -412,13 +512,14 @@ export interface CaptureGate {
   /**
    * A counter the gate advances every time it opens a capture window.
    *
-   * The reason it exists: an ingest event carries **no capture id** — the
-   * service assigns `sessionId`, `captureId` and `ingestSeq` when it receives
-   * the batch (module documentation, AAP §0.2.3) — so an event posted after
-   * the service has moved on to capture B is *stored under B*, whatever
-   * capture the work belonged to. Comparing {@link captureId} at `onEnd` does
-   * not catch it either: a span that started inside capture A and ends after B
-   * was armed reads B's id, because that is the only id there is by then.
+   * The reason it exists: the service assigns `sessionId`, `captureId` and
+   * `ingestSeq` when it receives a batch (module documentation)
+   * and reads the batch's `armedCaptureId` only to refuse one naming a capture
+   * it no longer has open, so two windows armed under **one** capture id look
+   * the same to it. Comparing {@link captureId} at `onEnd` does not catch a
+   * replaced capture either: a span that started inside capture A and ends
+   * after B was armed reads B's id, because that is the only id there is by
+   * then.
    *
    * So the processor stamps the generation on every span it sees start and
    * rejects a span whose stamp is not the generation in force when it ends
@@ -592,8 +693,9 @@ export interface DebuggenSpanProcessorOptions {
  * rules through them, so they are stable: add a counter rather than rename one.
  * Every number is cumulative over the processor's life — it is constructed once
  * by `register.ts` and survives every enable/disable cycle — except
- * {@link buffered}, which is the current queue depth, and
- * {@link credentialRejected}, which is a terminal state rather than a count.
+ * {@link buffered}, which is the current queue depth, {@link pendingLossEvents},
+ * which is the loss not yet reported, and {@link credentialRejected}, which is
+ * a terminal state rather than a count.
  */
 export interface DebuggenSpanProcessorStats {
   /**
@@ -621,12 +723,15 @@ export interface DebuggenSpanProcessorStats {
    * Spans dropped because they belong to a capture that has since been
    * replaced.
    *
-   * A span that started inside capture A and ended after capture B was armed.
-   * Its work is A's, an ingest event carries no capture id, and the service
-   * attributes what it receives to the capture that is active when it arrives —
-   * so exporting it would file A's evidence under B. `./control.ts` flushes A
-   * before it arms B, which is what gets A's *finished* spans out in time;
-   * this counter is the ones that were still running.
+   * A span that started inside capture A and ended after capture B was armed,
+   * or after A was re-armed under the same id. Its work belongs to a window
+   * the service has closed: posted under A's name it would be refused there as
+   * a stale capture, and in a same-id re-arm nothing on the wire could tell it
+   * from the new window's evidence. It is dropped before conversion and is not
+   * reported as loss, since the capture it belongs to can no longer take it.
+   * `./control.ts` flushes A before it arms B, which is what gets A's
+   * *finished* spans out in time; this counter is the ones that were still
+   * running.
    */
   readonly droppedStaleCapture: number;
 
@@ -670,7 +775,13 @@ export interface DebuggenSpanProcessorStats {
    */
   readonly droppedUnserializable: number;
 
-  /** Events lost with a batch that exhausted {@link MAX_POST_ATTEMPTS}. */
+  /**
+   * Events lost with a batch that exhausted {@link MAX_POST_ATTEMPTS}.
+   *
+   * Conservative: an attempt that timed out may have been stored by the
+   * service before its answer was lost, so this is an upper bound. The events
+   * are idempotent in the store; only this count can overstate.
+   */
   readonly droppedFailedBatch: number;
 
   /** Spans that reached `onEnd` after `shutdown()` completed. */
@@ -746,6 +857,56 @@ export interface DebuggenSpanProcessorStats {
 
   /** Batches abandoned after every permitted attempt failed. */
   readonly failedBatches: number;
+
+  /**
+   * Loss-only reports — `{ events: [], armedCaptureId, droppedCount,
+   * lossReportId }` — the service answered with a `2xx`.
+   *
+   * Counted here and nowhere else: a loss report carries no event, so it is
+   * never on {@link postedBatches}, {@link refusedBatches},
+   * {@link unacknowledgedBatches} or {@link failedBatches}, and never moves
+   * {@link postedEvents}. One that failed is not counted at all; its report
+   * stays on {@link pendingLossEvents}, unchanged, for the capture's next post
+   * to resend.
+   */
+  readonly lossReportBatches: number;
+
+  /**
+   * Lost events reported to the service as `droppedCount` in a post it
+   * answered with a `2xx`, whether the count rode on a batch of events or on a
+   * loss-only report.
+   *
+   * Credited once per report, when the first `2xx` for a post carrying it
+   * arrives: the attempts and resends before it carried the same
+   * `lossReportId` and count, which the service applies at most once.
+   *
+   * Every event credited to the loss ledger — {@link droppedOverflow},
+   * {@link droppedFailedBatch} and {@link droppedUnserializable} — is on
+   * exactly one of this, {@link pendingLossEvents} and
+   * {@link abandonedLossEvents}, so the three always add up to those three.
+   */
+  readonly reportedLossEvents: number;
+
+  /**
+   * Lost events recorded and not yet reported: every capture's outstanding
+   * report plus the loss waiting behind it, with a report riding on a post
+   * that is in flight counted once.
+   *
+   * A current value, not a cumulative one. It falls when a report is
+   * delivered or abandoned. A failed post leaves it unchanged: the report it
+   * carried stays reserved, under the same id, rather than being handed back.
+   */
+  readonly pendingLossEvents: number;
+
+  /**
+   * Lost events whose report was given up: the oldest capture's pending loss
+   * when the ledger passed {@link MAX_LOSS_LEDGER_CAPTURES}, everything pending
+   * when the credential was refused, and everything still pending when
+   * `shutdown()` finished.
+   *
+   * Non-zero means loss the service's capture ledger was never told of.
+   */
+  readonly abandonedLossEvents: number;
 
   /**
    * Unexpected failures caught inside the processor — a gate that threw, a
@@ -901,6 +1062,20 @@ function describeError(error: unknown): string {
     return `${error.name}: ${message}`;
   }
   return `non-error value of type ${typeof error}`;
+}
+
+/**
+ * The `droppedCount` field of a diagnostic about one post, present only when
+ * the post reported loss.
+ *
+ * Spread into a field bag, so a post that carried no loss is described by the
+ * same fields it always was.
+ *
+ * @param droppedCount The loss the post carried, `0` for none.
+ * @returns `{ droppedCount }`, or an empty bag.
+ */
+function lossField(droppedCount: number): { readonly droppedCount?: number } {
+  return droppedCount > 0 ? { droppedCount } : {};
 }
 
 /**
@@ -1336,6 +1511,75 @@ interface SpanCaptureStamp {
 }
 
 /**
+ * One converted event waiting in the buffer, with the capture it was recorded
+ * in.
+ *
+ * The capture travels beside the event rather than on it, because the ingress
+ * schema is strict and `captureId` is a key only the service may assign; it is
+ * what a drain groups by and what the post's `armedCaptureId` names.
+ */
+interface BufferedEvent {
+  /** The event, exactly as it will be posted. */
+  readonly event: TelemetryEventIngress;
+  /** The capture the event's span was recorded in: never `null` once buffered. */
+  readonly captureId: string;
+}
+
+/**
+ * One capture's loss as the service is told of it: a count under an identity
+ * that never changes (module overview, *One capture per post, and the loss it
+ * reports*).
+ *
+ * Minted when a post first carries the capture's pending loss, and then sent
+ * unchanged — the same id, the same count — by every attempt and every resend
+ * until a `2xx` delivers it. The service applies a report at most once per
+ * capture and id, which is what makes resending one it may already have
+ * recorded safe.
+ */
+interface LossReport {
+  /**
+   * The report's identity, `lossReportId` on the wire: 16 random lowercase
+   * hex characters from `@debuggen/shared`'s `newSpanId`, unique per report
+   * and derived from nothing this process holds.
+   */
+  readonly id: string;
+  /** The lost events it reports, `droppedCount` on the wire; at least one. */
+  readonly count: number;
+}
+
+/**
+ * One capture's unreported loss in the ledger.
+ *
+ * Two parts, because a count that has travelled under an id can never again
+ * be merged with one that has not: `reserved` is the report already minted and
+ * possibly already recorded by the service, `unreserved` the loss recorded
+ * since, which becomes a report of its own only once `reserved` is delivered.
+ * An entry exists only while one of the two is non-empty.
+ */
+interface LossLedgerEntry {
+  /** The capture's outstanding report, resent unchanged until delivered. */
+  reserved: LossReport | undefined;
+  /** Loss recorded and not yet in any report; `0` when there is none. */
+  unreserved: number;
+}
+
+/**
+ * Everything one ingest post carries besides the project root.
+ *
+ * A batch of events has at least one event; a loss-only report has none and
+ * carries a {@link LossReport}. Without one the body omits `droppedCount` and
+ * `lossReportId` both, rather than sending a zero or an id with no count.
+ */
+interface IngestPayload {
+  /** The capture every event of the post was recorded in. */
+  readonly armedCaptureId: string;
+  /** The events, all of that capture; empty only in a loss-only report. */
+  readonly events: readonly TelemetryEventIngress[];
+  /** That capture's report riding on this post, or `undefined` for none. */
+  readonly lossReport: LossReport | undefined;
+}
+
+/**
  * Stand-in written wherever a diagnostic might otherwise have quoted the
  * credential.
  *
@@ -1437,8 +1681,34 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    */
   readonly #stamps = new WeakMap<object, SpanCaptureStamp>();
 
-  /** Converted events waiting for a flush; the oldest is at index 0. */
-  readonly #buffer: TelemetryEventIngress[] = [];
+  /**
+   * Converted events waiting for a flush, each with its capture; the oldest is
+   * at index 0, so one capture's events form one contiguous run.
+   */
+  readonly #buffer: BufferedEvent[] = [];
+
+  /**
+   * Unreported loss per capture, in the order the captures were first credited
+   * (module overview, *One capture per post, and the loss it reports*).
+   *
+   * Bounded to {@link MAX_LOSS_LEDGER_CAPTURES} entries. Entries are updated
+   * in place, so a capture keeps its position however many times its report
+   * is resent or its loss grows, and the bound always evicts the capture that
+   * was credited first.
+   */
+  readonly #lossLedger = new Map<string, LossLedgerEntry>();
+
+  /**
+   * The report riding on the post in flight, or `undefined`.
+   *
+   * One suffices because drains are serialised and a drain posts one body at a
+   * time. It is what lets the ledger be evicted or abandoned while that post
+   * is on the wire without the report being counted twice: whatever happens to
+   * its entry meanwhile, the post settles the report itself, and
+   * {@link DebuggenSpanProcessorStats.pendingLossEvents} counts it here and
+   * nowhere else until then.
+   */
+  #lossReportInFlight: LossReport | undefined;
 
   /** The armed flush timer, or `undefined` when none is pending. */
   #flushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1480,10 +1750,10 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * process, and the gate every outbound path consults.
    *
    * One flag rather than two, because "the hint has been logged" and "the
-   * transport has stopped" are the same fact. It used to be only the former,
-   * which made the hint's own promise — *server-side telemetry stops until the
-   * dev server is relaunched* — a claim nothing enforced: the drain kept
-   * posting to the endpoint that had just refused it.
+   * transport has stopped" are the same fact. Keeping only the first would make
+   * the hint's own promise — *server-side telemetry stops until the dev server
+   * is relaunched* — a claim nothing enforces, with the drain still posting to
+   * the endpoint that had just refused it.
    *
    * @see {@link DebuggenSpanProcessorStats.credentialRejected}
    */
@@ -1551,6 +1821,15 @@ export class DebuggenSpanProcessor implements SpanProcessor {
 
   /** {@link DebuggenSpanProcessorStats.failedBatches} */
   #failedBatches = 0;
+
+  /** {@link DebuggenSpanProcessorStats.lossReportBatches} */
+  #lossReportBatches = 0;
+
+  /** {@link DebuggenSpanProcessorStats.reportedLossEvents} */
+  #reportedLossEvents = 0;
+
+  /** {@link DebuggenSpanProcessorStats.abandonedLossEvents} */
+  #abandonedLossEvents = 0;
 
   /** {@link DebuggenSpanProcessorStats.internalErrors} */
   #internalErrors = 0;
@@ -1653,6 +1932,10 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       refusedBatches: this.#refusedBatches,
       unacknowledgedBatches: this.#unacknowledgedBatches,
       failedBatches: this.#failedBatches,
+      lossReportBatches: this.#lossReportBatches,
+      reportedLossEvents: this.#reportedLossEvents,
+      pendingLossEvents: this.#pendingLossEvents(),
+      abandonedLossEvents: this.#abandonedLossEvents,
       internalErrors: this.#internalErrors,
       credentialRejected: this.#credentialRejected,
       buffered: this.#buffer.length,
@@ -1772,9 +2055,9 @@ export class DebuggenSpanProcessor implements SpanProcessor {
 
       // Rule 2 - the span must belong to the capture that is current. Ahead of
       // classification because it is two comparisons and because it is the
-      // rule that keeps one capture's evidence out of another's: the event
-      // carries no capture id of its own, so whatever is exported now is
-      // filed under whatever the service has armed now.
+      // rule that keeps one capture's evidence out of another's: a replaced
+      // capture's span would be posted naming a capture the service has
+      // closed, and a same-id re-arm's could not be told apart there at all.
       const stamp = this.#stamps.get(span);
       if (stamp !== undefined && this.#isStaleStamp(stamp, captureId)) {
         this.#droppedStaleCapture += 1;
@@ -1793,11 +2076,13 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         return;
       }
 
+      // The capture the span *ran in*, which the stale check has just proved
+      // is the current one — stated through the stamp where there is one so
+      // the sequence a span is numbered in, and the capture its post names,
+      // cannot belong to another capture.
+      const recordedIn = stamp?.captureId ?? captureId;
       const context: ConvertContext = {
-        // The capture the span *ran in*, which the stale check has just proved
-        // is the current one — stated through the stamp where there is one so
-        // the sequence a span is numbered in cannot belong to another capture.
-        captureId: stamp?.captureId ?? captureId,
+        captureId: recordedIn,
         producerId: this.#config.producerId,
         seq: this.#seq,
       };
@@ -1814,7 +2099,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       const clockOffsetMs = this.#clock.estimate();
 
       this.#convertedCount += 1;
-      this.#enqueue(clockOffsetMs === undefined ? event : { ...event, clockOffsetMs });
+      this.#enqueue(clockOffsetMs === undefined ? event : { ...event, clockOffsetMs }, recordedIn);
     } catch (error) {
       // A gate whose getter threw, or an array that refused a push. Counted,
       // logged at debug, and absolutely not raised into the application.
@@ -1940,8 +2225,11 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * Called by the provider's own shutdown, which the host may be awaiting on
    * its way out of the process, so it is deliberately impatient: single-attempt
    * posts, no backoff, and the whole flush bounded by
-   * {@link SHUTDOWN_FLUSH_DEADLINE_MS}. Anything still queued afterwards is
-   * abandoned and counted rather than held. Idempotent, and it never rejects.
+   * {@link SHUTDOWN_FLUSH_DEADLINE_MS}. The final drain also carries every
+   * capture's pending loss, as a loss-only report where no event of that
+   * capture is left to carry it. Anything still queued afterwards is abandoned
+   * and counted rather than held, and so is any loss still unreported.
+   * Idempotent, and it never rejects.
    */
   async shutdown(): Promise<void> {
     if (this.#shutdownComplete) {
@@ -1965,6 +2253,11 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       this.#droppedAtShutdown += abandoned;
       this.#log('debug', 'buffered events were abandoned at shutdown', { events: abandoned });
     }
+
+    // Nothing posts after this point, so pending loss has no future carrier;
+    // a post the deadline left in flight settles its own reservation, and
+    // what it hands back lands on the abandoned counter directly.
+    this.#abandonPendingLoss('shutdown');
   }
 
   /**
@@ -2026,21 +2319,26 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * At the cap the **oldest** events make room for the newest: a developer
    * reproducing an issue cares about what just happened, and the alternative —
    * refusing the new event — would leave a capture describing the moment
-   * before the one under investigation. Every discarded event is counted, and
-   * the warning is deferred to the next flush window so a burst produces one
-   * line rather than thousands.
+   * before the one under investigation. Every discarded event is counted and
+   * credited to the loss ledger under the capture it was recorded in, and the
+   * warning is deferred to the next flush window so a burst produces one line
+   * rather than thousands.
    *
    * @param event A converted, ingest-ready event.
+   * @param captureId The capture its span was recorded in.
    */
-  #enqueue(event: TelemetryEventIngress): void {
+  #enqueue(event: TelemetryEventIngress, captureId: string): void {
     if (this.#buffer.length >= MAX_BUFFERED_EVENTS) {
       const overflow = this.#buffer.length - MAX_BUFFERED_EVENTS + 1;
-      this.#buffer.splice(0, overflow);
+      const evicted = this.#buffer.splice(0, overflow);
       this.#droppedOverflow += overflow;
       this.#overflowSinceWarning += overflow;
+      for (const entry of evicted) {
+        this.#recordLoss(entry.captureId, 1);
+      }
     }
 
-    this.#buffer.push(event);
+    this.#buffer.push({ event, captureId });
 
     if (this.#buffer.length >= BATCH_MAX_EVENTS) {
       // A full batch travels now; waiting would only make it larger than the
@@ -2121,17 +2419,25 @@ export class DebuggenSpanProcessor implements SpanProcessor {
   }
 
   /**
-   * Post the buffer, one batch at a time, up to {@link MAX_DRAIN_BATCHES}.
+   * Post the buffer, one single-capture batch at a time, up to
+   * {@link MAX_DRAIN_BATCHES}, then report the loss no batch carried.
    *
    * The cap is what makes this terminate on a server that is producing spans as
    * fast as they are being posted: whatever arrives after it is reached belongs
-   * to the next window. Batches are taken out of the buffer before they are
-   * posted, so an event is never sent twice, and a batch that could not be
-   * delivered is dropped rather than re-queued (module overview).
+   * to the next window. A buffer spanning several captures needs one batch more
+   * per capture boundary, and what the cap leaves behind is likewise the next
+   * window's. Batches are taken out of the buffer before they are posted, so an
+   * event is never sent twice, and a batch that could not be delivered is
+   * dropped rather than re-queued (module overview) — its events credited to
+   * its capture's loss.
    *
    * A delivered batch is accounted by what its acknowledgement said
    * ({@link #recordAcknowledgement}), and whatever the service refused during
-   * the drain is summarised once at its end ({@link #reportRefusals}).
+   * the drain is summarised once at its end ({@link #reportRefusals}). The
+   * loss-only reports ({@link #reportPendingLoss}) follow the batches and are
+   * skipped when one of them failed; they are bounded by
+   * {@link LOSS_REPORTS_PER_CAPTURE} for each of the ledger's
+   * {@link MAX_LOSS_LEDGER_CAPTURES}, so they cannot keep a drain alive either.
    *
    * Never throws, whatever a batch does.
    *
@@ -2139,6 +2445,12 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    */
   async #drain(mode: DrainMode): Promise<void> {
     this.#reportOverflow();
+    // This drain takes the buffer, so a window armed for what is in it has
+    // nothing left to flush. Left armed, it would fire a drain holding only
+    // pending loss and send a loss-only report on a timer — the polling of an
+    // absent service that loss alone must never cause. The end of this drain
+    // re-arms a window for whatever it leaves behind or arrives meanwhile.
+    this.#clearFlushTimer();
 
     // A refused credential ends the outbound path: nothing is posted, and
     // whatever is still queued is released rather than held for a flush that
@@ -2152,28 +2464,53 @@ export class DebuggenSpanProcessor implements SpanProcessor {
 
     try {
       const attempts = mode === 'final' ? 1 : MAX_POST_ATTEMPTS;
+      // Set when a batch of this drain got no answer the service stood behind:
+      // the transport is down or refusing, and a loss report sent now would
+      // only fail with it, so the reports wait for the next drain.
+      let batchFailed = false;
 
-      for (let batches = 0; batches < MAX_DRAIN_BATCHES && this.#buffer.length > 0; batches += 1) {
-        const batch = this.#buffer.splice(0, BATCH_MAX_EVENTS);
-        const outcome = await this.#postBatch(batch, attempts);
+      for (let batches = 0; batches < MAX_DRAIN_BATCHES; batches += 1) {
+        const batch = this.#takeBatch();
+        if (batch === undefined) {
+          break;
+        }
+        const { captureId, events } = batch;
+        const outcome = await this.#postCarryingLoss(
+          captureId,
+          events,
+          this.#reserveLoss(captureId),
+          attempts,
+        );
 
         if (outcome.kind === 'sent') {
-          this.#recordAcknowledgement(batch.length, outcome.reading);
+          this.#recordAcknowledgement(events.length, outcome.reading);
           continue;
         }
 
         this.#failedBatches += 1;
         if (outcome.kind === 'unserializable') {
-          this.#droppedUnserializable += batch.length;
+          this.#droppedUnserializable += events.length;
         } else {
-          this.#droppedFailedBatch += batch.length;
+          this.#droppedFailedBatch += events.length;
+          batchFailed = true;
         }
+        this.#recordLoss(captureId, events.length);
 
         // The batch that was just refused is what latched the credential, and
         // it keeps the counters it has already been given. Everything behind it
         // stops here: this is the case the drop rule exists for, because
         // without it the remaining batches of this very drain would each be
         // posted to an endpoint that has already answered `401`.
+        if (this.#credentialRejected) {
+          this.#discardAfterCredentialRejection();
+          this.#reportRefusals(mode);
+          return;
+        }
+      }
+
+      if (!batchFailed) {
+        await this.#reportPendingLoss(attempts);
+        // A loss report can be what the endpoint refuses the credential on.
         if (this.#credentialRejected) {
           this.#discardAfterCredentialRejection();
           this.#reportRefusals(mode);
@@ -2312,10 +2649,15 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    *
    * The count lands on {@link DebuggenSpanProcessorStats.droppedCredentialRejected},
    * the same counter as the spans `onEnd` refuses, so one number accounts for
-   * every piece of evidence this condition cost. Diagnostics stay at `debug`:
-   * the one line a developer can act on was already written at `warn`, once.
+   * every piece of evidence this condition cost. The discarded events are not
+   * loss the service is told about — no post can reach it again — and the loss
+   * that was already pending is abandoned for the same reason. Diagnostics stay
+   * at `debug`: the one line a developer can act on was already written at
+   * `warn`, once.
    */
   #discardAfterCredentialRejection(): void {
+    this.#abandonPendingLoss('credential-rejected');
+
     const discarded = this.#buffer.length;
     if (discarded === 0) {
       return;
@@ -2328,6 +2670,353 @@ export class DebuggenSpanProcessor implements SpanProcessor {
     });
   }
 
+  /**
+   * Take the next batch out of the buffer: the contiguous run of the oldest
+   * event's capture, at most {@link BATCH_MAX_EVENTS} long.
+   *
+   * Contiguity is enough because captures only move forward: every event of
+   * the capture being replaced was buffered before the first event of the one
+   * replacing it, so the run ends exactly where the next capture begins and no
+   * post ever mixes two.
+   *
+   * @returns The batch and the capture it was recorded in, or `undefined` when
+   * the buffer is empty.
+   */
+  #takeBatch():
+    { readonly captureId: string; readonly events: TelemetryEventIngress[] } | undefined {
+    const head = this.#buffer[0];
+    if (head === undefined) {
+      return undefined;
+    }
+    const { captureId } = head;
+    const limit = Math.min(this.#buffer.length, BATCH_MAX_EVENTS);
+    let run = 1;
+    while (run < limit && this.#buffer[run]?.captureId === captureId) {
+      run += 1;
+    }
+    const taken = this.#buffer.splice(0, run);
+    return { captureId, events: taken.map((entry) => entry.event) };
+  }
+
+  /**
+   * Send the loss-only reports for every capture whose loss is pending and no
+   * event of which is still buffered to carry it.
+   *
+   * A capture that still has buffered events is skipped, because its next
+   * batch carries the report. Otherwise it gets up to
+   * {@link LOSS_REPORTS_PER_CAPTURE}: its outstanding report, resent under the
+   * same id, and then — once that one is delivered — a new report for the loss
+   * recorded behind it, so a capture is emptied in one drain rather than one
+   * report per drain. The walk follows the ledger's order, oldest capture
+   * first, over a snapshot of its keys — a report's settlement and an overflow
+   * during a post both write the ledger — and stops at the first report that
+   * fails to reach the service, leaving the rest pending for the next drain
+   * rather than failing each of them in turn. It is never scheduled on its
+   * own: loss alone arms no flush window.
+   *
+   * @param attempts Attempts each report gets, as the drain's batches do.
+   */
+  async #reportPendingLoss(attempts: number): Promise<void> {
+    const captures = [...this.#lossLedger.keys()];
+    for (const captureId of captures) {
+      for (let sent = 0; sent < LOSS_REPORTS_PER_CAPTURE; sent += 1) {
+        if (this.#credentialRejected) {
+          return;
+        }
+        if (this.#buffer.some((entry) => entry.captureId === captureId)) {
+          break;
+        }
+        // `undefined` when the capture has nothing pending, and also when no
+        // identity could be minted: a report is never posted without one.
+        const lossReport = this.#reserveLoss(captureId);
+        if (lossReport === undefined) {
+          break;
+        }
+
+        const outcome = await this.#postCarryingLoss(captureId, [], lossReport, attempts);
+        if (outcome.kind === 'failed') {
+          return;
+        }
+        if (outcome.kind === 'unserializable') {
+          break;
+        }
+        this.#lossReportBatches += 1;
+      }
+    }
+  }
+
+  /*
+   * -------------------------------------------------------------------------
+   * Loss ledger
+   * -------------------------------------------------------------------------
+   */
+
+  /**
+   * Post one capture's events with that capture's loss report on the body, and
+   * settle the report whatever becomes of the post.
+   *
+   * The report is marked as in flight for exactly as long as the post runs,
+   * and the `finally` is what guarantees it is settled — delivered, kept for a
+   * resend, or abandoned — even if something below were to throw.
+   *
+   * @param captureId The capture the events were recorded in.
+   * @param events Its events; empty for a loss-only report.
+   * @param lossReport The report {@link #reserveLoss} returned for the
+   * capture, or `undefined` when no loss rides on this post.
+   * @param attempts Attempts the post gets.
+   * @returns What became of the post. The events' own loss is the caller's to
+   * credit; only the report is settled here.
+   */
+  async #postCarryingLoss(
+    captureId: string,
+    events: readonly TelemetryEventIngress[],
+    lossReport: LossReport | undefined,
+    attempts: number,
+  ): Promise<BatchOutcome> {
+    this.#lossReportInFlight = lossReport;
+    let delivered = false;
+    try {
+      const outcome = await this.#postBatch(
+        { armedCaptureId: captureId, events, lossReport },
+        attempts,
+      );
+      delivered = outcome.kind === 'sent';
+      return outcome;
+    } finally {
+      this.#lossReportInFlight = undefined;
+      if (lossReport !== undefined) {
+        this.#settleReservation(captureId, lossReport, delivered);
+      }
+    }
+  }
+
+  /**
+   * The report the capture's next post carries: its outstanding one, or a new
+   * one holding everything pending.
+   *
+   * An outstanding report is returned as it is — same object, same id, same
+   * count — however many posts it has already ridden on, because the service
+   * may have recorded it on any of them. Only a capture with no outstanding
+   * report mints one, moving its whole unreserved count into it; the entry is
+   * updated in place, so the capture keeps its position in the ledger.
+   *
+   * @param captureId The capture the post names.
+   * @returns The report to send, or `undefined` when nothing is pending or no
+   * identity could be minted — in which case the loss stays where it was.
+   */
+  #reserveLoss(captureId: string): LossReport | undefined {
+    const entry = this.#lossLedger.get(captureId);
+    if (entry === undefined) {
+      return undefined;
+    }
+    if (entry.reserved !== undefined) {
+      return entry.reserved;
+    }
+    if (entry.unreserved <= 0) {
+      return undefined;
+    }
+    const id = this.#mintLossReportId();
+    if (id === undefined) {
+      return undefined;
+    }
+    const report: LossReport = { id, count: entry.unreserved };
+    entry.reserved = report;
+    entry.unreserved = 0;
+    return report;
+  }
+
+  /**
+   * A fresh `lossReportId`: 16 random lowercase hex characters.
+   *
+   * `@debuggen/shared`'s span-id generator, because it is the random id this
+   * process already draws from Web Crypto — unique per call, well inside the
+   * identifier grammar (1 to 64 characters, no whitespace) and derived from
+   * nothing the process holds, the credential least of all. It throws only on
+   * a host with no working randomness source, and then the loss is left
+   * unreserved and the post travels without it rather than under an identity
+   * that could collide.
+   *
+   * @returns The id, or `undefined` when none could be generated.
+   */
+  #mintLossReportId(): string | undefined {
+    try {
+      return newSpanId();
+    } catch (error) {
+      this.#internalErrors += 1;
+      this.#log(
+        'debug',
+        'a telemetry loss report could not be given an identity; its loss stays pending',
+        {
+          error: describeError(error),
+        },
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * Settle a report once the post that carried it has concluded.
+   *
+   * A `2xx` delivers it, whatever its acknowledgement said: it is the
+   * service's decision about those bytes, exactly as for the events. Anything
+   * else leaves it exactly as it was — the same object on the capture's entry,
+   * never merged into the loss recorded since and never given a new id — so
+   * the capture's next post resends what the service may already have
+   * recorded, and the service's per-report deduplication absorbs it.
+   *
+   * The report is abandoned instead when nothing could resend it: its entry
+   * was evicted or abandoned while the post was on the wire, or the
+   * credential has been refused, or `shutdown()` has finished.
+   *
+   * @param captureId The capture the post named.
+   * @param report The report the post carried.
+   * @param delivered Whether the service answered the post with a `2xx`.
+   */
+  #settleReservation(captureId: string, report: LossReport, delivered: boolean): void {
+    const entry = this.#lossLedger.get(captureId);
+    const held = entry?.reserved === report;
+
+    if (delivered) {
+      this.#reportedLossEvents += report.count;
+    } else if (held && !this.#credentialRejected && !this.#shutdownComplete) {
+      return;
+    } else {
+      this.#abandonedLossEvents += report.count;
+    }
+
+    if (entry !== undefined && held) {
+      entry.reserved = undefined;
+      if (entry.unreserved === 0) {
+        this.#lossLedger.delete(captureId);
+      }
+    }
+  }
+
+  /**
+   * Credit lost events to the capture they were recorded in.
+   *
+   * Called for events the buffer cap evicted and for the events of a batch
+   * that failed or could not be serialised. The count joins the capture's
+   * unreserved loss, never its outstanding report, whose count has already
+   * travelled under its id. Once the credential has been refused or
+   * `shutdown()` has finished no post can carry the count, so it goes
+   * straight to {@link DebuggenSpanProcessorStats.abandonedLossEvents}. A
+   * capture new to a full ledger evicts the oldest one, whose pending loss is
+   * abandoned.
+   *
+   * @param captureId The capture the events belonged to.
+   * @param events How many were lost; nothing happens for fewer than one.
+   */
+  #recordLoss(captureId: string, events: number): void {
+    if (events <= 0) {
+      return;
+    }
+    if (this.#credentialRejected || this.#shutdownComplete) {
+      this.#abandonedLossEvents += events;
+      return;
+    }
+
+    const entry = this.#lossLedger.get(captureId);
+    if (entry !== undefined) {
+      // In place: the capture keeps its position in the ledger.
+      entry.unreserved += events;
+      return;
+    }
+
+    this.#lossLedger.set(captureId, { reserved: undefined, unreserved: events });
+    if (this.#lossLedger.size <= MAX_LOSS_LEDGER_CAPTURES) {
+      return;
+    }
+
+    const oldest = this.#lossLedger.entries().next();
+    if (oldest.done === true) {
+      return;
+    }
+    const [evictedCapture, evictedEntry] = oldest.value;
+    this.#lossLedger.delete(evictedCapture);
+    const evictedEvents = this.#releaseEntry(evictedEntry);
+    this.#abandonedLossEvents += evictedEvents;
+    this.#log('debug', 'the oldest capture with unreported telemetry loss was abandoned', {
+      events: evictedEvents,
+      ledgerLimit: MAX_LOSS_LEDGER_CAPTURES,
+      abandonedTotal: this.#abandonedLossEvents,
+    });
+  }
+
+  /**
+   * Abandon every pending count: no post will carry it.
+   *
+   * A report riding on a post still in flight is not touched, and neither is
+   * the entry holding it; that post settles it, reporting it on a `2xx` and
+   * otherwise abandoning it unless the processor was reopened meanwhile
+   * ({@link #settleReservation}). Every other report, and all unreserved loss,
+   * is abandoned and its entry removed.
+   *
+   * @param reason Why nothing more can be reported, for the diagnostic.
+   */
+  #abandonPendingLoss(reason: 'credential-rejected' | 'shutdown'): void {
+    let events = 0;
+    for (const [captureId, entry] of this.#lossLedger) {
+      events += this.#releaseEntry(entry);
+      if (entry.reserved === undefined) {
+        // Deleting the entry being visited is safe during `Map` iteration.
+        this.#lossLedger.delete(captureId);
+      }
+    }
+    if (events === 0) {
+      return;
+    }
+    this.#abandonedLossEvents += events;
+    this.#log('debug', 'unreported telemetry loss was abandoned', {
+      events,
+      reason,
+      abandonedTotal: this.#abandonedLossEvents,
+    });
+  }
+
+  /**
+   * Empty an entry of everything no post in flight will settle, and say how
+   * much that was.
+   *
+   * The unreserved loss is always released, and so is the outstanding report
+   * unless it is the one on the wire: {@link #postCarryingLoss} settles that
+   * one itself, so releasing it here as well would count it twice. The caller
+   * adds the result to {@link DebuggenSpanProcessorStats.abandonedLossEvents}
+   * and decides what becomes of the entry.
+   *
+   * @param entry The entry being abandoned.
+   * @returns The events released from it.
+   */
+  #releaseEntry(entry: LossLedgerEntry): number {
+    let events = entry.unreserved;
+    entry.unreserved = 0;
+    if (entry.reserved !== undefined && entry.reserved !== this.#lossReportInFlight) {
+      events += entry.reserved.count;
+      entry.reserved = undefined;
+    }
+    return events;
+  }
+
+  /**
+   * The loss recorded and not yet reported or abandoned: every entry's
+   * outstanding report and unreserved loss, with the report on the post in
+   * flight counted once — here, rather than through its entry, since the
+   * entry may have been evicted or abandoned while the post is on the wire.
+   *
+   * @returns {@link DebuggenSpanProcessorStats.pendingLossEvents}.
+   */
+  #pendingLossEvents(): number {
+    const inFlight = this.#lossReportInFlight;
+    let total = inFlight?.count ?? 0;
+    for (const entry of this.#lossLedger.values()) {
+      total += entry.unreserved;
+      if (entry.reserved !== undefined && entry.reserved !== inFlight) {
+        total += entry.reserved.count;
+      }
+    }
+    return total;
+  }
+
   /*
    * -------------------------------------------------------------------------
    * Transport
@@ -2335,22 +3024,30 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    */
 
   /**
-   * Serialise one batch and post it, retrying within the attempt budget.
+   * Serialise one batch — or one loss-only report — and post it, retrying
+   * within the attempt budget.
    *
    * The body is built once and reused across attempts: it cannot change between
-   * them, and re-serialising would be the most expensive part of a retry.
+   * them, re-serialising would be the most expensive part of a retry, and the
+   * bytes the first attempt sent are the ones every retry must send. That
+   * includes `armedCaptureId`: a batch retried after the gate was re-armed for
+   * another capture still names the capture its events were recorded in. It
+   * includes the loss report too: every attempt carries the same
+   * `lossReportId` and `droppedCount`, so an attempt the service recorded
+   * before its answer was lost is recognised when the next one arrives.
    *
-   * @param events The batch, already removed from the buffer.
+   * @param payload The capture, its events (already removed from the buffer)
+   * and the loss report riding on this post.
    * @param maxAttempts Attempts permitted, at least one.
-   * @returns What became of the batch.
+   * @returns What became of the post.
    */
-  async #postBatch(
-    events: readonly TelemetryEventIngress[],
-    maxAttempts: number,
-  ): Promise<BatchOutcome> {
-    if (events.length === 0) {
+  async #postBatch(payload: IngestPayload, maxAttempts: number): Promise<BatchOutcome> {
+    const { armedCaptureId, events, lossReport } = payload;
+    const droppedCount = lossReport?.count ?? 0;
+    if (events.length === 0 && lossReport === undefined) {
       // Nothing to send and nothing to count: an acknowledgement of zero events
-      // lands on no counter.
+      // lands on no counter, and an empty batch reporting no loss is one the
+      // service refuses.
       return {
         kind: 'sent',
         reading: {
@@ -2372,11 +3069,28 @@ export class DebuggenSpanProcessor implements SpanProcessor {
 
     let body: string;
     try {
-      // The ingest body of AAP 0.4.2, exactly: the credential's project root
-      // and the events `./convert.ts` produced, carrying nothing but the
-      // `clockOffsetMs` `onEnd` stamped when each was created. Serialised once:
-      // every retry below sends these bytes, so no event is ever restamped.
-      body = JSON.stringify({ projectRoot: this.#config.projectRoot, events });
+      // The `POST /telemetry/ingest` body plus its delivery context: the
+      // credential's project root and the events `./convert.ts` produced,
+      // carrying nothing but the `clockOffsetMs` `onEnd` stamped when each was
+      // created; the capture they were recorded in; and that capture's loss
+      // report, `droppedCount` with its `lossReportId`, present only when
+      // there is one, because the contract admits no zero count and no id
+      // without a count.
+      // Serialised once: every retry below sends these bytes, so no event is
+      // ever restamped, no retry renames its capture and no retry re-identifies
+      // its loss.
+      const projectRoot = this.#config.projectRoot;
+      body = JSON.stringify(
+        lossReport === undefined
+          ? { projectRoot, events, armedCaptureId }
+          : {
+              projectRoot,
+              events,
+              armedCaptureId,
+              droppedCount: lossReport.count,
+              lossReportId: lossReport.id,
+            },
+      );
     } catch (error) {
       this.#log('debug', 'a telemetry batch could not be serialised', {
         events: events.length,
@@ -2386,7 +3100,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
     }
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      const outcome = await this.#attemptPost(body, events.length);
+      const outcome = await this.#attemptPost(body, events.length, droppedCount);
 
       if (outcome.kind === 'sent') {
         // A `2xx` ends the attempts whatever its acknowledgement says: it is the
@@ -2404,6 +3118,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
 
     this.#log('debug', 'a telemetry batch was dropped after every attempt failed', {
       events: events.length,
+      ...lossField(droppedCount),
       attempts: maxAttempts,
     });
     return { kind: 'failed' };
@@ -2424,11 +3139,13 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * the two. Every answer is sampled, whatever its status; a request that
    * rejected — refused, timed out, redirected — had no answer and gives none.
    *
-   * @param body The serialised `{ projectRoot, events }` payload.
+   * @param body The serialised
+   * `{ projectRoot, events, armedCaptureId, droppedCount?, lossReportId? }` payload.
    * @param eventCount How many events it carries: what the acknowledgement's
    * counts are clamped to, and a diagnostic field.
+   * @param droppedCount The loss it reports, `0` for none; a diagnostic field.
    */
-  async #attemptPost(body: string, eventCount: number): Promise<PostOutcome> {
+  async #attemptPost(body: string, eventCount: number, droppedCount: number): Promise<PostOutcome> {
     try {
       // One deadline for the whole exchange: the request, and the read of the
       // acknowledgement that answers it.
@@ -2464,7 +3181,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         // answer's headers are readable here whatever becomes of the body; the
         // body is read last, because reading it consumes the stream.
         const reading = await readIngestAcknowledgement(response, eventCount, signal);
-        this.#logAcknowledgement(response.status, eventCount, reading);
+        this.#logAcknowledgement(response.status, eventCount, droppedCount, reading);
         return { kind: 'sent', reading };
       }
 
@@ -2472,7 +3189,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       // the stream is released rather than left to the garbage collector
       // holding a connection.
       await releaseResponseBody(response);
-      return this.#classifyRejection(response.status, eventCount);
+      return this.#classifyRejection(response.status, eventCount, droppedCount);
     } catch (error) {
       // A refused connection, a DNS failure, an abort at the timeout, or a
       // `fetch` implementation that threw. All of them are moments rather than
@@ -2480,6 +3197,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       this.#log('debug', 'telemetry batch could not be delivered', {
         url: this.#config.ingestUrl,
         events: eventCount,
+        ...lossField(droppedCount),
         error: describeError(error),
       });
       return { kind: 'retry' };
@@ -2491,16 +3209,30 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * word when there was no acknowledgement — never a byte of the body.
    *
    * Per batch and therefore never at `warn`; the developer-facing summary of
-   * refusals is {@link #reportRefusals}, written once per drain at most.
+   * refusals is {@link #reportRefusals}, written once per drain at most. A
+   * loss-only report has no event for an acknowledgement to count, so its
+   * answer is recorded as delivering the loss and nothing more.
    *
    * @param status The `2xx` status.
    * @param eventCount Events in the batch.
+   * @param droppedCount The loss the post reported, `0` for none.
    * @param reading What its acknowledgement said, or why it said nothing.
    */
-  #logAcknowledgement(status: number, eventCount: number, reading: AcknowledgementReading): void {
+  #logAcknowledgement(
+    status: number,
+    eventCount: number,
+    droppedCount: number,
+    reading: AcknowledgementReading,
+  ): void {
+    if (eventCount === 0) {
+      this.#log('debug', 'telemetry loss report delivered', { status, droppedCount });
+      return;
+    }
+
     if (reading.kind === 'unacknowledged') {
       this.#log('debug', 'telemetry batch accepted without a readable acknowledgement', {
         events: eventCount,
+        ...lossField(droppedCount),
         status,
         reason: reading.reason,
       });
@@ -2510,6 +3242,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
     const { accepted, rejected, clamped } = reading.acknowledgement;
     this.#log('debug', 'telemetry batch acknowledged', {
       events: eventCount,
+      ...lossField(droppedCount),
       status,
       accepted,
       rejected,
@@ -2530,8 +3263,10 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    *
    * @param status The response status.
    * @param eventCount Events in the rejected batch, for diagnostics only.
+   * @param droppedCount The loss the batch reported, `0` for none; diagnostics
+   * only.
    */
-  #classifyRejection(status: number, eventCount: number): PostOutcome {
+  #classifyRejection(status: number, eventCount: number, droppedCount: number): PostOutcome {
     if (AUTH_REJECTED_STATUSES.has(status)) {
       if (!this.#credentialRejected) {
         this.#credentialRejected = true;
@@ -2555,6 +3290,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       this.#log('warn', 'the local service refused a telemetry batch', {
         status,
         events: eventCount,
+        ...lossField(droppedCount),
       });
       return { kind: 'permanent' };
     }
@@ -2562,6 +3298,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
     this.#log('debug', 'the local service could not accept a telemetry batch', {
       status,
       events: eventCount,
+      ...lossField(droppedCount),
     });
     return { kind: 'retry' };
   }

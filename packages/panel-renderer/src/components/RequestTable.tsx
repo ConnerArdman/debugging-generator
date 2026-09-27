@@ -442,10 +442,16 @@ const COLUMN_SORTS: Readonly<Record<string, DataQuerySort | undefined>> = {
  *   - `initiators` is `name`: the first caller's source chip and the overflow
  *     badge beside it.
  *
- * Every role has a non-zero floor, because the floor is what the grid scrolls
- * against: `DataTable` sums the floors into the grid's own minimum width, so a
- * panel narrower than their sum scrolls horizontally with every column still
- * readable instead of squeezing the tracks until one cell paints over the next.
+ * Every role has a non-zero floor, because the floors are what the grid fits
+ * or scrolls against: `DataTable` sums the columns' floors and minimums into
+ * the grid's own width. A panel just too narrow for every floor narrows the
+ * request (`text`) and initiator (`name`) columns, never below the
+ * `--dg-column-yield` fraction of theirs, only as far as the table needs to
+ * fit: the URL ellipsizes, the grouping chip moves under it and the caller
+ * chip truncates, while every figure stays in view. A panel too narrow even
+ * for that keeps every floor and scrolls horizontally with every column
+ * readable, instead of squeezing the tracks until one cell paints over the
+ * next.
  * Spare width goes mostly to the two columns whose values are text of
  * unbounded length — the request and its callers — so a wide panel shows URLs
  * and caller chips in full rather than widening columns of figures. A token

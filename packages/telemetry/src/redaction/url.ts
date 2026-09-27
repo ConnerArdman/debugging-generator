@@ -863,10 +863,10 @@ function truncatedStack(masked: string): string {
  *    ({@link FRAME_CONTEXT_PATTERN}) **and ends in a position** — then the
  *    runtime appended the position, which is exactly how
  *    `packages/code-analysis/src/source-map/resolver.ts` reads the same text,
- *    and AAP 0.4.2 requires that route to map a generated-chunk frame back to
- *    TypeScript. A dev-server chunk URL almost always carries a
- *    cache-busting query, so dropping the position here would disable source
- *    resolution for the common case. The brackets after the position are the
+ *    and that route maps a generated-chunk frame back to TypeScript. A
+ *    dev-server chunk URL almost always carries a cache-busting query, so
+ *    dropping the position here would disable source resolution for the
+ *    common case. The brackets after the position are the
  *    frame's own (`at fn (‹url›?v=?:10:5)` keeps `:10:5)`). The residual risk
  *    is a query value that itself ends in `:digits:digits`, of which at most
  *    two short numeric groups would be kept — digits only, never an
@@ -928,9 +928,9 @@ function maskFrameUrl(candidate: string, offset: number, whole: string): string 
  * `redactor.ts`, which means a frame's URL travels whole, and a dev-server
  * chunk URL carries a query string like any other request URL. Scrubbing by
  * content does not touch a query value — that is positional, and only this
- * module can see it — so before this function existed every parameter inside
- * a frame's URL was stored, broadcast and sent to the model provider, under
- * keys the privacy model had already ruled on everywhere else (AAP 0.5.2).
+ * module can see it — so without this function every parameter inside a
+ * frame's URL would be stored, broadcast and sent to the model provider, under
+ * keys the privacy model rules on everywhere else.
  *
  * What is kept is what a stack is for: `at`, the function names, the
  * indentation, the parentheses, the frame order, and each frame's file and

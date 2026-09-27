@@ -52,7 +52,8 @@
  * moment and its wrapper's `if (__dbg && typeof __dbg.span === "function")`
  * check must find a helper. Both happen while the agent is **dormant**: no
  * listener, no observer, no patch and no subscription on the developer's
- * application exists until the service arms one.
+ * application exists until the service arms one — or until the developer
+ * presses "Pick element", whose picker listens only until that pick ends.
  *
  * Then, in order: subscribe to the isolated-world bridge and announce
  * `agent.ready` (step 3); register the two flush hooks that get a capture's
@@ -117,7 +118,8 @@
  *   `visibilitychange` listeners do not tell a synthetic event from a real
  *   one, so a page that dispatches its own `pagehide` gets an early flush and
  *   releases element description (the one document-scoped family) until the
- *   next `pageshow`. No capture-scoped signal is affected.
+ *   next `pageshow`, ending an element pick in flight as it does. No
+ *   capture-scoped signal is affected.
  * - **Timers and the console.** The single React re-check is scheduled with
  *   the page's `setTimeout`, which is therefore handed a callback that can
  *   only re-check for React and re-announce `agent.ready`. When the service
@@ -213,10 +215,14 @@ import {
 } from './continuation.js';
 import {
   attachDomTarget,
+  cancelElementPick,
   describeElement,
   detachDomTarget,
+  hasElementPickResidue,
   isDomTargetAttached,
+  startElementPick,
 } from './dom-target.js';
+import type { ElementPickOutcome } from './dom-target.js';
 import { attachErrors, detachErrors, hasErrorsResidue, isErrorsAttached } from './errors.js';
 import {
   advanceFetchGeneration,
@@ -563,7 +569,8 @@ interface AgentGlobalScope {
  * the opening sequence and released when the document goes away, because the
  * capability they provide is used *outside* a capture — the panel picks an
  * element before the question is even asked (AAP 0.1.1, 0.4.2) — and they
- * observe nothing on their own.
+ * observe nothing on their own: element description registers listeners only
+ * for a pick the developer asked for, and only until that pick ends.
  */
 type HookScope = 'capture' | 'document';
 
@@ -617,7 +624,9 @@ const NO_FLAGS: readonly HookFlag[] = Object.freeze([]);
  *   description is what answers `describeTarget`/`target.request`, which the
  *   panel uses while the agent is dormant, so tying it to a capture would
  *   break target selection — the step that happens *before* a plan exists. Its
- *   adapter holds no resource; `./dom-target.js` documents why its own
+ *   adapter holds a resource only while a "Pick element" pick is active — the
+ *   picker's capture-phase listeners and its highlight — and releasing the
+ *   family ends that pick; `./dom-target.js` documents why its descriptor
  *   functions stay callable in both states.
  * - **`continuation` is named by two flags.** The lineage registry is fed by
  *   the request producer and closed by the interaction producer
@@ -634,9 +643,11 @@ const HOOK_BINDINGS: Readonly<Record<HookName, HookBinding>> = Object.freeze({
     attach: attachDomTarget,
     detach: detachDomTarget,
     isAttached: isDomTargetAttached,
-    // `./dom-target.ts` registers nothing with the page — it is a flag that
-    // gates `describeElement` — so it has no residue to leave behind.
-    hasResidue: (): boolean => false,
+    // `./dom-target.ts` registers with the page only while an element pick is
+    // active: capture-phase listeners on `window` and one highlight element.
+    // A pick's teardown can be refused by the page, so what it left behind is
+    // probed rather than assumed absent.
+    hasResidue: hasElementPickResidue,
   },
   continuation: {
     scope: 'capture',
@@ -1253,15 +1264,15 @@ function parseConfig(payload: unknown): ParsedAgentConfig {
  * Project a parsed configuration into the value published on
  * `window.__DEBUGGEN__.config`.
  *
- * **Not the payload.** The published value used to be the relayed frame's
- * `payload` verbatim, and a probe that posted an `agent.config` with extra keys
- * of its own — `ingestUrl`, `transport` — found them mirrored on that global,
- * unchanged, for any page script to read back. Nothing in this bundle ever read
- * them, so the mirror gave an attacker no capability; what it gave was a
+ * **Not the payload.** The published value is a projection of the parsed
+ * configuration, never the relayed frame's `payload`, so keys a frame carries
+ * beyond the schema — an `ingestUrl`, a `transport` — are never mirrored onto a
+ * page-readable global. Nothing in this bundle reads such keys, so mirroring
+ * the payload would give an attacker no capability; what it would give is a
  * page-writable, page-readable slot inside the agent's own published surface,
  * which is not a thing a diagnostic should be. `./transport.js`'s private
- * channel now keeps a page-forged frame from reaching this module at all, and
- * this projection is the second half of the same argument: even a legitimate
+ * channel keeps a page-forged frame from reaching this module at all, and this
+ * projection is the second half of the same argument: even a legitimate
  * configuration is published as the decisions this module *took*, never as the
  * bytes it was handed.
  *
@@ -1414,9 +1425,12 @@ function attachHook(name: HookName): boolean {
  * `./transport.ts`'s `ProducerFailureSource` names the producer *modules*, and
  * a family name is not always a module name: the `interactions` family is
  * produced by `./interaction.ts`, which reports itself as `'interaction'`, and
- * the two families that hold no host resource — `domTarget` and
- * `continuation` are a flag and a registry of maps — have no producer source
- * and nothing a detach could fail to release, so they carry `undefined`.
+ * two families carry `undefined` because no failure of theirs can reach this
+ * report. `continuation` is a registry of maps and holds no host resource.
+ * `domTarget` holds one only while an element pick is active, and its detach
+ * contains its own failures rather than throwing — `./dom-target.ts` may not
+ * import the transport — so what it could not release is read through its
+ * residue probe ({@link HOOK_BINDINGS}) instead.
  *
  * Total over {@link HookName} on purpose: a family added to {@link HOOK_NAMES}
  * without an entry here is a compile error rather than a report the service
@@ -1782,7 +1796,7 @@ function reportComponentTreeRefused(): void {
  */
 const HOOK_UNRELEASED_HINTS: Readonly<Record<HookName, string>> = Object.freeze({
   domTarget:
-    'Element description is a flag on this document and holds no page resource; nothing survives a detach.',
+    'Element picker listeners or its highlight are still on this page after a pick ended. Reload the tab to remove them.',
   continuation: 'The async-lineage registry holds no page resource; nothing survives a detach.',
   interactions:
     'Pointer and keyboard listeners are still registered on this page. Reload the tab to remove them.',
@@ -2084,11 +2098,14 @@ function resubscribeToBridge(): void {
  *
  * `pagehide` carries a second duty: it releases the document-scoped families
  * (see {@link HookScope}), because that is the only teardown a content script
- * has — there is no unload hook a bundle like this may take. `pageshow` is its
- * counterpart: a document restored from the back/forward cache re-arms them,
- * so element description follows the document it describes. Both calls are
- * idempotent, so the `pageshow` that fires on an ordinary load changes
- * nothing.
+ * has — there is no unload hook a bundle like this may take. Releasing
+ * `domTarget` ends an element pick in flight, whose request is answered
+ * `target: null` from inside that release; the answer is a control frame,
+ * dispatched on the spot and never buffered, so it does not depend on the
+ * flush that precedes it. `pageshow` is its counterpart: a document restored
+ * from the back/forward cache re-arms them, so element description follows
+ * the document it describes. Both calls are idempotent, so the `pageshow` that
+ * fires on an ordinary load changes nothing.
  *
  * **Not `beforeunload`.** It blocks navigation, disqualifies the page from the
  * back/forward cache, and is precisely the kind of side effect an
@@ -3014,6 +3031,13 @@ function handleInbound(message: BridgeInboundMessage): void {
   try {
     switch (message.type) {
       case 'bridge.ready':
+        // The bridge sends this only on a port it has just opened, so a pick
+        // still in flight was armed through an earlier port whose worker has
+        // already ended it. That is ordinarily done on `bridge.gone` below;
+        // this covers the one loss the bridge does not report — a port that
+        // failed inside this agent's own frame dispatch, where it withholds
+        // `bridge.gone` — and is a no-op otherwise. Nothing is re-armed.
+        cancelElementPick('relay-lost');
         // The bridge may have started after this agent announced itself, so
         // the announcement is repeated and anything buffered while it was away
         // is posted. `./transport.js` has already marked the bridge present.
@@ -3022,10 +3046,21 @@ function handleInbound(message: BridgeInboundMessage): void {
         return;
 
       case 'bridge.gone':
-        // `./transport.js` tracks the absence and stops flushing; there is
-        // nothing for the lifecycle to do. The hooks stay attached on purpose:
-        // the capture is still running, the service worker reconnects, and
-        // events buffer until it does (AAP 0.5.5).
+        // `./transport.js` tracks the absence and stops flushing. The hooks
+        // stay attached on purpose: the capture is still running, the service
+        // worker reconnects, and events buffer until it does.
+        //
+        // An element pick in flight is the one thing that ends here. The
+        // worker that armed it is the only party that can match its answer,
+        // and it has already dropped its record and told the panel picker mode
+        // is off; the bridge's next port may reach a restarted worker that
+        // never knew of the pick. Left armed, the pick would consume the
+        // developer's next click while the panel shows picker mode off. Its
+        // callback posts its one `target: null` answer, as every ending does;
+        // a bridge with no port leaves it unclaimed, and the transport counts
+        // it as a dropped control frame. Element description stays attached,
+        // so a `target.request` after the next `bridge.ready` arms afresh.
+        cancelElementPick('relay-lost');
         debugLog('bridge went away; buffering');
         return;
 
@@ -3044,7 +3079,7 @@ function handleInbound(message: BridgeInboundMessage): void {
         return;
 
       case 'target.request':
-        describeCurrentTarget(message.payload);
+        handleTargetRequest(message.payload);
         return;
 
       default:
@@ -3057,32 +3092,96 @@ function handleInbound(message: BridgeInboundMessage): void {
 }
 
 /**
- * Answer a `target.request` with a descriptor of the focused element.
+ * Handle a relayed `target.request`: arm an interactive pick for it, or end
+ * the one in flight.
  *
- * The panel's primary path does not come through here — the DevTools page
- * evaluates `window.__DEBUGGEN__.describeTarget($0)` directly, which is why
- * the helper publishes that function — so this is the fallback for a request
- * relayed through the bridge, and `document.activeElement` is the only
- * "current target" a page can answer with.
+ * "Pick element" — pressed in the DevTools panel, or relayed from
+ * VS Code — reaches the page as this frame, and what it asks for
+ * is **the element the developer clicks next**, on the page itself. The
+ * DevTools page's `describeTarget($0)` is the other control, "Use selected
+ * element", and never comes through here. So a request arms
+ * `./dom-target.ts`'s element picker, which highlights the element under the
+ * pointer and settles with the element a trusted primary click lands on —
+ * consuming that click, so the application does not act on it — or with a
+ * cancellation; {@link answerTargetRequest} then posts the one answer.
  *
- * `target` is `null` rather than absent when nothing describable is focused: a
- * relay that gets no answer at all cannot tell a refusal from a lost frame.
- * The `requestId` the bridge sent, if any, is echoed so a relay can match the
- * reply to its request.
+ * The payload is `{ requestId?, cancel? }`, a null-prototype record:
+ *
+ * - **No `cancel`:** one pick is armed for `requestId`. A pick already in
+ *   flight is superseded, and its own request is answered `target: null`
+ *   before the new pick is armed. When the `domTarget` family is not attached
+ *   — no document, or released on `pagehide` — or the page refuses the
+ *   picker's listeners, the request is answered `target: null` at once.
+ * - **`cancel: true`:** the pick in flight ends — the panel toggled picker
+ *   mode off — and is answered `target: null` under its own `requestId`. With
+ *   no pick in flight nothing is posted: there is no request to answer.
+ *
+ * A pick also never outlives the relay that armed it: {@link handleInbound}
+ * ends the pick in flight on `bridge.gone`, and on a `bridge.ready` that
+ * finds one still armed, because the worker that sent the request — the only
+ * party that can match its answer — has by then dropped its record of the
+ * pick and told the panel picker mode is off, and the bridge's next port may
+ * reach a restarted worker that never knew of it.
+ *
+ * Every armed pick is therefore answered exactly once, as
+ * `target.described { target, requestId? }`: the five-field descriptor on a
+ * pick, `null` on Escape, on a cancel request, on a newer request, on the
+ * bridge losing its worker port, on the document going away, and for a picked
+ * element that cannot be described. A `null` rather than an absent answer is
+ * what lets the relay tell a refusal from a lost frame, and the `requestId`
+ * echo is what lets it match an answer to the request that asked.
+ *
+ * @param payload The frame's payload, as `./transport.js` revived it.
  */
-function describeCurrentTarget(payload: Record<string, unknown>): void {
+function handleTargetRequest(payload: Record<string, unknown>): void {
   try {
-    const element = typeof document === 'undefined' ? undefined : document.activeElement;
-    const descriptor = element === null ? undefined : describeTargetForPanel(element);
-    const requestId = readString(payload['requestId']);
+    if (payload['cancel'] === true) {
+      // The pick's own callback posts its answer, under its own `requestId`.
+      cancelElementPick('request');
+      return;
+    }
 
+    const requestId = readString(payload['requestId']);
+    if (!isHookAttached('domTarget')) {
+      answerTargetRequest(requestId, undefined);
+      return;
+    }
+    const armed = startElementPick((outcome: ElementPickOutcome): void => {
+      answerTargetRequest(
+        requestId,
+        outcome.kind === 'picked' ? describeTargetForPanel(outcome.element) : undefined,
+      );
+    });
+    if (!armed) {
+      answerTargetRequest(requestId, undefined);
+    }
+  } catch {
+    // Contained like every inbound frame; a pick that did arm still answers
+    // through its callback when it ends.
+  }
+}
+
+/**
+ * Post the one `target.described` answer to a `target.request`.
+ *
+ * Posted as a control frame, which `./transport.js` dispatches immediately and
+ * independently of the telemetry buffer — so an answer settled inside
+ * `pagehide` (the document releasing its pick) reaches the bridge whatever
+ * the flush beside it does.
+ *
+ * @param requestId The request's id, echoed when it sent one and omitted
+ * otherwise.
+ * @param descriptor The picked element's descriptor, or `undefined` for a
+ * pick that ended without a describable element — posted as `target: null`.
+ */
+function answerTargetRequest(requestId: string | undefined, descriptor: unknown): void {
+  try {
     postControl('target.described', {
       target: descriptor ?? null,
       ...(requestId === undefined ? {} : { requestId }),
     });
   } catch {
-    // A page that refuses to report its focused element gets no descriptor;
-    // the panel's own `$0` path is unaffected.
+    // `postControl` contains its own failures; nothing further to try.
   }
 }
 
@@ -3092,11 +3191,12 @@ function describeCurrentTarget(payload: Record<string, unknown>): void {
  *
  * Published on the span helper as `describeTarget`, so it is reached through
  * `chrome.devtools.inspectedWindow.eval`, which can transport only
- * JSON-compliant values. Owner hints are deliberately **off**: the result is
- * forwarded verbatim as the `target.selected` payload's target, whose schema
- * admits exactly `selector`, `tagName`, optional `text`, `componentChain` and
- * `url`, so an extra key would be a validation failure at the service rather
- * than extra information.
+ * JSON-compliant values, and used by {@link handleTargetRequest} for the
+ * element a pick settled on. Owner hints are deliberately **off**: either way
+ * the result is forwarded verbatim as the `target.selected` payload's target,
+ * whose schema admits exactly `selector`, `tagName`, optional `text`,
+ * `componentChain` and `url`, so an extra key would be a validation failure at
+ * the service rather than extra information.
  *
  * The `domTarget` family is the gate: element description is a document-scoped
  * capability (see {@link HOOK_BINDINGS}), armed by the opening sequence and

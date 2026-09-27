@@ -1118,9 +1118,12 @@ describe('ExtensionState snapshots pass the webview parser unchanged', () => {
       },
     };
     store.applyPanelGenerated(panel);
-    store.applyTargetSelected({
-      sessionId: SESSION_ID,
-      target: validTarget(),
+    // The element picked in DevTools arrives on a newer record of the session.
+    const adopted = validSessionRecord();
+    store.applySessionRecord({
+      ...adopted,
+      updatedAt: adopted.updatedAt + 1,
+      target: { ...validTarget(), selector: 'main > button.secondary' },
     });
     store.applyCleanupCompleted({ sessionId: SESSION_ID, status: 'clean', conflicts: [] });
     const journal = validSessionRecord().modifications;
@@ -1151,6 +1154,7 @@ describe('ExtensionState snapshots pass the webview parser unchanged', () => {
       ].sort(),
     );
     expect(snapshot.modificationsTotal).toBe(journal.length + 3);
+    expect(snapshot.target?.selector).toBe('main > button.secondary');
     expectAccepted(snapshot);
   });
 

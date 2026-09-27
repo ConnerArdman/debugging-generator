@@ -212,6 +212,32 @@ describe('TargetPicker', () => {
     expect(onUseSelected).not.toHaveBeenCalled();
   });
 
+  it('describes picker mode as a click in the inspected page, cancelled with Escape there', () => {
+    const { rerender } = render(createElement(TargetPicker, props()));
+    const text = (): string => document.body.textContent;
+    expect(text()).toContain(
+      "Turns picker mode on or off. While it is on, the next element you click in the inspected page becomes the session's target; press Esc in the page to cancel.",
+    );
+    // "Pick element" never points at the Elements panel; "Use selected element" does.
+    expect(text()).not.toContain('select next in the Elements panel');
+    expect(text()).toContain(
+      "Uses the element currently selected in the Elements panel as the session's target.",
+    );
+    expect(screen.queryByText('Picker on')).toBeNull();
+
+    rerender(createElement(TargetPicker, props({ pickerActive: true })));
+    expect(buttons().pick.getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByText('Picker on')).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toBe(
+      'Picker mode on. Click an element in the inspected page, or press Escape there to cancel.',
+    );
+
+    rerender(createElement(TargetPicker, props({ pickerActive: false })));
+    expect(buttons().pick.getAttribute('aria-pressed')).toBe('false');
+    expect(screen.queryByText('Picker on')).toBeNull();
+    expect(screen.getByRole('status').textContent).toBe('');
+  });
+
   it('shares one in-flight state across both controls', async () => {
     let release: () => void = () => undefined;
     const onPick = vi.fn(

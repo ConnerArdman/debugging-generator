@@ -108,6 +108,11 @@
  * {@link CLI_CREDENTIAL_DISCONNECT_GRACE_MS} after that connection is gone,
  * at the end of its first lease when no preload ever connected with it, and
  * when the service shuts down; one nothing renews lapses within one lease.
+ * Its holder need not wait for any of that: `POST /credentials/release`
+ * (`../server/routes/credentials.ts`, editor role only) hands its token to
+ * {@link DevServerLauncher.releaseCredential}, which ends the supervision and
+ * revokes it at once — never a launched child's own credential, which only
+ * that child's exit or stop revokes.
  * It is the `devServer.credential` operation of `@debuggen/protocol`'s
  * route table, which owns its path, method and both body schemas: this module
  * reads the path and method off that row and re-exports the response schema,
@@ -120,7 +125,8 @@
  * `scripts/dev-instrumented.mjs` is the command-line mirror of this module
  * (its default mode asks this launcher to start the project through
  * `POST /dev-server/launch`, and it requests a credential through this route
- * with the editor credential).
+ * with the editor credential and releases it through `POST /credentials/release`
+ * as its dev server exits).
  *
  * ## Launch, readiness and shutdown
  *
@@ -143,9 +149,21 @@
  * argument, from `NODE_PATH` directories the service's user alone can write,
  * because `shell: false` decides how a program is spawned, never which one
  * (`sh -c '…'` would otherwise simply run `sh`). It then
- * mints the credential, spawns the child **without a shell option on any
- * platform** — on Windows `cmd.exe` is itself the executable, with a `/c` line
- * that refuses expansion and operator syntax instead of quoting around it
+ * mints the credential and spawns the child. A caller that admitted the root
+ * hands a {@link DevServerLaunchInput.confirmProjectRoot}: it re-proves the
+ * root's canonical identity immediately before detection reads the project
+ * and again immediately before the spawn, with no `await` between that proof
+ * and the spawn. Everything after the first proof acts in the canonical root
+ * it confirms — detection reads `package.json` and the lockfiles there, the
+ * command policy judges the script and any framework-CLI path there, and the
+ * child's working directory is that root — and the second proof must name
+ * the same root. So a symbolic link retargeted after admission is refused
+ * rather than followed, and one swapped to a decoy while detection awaits its
+ * probe and restored before the spawn cannot choose the command (CWE-367).
+ * The launcher spawns the child **without a shell option on any platform** —
+ * on Windows `cmd.exe` is itself the executable,
+ * with a `/c` line that refuses expansion and operator syntax instead of
+ * quoting around it
  * ({@link buildWindowsCommandInvocation}, checked before the credential is
  * minted) — digests its output (see "Child output" below), and waits, bounded
  * by the ready timeout, until the child is **verified**, never merely heard:
@@ -291,9 +309,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   HTTP_ROUTES,
   buildPath,
+  credentialsReleaseRequestSchema,
   describeZodIssues,
   devServerCredentialRequestSchema,
   devServerCredentialResponseSchema,
+  type CredentialsReleaseRequest,
+  type CredentialsReleaseResponse,
   type DevServerCredentialRequest,
   type DevServerCredentialResponse,
   type DevServerLaunchRequest,
@@ -420,8 +441,8 @@ export const DEFAULT_TERMINATION_BOUND_MS = DEFAULT_STOP_GRACE_MS + KILL_CONFIRM
  * The caller starts that dev server itself, so this service never observes
  * its exit. What it observes is the preload's `server-agent` control
  * connection, which the preload holds for as long as the dev server runs. The
- * credential is therefore a supervised lease (AAP §0.5.6: a server-agent
- * credential expires when the launched process exits):
+ * credential is therefore a supervised lease, so that a server-agent
+ * credential expires when the launched process exits:
  *
  * - it is minted to expire one lease from now, and the launcher renews it to
  *   one lease from now at most every third of a lease — and only while a
@@ -2382,9 +2403,11 @@ export type LaunchCommandRefusal =
 /** What {@link checkLaunchCommand} judges a parsed command against. */
 export interface LaunchCommandContext {
   /**
-   * The project root as the caller gave it, in its native spelling: the
-   * child's working directory, and what a relative framework-CLI path
-   * resolves against.
+   * The directory the child runs in, in its native spelling, and what a
+   * relative framework-CLI path resolves against. The launcher passes the
+   * canonical root its launch's {@link DevServerLaunchInput.confirmProjectRoot}
+   * proved — the directory `scripts` was read from — else the project root as
+   * the request spells it.
    */
   readonly projectRoot: string;
   /**
@@ -3162,6 +3185,17 @@ export interface ServerAgentCredentialRenewInput extends ServerAgentCredentialRe
 }
 
 /**
+ * What {@link ServerAgentCredentialIssuer.release} is asked to release: a
+ * token its holder presented, which this launcher may never have supervised
+ * (a credential a previous service instance minted, or one presented after
+ * {@link DevServerLauncher.dispose}), so no project root is known for it.
+ */
+export interface ServerAgentCredentialReleaseInput {
+  /** The plaintext credential its holder asked to release. */
+  readonly token: string;
+}
+
+/**
  * The access boundary's credential operations, as the launcher needs them —
  * satisfied by `../server/auth.ts` through {@link serverAgentCredentialIssuer}.
  *
@@ -3176,11 +3210,26 @@ export interface ServerAgentCredentialRenewInput extends ServerAgentCredentialRe
  *   credential of the project. It resolves to anything but an `Err` result
  *   once the credential no longer authenticates (including "it was already
  *   gone"); a `revoke` that throws, rejects or returns an `Err` is retried by
- *   the launcher with backoff until it succeeds or the lease lapses.
+ *   the launcher with backoff until it succeeds or the lease lapses. The
+ *   access boundary answers `ok(true)` when the call deleted the credential
+ *   and `ok(false)` when it was already gone; the launcher reads that
+ *   difference only to answer {@link DevServerLauncher.releaseCredential}'s
+ *   `released`, which is `true` for an `ok(true)` alone — any other answer
+ *   that is not an `Err` is a revocation that removed nothing it can vouch
+ *   for.
  * - `renew` extends a live, expiring credential's expiry: `ok(true)` when it
  *   did, `ok(false)` when the credential no longer exists (revoked or rotated
  *   away) — which the launcher takes as final — and an `Err` for a failure the
  *   next renewal retries. It must never revive a lapsed or revoked credential.
+ * - `release` revokes a credential its holder asked to release that this
+ *   launcher does not supervise: `ok(true)` when a live credential minted for
+ *   {@link DEV_SERVER_CREDENTIAL_PATH} was deleted by the call, `ok(false)`
+ *   when there was none — and never for a launched child's lease, which it
+ *   must leave untouched (`ok(false)`) — and an `Err` when the store failed.
+ *   Optional: an issuer without it answers every such release
+ *   `{ released: false }`. It must be reached synchronously and act
+ *   synchronously, like the access boundary's, so a caller's revocation fence
+ *   still holds when it runs.
  */
 export interface ServerAgentCredentialIssuer {
   issue(
@@ -3188,6 +3237,7 @@ export interface ServerAgentCredentialIssuer {
   ): MaybePromise<Result<ServerAgentCredential, DebuggenError>>;
   renew(input: ServerAgentCredentialRenewInput): MaybePromise<Result<boolean, DebuggenError>>;
   revoke(input: ServerAgentCredentialRevokeInput): MaybePromise<unknown>;
+  release?(input: ServerAgentCredentialReleaseInput): MaybePromise<Result<boolean, DebuggenError>>;
 }
 
 /**
@@ -3206,6 +3256,11 @@ export interface ServerAgentCredentialAuthority {
   renewServerAgentCredential(token: string, expiresAt: number): Result<boolean, DebuggenError>;
   /** Revokes exactly one credential; `false` when it was already gone. */
   revokeServerAgentCredential(token: string): Result<boolean, DebuggenError>;
+  /**
+   * Releases one live credential that is not a launched child's lease;
+   * `false` when there was none to release.
+   */
+  releaseServerAgentCredential(token: string): Result<boolean, DebuggenError>;
 }
 
 /**
@@ -3239,6 +3294,8 @@ export function serverAgentCredentialIssuer(
       authority.renewServerAgentCredential(input.token, input.expiresAt),
     revoke: (input: ServerAgentCredentialRevokeInput) =>
       authority.revokeServerAgentCredential(input.token),
+    release: (input: ServerAgentCredentialReleaseInput) =>
+      authority.releaseServerAgentCredential(input.token),
   });
 }
 
@@ -3369,7 +3426,12 @@ export interface ChildProcessLike {
 
 /** The options the launcher spawns every child with. */
 export interface SpawnOptionsLike {
-  /** The project root. */
+  /**
+   * The working directory. For a dev server, its project root: the canonical
+   * root the launch's {@link DevServerLaunchInput.confirmProjectRoot}
+   * confirmed, in the platform's native spelling, else the root as the
+   * request spells it.
+   */
   readonly cwd: string;
   /** From {@link buildDevServerEnv}. */
   readonly env: Readonly<Record<string, string>>;
@@ -3666,6 +3728,21 @@ export interface DevServerHold {
   release(): Promise<void>;
 }
 
+/**
+ * What a {@link DevServerLaunchInput.confirmProjectRoot} answers while the
+ * project root is still the directory it was admitted as: that directory's
+ * canonical path — every symbolic link resolved, absolute and normalised POSIX
+ * (`/home/dev/shop`, `C:/work/shop`).
+ *
+ * `../server/auth.ts`'s `AdmittedProjectRoot` satisfies it structurally, so
+ * `reconfirmProjectRoot(principal, admitted)` can be handed over as it is;
+ * this module never imports the access boundary.
+ */
+export interface ConfirmedProjectRoot {
+  /** The canonical path the root was admitted under, normalised POSIX. */
+  readonly canonicalRoot: string;
+}
+
 /** Input of {@link DevServerLauncher.launch}: the protocol request plus session context. */
 export type DevServerLaunchInput = Omit<DevServerLaunchRequest, 'sessionId'> & {
   /**
@@ -3681,6 +3758,52 @@ export type DevServerLaunchInput = Omit<DevServerLaunchRequest, 'sessionId'> & {
    * listener on its port is held by the launched child's process tree.
    */
   readonly devServerUrl?: string | undefined;
+  /**
+   * Re-proves, synchronously, that the project root still resolves to the
+   * canonical path it was admitted under (CWE-367). A launch acts on the root
+   * only after many awaits — detection reads the project, the credential is
+   * minted — and a symbolic link on the root's path may be retargeted in
+   * between, so the caller that admitted the root hands its re-proof here.
+   *
+   * A launch that spawns calls it twice: immediately before detection first
+   * reads the project, and again immediately before the spawn, after the
+   * child's environment is built, with no `await` between that call and the
+   * spawn. Every read and judgement after the first call acts in the
+   * {@link ConfirmedProjectRoot.canonicalRoot} it proved, in the platform's
+   * native spelling — the directory that was proven, never the links of the
+   * spelled root again: detection reads its `package.json` and lockfiles there
+   * (as `readRoot`), the command policy judges script declarations and
+   * framework-CLI paths there, and the child is spawned with it as `cwd`. So a
+   * link swapped to a decoy while detection awaits its probe, and restored
+   * before the spawn, cannot let the decoy's manifest authorize a script. The
+   * second call must prove the same canonical root as the first. Everything
+   * that names the project keeps the request's spelling: the registry key, the
+   * credential's scope, `DEBUGGEN_PROJECT_ROOT`, the project detection reports
+   * and its relaunch hint names, and every log field.
+   *
+   * An `Err` refuses the launch and is returned **unchanged**: before
+   * detection nothing is minted or spawned; before the spawn the credential
+   * minted for the child is revoked first. A callback that throws, answers a
+   * canonical root that is not an absolute path, or — before the spawn —
+   * proves a canonical root other than the one before detection refuses the
+   * launch the same way with an `INTERNAL` failure
+   * (`project-root-confirmation-threw`, `project-root-confirmation-invalid`,
+   * `project-root-confirmation-changed`). A launch that reuses or joins a
+   * child spawns nothing and does not call it. Without it the launcher behaves
+   * as before: detection reads, the policy judges and the child is spawned in
+   * the root as the request spells it.
+   *
+   * @example
+   * ```ts
+   * const admitted = admitProjectRoot(principal, projectRoot); // ../server/auth.ts
+   * if (isErr(admitted)) return answer(admitted.error);
+   * await launcher.launch({
+   *   projectRoot,
+   *   confirmProjectRoot: () => reconfirmProjectRoot(principal, admitted.value),
+   * });
+   * ```
+   */
+  readonly confirmProjectRoot?: (() => Result<ConfirmedProjectRoot, DebuggenError>) | undefined;
 };
 
 /** A dev server this launcher started (now, or earlier for the same project). */
@@ -3792,6 +3915,12 @@ export interface DevServerLauncher {
    * more first; when it survives again the launch is refused with the same
    * `survived-termination` error {@link DevServerLauncher.stop} answers, so no
    * second server is started beside it and its record is never replaced.
+   * A request carrying {@link DevServerLaunchInput.confirmProjectRoot} has
+   * its project root re-proved before detection and again immediately before
+   * the spawn; detection reads, the command policy judges and the child is
+   * spawned in the canonical root it confirms, which both proofs must agree
+   * on. A refusal is returned unchanged, with nothing spawned and no
+   * credential left live.
    */
   launch(request: DevServerLaunchInput): Promise<Result<DevServerLaunchResult, DebuggenError>>;
   /**
@@ -3822,13 +3951,57 @@ export interface DevServerLauncher {
    * ({@link DevServerLauncherDeps.serverAgentConnections}), revokes it
    * {@link CLI_CREDENTIAL_DISCONNECT_GRACE_MS} after that connection is gone —
    * the dev server exited — or at the end of the first lease when no preload
-   * ever connected with it, and revokes it on {@link dispose}. {@link stop},
+   * ever connected with it, and revokes it on {@link dispose} or when its
+   * holder releases it ({@link releaseCredential}). {@link stop},
    * {@link stopForSession} and {@link stopAll} never touch it: this service did
    * not start its dev server.
    */
   issueCredential(
     input: DevServerCredentialRequest,
   ): Promise<Result<DevServerCredentialResponse, DebuggenError>>;
+  /**
+   * Release a `server-agent` credential {@link issueCredential} minted, at its
+   * holder's request — the logic behind `POST /credentials/release`, which
+   * `scripts/dev-instrumented.mjs` calls as the dev server it started exits.
+   * The route authorises (editor role, then the revocation fence); this finds
+   * the credential and revokes it.
+   *
+   * **Synchronous from its entry to the store.** Nothing is awaited before the
+   * issuer's `revoke` or `release` is called, so the route's revocation fence,
+   * checked synchronously just before this call, still holds when the store
+   * acts: no rotation can interleave between the two.
+   *
+   * `released` says what **this request** did: `true` when it revoked a live
+   * credential, `false` when it released nothing. `false` is not proof that
+   * the token no longer authenticates — a launched child's own credential is
+   * answered `false` and stays live.
+   *
+   * - A credential this launcher supervises: supervision ends for good and the
+   *   credential is revoked through the same path every other revocation
+   *   takes, its sockets closed — `{ released: true }` when the issuer
+   *   confirms this request's revocation removed it while its lease was
+   *   current. One the store no longer held (a rotation removed it before
+   *   supervision noticed) or whose lease had already lapsed was not live:
+   *   `{ released: false }`, and its supervision is over all the same. A
+   *   revocation the store refuses joins the pending retries like every other,
+   *   and is answered as a `CLEANUP_PARTIAL` failure (reason
+   *   `credential-revocation-pending`) whose hint names the moment the
+   *   credential lapses at the latest.
+   * - A launched child's own credential: never touched — `{ released: false }`.
+   *   Only that child's exit or stop revokes it.
+   * - Any other token — a credential a previous service instance minted, one
+   *   supervision already revoked, one presented after {@link dispose}: the
+   *   issuer's `release` decides, `{ released }` as it answers and a
+   *   `STORE_ERROR` when it fails; an issuer without `release` answers
+   *   `{ released: false }`.
+   *
+   * Every `false` is the same answer, so the reply says nothing about which
+   * credentials exist. The token is hashed to find its lease and handed only
+   * to the issuer: it never reaches a log line, an error or a reply.
+   */
+  releaseCredential(
+    input: CredentialsReleaseRequest,
+  ): Promise<Result<CredentialsReleaseResponse, DebuggenError>>;
   /**
    * The session ended: release its hold on every session-owned child, stopping
    * each one no other session relies on and revoking its credential, and
@@ -5529,6 +5702,23 @@ class CredentialLease {
   }
 }
 
+/**
+ * What one revocation attempt learned from the issuer, for the caller that
+ * started it. A revocation succeeds once the credential no longer
+ * authenticates, which includes finding it already gone — rotated away, or
+ * revoked by a path this launcher never saw — so success alone does not say
+ * that the attempt removed anything. `removed` does: it is `true` only when
+ * the issuer answered `ok(true)`, the access boundary's "I deleted it just
+ * now" ({@link ServerAgentCredentialIssuer.revoke}); `ok(false)` ("it was
+ * already gone") and any other answer that is not an `Err` leave it `false`.
+ * Only {@link DevServerLauncher.releaseCredential} reads it, to answer
+ * `released` for what that one request did.
+ */
+interface RevocationReceipt {
+  /** Whether the issuer confirmed this attempt removed the credential. */
+  removed: boolean;
+}
+
 /** One address a verification round probes. */
 interface ReadyTarget {
   /** The URL probed: a candidate's `origin/`, or the requested URL. */
@@ -5788,7 +5978,13 @@ function executableName(file: string): string {
 
 /** The project root in the two spellings the launcher needs, validated. */
 interface ProjectRootForms {
-  /** As the caller gave it (trimmed), for `cwd` and for detection. */
+  /**
+   * As the caller gave it (trimmed): the project detection reports and its
+   * relaunch hint names. When the request carries no
+   * {@link DevServerLaunchInput.confirmProjectRoot} it is also the acting
+   * directory — what detection reads, what the command policy judges against
+   * and the child's `cwd`; with one, the confirmed canonical root is.
+   */
   readonly native: string;
   /** Normalised POSIX: the registry key, the credential scope and `DEBUGGEN_PROJECT_ROOT`. */
   readonly key: string;
@@ -5827,6 +6023,115 @@ function projectRootForms(
     }
   }
   return ok({ native, key: normalizePosix(toPosix(native)) });
+}
+
+/**
+ * The act a {@link DevServerLaunchInput.confirmProjectRoot} call guards:
+ * detection's first read of the project, or the spawn.
+ */
+type ProjectRootConfirmationStage = 'before-detection' | 'before-spawn';
+
+/**
+ * Why a confirmation the launcher ran could not stand as one: it threw, it
+ * answered no absolute canonical root, or — before the spawn — it proved a
+ * canonical root other than the one detection and the command policy were
+ * judged in (or proved one where the first proved none, or the reverse).
+ */
+type ProjectRootConfirmationFailure =
+  | 'project-root-confirmation-threw'
+  | 'project-root-confirmation-invalid'
+  | 'project-root-confirmation-changed';
+
+/** A drive with no path after it (`C:`), which Windows reads as that drive's current directory. */
+const BARE_WINDOWS_DRIVE = /^[A-Za-z]:$/;
+
+/** A `details.reason` of the shape this module logs: a short kebab-case word list. */
+const LOGGABLE_REASON = /^[a-z][a-z0-9-]{0,63}$/;
+
+/**
+ * A confirmed canonical root — normalised POSIX, as the access boundary
+ * proves it — in the spelling `spawn` takes as a working directory on
+ * `platform`: backslash-separated on Windows, a bare drive given its root
+ * separator so it names the drive's root; unchanged elsewhere.
+ *
+ * @example
+ * ```ts
+ * nativeWorkingDirectory('C:/work/shop', 'win32'); // 'C:\\work\\shop'
+ * nativeWorkingDirectory('/home/dev/shop', 'linux'); // '/home/dev/shop'
+ * ```
+ */
+function nativeWorkingDirectory(canonicalRoot: string, platform: NodeJS.Platform): string {
+  if (platform !== 'win32') {
+    return canonicalRoot;
+  }
+  const native = canonicalRoot.replaceAll('/', '\\');
+  return BARE_WINDOWS_DRIVE.test(native) ? `${native}\\` : native;
+}
+
+/**
+ * The directory a fresh launch acts in once its root has been confirmed
+ * before detection: the confirmed canonical root in the platform's native
+ * spelling, or — for a request without a confirmation — the root as the
+ * request spells it. Detection reads its project files there, the command
+ * policy judges script declarations and framework-CLI paths there, and the
+ * child is spawned there, so all three concern one directory (CWE-367).
+ */
+function actingDirectoryOf(
+  root: ProjectRootForms,
+  confirmed: ConfirmedProjectRoot | undefined,
+  platform: NodeJS.Platform,
+): string {
+  return confirmed === undefined
+    ? root.native
+    : nativeWorkingDirectory(confirmed.canonicalRoot, platform);
+}
+
+/**
+ * Whether the confirmation before the spawn proved the same canonical root
+ * as the one before detection — exactly, since both come from the same
+ * admitted value — or, for a request without a confirmation, that neither
+ * stage ran one.
+ */
+function isSameConfirmation(
+  first: ConfirmedProjectRoot | undefined,
+  second: ConfirmedProjectRoot | undefined,
+): boolean {
+  if (first === undefined || second === undefined) {
+    return first === second;
+  }
+  return first.canonicalRoot === second.canonicalRoot;
+}
+
+/** Whether a confirmation's answer names an absolute canonical root, read structurally. */
+function isConfirmedProjectRoot(value: unknown): value is ConfirmedProjectRoot {
+  if (typeof value !== 'object' || value === null || !('canonicalRoot' in value)) {
+    return false;
+  }
+  const { canonicalRoot } = value;
+  return typeof canonicalRoot === 'string' && isAbsolutePath(canonicalRoot);
+}
+
+/**
+ * The refusal of a launch whose project-root confirmation could not stand:
+ * `INTERNAL`, answered by the route with a fixed message, because it is a
+ * defect of the caller's check rather than anything the developer did. Names
+ * no path.
+ */
+function projectRootConfirmationError(reason: ProjectRootConfirmationFailure): DebuggenError {
+  return new DebuggenError(
+    'INTERNAL',
+    'The project root could not be confirmed, so no dev server was launched.',
+    {
+      hint: 'The service log holds the reason. Launch the dev server again from the project folder in VS Code.',
+      details: { reason },
+    },
+  );
+}
+
+/** An error's `details.reason`, when it has the shape this module logs. */
+function loggableReasonOf(error: DebuggenError): string | undefined {
+  const reason = error.details?.['reason'];
+  return typeof reason === 'string' && LOGGABLE_REASON.test(reason) ? reason : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -6158,8 +6463,22 @@ class DevServerLauncherImpl implements DevServerLauncher {
       hasServerAgentForProject: (projectRoot: string): boolean =>
         requestedUrl !== undefined && this.preloadServesAt(projectRoot, requestedUrl),
     });
+    // Detection is the first read of the project: re-prove the root first, so
+    // a link retargeted since admission is refused before anything is read,
+    // minted or spawned.
+    const readable = this.#confirmProjectRoot(root, request, 'before-detection');
+    if (isErr(readable)) {
+      return readable;
+    }
+    // From here on every read and judgement acts in the proven directory:
+    // detection awaits its probe before it reads `package.json` and the
+    // lockfiles, and a link on the spelled root swapped to a decoy across
+    // that await — and restored before the spawn — would otherwise let the
+    // decoy's manifest decide which script runs (CWE-367). Detection still
+    // reports, and its relaunch hint still names, the session's spelling.
+    const actingDirectory = actingDirectoryOf(root, readable.value, this.#platform);
     const detection = await this.#detect(
-      { projectRoot: root.native, devServerUrl: requestedUrl },
+      { projectRoot: root.native, readRoot: actingDirectory, devServerUrl: requestedUrl },
       {
         ...this.#deps.detectDeps,
         serverAgents,
@@ -6238,7 +6557,7 @@ class DevServerLauncherImpl implements DevServerLauncher {
       );
     }
 
-    const command = this.#resolveCommand(request.command, root, detection);
+    const command = this.#resolveCommand(request.command, actingDirectory, detection);
     if (isErr(command)) {
       return command;
     }
@@ -6306,11 +6625,32 @@ class DevServerLauncherImpl implements DevServerLauncher {
       return err(DebuggenError.from(error, 'CONFIG_INVALID'));
     }
 
+    // The last check before the spawn, with no `await` between it and the
+    // spawn: the root must still be the directory it was admitted as, and the
+    // child runs in that proven directory, not through the spelled root's
+    // links again (CWE-367).
+    const confirmed = this.#confirmProjectRoot(root, request, 'before-spawn');
+    if (isErr(confirmed)) {
+      await revokeUnused();
+      return confirmed;
+    }
+    // The command was judged in the directory the first confirmation proved;
+    // the child may only run where that judgement holds. `reconfirmProjectRoot`
+    // answers the same admitted value each time, so a difference is a defect
+    // of the caller's check, refused rather than trusted.
+    if (!isSameConfirmation(readable.value, confirmed.value)) {
+      const changed = projectRootConfirmationError('project-root-confirmation-changed');
+      this.#logUnconfirmedProjectRoot(root, 'before-spawn', changed, undefined);
+      await revokeUnused();
+      return err(changed);
+    }
+    const cwd = actingDirectory;
+
     let child: ChildProcessLike;
     const startedAt = this.#now();
     try {
       child = this.#spawn(invocation.value.command, invocation.value.args, {
-        cwd: root.native,
+        cwd,
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: false,
@@ -6405,6 +6745,71 @@ class DevServerLauncherImpl implements DevServerLauncher {
     }
 
     return err(await this.#failStartup(state, outcome, command.value.file));
+  }
+
+  /**
+   * Runs a launch's {@link DevServerLaunchInput.confirmProjectRoot} for one
+   * act of a fresh launch, synchronously, so the caller can act with no
+   * `await` between the proof and the act.
+   *
+   * The caller's own refusal is returned unchanged. A throw, or an answer
+   * whose canonical root is not an absolute path, fails closed as an
+   * `INTERNAL` refusal ({@link projectRootConfirmationError}) rather than
+   * letting a root nobody re-proved be acted on; the thrown value is not kept,
+   * because nothing promises it is free of paths. Every refusal is logged at
+   * `warn` by its code and reason alone, beside the registry key every record
+   * of this module carries.
+   *
+   * @param root The launch's project root.
+   * @param request The launch request, which may carry the confirmation.
+   * @param stage The act the confirmation guards, for the log.
+   * @returns `Ok(undefined)` when the request carries no confirmation, the
+   *   confirmed root, or the refusal.
+   */
+  #confirmProjectRoot(
+    root: ProjectRootForms,
+    request: DevServerLaunchInput,
+    stage: ProjectRootConfirmationStage,
+  ): Result<ConfirmedProjectRoot | undefined, DebuggenError> {
+    const confirm = request.confirmProjectRoot;
+    if (confirm === undefined) {
+      return ok(undefined);
+    }
+    let answer: Result<ConfirmedProjectRoot, DebuggenError>;
+    let thrownCode: string | undefined;
+    try {
+      answer = confirm();
+    } catch (error) {
+      thrownCode = errnoCodeOf(error);
+      answer = err(projectRootConfirmationError('project-root-confirmation-threw'));
+    }
+    if (isErr(answer)) {
+      this.#logUnconfirmedProjectRoot(root, stage, answer.error, thrownCode);
+      return answer;
+    }
+    if (!isConfirmedProjectRoot(answer.value)) {
+      const invalid = projectRootConfirmationError('project-root-confirmation-invalid');
+      this.#logUnconfirmedProjectRoot(root, stage, invalid, undefined);
+      return err(invalid);
+    }
+    return answer;
+  }
+
+  /** The `warn` record of a refused {@link DevServerLaunchInput.confirmProjectRoot}: codes only. */
+  #logUnconfirmedProjectRoot(
+    root: ProjectRootForms,
+    stage: ProjectRootConfirmationStage,
+    error: DebuggenError,
+    thrownCode: string | undefined,
+  ): void {
+    const reason = loggableReasonOf(error);
+    this.#log('warn', 'The project root was not confirmed; no dev server was launched', {
+      projectRoot: root.key,
+      stage,
+      code: error.code,
+      ...(reason === undefined ? {} : { reason }),
+      ...(thrownCode === undefined ? {} : { errorCode: thrownCode }),
+    });
   }
 
   /**
@@ -6583,14 +6988,24 @@ class DevServerLauncherImpl implements DevServerLauncher {
    * minted, so a shell, an interpreter, a script that starts no dev server,
    * a loader or modules from an untrusted directory never start. A
    * package-manager run records the script it starts.
+   *
+   * The policy is judged in `actingDirectory` — the confirmed canonical root
+   * the child will run in, else the root as the request spells it — against
+   * the dev-server scripts detection read from that same directory, so a
+   * script's declaration and a framework CLI's trusted path are established
+   * where the child resolves them, never through a link on the spelled root.
+   *
+   * @param requested The request's command, when it named one.
+   * @param actingDirectory The directory the child runs in (native spelling).
+   * @param detection The detection that read `actingDirectory`.
    */
   #resolveCommand(
     requested: string | undefined,
-    root: ProjectRootForms,
+    actingDirectory: string,
     detection: DevServerDetection,
   ): Result<ResolvedCommand, DebuggenError> {
     const policy: LaunchCommandContext = {
-      projectRoot: root.native,
+      projectRoot: actingDirectory,
       scripts: detection.devServerScripts,
       platform: this.#platform,
       nodeExecutablePath: this.#deps.nodeExecutablePath ?? process.execPath,
@@ -8076,12 +8491,178 @@ class DevServerLauncherImpl implements DevServerLauncher {
     return ok(body.data);
   }
 
+  async releaseCredential(
+    input: CredentialsReleaseRequest,
+  ): Promise<Result<CredentialsReleaseResponse, DebuggenError>> {
+    // Nothing below awaits before the issuer's `revoke` or `release` is
+    // called: the route checked its revocation fence synchronously just
+    // before this call, and that check must still hold when the store acts.
+    const parsed = credentialsReleaseRequestSchema.safeParse(input);
+    if (!parsed.success) {
+      // A fixed sentence: the rejected value may be the credential itself.
+      return err(
+        new DebuggenError(
+          'PROTOCOL_INVALID_MESSAGE',
+          'The credential release request is invalid.',
+          {
+            hint: 'Send { "token": "<the credential POST /dev-server/credential returned>" }.',
+            details: { reason: 'invalid-release-request' },
+          },
+        ),
+      );
+    }
+    const { token } = parsed.data;
+    const tokenHash = sha256Hex(token);
+
+    const supervision = this.#cliLeaseSupervisionOf(tokenHash);
+    if (supervision !== undefined) {
+      return this.#releaseSupervisedCliLease(supervision);
+    }
+
+    const child = this.#launchedChildOf(tokenHash);
+    if (child !== undefined) {
+      // Only the child's exit or stop revokes its credential; the caller is
+      // told what it is told for any token that is not live.
+      this.#log(
+        'warn',
+        "A credential release named a launched dev server's own credential; it is left to that dev server's stop",
+        { projectRoot: child.key },
+      );
+      return ok({ released: false });
+    }
+
+    return this.#releaseUnsupervised(token);
+  }
+
+  /** The supervision of the credential route lease whose token has the digest `tokenHash`, if any. */
+  #cliLeaseSupervisionOf(tokenHash: string): CliCredentialSupervision | undefined {
+    for (const supervision of this.#cliLeases.values()) {
+      if (supervision.lease.tokenHash === tokenHash) {
+        return supervision;
+      }
+    }
+    return undefined;
+  }
+
+  /** The registered launched child whose own credential has the digest `tokenHash`, if any. */
+  #launchedChildOf(tokenHash: string): ChildState | undefined {
+    for (const state of this.#registry.values()) {
+      if (state.lease.tokenHash === tokenHash) {
+        return state;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Release a supervised credential route lease at its holder's request:
+   * supervision ends first, so no later check renews or revokes it, then the
+   * credential is revoked through {@link #releaseCredential} — reached
+   * synchronously, whose retries take over a revocation the store refuses.
+   *
+   * `released` reports what this request did, never merely the state the
+   * credential ends in: it is `true` only when this request's own revocation
+   * removed the credential — the issuer confirmed the deletion (see
+   * {@link RevocationReceipt}) — while its lease was still current. Every
+   * other revocation that succeeds answers `released: false`:
+   *
+   * - the store no longer held the credential — a rotation removed it while
+   *   this launcher still supervised it, before its next check noticed — so
+   *   the revocation found nothing to remove;
+   * - the lease had already passed its expiry, so the credential was not live
+   *   (it is revoked all the same: only the store knows whether a renewal
+   *   still in flight extended it);
+   * - the store refused the revocation until the lease lapsed, so nothing was
+   *   removed.
+   *
+   * Supervision ends and the lease is settled in every one of those cases, so
+   * no retry or later check acts on a credential that no longer
+   * authenticates.
+   */
+  async #releaseSupervisedCliLease(
+    supervision: CliCredentialSupervision,
+  ): Promise<Result<CredentialsReleaseResponse, DebuggenError>> {
+    const { lease } = supervision;
+    this.#forgetCliLease(supervision);
+    if (lease.invalidated) {
+      return ok({ released: false });
+    }
+    const lapsed = this.#now() >= lease.expiresAt;
+    const receipt: RevocationReceipt = { removed: false };
+    const revoked = await this.#releaseCredential(lease, receipt);
+    if (!revoked) {
+      this.#log(
+        'warn',
+        "The server-agent credential of a dev server started outside the service could not be revoked at its holder's request yet; the revocation is retried",
+        { projectRoot: lease.projectRoot, expiresAt: lease.expiresAt },
+      );
+      return err(releasePendingError(lease.expiresAt));
+    }
+    const released = receipt.removed && !lapsed;
+    if (released) {
+      this.#log(
+        'info',
+        "The server-agent credential of a dev server started outside the service is revoked at its holder's request",
+        { projectRoot: lease.projectRoot, lapsed },
+      );
+    } else {
+      this.#log(
+        'info',
+        'The server-agent credential of a dev server started outside the service was no longer live when its holder released it; its supervision is over',
+        { projectRoot: lease.projectRoot, lapsed, removed: receipt.removed },
+      );
+    }
+    return ok({ released });
+  }
+
+  /**
+   * Release a token this launcher does not supervise through the issuer's own
+   * `release`, called synchronously: a credential a previous service instance
+   * minted, one supervision already revoked, or any token after `dispose`.
+   * The issuer never touches a launched child's lease. An issuer without
+   * `release` has nothing it could release.
+   */
+  async #releaseUnsupervised(
+    token: string,
+  ): Promise<Result<CredentialsReleaseResponse, DebuggenError>> {
+    const { credentials } = this.#deps;
+    if (credentials.release === undefined) {
+      return ok({ released: false });
+    }
+    let outcome: unknown;
+    try {
+      outcome = await credentials.release({ token });
+    } catch (error) {
+      this.#log('error', 'Releasing a server-agent credential failed', {
+        errorCode: errnoCodeOf(error),
+      });
+      return err(releaseFailedError(error));
+    }
+    if (isOkResultOf(outcome, true)) {
+      this.#log('info', "Released a server-agent credential at its holder's request", {});
+      return ok({ released: true });
+    }
+    if (isOkResultOf(outcome, false)) {
+      return ok({ released: false });
+    }
+    // An `Err` carries its error; anything else is not a `Result` at all.
+    const cause =
+      isErrResult(outcome) && typeof outcome === 'object' && outcome !== null && 'error' in outcome
+        ? outcome.error
+        : undefined;
+    this.#log('warn', 'The access boundary could not release a server-agent credential', {
+      errorCode: errnoCodeOf(cause),
+    });
+    return err(releaseFailedError(cause));
+  }
+
   /**
    * The {@link DEV_SERVER_CREDENTIAL_PATH} credentials under supervision (see
    * {@link DEFAULT_CLI_CREDENTIAL_LEASE_MS}), each until it is revoked or found
    * gone. `stop`, `stopForSession` and `stopAll` never read it: this service
-   * did not start those dev servers. {@link DevServerLauncher.dispose} revokes
-   * every one still here.
+   * did not start those dev servers. {@link DevServerLauncher.releaseCredential}
+   * revokes one at its holder's request, and {@link DevServerLauncher.dispose}
+   * revokes every one still here.
    */
   readonly #cliLeases = new Map<CredentialLease, CliCredentialSupervision>();
 
@@ -8352,9 +8933,15 @@ class DevServerLauncherImpl implements DevServerLauncher {
    * One revocation attempt through the issuer. Never throws, and logs (without
    * the token) when it could not revoke.
    *
+   * @param receipt Filled in when the issuer answers without an `Err`: whether
+   *   it confirmed that this attempt removed the credential (see
+   *   {@link RevocationReceipt}).
    * @returns `true` once the credential no longer authenticates.
    */
-  async #revoke(input: ServerAgentCredentialRevokeInput): Promise<boolean> {
+  async #revoke(
+    input: ServerAgentCredentialRevokeInput,
+    receipt?: RevocationReceipt,
+  ): Promise<boolean> {
     try {
       const outcome = await this.#deps.credentials.revoke(input);
       if (isErrResult(outcome)) {
@@ -8362,6 +8949,9 @@ class DevServerLauncherImpl implements DevServerLauncher {
           projectRoot: input.projectRoot,
         });
         return false;
+      }
+      if (receipt !== undefined) {
+        receipt.removed = isOkResultOf(outcome, true);
       }
       return true;
     } catch (error) {
@@ -8385,15 +8975,19 @@ class DevServerLauncherImpl implements DevServerLauncher {
    * a child (exit, stop, session end, shutdown, a failed start) and by an
    * unused credential; concurrent callers share one attempt.
    *
+   * @param receipt Filled in by the attempt this call starts, if the issuer
+   *   answers it; left as it was when the call shares an attempt already in
+   *   flight — that attempt is another caller's — or when the credential was
+   *   already gone before it.
    * @returns `true` once the credential no longer authenticates; `false` while
    *   its revocation is still pending.
    */
-  async #releaseCredential(lease: CredentialLease): Promise<boolean> {
+  async #releaseCredential(lease: CredentialLease, receipt?: RevocationReceipt): Promise<boolean> {
     lease.releaseRequested = true;
     this.#clearTimer(lease.renewalTimer);
     lease.renewalTimer = undefined;
 
-    const revoked = await lease.revoke((input) => this.#revoke(input));
+    const revoked = await lease.revoke((input) => this.#revoke(input, receipt));
     if (revoked) {
       this.#settleRevocation(lease);
       return true;
@@ -8752,6 +9346,40 @@ function revocationPendingError(pending: readonly CredentialLease[]): DebuggenEr
       details: { reason: 'credential-revocation-pending', pending: pending.length, lapsesAt },
     },
   );
+}
+
+/**
+ * A release its holder asked for whose revocation the store refused. Reported
+ * as incomplete cleanup rather than a release; the revocation keeps being
+ * retried, and the credential lapses with its lease at the latest — the
+ * moment named in the hint.
+ *
+ * @param lapsesAt When the credential stops authenticating on its own, in epoch milliseconds.
+ */
+function releasePendingError(lapsesAt: number): DebuggenError {
+  return new DebuggenError(
+    'CLEANUP_PARTIAL',
+    'The server-agent credential could not be revoked yet.',
+    {
+      hint: `Debug Generator keeps retrying the revocation; the credential stops working on its own by ${new Date(lapsesAt).toISOString()} at the latest. The service log holds the reason.`,
+      details: { reason: 'credential-revocation-pending', pending: 1, lapsesAt },
+    },
+  );
+}
+
+/**
+ * A release the access boundary could not perform: its `release` threw,
+ * failed or answered something that is not a `Result`. Fixed product copy;
+ * the cause is kept for a debugger and never rendered.
+ *
+ * @param cause What the issuer threw or failed with, when anything.
+ */
+function releaseFailedError(cause: unknown): DebuggenError {
+  return new DebuggenError('STORE_ERROR', 'The server-agent credential could not be released.', {
+    hint: 'The service log holds the reason. Release the credential again, or restart the Debug Generator service; it stops working on its own at the end of its lease at the latest.',
+    details: { reason: 'credential-release-failed' },
+    ...(cause === undefined ? {} : { cause }),
+  });
 }
 
 /**

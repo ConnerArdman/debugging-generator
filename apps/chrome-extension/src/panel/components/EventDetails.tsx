@@ -952,8 +952,10 @@ function AttributeValue(props: AttributeValueProps): ReactElement {
  * Each width is the `DataTable` role for the column's content, never a length:
  * the attribute key is a short `label`; the value is a `name`, which takes the
  * larger share of the drawer's spare width and wraps inside its `Code` beyond
- * that. Both roles have a readable floor, so a drawer narrower than the two
- * scrolls the table instead of squeezing either column.
+ * that. Both roles have a readable floor; the value column, a truncating role,
+ * may narrow to the `--dg-column-yield` fraction of its floor when that makes
+ * the table fit a narrow drawer, and a drawer too narrow even for that keeps
+ * both floors and scrolls the table instead of squeezing either column.
  */
 const ATTRIBUTE_COLUMNS: readonly DataTableColumn<AttributeRow>[] = [
   {

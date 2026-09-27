@@ -1,8 +1,8 @@
 /**
- * Unit spec for the read proof on the Chrome side of the access boundary
- * (AAP §0.5.6): how the credential store in `../src/background/auth.ts` keeps
- * the proof pairing issued, and how `../src/background/ws-bridge.ts` presents
- * it on the four DevTools reads.
+ * Unit spec for the read proof on the Chrome side of the local service's
+ * access boundary: how the credential store in `../src/background/auth.ts`
+ * keeps the proof pairing issued, and how `../src/background/ws-bridge.ts`
+ * presents it on the four DevTools reads.
  *
  * Chrome attaches `Origin: chrome-extension://<id>` to the worker's `POST`s and
  * to its WebSocket upgrade, but to none of its `GET`s, and an `Origin` is only

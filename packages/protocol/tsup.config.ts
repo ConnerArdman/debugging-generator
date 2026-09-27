@@ -9,8 +9,8 @@
  * client SDK (`client/{ws-client,http-client}.ts`).
  *
  * Three separate surfaces load or bundle the artefact this file emits, and
- * nothing else in the package, because AAP 0.4.2 holds both extensions
- * to importing `@debuggen/protocol` only and never service internals:
+ * nothing else in the package, because both extensions import
+ * `@debuggen/protocol` only, never service internals:
  *
  *   - `apps/local-service`   real Node 24 ESM, loaded from disk;
  *   - `apps/vscode-extension` an esbuild CommonJS extension-host bundle plus a

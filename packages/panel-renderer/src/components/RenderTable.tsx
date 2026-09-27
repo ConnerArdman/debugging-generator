@@ -483,11 +483,15 @@ const COLUMN_TOOLTIPS = Object.freeze({
  *                           as tall as the histogram beside it
  *   phases        label     one short phase chip per line
  *
- * Every role has a non-zero floor, and the primitive sums the floors into the
- * grid's own minimum width (`--dgc-min-inline`), so a panel narrower than the
- * sum scrolls the table horizontally with every column still readable, instead
- * of squeezing a column to its padding and painting one cell's content over the
- * next. Once every floor is met, spare width goes mostly to the name, the
+ * Every role has a non-zero floor, and the primitive sums the columns' floors
+ * and minimums into the grid's own width (`--dgc-readable-inline`,
+ * `--dgc-min-inline`). A panel just too narrow for every floor narrows the
+ * three `text` columns (the component name, the trigger histogram and the prop
+ * list), never below the `--dg-column-yield` fraction of theirs, only as far
+ * as the table needs to fit; a panel too narrow even for that keeps every
+ * floor and scrolls the table horizontally with every column readable, instead
+ * of squeezing a column to its padding and painting one cell's content over
+ * the next. Once every floor is met, spare width goes mostly to the name, the
  * histogram and the prop list, and barely to a figure column. A token floor and
  * a ratio resolve identically in the header row and in every data row, which is
  * what keeps each column under its own heading (see `../primitives/DataTable`

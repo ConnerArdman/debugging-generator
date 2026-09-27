@@ -51,6 +51,7 @@ import {
   createHttpApp,
 } from './http.js';
 import type { HttpApp, HttpAppDeps, ResponseVerificationMode } from './http.js';
+import { MAX_CREDENTIALS_REQUEST_BODY_BYTES } from './routes/credentials.js';
 import type * as DevServerModule from './routes/dev-server.js';
 import type * as HealthModule from './routes/health.js';
 import { MAX_PAIR_REQUEST_BODY_BYTES } from './routes/pair.js';
@@ -348,7 +349,7 @@ function operationRoute(
   };
 }
 
-/** Every route module that reads a body, each through one of its operations. */
+/** Every route module that reads a body, each through at least one of its operations. */
 const BODY_ROUTES: readonly BodyRoute[] = [
   operationRoute('session.create', EDITOR),
   operationRoute('telemetry.event', SERVER_AGENT),
@@ -363,6 +364,7 @@ const BODY_ROUTES: readonly BodyRoute[] = [
   operationRoute('pair.start', EDITOR),
   operationRoute('pair.complete', null),
   operationRoute('credentials.rotate', EDITOR),
+  operationRoute('credentials.release', EDITOR),
 ];
 
 afterEach(() => {
@@ -389,6 +391,10 @@ describe('the request-body guard', () => {
       expect(Number.isSafeInteger(maxBytes) && maxBytes > 0).toBe(true);
     }
     expect(REQUEST_BODY_LIMIT_BYTES['pair.complete']).toBe(MAX_PAIR_REQUEST_BODY_BYTES);
+    // The release's one-token body shares the credentials module's bound with the rotation.
+    expect(REQUEST_BODY_LIMIT_BYTES['credentials.release']).toBe(
+      MAX_CREDENTIALS_REQUEST_BODY_BYTES,
+    );
     expect(DEFAULT_REQUEST_BODY_LIMIT_BYTES).toBeGreaterThan(0);
   });
 

@@ -36,6 +36,18 @@
  * attempt id, is refused with nothing written. The question is never compared,
  * and never reaches a log line or an error.
  *
+ * **A session's project-root identity is stored with the session or not at
+ * all.** Schema version 6 of `./migrations.ts` adds `session_root_identities`,
+ * the canonical path each session's root was admitted under, which the session
+ * manager holds every sink to across a restart. The suite pins the step — a new
+ * store carries the table with its constraints, the step is idempotent, and a
+ * version-5 store gains it with every row kept and nothing backfilled — and the
+ * repository's half: `insert` with `canonicalRoot` writes the session and its
+ * identity in one transaction, so a refused identity leaves no session behind;
+ * `getRootIdentity` reads it back, answers `undefined` for a session stored
+ * without one, and refuses a blank id; deleting the session removes the row
+ * through `ON DELETE CASCADE`; and no log line or error carries the path.
+ *
  * The store is the real one: `openStore` against a file in an `mkdtemp`
  * sandbox — never `:memory:` — so the real DDL, the migration ladder and the
  * `foreign_keys` pragma (which is what performs the `SET NULL`) are exercised.
@@ -52,6 +64,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -65,6 +78,7 @@ import {
   newId,
   newPanelId,
   newSessionId,
+  noopLogger,
   unwrap,
 } from '@debuggen/shared';
 import type {
@@ -80,6 +94,7 @@ import type {
 
 import { openStore } from './db.js';
 import type { Store } from './db.js';
+import { STORE_MIGRATIONS, STORE_SCHEMA_VERSION } from './migrations.js';
 import { createPanelsRepo } from './panels-repo.js';
 import type { PanelsRepo } from './panels-repo.js';
 import { createSessionsRepo } from './sessions-repo.js';
@@ -689,5 +704,380 @@ describe('replaceLatestFollowUp', () => {
     expect(refusal.code).toBe('STORE_ERROR');
     expect(refusal.details?.['reason']).toBe('invalid-follow-up');
     expect(unwrap(sessions.listFollowUps(sessionA))).toEqual(rowsBefore);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Schema version 6 — the persisted project-root identity
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The table schema version 6 adds. */
+const IDENTITY_TABLE = 'session_root_identities';
+
+/** The description the version-6 ladder step logs and reports. */
+const VERSION_6_DESCRIPTION =
+  'record the canonical project-root identity each session was admitted under';
+
+/** The SQLite extended result code of a `CHECK` constraint failure. */
+const SQLITE_CONSTRAINT_CHECK = 275;
+
+/** The SQLite extended result code of a `STRICT` column refusing a value of another type. */
+const SQLITE_CONSTRAINT_DATATYPE = 3091;
+
+/** The SQLite extended result code of a `NOT NULL` constraint failure. */
+const SQLITE_CONSTRAINT_NOTNULL = 1299;
+
+/** The SQLite extended result code of a `REFERENCES` edge that found no parent row. */
+const SQLITE_CONSTRAINT_FOREIGNKEY = 787;
+
+/** A raw insert into {@link IDENTITY_TABLE}, past the repository on purpose. */
+const RAW_IDENTITY_INSERT_SQL = `INSERT INTO ${IDENTITY_TABLE} (session_id, canonical_root, recorded_at) VALUES (?, ?, ?)`;
+
+/** The canonical path the identity cases record: absolute and never a real directory. */
+const CANONICAL_ROOT = '/private/workspace/project-one';
+
+/**
+ * The SQLite extended result code a statement failed with, or `undefined` when
+ * it succeeded. A throw that carries no code is rethrown.
+ */
+function errcodeOf(action: () => void): number | undefined {
+  try {
+    action();
+  } catch (cause) {
+    if (typeof cause === 'object' && cause !== null && 'errcode' in cause) {
+      const { errcode } = cause;
+
+      return typeof errcode === 'number' ? errcode : undefined;
+    }
+
+    throw cause;
+  }
+
+  return undefined;
+}
+
+/** The DDL `db` holds for {@link IDENTITY_TABLE}, or `undefined` when it has none. */
+function identityTableSql(db: DatabaseSync): string | undefined {
+  const sql = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .get(IDENTITY_TABLE)?.['sql'];
+
+  return typeof sql === 'string' ? sql : undefined;
+}
+
+/** Every identity row, by session id. */
+function identityRows(db: DatabaseSync): Record<string, unknown>[] {
+  return db.prepare(`SELECT * FROM ${IDENTITY_TABLE} ORDER BY session_id`).all();
+}
+
+/** Every `sessions` row and every cleanup summary, as stored. */
+function sessionTables(db: DatabaseSync): Record<string, unknown> {
+  return {
+    sessions: db.prepare('SELECT * FROM sessions ORDER BY id').all(),
+    summaries: db.prepare('SELECT * FROM session_cleanup_summaries ORDER BY session_id').all(),
+  };
+}
+
+describe('schema version 6 adds the persisted project-root identity', () => {
+  it('declares the step on the ladder and stamps a new store at the current version', () => {
+    const step = STORE_MIGRATIONS.find((candidate) => candidate.version === 6);
+
+    expect(STORE_SCHEMA_VERSION).toBeGreaterThanOrEqual(6);
+    expect(step?.description).toBe(VERSION_6_DESCRIPTION);
+    expect(store.schemaVersion).toBe(STORE_SCHEMA_VERSION);
+    expect(store.db.prepare('PRAGMA user_version').get()?.['user_version']).toBe(
+      STORE_SCHEMA_VERSION,
+    );
+  });
+
+  it('gives a new store a STRICT, WITHOUT ROWID table keyed by the session and removed with it', () => {
+    expect(
+      store.db
+        .prepare(`SELECT name, type, pk FROM pragma_table_info('${IDENTITY_TABLE}') ORDER BY cid`)
+        .all(),
+    ).toEqual([
+      { name: 'session_id', type: 'TEXT', pk: 1 },
+      { name: 'canonical_root', type: 'TEXT', pk: 0 },
+      { name: 'recorded_at', type: 'INTEGER', pk: 0 },
+    ]);
+    expect(
+      store.db
+        .prepare('SELECT strict, wr FROM pragma_table_list WHERE name = ?')
+        .get(IDENTITY_TABLE),
+    ).toEqual({ strict: 1, wr: 1 });
+    expect(
+      store.db
+        .prepare(
+          `SELECT "table", "from", "to", on_delete FROM pragma_foreign_key_list('${IDENTITY_TABLE}')`,
+        )
+        .all(),
+    ).toEqual([{ table: 'sessions', from: 'session_id', to: 'id', on_delete: 'CASCADE' }]);
+  });
+
+  it('has the database itself refuse an empty, mistyped, missing or orphaned identity', () => {
+    const insert = store.db.prepare(RAW_IDENTITY_INSERT_SQL);
+
+    expect(errcodeOf(() => insert.run(sessionA, '', CLOCK_START))).toBe(SQLITE_CONSTRAINT_CHECK);
+    // `STRICT` converts only losslessly: a timestamp that is not a number is refused.
+    expect(errcodeOf(() => insert.run(sessionA, CANONICAL_ROOT, 'yesterday'))).toBe(
+      SQLITE_CONSTRAINT_DATATYPE,
+    );
+    expect(errcodeOf(() => insert.run(sessionA, null, CLOCK_START))).toBe(
+      SQLITE_CONSTRAINT_NOTNULL,
+    );
+    expect(errcodeOf(() => insert.run(newSessionId(), CANONICAL_ROOT, CLOCK_START))).toBe(
+      SQLITE_CONSTRAINT_FOREIGNKEY,
+    );
+    expect(identityRows(store.db)).toEqual([]);
+
+    // A well-formed identity of a stored session is storable.
+    expect(errcodeOf(() => insert.run(sessionA, CANONICAL_ROOT, CLOCK_START))).toBeUndefined();
+    expect(identityRows(store.db)).toEqual([
+      { session_id: sessionA, canonical_root: CANONICAL_ROOT, recorded_at: CLOCK_START },
+    ]);
+  });
+
+  it('is idempotent: the step leaves a store that already has the table, and its rows, untouched', () => {
+    const step = STORE_MIGRATIONS.find((candidate) => candidate.version === 6);
+
+    if (step === undefined) {
+      throw new Error('the ladder has no version-6 step');
+    }
+
+    store.db.prepare(RAW_IDENTITY_INSERT_SQL).run(sessionA, CANONICAL_ROOT, CLOCK_START);
+    const tableBefore = identityTableSql(store.db);
+    const rowsBefore = identityRows(store.db);
+
+    step.apply(store.db, { ddl: '', logger: noopLogger, now: () => CLOCK_START });
+
+    expect(identityTableSql(store.db)).toBe(tableBefore);
+    expect(identityRows(store.db)).toEqual(rowsBefore);
+  });
+
+  it('migrates a version-5 store forward, keeping every row and backfilling no identity', () => {
+    // One of the two sessions has ended: the step's report counts only the
+    // sessions whose sinks the manager would now refuse.
+    unwrap(sessions.setStatus(sessionB, 'ended'));
+    const databasePath = store.path;
+
+    store.close();
+
+    // Turn the file back into what a version-5 build left behind: stamped 5,
+    // with no identity table, every session row intact.
+    const legacy = new DatabaseSync(databasePath);
+    let before: Record<string, unknown>;
+
+    try {
+      legacy.exec(`DROP TABLE ${IDENTITY_TABLE}`);
+      legacy.exec('PRAGMA user_version = 5');
+
+      expect(identityTableSql(legacy)).toBeUndefined();
+
+      before = sessionTables(legacy);
+    } finally {
+      legacy.close();
+    }
+
+    const migrationLogs: CapturedLog[] = [];
+    const logger = createCapturingLogger(migrationLogs);
+
+    store = unwrap(openStore({ databasePath, logger }));
+    sessions = createSessionsRepo({ store, logger, now: () => CLOCK_START });
+
+    expect(store.schemaVersion).toBe(STORE_SCHEMA_VERSION);
+    expect(store.db.prepare('PRAGMA user_version').get()?.['user_version']).toBe(
+      STORE_SCHEMA_VERSION,
+    );
+    expect(
+      store.db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get()?.['value'],
+    ).toBe(String(STORE_SCHEMA_VERSION));
+    expect(identityTableSql(store.db)).toContain('WITHOUT ROWID');
+
+    // Every rung above version 5 ran once, lowest first: version 6 leads.
+    const applied = migrationLogs.filter((record) =>
+      record.message.startsWith('applied store migration'),
+    );
+
+    expect(applied).toHaveLength(STORE_SCHEMA_VERSION - 5);
+    expect(applied[0]?.message).toBe(`applied store migration 6 (${VERSION_6_DESCRIPTION})`);
+
+    // Additive, and nothing identified after the fact: every session row and
+    // summary is as it was, and no session gained an identity.
+    expect(sessionTables(store.db)).toEqual(before);
+    expect(identityRows(store.db)).toEqual([]);
+    expect(unwrap(sessions.getRootIdentity(sessionA))).toBeUndefined();
+
+    // The live session left without an identity is reported by count only.
+    expect(
+      migrationLogs
+        .filter((record) => record.fields['unidentifiedSessions'] !== undefined)
+        .map((record) => [record.level, record.fields['unidentifiedSessions']] as const),
+    ).toEqual([['warn', 1]]);
+
+    const logged = JSON.stringify(migrationLogs);
+
+    for (const needle of [sessionA, sessionB, '/workspace/project-one']) {
+      expect(logged).not.toContain(needle);
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The project-root identity, stored with its session
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('insert with canonicalRoot and getRootIdentity', () => {
+  /** A canonical path carrying the privacy sentinel, for the cases that assert it is never logged. */
+  const SENTINEL_ROOT = `/private/workspace/${SENTINEL}`;
+
+  /** The temporary trigger that refuses every identity write, dropped by the case that plants it. */
+  const REFUSE_IDENTITY_TRIGGER = 'sessions_suite_refuse_root_identity';
+
+  it('stores the session and its identity in one write, and reads the identity back', () => {
+    const sessionC = newSessionId();
+
+    const stored = unwrap(sessions.insert(makeSession(sessionC), { canonicalRoot: SENTINEL_ROOT }));
+
+    expect(stored).toEqual(unwrap(sessions.get(sessionC)));
+    expect(unwrap(sessions.getRootIdentity(sessionC))).toBe(SENTINEL_ROOT);
+    expect(identityRows(store.db).filter((row) => row['session_id'] === sessionC)).toEqual([
+      { session_id: sessionC, canonical_root: SENTINEL_ROOT, recorded_at: CLOCK_START },
+    ]);
+
+    // The store line says an identity was recorded, never which.
+    expect(
+      logs
+        .filter(
+          (record) =>
+            record.message === 'session stored' && record.fields['sessionId'] === sessionC,
+        )
+        .map((record) => record.fields['rootIdentity']),
+    ).toEqual([true]);
+    expect(JSON.stringify(logs)).not.toContain(SENTINEL);
+  });
+
+  it('answers undefined for a session stored without an identity and for an id the store does not hold', () => {
+    expect(unwrap(sessions.getRootIdentity(sessionA))).toBeUndefined();
+    expect(unwrap(sessions.getRootIdentity(newSessionId()))).toBeUndefined();
+    expect(
+      logs
+        .filter(
+          (record) =>
+            record.message === 'session stored' && record.fields['sessionId'] === sessionA,
+        )
+        .map((record) => record.fields['rootIdentity']),
+    ).toEqual([false]);
+  });
+
+  it('stores nothing when the identity cannot be written: the session’s insert rolls back with it', () => {
+    const sessionC = newSessionId();
+
+    store.db.exec(
+      `CREATE TEMP TRIGGER ${REFUSE_IDENTITY_TRIGGER} BEFORE INSERT ON ${IDENTITY_TABLE}
+       BEGIN SELECT RAISE(ABORT, 'injected identity write failure'); END`,
+    );
+
+    try {
+      const refusal = refusalOf(
+        sessions.insert(makeSession(sessionC), { canonicalRoot: SENTINEL_ROOT }),
+      );
+
+      expect(refusal.code).toBe('STORE_ERROR');
+      expect(refusal.details?.['reason']).toBe('store-failed');
+      expect(errorText(refusal)).not.toContain(SENTINEL);
+    } finally {
+      store.db.exec(`DROP TRIGGER IF EXISTS temp.${REFUSE_IDENTITY_TRIGGER}`);
+    }
+
+    // Neither the session, nor its summary, nor an identity was left behind…
+    expect(unwrap(sessions.get(sessionC))).toBeUndefined();
+    expect(
+      store.db
+        .prepare('SELECT session_id FROM session_cleanup_summaries WHERE session_id = ?')
+        .get(sessionC),
+    ).toBeUndefined();
+    expect(unwrap(sessions.getRootIdentity(sessionC))).toBeUndefined();
+    expect(JSON.stringify(logs)).not.toContain(SENTINEL);
+
+    // …so the same session can be stored whole once the write is possible again.
+    unwrap(sessions.insert(makeSession(sessionC), { canonicalRoot: SENTINEL_ROOT }));
+    expect(unwrap(sessions.getRootIdentity(sessionC))).toBe(SENTINEL_ROOT);
+  });
+
+  it('refuses an identity that could never be a path before anything is written, naming only the field', () => {
+    for (const canonicalRoot of ['', `${SENTINEL_ROOT}\u0000/tail`]) {
+      const sessionC = newSessionId();
+
+      const refusal = refusalOf(sessions.insert(makeSession(sessionC), { canonicalRoot }));
+
+      expect(refusal.code).toBe('STORE_ERROR');
+      expect(refusal.details?.['reason']).toBe('invalid-argument');
+      expect(refusal.details?.['field']).toBe('canonicalRoot');
+      expect(errorText(refusal)).not.toContain(SENTINEL);
+      expect(unwrap(sessions.get(sessionC))).toBeUndefined();
+    }
+
+    expect(identityRows(store.db)).toEqual([]);
+    expect(JSON.stringify(logs)).not.toContain(SENTINEL);
+  });
+
+  it('refuses a blank session id before it reaches the store', () => {
+    const refusal = refusalOf(sessions.getRootIdentity(''));
+
+    expect(refusal.code).toBe('STORE_ERROR');
+    expect(refusal.details?.['reason']).toBe('invalid-argument');
+    expect(refusal.details?.['field']).toBe('sessionId');
+  });
+
+  it('reports a row altered past the table’s CHECK as corrupt, by id and never by content', () => {
+    const sessionC = newSessionId();
+    unwrap(sessions.insert(makeSession(sessionC), { canonicalRoot: SENTINEL_ROOT }));
+
+    // What only a writer that switched the constraint off could leave behind.
+    store.db.exec('PRAGMA ignore_check_constraints = ON');
+
+    try {
+      store.db
+        .prepare(`UPDATE ${IDENTITY_TABLE} SET canonical_root = '' WHERE session_id = ?`)
+        .run(sessionC);
+    } finally {
+      store.db.exec('PRAGMA ignore_check_constraints = OFF');
+    }
+
+    const refusal = refusalOf(sessions.getRootIdentity(sessionC));
+
+    expect(refusal.code).toBe('STORE_ERROR');
+    expect(refusal.details?.['reason']).toBe('corrupt-row');
+    expect(refusal.details?.['table']).toBe(IDENTITY_TABLE);
+    expect(refusal.details?.['sessionId']).toBe(sessionC);
+    expect(
+      logs.some(
+        (record) =>
+          record.level === 'warn' &&
+          record.fields['operation'] === 'getRootIdentity' &&
+          record.fields['reason'] === 'corrupt-row',
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(logs)).not.toContain(SENTINEL);
+  });
+
+  it('removes the identity with its session through ON DELETE CASCADE', () => {
+    const sessionC = newSessionId();
+    unwrap(sessions.insert(makeSession(sessionC), { canonicalRoot: SENTINEL_ROOT }));
+    unwrap(sessions.insert(makeSession(newSessionId()), { canonicalRoot: CANONICAL_ROOT }));
+
+    expect(unwrap(sessions.delete(sessionC))).toBe(1);
+
+    expect(unwrap(sessions.getRootIdentity(sessionC))).toBeUndefined();
+    expect(identityRows(store.db).map((row) => row['canonical_root'])).toEqual([CANONICAL_ROOT]);
+  });
+
+  it('reads the identity by primary key, with no scan', () => {
+    const sql = statementRunBy((repo) => repo.getRootIdentity(sessionA));
+
+    expect(sql).toContain(IDENTITY_TABLE);
+    expect(queryPlan(sql)).toMatch(
+      /SEARCH session_root_identities USING PRIMARY KEY \(session_id=\?\)/u,
+    );
   });
 });

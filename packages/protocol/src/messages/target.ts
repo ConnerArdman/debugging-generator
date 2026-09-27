@@ -32,7 +32,7 @@
  * instruction and the WebSocket message is the service→panel leg, so the
  * editor, which has no DevTools connection, reaches the panel through the one
  * process that knows which tab is bound (conventional requests use HTTP; the
- * WebSocket vocabulary stays at its twenty-six types). Only the
+ * WebSocket vocabulary stays at its twenty-eight types). Only the
  * editor credential may call the route. It answers `{ sessionId, tabId }` once
  * the frame has been handed to the bound tab's live connection, or an error the
  * editor can act on — `TAB_NOT_BOUND` when the session has no bound tab,

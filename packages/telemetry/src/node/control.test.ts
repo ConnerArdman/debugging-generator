@@ -2343,9 +2343,10 @@ describe('a span that outlives the capture it started in', () => {
     straddling.end();
 
     // An ingest event carries no capture id — the service assigns it on
-    // arrival (AAP §0.2.3) — so exporting this span would file capture A's
-    // work under capture B. There is no way to label it correctly, so it is
-    // refused.
+    // arrival — and a post naming capture A is refused once the
+    // service has moved on to capture B, so this span can reach neither
+    // capture's evidence. There is no way to label it correctly, so it is
+    // refused here, before it costs a conversion or a request.
     expect(rig.processor.stats().droppedStaleCapture).toBe(1);
     expect(rig.processor.stats().convertedCount).toBe(0);
     expect(rig.processor.bufferedCount).toBe(0);

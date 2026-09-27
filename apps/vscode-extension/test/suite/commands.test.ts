@@ -2579,10 +2579,6 @@ function routeFramesIntoStore(
     client.on('session.bound', (message) => {
       seen(message.type, message.payload);
     }),
-    client.on('target.selected', (message) => {
-      seen(message.type, message.payload);
-      state.applyTargetSelected(message.payload);
-    }),
     client.on('instrumentation.plan', (message) => {
       seen(message.type, message.payload);
       state.applyInstrumentationPlan(message.payload);

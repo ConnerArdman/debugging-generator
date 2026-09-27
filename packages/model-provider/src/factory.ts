@@ -43,22 +43,20 @@
  * `modelUnavailableMessage` is declared once, in `./provider.js`, and imported
  * both here and by `./providers/anthropic.js`, so a configuration this module
  * refused and a runtime refusal inside the provider show the developer the
- * identical sentence (AAP 0.5.5) and both suites can assert the same string.
+ * identical sentence and both suites can assert the same string.
  *
- * It used to be declared *here*, which forced the implementation to import
- * upward and closed the runtime cycle
- * `factory → providers/index → providers/anthropic → factory`. That cycle is
- * gone: the one import edge between this module and the provider folder now
- * runs in a single direction, from here down to `./providers/index.js`, and
- * `./provider.js` — a leaf that imports only types — holds the shared sentence
- * both ends need. No module under `./providers/` imports this one.
+ * The sentence lives in `./provider.js` — a leaf that imports only types —
+ * rather than here, so the one import edge between this module and the
+ * provider folder runs in a single direction, from here down to
+ * `./providers/index.js`. No module under `./providers/` imports this one,
+ * which is what keeps the runtime cycle
+ * `factory → providers/index → providers/anthropic → factory` from forming.
  *
- * One habit from that arrangement is kept because it is worth keeping on its
- * own merits rather than for load order: **no imported binding is read at
- * module scope.** The list of valid provider ids a failure quotes is joined
- * inside the error builder at call time rather than cached in a constant, so a
- * provider added to `PROVIDER_IDS` updates the developer-facing wording with
- * nothing to edit here.
+ * One further rule holds on its own merits rather than for load order: **no
+ * imported binding is read at module scope.** The list of valid provider ids a
+ * failure quotes is joined inside the error builder at call time rather than
+ * cached in a constant, so a provider added to `PROVIDER_IDS` updates the
+ * developer-facing wording with nothing to edit here.
  */
 
 import { DebuggenError, assertNever, andThen, err, ok } from '@debuggen/shared';
@@ -473,7 +471,7 @@ function narrowProviderId(value: string, source: SettingSource): Result<Provider
  *   the rules-based path legitimately carries {@link UNCONFIGURED_MODEL}.
  * - No budget, base URL or credential other than `ANTHROPIC_API_KEY` is read
  *   from the environment. The environment surface is exactly the three names
- *   `.env.example` documents (AAP 0.3.4). The vendor client's own reads of
+ *   `.env.example` documents. The vendor client's own reads of
  *   `ANTHROPIC_BASE_URL` and `ANTHROPIC_LOG` are neutralised too, because
  *   `./providers/anthropic.js` always passes an explicit base URL and log
  *   level; `overrides.baseUrl` is the one way to name another endpoint, and

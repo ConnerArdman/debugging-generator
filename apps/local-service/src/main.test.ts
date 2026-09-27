@@ -24,9 +24,9 @@
  *    folds the write-ahead log back into the database.
  * 6. The composition adapters this file owns — the agent-readiness ledger and
  *    the entry guard — directly.
- * 7. **The state root stays outside every project** (AAP 0.4.2). A start whose
- *    stored sessions' projects contain `$DEBUGGEN_HOME` or lie inside it is
- *    refused after crash recovery restored their files, so is one whose stored
+ * 7. **The state root stays outside every project.** A start whose stored
+ *    sessions' projects contain `$DEBUGGEN_HOME` or lie inside it is refused
+ *    after crash recovery restored their files, so is one whose stored
  *    project cannot be resolved on disk (fail-closed), and the served session
  *    and dev-server routes refuse such a project.
  * 8. **Every connection is bounded** (CWE-400): the header deadline closes a
@@ -118,7 +118,7 @@ import { createDevServerLauncher } from './dev-server/launcher.js';
 import type { DevServerLauncher, DevServerTerminationReport } from './dev-server/launcher.js';
 import { fingerprintDocumentId } from './instrumentation/document-fingerprint.js';
 import type { ArmingSnapshot } from './instrumentation/service.js';
-import { createServiceLogger } from './logging.js';
+import { LOG_BINDING_KEYS, createServiceLogger } from './logging.js';
 import {
   DEV_SERVER_STOP_GRACE_MS,
   DROPPED_CONNECTIONS_REPORT_INTERVAL_MS,
@@ -725,7 +725,7 @@ async function storeSessionOf(handle: ServiceHandle, projectRoot: string): Promi
   );
 }
 
-describe('startService — the state root stays outside every project (AAP 0.4.2)', () => {
+describe('startService — the state root stays outside every project', () => {
   it("restores an overlapping project's instrumented file first, then refuses to start and releases the store", async () => {
     const { container, stateRoot } = makeStateRoot();
     // The project is the directory that holds the state root.
@@ -1926,6 +1926,7 @@ describe('startService — shutdown reports launched dev servers still running',
         launch: (request) => real.launch(request),
         stop: (input) => real.stop(input),
         issueCredential: (input) => real.issueCredential(input),
+        releaseCredential: (input) => real.releaseCredential(input),
         stopForSession: (sessionId) => real.stopForSession(sessionId),
         whenReleased: (sessionId) => real.whenReleased(sessionId),
         acquireForSession: (projectRoot) => real.acquireForSession(projectRoot),
@@ -2140,6 +2141,336 @@ describe('createAgentReadyLedger', () => {
     const serialized = JSON.stringify(records);
     expect(serialized).not.toContain('PRIVATE-SENTINEL');
     expect(serialized).not.toContain('token=');
+    ledger.close();
+  });
+
+  it('knows no navigation until the binding route records one, then stamps it with the clock, per tab', () => {
+    let clock = 5_000;
+    const ledger = silentLedger(() => clock);
+    expect(ledger.latestNavigationAt(7)).toBeUndefined();
+
+    ledger.recordNavigation(7);
+    expect(ledger.latestNavigationAt(7)).toBe(5_000);
+    expect(ledger.latestNavigationAt(8)).toBeUndefined();
+
+    clock = 6_000;
+    ledger.recordNavigation(8);
+    clock = 7_000;
+    ledger.recordNavigation(7);
+    expect(ledger.latestNavigationAt(7)).toBe(7_000);
+    expect(ledger.latestNavigationAt(8)).toBe(6_000);
+    // A navigation replaces no report: readiness judges the pair.
+    expect(ledger.latestAgentReady(7)).toBeUndefined();
+    ledger.close();
+  });
+
+  it('orders a report and a navigation that share one millisecond: the navigation after the report it follows, the next report no earlier than the navigation', () => {
+    const ledger = silentLedger(() => 1_000);
+
+    ledger.agentReady(report(7, 'doc-a'), connection);
+    expect(ledger.latestAgentReadyAt(7)).toBe(1_000);
+
+    // A reload in the same tick: stamped strictly after the report it leaves,
+    // so readiness's `navigatedAt > observedAt` distrusts doc-a.
+    ledger.recordNavigation(7);
+    const navigatedAt = ledger.latestNavigationAt(7);
+    expect(navigatedAt).toBe(1_001);
+    expect(navigatedAt).toBeGreaterThan(1_000);
+
+    // The reloaded document reports in that same tick: never dated before the
+    // navigation, so readiness trusts doc-b on sight.
+    ledger.agentReady(report(7, 'doc-b'), connection);
+    expect(ledger.latestAgentReady(7)?.documentId).toBe('doc-b');
+    expect(ledger.latestAgentReadyAt(7)).toBe(1_001);
+    expect(ledger.latestNavigationAt(7)).toBe(1_001);
+
+    // A second reload in the tick again lands after the report it leaves.
+    ledger.recordNavigation(7);
+    expect(ledger.latestNavigationAt(7)).toBe(1_002);
+    ledger.close();
+  });
+
+  it('stamps both with the clock once it has moved past the other', () => {
+    let clock = 1_000;
+    const ledger = silentLedger(() => clock);
+
+    ledger.agentReady(report(7, 'doc-a'), connection);
+    clock = 1_500;
+    ledger.recordNavigation(7);
+    expect(ledger.latestNavigationAt(7)).toBe(1_500);
+    clock = 1_800;
+    ledger.agentReady(report(7, 'doc-b'), connection);
+    expect(ledger.latestAgentReadyAt(7)).toBe(1_800);
+    ledger.close();
+  });
+
+  /**
+   * The clocks the replay cases run under: one that never moves, so every
+   * write shares a millisecond, and one that moves between writes.
+   */
+  const REPLAY_CLOCKS = [
+    { label: 'a constant clock', step: 0 },
+    { label: 'an advancing clock', step: 500 },
+  ] as const;
+
+  it.each(REPLAY_CLOCKS)(
+    'keeps the pre-navigation receipt of a replay of the stored document, under $label, storing the newest payload',
+    async ({ step }) => {
+      let clock = 1_000;
+      const ledger = silentLedger(() => clock);
+
+      ledger.agentReady(report(7, 'doc-a'), connection);
+      clock += step;
+      ledger.recordNavigation(7);
+      const navigatedAt = ledger.latestNavigationAt(7);
+      const waiting = ledger.waitForAgentReady(7, { timeoutMs: 1_000, afterDocumentId: 'doc-a' });
+
+      // The Chrome side re-relays the report it retained for the tab; the
+      // reload may already have replaced that document.
+      clock += step;
+      const replayed: AgentReadyPayload = { ...report(7, 'doc-a'), installedBeforeReact: false };
+      expect(isOk(ledger.agentReady(replayed, connection))).toBe(true);
+
+      expect(ledger.latestAgentReady(7)).toEqual(replayed);
+      expect(ledger.latestAgentReadyAt(7)).toBe(1_000);
+      expect(ledger.latestNavigationAt(7)).toBe(navigatedAt);
+      expect(navigatedAt).toBeGreaterThan(1_000);
+
+      // A second replay confirms no more than the first.
+      clock += step;
+      ledger.agentReady(report(7, 'doc-a'), connection);
+      expect(ledger.latestAgentReadyAt(7)).toBe(1_000);
+
+      // Neither answered the wait for a document other than doc-a.
+      ledger.agentReady(report(7, 'doc-b'), connection);
+      expect((await waiting)?.documentId).toBe('doc-b');
+      ledger.close();
+    },
+  );
+
+  it.each(REPLAY_CLOCKS)(
+    'stamps a different document that follows a replay no earlier than the navigation, under $label',
+    ({ step }) => {
+      let clock = 1_000;
+      const ledger = silentLedger(() => clock);
+
+      ledger.agentReady(report(7, 'doc-a'), connection);
+      clock += step;
+      ledger.recordNavigation(7);
+      clock += step;
+      ledger.agentReady(report(7, 'doc-a'), connection);
+      clock += step;
+      ledger.agentReady(report(7, 'doc-b'), connection);
+
+      const navigatedAt = ledger.latestNavigationAt(7);
+      const receivedAt = ledger.latestAgentReadyAt(7);
+      if (navigatedAt === undefined || receivedAt === undefined) {
+        throw new Error('The ledger holds no navigation or no report for tab 7.');
+      }
+      expect(ledger.latestAgentReady(7)?.documentId).toBe('doc-b');
+      expect(receivedAt).toBeGreaterThanOrEqual(navigatedAt);
+      expect(receivedAt).toBe(Math.max(clock, navigatedAt));
+      ledger.close();
+    },
+  );
+
+  it('refreshes the receipt of a same-document replay that no navigation preceded', () => {
+    let clock = 1_000;
+    const ledger = silentLedger(() => clock);
+
+    // A navigation recorded before the stored report is not "in between".
+    ledger.recordNavigation(7);
+    clock = 1_200;
+    ledger.agentReady(report(7, 'doc-a'), connection);
+    expect(ledger.latestAgentReadyAt(7)).toBe(1_200);
+    clock = 2_000;
+    ledger.agentReady(report(7, 'doc-a'), connection);
+    expect(ledger.latestAgentReadyAt(7)).toBe(2_000);
+    ledger.close();
+  });
+
+  it('keeps the navigation’s stamp on the replay of a report that was lent it in the same millisecond', () => {
+    const ledger = silentLedger(() => 3_000);
+
+    ledger.agentReady(report(8, 'doc-a'), connection);
+    ledger.recordNavigation(8);
+    ledger.agentReady(report(8, 'doc-b'), connection);
+    expect(ledger.latestAgentReadyAt(8)).toBe(3_001);
+
+    // doc-b arrived after the navigation, so its replay is not left behind by
+    // it: the receipt is refreshed, never dated back before the navigation.
+    ledger.agentReady(report(8, 'doc-b'), connection);
+    expect(ledger.latestAgentReadyAt(8)).toBe(3_001);
+    expect(ledger.latestNavigationAt(8)).toBe(3_001);
+    ledger.close();
+  });
+
+  it('remembers navigations for at most maxTabs tabs, forgetting the least recently navigated first', () => {
+    let clock = 1_000;
+    const ledger = createAgentReadyLedger({ logger: noopLogger, now: () => clock, maxTabs: 2 });
+
+    ledger.recordNavigation(1);
+    clock += 1;
+    ledger.recordNavigation(2);
+    clock += 1;
+    // Refreshing tab 1 makes tab 2 the oldest.
+    ledger.recordNavigation(1);
+    clock += 1;
+    ledger.recordNavigation(3);
+
+    expect(ledger.latestNavigationAt(2)).toBeUndefined();
+    expect(ledger.latestNavigationAt(1)).toBe(1_002);
+    expect(ledger.latestNavigationAt(3)).toBe(1_003);
+    ledger.close();
+  });
+
+  it('forgets a report together with its navigation when navigations of other tabs churn the bound', () => {
+    let clock = 1_000;
+    const ledger = createAgentReadyLedger({ logger: noopLogger, now: () => clock, maxTabs: 2 });
+
+    ledger.agentReady(report(1, 'doc-a'), connection);
+    clock += 1;
+    ledger.recordNavigation(1);
+    clock += 1;
+    // Navigations of unrelated (even unbound) tabs: tab 1 is the oldest entry.
+    ledger.recordNavigation(2);
+    clock += 1;
+    ledger.recordNavigation(3);
+
+    // Neither half outlives the other: a surviving report with its
+    // navigation forgotten would read as current on sight.
+    expect(ledger.latestAgentReady(1)).toBeUndefined();
+    expect(ledger.latestAgentReadyAt(1)).toBeUndefined();
+    expect(ledger.latestNavigationAt(1)).toBeUndefined();
+    expect(ledger.latestNavigationAt(2)).toBe(1_002);
+    expect(ledger.latestNavigationAt(3)).toBe(1_003);
+    ledger.close();
+  });
+
+  it('forgets a navigation together with its report when reports of other tabs churn the bound', () => {
+    let clock = 1_000;
+    const ledger = createAgentReadyLedger({ logger: noopLogger, now: () => clock, maxTabs: 2 });
+
+    ledger.agentReady(report(1, 'doc-a'), connection);
+    clock += 1;
+    ledger.recordNavigation(1);
+    clock += 1;
+    ledger.agentReady(report(2, 'doc-b'), connection);
+    clock += 1;
+    ledger.agentReady(report(3, 'doc-c'), connection);
+
+    expect(ledger.latestAgentReady(1)).toBeUndefined();
+    expect(ledger.latestAgentReadyAt(1)).toBeUndefined();
+    expect(ledger.latestNavigationAt(1)).toBeUndefined();
+    expect(ledger.latestAgentReady(2)?.documentId).toBe('doc-b');
+    expect(ledger.latestAgentReady(3)?.documentId).toBe('doc-c');
+    ledger.close();
+  });
+
+  it.each([
+    {
+      label: 'a navigation',
+      write: (ledger: ReturnType<typeof createAgentReadyLedger>): void => {
+        ledger.recordNavigation(1);
+      },
+      kept: { documentId: 'doc-a', receivedAt: 1_000, navigatedAt: 1_004 },
+    },
+    {
+      label: 'a report',
+      write: (ledger: ReturnType<typeof createAgentReadyLedger>): void => {
+        ledger.agentReady(report(1, 'doc-a2'), connection);
+      },
+      kept: { documentId: 'doc-a2', receivedAt: 1_004, navigatedAt: 1_001 },
+    },
+  ])(
+    'refreshes a tab’s recency on $label, forgetting the oldest other tab whole',
+    ({ write, kept }) => {
+      let clock = 1_000;
+      const ledger = createAgentReadyLedger({ logger: noopLogger, now: () => clock, maxTabs: 2 });
+
+      ledger.agentReady(report(1, 'doc-a'), connection);
+      clock += 1;
+      ledger.recordNavigation(1);
+      clock += 1;
+      ledger.agentReady(report(2, 'doc-b'), connection);
+      clock += 1;
+      ledger.recordNavigation(2);
+      clock += 1;
+      // Tab 1 is the oldest entry until this write makes it the newest.
+      write(ledger);
+      clock += 1;
+      ledger.recordNavigation(3);
+
+      expect(ledger.latestAgentReady(2)).toBeUndefined();
+      expect(ledger.latestAgentReadyAt(2)).toBeUndefined();
+      expect(ledger.latestNavigationAt(2)).toBeUndefined();
+      expect(ledger.latestAgentReady(1)?.documentId).toBe(kept.documentId);
+      expect(ledger.latestAgentReadyAt(1)).toBe(kept.receivedAt);
+      expect(ledger.latestNavigationAt(1)).toBe(kept.navigatedAt);
+      expect(ledger.latestNavigationAt(3)).toBe(1_005);
+      ledger.close();
+    },
+  );
+
+  it('forgets every navigation on close and ignores one recorded after it', () => {
+    const ledger = silentLedger();
+    ledger.recordNavigation(7);
+    expect(ledger.latestNavigationAt(7)).toBe(1_000);
+
+    ledger.close();
+    expect(ledger.latestNavigationAt(7)).toBeUndefined();
+    ledger.recordNavigation(7);
+    expect(ledger.latestNavigationAt(7)).toBeUndefined();
+  });
+
+  it.each([
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['not a number', Number.NaN],
+    ['beyond the safe integers', Number.MAX_SAFE_INTEGER + 1],
+  ])('ignores a navigation of a tab id that is %s', (_label, tabId) => {
+    const records: LogRecord[] = [];
+    const ledger = createAgentReadyLedger({
+      logger: createConsoleLogger({
+        level: 'trace',
+        sink: (record) => {
+          records.push(record);
+        },
+      }),
+      now: () => 1_000,
+    });
+
+    ledger.recordNavigation(tabId);
+
+    expect(ledger.latestNavigationAt(tabId)).toBeUndefined();
+    expect(records).toEqual([]);
+    ledger.close();
+  });
+
+  it('notes a navigation at debug by tab id alone', () => {
+    const records: LogRecord[] = [];
+    const ledger = createAgentReadyLedger({
+      logger: createConsoleLogger({
+        level: 'trace',
+        sink: (record) => {
+          records.push(record);
+        },
+      }),
+      now: () => 1_000,
+    });
+
+    ledger.recordNavigation(9);
+
+    const noted = records.filter(
+      (record) => record.message === 'recorded a committed navigation of a tab',
+    );
+    expect(noted).toHaveLength(1);
+    expect(noted[0]?.level).toBe('debug');
+    // Beside the subsystem binding every ledger record carries, the tab id is
+    // the one field: no URL, no document id, no connection.
+    const { [LOG_BINDING_KEYS.subsystem]: subsystem, ...fields } = noted[0]?.fields ?? {};
+    expect(typeof subsystem).toBe('string');
+    expect(fields).toEqual({ tabId: 9 });
     ledger.close();
   });
 });

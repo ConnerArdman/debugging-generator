@@ -126,9 +126,41 @@
  * under a then-live credential — a sweep, a follow-up, an ending waiting for
  * its cleanup — finishes, exactly as a request authorized before a rotation
  * still receives its answer. `session.create` is fenced after its dev-server
- * lookup, which awaits, and before the manager call. The `GET` handlers read
+ * lookup, which awaits, and before the manager call — the same point at which
+ * it re-proves its project root (next section). The `GET` handlers read
  * no body and await nothing before their effect, so the middleware's check,
  * made in the same turn, is already the fence for them.
+ *
+ * ## The project root a session is created for
+ *
+ * A scope check answers only for the moment it runs, and `session.create`
+ * awaits twice after it — the state-root check and the dev-server lookup — so
+ * a link on the root's path retargeted in between, even to another directory
+ * inside the workspace, would otherwise be stored as the root the pipeline
+ * indexes and patches (CWE-367). The root is therefore held to one canonical
+ * directory from admission to storage:
+ *
+ * 1. `admitProjectRoot` (`../auth.ts`) admits it for the editor — under an
+ *    announced workspace folder both as spelled and once every link is
+ *    resolved — and returns the proof: the root and the canonical path it was
+ *    judged on. It is `requireProjectScope`'s editor rule, and `session.create`
+ *    is the editor's alone.
+ * 2. The state-root separation is judged on that canonical path, the
+ *    directory actually admitted.
+ * 3. After the dev-server lookup's `await`, at the revocation fence,
+ *    `reconfirmProjectRoot` re-proves synchronously that the root is still in
+ *    scope and still resolves to the admitted path, with no `await` before
+ *    `SessionManager.create` stores the session. A root that moved is refused
+ *    `403 PATH_OUTSIDE_PROJECT`, the dev-server hold is given up, and nothing
+ *    is stored, broadcast or started.
+ * 4. The re-proved proof is handed to `SessionManager.create`, which records it
+ *    against the new session; the pipeline's indexing and patching are held to
+ *    it through `SessionManager.confirmProjectRoot`, immediately before each
+ *    acts, in the canonical directory it proves.
+ *
+ * The session records the root as the editor spelled it, and the dev server
+ * is looked up by that spelling, which is how the launcher and earlier
+ * sessions know the project.
  *
  * ## When each operation answers
  *
@@ -186,8 +218,9 @@
  * - `session.purge` answers once the retention sweep has finished, with what it
  *   removed. The sweep is **scoped** to the requesting editor: it acts only on
  *   the state of projects under the workspace folders the editor's credential
- *   announced — the very check `requireProjectScope` makes for every other
- *   route (AAP §0.5.6), joined by a canonical one: the folders and each stored
+ *   announced — the very check `requireProjectScope` makes for the other
+ *   routes and `admitProjectRoot`, its editor rule, for `session.create`,
+ *   joined by a canonical one: the folders and each stored
  *   root are resolved on disk, and a root is admitted only when its real
  *   location lies under a real folder — so a purge for workspace A never
  *   removes workspace B's sessions, telemetry, backups or index caches, not
@@ -259,7 +292,7 @@
  * | credential retired or expired while the body was read | `401` | `UNAUTHORIZED` |
  * | role not permitted (a `server-agent` credential, a DevTools create) | `403` | `UNAUTHORIZED` |
  * | DevTools client not bound to the session | `403` | `TAB_NOT_BOUND` |
- * | editor credential outside its announced workspace | `403` | `PATH_OUTSIDE_PROJECT` |
+ * | editor credential outside its announced workspace; a new session's root relinked after it was admitted | `403` | `PATH_OUTSIDE_PROJECT` |
  * | malformed or unknown session id | `404` | `SESSION_NOT_FOUND` |
  * | malformed or unknown panel id, or a panel of another session | `404` | `SESSION_NOT_FOUND` |
  * | project root that is not absolute | `400` | `PROJECT_NOT_FOUND` |
@@ -410,14 +443,17 @@ import type { SessionsRepo } from '../../store/sessions-repo.js';
 import {
   AUTH_FAILURE_REASONS,
   OPERATION_ROLES,
+  admitProjectRoot,
   authErrorResponse,
   authFailureStatus,
+  reconfirmProjectRoot,
   requireBoundSession,
   requireProjectScope,
   requireRole,
   requireSessionAccess,
 } from '../auth.js';
 import type {
+  AdmittedProjectRoot,
   AuthFailureReason,
   AuthService,
   AuthenticatedOperation,
@@ -1063,8 +1099,8 @@ export interface SessionRoutesDeps {
    * `requireProjectOutsideStateHome` of `../../config.ts`, so a symbolic link
    * into the state root is refused too — with `400 FS_UNSAFE_PATH`, before
    * any dev server is resolved, any session is stored or any follow-up can
-   * re-plan and patch (AAP §0.4.2: session data and backups stay outside the
-   * target project; CWE-200). The same field, by the same name and type, is
+   * re-plan and patch, because session data and backups stay outside the
+   * target project (CWE-200). The same field, by the same name and type, is
    * declared by `./dev-server.ts`, so `../http.ts`'s aggregate carries one
    * value to both. `main.ts` always supplies it; a suite that composes these
    * routes without a state tree leaves it out, and no overlap check is made.
@@ -1702,7 +1738,7 @@ async function canonicalLocationOf(path: string): Promise<string | undefined> {
 
 /**
  * The scope of the retention sweep `session.purge` runs for `principal`,
- * built once per purge (CWE-863; AAP §0.5.6).
+ * built once per purge (CWE-863).
  *
  * Every workspace folder the editor announced is canonicalised first, once:
  * each symbolic link resolved, a folder that does not exist yet judged by its
@@ -1933,6 +1969,30 @@ function settledSync<T>(
     return call();
   } catch {
     return err(portFailure('STORE_ERROR', reason));
+  }
+}
+
+/**
+ * Runs one of `../auth.ts`'s synchronous project-root proofs —
+ * `admitProjectRoot` or `reconfirmProjectRoot` — converting a throw into the
+ * `INTERNAL` `Err` it should have been. The thrown value is not kept: its
+ * message could quote the root.
+ *
+ * Synchronous on purpose, like the proofs it wraps: the caller acts on the
+ * returned proof in the same turn, with no `await` between the two.
+ *
+ * @param prove The proof to run.
+ * @param reason The kebab-case reason a throw is filed under.
+ * @returns The proof's own answer, or the `INTERNAL` failure.
+ */
+function provenRoot(
+  prove: () => Result<AdmittedProjectRoot, DebuggenError>,
+  reason: string,
+): Result<AdmittedProjectRoot, DebuggenError> {
+  try {
+    return prove();
+  } catch {
+    return err(portFailure('INTERNAL', reason));
   }
 }
 
@@ -2991,7 +3051,8 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
    * Without a canonical state root no check is made.
    *
    * @param c The request context.
-   * @param projectRoot The normalised absolute root the request acts on.
+   * @param projectRoot The normalised absolute root the request acts on — for
+   * `session.create`, the canonical directory `admitProjectRoot` admitted.
    * @param context The logger and the operation.
    * @returns `ok`, or the response that refuses the request.
    */
@@ -3457,7 +3518,21 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
    * The handlers
    * -------------------------------------------------------------------------------------------- */
 
-  /** `session.create`: authorize, validate, resolve the dev server, create, start the pipeline. */
+  /**
+   * `session.create`: authorize, validate, admit the project root, resolve the
+   * dev server, re-prove the root, create, start the pipeline.
+   *
+   * The root is held to one canonical directory from admission to storage
+   * (CWE-367; see "The project root a session is created for" in the module
+   * overview): `admitProjectRoot` judges it and keeps the canonical path it
+   * judged, the state-root separation is judged on that path, and — after the
+   * dev-server lookup's `await`, at the revocation fence —
+   * `reconfirmProjectRoot` re-proves it synchronously, with no `await` before
+   * `SessionManager.create` stores the session and records the proof for the
+   * pipeline's sinks. A refusal at the fence or at the re-proof gives up the
+   * dev-server hold the lookup took, so no launched child is left without an
+   * owner.
+   */
   const createSession: SessionRouteHandler = async (c) => {
     c.header(CACHE_CONTROL_HEADER, NO_STORE);
     const context: RequestContext = { log, operation: SESSION_CREATE_OPERATION };
@@ -3475,19 +3550,26 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
       return answerFailure(c, projectRoot.error, context);
     }
     // The editor may act only on a project under the workspace folders its
-    // connections announced (AAP §0.5.6), judged on the normalised root.
-    const scoped = requireProjectScope(principal.value, projectRoot.value);
-    if (isErr(scoped)) {
-      return answerFailure(c, scoped.error, context);
+    // connections announced, judged on the normalised root and on
+    // the canonical directory it resolves to, which the admission keeps.
+    const admitted = provenRoot(
+      () => admitProjectRoot(principal.value, projectRoot.value),
+      'project-root-admission-threw',
+    );
+    if (isErr(admitted)) {
+      return answerFailure(c, admitted.error, context);
     }
-    // Session data and backups live outside the project (AAP §0.4.2): a root
-    // that overlaps the state root is refused before any dev server is looked
-    // up, held or probed, and before anything is stored.
-    const apart = await keepApartFromStateHome(c, projectRoot.value, context);
+    // Session data and backups live outside the project: the
+    // directory actually admitted must not overlap the state root. Refused
+    // before any dev server is looked up, held or probed, and before anything
+    // is stored.
+    const apart = await keepApartFromStateHome(c, admitted.value.canonicalRoot, context);
     if (isErr(apart)) {
       return apart.error;
     }
 
+    // Looked up by the session's own spelling of the root: the launcher's
+    // registry and earlier sessions are keyed by it.
     const devServer = await resolveDevServerUrl(
       projectRoot.value,
       body.value.devServerUrl,
@@ -3496,11 +3578,23 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
     if (isErr(devServer)) {
       return answerFailure(c, devServer.error, context);
     }
-    // Fenced after the lookup's await, immediately before the manager stores
-    // the session — which it does synchronously.
+    const { hold, preloadAttributed } = devServer.value;
+    // Fenced and re-proved after the lookup's await, immediately before the
+    // manager stores the session — which it does synchronously, inside the
+    // call — so no rotation can land between the checks and the store, and a
+    // relink is caught unless it lands within these synchronous calls.
     const live = fence(c, principal.value, context);
     if (isErr(live)) {
+      await releaseDevServerHold(hold, context);
       return live.error;
+    }
+    const still = provenRoot(
+      () => reconfirmProjectRoot(principal.value, admitted.value),
+      'project-root-reconfirmation-threw',
+    );
+    if (isErr(still)) {
+      await releaseDevServerHold(hold, context);
+      return answerFailure(c, still.error, context);
     }
     const created = await settled(
       () =>
@@ -3510,10 +3604,10 @@ export function createSessionRoutes(deps: SessionRoutesDeps): SessionRoutes {
           target:
             body.value.target === undefined ? undefined : redactSelectedTarget(body.value.target),
           devServerUrl: devServer.value.url,
+          admittedRoot: still.value,
         }),
       'session-create-rejected',
     );
-    const { hold, preloadAttributed } = devServer.value;
     if (isErr(created)) {
       await releaseDevServerHold(hold, context);
       return answerFailure(c, created.error, context);

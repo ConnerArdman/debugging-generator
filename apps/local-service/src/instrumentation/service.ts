@@ -14,13 +14,25 @@
  * - **Installs a plan** ({@link InstrumentationService.install}) through the
  *   injected `installPlan`, bracketed by the conflict watcher's
  *   suspend → refresh → resume contract, and serialised per session.
- * - **Keeps the state root out of the project at the patch sink** (AAP §0.4.2):
+ * - **Keeps the state root out of the project at the patch sink**:
  *   every install first re-checks, with `../config.ts`'s
- *   `requireProjectOutsideStateHome`, that its project root neither is,
+ *   `requireProjectOutsideStateHome`, that its project root — the confirmed
+ *   canonical root, when the request carries a confirmation — neither is,
  *   contains nor lies inside the canonical state root, and is refused
  *   `FS_UNSAFE_PATH` — reported as `instrumentation.failed` — before any backup
  *   or patch is written. The routes' checks run earlier; this one runs where
  *   the bytes are written, however late the pipeline gets there.
+ * - **Re-proves the project root's identity at the patch sink** (CWE-367).
+ *   The pipeline installs long after the request that admitted the session's
+ *   root answered, and a link on that root's path can be retargeted in
+ *   between. An install whose request carries
+ *   {@link InstallRequest.confirmProjectRoot} calls it synchronously before it
+ *   first acts on the root, and again after the readiness facts are collected
+ *   with no `await` between that call and the installer's, and hands the patch
+ *   layer the confirmed canonical root
+ *   (`InstrumentationContext.canonicalProjectRoot`), inside which every target
+ *   is resolved and written. A refusal fails the install, through the same
+ *   `instrumentation.failed` path, before anything is written.
  * - **Applies only the delta of a follow-up** (AAP §0.4.2): plan version
  *   *n + 1* is the previous plan plus additive actions; the additive ids are
  *   computed with the upstream `actionIdentityKey`, installed actions are never
@@ -83,9 +95,10 @@
  * - **It never touches a developer's file.** Bytes reach a working tree only
  *   through the patch layer of `@debuggen/instrumentation`, which the installer
  *   drives, and come back only through that package's cleanup. This module hands
- *   the installer a correct journal and backup store and then calls it; it
- *   performs no rollback of its own — the installer already reverse-restores the
- *   records of a call that failed part-way (AAP §0.5.1, §0.5.3).
+ *   the installer a correct journal and backup store — and, for a confirmed
+ *   root, the canonical root the patch layer writes inside — and then calls it;
+ *   it performs no rollback of its own — the installer already reverse-restores
+ *   the records of a call that failed part-way.
  * - **It knows no adapter.** Every adapter arrives through the injected
  *   registry; nothing here imports, names or branches on a particular adapter or
  *   action type, so a seventh adapter is added by registering it, with no change
@@ -390,10 +403,10 @@ export interface InstrumentationServiceDeps {
   /**
    * The state root as the filesystem resolves it — every symbolic link
    * followed — which every install's project root is kept apart from before a
-   * backup or a patch is written (AAP §0.4.2; see "The state root stays outside
-   * every project" in `../config.ts`). `src/main.ts` passes the value it
-   * resolved once at start-up, so every check of the running service compares
-   * against one root. When absent, `config.debuggenHome` is canonicalised on the
+   * backup or a patch is written (see "The state root stays outside every
+   * project" in `../config.ts`). `src/main.ts` passes the value it resolved
+   * once at start-up, so every check of the running service compares against
+   * one root. When absent, `config.debuggenHome` is canonicalised on the
    * first install and kept once resolved; a failure is not kept, so the next
    * install tries again, and the install it fails is refused. A value given
    * must be absolute, or every install is refused.
@@ -456,6 +469,19 @@ export interface BuildContextInput {
   /** The project root: absolute, POSIX or Windows-style; normalised here. */
   readonly projectRoot: string;
   /**
+   * The canonical path {@link BuildContextInput.projectRoot} was confirmed to
+   * resolve to — every symbolic link resolved — when the caller holds one:
+   * absolute, POSIX or Windows-style; normalised here.
+   *
+   * Stamped on the context as `canonicalProjectRoot`, which the patch layer
+   * resolves, pins and writes every target inside, and refuses to patch
+   * through once the path no longer resolves to itself. Omitted, the context
+   * carries no canonical root and the patch layer resolves `projectRoot`
+   * afresh. {@link InstrumentationService.install} supplies it from the
+   * request's {@link InstallRequest.confirmProjectRoot}.
+   */
+  readonly canonicalProjectRoot?: string | undefined;
+  /**
    * The plan version the context is for; its `planVersion` is stamped on the
    * context and is the only member read. Typed as the one field so the planning
    * stage can build the context of the version it is about to author — the
@@ -516,6 +542,49 @@ export interface InstallRequest {
   readonly requireServerAgent?: boolean | undefined;
   /** Cancels the install; the installer unwinds what the call applied. */
   readonly signal?: AbortSignal | undefined;
+  /**
+   * Re-proves that the session's project root still resolves to the canonical
+   * directory it was admitted under, and answers that directory — for the
+   * pipeline, `SessionManager.confirmProjectRoot` for the request's session.
+   *
+   * **Why.** The pipeline installs long after the request that admitted the
+   * root answered. A symbolic link on the root's path retargeted in between —
+   * even to another directory inside the workspace — would otherwise redirect
+   * the patch layer's writes into a directory nobody admitted (CWE-367).
+   *
+   * **When.** The service calls it synchronously twice: immediately before it
+   * first acts on the root — the state-root separation check, which is then
+   * judged on the confirmed canonical root — and again after the readiness
+   * facts are collected, immediately before it hands the plan to the
+   * installer, with no `await` between that second call and the installer's.
+   * The install then runs **inside** the second answer's `canonicalRoot`: the
+   * context carries it as `canonicalProjectRoot`, where the patch layer
+   * resolves, pins and writes every target. Everything else keeps the
+   * request's spelling — the readiness facts, the conflict watcher and every
+   * frame.
+   *
+   * **Refusals.** An `Err` fails the install before anything is written and is
+   * reported unchanged through `instrumentation.failed` and the returned
+   * error. A callback that throws, or answers a canonical root that is not an
+   * absolute path, fails it the same way as `INTERNAL`
+   * (`details.reason`: `project-root-confirmation-threw`,
+   * `project-root-confirmation-invalid`); the thrown value is not kept, since
+   * nothing promises it is free of paths. Each refusal is logged at `warn` by
+   * its code and reason alone.
+   *
+   * Omitted, the install behaves as before: the context carries no canonical
+   * root and the patch layer resolves the spelled root itself.
+   *
+   * @example
+   * ```ts
+   * await instrumentation.install({
+   *   ...request,
+   *   confirmProjectRoot: () => sessions.confirmProjectRoot(request.sessionId),
+   * });
+   * ```
+   */
+  readonly confirmProjectRoot?:
+    (() => Result<{ readonly canonicalRoot: string }, DebuggenError>) | undefined;
 }
 
 /** What a successful install left in place. Plain, JSON-serialisable data. */
@@ -700,19 +769,24 @@ export interface InstrumentationService {
    * collaborators. Pure apart from constructing the session's backup-store
    * handle (which touches nothing on disk).
    *
-   * @returns The context, or `Err` for an empty session id or a relative or
-   * empty project root.
+   * @returns The context, or `Err` for an empty session id, a relative or
+   * empty project root, or a canonical project root that is given but not
+   * absolute.
    */
   buildContext(input: BuildContextInput): Result<InstrumentationContext, DebuggenError>;
 
   /**
    * Installs one plan version: a session's first install, or a follow-up's
    * delta install when {@link InstallRequest.previousPlanVersion} is given.
+   * With {@link InstallRequest.confirmProjectRoot}, the root is re-proved
+   * before the install first acts on it and immediately before the installer,
+   * and the install runs inside the confirmed canonical root.
    *
    * @returns The outcome, or `Err` when the installer reported that nothing
    * could be enabled, when a delta failed part-way (the error's
    * `details.activePlanVersion` is the previous version), when another install
-   * for the session is still running, or when a collaborator threw.
+   * for the session is still running, when the root's confirmation refused or
+   * could not stand, or when a collaborator threw.
    */
   install(request: InstallRequest): Promise<Result<InstrumentationOutcome, DebuggenError>>;
 
@@ -1368,6 +1442,75 @@ function wiringError(message: string, hint: string, field: string): DebuggenErro
 }
 
 /**
+ * The act a {@link InstallRequest.confirmProjectRoot} call guards, as its log
+ * record names it: the state-root separation check, the install's first act on
+ * the root; or the hand-over of the plan to the installer.
+ */
+type RootConfirmationStage = 'before-state-root-check' | 'before-install';
+
+/** Why an answer of {@link InstallRequest.confirmProjectRoot} could not stand as a confirmation. */
+type RootConfirmationFailure =
+  'project-root-confirmation-threw' | 'project-root-confirmation-invalid';
+
+/**
+ * A `details.reason` of the shape this module logs: a short kebab-case word
+ * list. A confirmation's refusal is a caller's value, so its reason is logged
+ * only when it has this closed shape — never free text that could hold a path.
+ */
+const LOGGABLE_REASON = /^[a-z][a-z0-9-]{0,63}$/u;
+
+/**
+ * Whether `value` is a non-empty absolute path, POSIX or Windows-style, read
+ * as given — a canonical path is never trimmed, since its every character is
+ * the filesystem's.
+ */
+function isAbsoluteRootPath(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0) {
+    return false;
+  }
+
+  const posix = toPosix(value);
+  return isAbsolutePosix(posix) || isWindowsAbsolute(posix);
+}
+
+/**
+ * The canonical root a confirmation answered, read structurally because the
+ * answer is a caller's, which the compiler may not have checked; `undefined`
+ * when it names no absolute path.
+ */
+function confirmedCanonicalRoot(value: unknown): string | undefined {
+  if (typeof value !== 'object' || value === null || !('canonicalRoot' in value)) {
+    return undefined;
+  }
+
+  const { canonicalRoot } = value;
+  return isAbsoluteRootPath(canonicalRoot) ? canonicalRoot : undefined;
+}
+
+/**
+ * The refusal of an install whose project-root confirmation could not stand:
+ * `INTERNAL`, because it is a defect of the caller's check rather than
+ * anything the developer did. Constant sentences that name no path, and no
+ * cause, so a thrown value's text never reaches a frame or a record.
+ */
+function rootConfirmationError(reason: RootConfirmationFailure): DebuggenError {
+  return new DebuggenError(
+    'INTERNAL',
+    'The project root could not be confirmed, so no instrumentation was installed.',
+    {
+      hint: 'The service log holds the reason. Start the session again from the project folder in VS Code.',
+      details: { reason },
+    },
+  );
+}
+
+/** An error's `details.reason`, when it has the shape this module logs. */
+function loggableReasonOf(error: DebuggenError): string | undefined {
+  const reason = error.details?.['reason'];
+  return typeof reason === 'string' && LOGGABLE_REASON.test(reason) ? reason : undefined;
+}
+
+/**
  * Re-issues an install error with the plan versions it concerns in its details,
  * keeping its code, message, hint and the original as its cause, so a caller —
  * and a suite — can read which version the session was left at.
@@ -1743,12 +1886,12 @@ export function createInstrumentationService(
 
   /**
    * Refuses to install into a project root that is, contains or lies inside
-   * the state root (AAP §0.4.2; CWE-200), re-checked on every install at the
-   * sink itself: the session and dev-server routes check before a session
-   * exists, but the pipeline installs later and asynchronously, and a folder
-   * can be replaced by a link into the state root in between. Runs before
-   * anything is read for the install, so a refused install writes no backup,
-   * no journal record and no patch.
+   * the state root (CWE-200), re-checked on every install at the sink itself:
+   * the session and dev-server routes check before a session exists, but the
+   * pipeline installs later and asynchronously, and a folder can be replaced
+   * by a link into the state root in between. Runs before anything is read for
+   * the install, so a refused install writes no backup, no journal record and
+   * no patch.
    *
    * The refusal is `requireProjectOutsideStateHome`'s own `FS_UNSAFE_PATH`
    * error — or `canonicalizePath`'s, when the configured state root cannot be
@@ -2154,6 +2297,20 @@ export function createInstrumentationService(
       return projectRoot;
     }
 
+    const canonicalProjectRoot = input.canonicalProjectRoot;
+
+    // A canonical root the patch layer would refuse at construction is refused
+    // here instead, before a backup store is opened for the context.
+    if (canonicalProjectRoot !== undefined && !isAbsoluteRootPath(canonicalProjectRoot)) {
+      return err(
+        wiringError(
+          'An instrumentation context was requested with a canonical project root that is not an absolute path.',
+          'Pass the canonical path the session’s project root was confirmed to resolve to, or omit it.',
+          'canonicalProjectRoot',
+        ),
+      );
+    }
+
     const code: unknown = input.code;
 
     if (typeof code !== 'object' || code === null) {
@@ -2199,6 +2356,11 @@ export function createInstrumentationService(
     const context: InstrumentationContext = {
       sessionId: input.sessionId,
       projectRoot: projectRoot.value,
+      // Present only when the caller confirmed one (exactOptionalPropertyTypes):
+      // an absent key is what tells the patch layer to resolve `projectRoot`.
+      ...(canonicalProjectRoot === undefined
+        ? {}
+        : { canonicalProjectRoot: normalizePosix(toPosix(canonicalProjectRoot)) }),
       planVersion,
       debuggenHome: deps.config.debuggenHome,
       logger,
@@ -2338,10 +2500,86 @@ export function createInstrumentationService(
   }
 
   /**
-   * The preparation half of an install: the state-root separation check, the
-   * readiness facts, the context, the delta, and — unless the delta is empty —
-   * the installer's call. A refused separation check ends the install here,
-   * through {@link failInstall} like every other preparation failure.
+   * Runs an install's {@link InstallRequest.confirmProjectRoot} for one act,
+   * synchronously, so the caller can act with no `await` between the proof and
+   * the act.
+   *
+   * The caller's own refusal is returned unchanged. A throw, or an answer
+   * whose canonical root is not an absolute path, fails closed as an
+   * `INTERNAL` refusal ({@link rootConfirmationError}) rather than letting a
+   * root nobody re-proved be written in; the thrown value is not kept — only
+   * its closed exception class is logged. Every refusal is logged at `warn` by
+   * its code and reason alone, never a path.
+   *
+   * @param request The install request, which may carry the confirmation.
+   * @param log The session's logger.
+   * @param stage The act the confirmation guards, for the log.
+   * @returns `Ok(undefined)` when the request carries no confirmation, the
+   *   confirmed canonical root, or the refusal.
+   */
+  function confirmInstallRoot(
+    request: InstallRequest,
+    log: Logger,
+    stage: RootConfirmationStage,
+  ): Result<{ readonly canonicalRoot: string } | undefined, DebuggenError> {
+    const confirm = request.confirmProjectRoot;
+
+    if (confirm === undefined) {
+      return ok(undefined);
+    }
+
+    let answer: Result<{ readonly canonicalRoot: string }, DebuggenError>;
+    let thrown: ExceptionDescription | undefined;
+
+    try {
+      answer = confirm();
+    } catch (caught) {
+      thrown = describeException(caught);
+      answer = err(rootConfirmationError('project-root-confirmation-threw'));
+    }
+
+    if (isErr(answer)) {
+      const reason = loggableReasonOf(answer.error);
+      log.warn('The project root was not confirmed; no instrumentation was installed', {
+        stage,
+        code: answer.error.code,
+        ...(reason === undefined ? {} : { reason }),
+        ...thrown,
+      });
+      return answer;
+    }
+
+    const canonicalRoot = confirmedCanonicalRoot(answer.value);
+
+    if (canonicalRoot === undefined) {
+      const invalid = rootConfirmationError('project-root-confirmation-invalid');
+      log.warn('The project root was not confirmed; no instrumentation was installed', {
+        stage,
+        code: invalid.code,
+        reason: 'project-root-confirmation-invalid',
+      });
+      return err(invalid);
+    }
+
+    return ok({ canonicalRoot });
+  }
+
+  /**
+   * The preparation half of an install: the root's first confirmation, the
+   * state-root separation check, the readiness facts, the root's second
+   * confirmation, the context, the delta, and — unless the delta is empty —
+   * the installer's call. A refused confirmation or separation check ends the
+   * install here, through {@link failInstall} like every other preparation
+   * failure.
+   *
+   * With {@link InstallRequest.confirmProjectRoot}, the root is re-proved
+   * immediately before the install first acts on it — the separation check,
+   * judged on the confirmed canonical root — and again after the readiness
+   * facts' `await`, from where the context, the delta and the installer's
+   * invocation follow with no `await` in between, the context carrying the
+   * second answer as `canonicalProjectRoot`. A link retargeted while the
+   * readiness facts were collected is therefore refused rather than written
+   * through.
    */
   async function prepareInstall(
     request: InstallRequest,
@@ -2350,9 +2588,15 @@ export function createInstrumentationService(
     log: Logger,
   ): Promise<Result<PreparedInstall, DebuggenError>> {
     const { sessionId, projectRoot, plan } = checked;
+    const beforeCheck = confirmInstallRoot(request, log, 'before-state-root-check');
+
+    if (isErr(beforeCheck)) {
+      return beforeCheck;
+    }
+
     // Logged by `failInstall`, whose record carries the error's closed shape
     // (its code and constant details) and never a path.
-    const apart = await requireStateHomeApart(projectRoot);
+    const apart = await requireStateHomeApart(beforeCheck.value?.canonicalRoot ?? projectRoot);
 
     if (isErr(apart)) {
       return apart;
@@ -2383,9 +2627,20 @@ export function createInstrumentationService(
       return evidence;
     }
 
+    // Re-proved after the last `await` before the installer: from here to the
+    // installer's invocation below, everything runs in this turn.
+    const beforeInstall = confirmInstallRoot(request, log, 'before-install');
+
+    if (isErr(beforeInstall)) {
+      return beforeInstall;
+    }
+
     const context = buildContext({
       sessionId,
       projectRoot,
+      ...(beforeInstall.value === undefined
+        ? {}
+        : { canonicalProjectRoot: beforeInstall.value.canonicalRoot }),
       plan,
       code: request.code,
       readiness: evidence.value.observed,

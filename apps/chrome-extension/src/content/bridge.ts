@@ -155,11 +155,10 @@
  * it sends re-enters this bridge. No heartbeat is ever sent over a live port:
  * the worker's lifetime is `background/ws-bridge.ts`'s concern (its
  * open-socket heartbeat, and the `chrome.alarms` tick that revives a suspended
- * worker, AAP §0.5.5), and a content-script heartbeat would defeat worker
- * suspension on every localhost tab. When the extension is reloaded or
- * updated, `chrome.runtime.id` disappears; the bridge then stops for good
- * rather than retrying into "Extension context invalidated" errors on every
- * tab.
+ * worker), and a content-script heartbeat would defeat worker suspension on
+ * every localhost tab. When the extension is reloaded or updated,
+ * `chrome.runtime.id` disappears; the bridge then stops for good rather than
+ * retrying into "Extension context invalidated" errors on every tab.
  *
  * ## What is logged
  *

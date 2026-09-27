@@ -1,5 +1,5 @@
 /**
- * The HTTP half of this package's transport SDK: one client over the twenty-one
+ * The HTTP half of this package's transport SDK: one client over the twenty-two
  * routes `../http.ts` declares, with the bearer credential applied and every
  * reply parsed by the route's own schema before it reaches a caller.
  *
@@ -126,7 +126,7 @@
  *
  * ## The public surface
  *
- * One generic {@link HttpClient.request} covers all twenty-one routes with exact
+ * One generic {@link HttpClient.request} covers all twenty-two routes with exact
  * body and response types, and three named methods exist only because their
  * callers need something a route table cannot express: {@link HttpClient.health}
  * is called before a credential exists, {@link HttpClient.pairComplete} carries

@@ -94,17 +94,20 @@
  *   `panels.themeName`) and plays the DevTools page's part by opening the
  *   `PORT_DEVTOOLS` port and sending its `devtools.hello` frame; the panel
  *   has no other way (such as a `?tabId=` parameter) to learn its tab.
- * - **Pairing** drives the panel's own `PairDialog`, typing only the pairing
- *   code: the dialog's service address field stays at
- *   `DEFAULT_SERVICE_BASE_URL`, so pairing is refused with an explanation when
- *   the suite's service listens elsewhere.
+ * - **Pairing** drives the panel's own `PairDialog`: it types the suite's
+ *   service origin into the dialog's "Service address" field (blank when that
+ *   origin is `DEFAULT_SERVICE_BASE_URL`) and then the pairing code, so a
+ *   per-clone `DEBUGGEN_HOST`/`DEBUGGEN_PORT` reaches the worker exactly as a
+ *   developer's non-default port does. The worker's saved address
+ *   (`SERVICE_ENDPOINT_STORAGE_KEY`) is verified after every pairing.
  * - **Panel accessible names.** `PANEL_NAMES` types the capture button,
- *   session summary, event drawer, live tail, pairing-code field and
- *   capture-notice names, and the renderer's `.dg-panel` block class is typed
- *   too, because their owning modules keep them private and a React component
- *   module cannot be evaluated in Node without React and its CSS. The
- *   connection pill's wording is imported from
- *   `@debuggen/chrome-extension/messages` (`PANEL_CONNECTION_LABELS`).
+ *   session summary, event drawer, live tail, pairing-code field,
+ *   capture-notice, "Pick element" toggle and "Picker on" badge names, and the
+ *   renderer's `.dg-panel` block class is typed too, because their owning
+ *   modules keep them private and a React component module cannot be
+ *   evaluated in Node without React and its CSS. The connection pill's wording
+ *   is imported from `@debuggen/chrome-extension/messages`
+ *   (`PANEL_CONNECTION_LABELS`).
  * - **`auth.json`** is named here because `AUTH_FILE_NAME` lives inside
  *   `apps/local-service`, which this directory cannot import; the service home
  *   is the `debuggenHome` the Playwright config hands its `webServer`.
@@ -200,6 +203,8 @@ import type {
 } from '@debuggen/chrome-extension/messages';
 import {
   DEVTOOLS_TOKEN_STORAGE_KEY,
+  parseServiceEndpoint,
+  SERVICE_ENDPOINT_STORAGE_KEY,
   STORED_CREDENTIAL_VERSION,
 } from '@debuggen/chrome-extension/auth';
 import { BINDING_STORAGE_KEY } from '@debuggen/chrome-extension/tab-registry';
@@ -348,12 +353,16 @@ const RENDERED_PANEL_BODY_CHILDREN = '.dg-panel__body > *';
  * exported, and their `.tsx` modules cannot be evaluated in Node; see header):
  * `START_CAPTURE_LABEL` / `STOP_CAPTURE_LABEL` in `CaptureControls.tsx`,
  * `SUMMARY_TITLE` in `SessionSummary.tsx`, `DRAWER_LABEL` /
- * `LIVE_TAIL_REGION_LABEL` in `App.tsx`, `PAIRING_FIELD_LABEL` in
- * `PairDialog.tsx` — the dialog also holds a "Service address" field, so the
- * code field is addressed by its name rather than as the dialog's only textbox —
- * and `NOTICES_LABEL` / `NOTICE_LABELS['page-reloaded']` in `LiveTail.tsx`: the
+ * `LIVE_TAIL_REGION_LABEL` in `App.tsx`, `PAIRING_FIELD_LABEL` and
+ * `SERVICE_ADDRESS_FIELD_LABEL` in `PairDialog.tsx` — the dialog holds both
+ * fields, so each is addressed by its name rather than as the dialog's only
+ * textbox — and `NOTICES_LABEL` / `NOTICE_LABELS['page-reloaded']` in `LiveTail.tsx`: the
  * name of the live tail's capture-notices list and the badge wording of the
- * entry a same-origin reload during a capture adds to it.
+ * entry a same-origin reload during a capture adds to it. `PICK_LABEL` and
+ * `PICKER_ON_LABEL` in `TargetPicker.tsx` are the name of the "Pick element"
+ * toggle, whose `aria-pressed` is picker mode, and the wording of the badge
+ * shown beside it while picker mode is on; that badge is hidden from assistive
+ * technology, so it is found by its text rather than by a role.
  */
 const PANEL_NAMES = Object.freeze({
   startCapture: 'Start capture',
@@ -362,8 +371,11 @@ const PANEL_NAMES = Object.freeze({
   eventDetails: 'Selected event',
   liveTail: 'Live event tail',
   pairingCode: 'Pairing code',
+  serviceAddress: 'Service address',
   captureNotices: 'Capture notices, newest first',
   pageReloadedNotice: 'Page reloaded during capture',
+  pickElement: 'Pick element',
+  pickerOn: 'Picker on',
 });
 
 /** Why the stubbed `chrome.devtools.inspectedWindow.eval` refuses, surfaced by the panel's element-selection path. */
@@ -512,6 +524,14 @@ export interface ServiceHandle {
     query: DataQueryFor<S>,
   ): Promise<DataResultFor<S>>;
   getCurrentPanel(id: string): Promise<HttpResponseBody<'panel.get'>>;
+  /**
+   * `POST /sessions/:id/target/request` with the editor credential — what VS
+   * Code's "Pick element" sends: the service pushes `target.request` to the
+   * session's bound DevTools tab, whose panel enters picker mode. Resolves with
+   * the session and the tab the push was handed to; success means the frame
+   * was delivered, never that an element was picked.
+   */
+  requestTarget(id: string): Promise<HttpResponseBody<'target.request'>>;
   /** Open an editor-role WebSocket announcing `projectRoot` and recording every inbound frame. */
   connectEditor(projectRoot: string, options?: WaitOptions): Promise<EditorClient>;
 }
@@ -651,6 +671,16 @@ export interface PanelHandle {
    * tab while a capture was running, which the same capture continues across.
    */
   readonly pageReloadedNotices: Locator;
+  /**
+   * The header's "Pick element" toggle. Its `aria-pressed` is the panel's
+   * picker mode, whichever route turned it on — the toggle itself, or the
+   * service relaying VS Code's `target.request` — and it is `aria-disabled`
+   * (never natively disabled) while no session is bound or a request is in
+   * flight, when a press does nothing.
+   */
+  readonly pickElementButton: Locator;
+  /** The "Picker on" badge the header shows beside the pressed toggle, only while picker mode is on. */
+  readonly pickerOnBadge: Locator;
   readonly pairDialog: Locator;
 }
 
@@ -1419,6 +1449,9 @@ async function createServiceHandle(baseUrl: string, home: string): Promise<Servi
     },
     async getCurrentPanel(id) {
       return unwrap('panel.get', await call('panel.get', { params: { id } }));
+    },
+    async requestTarget(id) {
+      return unwrap('target.request', await call('target.request', { params: { id }, body: {} }));
     },
     connectEditor(projectRoot, options) {
       return connectEditorClient(
@@ -3088,6 +3121,70 @@ async function hasStoredCredential(harness: ExtensionHarness): Promise<boolean> 
     .then((shape) => shape.version === STORED_CREDENTIAL_VERSION && shape.tokenLength >= 32);
 }
 
+/**
+ * The canonical service origin the extension would store for `address`, by the
+ * extension's own rule (`parseServiceEndpoint`): `http:` on `127.0.0.1` or
+ * `localhost`, the hosts its manifest grants. A service address the worker
+ * cannot reach is a configuration error of the run, named here rather than left
+ * to surface as a pairing timeout.
+ */
+function serviceEndpointOf(address: string, source: string): string {
+  const parsed = parseServiceEndpoint(address);
+  if (!parsed.ok) {
+    throw new Error(
+      `${source} ${address} is not an address the extension's worker can dial: ${parsed.error.message} Set DEBUGGEN_HOST to 127.0.0.1 or localhost.`,
+    );
+  }
+  return parsed.value;
+}
+
+/**
+ * What the worker has saved under `SERVICE_ENDPOINT_STORAGE_KEY` — written by
+ * the pairing dialog's "Service address" field, absent when the default
+ * applies. The value is an origin, not a secret. `refused` when the stored
+ * value is one the extension itself would not dial.
+ */
+type StoredServiceEndpoint =
+  | { readonly kind: 'default' }
+  | { readonly kind: 'configured'; readonly origin: string }
+  | { readonly kind: 'refused' };
+
+async function readStoredServiceEndpoint(
+  harness: ExtensionHarness,
+): Promise<StoredServiceEndpoint> {
+  const stored = await readWorkerStorage(
+    await harness.liveWorker(),
+    'local',
+    SERVICE_ENDPOINT_STORAGE_KEY,
+  );
+  if (stored === undefined) {
+    return { kind: 'default' };
+  }
+  const parsed = parseServiceEndpoint(stored);
+  return parsed.ok ? { kind: 'configured', origin: parsed.value } : { kind: 'refused' };
+}
+
+/** The origin the worker dials for `stored`, or `undefined` when the stored value is refused. */
+function dialledOrigin(stored: StoredServiceEndpoint, defaultOrigin: string): string | undefined {
+  switch (stored.kind) {
+    case 'default':
+      return defaultOrigin;
+    case 'configured':
+      return stored.origin;
+    case 'refused':
+      return undefined;
+  }
+}
+
+/**
+ * The value the dialog's "Service address" field shows once it has read the
+ * saved setting: the saved origin, or blank for the default and for a refused
+ * value (which the dialog reports as a field error instead).
+ */
+function prefilledAddress(stored: StoredServiceEndpoint): string {
+  return stored.kind === 'configured' ? stored.origin : '';
+}
+
 // ---------------------------------------------------------------------------
 // The panel page and its DevTools emulation
 // ---------------------------------------------------------------------------
@@ -3433,6 +3530,8 @@ async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promis
     pageReloadedNotices: captureNotices.getByRole('listitem').filter({
       has: page.getByText(PANEL_NAMES.pageReloadedNotice, { exact: true }),
     }),
+    pickElementButton: header.getByRole('button', { name: PANEL_NAMES.pickElement, exact: true }),
+    pickerOnBadge: header.getByText(PANEL_NAMES.pickerOn, { exact: true }),
     pairDialog: page.getByRole('dialog'),
   };
 }
@@ -3443,22 +3542,28 @@ async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promis
 
 /**
  * Pair through the panel's own `PairDialog`: `POST /pair/start` with the
- * editor credential yields the one-time code, which is typed into the dialog;
- * the service worker then calls `POST /pair/complete` from its
- * `chrome-extension://` origin and stores the devtools credential. This
- * process never calls `/pair/complete` itself — a devtools credential minted
- * from any other origin would be refused (docs/SECURITY.md, section 7.4).
+ * editor credential yields the one-time code, which is typed into the dialog
+ * together with the suite's service origin in its "Service address" field
+ * (blank when that origin is `DEFAULT_SERVICE_BASE_URL`); the dialog saves the
+ * address before it hands over the code, and the service worker then calls
+ * `POST /pair/complete` at that address from its `chrome-extension://` origin
+ * and stores the devtools credential. This process never calls
+ * `/pair/complete` itself — a devtools credential minted from any other origin
+ * would be refused (docs/SECURITY.md, section 7.4).
+ *
+ * A stored credential is reused only while the worker's saved address is the
+ * suite's service: a credential paired with another address belongs to
+ * another service and is removed before pairing afresh.
  */
 function createPairing(harness: ExtensionHarness, service: ServiceHandle): PairingHandle {
   let memo: Promise<void> | undefined;
 
   const pairOnce = async (): Promise<void> => {
-    const dialled = originOf(DEFAULT_SERVICE_BASE_URL);
-    if (originOf(service.baseUrl) !== dialled) {
-      throw new Error(
-        `The extension's service worker only dials ${String(dialled)} (DEFAULT_SERVICE_BASE_URL), but the suite's service listens on ${service.baseUrl}. Run the browser suite with DEBUGGEN_HOST/DEBUGGEN_PORT naming ${String(dialled)}, or the worker can neither pair nor connect.`,
-      );
-    }
+    const target = serviceEndpointOf(service.baseUrl, "The suite's service address");
+    const defaultOrigin = serviceEndpointOf(
+      DEFAULT_SERVICE_BASE_URL,
+      "The extension's DEFAULT_SERVICE_BASE_URL",
+    );
     const panel = await openPanel(harness, {
       inspectedTabId: undefined,
       inspectedUrl: undefined,
@@ -3468,31 +3573,47 @@ function createPairing(harness: ExtensionHarness, service: ServiceHandle): Pairi
       initScripts: [],
     });
     const pairThroughPanel = async (): Promise<void> => {
-      // Let the pill settle: a stored credential either connects, or is
-      // refused by the service (a rotated token, a fresh DEBUGGEN_HOME) and
-      // cleared by the worker, which shows as "not paired".
-      let settledOn: PanelConnectionStatus | undefined;
-      await pollFor(
-        async () => {
-          settledOn = await panel.connectionStatus();
-          return settledOn === 'connected' || settledOn === 'not-paired' ? true : undefined;
-        },
-        PAIRING_TIMEOUT_MS,
-        () =>
-          `The panel's connection pill did not settle on "${PANEL_CONNECTION_LABELS.connected}" or "${PANEL_CONNECTION_LABELS['not-paired']}" within ${String(PAIRING_TIMEOUT_MS)} ms; it reads ${settledOn === undefined ? 'nothing recognisable' : `"${PANEL_CONNECTION_LABELS[settledOn]}"`}${settledOn === 'service-not-running' ? ` — nothing answers ${String(dialled)} from Chromium` : ''}.`,
-      );
-      if (settledOn === 'connected' && (await hasStoredCredential(harness))) {
-        return;
+      const stored = await readStoredServiceEndpoint(harness);
+      if (dialledOrigin(stored, defaultOrigin) === target) {
+        // The worker dials the suite's service. Let the pill settle: a stored
+        // credential either connects, or is refused by the service (a rotated
+        // token, a fresh DEBUGGEN_HOME) and cleared by the worker, which shows
+        // as "not paired".
+        let settledOn: PanelConnectionStatus | undefined;
+        await pollFor(
+          async () => {
+            settledOn = await panel.connectionStatus();
+            return settledOn === 'connected' || settledOn === 'not-paired' ? true : undefined;
+          },
+          PAIRING_TIMEOUT_MS,
+          () =>
+            `The panel's connection pill did not settle on "${PANEL_CONNECTION_LABELS.connected}" or "${PANEL_CONNECTION_LABELS['not-paired']}" within ${String(PAIRING_TIMEOUT_MS)} ms; it reads ${settledOn === undefined ? 'nothing recognisable' : `"${PANEL_CONNECTION_LABELS[settledOn]}"`}${settledOn === 'service-not-running' ? ` — nothing answers ${target} from Chromium` : ''}.`,
+        );
+        if (settledOn === 'connected' && (await hasStoredCredential(harness))) {
+          return;
+        }
       }
+      // A credential not accepted by the suite's service — refused, or paired
+      // with another address — is removed so the dialog pairs afresh.
       if (await hasStoredCredential(harness)) {
         await removeWorkerStorage(await harness.liveWorker(), 'local', DEVTOOLS_TOKEN_STORAGE_KEY);
-        await panel.waitForNotPaired({ timeoutMs: PAIRING_TIMEOUT_MS });
       }
+      await panel.waitForNotPaired({ timeoutMs: PAIRING_TIMEOUT_MS });
 
       const { code } = await service.pairStart();
       if (!(await panel.pairDialog.isVisible())) {
         await panel.header.locator('button[aria-haspopup="dialog"]').click();
       }
+      // The dialog prefills the address field from the saved setting; typing
+      // only after that read has landed means the value submitted is the one
+      // typed here, never a late prefill over it.
+      const addressInput = panel.pairDialog.getByRole('textbox', {
+        name: PANEL_NAMES.serviceAddress,
+      });
+      await expect(addressInput).toHaveValue(prefilledAddress(stored), {
+        timeout: PAIRING_TIMEOUT_MS,
+      });
+      await addressInput.fill(target === defaultOrigin ? '' : target);
       const codeInput = panel.pairDialog.getByRole('textbox', { name: PANEL_NAMES.pairingCode });
       await codeInput.fill(code);
       await codeInput.press('Enter');
@@ -3507,7 +3628,7 @@ function createPairing(harness: ExtensionHarness, service: ServiceHandle): Pairi
           : '';
         const reason =
           status === 'service-not-running'
-            ? `service unreachable: the worker reports "${PANEL_CONNECTION_LABELS[status]}" — nothing answers ${String(dialled)} from Chromium`
+            ? `service unreachable: the worker reports "${PANEL_CONNECTION_LABELS[status]}" — nothing answers ${target} from Chromium`
             : dialogOpen
               ? `code rejected: the pairing dialog is still open and reads "${dialogText}"`
               : `worker not connected: the pill reads "${status === undefined ? 'nothing recognisable' : PANEL_CONNECTION_LABELS[status]}" after the code was accepted`;
@@ -3518,6 +3639,12 @@ function createPairing(harness: ExtensionHarness, service: ServiceHandle): Pairi
       if (!(await hasStoredCredential(harness))) {
         throw new Error(
           `The panel reports "${PANEL_CONNECTION_LABELS.connected}" but no devtools credential is stored under ${DEVTOOLS_TOKEN_STORAGE_KEY}.`,
+        );
+      }
+      const saved = dialledOrigin(await readStoredServiceEndpoint(harness), defaultOrigin);
+      if (saved !== target) {
+        throw new Error(
+          `Pairing connected, but the worker's saved service address (${SERVICE_ENDPOINT_STORAGE_KEY}) is ${saved ?? 'a value the extension refuses'}, not the suite's service ${target}.`,
         );
       }
     };

@@ -285,7 +285,12 @@ export interface ObservedReadinessInputs {
 // of assembling a second object. Those modules sit below this one and may not
 // import it, which is why the relationship is structural rather than an
 // `extends` clause: `projectRoot`, `backups`, `journal`, `logger`, `now` and
-// `signal` carry the same meanings in all three.
+// `signal` carry the same meanings in all three. `canonicalProjectRoot` is the
+// one member with no counterpart in either: the patch layer takes it as
+// `PatcherOptions.canonicalRoot`, a construction option of the patcher rather
+// than a member of a context, and a patcher given one hands the conflict
+// detector that canonical path as its `projectRoot`. An adapter that builds a
+// patcher therefore forwards it by name.
 // ---------------------------------------------------------------------------
 
 /**
@@ -334,8 +339,37 @@ export interface InstrumentationContext {
    * developer-facing relaunch command is composed
    * ({@link UnavailableSignal.hint}). Never read from the environment or
    * inferred from a page's URL.
+   *
+   * It stays the root **as the session records it**, links and all: an adapter
+   * compares it with a preload's announced root
+   * ({@link ObservedServerAgent.projectRoot}) and composes relaunch hints from
+   * it, and both are about the spelling the developer and their dev server
+   * use. Where files are actually resolved and written is
+   * {@link InstrumentationContext.canonicalProjectRoot} when the service holds
+   * one.
    */
   readonly projectRoot: string;
+
+  /**
+   * The canonical path {@link InstrumentationContext.projectRoot} was admitted
+   * under — absolute POSIX, every symbolic link resolved — supplied by the
+   * service when it holds one.
+   *
+   * The patch layer resolves, pins, reads and writes every patched file inside
+   * this path rather than inside `projectRoot`, so a `projectRoot` that is a
+   * link retargeted after admission cannot redirect a patch; and it refuses a
+   * patch (`PATH_OUTSIDE_PROJECT`, `details.reason: 'project-root-moved'`) once
+   * the path is no longer its own canonical form, because a directory on the
+   * way to it was replaced by a link since admission. An adapter that patches
+   * hands it to `./patch/patcher.ts` as `PatcherOptions.canonicalRoot` and uses
+   * it for nothing else: preload matching and relaunch hints stay on
+   * `projectRoot`.
+   *
+   * Absent when the service has no admitted canonical path for the root — a
+   * suite's temporary directory, for one — in which case the patch layer
+   * resolves `projectRoot` afresh on every attempt.
+   */
+  readonly canonicalProjectRoot?: string | undefined;
 
   /**
    * Which revision of this session's plan is being installed or removed,

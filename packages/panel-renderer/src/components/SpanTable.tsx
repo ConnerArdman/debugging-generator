@@ -392,11 +392,14 @@ const DURATION_COLUMN_KEY = 'duration' satisfies keyof TelemetryEvent;
  * whose floor keeps its content readable, in the vocabulary every table shares,
  * and every role's track has two parts:
  *
- * - The FLOOR is what the column never shrinks below. `primitives/DataTable`
- *   sums the floors into the grid's own minimum width, so a surface narrower
- *   than their sum scrolls the table horizontally with every column still
- *   readable, instead of squeezing each column to its padding and letting one
- *   cell's content paint over the next.
+ * - The FLOOR is what a compact column never shrinks below; a truncating
+ *   column (`name`, `text`) may narrow to the `--dg-column-yield` fraction of
+ *   its floor, and only when that makes the table fit its panel, so names
+ *   narrow while figures stay in view. `primitives/DataTable` sums the floors
+ *   and those minimums into the grid's own width, so a surface too narrow even
+ *   for the minimums keeps every floor and scrolls the table horizontally with
+ *   every column readable, instead of squeezing each column to its padding and
+ *   letting one cell's content paint over the next.
  * - The SHARE is a ratio, so a column lands at the same offset in every row
  *   (the header and each row are separate grid containers), and the largest
  *   share of spare width goes to the operation name, the one long and variable

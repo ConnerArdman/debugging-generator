@@ -2703,10 +2703,13 @@ function TimelineOperationName({
  * and its source chip are `name`, the identifier role; the kind chip is
  * `label`, whose floor holds a kind label such as "Outgoing request"; the
  * tier and the reported status are `status` chips; the offset and the duration
- * are `quantity` figures. Every role has a readable minimum, and the table
- * primitive sums those minimums into its floor, so in a narrow panel the
- * equivalent scrolls horizontally instead of squeezing a column to its padding
- * (see `DataTableColumn.width`).
+ * are `quantity` figures. Every role has a readable floor, and the table
+ * primitive sums the floors and minimums into its own width: a panel just too
+ * narrow for every floor narrows the two `name` columns, never below the
+ * `--dg-column-yield` fraction of their floor, only as far as the equivalent
+ * needs to fit, keeping every figure in view, and a panel too narrow even for
+ * that keeps every floor and scrolls horizontally instead of squeezing a
+ * column to its padding (see `DataTableColumn.width`).
  *
  * @param origin The window start every offset in the table is measured from.
  * @param revealedEventId The row whose description is revealed for keyboard

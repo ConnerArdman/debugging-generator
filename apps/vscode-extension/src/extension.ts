@@ -99,9 +99,14 @@ import { DebuggenError, createConsoleLogger, isErr, isOk } from '@debuggen/share
 import type { LogFields, LogRecord, Logger } from '@debuggen/shared';
 
 import { registerCommands } from './commands';
-import type { CommandId } from './commands';
+import type { CommandId, DestructiveConfirmation } from './commands';
 import { DEFAULT_SHUTDOWN_TIMEOUTS, endSessionsForShutdown } from './commands/end-session';
 import type { ShutdownReport } from './commands/end-session';
+import {
+  RESTART_SERVICE_ACTION,
+  RESTART_WITH_LIVE_SESSION,
+  hasLiveSession,
+} from './commands/start-service';
 import { createEditorCredentialStore } from './service/auth';
 import type { EditorCredentialStore } from './service/auth';
 import {
@@ -238,8 +243,22 @@ const MAX_DISPLAY_TEXT_LENGTH = 500;
 /** The upper bound of one serialised log-fields suffix in the output channel. */
 const MAX_LOG_FIELDS_LENGTH = 4_000;
 
-/** The command a refused credential is repaired with (AAP §0.5.6). */
+/**
+ * The command the credential repair offers once a restarted service re-issued
+ * the editor credential and `auth.json` was read back. Never
+ * offered while the credential is refused: `credentials.rotate` itself
+ * requires an editor credential the service accepts.
+ */
 const ROTATE_SERVICE_TOKEN_COMMAND = 'debuggen.rotateServiceToken' satisfies CommandId;
+
+/** The refused-credential prompt's action that reads `auth.json` again and reconnects. */
+const RETRY_CREDENTIAL_ACTION = 'Retry';
+
+/** The post-restart notice's action, which runs {@link ROTATE_SERVICE_TOKEN_COMMAND}. */
+const ROTATE_SERVICE_TOKEN_ACTION = 'Rotate Service Token';
+
+/** The refused-credential prompt's headline; it never carries a token or file content. */
+const CREDENTIAL_REFUSED_MESSAGE = 'The Debug Generator service refused this editor’s credential.';
 
 /** The command that starts the embedded service by the developer's request. */
 const START_SERVICE_COMMAND = 'debuggen.startService' satisfies CommandId;
@@ -1172,7 +1191,11 @@ async function projectRootOfSession(
  *   meanwhile; no second retry loop is layered on top.
  * - A refused credential (close code 4401 after the client re-read
  *   `auth.json` and found nothing newer) is terminal until the developer
- *   acts, so it is one notification with the two remedies (AAP §0.5.6).
+ *   acts, so it is one notification that leads with restarting
+ *   the service — which re-issues the editor credential in `auth.json` as it
+ *   starts — and offers a re-read of `auth.json`. Rotation needs a credential
+ *   the service accepts, so it is offered only after a restart and a
+ *   successful re-read (see {@link promptForCredentialRepair}).
  * - A service that became reachable — our child or someone else's — is
  *   connected to at once; `connect()` is idempotent.
  */
@@ -1211,7 +1234,11 @@ function wireTransport(rt: ExtensionRuntime): vscode.Disposable[] {
       return;
     }
     logger.warn('The service refused the editor credential', { code: detail.code });
-    void promptForCredentialRepair(rt);
+    void promptForCredentialRepair(rt).catch((error: unknown) => {
+      logger.error('Repairing the editor credential failed unexpectedly', {
+        code: DebuggenError.from(error).code,
+      });
+    });
   };
 
   const onStatus = (status: ServiceStatus): void => {
@@ -1274,42 +1301,123 @@ async function resync(rt: ExtensionRuntime): Promise<void> {
 }
 
 /**
- * The refused-credential notification. "Retry" re-reads `auth.json` and
- * resumes the socket; "Rotate Service Token" runs the (confirmed) command.
- * No token or file content is ever part of the message.
+ * The refused-credential notification, one per refusal the client reports.
+ *
+ * The service refuses the editor credential when `auth.json` names one its
+ * store does not hold. Rotation cannot repair that: `credentials.rotate`
+ * requires an editor credential the service accepts, and the service refuses
+ * it `UNAUTHORIZED` before the rotation runs. A restart can: the service
+ * re-registers or re-mints the editor credential in `auth.json` as it starts.
+ * So the prompt leads with the restart, and its actions depend
+ * on who owns the service:
+ *
+ * - a child of this window (`running`) — {@link RESTART_SERVICE_ACTION}, then
+ *   {@link RETRY_CREDENTIAL_ACTION}; the restart is
+ *   {@link restartForCredentialRepair};
+ * - any other service — {@link RETRY_CREDENTIAL_ACTION} only, with a hint to
+ *   restart it where it was started. `ServiceProcess.restart` refuses a
+ *   service this window did not spawn.
+ *
+ * "Retry" reads `auth.json` again and, once it was read, resumes the socket;
+ * it never offers rotation. No token or file content is ever part of a
+ * message or a log record.
+ *
+ * @param rt The runtime of the activation whose socket was refused.
  */
 async function promptForCredentialRepair(rt: ExtensionRuntime): Promise<void> {
-  const retry = 'Retry';
-  const rotate = 'Rotate Service Token';
+  const restartable = rt.serviceProcess.status.state === 'running';
   const choice = await showNotification(
     rt.logger,
-    {
-      level: 'warning',
-      message: 'The Debug Generator service refused this editor’s credential.',
-      hint: 'Retry after restarting the service, or rotate the service token.',
-    },
-    [retry, rotate],
+    restartable
+      ? {
+          level: 'warning',
+          message: CREDENTIAL_REFUSED_MESSAGE,
+          hint: 'Restart the service: as it starts it re-issues the editor credential in auth.json. Retry reads auth.json again.',
+        }
+      : {
+          level: 'warning',
+          message: CREDENTIAL_REFUSED_MESSAGE,
+          hint: 'Restart the service where it was started — a terminal or another VS Code window — so it re-issues the editor credential in auth.json, then choose Retry.',
+        },
+    restartable ? [RESTART_SERVICE_ACTION, RETRY_CREDENTIAL_ACTION] : [RETRY_CREDENTIAL_ACTION],
   );
   if (rt.disposed || choice === undefined) {
     return;
   }
-  if (choice === retry) {
-    const refreshed = await rt.credentials.refresh();
-    if (rt.disposed) {
-      return;
-    }
-    if (isErr(refreshed)) {
-      rt.logger.warn('The editor credential could not be re-read', {
-        code: refreshed.error.code,
-      });
-      surface(rt, {
-        level: 'error',
-        message: toDisplayText(`Could not read the editor credential: ${refreshed.error.message}`),
-        hint: refreshed.error.hint === undefined ? undefined : toDisplayText(refreshed.error.hint),
-      });
-      return;
-    }
+  if (restartable && choice === RESTART_SERVICE_ACTION) {
+    await restartForCredentialRepair(rt);
+    return;
+  }
+  if (choice === RETRY_CREDENTIAL_ACTION && (await rereadEditorCredential(rt))) {
     rt.client.connect();
+  }
+}
+
+/**
+ * The refused-credential prompt's "Restart service": confirm with
+ * {@link RESTART_WITH_LIVE_SESSION} while a session is live, restart this
+ * window's service once, read `auth.json` again and reconnect. One message per
+ * outcome:
+ *
+ * - declined confirmation — nothing is restarted and nothing is shown;
+ * - the restart failed — one error with the process manager's message and
+ *   hint; nothing is re-read, connected or offered;
+ * - the re-read failed — one error, as {@link rereadEditorCredential} words
+ *   it; nothing is connected or offered;
+ * - both succeeded — the socket is resumed, then one information notice whose
+ *   single action is {@link ROTATE_SERVICE_TOKEN_ACTION}. This is the only
+ *   point the repair offers rotation: `auth.json` now holds a credential the
+ *   restarted service issued or adopted, so the rotation it runs is accepted,
+ *   and it is worth running when something other than Debug Generator changed
+ *   the file. The command asks for its own confirmation.
+ *
+ * @param rt The runtime of the activation whose socket was refused.
+ */
+async function restartForCredentialRepair(rt: ExtensionRuntime): Promise<void> {
+  if (hasLiveSession({ state: rt.state })) {
+    const confirmed = await confirmModal(rt, RESTART_WITH_LIVE_SESSION);
+    if (rt.disposed || !confirmed) {
+      return;
+    }
+  }
+
+  const restarted = await rt.serviceProcess.restart();
+  if (rt.disposed) {
+    return;
+  }
+  if (isErr(restarted)) {
+    rt.logger.warn('The service could not be restarted to repair the editor credential', {
+      code: restarted.error.code,
+    });
+    surface(rt, {
+      level: 'error',
+      message: toDisplayText(
+        `Could not restart the Debug Generator service: ${restarted.error.message}`,
+      ),
+      hint: restarted.error.hint === undefined ? undefined : toDisplayText(restarted.error.hint),
+    });
+    return;
+  }
+
+  if (!(await rereadEditorCredential(rt))) {
+    return;
+  }
+  rt.client.connect();
+  rt.logger.info('The service was restarted to repair the editor credential', {
+    state: restarted.value.state,
+  });
+
+  const choice = await showNotification(
+    rt.logger,
+    {
+      level: 'info',
+      message:
+        'Restarted the Debug Generator service; this editor reconnects with the credential it issued.',
+      hint: 'If anything other than Debug Generator changed auth.json, rotate the service token to revoke every credential issued before.',
+    },
+    [ROTATE_SERVICE_TOKEN_ACTION],
+  );
+  if (rt.disposed || choice !== ROTATE_SERVICE_TOKEN_ACTION) {
     return;
   }
   try {
@@ -1318,6 +1426,61 @@ async function promptForCredentialRepair(rt: ExtensionRuntime): Promise<void> {
     rt.logger.warn('Rotating the service token could not be started', {
       code: DebuggenError.from(error).code,
     });
+  }
+}
+
+/**
+ * Reads `auth.json` again for the credential repair. A failure is logged by
+ * its code and surfaced once, with the store's message and hint — never a
+ * token or the file's content.
+ *
+ * @param rt The runtime of the activation whose socket was refused.
+ * @returns `true` once the credential was read and the runtime is still live.
+ */
+async function rereadEditorCredential(rt: ExtensionRuntime): Promise<boolean> {
+  const refreshed = await rt.credentials.refresh();
+  if (rt.disposed) {
+    return false;
+  }
+  if (isErr(refreshed)) {
+    rt.logger.warn('The editor credential could not be re-read', {
+      code: refreshed.error.code,
+    });
+    surface(rt, {
+      level: 'error',
+      message: toDisplayText(`Could not read the editor credential: ${refreshed.error.message}`),
+      hint: refreshed.error.hint === undefined ? undefined : toDisplayText(refreshed.error.hint),
+    });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Asks for confirmation in a modal warning, as `CommandUi.confirmDestructive`
+ * does for the commands. Never rejects: a modal that cannot be shown is logged
+ * by code and counts as declined.
+ *
+ * @param rt The runtime the modal belongs to.
+ * @param confirmation The headline, what will be lost, and the one confirming button.
+ * @returns `true` only when the developer chose exactly `confirmation.confirmLabel`.
+ */
+async function confirmModal(
+  rt: ExtensionRuntime,
+  confirmation: DestructiveConfirmation,
+): Promise<boolean> {
+  try {
+    const choice = await vscode.window.showWarningMessage(
+      confirmation.message,
+      { modal: true, detail: confirmation.detail },
+      confirmation.confirmLabel,
+    );
+    return choice === confirmation.confirmLabel;
+  } catch (error) {
+    rt.logger.debug('Confirmation could not be shown', {
+      code: DebuggenError.from(error).code,
+    });
+    return false;
   }
 }
 

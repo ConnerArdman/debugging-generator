@@ -17,8 +17,8 @@
  *
  * `props.modifications` is `WebviewState.modifications`: the session's
  * `ModificationRecord[]`, which the host keeps from the session record, from
- * `instrumentation.ready` / `cleanup.completed` (AAP 0.4.2) and from its reads
- * of the paged journal. The rows appear in exactly that order — the order the
+ * `instrumentation.ready` / `cleanup.completed` and from its reads of the paged
+ * journal. The rows appear in exactly that order — the order the
  * installer applied the plan in, which is meaningful when a follow-up layers a
  * second record onto the same file — and are never re-sorted. `DataTable` is
  * controlled and never re-orders rows itself, so passing the array through is

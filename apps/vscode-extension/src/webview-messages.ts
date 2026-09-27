@@ -268,9 +268,10 @@ export interface StageFailure {
  * `relevantFiles`, `modifications`, `analysis`, `target` and `cleanup` are the
  * host's current view of those facts, which it keeps from the latest session
  * record and from the messages that refine it between records
- * (`instrumentation.ready`, `analysis.completed`, `target.selected`,
- * `cleanup.completed`). `target` also exists before any session does, because an
- * element can be selected before the question is asked.
+ * (`instrumentation.ready`, `analysis.completed`, `cleanup.completed`).
+ * `target` comes from the session record alone: the service records the
+ * element picked in DevTools on the session the tab is bound to and
+ * broadcasts the record, so `target` is absent while no session is active.
  */
 export interface WebviewState {
   /** The host's connection to the local service, and what the status bar shows. */

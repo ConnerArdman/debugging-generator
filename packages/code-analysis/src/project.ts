@@ -137,9 +137,8 @@
  *   name begins with a dot, at any depth, which is why `.next`, `.turbo`,
  *   `.cache`, `.git` and every `.env*` are excluded twice over — and why a
  *   source file parked under any other hidden directory is invisible to the
- *   indexer. This used to be a glob matcher's `dot: false` default; it is now
- *   a rule of this module ({@link HIDDEN_PREFIX}), so the behaviour no longer
- *   depends on a third-party default.
+ *   indexer. The rule is this module's own ({@link HIDDEN_PREFIX}) rather than
+ *   a third-party matcher default, so no dependency upgrade can change it.
  * - **Type resolution is not required.** A target whose dependencies are not
  *   installed indexes exactly as one whose dependencies are: unresolvable
  *   module specifiers, missing `lib` files and missing ambient types produce no
@@ -314,14 +313,11 @@ const ENV_PREFIX = '.env.';
 /**
  * The prefix of a hidden filesystem entry, which is never indexed at any depth.
  *
- * This is a rule rather than a side effect. It used to arrive from a glob
- * matcher's `dot: false` default — a pattern that does not ask for a
- * dot-prefixed segment does not match one — and the module's documentation has
- * always stated the resulting behaviour: `.git`, `.next`, `.turbo` and `.cache`
- * are excluded twice over, and a source file parked under any other hidden
- * directory is invisible to the indexer. Now that {@link discoverCandidatePaths}
- * owns the traversal, the rule is stated here so the behaviour does not depend
- * on a third-party default, and so every `.env*` file is skipped before its
+ * This is a rule rather than a side effect: `.git`, `.next`, `.turbo` and
+ * `.cache` are excluded twice over, and a source file parked under any other
+ * hidden directory is invisible to the indexer. {@link discoverCandidatePaths}
+ * owns the traversal and applies the rule itself, so the behaviour depends on
+ * no third-party matcher default, and every `.env*` file is skipped before its
  * name is even judged.
  */
 const HIDDEN_PREFIX = '.';
@@ -2048,9 +2044,9 @@ function createProject(tsConfigFilePath: string | undefined): Result<Project> {
  * what the options are, and a configuration that extends a file it cannot read
  * is a configuration this module must report rather than guess at.
  *
- * Failure is reported exactly as the previous constructor-driven path reported
- * it — `CODE_INDEX_FAILED` with `details.reason` `tsconfig-unreadable` — so a
- * caller branching on the reason is unaffected.
+ * Every failure — a file that cannot be read, JSON that does not parse, a
+ * parser that throws — is reported the same way, as `CODE_INDEX_FAILED` with
+ * `details.reason` `tsconfig-unreadable`, so a caller branches on one reason.
  *
  * @param tsConfigFilePath The absolute path of the configuration to read.
  * @returns `Ok` with the resolved options, or `Err` when the file cannot be
@@ -2194,28 +2190,25 @@ interface DiscoverOptions {
  *
  * ## What it costs, and what it keeps
  *
- * One `readdir` per real directory, which is what any traversal costs, and the
- * property the previous negative globs existed for is kept: an excluded tree is
- * recognised at its own directory entry and is never enumerated, so
- * `node_modules` of a large project costs one rejected entry rather than a
- * hundred thousand paths. Exclusion is decided by the same predicates the
- * screen uses ({@link shouldExcludePath}, {@link isIndexableFile},
- * {@link isEnvFilePath}) rather than by a parallel list of patterns, so there
- * is no second spelling of the rule to drift.
+ * One `readdir` per real directory, which is what any traversal costs. An
+ * excluded tree is recognised at its own directory entry and is never
+ * enumerated, so `node_modules` of a large project costs one rejected entry
+ * rather than a hundred thousand paths. Exclusion is decided by the same
+ * predicates the screen uses ({@link shouldExcludePath},
+ * {@link isIndexableFile}, {@link isEnvFilePath}) rather than by a parallel
+ * list of patterns, so there is no second spelling of the rule to drift.
  *
- * A dot-prefixed entry is skipped at any depth. That is not incidental
- * tidiness: it is the behaviour the glob layer's `dot: false` default used to
- * supply, which this module's documentation states and which keeps `.git`,
- * `.next`, `.turbo` and every `.env*` out of the candidate list a second time
- * over.
+ * A dot-prefixed entry ({@link HIDDEN_PREFIX}) is skipped at any depth. That
+ * is not incidental tidiness: it is a rule this module's documentation states,
+ * and it keeps `.git`, `.next`, `.turbo` and every `.env*` out of the
+ * candidate list a second time over.
  *
  * ## Failures
  *
  * The root must be readable — a project whose top level cannot be listed is an
- * `Err`, as it was when the glob layer failed. A directory *below* the root
- * that cannot be listed is counted and reported rather than fatal: one
- * unreadable subdirectory in a large tree is a reason to index the rest, and
- * the report names it.
+ * `Err`. A directory *below* the root that cannot be listed is counted and
+ * reported rather than fatal: one unreadable subdirectory in a large tree is a
+ * reason to index the rest, and the report names it.
  *
  * @param options The project's two roots, the exclusions and where to report.
  * @returns `Ok` with absolute candidate paths spelled under
@@ -2469,9 +2462,9 @@ interface ScreenOptions {
  * every symbolic link resolved — is the only base a resolved path is required
  * to sit under, and a resolved path is by construction free of links, so the
  * comparison is between two canonical paths and has one answer. Accepting the
- * lexical root as a second base, as an earlier version of this screen did,
- * widens that answer for no gain: a resolved path can only match the lexical
- * root when the two are the same string.
+ * lexical root as a second base would widen that answer for no gain: a
+ * resolved path can only match the lexical root when the two are the same
+ * string.
  *
  * ## And the resolved path must be a regular file
  *
@@ -2682,9 +2675,9 @@ interface WalkOptions {
  * rather than a cheap one for the cache path and a thorough one for the
  * loading path.
  *
- * The refusals are reported here, under the same disposition
- * ({@link RefusalDisposition}) the loading path used to report them with,
- * because they still describe candidates refused *before being read*. What
+ * The refusals are reported here, under the disposition
+ * ({@link RefusalDisposition}) `'refused before being read'`, because they
+ * describe candidates refused before any file is opened. What
  * {@link admitScreenedSourceFiles} then does with the survivors is screen them
  * again — which is defence in depth and not redundancy, since a file can change
  * between the two passes and since a future call site may hand it paths this

@@ -1,24 +1,27 @@
 /**
- * The handshake, the page agent's lifecycle and the two arming frames:
- * `client.hello`, `agent.ready`, `agent.config` and `server-agent.config`
- * (AAP §0.4.2), together with the WebSocket transport constants of the local
- * service's access boundary (AAP §0.5.6).
+ * The handshake, the connection's liveness pair, the page agent's lifecycle and
+ * the two arming frames: `client.hello`, `client.ping`, `service.pong`,
+ * `agent.ready`, `agent.config` and `server-agent.config`,
+ * together with the WebSocket transport constants of the local service's access
+ * boundary.
  *
- * ## Why these four messages share a module
+ * ## Why these six messages share a module
  *
- * They are the frames that turn a socket into a participant. Everything else in
- * this folder assumes a connection that has already announced itself and a
- * runtime that has already been armed; these four establish exactly that, in
- * order:
+ * They are the frames that turn a socket into a participant and keep it one.
+ * Everything else in this folder assumes a connection that has already
+ * announced itself, is still answering, and a runtime that has already been
+ * armed; these six establish exactly that, in order:
  *
  * | Message | Sender → receiver | Payload |
  * | --- | --- | --- |
  * | `client.hello` | any client → service | {@link clientHelloPayloadSchema} |
+ * | `client.ping` | any authenticated client → service | {@link clientPingPayloadSchema} |
+ * | `service.pong` | service → the pinging client alone | {@link servicePongPayloadSchema} |
  * | `agent.ready` | page agent → bridge → service worker → service | {@link agentReadyPayloadSchema} |
  * | `agent.config` | service → page agent, via the service worker | {@link agentConfigPayloadSchema} |
  * | `server-agent.config` | service → dev-server Node preload | {@link serverAgentConfigPayloadSchema} |
  *
- * All four travel over the WebSocket transport inside the message envelope,
+ * All six travel over the WebSocket transport inside the message envelope,
  * whose schema and `type`-discriminated union live in `../envelope.ts` — that
  * module imports {@link AGENT_MESSAGE_PAYLOADS} from here, and the dependency
  * runs that way and only that way. This module knows nothing about the
@@ -84,6 +87,16 @@
  * - **Binding.** Which tab is bound to which session, and what a navigation
  *   does to that binding, is `./binding.ts`'s vocabulary. This module names a
  *   tab; it never compares an origin.
+ * - **Liveness.** `client.ping` is the one client frame with no effect: the
+ *   service answers it, on arrival and in the connection's own frame order,
+ *   with a `service.pong` to the sender alone whose `ref` is the ping's
+ *   envelope `id`, whatever the sender's role. It exists because the
+ *   WebSocket protocol's own ping and pong are control frames a browser
+ *   script never sees, so a client whose platform hides them — the MV3
+ *   service worker — has no other way to prove that *this socket* still
+ *   reaches a live service. How long a client waits for the answer is
+ *   {@link SERVICE_PONG_TIMEOUT_MS}; what it does about a missed one is the
+ *   client's decision.
  *
  * ## The two embedded configuration schemas
  *
@@ -119,6 +132,7 @@
  *
  * Parse helpers follow this folder's naming convention,
  * `parse<Message>Payload` — {@link parseClientHelloPayload},
+ * {@link parseClientPingPayload}, {@link parseServicePongPayload},
  * {@link parseAgentReadyPayload}, {@link parseAgentConfigPayload},
  * {@link parseServerAgentConfigPayload} — and none of them throws. Every export
  * is named; there is no default export.
@@ -444,6 +458,28 @@ export const WS_CLOSE_UNAUTHORIZED = 4401;
  */
 export const CLIENT_HELLO_TIMEOUT_MS = 3000;
 
+/**
+ * How long a client waits for the `service.pong` that answers one of its
+ * `client.ping` frames before it treats the connection as dead: five seconds.
+ *
+ * A **client's budget**, not a service deadline. The service answers a ping as
+ * soon as it reaches the head of the connection's frame queue — frames are
+ * handled strictly in arrival order per connection — so the only thing between
+ * a ping and its pong is the frames the same client sent before it and the
+ * round trip itself. On a loopback connection to a local process both are
+ * milliseconds; five seconds absorbs a service busy with a large telemetry
+ * batch or a garbage-collection pause, while staying short enough that a peer
+ * which vanished without a close frame (a killed process, a suspended laptop)
+ * is noticed within one heartbeat interval plus this budget.
+ *
+ * An `error` whose `ref` names the ping is an answer too: a service built
+ * before this frame existed refuses it as an unknown type under the ping's own
+ * id, which proves the peer alive just as well. Nothing here starts a timer;
+ * the constant is declared with the frame it governs so every client reads the
+ * same figure.
+ */
+export const SERVICE_PONG_TIMEOUT_MS = 5000;
+
 // ---------------------------------------------------------------------------
 // Section C — payload schemas
 // ---------------------------------------------------------------------------
@@ -526,6 +562,74 @@ export const clientHelloPayloadSchema = z.strictObject({
  * themselves, never the token.
  */
 export type ClientHelloPayload = z.infer<typeof clientHelloPayloadSchema>;
+
+/**
+ * `client.ping` — an authenticated client asks the service to prove that this
+ * connection still reaches it.
+ *
+ * The payload is **empty, strictly**: the frame's envelope `id` is the
+ * correlation key the answer carries back, and nothing else is needed or
+ * accepted. The frame names no session, no tab and no project, so it cannot be
+ * mistaken for an instruction and cannot be refused for a binding or a scope;
+ * it has no effect on the service beyond the answer (the arrival of any frame
+ * already refreshes the connection's last-seen time in the service's client
+ * registry). Any authenticated role may send it — the editor, the DevTools
+ * service worker and the dev-server preload alike — and the service answers the
+ * sender alone with {@link servicePongPayloadSchema}.
+ *
+ * Why an application frame rather than the WebSocket protocol's own ping: the
+ * service already pings every connection at the transport level, but those
+ * control frames are answered by the platform and never surface to a browser
+ * script, so a Manifest V3 service worker holding a socket cannot tell a live
+ * connection from one whose peer vanished without a close frame. This frame is
+ * the one it can see answered.
+ *
+ * An envelope `id` longer than a pong's `ref` may be (the envelope accepts 128
+ * characters, a `ref` {@link MAX_ID_LENGTH}) cannot be answered, and the
+ * service refuses such a ping with an `error` rather than leave it unanswered;
+ * every id `newMessageId()` mints fits.
+ */
+export const clientPingPayloadSchema = z.strictObject({});
+
+/**
+ * A validated `client.ping` payload: always `{}`.
+ */
+export type ClientPingPayload = z.infer<typeof clientPingPayloadSchema>;
+
+/**
+ * `service.pong` — the service's answer to one `client.ping`, sent to the
+ * pinging connection alone.
+ *
+ * One key, strictly: `ref`, the envelope `id` of the ping it answers. Required,
+ * because a pong that cannot be tied to a ping settles nothing, and non-empty
+ * and bounded exactly as the generic `error` frame's `ref` and the
+ * `source.result` `ref` are, so one correlation rule serves every answer a
+ * client may receive. The frame names no session, so no session filter holds it
+ * back from the one connection it answers, whatever that connection's role, and
+ * it carries nothing a client could act on beyond "the service read your ping
+ * on this socket".
+ *
+ * A client that sends pings on a schedule settles the outstanding one on a
+ * matching `ref` and ignores any other — a pong for a ping it has already
+ * given up on is not evidence about the current one.
+ */
+export const servicePongPayloadSchema = z.strictObject({
+  /**
+   * The envelope `id` of the `client.ping` this answers. Bounded like every
+   * correlation reference in this folder; see {@link idSchema}.
+   */
+  ref: z
+    .string({ error: 'expected a ref string' })
+    .min(1, { error: 'expected a non-empty ref' })
+    .max(MAX_ID_LENGTH, {
+      error: 'expected a ref of at most 64 characters',
+    }),
+});
+
+/**
+ * A validated `service.pong` payload.
+ */
+export type ServicePongPayload = z.infer<typeof servicePongPayloadSchema>;
 
 /**
  * `agent.ready` — the MAIN-world page agent reports that it has initialised in
@@ -729,7 +833,7 @@ export type ServerAgentConfigPayload = z.infer<typeof serverAgentConfigPayloadSc
 // ---------------------------------------------------------------------------
 // Section D — parse helpers
 //
-// One per payload, all four built the same way: `safeParse`, then either `ok`
+// One per payload, all six built the same way: `safeParse`, then either `ok`
 // with the parsed value or `err` with the error `protocolParseError` builds
 // from the issue list. None of them throws, and none of them can echo a
 // rejected value — the hints below are constant sentences about the schema,
@@ -740,7 +844,7 @@ export type ServerAgentConfigPayload = z.infer<typeof serverAgentConfigPayloadSc
 /**
  * The developer-facing next step attached to a rejected `client.hello`.
  *
- * Read this hint as the template for the three that follow: it describes the
+ * Read this hint as the template for the five that follow: it describes the
  * **schema**, never the value that failed it, because `DebuggenError.toPayload()`
  * forwards `hint` verbatim across the wire and into whatever log or banner
  * receives it (AAP §0.5.2).
@@ -752,6 +856,14 @@ export type ServerAgentConfigPayload = z.infer<typeof serverAgentConfigPayloadSc
  */
 const CLIENT_HELLO_HINT =
   'A client.hello payload carries the client kind (vscode, devtools, agent or server-agent), the protocol version as major.minor.patch, a credential, and optionally the project root it is acting for and the Chrome tab it is attached to. It must be the first frame after the upgrade.';
+
+/** The hint attached to a rejected `client.ping`. See {@link CLIENT_HELLO_HINT}. */
+const CLIENT_PING_HINT =
+  'A client.ping payload is an empty object; the frame id is what its service.pong answer references.';
+
+/** The hint attached to a rejected `service.pong`. See {@link CLIENT_HELLO_HINT}. */
+const SERVICE_PONG_HINT =
+  'A service.pong payload carries exactly one field, ref: the id of the client.ping it answers, of at most 64 characters.';
 
 /** The hint attached to a rejected `agent.ready`. See {@link CLIENT_HELLO_HINT}. */
 const AGENT_READY_HINT =
@@ -829,6 +941,64 @@ export function parseClientHelloPayload(value: unknown): Result<ClientHelloPaylo
       'Invalid client.hello payload',
       parsed.error.issues,
       CLIENT_HELLO_HINT,
+    ),
+  );
+}
+
+/**
+ * Validates an unknown value as a {@link ClientPingPayload}, without throwing.
+ *
+ * The payload has no field to get wrong, so the only rejection is a value that
+ * is not an object or one carrying a key: the service answers either with an
+ * `error` under the frame's ref rather than a pong, which a pinging client
+ * reads as an answer from a live peer, never as a dead connection.
+ *
+ * @param value Any value believed to be a `client.ping` payload.
+ * @returns `ok(payload)` with the validated (empty) payload, or `err(error)`
+ * describing the shape of every issue found.
+ */
+export function parseClientPingPayload(value: unknown): Result<ClientPingPayload, DebuggenError> {
+  const parsed = clientPingPayloadSchema.safeParse(value);
+
+  if (parsed.success) {
+    return ok(parsed.data);
+  }
+
+  return err(
+    protocolParseError(
+      'PROTOCOL_INVALID_MESSAGE',
+      'Invalid client.ping payload',
+      parsed.error.issues,
+      CLIENT_PING_HINT,
+    ),
+  );
+}
+
+/**
+ * Validates an unknown value as a {@link ServicePongPayload}, without throwing.
+ *
+ * Applied by a client to what arrived before it compares the `ref` with its
+ * outstanding ping, and by the service to the answer it built before it sends
+ * it, so a ping whose id could never be referenced is refused rather than
+ * answered with a frame its sender would reject.
+ *
+ * @param value Any value believed to be a `service.pong` payload.
+ * @returns `ok(payload)` with the validated payload, or `err(error)` describing
+ * the shape of every issue found.
+ */
+export function parseServicePongPayload(value: unknown): Result<ServicePongPayload, DebuggenError> {
+  const parsed = servicePongPayloadSchema.safeParse(value);
+
+  if (parsed.success) {
+    return ok(parsed.data);
+  }
+
+  return err(
+    protocolParseError(
+      'PROTOCOL_INVALID_MESSAGE',
+      'Invalid service.pong payload',
+      parsed.error.issues,
+      SERVICE_PONG_HINT,
     ),
   );
 }
@@ -939,14 +1109,15 @@ export function parseServerAgentConfigPayload(
 // ---------------------------------------------------------------------------
 
 /**
- * The handshake, lifecycle and arming messages, keyed by the message `type` that
- * carries each payload.
+ * The handshake, liveness, lifecycle and arming messages, keyed by the message
+ * `type` that carries each payload.
  *
  * The keys are the protocol's own names, verbatim from AAP §0.4.2 — including
  * the hyphen in `server-agent.config`, which is the spelling on the wire and in
- * the preload's own dispatch table. They are written out rather than assembled
- * from parts: a name a reader can grep for across the four processes is worth
- * more than a clever construction.
+ * the preload's own dispatch table — plus the `client.ping` / `service.pong`
+ * liveness pair, which sits directly after the handshake it keeps alive. They
+ * are written out rather than assembled from parts: a name a reader can grep
+ * for across the four processes is worth more than a clever construction.
  *
  * `../envelope.ts` composes this object with the equivalent registry from every
  * other module in this folder to build the discriminated union that dispatches
@@ -956,12 +1127,14 @@ export function parseServerAgentConfigPayload(
  * is for the dispatcher, not a substitute for the named exports.
  *
  * Frozen, and `as const` so each key maps to its own schema type rather than to
- * a union of the four: a lookup on a literal key gives the exact schema, and the
+ * a union of the six: a lookup on a literal key gives the exact schema, and the
  * object cannot be extended at runtime by a consumer that would rather add a
  * message than declare one.
  */
 export const AGENT_MESSAGE_PAYLOADS = Object.freeze({
   'client.hello': clientHelloPayloadSchema,
+  'client.ping': clientPingPayloadSchema,
+  'service.pong': servicePongPayloadSchema,
   'agent.ready': agentReadyPayloadSchema,
   'agent.config': agentConfigPayloadSchema,
   'server-agent.config': serverAgentConfigPayloadSchema,

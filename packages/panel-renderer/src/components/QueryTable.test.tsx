@@ -1716,12 +1716,14 @@ const COLUMN_WIDTHS: readonly DataTableColumnWidth[] = [
 ];
 
 /**
- * A reference to one of the column-geometry tokens a role track is built from.
- * Removing every such reference from a track template must leave nothing but
- * the `minmax()` frames and the spaces between tracks: no number and no unit is
- * the component's own.
+ * A reference to one of the values a role track is built from: a column-geometry
+ * token, the two layout tokens a truncating track measures its row by, or one of
+ * the sums the grid publishes for it. Removing every such reference from a track
+ * template must leave nothing but math frames, operators and the spaces between
+ * tracks: no number and no unit is the component's own.
  */
-const COLUMN_TOKEN_REFERENCE = /var\(--dg-column-(?:min|share)-[a-z]+\)/gu;
+const COLUMN_TOKEN_REFERENCE =
+  /var\(--(?:dg-column-(?:(?:min|share)-[a-z]+|yield)|dg-space-2|dg-size-full|dgc-(?:readable-inline|min-inline|yield-count|column-count))\)/gu;
 
 /** Every theme's token set, each of which must give every column a floor. */
 const THEMES: readonly TokenValues[] = [
@@ -1738,9 +1740,9 @@ const THEMES: readonly TokenValues[] = [
  * @returns The floor in `ch`, or `undefined` when the floor is no `ch` token.
  */
 function floorChOf(width: DataTableColumnWidth, theme: TokenValues): number | undefined {
-  const { minimum } = DATA_TABLE_COLUMN_TRACKS[width];
+  const { floor } = DATA_TABLE_COLUMN_TRACKS[width];
   const keys = Object.keys(theme) as TokenKey[];
-  const key = keys.find((candidate) => cssVar(candidate) === minimum);
+  const key = keys.find((candidate) => cssVar(candidate) === floor);
   const magnitude = key === undefined ? undefined : /^(\d+(?:\.\d+)?)ch$/u.exec(theme[key])?.[1];
 
   return magnitude === undefined ? undefined : Number(magnitude);
@@ -1761,7 +1763,9 @@ describe('QueryTable column layout', () => {
     expect(template).toBe(
       COLUMN_WIDTHS.map((width) => DATA_TABLE_COLUMN_TRACKS[width].track).join(' '),
     );
-    expect(template.replace(COLUMN_TOKEN_REFERENCE, '')).toMatch(/^(?:minmax\(, \)| )+$/u);
+    expect(
+      template.replace(COLUMN_TOKEN_REFERENCE, '').replace(/\b(?:minmax|clamp|calc|max)\(/gu, '('),
+    ).toMatch(/^[(), +*/-]+$/u);
 
     // Not one track is a floorless `minmax(0, …)`, which would let every column
     // collapse to its padding and a caller chip paint over the Rows and
@@ -1774,10 +1778,14 @@ describe('QueryTable column layout', () => {
       }
     }
 
-    // Every column's floor reaches the grid's own minimum inline size, which is
-    // what turns a panel narrower than the columns need into a horizontal scroll.
+    // Every column's minimum and readable floor reach the grid's own sums, which
+    // decide whether a narrow panel truncates its name and text columns to fit or,
+    // too narrow even for the minimums, keeps every floor and scrolls.
     expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe(
       `calc(${COLUMN_WIDTHS.map((width) => DATA_TABLE_COLUMN_TRACKS[width].minimum).join(' + ')})`,
+    );
+    expect(grid.style.getPropertyValue('--dgc-readable-inline')).toBe(
+      `calc(${COLUMN_WIDTHS.map((width) => DATA_TABLE_COLUMN_TRACKS[width].floor).join(' + ')})`,
     );
     expect(grid.style.getPropertyValue('--dgc-column-count')).toBe(String(HEADERS.length));
 

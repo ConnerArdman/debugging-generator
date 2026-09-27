@@ -165,6 +165,7 @@ import {
   setBindingState,
   setConnectionStatus,
   setLastError,
+  setPickerActive,
   usePanelStoreSelector,
 } from './session-store';
 import type { PanelConnectionSlice, PanelSnapshot } from './session-store';
@@ -1245,6 +1246,14 @@ function applyPush(live: Controller, push: PortPush): void {
       // stored as is and read by the panel's reload notice.
       setReloadState(push.state);
       return;
+    case 'picker':
+      // The page's pick ended — the developer clicked an element, pressed
+      // Escape in the page, the page was hidden or its document went away —
+      // so picker mode ends here too. The store change is what `App.tsx`'s
+      // picker-mode listener follows to close the activation on screen; no
+      // error is raised, because ending a pick is not a failure.
+      setPickerActive(push.state.active);
+      return;
     default:
       assertNever(push, 'Unhandled panel port push');
   }
@@ -1543,8 +1552,9 @@ function scheduleReconnect(live: Controller): void {
 
 /**
  * The live port closed (or refused a post): detach it, reject every request in
- * flight on it, show `reconnecting`, tell the consumer listeners, and schedule
- * a reconnect. Requests still waiting for a port stay queued for the next one.
+ * flight on it, end picker mode, show `reconnecting`, tell the consumer
+ * listeners, and schedule a reconnect. Requests still waiting for a port stay
+ * queued for the next one.
  */
 function handlePortLoss(live: Controller, port: PanelPortLike): void {
   if (live.port !== port) {
@@ -1562,6 +1572,14 @@ function handlePortLoss(live: Controller, port: PanelPortLike): void {
   // port's snapshot (or a `reload` push to it) states it afresh. A stale
   // "Reload page" can therefore never be activated across a reconnect.
   setReloadState(PANEL_RELOAD_NOT_NEEDED);
+  // Picker mode ends with the port. The worker generation that armed any page
+  // pick for this panel is gone or has lost this panel, and in both cases the
+  // page's pick ends: the page agent ends it when its bridge's worker port
+  // closes, and the worker cancels it when a tab loses its last panel. No
+  // `picker` push can arrive for that pick on the next port, so a toggle left
+  // pressed here would claim a picker mode nothing holds. Local only: the
+  // store change closes the activation on screen, and no request is sent.
+  setPickerActive(false);
   notifyDisconnect(live.logger, {
     reason: 'disconnected',
     error: connectionLossError('disconnected'),

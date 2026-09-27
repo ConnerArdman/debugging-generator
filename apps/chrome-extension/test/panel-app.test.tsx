@@ -19,24 +19,37 @@
  *     service answers from the capture that panel was generated from;
  *   - an unexpected exception's text never reaches the screen, the store or the
  *     console: a command that fails with one is presented as fixed copy under
- *     its fallback code, and the panel logs that closed code alone.
+ *     its fallback code, and the panel logs that closed code alone;
+ *   - a paired panel whose service moved changes the address without pairing
+ *     again: "Change service address…" beside "Service not running" or
+ *     "Reconnecting…" opens the dialog in address mode — modal, the header and
+ *     body inert — which saves the setting to extension storage and hands
+ *     focus back; there is no such control without extension storage; and a
+ *     "Not paired" push while it is open gives way to the pairing dialog, after
+ *     which the address dialog does not reappear by itself;
+ *   - the failure notice's "Retry" clears it and re-reads the session (a
+ *     renewed failure sets it again), "Dismiss" clears it, and either moves
+ *     focus to the panel body.
  *
  * Harness: the panel connection module is replaced with one whose port
- * requests this suite answers (`harness.handler`), so the real store, data
- * provider, actions and components run unchanged. The session store is the
- * real module and is reset around every case. Fixture strings are generic
- * product vocabulary written for this suite; no inspected project's names or
- * routes appear in it (AAP 0.5.4).
+ * requests this suite answers (`harness.handler`) and whose `resync` is a spy
+ * (`harness.resync`), so the real store, data provider, actions and components
+ * run unchanged. The session store is the real module and is reset around
+ * every case. The address cases stub `chrome` with an in-memory
+ * `chrome.storage.local` and nothing else; every stub is removed after each
+ * case. Fixture strings are generic product vocabulary written for this suite;
+ * no inspected project's names or routes appear in it.
  */
 import { PANEL_SPEC_VERSION } from '@debuggen/panel-schema';
 import type { PanelSpec } from '@debuggen/panel-schema';
-import type { SessionRecord, TelemetryEvent } from '@debuggen/protocol';
+import type { ErrorPayload, SessionRecord, TelemetryEvent } from '@debuggen/protocol';
 import { createEnvelope, parseSessionRecord } from '@debuggen/protocol';
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { MockInstance } from 'vitest';
+import type { Mock, MockInstance } from 'vitest';
 
+import { SERVICE_ENDPOINT_STORAGE_KEY } from '../src/background/auth';
 import { App } from '../src/panel/App';
 import { EVENT_RESOLUTION_PAGE_BUDGET } from '../src/panel/data-provider';
 import type * as ConnectionModule from '../src/panel/state/connection';
@@ -47,8 +60,9 @@ import {
   resetPanelStore,
   selectEvent,
   setConnectionStatus,
+  setLastError,
 } from '../src/panel/state/session-store';
-import { PANEL_CONNECTION_LABELS } from '../src/shared/messages';
+import { DEFAULT_SERVICE_BASE_URL, PANEL_CONNECTION_LABELS } from '../src/shared/messages';
 
 /** Answers one port request the panel sends, in place of the service worker. */
 type PortRequestHandler = (kind: string, payload: unknown) => Promise<unknown>;
@@ -62,6 +76,8 @@ interface RecordedRequest {
 const harness = vi.hoisted(() => ({
   handler: undefined as PortRequestHandler | undefined,
   requests: [] as RecordedRequest[],
+  /** Stands in for the connection's hydration re-run, so a case can count it. */
+  resync: vi.fn<() => void>(),
 }));
 
 vi.mock('../src/panel/state/connection', async (importOriginal) => {
@@ -71,6 +87,7 @@ vi.mock('../src/panel/state/connection', async (importOriginal) => {
     // No runtime port in a unit document: the connection's lifetime is a no-op
     // and every request is answered by the case's handler.
     startPanelConnection: () => ({ ...actual.getPanelConnection(), stop: () => undefined }),
+    getPanelConnection: () => ({ ...actual.getPanelConnection(), resync: harness.resync }),
     onPortDisconnect: () => () => undefined,
     panelRequest: (kind: string, payload: unknown): Promise<unknown> => {
       harness.requests.push({ kind, payload });
@@ -278,6 +295,7 @@ beforeEach(() => {
   resetPanelStore({ includeConnection: true });
   harness.handler = undefined;
   harness.requests.length = 0;
+  harness.resync.mockReset();
   consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
   consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 });
@@ -285,10 +303,55 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   resetPanelStore({ includeConnection: true });
+  vi.unstubAllGlobals();
   expect(consoleError).not.toHaveBeenCalled();
   expect(consoleWarn).not.toHaveBeenCalled();
   vi.restoreAllMocks();
 });
+
+/** The element `selector` matches inside `container`; throws when there is none. */
+function requireElement(container: HTMLElement, selector: string): HTMLElement {
+  const element = container.querySelector(selector);
+  if (!(element instanceof HTMLElement)) {
+    throw new Error(`The panel rendered no ${selector}.`);
+  }
+  return element;
+}
+
+/** An in-memory `chrome.storage.local` whose three methods are recording mocks. */
+interface MemoryArea {
+  readonly items: Map<string, unknown>;
+  readonly get: Mock<(key: string) => Promise<Record<string, unknown>>>;
+  readonly set: Mock<(next: Readonly<Record<string, unknown>>) => Promise<void>>;
+  readonly remove: Mock<(key: string) => Promise<void>>;
+}
+
+/**
+ * Give the document an extension storage area — `chrome.storage.local` and
+ * nothing else, so no DevTools or runtime API appears with it — and return it.
+ * `afterEach` removes the stub.
+ */
+function stubExtensionStorage(): MemoryArea {
+  const items = new Map<string, unknown>();
+  const area: MemoryArea = {
+    items,
+    get: vi.fn((key: string) =>
+      Promise.resolve<Record<string, unknown>>(items.has(key) ? { [key]: items.get(key) } : {}),
+    ),
+    set: vi.fn((next: Readonly<Record<string, unknown>>) => {
+      for (const [key, value] of Object.entries(next)) {
+        items.set(key, value);
+      }
+      return Promise.resolve();
+    }),
+    remove: vi.fn((key: string) => {
+      items.delete(key);
+      return Promise.resolve();
+    }),
+  };
+  vi.stubGlobal('chrome', { storage: { local: area } });
+  return area;
+}
 
 describe('the session fixture', () => {
   it('is a valid SessionRecord', () => {
@@ -318,6 +381,189 @@ describe('App — service not running', () => {
     expect(screen.getByText(PANEL_CONNECTION_LABELS.connected)).toBeTruthy();
     expect(screen.queryByText(START_SERVICE_COMMAND)).toBeNull();
     expect(screen.queryByText(START_SERVICE_ACTION)).toBeNull();
+  });
+});
+
+describe('App — changing the service address while paired', () => {
+  const ADDRESS_ACTION = 'Change service address…';
+  const ADDRESS_DIALOG = 'Change the service address';
+  const PAIR_DIALOG = 'Pair this panel with VS Code';
+  /** A loopback port other than the default one, where the service now listens. */
+  const MOVED_SERVICE_URL = 'http://127.0.0.1:20150';
+
+  it('opens the address dialog from "Service not running", saves the address, and hands focus back', async () => {
+    const area = stubExtensionStorage();
+    setConnectionStatus({ status: 'service-not-running', serviceUrl: DEFAULT_SERVICE_BASE_URL });
+    const user = userEvent.setup();
+
+    const { container } = render(<App theme="dark" />);
+    const header = requireElement(container, 'header');
+    const main = requireElement(container, 'main');
+    const control = within(header).getByRole('button', { name: ADDRESS_ACTION });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(control.getAttribute('aria-expanded')).toBe('false');
+
+    await user.click(control);
+
+    const dialog = screen.getByRole('dialog', { name: ADDRESS_DIALOG });
+    expect(header.hasAttribute('inert')).toBe(true);
+    expect(main.hasAttribute('inert')).toBe(true);
+    expect(dialog.closest('[inert]')).toBeNull();
+    expect(control.getAttribute('aria-expanded')).toBe('true');
+    expect(within(dialog).queryByRole('textbox', { name: /pairing code/i })).toBeNull();
+    const field = within(dialog).getByRole('textbox', { name: /service address/i });
+    expect(document.activeElement).toBe(field);
+
+    await user.type(field, `${MOVED_SERVICE_URL}{Enter}`);
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    expect(area.items.get(SERVICE_ENDPOINT_STORAGE_KEY)).toBe(MOVED_SERVICE_URL);
+    expect(header.hasAttribute('inert')).toBe(false);
+    expect(main.hasAttribute('inert')).toBe(false);
+    expect(document.activeElement).toBe(control);
+    expect(control.getAttribute('aria-expanded')).toBe('false');
+    // Saving the address is not pairing: nothing was sent to the worker.
+    expect(harness.requests.map((request) => request.kind)).not.toContain('pair.complete');
+  });
+
+  it('offers the same control beside "Reconnecting…", and Escape closes it without saving', async () => {
+    const area = stubExtensionStorage();
+    setConnectionStatus({ status: 'reconnecting', serviceUrl: DEFAULT_SERVICE_BASE_URL });
+    const user = userEvent.setup();
+
+    const { container } = render(<App theme="dark" />);
+    const control = within(requireElement(container, 'header')).getByRole('button', {
+      name: ADDRESS_ACTION,
+    });
+    await user.click(control);
+    const field = within(screen.getByRole('dialog', { name: ADDRESS_DIALOG })).getByRole(
+      'textbox',
+      { name: /service address/i },
+    );
+    await user.type(field, MOVED_SERVICE_URL);
+    await user.keyboard('{Escape}');
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(area.set).not.toHaveBeenCalled();
+    expect(area.remove).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(control);
+  });
+
+  it.each(['service-not-running', 'reconnecting'] as const)(
+    'offers no address control while %s where the document has no extension storage',
+    (status) => {
+      expect(typeof (globalThis as { chrome?: unknown }).chrome).toBe('undefined');
+      setConnectionStatus({ status, serviceUrl: DEFAULT_SERVICE_BASE_URL });
+
+      render(<App theme="dark" />);
+
+      expect(screen.getByText(PANEL_CONNECTION_LABELS[status])).toBeTruthy();
+      expect(screen.queryByRole('button', { name: ADDRESS_ACTION })).toBeNull();
+      expect(screen.queryByRole('dialog')).toBeNull();
+    },
+  );
+
+  it('gives way to the pairing dialog on "Not paired", and does not reopen once that closes', async () => {
+    stubExtensionStorage();
+    setConnectionStatus({ status: 'reconnecting', serviceUrl: DEFAULT_SERVICE_BASE_URL });
+    const user = userEvent.setup();
+
+    const { container } = render(<App theme="dark" />);
+    const header = requireElement(container, 'header');
+    await user.click(within(header).getByRole('button', { name: ADDRESS_ACTION }));
+    expect(screen.getByRole('dialog', { name: ADDRESS_DIALOG })).toBeTruthy();
+
+    act(() => {
+      setConnectionStatus('not-paired');
+    });
+
+    expect(screen.getAllByRole('dialog')).toHaveLength(1);
+    const pairing = screen.getByRole('dialog', { name: PAIR_DIALOG });
+    expect(header.hasAttribute('inert')).toBe(true);
+    expect(document.activeElement).toBe(
+      within(pairing).getByRole('textbox', { name: /pairing code/i }),
+    );
+
+    await user.click(within(pairing).getByRole('button', { name: 'Cancel' }));
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    // The address control that opened the first dialog has left the header.
+    expect(document.activeElement).toBe(requireElement(container, 'main'));
+
+    act(() => {
+      setConnectionStatus('reconnecting');
+    });
+
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(header.hasAttribute('inert')).toBe(false);
+    expect(
+      within(header).getByRole('button', { name: ADDRESS_ACTION }).getAttribute('aria-expanded'),
+    ).toBe('false');
+  });
+});
+
+describe('App — the failure notice', () => {
+  const NOTICE_TITLE = 'A Debug Generator request did not complete';
+  const RETRY_HINT = 'Retry reloads this panel’s session state from the local service.';
+  const FAILURE: ErrorPayload = {
+    code: 'TRANSPORT_DISCONNECTED',
+    message: 'Could not stop the capture: the local service did not answer the request.',
+  };
+  const RENEWED_FAILURE: ErrorPayload = {
+    code: 'TRANSPORT_DISCONNECTED',
+    message: 'Could not read the session: the local service did not answer the request.',
+  };
+
+  it('Retry clears the notice, re-reads the session and moves focus to the panel body', async () => {
+    setConnectionStatus({ status: 'connected', serviceUrl: DEFAULT_SERVICE_BASE_URL });
+    setLastError(FAILURE);
+    const user = userEvent.setup();
+
+    const { container } = render(<App theme="dark" />);
+    expect(screen.getByText(NOTICE_TITLE)).toBeTruthy();
+    expect(screen.getByText(FAILURE.message)).toBeTruthy();
+    expect(screen.getByText(RETRY_HINT)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy();
+
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+
+    expect(screen.queryByText(NOTICE_TITLE)).toBeNull();
+    expect(getPanelSnapshot().lastError).toBeUndefined();
+    expect(harness.resync).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(requireElement(container, 'main'));
+  });
+
+  it('shows a failure the re-read reports, because the notice is cleared before it runs', async () => {
+    setConnectionStatus({ status: 'connected', serviceUrl: DEFAULT_SERVICE_BASE_URL });
+    setLastError(FAILURE);
+    harness.resync.mockImplementationOnce(() => {
+      setLastError(RENEWED_FAILURE);
+    });
+    const user = userEvent.setup();
+
+    render(<App theme="dark" />);
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+
+    expect(getPanelSnapshot().lastError).toEqual(RENEWED_FAILURE);
+    expect(screen.getByText(RENEWED_FAILURE.message)).toBeTruthy();
+    expect(screen.queryByText(FAILURE.message)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
+  });
+
+  it('Dismiss clears the notice without re-reading the session, and moves focus to the panel body', async () => {
+    setConnectionStatus({ status: 'connected', serviceUrl: DEFAULT_SERVICE_BASE_URL });
+    setLastError(FAILURE);
+    const user = userEvent.setup();
+
+    const { container } = render(<App theme="dark" />);
+    await user.click(screen.getByRole('button', { name: 'Dismiss' }));
+
+    expect(screen.queryByText(NOTICE_TITLE)).toBeNull();
+    expect(getPanelSnapshot().lastError).toBeUndefined();
+    expect(harness.resync).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(requireElement(container, 'main'));
   });
 });
 

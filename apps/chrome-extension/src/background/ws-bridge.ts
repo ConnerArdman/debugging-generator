@@ -19,10 +19,11 @@
  *   deliberately leaves to this module: while the socket is open, a heartbeat
  *   every {@link SOCKET_HEARTBEAT_INTERVAL_MS} re-creates the `chrome.alarms`
  *   keepalive — an extension API call, which refreshes the worker's idle timer
- *   while it is active — and probes the service, retiring a socket whose peer
- *   stopped answering onto the backoff curve. The alarm does not prevent
- *   Manifest V3 suspension: once the worker is suspended it fires within one
- *   period, and its tick revives the worker and reconnects
+ *   while it is active — and sends `client.ping` on the socket itself, retiring
+ *   the socket onto the backoff curve when no `service.pong` answers it within
+ *   `SERVICE_PONG_TIMEOUT_MS`. The alarm does not prevent Manifest V3
+ *   suspension: once the worker is suspended it fires within one period, and
+ *   its tick revives the worker and reconnects
  *   ({@link WsBridge.handleKeepaliveAlarm});
  * - the envelope wrap of the page agent's **raw** event batches: the MAIN-world
  *   agent has no socket and never imports the protocol, so the worker turns its
@@ -33,7 +34,7 @@
  *   first carrying its reported loss ({@link TelemetryBatchContext}); an
  *   event-less batch that reports loss becomes one loss-only frame, so a
  *   capture's final loss reaches the service when no later batch will carry
- *   it (AAP §0.4.2, §0.5.6);
+ *   it;
  * - the **service-confirmed route** of each tab: which tab ↔ session pairs the
  *   service has answered with `session.bound` on the *current* connection.
  *   Telemetry is written only along a confirmed route and only to an open
@@ -214,6 +215,7 @@ import {
   parseServiceOrigin,
   ReconnectingWsClient,
   resolveWsUrl,
+  SERVICE_PONG_TIMEOUT_MS,
   telemetryEventPayloadSchema,
   WS_CLOSE_UNAUTHORIZED,
 } from '@debuggen/protocol';
@@ -222,10 +224,19 @@ import type {
   DebuggenErrorCode,
   LogFields,
   Logger,
+  MessageId,
   Result,
   SessionId,
 } from '@debuggen/shared';
-import { assertNever, DebuggenError, err, isErr, noopLogger, ok } from '@debuggen/shared';
+import {
+  assertNever,
+  DebuggenError,
+  err,
+  isErr,
+  newMessageId,
+  noopLogger,
+  ok,
+} from '@debuggen/shared';
 
 import type {
   PageAgentReadyPayload,
@@ -316,33 +327,22 @@ const BRIDGE_CLOSED_REASON = 'the service worker bridge was disposed';
  *
  * Below the roughly thirty-second idle window after which Chrome suspends a
  * Manifest V3 service worker (AAP §0.1.1, §0.5.5), with room to spare for the
- * probe each tick waits on. Each tick is a `chrome.alarms` call — an extension
- * API call, which resets the worker's idle timer — so an open connection keeps
- * its worker alive without depending on the platform's socket-activity
- * heuristics, and the tick's health probe is what notices a connection whose
- * peer vanished without a close frame.
+ * `SERVICE_PONG_TIMEOUT_MS` answer each tick waits on. Each tick is a
+ * `chrome.alarms` call — an extension API call, which resets the worker's idle
+ * timer — so an open connection keeps its worker alive without depending on
+ * the platform's socket-activity heuristics, and the tick's `client.ping` is
+ * what notices a connection whose peer vanished without a close frame.
  *
- * The protocol offers no client-to-service frame that is free of side effects
- * (its message vocabulary is fixed by AAP §0.4.2, and the service's own
- * ping/pong are control frames a worker's script never sees), so the liveness
- * half of the heartbeat is the auth-exempt `GET /health` the pill already uses,
- * bounded by the same {@link CLIENT_HELLO_TIMEOUT_MS} window.
+ * The ping travels on the socket it tests. The service's own WebSocket pings
+ * are control frames a worker's script never sees, and `GET /health` proves
+ * only that the service's HTTP listener answers, not that this socket still
+ * carries frames; `client.ping` is authenticated, touches no session, and is
+ * answered by exactly one `service.pong` to this connection, whose `ref` is
+ * the ping's id. One unanswered ping retires the socket, so a dead peer is
+ * detected at most one interval plus one pong window — about twenty-five
+ * seconds — after the last answered ping.
  */
 export const SOCKET_HEARTBEAT_INTERVAL_MS = 20_000;
-
-/**
- * How many consecutive heartbeat probes may go unanswered on one open
- * connection before its socket is retired as dead: two.
- *
- * One unanswered probe can be a busy service; two in a row, one heartbeat
- * interval apart, is a service that is gone while the socket still reads open —
- * detected on the second failed tick, about forty seconds (two intervals, plus
- * at most two probe windows) after the last answered probe. The
- * socket is then retired onto the backoff curve through
- * `ReconnectingWsClient.restart`, which reconnects as soon as the service
- * answers again.
- */
-export const SOCKET_HEARTBEAT_FAILURE_LIMIT = 2;
 
 /**
  * The reason a socket retired by the heartbeat is closed with, and reported
@@ -369,7 +369,7 @@ const SERVICE_NOT_RUNNING_HINT =
  * place the address is entered: the pairing dialog, whose change applies at
  * once through {@link WsBridge.setServiceBaseUrl} — no reload is needed.
  */
-const SERVICE_MISCONFIGURED_HINT = `Enter the local service's loopback address in the Debug Generator panel's pairing dialog (the default is ${DEFAULT_SERVICE_BASE_URL}).`;
+const SERVICE_MISCONFIGURED_HINT = `Enter the local service's loopback address in the Debug Generator panel: in the pairing dialog, or with "Change service address…" once paired (the default is ${DEFAULT_SERVICE_BASE_URL}).`;
 
 /**
  * What the developer can do when the service address could not be
@@ -583,7 +583,8 @@ export interface WsBridgeDeps {
   /**
    * The one-shot timers the socket client's backoff, opening deadline and
    * credential deadline run on, the bridge's own open-socket heartbeat
-   * ({@link SOCKET_HEARTBEAT_INTERVAL_MS}), and the bound of every
+   * ({@link SOCKET_HEARTBEAT_INTERVAL_MS}) and the `SERVICE_PONG_TIMEOUT_MS`
+   * wait for each of its answers, and the bound of every
    * {@link WsBridge.awaitTabRoute} wait. When given, this module never calls
    * a global timer. Omitted, the client uses the platform timers and so do
    * the heartbeat and the route waits, each resolving the global at call time
@@ -1606,6 +1607,35 @@ interface QueuedFrameRecord {
 }
 
 /**
+ * How the wait for one heartbeat `client.ping`'s answer ended:
+ *
+ * - `answered` — a `service.pong` whose `ref` is the ping's id arrived, or an
+ *   `error` whose `ref` is: a service that predates the liveness pair refuses
+ *   the unknown type under the ping's id, and that refusal proves the socket
+ *   carries frames both ways just as well;
+ * - `timed-out` — nothing naming the ping arrived within
+ *   `SERVICE_PONG_TIMEOUT_MS`;
+ * - `cancelled` — the heartbeat stopped while the ping waited (the transport
+ *   left `open`, the credential was removed, or the bridge was disposed).
+ */
+type HeartbeatPingOutcome = 'answered' | 'timed-out' | 'cancelled';
+
+/**
+ * The heartbeat's one outstanding `client.ping`: the id its answer must name,
+ * the handle of the `SERVICE_PONG_TIMEOUT_MS` deadline, and the resolver of
+ * the tick's wait. At most one exists, because the next tick is scheduled only
+ * once this one's wait has ended.
+ */
+interface OutstandingPing {
+  /** The ping's envelope id, which the answering `service.pong` or `error` names as its `ref`. */
+  readonly id: MessageId;
+  /** The deadline timer on the bridge's timers. */
+  readonly deadline: number;
+  /** Ends the tick's wait with the given outcome. */
+  readonly finish: (outcome: HeartbeatPingOutcome) => void;
+}
+
+/**
  * Build the bridge. Pure construction: the socket client is created but not
  * connected, no alarm is created, nothing is read from storage and nothing is
  * published until a member is called — `service-worker.ts` calls
@@ -1677,13 +1707,17 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
   let heartbeatHandle: number | undefined;
   /**
    * The open generation whose tick is running right now (its alarm call or
-   * probe awaited), or `undefined` between ticks and once the heartbeat is
-   * stopped — so a tick in flight counts as a running heartbeat, and a tick
-   * orphaned by {@link stopHeartbeat} can tell that it was.
+   * its ping's answer awaited), or `undefined` between ticks and once the
+   * heartbeat is stopped — so a tick in flight counts as a running heartbeat,
+   * and a tick orphaned by {@link stopHeartbeat} can tell that it was.
    */
   let heartbeatTickGeneration: number | undefined;
-  /** Consecutive heartbeat probes the service left unanswered on this connection. */
-  let heartbeatFailures = 0;
+  /**
+   * The `client.ping` the running tick is waiting on, from just before it is
+   * written until its answer, its deadline or {@link stopHeartbeat} ends the
+   * wait.
+   */
+  let outstandingPing: OutstandingPing | undefined;
   /** The last snapshot published, serialized, so an identical one is not re-sent. */
   let lastPublishedKey: string | undefined;
 
@@ -1993,12 +2027,34 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
   }
 
   /**
-   * Every validated inbound frame, before typed dispatch: keep the routing memo
-   * current, then relay the frames the panel renders. Subscribers registered
-   * through {@link WsBridge.subscribe} receive the frame from the client's own
-   * typed dispatch, right after this.
+   * Every validated inbound frame, before typed dispatch: end the heartbeat's
+   * wait when the frame answers its ping, keep the routing memo current, then
+   * relay the frames the panel renders. Subscribers registered through
+   * {@link WsBridge.subscribe} receive the frame from the client's own typed
+   * dispatch, right after this.
+   *
+   * An `error` naming the outstanding ping is that ping's answer — the refusal
+   * of a service that predates the liveness pair — and is not relayed: it is
+   * about this connection's heartbeat, which no panel shows. A `service.pong`
+   * is never relayed either way; one naming no outstanding ping — the answer
+   * to a ping the client queued and later flushed onto a new connection — is
+   * ignored.
    */
   function handleInbound(message: ProtocolMessage): void {
+    if (message.type === MESSAGE_TYPE.SERVICE_PONG) {
+      answerOutstandingPing(message.payload.ref);
+      return;
+    }
+    if (
+      message.type === MESSAGE_TYPE.ERROR &&
+      message.payload.ref !== undefined &&
+      answerOutstandingPing(message.payload.ref)
+    ) {
+      log.debug('the local service refused the heartbeat ping; the socket answered', {
+        code: message.payload.code,
+      });
+      return;
+    }
     if (message.type === MESSAGE_TYPE.SESSION_BOUND) {
       rememberBinding(message.payload);
       confirmRoute(message.payload);
@@ -2520,9 +2576,10 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
   }
 
   /**
-   * Stop the heartbeat: cancel the scheduled tick, orphan a tick in flight (it
-   * notices after its awaits and neither re-arms nor restarts anything), and
-   * forget the failures counted on the connection that ended. Idempotent.
+   * Stop the heartbeat: cancel the scheduled tick, end the wait of an
+   * outstanding ping (its deadline timer is cleared, so it neither fires nor
+   * restarts anything), and orphan a tick in flight (it notices after its
+   * await and neither re-arms nor restarts anything). Idempotent.
    */
   function stopHeartbeat(): void {
     if (heartbeatHandle !== undefined) {
@@ -2530,7 +2587,54 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
       heartbeatHandle = undefined;
     }
     heartbeatTickGeneration = undefined;
-    heartbeatFailures = 0;
+    finishOutstandingPing('cancelled');
+  }
+
+  /**
+   * Register the tick's `client.ping` under `id` and wait for its answer, at
+   * most {@link SERVICE_PONG_TIMEOUT_MS} on the bridge's timers. Registered
+   * before the ping is written, so no answer can arrive unregistered, however
+   * the transport schedules its events. Never rejects.
+   */
+  function awaitPingAnswer(id: MessageId): Promise<HeartbeatPingOutcome> {
+    return new Promise<HeartbeatPingOutcome>((resolve) => {
+      const deadline = bridgeTimers.setTimeout(() => {
+        if (outstandingPing?.id === id) {
+          finishOutstandingPing('timed-out');
+        }
+      }, SERVICE_PONG_TIMEOUT_MS);
+      outstandingPing = { id, deadline, finish: resolve };
+    });
+  }
+
+  /**
+   * End the outstanding ping's wait with `outcome`, if a ping is outstanding.
+   * Its deadline timer is cleared unless it is the deadline that fired.
+   */
+  function finishOutstandingPing(outcome: HeartbeatPingOutcome): void {
+    const pending = outstandingPing;
+    if (pending === undefined) {
+      return;
+    }
+    outstandingPing = undefined;
+    if (outcome !== 'timed-out') {
+      bridgeTimers.clearTimeout(pending.deadline);
+    }
+    pending.finish(outcome);
+  }
+
+  /**
+   * Treat an inbound reply that names `ref` as the outstanding ping's answer.
+   *
+   * @returns Whether `ref` was the outstanding ping's id — the reply was the
+   * heartbeat's, and has been consumed.
+   */
+  function answerOutstandingPing(ref: string): boolean {
+    if (outstandingPing?.id !== ref) {
+      return false;
+    }
+    finishOutstandingPing('answered');
+    return true;
   }
 
   /** Whether the heartbeat is running: a tick scheduled, or one in flight for the open connection. */
@@ -2556,14 +2660,18 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
    *    runs the alarm never needs to fire, and once an evicted worker stops
    *    running the heartbeat, the alarm fires within one period and its tick
    *    revives the worker and reconnects (a dead-man switch).
-   * 2. Probe the service's health, bounded by `CLIENT_HELLO_TIMEOUT_MS`. A peer
-   *    that vanished without a close frame (a killed process, a suspended
-   *    laptop) leaves the socket looking open; the probe is what notices.
-   *    After {@link SOCKET_HEARTBEAT_FAILURE_LIMIT} consecutive unanswered
-   *    probes on this connection, the socket is retired onto the client's
-   *    jittered backoff curve through `client.restart`; the transition to
-   *    `reconnecting` stops this heartbeat and the next open starts another.
-   *    One answered probe resets the count.
+   * 2. Send `client.ping` on the socket — through {@link sendTracked}, like
+   *    every frame — under a freshly minted id, and wait up to
+   *    `SERVICE_PONG_TIMEOUT_MS` for the `service.pong` naming it (or an
+   *    `error` naming it, which {@link handleInbound} counts as the same
+   *    answer). A peer that vanished without a close frame (a killed process,
+   *    a suspended laptop) leaves the socket looking open; the unanswered ping
+   *    is what notices. An answer schedules the next tick. No answer, a socket
+   *    that cannot take the write now, a send the client refused, or a ping
+   *    the client queued instead of writing retires the socket at once onto
+   *    the client's jittered backoff curve through `client.restart`; the
+   *    transition to `reconnecting` stops this heartbeat, probes the service
+   *    for the pill, and the next open starts another heartbeat.
    *
    * A tick orphaned by {@link stopHeartbeat} or overtaken by a newer
    * connection while it awaited does nothing further.
@@ -2587,7 +2695,35 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
     } else {
       keepaliveArmed = true;
     }
-    const probe = await probeInBackground();
+    if (!isHeartbeatCurrent(generation)) {
+      heartbeatTickGeneration = undefined;
+      return;
+    }
+    if (!socketWritable()) {
+      heartbeatTickGeneration = undefined;
+      retireSilentSocket('the open socket cannot take the heartbeat ping; reconnecting', {
+        transport: client.state,
+      });
+      return;
+    }
+    const pingId = newMessageId();
+    const answer = awaitPingAnswer(pingId);
+    const sent = sendTracked(MESSAGE_TYPE.CLIENT_PING, {}, { id: pingId });
+    if (heartbeatTickGeneration !== generation) {
+      // The write itself moved the transport off `open`, which stopped the
+      // heartbeat and ended the wait.
+      return;
+    }
+    if (isErr(sent) || sent.value === 'queued') {
+      finishOutstandingPing('cancelled');
+      heartbeatTickGeneration = undefined;
+      retireSilentSocket(
+        'the heartbeat ping was not written to the open socket; reconnecting',
+        isErr(sent) ? { code: sent.error.code } : { outcome: sent.value },
+      );
+      return;
+    }
+    const outcome = await answer;
     if (heartbeatTickGeneration !== generation) {
       return;
     }
@@ -2595,25 +2731,30 @@ export function createWsBridge(deps: WsBridgeDeps): WsBridge {
     if (!isHeartbeatCurrent(generation)) {
       return;
     }
-    if (isErr(probe)) {
-      heartbeatFailures += 1;
-      if (heartbeatFailures >= SOCKET_HEARTBEAT_FAILURE_LIMIT) {
-        log.warn('the local service stopped answering on an open socket; reconnecting', {
-          failures: heartbeatFailures,
-          code: probe.error.code,
-        });
-        heartbeatFailures = 0;
-        client.restart(SERVICE_STOPPED_ANSWERING_REASON);
+    switch (outcome) {
+      case 'answered':
+        scheduleHeartbeatTick(generation);
         return;
-      }
-      log.info('the local service missed a heartbeat', {
-        failures: heartbeatFailures,
-        code: probe.error.code,
-      });
-    } else {
-      heartbeatFailures = 0;
+      case 'timed-out':
+        retireSilentSocket('the local service did not answer the heartbeat ping; reconnecting', {
+          timeoutMs: SERVICE_PONG_TIMEOUT_MS,
+        });
+        return;
+      case 'cancelled':
+        return;
+      default:
+        assertNever(outcome);
     }
-    scheduleHeartbeatTick(generation);
+  }
+
+  /**
+   * Retire the open socket onto the client's jittered backoff curve: its peer
+   * left the heartbeat ping unanswered, or the socket could not carry the ping
+   * at all. The record names state names, outcomes, codes and bounds only.
+   */
+  function retireSilentSocket(why: string, fields: LogFields): void {
+    log.warn(why, fields);
+    client.restart(SERVICE_STOPPED_ANSWERING_REASON);
   }
 
   /**

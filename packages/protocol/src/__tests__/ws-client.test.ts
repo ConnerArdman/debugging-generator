@@ -1111,7 +1111,7 @@ describe('credential resolution', () => {
 });
 
 // ---------------------------------------------------------------------------
-// The credential deadline's life cycle (R1-F04)
+// The credential deadline's life cycle
 // ---------------------------------------------------------------------------
 
 describe('the credential deadline of an asynchronous provider', () => {
@@ -1859,7 +1859,7 @@ describe('races and the socket life cycle', () => {
 });
 
 // ---------------------------------------------------------------------------
-// The opening deadline (INT-F39)
+// The opening deadline
 // ---------------------------------------------------------------------------
 
 /** The one pending timer, asserted to be the opening deadline of `ms`. */
@@ -2694,7 +2694,7 @@ describe('state events', () => {
 });
 
 // ---------------------------------------------------------------------------
-// The loopback-only service origin (R1-F09, R5-F04)
+// The loopback-only service origin
 // ---------------------------------------------------------------------------
 
 /** One configured value the loopback-only policy must refuse. */

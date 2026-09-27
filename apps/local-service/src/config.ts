@@ -70,9 +70,9 @@
  *
  * ## The state root stays outside every project
  *
- * AAP 0.4.2 keeps session data and file backups "outside the target project
- * (under `~/.debuggen`) so a session never pollutes the developer's git
- * status". A configured `DEBUGGEN_HOME` is an arbitrary absolute path, so that
+ * Session data and file backups live outside every target project (under
+ * `~/.debuggen` by default), so a session never pollutes the developer's git
+ * status. A configured `DEBUGGEN_HOME` is an arbitrary absolute path, so that
  * promise is enforced rather than assumed: a project root that **is** the state
  * root, **contains** it (`DEBUGGEN_HOME=/work/shop/.state` with the project
  * `/work/shop`) or **lies inside** it is refused, because the store, the editor
@@ -2809,8 +2809,8 @@ function pathUnresolvable(stage: string, errno: string | undefined): DebuggenErr
 }
 
 /**
- * Refuses a project root that overlaps the state root (AAP 0.4.2: session data
- * and backups live outside the target project).
+ * Refuses a project root that overlaps the state root, because session data
+ * and backups live outside every target project.
  *
  * The project root is canonicalised with {@link canonicalizePath} — so a
  * project reached through a symbolic link into the state root is refused, and

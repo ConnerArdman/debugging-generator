@@ -3740,6 +3740,33 @@ describe('createContentBridge', () => {
       },
     );
 
+    it('carries a target.request that cancels the page pick with its flag intact, and drops a flag that is not exactly true', () => {
+      const { bridge, runtime, agent } = startedHarness();
+      const arming = downstreamFrames()['target.request'];
+      const cancelling = withFields(arming, {
+        payload: { requestId: 'request-0004', cancel: true },
+      });
+
+      runtime.latestPort().emitMessage(cancelling);
+
+      // The agent's guard admitted it too: `received` holds only valid page frames.
+      expect(lastReceived(agent)).toEqual({
+        source: BRIDGE_SOURCE_TAG,
+        version: PAGE_CHANNEL_VERSION,
+        type: 'target.request',
+        payload: { requestId: 'request-0004', cancel: true },
+      });
+
+      for (const cancel of [false, 'true', 1, null]) {
+        runtime
+          .latestPort()
+          .emitMessage(withFields(arming, { payload: { requestId: 'request-0005', cancel } }));
+      }
+
+      expect(bridge.getStats()).toMatchObject({ forwardedDown: 1, droppedDownUnrecognised: 4 });
+      expect(agent.receivedTypes()).toEqual(['bridge.ready', 'target.request']);
+    });
+
     it('counts a frame the agent did not claim as delivered but not acknowledged', () => {
       const { bridge, runtime } = startedHarness({ claimBridgeFrames: false });
       runtime.latestPort().emitMessage(downstreamFrames()['target.request']);
@@ -5289,10 +5316,20 @@ describe('createWorker — a bridge frame that waited is checked again before it
   it('does not forward an element described by a document superseded while the registry was read', async () => {
     const { logger, records } = recordingLogger();
     const worker = await startedWorker([storedBinding(SESSION_A_TAB_ID, SESSION_A)], { logger });
+    // Only the answer to the tab's live pick is a selection, so each
+    // document's pick is armed through the panel before the page answers it.
+    const panel = openWorkerPanel(worker);
+    await askWorker(panel.port, 'session.snapshot', { inspectedTabId: SESSION_A_TAB_ID });
     const old = connectWorkerBridge(worker, SESSION_A_TAB_ID);
     old.deliver(upstreamFrame('agent.ready', readyPayload()));
+    await askWorker(panel.port, 'target.pick', { sessionId: SESSION_A, enabled: true });
 
-    old.deliver(upstreamFrame('target.described', describedPayload()));
+    old.deliver(
+      upstreamFrame('target.described', {
+        ...describedPayload(),
+        requestId: lastTargetRequestId(old),
+      }),
+    );
     const current = connectWorkerBridge(worker, SESSION_A_TAB_ID);
     await vi.waitFor(() => {
       expect(droppedStale(records, 'target.described')).toBe(true);
@@ -5307,7 +5344,13 @@ describe('createWorker — a bridge frame that waited is checked again before it
 
     // The current document's own selection is forwarded.
     current.deliver(upstreamFrame('agent.ready', successorReadyPayload()));
-    current.deliver(upstreamFrame('target.described', describedPayload()));
+    await askWorker(panel.port, 'target.pick', { sessionId: SESSION_A, enabled: true });
+    current.deliver(
+      upstreamFrame('target.described', {
+        ...describedPayload(),
+        requestId: lastTargetRequestId(current),
+      }),
+    );
     await vi.waitFor(() => {
       expect(forwarded()).toBe(1);
     });

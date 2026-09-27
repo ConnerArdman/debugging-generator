@@ -162,7 +162,12 @@
  */
 
 import { applyLineageAttributes, getLineage, notifyInteraction } from './continuation.js';
-import { describeElement, nearestComponentName, type TargetDescriptor } from './dom-target.js';
+import {
+  describeElement,
+  isElementPickActive,
+  nearestComponentName,
+  type TargetDescriptor,
+} from './dom-target.js';
 import { newSpanId, newTraceId } from './ids.js';
 import {
   emit,
@@ -1222,9 +1227,19 @@ function armCloseTimer(record: InteractionRecord): void {
  * ended — the difference between a residue the module remembers to retry and
  * a producer that is still running. The gate is what makes "disabled, not
  * merely idled" (AAP 0.5.1) true even when removal itself fails.
+ *
+ * **Gated on the element picker as well.** While `./dom-target.ts` has a pick
+ * in flight ({@link isElementPickActive}), the gesture the developer makes is
+ * the choice of an element for "Pick element", not an interaction with the
+ * application: the picker consumes it so the application never sees it, and
+ * recording it here would open a window — and a continuation window after it
+ * — for a click that caused nothing. This listener is usually registered
+ * before the picker's, so it runs first on the very click that ends the pick;
+ * the check is therefore made here rather than left to the picker's
+ * `stopImmediatePropagation`.
  */
 function handleInteractionEvent(event: Event): void {
-  if (!attached) {
+  if (!attached || isElementPickActive()) {
     return;
   }
 

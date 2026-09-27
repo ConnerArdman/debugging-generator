@@ -305,11 +305,11 @@ const REJECTION_EVENT_TYPE = 'unhandledrejection';
  * nothing here rate-limits and nothing here passes a page string — no
  * message, no URL, no rejection value — in a stage or a detail field.
  *
- * Why report at all: a swallowed failure used to be visible only as
+ * Why report at all: without the frame, a swallowed failure is visible only as
  * `getErrorStats().failures`, which nothing outside the page reads, so a
- * capture could lose the error signal entirely while both UIs showed a
- * capture that succeeded. AAP 0.5.5 requires the missing signal to be stated
- * rather than inferred.
+ * capture could lose the error signal entirely while both UIs show a capture
+ * that succeeded. A missing signal must be stated to the developer rather than
+ * inferred.
  *
  * One stage id per distinct thing that can go wrong, because the stage is what
  * a developer reads in the frame:
@@ -325,7 +325,7 @@ const REJECTION_EVENT_TYPE = 'unhandledrejection';
  * - {@link STAGE_DETACH_STATE_RESET} — the state reset itself failed.
  *
  * Deliberately *not* reported: the per-field guards in `readProperty`,
- * `isDomNode`, `isErrorLike` and `readTagName`. Each costs one attribute of
+ * `isDomNode`, `isBrandedError` and `readTagName`. Each costs one attribute of
  * one event and leaves the event itself intact, they run once per property of
  * every failure on a page that may be failing in a loop, and one hostile
  * accessor would otherwise spend this source's whole four-frame budget on a
@@ -1057,15 +1057,15 @@ function hasErrorDataBrand(value: object): boolean {
  * Whether a value is an error the language will vouch for — and deliberately
  * **not** whether it looks like one.
  *
- * Named for the brand rather than for the shape on purpose. This predicate
- * used to be `isErrorLike` and used to accept any object carrying a string
- * `name` and a string `message`, which let an ordinary rejected application
- * record — an API error payload, a GraphQL error, a validation model, any
- * class instance with a `name` field — have its `name`, `message` and `stack`
- * copied into a telemetry event, persisted by the service, tailed into
- * DevTools and, after aggregation, sent to a model provider. AAP 0.5.2 keeps
- * application data out of the capture; a duck-typed predicate cannot, because
- * the duck is the application's to shape.
+ * Named for the brand rather than for the shape on purpose. A shape test,
+ * accepting any object that carries a string `name` and a string `message`,
+ * would admit an ordinary rejected application record — an API error payload,
+ * a GraphQL error, a validation model, any class instance with a `name`
+ * field — and copy its `name`, `message` and `stack` into a telemetry event
+ * that is persisted by the service, tailed into DevTools and, after
+ * aggregation, sent to a model provider. Application data stays out of the
+ * capture; a duck-typed predicate cannot keep it out, because the duck is the
+ * application's to shape.
  *
  * One check decides it, and a second exists only for a host that lacks the
  * first:
@@ -1084,8 +1084,9 @@ function hasErrorDataBrand(value: object): boolean {
  *    `Error.isError` at all, or when that predicate threw rather than
  *    answered, since a throw decides nothing either way.
  *
- * `instanceof` appears nowhere in this function, and that absence is the fix:
- * it is both forgeable and already `true` for objects that have no error slot.
+ * `instanceof` appears nowhere in this function, and that absence is
+ * deliberate: it is both forgeable and already `true` for objects that have no
+ * error slot.
  *
  * A negative costs nothing but the tag: {@link describeValue} then reports
  * `[object]`, `[array]` or `[dom]` and reads no property whatsoever.

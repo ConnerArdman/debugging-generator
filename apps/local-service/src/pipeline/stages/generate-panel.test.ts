@@ -3,9 +3,7 @@
  * (`./generate-panel.ts`): the panel a caller names in `supersedes` is handed
  * to the panel subsystem as `expectedPredecessor`, a stale refusal from that
  * subsystem fails the stage unchanged, and a returned panel that supersedes any
- * other panel fails the stage rather than being reported as a success
- * (AAP §0.4.2, Follow-up row; §0.5.5: a failure is never presented as a
- * success).
+ * other panel fails the stage rather than being reported as a success.
  *
  * The panel generator is a double: its own checks — before the model call and
  * inside the store's insert transaction — are pinned by

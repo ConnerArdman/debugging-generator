@@ -3,10 +3,11 @@
  *
  * The command is driven through a fake {@link CommandContext}: the service
  * client answers `rotateCredentials()` with whatever a case scripts, the
- * credential store holds a recognisable fake token, and every UI call is a
- * spy. The command module itself needs no `vscode` module — it imports types
- * only from `./index` and reaches the editor solely through the injected
- * `CommandUi`.
+ * credential store holds a recognisable fake token, the process manager
+ * reports a scripted state and counts `restart()` calls, and every UI call is
+ * a spy. The command module itself needs no `vscode` module — it imports types
+ * only from `./index`, the restart flow from `./start-service`, and reaches
+ * the editor solely through the injected `CommandUi`.
  *
  * The last block drives `ServiceClient.rotateCredentials` of
  * `../service/client` over a fake `fetch`, so the operation id, the route
@@ -30,11 +31,19 @@
  *   or resolution failure gets one failure and no launch;
  * - failure shows exactly one error with the command's prefix and the
  *   service's own message — never a claim of its own about what changed;
- * - a failure that may follow the service's commit (any HTTP reply, a
- *   timeout, a dropped connection) clears the pairing code and offers "Pair
- *   Chrome", which runs `debuggen.pairChrome`; one that provably never reached
- *   the service (a refused connection, a refusal raised before sending) keeps
- *   the code and offers nothing;
+ * - a failure that may follow the service's commit (an HTTP reply other than
+ *   `UNAUTHORIZED`, a timeout, a dropped connection) clears the pairing code
+ *   and offers "Pair Chrome", which runs `debuggen.pairChrome`; one that
+ *   provably never reached the service (a refused connection, a refusal raised
+ *   before sending) keeps the code and offers nothing;
+ * - an `UNAUTHORIZED` reply (`401` or `403`) is the access boundary refusing
+ *   the editor credential before the rotation ran: the pairing code stays, no
+ *   "Pair Chrome" is offered, and one failure in the command's own words
+ *   (the service's refusal kept as its `cause`) names the restart as the
+ *   remedy. A child of this window is offered "Restart service", which runs
+ *   `./start-service.ts`'s restart flow — the live-session confirmation, one
+ *   `restart()`, the health check, the reconnect and its one notice; any other
+ *   service process state is offered no restart;
  * - no credential, and no digest of one, reaches a log record or a notice;
  * - the client method sends `POST /credentials/rotate` with `{}` and the
  *   bearer credential, validates the tally, and resolves every failure.
@@ -44,11 +53,13 @@ import { createHash, randomBytes } from 'node:crypto';
 
 import { describe, expect, it, vi, type Mock } from 'vitest';
 
+import { PROTOCOL_VERSION } from '@debuggen/protocol';
 import type {
   CredentialsRotateResponse,
   DevServerStopRequest,
   DevServerStopResponse,
   FetchLike,
+  HealthResponse,
   HttpCallOptions,
   HttpResponseLike,
 } from '@debuggen/protocol';
@@ -57,6 +68,7 @@ import type { LogFields, Logger, Result } from '@debuggen/shared';
 
 import { createServiceClient } from '../service/client';
 import type { ServiceClient, ServiceCredential } from '../service/client';
+import type { ServiceProcessState, ServiceStatus } from '../service/process';
 
 import type {
   CommandContext,
@@ -65,6 +77,7 @@ import type {
   FailureNoticeOptions,
 } from './index';
 import {
+  CREDENTIAL_REFUSED_MESSAGE,
   LAUNCH_DEV_SERVER_ACTION,
   PAIR_CHROME_ACTION,
   RELAUNCH_DEV_SERVER_ACTION,
@@ -74,6 +87,7 @@ import {
   STOP_DEV_SERVER_FAILURE_PREFIX,
   rotateServiceToken,
 } from './rotate-service-token';
+import { RESTART_SERVICE_ACTION, RESTART_WITH_LIVE_SESSION } from './start-service';
 
 // `../service/client` reads `vscode` only in its default configuration source,
 // which every case below replaces; the module still has to resolve at load.
@@ -109,6 +123,37 @@ const ROTATED_BUT_FILE_FAILED = new DebuggenError(
   },
 );
 
+/**
+ * The access boundary's refusal of the editor credential, as the protocol
+ * client reports a `401` reply: `UNAUTHORIZED` with the status in `details`.
+ */
+const REFUSED_CREDENTIAL = new DebuggenError('UNAUTHORIZED', 'Unknown credential', {
+  hint: 'The local service refused this credential. Pair this client again, or supply the rotated credential with setToken().',
+  details: { operation: 'credentials.rotate', status: 401 },
+});
+
+/** The service URL every status snapshot of the harness names. */
+const HARNESS_SERVICE_URL = 'http://127.0.0.1:43117';
+
+/** The version the harness's `GET /health` answers with after a restart. */
+const RESTARTED_VERSION = '9.8.7';
+
+/** A `ServiceStatus` snapshot in `state`, owned by this window unless it is `external`. */
+function statusOf(state: ServiceProcessState): ServiceStatus {
+  return Object.freeze({
+    state,
+    mode: state === 'external' ? 'external' : 'embedded',
+    pid: state === 'running' ? 4242 : undefined,
+    origin: undefined,
+    runtime: undefined,
+    serviceUrl: HARNESS_SERVICE_URL,
+    restartAttempts: 0,
+    settingsChanged: false,
+    error: undefined,
+    since: 0,
+  });
+}
+
 /** One log record the fake logger captured. */
 interface LogRecord {
   readonly level: string;
@@ -133,6 +178,11 @@ interface HarnessOptions {
   readonly choices?: readonly (string | undefined)[];
   /** The button the developer chooses on a failure notice. Default: none. */
   readonly failureChoice?: string;
+  /**
+   * The buttons chosen on successive failure notices, in order, taking
+   * precedence over {@link failureChoice}; a notice past the end is dismissed.
+   */
+  readonly failureChoices?: readonly (string | undefined)[];
   /** Whether the window holds a project. Default `true`. */
   readonly project?: boolean;
   /** Makes `executeCommand` reject with this error. */
@@ -141,6 +191,17 @@ interface HarnessOptions {
   readonly stop?: Result<DevServerStopResponse, DebuggenError>;
   /** A real service client to use instead of the scripted spies. */
   readonly client?: ServiceClient;
+  /**
+   * The answers to successive modals, in order, taking precedence over
+   * {@link confirm}; a modal past the end of the list is confirmed.
+   */
+  readonly confirms?: readonly boolean[];
+  /** The process manager's state. Default `external`: a service this window did not spawn. */
+  readonly serviceState?: ServiceProcessState;
+  /** What `serviceProcess.restart()` resolves to. Default: a `running` child. */
+  readonly restart?: Result<ServiceStatus, DebuggenError>;
+  /** The active session's id; with no record in the store it counts as live. Default: none. */
+  readonly activeSessionId?: string;
 }
 
 /** The fake context and every spy a case asserts on. */
@@ -167,6 +228,9 @@ interface Harness {
   readonly clearPairing: Mock<() => void>;
   readonly postPairing: Mock<(...args: readonly unknown[]) => void>;
   readonly resolveProjectRoot: Mock<(options?: unknown) => Result<unknown, DebuggenError>>;
+  readonly restart: Mock<() => Promise<Result<ServiceStatus, DebuggenError>>>;
+  readonly health: Mock<() => Promise<Result<HealthResponse, DebuggenError>>>;
+  readonly connect: Mock<() => void>;
 }
 
 /** A logger that records every call. */
@@ -195,11 +259,19 @@ function createHarness(options: HarnessOptions = {}): Harness {
   const logs: LogRecord[] = [];
   let cachedToken: string | undefined = FAKE_TOKEN;
   let noticesShown = 0;
+  let failuresShown = 0;
+  let modalsShown = 0;
 
   const confirmDestructive = vi.fn((confirmation: DestructiveConfirmation) => {
     void confirmation;
     events.push('confirm');
-    return Promise.resolve(options.confirm ?? true);
+    const shown = modalsShown;
+    modalsShown += 1;
+    return Promise.resolve(
+      options.confirms === undefined
+        ? (options.confirm ?? true)
+        : (options.confirms[shown] ?? true),
+    );
   });
   const notify = vi.fn((notice: CommandNotice) => {
     void notice;
@@ -212,7 +284,11 @@ function createHarness(options: HarnessOptions = {}): Harness {
     void error;
     void failureOptions;
     events.push('notifyFailure');
-    return Promise.resolve<string | undefined>(options.failureChoice);
+    const shown = failuresShown;
+    failuresShown += 1;
+    return Promise.resolve<string | undefined>(
+      options.failureChoices === undefined ? options.failureChoice : options.failureChoices[shown],
+    );
   });
   const executeCommand = vi.fn((command: string, ...args: readonly unknown[]) => {
     void args;
@@ -256,18 +332,46 @@ function createHarness(options: HarnessOptions = {}): Harness {
       ? err(new DebuggenError('PROJECT_NOT_FOUND', 'No folder is open in this VS Code window.'))
       : ok({ projectRoot: '/work/shop', name: 'shop', folderIndex: 0 });
   });
+  const restart = vi.fn(() => {
+    events.push('restart');
+    return Promise.resolve(options.restart ?? ok(statusOf('running')));
+  });
+  const health = vi.fn(() => {
+    events.push('health');
+    return Promise.resolve(
+      ok<HealthResponse>({
+        version: RESTARTED_VERSION,
+        protocolVersion: PROTOCOL_VERSION,
+        pairingAvailable: true,
+      }),
+    );
+  });
+  const connect = vi.fn(() => {
+    events.push('connect');
+  });
 
   const ctx = {
-    state: { clearPairing },
-    client: options.client ?? { rotateCredentials, stopDevServer },
+    state: {
+      clearPairing,
+      activeSessionId: options.activeSessionId,
+      activeSession: undefined,
+      setServiceReachable: () => undefined,
+    },
+    client: options.client ?? {
+      rotateCredentials,
+      stopDevServer,
+      health,
+      connect,
+      baseUrl: HARNESS_SERVICE_URL,
+    },
     credentials: {
       invalidate,
       refresh,
       token: () => cachedToken,
     },
     sessionView: { postPairing },
-    sessionsTree: {},
-    serviceProcess: {},
+    sessionsTree: { refresh: () => Promise.resolve() },
+    serviceProcess: { status: statusOf(options.serviceState ?? 'external'), restart },
     logger: recordingLogger(logs),
     ui: { confirmDestructive, notify, notifyFailure, executeCommand },
     guards: {},
@@ -290,6 +394,9 @@ function createHarness(options: HarnessOptions = {}): Harness {
     clearPairing,
     postPairing,
     resolveProjectRoot,
+    restart,
+    health,
+    connect,
   };
 }
 
@@ -790,6 +897,156 @@ describe('rotateServiceToken — a failed rotation', () => {
 });
 
 // ---------------------------------------------------------------------------
+// A rotation refused at the access boundary
+// ---------------------------------------------------------------------------
+
+describe('rotateServiceToken — a rotation refused at the access boundary', () => {
+  it('offers "Restart service" for a child of this window, keeps the pairing code, and restarts nothing when dismissed', async () => {
+    const harness = createHarness({ reply: err(REFUSED_CREDENTIAL), serviceState: 'running' });
+
+    await rotateServiceToken(harness.ctx);
+
+    expect(harness.notifyFailure).toHaveBeenCalledTimes(1);
+    const [error, failureOptions] = harness.notifyFailure.mock.calls[0]!;
+    expect(error).not.toBe(REFUSED_CREDENTIAL);
+    expect(error.cause).toBe(REFUSED_CREDENTIAL);
+    expect(error.code).toBe('UNAUTHORIZED');
+    expect(error.message).toBe(CREDENTIAL_REFUSED_MESSAGE);
+    expect(error.hint).toContain('Rotation needs a credential the service accepts');
+    expect(error.hint).toContain(`"${RESTART_SERVICE_ACTION}"`);
+    expect(error.hint).toContain('re-issues the editor credential in auth.json');
+    expect(failureOptions).toStrictEqual({
+      prefix: ROTATE_SERVICE_TOKEN_FAILURE_PREFIX,
+      actions: [RESTART_SERVICE_ACTION],
+    });
+    expect(harness.clearPairing).not.toHaveBeenCalled();
+    expect(harness.postPairing).not.toHaveBeenCalled();
+    expect(harness.restart).not.toHaveBeenCalled();
+    expect(harness.notify).not.toHaveBeenCalled();
+    expect(harness.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it('runs the restart flow of debuggen.startService when "Restart service" is chosen', async () => {
+    const harness = createHarness({
+      reply: err(REFUSED_CREDENTIAL),
+      serviceState: 'running',
+      failureChoice: RESTART_SERVICE_ACTION,
+    });
+
+    await rotateServiceToken(harness.ctx);
+
+    // No live session: the rotation modal is the only confirmation.
+    expect(harness.confirmDestructive).toHaveBeenCalledTimes(1);
+    expect(harness.restart).toHaveBeenCalledTimes(1);
+    expect(harness.restart).toHaveBeenCalledWith();
+    expect(harness.health).toHaveBeenCalledTimes(1);
+    expect(harness.connect).toHaveBeenCalledTimes(1);
+    const { events } = harness;
+    expect(events.indexOf('notifyFailure')).toBeLessThan(events.indexOf('restart'));
+    expect(events.indexOf('restart')).toBeLessThan(events.indexOf('health'));
+    expect(events.indexOf('health')).toBeLessThan(events.indexOf('connect'));
+    expect(events.indexOf('connect')).toBeLessThan(events.indexOf('notify'));
+    const notice = onlyNotice(harness);
+    expect(notice.level).toBe('info');
+    expect(notice.message).toBe(
+      `Restarted the Debug Generator service ${RESTARTED_VERSION} at ${HARNESS_SERVICE_URL}.`,
+    );
+    expect(notice.actions).toBeUndefined();
+    expect(harness.notifyFailure).toHaveBeenCalledTimes(1);
+    expect(harness.clearPairing).not.toHaveBeenCalled();
+    expect(harness.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it('asks the live-session confirmation before that restart, and restarts nothing when it is declined', async () => {
+    const harness = createHarness({
+      reply: err(REFUSED_CREDENTIAL),
+      serviceState: 'running',
+      failureChoice: RESTART_SERVICE_ACTION,
+      activeSessionId: 'session-live',
+      confirms: [true, false],
+    });
+
+    await rotateServiceToken(harness.ctx);
+
+    expect(harness.confirmDestructive).toHaveBeenCalledTimes(2);
+    expect(harness.confirmDestructive.mock.calls[0]?.[0]).toBe(ROTATE_SERVICE_TOKEN_CONFIRMATION);
+    expect(harness.confirmDestructive.mock.calls[1]?.[0]).toBe(RESTART_WITH_LIVE_SESSION);
+    expect(harness.restart).not.toHaveBeenCalled();
+    expect(harness.health).not.toHaveBeenCalled();
+    expect(harness.connect).not.toHaveBeenCalled();
+    expect(harness.notify).not.toHaveBeenCalled();
+  });
+
+  it('reports a failed restart once, through the restart flow, without offering another restart', async () => {
+    const restartFailure = new DebuggenError(
+      'INTERNAL',
+      'The service child did not answer after a restart',
+      { hint: 'Open the "Debug Generator Service" output for the reason.' },
+    );
+    const harness = createHarness({
+      reply: err(REFUSED_CREDENTIAL),
+      serviceState: 'running',
+      failureChoices: [RESTART_SERVICE_ACTION],
+      restart: err(restartFailure),
+    });
+
+    await rotateServiceToken(harness.ctx);
+
+    expect(harness.restart).toHaveBeenCalledTimes(1);
+    expect(harness.notifyFailure).toHaveBeenCalledTimes(2);
+    const [restartError, restartOptions] = harness.notifyFailure.mock.calls[1]!;
+    expect(restartError).toBe(restartFailure);
+    expect(restartOptions?.prefix).toBe('Could not restart the Debug Generator service');
+    expect(restartOptions?.actions).not.toContain(RESTART_SERVICE_ACTION);
+    expect(harness.health).not.toHaveBeenCalled();
+    expect(harness.connect).not.toHaveBeenCalled();
+  });
+
+  it.each(['external', 'starting', 'failed', 'stopped', 'idle'] as const)(
+    'offers no restart when the service process is %s, whatever is chosen',
+    async (serviceState) => {
+      const harness = createHarness({
+        reply: err(REFUSED_CREDENTIAL),
+        serviceState,
+        failureChoice: RESTART_SERVICE_ACTION,
+      });
+
+      await rotateServiceToken(harness.ctx);
+
+      expect(harness.notifyFailure).toHaveBeenCalledTimes(1);
+      const [error, failureOptions] = harness.notifyFailure.mock.calls[0]!;
+      expect(error.message).toBe(CREDENTIAL_REFUSED_MESSAGE);
+      expect(error.hint).toContain(
+        'Restart the service where it was started — a terminal or another VS Code window',
+      );
+      expect(error.hint).not.toContain(`"${RESTART_SERVICE_ACTION}"`);
+      expect(failureOptions).toStrictEqual({ prefix: ROTATE_SERVICE_TOKEN_FAILURE_PREFIX });
+      expect(harness.restart).not.toHaveBeenCalled();
+      expect(harness.clearPairing).not.toHaveBeenCalled();
+      expect(harness.executeCommand).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps reporting an UNAUTHORIZED the client raised before sending as it stands', async () => {
+    const unsent = new DebuggenError('UNAUTHORIZED', 'The editor credential file is missing');
+    const harness = createHarness({
+      reply: err(unsent),
+      serviceState: 'running',
+      failureChoice: RESTART_SERVICE_ACTION,
+    });
+
+    await rotateServiceToken(harness.ctx);
+
+    expect(harness.notifyFailure).toHaveBeenCalledTimes(1);
+    const [error, failureOptions] = harness.notifyFailure.mock.calls[0]!;
+    expect(error).toBe(unsent);
+    expect(failureOptions).toStrictEqual({ prefix: ROTATE_SERVICE_TOKEN_FAILURE_PREFIX });
+    expect(harness.restart).not.toHaveBeenCalled();
+    expect(harness.clearPairing).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Credential hygiene
 // ---------------------------------------------------------------------------
 
@@ -804,6 +1061,15 @@ describe('rotateServiceToken — credential hygiene', () => {
     ],
     ['pre-commit failure', { reply: err(NOT_ROTATED) }],
     ['post-commit failure', { reply: err(ROTATED_BUT_FILE_FAILED) }],
+    ['refused credential', { reply: err(REFUSED_CREDENTIAL) }],
+    [
+      'refused credential with a restart',
+      {
+        reply: err(REFUSED_CREDENTIAL),
+        serviceState: 'running',
+        failureChoice: RESTART_SERVICE_ACTION,
+      },
+    ],
     ['dismissal', { confirm: false }],
   ];
 
@@ -1164,25 +1430,54 @@ describe('rotateServiceToken — the pairing code after a failed rotation', () =
     });
   });
 
-  it('clears the pairing code after a 401 reply, because the service answered it', async () => {
-    const fetch = vi.fn<FetchLike>(() =>
-      Promise.resolve(reply(401, { code: 'UNAUTHORIZED', message: 'Unknown credential' })),
-    );
-    const client = clientOver(fetch, fakeCredential(FAKE_TOKEN, FAKE_TOKEN));
-    const harness = createHarness({ client });
+  it.each([401, 403])(
+    'keeps the pairing code after a %i UNAUTHORIZED reply, because the access boundary refused it before the rotation ran',
+    async (status) => {
+      const fetch = vi.fn<FetchLike>(() =>
+        Promise.resolve(reply(status, { code: 'UNAUTHORIZED', message: 'Unknown credential' })),
+      );
+      const client = clientOver(fetch, fakeCredential(FAKE_TOKEN, FAKE_TOKEN));
+      const harness = createHarness({ client, failureChoice: PAIR_CHROME_ACTION });
 
-    await rotateServiceToken(harness.ctx);
-    client.dispose();
+      await rotateServiceToken(harness.ctx);
+      client.dispose();
 
-    const [error, failureOptions] = harness.notifyFailure.mock.calls[0]!;
-    expect(error.code).toBe('UNAUTHORIZED');
-    expect(error.details?.['status']).toBe(401);
-    expect(harness.clearPairing).toHaveBeenCalledTimes(1);
-    expect(failureOptions).toEqual({
-      prefix: ROTATE_SERVICE_TOKEN_FAILURE_PREFIX,
-      actions: [PAIR_CHROME_ACTION],
-    });
-  });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(harness.clearPairing).not.toHaveBeenCalled();
+      expect(harness.postPairing).not.toHaveBeenCalled();
+      expect(harness.notify).not.toHaveBeenCalled();
+      expect(harness.notifyFailure).toHaveBeenCalledTimes(1);
+      const [error, failureOptions] = harness.notifyFailure.mock.calls[0]!;
+      // The command's own words, stating the outcome the refusal proves.
+      expect(error.code).toBe('UNAUTHORIZED');
+      expect(error.message).toBe(CREDENTIAL_REFUSED_MESSAGE);
+      expect(CREDENTIAL_REFUSED_MESSAGE).toBe(
+        'The service refused this editor’s credential, so nothing was rotated.',
+      );
+      expect(error.hint).toContain('Rotation needs a credential the service accepts');
+      expect(error.hint).toContain('where it was started');
+      expect(error.hint).toContain('re-issues the editor credential in auth.json');
+      expect(error.details?.['status']).toBe(status);
+      // The service's refusal stays reachable as the cause.
+      const cause = error.cause;
+      expect(DebuggenError.is(cause)).toBe(true);
+      expect(DebuggenError.is(cause) ? cause.details?.['status'] : undefined).toBe(status);
+      expect(DebuggenError.is(cause) ? cause.message : undefined).toContain('Unknown credential');
+      // An external service: neither "Pair Chrome" nor "Restart service".
+      expect(failureOptions).toStrictEqual({ prefix: ROTATE_SERVICE_TOKEN_FAILURE_PREFIX });
+      expect(harness.executeCommand).not.toHaveBeenCalled();
+      expect(harness.restart).not.toHaveBeenCalled();
+      expect(harness.logs).toContainEqual({
+        level: 'warn',
+        message: 'Service token rotation failed',
+        fields: {
+          command: 'debuggen.rotateServiceToken',
+          code: 'UNAUTHORIZED',
+          pairingCleared: false,
+        },
+      });
+    },
+  );
 
   it('clears the pairing code when the connection dropped after it was accepted', async () => {
     const fetch = vi.fn<FetchLike>(() => Promise.reject(fetchRejection('ECONNRESET')));

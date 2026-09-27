@@ -19,12 +19,17 @@
  * - the session manager **records** every call and applies it without any
  *   guard of its own, so a test observes what the orchestrator *asked for*
  *   (the state machine's own table is covered by `../sessions/state-machine.test.ts`);
- *   a test that needs a refusal scripts it explicitly;
+ *   a test that needs a refusal scripts it explicitly. Its `confirmProjectRoot`
+ *   answers the suite's root as its own canonical path unless a test scripts
+ *   another identity, a refusal or a throw;
  * - the stage fakes model each stage's documented contract with the scripted
  *   collaborators (the plan stage records its plan through the manager, then
  *   calls the `beforeInstall` seam, then installs; the capture stage opens and
  *   closes the window through the manager), so what the orchestrator does with
- *   their artifacts is observable;
+ *   their artifacts is observable. The plan and follow-up fakes can instead be
+ *   handed out by the orchestrator's own stage factories, which this file
+ *   replaces with spies, so a case observes the installer the orchestrator
+ *   wires into those stages;
  * - the model provider, the prompt loader's `load`/`loadVersion`, the context
  *   builder, the analysis collaborators and the repositories the orchestrator
  *   only hands on are **tripwires**: any call is recorded, and a provider call
@@ -122,10 +127,25 @@ import {
   type PipelineOrchestratorDeps,
   type StageOverrides,
 } from './orchestrator.js';
-// The one value imported from a stage module: AAP §0.5.5's pure empty-capture
-// rule, so a faked capture stage can report the verdict the real rule reaches.
-// It is a pure function — no stage runs, and every stage is still overridden.
+// The one value imported from a stage module for its behaviour: the
+// pure empty-capture rule, so a faked capture stage can report the verdict the
+// real rule reaches. It is a pure function — no stage runs.
 import { classifyCaptureEmptiness } from './stages/capture.js';
+// The two installing stages' factories, imported only as the spies below: a
+// case that names a stage in `builtStages` lets the orchestrator build it, and
+// the spy hands back the same fake over the installer the orchestrator wired.
+import { createFollowUpStage } from './stages/followup.js';
+import { createPlanStage } from './stages/plan.js';
+
+vi.mock('./stages/plan.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./stages/plan.js')>();
+  return { ...actual, createPlanStage: vi.fn(actual.createPlanStage) };
+});
+
+vi.mock('./stages/followup.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./stages/followup.js')>();
+  return { ...actual, createFollowUpStage: vi.fn(actual.createFollowUpStage) };
+});
 
 /* -------------------------------------------------------------------------------------------------
  * Types derived from the orchestrator's own ports — never restated, never imported from a stage
@@ -762,7 +782,10 @@ interface ProgressCall {
 /** Mutable state every double shares: the origin of the next progress row and the event timeline. */
 interface SharedState {
   origin: RowOrigin;
-  /** One entry per stage call, transition, plan record, install, load and progress row, in order. */
+  /**
+   * One entry per stage call, transition, plan record, root confirmation,
+   * install, load and progress row, in order.
+   */
   readonly timeline: string[];
 }
 
@@ -855,7 +878,21 @@ interface ManagerScript {
    * `capturing` — or `undefined` to close the window.
    */
   stopCaptureError: DebuggenError | undefined;
+  /**
+   * Answers `confirmProjectRoot` for a session the manager holds: the root's
+   * re-proven identity, a refusal, or a throw. Defaults to the suite's root
+   * confirmed as its own canonical path (one frozen answer).
+   */
+  confirmProjectRoot: (sessionId: string) => RootConfirmation;
 }
+
+/** What `SessionManager.confirmProjectRoot` answers, read off the port. */
+type RootConfirmation = ReturnType<SessionManager['confirmProjectRoot']>;
+
+/** The default confirmation: the suite's root resolves to itself. */
+const CONFIRMED_ROOT: RootConfirmation = ok(
+  Object.freeze({ projectRoot: PROJECT_ROOT, canonicalRoot: PROJECT_ROOT }),
+);
 
 /** The recording session manager and everything it recorded. */
 interface FakeManager {
@@ -912,6 +949,7 @@ function fakeManager(
     refusePatch: undefined,
     startCaptureError: undefined,
     stopCaptureError: undefined,
+    confirmProjectRoot: () => CONFIRMED_ROOT,
   };
 
   const store = (next: Partial<SessionRecord>): SessionRecord => {
@@ -922,6 +960,13 @@ function fakeManager(
   const members = {
     get: (sessionId: string): Result<SessionRecord | undefined, DebuggenError> =>
       ok(answers(sessionId) ? record : undefined),
+
+    // Synchronous, as the real manager's is: the orchestrator must be able to
+    // act in the turn the identity was proven in.
+    confirmProjectRoot: (sessionId: string): RootConfirmation => {
+      state.timeline.push('confirmProjectRoot');
+      return answers(sessionId) ? script.confirmProjectRoot(sessionId) : err(notFound(sessionId));
+    },
 
     transitionTo: (
       sessionId: string,
@@ -1091,7 +1136,18 @@ interface HarnessOptions {
   readonly evaluateReadiness?: Mock<EvaluateReadinessFn>;
   /** Further session ids the manager answers with the suite's one record (see `fakeManager`). */
   readonly sessionAliases?: readonly string[];
+  /**
+   * The installing stages the orchestrator builds through its own factory
+   * instead of taking the override. The factory is this file's spy (see the
+   * `vi.mock` calls): it returns the same fake, which then installs through
+   * the installer the orchestrator handed the factory — so a test observes the
+   * wiring of that installer rather than the fake's own call.
+   */
+  readonly builtStages?: readonly InstallingStage[];
 }
+
+/** The stages that install through the orchestrator's installer. */
+type InstallingStage = 'plan' | 'followUp';
 
 /** The names of the tripwired collaborators the orchestrator only hands on (or reads narrowly). */
 type TripwireName =
@@ -1210,6 +1266,16 @@ function harness(options: HarnessOptions = {}): Harness {
     stopSession: () => Promise.resolve(),
     dispose: () => Promise.resolve(),
   };
+  /**
+   * What the plan and follow-up fakes install through: the scripted service
+   * itself, or — for a stage in `builtStages` — the installer the orchestrator
+   * handed that stage's factory.
+   */
+  const installers: Record<InstallingStage, Pick<InstrumentationService, 'install'>> = {
+    plan: instrumentationDep,
+    followUp: instrumentationDep,
+  };
+  const builtStages = new Set(options.builtStages);
 
   const codeIndex = {
     load: vi.fn<CodeIndexPort['load']>(() => {
@@ -1312,7 +1378,7 @@ function harness(options: HarnessOptions = {}): Harness {
       if (handed !== undefined && !handed.ok) {
         return err(handed.error);
       }
-      const installed = await instrumentationDep.install({
+      const installed = await installers.plan.install({
         sessionId: context.sessionId,
         projectRoot: context.projectRoot,
         plan: recorded.value.plan,
@@ -1476,7 +1542,7 @@ function harness(options: HarnessOptions = {}): Harness {
       if (handed !== undefined && !handed.ok) {
         return err(handed.error);
       }
-      const installed = await instrumentationDep.install({
+      const installed = await installers.followUp.install({
         sessionId: context.sessionId,
         projectRoot: context.projectRoot,
         plan: PLAN_V2,
@@ -1535,14 +1601,28 @@ function harness(options: HarnessOptions = {}): Harness {
     stages: {
       understand: { run: stages.understand },
       investigate: { run: stages.investigate },
-      plan: { run: stages.plan },
+      ...(builtStages.has('plan') ? {} : { plan: { run: stages.plan } }),
       capture: { arm: stages.arm, complete: stages.complete },
       analyze: { run: stages.analyze },
       generatePanel: { run: stages.generatePanel },
-      followUp: { run: stages.followUp },
+      ...(builtStages.has('followUp') ? {} : { followUp: { run: stages.followUp } }),
     },
     now: () => FIXED_EPOCH_MS,
   };
+
+  // A built stage is still the fake; only its installer is the orchestrator's.
+  if (builtStages.has('plan')) {
+    vi.mocked(createPlanStage).mockImplementationOnce((planDeps) => {
+      installers.plan = planDeps.instrumentation;
+      return { run: stages.plan };
+    });
+  }
+  if (builtStages.has('followUp')) {
+    vi.mocked(createFollowUpStage).mockImplementationOnce((followUpDeps) => {
+      installers.followUp = followUpDeps.instrumentation;
+      return { run: stages.followUp };
+    });
+  }
 
   return {
     orchestrator: createPipelineOrchestrator(deps),
@@ -3578,6 +3658,267 @@ describe('code-index handle lifetime', () => {
 });
 
 /* =================================================================================================
+ * 6b. The project root is re-proved before it is indexed or patched (CWE-367)
+ * ============================================================================================== */
+
+/** Where the suite's root was admitted to resolve: the directory behind a link on its path. */
+const CANONICAL_ROOT = '/volumes/data/ledger-tool';
+
+/** The log message of a confirmation the orchestrator itself could not accept. */
+const ROOT_UNCONFIRMED_MESSAGE =
+  'The project root could not be confirmed for indexing; the project was not indexed.';
+
+/** The access boundary's refusal of a root that now resolves elsewhere: no path in it. */
+function movedRefusal(): DebuggenError {
+  return new DebuggenError(
+    'PATH_OUTSIDE_PROJECT',
+    'The project root no longer resolves to the directory it was admitted as.',
+    {
+      hint: 'Start a new session from the folder in VS Code.',
+      details: { reason: 'project-out-of-scope' },
+    },
+  );
+}
+
+/** One operation that indexes the project, and the stage its refused confirmation fails. */
+interface IndexingOperation {
+  readonly operation: 'run' | 'completeCapture' | 'followUp';
+  readonly stage: ProgressStage;
+  /** Drives the session to where the operation starts. */
+  readonly arrange: (h: Harness) => Promise<void>;
+  readonly act: (h: Harness) => Promise<Result<unknown, DebuggenError>>;
+  /** The stage call the refusal must keep from running. */
+  readonly stageCall: (h: Harness) => CallCounted;
+}
+
+const INDEXING_OPERATIONS: readonly IndexingOperation[] = [
+  {
+    operation: 'run',
+    stage: 'understand',
+    arrange: () => Promise.resolve(),
+    act: (h) => h.orchestrator.run({ sessionId: SESSION_ID }),
+    stageCall: (h) => h.stages.understand,
+  },
+  {
+    operation: 'completeCapture',
+    stage: 'analyze',
+    arrange: toCapturing,
+    act: (h) => h.orchestrator.completeCapture({ sessionId: SESSION_ID }),
+    stageCall: (h) => h.stages.analyze,
+  },
+  {
+    operation: 'followUp',
+    stage: 'followup',
+    arrange: toGenerated,
+    act: (h) =>
+      h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why twice?',
+      }),
+    stageCall: (h) => h.stages.followUp,
+  },
+];
+
+describe('the project root is re-proved before it is indexed or patched', () => {
+  it('indexes the canonical root the manager confirmed, and holds and releases the handles under it', async () => {
+    const h = harness();
+    h.manager.script.confirmProjectRoot = () =>
+      ok({ projectRoot: PROJECT_ROOT, canonicalRoot: CANONICAL_ROOT });
+
+    await toGenerated(h);
+
+    // run and completeCapture each indexed the directory that was proven…
+    expect(h.codeIndex.load.mock.calls.map((call) => call[0])).toEqual([
+      CANONICAL_ROOT,
+      CANONICAL_ROOT,
+    ]);
+    // …while every stage still reads the session's root as it was spelled.
+    expect(h.stages.understand.mock.calls[0]?.[0].projectRoot).toBe(PROJECT_ROOT);
+    expect(h.stages.analyze.mock.calls[0]?.[0].projectRoot).toBe(PROJECT_ROOT);
+    expect(h.codeIndex.invalidate).not.toHaveBeenCalled();
+
+    h.orchestrator.releaseSession(SESSION_ID);
+
+    expect(h.codeIndex.invalidate.mock.calls).toEqual([[CANONICAL_ROOT]]);
+  });
+
+  it('accepts an identity that names the session’s root in another spelling of the same path', async () => {
+    const h = harness();
+    h.manager.script.confirmProjectRoot = () =>
+      ok({ projectRoot: '/workspace//ledger-tool/', canonicalRoot: CANONICAL_ROOT });
+
+    await toReady(h);
+
+    expect(h.codeIndex.load.mock.calls[0]?.[0]).toBe(CANONICAL_ROOT);
+  });
+
+  it('confirms the root immediately before every load, with no await in between', async () => {
+    const h = harness();
+    h.manager.script.confirmProjectRoot = () => {
+      // A microtask queued by the proof runs at the next `await`: had the
+      // orchestrator awaited anything between the proof and the load, it would
+      // be marked before the load.
+      queueMicrotask(() => h.timeline.push('microtask'));
+      return CONFIRMED_ROOT;
+    };
+
+    await toGenerated(h);
+    expectOk(
+      await h.orchestrator.followUp({
+        sessionId: SESSION_ID,
+        attemptId: nextAttemptId(),
+        question: 'Why twice?',
+      }),
+    );
+
+    const loads = h.timeline.flatMap((entry, at) => (entry === 'load' ? [at] : []));
+    expect(loads).toHaveLength(3);
+    for (const at of loads) {
+      expect(h.timeline.slice(at - 1, at + 2)).toEqual(['confirmProjectRoot', 'load', 'microtask']);
+    }
+    // Each confirmation asked about the operation's own session.
+    expect(h.manager.wire.calls.filter((call) => call.member === 'confirmProjectRoot')).toEqual(
+      Array.from({ length: 3 }, () => ({ member: 'confirmProjectRoot', args: [SESSION_ID] })),
+    );
+  });
+
+  it.each(INDEXING_OPERATIONS)(
+    '$operation fails at the $stage stage when the root moved, indexing nothing',
+    async ({ stage, arrange, act, stageCall }) => {
+      const h = harness();
+      await arrange(h);
+      const moved = movedRefusal();
+      h.manager.script.confirmProjectRoot = () => err(moved);
+      const loadsBefore = h.codeIndex.load.mock.calls.length;
+      const stageCallsBefore = stageCall(h).mock.calls.length;
+
+      const error = expectErr(await act(h));
+
+      // The manager's refusal, unchanged — code, message and hint.
+      expect(error).toBe(moved);
+      expect(h.codeIndex.load.mock.calls.length).toBe(loadsBefore);
+      expect(stageCall(h).mock.calls.length).toBe(stageCallsBefore);
+      expect(failuresOf(h).at(-1)).toEqual({
+        stage,
+        code: 'PATH_OUTSIDE_PROJECT',
+        message: moved.message,
+        hint: moved.hint,
+      });
+      expect(h.manager.current().status).toBe('failed');
+    },
+  );
+
+  it.each([
+    {
+      kind: 'throws',
+      reason: 'project-root-confirmation-threw',
+      confirm: (): RootConfirmation => {
+        throw new Error('/private/leaked/ledger-tool could not be read');
+      },
+      logged: { errorClass: 'Error' },
+    },
+    {
+      kind: 'answers a relative canonical root',
+      reason: 'project-root-confirmation-invalid',
+      confirm: (): RootConfirmation =>
+        ok({ projectRoot: PROJECT_ROOT, canonicalRoot: 'leaked/ledger-tool' }),
+      logged: {},
+    },
+    {
+      kind: 'confirms another root than the session’s',
+      reason: 'confirmed-root-mismatch',
+      confirm: (): RootConfirmation =>
+        ok({ projectRoot: '/workspace/leaked-tool', canonicalRoot: '/volumes/leaked-tool' }),
+      logged: {},
+    },
+  ])(
+    'fails the run as INTERNAL when the confirmation $kind, keeping nothing it carried',
+    async ({ reason, confirm, logged }) => {
+      const h = harness();
+      h.manager.script.confirmProjectRoot = confirm;
+
+      const error = expectErr(await h.orchestrator.run({ sessionId: SESSION_ID }));
+
+      expect(error.code).toBe('INTERNAL');
+      expect(error.details).toEqual({ reason, sessionId: SESSION_ID });
+      expect(error.cause).toBeUndefined();
+      expect(h.codeIndex.load).not.toHaveBeenCalled();
+      expect(h.stages.understand).not.toHaveBeenCalled();
+      expect(failuresOf(h)).toEqual([
+        { stage: 'understand', code: 'INTERNAL', message: error.message, hint: error.hint },
+      ]);
+      expect(h.manager.current().status).toBe('failed');
+      const warned = h.records.filter(
+        (record) => record.level === 'warn' && record.message === ROOT_UNCONFIRMED_MESSAGE,
+      );
+      expect(warned.map((record) => record.fields)).toEqual([
+        expect.objectContaining({ code: 'INTERNAL', reason, ...logged }),
+      ]);
+      // No record, failure or error carries what the confirmation held.
+      expect(JSON.stringify(h.records)).not.toMatch(/leaked/u);
+      expect(JSON.stringify(failuresOf(h))).not.toMatch(/leaked/u);
+    },
+  );
+
+  it.each([
+    {
+      stage: 'plan' as const,
+      arrange: (): Promise<void> => Promise.resolve(),
+      act: async (h: Harness): Promise<void> => {
+        await toReady(h);
+      },
+    },
+    {
+      stage: 'followUp' as const,
+      arrange: async (h: Harness): Promise<void> => {
+        await toGenerated(h);
+        h.script.followUpPath = 'new-capture';
+      },
+      act: async (h: Harness): Promise<void> => {
+        expectOk(
+          await h.orchestrator.followUp({
+            sessionId: SESSION_ID,
+            attemptId: nextAttemptId(),
+            question: 'Why again?',
+          }),
+        );
+      },
+    },
+  ])(
+    'hands every $stage-stage install the manager’s confirmation of the same session',
+    async ({ stage, arrange, act }) => {
+      const h = harness({ builtStages: [stage] });
+      await arrange(h);
+      const installsBefore = h.instrumentation.install.mock.calls.length;
+
+      await act(h);
+
+      const requests = h.instrumentation.install.mock.calls
+        .slice(installsBefore)
+        .map((call) => call[0]);
+      expect(requests).toHaveLength(1);
+      const [request] = requests;
+      if (request === undefined) {
+        throw new Error(`Expected the ${stage} stage to install once.`);
+      }
+      expect(request.reportStageFailure).toBe(false);
+      const confirm = request.confirmProjectRoot;
+      expect(confirm).toBeTypeOf('function');
+
+      const asked = h.manager.wire.calls.length;
+      const answer = confirm?.();
+
+      expect(answer).toBe(CONFIRMED_ROOT);
+      expect(h.manager.wire.calls.slice(asked)).toEqual([
+        { member: 'confirmProjectRoot', args: [request.sessionId] },
+      ]);
+      expect(request.sessionId).toBe(SESSION_ID);
+    },
+  );
+});
+
+/* =================================================================================================
  * 7. The model boundary and privacy
  * ============================================================================================== */
 
@@ -3621,6 +3962,7 @@ describe('model boundary and privacy', () => {
     // `retry`, `end` or another lifecycle method the double does not implement.
     const implemented = new Set([
       'get',
+      'confirmProjectRoot',
       'transitionTo',
       'patch',
       'recordPlan',

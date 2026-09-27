@@ -68,13 +68,18 @@
  * ## Sizes
  *
  * Every visual dimension a stylesheet renders is a token too — the spacing
- * scale, the radii, the two border widths, the glyph, spinner and icon-only
- * control sizes, the one-line block size, the unit a measured coordinate is
- * given, and the column geometry of every data table. The glyph, line and
- * column sizes are font-relative (`em`, `lh` and `ch`), and the token test
- * forbids a length literal and a border-width keyword anywhere in the authored
- * stylesheets, so a glyph box, a hairline or a table track can no more be
- * written inline than a colour can.
+ * scale and its inverse steps, the radii (the round one included), the two
+ * border widths, the glyph, spinner, icon-only control and hidden-box sizes,
+ * the one-line block size and the inset that centres a glyph in it, the unit a
+ * measured coordinate is given, the proportions a box fills or centres by, the
+ * column geometry of every data table, the stroke weights and dash patterns of
+ * drawn charts, the extents of every scroll cap, state box and loading
+ * silhouette, and the geometry of a split layout. The glyph, line and column sizes are font-relative (`em`, `lh`
+ * and `ch`) and every extent is a multiple of a space token. The token test
+ * forbids any number other than zero — a length, a percentage, a ratio, a
+ * factor, a stroke weight — and any border-width keyword anywhere in the
+ * authored stylesheets, so a glyph box, a hairline, a scroll cap or a table
+ * track can no more be written inline than a colour can.
  *
  * ## Table columns
  *
@@ -83,9 +88,14 @@
  * (ordinal, count, quantity, status, label, name, text, standard) to a grid
  * track built from one `columnMin*` token — the readable minimum of that kind
  * of content, in `ch` of the table's own type — and one `columnShare*` token —
- * the share of spare width it takes. Both extension surfaces and every
- * visualization table therefore agree on how wide a duration or a path column
- * is, and one edit here re-densifies all of them at once.
+ * the share of spare width it takes. The two truncating roles (name and text)
+ * may narrow to `columnYield` of their floor, and only when that makes the
+ * table fit: a panel just too narrow for every floor truncates its names and
+ * free text and keeps its figures, statuses and controls in view without
+ * scrolling, and a panel too narrow even for the yielded floors keeps every
+ * floor and scrolls. Both extension surfaces and every visualization table
+ * therefore agree on how wide a duration or a path column is, and one edit
+ * here re-densifies all of them at once.
  */
 
 /**
@@ -227,6 +237,25 @@ const darkTokens = {
   space6: '20px',
   space7: '24px',
 
+  // --- Inverse spacing ------------------------------------------------------
+  // A step of the scale pulled the other way: a margin or an offset that moves
+  // an edge back toward its start by exactly one space step. Stated as the
+  // negation of the step it mirrors, so it tracks that step through any change
+  // to the scale; a stylesheet names it instead of multiplying a step by a
+  // number of its own.
+  /**
+   * The smallest step inward: the outline offset that draws the focus ring
+   * inside an element's box where a scroll container's edge, or a sticky
+   * header above it, would otherwise hide a ring drawn outside.
+   */
+  spaceInverse0: 'calc(var(--dg-space-0) * -1)',
+  /**
+   * One `space1` step back toward the start: the bleed of a control that gives
+   * its own padding back to the cell it fills, and the signed gap of a tooltip
+   * placed before its trigger.
+   */
+  spaceInverse1: 'calc(var(--dg-space-1) * -1)',
+
   // --- Typography -----------------------------------------------------------
   /** Interface font stack. */
   fontUi: '-apple-system, "Segoe UI", Inter, sans-serif',
@@ -265,6 +294,12 @@ const darkTokens = {
   radiusSm: '2px',
   radiusMd: '4px',
   radiusLg: '6px',
+  /**
+   * The radius that rounds a square into a circle — a status dot, the
+   * progress spinner's ring. Half of each side, so the corners meet exactly at
+   * the middle of every edge whatever size the square is given.
+   */
+  radiusRound: '50%',
 
   // --- Glyph and control sizes ----------------------------------------------
   // Font-relative on purpose: a glyph, a spinner and an icon-only control scale
@@ -292,6 +327,25 @@ const darkTokens = {
    * above: `1lh` resolves against the element that consumes the token.
    */
   lineBlockSize: '1lh',
+  /**
+   * The block margin that centres a glyph square (`iconSize`) in one line box
+   * (`lineBlockSize`): half the difference between the two, on either side.
+   * A glyph that must hold a line open on its own — the only item left on the
+   * first line of a source chip whose runs have wrapped out of view — takes it
+   * as a margin rather than a taller box, so its margin box spans the line and
+   * centres it where a glyph beside text sits, while its own box, and the
+   * baseline a flex container synthesizes from that box, stay the glyph
+   * square's. Font-relative through both operands.
+   */
+  glyphLineInset: 'calc((var(--dg-line-block-size) - var(--dg-icon-size)) / 2)',
+  /**
+   * The box of content removed from the visual surface but kept in the
+   * accessibility tree (the visually hidden utility). It paints nothing —
+   * `clip-path` removes it entirely — and exists only so the out-of-flow box
+   * can never extend a scrollable area; font-relative like the glyph square,
+   * so it stays a small box beside any type role.
+   */
+  hiddenBoxSize: '1em',
 
   // --- Measured geometry ----------------------------------------------------
   /**
@@ -305,6 +359,16 @@ const darkTokens = {
    * element by the same factor.
    */
   pixelUnit: '1px',
+
+  // --- Proportions ----------------------------------------------------------
+  // Shares of the containing block, for the boxes that fill, cap or centre
+  // against their container rather than taking a size of their own. They are
+  // named so that a stylesheet states the relationship — "as wide as its
+  // container", "half of it" — and writes no percentage itself.
+  /** The whole of the containing block: a box that fills or is capped at it. */
+  sizeFull: '100%',
+  /** Half of the containing block: an inset that meets itself in the middle. */
+  sizeHalf: '50%',
 
   // --- Table columns: readable minimums -------------------------------------
   // The floor of each semantic column role, in `ch` of the table's own type,
@@ -352,6 +416,119 @@ const darkTokens = {
   /** Free text. */
   columnShareWidest: '3fr',
 
+  // --- Table columns: yield -------------------------------------------------
+  /**
+   * The fraction of its readable floor a TRUNCATING column role (`name`,
+   * `text`) can narrow to when that makes its table fit a panel too narrow for
+   * every floor. Names and free text truncate with an ellipsis and stay
+   * identifiable, while figures, statuses and action controls do not survive
+   * being cut, so such a panel narrows the truncating columns and keeps the
+   * compact ones — a row's controls included — in view. A table too narrow
+   * even for the yielded floors gains nothing from truncating and keeps every
+   * floor. A unitless factor: it scales a `columnMin*` floor and carries no
+   * unit.
+   */
+  columnYield: '0.5',
+  /**
+   * How abruptly a table too narrow even for its yielded floors takes the
+   * yield back: its grid grows this many pixels for every pixel of that
+   * shortfall, up to the readable floors, so a fraction of a pixel below the
+   * width at which the yielded floors fit, every column is back at its
+   * readable floor and the table scrolls exactly as a table with no truncating
+   * column does. Large enough that the change of regime spans less than a
+   * pixel for any table's yield; a unitless factor, like the split layout's
+   * grow scale.
+   */
+  columnYieldReturnScale: '1000',
+
+  // --- SVG strokes ----------------------------------------------------------
+  // The stroke weights and dash patterns of drawn chart geometry — timeline
+  // bars and connectors, hierarchy frames, graph nodes and edges. Unitless:
+  // an SVG stroke is measured in the user units of the drawing it belongs to,
+  // which is why these are not the border widths above. Theme-invariant for
+  // the same reason a border width is: a theme recolours a stroke, never
+  // reweighs it.
+  /** Gridlines, axis ticks, lanes, resting bars, frames and connectors. */
+  strokeWidthHairline: '1',
+  /** A selected or hovered bar or frame, and a graph participant's outline. */
+  strokeWidthEmphasis: '2',
+  /**
+   * The halo painted beneath a chart label (`paint-order: stroke`) so it stays
+   * legible where a connector or gridline runs behind it.
+   */
+  strokeWidthHalo: '3',
+  /** An ambiguous relationship: dashes, so it never reads as a measured one. */
+  strokeDashDashed: '4 3',
+  /** An orphaned relationship: dots, the weakest line the charts draw. */
+  strokeDashDotted: '1 3',
+
+  // --- Component extents ----------------------------------------------------
+  // The box sizes of the containers and silhouettes the components draw:
+  // scroll caps that keep a long result inside its own section, the floors of
+  // state boxes and loading silhouettes, and the legible minimum of a chart.
+  // Each is a multiple of the largest space token, so every extent stays on the
+  // design scale and moves with it; the multiple is the design decision, and
+  // it is stated here, once, rather than in a stylesheet.
+  /** The scroll cap of a data table's rows. */
+  scrollCapLg: 'calc(var(--dg-space-7) * 18)',
+  /** The scroll cap of a chart's plotting area: a timeline, a graph. */
+  scrollCapMd: 'calc(var(--dg-space-7) * 16)',
+  /** The scroll cap of a log or a hierarchy: an event log, a flame view. */
+  scrollCapSm: 'calc(var(--dg-space-7) * 14)',
+  /** The scroll cap of a block of code. */
+  codeBlockMaxBlockSize: 'calc(var(--dg-space-7) * 8)',
+  /** The scroll cap of the failing query an error state quotes. */
+  errorQueryMaxBlockSize: 'calc(var(--dg-space-7) * 5)',
+  /** The floor of an empty or error state box, so a state never collapses. */
+  stateMinBlockSize: 'calc(var(--dg-space-7) * 4)',
+  /** The floor of a loading state box. */
+  loadingMinBlockSize: 'calc(var(--dg-space-7) * 3)',
+  /** The height of a solid loading silhouette: a card group awaiting data. */
+  skeletonBlockSize: 'calc(var(--dg-space-7) * 3)',
+  /** The height of a chart's loading silhouette: the plotting area awaiting data. */
+  skeletonChartBlockSize: 'calc(var(--dg-space-7) * 6)',
+  /** The shortest bar of a list silhouette, so a stack of bars reads as a list. */
+  skeletonRowShort: '70%',
+  /** The middle bar length of a list silhouette. */
+  skeletonRowMedium: '85%',
+  /** The widest a tooltip bubble grows before its text wraps. */
+  tooltipMaxInlineSize: 'calc(var(--dg-space-7) * 10)',
+  /** The widest a toolbar's search field grows. */
+  searchMaxInlineSize: 'calc(var(--dg-space-7) * 12)',
+  /**
+   * The legible minimum of a scaled chart canvas (timeline, flame view): below
+   * it the canvas stops shrinking and its viewport scrolls instead, so an axis
+   * label never renders too small to read.
+   */
+  chartMinInlineSize: 'calc(var(--dg-space-7) * 32)',
+  /** The narrowest a metric tile gets before the tile grid wraps a track. */
+  metricCardMinInlineSize: 'calc(var(--dg-space-7) * 6)',
+  /**
+   * The floor of a waterfall's time track: the design strip its tick labels
+   * are fitted to, so a tick set is never drawn on a strip too narrow for it.
+   */
+  waterfallAxisMinInlineSize: 'calc(var(--dg-space-7) * 7)',
+  /** A waterfall row's share of spare width for the operation's label. */
+  waterfallLabelShare: '2fr',
+  /** A waterfall row's share of spare width for the time track, against the label's. */
+  waterfallBarShare: '5fr',
+
+  // --- Split layout ---------------------------------------------------------
+  /**
+   * The basis unit of a split pane: the width one unit of weight asks for, and
+   * so the width at which a division stops fitting on one line and its panes
+   * fall into a column.
+   */
+  splitPaneBasis: 'calc(var(--dg-space-7) * 20)',
+  /** The weight of a pane given none of its own: every unweighted pane is equal. */
+  splitPaneWeight: '1',
+  /**
+   * The constant a pane's weight is scaled by to become its grow factor, so
+   * the factors on any line sum to at least one and a pane that wrapped onto a
+   * line of its own always fills it. Unitless, and never a visible size.
+   */
+  splitGrowScale: '1000',
+
   // --- Elevation ------------------------------------------------------------
   shadow0: 'none',
   shadow1: '0 1px 2px rgba(0, 0, 0, 0.4)',
@@ -376,6 +553,15 @@ const darkTokens = {
   motionEasing: 'ease-out',
   /** One sweep of a loading skeleton's shimmer. */
   shimmerDuration: '1200ms',
+  /**
+   * The size of a loading skeleton's shimmer gradient against the element it
+   * sweeps: twice its width, so one sweep carries the highlight fully across.
+   */
+  shimmerBackgroundSize: '200% 100%',
+  /** One turn of the progress spinner: continuous rather than frantic. */
+  spinDuration: '800ms',
+  /** The rotation of one spinner turn. */
+  spinRotation: '1turn',
 
   // --- Stacking -------------------------------------------------------------
   zBase: '0',
@@ -402,11 +588,13 @@ export type TokenValues = Readonly<Record<TokenKey, string>>;
 
 /**
  * The light value set — a complete second palette, emitted under
- * `[data-theme="light"]`. Theme-invariant families (border widths, spacing,
- * font stacks, type roles, radii, glyph and line sizes, measured geometry,
- * table column geometry, duration aliases and stacking levels) repeat the dark
- * values verbatim, which is what lets the generator emit three self-contained
- * blocks and lets the token test assert those families are identical.
+ * `[data-theme="light"]`. Theme-invariant families (border widths, spacing
+ * and its inverse steps, font stacks, type roles, radii, glyph and line sizes,
+ * measured geometry, proportions, table column geometry, SVG strokes,
+ * component extents, split layout, motion, duration aliases and stacking
+ * levels) repeat the dark values verbatim, which is what lets the generator
+ * emit three self-contained blocks and lets the token test assert those
+ * families are identical.
  */
 const lightTokens: TokenValues = {
   // --- Surfaces -------------------------------------------------------------
@@ -485,6 +673,10 @@ const lightTokens: TokenValues = {
   space6: '20px',
   space7: '24px',
 
+  // --- Inverse spacing ------------------------------------------------------
+  spaceInverse0: 'calc(var(--dg-space-0) * -1)',
+  spaceInverse1: 'calc(var(--dg-space-1) * -1)',
+
   // --- Typography -----------------------------------------------------------
   fontUi: '-apple-system, "Segoe UI", Inter, sans-serif',
   fontMono: '"JetBrains Mono", "SF Mono", Menlo, monospace',
@@ -501,15 +693,22 @@ const lightTokens: TokenValues = {
   radiusSm: '2px',
   radiusMd: '4px',
   radiusLg: '6px',
+  radiusRound: '50%',
 
   // --- Glyph and control sizes ----------------------------------------------
   iconSize: '1em',
   spinnerSize: 'var(--dg-icon-size)',
   iconButtonSize: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
   lineBlockSize: '1lh',
+  glyphLineInset: 'calc((var(--dg-line-block-size) - var(--dg-icon-size)) / 2)',
+  hiddenBoxSize: '1em',
 
   // --- Measured geometry ----------------------------------------------------
   pixelUnit: '1px',
+
+  // --- Proportions ----------------------------------------------------------
+  sizeFull: '100%',
+  sizeHalf: '50%',
 
   // --- Table columns: readable minimums -------------------------------------
   columnMinOrdinal: '8ch',
@@ -527,6 +726,42 @@ const lightTokens: TokenValues = {
   columnShareWide: '2fr',
   columnShareWidest: '3fr',
 
+  // --- Table columns: yield -------------------------------------------------
+  columnYield: '0.5',
+  columnYieldReturnScale: '1000',
+
+  // --- SVG strokes ----------------------------------------------------------
+  strokeWidthHairline: '1',
+  strokeWidthEmphasis: '2',
+  strokeWidthHalo: '3',
+  strokeDashDashed: '4 3',
+  strokeDashDotted: '1 3',
+
+  // --- Component extents ----------------------------------------------------
+  scrollCapLg: 'calc(var(--dg-space-7) * 18)',
+  scrollCapMd: 'calc(var(--dg-space-7) * 16)',
+  scrollCapSm: 'calc(var(--dg-space-7) * 14)',
+  codeBlockMaxBlockSize: 'calc(var(--dg-space-7) * 8)',
+  errorQueryMaxBlockSize: 'calc(var(--dg-space-7) * 5)',
+  stateMinBlockSize: 'calc(var(--dg-space-7) * 4)',
+  loadingMinBlockSize: 'calc(var(--dg-space-7) * 3)',
+  skeletonBlockSize: 'calc(var(--dg-space-7) * 3)',
+  skeletonChartBlockSize: 'calc(var(--dg-space-7) * 6)',
+  skeletonRowShort: '70%',
+  skeletonRowMedium: '85%',
+  tooltipMaxInlineSize: 'calc(var(--dg-space-7) * 10)',
+  searchMaxInlineSize: 'calc(var(--dg-space-7) * 12)',
+  chartMinInlineSize: 'calc(var(--dg-space-7) * 32)',
+  metricCardMinInlineSize: 'calc(var(--dg-space-7) * 6)',
+  waterfallAxisMinInlineSize: 'calc(var(--dg-space-7) * 7)',
+  waterfallLabelShare: '2fr',
+  waterfallBarShare: '5fr',
+
+  // --- Split layout ---------------------------------------------------------
+  splitPaneBasis: 'calc(var(--dg-space-7) * 20)',
+  splitPaneWeight: '1',
+  splitGrowScale: '1000',
+
   // --- Elevation ------------------------------------------------------------
   // Same geometry as dark, tinted for a light background.
   shadow0: 'none',
@@ -540,6 +775,9 @@ const lightTokens: TokenValues = {
   motionDuration: '160ms',
   motionEasing: 'ease-out',
   shimmerDuration: '1200ms',
+  shimmerBackgroundSize: '200% 100%',
+  spinDuration: '800ms',
+  spinRotation: '1turn',
 
   // --- Stacking -------------------------------------------------------------
   zBase: '0',
@@ -633,6 +871,10 @@ const highContrastTokens: TokenValues = {
   space6: '20px',
   space7: '24px',
 
+  // --- Inverse spacing (as dark) --------------------------------------------
+  spaceInverse0: 'calc(var(--dg-space-0) * -1)',
+  spaceInverse1: 'calc(var(--dg-space-1) * -1)',
+
   // --- Typography (as dark) -------------------------------------------------
   fontUi: '-apple-system, "Segoe UI", Inter, sans-serif',
   fontMono: '"JetBrains Mono", "SF Mono", Menlo, monospace',
@@ -649,15 +891,22 @@ const highContrastTokens: TokenValues = {
   radiusSm: '2px',
   radiusMd: '4px',
   radiusLg: '6px',
+  radiusRound: '50%',
 
   // --- Glyph and control sizes (as dark) ------------------------------------
   iconSize: '1em',
   spinnerSize: 'var(--dg-icon-size)',
   iconButtonSize: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
   lineBlockSize: '1lh',
+  glyphLineInset: 'calc((var(--dg-line-block-size) - var(--dg-icon-size)) / 2)',
+  hiddenBoxSize: '1em',
 
   // --- Measured geometry (as dark) ------------------------------------------
   pixelUnit: '1px',
+
+  // --- Proportions (as dark) ------------------------------------------------
+  sizeFull: '100%',
+  sizeHalf: '50%',
 
   // --- Table columns: readable minimums (as dark) ---------------------------
   columnMinOrdinal: '8ch',
@@ -675,6 +924,42 @@ const highContrastTokens: TokenValues = {
   columnShareWide: '2fr',
   columnShareWidest: '3fr',
 
+  // --- Table columns: yield (as dark) ---------------------------------------
+  columnYield: '0.5',
+  columnYieldReturnScale: '1000',
+
+  // --- SVG strokes (as dark) ------------------------------------------------
+  strokeWidthHairline: '1',
+  strokeWidthEmphasis: '2',
+  strokeWidthHalo: '3',
+  strokeDashDashed: '4 3',
+  strokeDashDotted: '1 3',
+
+  // --- Component extents (as dark) ------------------------------------------
+  scrollCapLg: 'calc(var(--dg-space-7) * 18)',
+  scrollCapMd: 'calc(var(--dg-space-7) * 16)',
+  scrollCapSm: 'calc(var(--dg-space-7) * 14)',
+  codeBlockMaxBlockSize: 'calc(var(--dg-space-7) * 8)',
+  errorQueryMaxBlockSize: 'calc(var(--dg-space-7) * 5)',
+  stateMinBlockSize: 'calc(var(--dg-space-7) * 4)',
+  loadingMinBlockSize: 'calc(var(--dg-space-7) * 3)',
+  skeletonBlockSize: 'calc(var(--dg-space-7) * 3)',
+  skeletonChartBlockSize: 'calc(var(--dg-space-7) * 6)',
+  skeletonRowShort: '70%',
+  skeletonRowMedium: '85%',
+  tooltipMaxInlineSize: 'calc(var(--dg-space-7) * 10)',
+  searchMaxInlineSize: 'calc(var(--dg-space-7) * 12)',
+  chartMinInlineSize: 'calc(var(--dg-space-7) * 32)',
+  metricCardMinInlineSize: 'calc(var(--dg-space-7) * 6)',
+  waterfallAxisMinInlineSize: 'calc(var(--dg-space-7) * 7)',
+  waterfallLabelShare: '2fr',
+  waterfallBarShare: '5fr',
+
+  // --- Split layout (as dark) -----------------------------------------------
+  splitPaneBasis: 'calc(var(--dg-space-7) * 20)',
+  splitPaneWeight: '1',
+  splitGrowScale: '1000',
+
   // --- Elevation (delta 3: no elevation shadows) ----------------------------
   shadow0: 'none',
   shadow1: 'none',
@@ -691,6 +976,9 @@ const highContrastTokens: TokenValues = {
   motionDuration: '160ms',
   motionEasing: 'ease-out',
   shimmerDuration: '1200ms',
+  shimmerBackgroundSize: '200% 100%',
+  spinDuration: '800ms',
+  spinRotation: '1turn',
 
   // --- Stacking (as dark) ---------------------------------------------------
   zBase: '0',

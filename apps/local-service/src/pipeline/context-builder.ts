@@ -648,9 +648,9 @@ function maskGuardParsedQuery(text: string): string {
  * Used for every string of a selected element — tag name, selector, visible
  * text, component names — because the element is described by the browser,
  * not by the ingest checkpoint, and nothing upstream of this builder has run
- * the rules of AAP §0.5.2 over it; and, through {@link redactQuestionText}, for
- * the developer's question, which is free text of the same exposure. Two
- * passes run over the whole value:
+ * the redaction rules over it; and, through {@link redactQuestionText}, for the
+ * developer's question, which is free text of the same exposure. Two passes
+ * run over the whole value:
  *
  * 1. `scrub`: provider keys, bearer credentials, JWT-shaped strings,
  *    private-key blocks and credentialed connection strings become

@@ -68,14 +68,18 @@
  * destination and the delivery note go into columns of the order in the same
  * transaction as its lines, and every order this module answers with - the one
  * just written as much as one read back weeks later - is built from those
- * columns rather than from the request that carried them. An order placed
- * before the store recorded them carries none, which reads back as the account's
- * own contact and as the empty address {@link blank} describes, rather than as
- * a guess.
+ * columns rather than from the request that carried them. An order written
+ * without a collected contact or destination - the seeded order history, which
+ * records charges and lines only - carries none, which reads back as the
+ * account's own contact and as the empty address {@link blank} describes,
+ * rather than as a guess.
  *
- * Importing this module opens no connection and reads no configuration - the
- * client in `@/server/db/prisma` connects on its first query - so a page that
- * imports it still builds and type-checks against a machine with no database.
+ * Importing this module opens no connection and reads no configuration other
+ * than `DATABASE_URL`, which `@/server/db/pool` reads to build the pool the
+ * client in `@/server/db/prisma` queries through. Neither connects until the
+ * first query, and an absent `DATABASE_URL` surfaces only there, so a page that
+ * imports this module still builds and type-checks against a machine with no
+ * database.
  */
 
 import { CartStatus, OrderStatus } from '@/generated/prisma/client';
@@ -251,13 +255,14 @@ type Account = {
  * The columns an order keeps of what its checkout collected: who placed it,
  * where it ships and what the packers were told.
  *
- * Every member is nullable because an order placed before the store recorded
- * them carries none, and each of the two groups is written as a set or not at
- * all - so `contactEmail` decides whether the order has a contact of its own
- * and `shipLine1` decides whether it has a destination, rather than each field
- * being interpreted on its own. {@link recorded} and {@link destination} are
- * where those two decisions are made, and they are made in one place so that a
- * freshly written order and one read back weeks later are described identically.
+ * Every member is nullable because an order written without a collected
+ * contact or destination carries none, and each of the two groups is written
+ * as a set or not at all - so the order has a contact of its own only when both
+ * `contactName` and `contactEmail` are present, and a destination only when all
+ * five required `ship*` columns are, rather than each field being interpreted
+ * on its own. {@link recorded} and {@link destination} are where those two
+ * decisions are made, and they are made in one place so that a freshly written
+ * order and one read back weeks later are described identically.
  */
 type Collected = {
   contactName: string | null;
@@ -622,11 +627,12 @@ function contact(account: Account): CustomerContact {
  * Who placed the order, as the checkout collected it, or `null` for an order
  * that recorded nobody.
  *
- * The three columns are written together by {@link recordOrder}, so the email -
- * the one of them a contact cannot be described without - is what decides
- * whether the order has a contact of its own. An order that has none is
- * described by its account instead, which is what {@link contact} answers, and
- * the two are read in that order everywhere an order is returned.
+ * The three columns are written together by {@link recordOrder}, so the name
+ * and the email - the two a contact cannot be described without - are checked
+ * together to decide whether the order has a contact of its own; the company
+ * passes through as recorded. An order that has none is described by its
+ * account instead, which is what {@link contact} answers, and the two are read
+ * in that order everywhere an order is returned.
  *
  * @param row The order's collected columns, as every query below selects them.
  */
@@ -681,11 +687,11 @@ function destination(row: Collected): ShippingAddress {
  * content.
  *
  * Every order placed through this store's checkout carries where it ships (see
- * {@link recordOrder}), so this is what the orders that predate those columns
- * read back as - the seeded history, which records charges and lines and never
- * had an address to record. An empty address is the truthful answer for them:
- * it says the store does not know where that order went, where an invented or
- * partially defaulted one would say something false.
+ * {@link recordOrder}), so this is what the orders written without a
+ * destination read back as - the seeded history, which records charges and
+ * lines and never had an address to record. An empty address is the truthful
+ * answer for them: it says the store does not know where that order went, where
+ * an invented or partially defaulted one would say something false.
  */
 function blank(): ShippingAddress {
   return {
@@ -1085,7 +1091,7 @@ export async function listCustomerOrders(
  * for, and the lines are read in a fixed order so the same order reads the same
  * way on every visit. The contact and the destination come from the order's own
  * columns, falling back to the account's contact and to {@link blank} for an
- * order placed before the store recorded them.
+ * order written without a collected contact or destination.
  *
  * @param id The order's identifier.
  * @returns The order's full detail payload.

@@ -108,9 +108,12 @@ import type { DatabaseSync } from 'node:sqlite';
  * document — see {@link SESSION_CLEANUP_SUMMARIES_MIGRATION}. Version 5 adds
  * the `telemetry_events.clock_offset_ms` column, the informational clock
  * offset each producer reports on its events (AAP 0.2.3) — see
- * {@link PRODUCER_CLOCK_OFFSET_MIGRATION}.
+ * {@link PRODUCER_CLOCK_OFFSET_MIGRATION}. Version 6 adds the persisted
+ * project-root identity, the canonical path each session's root was admitted
+ * under, which the session manager holds every sink to across a restart — see
+ * {@link SESSION_ROOT_IDENTITIES_MIGRATION}.
  */
-export const STORE_SCHEMA_VERSION = 5;
+export const STORE_SCHEMA_VERSION = 6;
 
 /**
  * The `subsystem` field every log record from this module carries, so store
@@ -775,6 +778,113 @@ const PRODUCER_CLOCK_OFFSET_MIGRATION: StoreMigration = {
   },
 };
 
+/* -------------------------------------------------------------------------------------------------
+ * Version 6 — the persisted project-root identity
+ *
+ * Self-contained on purpose, as version 4 is: every statement and constant of
+ * this step lives in this section, so the step can be renumbered as a unit
+ * should another ladder step land first.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The persisted project-root identity: one row per session created with an
+ * admission proof, holding the canonical path — every symbolic link resolved —
+ * its project root was admitted under. `./sessions-repo.ts` writes the row in
+ * the same transaction as the session's insert, and never rewrites it.
+ *
+ * ## Why it is persisted
+ *
+ * The pipeline indexes and patches a session's project long after the
+ * `session.create` request that admitted its root has answered, and a
+ * symbolic link on the root's path retargeted in between would otherwise be
+ * followed (CWE-367). `SessionManager.confirmProjectRoot` therefore re-proves,
+ * immediately before every such sink, that the root still resolves to the
+ * directory recorded here. Held in memory only, that proof would not survive a
+ * restart: a session read back from the store would have to take whatever its
+ * root resolves to *then* as its identity, so a link retargeted while the
+ * service was down would be accepted. This row is what the manager holds a
+ * restarted process's sinks to instead.
+ *
+ * ## Why a side table rather than a column or a document field
+ *
+ * - `ALTER TABLE sessions ADD COLUMN` would append the column **after**
+ *   `record`, and reading it would walk the document's overflow chain — the
+ *   reason version 4 set out for its own side table.
+ * - The `SessionRecord` document is the protocol's session contract, broadcast
+ *   to every client and rewritten by every write of the session. The identity
+ *   is a service-internal proof, written once and never patched, so it stays
+ *   out of both.
+ *
+ * ## The constraints
+ *
+ * - `session_id` references `sessions (id)` with `ON DELETE CASCADE`, so
+ *   deleting a session — the retention sweep's one statement — removes its
+ *   identity with it.
+ * - `canonical_root` is non-empty text.
+ * - `recorded_at` is whole epoch milliseconds: when the proof was recorded.
+ *
+ * `STRICT`, as every table of `./schema.sql` is, so a mistyped value is refused
+ * rather than coerced, and `WITHOUT ROWID`, since the one lookup is by primary
+ * key.
+ */
+const CREATE_SESSION_ROOT_IDENTITIES_SQL = `CREATE TABLE IF NOT EXISTS session_root_identities (
+  session_id     TEXT PRIMARY KEY REFERENCES sessions (id) ON DELETE CASCADE,
+  canonical_root TEXT NOT NULL CHECK (length(canonical_root) > 0),
+  recorded_at    INTEGER NOT NULL
+) STRICT, WITHOUT ROWID`;
+
+/**
+ * How many stored sessions that have not ended carry no recorded identity —
+ * the sessions whose sinks the session manager now refuses. `ended` is the one
+ * terminal status, and a sink never acts on an ended session anyway.
+ */
+const COUNT_UNIDENTIFIED_LIVE_SESSIONS_SQL = `SELECT COUNT(*) AS unidentified FROM sessions
+WHERE status <> 'ended'
+  AND NOT EXISTS (
+    SELECT 1 FROM session_root_identities WHERE session_root_identities.session_id = sessions.id
+  )`;
+
+/**
+ * Schema version 6: the persisted project-root identity — see
+ * {@link CREATE_SESSION_ROOT_IDENTITIES_SQL} for why it is persisted and why
+ * it is a side table.
+ *
+ * Purely additive: one `IF NOT EXISTS` table and nothing else. No row of any
+ * table an earlier step declared is rewritten or removed; the step's one read
+ * counts, by the `status` projection, the sessions it leaves without a row.
+ *
+ * ## No backfill
+ *
+ * No build before this step recorded an admission proof, so there is nothing
+ * to derive a row from. Resolving each stored `project_root` now would record
+ * whatever its links lead to at migration time — exactly the identification
+ * after the fact this table exists to replace. Sessions stored before this
+ * step therefore have no row, and `SessionManager.confirmProjectRoot` refuses
+ * every sink of such a session (`PATH_OUTSIDE_PROJECT`, `project-out-of-scope`)
+ * rather than identify its root: its pipeline can no longer index or patch,
+ * and the developer starts a new session from the folder in VS Code. Such
+ * sessions that have not ended are reported at `warn` by count only — never an
+ * id or a path, because the line reaches the service log.
+ */
+const SESSION_ROOT_IDENTITIES_MIGRATION: StoreMigration = {
+  version: 6,
+  description: 'record the canonical project-root identity each session was admitted under',
+  apply: (db, { logger }) => {
+    db.exec(CREATE_SESSION_ROOT_IDENTITIES_SQL);
+
+    const counted = db.prepare(COUNT_UNIDENTIFIED_LIVE_SESSIONS_SQL).get()?.['unidentified'];
+    const unidentified =
+      typeof counted === 'bigint' ? Number(counted) : typeof counted === 'number' ? counted : 0;
+
+    if (unidentified > 0) {
+      logger.warn(
+        'some stored sessions that have not ended carry no recorded project-root identity; their pipelines are refused until a new session is started',
+        { subsystem: SUBSYSTEM, unidentifiedSessions: unidentified },
+      );
+    }
+  },
+};
+
 /**
  * The store's schema ladder, in ascending version order.
  *
@@ -791,7 +901,9 @@ const PRODUCER_CLOCK_OFFSET_MIGRATION: StoreMigration = {
  * ({@link ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION}); version 4 adds the
  * session cleanup summary projection and backfills it from the stored
  * documents ({@link SESSION_CLEANUP_SUMMARIES_MIGRATION}); version 5 adds the
- * per-producer clock offset column ({@link PRODUCER_CLOCK_OFFSET_MIGRATION}).
+ * per-producer clock offset column ({@link PRODUCER_CLOCK_OFFSET_MIGRATION});
+ * version 6 adds the persisted project-root identity, with no backfill
+ * ({@link SESSION_ROOT_IDENTITIES_MIGRATION}).
  *
  * Appending a step is two edits in one commit. The step takes the next
  * version: one above the highest version in this list, which is the current
@@ -835,6 +947,7 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
   ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION,
   SESSION_CLEANUP_SUMMARIES_MIGRATION,
   PRODUCER_CLOCK_OFFSET_MIGRATION,
+  SESSION_ROOT_IDENTITIES_MIGRATION,
 ];
 
 /**

@@ -42,8 +42,8 @@
  * 3. **The state tree** — `$DEBUGGEN_HOME`, `backups/` and `index/`, created and
  *    verified `0700` and symlink-free by `ensureSecureDir` (mkdir's own mode is
  *    umask-masked, which is why it is not used) — and its canonical location,
- *    resolved once with `realpath`: the value every project root is kept apart
- *    from (AAP 0.4.2).
+ *    resolved once with `realpath`: the value every project root is kept
+ *    apart from.
  * 4. **The session store** — `openStore` from `./store/db.js`: the owner-only
  *    database file, WAL mode, the pragmas and the schema ladder.
  * 5. **The editor credential** — `AuthService.ensureEditorCredential` from
@@ -114,7 +114,8 @@
  * same object:
  *
  * - an **agent-readiness ledger** — the relayed `agent.ready` reports per tab,
- *   written by the WebSocket router and read by the readiness gate;
+ *   written by the WebSocket router, and each tab's latest committed
+ *   navigation, written by the binding route, both read by the readiness gate;
  * - the **server-agent presence** view of the client registry;
  * - the **source-open delivery** port over the client registry;
  * - the **credential issuer** the dev-server launcher mints, renews and revokes
@@ -315,7 +316,7 @@ import type { ClientRegistry } from './server/clients.js';
 import { DEFAULT_REQUEST_BODY_TIMEOUT_MS, createHttpApp } from './server/http.js';
 import type { HttpApp } from './server/http.js';
 import { createBindingRoutes, redactSelectedTarget } from './server/routes/binding.js';
-import type { BindingRoutes } from './server/routes/binding.js';
+import type { BindingRoutes, NavigationRecorder } from './server/routes/binding.js';
 import { devServerLookupFromLaunches } from './server/routes/sessions.js';
 import { createWsServer } from './server/ws.js';
 import type {
@@ -595,8 +596,9 @@ const HTTP_RESERVED_CONNECTIONS = 64;
  * admission rate or with nothing left to evict, and a connection evicted, is
  * reported at `warn`, at most once per
  * {@link DROPPED_CONNECTIONS_REPORT_INTERVAL_MS} for each kind, with counts
- * only. No environment variable changes these (the settings surface is fixed
- * by AAP 0.3.4); {@link StartServiceOptions.httpLimits} is the suites' seam.
+ * only. No environment variable changes these (the service's settings are the
+ * `SERVICE_ENV_KEYS` of `./config.ts`, each documented in the root
+ * `.env.example`); {@link StartServiceOptions.httpLimits} is the suites' seam.
  */
 export const HTTP_SERVER_LIMITS: HttpServerLimits = Object.freeze({
   headersTimeoutMs: HTTP_HEADERS_TIMEOUT_MS,
@@ -738,9 +740,13 @@ const DEV_SERVERS_SURVIVED_MESSAGE = 'launched dev servers are still running aft
 const CLIENT_SWEEP_INTERVAL_MS = 30_000;
 
 /**
- * The most tabs the agent-readiness ledger remembers a report for. One entry per
- * inspected tab; the oldest report is forgotten first, which is harmless because
- * the page agent reports again on its next document load.
+ * The most tabs the agent-readiness ledger remembers. One entry per tab holds
+ * both its latest report and its latest navigation, so the two share one
+ * lifetime: a write of either makes the tab the most recent, and the least
+ * recently written tab is forgotten whole. That fails closed — readiness then
+ * sees no report for the tab and asks for a reload, and the page agent reports
+ * again on its next document load — whereas a report that outlived the
+ * navigation recorded after it would be trusted on sight.
  */
 const MAX_TRACKED_AGENT_TABS = 256;
 
@@ -1259,9 +1265,9 @@ export const STORED_PROJECT_UNRESOLVABLE_STARTUP_HINT =
 
 /**
  * Refuses to serve when the state root overlaps the project of any stored
- * session, or when a stored project cannot be shown to lie apart from it
- * (AAP 0.4.2: session data and backups live outside the target project, so a
- * session never pollutes its git status; CWE-200).
+ * session, or when a stored project cannot be shown to lie apart from it:
+ * session data and backups live outside every target project, so a session
+ * never pollutes its git status (CWE-200).
  *
  * Run after the modification reconciliation, which must still restore every
  * file a previous process left instrumented, and before anything else writes
@@ -1627,27 +1633,77 @@ function revokeLaunchedCredentials(
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The relayed page-agent reports, per tab: the one object that is both the
- * WebSocket router's {@link AgentReadinessPort} (where a relayed `agent.ready`
- * is written) and the readiness gate's {@link BrowserAgentRegistry} (where it
- * is read), so the report the gate judges is exactly the report the router
- * accepted.
+ * The relayed page-agent reports and the committed navigations, per tab: the
+ * one object that is the WebSocket router's {@link AgentReadinessPort} (where
+ * a relayed `agent.ready` is written), the binding route's
+ * {@link NavigationRecorder} (where every accepted `tab.navigated` is written)
+ * and the readiness gate's {@link BrowserAgentRegistry} (where both are read),
+ * so the report the gate judges is exactly the report the router accepted, and
+ * a reload the route accepted marks it as possibly left behind.
+ *
+ * **A report's receipt time** is when its document was last confirmed as the
+ * tab's current one. Readiness distrusts a report on sight when
+ * `latestNavigationAt > latestAgentReadyAt`. A report of a new document
+ * confirms it, and so does a repeat of the stored document with no
+ * navigation recorded after its receipt. A replay of the stored document after
+ * a later navigation — the Chrome side re-relays the report it retained for a
+ * tab, which a navigation does not clear there — confirms nothing: its payload
+ * is stored, but its receipt time stays the earlier one, so the navigation
+ * still reads as after it.
+ *
+ * **Ordering within one millisecond.** The clock has whole milliseconds, so a
+ * reload and the new document's report can share one tick. The ledger
+ * therefore stamps a navigation strictly after the report it follows (the
+ * report's receipt time plus one when the clock has not moved past it) and a
+ * confirming report no earlier than the navigation it follows (the
+ * navigation's stamp when that is ahead of the clock). Otherwise both carry
+ * the clock's reading.
+ *
+ * **One lifetime per tab.** A tab's report and its navigation are one entry:
+ * a write of either makes the tab the most recent, and beyond the size bound
+ * the least recently written tab is forgotten whole. A report therefore never
+ * outlives the navigation recorded after it — which would read as current —
+ * and a forgotten tab reads as one no agent reported for, so readiness asks
+ * for a reload.
  */
-export interface AgentReadyLedger extends AgentReadinessPort, BrowserAgentRegistry {
+export interface AgentReadyLedger
+  extends AgentReadinessPort, BrowserAgentRegistry, NavigationRecorder {
   /**
-   * Records a relayed report as the tab's newest one and wakes the waits it
-   * answers. Synchronous; refused with `TRANSPORT_DISCONNECTED` after
-   * {@link AgentReadyLedger.close}.
+   * Records a relayed report as the tab's newest one, with its receipt time as
+   * the ledger overview describes, and wakes the waits it answers: those for
+   * any report, and those for a document other than the one it names — so a
+   * replay of the known document answers none. Synchronous; refused with
+   * `TRANSPORT_DISCONNECTED` after {@link AgentReadyLedger.close}.
    */
   agentReady(
     payload: AgentReadyPayload,
     client: WsConnectionFacts,
   ): Result<AgentReadyReceipt, DebuggenError>;
 
-  /** When the report {@link BrowserAgentRegistry.latestAgentReady} returns was received. */
+  /**
+   * When the document of the report {@link BrowserAgentRegistry.latestAgentReady}
+   * returns was last confirmed current, in epoch milliseconds: its receipt, or
+   * that of a later report of the same document no navigation preceded.
+   * `undefined` when no report is remembered.
+   */
   latestAgentReadyAt(tabId: number): number | undefined;
 
-  /** Resolves every pending wait with `undefined` and forgets every report. Idempotent. */
+  /**
+   * When the binding route last recorded a committed navigation of `tabId`, in
+   * epoch milliseconds; `undefined` when none is remembered. Always after the
+   * receipt time of the report the tab held when the navigation was recorded.
+   */
+  latestNavigationAt(tabId: number): number | undefined;
+
+  /**
+   * Records a committed navigation of `tabId`, stamped as the ledger overview
+   * describes, and notes it at `debug` by tab id alone. Synchronous; throws
+   * nothing of its own. A no-op after {@link AgentReadyLedger.close} and for a
+   * tab id that is not a non-negative safe integer.
+   */
+  recordNavigation(tabId: number): void;
+
+  /** Resolves every pending wait with `undefined` and forgets every report and navigation. Idempotent. */
   close(): void;
 }
 
@@ -1666,16 +1722,42 @@ export interface AgentReadyLedgerDeps {
    * (`./instrumentation/document-fingerprint.ts`).
    */
   readonly logger: Logger;
-  /** The clock a report is stamped with, in epoch milliseconds. */
+  /** The clock a report and a navigation are stamped with, in epoch milliseconds. */
   readonly now?: (() => number) | undefined;
-  /** The most tabs remembered; the oldest report is forgotten first. */
+  /**
+   * The most tabs remembered, {@link MAX_TRACKED_AGENT_TABS} by default (and
+   * for a value that is not a positive safe integer). A tab's report and its
+   * navigation are one entry: a write of either makes the tab the most recent,
+   * and beyond the bound the least recently written tab is forgotten whole.
+   */
   readonly maxTabs?: number | undefined;
 }
 
-/** One stored report and when it arrived. */
+/** One stored report and its receipt time. */
 interface AgentReport {
+  /** The newest payload relayed for the tab, a replay's included. */
   readonly payload: AgentReadyPayload;
+  /**
+   * When the payload's document was last confirmed as the tab's current one,
+   * in epoch milliseconds (see "A report's receipt time" in
+   * {@link AgentReadyLedger}): a replay after a later navigation keeps it.
+   */
   readonly receivedAt: number;
+}
+
+/**
+ * Everything the ledger knows about one tab: at least one member is present.
+ * One entry, so a report and the navigation that may have left it behind are
+ * remembered and forgotten together.
+ */
+interface TabEvidence {
+  /** The tab's newest relayed report; absent until one arrives. */
+  readonly report?: AgentReport;
+  /**
+   * When the binding route last recorded a committed navigation of the tab,
+   * in epoch milliseconds; absent until one is recorded.
+   */
+  readonly navigatedAt?: number;
 }
 
 /** One pending {@link BrowserAgentRegistry.waitForAgentReady}. */
@@ -1695,6 +1777,17 @@ interface AgentWaiter {
  * when it knows none), with `undefined` on its timeout, on abort and on
  * {@link AgentReadyLedger.close}; it never rejects and never outlives its bound.
  *
+ * It is also the binding route's {@link NavigationRecorder}: every
+ * `tab.navigated` the route accepts is stamped here, and readiness reads the
+ * stamp back through {@link BrowserAgentRegistry.latestNavigationAt}, which is
+ * how a reload or a same-URL load marks the stored report as possibly left
+ * behind. A report's receipt time is when its document was last confirmed
+ * current, so a replay of that document after a later navigation confirms
+ * nothing and stays behind the navigation; stamps are ordered within one
+ * millisecond; and a tab's report and navigation share one eviction lifetime —
+ * each as the {@link AgentReadyLedger} overview describes. A navigation logs
+ * the tab id alone at `debug`, and so does forgetting a tab.
+ *
  * @param deps The logger, and optionally a clock and a size bound.
  * @returns The ledger.
  *
@@ -1703,6 +1796,10 @@ interface AgentWaiter {
  * const ledger = createAgentReadyLedger({ logger });
  * ledger.agentReady(payload, connection); // from the WebSocket router
  * ledger.latestAgentReady(payload.tabId); // → payload
+ * ledger.recordNavigation(payload.tabId); // from the binding route: a reload
+ * ledger.latestNavigationAt(payload.tabId); // → later than latestAgentReadyAt(payload.tabId)
+ * ledger.agentReady(payload, connection); // the old document replayed: confirms nothing
+ * ledger.latestNavigationAt(payload.tabId); // → still later than latestAgentReadyAt(payload.tabId)
  * ```
  */
 export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLedger {
@@ -1711,20 +1808,32 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
   const requestedMax = deps.maxTabs ?? MAX_TRACKED_AGENT_TABS;
   const maxTabs =
     Number.isSafeInteger(requestedMax) && requestedMax > 0 ? requestedMax : MAX_TRACKED_AGENT_TABS;
-  const reports = new Map<number, AgentReport>();
+  /**
+   * Each tab's report and navigation, in one entry. Insertion order is
+   * recency order: every write deletes and re-inserts its tab's entry.
+   */
+  const evidence = new Map<number, TabEvidence>();
   const waiters = new Map<number, Set<AgentWaiter>>();
   let closed = false;
 
-  /** Stores a report as the tab's most recent one, evicting beyond the bound. */
-  function remember(tabId: number, report: AgentReport): void {
-    reports.delete(tabId);
-    reports.set(tabId, report);
-    while (reports.size > maxTabs) {
-      const oldest = reports.keys().next();
+  /**
+   * Stores a tab's merged evidence as the most recently written entry, then
+   * forgets whole entries, least recently written first, beyond the bound — so
+   * a report never outlives the navigation recorded after it, nor the reverse.
+   */
+  function remember(tabId: number, entry: TabEvidence): void {
+    evidence.delete(tabId);
+    evidence.set(tabId, entry);
+    while (evidence.size > maxTabs) {
+      const oldest = evidence.keys().next();
       if (oldest.done === true) {
         break;
       }
-      reports.delete(oldest.value);
+      evidence.delete(oldest.value);
+      // Readiness now finds no report for that tab and asks for a reload.
+      log.debug('forgot the readiness evidence of the least recently written tab', {
+        tabId: oldest.value,
+      });
     }
   }
 
@@ -1746,7 +1855,34 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
         ),
       );
     }
-    remember(payload.tabId, { payload, receivedAt: now() });
+    const clockNow = now();
+    const known = evidence.get(payload.tabId);
+    const stored = known?.report;
+    const navigatedAt = known?.navigatedAt;
+    // A replay: the document the tab already reported, relayed again after a
+    // navigation was recorded past that report. The Chrome side re-relays the
+    // report it retained for a tab, which a navigation does not clear there,
+    // and the navigation may have replaced that document — so the frame
+    // confirms nothing. Its payload is stored, but it keeps the earlier
+    // receipt and is never lent the navigation's stamp: readiness still sees
+    // the navigation after it and does not trust it on sight.
+    const replayAfterNavigation =
+      stored !== undefined &&
+      stored.payload.documentId === payload.documentId &&
+      navigatedAt !== undefined &&
+      navigatedAt > stored.receivedAt;
+    // Anything else — another document, or the same one with no navigation
+    // after its receipt — confirms its document now, and is never stamped
+    // before the navigation it follows: a navigation recorded ahead of the
+    // clock (see recordNavigation) lends the report its stamp, so readiness
+    // never reads it as left behind by that navigation.
+    let receivedAt = clockNow;
+    if (replayAfterNavigation) {
+      receivedAt = stored.receivedAt;
+    } else if (navigatedAt !== undefined && navigatedAt > clockNow) {
+      receivedAt = navigatedAt;
+    }
+    remember(payload.tabId, { ...known, report: { payload, receivedAt } });
     // The id is page-controlled text: the ledger keeps it for matching, the
     // log line carries only its fingerprint and shape flag (CWE-532).
     log.debug('recorded a page-agent readiness report', {
@@ -1754,6 +1890,7 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
       ...documentLogFields(payload.documentId),
       reactDetected: payload.reactDetected,
       installedBeforeReact: payload.installedBeforeReact,
+      replayAfterNavigation,
       clientId: client.id,
     });
     const pending = waiters.get(payload.tabId);
@@ -1771,7 +1908,7 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
     tabId: number,
     options: WaitForAgentReadyOptions,
   ): Promise<AgentReadyPayload | undefined> {
-    const current = reports.get(tabId)?.payload;
+    const current = evidence.get(tabId)?.report?.payload;
     if (current !== undefined && answers(options.afterDocumentId, current)) {
       return Promise.resolve(current);
     }
@@ -1816,6 +1953,25 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
     });
   }
 
+  function recordNavigation(tabId: number): void {
+    if (closed || !Number.isSafeInteger(tabId) || tabId < 0) {
+      return;
+    }
+    // Strictly after the report it follows: when the clock has not moved past
+    // the report's receipt (one millisecond, or a clock stepped back), the
+    // navigation is stamped one past it, so readiness's `navigatedAt >
+    // observedAt` holds and the report is not trusted on sight.
+    const clockNow = now();
+    const known = evidence.get(tabId);
+    const reportedAt = known?.report?.receivedAt;
+    const navigatedAt =
+      reportedAt !== undefined && reportedAt >= clockNow ? reportedAt + 1 : clockNow;
+    remember(tabId, { ...known, navigatedAt });
+    // The tab id alone: the navigated URL is page-shaped text and never reaches
+    // the ledger (CWE-532).
+    log.debug('recorded a committed navigation of a tab', { tabId });
+  }
+
   function close(): void {
     if (closed) {
       return;
@@ -1827,13 +1983,17 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
       }
     }
     waiters.clear();
-    reports.clear();
+    evidence.clear();
   }
 
   return Object.freeze({
     agentReady,
-    latestAgentReady: (tabId: number): AgentReadyPayload | undefined => reports.get(tabId)?.payload,
-    latestAgentReadyAt: (tabId: number): number | undefined => reports.get(tabId)?.receivedAt,
+    latestAgentReady: (tabId: number): AgentReadyPayload | undefined =>
+      evidence.get(tabId)?.report?.payload,
+    latestAgentReadyAt: (tabId: number): number | undefined =>
+      evidence.get(tabId)?.report?.receivedAt,
+    latestNavigationAt: (tabId: number): number | undefined => evidence.get(tabId)?.navigatedAt,
+    recordNavigation,
     waitForAgentReady,
     close,
   });
@@ -4043,11 +4203,11 @@ export async function startService(
     });
   }
 
-  // The state root stays outside every project (AAP 0.4.2). Checked only now,
-  // so the reconciliation above has already restored every file a previous
-  // process left instrumented; a stored session whose project contains the
-  // state root, lies inside it, or cannot be resolved on disk to show it lies
-  // apart, refuses the start before anything else is written there or served.
+  // The state root stays outside every project. Checked only now, so the
+  // reconciliation above has already restored every file a previous process
+  // left instrumented; a stored session whose project contains the state root,
+  // lies inside it, or cannot be resolved on disk to show it lies apart,
+  // refuses the start before anything else is written there or served.
   const apart = await refuseStoredProjectOverlap(repos.sessions, canonicalStateHome);
   if (isErr(apart)) {
     return refuse('state-home-overlap', apart.error);
@@ -4501,6 +4661,9 @@ export async function startService(
     reopener,
     arming: instrumentation,
     progress,
+    // The ledger the readiness gate reads: every navigation the route accepts
+    // is what lets readiness distrust a report a reload left behind.
+    navigations: ledger,
     logger: root,
     ...clock,
   });

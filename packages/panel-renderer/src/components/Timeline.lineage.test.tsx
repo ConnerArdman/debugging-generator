@@ -739,7 +739,7 @@ describe('Timeline lineage styling', () => {
   it('outlines an ambiguous bar with a dashed warning stroke, unlike an orphan’s solid one', () => {
     const ambiguous = declarationsOf('.dg-timeline__bar.dg-is-ambiguous');
     expect(ambiguous).toContain('stroke: var(--dg-warning)');
-    expect(ambiguous).toContain('stroke-dasharray: 4 3');
+    expect(ambiguous).toContain('stroke-dasharray: var(--dg-stroke-dash-dashed)');
 
     const orphan = declarationsOf('.dg-timeline__bar.dg-is-orphan');
     expect(orphan).toContain('stroke: var(--dg-warning)');
@@ -767,7 +767,7 @@ describe('Timeline lineage styling', () => {
   it('strokes an ambiguous connector dashed in the warning tone and an inferred one solid in the info tone', () => {
     const ambiguous = declarationsOf('.dg-timeline__edge.dg-is-ambiguous');
     expect(ambiguous).toContain('stroke: var(--dg-warning)');
-    expect(ambiguous).toContain('stroke-dasharray: 4 3');
+    expect(ambiguous).toContain('stroke-dasharray: var(--dg-stroke-dash-dashed)');
 
     const inferred = declarationsOf('.dg-timeline__edge.dg-is-inferred');
     expect(inferred).toContain('stroke: var(--dg-info)');

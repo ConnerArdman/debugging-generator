@@ -1770,12 +1770,13 @@ describe('EventLog attributes', () => {
 
   it('declares the strip layout that keeps the count visible, with no measured width', () => {
     // The chips start from nothing, grow no further than their own text, and
-    // ellipsize at their own border; the count never shrinks. Structural forms
-    // and the literals the package permits (`0`, `none`, `auto`, `inherit`,
+    // ellipsize at their own border; the count never shrinks. Keywords and
+    // the literals the package permits (`0`, `none`, `auto`, `inherit`,
     // `currentColor`, `transparent`) only.
     const chip = ruleOf('.dg-event-log__attr');
     for (const declaration of [
-      'flex: 1 1 0;',
+      'flex: auto;',
+      'flex-basis: 0;',
       'min-inline-size: 0;',
       'max-inline-size: max-content;',
       'overflow: hidden;',
@@ -1784,6 +1785,9 @@ describe('EventLog attributes', () => {
     ]) {
       expect(chip.body).toContain(declaration);
     }
+    // The zero basis follows the shorthand, which would otherwise reset it to
+    // `auto` and start every chip from its whole text.
+    expect(chip.body.indexOf('flex-basis: 0;')).toBeGreaterThan(chip.body.indexOf('flex: auto;'));
 
     expect(ruleOf('.dg-event-log__more').body).toContain('flex: none;');
   });

@@ -1,6 +1,6 @@
 /**
- * The revocation fence of `POST /sessions/:id/panel-data` (AAP §0.5.6), across
- * a real credential rotation.
+ * The revocation fence of `POST /sessions/:id/panel-data` — a revoked
+ * credential reads nothing — across a real credential rotation.
  *
  * The auth middleware resolves a principal once, before the handler runs; the
  * handler then awaits the body and the resolver. A rotation that lands inside
@@ -32,8 +32,6 @@
  *
  * ## Rules ruling
  *
- * - **User rules (AAP §0.10).** `review_rules` answers "No user rules
- *   provided.", so the §0.10 baseline governs this file.
  * - **Gate membership.** Collected by the `local-service-integration` project
  *   (`pnpm test:integration`) and held to `tsc -b`, `eslint --max-warnings 0`
  *   and `prettier --check` like any source file.
@@ -441,7 +439,8 @@ async function postStreamed(app: Hono<ServerEnv>, token: string, body: HeldBody)
 /**
  * The live editor connection announcing the suite's project — opened under the
  * current credential when a rotation closed the last one — which editor
- * session requests require (AAP §0.5.6).
+ * session requests require: an editor credential acts only on projects under
+ * the workspace folders its live connections announced.
  */
 async function announcedEditor(): Promise<HarnessWsClient> {
   const editor = await harness.editor(project.root);

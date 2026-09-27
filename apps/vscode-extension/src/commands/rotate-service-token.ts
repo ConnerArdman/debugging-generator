@@ -39,16 +39,25 @@
  *      the service's own message and hint. The service's message says whether
  *      the rotation was applied ("Credentials were not rotated; every existing
  *      credential is still valid." before its commit, "Credentials were
- *      rotated, but …" with a restart hint after it), so this command never
- *      states on its own that nothing changed. A credential re-read that failed
- *      too is logged, not shown a second time.
+ *      rotated, but …" with a restart hint after it), so this command states
+ *      on its own that nothing changed only for a refused credential (below),
+ *      whose refusal precedes the rotation handler. A credential re-read that
+ *      failed too is logged, not shown a second time.
  *      Because a committed rotation can still end in an error, and the error
  *      carries no structured "rotated" flag, every failure is treated as
- *      possibly applied unless the client's structured facts prove the
- *      request never reached the service (no HTTP status, and a refusal raised
- *      before sending or a refused connection): the pairing code on display
- *      is cleared and the notice offers "Pair Chrome". A request that provably
- *      never left keeps the code and offers nothing, since nothing changed.
+ *      possibly applied unless the client's structured facts prove it was not
+ *      (see {@link provablyNotApplied}): the pairing code on display is cleared
+ *      and the notice offers "Pair Chrome". A request that provably never left
+ *      keeps the code and offers nothing, since nothing changed.
+ *    - Refused credential: an `UNAUTHORIZED` reply (it carries an HTTP status)
+ *      is the service's access boundary refusing the editor credential before
+ *      the rotation handler runs, so nothing was rotated. It keeps the pairing
+ *      code, offers no "Pair Chrome", and is reported in this command's own
+ *      words, because rotation needs a credential the service accepts: the
+ *      remedy is restarting the service, which re-issues the editor credential
+ *      in `auth.json` as it starts. A child of this window is offered
+ *      "Restart service", which runs `./start-service.ts`'s restart flow; any
+ *      other service is to be restarted where it was started.
  *    - Success: the pairing code on display is cleared (the service deleted
  *      every outstanding code), then one warning notice with the service's
  *      tally and the two follow-ups — "Pair Chrome" (`debuggen.pairChrome`)
@@ -70,10 +79,14 @@
  * - It never writes or deletes `$DEBUGGEN_HOME/auth.json` and never mints or
  *   hashes a credential: the service owns that file, and `../service/auth.ts`
  *   is the only reader in the extension.
- * - It never opens, closes or reconnects a socket: reconnection belongs to the
- *   protocol's `ReconnectingWsClient` inside `../service/client.ts`.
+ * - It never opens, closes or reconnects a socket itself: reconnection belongs
+ *   to the protocol's `ReconnectingWsClient` inside `../service/client.ts`. The
+ *   restart flow it hands a refused credential to resumes the socket through
+ *   `ServiceClient.connect()` once the restarted service answers.
  * - It never signals a process: the service stops the dev server it launched,
- *   and only through `devServer.stop`, keyed by project, never by pid.
+ *   and only through `devServer.stop`, keyed by project, never by pid. A
+ *   restart the developer chooses for a refused credential is the process
+ *   manager's own `ServiceProcess.restart`.
  * - It never logs or displays a credential, a credential hash or the content of
  *   `auth.json` (AAP §0.5.2): log records carry the command id, error codes,
  *   the service's two counts and flags — never a project path.
@@ -85,8 +98,10 @@
  *
  * Authored as ESM with extensionless relative specifiers and bundled to
  * CommonJS by `esbuild.mjs`; no top-level `await`; Node and `vscode` types
- * only. Like every command module it imports **types only** from `./index`,
- * which keeps the barrel → module edge the folder's single runtime edge.
+ * only. Like every command module it imports **types only** from `./index`.
+ * Its one runtime edge inside the folder is `./start-service`, for the restart
+ * a refused credential is offered; that module imports types only from
+ * `./index` too, so the folder stays acyclic.
  *
  * @example
  * ```ts
@@ -102,6 +117,7 @@ import { DebuggenError, err, isErr, isOk, ok } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 
 import type { CommandContext, CommandId, CommandNotice, DestructiveConfirmation } from './index';
+import { RESTART_SERVICE_ACTION, restartServiceOnRequest } from './start-service';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -133,8 +149,18 @@ export const ROTATE_SERVICE_TOKEN_FAILURE_PREFIX = 'Could not rotate the service
 const ACTION_FAILURE_PREFIX = 'Could not run the requested action';
 
 /**
+ * The failure message of a rotation the service refused at its access
+ * boundary, after {@link ROTATE_SERVICE_TOKEN_FAILURE_PREFIX}. The refusal
+ * precedes the rotation handler, so the sentence can state the outcome.
+ */
+export const CREDENTIAL_REFUSED_MESSAGE =
+  'The service refused this editor’s credential, so nothing was rotated.';
+
+/**
  * The button that starts a new Chrome pairing: on the success notice, and on
- * the failure notice of a rotation that may have been applied.
+ * the failure notice of a rotation that may have been applied — never on a
+ * rotation the service refused at its access boundary, which left every
+ * pairing code valid.
  */
 export const PAIR_CHROME_ACTION = 'Pair Chrome';
 
@@ -239,17 +265,37 @@ function causeChainHasCode(error: unknown, code: string): boolean {
 }
 
 /**
- * Whether a failed `credentials.rotate` request provably never reached the
- * service — the only failure after which the rotation certainly was not
- * applied, so a pairing code on display is still redeemable.
+ * Whether a failed `credentials.rotate` request is the service's access
+ * boundary refusing the editor credential: `UNAUTHORIZED` with an HTTP status
+ * (`401`, or `403` for a role `credentials.rotate` does not grant). The auth
+ * middleware and the route's revocation fence answer it before the rotation
+ * handler runs, so the rotation was not applied; and because rotation itself
+ * requires a credential the service accepts, repeating it cannot help — only
+ * a restart, which re-issues the editor credential in `auth.json`, can.
+ *
+ * An `UNAUTHORIZED` without a status is the client's own refusal before
+ * sending (no credential to present) and is not this.
+ *
+ * @param error The rotation's failure.
+ */
+function refusedAtAccessBoundary(error: DebuggenError): boolean {
+  return error.code === 'UNAUTHORIZED' && error.details?.['status'] !== undefined;
+}
+
+/**
+ * Whether a failed `credentials.rotate` request provably was not applied, so
+ * a pairing code on display is still redeemable.
  *
  * The service can commit a rotation (every credential and every pairing code
  * deleted) and still answer with an error, and its error body carries no
  * structured "rotated" flag. So the answer is built only from the structured
  * facts the protocol client attaches, never from message prose:
  *
- * - a failure with `details.status` is an HTTP reply: the service had the
- *   request, and a post-commit failure arrives exactly that way;
+ * - an `UNAUTHORIZED` reply is a refusal at the access boundary, answered
+ *   before the rotation handler runs ({@link refusedAtAccessBoundary});
+ * - any other failure with `details.status` is an HTTP reply from the
+ *   rotation handler or after it — a post-commit failure arrives exactly that
+ *   way — so it counts as possibly applied;
  * - {@link UNSENT_FAILURE_CODES} without a status are the client's own
  *   refusals before its transport is invoked;
  * - a `TRANSPORT_DISCONNECTED` that no timeout or abort ended and whose cause
@@ -261,7 +307,10 @@ function causeChainHasCode(error: unknown, code: string): boolean {
  *
  * @param error The rotation's failure.
  */
-function provablyNeverReachedService(error: DebuggenError): boolean {
+function provablyNotApplied(error: DebuggenError): boolean {
+  if (refusedAtAccessBoundary(error)) {
+    return true;
+  }
   if (error.details?.['status'] !== undefined) {
     return false;
   }
@@ -393,6 +442,56 @@ async function runFollowUp(ctx: CommandContext, command: CommandId): Promise<voi
     await ctx.ui.executeCommand(command);
   } catch (thrown) {
     await ctx.ui.notifyFailure(DebuggenError.from(thrown), { prefix: ACTION_FAILURE_PREFIX });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A rotation refused at the access boundary
+// ---------------------------------------------------------------------------
+
+/**
+ * The failure this command reports for a rotation the service refused at its
+ * access boundary ({@link refusedAtAccessBoundary}), in place of the service's
+ * refusal, which the original keeps as `cause`. The hint names the one remedy
+ * that works — a restart, after which `auth.json` holds a credential the
+ * service accepts — as the button when this window owns the service, and as
+ * where to restart it otherwise. It never contains a credential.
+ *
+ * @param refusal The service's `UNAUTHORIZED` reply.
+ * @param restartable Whether this window's own child answers, so
+ *   {@link RESTART_SERVICE_ACTION} is offered.
+ */
+function credentialRefusedFailure(refusal: DebuggenError, restartable: boolean): DebuggenError {
+  return new DebuggenError('UNAUTHORIZED', CREDENTIAL_REFUSED_MESSAGE, {
+    hint: restartable
+      ? `Rotation needs a credential the service accepts. Choose "${RESTART_SERVICE_ACTION}" so the service re-issues the editor credential in auth.json as it starts, then rotate again.`
+      : 'Rotation needs a credential the service accepts. Restart the service where it was started — a terminal or another VS Code window — so it re-issues the editor credential in auth.json, then rotate again.',
+    details: { status: refusal.details?.['status'] },
+    cause: refusal,
+  });
+}
+
+/**
+ * Reports a rotation the service refused at its access boundary: one failure
+ * notice with this command's prefix and {@link credentialRefusedFailure}'s
+ * words. Nothing was rotated, so the pairing code stays and no "Pair Chrome"
+ * is offered. A child of this window (`running`) is offered
+ * {@link RESTART_SERVICE_ACTION}, which runs `./start-service.ts`'s restart
+ * flow — its confirmation while a session is live, the restart and its own
+ * outcome notice. `ServiceProcess.restart` refuses any other service, so none
+ * is offered for one.
+ *
+ * @param ctx The resolved command context.
+ * @param refusal The service's `UNAUTHORIZED` reply.
+ */
+async function reportRefusedCredential(ctx: CommandContext, refusal: DebuggenError): Promise<void> {
+  const restartable = ctx.serviceProcess.status.state === 'running';
+  const choice = await ctx.ui.notifyFailure(credentialRefusedFailure(refusal, restartable), {
+    prefix: ROTATE_SERVICE_TOKEN_FAILURE_PREFIX,
+    ...(restartable ? { actions: [RESTART_SERVICE_ACTION] } : {}),
+  });
+  if (restartable && choice === RESTART_SERVICE_ACTION) {
+    await restartServiceOnRequest(ctx);
   }
 }
 
@@ -547,10 +646,13 @@ async function relaunchDevServer(ctx: CommandContext): Promise<void> {
  * `credentials.rotate` request, re-reads the editor credential, and reports the
  * outcome once — a failure with the service's own message (offering "Pair
  * Chrome", with the pairing code cleared, whenever the rotation may have been
- * applied), or a warning that names what was revoked and offers "Pair Chrome"
- * and, when a project is open, "Relaunch Dev Server". Resolves after the
- * developer has answered or dismissed that notice and any follow-up it chose
- * has run; it never rejects for an expected condition.
+ * applied); for an editor credential the service refused, a failure in this
+ * command's words that keeps the pairing code and offers "Restart service"
+ * when this window runs the service; or a warning that names what was revoked
+ * and offers "Pair Chrome" and, when a project is open, "Relaunch Dev
+ * Server". Resolves after the developer has answered or dismissed that notice
+ * and any follow-up it chose has run; it never rejects for an expected
+ * condition.
  *
  * @param ctx The command context built by `registerCommands`.
  * @param args Whatever VS Code invoked the command with. The command takes no
@@ -572,15 +674,19 @@ export async function rotateServiceToken(
   const reloadFailure = await reloadEditorCredential(ctx, isOk(rotated));
 
   if (isErr(rotated)) {
-    // Unless the request provably never reached the service, the rotation may
-    // have been applied before the failure, taking every pairing code with it:
-    // the code on display is cleared and re-pairing is offered.
-    const possiblyApplied = !provablyNeverReachedService(rotated.error);
+    // Unless the failure provably left the rotation unapplied, it may have
+    // been applied before the failure, taking every pairing code with it: the
+    // code on display is cleared and re-pairing is offered.
+    const possiblyApplied = !provablyNotApplied(rotated.error);
     ctx.logger.warn('Service token rotation failed', {
       command: COMMAND_ID,
       code: rotated.error.code,
       pairingCleared: possiblyApplied,
     });
+    if (refusedAtAccessBoundary(rotated.error)) {
+      await reportRefusedCredential(ctx, rotated.error);
+      return;
+    }
     if (possiblyApplied) {
       clearPairingDisplay(ctx);
     }

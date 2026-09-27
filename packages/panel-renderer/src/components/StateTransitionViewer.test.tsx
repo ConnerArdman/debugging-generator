@@ -2049,7 +2049,10 @@ describe('StateTransitionViewer clipped cells', () => {
       const properties = declarations.map((declaration) => declaration.property);
 
       expect(declarations).toContainEqual({ property: 'min-inline-size', value: '0' });
-      expect(declarations).toContainEqual({ property: 'max-inline-size', value: '100%' });
+      expect(declarations).toContainEqual({
+        property: 'max-inline-size',
+        value: 'var(--dg-size-full)',
+      });
       expect(properties).not.toContain('display');
       expect(properties).not.toContain('align-items');
     }
@@ -2057,7 +2060,7 @@ describe('StateTransitionViewer clipped cells', () => {
     // The summary itself ellipsizes on one line inside that bound.
     const summary = declarationsFor('.dg-state-transitions__value');
     expect(summary).toContainEqual({ property: 'min-inline-size', value: '0' });
-    expect(summary).toContainEqual({ property: 'max-inline-size', value: '100%' });
+    expect(summary).toContainEqual({ property: 'max-inline-size', value: 'var(--dg-size-full)' });
     expect(summary).toContainEqual({ property: 'overflow', value: 'hidden' });
     expect(summary).toContainEqual({ property: 'text-overflow', value: 'ellipsis' });
     expect(summary).toContainEqual({ property: 'white-space', value: 'nowrap' });
@@ -2065,7 +2068,7 @@ describe('StateTransitionViewer clipped cells', () => {
     // The trigger control may shrink below its label inside its track.
     const trigger = declarationsFor('.dg-state-transitions__trigger');
     expect(trigger).toContainEqual({ property: 'min-inline-size', value: '0' });
-    expect(trigger).toContainEqual({ property: 'max-inline-size', value: '100%' });
+    expect(trigger).toContainEqual({ property: 'max-inline-size', value: 'var(--dg-size-full)' });
 
     // And every chip in a row's cells shrinks with its cell and clips at its
     // own border instead of overflowing into the next column.

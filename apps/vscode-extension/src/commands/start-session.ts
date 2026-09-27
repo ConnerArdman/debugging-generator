@@ -13,7 +13,9 @@
  *   `{ question }` (its "retry" of a failed early stage does the same with the
  *   session's own question). The command then starts a session on the
  *   workspace project with `session.create` — `POST /sessions`, body
- *   `{ projectRoot, question, target?, devServerUrl? }`.
+ *   `{ projectRoot, question, devServerUrl? }`. The body never carries a
+ *   `target`: the element the developer picks in DevTools is recorded by the
+ *   service on the session the DevTools tab is bound to.
  *
  * ```text
  * requireWorkspaceProject ──▶ reveal + focus "question" ──▶ question? ──no──▶ done
@@ -102,7 +104,7 @@ import { DebuggenError, isErr } from '@debuggen/shared';
 import type { DebuggenErrorCode } from '@debuggen/shared';
 
 import type { ProjectRootInfo } from '../service/discovery';
-import type { ExtensionState, SessionCreationWindow } from '../state';
+import type { SessionCreationWindow } from '../state';
 import type { HostToWebviewMessageOf } from '../webview-messages';
 
 import {
@@ -293,33 +295,27 @@ async function answeringDevServerUrl(
 /**
  * Builds the `session.create` body.
  *
- * `target` is included only when the store holds an element selected while no
- * session was active ({@link ExtensionState.pendingTarget}) — the one the
- * developer picked in the DevTools panel for the question they are about to
- * ask — and is otherwise omitted rather than sent as `undefined`: an absent key
- * is how the body says "no target", in which case the service uses the bound
- * tab's current URL (AAP §0.2.3). The previous session's own target is never
- * carried into a new session.
- * `devServerUrl` follows the same rule: present only when the configured dev
- * server answered the probe.
+ * The editor never sends `target`. The element picked in DevTools is recorded
+ * by the service on the session the DevTools tab is bound to, and reaches the
+ * editor as that session's record `target`; a new session never inherits the
+ * previous session's target. Without one, the service's first stage starts
+ * from the bound tab's current URL.
+ * `devServerUrl` is present only when the configured dev server answered the
+ * probe, and is otherwise omitted rather than sent as `undefined`.
  *
  * @param projectRoot The workspace project, in the product's POSIX spelling.
  * @param question The trimmed, non-empty question, forwarded unread.
- * @param state The host store, read after the previous session was ended.
  * @param devServerUrl The configured dev server's URL, when it answered.
  * @returns The request body.
  */
 function buildCreateRequest(
   projectRoot: string,
   question: string,
-  state: ExtensionState,
   devServerUrl: string | undefined,
 ): SessionCreateRequest {
-  const target = state.pendingTarget;
   return {
     projectRoot,
     question,
-    ...(target === undefined ? {} : { target }),
     ...(devServerUrl === undefined ? {} : { devServerUrl }),
   };
 }
@@ -340,18 +336,18 @@ function buildCreateRequest(
  *    the previous session stays on screen while it does and nothing is
  *    awaited between the gates below and the request.
  * 5. Refuses, silently, once the extension is shutting down
- *    ({@link ExtensionState.isShuttingDown}), and, with one notice, while
+ *    (`ExtensionState.isShuttingDown`), and, with one notice, while
  *    another start or reopen is replacing the active session
- *    ({@link ExtensionState.sessionCreationPending}); two replacements in
+ *    (`ExtensionState.sessionCreationPending`); two replacements in
  *    flight could adopt a session the other has not ended.
  * 6. Opens the creation window synchronously, before anything is awaited, so
  *    the check in step 5 is race-free and no frame of the new session is lost.
  * 7. Ends the active session through {@link endBeforeReplacing} and stops when
  *    it says so; the ended session and its verdict stay in view. Checks the
  *    shutdown gate again afterwards.
- * 8. Registers the create with {@link ExtensionState.trackSessionCreate} and
- *    sends `session.create` once, in the same turn, with the pending target and
- *    a {@link SESSION_CREATE_TIMEOUT_MS} budget. A failure abandons the window
+ * 8. Registers the create with `ExtensionState.trackSessionCreate` and
+ *    sends `session.create` once, in the same turn, with a
+ *    {@link SESSION_CREATE_TIMEOUT_MS} budget. A failure abandons the window
  *    and becomes one error notice carrying the service's hint; it is never
  *    presented as a started session, and the previous session stays in view.
  *    A create that got no answer may still have produced a session, so its
@@ -453,7 +449,7 @@ export async function startSession(
     const ticket = ctx.state.trackSessionCreate(endpoint);
     try {
       const created = await ctx.client.createSession(
-        buildCreateRequest(project.projectRoot, question, ctx.state, devServerUrl),
+        buildCreateRequest(project.projectRoot, question, devServerUrl),
         { timeoutMs: SESSION_CREATE_TIMEOUT_MS },
       );
       if (isErr(created)) {

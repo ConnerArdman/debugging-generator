@@ -11,18 +11,22 @@
  *     `{ devServerUrl, pid }`, `POST /dev-server/stop`, `GET /health`), the
  *     service's own credential route (`POST /dev-server/credential`
  *     `{ projectRoot }` → `{ token, expiresAt }`, defined by
- *     `apps/local-service/src/dev-server/launcher.ts`), and `docs/SECURITY.md` §7 for who
- *     must present a credential. It is written from those definitions and
- *     NEVER from the module under test — deriving the accepted routes from the
- *     caller's own exports would make the pair self-consistent and blind to
- *     exactly the drift this suite exists to catch. `SERVICE_ROUTES` is then
+ *     `apps/local-service/src/dev-server/launcher.ts`), its release route
+ *     (`POST /credentials/release` `{ token }` → `{ released }`, the
+ *     `credentials.release` row of `packages/protocol/src/http.ts`), and
+ *     `docs/SECURITY.md` §7 for who must present a credential. It is written
+ *     from those definitions and NEVER from the module under test — deriving
+ *     the accepted routes from the caller's own exports would make the pair
+ *     self-consistent and blind to exactly the drift this suite exists to
+ *     catch. `SERVICE_ROUTES` is then
  *     asserted against it, so a rename on either side fails.
  *
  *     The definer is enforced the way a service enforces it: unknown path 404,
  *     wrong method 405, missing or wrong bearer credential 401, wrong
  *     content-type 415, and a body that is not exactly `{ projectRoot }` (plus
- *     the launch route's optional `command`) 400. Every rejection is recorded,
- *     and the end-to-end cases assert the caller provokes none of them.
+ *     the launch route's optional `command`; `{ token }` for the release
+ *     route) 400. Every rejection is recorded, and the end-to-end cases assert
+ *     the caller provokes none of them.
  *
  *     `GET /health` answers the service-identity challenge from
  *     {@link IDENTITY}, transcribed the same way, and impostor listeners —
@@ -65,7 +69,9 @@ import {
   CHILD_ENV_ALLOWLIST,
   DEFAULT_SERVICE_HOST,
   DEFAULT_SERVICE_PORT,
+  DevInstrumentedError,
   INGEST_PATH,
+  RELEASE_PATH,
   RESPONSE_MAX_BYTES,
   SERVICE_IDENTITY_CHALLENGE_BYTES,
   SERVICE_IDENTITY_CHALLENGE_HEADER,
@@ -86,8 +92,11 @@ import {
   launchDevServer,
   main,
   parseArgs,
+  prepareLocalSpawn,
+  releaseServerAgentCredential,
   requestServerAgentCredential,
   resolveExtraEnv,
+  resolvePreload,
   resolveProject,
   resolveServiceBase,
   stopDevServer,
@@ -137,17 +146,29 @@ const PROTOCOL_ROUTES = Object.freeze({
     required: Object.freeze(['projectRoot']),
     optional: Object.freeze([]),
   }),
+  // `credentials.release` in packages/protocol/src/http.ts: a strict
+  // `{ token }` naming the server-agent credential to revoke, editor role
+  // only, answered with a strict `{ released: boolean }` — `false` when
+  // nothing was live under that token any more, which is a success too.
+  release: Object.freeze({
+    method: 'POST',
+    path: '/credentials/release',
+    authenticated: true,
+    required: Object.freeze(['token']),
+    optional: Object.freeze([]),
+  }),
 });
 
 /**
  * Every route of the contract: the protocol table's three in the order it
- * lists them, then the service's credential route.
+ * lists them, then the service's credential route and its release route.
  */
 const ALL_PROTOCOL_ROUTES = Object.freeze([
   PROTOCOL_ROUTES.health,
   PROTOCOL_ROUTES.launch,
   PROTOCOL_ROUTES.stop,
   PROTOCOL_ROUTES.credential,
+  PROTOCOL_ROUTES.release,
 ]);
 
 /** Shorthands for expectations, spelled from the contract above. */
@@ -155,6 +176,7 @@ const HEALTH = PROTOCOL_ROUTES.health.path;
 const LAUNCH = PROTOCOL_ROUTES.launch.path;
 const STOP = PROTOCOL_ROUTES.stop.path;
 const CREDENTIAL = PROTOCOL_ROUTES.credential.path;
+const RELEASE = PROTOCOL_ROUTES.release.path;
 
 /**
  * The service-identity contract of `GET /health`, transcribed from its
@@ -280,6 +302,10 @@ function captureStream() {
  *   every request the contract refused
  * @property {() => string[]} routes `METHOD /path` for each request, in order
  * @property {number} expiresAt the `expiresAt` a default credential answer carries
+ * @property {Array<Record<'SIGINT' | 'SIGTERM', number>>} releaseSignalListeners
+ *   how many `SIGINT` and `SIGTERM` listeners this process had when each
+ *   release request arrived — the stub runs in the process `main` runs in, so
+ *   this is what the command had installed while the release was in flight
  * @property {() => Promise<void>} close shut the server down
  */
 
@@ -303,6 +329,14 @@ function captureStream() {
  *   with the identity proof ({@link identityAnswer}) before later ones are
  *   answered without it, as when another process has taken the port over;
  *   default every probe
+ * @param {number} [options.releaseStatus] status for the release route
+ * @param {unknown} [options.releaseBody] body the release route answers with,
+ *   whatever its status; by default, on 200, `{ released }` — `true` the first
+ *   time a token this stub minted is named, `false` for any other token or a
+ *   second release, as the service answers — and a `{ code, message }` error
+ *   otherwise (`CLEANUP_PARTIAL` on 500)
+ * @param {Promise<unknown>} [options.releaseGate] the release route answers
+ *   only once this settles, so a test can act while the release is in flight
  * @returns {Promise<StubService>}
  */
 async function startStubService(options = {}) {
@@ -320,11 +354,16 @@ async function startStubService(options = {}) {
       : credentialStatus === 200
         ? { token: SERVER_AGENT_TOKEN, expiresAt }
         : { code: 'UNAUTHORIZED', message: 'credential refused' };
+  const releaseStatus = options.releaseStatus ?? 200;
 
+  /** Tokens this stub minted that no release has named yet. @type {Set<string>} */
+  const live = new Set();
   /** @type {RecordedRequest[]} */
   const requests = [];
   /** @type {Array<{ path: string, status: number, reason: string }>} */
   const rejections = [];
+  /** @type {Array<Record<'SIGINT' | 'SIGTERM', number>>} */
+  const releaseSignalListeners = [];
 
   const server = http.createServer((req, res) => {
     /** @type {Buffer[]} */
@@ -432,7 +471,29 @@ async function startStubService(options = {}) {
           res.end(options.credentialText);
           return;
         }
+        const minted = /** @type {{ token?: unknown } | null | undefined} */ (credentialBody);
+        if (credentialStatus === 200 && typeof minted?.token === 'string') live.add(minted.token);
         answer(credentialStatus, credentialBody);
+        return;
+      }
+      if (requestPath === RELEASE) {
+        releaseSignalListeners.push({
+          SIGINT: process.listenerCount('SIGINT'),
+          SIGTERM: process.listenerCount('SIGTERM'),
+        });
+        // The contract checks above guarantee a non-empty string token here.
+        const named = String(/** @type {Record<string, unknown>} */ (parsed).token);
+        const releaseBody =
+          'releaseBody' in options
+            ? options.releaseBody
+            : releaseStatus === 200
+              ? { released: live.delete(named) }
+              : releaseStatus === 500
+                ? { code: 'CLEANUP_PARTIAL', message: 'revocation still pending' }
+                : { code: 'REFUSED', message: 'release refused' };
+        /** @returns {void} */
+        const respond = () => answer(releaseStatus, releaseBody);
+        void Promise.resolve(options.releaseGate).then(respond, respond);
         return;
       }
       answer(stopStatus, stopStatus === 200 ? { stopped: true } : { message: 'stop refused' });
@@ -449,6 +510,7 @@ async function startStubService(options = {}) {
     rejections,
     routes: () => requests.map((request) => `${request.method} ${request.path}`),
     expiresAt,
+    releaseSignalListeners,
     close: () =>
       new Promise((resolve) => {
         server.closeAllConnections();
@@ -520,6 +582,8 @@ async function createFixture(options = {}) {
  * @property {() => Record<string, string>} readEnv the fake's whole
  *   environment, as `env` printed it
  * @property {() => boolean} ran whether the fake was executed at all
+ * @property {() => boolean} ready whether the fake has written both records,
+ *   and so — with `waitForSignal` — is now waiting for its signal
  */
 
 /**
@@ -550,6 +614,13 @@ function shellQuote(value) {
  * @param {Fixture} fixture
  * @param {object} [options]
  * @param {number} [options.exitCode] status the fake exits with (default 0)
+ * @param {string} [options.interpreter] the `#!` interpreter (default
+ *   `/bin/sh`); an interpreter that does not exist makes the kernel refuse the
+ *   exec with ENOENT, so the spawn itself fails although `PATH` lookup found
+ *   an executable file
+ * @param {boolean} [options.waitForSignal] instead of exiting at once, wait
+ *   until `SIGINT` or `SIGTERM` arrives and then exit with `exitCode`, like a
+ *   dev server stopped with Ctrl-C
  * @returns {Promise<FakeDevServer>}
  */
 async function createFakeDevServer(fixture, options = {}) {
@@ -558,12 +629,14 @@ async function createFakeDevServer(fixture, options = {}) {
 
   const dump = path.join(fixture.base, `dev-server-${randomUUID()}.txt`);
   const envDump = `${dump}.env`;
+  const readyMarker = `${dump}.ready`;
   const exitCode = options.exitCode ?? 0;
   const executable = path.join(binDir, 'pnpm');
   await fs.promises.writeFile(
     executable,
     [
-      '#!/bin/sh',
+      `#!${options.interpreter ?? '/bin/sh'}`,
+      ...(options.waitForSignal === true ? [`trap 'exit ${String(exitCode)}' INT TERM`] : []),
       '{',
       '  echo "argv=$*"',
       '  echo "cwd=$(pwd)"',
@@ -573,6 +646,10 @@ async function createFakeDevServer(fixture, options = {}) {
       '  echo "DEBUGGEN_TOKEN=${DEBUGGEN_TOKEN-<unset>}"',
       `} > ${shellQuote(dump)}`,
       `env > ${shellQuote(envDump)}`,
+      `: > ${shellQuote(readyMarker)}`,
+      // Short sleeps, so the trap runs promptly once a signal arrives: the
+      // shell defers it until its foreground command has finished.
+      ...(options.waitForSignal === true ? ['while :; do sleep 0.05; done'] : []),
       `exit ${String(exitCode)}`,
       '',
     ].join('\n'),
@@ -598,6 +675,7 @@ async function createFakeDevServer(fixture, options = {}) {
     binDir,
     env: { PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}` },
     ran: () => fs.existsSync(dump),
+    ready: () => fs.existsSync(readyMarker),
     read: () => parse(dump),
     readEnv: () => parse(envDump),
   };
@@ -757,18 +835,27 @@ describe('the route contract the caller is held to', () => {
     // Left side: the caller's exported list. Right side: the contract
     // transcribed at the top of this file from the protocol's route table and the
     // service's launcher. A rename on either side fails here.
-    expect([...SERVICE_ROUTES]).toEqual([HEALTH, LAUNCH, STOP, CREDENTIAL]);
-    expect([HEALTH, LAUNCH, STOP, CREDENTIAL]).toEqual([
+    expect([...SERVICE_ROUTES]).toEqual([HEALTH, LAUNCH, STOP, CREDENTIAL, RELEASE]);
+    expect([HEALTH, LAUNCH, STOP, CREDENTIAL, RELEASE]).toEqual([
       '/health',
       '/dev-server/launch',
       '/dev-server/stop',
       '/dev-server/credential',
+      '/credentials/release',
     ]);
+    expect(RELEASE_PATH).toBe('/credentials/release');
     expect(PROTOCOL_ROUTES.credential).toEqual({
       method: 'POST',
       path: '/dev-server/credential',
       authenticated: true,
       required: ['projectRoot'],
+      optional: [],
+    });
+    expect(PROTOCOL_ROUTES.release).toEqual({
+      method: 'POST',
+      path: '/credentials/release',
+      authenticated: true,
+      required: ['token'],
       optional: [],
     });
   });
@@ -833,6 +920,25 @@ describe('the route contract the caller is held to', () => {
       ...credential.optional,
     ]);
     expect(schemaKeys('devServerCredentialResponseSchema')).toEqual(['token', 'expiresAt']);
+
+    // The release route is the `credentials.release` row of the protocol's
+    // table. Its schemas are read by the names that row gives them, so the
+    // check follows the definer rather than a name this file would guess.
+    const release = PROTOCOL_ROUTES.release;
+    const releaseRow = new RegExp(
+      `'credentials\\.release':\\s*\\{\\s*operation:\\s*'credentials\\.release',\\s*method:\\s*'${release.method}',\\s*pattern:\\s*'${escapeRegExp(release.path)}',[^}]*?request:\\s*([A-Za-z_$][\\w$]*),\\s*response:\\s*([A-Za-z_$][\\w$]*)`,
+      'u',
+    ).exec(protocol);
+    expect(
+      releaseRow,
+      `${protocolFile} must declare credentials.release as ${release.method} ${release.path}`,
+    ).not.toBeNull();
+    const [, releaseRequest = '', releaseResponse = ''] = releaseRow ?? [];
+    expect(strictObjectKeys(protocol, releaseRequest)).toEqual([
+      ...release.required,
+      ...release.optional,
+    ]);
+    expect(strictObjectKeys(protocol, releaseResponse)).toEqual(['released']);
   });
 });
 
@@ -2242,13 +2348,28 @@ describe('the local spawn mode', () => {
       expect(stderr.text()).toBe('');
 
       // The pre-flight, then the credential route with the editor credential and
-      // the project root, and nothing else: no launch, no stop, no retry.
-      expect(service.routes()).toEqual([`GET ${HEALTH}`, `POST ${CREDENTIAL}`]);
+      // the project root; once the child has exited, a fresh identity probe and
+      // exactly one release of the minted credential. No launch, no stop, no
+      // retry.
+      expect(service.routes()).toEqual([
+        `GET ${HEALTH}`,
+        `POST ${CREDENTIAL}`,
+        `GET ${HEALTH}`,
+        `POST ${RELEASE}`,
+      ]);
       expect(service.rejections).toEqual([]);
       expect(service.requests[0]?.authorization).toBeUndefined();
       expect(service.requests[0]?.challenge).toMatch(BASE64URL_32_BYTES);
       expect(service.requests[1]?.authorization).toBe(`Bearer ${EDITOR_TOKEN}`);
       expect(service.requests[1]?.body).toEqual({ projectRoot: fixture.projectDir });
+      expect(service.requests[2]?.authorization).toBeUndefined();
+      expect(service.requests[2]?.challenge).toMatch(BASE64URL_32_BYTES);
+      expect(service.requests[2]?.challenge).not.toBe(service.requests[0]?.challenge);
+      expect(service.requests[3]?.authorization).toBe(`Bearer ${EDITOR_TOKEN}`);
+      expect(service.requests[3]?.body).toEqual({ token: SERVER_AGENT_TOKEN });
+      expect(squash(stdout.text())).toContain(
+        'released the server-agent credential; the service revoked it',
+      );
 
       // All four preload variables reached the child, the credential verbatim.
       expect(dev.ran()).toBe(true);
@@ -2267,7 +2388,8 @@ describe('the local spawn mode', () => {
       }
 
       // The banner describes the credential by length and the end of its first
-      // lease only, and says how the service renews and revokes it.
+      // lease only, says that this command releases it when the dev server
+      // exits, and how the service renews and revokes it otherwise.
       const banner = squash(stdout.text());
       expect(banner).toContain(`DEBUGGEN_TOKEN <set, ${SERVER_AGENT_TOKEN.length} bytes>`);
       expect(banner).toContain(
@@ -2275,8 +2397,13 @@ describe('the local spawn mode', () => {
       );
       expect(banner).toContain('This run is AUTHENTICATED');
       expect(banner).toContain('the service renews it while the dev server');
-      expect(banner).toContain('It is revoked when the dev server disconnects, 20 seconds after');
-      expect(banner).toContain('shortly after the dev server exits, Ctrl-C included');
+      expect(banner).toContain(
+        `When the dev server exits, Ctrl-C included, this command releases it (POST ${RELEASE})`,
+      );
+      expect(banner).toContain(
+        'the service still revokes it when the dev server disconnects, 20 seconds after',
+      );
+      expect(banner).toContain('shortly after the dev server exits');
       expect(banner).toContain('lapses within 5 minutes');
       expect(banner).not.toContain('no revoke route');
       expect(banner).not.toContain('not revoked');
@@ -2468,7 +2595,7 @@ describe('the local spawn mode', () => {
     });
   }
 
-  it('documents the mode it implements: authenticated, service-dependent, a lease revoked when the dev server disconnects', () => {
+  it('documents the mode it implements: authenticated, service-dependent, released when the dev server exits, a supervised lease otherwise', () => {
     const text = usage();
     const options = text.slice(text.indexOf('\nOptions\n'));
     const start = options.indexOf('  --spawn-local');
@@ -2502,7 +2629,24 @@ describe('the local spawn mode', () => {
     expect(walkthrough).toContain('and when the service shuts down');
     expect(walkthrough).toContain('A lease nothing renews lapses within 5 minutes');
     expect(walkthrough).toContain('debuggen.rotateServiceToken revokes it at once');
-    expect(walkthrough).toContain('This command itself renews and revokes nothing');
+    expect(walkthrough).toContain('This command itself never renews it');
+    // The release is documented as the behaviour asserted below: after the
+    // child exits, after a signal, after a failed spawn, after a post-mint
+    // failure; proved identity first; one request; a warning, not an exit code.
+    expect(walkthrough).toContain(
+      `has the service prove itself again as in step 3, then releases the credential: POST {service}${RELEASE} with { token }`,
+    );
+    expect(walkthrough).toContain(
+      'after the dev server exits (Ctrl-C and SIGTERM included), after a spawn that failed, and after a failure between the mint and the spawn',
+    );
+    expect(walkthrough).toContain('{ released: false } when nothing was live under it any more');
+    expect(walkthrough).toContain('The release is one request, never retried');
+    expect(walkthrough).toContain('a warning that leaves the exit status alone');
+    expect(walkthrough).not.toContain('it sends nothing further');
+    expect(squash(SCRIPT_SOURCE)).not.toContain('it sends nothing further');
+    expect(paragraph).toContain(
+      `This command releases it through POST ${RELEASE} once the dev server has exited.`,
+    );
 
     // The exit-code table agrees that every --spawn-local failure precedes the
     // spawn.
@@ -2510,6 +2654,7 @@ describe('the local spawn mode', () => {
     expect(exitCodes).toContain(
       'in --spawn-local every such failure happens before the spawn, and the message says nothing was spawned',
     );
+    expect(exitCodes).toContain('The closing release of --spawn-local never changes the exit code');
 
     // The help text claims no unauthenticated mode.
     for (const unauthenticated of [
@@ -2536,6 +2681,466 @@ describe('the local spawn mode', () => {
       expect(squash(SCRIPT_SOURCE), unrevoked).not.toContain(unrevoked);
     }
   });
+});
+
+describe('releasing the server-agent credential', () => {
+  /** The random parts of both credentials: what must never leak, even in part. */
+  const secretParts = [
+    EDITOR_TOKEN.slice('editor-credential-'.length),
+    SERVER_AGENT_TOKEN.slice('server-agent-credential-'.length),
+  ];
+
+  /**
+   * Assert that no credential, whole or by its random part, is in `text`.
+   *
+   * @param {string} text
+   * @param {string} [label]
+   * @returns {void}
+   */
+  const expectNoCredential = (text, label) => {
+    for (const secret of [EDITOR_TOKEN, SERVER_AGENT_TOKEN, ...secretParts]) {
+      expect(text, label).not.toContain(secret);
+    }
+  };
+
+  /**
+   * The fallback every release warning states, whitespace-collapsed.
+   */
+  const FALLBACK =
+    "The service still revokes it without this command: 20 seconds after the dev server's preload disconnects, or at the end of its lease.";
+
+  /**
+   * A gate for the stub's release answer and the function that opens it.
+   *
+   * @returns {{ gate: Promise<unknown>, open: () => void }}
+   */
+  const releaseGate = () => {
+    /** @type {(value: unknown) => void} */
+    let resolveGate = () => undefined;
+    const gate = new Promise((resolve) => {
+      resolveGate = resolve;
+    });
+    return { gate, open: () => resolveGate(undefined) };
+  };
+
+  it('releases a minted credential with one editor-authorised request, and answers false once nothing is live', async () => {
+    service = await startStubService();
+    const projectRoot = path.join(os.tmpdir(), 'some-project');
+    await requestServerAgentCredential({
+      base: service.base,
+      editorToken: EDITOR_TOKEN,
+      projectRoot,
+    });
+
+    const request = { base: service.base, editorToken: EDITOR_TOKEN, token: SERVER_AGENT_TOKEN };
+    await expect(releaseServerAgentCredential(request)).resolves.toBe(true);
+    // Released already: the service finds nothing live under the token, and
+    // says so with `false` — a success, not an error.
+    await expect(releaseServerAgentCredential(request)).resolves.toBe(false);
+
+    expect(service.routes()).toEqual([`POST ${CREDENTIAL}`, `POST ${RELEASE}`, `POST ${RELEASE}`]);
+    for (const release of service.requests.slice(1)) {
+      expect(release.authorization).toBe(`Bearer ${EDITOR_TOKEN}`);
+      expect(release.body).toEqual({ token: SERVER_AGENT_TOKEN });
+    }
+    expect(service.rejections).toEqual([]);
+  });
+
+  it('sends nothing when it is given no credential to release', async () => {
+    service = await startStubService();
+
+    for (const token of ['', undefined]) {
+      await expect(
+        releaseServerAgentCredential({
+          base: service.base,
+          editorToken: EDITOR_TOKEN,
+          token: /** @type {string} */ (token),
+        }),
+      ).rejects.toThrow(TypeError);
+    }
+    expect(service.routes()).toEqual([]);
+  });
+
+  it('turns every answer but a strict { released } into one failed request that names neither credential', async () => {
+    // Every refusal reason echoes both credentials, as a careless or hostile
+    // service might: only the redacted form may reach a message.
+    const echo = `Bearer ${EDITOR_TOKEN} for ${SERVER_AGENT_TOKEN}`;
+    const withoutRelease = [
+      PROTOCOL_ROUTES.health,
+      PROTOCOL_ROUTES.launch,
+      PROTOCOL_ROUTES.stop,
+      PROTOCOL_ROUTES.credential,
+    ];
+    /** @type {Array<[string, Parameters<typeof startStubService>[0], string[]]>} */
+    const cases = [
+      [
+        '401',
+        { releaseStatus: 401, releaseBody: { code: 'UNAUTHORIZED', message: echo } },
+        [
+          `the service rejected the editor credential at ${RELEASE} with 401`,
+          `Bearer [redacted] for [redacted]`,
+        ],
+      ],
+      [
+        '403',
+        { releaseStatus: 403, releaseBody: { code: 'FORBIDDEN', message: echo } },
+        [`the service rejected the editor credential at ${RELEASE} with 403`],
+      ],
+      [
+        '404, a service without the route',
+        { implemented: withoutRelease },
+        [`the service answered 404 for ${RELEASE}: it does not implement the release route`],
+      ],
+      [
+        '405, a service with the route under another method',
+        { implemented: [...withoutRelease, { ...PROTOCOL_ROUTES.release, method: 'GET' }] },
+        [`the service answered 405 for ${RELEASE}`],
+      ],
+      [
+        '500 CLEANUP_PARTIAL',
+        {
+          releaseStatus: 500,
+          releaseBody: { code: 'CLEANUP_PARTIAL', message: `revocation pending: ${echo}` },
+        },
+        [
+          'answered 500 Internal Server Error: revocation pending: Bearer [redacted] for [redacted]',
+        ],
+      ],
+      ['502', { releaseStatus: 502 }, ['answered 502 Bad Gateway']],
+      [
+        'a 2xx without the flag',
+        { releaseBody: { ok: true } },
+        ['off-contract: it carries no boolean released'],
+      ],
+      [
+        'a 2xx with a string flag',
+        { releaseBody: { released: 'true' } },
+        ['off-contract: it carries no boolean released'],
+      ],
+      [
+        'a 2xx that echoes the credential beside the flag',
+        { releaseBody: { released: true, token: SERVER_AGENT_TOKEN } },
+        ['off-contract: it carries fields other than released'],
+      ],
+      [
+        'a 2xx array',
+        { releaseBody: [SERVER_AGENT_TOKEN] },
+        ['off-contract: the body is not a JSON object'],
+      ],
+      ['a 2xx null', { releaseBody: null }, ['off-contract: the body is not a JSON object']],
+    ];
+
+    for (const [name, stub, fragments] of cases) {
+      service = await startStubService(stub);
+
+      const failure = await releaseServerAgentCredential({
+        base: service.base,
+        editorToken: EDITOR_TOKEN,
+        token: SERVER_AGENT_TOKEN,
+      }).then(
+        () => undefined,
+        (/** @type {unknown} */ error) => error,
+      );
+
+      expect(failure, name).toBeInstanceOf(DevInstrumentedError);
+      const { message, hint } = /** @type {DevInstrumentedError} */ (failure);
+      for (const fragment of fragments) expect(message, name).toContain(fragment);
+      expectNoCredential(`${message}\n${hint ?? ''}`, name);
+      // One request: no retry, no fallback path.
+      expect(
+        service.routes().filter((route) => route.endsWith(RELEASE)),
+        name,
+      ).toEqual([`POST ${RELEASE}`]);
+
+      await service.close();
+      service = undefined;
+    }
+  });
+
+  const spawns = it.skipIf(process.platform === 'win32');
+
+  spawns(
+    'releases the credential after a dev server stopped by a forwarded Ctrl-C, keeping its exit status',
+    async () => {
+      service = await startStubService();
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture, { waitForSignal: true, exitCode: 130 });
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+      const started = service;
+
+      const run = main(['--spawn-local', '--service', started.base], context);
+      await waitFor(() => dev.ready(), 'the dev server to start');
+      // Forwarded by the command to its child, which exits on it.
+      process.emit('SIGINT');
+
+      await expect(run).resolves.toBe(130);
+      expect(started.routes()).toEqual([
+        `GET ${HEALTH}`,
+        `POST ${CREDENTIAL}`,
+        `GET ${HEALTH}`,
+        `POST ${RELEASE}`,
+      ]);
+      expect(started.requests[3]?.body).toEqual({ token: SERVER_AGENT_TOKEN });
+      expect(started.requests[3]?.authorization).toBe(`Bearer ${EDITOR_TOKEN}`);
+      expect(started.rejections).toEqual([]);
+      expect(stderr.text()).toBe('');
+      expect(stdout.text()).toContain(
+        'dev-instrumented: released the server-agent credential; the service revoked it',
+      );
+      expectNoCredential(`${stdout.text()}${stderr.text()}`);
+    },
+  );
+
+  spawns(
+    'releases the credential when the dev server cannot be spawned, and still reports that failure',
+    async () => {
+      service = await startStubService();
+      const fixture = await createFixture();
+      // `pnpm` is found on PATH, but its interpreter does not exist: the exec
+      // fails with ENOENT and the child never runs.
+      const dev = await createFakeDevServer(fixture, {
+        interpreter: path.join(fixture.base, 'no-such-interpreter'),
+      });
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+
+      const code = await main(['--spawn-local', '--service', service.base], context);
+
+      expect(code).toBe(2);
+      expect(dev.ran()).toBe(false);
+      expect(squash(stderr.text())).toContain('could not run pnpm --filter target-app dev');
+      expect(squash(stderr.text())).not.toContain('warning:');
+      expect(service.routes()).toEqual([
+        `GET ${HEALTH}`,
+        `POST ${CREDENTIAL}`,
+        `GET ${HEALTH}`,
+        `POST ${RELEASE}`,
+      ]);
+      expect(service.requests[3]?.body).toEqual({ token: SERVER_AGENT_TOKEN });
+      expect(stdout.text()).toContain('released the server-agent credential');
+      expectNoCredential(`${stdout.text()}${stderr.text()}`);
+    },
+  );
+
+  /**
+   * Drive the one post-mint, pre-spawn failure no command line reaches:
+   * `parseArgs` refuses a `DEBUGGEN_*` extra, but `resolveExtraEnv` passes one
+   * through and `buildChildEnv` refuses it — after the credential was minted.
+   *
+   * @param {Parameters<typeof startStubService>[0]} stub
+   */
+  const failAfterMint = async (stub) => {
+    service = await startStubService(stub);
+    const fixture = await createFixture();
+    const dev = await createFakeDevServer(fixture);
+    const stdout = captureStream();
+    const stderr = captureStream();
+
+    const failure = await prepareLocalSpawn({
+      root: fixture.root,
+      project: await resolveProject({ root: fixture.root }),
+      preload: await resolvePreload(fixture.root),
+      base: service.base,
+      env: { DEBUGGEN_HOME: fixture.home, PATH: dev.env.PATH },
+      extraEnv: [{ name: 'DEBUGGEN_TOKEN', value: 'supplied-as-an-extra' }],
+      stdout,
+      stderr,
+    }).then(
+      () => undefined,
+      (/** @type {unknown} */ error) => error,
+    );
+
+    expect(failure).toBeInstanceOf(DevInstrumentedError);
+    const { message, hint } = /** @type {DevInstrumentedError} */ (failure);
+    // The original failure is the one raised, still saying nothing was spawned.
+    expect(message).toBe(`--env "DEBUGGEN_TOKEN" is in the product's own DEBUGGEN_ namespace`);
+    expect(squash(hint ?? '')).toContain('Nothing was spawned');
+    expect(dev.ran()).toBe(false);
+    expectNoCredential(`${message}\n${hint ?? ''}\n${stdout.text()}\n${stderr.text()}`);
+    return { stdout: stdout.text(), stderr: stderr.text(), started: service };
+  };
+
+  it('releases the credential when a step after the mint fails, and raises that failure', async () => {
+    const { stdout, stderr, started } = await failAfterMint({});
+
+    expect(started.routes()).toEqual([
+      `GET ${HEALTH}`,
+      `POST ${CREDENTIAL}`,
+      `GET ${HEALTH}`,
+      `POST ${RELEASE}`,
+    ]);
+    expect(started.requests[3]?.body).toEqual({ token: SERVER_AGENT_TOKEN });
+    expect(stdout).toBe(
+      'dev-instrumented: released the server-agent credential; the service revoked it\n',
+    );
+    expect(stderr).toBe('');
+  });
+
+  it('still raises the original failure when that release fails too', async () => {
+    const { stdout, stderr, started } = await failAfterMint({ releaseStatus: 500 });
+
+    expect(started.routes().filter((route) => route.endsWith(RELEASE))).toEqual([
+      `POST ${RELEASE}`,
+    ]);
+    expect(stdout).toBe('');
+    expect(squash(stderr)).toContain('warning: the server-agent credential was not released');
+    expect(squash(stderr)).toContain(FALLBACK);
+  });
+
+  /**
+   * @typedef {object} UnreleasedCase
+   * @property {string} name what goes wrong, for the test title
+   * @property {Parameters<typeof startStubService>[0]} stub
+   * @property {string[]} expected fragments of the (whitespace-collapsed) warning
+   * @property {string[]} routes what the stub must have been asked
+   */
+
+  const minted = [`GET ${HEALTH}`, `POST ${CREDENTIAL}`];
+
+  /** @type {UnreleasedCase[]} */
+  const unreleased = [
+    {
+      name: 'the service answers 500 CLEANUP_PARTIAL',
+      stub: {
+        releaseStatus: 500,
+        releaseBody: {
+          code: 'CLEANUP_PARTIAL',
+          message: `revocation of ${SERVER_AGENT_TOKEN} still pending`,
+        },
+      },
+      expected: [
+        'warning: the server-agent credential was not released',
+        'answered 500 Internal Server Error: revocation of [redacted] still pending',
+      ],
+      routes: [...minted, `GET ${HEALTH}`, `POST ${RELEASE}`],
+    },
+    {
+      name: 'the service does not implement the release route',
+      stub: {
+        implemented: [
+          PROTOCOL_ROUTES.health,
+          PROTOCOL_ROUTES.launch,
+          PROTOCOL_ROUTES.stop,
+          PROTOCOL_ROUTES.credential,
+        ],
+      },
+      expected: [
+        'warning: the server-agent credential was not released',
+        `the service answered 404 for ${RELEASE}`,
+      ],
+      routes: [...minted, `GET ${HEALTH}`, `POST ${RELEASE}`],
+    },
+    {
+      name: 'the service answers off-contract',
+      stub: { releaseBody: { released: 'yes' } },
+      expected: [
+        'warning: the server-agent credential was not released',
+        'off-contract: it carries no boolean released',
+      ],
+      routes: [...minted, `GET ${HEALTH}`, `POST ${RELEASE}`],
+    },
+    {
+      name: 'the service refuses the editor credential',
+      stub: { releaseStatus: 401 },
+      expected: [`rejected the editor credential at ${RELEASE} with 401`],
+      routes: [...minted, `GET ${HEALTH}`, `POST ${RELEASE}`],
+    },
+    {
+      // One proof, for the pre-flight: by the time the dev server exits the
+      // port answers without one, as after another process took it over.
+      name: 'the listener no longer proves it is the service',
+      stub: { identityProbes: 1 },
+      expected: [
+        'warning: the release of the server-agent credential was skipped',
+        'did not prove it is the Debug Generator service',
+        'the editor credential was not sent',
+      ],
+      // The probe, and nothing that carries either credential after it.
+      routes: [...minted, `GET ${HEALTH}`],
+    },
+  ];
+
+  for (const entry of unreleased) {
+    spawns(`warns once and keeps the child's exit status when ${entry.name}`, async () => {
+      service = await startStubService(entry.stub);
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture, { exitCode: 7 });
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+      const started = service;
+
+      const code = await main(['--spawn-local', '--service', started.base], context);
+
+      expect(code).toBe(7);
+      expect(dev.ran()).toBe(true);
+      expect(started.routes()).toEqual(entry.routes);
+      expect(started.requests[2]?.authorization).toBeUndefined();
+
+      const warnings = squash(stderr.text());
+      expect(warnings.match(/warning:/gu) ?? []).toHaveLength(1);
+      for (const fragment of entry.expected) expect(warnings).toContain(fragment);
+      expect(warnings).toContain(FALLBACK);
+      expect(stdout.text()).not.toContain('released the server-agent credential');
+      expectNoCredential(`${stdout.text()}${stderr.text()}`);
+    });
+  }
+
+  spawns('treats { released: false } as a success', async () => {
+    service = await startStubService({ releaseBody: { released: false } });
+    const fixture = await createFixture();
+    const dev = await createFakeDevServer(fixture, { exitCode: 7 });
+    const { context, stdout, stderr } = contextFor(fixture, dev.env);
+
+    const code = await main(['--spawn-local', '--service', service.base], context);
+
+    expect(code).toBe(7);
+    expect(stderr.text()).toBe('');
+    expect(stdout.text()).toContain(
+      'dev-instrumented: the server-agent credential was no longer live; there was nothing to release',
+    );
+  });
+
+  spawns(
+    'holds SIGINT and SIGTERM while the release is in flight, then lets them through',
+    async () => {
+      const { gate, open } = releaseGate();
+      service = await startStubService({ releaseGate: gate });
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture, { exitCode: 5 });
+      const { context, stdout } = contextFor(fixture, dev.env);
+      const started = service;
+      const before = {
+        SIGINT: process.listenerCount('SIGINT'),
+        SIGTERM: process.listenerCount('SIGTERM'),
+      };
+
+      const run = main(['--spawn-local', '--service', started.base], context);
+      try {
+        await waitFor(
+          () => started.requests.some((request) => request.path === RELEASE),
+          'the release request',
+        );
+        // Held, not acted on: noted once, however many arrive.
+        process.emit('SIGINT');
+        process.emit('SIGINT');
+      } finally {
+        open();
+      }
+
+      await expect(run).resolves.toBe(5);
+      expect(started.releaseSignalListeners).toEqual([
+        { SIGINT: before.SIGINT + 1, SIGTERM: before.SIGTERM + 1 },
+      ]);
+      expect(process.listenerCount('SIGINT')).toBe(before.SIGINT);
+      expect(process.listenerCount('SIGTERM')).toBe(before.SIGTERM);
+      const notes = stdout
+        .text()
+        .split('\n')
+        .filter((line) => line.includes('finishing the credential release first'));
+      expect(notes).toEqual([
+        'dev-instrumented: SIGINT received; finishing the credential release first (at most 7 s)',
+      ]);
+      expect(stdout.text()).toContain('released the server-agent credential');
+    },
+  );
 });
 
 describe('service reasons in messages', () => {
@@ -2645,7 +3250,7 @@ describe('response and project text that reaches the terminal', () => {
   /** A reason phrase that echoes both credentials, as a hostile listener might. */
   const HOSTILE_PHRASE = `denied Bearer ${EDITOR_TOKEN} after minting ${SERVER_AGENT_TOKEN}`;
 
-  it('redacts both credentials from the status phrase of a refused credential, launch or stop', async () => {
+  it('redacts both credentials from the status phrase of a refused credential, launch, stop or release', async () => {
     const scripted = await startScriptedServer((_req, res) => {
       res.writeHead(500, HOSTILE_PHRASE, { 'content-type': 'application/json' });
       // The body names the minted token, which is how this command learns it.
@@ -2675,6 +3280,24 @@ describe('response and project text that reaches the terminal', () => {
       expect(credential).not.toContain(SERVER_AGENT_TOKEN);
       expect(launch).toContain(': refused');
       expect(stop).toContain(': refused');
+
+      // The release names the server-agent credential in its own body, so
+      // both credentials are redacted from its phrase and its reason.
+      const release = await releaseServerAgentCredential({
+        base: scripted.base,
+        editorToken: EDITOR_TOKEN,
+        token: SERVER_AGENT_TOKEN,
+      }).then(
+        () => undefined,
+        (/** @type {unknown} */ error) => error,
+      );
+      expect(release).toBeInstanceOf(DevInstrumentedError);
+      const releaseMessage = /** @type {DevInstrumentedError} */ (release).message;
+      expect(releaseMessage).toContain(
+        'answered 500 denied Bearer [redacted] after minting [redacted]: refused',
+      );
+      expect(releaseMessage).not.toContain(EDITOR_TOKEN);
+      expect(releaseMessage).not.toContain(SERVER_AGENT_TOKEN);
     } finally {
       await scripted.close();
     }
@@ -3432,6 +4055,66 @@ describe('the command as a process', () => {
     expect(output).toContain('stopped the dev server');
     expect(output).not.toContain(EDITOR_TOKEN);
   });
+
+  const spawns = it.skipIf(process.platform === 'win32');
+
+  spawns(
+    'finishes the credential release when a real SIGINT arrives while it is in flight',
+    async () => {
+      /** @type {(value: unknown) => void} */
+      let openGate = () => undefined;
+      const gate = new Promise((resolve) => {
+        openGate = resolve;
+      });
+      service = await startStubService({ releaseGate: gate });
+      const fixture = await createFixture();
+      const dev = await createFakeDevServer(fixture, { exitCode: 3 });
+      const script = await installScript(fixture);
+      const started = service;
+
+      const child = spawn(process.execPath, [script, '--spawn-local', '--service', started.base], {
+        env: { PATH: dev.env.PATH, DEBUGGEN_HOME: fixture.home },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let output = '';
+      child.stdout.on('data', (chunk) => (output += String(chunk)));
+      child.stderr.on('data', (chunk) => (output += String(chunk)));
+      const exited = new Promise((resolve) => {
+        child.once('exit', (code, signal) => resolve({ code, signal }));
+      });
+
+      try {
+        await waitFor(
+          () => started.requests.some((request) => request.path === RELEASE),
+          'the release request from the child process',
+        );
+        // Without the hold, SIGINT's default action would end the process
+        // here, between sending the release and hearing its answer.
+        child.kill('SIGINT');
+        await waitFor(
+          () => output.includes('SIGINT received; finishing the credential release first'),
+          'the held signal to be noted',
+        );
+      } finally {
+        openGate(undefined);
+      }
+      const result = await exited;
+
+      // The dev server's own status, not a signal death and not a failure.
+      expect(result).toEqual({ code: 3, signal: null });
+      expect(started.routes()).toEqual([
+        `GET ${HEALTH}`,
+        `POST ${CREDENTIAL}`,
+        `GET ${HEALTH}`,
+        `POST ${RELEASE}`,
+      ]);
+      expect(started.requests[3]?.body).toEqual({ token: SERVER_AGENT_TOKEN });
+      expect(output).toContain('released the server-agent credential; the service revoked it');
+      expect(output).not.toContain('warning:');
+      expect(output).not.toContain(EDITOR_TOKEN);
+      expect(output).not.toContain(SERVER_AGENT_TOKEN);
+    },
+  );
 
   it('prints usage and exits 0 for --help', async () => {
     const fixture = await createFixture();

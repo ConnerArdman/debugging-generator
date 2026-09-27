@@ -496,9 +496,10 @@ export interface OrderSummary {
  *
  * `shippingOption` is `null` for an order whose chosen service was not
  * recorded. `notes` is `null` when the buyer left the delivery notes empty, and
- * for an order placed before the store recorded them; `shippingAddress` reads
- * back with empty fields for the same reason, which says the store does not
- * know where that order went rather than inventing a destination for it.
+ * for an order written without a collected contact or destination;
+ * `shippingAddress` reads back with empty fields for such an order, which says
+ * the store does not know where that order went rather than inventing a
+ * destination for it.
  */
 export interface OrderDetail extends OrderSummary {
   lines: OrderLine[];

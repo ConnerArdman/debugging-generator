@@ -72,6 +72,18 @@
  *   unlistable group is left alone and logged. `createProcessGroupInspector`
  *   is exercised on the real `/proc` and through injected `/proc` and `ps`
  *   doubles.
+ * - **The project root is re-proved before it is acted on (CWE-367).** A
+ *   launch carrying `confirmProjectRoot` runs it before detection reads the
+ *   project and again as the last step before the spawn — no microtask runs
+ *   between that call and the spawn — and spawns in the canonical root it
+ *   confirms, while the registry key, the credential scope and
+ *   `DEBUGGEN_PROJECT_ROOT` keep the request's spelling. A refusal, a throw,
+ *   a malformed answer or a second proof naming another root spawns nothing
+ *   and leaves no credential live, and a real link retargeted during
+ *   detection is refused. Detection reads, and the command policy judges, in
+ *   that same canonical root: a real link swapped to a decoy across detection's
+ *   held probe and restored before the spawn neither lets the decoy's
+ *   manifest authorize a script nor hides the project's own dev script.
  *
  * Five habits in here are deliberate.
  *
@@ -114,9 +126,11 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:http';
@@ -140,6 +154,7 @@ import {
   devServerLaunchResponseSchema,
   formatBearer,
 } from '@debuggen/protocol';
+import type { CredentialsReleaseRequest } from '@debuggen/protocol';
 import {
   DEBUGGEN_ERROR_CODES,
   DebuggenError,
@@ -224,6 +239,7 @@ import {
 import type {
   AcceptedLaunchCommand,
   ChildProcessLike,
+  ConfirmedProjectRoot,
   DevServerLaunchInput,
   DevServerLauncher,
   DevServerLauncherDeps,
@@ -749,7 +765,8 @@ function createIssuer(
       : answer(input, token, index);
   });
   const renew = vi.fn<RenewFn>(() => ok(true));
-  const revoke = vi.fn<RevokeFn>(() => undefined);
+  // As the access boundary answers: `ok(true)`, it deleted the credential just now.
+  const revoke = vi.fn<RevokeFn>(() => ok(true));
   return { credentials: { issue, renew, revoke }, issue, renew, revoke, tokens };
 }
 
@@ -3667,8 +3684,8 @@ describe('the dev-server credential route contract', () => {
 
   // The route is a row of the table like every other service route, so no
   // route is registered beside the table and no second owner of the path exists.
-  it('is claimed by exactly one of the twenty-one protocol operations, which requires a credential', () => {
-    expect(HTTP_OPERATIONS).toHaveLength(21);
+  it('is claimed by exactly one of the twenty-two protocol operations, which requires a credential', () => {
+    expect(HTTP_OPERATIONS).toHaveLength(22);
 
     const claiming = HTTP_OPERATIONS.filter(
       (operation) =>
@@ -4243,6 +4260,306 @@ describe('DevServerLauncher.issueCredential: the supervised lease', () => {
 });
 
 // ---------------------------------------------------------------------------
+// releaseCredential — the holder's early release (CWE-613)
+// ---------------------------------------------------------------------------
+
+type ReleaseFn = NonNullable<ServerAgentCredentialIssuer['release']>;
+
+/** An issuer double that also answers `release`, with every release recorded. */
+function createReleasingIssuer(): FakeIssuer & { readonly release: Mock<ReleaseFn> } {
+  const issuer = createIssuer();
+  const release = vi.fn<ReleaseFn>(() => ok(true));
+  return { ...issuer, credentials: { ...issuer.credentials, release }, release };
+}
+
+/** The token of a launched child, read from the environment its spawn received. */
+function launchedChildToken(harness: Harness, index = 0): string {
+  const token = harness.spawner.call(index).options.env[PRELOAD_ENV_KEYS.token];
+  if (token === undefined) {
+    throw new Error(`spawn #${String(index)} received no credential`);
+  }
+  return token;
+}
+
+describe('DevServerLauncher.releaseCredential', () => {
+  it('revokes a supervised credential at once, ends its supervision, and answers false the second time', async () => {
+    const harness = supervisedHarness();
+    const token = await issueLease(harness);
+    harness.connections.connect(token);
+
+    expect(expectOk(await harness.launcher.releaseCredential({ token }))).toEqual({
+      released: true,
+    });
+    expect(revokedTokens(harness.issuer)).toEqual([token]);
+    expect(harness.issuer.revoke.mock.calls[0]?.[0]).toMatchObject({
+      projectRoot: harness.projectRoot,
+    });
+    // Supervision is over: no check, renewal or retry is left behind.
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(3 * CLI_LEASE_MS);
+    expect(harness.issuer.renew).not.toHaveBeenCalled();
+    expect(harness.issuer.revoke).toHaveBeenCalledTimes(1);
+
+    // Nothing supervises it now, and this issuer has no release of its own.
+    expect(expectOk(await harness.launcher.releaseCredential({ token }))).toEqual({
+      released: false,
+    });
+    expect(harness.issuer.revoke).toHaveBeenCalledTimes(1);
+
+    const released = recordsMentioning(harness.records, "at its holder's request");
+    expect(released).toHaveLength(1);
+    expect(released[0]?.level).toBe('info');
+    expect(released[0]?.fields).toMatchObject({ projectRoot: harness.projectRoot, lapsed: false });
+    expect(serializedRecords(harness.records)).not.toContain(token);
+  });
+
+  it('leaves the project’s other supervised credential alone', async () => {
+    const harness = supervisedHarness();
+    const departing = await issueLease(harness);
+    const staying = await issueLease(harness);
+    harness.connections.connect(departing);
+    harness.connections.connect(staying);
+
+    expectOk(await harness.launcher.releaseCredential({ token: departing }));
+
+    await vi.advanceTimersByTimeAsync(CLI_LEASE_MS);
+    expect(revokedTokens(harness.issuer)).toEqual([departing]);
+    expect(harness.issuer.renew).toHaveBeenCalled();
+    expect(harness.issuer.renew.mock.calls.every(([input]) => input.token === staying)).toBe(true);
+  });
+
+  it('reaches the issuer synchronously, with nothing awaited before the store acts', async () => {
+    const issuer = createReleasingIssuer();
+    const harness = supervisedHarness({ issuer });
+    const supervised = await issueLease(harness);
+
+    // A supervised credential: its revocation is under way before the call returns.
+    const revoking = harness.launcher.releaseCredential({ token: supervised });
+    expect(revokedTokens(issuer)).toEqual([supervised]);
+    expectOk(await revoking);
+
+    // An unsupervised one: the issuer's release is called before the call returns.
+    const other = fixtureCredential(41);
+    const releasing = harness.launcher.releaseCredential({ token: other });
+    expect(issuer.release).toHaveBeenCalledTimes(1);
+    expect(issuer.release.mock.calls[0]?.[0]).toStrictEqual({ token: other });
+    expectOk(await releasing);
+  });
+
+  it('answers CLEANUP_PARTIAL when the store refuses the revocation, and keeps retrying it', async () => {
+    const harness = supervisedHarness();
+    harness.issuer.revoke.mockReturnValueOnce(storeBusy());
+    const token = await issueLease(harness);
+
+    const error = expectErr(
+      await harness.launcher.releaseCredential({ token }),
+      'CLEANUP_PARTIAL',
+      'credential-revocation-pending',
+    );
+    const lapsesAt = FIXED_NOW + CLI_LEASE_MS;
+    expect(error.details).toMatchObject({ lapsesAt });
+    expect(error.hint).toContain(new Date(lapsesAt).toISOString());
+    expect(errorSurfaces(error)).not.toContain(token);
+
+    // The pending retry revokes it after the first backoff; supervision never resumes.
+    await vi.advanceTimersByTimeAsync(REVOCATION_RETRY_INITIAL_MS);
+    expect(revokedTokens(harness.issuer)).toEqual([token, token]);
+    await vi.advanceTimersByTimeAsync(CLI_LEASE_MS);
+    expect(harness.issuer.revoke).toHaveBeenCalledTimes(2);
+    expect(harness.issuer.renew).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(serializedRecords(harness.records)).not.toContain(token);
+  });
+
+  it('still revokes a supervised credential past its expiry, but answers false: it was not live', async () => {
+    const harness = supervisedHarness();
+    const token = await issueLease(harness);
+    // The clock passes the lease's end before its check has run.
+    vi.setSystemTime(FIXED_NOW + CLI_LEASE_MS);
+
+    expect(expectOk(await harness.launcher.releaseCredential({ token }))).toEqual({
+      released: false,
+    });
+    expect(revokedTokens(harness.issuer)).toEqual([token]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('answers false for a supervised credential the store no longer holds, and still ends its supervision', async () => {
+    const harness = supervisedHarness();
+    const token = await issueLease(harness);
+    harness.connections.connect(token);
+    // A rotation removed the credential before supervision's next check
+    // noticed: the access boundary finds nothing to delete.
+    harness.issuer.revoke.mockReturnValueOnce(ok(false));
+
+    expect(expectOk(await harness.launcher.releaseCredential({ token }))).toEqual({
+      released: false,
+    });
+    expect(revokedTokens(harness.issuer)).toEqual([token]);
+
+    // The revocation succeeded — the credential authenticates nothing — so no
+    // retry, renewal or check is left behind to act on it.
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(3 * CLI_LEASE_MS);
+    expect(harness.issuer.renew).not.toHaveBeenCalled();
+    expect(harness.issuer.revoke).toHaveBeenCalledTimes(1);
+
+    // Nothing claims this request revoked it.
+    expect(recordsMentioning(harness.records, "at its holder's request")).toEqual([]);
+    const notLive = recordsMentioning(
+      harness.records,
+      'no longer live when its holder released it',
+    );
+    expect(notLive).toHaveLength(1);
+    expect(notLive[0]?.level).toBe('info');
+    expect(notLive[0]?.fields).toMatchObject({
+      projectRoot: harness.projectRoot,
+      lapsed: false,
+      removed: false,
+    });
+    expect(serializedRecords(harness.records)).not.toContain(token);
+  });
+
+  it.each([
+    ['answers nothing', (): unknown => undefined],
+    ['answers something that is not a Result', (): unknown => 'revoked'],
+  ])(
+    'answers false for a supervised credential whose issuer revocation %s: nothing confirms this request removed it',
+    async (_label, answer) => {
+      const harness = supervisedHarness();
+      const token = await issueLease(harness);
+      harness.issuer.revoke.mockImplementationOnce(answer);
+
+      expect(expectOk(await harness.launcher.releaseCredential({ token }))).toEqual({
+        released: false,
+      });
+      // It counts as revoked all the same: nothing is retried.
+      expect(revokedTokens(harness.issuer)).toEqual([token]);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(recordsMentioning(harness.records, "at its holder's request")).toEqual([]);
+    },
+  );
+
+  it("never touches a launched child's own credential", async () => {
+    const issuer = createReleasingIssuer();
+    const harness = createHarness({ issuer });
+    await launchReady(harness);
+    const token = launchedChildToken(harness);
+
+    expect(expectOk(await harness.launcher.releaseCredential({ token }))).toEqual({
+      released: false,
+    });
+
+    expect(issuer.revoke).not.toHaveBeenCalled();
+    expect(issuer.release).not.toHaveBeenCalled();
+    expect(harness.launcher.addressOfCredential(sha256Hex(token))).toBe(DEV_URL);
+    expect(harness.launcher.list().map((record) => record.status)).toEqual(['ready']);
+    const warned = recordsMentioning(harness.records, "launched dev server's own credential");
+    expect(warned).toHaveLength(1);
+    expect(warned[0]?.level).toBe('warn');
+    expect(serializedRecords(harness.records)).not.toContain(token);
+  });
+
+  it('hands a token it does not supervise to the issuer’s release, and answers as it does', async () => {
+    const issuer = createReleasingIssuer();
+    issuer.release.mockReturnValueOnce(ok(true)).mockReturnValueOnce(ok(false));
+    const harness = createHarness({ issuer });
+    const token = fixtureCredential(42);
+
+    expect(expectOk(await harness.launcher.releaseCredential({ token }))).toEqual({
+      released: true,
+    });
+    expect(expectOk(await harness.launcher.releaseCredential({ token }))).toEqual({
+      released: false,
+    });
+
+    expect(issuer.release.mock.calls.map(([input]) => input)).toStrictEqual([{ token }, { token }]);
+    expect(issuer.revoke).not.toHaveBeenCalled();
+    expect(serializedRecords(harness.records)).not.toContain(token);
+  });
+
+  it('answers false for a token it does not supervise when the issuer has no release', async () => {
+    const harness = createHarness();
+
+    expect(
+      expectOk(await harness.launcher.releaseCredential({ token: fixtureCredential(43) })),
+    ).toEqual({ released: false });
+    expect(harness.issuer.revoke).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['answers an Err', (): ReturnType<ReleaseFn> => storeBusy()],
+    [
+      'throws',
+      (): ReturnType<ReleaseFn> => {
+        throw new Error('database is locked');
+      },
+    ],
+    [
+      'answers something that is not a Result',
+      // A port that broke its contract: the value is deliberately not a Result.
+      (): ReturnType<ReleaseFn> => 'released' as unknown as ReturnType<ReleaseFn>,
+    ],
+  ])(
+    'turns an issuer release that %s into STORE_ERROR, echoing nothing',
+    async (_label, answer) => {
+      const issuer = createReleasingIssuer();
+      issuer.release.mockImplementationOnce(answer);
+      const harness = createHarness({ issuer });
+      const token = fixtureCredential(44);
+
+      const error = expectErr(
+        await harness.launcher.releaseCredential({ token }),
+        'STORE_ERROR',
+        'credential-release-failed',
+      );
+
+      expect(errorSurfaces(error)).not.toContain(token);
+      expect(serializedRecords(harness.records)).not.toContain(token);
+      expect(issuer.revoke).not.toHaveBeenCalled();
+    },
+  );
+
+  it('refuses an invalid request before anything is asked, echoing nothing', async () => {
+    const issuer = createReleasingIssuer();
+    const harness = createHarness({ issuer });
+    const oversized = `${fixtureCredential(45)}${'x'.repeat(512)}`;
+
+    for (const input of [
+      { token: '' },
+      { token: oversized },
+      { token: fixtureCredential(45), projectRoot: harness.projectRoot },
+      { token: 4173 },
+    ]) {
+      const error = expectErr(
+        await harness.launcher.releaseCredential(input as unknown as CredentialsReleaseRequest),
+        'PROTOCOL_INVALID_MESSAGE',
+        'invalid-release-request',
+      );
+      expect(errorSurfaces(error)).not.toContain(fixtureCredential(45));
+      expect(errorSurfaces(error)).not.toContain('4173');
+    }
+    expect(issuer.release).not.toHaveBeenCalled();
+    expect(issuer.revoke).not.toHaveBeenCalled();
+  });
+
+  it('asks the issuer after dispose, when no supervision remains', async () => {
+    const issuer = createReleasingIssuer();
+    issuer.release.mockReturnValue(ok(false));
+    const harness = createHarness({ issuer });
+    const token = await issueLease(harness);
+    await harness.launcher.dispose();
+    expect(revokedTokens(issuer)).toEqual([token]);
+
+    expect(expectOk(await harness.launcher.releaseCredential({ token }))).toEqual({
+      released: false,
+    });
+    expect(issuer.release.mock.calls.map(([input]) => input)).toStrictEqual([{ token }]);
+    expect(issuer.revoke).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // launch — over the fake spawn (no dev server is ever started)
 // ---------------------------------------------------------------------------
 
@@ -4310,8 +4627,9 @@ describe('DevServerLauncher.launch: the spawn', () => {
 
     await launchReady(harness);
 
-    // AAP §0.5.6: scoped to one projectRoot, revoked when the child exits, and
-    // never valid past its lease even if that revocation cannot run.
+    // A server-agent credential is scoped to one projectRoot, revoked when the
+    // child exits, and never valid past its lease even if that revocation
+    // cannot run.
     expect(harness.issuer.issue.mock.calls).toStrictEqual([
       [
         {
@@ -4330,7 +4648,12 @@ describe('DevServerLauncher.launch: the spawn', () => {
 
     expect(harness.detect).toHaveBeenCalledTimes(1);
     const [input, deps] = harness.detect.mock.calls[0] ?? [];
-    expect(input).toEqual({ projectRoot: harness.projectRoot, devServerUrl: DEV_URL });
+    // Without a confirmation, the directory detection reads is the root as spelled.
+    expect(input).toEqual({
+      projectRoot: harness.projectRoot,
+      readRoot: harness.projectRoot,
+      devServerUrl: DEV_URL,
+    });
     expect(deps).toMatchObject({
       config: SERVICE_CONFIG,
       preloadPath: harness.preloadPath,
@@ -4365,7 +4688,7 @@ describe('DevServerLauncher.launch: the spawn', () => {
     await launchReady(harness);
     expectOk(await harness.launcher.stop({ projectRoot: harness.projectRoot }));
 
-    // AAP §0.5.1: this path instruments through the environment only.
+    // This path instruments through the environment only: no project file is written.
     expect(snapshotTree(harness.projectRoot)).toEqual(before);
     expect(before).toEqual([`package.json\n${JSON.stringify(FIXTURE_MANIFEST, null, 2)}\n`]);
   });
@@ -4837,6 +5160,609 @@ describe('DevServerLauncher.launch: Windows (cmd.exe as the executable, expansio
     expect(call.args).toEqual([cli, 'dev', '--port', '4173']);
     expect(call.options.shell).toBe(false);
     expect(call.options.windowsVerbatimArguments).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The project root is re-proved before it is read and before the spawn (CWE-367)
+// ---------------------------------------------------------------------------
+
+/** A launch's project-root confirmation, as the route hands it to the launcher. */
+type ConfirmFn = NonNullable<DevServerLaunchInput['confirmProjectRoot']>;
+
+/** One planned answer of a confirmation: a thunk, so a throw happens at the call it is planned for. */
+type ConfirmAnswer = () => Result<ConfirmedProjectRoot, DebuggenError>;
+
+/**
+ * Where a confirmation says the admitted root resolves: deliberately another
+ * spelling than any fixture project's, so a spawn in it can never be mistaken
+ * for a spawn in the spelled root. The fake spawn never enters it.
+ */
+const CANONICAL_ROOT = '/srv/canonical/atlas-console';
+
+/** The message every refused confirmation is logged under. */
+const UNCONFIRMED_RECORD = 'The project root was not confirmed; no dev server was launched';
+
+/** A confirmation that still finds the root where it was admitted. */
+const confirmedRoot: ConfirmAnswer = () => ok({ canonicalRoot: CANONICAL_ROOT });
+
+/**
+ * The access boundary's refusal of a root that resolves elsewhere since it was
+ * admitted, as `reconfirmProjectRoot` answers it: `PATH_OUTSIDE_PROJECT`,
+ * reason `project-out-of-scope`, a constant message naming no path.
+ */
+function movedRootRefusal(): Result<ConfirmedProjectRoot, DebuggenError> {
+  return err(
+    new DebuggenError(
+      'PATH_OUTSIDE_PROJECT',
+      'The project root no longer resolves to the directory it was admitted as.',
+      { details: { reason: 'project-out-of-scope' } },
+    ),
+  );
+}
+
+/** A confirmation answering `answers` in call order, and {@link confirmedRoot} once they run out. */
+function plannedConfirmation(...answers: readonly ConfirmAnswer[]): Mock<ConfirmFn> {
+  let calls = 0;
+  return vi.fn<ConfirmFn>(() => {
+    const answer = answers[calls] ?? confirmedRoot;
+    calls += 1;
+    return answer();
+  });
+}
+
+/** The fields of the one refused-confirmation record; a test failure unless exactly one was written. */
+function unconfirmedFields(harness: Harness): Readonly<Record<string, unknown>> | undefined {
+  const records = harness.records.filter((record) => record.message === UNCONFIRMED_RECORD);
+  expect(records).toHaveLength(1);
+  return records[0]?.fields;
+}
+
+describe('DevServerLauncher.launch: the project root is re-proved before it is read and before the spawn (CWE-367)', () => {
+  it('spawns in the confirmed canonical root while every other surface keeps the session spelling', async () => {
+    const confirm = plannedConfirmation();
+    const harness = createHarness();
+
+    const { launch } = await launchReady(harness, { confirmProjectRoot: confirm });
+
+    const { options } = harness.spawner.call(0);
+    expect(CANONICAL_ROOT).not.toBe(harness.projectRoot);
+    expect(options.cwd).toBe(CANONICAL_ROOT);
+    expect(options.env[PRELOAD_ENV_KEYS.projectRoot]).toBe(harness.projectRoot);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(harness.detect.mock.calls[0]?.[0]).toMatchObject({ projectRoot: harness.projectRoot });
+    expect(harness.issuer.issue.mock.calls).toStrictEqual([
+      [
+        {
+          projectRoot: harness.projectRoot,
+          expiresAt: FIXED_NOW + DEFAULT_MANAGED_CREDENTIAL_LEASE_MS,
+          lease: true,
+        },
+      ],
+    ]);
+    expect(harness.launcher.list()).toMatchObject([
+      { projectRoot: harness.projectRoot, pid: launch.pid },
+    ]);
+    expect(harness.issuer.revoke).not.toHaveBeenCalled();
+    expect(harness.records.filter((record) => record.message === UNCONFIRMED_RECORD)).toEqual([]);
+    expect(serializedRecords(harness.records)).not.toContain(CANONICAL_ROOT);
+  });
+
+  it('refuses a root that moved after detection: nothing is spawned, the minted credential is revoked, and the exact refusal is returned', async () => {
+    const refusal = movedRootRefusal();
+    const confirm = plannedConfirmation(confirmedRoot, () => refusal);
+    const harness = createHarness();
+
+    const result = await harness.launcher.launch({
+      projectRoot: harness.projectRoot,
+      confirmProjectRoot: confirm,
+    });
+
+    expect(result).toBe(refusal);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(harness.detect).toHaveBeenCalledTimes(1);
+    expect(harness.issuer.issue).toHaveBeenCalledTimes(1);
+    expect(harness.issuer.tokens).toHaveLength(1);
+    expect(revokedTokens(harness.issuer)).toEqual(harness.issuer.tokens);
+    expect(harness.spawner.spawn).not.toHaveBeenCalled();
+    expect(harness.launcher.list()).toEqual([]);
+    expect(unconfirmedFields(harness)).toStrictEqual({
+      subsystem: 'dev-server',
+      projectRoot: harness.projectRoot,
+      stage: 'before-spawn',
+      code: 'PATH_OUTSIDE_PROJECT',
+      reason: 'project-out-of-scope',
+    });
+  });
+
+  it('refuses a root that moved before detection: nothing is read, minted or spawned', async () => {
+    const refusal = movedRootRefusal();
+    const confirm = plannedConfirmation(() => refusal);
+    const harness = createHarness();
+
+    const result = await harness.launcher.launch({
+      projectRoot: harness.projectRoot,
+      confirmProjectRoot: confirm,
+    });
+
+    expect(result).toBe(refusal);
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(harness.detect).not.toHaveBeenCalled();
+    expect(harness.issuer.issue).not.toHaveBeenCalled();
+    expect(harness.issuer.revoke).not.toHaveBeenCalled();
+    expect(harness.spawner.spawn).not.toHaveBeenCalled();
+    expect(harness.launcher.list()).toEqual([]);
+    expect(unconfirmedFields(harness)).toStrictEqual({
+      subsystem: 'dev-server',
+      projectRoot: harness.projectRoot,
+      stage: 'before-detection',
+      code: 'PATH_OUTSIDE_PROJECT',
+      reason: 'project-out-of-scope',
+    });
+  });
+
+  it.each([
+    { stage: 'before-detection', throwsOnCall: 1 },
+    { stage: 'before-spawn', throwsOnCall: 2 },
+  ] as const)(
+    'fails closed when the confirmation throws $stage, keeping nothing the throw said',
+    async ({ stage, throwsOnCall }) => {
+      const sentinel = '/srv/private/unlogged-sentinel';
+      const throwing: ConfirmAnswer = () => {
+        throw Object.assign(new Error(`EACCES: permission denied, realpath '${sentinel}'`), {
+          code: 'EACCES',
+        });
+      };
+      const confirm = plannedConfirmation(
+        ...(throwsOnCall === 1 ? [throwing] : [confirmedRoot, throwing]),
+      );
+      const harness = createHarness();
+
+      const result = await harness.launcher.launch({
+        projectRoot: harness.projectRoot,
+        confirmProjectRoot: confirm,
+      });
+
+      const error = expectErr(result, 'INTERNAL', 'project-root-confirmation-threw');
+      expect(error.cause).toBeUndefined();
+      expect(errorSurfaces(error)).not.toContain(sentinel);
+      expect(confirm).toHaveBeenCalledTimes(throwsOnCall);
+      expect(harness.detect).toHaveBeenCalledTimes(throwsOnCall - 1);
+      // Never minted before detection; minted and revoked before the spawn.
+      expect(harness.issuer.issue).toHaveBeenCalledTimes(throwsOnCall - 1);
+      expect(revokedTokens(harness.issuer)).toEqual(harness.issuer.tokens);
+      expect(harness.spawner.spawn).not.toHaveBeenCalled();
+      expect(harness.launcher.list()).toEqual([]);
+      expect(unconfirmedFields(harness)).toStrictEqual({
+        subsystem: 'dev-server',
+        projectRoot: harness.projectRoot,
+        stage,
+        code: 'INTERNAL',
+        reason: 'project-root-confirmation-threw',
+        errorCode: 'EACCES',
+      });
+      expect(serializedRecords(harness.records)).not.toContain(sentinel);
+    },
+  );
+
+  it.each(['', 'relative/atlas-console'])(
+    'fails closed on a confirmed canonical root that is not an absolute path (%j)',
+    async (canonicalRoot) => {
+      const confirm = plannedConfirmation(confirmedRoot, () => ok({ canonicalRoot }));
+      const harness = createHarness();
+
+      const result = await harness.launcher.launch({
+        projectRoot: harness.projectRoot,
+        confirmProjectRoot: confirm,
+      });
+
+      expectErr(result, 'INTERNAL', 'project-root-confirmation-invalid');
+      expect(harness.issuer.tokens).toHaveLength(1);
+      expect(revokedTokens(harness.issuer)).toEqual(harness.issuer.tokens);
+      expect(harness.spawner.spawn).not.toHaveBeenCalled();
+      expect(unconfirmedFields(harness)).toMatchObject({
+        stage: 'before-spawn',
+        code: 'INTERNAL',
+        reason: 'project-root-confirmation-invalid',
+      });
+    },
+  );
+
+  it('re-proves the root as the last step before the spawn, with no await in between', async () => {
+    const harness = createHarness();
+    let calls = 0;
+    let spawnsSeenByTheNextMicrotask: number | undefined;
+    const confirm = vi.fn<ConfirmFn>(() => {
+      calls += 1;
+      if (calls === 2) {
+        // Runs at the first suspension after this call: had the launcher
+        // awaited anything before spawning, it would see no spawn yet.
+        queueMicrotask(() => {
+          spawnsSeenByTheNextMicrotask = harness.spawner.spawn.mock.calls.length;
+        });
+      }
+      return ok({ canonicalRoot: CANONICAL_ROOT });
+    });
+
+    await launchReady(harness, { confirmProjectRoot: confirm });
+
+    const events = [
+      ...confirm.mock.invocationCallOrder.map((order) => ({ order, event: 'confirm' })),
+      ...harness.detect.mock.invocationCallOrder.map((order) => ({ order, event: 'detect' })),
+      ...harness.issuer.issue.mock.invocationCallOrder.map((order) => ({ order, event: 'issue' })),
+      ...harness.spawner.spawn.mock.invocationCallOrder.map((order) => ({
+        order,
+        event: 'spawn',
+      })),
+    ]
+      .sort((left, right) => left.order - right.order)
+      .map(({ event }) => event);
+    expect(events).toEqual(['confirm', 'detect', 'issue', 'confirm', 'spawn']);
+    expect(spawnsSeenByTheNextMicrotask).toBe(1);
+  });
+
+  it('refuses a real link retargeted while detection read the project, and spawns in its target otherwise', async () => {
+    const sandbox = makeSandbox('linked-root');
+    const admittedTarget = join(sandbox, 'admitted');
+    const otherTarget = join(sandbox, 'other');
+    for (const directory of [admittedTarget, otherTarget]) {
+      mkdirSync(directory);
+      writeFileSync(
+        join(directory, 'package.json'),
+        `${JSON.stringify(FIXTURE_MANIFEST, null, 2)}\n`,
+      );
+    }
+    const link = join(sandbox, 'project');
+    symlinkSync(admittedTarget, link, 'dir');
+    const canonical = realpathSync.native(admittedTarget);
+    // What `reconfirmProjectRoot` proves, reduced to identity: the link still
+    // leads to the directory it led to when the root was admitted.
+    const linkConfirmation = (): Mock<ConfirmFn> =>
+      vi.fn<ConfirmFn>(() =>
+        realpathSync.native(link) === canonical
+          ? ok({ canonicalRoot: canonical })
+          : movedRootRefusal(),
+      );
+
+    const steady = createHarness({ projectRoot: link });
+    await launchReady(steady, { confirmProjectRoot: linkConfirmation() });
+    expect(steady.spawner.call(0).options.cwd).toBe(canonical);
+    expect(steady.spawner.call(0).options.env[PRELOAD_ENV_KEYS.projectRoot]).toBe(link);
+
+    const swapped = createHarness({
+      projectRoot: link,
+      detect: (input) => {
+        // The link is retargeted while detection reads the project.
+        unlinkSync(link);
+        symlinkSync(otherTarget, link, 'dir');
+        return Promise.resolve(detectionFor(input.projectRoot, BUNDLED_PRELOAD));
+      },
+    });
+    const result = await swapped.launcher.launch({
+      projectRoot: link,
+      confirmProjectRoot: linkConfirmation(),
+    });
+
+    expectErr(result, 'PATH_OUTSIDE_PROJECT', 'project-out-of-scope');
+    expect(swapped.detect).toHaveBeenCalledTimes(1);
+    expect(swapped.issuer.tokens).toHaveLength(1);
+    expect(revokedTokens(swapped.issuer)).toEqual(swapped.issuer.tokens);
+    expect(swapped.spawner.spawn).not.toHaveBeenCalled();
+  });
+
+  it('without a confirmation, spawns in the root exactly as the request spells it', async () => {
+    const sandbox = makeSandbox('unconfirmed-link');
+    const target = join(sandbox, 'target');
+    mkdirSync(target);
+    writeFileSync(join(target, 'package.json'), `${JSON.stringify(FIXTURE_MANIFEST, null, 2)}\n`);
+    const link = join(sandbox, 'project');
+    symlinkSync(target, link, 'dir');
+    const harness = createHarness({ projectRoot: link });
+
+    await launchReady(harness);
+
+    expect(harness.spawner.call(0).options.cwd).toBe(link);
+    expect(harness.records.filter((record) => record.message === UNCONFIRMED_RECORD)).toEqual([]);
+  });
+
+  it.each([
+    { canonicalRoot: 'C:/work/atlas-console', cwd: 'C:\\work\\atlas-console' },
+    { canonicalRoot: 'C:', cwd: 'C:\\' },
+  ])(
+    'spawns on Windows in the native spelling of the confirmed root ($canonicalRoot)',
+    async ({ canonicalRoot, cwd }) => {
+      const harness = createHarness({
+        parentEnv: WINDOWS_PARENT_ENV,
+        deps: { platform: 'win32' },
+      });
+
+      await launchReady(harness, { confirmProjectRoot: () => ok({ canonicalRoot }) });
+
+      const { command, options } = harness.spawner.call(0);
+      expect(command).toBe(WINDOWS_COMSPEC);
+      expect(options.cwd).toBe(cwd);
+      expect(options.env[PRELOAD_ENV_KEYS.projectRoot]).toBe(harness.projectRoot);
+      // Detection reads the same proven directory the child runs in.
+      expect(harness.detect.mock.calls[0]?.[0]).toMatchObject({
+        projectRoot: harness.projectRoot,
+        readRoot: cwd,
+      });
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Detection and the command policy judge the confirmed canonical root (CWE-367)
+// ---------------------------------------------------------------------------
+
+/**
+ * A project root spelled through a real symbolic link, and the two real
+ * directories it can lead to: `admitted`, the project the root was admitted
+ * as, and `decoy`, another directory the link can be retargeted to.
+ */
+interface SwappableRoot {
+  /** The root as the session spells it: the link. */
+  readonly link: string;
+  /** The admitted project's canonical path — what a confirmation proves. */
+  readonly canonical: string;
+  readonly admitted: string;
+  /** The decoy's canonical path. */
+  readonly decoy: string;
+  /** Point the link at `target`, replacing it. */
+  retarget(target: string): void;
+  /** Where the link leads now, every link resolved. */
+  resolved(): string;
+  /**
+   * The confirmation `reconfirmProjectRoot` would hand over, reduced to
+   * identity: the link must still lead to the admitted project.
+   */
+  confirmation(): Mock<ConfirmFn>;
+}
+
+/** Build a {@link SwappableRoot} whose two directories hold the given manifests. */
+function swappableRoot(label: string, admitted: unknown, decoy: unknown): SwappableRoot {
+  const sandbox = makeSandbox(label);
+  const admittedDirectory = join(sandbox, 'admitted');
+  const decoyDirectory = join(sandbox, 'decoy');
+  for (const [directory, manifest] of [
+    [admittedDirectory, admitted],
+    [decoyDirectory, decoy],
+  ] as const) {
+    mkdirSync(directory);
+    writeFileSync(join(directory, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  }
+  const link = join(sandbox, 'project');
+  symlinkSync(admittedDirectory, link, 'dir');
+  const canonical = realpathSync.native(admittedDirectory);
+  const resolved = (): string => realpathSync.native(link);
+  return {
+    link,
+    canonical,
+    admitted: admittedDirectory,
+    decoy: realpathSync.native(decoyDirectory),
+    retarget: (target) => {
+      unlinkSync(link);
+      symlinkSync(target, link, 'dir');
+    },
+    resolved,
+    confirmation: () =>
+      vi.fn<ConfirmFn>(() =>
+        resolved() === canonical ? ok({ canonicalRoot: canonical }) : movedRootRefusal(),
+      ),
+  };
+}
+
+/**
+ * Detection's session-URL probe, held open: `onSent` runs the moment the probe
+ * is sent, and nothing answers until the test calls `refuse`, which answers as
+ * a refused connection — nothing listens at the address yet.
+ */
+function heldDetectionProbe(onSent: () => void): {
+  readonly fetchImpl: Mock<FetchLike>;
+  readonly sent: Promise<void>;
+  readonly refuse: () => void;
+} {
+  const sent = deferred<undefined>();
+  let refuse: () => void = () => undefined;
+  const answer = new Promise<never>((_resolve, reject) => {
+    refuse = () => {
+      const socketError = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:4173'), {
+        code: 'ECONNREFUSED',
+      });
+      reject(new TypeError('fetch failed', { cause: socketError }));
+    };
+  });
+  const fetchImpl = vi.fn<FetchLike>(() => {
+    onSent();
+    sent.resolve(undefined);
+    return answer;
+  });
+  return { fetchImpl, sent: sent.promise, refuse };
+}
+
+/** A generic Next.js project pinned to pnpm, with the given scripts. */
+function pnpmProject(scripts: Readonly<Record<string, string>>): Readonly<Record<string, unknown>> {
+  return {
+    name: 'atlas-console',
+    private: true,
+    packageManager: 'pnpm@9.15.0',
+    scripts,
+    devDependencies: { next: '16.3.5' },
+  };
+}
+
+/**
+ * A harness launching through the link of `root` with real detection, whose
+ * probe retargets the link to the decoy when it is sent and which restores it
+ * the moment detection has finished reading — before the launch acts again —
+ * so the confirmation before the spawn still finds the admitted project: the
+ * swap-and-restore an attacker who can relink the root would time.
+ */
+function swapAndRestoreHarness(root: SwappableRoot): {
+  readonly harness: Harness;
+  readonly probe: ReturnType<typeof heldDetectionProbe>;
+  /** Where the link led when detection finished reading. */
+  readonly linkedWhileDetecting: () => string | undefined;
+} {
+  let linked: string | undefined;
+  const probe = heldDetectionProbe(() => {
+    root.retarget(root.decoy);
+  });
+  const harness = createHarness({
+    projectRoot: root.link,
+    detect: async (input, deps) => {
+      const detection = await detectDevServer(input, deps);
+      linked = root.resolved();
+      root.retarget(root.admitted);
+      return detection;
+    },
+    deps: { detectDeps: { fetchImpl: probe.fetchImpl } },
+  });
+  return { harness, probe, linkedWhileDetecting: () => linked };
+}
+
+describe('DevServerLauncher.launch: detection and the command policy judge the confirmed canonical root (CWE-367)', () => {
+  it('hands detection the confirmed canonical root to read while it keeps the session spelling as the project', async () => {
+    const harness = createHarness();
+
+    await launchReady(harness, {
+      devServerUrl: DEV_URL,
+      confirmProjectRoot: plannedConfirmation(),
+    });
+
+    expect(harness.detect).toHaveBeenCalledTimes(1);
+    expect(harness.detect.mock.calls[0]?.[0]).toEqual({
+      projectRoot: harness.projectRoot,
+      readRoot: CANONICAL_ROOT,
+      devServerUrl: DEV_URL,
+    });
+  });
+
+  it('refuses a script a decoy declared as a dev server while the link was swapped across the held probe and restored', async () => {
+    const root = swappableRoot(
+      'decoy-script',
+      pnpmProject({ dev: 'next dev', deploy: 'vercel deploy --prod' }),
+      pnpmProject({ deploy: 'next dev' }),
+    );
+    const { harness, probe, linkedWhileDetecting } = swapAndRestoreHarness(root);
+    const confirm = root.confirmation();
+
+    const pending = harness.launcher.launch({
+      projectRoot: root.link,
+      devServerUrl: DEV_URL,
+      command: 'pnpm run deploy',
+      confirmProjectRoot: confirm,
+    });
+    await probe.sent;
+    expect(root.resolved()).toBe(root.decoy);
+    probe.refuse();
+    const result = await pending;
+
+    // Judged on the canonical project's manifest, whose `deploy` starts no dev server.
+    const error = expectErr(result, 'DEV_SERVER_LAUNCH_FAILED', 'script-not-declared');
+    expect(error.details).toStrictEqual({ reason: 'script-not-declared' });
+    // The decoy was in place for the whole of detection, and the link was
+    // restored before the launch acted again, so a final confirmation passes.
+    expect(linkedWhileDetecting()).toBe(root.decoy);
+    expect(root.resolved()).toBe(root.canonical);
+    expect(harness.detect.mock.calls[0]?.[0]).toMatchObject({
+      projectRoot: root.link,
+      readRoot: root.canonical,
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(harness.issuer.issue).not.toHaveBeenCalled();
+    expect(harness.issuer.revoke).not.toHaveBeenCalled();
+    expect(harness.spawner.spawn).not.toHaveBeenCalled();
+    expect(harness.launcher.list()).toEqual([]);
+  });
+
+  it("launches the canonical project's own dev script although the link led to a decoy declaring none while detection read", async () => {
+    const root = swappableRoot('decoy-empty', pnpmProject({ dev: 'next dev', lint: 'eslint .' }), {
+      name: 'decoy',
+      private: true,
+      scripts: {},
+    });
+    const { harness, probe, linkedWhileDetecting } = swapAndRestoreHarness(root);
+    const confirm = root.confirmation();
+
+    const pending = harness.launcher.launch({
+      projectRoot: root.link,
+      devServerUrl: DEV_URL,
+      confirmProjectRoot: confirm,
+    });
+    await probe.sent;
+    probe.refuse();
+    const child = await spawnedChild(harness, pending);
+    child.print(`   - Local:        ${DEV_ORIGIN}\n`);
+    const launch = expectOk(await pending);
+
+    expect(linkedWhileDetecting()).toBe(root.decoy);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    const call = harness.spawner.call(0);
+    expect(call.command).toBe('pnpm');
+    expect(call.args).toEqual(['run', 'dev']);
+    expect(call.options.cwd).toBe(root.canonical);
+    expect(call.options.env[PRELOAD_ENV_KEYS.projectRoot]).toBe(root.link);
+    if (!launch.managed) {
+      throw new Error('expected a managed launch');
+    }
+    // Detection read the canonical project and reports it under the session spelling.
+    expect(launch.detection).toMatchObject({
+      projectRoot: root.link,
+      packageManager: 'pnpm',
+      devScript: { name: 'dev', command: 'next dev' },
+      devServerScripts: ['dev'],
+    });
+    expect(launch.detection?.relaunchCommand).toContain(`cd ${root.link} && `);
+    expect(launch.detection?.relaunchCommand).toContain(
+      `${PRELOAD_ENV_KEYS.projectRoot}=${root.link} `,
+    );
+    expect(JSON.stringify(launch.detection)).not.toContain(root.canonical);
+  });
+
+  it('resolves a relative framework-CLI path against the confirmed canonical root, where the child runs', async () => {
+    const canonicalCli = `${CANONICAL_ROOT}/node_modules/next/dist/bin/next`;
+    const isTrustedDevCli = vi.fn((path: string) => path === canonicalCli);
+    const harness = createHarness({ deps: { isTrustedDevCli } });
+
+    await launchReady(harness, {
+      command: 'node node_modules/next/dist/bin/next dev',
+      confirmProjectRoot: plannedConfirmation(),
+    });
+
+    expect(isTrustedDevCli.mock.calls).toEqual([[canonicalCli]]);
+    const call = harness.spawner.call(0);
+    expect(call.args).toEqual(['node_modules/next/dist/bin/next', 'dev']);
+    expect(call.options.cwd).toBe(CANONICAL_ROOT);
+  });
+
+  it('refuses a spawn whose confirmation proves another canonical root than detection read: nothing is spawned and the minted credential is revoked', async () => {
+    const elsewhere = '/srv/canonical/other-console';
+    const confirm = plannedConfirmation(confirmedRoot, () => ok({ canonicalRoot: elsewhere }));
+    const harness = createHarness();
+
+    const result = await harness.launcher.launch({
+      projectRoot: harness.projectRoot,
+      confirmProjectRoot: confirm,
+    });
+
+    const error = expectErr(result, 'INTERNAL', 'project-root-confirmation-changed');
+    expect(errorSurfaces(error)).not.toContain(CANONICAL_ROOT);
+    expect(errorSurfaces(error)).not.toContain(elsewhere);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(harness.detect).toHaveBeenCalledTimes(1);
+    expect(harness.issuer.tokens).toHaveLength(1);
+    expect(revokedTokens(harness.issuer)).toEqual(harness.issuer.tokens);
+    expect(harness.spawner.spawn).not.toHaveBeenCalled();
+    expect(harness.launcher.list()).toEqual([]);
+    expect(unconfirmedFields(harness)).toStrictEqual({
+      subsystem: 'dev-server',
+      projectRoot: harness.projectRoot,
+      stage: 'before-spawn',
+      code: 'INTERNAL',
+      reason: 'project-root-confirmation-changed',
+    });
+    expect(serializedRecords(harness.records)).not.toContain(elsewhere);
   });
 });
 
@@ -6666,7 +7592,7 @@ describe('DevServerLauncher.stopForSession', () => {
     expect(harness.launcher.list()).toMatchObject([{ sessionIds: [] }]);
     expect(harness.launcher.list()[0]?.sessionId).toBeUndefined();
 
-    // AAP §0.5.1: the developer's dev server keeps serving after the session ends.
+    // The developer's dev server keeps serving after the session ends.
     expect(expectOk(await harness.launcher.stopForSession('ses-alpha'))).toStrictEqual({
       stopped: 0,
     });
@@ -7274,6 +8200,92 @@ describe('serverAgentCredentialIssuer over the real access boundary', () => {
       expect(expectOk(auth.revokeServerAgentCredential(unbounded.token))).toBe(true);
       expect(expectOk(auth.revokeServerAgentCredential(unbounded.token))).toBe(false);
       expect(principalOf(auth, unbounded.token)).toBeUndefined();
+    } finally {
+      boundary.release();
+    }
+  });
+
+  it("releases a POST /dev-server/credential credential through the access boundary, and never a launched child's", async () => {
+    const boundary = openBoundary(() => FIXED_NOW);
+    try {
+      const { auth } = boundary;
+      const issuer = serverAgentCredentialIssuer(auth);
+      const harness = createHarness({ deps: { credentials: issuer } });
+
+      // Supervised here: revoked through the launcher's own path.
+      const minted = expectOk(
+        await harness.launcher.issueCredential({ projectRoot: harness.projectRoot }),
+      );
+      expect(principalOf(auth, minted.token)).toBeDefined();
+      expect(expectOk(await harness.launcher.releaseCredential({ token: minted.token }))).toEqual({
+        released: true,
+      });
+      expect(principalOf(auth, minted.token)).toBeUndefined();
+      // Gone: the access boundary finds nothing to release.
+      expect(expectOk(await harness.launcher.releaseCredential({ token: minted.token }))).toEqual({
+        released: false,
+      });
+
+      // Minted by a previous service instance: unsupervised here, released by the store.
+      const earlier = expectOk(
+        auth.issueServerAgentCredential({
+          projectRoot: harness.projectRoot,
+          expiresAt: FIXED_NOW + DEFAULT_CLI_CREDENTIAL_LEASE_MS,
+        }),
+      );
+      expect(expectOk(await harness.launcher.releaseCredential({ token: earlier.token }))).toEqual({
+        released: true,
+      });
+      expect(principalOf(auth, earlier.token)).toBeUndefined();
+
+      // A launched child's lease survives the route and the store alike.
+      const { child } = await launchReady(harness);
+      const childToken = launchedChildToken(harness);
+      expect(expectOk(await harness.launcher.releaseCredential({ token: childToken }))).toEqual({
+        released: false,
+      });
+      const direct = issuer.release?.({ token: childToken });
+      expect(direct).toBeDefined();
+      if (direct !== undefined) {
+        expect(expectOk(await direct)).toBe(false);
+      }
+      expect(principalOf(auth, childToken)).toBeDefined();
+
+      // Only the child's own exit revokes it.
+      child.finish(0, null);
+      await vi.waitFor(() => {
+        expect(principalOf(auth, childToken)).toBeUndefined();
+      });
+    } finally {
+      boundary.release();
+    }
+  });
+
+  it('answers false for a supervised credential a rotation already removed: this release revoked nothing', async () => {
+    const boundary = openBoundary(() => FIXED_NOW);
+    try {
+      const { auth } = boundary;
+      const harness = createHarness({ deps: { credentials: serverAgentCredentialIssuer(auth) } });
+      const minted = expectOk(
+        await harness.launcher.issueCredential({ projectRoot: harness.projectRoot }),
+      );
+      expect(principalOf(auth, minted.token)).toBeDefined();
+
+      // The editor rotates every credential while the launcher still
+      // supervises this one: its row is gone before any check notices.
+      expectOk(auth.rotateAll());
+      expect(principalOf(auth, minted.token)).toBeUndefined();
+
+      // The holder's release, made afterwards, finds nothing to remove and says so.
+      expect(expectOk(await harness.launcher.releaseCredential({ token: minted.token }))).toEqual({
+        released: false,
+      });
+      expect(principalOf(auth, minted.token)).toBeUndefined();
+      // Supervision ended with that release: a repeat reaches the access
+      // boundary's own release, which finds nothing either.
+      expect(expectOk(await harness.launcher.releaseCredential({ token: minted.token }))).toEqual({
+        released: false,
+      });
     } finally {
       boundary.release();
     }

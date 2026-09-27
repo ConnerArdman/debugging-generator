@@ -13,14 +13,14 @@
  * whatever a stranger put in a link into the page, which is not a thing to do with text nobody in
  * this store wrote.
  *
- * A SERVER COMPONENT THAT READS NOTHING, BECAUSE `next build` RENDERS IT
+ * A SERVER COMPONENT THAT READS NOTHING, SO RENDERING IT NEEDS NO DATABASE
  * There is no client directive and no data access of any kind: nothing from `@/server/**`, no
- * service call, no `fetch`, no cookie or header read and no environment variable. This route is
- * prerendered by `next build` as `/_not-found`, wrapped in the root layout, so a query here would
- * make the build itself need a reachable database - and the build is expected to succeed on a
- * clean clone with a credential-free `DATABASE_URL` and no PostgreSQL running. Nothing is read
- * from the clock or from `Math.random()` either, so the markup produced at build time, at request
- * time and after hydration is the same markup.
+ * service call, no `fetch`, no cookie or header read and no environment variable. The root
+ * layout's `dynamic = 'force-dynamic'` covers this route too, so `next build` does not prerender
+ * it: it is rendered on demand, per request, inside the root layout. Because it reads nothing,
+ * rendering it touches neither the database nor the network, whatever brought the reader here.
+ * Nothing is read from the clock or from `Math.random()` either, so the markup the server renders
+ * and the markup produced at hydration are the same markup.
  *
  * WHAT IT DOES NOT DECLARE
  * No route segment config. `dynamic`, `revalidate` and `runtime` are page-level exports that this

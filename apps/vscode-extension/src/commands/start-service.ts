@@ -48,6 +48,24 @@
  * (AAP §0.5.1) — and the restart's own outcome is reported without offering a
  * further restart, so the flow is bounded.
  *
+ * ## The restart is also the refused-credential remedy
+ *
+ * A service refuses the editor credential (`UNAUTHORIZED`, WebSocket close
+ * 4401) when `auth.json` names a credential its store does not hold. Rotation
+ * cannot repair that — `credentials.rotate` itself requires an editor
+ * credential the service accepts — but a restart can: the service re-registers
+ * or re-mints the editor credential in `auth.json` as it starts.
+ * So this module exports the pieces of its restart for the two places that
+ * offer it for a refused credential:
+ *
+ * - `src/extension.ts`'s refused-credential prompt uses
+ *   {@link RESTART_SERVICE_ACTION}, {@link RESTART_WITH_LIVE_SESSION} and
+ *   {@link hasLiveSession}. It holds no {@link CommandContext}, so it runs its
+ *   own restart and then re-reads `auth.json` before reconnecting.
+ * - `./rotate-service-token.ts` offers {@link RESTART_SERVICE_ACTION} on a
+ *   rotation the service refused at its access boundary and runs
+ *   {@link restartServiceOnRequest} when it is chosen.
+ *
  * ## Module conventions
  *
  * Extension-host code: ESM authoring with extensionless relative imports,
@@ -68,7 +86,7 @@ import type { DebuggenError } from '@debuggen/shared';
 import type { ServiceClient } from '../service/client';
 import type { ServiceMode, ServiceProcess } from '../service/process';
 
-import type { CommandContext, CommandId } from './index';
+import type { CommandContext, CommandId, DestructiveConfirmation } from './index';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -80,8 +98,12 @@ const COMMAND_ID = 'debuggen.startService' satisfies CommandId;
 /** The notification action that reveals the service output channel. */
 const SHOW_OUTPUT_ACTION = 'Show output';
 
-/** The notification action (and confirmation button) that restarts this window's service. */
-const RESTART_SERVICE_ACTION = 'Restart service';
+/**
+ * The notification action (and confirmation button) that restarts this
+ * window's service. Offered by this command, by the refused-credential prompt
+ * of `src/extension.ts` and by `./rotate-service-token.ts`.
+ */
+export const RESTART_SERVICE_ACTION = 'Restart service';
 
 /** Failure headline prefix when {@link ServiceProcess.ensureRunning} produced no service. */
 const START_FAILED_PREFIX = 'Could not start the Debug Generator service';
@@ -97,8 +119,11 @@ const RESTART_FAILED_PREFIX = 'Could not restart the Debug Generator service';
 const SETTINGS_CHANGED_DETAIL =
   'A setting it was started with (debuggen.serviceUrl or debuggen.provider) has changed since; restart the service to apply it.';
 
-/** The confirmation shown before a restart while a session is live. */
-const RESTART_WITH_LIVE_SESSION = Object.freeze({
+/**
+ * The confirmation shown before a restart while a session is live (see
+ * {@link hasLiveSession}), wherever the restart is offered.
+ */
+export const RESTART_WITH_LIVE_SESSION: DestructiveConfirmation = Object.freeze({
   message: 'Restart the Debug Generator service while a session is active?',
   detail:
     'On start the service restores every file it instrumented, so the active session loses its instrumentation, and any dev server it launched is stopped. End the session first to finish it cleanly.',
@@ -217,7 +242,7 @@ async function confirmReachable(
     actions: offerRestart ? [RESTART_SERVICE_ACTION] : undefined,
   });
   if (choice === RESTART_SERVICE_ACTION) {
-    await restartService(ctx);
+    await restartServiceOnRequest(ctx);
   }
 }
 
@@ -245,15 +270,33 @@ async function reportFailure(
   if (choice === SHOW_OUTPUT_ACTION) {
     ctx.serviceProcess.showOutput();
   } else if (choice === RESTART_SERVICE_ACTION) {
-    await restartService(ctx);
+    await restartServiceOnRequest(ctx);
   }
 }
 
 /**
- * The developer chose {@link RESTART_SERVICE_ACTION}: confirm when a session is
- * live, restart once and report that outcome without offering another restart.
+ * The developer chose {@link RESTART_SERVICE_ACTION}: confirm with
+ * {@link RESTART_WITH_LIVE_SESSION} when a session is live, call
+ * {@link ServiceProcess.restart} once, and report that outcome — the restarted
+ * service confirmed with `GET /health`, the socket connected and one notice,
+ * or one failure — without offering another restart, so the flow is bounded.
+ *
+ * Offered by this command and by `./rotate-service-token.ts` when the service
+ * refused the editor credential, since the restarted service re-issues it in
+ * `auth.json`. The protocol client reads that file again on the next refusal
+ * it meets, so nothing here touches the credential. Resolves after the notice
+ * was answered or dismissed; never rejects for an expected condition.
+ *
+ * @example
+ * ```ts
+ * if (choice === RESTART_SERVICE_ACTION) {
+ *   await restartServiceOnRequest(ctx);
+ * }
+ * ```
+ *
+ * @param ctx The command context built by `registerCommands`.
  */
-async function restartService(ctx: CommandContext): Promise<void> {
+export async function restartServiceOnRequest(ctx: CommandContext): Promise<void> {
   if (hasLiveSession(ctx) && !(await ctx.ui.confirmDestructive(RESTART_WITH_LIVE_SESSION))) {
     return;
   }
@@ -270,10 +313,18 @@ async function restartService(ctx: CommandContext): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /**
- * Whether a session is active and not yet ended. A known id whose record has
- * not arrived counts as live: the confirmation errs on the side of asking.
+ * Whether a session is active and not yet ended, which is when a restart asks
+ * for {@link RESTART_WITH_LIVE_SESSION} first. A known id whose record has not
+ * arrived counts as live: the confirmation errs on the side of asking.
+ *
+ * @example
+ * ```ts
+ * hasLiveSession({ state: rt.state }); // outside a command context
+ * ```
+ *
+ * @param ctx Anything holding the host store.
  */
-function hasLiveSession(ctx: Pick<CommandContext, 'state'>): boolean {
+export function hasLiveSession(ctx: Pick<CommandContext, 'state'>): boolean {
   const sessionId = ctx.state.activeSessionId;
   if (sessionId === undefined || sessionId === '') {
     return false;

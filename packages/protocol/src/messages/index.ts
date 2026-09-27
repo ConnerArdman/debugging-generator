@@ -66,8 +66,9 @@
  * export condition, `tsup.config.ts` one entry), so a symbol it does not
  * forward does not exist for `apps/local-service`, `apps/vscode-extension` or
  * `apps/chrome-extension`. This barrel is what it forwards the message layer
- * from, so everything the three surfaces need arrives here first: the handshake
- * constants ({@link WS_CLOSE_UNAUTHORIZED}, {@link CLIENT_HELLO_TIMEOUT_MS}),
+ * from, so everything the three surfaces need arrives here first: the
+ * connection constants ({@link WS_CLOSE_UNAUTHORIZED},
+ * {@link CLIENT_HELLO_TIMEOUT_MS}, {@link SERVICE_PONG_TIMEOUT_MS}),
  * the closed vocabularies ({@link CLIENT_KINDS}, {@link PROGRESS_STAGES},
  * {@link PROGRESS_STATUSES}, {@link BINDING_REASONS},
  * {@link SOURCE_RESULT_STATUSES}), every payload schema, every inferred payload
@@ -142,19 +143,23 @@ export type { ErrorPayload, ErrorPayloadDriftAssertions } from './error.js';
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The client-kind vocabulary and the two handshake constants: see `./agent.js`.
+ * The client-kind vocabulary and the three connection constants: see
+ * `./agent.js`.
  *
  * {@link CLIENT_KINDS} is the closed set of connection kinds — the editor, the
  * DevTools panel, the page agent and the Node preload — that `client.hello`
  * announces; {@link WS_CLOSE_UNAUTHORIZED} is the close code a connection that
- * fails to authenticate receives, and {@link CLIENT_HELLO_TIMEOUT_MS} the
- * window it has to send that first frame in (AAP §0.5.6). All three are read by
- * the service's socket server and by both extension clients, so they are
- * declared once and forwarded rather than restated at either end.
+ * fails to authenticate receives, {@link CLIENT_HELLO_TIMEOUT_MS} the window it
+ * has to send that first frame in, and
+ * {@link SERVICE_PONG_TIMEOUT_MS} how long a client waits for the answer to its
+ * `client.ping`. All four are read by the service's socket server or by the
+ * extension clients, so they are declared once and forwarded rather than
+ * restated at either end.
  */
 export {
   CLIENT_HELLO_TIMEOUT_MS,
   CLIENT_KINDS,
+  SERVICE_PONG_TIMEOUT_MS,
   WS_CLOSE_UNAUTHORIZED,
   clientKindSchema,
 } from './agent.js';
@@ -163,17 +168,21 @@ export {
  * The agent-domain payload schemas and this domain's registry entry: see
  * `./agent.js`.
  *
- * `client.hello` is the first frame of every connection, `agent.ready` the
- * browser agent's report that it is installed in a document, and
- * `agent.config` / `server-agent.config` the two arming messages whose cleared
- * form returns each producer to dormant (AAP §0.5.1).
+ * `client.hello` is the first frame of every connection, `client.ping` /
+ * `service.pong` the side-effect-free liveness pair any authenticated
+ * connection may exchange, `agent.ready` the browser agent's report that it is
+ * installed in a document, and `agent.config` / `server-agent.config` the two
+ * arming messages whose cleared form returns each producer to dormant
+ * (its hooks disabled, not merely idled).
  */
 export {
   AGENT_MESSAGE_PAYLOADS,
   agentConfigPayloadSchema,
   agentReadyPayloadSchema,
   clientHelloPayloadSchema,
+  clientPingPayloadSchema,
   serverAgentConfigPayloadSchema,
+  servicePongPayloadSchema,
 } from './agent.js';
 
 /** The agent-domain parse helpers: see `./agent.js`. */
@@ -181,7 +190,9 @@ export {
   parseAgentConfigPayload,
   parseAgentReadyPayload,
   parseClientHelloPayload,
+  parseClientPingPayload,
   parseServerAgentConfigPayload,
+  parseServicePongPayload,
 } from './agent.js';
 
 /** The agent-domain inferred types: see `./agent.js`. */
@@ -190,7 +201,9 @@ export type {
   AgentReadyPayload,
   ClientHelloPayload,
   ClientKind,
+  ClientPingPayload,
   ServerAgentConfigPayload,
+  ServicePongPayload,
 } from './agent.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -647,7 +660,7 @@ export type {
  *
  * The merge of the eleven per-domain maps and nothing else. No schema is listed
  * here by hand: each one is named exactly once, in the module that declares it
- * (`./agent.js` names its four, `./error.js` its one), and arrives here through
+ * (`./agent.js` names its six, `./error.js` its one), and arrives here through
  * a spread. Re-listing one would be the second definition AAP §0.9.1 forbids,
  * and would eventually name a different schema than its module does.
  *
@@ -701,21 +714,25 @@ export const MESSAGE_PAYLOAD_SCHEMAS = Object.freeze({
 } as const) satisfies Readonly<Record<MessageType, ZodType>>;
 
 /**
- * The twenty-six WebSocket message types of this protocol, each under a named
+ * The twenty-eight WebSocket message types of this protocol, each under a named
  * constant: the identifiers the three runnable surfaces send, subscribe to,
  * build envelopes with and switch on, instead of repeating the wire string at
  * every boundary.
  *
  * This object is where each name is spelled, once. Twenty-five names are the
  * specified WebSocket message names, character for character — the dot
- * spellings, and the hyphen in `'server-agent.config'`. The twenty-sixth,
- * `'source.result'`, is the answer to `'source.open'`, named in that message's
- * domain so a click on a source link is acknowledged end to end instead of
- * being reported done when a frame was merely queued. A single character of
- * drift is a frame one process sends and another refuses, so every other
- * statement of the vocabulary is derived from here: {@link MESSAGE_TYPES} lists
- * these constants in discriminant order, {@link MessageType} is derived from
- * that tuple, and the envelope's union from both.
+ * spellings, and the hyphen in `'server-agent.config'`. Three more answer a
+ * need the specified set leaves open. `'source.result'` is the answer to
+ * `'source.open'`, named in that message's domain so a click on a source link
+ * is acknowledged end to end instead of being reported done when a frame was
+ * merely queued. `'client.ping'` and `'service.pong'` are the side-effect-free
+ * liveness pair, named beside the handshake, so a client whose platform hides
+ * WebSocket control frames can prove its socket still reaches a live service.
+ * A single character of drift is a frame one process sends and another
+ * refuses, so every other statement of the vocabulary is derived from here:
+ * {@link MESSAGE_TYPES} lists these constants in discriminant order,
+ * {@link MessageType} is derived from that tuple, and the envelope's union
+ * from both.
  *
  * A key is its wire name in upper snake case — `.` and `-` become `_` — so the
  * identifier is predictable from the name (`'server-agent.config'` is
@@ -749,6 +766,8 @@ export const MESSAGE_PAYLOAD_SCHEMAS = Object.freeze({
  */
 export const MESSAGE_TYPE = Object.freeze({
   CLIENT_HELLO: 'client.hello',
+  CLIENT_PING: 'client.ping',
+  SERVICE_PONG: 'service.pong',
   AGENT_READY: 'agent.ready',
   AGENT_CONFIG: 'agent.config',
   SERVER_AGENT_CONFIG: 'server-agent.config',
@@ -777,7 +796,7 @@ export const MESSAGE_TYPE = Object.freeze({
 } as const);
 
 /**
- * The twenty-six WebSocket message types of this protocol, in the order
+ * The twenty-eight WebSocket message types of this protocol, in the order
  * `../envelope.ts` builds its discriminated union in.
  *
  * Built from {@link MESSAGE_TYPE}'s constants rather than from strings, so the
@@ -789,7 +808,8 @@ export const MESSAGE_TYPE = Object.freeze({
  *
  * The order is the domain order of the registry above, read top to bottom:
  *
- * 1. the handshake and the two runtime agents — `client.hello`, `agent.ready`,
+ * 1. the handshake, its liveness pair and the two runtime agents —
+ *    `client.hello`, `client.ping`, `service.pong`, `agent.ready`,
  *    `agent.config`, `server-agent.config`;
  * 2. tab binding — `session.bind`, `session.bound`, `tab.navigated`,
  *    `session.unbind`;
@@ -818,6 +838,8 @@ export const MESSAGE_TYPE = Object.freeze({
  */
 export const MESSAGE_TYPES = [
   MESSAGE_TYPE.CLIENT_HELLO,
+  MESSAGE_TYPE.CLIENT_PING,
+  MESSAGE_TYPE.SERVICE_PONG,
   MESSAGE_TYPE.AGENT_READY,
   MESSAGE_TYPE.AGENT_CONFIG,
   MESSAGE_TYPE.SERVER_AGENT_CONFIG,
@@ -846,7 +868,7 @@ export const MESSAGE_TYPES = [
 ] as const;
 
 /**
- * One of the twenty-six names in {@link MESSAGE_TYPES}: the discriminant of
+ * One of the twenty-eight names in {@link MESSAGE_TYPES}: the discriminant of
  * every frame this protocol carries.
  *
  * Derived from the tuple rather than written out, so the type and the runtime
@@ -890,10 +912,15 @@ export type MessageType = (typeof MESSAGE_TYPES)[number];
  * One name legitimately exists in both worlds, and it is not in this map:
  * `telemetry.event` is a WebSocket message type (the batch the page agent's
  * relay sends inward) *and* the operation id of `POST /telemetry/ingest`, whose
- * request body — `{ projectRoot, events }`, the Node preload's envelope-free
- * form — is defined in `../http.ts` beside the route constant. It stays in
- * {@link MESSAGE_TYPES} and must never be added here: the same payload schema
- * serves both, and the difference is only which transport carries it.
+ * request body — `{ projectRoot, events, armedCaptureId?, droppedCount?,
+ * lossReportId? }`, the Node preload's envelope-free form — is defined in
+ * `../http.ts` beside the route constant. It stays in {@link MESSAGE_TYPES} and
+ * must never be added here: both transports carry the same ingress events, the
+ * same refusal-only capture identity, the same loss report and the same
+ * loss-only rule (the HTTP body embeds `./telemetry.ts`'s factories and check),
+ * and the difference is which transport carries the batch, how its producer is
+ * identified, and the retry identity (`lossReportId`) only the HTTP body's
+ * in-place retries need.
  *
  * Frozen and `as const`, so the operation names survive as literal types and no
  * consumer can extend the set at runtime.
@@ -937,7 +964,7 @@ export type HttpOnlyPayloadName = (typeof HTTP_ONLY_PAYLOAD_NAMES)[number];
  *
  * Four properties of the registries above are proved here, by the compiler, at
  * the point the registries are assembled: the WebSocket registry covers exactly
- * the twenty-six message types, the named constants are exactly those types,
+ * the twenty-eight message types, the named constants are exactly those types,
  * the HTTP-only names overlap the message types nowhere, and the HTTP-only tuple
  * and map name the same five operations.
  * Each is a type-level assertion with no runtime representation — the runtime
@@ -996,7 +1023,7 @@ export type MessageRegistryIsComplete = AssertTrue<
 >;
 
 /**
- * Compile-time proof that {@link MESSAGE_TYPES} still lists twenty-six names —
+ * Compile-time proof that {@link MESSAGE_TYPES} still lists twenty-eight names —
  * the one property {@link MessageRegistryIsComplete} cannot see.
  *
  * That assertion compares a *key set* with a *union*, and both are blind to a
@@ -1009,11 +1036,12 @@ export type MessageRegistryIsComplete = AssertTrue<
  * happened to be a duplicate would hide the same way.
  *
  * So the count is asserted here: the twenty-five specified WebSocket messages,
- * plus `source.result`, the answer to `source.open`. It is the one figure in
- * this file not derived from something else, which makes it the one that has to
- * be maintained: adding a twenty-seventh message means updating this literal in
- * the same edit as the tuple, and the failure is a compile error in this file,
- * naming this line. The runtime half — twenty-six distinct keys in
+ * plus `source.result`, the answer to `source.open`, plus the `client.ping` /
+ * `service.pong` liveness pair. It is the one figure in this file not derived
+ * from something else, which makes it the one that has to be maintained:
+ * adding a twenty-ninth message means updating this literal in the same edit as
+ * the tuple, and the failure is a compile error in this file, naming this line.
+ * The runtime half — twenty-eight distinct keys in
  * {@link MESSAGE_PAYLOAD_SCHEMAS}, in this order — belongs to
  * `../__tests__/messages.test.ts`.
  *
@@ -1021,8 +1049,8 @@ export type MessageRegistryIsComplete = AssertTrue<
  *
  * @internal
  */
-export type MessageTypeCountIsTwentySix = AssertTrue<
-  (typeof MESSAGE_TYPES)['length'] extends 26 ? true : false
+export type MessageTypeCountIsTwentyEight = AssertTrue<
+  (typeof MESSAGE_TYPES)['length'] extends 28 ? true : false
 >;
 
 /**

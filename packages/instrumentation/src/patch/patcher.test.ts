@@ -106,18 +106,29 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { applyPatch } from 'diff';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { DebuggenError, err, isErr, isOk, newActionId, newSessionId, ok } from '@debuggen/shared';
+import {
+  DebuggenError,
+  err,
+  isErr,
+  isOk,
+  newActionId,
+  newSessionId,
+  normalizePosix,
+  ok,
+  toPosix,
+} from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 import { atomicReplaceFileIfUnchanged, sha256Hex } from '@debuggen/shared/node';
 
@@ -570,6 +581,18 @@ interface HarnessOptions {
    * installed. See {@link RecordingOptions.onBeforeInstall}.
    */
   readonly onBeforeInstall?: (() => void) | undefined;
+
+  /**
+   * The project root to hand the patcher, spelled as a session would record
+   * it. Defaults to the sandbox's own copy.
+   */
+  readonly projectRoot?: string | undefined;
+
+  /**
+   * The admitted canonical root, for the cases that exercise it. Omitted, the
+   * option is left out of the patcher's options altogether.
+   */
+  readonly canonicalRoot?: string | undefined;
 }
 
 /**
@@ -593,7 +616,8 @@ function buildPatcher(sandbox: Sandbox, options: HarnessOptions = {}): Harness {
   const stages: PatchStage[] = [];
 
   const patcher = createPatcher({
-    projectRoot: sandbox.projectRoot,
+    projectRoot: options.projectRoot ?? sandbox.projectRoot,
+    ...(options.canonicalRoot !== undefined ? { canonicalRoot: options.canonicalRoot } : {}),
     sessionId: sandbox.sessionId,
     planVersion: options.planVersion ?? 1,
     backups,
@@ -2173,6 +2197,352 @@ describe('the pinned target', () => {
       expectFileBytes(join(moved, basename(TARGET_FILE)), sandbox.originalBytes);
     },
   );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The admitted canonical root
+ * ---------------------------------------------------------------------------
+ *
+ * The CWE-367 case one level up from the target. The service admits a project
+ * root once, recording the canonical path it resolved to, and the patch runs
+ * minutes later. Resolving the *spelled* root afresh at that point pins
+ * whatever the spelling names by then, so a link retargeted in between would
+ * carry the whole patch into a directory nobody admitted. With
+ * `canonicalRoot` the sequence works inside the admitted path, and re-proves
+ * on every attempt that the path still resolves to itself.
+ *
+ * Every root here is taken with `realpathSync.native`, which is how the
+ * service's admission gate computes it.
+ */
+
+/** A directory the {@link Sandbox} layout has, and the one it is swapped for. */
+interface ReplacedComponent {
+  /** How the case names the component in its title. */
+  readonly component: string;
+
+  /** The component of the admitted path that is replaced after admission. */
+  readonly replaced: (sandbox: Sandbox) => string;
+
+  /** The decoy directory the replacing link points at. */
+  readonly target: (decoy: Sandbox) => string;
+}
+
+/**
+ * The two places on the admitted path a link can be planted: the project
+ * directory itself, and a directory above it. The fixed point has to catch
+ * both, because the kernel follows a link wherever on the path it sits.
+ */
+const REPLACED_COMPONENTS: readonly ReplacedComponent[] = [
+  {
+    component: 'the project directory itself',
+    replaced: (sandbox) => sandbox.projectRoot,
+    target: (decoy) => decoy.projectRoot,
+  },
+  {
+    component: 'a directory above the project',
+    replaced: (sandbox) => sandbox.root,
+    target: (decoy) => decoy.root,
+  },
+];
+
+/**
+ * Where a path inside `replaced` lives once `replaced` has been moved to
+ * `moved`; any other path is returned unchanged.
+ */
+function relocated(path: string, replaced: string, moved: string): string {
+  const inside = relative(replaced, path);
+
+  return inside.startsWith('..') ? path : join(moved, inside);
+}
+
+/**
+ * The coded error a `createPatcher` call threw, or a failed test when it threw
+ * anything else or nothing at all.
+ */
+function constructionError(build: () => Patcher): DebuggenError {
+  let built: Patcher;
+
+  try {
+    built = build();
+  } catch (caught) {
+    if (DebuggenError.is(caught)) {
+      return caught;
+    }
+
+    throw caught;
+  }
+
+  throw new Error(`Expected createPatcher to throw, received a patcher over ${built.projectRoot}`);
+}
+
+describe('the admitted canonical root', () => {
+  it('patches inside an admitted root that still resolves to itself', async () => {
+    const sandbox = makeSandbox();
+    const canonicalRoot = realpathSync.native(sandbox.projectRoot);
+    const { patcher, journal, log } = buildPatcher(sandbox, { canonicalRoot });
+
+    const outcome = appliedOutcome(
+      await patcher.patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+    );
+    const canonicalTarget = join(canonicalRoot, TARGET_FILE);
+
+    // The record names the file project-relative, as every record does, and
+    // the bytes that changed are the ones at the admitted path.
+    expect(outcome.record.file).toBe(TARGET_FILE);
+    expect(outcome.location.file).toBe(TARGET_FILE);
+    expect(journal.rows.map((row) => row.status)).toEqual(['applied']);
+    expect(log.pins).toEqual([`${patcher.projectRoot}::${TARGET_FILE}`]);
+    expect(digestOnDisk(canonicalTarget)).toBe(outcome.instrumentedHash);
+    expect(Buffer.compare(readFileSync(canonicalTarget), sandbox.originalBytes)).not.toBe(0);
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'patches the admitted directory when the spelled root is retargeted after admission (requires symlink creation)',
+    async () => {
+      // The decoy is a full copy of the fixture, so the same relative target
+      // exists there and is patchable: a sequence that followed the spelled
+      // root would succeed there, which the byte comparison below would catch.
+      const sandbox = makeSandbox();
+      const decoy = makeSandbox('decoy');
+      const spelledRoot = join(caseRoot, 'linked-project');
+
+      symlinkSync(sandbox.projectRoot, spelledRoot);
+
+      const canonicalRoot = realpathSync.native(spelledRoot);
+      const { patcher, journal, log } = buildPatcher(sandbox, {
+        projectRoot: spelledRoot,
+        canonicalRoot,
+      });
+
+      // Admitted and built; only now is the spelled link pointed elsewhere.
+      unlinkSync(spelledRoot);
+      symlinkSync(decoy.projectRoot, spelledRoot);
+
+      const outcome = appliedOutcome(
+        await patcher.patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+      );
+
+      expect(outcome.record.file).toBe(TARGET_FILE);
+      expect(journal.rows).toHaveLength(1);
+      expect(digestOnDisk(sandbox.targetPath)).toBe(outcome.instrumentedHash);
+      expect(log.pins).toEqual([`${patcher.projectRoot}::${TARGET_FILE}`]);
+      // The spelled root was never consulted: nothing resolved through it.
+      expect(log.resolutions.filter((path) => path.startsWith(spelledRoot))).toEqual([]);
+
+      // The decoy holds exactly its own bytes, with nothing written beside it.
+      expectFileBytes(decoy.targetPath, decoy.originalBytes);
+      expect(temporaryLeftoversIn(dirname(decoy.targetPath))).toEqual([]);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'confirms a chained baseline inside the admitted directory, not wherever the spelled root now points (requires symlink creation)',
+    async () => {
+      // The conflict detector reads the file too, for the second plan version's
+      // baseline. Handed the spelled root it would read the decoy, whose bytes
+      // are not the first record's instrumented bytes, and refuse the chain.
+      const sandbox = makeSandbox();
+      const decoy = makeSandbox('decoy');
+      const spelledRoot = join(caseRoot, 'linked-project');
+
+      symlinkSync(sandbox.projectRoot, spelledRoot);
+
+      const canonicalRoot = realpathSync.native(spelledRoot);
+      const journal = createTestJournal();
+      const backups = createBackupStore({
+        debuggenHome: sandbox.debuggenHome,
+        sessionId: sandbox.sessionId,
+      });
+      const patcherFor = (planVersion: number): Patcher =>
+        createPatcher({
+          projectRoot: spelledRoot,
+          canonicalRoot,
+          sessionId: sandbox.sessionId,
+          planVersion,
+          backups,
+          journal,
+        });
+
+      const first = appliedOutcome(
+        await patcherFor(1).patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+      );
+
+      unlinkSync(spelledRoot);
+      symlinkSync(decoy.projectRoot, spelledRoot);
+
+      const second = appliedOutcome(
+        await patcherFor(2).patchTarget({ file: TARGET_FILE, symbol: OTHER_SYMBOL }),
+      );
+
+      expect(second.previousRecordId).toBe(first.record.id);
+      expect(second.originalHash).toBe(first.instrumentedHash);
+      expect(digestOnDisk(sandbox.targetPath)).toBe(second.instrumentedHash);
+      expectFileBytes(decoy.targetPath, decoy.originalBytes);
+    },
+  );
+
+  for (const { component, replaced, target } of REPLACED_COMPONENTS) {
+    it.skipIf(!CAN_CREATE_SYMLINKS)(
+      `refuses the patch when ${component} is replaced by a link after admission, touching nothing (requires symlink creation)`,
+      async () => {
+        const sandbox = makeSandbox();
+        const decoy = makeSandbox('decoy');
+        const canonicalRoot = realpathSync.native(sandbox.projectRoot);
+        const { patcher, journal, log, stages } = buildPatcher(sandbox, { canonicalRoot });
+        const replacedPath = replaced(sandbox);
+        const moved = `${replacedPath}-moved`;
+        const decoyDirectory = dirname(decoy.targetPath);
+        const decoyEntries = readdirSync(decoyDirectory).sort();
+
+        // Admitted and built; only now is a component of the admitted path
+        // moved aside and a link to the decoy planted where it was.
+        renameSync(replacedPath, moved);
+        symlinkSync(target(decoy), replacedPath);
+
+        const error = refusalOf(
+          await patcher.patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+        );
+
+        expect(error.code).toBe('PATH_OUTSIDE_PROJECT');
+        expect(error.details).toEqual({
+          reason: 'project-root-moved',
+          file: TARGET_FILE,
+          symbol: TARGET_SYMBOL,
+        });
+        // Path-free: the message and hint may be logged and forwarded.
+        expect(`${error.message} ${error.hint ?? ''}`).not.toMatch(/[\\/]/u);
+
+        // Refused ahead of the first stage: no pin, no read, no write, no
+        // record, no backup in either state root, and no stage completed.
+        expect(stages).toEqual([]);
+        expect(log.pins).toEqual([]);
+        expect(log.snapshots).toEqual([]);
+        expect(log.reads).toEqual([]);
+        expect(log.writes).toEqual([]);
+        expect(journal.rows).toEqual([]);
+        expect(patcher.journaledRecords()).toEqual([]);
+        expect(patcher.detectedConflicts()).toEqual([]);
+        expect(
+          existsSync(join(relocated(sandbox.debuggenHome, replacedPath, moved), 'backups')),
+        ).toBe(false);
+        expect(existsSync(join(decoy.debuggenHome, 'backups'))).toBe(false);
+
+        // The decoy the link reaches holds exactly its own bytes, with nothing
+        // added beside it, and the admitted file — wherever it now lives —
+        // still holds the developer's.
+        expectFileBytes(decoy.targetPath, decoy.originalBytes);
+        expect(readdirSync(decoyDirectory).sort()).toEqual(decoyEntries);
+        expectFileBytes(relocated(sandbox.targetPath, replacedPath, moved), sandbox.originalBytes);
+      },
+    );
+  }
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'reports the refusal to a batch at the resolve-target stage, with nothing that could hold a patch (requires symlink creation)',
+    async () => {
+      const sandbox = makeSandbox();
+      const decoy = makeSandbox('decoy');
+      const canonicalRoot = realpathSync.native(sandbox.projectRoot);
+      const { patcher } = buildPatcher(sandbox, { canonicalRoot });
+      const moved = `${sandbox.projectRoot}-moved`;
+
+      renameSync(sandbox.projectRoot, moved);
+      symlinkSync(decoy.projectRoot, sandbox.projectRoot);
+
+      const batch = await patcher.patchActions([patchAction(TARGET_FILE, TARGET_SYMBOL)]);
+
+      expect(batch.applied).toEqual([]);
+      expect(batch.journaled).toEqual([]);
+      expect(batch.failure?.error.details?.['reason']).toBe('project-root-moved');
+      expect(batch.failure?.stage).toBe('resolve-target');
+      expect(batch.failure?.record).toBeUndefined();
+      expect(batch.failure?.fileMayHoldPatch).toBe(false);
+      expectFileBytes(decoy.targetPath, decoy.originalBytes);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    're-proves the root on every attempt, so a root put back is patched again (requires symlink creation)',
+    async () => {
+      // The check is a property of each attempt, not a verdict the patcher
+      // remembers: the refusal while the link stands, and the patch once the
+      // admitted directory is back where it was admitted.
+      const sandbox = makeSandbox();
+      const decoy = makeSandbox('decoy');
+      const canonicalRoot = realpathSync.native(sandbox.projectRoot);
+      const { patcher, journal } = buildPatcher(sandbox, { canonicalRoot });
+      const moved = `${sandbox.projectRoot}-moved`;
+
+      renameSync(sandbox.projectRoot, moved);
+      symlinkSync(decoy.projectRoot, sandbox.projectRoot);
+
+      const refused = refusalOf(
+        await patcher.patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+      );
+
+      expect(refused.details?.['reason']).toBe('project-root-moved');
+
+      unlinkSync(sandbox.projectRoot);
+      renameSync(moved, sandbox.projectRoot);
+
+      const outcome = appliedOutcome(
+        await patcher.patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+      );
+
+      expect(journal.rows).toHaveLength(1);
+      expect(digestOnDisk(sandbox.targetPath)).toBe(outcome.instrumentedHash);
+      expectFileBytes(decoy.targetPath, decoy.originalBytes);
+    },
+  );
+
+  it.each(['project', './project', 'src/../project', ''])(
+    'refuses a canonical root that is not absolute (%j) when the patcher is built',
+    (canonicalRoot) => {
+      const sandbox = makeSandbox();
+
+      const error = constructionError(() =>
+        createPatcher({
+          projectRoot: sandbox.projectRoot,
+          canonicalRoot,
+          sessionId: sandbox.sessionId,
+          planVersion: 1,
+          backups: createBackupStore({
+            debuggenHome: sandbox.debuggenHome,
+            sessionId: sandbox.sessionId,
+          }),
+          journal: createTestJournal(),
+        }),
+      );
+
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.details?.['reason']).toBe('canonical-root-not-absolute');
+    },
+  );
+
+  it('reports the admitted canonical root as its project root, and the spelled one without it', () => {
+    const sandbox = makeSandbox();
+    const backups = createBackupStore({
+      debuggenHome: sandbox.debuggenHome,
+      sessionId: sandbox.sessionId,
+    });
+    const build = (canonicalRoot: string | undefined): Patcher =>
+      createPatcher({
+        projectRoot: sandbox.projectRoot,
+        ...(canonicalRoot !== undefined ? { canonicalRoot } : {}),
+        sessionId: sandbox.sessionId,
+        planVersion: 1,
+        backups,
+        journal: createTestJournal(),
+      });
+    const canonicalRoot = realpathSync.native(sandbox.projectRoot);
+
+    expect(build(canonicalRoot).projectRoot).toBe(normalizePosix(toPosix(canonicalRoot)));
+    expect(build(undefined).projectRoot).toBe(normalizePosix(toPosix(sandbox.projectRoot)));
+    // A drive-rooted canonical path is accepted and normalised to forward
+    // slashes, which is the form the fixed-point comparison is made in.
+    expect(build('D:\\work\\lumen-app\\').projectRoot).toBe('D:/work/lumen-app');
+  });
 });
 
 /*

@@ -73,8 +73,8 @@
  * handler then awaits the client's body, for as long as the client chooses,
  * and the resolver's reads. A credential retired inside those waits — by
  * `POST /credentials/rotate` on another connection (`AuthService.rotateAll`),
- * by an expiry — must read nothing (AAP §0.5.6), and this route's one effect
- * is disclosure: its reply. So every reply that follows an `await` is built
+ * by an expiry — must read nothing, and this route's one effect is
+ * disclosure: its reply. So every reply that follows an `await` is built
  * only after the fence, with no `await` between the two: a body refused as
  * unreadable, oversized, late or off-schema is fenced after its read, and
  * everything the resolver answered is fenced after the resolver. The check and

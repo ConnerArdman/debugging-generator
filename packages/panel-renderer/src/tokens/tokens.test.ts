@@ -27,10 +27,11 @@
  *   3. **Reach.** The two authored stylesheets consume the table and extend it
  *      nowhere: neither declares a custom property, every property a rule reads
  *      is either a catalogued token or a component-scoped `--dgc-*` value, no
- *      length is written as a literal outside one documented clip box — a
- *      measured `--dgc-*` number takes its unit from `--dg-pixel-unit` — no
- *      border or outline width is written as a keyword, and no retired
- *      constant namespace is named in a rule or a comment. A value declared
+ *      length, no colour and no number other than zero is written as a literal
+ *      anywhere in a value — a measured `--dgc-*` number takes its unit from
+ *      `--dg-pixel-unit`, a percentage, ratio, factor, stroke or extent is a
+ *      token — no border or outline width is written as a keyword, and no
+ *      retired constant namespace is named in a rule or a comment. A value declared
  *      beside the tokens is covered by none of the checks here, which would
  *      leave this suite describing less of the product than it appears to.
  *   4. **Contrast.** Every text/surface and status/surface pair of every theme
@@ -280,11 +281,24 @@ const TOKEN_KEYS = Object.keys(DESIGN_TOKENS.dark) as TokenKey[];
  * the stroke of a relationship connector, which neither border colour can
  * carry at the 3:1 non-text bar; `--dg-icon-size`, `--dg-spinner-size`,
  * `--dg-icon-button-size` and `--dg-line-block-size` are the glyph, spinner,
- * icon-only control and one-line boxes; `--dg-border-width-hairline` and
+ * icon-only control and one-line boxes, `--dg-glyph-line-inset` the margin
+ * that centres a glyph in one line, and `--dg-hidden-box-size` the box of
+ * visually hidden content; `--dg-border-width-hairline` and
  * `--dg-border-width-marker` are the two edge weights; `--dg-pixel-unit` is
- * the unit a measured coordinate is given; and the `--dg-column-min-*` and
+ * the unit a measured coordinate is given; the `--dg-column-min-*` and
  * `--dg-column-share-*` families are the floors and spare-width shares every
- * data-table column role is built from (`src/primitives/DataTable.tsx`).
+ * data-table column role is built from (`src/primitives/DataTable.tsx`), and
+ * `--dg-column-yield` the fraction of its floor a truncating role gives up so
+ * a narrow table fits, and `--dg-column-yield-return-scale` how abruptly a
+ * table too narrow even for that takes the yield back;
+ * `--dg-space-inverse-*` are the negated space steps,
+ * `--dg-size-full`, `--dg-size-half` and `--dg-radius-round` the proportions a
+ * box fills, centres or rounds by; `--dg-stroke-*` are the stroke weights and
+ * dash patterns of drawn charts; the scroll caps, state and silhouette floors,
+ * chart minimums and waterfall shares are the component extents; the
+ * `--dg-split-*` family is the split layout's basis, default weight and grow
+ * scale; and `--dg-spin-*` with `--dg-shimmer-background-size` complete the
+ * motion family.
  * The stylesheets and the table primitive need every one of them, and none of
  * them may be written as a literal, so the only lawful place for them is this
  * table — which is also what puts them under every check below, the property a
@@ -297,6 +311,8 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-border-subtle',
   '--dg-border-width-hairline',
   '--dg-border-width-marker',
+  '--dg-chart-min-inline-size',
+  '--dg-code-block-max-block-size',
   '--dg-column-min-count',
   '--dg-column-min-label',
   '--dg-column-min-name',
@@ -309,17 +325,22 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-column-share-default',
   '--dg-column-share-wide',
   '--dg-column-share-widest',
+  '--dg-column-yield',
+  '--dg-column-yield-return-scale',
   '--dg-danger',
   '--dg-duration-critical',
   '--dg-duration-fast',
   '--dg-duration-normal',
   '--dg-duration-slow',
+  '--dg-error-query-max-block-size',
   '--dg-focus-ring',
   '--dg-font-mono',
   '--dg-font-ui',
   '--dg-font-weight-medium',
+  '--dg-glyph-line-inset',
   '--dg-graph-edge',
   '--dg-heading',
+  '--dg-hidden-box-size',
   '--dg-icon-button-size',
   '--dg-icon-size',
   '--dg-info',
@@ -342,6 +363,8 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-kind-service',
   '--dg-kind-service-ink',
   '--dg-line-block-size',
+  '--dg-loading-min-block-size',
+  '--dg-metric-card-min-inline-size',
   '--dg-mono-md',
   '--dg-mono-sm',
   '--dg-motion-duration',
@@ -349,11 +372,23 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-pixel-unit',
   '--dg-radius-lg',
   '--dg-radius-md',
+  '--dg-radius-round',
   '--dg-radius-sm',
+  '--dg-scroll-cap-lg',
+  '--dg-scroll-cap-md',
+  '--dg-scroll-cap-sm',
+  '--dg-search-max-inline-size',
   '--dg-shadow-0',
   '--dg-shadow-1',
   '--dg-shadow-2',
+  '--dg-shimmer-background-size',
   '--dg-shimmer-duration',
+  '--dg-size-full',
+  '--dg-size-half',
+  '--dg-skeleton-block-size',
+  '--dg-skeleton-chart-block-size',
+  '--dg-skeleton-row-medium',
+  '--dg-skeleton-row-short',
   '--dg-space-0',
   '--dg-space-1',
   '--dg-space-2',
@@ -362,7 +397,20 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-space-5',
   '--dg-space-6',
   '--dg-space-7',
+  '--dg-space-inverse-0',
+  '--dg-space-inverse-1',
+  '--dg-spin-duration',
+  '--dg-spin-rotation',
   '--dg-spinner-size',
+  '--dg-split-grow-scale',
+  '--dg-split-pane-basis',
+  '--dg-split-pane-weight',
+  '--dg-state-min-block-size',
+  '--dg-stroke-dash-dashed',
+  '--dg-stroke-dash-dotted',
+  '--dg-stroke-width-emphasis',
+  '--dg-stroke-width-hairline',
+  '--dg-stroke-width-halo',
   '--dg-success',
   '--dg-surface-base',
   '--dg-surface-elevated',
@@ -374,7 +422,11 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-text-secondary',
   '--dg-text-sm',
   '--dg-text-xs',
+  '--dg-tooltip-max-inline-size',
   '--dg-warning',
+  '--dg-waterfall-axis-min-inline-size',
+  '--dg-waterfall-bar-share',
+  '--dg-waterfall-label-share',
   '--dg-z-base',
   '--dg-z-overlay',
   '--dg-z-tooltip',
@@ -516,10 +568,11 @@ const GRAPH_EDGE_RULES = ['.dg-dependency-graph__edge', '.dg-timeline__edge'] as
  * They are font-relative by design (see the token source), so each is pinned
  * to its exact expression: `1em` for the glyph square, an alias of the glyph
  * square for the spinner, a sum of the glyph square and two space tokens for
- * the icon-only control, and `1lh` for the one-line box. A value in an absolute
- * unit would still render, which is exactly why it has to fail here instead — a
- * fixed square next to scaling type is the defect these tokens exist to
- * prevent.
+ * the icon-only control, `1lh` for the one-line box, and half the difference
+ * of the two for the margin that centres the glyph in that line. A value in an
+ * absolute unit would still render, which is exactly why it has to fail here
+ * instead — a fixed square next to scaling type is the defect these tokens
+ * exist to prevent.
  */
 const SIZE_TOKENS = [
   { key: 'iconSize', value: '1em' },
@@ -529,6 +582,11 @@ const SIZE_TOKENS = [
     value: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
   },
   { key: 'lineBlockSize', value: '1lh' },
+  {
+    key: 'glyphLineInset',
+    value: 'calc((var(--dg-line-block-size) - var(--dg-icon-size)) / 2)',
+  },
+  { key: 'hiddenBoxSize', value: '1em' },
 ] as const satisfies readonly { readonly key: TokenKey; readonly value: string }[];
 
 /**
@@ -623,23 +681,109 @@ const LENGTH_LITERAL_PATTERN =
   /(?<![\w.-])\d*\.?\d+(?:px|em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vi|vb|vmin|vmax|svw|svh|lvw|lvh|dvw|dvh|cqw|cqh|cqi|cqb|cqmin|cqmax|pt|pc|in|cm|mm|q)(?![\w-])/giu;
 
 /**
- * The declarations that may carry a length literal although they are not a
- * unit bridge, each stated exactly and with the rule it belongs to.
+ * A number written as a literal anywhere in a declaration's value — with or
+ * without a unit, a percentage sign, a flex unit or an angle — including a
+ * signed one such as the `-1` of a negation.
  *
- * One exists: the visually hidden utility of `base.css` bounds its clip box
- * with a font-relative square. That box paints nothing — `clip-path` removes
- * it from the visual surface entirely — so its size is not a visual dimension
- * and has no token to resolve to; it exists only so the out-of-flow box can
- * never extend a scrollable area.
+ * The number may not follow a word character or a dot, so the digits inside an
+ * identifier never match; a custom property's name is removed before the scan
+ * (see {@link numericLiteralsIn}), because `--dg-space-1` is a reference, not a
+ * number. A sign counts only where it cannot be part of an identifier. The
+ * scan is run on declaration VALUES only: the numbers of a selector such as
+ * `:nth-of-type(3n + 2)` choose elements and are no visual value.
  */
-const STRUCTURAL_LENGTH_DECLARATIONS = [
-  { rel: 'src/styles/base.css', selector: '.dg-visually-hidden', declaration: 'inline-size: 1em' },
-  { rel: 'src/styles/base.css', selector: '.dg-visually-hidden', declaration: 'block-size: 1em' },
-] as const satisfies readonly {
-  readonly rel: string;
-  readonly selector: string;
-  readonly declaration: string;
-}[];
+const NUMERIC_LITERAL_PATTERN = /(?<![\w.-])[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?(?:[a-z]+|%)?/giu;
+
+/**
+ * A colour written as a literal: hexadecimal notation, or a functional colour
+ * notation of any colour space. Every colour is a token.
+ */
+const COLOUR_LITERAL_PATTERN =
+  /#[0-9a-f]{3,8}(?![\w-])|(?<![\w-])(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(/iu;
+
+/**
+ * The numbers a declaration value writes as literals, other than zero.
+ *
+ * Zero is one of the permitted literals, in any unit (`0`, `0%`): it is the
+ * absence of a size rather than a size. Quoted strings (a `content` glyph) and
+ * custom property names are removed first, so only a number the stylesheet
+ * itself states is reported.
+ */
+function numericLiteralsIn(value: string): string[] {
+  const scanned = value.replace(/(['"])(?:\\.|(?!\1).)*\1/gu, '').replace(/--[\w-]+/gu, '');
+  return [...scanned.matchAll(NUMERIC_LITERAL_PATTERN)]
+    .map((match) => match[0])
+    .filter((literal) => Number.parseFloat(literal) !== 0);
+}
+
+/**
+ * The inverse spacing steps, each the exact negation of the space step it
+ * mirrors: a stylesheet names the inverse step, and the negation lives here.
+ */
+const INVERSE_SPACE_TOKENS = [
+  { key: 'spaceInverse0', mirrors: 'space0' },
+  { key: 'spaceInverse1', mirrors: 'space1' },
+] as const satisfies readonly { readonly key: TokenKey; readonly mirrors: TokenKey }[];
+
+/**
+ * The proportions, pinned to the exact share each one names. A proportion
+ * encodes a relationship ("as wide as its container", "half of it", "a circle
+ * of the square"), so any other value would silently change what every rule
+ * that names it means.
+ */
+const PROPORTION_TOKENS = [
+  { key: 'sizeFull', value: '100%' },
+  { key: 'sizeHalf', value: '50%' },
+  { key: 'radiusRound', value: '50%' },
+] as const satisfies readonly { readonly key: TokenKey; readonly value: string }[];
+
+/** The three SVG stroke weights, from the lightest to the heaviest. */
+const STROKE_WIDTH_KEYS = [
+  'strokeWidthHairline',
+  'strokeWidthEmphasis',
+  'strokeWidthHalo',
+] as const satisfies readonly TokenKey[];
+
+/** The two SVG dash patterns. */
+const STROKE_DASH_KEYS = [
+  'strokeDashDashed',
+  'strokeDashDotted',
+] as const satisfies readonly TokenKey[];
+
+/** A strictly positive unitless number, captured as its magnitude. */
+const UNITLESS_NUMBER_PATTERN = /^(\d*\.?\d+)$/u;
+
+/** A dash pattern: a dash and a gap, each a strictly positive unitless number. */
+const DASH_PATTERN = /^(\d*\.?\d+) (\d*\.?\d+)$/u;
+
+/**
+ * The component extents that are a multiple of a space token: the form every
+ * one of them must keep, `calc(var(--dg-space-N) * k)` with a positive integer
+ * `k`, so an extent stays on the design scale and moves with it.
+ */
+const SPACE_MULTIPLE_EXTENT_KEYS = [
+  'scrollCapLg',
+  'scrollCapMd',
+  'scrollCapSm',
+  'codeBlockMaxBlockSize',
+  'errorQueryMaxBlockSize',
+  'stateMinBlockSize',
+  'loadingMinBlockSize',
+  'skeletonBlockSize',
+  'skeletonChartBlockSize',
+  'tooltipMaxInlineSize',
+  'searchMaxInlineSize',
+  'chartMinInlineSize',
+  'metricCardMinInlineSize',
+  'waterfallAxisMinInlineSize',
+  'splitPaneBasis',
+] as const satisfies readonly TokenKey[];
+
+/** A multiple of a space token, capturing the token name and the multiple. */
+const SPACE_MULTIPLE_PATTERN = /^calc\(var\((--dg-space-\d)\) \* (\d+)\)$/u;
+
+/** A percentage strictly between 0 and 100, captured as its magnitude. */
+const PARTIAL_PERCENTAGE_PATTERN = /^(\d+(?:\.\d+)?)%$/u;
 
 /**
  * The contrast minimum normal-size text must reach, stated here as a literal.
@@ -739,18 +883,62 @@ const THEME_INVARIANT_FAMILIES = [
     family: 'spacing scale',
     keys: ['space0', 'space1', 'space2', 'space3', 'space4', 'space5', 'space6', 'space7'],
   },
+  { family: 'inverse spacing', keys: ['spaceInverse0', 'spaceInverse1'] },
   { family: 'font stacks', keys: ['fontUi', 'fontMono'] },
   { family: 'type weight', keys: ['fontWeightMedium'] },
   {
     family: 'type roles',
     keys: ['textXs', 'textSm', 'textMd', 'textLg', 'heading', 'monoSm', 'monoMd'],
   },
-  { family: 'radii', keys: ['radiusSm', 'radiusMd', 'radiusLg'] },
+  { family: 'radii', keys: ['radiusSm', 'radiusMd', 'radiusLg', 'radiusRound'] },
   {
     family: 'glyph and control sizes',
-    keys: ['iconSize', 'spinnerSize', 'iconButtonSize', 'lineBlockSize'],
+    keys: [
+      'iconSize',
+      'spinnerSize',
+      'iconButtonSize',
+      'lineBlockSize',
+      'glyphLineInset',
+      'hiddenBoxSize',
+    ],
   },
   { family: 'measured geometry', keys: ['pixelUnit'] },
+  { family: 'proportions', keys: ['sizeFull', 'sizeHalf'] },
+  { family: 'table column yield', keys: ['columnYield', 'columnYieldReturnScale'] },
+  {
+    family: 'SVG strokes',
+    keys: [
+      'strokeWidthHairline',
+      'strokeWidthEmphasis',
+      'strokeWidthHalo',
+      'strokeDashDashed',
+      'strokeDashDotted',
+    ],
+  },
+  {
+    family: 'component extents',
+    keys: [
+      'scrollCapLg',
+      'scrollCapMd',
+      'scrollCapSm',
+      'codeBlockMaxBlockSize',
+      'errorQueryMaxBlockSize',
+      'stateMinBlockSize',
+      'loadingMinBlockSize',
+      'skeletonBlockSize',
+      'skeletonChartBlockSize',
+      'skeletonRowShort',
+      'skeletonRowMedium',
+      'tooltipMaxInlineSize',
+      'searchMaxInlineSize',
+      'chartMinInlineSize',
+      'metricCardMinInlineSize',
+      'waterfallAxisMinInlineSize',
+      'waterfallLabelShare',
+      'waterfallBarShare',
+    ],
+  },
+  { family: 'split layout', keys: ['splitPaneBasis', 'splitPaneWeight', 'splitGrowScale'] },
   {
     family: 'table column minimums',
     keys: [
@@ -770,7 +958,17 @@ const THEME_INVARIANT_FAMILIES = [
   },
   // Reducing motion is a user preference expressed through a media query, not a
   // theme, so a theme never shortens or removes a duration.
-  { family: 'motion constants', keys: ['motionDuration', 'motionEasing', 'shimmerDuration'] },
+  {
+    family: 'motion constants',
+    keys: [
+      'motionDuration',
+      'motionEasing',
+      'shimmerDuration',
+      'shimmerBackgroundSize',
+      'spinDuration',
+      'spinRotation',
+    ],
+  },
   { family: 'stacking levels', keys: ['zBase', 'zOverlay', 'zTooltip'] },
 ] as const satisfies readonly { readonly family: string; readonly keys: readonly TokenKey[] }[];
 
@@ -786,6 +984,7 @@ const THEME_INVARIANT_FAMILIES = [
 const MOTION_TOKENS = [
   { key: 'motionDuration', kind: 'duration' },
   { key: 'shimmerDuration', kind: 'duration' },
+  { key: 'spinDuration', kind: 'duration' },
   { key: 'motionEasing', kind: 'easing' },
 ] as const satisfies readonly {
   readonly key: TokenKey;
@@ -1186,7 +1385,7 @@ describe('generated token stylesheet', () => {
   });
 
   it('declares exactly the catalogued custom properties', () => {
-    expect(EXPECTED_CSS_PROPERTY_NAMES).toHaveLength(87);
+    expect(EXPECTED_CSS_PROPERTY_NAMES).toHaveLength(125);
     expect(
       new Set(EXPECTED_CSS_PROPERTY_NAMES).size,
       'the catalogue lists a custom property twice',
@@ -1496,11 +1695,210 @@ describe('design token completeness', () => {
       expect(DESIGN_TOKENS[theme].graphEdge, `${theme}.graphEdge`).toBe(cssVar('textMuted'));
     }
   });
+
+  for (const { key, mirrors } of INVERSE_SPACE_TOKENS) {
+    it(`keeps ${String(key)} the exact negation of ${String(mirrors)} in every theme`, () => {
+      // Stated as a negation of the step rather than as a length of its own, so
+      // an inverse step can never drift from the step it mirrors.
+      for (const theme of PANEL_THEMES) {
+        expect(DESIGN_TOKENS[theme][key], `${theme}.${String(key)}`).toBe(
+          `calc(${cssVar(mirrors)} * -1)`,
+        );
+      }
+    });
+  }
+
+  for (const { key, value } of PROPORTION_TOKENS) {
+    it(`keeps ${String(key)} exactly ${value} in every theme`, () => {
+      for (const theme of PANEL_THEMES) {
+        expect(
+          DESIGN_TOKENS[theme][key],
+          `${theme}.${String(key)} names a relationship to its container; any other share would ` +
+            'change what every rule that reads it means',
+        ).toBe(value);
+      }
+    });
+  }
+
+  it('gives the stroke weights strictly positive unitless values, lightest to heaviest', () => {
+    // Unitless on purpose: an SVG stroke is measured in the user units of the
+    // drawing it belongs to, and a unit would scale it with the page instead.
+    const weights = STROKE_WIDTH_KEYS.map((key) => {
+      const value = DESIGN_TOKENS.dark[key];
+      const [, magnitude] = UNITLESS_NUMBER_PATTERN.exec(value) ?? [];
+
+      expect(
+        magnitude,
+        `${String(key)} holds "${value}", which is not a unitless number`,
+      ).toBeDefined();
+      return Number(magnitude);
+    });
+
+    expect(
+      weights.every((weight) => weight > 0),
+      'a zero stroke draws nothing',
+    ).toBe(true);
+    expect(weights, 'hairline, emphasis and halo must grow in that order').toEqual(
+      [...weights].sort((first, second) => first - second),
+    );
+    expect(new Set(weights).size, 'two stroke roles share one weight').toBe(weights.length);
+  });
+
+  it('gives each dash pattern a strictly positive dash and gap', () => {
+    for (const key of STROKE_DASH_KEYS) {
+      const value = DESIGN_TOKENS.dark[key];
+      const [, dash, gap] = DASH_PATTERN.exec(value) ?? [];
+
+      expect(dash, `${String(key)} holds "${value}", which is not a dash and a gap`).toBeDefined();
+      expect(Number(dash), `${String(key)} must draw a dash`).toBeGreaterThan(0);
+      expect(Number(gap), `${String(key)} must leave a gap`).toBeGreaterThan(0);
+    }
+
+    expect(
+      DESIGN_TOKENS.dark.strokeDashDashed,
+      'the dashed and dotted patterns must read as two different lines',
+    ).not.toBe(DESIGN_TOKENS.dark.strokeDashDotted);
+  });
+
+  it('builds every component extent as a positive multiple of a catalogued space token', () => {
+    const catalogued = new Set(EXPECTED_CSS_PROPERTY_NAMES);
+
+    for (const key of SPACE_MULTIPLE_EXTENT_KEYS) {
+      const value = DESIGN_TOKENS.dark[key];
+      const [, token = '', multiple] = SPACE_MULTIPLE_PATTERN.exec(value) ?? [];
+
+      expect(
+        multiple,
+        `${String(key)} holds "${value}", which is not calc(var(--dg-space-N) * k): an extent ` +
+          'off the design scale would not move with it',
+      ).toBeDefined();
+      expect(catalogued.has(token), `${String(key)} scales ${token}, which no token declares`).toBe(
+        true,
+      );
+      expect(Number(multiple), `${String(key)} must be a positive extent`).toBeGreaterThan(0);
+    }
+  });
+
+  it('orders the three scroll caps from the tallest to the shortest', () => {
+    const multiple = (key: TokenKey): number =>
+      Number(SPACE_MULTIPLE_PATTERN.exec(DESIGN_TOKENS.dark[key])?.[2] ?? Number.NaN);
+
+    expect(multiple('scrollCapLg')).toBeGreaterThan(multiple('scrollCapMd'));
+    expect(multiple('scrollCapMd')).toBeGreaterThan(multiple('scrollCapSm'));
+  });
+
+  it('keeps the list silhouette bars partial and of two distinct lengths', () => {
+    const lengths = (['skeletonRowShort', 'skeletonRowMedium'] as const).map((key) => {
+      const value = DESIGN_TOKENS.dark[key];
+      const [, magnitude] = PARTIAL_PERCENTAGE_PATTERN.exec(value) ?? [];
+
+      expect(magnitude, `${key} holds "${value}", which is not a percentage`).toBeDefined();
+      expect(Number(magnitude), `${key} must be shorter than a full bar`).toBeLessThan(100);
+      expect(Number(magnitude), `${key} must draw a bar`).toBeGreaterThan(0);
+      return Number(magnitude);
+    });
+
+    const [short = Number.NaN, medium = Number.NaN] = lengths;
+    expect(short, 'the short bar must be shorter than the medium one').toBeLessThan(medium);
+  });
+
+  it('gives the waterfall time track a larger share than its label, in fr', () => {
+    const share = (key: TokenKey): number =>
+      Number(FR_FACTOR_PATTERN.exec(DESIGN_TOKENS.dark[key])?.[1] ?? Number.NaN);
+
+    expect(share('waterfallLabelShare')).toBeGreaterThan(0);
+    expect(share('waterfallBarShare')).toBeGreaterThan(share('waterfallLabelShare'));
+  });
+
+  it('keeps the split layout factors unitless: one default weight, a grow scale of at least one', () => {
+    const { splitPaneWeight, splitGrowScale } = DESIGN_TOKENS.dark;
+
+    expect(splitPaneWeight, 'an unweighted pane weighs exactly one').toBe('1');
+    expect(splitGrowScale).toMatch(UNITLESS_NUMBER_PATTERN);
+    expect(
+      Number(splitGrowScale),
+      'scaled weights must sum to at least one on any line, or a wrapped pane stops short',
+    ).toBeGreaterThanOrEqual(1);
+  });
+
+  it('keeps the column yield a unitless fraction strictly between nothing and the whole floor', () => {
+    // One would yield nothing, which is the scrolling the yield exists to
+    // postpone; zero would let a truncating column collapse to its padding.
+    const value = DESIGN_TOKENS.dark.columnYield;
+    const [, magnitude] = UNITLESS_NUMBER_PATTERN.exec(value) ?? [];
+
+    expect(magnitude, `columnYield holds "${value}", which is not a unitless number`).toBeDefined();
+    expect(Number(magnitude)).toBeGreaterThan(0);
+    expect(Number(magnitude)).toBeLessThan(1);
+  });
+
+  it('keeps the yield return scale a unitless factor steep enough for a sub-pixel change of regime', () => {
+    // A table too narrow even for its yielded floors grows its grid by this
+    // factor per pixel of shortfall, up to the yield it can take back. Six
+    // truncating text columns - twice the widest table in the product - at a
+    // generous ten pixels per `ch` must still change regime within one pixel.
+    const { columnYieldReturnScale, columnYield, columnMinText } = DESIGN_TOKENS.dark;
+    const [, textFloor] = /^(\d+)ch$/u.exec(columnMinText) ?? [];
+
+    expect(columnYieldReturnScale).toMatch(/^\d+$/u);
+    expect(textFloor, `columnMinText holds "${columnMinText}"`).toBeDefined();
+    const capacityPx = 6 * Number(textFloor) * (1 - Number(columnYield)) * 10;
+    expect(capacityPx / Number(columnYieldReturnScale)).toBeLessThan(1);
+  });
+
+  it('keeps the spinner a full turn and the shimmer gradient wider than its element', () => {
+    const { spinRotation, shimmerBackgroundSize } = DESIGN_TOKENS.dark;
+    const [, inline, block] = /^(\d+)% (\d+)%$/u.exec(shimmerBackgroundSize) ?? [];
+
+    expect(spinRotation, 'one spinner turn is one full rotation').toBe('1turn');
+    expect(inline, `shimmerBackgroundSize holds "${shimmerBackgroundSize}"`).toBeDefined();
+    expect(
+      Number(inline),
+      'a gradient no wider than its element cannot sweep across it',
+    ).toBeGreaterThan(100);
+    expect(Number(block), 'the gradient covers the element block-wise').toBe(100);
+  });
 });
 
 /* -------------------------------------------------------------------------- */
 /* 3. Reach: the stylesheets extend the table nowhere                         */
 /* -------------------------------------------------------------------------- */
+
+describe('numeric literal scanner', () => {
+  // The reach checks below are only as good as the scanner they rely on, so its
+  // answers are pinned against hand-worked values: a reference is not a
+  // number, zero is permitted in any unit, and a signed, percentage, fractional
+  // or angular number is found wherever it sits in a value.
+  const cases = [
+    { value: 'var(--dg-space-7)', literals: [] },
+    { value: 'calc(var(--dg-space-7) * 18)', literals: ['18'] },
+    { value: 'calc(var(--dg-space-1) * -1)', literals: ['-1'] },
+    { value: '0', literals: [] },
+    { value: 'max(0%, var(--dgc-min-inline, 0))', literals: [] },
+    { value: '100%', literals: ['100%'] },
+    { value: '1 1 auto', literals: ['1', '1'] },
+    { value: '1 / -1', literals: ['1', '-1'] },
+    { value: 'minmax(0, 2fr) .5fr', literals: ['2fr', '.5fr'] },
+    { value: '1turn', literals: ['1turn'] },
+    { value: "'↑ 2' / ''", literals: [] },
+    { value: 'translate3d(var(--dg-size-full), 0, 0)', literals: [] },
+    { value: 'var(--dg-border-width-hairline) solid var(--dg-border-subtle)', literals: [] },
+  ] as const;
+
+  for (const { value, literals } of cases) {
+    it(`finds [${literals.join(', ')}] in "${value}"`, () => {
+      expect(numericLiteralsIn(value)).toEqual(literals);
+    });
+  }
+
+  it('recognises colour literals and leaves token references alone', () => {
+    expect(COLOUR_LITERAL_PATTERN.test('#1d2230')).toBe(true);
+    expect(COLOUR_LITERAL_PATTERN.test('rgba(0, 0, 0, 0.4)')).toBe(true);
+    expect(COLOUR_LITERAL_PATTERN.test('oklch(0.7 0.1 200)')).toBe(true);
+    expect(COLOUR_LITERAL_PATTERN.test('var(--dg-accent)')).toBe(false);
+    expect(COLOUR_LITERAL_PATTERN.test('var(--dgc-badge-color, currentColor)')).toBe(false);
+  });
+});
 
 describe('authored stylesheets', () => {
   for (const { rel, file } of AUTHORED_STYLESHEETS) {
@@ -1568,20 +1966,13 @@ describe('authored stylesheets', () => {
         // A length literal is a visual dimension decided outside the token
         // table — the shape a hardcoded glyph box or a hardcoded inset takes.
         // That includes the unit a UNITLESS measured `--dgc-*` number is given:
-        // it is `--dg-pixel-unit`, never a `1px` written here. One form is
-        // exempt: the documented clip box of content that paints nothing.
-        const exempt = STRUCTURAL_LENGTH_DECLARATIONS.filter((entry) => entry.rel === rel);
+        // it is `--dg-pixel-unit`, never a `1px` written here, and a zero
+        // written with a unit: the permitted literal is the bare `0`.
         const offenders: string[] = [];
 
         for (const { selector, declarations } of styleRules(rules)) {
           for (const declaration of declarations) {
-            if (declaration.match(LENGTH_LITERAL_PATTERN) === null) {
-              continue;
-            }
-            const sanctioned = exempt.some(
-              (entry) => entry.selector === selector && entry.declaration === declaration,
-            );
-            if (!sanctioned) {
+            if (declaration.match(LENGTH_LITERAL_PATTERN) !== null) {
               offenders.push(`${selector} { ${declaration} }`);
             }
           }
@@ -1591,6 +1982,55 @@ describe('authored stylesheets', () => {
           offenders,
           'a length written as a literal is a visual value outside the token table. ' +
             'Resolve it to a --dg-* token — add one to src/tokens/tokens.ts if none fits',
+        ).toEqual([]);
+      });
+
+      it('states every number other than zero through a token', () => {
+        // The design system admits `0`, `none`, `auto`, `inherit`,
+        // `currentColor` and `transparent` as the only literals, so ANY other
+        // number in a value is a decision taken outside the token table: a
+        // percentage, a flex or grid factor, an aspect ratio, a stroke weight,
+        // a dash pattern, the multiple of an extent, a negation, an angle. Each
+        // one is a token — a proportion, a stroke, an extent, an inverse space
+        // step — and a rule names it. The value is scanned with custom property
+        // names and quoted strings removed, so a token reference is never
+        // mistaken for a number.
+        const offenders: string[] = [];
+
+        for (const { selector, declarations } of styleRules(rules)) {
+          for (const declaration of declarations) {
+            const separator = declaration.indexOf(':');
+            const literals = numericLiteralsIn(declaration.slice(separator + 1));
+            if (separator >= 0 && literals.length > 0) {
+              offenders.push(`${selector} { ${declaration} } — ${literals.join(', ')}`);
+            }
+          }
+        }
+
+        expect(
+          offenders,
+          'a number written in a stylesheet is a value outside the token table. Resolve it to a ' +
+            '--dg-* token — add one to src/tokens/tokens.ts if none fits — or to a keyword the ' +
+            'design system permits',
+        ).toEqual([]);
+      });
+
+      it('states every colour through a token', () => {
+        const offenders: string[] = [];
+
+        for (const { selector, declarations } of styleRules(rules)) {
+          for (const declaration of declarations) {
+            const separator = declaration.indexOf(':');
+            if (separator >= 0 && COLOUR_LITERAL_PATTERN.test(declaration.slice(separator + 1))) {
+              offenders.push(`${selector} { ${declaration} }`);
+            }
+          }
+        }
+
+        expect(
+          offenders,
+          'a colour written as a literal escapes every theme and every contrast check in this ' +
+            'suite. Reference the --dg-* token for its role instead',
         ).toEqual([]);
       });
 
@@ -1665,22 +2105,6 @@ describe('authored stylesheets', () => {
             bridges,
             'the canvas height, row offset and tooltip coordinates are each bridged here',
           ).toBeGreaterThanOrEqual(MEASURED_GEOMETRY_PROPERTIES.length);
-        }
-      });
-
-      it('keeps every structural length exemption pointing at a real declaration', () => {
-        // An exemption whose declaration no longer exists would silently widen
-        // the rule above the next time a declaration of that shape appears.
-        const present = styleRules(rules);
-
-        for (const entry of STRUCTURAL_LENGTH_DECLARATIONS.filter((item) => item.rel === rel)) {
-          expect(
-            present.some(
-              (rule) =>
-                rule.selector === entry.selector && rule.declarations.includes(entry.declaration),
-            ),
-            `${entry.selector} { ${entry.declaration} } is exempted but no longer declared`,
-          ).toBe(true);
         }
       });
 

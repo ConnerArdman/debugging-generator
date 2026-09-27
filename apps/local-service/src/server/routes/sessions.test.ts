@@ -18,8 +18,9 @@
  * that ends a page early. Every response is parsed with protocol's own
  * `parseHttpResponse`, the parser a client applies.
  *
- * The last suite covers the state-root separation (AAP §0.4.2): `POST /sessions`
- * and `POST /sessions/:id/question` refuse a project root that is, contains or
+ * The state-root suite covers the separation that keeps session data and
+ * backups outside every target project: `POST /sessions` and
+ * `POST /sessions/:id/question` refuse a project root that is, contains or
  * lies inside the canonical state root the routes were built with, before the
  * revocation fence, the manager or the orchestrator is reached. Its folders are
  * real directories under a realpath'd `mkdtemp` sandbox, so the symbolic-link
@@ -35,11 +36,31 @@
  * by the real `fs.realpath`; a self-referential link stands for an
  * unresolvable path, because it fails with `ELOOP` even for root.
  *
+ * The root-identity suite covers the project root `POST /sessions` stores
+ * (CWE-367): admitted with its canonical directory, re-proved after the
+ * dev-server lookup's `await` and immediately before the real session manager
+ * stores the session, and handed to that manager as the proof its pipeline
+ * sinks are held to. A link on the root's path is retargeted while the lookup
+ * awaits — to another directory of the workspace, and out of it — and the
+ * create is refused `403` with nothing stored, broadcast or started. A
+ * dev-server hold is given up on that refusal and on the revocation fence's,
+ * and handed to the session otherwise; the state-root separation is judged on
+ * the admitted directory. Its links are real, under a realpath'd `mkdtemp`
+ * sandbox, and each retarget renames a fresh link over the old one.
+ *
  * Fixtures are neutral (`/w/…`, `src/moduleN.ts`); no environment variable is
  * read and nothing under `$DEBUGGEN_HOME` is touched.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -68,6 +89,9 @@ import { DebuggenError, err, newSessionId, ok, unwrap } from '@debuggen/shared';
 import type { LogFields, LogLevel, Logger, Result, SessionId } from '@debuggen/shared';
 
 import { STATE_HOME_OVERLAP_MESSAGE } from '../../config.js';
+import { createSessionManager } from '../../sessions/manager.js';
+import type { SessionBroadcaster, SessionManager } from '../../sessions/manager.js';
+import { createSessionProgress } from '../../sessions/progress.js';
 import { openStore } from '../../store/db.js';
 import type { RetentionReport, RetentionScope } from '../../store/retention.js';
 import type { Store } from '../../store/db.js';
@@ -84,7 +108,12 @@ import type {
   TabBinding,
 } from '../auth.js';
 import { createSessionRoutes } from './sessions.js';
-import type { SessionRoutes, SessionRoutesDeps } from './sessions.js';
+import type {
+  SessionDevServerHold,
+  SessionDevServerLookup,
+  SessionRoutes,
+  SessionRoutesDeps,
+} from './sessions.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Fixtures
@@ -1351,5 +1380,396 @@ describe("POST /sessions/purge sweeps only the requesting editor's workspace", (
 
       expect(await scope(folder(join(unresolvable, 'app')))).toBe(false);
     });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * POST /sessions holds the project root to the directory it admitted, from admission to storage
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('POST /sessions re-proves the admitted project root before storing it, and hands the proof over', () => {
+  /** Where the dev server of every session created here serves; nothing is ever dialled. */
+  const DEV_SERVER_URL = 'http://127.0.0.1:4173/';
+
+  /** The question every create asks; nothing may branch on it. */
+  const QUESTION = 'Why is handlerAlpha slow?';
+
+  /** `../auth.ts`'s refusal of a root still in scope whose links now lead elsewhere. */
+  const ROOT_MOVED_MESSAGE =
+    'The project root no longer resolves to the directory it was admitted as.';
+
+  /** The realpath'd sandbox of the running test; every folder and link below lives in it. */
+  let sandbox: string;
+  /** The one workspace folder the editor announced. */
+  let workspace: string;
+  /** The directory the project root leads to when the create is admitted. */
+  let admittedDirectory: string;
+  /** The project root the editor sends: a link inside the workspace to {@link admittedDirectory}. */
+  let link: string;
+
+  /**
+   * Creates `path` (and its parents) and returns it.
+   *
+   * @param path The absolute directory.
+   * @returns `path`.
+   */
+  function folder(path: string): string {
+    mkdirSync(path, { recursive: true });
+    return path;
+  }
+
+  beforeEach(() => {
+    sandbox = realpathSync(mkdtempSync(join(tmpdir(), 'debuggen-session-root-identity-')));
+    workspace = folder(join(sandbox, 'workspace'));
+    admittedDirectory = folder(join(workspace, 'shop-a'));
+    link = join(workspace, 'app');
+    symlinkSync(admittedDirectory, link);
+    principal = editor([workspace]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+    expect(existsSync(sandbox)).toBe(false);
+  });
+
+  /**
+   * Points {@link link} at `target` in one step: a fresh link is planted beside
+   * it and renamed over it, so no reader ever finds the root missing.
+   *
+   * @param target The directory the root leads to from now on.
+   */
+  function retarget(target: string): void {
+    const staged = `${link}.next`;
+    symlinkSync(target, staged);
+    renameSync(staged, link);
+  }
+
+  /** What {@link identityHarness} is built with. */
+  interface IdentityHarnessOptions {
+    /** Where the create looks its dev server up. */
+    readonly devServers: SessionDevServerLookup;
+    /** The revocation fence; admits every request when omitted. */
+    readonly requireLiveCredential?: SessionRoutesDeps['auth']['requireLiveCredential'];
+    /** The canonical state root; no overlap check is made when omitted. */
+    readonly canonicalStateHome?: string | undefined;
+  }
+
+  /** `POST /sessions` over a real session manager, and what the test observes of it. */
+  interface IdentityHarness {
+    readonly app: Hono<ServerEnv>;
+    /** The real manager the route stores through, for its `confirmProjectRoot` and `list`. */
+    readonly manager: SessionManager;
+    /** The route's calls of `SessionManager.create`, each forwarded to {@link manager}. */
+    readonly create: Mock<SessionRoutesDeps['manager']['create']>;
+    /** The pipeline runs the route started. */
+    readonly run: Mock<SessionRoutesDeps['orchestrator']['run']>;
+    /** The type of every frame the manager broadcast, in order. */
+    readonly frames: string[];
+  }
+
+  /**
+   * Builds `POST /sessions` over a real {@link createSessionManager} on the
+   * suite's store, broadcasting into {@link IdentityHarness.frames}. The
+   * pipeline is only observed being started: its run never settles, so no
+   * background write outlives the test.
+   *
+   * @param options The lookup, and optionally the fence and the state root.
+   * @returns The application and its observed collaborators.
+   */
+  function identityHarness(options: IdentityHarnessOptions): IdentityHarness {
+    const frames: string[] = [];
+    const broadcaster: SessionBroadcaster = {
+      broadcast: (_sessionId, message) => {
+        frames.push(message.type);
+      },
+      broadcastToKinds: (_sessionId, _kinds, message) => {
+        frames.push(message.type);
+      },
+    };
+    const progress = createSessionProgress({ sessions, broadcaster, now: () => BASE_TIME });
+    const manager = createSessionManager({
+      sessions,
+      broadcaster,
+      progress,
+      config: { provider: 'deterministic' },
+      now: () => BASE_TIME,
+    });
+    const create = vi.fn<SessionRoutesDeps['manager']['create']>((input) => manager.create(input));
+    const run = vi.fn<SessionRoutesDeps['orchestrator']['run']>(
+      () => new Promise<never>(() => undefined),
+    );
+
+    const routes: SessionRoutes = createSessionRoutes({
+      manager: {
+        create,
+        get: (sessionId) => manager.get(sessionId),
+        list: (listOptions) => manager.list(listOptions),
+        end: unused,
+        fail: unused,
+        patch: unused,
+      },
+      reopener: { reopen: unused },
+      orchestrator: {
+        run,
+        beginCapture: unused,
+        completeCapture: unused,
+        followUp: unused,
+        cancel: unused,
+        activeRun: unused,
+        releaseSession: unused,
+      },
+      sessions: {
+        getActiveCapture: unused,
+        getCapture: unused,
+        listWithinFolders: unused,
+        getAccessTarget: unused,
+      },
+      panels: { getLatestPanel: unused, getPanel: unused },
+      modifications,
+      bindings: { bindingForSession: () => undefined, sendToBoundTab: unused },
+      devServers: options.devServers,
+      retention: { purge: unused },
+      auth: { requireLiveCredential: options.requireLiveCredential ?? (() => ok(undefined)) },
+      canonicalStateHome: options.canonicalStateHome,
+      logger: createCapturingLogger(logs),
+    });
+
+    const target = new Hono<ServerEnv>();
+    target.use('*', async (c, next) => {
+      if (principal !== undefined) {
+        c.set('principal', principal);
+      }
+      await next();
+    });
+    target.post(HTTP_ROUTES['session.create'].pattern, routes['session.create']);
+    return { app: target, manager, create, run, frames };
+  }
+
+  /**
+   * A lookup whose answer arrives a macrotask after the create asked for it,
+   * with `during` run first: the window between admission and storage in
+   * which a link on the root's path can be retargeted.
+   *
+   * @param during What happens while the lookup awaits.
+   * @returns The lookup.
+   */
+  function lookupAwaiting(during: () => void = () => undefined): SessionDevServerLookup {
+    return {
+      devServerUrlFor: () =>
+        new Promise<string>((resolve) => {
+          setImmediate(() => {
+            during();
+            resolve(DEV_SERVER_URL);
+          });
+        }),
+    };
+  }
+
+  /** A launched dev server held for the create, and the hold's observed `commit` and `release`. */
+  interface HeldDevServer {
+    readonly devServers: SessionDevServerLookup;
+    readonly commit: Mock<SessionDevServerHold['commit']>;
+    readonly release: Mock<SessionDevServerHold['release']>;
+  }
+
+  /**
+   * A lookup that holds a session-owned launched dev server, running
+   * `whileHeld` as the hold is taken — after the root was admitted, before
+   * the session is stored.
+   *
+   * @param whileHeld What happens once the hold exists.
+   * @returns The lookup and the hold's observed calls.
+   */
+  function heldDevServer(whileHeld: () => void = () => undefined): HeldDevServer {
+    const commit = vi.fn<SessionDevServerHold['commit']>(() => true);
+    const release = vi.fn<SessionDevServerHold['release']>(() => Promise.resolve());
+    return {
+      devServers: {
+        devServerUrlFor: unused,
+        acquireLaunched: () => {
+          whileHeld();
+          return { devServerUrl: DEV_SERVER_URL, sessionOwned: true, commit, release };
+        },
+      },
+      commit,
+      release,
+    };
+  }
+
+  /**
+   * Sends one `POST /sessions` for `projectRoot` through `target`.
+   *
+   * @param target The application.
+   * @param projectRoot The root the editor sends.
+   * @returns The answer.
+   */
+  async function createFor(target: Hono<ServerEnv>, projectRoot: string): Promise<Answer> {
+    const response = await target.request(HTTP_ROUTES['session.create'].pattern, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectRoot, question: QUESTION }),
+    });
+    return {
+      status: response.status,
+      cacheControl: response.headers.get('cache-control'),
+      body: await response.json(),
+    };
+  }
+
+  /**
+   * Asserts that a refused create left no trace: the manager was never asked
+   * to store, nothing is stored, no frame was broadcast, no pipeline started,
+   * and neither the reply nor the service log names a path.
+   *
+   * @param harness The harness the create ran through.
+   * @param answer The refusal.
+   */
+  function expectNothingCreated(harness: IdentityHarness, answer: Answer): void {
+    expect(answer.cacheControl).toBe('no-store');
+    expect(harness.create).not.toHaveBeenCalled();
+    expect(unwrap(harness.manager.list())).toEqual([]);
+    expect(harness.frames).toEqual([]);
+    expect(harness.run).not.toHaveBeenCalled();
+    expect(JSON.stringify(answer.body)).not.toContain(sandbox);
+    expect(JSON.stringify(logs)).not.toContain(sandbox);
+  }
+
+  it('admits a root linked inside the workspace and hands the manager the directory it proved', async () => {
+    const harness = identityHarness({ devServers: lookupAwaiting() });
+
+    const answer = await createFor(harness.app, link);
+
+    expect(answer.status).toBe(200);
+    const session = unwrap(parseHttpResponse('session.create', answer.body));
+    // The session keeps the editor's spelling; the proof names where it led.
+    expect(session.projectRoot).toBe(link);
+    expect(harness.create.mock.calls.map(([input]) => input.admittedRoot)).toEqual([
+      { projectRoot: link, canonicalRoot: admittedDirectory },
+    ]);
+    expect(unwrap(harness.manager.confirmProjectRoot(session.id))).toEqual({
+      projectRoot: link,
+      canonicalRoot: admittedDirectory,
+    });
+    expect(harness.frames).toEqual(['session.created']);
+    expect(harness.run).toHaveBeenCalledWith({ sessionId: session.id });
+
+    // The proof was recorded, not deferred to the first sink: relinked after
+    // the create, the root is refused rather than re-identified where it now
+    // leads.
+    retarget(folder(join(workspace, 'shop-b')));
+    expect(harness.manager.confirmProjectRoot(session.id)).toMatchObject({
+      ok: false,
+      error: { code: 'PATH_OUTSIDE_PROJECT', message: ROOT_MOVED_MESSAGE },
+    });
+  });
+
+  it('refuses a root relinked to another directory of the workspace while the dev server was looked up', async () => {
+    const sibling = folder(join(workspace, 'shop-b'));
+    const harness = identityHarness({
+      devServers: lookupAwaiting(() => {
+        retarget(sibling);
+      }),
+    });
+
+    const answer = await createFor(harness.app, link);
+
+    expect(answer.status).toBe(403);
+    expect(answer.body).toEqual({ code: 'PATH_OUTSIDE_PROJECT', message: ROOT_MOVED_MESSAGE });
+    expectNothingCreated(harness, answer);
+  });
+
+  it('refuses a root relinked out of the workspace while the dev server was looked up', async () => {
+    const outside = folder(join(sandbox, 'elsewhere', 'app'));
+    const harness = identityHarness({
+      devServers: lookupAwaiting(() => {
+        retarget(outside);
+      }),
+    });
+
+    const answer = await createFor(harness.app, link);
+
+    expect(answer.status).toBe(403);
+    // No longer in scope at all: the admission's own refusal, not the moved one.
+    expect(answer.body).toEqual({
+      code: 'PATH_OUTSIDE_PROJECT',
+      message: AUTH_FAILURE_REASONS['project-out-of-scope'].message,
+    });
+    expectNothingCreated(harness, answer);
+  });
+
+  it('gives up the dev-server hold when the root moved after the hold was taken', async () => {
+    const held = heldDevServer(() => {
+      retarget(folder(join(workspace, 'shop-b')));
+    });
+    const harness = identityHarness({ devServers: held.devServers });
+
+    const answer = await createFor(harness.app, link);
+
+    expect(answer.status).toBe(403);
+    expect(answer.body).toEqual({ code: 'PATH_OUTSIDE_PROJECT', message: ROOT_MOVED_MESSAGE });
+    expect(held.release).toHaveBeenCalledTimes(1);
+    expect(held.commit).not.toHaveBeenCalled();
+    expectNothingCreated(harness, answer);
+  });
+
+  it('gives up the dev-server hold when the credential was retired while the dev server was looked up', async () => {
+    const held = heldDevServer();
+    const harness = identityHarness({
+      devServers: held.devServers,
+      requireLiveCredential: () =>
+        err(
+          new DebuggenError('UNAUTHORIZED', AUTH_FAILURE_REASONS['unknown-credential'].message, {
+            details: { reason: 'unknown-credential' },
+          }),
+        ),
+    });
+
+    const answer = await createFor(harness.app, link);
+
+    expect(answer.status).toBe(401);
+    expect(held.release).toHaveBeenCalledTimes(1);
+    expect(held.commit).not.toHaveBeenCalled();
+    expectNothingCreated(harness, answer);
+  });
+
+  it('hands the hold to the session, and gives nothing up, when the root still leads where it was admitted', async () => {
+    const held = heldDevServer();
+    const harness = identityHarness({ devServers: held.devServers });
+
+    const answer = await createFor(harness.app, link);
+
+    expect(answer.status).toBe(200);
+    const session = unwrap(parseHttpResponse('session.create', answer.body));
+    expect(session.devServerUrl).toBe(DEV_SERVER_URL);
+    expect(held.commit.mock.calls).toEqual([[session.id]]);
+    expect(held.release).not.toHaveBeenCalled();
+    expect(unwrap(harness.manager.confirmProjectRoot(session.id)).canonicalRoot).toBe(
+      admittedDirectory,
+    );
+  });
+
+  it('judges the state-root separation on the directory admitted, before any dev server is looked up', async () => {
+    // The state root sits inside the workspace, so a link to it is admitted
+    // and only the separation, judged on where the link leads, refuses it.
+    const stateHome = folder(join(workspace, 'state-home'));
+    const intoState = join(workspace, 'linked-into-state');
+    symlinkSync(folder(join(stateHome, 'project')), intoState);
+    const devServerUrlFor = vi.fn<SessionDevServerLookup['devServerUrlFor']>(() => DEV_SERVER_URL);
+    const harness = identityHarness({
+      devServers: { devServerUrlFor },
+      canonicalStateHome: stateHome,
+    });
+
+    const refused = await createFor(harness.app, intoState);
+
+    expect(refused.status).toBe(400);
+    expect(refused.body).toEqual({ code: 'FS_UNSAFE_PATH', message: STATE_HOME_OVERLAP_MESSAGE });
+    expect(devServerUrlFor).not.toHaveBeenCalled();
+    expectNothingCreated(harness, refused);
+
+    // A root apart from the state root is admitted under the same check.
+    const admitted = await createFor(harness.app, link);
+    expect(admitted.status).toBe(200);
+    expect(devServerUrlFor).toHaveBeenCalledTimes(1);
   });
 });

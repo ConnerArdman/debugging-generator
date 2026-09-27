@@ -13,6 +13,12 @@
  *     recovery line.
  *   - **The pairing control.** `not-paired` renders a real button that announces its dialog and
  *     raises the intent once per click.
+ *   - **The address control.** `reconnecting` and `service-not-running` render a "Change service
+ *     address…" button when — and only when — the owner supplies its callback: a real button that
+ *     announces its dialog, raises the intent once per click, sits outside the live region and the
+ *     recovery line (whose sentence is unchanged), keeps its element across the two states, and is
+ *     named in the tooltip hint only while it is rendered. `connected` and `not-paired` never
+ *     render it.
  *   - **The binding notice.** A `tab-left` binding renders `formatTabLeftMessage`'s sentence
  *     inside the live region and names the region with it.
  *   - **The live region.** The recovery line sits outside the `role="status"` element so a
@@ -292,6 +298,148 @@ describe('ConnectionStatus — not paired', () => {
     expect(screen.getByRole('button', { name: 'Pair…' }).getAttribute('aria-expanded')).toBe(
       'true',
     );
+  });
+});
+
+/** The address control's visible label and accessible name. */
+const ADDRESS_ACTION = 'Change service address…';
+
+/** The two states in which the worker cannot reach the service. */
+const UNREACHABLE_STATUSES = ['reconnecting', 'service-not-running'] as const;
+
+describe('ConnectionStatus — changing the service address', () => {
+  it.each(UNREACHABLE_STATUSES)(
+    'renders a Change service address… button beside the %s pill that announces its dialog and raises the intent once per click',
+    async (status) => {
+      const user = userEvent.setup();
+      const onRequestAddressChange = vi.fn<() => void>();
+      render(statusElement({ status, onRequestAddressChange, serviceStartCommand: START_COMMAND }));
+
+      const button = screen.getByRole('button', { name: ADDRESS_ACTION });
+      expect(button.textContent).toBe(ADDRESS_ACTION);
+      expect(button.getAttribute('type')).toBe('button');
+      expect(button.getAttribute('aria-haspopup')).toBe('dialog');
+      expect(button.hasAttribute('aria-expanded')).toBe(false);
+      expect(statusRegion().contains(button)).toBe(false);
+      expect(textOf(statusRegion())).toBe(PANEL_CONNECTION_LABELS[status]);
+
+      await user.click(button);
+
+      expect(onRequestAddressChange).toHaveBeenCalledTimes(1);
+      expect(onRequestAddressChange).toHaveBeenCalledWith();
+    },
+  );
+
+  it('keeps the recovery line exactly as it reads without the control, and outside it', () => {
+    const { rerender } = render(
+      statusElement({
+        status: 'service-not-running',
+        serviceStartCommand: START_COMMAND,
+        onRequestAddressChange: noop,
+      }),
+    );
+
+    const button = screen.getByRole('button', { name: ADDRESS_ACTION });
+    expect(recoveryLine().textContent).toBe(LINE_WITH_COMMAND);
+    expect(recoveryLine().contains(button)).toBe(false);
+
+    rerender(statusElement({ status: 'service-not-running', onRequestAddressChange: noop }));
+
+    expect(recoveryLine().textContent).toBe(LINE_WITHOUT_COMMAND);
+    expect(recoveryLine().contains(screen.getByRole('button', { name: ADDRESS_ACTION }))).toBe(
+      false,
+    );
+  });
+
+  it('reflects the address dialog visibility as aria-expanded when the owner reports it', () => {
+    const { rerender } = render(
+      statusElement({
+        status: 'reconnecting',
+        onRequestAddressChange: noop,
+        addressDialogOpen: false,
+      }),
+    );
+    expect(screen.getByRole('button', { name: ADDRESS_ACTION }).getAttribute('aria-expanded')).toBe(
+      'false',
+    );
+
+    rerender(
+      statusElement({
+        status: 'reconnecting',
+        onRequestAddressChange: noop,
+        addressDialogOpen: true,
+      }),
+    );
+    expect(screen.getByRole('button', { name: ADDRESS_ACTION }).getAttribute('aria-expanded')).toBe(
+      'true',
+    );
+  });
+
+  it('keeps the same control element across Reconnecting… and Service not running', () => {
+    const { rerender } = render(
+      statusElement({ status: 'reconnecting', onRequestAddressChange: noop }),
+    );
+    const button = screen.getByRole('button', { name: ADDRESS_ACTION });
+
+    rerender(statusElement({ status: 'service-not-running', onRequestAddressChange: noop }));
+
+    expect(screen.getByRole('button', { name: ADDRESS_ACTION })).toBe(button);
+    expect(recoveryLine().textContent).toBe(LINE_WITHOUT_COMMAND);
+  });
+
+  it.each(['connected', 'not-paired'] as const)(
+    'offers no address control when %s, even with the callback',
+    (status) => {
+      render(statusElement({ status, onRequestAddressChange: noop, serviceUrl: SERVICE_URL }));
+
+      expect(screen.queryByRole('button', { name: ADDRESS_ACTION })).toBeNull();
+      expect(textOf(tooltipBubble())).not.toContain(ADDRESS_ACTION);
+    },
+  );
+
+  it.each(UNREACHABLE_STATUSES)(
+    'offers no address control when %s without the callback, and the hint does not name it',
+    (status) => {
+      render(statusElement({ status, serviceUrl: SERVICE_URL }));
+
+      expect(screen.queryByRole('button', { name: ADDRESS_ACTION })).toBeNull();
+      expect(textOf(tooltipBubble())).not.toContain(ADDRESS_ACTION);
+    },
+  );
+
+  it.each(UNREACHABLE_STATUSES)(
+    'names the control in the %s tooltip hint while it is rendered',
+    (status) => {
+      render(statusElement({ status, serviceUrl: SERVICE_URL, onRequestAddressChange: noop }));
+
+      const hint = textOf(tooltipBubble());
+      expect(hint).toContain(ADDRESS_ACTION);
+      expect(hint).toContain(SERVICE_URL);
+      expect(hint).toContain('pairing');
+    },
+  );
+
+  it('renders every status with the control offered without an error or a warning', () => {
+    const spies = CONSOLE_METHODS.map((method) => vi.spyOn(console, method));
+    const { rerender } = render(statusElement());
+    for (const status of PANEL_CONNECTION_STATUSES) {
+      for (const addressDialogOpen of [undefined, false, true]) {
+        rerender(
+          statusElement({
+            status,
+            onRequestAddressChange: noop,
+            addressDialogOpen,
+            serviceStartCommand: START_COMMAND,
+            serviceUrl: SERVICE_URL,
+          }),
+        );
+        expect(textOf(statusRegion())).toBe(PANEL_CONNECTION_LABELS[status]);
+      }
+    }
+
+    for (const spy of spies) {
+      expect(spy).not.toHaveBeenCalled();
+    }
   });
 });
 

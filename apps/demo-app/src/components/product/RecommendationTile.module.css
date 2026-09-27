@@ -46,8 +46,8 @@
  * The accent hairline is a supplementary hover cue that changes together with the elevation; the
  * tile's resting border and its focus ring are what identify it. */
 .root:hover {
-  border-color: var(--ls-accent, #0f766e);
-  box-shadow: var(--ls-shadow-1, 0 1px 2px rgba(15, 23, 42, 0.08));
+  border-color: var(--ls-accent, #f59e0b);
+  box-shadow: var(--ls-shadow-1, 0 1px 2px rgba(15, 23, 42, 0.06));
 }
 
 /* The strip of tiles is navigated from the keyboard, so the ring is restated here at the module's
@@ -58,7 +58,7 @@
  * edge on the first one. Drawn just inside the border the whole ring survives, in either variant
  * and wherever the tile is placed. */
 .root:focus-visible {
-  outline: 2px solid var(--ls-focus, #1d4ed8);
+  outline: 2px solid var(--ls-focus, #0f766e);
   outline-offset: -2px;
 }
 

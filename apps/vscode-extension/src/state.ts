@@ -195,7 +195,6 @@ import type {
   SessionListItem,
   SessionProgressPayload,
   SessionRecord,
-  TargetSelectedPayload,
   UnavailableSignalPayload,
 } from '@debuggen/protocol';
 
@@ -545,20 +544,6 @@ export const MAX_HELD_FRAMES = 512;
  */
 export const MAX_ACKNOWLEDGED_ENDS = 128;
 
-/**
- * Where the current target came from.
- *
- * - `session`: the active session's own target — from its record or from a
- *   `target.selected` naming it. Session-scoped, so {@link ExtensionState.resetSession}
- *   clears it.
- * - `pending`: an element selected while no session was active, which is
- *   legitimate because a developer may point at something before asking about
- *   it. It is an input to the *next* session rather than state of the previous
- *   one, so a reset keeps it; the first record of the next session either
- *   adopts it (the session was created with it) or supersedes it.
- */
-type TargetScope = 'session' | 'pending';
-
 /** One frame a creation window holds: the session it names and how to apply it later. */
 interface HeldFrame {
   readonly sessionId: string;
@@ -728,10 +713,10 @@ export class ExtensionState implements vscode.Disposable {
   private latestPanelValue: PanelSummary | undefined;
   private captureValue: CaptureState = IDLE_CAPTURE;
   private failureValue: StageFailure | undefined;
-
-  // Target (session-scoped or pending; see TargetScope) --------------------
+  /** The active session's record `target`; see {@link applyRecordTarget}. */
   private targetValue: SelectedTarget | undefined;
-  private targetScope: TargetScope | undefined;
+  /** The `updatedAt` of the record {@link targetValue} was taken from. */
+  private targetRecordUpdatedAt: number | undefined;
 
   // Cleanup (survives resetSession until the next session's record) --------
   private cleanupValue: SessionCleanupState = PENDING_CLEANUP;
@@ -900,19 +885,14 @@ export class ExtensionState implements vscode.Disposable {
     return this.latestPanelValue;
   }
 
-  /** The element selected in DevTools, when there is one. */
+  /**
+   * The element selected in DevTools for the active session, when its record
+   * names one. The service records the selection on the session bound to the
+   * DevTools tab and broadcasts the record, so this is always the held
+   * record's `target`, and `undefined` while no session is active.
+   */
   get target(): SelectedTarget | undefined {
     return this.targetValue;
-  }
-
-  /**
-   * The element selected while no session was active — the next question's
-   * input — or `undefined` when the current target (if any) belongs to a
-   * session. A new session is created with this target, never with the
-   * previous session's own.
-   */
-  get pendingTarget(): SelectedTarget | undefined {
-    return this.targetScope === 'pending' ? this.targetValue : undefined;
   }
 
   /**
@@ -933,9 +913,8 @@ export class ExtensionState implements vscode.Disposable {
    * the session here: no record of it that is not `ended` replaces the ended
    * one — in the active view, in {@link sessionList}, or when a creation window
    * replays what it held — and its delayed live frames (`capture.started`,
-   * `instrumentation.plan` / `.ready` / `.failed`, a `running` progress row, a
-   * target selection) are not applied. Its final record, and its
-   * `cleanup.completed`, still are.
+   * `instrumentation.plan` / `.ready` / `.failed`, a `running` progress row)
+   * are not applied. Its final record, and its `cleanup.completed`, still are.
    *
    * @param sessionId The session to ask about.
    */
@@ -1318,14 +1297,13 @@ export class ExtensionState implements vscode.Disposable {
    *
    * Until the window closes, every session-scoped frame for a session other
    * than the active one — records, progress rows, instrumentation, capture,
-   * analysis, panel, cleanup and target frames — is held in arrival order, at
-   * most {@link MAX_HELD_FRAMES} of them. Holding is in addition to what the
-   * store already does with such a frame: a record still refreshes
-   * {@link sessionList}, and a target selected while no session is active still
-   * becomes the {@link pendingTarget}. Frames of the active session apply
-   * immediately, as always. Several windows may be open at once; each holds its
-   * own list, so closing one never disturbs another. On a disposed store, or
-   * once {@link beginShutdown} ran, the window is born closed.
+   * analysis, panel and cleanup frames — is held in arrival order, at most
+   * {@link MAX_HELD_FRAMES} of them. Holding is in addition to what the store
+   * already does with such a frame: a record still refreshes
+   * {@link sessionList}. Frames of the active session apply immediately, as
+   * always. Several windows may be open at once; each holds its own list, so
+   * closing one never disturbs another. On a disposed store, or once
+   * {@link beginShutdown} ran, the window is born closed.
    *
    * @returns The window; close it with `adopt` or `abandon` on every path.
    */
@@ -1529,14 +1507,13 @@ export class ExtensionState implements vscode.Disposable {
    *
    * Clears the session and its owning endpoint, its progress rows, relevant
    * files, modifications and their counted total, instrumentation report,
-   * analysis, panel summary, session target, capture window and failure.
+   * analysis, panel summary, target, capture window and failure; a new
+   * session never inherits the previous session's target.
    * Keeps the connection, provider, service URL and {@link sessionList};
    * keeps the pairing code, which belongs to the Chrome extension rather than
-   * to any session; keeps a target selected while no
-   * session was active (it is the next question's input); and keeps the
-   * previous session's cleanup status visible until the next session's record
-   * replaces it, so "files restored" does not vanish the moment the developer
-   * starts typing a new question.
+   * to any session; and keeps the previous session's cleanup status visible
+   * until the next session's record replaces it, so "files restored" does not
+   * vanish the moment the developer starts typing a new question.
    */
   resetSession(): void {
     if (this.isDisposed) {
@@ -1554,10 +1531,8 @@ export class ExtensionState implements vscode.Disposable {
     this.latestPanelValue = undefined;
     this.captureValue = IDLE_CAPTURE;
     this.failureValue = undefined;
-    if (this.targetScope === 'session') {
-      this.targetValue = undefined;
-      this.targetScope = undefined;
-    }
+    this.targetValue = undefined;
+    this.targetRecordUpdatedAt = undefined;
     this.markChanged();
   }
 
@@ -1904,35 +1879,6 @@ export class ExtensionState implements vscode.Disposable {
     this.markChanged();
   }
 
-  /**
-   * Records `target.selected`, the element shown by `TargetBadge`. A later
-   * selection replaces an earlier one. With a session active, only a selection
-   * for that session is accepted; with none, the selection is kept as the next
-   * question's pending target. A selection for a session other than the active
-   * one is also held while a {@link SessionCreationWindow} is open, so it
-   * becomes that session's own target if the session is adopted. A selection
-   * for an active session acknowledged as ended is a delayed frame — an ended
-   * session is unbound — and is ignored.
-   */
-  applyTargetSelected(payload: TargetSelectedPayload): void {
-    if (this.isDisposed) {
-      return;
-    }
-    const active = this.sessionValue;
-    const admitted = this.admitsFrame(payload.sessionId, payload, (held) => {
-      this.applyTargetSelected(held);
-    });
-    if (
-      (!admitted && active !== undefined) ||
-      (admitted && this.isLiveFrameOfEndedSession(payload.sessionId))
-    ) {
-      return;
-    }
-    this.targetValue = own(payload.target);
-    this.targetScope = active === undefined ? 'pending' : 'session';
-    this.markChanged();
-  }
-
   // -------------------------------------------------------------------------
   // Pairing and failures
   // -------------------------------------------------------------------------
@@ -2219,7 +2165,7 @@ export class ExtensionState implements vscode.Disposable {
 
   /**
    * Whether a live frame of `sessionId` — one that would show the session
-   * capturing, instrumenting, failing or targeting again — must be ignored
+   * capturing, instrumenting or failing again — must be ignored
    * because the store has acknowledged the session as ended. Frames that only
    * complete what the session did before it ended (`capture.stopped`,
    * `analysis.completed`, `panel.generated`, `cleanup.completed`) are not
@@ -2395,22 +2341,43 @@ export class ExtensionState implements vscode.Disposable {
   }
 
   /**
-   * Adopts the record's target, or keeps a selection for this session that the
-   * record does not reflect yet. A pending target selected before the session
-   * existed is otherwise superseded: once a session is active the badge shows
-   * that session's target, never an element it was not created with.
+   * Takes the record's `target` as the target, and clears the target only when
+   * a provably newer record names none.
+   *
+   * The record is the only source: the service stores the element picked in
+   * the DevTools panel bound to the session, then broadcasts the stored
+   * record, and `target.selected` itself travels DevTools → service only, so no
+   * selection exists here that the record does not carry.
+   *
+   * Only a record that supersedes the one held reaches this point (see
+   * `supersedes`), and `supersedes` admits a record stamped at the same
+   * `updatedAt` as the held one. The service's `updatedAt` is whole
+   * milliseconds and never decreases, but two consecutive records of one
+   * session can share it, so a targetless snapshot the service produced just
+   * before it recorded the selection — the answer to a `GET /sessions/:id`
+   * still in flight, say — can arrive after the record carrying the target and
+   * tie with it. Such a record, stamped no later than the record the held
+   * target came from, keeps the target; a targetless record stamped strictly
+   * later clears it. After {@link resetSession} (adoption of another session
+   * included) no target is held, so the adopted record's own `target`, or its
+   * absence, is taken as it is.
    */
   private applyRecordTarget(record: SessionRecord): void {
     if (record.target !== undefined) {
       this.targetValue = record.target;
-      this.targetScope = 'session';
+      this.targetRecordUpdatedAt = record.updatedAt;
       return;
     }
-    if (this.targetScope === 'session' && this.targetValue !== undefined) {
+    const heldStamp = this.targetRecordUpdatedAt;
+    if (
+      this.targetValue !== undefined &&
+      heldStamp !== undefined &&
+      record.updatedAt <= heldStamp
+    ) {
       return;
     }
     this.targetValue = undefined;
-    this.targetScope = undefined;
+    this.targetRecordUpdatedAt = undefined;
   }
 
   // -------------------------------------------------------------------------

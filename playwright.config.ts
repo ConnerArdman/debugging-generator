@@ -85,8 +85,11 @@ const DEFAULT_SERVICE_HOST = '127.0.0.1';
 const DEFAULT_SERVICE_PORT = '43117';
 const DEFAULT_DEMO_URL = 'http://localhost:3000';
 /**
- * The fixture app declares `next dev --port 3100` in tests/fixtures/sample-next-app, so
- * it can never collide with the demo application on 3000.
+ * The fixture app declares `next dev --port 3100` in tests/fixtures/sample-next-app, so this
+ * default differs from the demo application's default on 3000. Only the defaults differ:
+ * `DEMO_URL` and `FIXTURE_APP_URL` are both overridable, and this config does not check one
+ * against the other. The e2e helper `sampleAppPort()` in `tests/e2e/helpers/sample-app.ts`
+ * refuses a fixture port equal to the demo's or the service's port.
  */
 const DEFAULT_FIXTURE_APP_URL = 'http://localhost:3100';
 

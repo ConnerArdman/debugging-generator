@@ -10,7 +10,7 @@
  * reading each `HTTP_ROUTES[operation]` row for its method and its `:id`-form
  * pattern; the handler comes from an exhaustive
  * `Record<HttpOperationId, HttpRouteHandler>` assembled from the seven route
- * modules that own protocol's twenty HTTP operations:
+ * modules that own protocol's twenty-two HTTP operations:
  *
  * | Module | Operations |
  * | --- | --- |
@@ -19,7 +19,7 @@
  * | `./routes/telemetry.ts` | `telemetry.event` (`POST /telemetry/ingest`) |
  * | `./routes/dev-server.ts` | `devServer.launch`, `devServer.stop`, `devServer.credential` |
  * | `./routes/pair.ts` | `pair.start`, `pair.complete` |
- * | `./routes/credentials.ts` | `credentials.rotate` |
+ * | `./routes/credentials.ts` | `credentials.rotate`, `credentials.release` |
  * | `./routes/health.ts` | `health` |
  *
  * Because the record is keyed by protocol's own operation-id union, a route
@@ -274,8 +274,8 @@ const NOSNIFF = 'nosniff';
  * The response-header policy every reply of this service carries — success,
  * refusal, `404`, `5xx` and the listener's own fallbacks alike: never cached,
  * never content-sniffed. It is deliberately these two headers and nothing
- * more: no `Access-Control-Allow-Origin` (AAP §0.5.6 — its absence is what
- * keeps web pages from reading any reply) and no `Server` banner.
+ * more: no `Access-Control-Allow-Origin` (its absence is what keeps web pages
+ * from reading any reply) and no `Server` banner.
  *
  * Applied by {@link withResponsePolicy} at the application's exits and
  * stamped on the Node response by {@link HttpApp.requestListener}; the error
@@ -416,9 +416,11 @@ const REFUSED_BODY_DISCARD_MAX_MS = 1_000;
  * operation a route is authorized as. Each value is the owning route module's
  * own exported bound, so a number is defined once, next to the route that
  * explains it; this table only says which bound guards which operation.
- * `devServer.credential` shares the dev-server module's single bound, and the
+ * `devServer.credential` shares the dev-server module's single bound, the
  * three bodiless `POST` operations — `session.purge`, `target.request` and
- * `credentials.rotate` — take the empty-body bounds of their own modules.
+ * `credentials.rotate` — take the empty-body bounds of their own modules, and
+ * `credentials.release`, whose body is one token, shares the credentials
+ * module's bound with the rotation.
  *
  * Operations without a body (`GET` routes) need no entry: no body stream
  * reaches them. Any other operation absent here takes
@@ -441,6 +443,7 @@ export const REQUEST_BODY_LIMIT_BYTES: Readonly<Partial<Record<HttpOperationId, 
     'pair.start': MAX_PAIR_REQUEST_BODY_BYTES,
     'pair.complete': MAX_PAIR_REQUEST_BODY_BYTES,
     'credentials.rotate': MAX_CREDENTIALS_REQUEST_BODY_BYTES,
+    'credentials.release': MAX_CREDENTIALS_REQUEST_BODY_BYTES,
   } satisfies Partial<Record<HttpOperationId, number>>);
 
 /**
@@ -665,9 +668,9 @@ export interface HttpAppOwnDeps {
  * to the route: a field a route module adds reaches this aggregate — and
  * therefore the composition root's call — in the same edit. Where two modules
  * carry the same subsystem the field names agree (`sessions`, `bindings`,
- * `auth`, `logger`), so the intersection asks for one object that satisfies
- * both slices: the sessions repository, the client registry and the auth
- * service each do.
+ * `auth`, `launcher`, `logger`), so the intersection asks for one object that
+ * satisfies both slices: the sessions repository, the client registry, the
+ * auth service and the dev-server launcher each do.
  */
 export type HttpAppDeps = SessionRoutesDeps &
   PanelDataRoutesDeps &
@@ -720,7 +723,7 @@ export interface HttpApp {
    */
   readonly telemetry: Pick<TelemetryRoutes, 'handleTelemetryEventFrame'>;
 
-  /** Every registered route: the protocol table's twenty-one operations, in the table's order, and nothing else. */
+  /** Every registered route: the protocol table's twenty-two operations, in the table's order, and nothing else. */
   readonly routes: readonly RegisteredHttpRoute[];
 
   /**
@@ -1541,7 +1544,7 @@ function verifyDistinctRoutes(
 
 /**
  * Builds the seven HTTP route modules and turns them into the registration
- * list: protocol's twenty-one operations in the table's own order, and nothing
+ * list: protocol's twenty-two operations in the table's own order, and nothing
  * else.
  *
  * Each factory receives the whole aggregate typed as its own narrow deps

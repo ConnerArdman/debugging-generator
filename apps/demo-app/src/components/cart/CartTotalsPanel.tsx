@@ -7,10 +7,12 @@
  * the default, which is the tight form) and the `/cart` page together with the checkout review
  * column (`variant="page"`, the roomy one). All of them get the same rows in the same order - the
  * units in the cart, the merchandise subtotal, one row per charge the placing surface knows about,
- * the closing figure those charges add up to, and the dispatch promise - because a shopper who
- * opens the drawer and then the page must not be quoted two different carts. The one line that is
- * not printed everywhere is the store's free-freight offer, which belongs to a surface quoting a
- * cart rather than one quoting an order; the last of the decisions below says why.
+ * the closing figure those charges add up to, and the dispatch line carrying the warehouse's
+ * cut-off - because a shopper who opens the drawer and then the page must not be quoted two
+ * different carts. Two statements are not printed everywhere: the store's free-freight offer,
+ * which belongs to a surface quoting a cart rather than one quoting an order, and an arrival
+ * estimate, which belongs to a surface quoting an order rather than one quoting a cart; the last
+ * two of the decisions below say why.
  *
  * IT PRINTS NO FIGURE UNTIL THERE IS A CART BEHIND ONE
  * `@/hooks/useCartSummary` publishes either the cart's totals or the reason it has none, and this
@@ -29,7 +31,7 @@
  * The same holds one step further on, where the contents *were* established and there are none:
  * "Items 0", a subtotal of nothing and the free-freight offer measured against an empty cart are
  * three figures about an order nobody is placing. So a cart-quoting surface prints the state in
- * words there too, and keeps only the store's dispatch promise beside it. This is the answer the
+ * words there too, and keeps only the dispatch line beside it. This is the answer the
  * cart drawer already gives by dropping its footer - totals and both destinations together - for
  * the same state, and one cart must not be answered two ways by the two surfaces quoting it; on
  * the cart's own page the row of actions withholds checkout for exactly the same reading. A
@@ -64,9 +66,10 @@
  * as `dispatchCountdownMs` - a number the provider read from the clock after it mounted, or `null`
  * before its first reading - so the markup the server produced and the first markup the browser
  * renders always agree and the cart raises no hydration warning. Before that first reading the
- * panel simply prints `estimatedDeliveryLabel` and no countdown, which is why nothing here
- * suppresses a hydration warning either. The countdown is folded down to whole minutes as well, so
- * the sentence changes at most once a minute.
+ * dispatch line simply carries no countdown - a surface quoting charges prints the delivery
+ * estimate its caller supplied, and a surface quoting a cart prints that delivery time is quoted
+ * at checkout - which is why nothing here suppresses a hydration warning either. The countdown is
+ * folded down to whole minutes as well, so the sentence changes at most once a minute.
  *
  * MARKUP AND APPEARANCE
  * The rows are label-and-value pairs, so they are a `<dl>` with a `<div>` group per row, exactly
@@ -79,7 +82,7 @@
  * there is no `style` prop. Variants are `data-variant` and the free-freight state is `data-qualifies`,
  * both read by attribute selectors in that file rather than by looking a class name up.
  *
- * Two presentation decisions worth recording, because both look arbitrary otherwise:
+ * The presentation decisions worth recording, because each looks arbitrary otherwise:
  *
  *   - Heading level follows the variant: `<h2>` on the page, where the block is a section of the
  *     document, and `<h3>` in the drawer, whose dialog already carries the `<h2>`. A caller that
@@ -107,6 +110,17 @@
  *     contradicts it and no order total is asserted, and omitted where charges are quoted - there,
  *     what is true of freight is the freight row and the caption the placing surface prints under
  *     these figures.
+ *   - AN ARRIVAL ESTIMATE IS A STATEMENT ABOUT A SHIPPING SERVICE, SO IT IS PRINTED ONLY WHERE
+ *     CHARGES ARE QUOTED. How long an order takes to arrive depends on the service that carries it
+ *     and the destination it is carried to, and a cart has neither: the transit figure its own
+ *     reading carries belongs to no service a buyer can choose, and the services quoted for one
+ *     destination differ by days. Printed on a surface quoting a cart, that figure contradicts the
+ *     service the buyer goes on to pick - "Arrives in 2 days" in the drawer beside a chosen
+ *     seven-day freight service. So the merchandise-only surfaces say that the delivery time is
+ *     quoted at checkout, and the surface quoting charges prints the estimate its caller supplies
+ *     through `summary` for the service those charges are quoted for. The dispatch cut-off is
+ *     printed on every surface in both readings: it is when the warehouse ships, which no choice
+ *     of service changes.
  */
 
 import clsx from 'clsx';
@@ -164,9 +178,22 @@ const ESTIMATED_TOTAL_READING = 'excludes the charges still to be confirmed on t
  */
 const PENDING_CHARGE_NOTE = 'Confirmed on the order';
 
-/** Names the dispatch line for a reader, since its value can be a bare dash before the first
- * countdown reading arrives and would otherwise be announced with nothing to attach it to. */
+/**
+ * Read to assistive technology before the delivery estimate on a surface quoting charges, where
+ * the dispatch line opens with the estimate the caller supplied for the service those charges are
+ * quoted for. The estimate is printed as `summary` carries it, which can be a bare dash before the
+ * dispatch provider's first reading, and would otherwise be announced with nothing to attach it to.
+ */
 const DELIVERY_READING = 'Delivery estimate:';
+
+/**
+ * Opens the dispatch line on a surface quoting a cart, in place of an arrival estimate.
+ *
+ * A cart has no destination and no shipping service, so no arrival it could state would hold for
+ * the service a buyer goes on to choose; this says where that estimate is given instead. It names
+ * itself, so unlike {@link DELIVERY_READING} it carries no hidden prefix.
+ */
+const DELIVERY_QUOTED_NOTE = 'Delivery time quoted at checkout';
 
 /** The qualifying state, as the label that carries it rather than as a colour alone. */
 const FREE_FREIGHT_BADGE = 'Free freight';
@@ -220,10 +247,13 @@ const CART_EMPTY_NOTE = 'Your cart is empty. Its totals appear here once you add
 /** How many placeholder bars stand in for the rows while the cart is being read. */
 const PENDING_ROW_COUNT = 3;
 
-/** Divides the dispatch estimate from the cut-off countdown printed after it. */
+/**
+ * Divides the dispatch line's opening - the delivery estimate, or {@link DELIVERY_QUOTED_NOTE} -
+ * from the cut-off countdown printed after it.
+ */
 const NOTE_SEPARATOR = '\u00b7';
 
-/** Opens the cut-off countdown, which follows the dispatch estimate in the same quiet line. */
+/** Opens the cut-off countdown, which follows the line's opening in the same quiet line. */
 const CUTOFF_PREFIX = 'next dispatch cut-off in';
 
 /** The countdown's wording inside its final minute, where whole minutes have nothing left to say. */
@@ -247,8 +277,8 @@ const MINUTES_PER_HOUR = 60;
  *
  * `null` covers all three ways the value can carry no countdown - the provider has not read the
  * clock yet (`null`), the cut-off has passed for this reading (`0` or negative), or the figure is
- * not a usable number at all - and the caller then prints the dispatch estimate on its own rather
- * than a sentence built from a non-finite value.
+ * not a usable number at all - and the caller then prints the dispatch line's opening on its own
+ * rather than a sentence built from a non-finite value.
  *
  * The result is coarse on purpose. Seconds are folded into whole minutes, so the wording changes
  * at most once a minute, and a shopper reading the line is not watching digits flicker while they
@@ -329,10 +359,14 @@ interface Props {
    * What the placing surface adds to the merchandise figure, in the order the rows should be read.
    *
    * Omitted - the cart drawer and the `/cart` page, neither of which knows a destination or a
-   * service - the block prints the merchandise subtotal as its single, closing money row and
-   * asserts no order total. Given, each entry prints a row and the closing row becomes their sum
-   * over that subtotal: see {@link CartCharge} for what an unestablished amount means, and the
-   * header for why the two arrangements are labelled differently.
+   * service - the block prints the merchandise subtotal as its single, closing money row, asserts
+   * no order total and states no arrival estimate. Given, each entry prints a row and the closing
+   * row becomes their sum over that subtotal: see {@link CartCharge} for what an unestablished
+   * amount means, and the header for why the two arrangements are labelled differently.
+   *
+   * A caller that quotes charges also supplies, through `summary`, the delivery estimate for the
+   * service those charges are quoted for: the dispatch line prints `estimatedDeliveryLabel` only
+   * where charges are given, and prints it as that summary carries it.
    *
    * An empty array is the same as omitting it, so a caller assembling charges conditionally needs
    * no branch at the call site.
@@ -364,18 +398,20 @@ interface Props {
  * Renders the cart's totals.
  *
  * @example The drawer's footer and the `/cart` page's summary column: merchandise only, so the
- * subtotal is the closing figure and no order total is claimed.
+ * subtotal is the closing figure, no order total is claimed and delivery time is left to checkout.
  * ```tsx
  * <CartTotalsPanel variant="drawer" />
  * <CartTotalsPanel variant="page" className={styles.totals} />
  * ```
  *
- * @example The checkout review column, which knows the chosen freight charge and knows that the
- * discount and the tax are settled when the order is written.
+ * @example The checkout review column, which knows the chosen freight charge and that service's
+ * delivery estimate - carried in `reviewedTotals`, the cart's reading with `estimatedDeliveryLabel`
+ * replaced - and knows that the discount and the tax are settled when the order is written.
  * ```tsx
  * <CartTotalsPanel
  *   variant="page"
  *   heading=""
+ *   summary={reviewedTotals}
  *   charges={[
  *     { id: 'freight', label: 'Freight', detail: 'Standard ground', amountCents: 1250 },
  *     { id: 'discounts', label: 'Discounts', amountCents: null },
@@ -407,10 +443,29 @@ export function CartTotalsPanel({
   const cutoff = dispatchCutoffNote(totals.dispatchCountdownMs);
 
   /*
-   * The dispatch promise, which is the one line that holds in every state of the cart: it is the
-   * store's cut-off as the dispatch provider published it, not a property of what a buyer has
-   * collected, so it is printed whether or not there are figures to print beside it. Assembled
-   * once here and rendered by both arrangements below rather than written twice.
+   * The charges as the rows below iterate them, and the questions the block turns on. An absent
+   * prop and an empty array are one case on purpose - a caller assembling charges conditionally
+   * should not have to branch at the call site - and `hasCharges` is what decides whether the
+   * merchandise row is the closing row or the first of several, and which reading the dispatch
+   * line gives. Pure derivations of the props, so they are worked out before either early return
+   * and read the same way by every arrangement.
+   */
+  const chargeRows: readonly CartCharge[] = charges ?? [];
+  const hasCharges = chargeRows.length > 0;
+  const hasPendingCharge = chargeRows.some((charge) => charge.amountCents === null);
+
+  /*
+   * The dispatch line, which is the one line that holds in every state of the cart: it is not a
+   * property of what a buyer has collected, so it is printed whether or not there are figures to
+   * print beside it. Assembled once here and rendered by every arrangement below rather than
+   * written more than once.
+   *
+   * It has two readings, and `hasCharges` chooses between them. A surface quoting charges opens it
+   * with the delivery estimate its `summary` carries, which that caller states for the service the
+   * charges are quoted for. A surface quoting a cart has no service to state an arrival for, so it
+   * opens it with {@link DELIVERY_QUOTED_NOTE} instead; see the header. Both close with the
+   * dispatch provider's cut-off, which is the warehouse's and holds whatever service carries the
+   * order.
    *
    * The space after the hidden prefix is load-bearing: without it the accessible reading runs the
    * two together, and the clipped span is out of flow, so the character collapses away as leading
@@ -418,7 +473,13 @@ export function CartTotalsPanel({
    */
   const dispatch = (
     <p className={styles.dispatch}>
-      <VisuallyHidden>{DELIVERY_READING}</VisuallyHidden> {totals.estimatedDeliveryLabel}
+      {hasCharges ? (
+        <>
+          <VisuallyHidden>{DELIVERY_READING}</VisuallyHidden> {totals.estimatedDeliveryLabel}
+        </>
+      ) : (
+        DELIVERY_QUOTED_NOTE
+      )}
       {cutoff === null ? null : ` ${NOTE_SEPARATOR} ${cutoff}`}
     </p>
   );
@@ -463,16 +524,6 @@ export function CartTotalsPanel({
       </Card>
     );
   }
-
-  /*
-   * The charges as the rows below iterate them, and the two questions the arrangement turns on.
-   * An absent prop and an empty array are one case on purpose - a caller assembling charges
-   * conditionally should not have to branch at the call site - and `hasCharges` is what decides
-   * whether the merchandise row is the closing row or the first of several.
-   */
-  const chargeRows: readonly CartCharge[] = charges ?? [];
-  const hasCharges = chargeRows.length > 0;
-  const hasPendingCharge = chargeRows.some((charge) => charge.amountCents === null);
 
   /*
    * NOTHING TO TOTAL: A CART THAT WAS READ AND HOLDS NOTHING.
@@ -663,9 +714,9 @@ export function CartTotalsPanel({
           </p>
         )}
 
-        {/* The same line the no-figures arrangement above prints, assembled once beside the
-            countdown it reads: the dispatch promise is the store's, so it does not change with
-            what a buyer has collected. */}
+        {/* The same line the no-figures arrangements above print, assembled once beside the
+            countdown it reads: its reading turns on whether charges are quoted, never on what a
+            buyer has collected. */}
         {dispatch}
       </div>
     </Card>

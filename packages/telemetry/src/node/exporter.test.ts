@@ -44,6 +44,19 @@
  * - {@link REFUSAL_WARNING_INTERVAL_MS} — refusals are summarised in at most
  *   one warning per drain, no more often than this interval, with nothing lost
  *   to it and the remainder written by the shutdown flush.
+ * - {@link MAX_LOSS_LEDGER_CAPTURES} — the captures whose unreported loss is
+ *   held at once, asserted one over: the oldest capture's loss is abandoned
+ *   and never reported. Around it, the capture contract of every post: one
+ *   capture per post, named as `armedCaptureId` on every attempt, and the
+ *   loss the buffer cap or a failed batch cost carried as `droppedCount` — on
+ *   the capture's next batch, or on a loss-only report when none is left —
+ *   once, never as zero, never in a drain whose batch just failed, and never
+ *   on a timer of its own. Every count travels as a report with a stable
+ *   `lossReportId`, present exactly when `droppedCount` is: every attempt and
+ *   every resend of a report carries the same id and count, loss recorded
+ *   behind an outstanding report travels under a new id only once that report
+ *   is delivered, and every lost event is on exactly one of reported, pending
+ *   and abandoned — including while its report is on the wire.
  *
  * ## Techniques, and why each one is the way it is
  *
@@ -106,12 +119,13 @@ import {
   DebuggenSpanProcessor,
   MAX_ACKNOWLEDGEMENT_BYTES,
   MAX_DRAIN_BATCHES,
+  MAX_LOSS_LEDGER_CAPTURES,
   MAX_POST_ATTEMPTS,
   REFUSAL_WARNING_INTERVAL_MS,
   RETRYABLE_CLIENT_STATUSES,
   SHUTDOWN_FLUSH_DEADLINE_MS,
 } from './exporter.js';
-import type { CaptureGate } from './exporter.js';
+import type { CaptureGate, DebuggenSpanProcessorStats } from './exporter.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -323,6 +337,59 @@ const OPEN_GATE: CaptureGate = {
   isKindEnabled: (): boolean => true,
 };
 
+/**
+ * A gate a case can re-arm, clear and re-open, as `./control.ts` does between
+ * captures.
+ *
+ * Mutable where {@link CaptureGate} is read-only, which is structurally
+ * assignable to it; the generation advances on every arming exactly as the
+ * real gate's does, so the processor's stale-stamp rule sees what it would see
+ * in a dev server.
+ */
+interface SwitchableGate {
+  /** The armed capture, or `null` while the gate is shut. */
+  captureId: string | null;
+  /** Advanced by {@link armGate} on every arming. */
+  captureGeneration: number;
+  /** Every kind is wanted, as with {@link OPEN_GATE}. */
+  readonly isKindEnabled: () => boolean;
+}
+
+/**
+ * A switchable gate armed for `captureId` at generation 1.
+ *
+ * @param captureId The first capture.
+ * @returns The gate.
+ */
+function switchableGate(captureId: string): SwitchableGate {
+  return { captureId, captureGeneration: 1, isKindEnabled: (): boolean => true };
+}
+
+/**
+ * Arm the gate for a capture, advancing the generation as `./control.ts` does.
+ *
+ * @param gate The gate.
+ * @param captureId The capture to arm.
+ */
+function armGate(gate: SwitchableGate, captureId: string): void {
+  gate.captureGeneration += 1;
+  gate.captureId = captureId;
+}
+
+/** The capture a case moves to after {@link CAPTURE_ID}. */
+const NEXT_CAPTURE_ID = `cap_${'b'.repeat(16)}`;
+
+/**
+ * A capture id that encodes its index, for the cases that need more captures
+ * than the loss ledger holds.
+ *
+ * @param index The capture's position.
+ * @returns A 20-character capture id.
+ */
+function captureIdFor(index: number): string {
+  return `cap_${index.toString(16).padStart(16, '0')}`;
+}
+
 /** One line a diagnostic produced, as the recording logger keeps it. */
 interface LogEntry {
   /** The severity the call site chose. */
@@ -472,6 +539,16 @@ interface FetchPlan {
   /** When true, every call returns a promise that never settles. */
   readonly hangForever?: boolean | undefined;
 
+  /**
+   * The 1-based call from which every call returns a promise that never
+   * settles, the calls before it being answered from {@link statuses}.
+   *
+   * What lets a case leave one particular post on the wire — a loss report
+   * after the failed batch that created its loss — while the shutdown
+   * deadline passes over it.
+   */
+  readonly hangFromCall?: number | undefined;
+
   /** Called before each answer, so a case can feed the processor mid-drain. */
   readonly beforeAnswer?: ((call: number) => void) | undefined;
 }
@@ -519,7 +596,10 @@ function createFetchRig(plan: FetchPlan = {}): FetchRig {
     calls.push(init === undefined ? { input } : { input, init });
     plan.beforeAnswer?.(calls.length);
 
-    if (plan.hangForever === true) {
+    if (
+      plan.hangForever === true ||
+      (plan.hangFromCall !== undefined && calls.length >= plan.hangFromCall)
+    ) {
       return new Promise<Response>(() => {
         // Deliberately never settles: this is how a case reaches the shutdown
         // deadline without a real service and without a real wait.
@@ -563,14 +643,16 @@ const harnesses: Harness[] = [];
  * Build a processor wired exactly as `register.ts` wires it, with doubles.
  *
  * @param plan How the injected `fetch` should answer.
+ * @param gate The capture gate; {@link OPEN_GATE} unless a case moves between
+ * captures.
  * @returns The harness, registered for teardown.
  */
-function createHarness(plan: FetchPlan = {}): Harness {
+function createHarness(plan: FetchPlan = {}, gate: CaptureGate = OPEN_GATE): Harness {
   const config = activeConfig();
   const fetchRig = createFetchRig(plan);
   const logger = new RecordingLogger();
   const processor = new DebuggenSpanProcessor({
-    gate: OPEN_GATE,
+    gate,
     config,
     logger,
     fetchImpl: fetchRig.impl,
@@ -725,6 +807,94 @@ function batchSizesOf(rig: FetchRig): number[] {
   return rig.calls.map((call) => eventsOf(call).length);
 }
 
+/** The capture one call's body named. */
+function armedCaptureIdOf(call: FetchCall): string {
+  const armedCaptureId = bodyOf(call).armedCaptureId;
+  if (typeof armedCaptureId !== 'string') {
+    throw new Error('the ingest body named no capture');
+  }
+  return armedCaptureId;
+}
+
+/** The capture each call named, in order. */
+function armedCaptureIdsOf(rig: FetchRig): string[] {
+  return rig.calls.map((call) => armedCaptureIdOf(call));
+}
+
+/**
+ * The loss one call's body reported, or `undefined` when it carried no
+ * `droppedCount` key at all.
+ *
+ * A key that is present must be a positive integer: the contract admits no
+ * zero and no fraction, so this reader fails rather than normalising one.
+ *
+ * @param call The call.
+ * @returns The count, or `undefined`.
+ */
+function droppedCountOf(call: FetchCall): number | undefined {
+  const body = bodyOf(call);
+  if (!Object.hasOwn(body, 'droppedCount')) {
+    return undefined;
+  }
+  const droppedCount = body.droppedCount;
+  if (typeof droppedCount !== 'number' || !Number.isSafeInteger(droppedCount) || droppedCount < 1) {
+    throw new Error('the ingest body carried a droppedCount that is not a positive integer');
+  }
+  return droppedCount;
+}
+
+/** The loss each call reported, in order; `undefined` where it carried none. */
+function droppedCountsOf(rig: FetchRig): (number | undefined)[] {
+  return rig.calls.map((call) => droppedCountOf(call));
+}
+
+/**
+ * The longest `lossReportId` the ingest contract admits.
+ *
+ * Spelled rather than imported: the grammar belongs to `@debuggen/protocol`,
+ * which this package sits below and may not import.
+ */
+const LOSS_REPORT_ID_MAX_LENGTH = 64;
+
+/**
+ * The loss report identity one call's body carried, or `undefined` when it
+ * carried no `lossReportId` key at all.
+ *
+ * The key must travel exactly when `droppedCount` does — an id without a
+ * count, or a count without an id, is a body the service refuses — and inside
+ * the contract's identifier grammar: 1 to {@link LOSS_REPORT_ID_MAX_LENGTH}
+ * characters with no surrounding whitespace. This reader fails on anything
+ * else rather than normalising it.
+ *
+ * @param call The call.
+ * @returns The id, or `undefined`.
+ */
+function lossReportIdOf(call: FetchCall): string | undefined {
+  const body = bodyOf(call);
+  const carriesId = Object.hasOwn(body, 'lossReportId');
+  if (carriesId !== Object.hasOwn(body, 'droppedCount')) {
+    throw new Error('the ingest body carried lossReportId and droppedCount apart');
+  }
+  if (!carriesId) {
+    return undefined;
+  }
+  const lossReportId = body.lossReportId;
+  if (
+    typeof lossReportId !== 'string' ||
+    lossReportId.length < 1 ||
+    lossReportId.length > LOSS_REPORT_ID_MAX_LENGTH ||
+    lossReportId.trim() !== lossReportId
+  ) {
+    throw new Error('the ingest body carried a lossReportId outside the identifier grammar');
+  }
+  return lossReportId;
+}
+
+/** The report identity each call carried, in order; `undefined` where none. */
+function lossReportIdsOf(rig: FetchRig): (string | undefined)[] {
+  return rig.calls.map((call) => lossReportIdOf(call));
+}
+
 /**
  * The `seq` of one posted event.
  *
@@ -809,9 +979,12 @@ describe('BATCH_MAX_EVENTS', () => {
     expect(headers['Content-Type']).toBe('application/json');
     expect(headers.Authorization).toBe(`Bearer ${config.token}`);
 
+    // The events, the project root, and the capture the events were recorded
+    // in. Nothing was lost, so no `droppedCount` travels.
     const body = bodyOf(call);
-    expect(Object.keys(body).sort()).toEqual(['events', 'projectRoot']);
+    expect(Object.keys(body).sort()).toEqual(['armedCaptureId', 'events', 'projectRoot']);
     expect(body.projectRoot).toBe(config.projectRoot);
+    expect(body.armedCaptureId).toBe(CAPTURE_ID);
   });
 
   it('posts the threshold batch and the remainder, in feed order, one event over', async () => {
@@ -1889,5 +2062,720 @@ describe('the ingest acknowledgement', () => {
     await processor.forceFlush();
 
     expect(logger.entriesAt('warn')).toHaveLength(2);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * One capture per post, and the loss it reports
+ *
+ * Every post names the capture its events were recorded in, so the service
+ * can refuse a batch that outlived its capture instead of storing it under
+ * the next one; and every event this processor loses is reported to that
+ * capture as `droppedCount`, so the service's capture ledger sees server-tier
+ * loss. The cases drive a switchable gate the way `./control.ts` drives the
+ * real one — arm, re-arm, clear — and read the capture and the count off the
+ * wire.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Assert that every event credited to the loss ledger is on exactly one of
+ * its three outcomes: reported, pending or abandoned.
+ *
+ * @param processor The processor.
+ */
+function expectLossAccounted(processor: DebuggenSpanProcessor): void {
+  const stats = processor.stats();
+  expect(stats.reportedLossEvents + stats.pendingLossEvents + stats.abandonedLossEvents).toBe(
+    stats.droppedOverflow + stats.droppedFailedBatch + stats.droppedUnserializable,
+  );
+}
+
+describe('one capture per post, and the loss it reports', () => {
+  it('names the capture its events were recorded in on every post, and reports no loss it did not have', async () => {
+    const { processor, fetch: rig } = createHarness();
+
+    feedSpans(processor, BATCH_MAX_EVENTS + 1);
+    await processor.forceFlush();
+
+    expect(armedCaptureIdsOf(rig)).toEqual([CAPTURE_ID, CAPTURE_ID]);
+    // Nothing was lost, so no post carries either key at all — never a zero,
+    // and never a report identity without a count.
+    expect(droppedCountsOf(rig)).toEqual([undefined, undefined]);
+    expect(lossReportIdsOf(rig)).toEqual([undefined, undefined]);
+    expect(processor.stats()).toMatchObject({
+      postedBatches: 2,
+      postedEvents: BATCH_MAX_EVENTS + 1,
+      lossReportBatches: 0,
+      reportedLossEvents: 0,
+      pendingLossEvents: 0,
+      abandonedLossEvents: 0,
+    });
+  });
+
+  it('posts a buffer holding two captures as separate posts, the older capture first', async () => {
+    const olderEvents = BATCH_MAX_EVENTS + 44;
+    const newerEvents = 10;
+    const gate = switchableGate(CAPTURE_ID);
+    const { processor, fetch: rig } = createHarness({}, gate);
+
+    // Re-armed before any drain has run: the threshold drain is queued, not
+    // run, while the feed is synchronous, so it finds both captures buffered.
+    feedSpans(processor, olderEvents);
+    armGate(gate, NEXT_CAPTURE_ID);
+    feedSpans(processor, newerEvents, olderEvents);
+    await processor.forceFlush();
+
+    expect(armedCaptureIdsOf(rig)).toEqual([CAPTURE_ID, CAPTURE_ID, NEXT_CAPTURE_ID]);
+    // The older capture's run is split at the batch size and never topped up
+    // with the newer capture's events.
+    expect(batchSizesOf(rig)).toEqual([
+      BATCH_MAX_EVENTS,
+      olderEvents - BATCH_MAX_EVENTS,
+      newerEvents,
+    ]);
+
+    // Each capture's events are its own, in feed order, numbered in its own
+    // sequence.
+    const newer = eventsOf(at(rig.calls, 2, 'the ingest calls'));
+    expect(newer.map((event) => event.spanId)).toEqual(
+      numberRange(olderEvents, newerEvents).map((index) => spanIdFor(index)),
+    );
+    expect(newer.map((event) => seqOf(event))).toEqual(numberRange(0, newerEvents));
+    expect(
+      rig.calls
+        .slice(0, 2)
+        .flatMap((call) => eventsOf(call))
+        .map((event) => seqOf(event)),
+    ).toEqual(numberRange(0, olderEvents));
+    expect(processor.stats()).toMatchObject({
+      postedBatches: 3,
+      postedEvents: olderEvents + newerEvents,
+    });
+  });
+
+  it('still names the recorded capture, byte for byte, when a batch is retried across a re-arm', async () => {
+    vi.useFakeTimers();
+    const gate = switchableGate(CAPTURE_ID);
+    const harness = createHarness(
+      {
+        statuses: [UNAVAILABLE_STATUS, ACCEPTED_STATUS],
+        beforeAnswer: (call) => {
+          if (call !== 1) {
+            return;
+          }
+          // The capture stops and the next one is armed while the first
+          // attempt is on the wire, and the next capture's first span ends.
+          armGate(gate, NEXT_CAPTURE_ID);
+          feedSpans(harness.processor, 1, 1);
+        },
+      },
+      gate,
+    );
+
+    feedSpans(harness.processor, 1);
+    const flushing = harness.processor.forceFlush();
+    await vi.advanceTimersByTimeAsync(RECONNECT_MIN_MS * 2 ** MAX_POST_ATTEMPTS);
+    await flushing;
+
+    const { calls } = harness.fetch;
+    expect(armedCaptureIdsOf(harness.fetch)).toEqual([CAPTURE_ID, CAPTURE_ID, NEXT_CAPTURE_ID]);
+    // The retry resends the first attempt's bytes: the batch is never renamed
+    // after the capture the gate holds now.
+    expect(at(calls, 1, 'the ingest calls').init?.body).toBe(
+      at(calls, 0, 'the ingest calls').init?.body,
+    );
+    const moved = eventsOf(at(calls, 2, 'the ingest calls'));
+    expect(moved.map((event) => event.spanId)).toEqual([spanIdFor(1)]);
+    expect(moved.map((event) => seqOf(event))).toEqual([0]);
+    expect(harness.processor.stats()).toMatchObject({ postedBatches: 2, failedBatches: 0 });
+  });
+
+  it('reports overflow loss as droppedCount on the next post for its capture, exactly once', async () => {
+    const { processor, fetch: rig } = createHarness();
+
+    feedSpans(processor, MAX_BUFFERED_EVENTS + 1);
+    expect(processor.stats()).toMatchObject({ droppedOverflow: 1, pendingLossEvents: 1 });
+
+    await processor.forceFlush();
+
+    const counts = droppedCountsOf(rig);
+    expect(counts[0]).toBe(1);
+    expect(counts.slice(1).every((count) => count === undefined)).toBe(true);
+    // Carried by an event batch, so no loss-only report was needed, and the
+    // count is loss, never delivered events.
+    expect(rig.calls).toHaveLength(Math.ceil(MAX_BUFFERED_EVENTS / BATCH_MAX_EVENTS));
+    expect(processor.stats()).toMatchObject({
+      postedEvents: MAX_BUFFERED_EVENTS,
+      lossReportBatches: 0,
+      reportedLossEvents: 1,
+      pendingLossEvents: 0,
+      abandonedLossEvents: 0,
+    });
+
+    await processor.forceFlush();
+    expect(rig.calls).toHaveLength(Math.ceil(MAX_BUFFERED_EVENTS / BATCH_MAX_EVENTS));
+    expectLossAccounted(processor);
+  });
+
+  it("credits a failed batch's events to its capture and reports them on the next delivered post", async () => {
+    const { processor, fetch: rig } = createHarness({
+      statuses: [REFUSED_STATUS, ACCEPTED_STATUS],
+    });
+
+    feedSpans(processor, 3);
+    await processor.forceFlush();
+
+    expect(rig.calls).toHaveLength(1);
+    expect(processor.stats()).toMatchObject({
+      failedBatches: 1,
+      droppedFailedBatch: 3,
+      pendingLossEvents: 3,
+    });
+
+    feedSpans(processor, 2, 3);
+    await processor.forceFlush();
+    feedSpans(processor, 1, 5);
+    await processor.forceFlush();
+
+    // Reported on the next post, and only there.
+    expect(droppedCountsOf(rig)).toEqual([undefined, 3, undefined]);
+    expect(batchSizesOf(rig)).toEqual([3, 2, 1]);
+    expect(processor.stats()).toMatchObject({
+      postedEvents: 3,
+      reportedLossEvents: 3,
+      pendingLossEvents: 0,
+      lossReportBatches: 0,
+    });
+    expectLossAccounted(processor);
+  });
+
+  it('keeps the report a refused post carried, and sends what was lost behind it under a new id only after it is delivered', async () => {
+    const { processor, fetch: rig } = createHarness({
+      statuses: [REFUSED_STATUS, REFUSED_STATUS, ACCEPTED_STATUS],
+    });
+
+    feedSpans(processor, 3);
+    await processor.forceFlush();
+    feedSpans(processor, 2, 3);
+    await processor.forceFlush();
+
+    // The refused post carried a report of the first batch's three events.
+    // It stays outstanding as it was, and the second batch's own two events
+    // wait beside it rather than being folded into a count already sent.
+    expect(droppedCountsOf(rig)).toEqual([undefined, 3]);
+    expect(processor.stats()).toMatchObject({ pendingLossEvents: 5, reportedLossEvents: 0 });
+    expectLossAccounted(processor);
+
+    feedSpans(processor, 1, 5);
+    await processor.forceFlush();
+
+    // The next post resends the same report, and only once it is delivered
+    // does the loss behind it travel, as a loss-only report under a new id.
+    expect(droppedCountsOf(rig)).toEqual([undefined, 3, 3, 2]);
+    expect(batchSizesOf(rig)).toEqual([3, 2, 1, 0]);
+    const [none, refused, resent, followUp] = lossReportIdsOf(rig);
+    expect(none).toBeUndefined();
+    expect(refused).toBeDefined();
+    expect(resent).toBe(refused);
+    expect(followUp).toBeDefined();
+    expect(followUp).not.toBe(refused);
+    expect(processor.stats()).toMatchObject({
+      droppedFailedBatch: 5,
+      lossReportBatches: 1,
+      reportedLossEvents: 5,
+      pendingLossEvents: 0,
+    });
+    expectLossAccounted(processor);
+  });
+
+  it('sends the identical lossReportId and droppedCount on every attempt of a retried post', async () => {
+    vi.useFakeTimers();
+    const retries = Array.from({ length: MAX_POST_ATTEMPTS - 1 }, () => UNAVAILABLE_STATUS);
+    const pendingWhileOnTheWire: number[] = [];
+    const harness = createHarness({
+      statuses: [REFUSED_STATUS, ...retries, ACCEPTED_STATUS],
+      beforeAnswer: (call) => {
+        if (call === 1) {
+          return;
+        }
+        // The report on the wire is pending exactly once, not once for the
+        // post and once more for the capture it was reserved from.
+        pendingWhileOnTheWire.push(harness.processor.stats().pendingLossEvents);
+        expectLossAccounted(harness.processor);
+      },
+    });
+    const { processor, fetch: rig } = harness;
+
+    feedSpans(processor, 2);
+    await processor.forceFlush();
+    feedSpans(processor, 1, 2);
+    const flushing = processor.forceFlush();
+    await vi.advanceTimersByTimeAsync(RECONNECT_MIN_MS * 2 ** MAX_POST_ATTEMPTS);
+    await flushing;
+
+    const attempts = rig.calls.slice(1);
+    expect(attempts).toHaveLength(MAX_POST_ATTEMPTS);
+    // Byte for byte: one serialisation, every attempt.
+    const first = at(attempts, 0, 'the attempts').init?.body;
+    for (const attempt of attempts) {
+      expect(attempt.init?.body).toBe(first);
+    }
+    expect(droppedCountsOf(rig).slice(1)).toEqual(attempts.map(() => 2));
+    const ids = lossReportIdsOf(rig).slice(1);
+    expect(new Set(ids).size).toBe(1);
+    expect(at(ids, 0, 'the report ids')).toBeDefined();
+    expect(pendingWhileOnTheWire).toEqual(attempts.map(() => 2));
+
+    // Delivered once, on the attempt that was answered with a `2xx`.
+    expect(processor.stats()).toMatchObject({
+      postedBatches: 1,
+      reportedLossEvents: 2,
+      pendingLossEvents: 0,
+      lossReportBatches: 0,
+    });
+    expectLossAccounted(processor);
+  });
+
+  it('resends the same report in the next drain after its post exhausted every attempt', async () => {
+    vi.useFakeTimers();
+    const exhausted = Array.from({ length: MAX_POST_ATTEMPTS }, () => SERVER_ERROR_STATUS);
+    const gate = switchableGate(CAPTURE_ID);
+    const { processor, fetch: rig } = createHarness(
+      { statuses: [REFUSED_STATUS, ...exhausted, ACKNOWLEDGED_STATUS] },
+      gate,
+    );
+
+    feedSpans(processor, 1);
+    await processor.forceFlush();
+    gate.captureId = null;
+
+    // A `5xx` may come from a service that recorded the report before it
+    // failed, which is exactly why the next drain must not rename it.
+    const failing = processor.forceFlush();
+    await vi.advanceTimersByTimeAsync(RECONNECT_MIN_MS * 2 ** MAX_POST_ATTEMPTS);
+    await failing;
+    expect(rig.calls).toHaveLength(1 + MAX_POST_ATTEMPTS);
+    expect(processor.stats()).toMatchObject({
+      pendingLossEvents: 1,
+      reportedLossEvents: 0,
+      lossReportBatches: 0,
+    });
+    expectLossAccounted(processor);
+
+    await processor.forceFlush();
+
+    const reports = rig.calls.slice(1);
+    expect(reports).toHaveLength(MAX_POST_ATTEMPTS + 1);
+    expect(batchSizesOf(rig).slice(1)).toEqual(reports.map(() => 0));
+    expect(droppedCountsOf(rig).slice(1)).toEqual(reports.map(() => 1));
+    expect(new Set(lossReportIdsOf(rig).slice(1)).size).toBe(1);
+    const failedBody = at(reports, 0, 'the loss reports').init?.body;
+    expect(at(reports, MAX_POST_ATTEMPTS, 'the loss reports').init?.body).toBe(failedBody);
+    expect(processor.stats()).toMatchObject({
+      pendingLossEvents: 0,
+      reportedLossEvents: 1,
+      lossReportBatches: 1,
+    });
+
+    // Delivered, so nothing is left to resend.
+    await processor.forceFlush();
+    expect(rig.calls).toHaveLength(MAX_POST_ATTEMPTS + 2);
+    expectLossAccounted(processor);
+  });
+
+  it('sends a loss-only report once no event is left to carry the loss, counted apart from batches', async () => {
+    const gate = switchableGate(CAPTURE_ID);
+    const {
+      processor,
+      config,
+      fetch: rig,
+    } = createHarness({ statuses: [REFUSED_STATUS, ACCEPTED_STATUS] }, gate);
+
+    feedSpans(processor, 2);
+    await processor.forceFlush();
+    expect(rig.calls).toHaveLength(1);
+
+    // `./control.ts` clears the gate before its disable-path flush, so the
+    // report must name the capture the loss belongs to, not the gate's.
+    gate.captureId = null;
+    await processor.forceFlush();
+
+    expect(rig.calls).toHaveLength(2);
+    const report = at(rig.calls, 1, 'the ingest calls');
+    const body = bodyOf(report);
+    expect(Object.keys(body).sort()).toEqual([
+      'armedCaptureId',
+      'droppedCount',
+      'events',
+      'lossReportId',
+      'projectRoot',
+    ]);
+    // A loss-only report is a report like any other: it carries its identity.
+    const lossReportId = lossReportIdOf(report);
+    expect(lossReportId).toBeDefined();
+    expect(body).toEqual({
+      projectRoot: config.projectRoot,
+      events: [],
+      armedCaptureId: CAPTURE_ID,
+      droppedCount: 2,
+      lossReportId,
+    });
+    expect(headersOf(report).Authorization).toBe(`Bearer ${config.token}`);
+    expect(processor.stats()).toMatchObject({
+      lossReportBatches: 1,
+      reportedLossEvents: 2,
+      pendingLossEvents: 0,
+      postedBatches: 0,
+      postedEvents: 0,
+      refusedBatches: 0,
+      unacknowledgedBatches: 0,
+      failedBatches: 1,
+    });
+
+    // Delivered once: a further flush has nothing to say.
+    await processor.forceFlush();
+    expect(rig.calls).toHaveLength(2);
+    expectLossAccounted(processor);
+  });
+
+  it('holds every loss-only report in a drain where a batch failed, and sends them oldest first later', async () => {
+    const gate = switchableGate(CAPTURE_ID);
+    const { processor, fetch: rig } = createHarness(
+      { statuses: [REFUSED_STATUS, REFUSED_STATUS, ACCEPTED_STATUS] },
+      gate,
+    );
+
+    feedSpans(processor, 1);
+    await processor.forceFlush();
+    armGate(gate, NEXT_CAPTURE_ID);
+    feedSpans(processor, 1, 1);
+    await processor.forceFlush();
+
+    // The second drain's batch failed, so the first capture's pending loss
+    // was not reported in it.
+    expect(armedCaptureIdsOf(rig)).toEqual([CAPTURE_ID, NEXT_CAPTURE_ID]);
+    expect(processor.stats().pendingLossEvents).toBe(2);
+
+    await processor.forceFlush();
+
+    expect(armedCaptureIdsOf(rig)).toEqual([
+      CAPTURE_ID,
+      NEXT_CAPTURE_ID,
+      CAPTURE_ID,
+      NEXT_CAPTURE_ID,
+    ]);
+    expect(batchSizesOf(rig)).toEqual([1, 1, 0, 0]);
+    expect(droppedCountsOf(rig)).toEqual([undefined, undefined, 1, 1]);
+    // Each capture's report is its own: two captures, two identities.
+    const [, , olderReport, newerReport] = lossReportIdsOf(rig);
+    expect(olderReport).toBeDefined();
+    expect(newerReport).toBeDefined();
+    expect(newerReport).not.toBe(olderReport);
+    expect(processor.stats()).toMatchObject({ lossReportBatches: 2, pendingLossEvents: 0 });
+    expectLossAccounted(processor);
+  });
+
+  it('arms no flush window for loss alone, so an absent service is not polled', async () => {
+    vi.useFakeTimers();
+    const { processor, fetch: rig } = createHarness({ rejectEverything: true });
+
+    feedSpans(processor, 1);
+    const flushing = processor.forceFlush();
+    await vi.advanceTimersByTimeAsync(RECONNECT_MIN_MS * 2 ** MAX_POST_ATTEMPTS);
+    await flushing;
+    expect(rig.calls).toHaveLength(MAX_POST_ATTEMPTS);
+
+    // Many flush windows later, nothing has tried again: the loss waits for
+    // the next event, an explicit flush or the shutdown drain.
+    await vi.advanceTimersByTimeAsync(BATCH_FLUSH_INTERVAL_MS * 10);
+    expect(rig.calls).toHaveLength(MAX_POST_ATTEMPTS);
+    expect(processor.stats()).toMatchObject({ pendingLossEvents: 1, lossReportBatches: 0 });
+  });
+
+  it('abandons the oldest capture once more than MAX_LOSS_LEDGER_CAPTURES hold loss', async () => {
+    const captures = MAX_LOSS_LEDGER_CAPTURES + 1;
+    const gate = switchableGate(captureIdFor(0));
+    const { processor, fetch: rig } = createHarness(
+      { statuses: [...Array.from({ length: captures }, () => REFUSED_STATUS), ACCEPTED_STATUS] },
+      gate,
+    );
+
+    for (let index = 0; index < captures; index += 1) {
+      if (index > 0) {
+        armGate(gate, captureIdFor(index));
+      }
+      feedSpans(processor, 1, index);
+      await processor.forceFlush();
+    }
+
+    expect(rig.calls).toHaveLength(captures);
+    expect(processor.stats()).toMatchObject({
+      pendingLossEvents: MAX_LOSS_LEDGER_CAPTURES,
+      abandonedLossEvents: 1,
+    });
+
+    gate.captureId = null;
+    await processor.forceFlush();
+
+    // One report per capture still held, in arming order; the evicted capture
+    // is never reported.
+    const reported = armedCaptureIdsOf(rig).slice(captures);
+    expect(reported).toEqual(
+      numberRange(1, MAX_LOSS_LEDGER_CAPTURES).map((index) => captureIdFor(index)),
+    );
+    expect(reported).not.toContain(captureIdFor(0));
+    expect(processor.stats()).toMatchObject({
+      lossReportBatches: MAX_LOSS_LEDGER_CAPTURES,
+      reportedLossEvents: MAX_LOSS_LEDGER_CAPTURES,
+      pendingLossEvents: 0,
+      abandonedLossEvents: 1,
+    });
+
+    // Every report has an identity of its own, inside the grammar the reader
+    // enforces, and none is derived from the credential, the project root or
+    // the capture it reports on.
+    const ids = lossReportIdsOf(rig).slice(captures);
+    expect(ids).toHaveLength(MAX_LOSS_LEDGER_CAPTURES);
+    expect(new Set(ids).size).toBe(MAX_LOSS_LEDGER_CAPTURES);
+    const { token, projectRoot } = activeConfig();
+    for (const [index, id] of ids.entries()) {
+      if (id === undefined) {
+        throw new Error(`loss report ${String(index)} carried no lossReportId`);
+      }
+      expect(token).not.toContain(id);
+      expect(projectRoot).not.toContain(id);
+      expect(id).not.toBe(at(reported, index, 'the reported captures'));
+    }
+    expectLossAccounted(processor);
+  });
+
+  it('abandons the pending loss when the credential is refused, and posts nothing more', async () => {
+    const { processor, fetch: rig } = createHarness({
+      statuses: [REFUSED_STATUS, UNAUTHORIZED_STATUS],
+    });
+
+    feedSpans(processor, 2);
+    await processor.forceFlush();
+    feedSpans(processor, 1, 2);
+    await processor.forceFlush();
+
+    // The refused post carried the loss; the refusal latched the credential.
+    expect(droppedCountsOf(rig)).toEqual([undefined, 2]);
+    expect(lossReportIdsOf(rig)[0]).toBeUndefined();
+    expect(lossReportIdsOf(rig)[1]).toBeDefined();
+    expect(processor.stats()).toMatchObject({
+      credentialRejected: true,
+      droppedFailedBatch: 3,
+      reportedLossEvents: 0,
+      pendingLossEvents: 0,
+      abandonedLossEvents: 3,
+    });
+
+    await processor.forceFlush();
+    await processor.shutdown();
+
+    expect(rig.calls).toHaveLength(2);
+    expect(processor.stats()).toMatchObject({ pendingLossEvents: 0, abandonedLossEvents: 3 });
+    expectLossAccounted(processor);
+  });
+
+  it('sends pending loss once in the shutdown drain', async () => {
+    const { processor, fetch: rig } = createHarness({
+      statuses: [REFUSED_STATUS, ACCEPTED_STATUS],
+    });
+
+    feedSpans(processor, 1);
+    await processor.forceFlush();
+    await processor.shutdown();
+
+    expect(rig.calls).toHaveLength(2);
+    expect(batchSizesOf(rig)).toEqual([1, 0]);
+    expect(droppedCountsOf(rig)).toEqual([undefined, 1]);
+    expect(processor.stats()).toMatchObject({
+      lossReportBatches: 1,
+      reportedLossEvents: 1,
+      pendingLossEvents: 0,
+      abandonedLossEvents: 0,
+    });
+
+    // The next capture's provider reopens the processor; the report is not
+    // sent a second time.
+    processor.reopen();
+    await processor.forceFlush();
+    expect(rig.calls).toHaveLength(2);
+    expectLossAccounted(processor);
+  });
+
+  it('abandons at shutdown the loss its single attempt could not deliver', async () => {
+    const { processor, fetch: rig } = createHarness({ rejectEverything: true });
+
+    feedSpans(processor, 1);
+    await processor.shutdown();
+
+    // One attempt for the batch, and no report in the drain it failed in.
+    expect(rig.calls).toHaveLength(1);
+    expect(processor.stats()).toMatchObject({
+      droppedFailedBatch: 1,
+      pendingLossEvents: 0,
+      abandonedLossEvents: 1,
+    });
+
+    processor.reopen();
+    await processor.forceFlush();
+    expect(rig.calls).toHaveLength(1);
+    expectLossAccounted(processor);
+  });
+
+  it('leaves a report still on the wire out of the shutdown abandonment, and counts it once', async () => {
+    vi.useFakeTimers();
+    const gate = switchableGate(CAPTURE_ID);
+    const { processor, fetch: rig } = createHarness(
+      { statuses: [REFUSED_STATUS, REFUSED_STATUS], hangFromCall: 3 },
+      gate,
+    );
+
+    feedSpans(processor, 2);
+    await processor.forceFlush();
+    armGate(gate, NEXT_CAPTURE_ID);
+    feedSpans(processor, 1, 2);
+    await processor.forceFlush();
+
+    // The shutdown drain's first loss report never gets an answer before the
+    // deadline passes over it.
+    const shuttingDown = processor.shutdown();
+    await vi.advanceTimersByTimeAsync(SHUTDOWN_FLUSH_DEADLINE_MS);
+    await shuttingDown;
+
+    expect(processor.isShutDown).toBe(true);
+    expect(armedCaptureIdsOf(rig)).toEqual([CAPTURE_ID, NEXT_CAPTURE_ID, CAPTURE_ID]);
+    expect(droppedCountsOf(rig)).toEqual([undefined, undefined, 2]);
+    // The report on the wire is still the post's to settle, so it stays
+    // pending, counted once; the other capture's loss had no carrier left.
+    expect(processor.stats()).toMatchObject({
+      droppedFailedBatch: 3,
+      reportedLossEvents: 0,
+      pendingLossEvents: 2,
+      abandonedLossEvents: 1,
+    });
+    expectLossAccounted(processor);
+  });
+
+  it('lets a report on the wire outlive the eviction of its capture, and counts it once', async () => {
+    const overflowCapture = captureIdFor(MAX_LOSS_LEDGER_CAPTURES);
+    const gate = switchableGate(captureIdFor(0));
+    const onTheWire: DebuggenSpanProcessorStats[] = [];
+    const harness = createHarness(
+      {
+        statuses: [
+          ...Array.from({ length: MAX_LOSS_LEDGER_CAPTURES }, () => REFUSED_STATUS),
+          ACCEPTED_STATUS,
+        ],
+        beforeAnswer: (call) => {
+          if (call !== MAX_LOSS_LEDGER_CAPTURES + 1) {
+            return;
+          }
+          // While the oldest capture's report is on the wire, a new capture
+          // overflows the buffer: its loss makes it the ledger's ninth
+          // capture, which evicts the oldest — the one being reported.
+          armGate(gate, overflowCapture);
+          feedSpans(harness.processor, MAX_BUFFERED_EVENTS + 1, MAX_LOSS_LEDGER_CAPTURES);
+          onTheWire.push(harness.processor.stats());
+          expectLossAccounted(harness.processor);
+        },
+      },
+      gate,
+    );
+    const { processor, fetch: rig } = harness;
+
+    for (let index = 0; index < MAX_LOSS_LEDGER_CAPTURES; index += 1) {
+      if (index > 0) {
+        armGate(gate, captureIdFor(index));
+      }
+      feedSpans(processor, 1, index);
+      await processor.forceFlush();
+    }
+    gate.captureId = null;
+    await processor.forceFlush();
+    // The overflow queued drains of its own; this one runs behind them all.
+    await processor.forceFlush();
+
+    // The evicted capture's report was the post's to settle, so eviction
+    // abandoned nothing and the report counted as pending exactly once.
+    expect(onTheWire).toHaveLength(1);
+    expect(at(onTheWire, 0, 'the snapshots on the wire')).toMatchObject({
+      droppedOverflow: 1,
+      pendingLossEvents: MAX_LOSS_LEDGER_CAPTURES + 1,
+      abandonedLossEvents: 0,
+    });
+
+    // Delivered once, and never resent under its own id or any other.
+    const evictedReport = at(rig.calls, MAX_LOSS_LEDGER_CAPTURES, 'the ingest calls');
+    expect(armedCaptureIdOf(evictedReport)).toBe(captureIdFor(0));
+    const evictedId = lossReportIdOf(evictedReport);
+    expect(evictedId).toBeDefined();
+    expect(lossReportIdsOf(rig).filter((id) => id === evictedId)).toHaveLength(1);
+    expect(
+      armedCaptureIdsOf(rig).filter((captureId) => captureId === captureIdFor(0)),
+    ).toHaveLength(2);
+    expect(processor.stats()).toMatchObject({
+      droppedFailedBatch: MAX_LOSS_LEDGER_CAPTURES,
+      droppedOverflow: 1,
+      postedEvents: MAX_BUFFERED_EVENTS,
+      lossReportBatches: MAX_LOSS_LEDGER_CAPTURES,
+      reportedLossEvents: MAX_LOSS_LEDGER_CAPTURES + 1,
+      pendingLossEvents: 0,
+      abandonedLossEvents: 0,
+    });
+    expectLossAccounted(processor);
+  });
+
+  it('keeps the loss pending, and posts the batch without it, when no report identity can be minted', async () => {
+    const {
+      processor,
+      fetch: rig,
+      logger,
+    } = createHarness({
+      statuses: [REFUSED_STATUS, ACCEPTED_STATUS],
+    });
+
+    feedSpans(processor, 1);
+    await processor.forceFlush();
+    feedSpans(processor, 1, 1);
+
+    // No Web Crypto global: `@debuggen/shared` cannot draw a random identity,
+    // and a report is never sent under anything else.
+    vi.stubGlobal('crypto', undefined);
+    try {
+      await processor.forceFlush();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(droppedCountsOf(rig)).toEqual([undefined, undefined]);
+    expect(lossReportIdsOf(rig)).toEqual([undefined, undefined]);
+    // Once for the batch, and once for the loss-only report the drain then
+    // tried: neither could carry the loss, and neither threw.
+    expect(processor.stats()).toMatchObject({
+      postedBatches: 1,
+      internalErrors: 2,
+      reportedLossEvents: 0,
+      pendingLossEvents: 1,
+      lossReportBatches: 0,
+    });
+    expect(logText(logger)).not.toContain(AGENT_TOKEN);
+    expectLossAccounted(processor);
+
+    await processor.forceFlush();
+
+    expect(droppedCountsOf(rig)).toEqual([undefined, undefined, 1]);
+    expect(lossReportIdsOf(rig)[2]).toBeDefined();
+    expect(processor.stats()).toMatchObject({
+      reportedLossEvents: 1,
+      pendingLossEvents: 0,
+      lossReportBatches: 1,
+    });
+    expectLossAccounted(processor);
   });
 });

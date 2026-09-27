@@ -40,27 +40,45 @@
  *   selector (`.dg-tooltip__bubble.dg-is-open`), which never carries the
  *   utility.
  *
- * ## Zero hardcoded values, and the structural-value policy
+ * ## Zero hardcoded values
  *
  * Every colour, spacing, radius, glyph and control size, shadow, font, focus
- * ring and stacking level resolves to a `var(--dg-*)` token generated from
- * `tokens.ts`. The only literals permitted are `0`, `none`, `auto`, `inherit`,
- * `currentColor` and `transparent`. There is no hexadecimal or functional
- * colour notation, no length literal of any unit — absolute, root-relative or
- * font-relative — and no bare line-height anywhere below. A glyph box and a
- * spinner are the font-relative size tokens (`--dg-icon-size`,
- * `--dg-spinner-size`); every interactive control's box is floored at the
- * WCAG 2.2 SC 2.5.8 target size, which is the largest space token
- * (`--dg-space-7`, 24 px). `src/tokens/tokens.test.ts` fails on any length
- * written as a literal.
+ * ring, stacking level, proportion, stroke and extent resolves to a
+ * `var(--dg-*)` token generated from `tokens.ts`. The only literals permitted
+ * are `0`, `none`, `auto`, `inherit`, `currentColor` and `transparent`, so no
+ * declaration below writes any number other than zero: no hexadecimal or
+ * functional colour notation, no length of any unit, no percentage, no flex
+ * or grid factor, no aspect ratio, no stroke weight or dash pattern, no
+ * multiplier, no negation and no bare line-height. A glyph box and a spinner
+ * are the font-relative size tokens (`--dg-icon-size`, `--dg-spinner-size`);
+ * every interactive control's box is floored at the WCAG 2.2 SC 2.5.8 target
+ * size, which is the largest space token (`--dg-space-7`, 24 px).
+ * `src/tokens/tokens.test.ts` fails on any number other than zero written in a
+ * declaration value.
  *
- * `base.css` records the structural forms that encode no design decision and
- * are therefore permitted, and this file uses exactly those: percentages
- * (`100%`, `50%`), flex ratios (`flex: 1 1 auto`), `aspect-ratio: 1`,
- * intrinsic sizes (`max-content`) and unitless SVG geometry (`stroke-width`,
- * `stroke-dasharray`). Three kinds of value that once appeared here as
- * keywords or units are tokens instead, so no rule below writes them:
+ * `base.css` records how a relationship is written without a number, and this
+ * file follows it exactly:
  *
+ * - A share of the containing block is a proportion token: `--dg-size-full`
+ *   for a box that fills or is capped at its container, `--dg-radius-round`
+ *   for a circle, and the skeleton-row shares for a loading silhouette's bars.
+ * - Flexing is `flex: auto` or `flex: none`, followed — where a rule needs a
+ *   different basis or no growth — by only the longhand that differs
+ *   (`flex-basis: 0`, `flex-grow: 0`).
+ * - A grid item that spans every track is `grid-column: full`, against the
+ *   `[full-start]` and `[full-end]` lines its grid's template names; a subgrid
+ *   inherits those names.
+ * - A square box states the same size token on both axes rather than an
+ *   aspect ratio.
+ * - SVG geometry is the stroke tokens: `--dg-stroke-width-hairline`,
+ *   `-emphasis` and `-halo` for a weight, `--dg-stroke-dash-dashed` and
+ *   `-dotted` for a dash pattern.
+ * - Every component extent — a scroll cap, the floor of a state box, a loading
+ *   silhouette, a tooltip's or a search field's widest, a chart's legible
+ *   minimum, a split pane's basis — is a token of its own, stated in the token
+ *   table as a multiple of a space step. A space step pulled inward or back —
+ *   an inward focus ring, a control bleeding into its cell's padding, a
+ *   tooltip placed before its trigger — is `--dg-space-inverse-*`.
  * - An edge's weight is its ROLE: `--dg-border-width-hairline` for every
  *   divider, table rule, outline and control or card border, and
  *   `--dg-border-width-marker` for every emphasis edge — the inline-start
@@ -72,21 +90,18 @@
  * - A share of a grid's spare width is a `--dg-column-share-*` token — the
  *   single track that fills its grid is
  *   `minmax(0, var(--dg-column-share-default))` — the same shares
- *   `src/primitives/DataTable.tsx` builds its column tracks from. The one
- *   ratio left in a rule is the waterfall row's name-to-bar split
- *   (`minmax(0, 2fr) minmax(0, 5fr)`), which proportions a time axis against
- *   its labels — chart geometry of `components/Waterfall.tsx`, not a column
- *   share.
+ *   `src/primitives/DataTable.tsx` builds its column tracks from. The
+ *   waterfall row's name-to-bar split has shares of its own
+ *   (`--dg-waterfall-label-share`, `--dg-waterfall-bar-share`), because it
+ *   proportions a time axis against its labels — chart geometry of
+ *   `components/Waterfall.tsx`, not a column share.
  *
  * Three derived forms appear, each annotated where it occurs:
  *
- * - `calc(<space token> * n)` for the few silhouette and container sizes the
- *   token table has no value for (a loading placeholder's height, a scroll
- *   container's cap, a tooltip's maximum width, a split pane's basis). The
- *   token remains the unit of the design scale; the multiplier is the only
- *   thing this file adds. A size composed from two tokens is written as their
- *   sum (`calc(<token> + <token>)`) for the same reason — the `md` icon-only
- *   control's side and the dropdown's chevron room are each one such sum.
+ * - `calc(<token> + <token>)`, a size composed from two tokens and written as
+ *   their sum so it names exactly the design-scale values it is built from —
+ *   the `md` icon-only control's side, the dropdown's chevron room and the
+ *   sort control's bleed into its cell are each one such sum.
  * - `calc(var(--dgc-…, 0) * var(--dg-pixel-unit))` where a component hands CSS
  *   a UNITLESS number it measured in CSS pixels (a virtualizer offset, a
  *   tooltip coordinate). The number is the value and `--dg-pixel-unit` is only
@@ -94,14 +109,15 @@
  *   `src/primitives/DataTable.tsx` and `src/primitives/Tooltip.tsx` declare,
  *   and `src/tokens/tokens.test.ts` fails on any other multiplier for those
  *   measured properties.
- * - `calc(var(--dgc-…, 0) * <space token>)` where a component hands CSS a
- *   COUNT rather than a measurement (a tree depth). The count says how many
- *   steps and the token is the step, so the indentation stays on the design
- *   scale.
+ * - `calc(var(--dgc-…, <fallback>) * <token>)` where a component hands CSS a
+ *   COUNT or a WEIGHT rather than a measurement (a tree depth, a table's
+ *   column count, a split pane's weight). The number says how many steps and
+ *   the token is the step, so the result stays on the design scale; the
+ *   fallback is `0` or a token.
  *
  * No `@media` rule appears here at all. `base.css` owns the only one in the
  * package (`prefers-reduced-motion`), and responsiveness is intrinsic —
- * `flex-wrap`, `min-inline-size: 0`, `flex: 1 1 auto` and auto-fitting grid
+ * `flex-wrap`, `min-inline-size: 0`, `flex: auto` and auto-fitting grid
  * tracks — because the token table declares no breakpoint. Hover states are
  * plain `:hover` for the same reason; each one changes paint only — a colour,
  * an underline or an SVG stroke width, never geometry — so a sticky hover on a
@@ -160,6 +176,8 @@
  *                             --dgc-badge-color     primitives/Badge
  *                             --dgc-columns         primitives/DataTable
  *                             --dgc-min-inline      primitives/DataTable
+ *                             --dgc-readable-inline primitives/DataTable
+ *                             --dgc-yield-count     primitives/DataTable
  *                             --dgc-column-count    primitives/DataTable
  *                             --dgc-align           primitives/DataTable
  *                             --dgc-tooltip-block   primitives/Tooltip
@@ -223,7 +241,7 @@
  * and no rule here removes it. Two adjustments are made, neither of which
  * changes the ring itself. A scroll container or a sticky header that would
  * otherwise clip it pulls `outline-offset` inward
- * (`calc(var(--dg-space-0) * -1)`). A text field or picker draws it on its
+ * (`--dg-space-inverse-0`). A text field or picker draws it on its
  * field box, the visible edge, instead of on the borderless native control
  * inside that box — same token, same offset — so a field shows one ring
  * rather than two crossing ones.
@@ -245,7 +263,7 @@
  * light themes.
  *
  * @see src/styles/base.css for the reset, the global utilities and the
- *      structural-value policy this file follows.
+ *      zero-hardcoded-value policy this file follows.
  * @see src/tokens/tokens.ts for the token source every `var(--dg-*)` resolves
  *      against.
  */
@@ -277,15 +295,17 @@
  * takes that block's 24 px target floor, and a chip that is only a label (a
  * badge, a status marker) needs no target size at all.
  *
- * A chip is never wider than the box it sits in (`max-inline-size: 100%`), and
+ * A chip is never wider than the box it sits in (`--dg-size-full`), and
  * a label that does not fit is CLIPPED at the chip's own edge rather than
  * painted over the neighbouring cell, so a chip in a narrow column can never
  * run its text into the value beside it. `clip`, not `hidden`: it clips
  * without making the chip a scroll container, so the chip keeps its content
  * baseline inside a line of text and keeps its automatic minimum inside a flex
- * row. The columns that hold chips are sized to fit them (see the track notes
- * in primitives/DataTable.tsx); the clip is the guarantee that a value wider
- * than its column still cannot collide with another. */
+ * row. The columns that hold chips fit them at their readable floors, and a
+ * name or text column narrowed so its table fits truncates the runs inside
+ * its chips with an ellipsis (see the track notes in primitives/DataTable.tsx
+ * and the source-link rules below); the clip is the guarantee that a value
+ * wider than its column still cannot collide with another. */
 .dg-badge,
 .dg-source-link,
 .dg-render-table__trigger,
@@ -294,7 +314,7 @@
   display: inline-flex;
   align-items: center;
   gap: var(--dg-space-1);
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
   overflow: clip;
   padding-block: var(--dg-space-0);
   padding-inline: var(--dg-space-2);
@@ -321,7 +341,7 @@
 .dg-source-link__file,
 .dg-state-transitions__value {
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -373,7 +393,7 @@
 
 .dg-virtual-canvas {
   position: relative;
-  inline-size: 100%;
+  inline-size: var(--dg-size-full);
   min-block-size: calc(var(--dgc-virtual-total, 0) * var(--dg-pixel-unit));
 }
 
@@ -386,7 +406,7 @@
   position: absolute;
   inset-block-start: calc(var(--dgc-virtual-start, 0) * var(--dg-pixel-unit));
   inset-inline-start: 0;
-  inline-size: 100%;
+  inline-size: var(--dg-size-full);
 }
 
 /* ==========================================================================
@@ -478,7 +498,7 @@
 }
 
 .dg-button--full {
-  inline-size: 100%;
+  inline-size: var(--dg-size-full);
 }
 
 .dg-button__icon {
@@ -666,7 +686,7 @@
 }
 
 .dg-field--full {
-  inline-size: 100%;
+  inline-size: var(--dg-size-full);
 }
 
 /* Colour and type only: this class is composed with `dg-visually-hidden`
@@ -792,7 +812,7 @@
 /* --- the text control ----------------------------------------------------- */
 
 .dg-input {
-  flex: 1 1 auto;
+  flex: auto;
   min-inline-size: 0;
   padding-block: var(--dg-space-2);
   background: transparent;
@@ -842,7 +862,7 @@
 }
 
 .dg-select__native {
-  flex: 1 1 auto;
+  flex: auto;
   min-inline-size: 0;
   appearance: none;
   padding-block: var(--dg-space-2);
@@ -881,12 +901,13 @@
 /* Pointer-inert and overlaid, not a flex sibling: a click anywhere over the
  * chevron has to reach the control beneath it and open the dropdown. The
  * `dg-icon` utility already makes the glyph itself inert; this makes the box
- * around it inert too. */
+ * around it inert too. The box spans the row's whole block size and centres
+ * the glyph in it by its own flex alignment, so the chevron sits on the row's
+ * middle at any field height without an offset or a transform. */
 .dg-select__chevron {
   position: absolute;
   inset-inline-end: var(--dg-space-2);
-  inset-block-start: 50%;
-  translate: 0 -50%;
+  inset-block: 0;
   display: inline-flex;
   align-items: center;
   color: var(--dg-text-secondary);
@@ -1056,8 +1077,9 @@
  * the header one width, the first row another and the third row a third, and
  * the header ends up over the wrong column — confirmed in the browser, not
  * theorised. Columns take a semantic role that DataTable.tsx resolves to a
- * `minmax(<--dg-column-min-*>, <--dg-column-share-*>)` track built from the
- * tokens alone; `subgrid` is not an escape, because an absolutely
+ * `minmax(<minimum>, <--dg-column-share-*>)` track built from the
+ * `--dg-column-*` tokens and the grid's own published sums alone, all of which
+ * every row inherits alike; `subgrid` is not an escape, because an absolutely
  * positioned virtualized row cannot be a subgrid of the grid it belongs to.
  *
  * The sorted column is reported by the CELL's `aria-sort` attribute and by
@@ -1078,34 +1100,59 @@
   color: var(--dg-text-secondary);
 }
 
-/* Gap: the token table has no size family, so the scroll cap is expressed as a
- * multiple of the largest space token. Eighteen of them keep a long result
- * scrolling inside its own section instead of pushing the rest of a dense
- * panel off screen; a shorter result never reaches the cap and does not
- * scroll. */
+/* The largest scroll cap keeps a long result scrolling inside its own section
+ * instead of pushing the rest of a dense panel off screen; a shorter result
+ * never reaches the cap and does not scroll. */
 .dg-data-table .dg-virtual-viewport {
-  max-block-size: calc(var(--dg-space-7) * 18);
+  max-block-size: var(--dg-scroll-cap-lg);
 }
 
-/* The grid's floor, and the reason a narrow table scrolls instead of
- * squeezing. primitives/DataTable.tsx publishes the sum of its columns'
- * minimum tracks as `--dgc-min-inline` and their number as
- * `--dgc-column-count`; the floor adds the gaps between the tracks and the
- * row's inline-start edge (the `--dg-border-width-marker` border below, which
- * `--dg-space-1` covers). Wider than its viewport, the grid overflows it and
- * the viewport — `overflow: auto` — scrolls horizontally with every column
- * still at its readable minimum. The floor is a sum of MINIMUMS rather than
- * `max-content`: each row is its own grid container, so a content-sized grid
- * would change width with whichever rows the window currently renders. With
- * no stated minimum the fallback leaves the grid exactly as wide as its
- * viewport. */
+/* The grid's floor, and the reason a narrow table either truncates to fit or
+ * scrolls, but never overprints. primitives/DataTable.tsx publishes the sum of
+ * its columns' guaranteed minimums as `--dgc-min-inline`, their number as
+ * `--dgc-column-count` and — when a truncating column (a name, free text) is
+ * among them — the sum of their readable floors as `--dgc-readable-inline`. A
+ * compact column (a figure, a status, a row's controls) has one width for
+ * both; a truncating column's minimum is its floor scaled by
+ * `--dg-column-yield`. Both sums take the gaps between the tracks — one
+ * `--dg-space-2` per column, less one — and the row's inline-start edge (the
+ * `--dg-border-width-marker` border below, which `--dg-space-1` covers).
+ *
+ * The rule is that truncating is spent only on fitting:
+ *   - while the minimums fit the viewport, the grid is the viewport's width,
+ *     and each truncating track (see DataTable.tsx) narrows just far enough
+ *     for the row to hold every column — not at all when the readable floors
+ *     already fit;
+ *   - once even the minimums overflow, truncating no longer buys a fit, so
+ *     the `clamp()` below grows the grid by `--dg-column-yield-return-scale`
+ *     pixels for each pixel the viewport is short of them, up to the readable
+ *     sum: within a fraction of a pixel every track has taken its yield back,
+ *     and the table scrolls horizontally (`overflow: auto`) with every column
+ *     at its readable floor — exactly as a table without truncating columns
+ *     does.
+ * The floor is a sum of MINIMUMS and FLOORS rather than `max-content`: each row
+ * is its own grid container, so a content-sized grid would change width with
+ * whichever rows the window currently renders. DataTable.tsx writes the count
+ * on every grid and the sums only when its columns state them: with no stated
+ * minimum the floor is only the gaps and the edge, so the grid is as wide as
+ * its viewport, and a grid carrying no property sums below zero, so the full
+ * width wins. */
 .dg-data-table [role='grid'] {
   display: block;
   min-inline-size: max(
-    100%,
+    var(--dg-size-full),
     calc(
-      var(--dgc-min-inline, 0%) + (var(--dgc-column-count, 1) - 1) * var(--dg-space-2) +
-        var(--dg-space-1)
+      var(--dgc-min-inline, 0%) + var(--dgc-column-count, 0) * var(--dg-space-2) -
+        var(--dg-space-2) + var(--dg-space-1) +
+        clamp(
+          0%,
+          (
+              var(--dgc-min-inline, 0%) + var(--dgc-column-count, 0) * var(--dg-space-2) -
+                var(--dg-space-2) + var(--dg-space-1) - var(--dg-size-full)
+            ) *
+            var(--dg-column-yield-return-scale),
+          var(--dgc-readable-inline, var(--dgc-min-inline, 0%)) - var(--dgc-min-inline, 0%)
+        )
     )
   );
 }
@@ -1167,10 +1214,11 @@
  * against the label, the control takes one space step of inline padding and
  * gives it back as a negative margin into the cell's own padding: the label
  * stays exactly where a static header's label is, and the box grows outward
- * rather than pushing the text. */
+ * rather than pushing the text. Its width is the cell's plus that step on each
+ * side, and the margin is the inverse step. */
 .dg-data-table__sort-button {
-  inline-size: calc(100% + var(--dg-space-1) * 2);
-  margin-inline: calc(var(--dg-space-1) * -1);
+  inline-size: calc(var(--dg-size-full) + var(--dg-space-1) + var(--dg-space-1));
+  margin-inline: var(--dg-space-inverse-1);
   justify-content: inherit;
   padding-inline: var(--dg-space-1);
   color: inherit;
@@ -1246,7 +1294,7 @@
 /* Inward offset: the ring of the roving tab stop would otherwise be clipped by
  * the scroll container's edge or hidden under the sticky header. */
 .dg-data-table__row:focus-visible {
-  outline-offset: calc(var(--dg-space-0) * -1);
+  outline-offset: var(--dg-space-inverse-0);
 }
 
 /* The roving tab stop. Kept quiet — it says where the keyboard is, not what is
@@ -1297,8 +1345,10 @@
  * label, a value in a panel narrower than any sizing anticipated — is clipped
  * at the cell's edge instead of painting over the neighbouring column, in
  * either inline direction (an end-aligned cell overflows toward its START).
- * The columns are sized so that their content fits (see the track notes in
- * primitives/DataTable.tsx); this is the guarantee for everything else.
+ * The columns are sized so that their content fits at their readable floors,
+ * and content in a column narrowed to fit its table ellipsizes or wraps (see
+ * the track notes in primitives/DataTable.tsx); this is the guarantee for
+ * everything else.
  * `clip` rather than `hidden`: the cell does not become a scroll container, so
  * it keeps its flex minimum and a wheel over it still scrolls the table. The
  * clip margin reaches into the padding-free edge a compact cell has, so the
@@ -1492,13 +1542,12 @@
   font: var(--dg-mono-md);
 }
 
-/* The preformatted box. Gap: no size token exists for a scroll cap, so it is
- * eight units of the largest space token — enough for a multi-line statement
- * without letting one push a panel section open. */
+/* The preformatted box, capped at `--dg-code-block-max-block-size` — enough
+ * for a multi-line statement without letting one push a panel section open. */
 .dg-code--block {
   display: block;
   padding: var(--dg-space-2);
-  max-block-size: calc(var(--dg-space-7) * 8);
+  max-block-size: var(--dg-code-block-max-block-size);
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
@@ -1612,10 +1661,10 @@
  * the trigger's own `overflow: hidden; text-overflow: ellipsis` has nothing to
  * clip against: a described chip in a narrow table cell would push past the cell
  * and paint over its neighbour instead of truncating. Relational, not a length —
- * a trigger is simply never wider than the box it sits in. */
+ * a trigger is simply never wider than the box it sits in (`--dg-size-full`). */
 .dg-tooltip,
 .dg-tooltip__trigger {
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
 }
 
 /* Paint only — layout lives on the open-state selector, as the section note
@@ -1634,15 +1683,14 @@
 /* The open bubble sits at the two UNITLESS viewport coordinates Tooltip.tsx
  * measured in CSS pixels, each given its unit by `--dg-pixel-unit`.
  *
- * Gap: no size token exists for a maximum width. Ten units of the largest
- * space token is about a short sentence at the `--dg-text-sm` role, which is
- * what a tooltip carries. */
+ * `--dg-tooltip-max-inline-size` is about a short sentence at the
+ * `--dg-text-sm` role, which is what a tooltip carries. */
 .dg-tooltip__bubble.dg-is-open {
   position: fixed;
   inset-block-start: calc(var(--dgc-tooltip-block, 0) * var(--dg-pixel-unit));
   inset-inline-start: calc(var(--dgc-tooltip-inline, 0) * var(--dg-pixel-unit));
   inline-size: max-content;
-  max-inline-size: calc(var(--dg-space-7) * 10);
+  max-inline-size: var(--dg-tooltip-max-inline-size);
   padding-block: var(--dg-space-1);
   padding-inline: var(--dg-space-2);
   /* The hairline is what delineates the bubble in the high-contrast theme,
@@ -1658,9 +1706,10 @@
  * the axis the bubble sits on: negative when the bubble lies before the
  * trigger (above it, or at its inline start), positive after it. Tooltip.tsx
  * reads its magnitude as the gap and cancels the margin when it places the
- * border box, so a bubble flipped to the other side keeps the same gap. */
+ * border box, so a bubble flipped to the other side keeps the same gap. The
+ * negative gap is the inverse of the positive one, `--dg-space-inverse-1`. */
 .dg-tooltip__bubble.dg-is-open.dg-tooltip--top {
-  margin-block-start: calc(var(--dg-space-1) * -1);
+  margin-block-start: var(--dg-space-inverse-1);
 }
 
 .dg-tooltip__bubble.dg-is-open.dg-tooltip--bottom {
@@ -1668,7 +1717,7 @@
 }
 
 .dg-tooltip__bubble.dg-is-open.dg-tooltip--start {
-  margin-inline-start: calc(var(--dg-space-1) * -1);
+  margin-inline-start: var(--dg-space-inverse-1);
 }
 
 .dg-tooltip__bubble.dg-is-open.dg-tooltip--end {
@@ -1736,16 +1785,15 @@
  * of collapsing and then pushing the layout when it resolves.
  * ========================================================================== */
 
-/* Gap: no size token exists for a placeholder's height; four units of the
- * largest space token is about three lines of the body role, which is what
- * each of these three states renders. */
+/* `--dg-state-min-block-size` is about three lines of the body role, which is
+ * what each of these three states renders. */
 .dg-empty-state {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: var(--dg-space-1);
-  min-block-size: calc(var(--dg-space-7) * 4);
+  min-block-size: var(--dg-state-min-block-size);
   padding: var(--dg-space-5);
   color: var(--dg-text-muted);
   text-align: center;
@@ -1766,7 +1814,7 @@
 }
 
 .dg-empty-state__message {
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
   color: var(--dg-text-muted);
 }
 
@@ -1782,15 +1830,17 @@
   display: flex;
   flex-direction: column;
   gap: var(--dg-space-2);
-  min-block-size: calc(var(--dg-space-7) * 3);
+  min-block-size: var(--dg-loading-min-block-size);
   padding: var(--dg-space-3);
 }
 
 /* The shared shimmer treatment, free-standing so any component awaiting a
  * value can reuse it without pulling in the placeholder's layout. The sweep is
  * two surface tokens and nothing else; `to right` is a keyword, so the gradient
- * introduces no numeric literal, and the reduced-motion block in base.css
- * stops the animation without this rule knowing about it. */
+ * introduces no numeric literal, the gradient's extent against the element is
+ * `--dg-shimmer-background-size`, and the sweep runs from the full-width
+ * position to the start. The reduced-motion block in base.css stops the
+ * animation without this rule knowing about it. */
 .dg-skeleton {
   background-image: linear-gradient(
     to right,
@@ -1799,7 +1849,7 @@
     var(--dg-surface-elevated)
   );
   background-repeat: no-repeat;
-  background-size: 200% 100%;
+  background-size: var(--dg-shimmer-background-size);
   border-radius: var(--dg-radius-sm);
   animation-name: dg-shimmer;
   animation-duration: var(--dg-shimmer-duration);
@@ -1809,7 +1859,7 @@
 
 @keyframes dg-shimmer {
   from {
-    background-position: 100% 0;
+    background-position: var(--dg-size-full) 0;
   }
 
   to {
@@ -1819,29 +1869,31 @@
 
 .dg-loading-state__row {
   block-size: var(--dg-space-4);
-  inline-size: 100%;
+  inline-size: var(--dg-size-full);
 }
 
 /* A silhouette, not a rendering: the bars vary in width so a stack of them
- * reads as a list rather than a solid block. Percentages only. */
+ * reads as a list rather than a solid block. Each length is a share of the
+ * placeholder — full, `--dg-skeleton-row-short` or `--dg-skeleton-row-medium`
+ * — so the silhouette keeps its shape at any width. */
 .dg-loading-state--rows .dg-loading-state__row:nth-of-type(3n) {
-  inline-size: 70%;
+  inline-size: var(--dg-skeleton-row-short);
 }
 
 .dg-loading-state--rows .dg-loading-state__row:nth-of-type(3n + 2) {
-  inline-size: 85%;
+  inline-size: var(--dg-skeleton-row-medium);
 }
 
 /* `block` and `chart` render exactly one skeleton element, shaped entirely
- * here. Gap: no size token exists for either silhouette, so both are multiples
- * of the largest space token — a solid area for a card group, a taller one for
- * the plotting area an SVG view occupies. */
+ * here: a solid area for a card group (`--dg-skeleton-block-size`), and a
+ * taller one for the plotting area an SVG view occupies
+ * (`--dg-skeleton-chart-block-size`). */
 .dg-loading-state--block .dg-loading-state__row {
-  block-size: calc(var(--dg-space-7) * 3);
+  block-size: var(--dg-skeleton-block-size);
 }
 
 .dg-loading-state--chart .dg-loading-state__row {
-  block-size: calc(var(--dg-space-7) * 6);
+  block-size: var(--dg-skeleton-chart-block-size);
 }
 
 /* A free-standing spinner for a surface that shows progress inline rather than
@@ -1850,16 +1902,16 @@
  * `scripts/check-css-classes.mjs` lists it as such. Its square is
  * `--dg-spinner-size`, the glyph square it stands in for, so it scales with
  * the type role beside it. The ring is a `--dg-border-width-marker` border
- * with one accent-coloured side; `100%` makes it round. Gap: no
- * rotation-duration token exists, so the shared motion constant is multiplied
- * to a speed that reads as continuous rather than frantic.
+ * with one accent-coloured side; `--dg-radius-round` makes it round. One turn
+ * (`--dg-spin-rotation`) takes `--dg-spin-duration`, a speed that reads as
+ * continuous rather than frantic.
  *
  * Geometry a host needs to know, measured in the browser rather than reasoned
  * about: rotating a square grows its axis-aligned bounding box by up to a
  * factor of the square root of two, so this element's *transformed* extent
  * reaches about a fifth of an em past each side of its border box, and
  * `getBoundingClientRect` reports that larger box mid-animation. No painted
- * pixel moves — `border-radius: 100%` makes the ring a circle inscribed in the
+ * pixel moves — the round radius makes the ring a circle inscribed in the
  * square, and a rotated circle occupies exactly the same pixels — but a
  * transformed box does contribute to an ancestor's scrollable overflow. Every
  * surface in this file that hosts a spinner pads its content by at least
@@ -1876,16 +1928,16 @@
   block-size: var(--dg-spinner-size);
   border: var(--dg-border-width-marker) solid var(--dg-border-subtle);
   border-block-start-color: var(--dg-accent);
-  border-radius: 100%;
+  border-radius: var(--dg-radius-round);
   animation-name: dg-spin;
-  animation-duration: calc(var(--dg-motion-duration) * 5);
+  animation-duration: var(--dg-spin-duration);
   animation-timing-function: linear;
   animation-iteration-count: infinite;
 }
 
 @keyframes dg-spin {
   to {
-    rotate: 1turn;
+    rotate: var(--dg-spin-rotation);
   }
 }
 
@@ -1896,7 +1948,7 @@
   display: flex;
   flex-direction: column;
   gap: var(--dg-space-2);
-  min-block-size: calc(var(--dg-space-7) * 4);
+  min-block-size: var(--dg-state-min-block-size);
   padding: var(--dg-space-4);
   background: var(--dg-surface-elevated);
   border: var(--dg-border-width-hairline) solid var(--dg-border-subtle);
@@ -1921,10 +1973,10 @@
 
 /* The failing query, rendered through `Code` in its block form: a scrollable,
  * wrapping box inside the strong border with its text in the primary colour,
- * named by `aria-label` on a `group` role. Gap: five units of the largest
- * space token cap the box without hiding a short query. */
+ * named by `aria-label` on a `group` role. `--dg-error-query-max-block-size`
+ * caps the box without hiding a short query. */
 .dg-error-state__query {
-  max-block-size: calc(var(--dg-space-7) * 5);
+  max-block-size: var(--dg-error-query-max-block-size);
   border-color: var(--dg-border-strong);
   color: var(--dg-text-primary);
   white-space: pre-wrap;
@@ -1964,9 +2016,9 @@
   z-index: var(--dg-z-base);
   display: flex;
   flex-direction: column;
-  inline-size: 100%;
+  inline-size: var(--dg-size-full);
   min-inline-size: 0;
-  block-size: 100%;
+  block-size: var(--dg-size-full);
   background: var(--dg-surface-base);
   color: var(--dg-text-primary);
   font: var(--dg-text-md);
@@ -1984,13 +2036,13 @@
  * that fills the frame would be clipped by the frame's edge. */
 .dg-panel-shell__viewport {
   position: relative;
-  flex: 1 1 auto;
+  flex: auto;
   min-inline-size: 0;
   min-block-size: 0;
 }
 
 .dg-panel-shell__viewport:focus-visible {
-  outline-offset: calc(var(--dg-space-0) * -1);
+  outline-offset: var(--dg-space-inverse-0);
 }
 
 /* ==========================================================================
@@ -2086,8 +2138,8 @@
  * observed in the browser, not theorised. Every pane therefore starts from the
  * same basis and grows by the same factor, which makes their widths equal
  * whatever they contain, and keeps shrinking so a narrow surface squeezes the
- * panes evenly instead of overflowing. No size token exists for a basis, so it
- * is twenty units of the largest space token — 480 px.
+ * panes evenly instead of overflowing. That basis is `--dg-split-pane-basis`,
+ * twenty units of the largest space token — 480 px.
  *
  * That basis is also the collapse threshold. `--collapse` — which the component
  * emits for a horizontal division unless the caller opts out — is the whole of
@@ -2112,9 +2164,10 @@
  *
  * A caller that needs a weighting sets `--dgc-split-weight` inline on the pane;
  * the declaration order inside the rule is what lets that override the `flex`
- * shorthand, and the `1` fallback is what makes an unweighted pane equal. The
- * property is always a positive unitless number — the component drops anything
- * else — so the `calc()` it feeds can never resolve to an invalid length.
+ * shorthand, and the `--dg-split-pane-weight` fallback is what makes an
+ * unweighted pane equal. The property is always a positive unitless number —
+ * the component drops anything else — so the `calc()` it feeds can never
+ * resolve to an invalid length.
  * ========================================================================== */
 
 .dg-split {
@@ -2225,8 +2278,9 @@
  * every pane's size is exactly proportional to its weight, at every container
  * width. Growing alone would divide only the free space, which at a realistic
  * width gives `[2, 1]` a ratio near 1.5 instead of 2 (measured in the browser,
- * not theorised). The unweighted case is unchanged: the fallback is 1, so the
- * basis stays one unit and every pane grows equally.
+ * not theorised). The unweighted case is unchanged: the fallback is
+ * `--dg-split-pane-weight`, one, so the basis stays one unit and every pane
+ * grows equally.
  *
  * It also decides where a weighted division collapses, and the consequence is
  * deliberate: because each pane's basis is its own share, every pane sits
@@ -2239,28 +2293,37 @@
  * panes to hold on longer is the basis unit below, never the weight
  * multiplication, which is what makes the proportions exact.
  *
- * The grow factor is the weight scaled by a constant, never the bare weight.
- * Flexbox hands out only `Σgrow × F` of the free space when the factors on a
- * line sum to less than one, so a pane with a fractional weight that wrapped
- * onto a line of its own — a `[1, 0.6]` drawer in a collapsed column — would
- * stop at 60 % of the row instead of filling it. Scaling every factor by the
- * same constant leaves each pane's share `w / Σw` of the free space exactly as
- * it was on a shared line, and guarantees the factors on any line sum to at
- * least one, so a collapsed column is always full width. */
+ * The grow factor is the weight scaled by a constant, `--dg-split-grow-scale`,
+ * never the bare weight. Flexbox hands out only `Σgrow × F` of the free space
+ * when the factors on a line sum to less than one, so a pane with a fractional
+ * weight that wrapped onto a line of its own — a `[1, 0.6]` drawer in a
+ * collapsed column — would stop at 60 % of the row instead of filling it.
+ * Scaling every factor by the same constant leaves each pane's share `w / Σw`
+ * of the free space exactly as it was on a shared line, and guarantees the
+ * factors on any line sum to at least one, so a collapsed column is always
+ * full width.
+ *
+ * `flex: auto` supplies the shrink factor every pane keeps; the basis and the
+ * grow factor that follow it replace the shorthand's two other longhands. */
 .dg-split__pane {
-  flex: 1 1 calc(var(--dg-space-7) * 20);
-  flex-basis: calc(var(--dg-space-7) * 20 * var(--dgc-split-weight, 1));
-  flex-grow: calc(var(--dgc-split-weight, 1) * 1000);
+  flex: auto;
+  flex-basis: calc(
+    var(--dg-split-pane-basis) * var(--dgc-split-weight, var(--dg-split-pane-weight))
+  );
+  flex-grow: calc(
+    var(--dgc-split-weight, var(--dg-split-pane-weight)) * var(--dg-split-grow-scale)
+  );
   min-inline-size: 0;
   min-block-size: 0;
 }
 
 /* Along the block axis the basis would be a height, which no view here wants: a
- * stacked pane is as tall as its content and only grows when a weight asks it
- * to. The inline size stays unconstrained, so a stacked pane fills the
- * division. */
+ * stacked pane is as tall as its content (`flex-basis: auto`) and only grows
+ * when a weight asks it to — an unweighted one does not grow at all. It keeps
+ * the pane rule's shrink factor. The inline size stays unconstrained, so a
+ * stacked pane fills the division. */
 .dg-split--vertical > .dg-split__panes > .dg-split__pane {
-  flex: 0 1 auto;
+  flex-basis: auto;
   flex-grow: var(--dgc-split-weight, 0);
 }
 
@@ -2453,16 +2516,16 @@
  * it for a bar a host composes by hand, which is why
  * `scripts/check-css-classes.mjs` lists it as a published class. */
 .dg-toolbar__spacer {
-  flex: 1 1 auto;
+  flex: auto;
 }
 
-/* The search field takes the free space but stops short of the whole row, so a
- * wide panel does not stretch one input across it. Gap: no size token exists
- * for a control's maximum width. */
+/* The search field takes the free space but stops short of the whole row, at
+ * `--dg-search-max-inline-size`, so a wide panel does not stretch one input
+ * across it. */
 .dg-toolbar__search {
-  flex: 1 1 auto;
+  flex: auto;
   min-inline-size: 0;
-  max-inline-size: calc(var(--dg-space-7) * 12);
+  max-inline-size: var(--dg-search-max-inline-size);
 }
 
 /* The three typed control sections of `layout/Toolbar.tsx` — the option
@@ -2762,10 +2825,10 @@
 .dg-state-transitions__empty,
 .dg-dependency-graph__empty {
   display: flex;
-  flex: 1 1 auto;
+  flex: auto;
   flex-direction: column;
   min-inline-size: 0;
-  min-block-size: calc(var(--dg-space-7) * 4);
+  min-block-size: var(--dg-state-min-block-size);
 }
 
 /* Where the box is a wrapper, the state inside it also grows along the column,
@@ -2778,7 +2841,7 @@
 .dg-flame__empty > .dg-empty-state,
 .dg-component-tree__empty > .dg-empty-state,
 .dg-dependency-graph__empty > .dg-empty-state {
-  flex: 1 1 auto;
+  flex: auto;
 }
 
 .dg-timeline__loading,
@@ -2794,10 +2857,10 @@
 .dg-state-transitions__loading,
 .dg-dependency-graph__loading {
   display: flex;
-  flex: 1 1 auto;
+  flex: auto;
   flex-direction: column;
   min-inline-size: 0;
-  min-block-size: calc(var(--dg-space-7) * 4);
+  min-block-size: var(--dg-state-min-block-size);
 }
 
 .dg-timeline__error,
@@ -2813,7 +2876,7 @@
 .dg-state-transitions__error,
 .dg-dependency-graph__error {
   display: flex;
-  flex: 1 1 auto;
+  flex: auto;
   flex-direction: column;
   min-inline-size: 0;
 }
@@ -2897,15 +2960,15 @@
 
 /* The two time charts declare a viewBox `CHART_VIEWBOX_WIDTH` units wide with
  * `width="100%"` and `preserveAspectRatio="xMinYMin meet"`, so CSS scales the
- * drawing uniformly to its section. `inline-size: 100%` makes the element as
- * wide as its viewport and `block-size: auto` lets its height follow the
- * viewBox's aspect ratio, so the drawing fills the element with no blank band
- * beneath or beside it; the `height` attribute is only the intrinsic fallback.
- * The labels inside are set in a type role and scale with the drawing, so the
- * minimum is what keeps them legible on a narrow panel: below it the canvas
- * stops shrinking and its viewport scrolls horizontally instead. Gap: no size
- * token exists for a chart's legible minimum; thirty-two units of the largest
- * space token keeps an 11-unit label above eight pixels.
+ * drawing uniformly to its section. `inline-size: var(--dg-size-full)` makes
+ * the element as wide as its viewport and `block-size: auto` lets its height
+ * follow the viewBox's aspect ratio, so the drawing fills the element with no
+ * blank band beneath or beside it; the `height` attribute is only the
+ * intrinsic fallback. The labels inside are set in a type role and scale with
+ * the drawing, so the minimum is what keeps them legible on a narrow panel:
+ * below it the canvas stops shrinking and its viewport scrolls horizontally
+ * instead. That minimum, `--dg-chart-min-inline-size`, keeps an 11-unit label
+ * above eight pixels.
  *
  * The dependency graph is not in this rule: it declares its own deterministic
  * logical size as its `width` and `height`, one unit to a CSS pixel, so its
@@ -2913,9 +2976,9 @@
  * in its viewport. */
 .dg-timeline__canvas,
 .dg-flame__canvas {
-  inline-size: 100%;
+  inline-size: var(--dg-size-full);
   block-size: auto;
-  min-inline-size: calc(var(--dg-space-7) * 32);
+  min-inline-size: var(--dg-chart-min-inline-size);
 }
 
 /* The scroll viewport each canvas scrolls in. Inline-size containment makes
@@ -2929,8 +2992,9 @@
   contain: inline-size;
 }
 
-/* Axis furniture, shared by the two time-based views. Unitless SVG geometry,
- * and `crispEdges` so a hairline rule lands on a device pixel. */
+/* Axis furniture, shared by the two time-based views. A hairline stroke
+ * (`--dg-stroke-width-hairline`), and `crispEdges` so it lands on a device
+ * pixel. */
 .dg-timeline__axis,
 .dg-flame__axis {
   color: var(--dg-text-muted);
@@ -2941,7 +3005,7 @@
 .dg-flame__axis-tick {
   fill: none;
   stroke: var(--dg-border-subtle);
-  stroke-width: 1;
+  stroke-width: var(--dg-stroke-width-hairline);
   shape-rendering: crispEdges;
 }
 
@@ -2999,9 +3063,8 @@
 .dg-timeline__viewport {
   position: relative;
   min-inline-size: 0;
-  /* Gap: no size token exists for a chart's scroll cap. Sixteen units of the
-   * largest space token holds a deep trace without taking the whole panel. */
-  max-block-size: calc(var(--dg-space-7) * 16);
+  /* A chart's scroll cap holds a deep trace without taking the whole panel. */
+  max-block-size: var(--dg-scroll-cap-md);
 }
 
 /* The detail strip between the canvas and the table: the selected span, or a
@@ -3030,14 +3093,16 @@
 }
 
 .dg-timeline__detail > .dg-stack {
-  flex: 0 1 auto;
+  flex: auto;
+  flex-grow: 0;
   min-inline-size: 0;
 }
 
 .dg-timeline__detail-rest {
   display: flex;
   align-items: center;
-  flex: 1 1 0;
+  flex: auto;
+  flex-basis: 0;
   min-inline-size: 0;
   overflow-x: clip;
   overflow-y: visible;
@@ -3056,7 +3121,7 @@
 .dg-timeline__lane {
   fill: var(--dgc-lane-color, var(--dg-surface-elevated));
   stroke: var(--dg-border-subtle);
-  stroke-width: 1;
+  stroke-width: var(--dg-stroke-width-hairline);
 }
 
 /* The tier name at the lane's leading edge. The name itself comes from the
@@ -3075,7 +3140,7 @@
 .dg-timeline__bar {
   fill: var(--dgc-bar-color, var(--dg-kind-function));
   stroke: transparent;
-  stroke-width: 1;
+  stroke-width: var(--dg-stroke-width-hairline);
   cursor: pointer;
 }
 
@@ -3089,7 +3154,7 @@
  * selected ambiguous bar still reads as ambiguous. */
 .dg-timeline__bar.dg-is-ambiguous {
   stroke: var(--dg-warning);
-  stroke-dasharray: 4 3;
+  stroke-dasharray: var(--dg-stroke-dash-dashed);
 }
 
 .dg-timeline__bar:hover {
@@ -3100,14 +3165,14 @@
  * the keyboard reads them in the table beneath it, whose rows carry the ring. */
 .dg-timeline__bar.dg-is-selected {
   stroke: var(--dg-accent);
-  stroke-width: 2;
+  stroke-width: var(--dg-stroke-width-emphasis);
 }
 
 /* A label beside its bar — after the bar's end or before its start — on the
  * lane surface. The halo — a stroke in the lane's own surface colour painted
  * beneath the fill (`paint-order: stroke`) — keeps the label legible where a
  * connector or a gridline runs behind it, without a box that would read as a
- * control. Unitless SVG stroke width, like every stroke in this section. */
+ * control. Its weight is the halo stroke token, `--dg-stroke-width-halo`. */
 .dg-timeline__bar-label {
   fill: var(--dg-text-secondary);
   font: var(--dg-mono-sm);
@@ -3115,7 +3180,7 @@
   pointer-events: none;
   paint-order: stroke;
   stroke: var(--dg-surface-elevated);
-  stroke-width: 3;
+  stroke-width: var(--dg-stroke-width-halo);
   stroke-linejoin: round;
 }
 
@@ -3154,7 +3219,7 @@
 .dg-timeline__edge {
   fill: none;
   stroke: var(--dg-graph-edge);
-  stroke-width: 1;
+  stroke-width: var(--dg-stroke-width-hairline);
   stroke-linecap: round;
   pointer-events: none;
 }
@@ -3171,7 +3236,7 @@
  * as well, so neither the dash nor the tone is the only signal. */
 .dg-timeline__edge--dashed,
 .dg-timeline__edge.dg-is-ambiguous {
-  stroke-dasharray: 4 3;
+  stroke-dasharray: var(--dg-stroke-dash-dashed);
 }
 
 .dg-timeline__edge.dg-is-ambiguous {
@@ -3185,13 +3250,13 @@
 .dg-timeline__edge.dg-is-orphan,
 .dg-timeline__edge.dg-is-orphaned {
   stroke: var(--dg-warning);
-  stroke-dasharray: 1 3;
+  stroke-dasharray: var(--dg-stroke-dash-dotted);
 }
 
 .dg-timeline__bar.dg-is-orphan,
 .dg-timeline__bar.dg-is-orphaned {
   stroke: var(--dg-warning);
-  stroke-width: 1;
+  stroke-width: var(--dg-stroke-width-hairline);
 }
 
 /* High contrast outlines every filled shape, so a bar at rest strokes with the
@@ -3205,7 +3270,7 @@
 }
 
 :where([data-theme='high-contrast']) .dg-timeline__bar:hover {
-  stroke-width: 2;
+  stroke-width: var(--dg-stroke-width-emphasis);
 }
 
 /* ==========================================================================
@@ -3225,17 +3290,17 @@
  * squeezing the axis labels into each other or spilling tracks past the rows
  * that hold them. One grid column holds both children: never narrower than the
  * widest row's minimum (`min-content`), otherwise the viewport's whole width
- * (`1fr`). So the axis row and the top-level rows always share one inline
- * size — scrolling changes nothing about how the strip lines up with their
- * tracks — and each row's background, state edge and focus ring span its
- * tracks rather than stopping short of an overflowing one. A row pulls its
- * focus ring inward, so the scroll edge never clips it, and an open
+ * (`--dg-column-share-default`). So the axis row and the top-level rows always
+ * share one inline size — scrolling changes nothing about how the strip lines
+ * up with their tracks — and each row's background, state edge and focus ring
+ * span its tracks rather than stopping short of an overflowing one. A row
+ * pulls its focus ring inward, so the scroll edge never clips it, and an open
  * description bubble is fixed to the browser viewport (primitives/Tooltip), so
  * the scroll container does not clip it either. `min-inline-size: 0` lets the
  * viewport itself narrow with the panel. */
 .dg-waterfall__viewport {
   display: grid;
-  grid-template-columns: minmax(min-content, 1fr);
+  grid-template-columns: minmax(min-content, var(--dg-column-share-default));
   min-inline-size: 0;
 }
 
@@ -3243,13 +3308,18 @@
  * labels to (`AXIS_DESIGN_WIDTH_EM`, fourteen ems of the `xs` role: 154 px at
  * its 11 px), so the tick set fitted to that strip is never drawn on a
  * narrower one, where its labels would collide. The axis row uses this same
- * grid, so its strip takes the same floor as the bars' tracks. Gap: no size
- * token exists for the axis's legible minimum; seven units of the largest
- * space token (168 px) clear the strip, and Waterfall.test.tsx holds the two
- * together in every theme. */
+ * grid, so its strip takes the same floor as the bars' tracks. That floor is
+ * `--dg-waterfall-axis-min-inline-size` (168 px), which clears the strip, and
+ * Waterfall.test.tsx holds the two together in every theme. Above their
+ * floors the label and the time track divide the spare width in the
+ * waterfall's own shares, `--dg-waterfall-label-share` against
+ * `--dg-waterfall-bar-share`. */
 .dg-waterfall__row {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(calc(var(--dg-space-7) * 7), 5fr) max-content;
+  grid-template-columns:
+    minmax(0, var(--dg-waterfall-label-share))
+    minmax(var(--dg-waterfall-axis-min-inline-size), var(--dg-waterfall-bar-share))
+    max-content;
   align-items: center;
   gap: var(--dg-space-2);
   padding-block: var(--dg-space-0);
@@ -3266,7 +3336,7 @@
 }
 
 .dg-waterfall__row:focus-visible {
-  outline-offset: calc(var(--dg-space-0) * -1);
+  outline-offset: var(--dg-space-inverse-0);
 }
 
 .dg-waterfall__row.dg-is-expanded {
@@ -3401,8 +3471,8 @@
  * ========================================================================== */
 
 .dg-event-log .dg-virtual-viewport {
-  /* Gap: no size token exists for a log's scroll cap. */
-  max-block-size: calc(var(--dg-space-7) * 14);
+  /* A log's scroll cap. */
+  max-block-size: var(--dg-scroll-cap-sm);
 }
 
 .dg-event-log__seq {
@@ -3427,13 +3497,15 @@
  * clips at the cell, and a chip keeping the flex default `min-inline-size:
  * auto` could not shrink below its whole text: one long pair pushed the rest,
  * and the "+N more" count after them, past the clip and cut them mid-glyph.
- * Here every chip starts from nothing and grows toward its own text — the
- * `max-content` ceiling — so free space is shared out like water: pairs short
- * enough to fit are shown whole, and only the longest divide what remains and
- * ellipsize, each at its own border. The component sets the chip's text as its
- * title, so a shortened pair is still readable on hover. */
+ * Here every chip starts from nothing (`flex-basis: 0` after `flex: auto`)
+ * and grows toward its own text — the `max-content` ceiling — so free space is
+ * shared out like water: pairs short enough to fit are shown whole, and only
+ * the longest divide what remains and ellipsize, each at its own border. The
+ * component sets the chip's text as its title, so a shortened pair is still
+ * readable on hover. */
 .dg-event-log__attr {
-  flex: 1 1 0;
+  flex: auto;
+  flex-basis: 0;
   min-inline-size: 0;
   max-inline-size: max-content;
   overflow: hidden;
@@ -3465,25 +3537,29 @@
 
 .dg-metric-cards {
   display: grid;
-  /* Gap: `auto-fit` needs a definite minimum to decide a track count, and the
-   * token table has no size family, so the minimum is six units of the largest
-   * space token — about the width of a label and a formatted value. */
-  grid-template-columns: repeat(
-    auto-fit,
-    minmax(calc(var(--dg-space-7) * 6), var(--dg-column-share-default))
-  );
+  /* `auto-fit` needs a definite minimum to decide a track count:
+   * `--dg-metric-card-min-inline-size`, about the width of a label and a
+   * formatted value. The `full` lines bracket every track, however many the
+   * container fits. */
+  grid-template-columns:
+    [full-start] repeat(
+      auto-fit,
+      minmax(var(--dg-metric-card-min-inline-size), var(--dg-column-share-default))
+    )
+    [full-end];
   gap: var(--dg-space-3);
   min-inline-size: 0;
 }
 
 /* The three state boxes are items of the tile grid above, because the block
- * keeps its class in every state. Each spans every track, first grid line to
- * last, so a state reads across the whole node like every other component's
- * instead of occupying the width of one tile. */
+ * keeps its class in every state. Each spans every track, from the grid's
+ * `full-start` line to its `full-end` line, so a state reads across the whole
+ * node like every other component's instead of occupying the width of one
+ * tile. */
 .dg-metric-cards__empty,
 .dg-metric-cards__loading,
 .dg-metric-cards__error {
-  grid-column: 1 / -1;
+  grid-column: full;
 }
 
 /* MetricCards.tsx writes each tile part under two names — the tile's own
@@ -3572,8 +3648,8 @@
 .dg-flame__viewport {
   position: relative;
   min-inline-size: 0;
-  /* Gap: no size token exists for a chart's scroll cap. */
-  max-block-size: calc(var(--dg-space-7) * 14);
+  /* A hierarchy's scroll cap. */
+  max-block-size: var(--dg-scroll-cap-sm);
 }
 
 /* One drawn row of the icicle — a depth, or one sub-row of a depth whose
@@ -3588,7 +3664,7 @@
   /* Separation between neighbouring frames, painted in the panel surface so a
    * dense row reads as distinct blocks. */
   stroke: var(--dg-surface-base);
-  stroke-width: 1;
+  stroke-width: var(--dg-stroke-width-hairline);
   cursor: pointer;
 }
 
@@ -3601,7 +3677,7 @@
  * ring. */
 .dg-flame__frame.dg-is-selected {
   stroke: var(--dg-accent);
-  stroke-width: 2;
+  stroke-width: var(--dg-stroke-width-emphasis);
 }
 
 .dg-flame__frame-label {
@@ -3628,8 +3704,8 @@
 }
 
 .dg-flame__equivalent .dg-virtual-viewport {
-  /* Gap: no size token exists for a list's scroll cap. */
-  max-block-size: calc(var(--dg-space-7) * 14);
+  /* A hierarchy's scroll cap, the same as the icicle's above. */
+  max-block-size: var(--dg-scroll-cap-sm);
 }
 
 /* One frame's row. `--dgc-depth` is the frame's depth as a unitless integer and
@@ -3662,7 +3738,7 @@
  * drawing it inside the row keeps the ring clear of the viewport's clipping
  * edge and of the rows above and below. */
 .dg-flame__equivalent-row:focus-visible {
-  outline-offset: calc(var(--dg-space-0) * -1);
+  outline-offset: var(--dg-space-inverse-0);
 }
 
 .dg-flame__equivalent-row.dg-is-selected {
@@ -3678,12 +3754,13 @@
  * leaf's name lines up with the foldable rows at its depth. The same box as
  * `.dg-component-tree__toggle:empty` — the icon-only toggle's size through
  * `--dg-icon-button-size`, resolved in the small type role the `sm` button
- * sets, and kept square by `aspect-ratio` — so it tracks the control through a
- * token change. */
+ * sets, and kept square by stating that one token on both axes — so it tracks
+ * the control through a token change, and a row that stretches its items
+ * cannot make it taller than it is wide. */
 .dg-flame__toggle:empty {
   font: var(--dg-text-sm);
   inline-size: var(--dg-icon-button-size);
-  aspect-ratio: 1;
+  block-size: var(--dg-icon-button-size);
 }
 
 /* A record the correlator re-attached to the trace root: the structure around
@@ -3859,7 +3936,7 @@
 }
 
 .dg-component-tree__node:focus-visible {
-  outline-offset: calc(var(--dg-space-0) * -1);
+  outline-offset: var(--dg-space-inverse-0);
 }
 
 /* Above the threshold the component was given — always beside the count that
@@ -3885,11 +3962,10 @@
  * draws — a `sm` icon-only button, which is the 24 px square the button
  * block's target floor makes it — through that same `--dg-space-7` token, so
  * the placeholder tracks the toggle through a token change instead of
- * drifting from it, and `aspect-ratio` keeps it square without a second
- * length. */
+ * drifting from it. The one token on both axes keeps it square. */
 .dg-component-tree__toggle:empty {
   inline-size: var(--dg-space-7);
-  aspect-ratio: 1;
+  block-size: var(--dg-space-7);
 }
 
 /* Expansion needs no rule of its own: the node's `aria-expanded` attribute
@@ -3983,6 +4059,28 @@
   flex: none;
 }
 
+/* The URL's slot starts from a zero basis and grows to its own content and no
+ * further, so it takes only the width the toggle, the method and the chip
+ * leave: a row that fits reads exactly as one whose URL simply shrank. A
+ * Request column narrowed below even those three — the column narrowed to fit
+ * its table — moves the chip onto a line of its own instead of cutting it at
+ * the cell's edge; the wrap is only ever reached then, because the URL's zero
+ * basis never pushes anything onto a second line. The URL keeps at least one
+ * glyph square (`--dg-icon-size`), the room its ellipsis needs, so the chip
+ * wraps before the URL could shrink to a sliver of its first letter. */
+.dg-request-table__group-row > .dg-stack__items {
+  flex-wrap: wrap;
+}
+
+.dg-request-table__group-row
+  > .dg-stack__items
+  > :has(> .dg-tooltip__trigger > .dg-request-table__url) {
+  flex: auto;
+  flex-basis: 0;
+  min-inline-size: var(--dg-icon-size);
+  max-inline-size: max-content;
+}
+
 .dg-request-table__group-row.dg-is-duplicate {
   border-inline-start-color: var(--dg-warning);
 }
@@ -3998,25 +4096,28 @@
  * tracks as a SUBGRID, so every occurrence's four slots share one set of
  * column edges. RequestTable.tsx renders exactly those four slots per
  * occurrence, in that order; a note above the list (truncation, no
- * occurrences) spans every track. */
+ * occurrences) spans every track. Spanning is by name: the template brackets
+ * the four tracks with the `full-start` and `full-end` lines, and each subgrid
+ * inherits those names from the grid it adopts, so `grid-column: full` spans
+ * all four tracks at every level. */
 .dg-request-table__occurrences > .dg-stack__items {
   display: grid;
   grid-template-columns:
-    max-content max-content max-content
-    minmax(0, var(--dg-column-share-default));
+    [full-start] max-content max-content max-content
+    minmax(0, var(--dg-column-share-default)) [full-end];
   align-items: center;
   column-gap: var(--dg-space-3);
 }
 
 .dg-request-table__occurrences > .dg-stack__items > * {
-  grid-column: 1 / -1;
+  grid-column: full;
 }
 
 .dg-request-table__occurrence-row,
 .dg-request-table__occurrence-row > .dg-stack__items {
   display: grid;
   grid-template-columns: subgrid;
-  grid-column: 1 / -1;
+  grid-column: full;
   align-items: center;
   min-inline-size: 0;
 }
@@ -4045,7 +4146,7 @@
  * its column truncates rather than overlapping the next slot. */
 .dg-request-table__occurrence-row > .dg-stack__items > * {
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
 }
 
 /* The slot the initiating component's source chip sits in. */
@@ -4119,7 +4220,7 @@
   display: inline-flex;
   align-items: stretch;
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
 }
 
 /* The execution count never gives up width: when the chip and its count are
@@ -4130,6 +4231,14 @@
   flex: none;
 }
 
+/* The span name after a caller's chip wraps at its spaces and, in a caller
+ * column narrowed to fit its table below the longest word, inside that word,
+ * rather than being cut at the cell's edge: it carries no tooltip, so the
+ * whole name has to stay on screen. */
+.dg-query-table__caller > .dg-stack__items > .dg-text {
+  overflow-wrap: anywhere;
+}
+
 /* The list of caller chips inside one cell, and the list of executions inside an
  * expanded row. Both are `Stack`s, so their spacing is the stack's; these rules
  * only let them shrink below their content and never grow past their column,
@@ -4138,7 +4247,7 @@
 .dg-query-table__callers,
 .dg-query-table__occurrences {
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
 }
 
 /* One execution of a grouped statement, on the elevated surface so the nesting
@@ -4204,8 +4313,8 @@
  * This rule therefore sets no display, gap or alignment of its own. Cross-axis
  * alignment on the OUTER column is exactly what must stay at the default
  * stretch: any other value (a `baseline` here once) lets the items row size
- * itself from its content instead of from the cell, the summary's
- * `max-inline-size: 100%` then resolves against that oversized row, the
+ * itself from its content instead of from the cell, the summary's full-size
+ * `max-inline-size` then resolves against that oversized row, the
  * ellipsis never triggers, and a long summary paints across the next column.
  * The two declarations below bound the cell to its grid track, so the
  * stretched row — and the summary inside it — are bounded too. */
@@ -4214,7 +4323,7 @@
 .dg-state-transitions__previous,
 .dg-state-transitions__next {
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
 }
 
 /* The reported-state cell, and whether the producer reported values at all.
@@ -4285,7 +4394,7 @@
   align-items: center;
   gap: var(--dg-space-1);
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
   color: var(--dg-accent);
   font: var(--dg-text-xs);
   cursor: pointer;
@@ -4315,8 +4424,8 @@
 .dg-dependency-graph__viewport {
   position: relative;
   min-inline-size: 0;
-  /* Gap: no size token exists for a graph's scroll cap. */
-  max-block-size: calc(var(--dg-space-7) * 16);
+  /* A chart's scroll cap, the same as the timeline's. */
+  max-block-size: var(--dg-scroll-cap-md);
 }
 
 /* The two paint groups the component draws, in paint order: every
@@ -4337,7 +4446,7 @@
 .dg-dependency-graph__node {
   fill: var(--dg-surface-elevated);
   stroke: var(--dgc-node-color, var(--dg-border-strong));
-  stroke-width: 2;
+  stroke-width: var(--dg-stroke-width-emphasis);
   cursor: pointer;
 }
 
@@ -4412,7 +4521,7 @@
 .dg-dependency-graph__edge {
   fill: none;
   stroke: var(--dg-graph-edge);
-  stroke-width: 1;
+  stroke-width: var(--dg-stroke-width-hairline);
   stroke-linecap: round;
   pointer-events: none;
 }
@@ -4431,12 +4540,12 @@
 
 .dg-dependency-graph__edge.dg-is-ambiguous {
   stroke: var(--dg-warning);
-  stroke-dasharray: 4 3;
+  stroke-dasharray: var(--dg-stroke-dash-dashed);
 }
 
 .dg-dependency-graph__edge.dg-is-orphan {
   stroke: var(--dg-warning);
-  stroke-dasharray: 1 3;
+  stroke-dasharray: var(--dg-stroke-dash-dotted);
 }
 
 .dg-dependency-graph__edge-label {
@@ -4531,12 +4640,40 @@
   text-decoration: underline;
 }
 
+/* The symbol names the chip, so it is the last run to give way. The path
+ * beside it starts from a zero basis and grows to its own content and no
+ * further: it takes only the width the symbol leaves, so a tight chip
+ * ellipsizes the path first, exactly as a symbol that never shrank did. Only a
+ * chip too narrow for the symbol itself — a name column narrowed to fit its
+ * table — then ellipsizes the symbol too, instead of cutting it off at the
+ * chip's clipped edge mid-letter.
+ *
+ * Neither run ever shows less than one glyph square (`--dg-icon-size`), the
+ * room its own ellipsis needs: a narrower box would paint a sliver of its
+ * first letter and no ellipsis at all. A run that cannot have that room
+ * leaves the chip's line instead — the runs wrap (see the chip rules below)
+ * and only the first line is shown — so a chip squeezed below its glyph, a
+ * symbol ellipsis and a path ellipsis shows its glyph and ellipsized symbol,
+ * and one squeezed further its glyph alone. The symbol is never wider than
+ * the line beside its glyph, so it wraps away only when not even one glyph of
+ * it fits; the path, from its zero basis, wraps away as soon as it could not
+ * show its ellipsis. */
 .dg-source-link__symbol {
-  flex: none;
+  flex: auto;
+  flex-grow: 0;
+  min-inline-size: var(--dg-icon-size);
+  max-inline-size: calc(var(--dg-size-full) - var(--dg-icon-size) - var(--dg-space-1));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--dg-text-primary);
 }
 
 .dg-source-link__file {
+  flex: auto;
+  flex-basis: 0;
+  min-inline-size: var(--dg-icon-size);
+  max-inline-size: max-content;
   color: var(--dg-accent);
 }
 
@@ -4547,6 +4684,19 @@
  * base.css, so a single class placed here wins. */
 .dg-source-link__icon {
   color: var(--dg-text-muted);
+}
+
+/* The glyph holds the chip's first line open to one full line box whatever
+ * else that line holds: its block margins (`--dg-glyph-line-inset`) make its
+ * margin box exactly one line tall, so a chip whose runs have wrapped out of
+ * view (see the chip rules below) keeps its glyph centred where every other
+ * chip's glyph sits, and the wrapped runs start a full gap below the one line
+ * the chip shows. A margin rather than a taller box on purpose: the glyph's
+ * own box stays the font-relative square, and so does the baseline a flex
+ * container synthesizes from it, so a chip whose runs fit sits, aligns and
+ * baseline-aligns exactly as it does without this rule. */
+.dg-source-link .dg-source-link__icon {
+  margin-block: var(--dg-glyph-line-inset);
 }
 
 /* The symbol and the path are the `Code` primitive, which paints a surface, a
@@ -4619,6 +4769,27 @@
   min-inline-size: 0;
 }
 
+/* The chip is one line of runs. They may wrap — a run with no room for its
+ * own ellipsis leaves the line (see the run rules above) — but the box shows
+ * one line and clips the rest: the interactive chip's label is capped at one
+ * line box (`--dg-line-block-size`) and clips with its own `overflow: hidden`,
+ * and the inert chip, whose root holds the runs, is capped at the same target
+ * height its minimum already gives it and clips with the chip's `clip`. A
+ * chip whose runs fit — every chip at a table's readable floors — never
+ * wraps, since only a run without room for its ellipsis breaks the line. */
+.dg-source-link .dg-button__label,
+.dg-source-link.dg-is-static {
+  flex-wrap: wrap;
+}
+
+.dg-source-link .dg-button__label {
+  max-block-size: var(--dg-line-block-size);
+}
+
+.dg-source-link.dg-is-static {
+  max-block-size: var(--dg-space-7);
+}
+
 /* ==========================================================================
  * host/PanelHost.tsx and host/NodeRenderer.tsx
  *
@@ -4674,7 +4845,7 @@
   display: flex;
   flex-direction: column;
   min-inline-size: 0;
-  min-block-size: calc(var(--dg-space-7) * 4);
+  min-block-size: var(--dg-state-min-block-size);
 }
 
 .dg-panel__banner {
@@ -4682,7 +4853,7 @@
   flex-wrap: wrap;
   align-items: center;
   gap: var(--dg-space-2);
-  inline-size: 100%;
+  inline-size: var(--dg-size-full);
   min-inline-size: 0;
   padding-block: var(--dg-space-2);
   padding-inline: var(--dg-space-4);

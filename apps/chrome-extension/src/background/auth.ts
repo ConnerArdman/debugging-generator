@@ -37,7 +37,8 @@
  * The service listens on a port the developer chooses (`DEBUGGEN_PORT`), so
  * the extension cannot assume `DEFAULT_SERVICE_BASE_URL`. The address is kept
  * under {@link SERVICE_ENDPOINT_STORAGE_KEY}, entered in the pairing dialog
- * (it must be right before a code can be redeemed), and applied by
+ * (it must be right before a code can be redeemed) or, once paired, in that
+ * dialog's address-only mode ("Change service address…"), and applied by
  * `service-worker.ts` to both the socket and every HTTP call.
  * {@link parseServiceEndpoint} is the one validator: the protocol's
  * loopback-only policy, narrowed to the two hosts the manifest's

@@ -32,9 +32,13 @@
  *                    credential stops the command before anything is spawned —
  *                    without one the preload stays inert and records nothing
  *                    (`packages/telemetry/src/node/config.ts`), so starting the
- *                    server anyway would only look instrumented. The service
- *                    supervises the credential as a lease and revokes it
- *                    shortly after the dev server exits, Ctrl-C included
+ *                    server anyway would only look instrumented. Once the
+ *                    dev server has exited — on its own, through a forwarded
+ *                    Ctrl-C or SIGTERM, or because it could not be started —
+ *                    this command releases the credential
+ *                    (`POST /credentials/release`); the service supervises it
+ *                    as a lease as well, and revokes it shortly after the dev
+ *                    server exits when that release does not happen
  *                    (WHY THE CREDENTIAL MATTERS below).
  *
  * `--detach` returns as soon as the service has reported the launch instead of
@@ -44,12 +48,15 @@
  *
  * ROUTES — THE CONTRACT IS NOT NEGOTIABLE HERE: this file is a *caller*. The
  * routes it may use are the ones the service defines, and
- * {@link SERVICE_ROUTES} is the whole list: `GET /health`,
- * `POST /dev-server/launch` and `POST /dev-server/stop` from the protocol's
- * route table (`HTTP_ROUTES` in `packages/protocol/src/http.ts`), and
- * `POST /dev-server/credential`, which the service's launcher defines once
- * (`DEV_SERVER_CREDENTIAL_PATH` in `apps/local-service/src/dev-server/launcher.ts`)
- * and `apps/local-service/src/server/routes/dev-server.ts` registers. There is
+ * {@link SERVICE_ROUTES} is the whole list, every one of them a row of the
+ * protocol's route table (`HTTP_ROUTES` in `packages/protocol/src/http.ts`):
+ * `GET /health`, `POST /dev-server/launch`, `POST /dev-server/stop`,
+ * `POST /dev-server/credential` (which the service's launcher reads off that
+ * row as `DEV_SERVER_CREDENTIAL_PATH` in
+ * `apps/local-service/src/dev-server/launcher.ts`, and
+ * `apps/local-service/src/server/routes/dev-server.ts` registers), and
+ * `POST /credentials/release` (operation `credentials.release`, editor
+ * credential required). There is
  * deliberately no route-name guessing, no probe list and no environment
  * override that points at a different path: a caller that invents an endpoint
  * the service does not define cannot work against the specified service, and
@@ -79,8 +86,9 @@
  *   - retry/backoff, health polling or waiting for the server to be listening;
  *   - session creation, tab binding or any session bookkeeping;
  *   - minting, hashing, storing, refreshing or revoking credentials — the
- *     service mints the one `--spawn-local` asks for, and this script only
- *     passes it to the child it spawns;
+ *     service mints the one `--spawn-local` asks for and revokes it, and this
+ *     script only passes it to the child it spawns and, once that child is
+ *     gone, asks the service to release it: one request, never retried;
  *   - reading, parsing or forwarding `.env` files — the child does its own.
  * If you are about to add any of the above, add it to the launcher instead and
  * let this script keep being a thin wrapper.
@@ -121,23 +129,38 @@
  *     shuts down, and revokes it at the end of the first lease when no preload
  *     ever connected with it. A lease nothing renews any more — the service
  *     crashed — lapses within 5 minutes of its last renewal.
- *     `debuggen.rotateServiceToken` revokes it at once.
+ *     `debuggen.rotateServiceToken` revokes it at once. That supervision is
+ *     the fallback: this command does not wait for it. The moment nothing
+ *     will use the credential any more — the child exited, on its own or
+ *     through a forwarded signal, or could not be spawned, or a step after
+ *     the mint failed before the spawn — it asks
+ *     `POST /credentials/release` with `{ token }`, authorised by the editor
+ *     credential, and the service revokes the credential then
+ *     (`{ released: true }`) or reports that nothing was live under it any
+ *     more (`{ released: false }`, equally a success). A release that fails or
+ *     is skipped is a warning, never a change to the exit status, and the
+ *     supervision above still ends the credential.
  * Either way the child receives `DEBUGGEN_TOKEN` together with a matching
  * `DEBUGGEN_PROJECT_ROOT` and the `DEBUGGEN_INGEST_URL` endpoint.
  *
  * SAFETY: the editor credential is sent only as a bearer token, only to a
  * loopback address, and only after the listener there has proved it is the
  * service holding that same credential (SERVICE IDENTITY above); the foreground
- * mode repeats the proof before its closing stop request, because the listener
- * on the port may have changed while the dev server ran. Every answer is read
- * under the {@link RESPONSE_MAX_BYTES} cap, so an oversized reply is discarded
- * rather than buffered. The server-agent credential is held only in this
- * process's memory and in the child's environment. This command never prints,
- * logs or writes either: both are redacted out of every part of a service
- * error it echoes (the status phrase included), a credential response is never
- * echoed at all, and the banner describes the server-agent credential by its
- * length only. This script writes nothing anywhere: it only reads, requests
- * and spawns, and once the child has exited it sends nothing further.
+ * mode repeats the proof before its closing stop request, and `--spawn-local`
+ * before its closing release request, because the listener on the port may
+ * have changed while the dev server ran. Every answer is read under the
+ * {@link RESPONSE_MAX_BYTES} cap, so an oversized reply is discarded rather
+ * than buffered. The server-agent credential is held only in this process's
+ * memory and in the child's environment, and it leaves this process once more
+ * only as the body of that release request, to the listener that has just
+ * proved again that it is the service. This command never prints, logs or
+ * writes either credential: both are redacted out of every part of a service
+ * error it echoes (the status phrase included), a credential or release
+ * response is never echoed at all, and the banner describes the server-agent
+ * credential by its length only. This script writes nothing anywhere: it only
+ * reads, requests and spawns, and once the child has exited it sends two
+ * requests more and nothing else: the identity probe, then — only when that
+ * proof holds — the one release request.
  *
  * The child's own output is deliberately NOT filtered: it inherits this
  * terminal (`stdio: 'inherit'`) so the dev server keeps its colours, its TTY
@@ -269,49 +292,93 @@ export const STOP_PATH = '/dev-server/stop';
  * exactly this route and hands the answer's `token` to its child as
  * `DEBUGGEN_TOKEN`.
  *
- * It is not a row of the protocol's route table: the service's launcher
- * defines it once, as `DEV_SERVER_CREDENTIAL_PATH` in
- * `apps/local-service/src/dev-server/launcher.ts` together with both strict
- * body schemas, and `apps/local-service/src/server/routes/dev-server.ts`
- * registers it behind the editor-only bearer check. The service answers 403
- * when `projectRoot` is outside the workspace folders the connected editor
- * announced.
+ * It is the protocol route table's `devServer.credential` row, with both
+ * strict body schemas (`devServerCredentialRequestSchema`,
+ * `devServerCredentialResponseSchema`) beside it in
+ * `packages/protocol/src/http.ts`; the service's launcher reads the path off
+ * that row as `DEV_SERVER_CREDENTIAL_PATH`
+ * (`apps/local-service/src/dev-server/launcher.ts`), and
+ * `apps/local-service/src/server/routes/dev-server.ts` registers it behind the
+ * editor-only bearer check. The service answers 403 when `projectRoot` is
+ * outside the workspace folders the connected editor announced.
  *
- * A credential minted here is a lease the service supervises, and nothing in
- * this script renews or revokes it: `expiresAt` ends a first lease of 5
- * minutes, which the service renews while the dev server's preload holds its
- * server-agent control connection. The service revokes the credential once
- * that connection has been gone for 20 seconds, at the end of the first lease
- * when no preload ever connected with it, and when the service shuts down; a
- * lease nothing renews lapses within 5 minutes of its last renewal, and
+ * A credential minted here is a lease the service supervises, and this script
+ * never renews it: `expiresAt` ends a first lease of 5 minutes, which the
+ * service renews while the dev server's preload holds its server-agent control
+ * connection. Once the dev server has exited, `--spawn-local` releases the
+ * credential through {@link RELEASE_PATH}. Should that release fail or be
+ * skipped, the service still revokes the credential once that connection has
+ * been gone for 20 seconds, at the end of the first lease when no preload ever
+ * connected with it, and when the service shuts down; a lease nothing renews
+ * lapses within 5 minutes of its last renewal, and
  * `debuggen.rotateServiceToken` revokes every credential at once.
  */
 export const CREDENTIAL_PATH = '/dev-server/credential';
 
 /**
- * Every service route this command is permitted to call, and therefore the
- * complete list a service build must answer for it to work: the three the
- * protocol defines and the service's own credential route. A
- * request to anything else is a bug in this file, which is why the list is
- * exported and asserted by `scripts/dev-instrumented.test.mjs` against a stub
- * service that implements only these paths.
+ * The service's credential release route: `POST /credentials/release`
+ * (protocol operation `credentials.release`), `{ token }` →
+ * `{ released: boolean }`, editor credential required. `--spawn-local` calls
+ * exactly this route, once, when the server-agent credential it obtained from
+ * {@link CREDENTIAL_PATH} has no further use — its dev server exited, or could
+ * not be spawned — so the credential stops working then rather than when the
+ * service's lease supervision catches up with it.
+ *
+ * `{ released: true }` means the service revoked the credential on this
+ * request; `{ released: false }` means this request released nothing. The
+ * flag reports what the request did, not the state of the token: in general a
+ * `false` is no proof that a token stops authenticating, since the service
+ * answers it for a dev server it launched itself, whose credential stays live.
+ * The token this command sends is never such a credential — it is the one
+ * {@link CREDENTIAL_PATH} minted — so for it `false` means nothing was live
+ * under it any more (the service's supervision had already revoked it, its
+ * lease lapsed, or a rotation retired it), which is an equally successful
+ * outcome. The answer is strict: any other body is off-contract. 401 and 403
+ * mean the editor credential was refused, 404 and 405 a service older than
+ * this checkout, and a 500 (`CLEANUP_PARTIAL`) a revocation the service has
+ * not completed yet and keeps retrying. See {@link releaseServerAgentCredential}.
  */
-export const SERVICE_ROUTES = Object.freeze([HEALTH_PATH, LAUNCH_PATH, STOP_PATH, CREDENTIAL_PATH]);
+export const RELEASE_PATH = '/credentials/release';
+
+/**
+ * Every service route this command is permitted to call, and therefore the
+ * complete list a service build must answer for it to work: the five rows of
+ * the protocol's route table named above. A request to anything else is a bug
+ * in this file, which is why the list is exported and asserted by
+ * `scripts/dev-instrumented.test.mjs` against a stub service that implements
+ * only these paths.
+ */
+export const SERVICE_ROUTES = Object.freeze([
+  HEALTH_PATH,
+  LAUNCH_PATH,
+  STOP_PATH,
+  CREDENTIAL_PATH,
+  RELEASE_PATH,
+]);
 
 /** Timeout for the liveness pre-flight: 2 s, after which the service counts as not answering. */
 export const HEALTH_TIMEOUT_MS = 2_000;
 
-/** Timeout for the launch, stop and credential requests. */
+/** Timeout for the launch, stop, credential and release requests. */
 export const REQUEST_TIMEOUT_MS = 5_000;
 
 /**
+ * The longest the closing release of `--spawn-local` can take: the identity
+ * probe that precedes it ({@link HEALTH_TIMEOUT_MS}, one address — the one
+ * already proved) and then the release request itself
+ * ({@link REQUEST_TIMEOUT_MS}). Shutdown signals are held for this long at
+ * most (see {@link holdShutdownSignals}).
+ */
+const RELEASE_STEP_MAX_MS = HEALTH_TIMEOUT_MS + REQUEST_TIMEOUT_MS;
+
+/**
  * The most bytes this command reads from a service answer: 64 KiB. Every
- * answer it expects — `{ devServerUrl, pid }`, `{ token, expiresAt }`, an
- * error body — is a small JSON object of a few hundred bytes, so the cap
- * leaves ample room while keeping a misbehaving listener from making this
- * process buffer an unbounded body before anything is parsed. A declared
- * `Content-Length` above it is refused before any byte is read, and a body
- * that streams past it is cancelled the moment it does.
+ * answer it expects — `{ devServerUrl, pid }`, `{ token, expiresAt }`,
+ * `{ released }`, an error body — is a small JSON object of a few hundred
+ * bytes, so the cap leaves ample room while keeping a misbehaving listener
+ * from making this process buffer an unbounded body before anything is
+ * parsed. A declared `Content-Length` above it is refused before any byte is
+ * read, and a body that streams past it is cancelled the moment it does.
  */
 export const RESPONSE_MAX_BYTES = 64 * 1024;
 
@@ -333,15 +400,18 @@ const EXIT_OK = 0;
  * answered off-contract, an unusable target project, or no package manager on
  * `PATH`. Every message that uses this code states whether anything was
  * launched or spawned, so "2" is never ambiguous about the state it leaves
- * behind.
+ * behind. A release request that fails is never one of these: it is reported
+ * as a warning, and the exit status stays the one the run already had.
  */
 const EXIT_PREFLIGHT = 2;
 
 /**
  * Status codes that mean "this service build does not implement that route".
- * They are a hard failure, never a signal to try a different path: the routes
- * in {@link SERVICE_ROUTES} are the service's own, so a 404 or 405 is a version
- * mismatch between this checkout and the running service.
+ * They are a failure, never a signal to try a different path: the routes in
+ * {@link SERVICE_ROUTES} are the service's own, so a 404 or 405 is a version
+ * mismatch between this checkout and the running service. (For the release
+ * route that failure is reported as a warning; see
+ * {@link releaseServerAgentCredential}.)
  */
 const ROUTE_ABSENT_STATUSES = Object.freeze([404, 405]);
 
@@ -513,9 +583,8 @@ What it does (default mode)
   inside the dev-server process before the framework starts. Nothing in the
   target project's source is modified, and this script writes nothing to disk.
 
-  Every route it calls is defined by the service — three by the protocol's
-  route table, ${CREDENTIAL_PATH} by the service's
-  launcher — and these four are all of them:
+  Every route it calls is a row of the protocol's route table, and these five
+  are all of them:
   ${SERVICE_ROUTES.join(', ')}.
 
   Any local process can answer GET ${HEALTH_PATH} on the service's port, so a
@@ -543,7 +612,14 @@ What it does (--spawn-local)
      variables of this terminal (see "What the child inherits"), the --env
      variables, the preload on NODE_OPTIONS, and DEBUGGEN_INGEST_URL,
      DEBUGGEN_PROJECT_ROOT and DEBUGGEN_TOKEN
-  6. forwards SIGINT/SIGTERM to that child and exits with its status
+  6. forwards SIGINT/SIGTERM to that child and waits for it to exit
+  7. once the child has exited — on its own, through a forwarded signal, or
+     because it could not be started — has the service prove itself again as
+     in step 3, then releases the credential: POST {service}${RELEASE_PATH}
+     with { token }, authorised by the editor credential; a release that
+     fails or is skipped prints one warning and leaves the credential to the
+     service's supervision below
+  8. exits with the child's status
 
   This is an AUTHENTICATED run: it needs a running service and ${AUTH_FILE_NAME},
   and the service mints the credential only for a project under the
@@ -553,20 +629,32 @@ What it does (--spawn-local)
   one.
 
   The server-agent credential is held in this process's memory and in the
-  child's environment only; this command never prints, logs or writes it (the
-  banner shows its length). The dev server inherits this terminal unfiltered,
-  so a dev script that prints its own environment would show it there.
+  child's environment only, and goes back to the service once, as the body of
+  the release; this command never prints, logs or writes it (the banner shows
+  its length). The dev server inherits this terminal unfiltered, so a dev
+  script that prints its own environment would show it there.
 
-  The service supervises the credential as a lease. The banner shows when
-  its first lease ends (5 minutes after minting); the service renews it while
-  the dev server's preload keeps its server-agent control connection open,
-  and revokes it when the dev server disconnects — 20 seconds after that
+  This command releases the credential as soon as nothing will use it: after
+  the dev server exits (Ctrl-C and SIGTERM included), after a spawn that
+  failed, and after a failure between the mint and the spawn. The service
+  answers { released: true } when it revoked the credential then, and
+  { released: false } when nothing was live under it any more; both are a
+  success, and either prints one line. A signal that arrives while the
+  release is in flight (${String(RELEASE_STEP_MAX_MS / 1000)} seconds at most) waits for it rather than
+  ending this command mid-request. The release is one request, never
+  retried, and a failed or skipped one is a warning that leaves the exit
+  status alone.
+
+  The service also supervises the credential as a lease, which is what ends it
+  when the release does not happen. The banner shows when its first lease
+  ends (5 minutes after minting); the service renews it while the dev
+  server's preload keeps its server-agent control connection open, and
+  revokes it when the dev server disconnects — 20 seconds after that
   connection is gone, so it stops working shortly after the dev server
   exits, Ctrl-C included — and when the service shuts down. A lease nothing
   renews lapses within 5 minutes of its last renewal (a service that
   crashed, or a preload that never connected), and debuggen.rotateServiceToken
-  revokes it at once. This command itself renews and revokes nothing, and
-  once the child has exited it sends nothing further.
+  revokes it at once. This command itself never renews it.
 
 Options
   --project <dir>   project to launch; relative paths resolve against the
@@ -589,7 +677,9 @@ Options
                     obtained nothing is spawned. The credential is a lease the
                     service renews while the dev server runs and revokes when
                     the dev server disconnects; otherwise it lapses within 5
-                    minutes. Signals and the exit code are forwarded.
+                    minutes. This command releases it through
+                    POST ${RELEASE_PATH} once the dev server has exited.
+                    Signals and the exit code are forwarded.
   --env NAME[=value]
                     give the --spawn-local child one more variable: NAME alone
                     forwards this terminal's value (exit 2 when it is unset),
@@ -668,7 +758,11 @@ Exit codes
       such failure happens before the spawn, and the message says nothing was
       spawned.
   n   whatever the --spawn-local child exited with; 128 + signal number when it
-      was signalled`;
+      was signalled
+
+  The closing release of --spawn-local never changes the exit code: one that
+  fails, or is skipped because the service did not prove itself again, is a
+  warning on stderr.`;
 }
 
 /**
@@ -2219,7 +2313,10 @@ function parseCredentialAnswer(json, now) {
  * exits — at the end of the first lease when no preload ever connected, and
  * when it shuts down; a lease nothing renews lapses within 5 minutes of its
  * last renewal, and `debuggen.rotateServiceToken` revokes it at once. This
- * function neither renews nor revokes it.
+ * function neither renews nor releases it: `--spawn-local` hands it back
+ * through {@link releaseServerAgentCredential} once its dev server has
+ * exited, so the service revokes it then rather than when its supervision
+ * notices.
  *
  * @param {object} request
  * @param {string} request.base service base URL, without a trailing slash
@@ -2301,6 +2398,168 @@ export async function requestServerAgentCredential({ base, editorToken, projectR
     );
   }
   return answer.credential;
+}
+
+/**
+ * The keys of a `POST /credentials/release` answer, exactly: the service's
+ * response schema for the `credentials.release` operation is strict, so any
+ * other key means the definer has drifted from the contract this caller
+ * consumes.
+ */
+const RELEASE_RESPONSE_KEYS = Object.freeze(['released']);
+
+/**
+ * Validate a 2xx `POST /credentials/release` body against the service's strict
+ * `{ released: boolean }` shape. A failure is described in words that never
+ * quote the body — not a value, not a key name — for the reason
+ * {@link parseCredentialAnswer} gives: the request carried a credential, and an
+ * answer that is off-contract may carry it back.
+ *
+ * @param {unknown} json parsed body
+ * @returns {{ released: boolean, problem?: undefined } | { released?: undefined, problem: string }}
+ */
+function parseReleaseAnswer(json) {
+  if (typeof json !== 'object' || json === null || Array.isArray(json)) {
+    return { problem: 'the body is not a JSON object' };
+  }
+  const record = /** @type {Record<string, unknown>} */ (json);
+  const { released } = record;
+  if (typeof released !== 'boolean') {
+    return { problem: 'it carries no boolean released' };
+  }
+  if (Object.keys(record).some((key) => !RELEASE_RESPONSE_KEYS.includes(key))) {
+    return { problem: 'it carries fields other than released' };
+  }
+  return { released };
+}
+
+/**
+ * The recovery hint for a release the service refused on the editor
+ * credential. There is nothing to re-run: the credential being released has
+ * no further use either way, and the hint says what still ends it.
+ *
+ * @returns {string}
+ */
+function releaseRejectedHint() {
+  return [
+    `The editor credential in ${AUTH_FILE_NAME} is stale or was rotated while the dev`,
+    'server ran. A rotation (debuggen.rotateServiceToken) revokes every server-agent',
+    'credential with it, so it has already ended this one; otherwise the service',
+    "ends it 20 seconds after the dev server's preload disconnects, or at the end of",
+    'its lease.',
+  ].join('\n');
+}
+
+/**
+ * Hand a server-agent credential back to the service that minted it:
+ * `POST /credentials/release` with `{ token }`, authorised by the editor
+ * credential, answered with `{ released }`.
+ *
+ * `--spawn-local` calls it once the credential it obtained through
+ * {@link requestServerAgentCredential} has no further use — its dev server
+ * exited, or could not be started — so the credential stops authenticating
+ * at that moment rather than when the service's lease supervision notices the
+ * dev server is gone (20 seconds after its preload disconnects, or at the end
+ * of the lease). The caller proves the service's identity again first
+ * ({@link checkServiceHealth}); this function sends the request and judges the
+ * answer, nothing else.
+ *
+ * `true` means the service revoked the credential on this request; `false`
+ * means nothing was live under the token any more — its supervision had
+ * already revoked it, the lease lapsed, or a rotation retired it — which is a
+ * success too: either way the credential no longer works. It is one request:
+ * nothing here retries, backs off or tries another path.
+ *
+ * No message ever carries either credential. Both are redacted from every
+ * reason and status phrase that is echoed, and a 2xx body is never echoed at
+ * all, because it answers a request that carried the server-agent
+ * credential.
+ *
+ * @example
+ * const released = await releaseServerAgentCredential({ base, editorToken, token });
+ * // → true (revoked now) or false (already gone); throws when not released
+ *
+ * @param {object} request
+ * @param {string} request.base service base URL at the address that proved the
+ *   service, without a trailing slash
+ * @param {string} request.editorToken editor credential from auth.json, sent as
+ *   the bearer token
+ * @param {string} request.token the server-agent credential to release, sent as
+ *   the body's `token`
+ * @returns {Promise<boolean>} whether the service revoked the credential on this
+ *   request (`false`: nothing was live under it any more)
+ * @throws {DevInstrumentedError} when the service refused the editor credential
+ *   (401, 403), does not implement the route (404, 405), answered any other
+ *   non-2xx status (a 500 `CLEANUP_PARTIAL` among them: a revocation the
+ *   service has not completed and keeps retrying), answered off-contract, or
+ *   could not be reached
+ * @throws {TypeError} when `token` is not a non-empty string
+ */
+export async function releaseServerAgentCredential({ base, editorToken, token }) {
+  if (typeof token !== 'string' || token === '') {
+    throw new TypeError(
+      'releaseServerAgentCredential needs the server-agent credential to release',
+    );
+  }
+  const url = `${base}${RELEASE_PATH}`;
+  const secrets = [editorToken, token];
+  const response = await postJson({
+    url,
+    editorToken,
+    body: { token },
+    consequence: [
+      'The service may have released the credential before it answered. If it did',
+      "not, it revokes it 20 seconds after the dev server's preload disconnects, or",
+      'at the end of its lease.',
+    ].join('\n'),
+  });
+
+  if (response.status === 401 || response.status === 403) {
+    throw new DevInstrumentedError(
+      withReason(
+        `the service rejected the editor credential at ${RELEASE_PATH} with ${response.status}`,
+        response,
+        secrets,
+      ),
+      { hint: releaseRejectedHint() },
+    );
+  }
+  if (ROUTE_ABSENT_STATUSES.includes(response.status)) {
+    throw new DevInstrumentedError(
+      `the service answered ${response.status} for ${RELEASE_PATH}: it does not implement the release route, so nothing was released`,
+      { hint: routeAbsentHint(RELEASE_PATH) },
+    );
+  }
+  if (response.status < 200 || response.status >= 300) {
+    throw new DevInstrumentedError(
+      withReason(`${url} answered ${statusLine(response, secrets)}`, response, secrets),
+      {
+        hint: [
+          'The credential was not released by this request, and nothing here retries it.',
+          'A revocation the service has begun and not completed (CLEANUP_PARTIAL) it',
+          'keeps retrying on its own. The service log has the detail behind that status.',
+        ].join('\n'),
+      },
+    );
+  }
+
+  const answer = parseReleaseAnswer(response.json);
+  if (answer.released === undefined) {
+    throw new DevInstrumentedError(
+      `${url} answered ${response.status} off-contract: ${answer.problem}`,
+      {
+        hint: [
+          `${RELEASE_PATH} answers exactly { released }, a boolean. This service did`,
+          'not, so it does not match the contract this command was built against, and',
+          'whether it released the credential is unknown. The body is not shown because',
+          'it may carry a credential. Rebuild and restart the service:',
+          '',
+          '  pnpm --filter @debuggen/local-service build',
+        ].join('\n'),
+      },
+    );
+  }
+  return answer.released;
 }
 
 /**
@@ -3219,7 +3478,8 @@ export function describeToken(token) {
  * `dev` — including the effective `NODE_OPTIONS`, so an inherited value is
  * visibly preserved rather than assumed — names the `--env` extras without
  * their values, describes the server-agent credential by its length only, and
- * states when its first lease ends and how the service renews and revokes it.
+ * states when its first lease ends, that this command releases it when the dev
+ * server exits, and how the service renews and revokes it otherwise.
  *
  * @param {object} request
  * @param {string} request.root repository root
@@ -3284,11 +3544,13 @@ export function buildBanner({
     '',
     '  The credential is a lease the service supervises: its first lease ends',
     `  at ${expiry}, and the service renews it while the dev server's preload`,
-    '  stays connected. It is revoked when the dev server disconnects, 20',
-    '  seconds after its connection is gone (so shortly after the dev server',
-    '  exits, Ctrl-C included), and when the service shuts down; a lease',
-    '  nothing renews lapses within 5 minutes, and debuggen.rotateServiceToken',
-    '  revokes it at once.',
+    '  stays connected. When the dev server exits, Ctrl-C included, this',
+    `  command releases it (POST ${RELEASE_PATH}) once the service has proved`,
+    '  itself again. Should that release fail, the service still revokes it',
+    '  when the dev server disconnects, 20 seconds after its connection is gone',
+    '  (so shortly after the dev server exits), and when the service shuts',
+    '  down; a lease nothing renews lapses within 5 minutes, and',
+    '  debuggen.rotateServiceToken revokes it at once.',
   ].join('\n');
 }
 
@@ -3504,6 +3766,148 @@ function beforeSpawn(error) {
 }
 
 /**
+ * Keep `SIGINT` and `SIGTERM` from ending this process while a short, bounded
+ * step finishes, and return the function that lets them through again.
+ *
+ * A listener is what suppresses a signal's default termination; this one hands
+ * the signal to `onSignal` and nothing else. The step it guards is the closing
+ * release of `--spawn-local`, which takes at most {@link RELEASE_STEP_MAX_MS}:
+ * a developer's second Ctrl-C arriving while it is in flight would otherwise
+ * end this process between sending the release and hearing whether it
+ * happened. The listeners are removed as soon as the step settles, so a
+ * signal after that behaves as it always does.
+ *
+ * @param {(signal: NodeJS.Signals) => void} onSignal called for every signal
+ *   that arrives while the listeners are installed
+ * @param {readonly NodeJS.Signals[]} [signals] signals to hold
+ * @returns {() => void} removes the listeners again
+ */
+function holdShutdownSignals(onSignal, signals = ['SIGINT', 'SIGTERM']) {
+  /** @type {Array<[NodeJS.Signals, () => void]>} */
+  const handlers = [];
+  for (const signal of signals) {
+    /** @returns {void} */
+    const handler = () => onSignal(signal);
+    handlers.push([signal, handler]);
+    process.on(signal, handler);
+  }
+  return () => {
+    for (const [signal, handler] of handlers) process.off(signal, handler);
+  };
+}
+
+/**
+ * What ends the server-agent credential when this command could not release
+ * it: the service's own supervision of the lease. Every release warning closes
+ * with it, so a warning is never read as "the credential stays valid".
+ */
+const RELEASE_FALLBACK = [
+  '  The service still revokes it without this command: 20 seconds after the',
+  "  dev server's preload disconnects, or at the end of its lease.",
+].join('\n');
+
+/**
+ * The one line a successful release prints, by what the service answered.
+ */
+const RELEASE_OUTCOME = Object.freeze({
+  released: 'dev-instrumented: released the server-agent credential; the service revoked it',
+  alreadyGone:
+    'dev-instrumented: the server-agent credential was no longer live; there was nothing to release',
+});
+
+/**
+ * Print the single warning a release that did not happen produces: what went
+ * wrong, then {@link RELEASE_FALLBACK}. The text is redacted of both
+ * credentials before it is written, whatever produced it.
+ *
+ * @param {import('node:stream').Writable} stderr stream to warn on
+ * @param {string} headline what did not happen
+ * @param {unknown} error why
+ * @param {readonly string[]} secrets credentials to redact
+ * @returns {void}
+ */
+function warnUnreleased(stderr, headline, error, secrets) {
+  const reason = error instanceof Error ? error.message : String(error);
+  writeLine(
+    stderr,
+    redactSecrets(
+      `dev-instrumented: warning: ${headline}: ${reason}\n${RELEASE_FALLBACK}`,
+      secrets,
+    ),
+  );
+}
+
+/**
+ * Release a `--spawn-local` server-agent credential once nothing will use it
+ * any more: after the dev server exited — on its own, through a forwarded
+ * signal, or because it could not be spawned — or after a step between the
+ * mint and the spawn failed.
+ *
+ * The listener at `base` is made to prove it is the service again first
+ * ({@link checkServiceHealth}), exactly as the foreground mode does before its
+ * closing stop: the dev server may have run for hours, and whatever holds the
+ * port now is what the editor credential and the server-agent credential
+ * would reach. A listener that cannot prove it is sent neither, and the
+ * release is skipped. Then one release request is sent
+ * ({@link releaseServerAgentCredential}), never retried. Shutdown signals are
+ * held for the whole step ({@link holdShutdownSignals}), which is bounded by
+ * the probe's and the request's timeouts.
+ *
+ * Every failure of the step is reported rather than thrown, and none changes
+ * an exit status: the release is the prompt end of a credential that the
+ * service's lease supervision ends anyway, so a release that is skipped or
+ * fails prints one warning to `stderr` naming that fallback, and one that
+ * succeeds — `{ released: true }` or `{ released: false }` alike — prints one
+ * line to `stdout`. Neither credential is ever printed.
+ *
+ * @param {object} request
+ * @param {string} request.base service base URL at the address that proved the
+ *   service when the credential was minted
+ * @param {string} request.editorToken editor credential from auth.json
+ * @param {string} request.token the server-agent credential to release
+ * @param {import('node:stream').Writable} request.stdout stream the outcome
+ *   line and a held signal's note are written to
+ * @param {import('node:stream').Writable} request.stderr stream a warning is
+ *   written to
+ * @returns {Promise<void>}
+ */
+async function releaseAfterUse({ base, editorToken, token, stdout, stderr }) {
+  const secrets = [editorToken, token];
+  let signalNoted = false;
+  const letSignalsThrough = holdShutdownSignals((signal) => {
+    if (signalNoted) return;
+    signalNoted = true;
+    writeLine(
+      stdout,
+      `dev-instrumented: ${signal} received; finishing the credential release first (at most ${String(RELEASE_STEP_MAX_MS / 1000)} s)`,
+    );
+  });
+
+  try {
+    try {
+      await checkServiceHealth(base, editorToken);
+    } catch (error) {
+      warnUnreleased(
+        stderr,
+        'the release of the server-agent credential was skipped',
+        error,
+        secrets,
+      );
+      return;
+    }
+
+    try {
+      const released = await releaseServerAgentCredential({ base, editorToken, token });
+      writeLine(stdout, released ? RELEASE_OUTCOME.released : RELEASE_OUTCOME.alreadyGone);
+    } catch (error) {
+      warnUnreleased(stderr, 'the server-agent credential was not released', error, secrets);
+    }
+  } finally {
+    letSignalsThrough();
+  }
+}
+
+/**
  * @typedef {object} LocalSpawnPlan
  * @property {LaunchCommand} command what will be spawned
  * @property {Record<string, string>} childEnv the child's environment,
@@ -3514,7 +3918,13 @@ function beforeSpawn(error) {
  *   first lease ends
  * @property {string} serviceBase the service base URL at the address that
  *   proved the service ({@link checkServiceHealth}); the credential request
- *   went there, and the child's ingest URL names it
+ *   went there, the child's ingest URL names it, and the closing release is
+ *   sent there once the service has proved itself again
+ * @property {string} editorToken the editor credential from auth.json, which
+ *   authorises the closing release; held in memory only and never printed
+ * @property {string} token the server-agent credential the service minted —
+ *   the same value `childEnv.DEBUGGEN_TOKEN` carries — for the closing release
+ *   to name; held in memory only and never printed
  */
 
 /**
@@ -3526,10 +3936,19 @@ function beforeSpawn(error) {
  * and only then ask it for a server-agent credential scoped to the project.
  *
  * The credential is requested last, once everything local has been validated,
- * so the service never mints one for a run that cannot start: a credential no
- * preload ever connects with stays valid until the service revokes it at the
- * end of its first lease, 5 minutes after minting, with no process to use it.
- * Every failure is raised with a hint that says nothing was spawned.
+ * so the service is not asked to mint one for a run that cannot start: a
+ * credential no preload ever connects with, and that nothing releases, stays
+ * valid until the service revokes it at the end of its first lease, 5 minutes
+ * after minting. Should a step after the mint still fail — building the
+ * child's environment refuses an extra — the credential is released before
+ * the failure is raised ({@link releaseAfterUse}): best effort, reported on
+ * its own line, and the original failure is what the command reports and
+ * exits with. Every failure is raised with a hint that says nothing was
+ * spawned.
+ *
+ * Exported so `scripts/dev-instrumented.test.mjs` can drive a failure between
+ * the mint and the spawn, which no command line reaches: `parseArgs` refuses
+ * every extra that {@link buildChildEnv} would.
  *
  * @param {object} request
  * @param {string} request.root repository root
@@ -3539,10 +3958,25 @@ function beforeSpawn(error) {
  * @param {NodeJS.ProcessEnv} request.env environment to read, and to take the
  *   allowlisted child variables from
  * @param {readonly ExtraEnvRequest[]} request.extraEnv the `--env` requests
+ * @param {import('node:stream').Writable} request.stdout stream a release's
+ *   outcome line is written to, should a failure after the mint need one
+ * @param {import('node:stream').Writable} request.stderr stream a release's
+ *   warning is written to, likewise
  * @returns {Promise<LocalSpawnPlan>}
  * @throws {DevInstrumentedError} exit 2, before anything is spawned
  */
-async function prepareLocalSpawn({ root, project, preload, base, env, extraEnv }) {
+export async function prepareLocalSpawn({
+  root,
+  project,
+  preload,
+  base,
+  env,
+  extraEnv,
+  stdout,
+  stderr,
+}) {
+  /** @type {{ serviceBase: string, editorToken: string, token: string } | undefined} */
+  let minted;
   try {
     const extras = resolveExtraEnv(extraEnv, env);
     const command = buildLaunchCommand({ project, root, env });
@@ -3553,6 +3987,7 @@ async function prepareLocalSpawn({ root, project, preload, base, env, extraEnv }
       editorToken,
       projectRoot: project.dir,
     });
+    minted = { serviceBase, editorToken, token };
     const childEnv = buildChildEnv({
       preloadUrl: preload.url,
       base: serviceBase,
@@ -3561,8 +3996,25 @@ async function prepareLocalSpawn({ root, project, preload, base, env, extraEnv }
       env,
       extraEnv: extras,
     });
-    return { command, childEnv, extraEnvNames: Object.keys(extras), expiresAt, serviceBase };
+    return {
+      command,
+      childEnv,
+      extraEnvNames: Object.keys(extras),
+      expiresAt,
+      serviceBase,
+      editorToken,
+      token,
+    };
   } catch (error) {
+    if (minted !== undefined) {
+      await releaseAfterUse({
+        base: minted.serviceBase,
+        editorToken: minted.editorToken,
+        token: minted.token,
+        stdout,
+        stderr,
+      });
+    }
     throw beforeSpawn(error);
   }
 }
@@ -3595,9 +4047,10 @@ function reportFailure(error, stderr = process.stderr) {
  * @property {NodeJS.ProcessEnv} [env] environment to read and to inherit into a
  *   `--spawn-local` child
  * @property {import('node:stream').Writable} [stdout] stream the banner, the
- *   launch report and the usage text are written to
- * @property {import('node:stream').Writable} [stderr] stream failures and hints
- *   are written to
+ *   launch report, the usage text and a credential release's outcome line are
+ *   written to
+ * @property {import('node:stream').Writable} [stderr] stream failures, hints
+ *   and a credential release's warning are written to
  */
 
 /**
@@ -3613,7 +4066,11 @@ function reportFailure(error, stderr = process.stderr) {
  * `--spawn-local` runs the same pre-flight and one more step: it asks the
  * service for the server-agent credential its child needs, after the launch
  * command has been resolved and validated (see {@link prepareLocalSpawn}). Any
- * failure there exits 2 before the child exists.
+ * failure there exits 2 before the child exists. Once the credential exists,
+ * every path out — the child's exit, a signal-forwarded exit, a failed spawn,
+ * a failure between the mint and the spawn — ends with the service proving
+ * itself again and one release request ({@link releaseAfterUse}), whose
+ * outcome never changes the exit code.
  *
  * The context parameter exists so the whole command can be driven against a
  * temporary tree and a stub service in `scripts/dev-instrumented.test.mjs`;
@@ -3669,34 +4126,44 @@ export async function main(argv = process.argv.slice(2), context = {}) {
       // The authenticated local spawn: the child starts only with a
       // server-agent credential the service minted for this project root, so
       // the preload it carries is armed rather than inert. The credential is
-      // held in `childEnv` and nowhere else; the banner describes it by length
-      // and the end of its first lease only, and once the child exits nothing
-      // further is sent: the service revokes the credential when the child's
-      // preload disconnects.
-      const { command, childEnv, extraEnvNames, expiresAt, serviceBase } = await prepareLocalSpawn({
-        root,
-        project,
-        preload,
-        base,
-        env,
-        extraEnv: options.extraEnv,
-      });
-
-      writeLine(
-        stdout,
-        buildBanner({
+      // held in `childEnv` and in this plan, nowhere else; the banner
+      // describes it by length and the end of its first lease only.
+      const { command, childEnv, extraEnvNames, expiresAt, serviceBase, editorToken, token } =
+        await prepareLocalSpawn({
           root,
           project,
-          command,
           preload,
-          base: serviceBase,
-          childEnv,
-          extraEnvNames,
-          expiresAt,
-        }),
-      );
+          base,
+          env,
+          extraEnv: options.extraEnv,
+          stdout,
+          stderr,
+        });
 
-      return await runDevServer(command, childEnv);
+      // From here on the credential exists, so every way out of this block —
+      // the child's own exit, an exit a forwarded SIGINT/SIGTERM caused, a
+      // spawn that failed (ENOENT) — releases it before this command returns.
+      // The release never changes what is returned or thrown: the child's
+      // status stays the exit code, and a spawn failure is still reported.
+      try {
+        writeLine(
+          stdout,
+          buildBanner({
+            root,
+            project,
+            command,
+            preload,
+            base: serviceBase,
+            childEnv,
+            extraEnvNames,
+            expiresAt,
+          }),
+        );
+
+        return await runDevServer(command, childEnv);
+      } finally {
+        await releaseAfterUse({ base: serviceBase, editorToken, token, stdout, stderr });
+      }
     }
 
     const editorToken = await readEditorCredential(resolveDebuggenHome(env));

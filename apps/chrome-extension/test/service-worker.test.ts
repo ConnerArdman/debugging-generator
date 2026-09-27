@@ -28,7 +28,24 @@
  *   `target.pick`; the worker sends nothing to the DevTools page for it, so the
  *   Elements panel's `$0` never becomes the target on its own. "Pick element"
  *   arms the page agent's picker only, and with no agent answers
- *   `AGENT_NOT_READY` — the `$0` route is "Use selected element".
+ *   `AGENT_NOT_READY` — the `$0` route is "Use selected element". Leaving
+ *   picker mode cancels the page's pick (`target.request { cancel: true }`)
+ *   and is always answered inactive.
+ * - **Picker mode ends when the page's pick ends.** The answer to the armed
+ *   pick — an element or `null` — and the departure of the bridge holding it
+ *   each push `picker { active: false }` to the tab's panel; an answer to an
+ *   earlier (cancelled or superseded) pick, or to one the panel cancelled
+ *   itself, pushes nothing, and an answer to a pick this worker never
+ *   recorded (a revived worker) pushes picker mode off. The page's pick is
+ *   cancelled — whether or not this worker recorded one — when the tab's
+ *   session ends, when the tab is rebound to another session, when the
+ *   panel's "Use selected element" is submitted (ahead of the selection
+ *   frame), and when the tab's last panel closes.
+ * - **Only the live pick's element becomes the target, and only for its own
+ *   session.** A non-null answer is forwarded only when it answers the
+ *   recorded, uncancelled pick by its `requestId` on the bridge connection it
+ *   was armed on, and the tab is still bound to the session the pick was
+ *   armed for; every other element is dropped and logged by reason code.
  * - **A page-agent pick must be of the tab's current document.** A
  *   `target.described` from a bridge whose agent document is not the tab's
  *   current one is dropped, and the panel told.
@@ -1189,8 +1206,9 @@ describe('a selection from the page is forwarded under the same verdict', () => 
     const h = setup();
     const { panel } = await startBound(h);
     const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
 
-    bridge.send(bridgeFrame('target.described', { target: PICKED }));
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId }));
     await flush();
     const frame = onlySelectedFrame(h);
     expect(frame.payload).toEqual({ sessionId: SESSION, target: PICKED });
@@ -1226,7 +1244,8 @@ describe('a selection from the page is forwarded under the same verdict', () => 
     // bridge — which retires the earlier one — announces itself before the
     // worker acts on the pick.
     const earlier = await connectReadyBridge(h, PREVIOUS_DOCUMENT_ID);
-    earlier.send(bridgeFrame('target.described', { target: PICKED }));
+    const earlierPick = await armPick(panel, earlier);
+    earlier.send(bridgeFrame('target.described', { target: PICKED, requestId: earlierPick }));
     const current = connectBridge(h);
     current.send(agentReady(DOCUMENT_ID));
     await flush();
@@ -1249,7 +1268,8 @@ describe('a selection from the page is forwarded under the same verdict', () => 
     ).toBe(true);
 
     // The same element picked in the current document is forwarded.
-    current.send(bridgeFrame('target.described', { target: PICKED }));
+    const currentPick = await armPick(panel, current);
+    current.send(bridgeFrame('target.described', { target: PICKED, requestId: currentPick }));
     await flush();
     expect(onlySelectedFrame(h).payload).toEqual({ sessionId: SESSION, target: PICKED });
     expectNoDescriptorInLogs(h, PICKED);
@@ -1259,8 +1279,10 @@ describe('a selection from the page is forwarded under the same verdict', () => 
     const h = setup();
     const { panel } = await startBound(h);
     const bridge = connectBridge(h);
+    // The pick is armed on the bridge before its agent announced a document.
+    const requestId = await armPick(panel, bridge);
 
-    bridge.send(bridgeFrame('target.described', { target: PICKED }));
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId }));
     await flush();
 
     // No document of this bridge has announced itself, so the pick cannot be
@@ -1278,10 +1300,11 @@ describe('a selection from the page is forwarded under the same verdict', () => 
     ).toBe(true);
     expect(protocolPushes(panel).filter((message) => message.type === 'error')).toEqual([]);
 
-    // Once its document is announced, the same bridge's pick is forwarded.
+    // Once its document is announced, the same bridge's pick is forwarded: the
+    // withheld answer settled nothing, so the pick is still the live one.
     bridge.send(agentReady(DOCUMENT_ID));
     await flush();
-    bridge.send(bridgeFrame('target.described', { target: PICKED }));
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId }));
     await flush();
     expect(onlySelectedFrame(h).payload).toEqual({ sessionId: SESSION, target: PICKED });
     expectNoDescriptorInLogs(h, PICKED);
@@ -1459,7 +1482,7 @@ describe("target.pick arms the page agent's picker only", () => {
     ).toBe(true);
   });
 
-  it('leaves picker mode without a request to anything', async () => {
+  it('leaves picker mode by cancelling the page pick, asking DevTools for nothing', async () => {
     const h = setup();
     const { panel, devtools } = await startBound(h);
     const bridge = await connectReadyBridge(h);
@@ -1471,10 +1494,53 @@ describe("target.pick arms the page agent's picker only", () => {
 
     expect(responseTo(panel, off.requestId)).toMatchObject({
       ok: true,
+      kind: 'target.pick',
+      payload: { active: false },
+    });
+    // Exactly one cancel reaches the page — sent even though this worker armed
+    // nothing, because the page may hold a pick an earlier worker armed.
+    const sent = downstream(bridge).slice(bridgeBefore);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      channel: EXTENSION_CHANNEL,
+      type: 'target.request',
+      payload: { cancel: true },
+    });
+    expect(typeof requestIdOf(sent[0])).toBe('string');
+    expect(downstream(devtools)).toHaveLength(0);
+    expect(selectedFrames(h)).toHaveLength(0);
+  });
+
+  it('answers leaving picker mode inactive even with no page agent to cancel', async () => {
+    const h = setup();
+    const { panel, devtools } = await startBound(h);
+
+    const off = portRequest('target.pick', { sessionId: SESSION, enabled: false });
+    panel.send(off);
+    await flush();
+
+    expect(responseTo(panel, off.requestId)).toMatchObject({
+      ok: true,
+      payload: { active: false },
+    });
+    expect(downstream(devtools)).toHaveLength(0);
+  });
+
+  it('answers leaving picker mode inactive for a session outside the panel scope, cancelling nothing', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const bridgeBefore = downstream(bridge).length;
+
+    const off = portRequest('target.pick', { sessionId: 'ses_9z9z9z9z9z9z9z9z', enabled: false });
+    panel.send(off);
+    await flush();
+
+    expect(responseTo(panel, off.requestId)).toMatchObject({
+      ok: true,
       payload: { active: false },
     });
     expect(downstream(bridge)).toHaveLength(bridgeBefore);
-    expect(downstream(devtools)).toHaveLength(0);
   });
 
   it('refuses a pick for a session no inspected tab of this panel is bound to', async () => {
@@ -1493,5 +1559,640 @@ describe("target.pick arms the page agent's picker only", () => {
     });
     expect(downstream(bridge)).toHaveLength(bridgeBefore);
     expect(downstream(devtools)).toHaveLength(0);
+  });
+});
+
+/*
+ * ===========================================================================
+ * Picker mode ends when the page's pick ends: the `picker` push
+ * ===========================================================================
+ */
+
+/** The `picker` pushes a panel port received, in order. */
+function pickerPushes(port: FakePort): Frame[] {
+  return port.posted
+    .filter(isFrame)
+    .filter((frame) => frame.direction === 'push' && frame.kind === 'picker');
+}
+
+/** The one `picker` push that says the page's picker is off. */
+const PICKER_OFF: Frame = Object.freeze({
+  channel: EXTENSION_CHANNEL,
+  version: PORT_PROTOCOL_VERSION,
+  direction: 'push',
+  kind: 'picker',
+  state: { active: false },
+});
+
+/** A second tab, with no binding: its bridge is another tab's connection. */
+const OTHER_TAB = 42;
+
+/**
+ * Arm the page agent's picker through the panel, as "Pick element" does, and
+ * return the `requestId` of the `target.request` the bridge received.
+ */
+async function armPick(panel: FakePort, bridge: FakePort): Promise<string> {
+  const before = downstream(bridge).length;
+  const pick = portRequest('target.pick', { sessionId: SESSION, enabled: true });
+  panel.send(pick);
+  await flush();
+  expect(responseTo(panel, pick.requestId)).toMatchObject({ ok: true, payload: { active: true } });
+  const armed = downstream(bridge).slice(before);
+  expect(armed).toHaveLength(1);
+  expect(armed[0]).toMatchObject({ type: 'target.request' });
+  // An arming request carries no `cancel` flag at all.
+  const payload = armed[0]?.payload;
+  expect(isFrame(payload) && 'cancel' in payload).toBe(false);
+  const requestId = requestIdOf(armed[0]);
+  if (typeof requestId !== 'string') {
+    throw new Error('the arming target.request carried no requestId');
+  }
+  return requestId;
+}
+
+/** Leave picker mode through the panel, as pressing the pressed toggle does. */
+async function leavePickerMode(panel: FakePort): Promise<void> {
+  const off = portRequest('target.pick', { sessionId: SESSION, enabled: false });
+  panel.send(off);
+  await flush();
+  expect(responseTo(panel, off.requestId)).toMatchObject({ ok: true, payload: { active: false } });
+}
+
+describe('picker mode ends in the panel when the page pick ends', () => {
+  it('pushes picker mode off when the armed pick is answered, and still forwards the element', async () => {
+    const h = setup();
+    const { panel, devtools } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+    expect(pickerPushes(panel)).toHaveLength(0);
+
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId }));
+    await flush();
+
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+    expect(onlySelectedFrame(h).payload).toEqual({ sessionId: SESSION, target: PICKED });
+    expect(downstream(devtools)).toHaveLength(0);
+    expectNoDescriptorInLogs(h, PICKED);
+  });
+
+  it('pushes picker mode off when the armed pick ends without an element (Escape in the page)', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+
+    bridge.send(bridgeFrame('target.described', { target: null, requestId }));
+    await flush();
+
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+    expect(selectedFrames(h)).toHaveLength(0);
+    expect(sessionReads(h)).toBe(0);
+  });
+
+  it('pushes nothing for an answer to an earlier pick after re-arming, then ends the current one', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const first = await armPick(panel, bridge);
+    await leavePickerMode(panel);
+    const second = await armPick(panel, bridge);
+    expect(second).not.toBe(first);
+
+    // The page answers the cancelled pick only now, after the new one was armed.
+    bridge.send(bridgeFrame('target.described', { target: null, requestId: first }));
+    await flush();
+    expect(pickerPushes(panel)).toHaveLength(0);
+
+    // The current pick's own answer ends picker mode.
+    bridge.send(bridgeFrame('target.described', { target: null, requestId: second }));
+    await flush();
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+  });
+
+  it('pushes nothing for the answer to a pick the panel itself cancelled', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+    await leavePickerMode(panel);
+
+    // The agent answers the cancelled pick with its own id.
+    bridge.send(bridgeFrame('target.described', { target: null, requestId }));
+    await flush();
+
+    expect(pickerPushes(panel)).toHaveLength(0);
+    expect(selectedFrames(h)).toHaveLength(0);
+  });
+
+  it('pushes picker mode off for an answer to a pick this worker holds no record of (a revived worker)', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+
+    // A pick an earlier worker generation armed ends in the page.
+    bridge.send(bridgeFrame('target.described', { target: null, requestId: newPortRequestId() }));
+    await flush();
+
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+    expect(selectedFrames(h)).toHaveLength(0);
+  });
+
+  it('pushes picker mode off when the bridge holding the pick disconnects', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    await armPick(panel, bridge);
+
+    bridge.onDisconnect.fire(bridge);
+    await flush();
+
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+  });
+
+  it('pushes picker mode off when the next document retires the bridge holding the pick', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const earlier = await connectReadyBridge(h, PREVIOUS_DOCUMENT_ID);
+    await armPick(panel, earlier);
+
+    const current = connectBridge(h);
+    current.send(agentReady(DOCUMENT_ID));
+    await flush();
+
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+  });
+
+  it("leaves the pick armed when another tab's bridge disconnects", async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+
+    const other = connectPort(h, PORT_CONTENT_BRIDGE, {
+      id: EXTENSION_ID,
+      tab: { ...INSPECTED_TAB, id: OTHER_TAB },
+      frameId: 0,
+      origin: APP_ORIGIN,
+      url: APP_URL,
+    });
+    await flush();
+    other.onDisconnect.fire(other);
+    await flush();
+    expect(pickerPushes(panel)).toHaveLength(0);
+
+    // The pick is still recorded: its own answer ends it, once.
+    bridge.send(bridgeFrame('target.described', { target: null, requestId }));
+    await flush();
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+  });
+
+  it('pushes nothing when the bridge of a pick the panel cancelled disconnects', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    await armPick(panel, bridge);
+    await leavePickerMode(panel);
+
+    bridge.onDisconnect.fire(bridge);
+    await flush();
+
+    expect(pickerPushes(panel)).toHaveLength(0);
+  });
+
+  it("cancels the armed pick in the page when the tab's session ends, and its answer selects nothing", async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+    const before = downstream(bridge).length;
+
+    await h.worker.registry.unbind(TAB, 'session-ended');
+    await flush();
+
+    const cancels = downstream(bridge)
+      .slice(before)
+      .filter((frame) => frame.type === 'target.request');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]).toMatchObject({ payload: { cancel: true } });
+    expect(requestIdOf(cancels[0])).not.toBe(requestId);
+
+    // The page answers the cancelled pick; the panel already reset with the binding.
+    bridge.send(bridgeFrame('target.described', { target: null, requestId }));
+    await flush();
+    expect(pickerPushes(panel)).toHaveLength(0);
+    expect(selectedFrames(h)).toHaveLength(0);
+  });
+
+  it('cancels a pick armed for the session the tab is rebound away from', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    await armPick(panel, bridge);
+    const before = downstream(bridge).length;
+
+    await serviceSends(
+      h,
+      createEnvelope('session.bound', {
+        sessionId: 'ses_9z9z9z9z9z9z9z9z',
+        tabId: TAB,
+        url: APP_URL,
+      }),
+    );
+    await expect(h.worker.registry.getTabForSession('ses_9z9z9z9z9z9z9z9z')).resolves.toBe(TAB);
+
+    const cancels = downstream(bridge)
+      .slice(before)
+      .filter((frame) => frame.type === 'target.request');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]).toMatchObject({ payload: { cancel: true } });
+    expect(pickerPushes(panel)).toHaveLength(0);
+  });
+
+  it('still cancels the page pick on a session end when this worker recorded none', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const before = downstream(bridge).length;
+
+    // A revived worker remembers no pick, yet the page may hold one: the
+    // binding's end cancels it there all the same — once, and pushing nothing.
+    await h.worker.registry.unbind(TAB, 'session-ended');
+    await flush();
+
+    const cancels = downstream(bridge)
+      .slice(before)
+      .filter((frame) => frame.type === 'target.request');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]).toMatchObject({ payload: { cancel: true } });
+    expect(pickerPushes(panel)).toHaveLength(0);
+  });
+
+  it('still cancels the page pick when the tab is rebound to another session with no pick recorded', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const before = downstream(bridge).length;
+
+    await serviceSends(
+      h,
+      createEnvelope('session.bound', {
+        sessionId: 'ses_9z9z9z9z9z9z9z9z',
+        tabId: TAB,
+        url: APP_URL,
+      }),
+    );
+    await expect(h.worker.registry.getTabForSession('ses_9z9z9z9z9z9z9z9z')).resolves.toBe(TAB);
+
+    const cancels = downstream(bridge)
+      .slice(before)
+      .filter((frame) => frame.type === 'target.request');
+    expect(cancels).toHaveLength(1);
+    expect(cancels[0]).toMatchObject({ payload: { cancel: true } });
+    expect(pickerPushes(panel)).toHaveLength(0);
+  });
+});
+
+/*
+ * ===========================================================================
+ * A page pick's element is the target only when it answers the live pick
+ * ===========================================================================
+ */
+
+/** Another session, which the tab can be rebound to. */
+const OTHER_SESSION = 'ses_9z9z9z9z9z9z9z9z';
+
+/** The log line every page-pick element the worker does not forward is dropped with. */
+const DROPPED_PICK_MESSAGE = 'A picked element that answers no live pick was dropped.';
+
+/** Whether a page-pick element was dropped and logged with `reason` for {@link TAB}. */
+function droppedPick(h: Harness, reason: string): boolean {
+  return loggedVerdict(h, DROPPED_PICK_MESSAGE, { tabId: TAB, reason });
+}
+
+/** The service binds {@link TAB} to {@link OTHER_SESSION}, displacing {@link SESSION}. */
+function reboundToOtherSession(): ProtocolMessage {
+  return createEnvelope('session.bound', { sessionId: OTHER_SESSION, tabId: TAB, url: APP_URL });
+}
+
+describe("a page pick's element is forwarded only as the answer to the live pick, for its own session", () => {
+  it('drops an element that answers a pick the panel cancelled, pushing nothing', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+    await leavePickerMode(panel);
+
+    // The developer's click was already on its way when the panel left picker mode.
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId }));
+    await flush();
+
+    expect(selectedFrames(h)).toHaveLength(0);
+    expect(sessionReads(h)).toBe(0);
+    expect(pickerPushes(panel)).toHaveLength(0);
+    expect(droppedPick(h, 'cancelled')).toBe(true);
+    expectNoDescriptorInLogs(h, PICKED);
+  });
+
+  it('drops an element that answers a pick superseded by re-arming, and forwards the current pick’s', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const first = await armPick(panel, bridge);
+    const second = await armPick(panel, bridge);
+    expect(second).not.toBe(first);
+
+    // A late element for the superseded pick: the current one is still armed.
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId: first }));
+    await flush();
+    expect(selectedFrames(h)).toHaveLength(0);
+    expect(pickerPushes(panel)).toHaveLength(0);
+    expect(droppedPick(h, 'superseded')).toBe(true);
+
+    // The current pick's own element is the selection.
+    bridge.send(bridgeFrame('target.described', { target: OTHER, requestId: second }));
+    await flush();
+    expect(onlySelectedFrame(h).payload).toEqual({ sessionId: SESSION, target: OTHER });
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+    expectNoDescriptorInLogs(h, PICKED);
+  });
+
+  it('drops an element that answers a pick armed before the tab was rebound to another session', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+
+    await serviceSends(h, reboundToOtherSession());
+    await expect(h.worker.registry.getTabForSession(OTHER_SESSION)).resolves.toBe(TAB);
+
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId }));
+    await flush();
+
+    // Neither the session the pick was armed for nor the one now bound gets it.
+    expect(selectedFrames(h)).toHaveLength(0);
+    expect(droppedPick(h, 'cancelled')).toBe(true);
+    expectNoDescriptorInLogs(h, PICKED);
+  });
+
+  it('drops the live pick’s element when the tab is rebound to another session while it is handled', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+
+    // The answer settles the live pick on arrival; the rebind lands before the
+    // worker reads the tab's binding to forward it.
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId }));
+    latestSocket(h).receive(reboundToOtherSession());
+    await flush();
+    await expect(h.worker.registry.getTabForSession(OTHER_SESSION)).resolves.toBe(TAB);
+
+    // The element was the pick of the session the tab left: it is sent for
+    // neither that session nor the one that now holds the tab.
+    expect(selectedFrames(h)).toHaveLength(0);
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+    expect(droppedPick(h, 'rebound')).toBe(true);
+    expectNoDescriptorInLogs(h, PICKED);
+  });
+
+  it('drops an element for a pick this worker holds no record of, still pushing picker mode off', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+
+    // Nothing was armed by this worker generation: with an id, and without one.
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId: newPortRequestId() }));
+    await flush();
+    bridge.send(bridgeFrame('target.described', { target: PICKED }));
+    await flush();
+
+    expect(selectedFrames(h)).toHaveLength(0);
+    expect(sessionReads(h)).toBe(0);
+    // The page's pick has ended, so "off" is the true state either way.
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF, PICKER_OFF]);
+    expect(droppedPick(h, 'unarmed')).toBe(true);
+    expectNoDescriptorInLogs(h, PICKED);
+  });
+
+  it('ends the live pick but forwards nothing for an element that names no requestId', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    await armPick(panel, bridge);
+
+    bridge.send(bridgeFrame('target.described', { target: PICKED }));
+    await flush();
+
+    expect(selectedFrames(h)).toHaveLength(0);
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+    expect(droppedPick(h, 'unidentified')).toBe(true);
+    expectNoDescriptorInLogs(h, PICKED);
+  });
+
+  it('drops an element that another bridge connection answers with the armed pick’s id', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const earlier = await connectReadyBridge(h, PREVIOUS_DOCUMENT_ID);
+    const requestId = await armPick(panel, earlier);
+
+    // The next document's bridge retires the one the pick was armed on…
+    const current = connectBridge(h);
+    current.send(agentReady(DOCUMENT_ID));
+    await flush();
+    expect(pickerPushes(panel)).toEqual([PICKER_OFF]);
+
+    // …so an answer carrying that pick's id on the new connection selects nothing.
+    current.send(bridgeFrame('target.described', { target: PICKED, requestId }));
+    await flush();
+
+    expect(selectedFrames(h)).toHaveLength(0);
+    expect(sessionReads(h)).toBe(0);
+    expect(droppedPick(h, 'unarmed')).toBe(true);
+    expectNoDescriptorInLogs(h, PICKED);
+  });
+});
+
+/*
+ * ===========================================================================
+ * "Use selected element" ends the page pick before the selection is sent
+ * ===========================================================================
+ */
+
+/** One step of the picker traffic {@link recordPickTraffic} saw, in the order it happened. */
+type PickTraffic = 'page:arm' | 'page:cancel' | 'service:target.selected';
+
+/**
+ * Record, in one sequence, every `target.request` the worker posts on `bridge`
+ * (arming or cancelling) and every `target.selected` frame it writes on
+ * `socket`, so a case can assert which reached its recipient first.
+ */
+function recordPickTraffic(socket: FakeSocket, bridge: FakePort): PickTraffic[] {
+  const order: PickTraffic[] = [];
+  const post = bridge.postMessage;
+  bridge.postMessage = (message: unknown): void => {
+    if (isFrame(message) && message.type === 'target.request') {
+      const { payload } = message;
+      order.push(isFrame(payload) && payload.cancel === true ? 'page:cancel' : 'page:arm');
+    }
+    post(message);
+  };
+  const send = socket.send.bind(socket);
+  vi.spyOn(socket, 'send').mockImplementation((data: string) => {
+    const decoded = decodeMessage(data);
+    if (!isErr(decoded) && isMessageOfType(decoded.value, 'target.selected')) {
+      order.push('service:target.selected');
+    }
+    send(data);
+  });
+  return order;
+}
+
+/** The `target.request { cancel: true }` frames posted on a bridge port, in order. */
+function pickCancels(bridge: FakePort): Frame[] {
+  return downstream(bridge).filter(
+    (frame) =>
+      frame.type === 'target.request' && isFrame(frame.payload) && frame.payload.cancel === true,
+  );
+}
+
+describe('"Use selected element" cancels the page pick before the selection is sent', () => {
+  it('posts exactly one cancel ahead of the selection frame, and the pick’s late element selects nothing', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+    const order = recordPickTraffic(latestSocket(h), bridge);
+
+    // Picker mode is on when the developer confirms the Elements panel's `$0`.
+    panel.send(portRequest('target.selected', { sessionId: SESSION, target: OTHER }));
+    await flush();
+
+    expect(order).toEqual(['page:cancel', 'service:target.selected']);
+    expect(pickCancels(bridge)).toHaveLength(1);
+    expect(requestIdOf(pickCancels(bridge)[0])).not.toBe(requestId);
+    expect(onlySelectedFrame(h).payload).toEqual({ sessionId: SESSION, target: OTHER });
+
+    // The developer's next click in the page answers the cancelled pick: it
+    // must not replace the target just confirmed, nor switch anything off.
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId }));
+    await flush();
+
+    expect(onlySelectedFrame(h).payload).toEqual({ sessionId: SESSION, target: OTHER });
+    expect(order).toEqual(['page:cancel', 'service:target.selected']);
+    expect(pickerPushes(panel)).toHaveLength(0);
+    expect(droppedPick(h, 'cancelled')).toBe(true);
+    expectNoDescriptorInLogs(h, PICKED);
+  });
+
+  it('posts the cancel even when this worker generation recorded no pick', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const order = recordPickTraffic(latestSocket(h), bridge);
+
+    // The page may hold a pick an earlier worker generation armed.
+    panel.send(portRequest('target.selected', { sessionId: SESSION, target: OTHER }));
+    await flush();
+
+    expect(order).toEqual(['page:cancel', 'service:target.selected']);
+    expect(pickCancels(bridge)).toHaveLength(1);
+  });
+
+  it('cancels nothing for a selection refused by the panel scope check', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const before = downstream(bridge).length;
+
+    panel.send(portRequest('target.selected', { sessionId: OTHER_SESSION, target: OTHER }));
+    await flush();
+
+    expect(downstream(bridge)).toHaveLength(before);
+    expect(selectedFrames(h)).toHaveLength(0);
+  });
+});
+
+/*
+ * ===========================================================================
+ * The page pick ends with the tab's last panel
+ * ===========================================================================
+ */
+
+/** How many panel connections the worker's hub associates with {@link TAB}. */
+function panelsOnTab(h: Harness): number {
+  return h.worker.hub
+    .listConnections()
+    .filter((connection) => connection.role === PORT_PANEL && connection.tabId === TAB).length;
+}
+
+/**
+ * Open another panel document on the worker and associate it with {@link TAB}
+ * through its `session.snapshot`. The answer itself is not asserted: for a
+ * bound tab it also reads the session's panels, a route this harness's HTTP
+ * table does not serve — the association, made before that read, is what the
+ * cases need.
+ */
+async function openPanelOnTab(h: Harness): Promise<FakePort> {
+  const before = panelsOnTab(h);
+  const panel = connectPort(h, PORT_PANEL, { id: EXTENSION_ID, url: EXTENSION_PAGE_URL });
+  const snapshot = portRequest('session.snapshot', { inspectedTabId: TAB });
+  panel.send(snapshot);
+  await flush();
+  expect(responseTo(panel, snapshot.requestId)).toBeDefined();
+  expect(panelsOnTab(h)).toBe(before + 1);
+  return panel;
+}
+
+describe("the page pick is cancelled when the tab's last panel closes", () => {
+  it('cancels the armed pick once, and its late element selects nothing', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+
+    // The panel document closes or reloads; the tab's DevTools page remains,
+    // so the tab stays bound.
+    panel.onDisconnect.fire(panel);
+    await flush();
+
+    expect(pickCancels(bridge)).toHaveLength(1);
+    expect(requestIdOf(pickCancels(bridge)[0])).not.toBe(requestId);
+    await expect(h.worker.registry.getTabForSession(SESSION)).resolves.toBe(TAB);
+
+    // The click the page consumed for the cancelled pick is not a selection.
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId }));
+    await flush();
+    expect(selectedFrames(h)).toHaveLength(0);
+    expect(droppedPick(h, 'cancelled')).toBe(true);
+    expectNoDescriptorInLogs(h, PICKED);
+  });
+
+  it('cancels the page pick even when this worker generation recorded none', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const bridge = await connectReadyBridge(h);
+
+    panel.onDisconnect.fire(panel);
+    await flush();
+
+    expect(pickCancels(bridge)).toHaveLength(1);
+  });
+
+  it('leaves the pick armed while another panel of the tab remains', async () => {
+    const h = setup();
+    const { panel } = await startBound(h);
+    const second = await openPanelOnTab(h);
+    const bridge = await connectReadyBridge(h);
+    const requestId = await armPick(panel, bridge);
+
+    panel.onDisconnect.fire(panel);
+    await flush();
+    expect(pickCancels(bridge)).toHaveLength(0);
+
+    // The pick is still live for the remaining panel: its element is the selection.
+    bridge.send(bridgeFrame('target.described', { target: PICKED, requestId }));
+    await flush();
+    expect(onlySelectedFrame(h).payload).toEqual({ sessionId: SESSION, target: PICKED });
+    expect(pickerPushes(second)).toEqual([PICKER_OFF]);
   });
 });

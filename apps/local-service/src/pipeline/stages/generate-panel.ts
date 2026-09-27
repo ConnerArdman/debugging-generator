@@ -42,11 +42,11 @@
  * 3. **Translate out and report.** The generator's result is projected
  *    field for field onto {@link GeneratePanelStageResult}; its typed `Err` is
  *    returned unchanged, so the developer-facing sentence of the failing
- *    subsystem survives (AAP §0.5.5). A returned panel that does not
- *    supersede the expected predecessor breaks the subsystem's contract and
- *    fails the stage rather than being reported as success. The
- *    `generate-panel` progress rows are this file's own responsibility — the
- *    panel subsystem deliberately emits none and writes no session status.
+ *    subsystem survives. A returned panel that does not supersede the
+ *    expected predecessor breaks the subsystem's contract and fails the stage
+ *    rather than being reported as success. The `generate-panel` progress
+ *    rows are this file's own responsibility — the panel subsystem
+ *    deliberately emits none and writes no session status.
  *
  * ## A fallback panel is a success
  *
@@ -240,7 +240,7 @@ export interface GeneratePanelStage {
  * Failures this stage raises itself — preconditions before the generator is called, and the one
  * post-condition it checks on the generator's answer. Every other failure is the panel subsystem's
  * error, passed through unchanged. Details carry the stage and an enumerated reason, never a
- * payload value (AAP §0.5.2).
+ * payload value.
  * ---------------------------------------------------------------------------------------------- */
 
 /** The capture named by the input is not the capture the pipeline run was started for. */

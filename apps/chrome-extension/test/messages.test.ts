@@ -17,6 +17,10 @@
  *   refused with `CAPTURE_ALREADY_ACTIVE`, and no other `details` field, and
  *   the panel's parser admits that detail on that answer only.
  * - **The reload offer vocabulary is closed.**
+ * - **Picker mode's two new frames mean one thing each.** The `picker` push
+ *   admits exactly `{ active: boolean }`; `target.request` admits a `cancel`
+ *   flag that is absent or exactly `true`, on the page channel and on the
+ *   bridge port alike, and the bridge port still requires the request id.
  *
  * Every fixture is built from the protocol's own constructors (`createEnvelope`)
  * and the shared id minters, so ids and envelopes are exactly what the running
@@ -29,12 +33,17 @@ import { DebuggenError, newCaptureId, newSessionId } from '@debuggen/shared';
 
 import { portErr } from '../src/background/messages';
 import {
+  BRIDGE_SOURCE_TAG,
   EXTENSION_CHANNEL,
+  PAGE_CHANNEL_VERSION,
   PAGE_RELOAD_ACTION_LABEL,
   PANEL_RELOAD_NOT_NEEDED,
   PANEL_RELOAD_REASONS,
   PORT_PROTOCOL_VERSION,
+  PORT_PUSH_KINDS,
   classifyPanelPortFrame,
+  isBridgeChannelMessage,
+  isBridgeDownstreamMessage,
   isPanelReloadState,
   isPortPush,
   isPortRequest,
@@ -329,6 +338,94 @@ describe('parsePortPush — pushes are parsed, relayed frames with the protocol 
       parsePortPush(push({ kind: 'reload', state: { kind: 'reloading' }, extra: true })),
     ).toBeUndefined();
     expect(parsePortPush(push({ kind: 'toast', state: {} }))).toBeUndefined();
+  });
+});
+
+describe('the picker push — the worker says the page’s picker is on or off', () => {
+  it('is a known push kind', () => {
+    expect(PORT_PUSH_KINDS).toContain('picker');
+  });
+
+  it('admits exactly a boolean `active` and answers a rebuilt frame', () => {
+    for (const active of [false, true]) {
+      const frame = push({ kind: 'picker', state: { active } });
+      const parsed = parsePortPush(frame);
+      expect(parsed).toEqual(frame);
+      expect(parsed).not.toBe(frame);
+      expect(isPortPush(frame)).toBe(true);
+      expect(classifyPanelPortFrame(frame)).toEqual({ kind: 'push', push: frame });
+    }
+  });
+
+  it('refuses a state that is not exactly one boolean, and an extra frame key', () => {
+    for (const state of [
+      {},
+      { active: 'false' },
+      { active: 0 },
+      { active: null },
+      { active: false, target: null },
+      null,
+      [],
+      false,
+    ]) {
+      const frame = push({ kind: 'picker', state });
+      expect(parsePortPush(frame)).toBeUndefined();
+      expect(classifyPanelPortFrame(frame)).toEqual({ kind: 'malformed-push', pushKind: 'picker' });
+    }
+    expect(
+      parsePortPush(push({ kind: 'picker', state: { active: false }, extra: true })),
+    ).toBeUndefined();
+    expect(parsePortPush(push({ kind: 'picker' }))).toBeUndefined();
+  });
+});
+
+describe('target.request — arming a page pick, or cancelling it', () => {
+  const requestId = newPortRequestId();
+
+  /** A bridge → page `target.request` frame, as the bridge posts it on the channel node. */
+  function pageRequest(
+    payload: Readonly<Record<string, unknown>>,
+  ): Readonly<Record<string, unknown>> {
+    return {
+      source: BRIDGE_SOURCE_TAG,
+      version: PAGE_CHANNEL_VERSION,
+      type: 'target.request',
+      payload,
+    };
+  }
+
+  /** A worker → bridge `target.request` frame, as the worker posts it on the bridge port. */
+  function downstreamRequest(
+    payload: Readonly<Record<string, unknown>>,
+  ): Readonly<Record<string, unknown>> {
+    return { ...FRAMING, direction: 'downstream', type: 'target.request', payload };
+  }
+
+  it('admits an arming request and a cancelling one on the page channel', () => {
+    expect(isBridgeChannelMessage(pageRequest({ requestId }))).toBe(true);
+    expect(isBridgeChannelMessage(pageRequest({}))).toBe(true);
+    expect(isBridgeChannelMessage(pageRequest({ requestId, cancel: true }))).toBe(true);
+    expect(isBridgeChannelMessage(pageRequest({ cancel: true }))).toBe(true);
+  });
+
+  it('refuses a page-channel cancel flag that is not exactly true', () => {
+    for (const cancel of [false, 'true', 1, null, {}]) {
+      expect(isBridgeChannelMessage(pageRequest({ requestId, cancel }))).toBe(false);
+    }
+    expect(isBridgeChannelMessage(pageRequest({ requestId: '', cancel: true }))).toBe(false);
+  });
+
+  it('admits an arming request and a cancelling one on the bridge port, each with its id', () => {
+    expect(isBridgeDownstreamMessage(downstreamRequest({ requestId }))).toBe(true);
+    expect(isBridgeDownstreamMessage(downstreamRequest({ requestId, cancel: true }))).toBe(true);
+  });
+
+  it('refuses a bridge-port request without an id, or with a cancel flag that is not exactly true', () => {
+    expect(isBridgeDownstreamMessage(downstreamRequest({ cancel: true }))).toBe(false);
+    expect(isBridgeDownstreamMessage(downstreamRequest({}))).toBe(false);
+    for (const cancel of [false, 'true', 1, null, {}]) {
+      expect(isBridgeDownstreamMessage(downstreamRequest({ requestId, cancel }))).toBe(false);
+    }
   });
 });
 

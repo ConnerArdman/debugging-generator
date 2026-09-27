@@ -219,7 +219,7 @@ export interface CommandUi {
    */
   notify(notice: CommandNotice): Promise<string | undefined>;
   /**
-   * Renders a failure as one error notice, never as success (AAP §0.5.5):
+   * Renders a failure as one error notice, never as success:
    * `prefix: error.message` as the headline (the message alone without a
    * prefix) and `error.hint`, when set, as the detail. The service's error
    * payload is `{ code, message, ref? }`, so recovery text it writes, such as

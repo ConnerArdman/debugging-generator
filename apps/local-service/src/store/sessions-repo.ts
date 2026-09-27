@@ -4,14 +4,15 @@
  *
  * ## What this module owns
  *
- * Eight tables name this file as their owner — seven declared by
- * `./schema.sql` and one added by schema version 4 in `./migrations.ts` — and no
- * other module writes them:
+ * Nine tables name this file as their owner — seven declared by
+ * `./schema.sql` and two added by schema versions 4 and 6 in `./migrations.ts` —
+ * and no other module writes them:
  *
  * | Table | What a row is |
  * | --- | --- |
  * | `sessions` | one session: the authoritative `SessionRecord` JSON document plus its indexed projections |
  * | `session_cleanup_summaries` | one session's cleanup status, completion time and conflict count: the list row's projection of `record.cleanup` |
+ * | `session_root_identities` | the canonical path one session's project root was admitted under, written with the session by {@link SessionsRepo.insert} and read by {@link SessionsRepo.getRootIdentity} |
  * | `session_progress` | one line of the append-only pipeline progress log the editor replays on reopen |
  * | `plans` | one version of the session's instrumentation plan ladder |
  * | `captures` | one capture window, open while `stopped_at` is `NULL` |
@@ -375,6 +376,20 @@ const SELECT_SESSION_STAMPS_SQL = 'SELECT created_at, updated_at FROM sessions W
  * `ON DELETE CASCADE`, so this one statement removes the whole session.
  */
 const DELETE_SESSION_SQL = 'DELETE FROM sessions WHERE id = ?';
+
+/**
+ * Records the canonical path a session's project root was admitted under —
+ * schema version 6's `session_root_identities` (`./migrations.ts`). Run only by
+ * {@link SessionsRepo.insert}, inside the transaction that inserts the session,
+ * so the session and its identity commit together or not at all. A plain
+ * insert, never an upsert: the row is written once and never replaced.
+ */
+const INSERT_ROOT_IDENTITY_SQL = `INSERT INTO session_root_identities (session_id, canonical_root, recorded_at)
+VALUES (?, ?, ?)`;
+
+/** Reads one session's recorded root identity, by primary key. */
+const SELECT_ROOT_IDENTITY_SQL =
+  'SELECT canonical_root FROM session_root_identities WHERE session_id = ?';
 
 /** The projection columns {@link SessionsRepo.list} reads, never the document. */
 const SESSION_LIST_COLUMNS =
@@ -862,6 +877,28 @@ export interface StoredAccessTarget {
   readonly projectRoot: string;
 }
 
+/**
+ * What {@link SessionsRepo.insert} stores beside the session's record.
+ *
+ * `| undefined` is declared explicitly, as on every option object here, so a
+ * caller holding an optional value can pass it through under
+ * `exactOptionalPropertyTypes`.
+ */
+export interface InsertSessionOptions {
+  /**
+   * The canonical path — every symbolic link resolved — the session's project
+   * root was admitted under: `AdmittedProjectRoot.canonicalRoot` of the proof
+   * the `session.create` route took. Written to `session_root_identities` in
+   * the same transaction as the session, so a session stored with a proof
+   * never exists without it. Absent for a session created without a proof,
+   * which then has no recorded identity ({@link SessionsRepo.getRootIdentity}
+   * answers `undefined`).
+   *
+   * A path, so it is never logged and never placed in an error.
+   */
+  readonly canonicalRoot?: string | undefined;
+}
+
 /** Narrowing and paging for {@link SessionsRepo.list}. All members optional. */
 export interface ListSessionsOptions {
   /** Keep only the sessions of this exact project root. */
@@ -1326,16 +1363,28 @@ export interface SessionsRepo {
    * written; timestamps — `createdAt`, `updatedAt` and `cleanup.completedAt` —
    * are canonicalised to whole milliseconds (the columns are `STRICT` integers)
    * in the document and the columns alike. The session's cleanup summary row is
-   * written in the same transaction.
+   * written in the same transaction, and so is its project-root identity when
+   * `options.canonicalRoot` is given: the session and its identity are stored
+   * together or not at all, so a session created with an admission proof can
+   * never be read back without it.
    *
    * @param record The new session's record.
+   * @param options The session's recorded project-root identity, when it has one.
    * @returns The record as stored, or `err`: `STORE_ERROR` when the record does
-   * not satisfy the session contract (`details.reason` `invalid-record`) or a
-   * session with its id already exists (`duplicate-session`).
+   * not satisfy the session contract (`details.reason` `invalid-record`), when
+   * `canonicalRoot` is given but is not a non-empty path string without a NUL
+   * (`invalid-argument`, before anything is written), or when a session with
+   * its id already exists (`duplicate-session`).
    * @throws {DebuggenError} `INTERNAL` when the record would carry the
    * request-key secret into the document — a programmer error.
+   *
+   * @example
+   * ```ts
+   * const stored = sessions.insert(record, { canonicalRoot: admitted.canonicalRoot });
+   * // stored.ok → the session and its identity both committed
+   * ```
    */
-  insert(record: SessionRecord): Result<SessionRecord>;
+  insert(record: SessionRecord, options?: InsertSessionOptions): Result<SessionRecord>;
 
   /**
    * Persists a session, inserting it when absent and replacing it otherwise —
@@ -1387,6 +1436,30 @@ export interface SessionsRepo {
    * ```
    */
   getAccessTarget(sessionId: SessionId): Result<StoredAccessTarget | undefined>;
+
+  /**
+   * Reads the canonical path the session's project root was admitted under, as
+   * {@link SessionsRepo.insert} recorded it with the session.
+   *
+   * The session manager's `confirmProjectRoot` reads this for a session it
+   * holds no proof for in memory — one read back after a restart — and holds
+   * every sink to it. One primary-key lookup of one small row; the session's
+   * document is not read.
+   *
+   * @param sessionId The session's id.
+   * @returns `ok(canonicalRoot)`, `ok(undefined)` when no identity is recorded —
+   * the session was created without a proof, stored before schema version 6,
+   * or does not exist — or `err` `STORE_ERROR`: `invalid-argument` for an id
+   * that is not a non-empty string, `corrupt-row` when the stored value is not
+   * non-empty text, `store-failed` when the store cannot be read.
+   *
+   * @example
+   * ```ts
+   * const recorded = sessions.getRootIdentity(sessionId);
+   * // recorded.value → '/home/dev/work/shop', or undefined
+   * ```
+   */
+  getRootIdentity(sessionId: SessionId): Result<string | undefined>;
 
   /**
    * Persists a status the session state machine has decided on.
@@ -1500,9 +1573,9 @@ export interface SessionsRepo {
 
   /**
    * Deletes one session and, through the schema's `ON DELETE CASCADE` edges,
-   * everything scoped to it: its cleanup summary, progress, plans, captures and
-   * their telemetry, panels, analyses, follow-ups, its binding, its request-key
-   * secret — and its modification journal rows.
+   * everything scoped to it: its cleanup summary, its project-root identity,
+   * progress, plans, captures and their telemetry, panels, analyses, follow-ups,
+   * its binding, its request-key secret — and its modification journal rows.
    *
    * That cascade is why per-session purging is a single statement, and it only
    * holds because `./db.ts` sets `PRAGMA foreign_keys = ON` on every connection
@@ -1843,8 +1916,8 @@ export interface SessionsRepo {
    *
    * With no attempt id to find the row by, the newest row is taken, and only
    * when it can be the same follow-up: it must carry no attempt id either and
-   * the same `askedAt` as `record`. The question's text is never compared
-   * (AAP §0.5.4).
+   * the same `askedAt` as `record`. The question's text is never compared: no
+   * match on a question's wording decides which row is rewritten.
    *
    * @param sessionId The session the follow-up belongs to.
    * @param record The follow-up as it is to be stored, without an `attemptId`.
@@ -2058,6 +2131,20 @@ function changesOf(result: { readonly changes: number | bigint }): number {
  */
 function isNonEmptyText(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
+}
+
+/**
+ * Whether `value` can stand as a recorded project-root identity: a non-empty
+ * string without a NUL, the character no path a resolver produces can carry.
+ * The shape of the path itself is the access boundary's to judge
+ * (`src/server/auth.ts`), which produced it; the store only refuses what could
+ * never be one.
+ *
+ * @param value The candidate canonical path.
+ * @returns `true` for a storable identity.
+ */
+function isCanonicalRootText(value: unknown): value is string {
+  return isNonEmptyText(value) && !value.includes('\u0000');
 }
 
 /**
@@ -3551,8 +3638,26 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
   // sessions
   // -----------------------------------------------------------------------------------------------
 
-  function insert(record: SessionRecord): Result<SessionRecord> {
+  function insert(
+    record: SessionRecord,
+    options: InsertSessionOptions = {},
+  ): Result<SessionRecord> {
     const operation = 'insert';
+    const { canonicalRoot } = options;
+
+    // Refused before the record is even prepared, so nothing is written for a
+    // proof the store could not hold. The value is a path: only the field's
+    // name reaches the error.
+    if (canonicalRoot !== undefined && !isCanonicalRootText(canonicalRoot)) {
+      const refused = invalidArgumentError(
+        operation,
+        'canonicalRoot',
+        'a non-empty path string without a NUL character',
+      );
+      reportFailure('a session could not be stored', operation, refused);
+      return err(refused);
+    }
+
     const prepared = attempt(operation, () => prepareSession(record, operation));
 
     if (isErr(prepared)) {
@@ -3571,6 +3676,14 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
           // The list's projection of the document, in the same transaction.
           store.statement(UPSERT_CLEANUP_SUMMARY_SQL).run(...cleanupSummaryValues(prepared.value));
 
+          // The admitted identity, in the same transaction: a failure here
+          // throws, which rolls the session's insert back with it.
+          if (canonicalRoot !== undefined) {
+            store
+              .statement(INSERT_ROOT_IDENTITY_SQL)
+              .run(columns.id, canonicalRoot, stamp(operation));
+          }
+
           return ok(prepared.value.record);
         }),
       fields,
@@ -3580,7 +3693,11 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
     if (isErr(outcome)) {
       reportFailure('a session could not be stored', operation, outcome.error, fields);
     } else {
-      logger.info('session stored', { ...fields, status: columns.status });
+      logger.info('session stored', {
+        ...fields,
+        status: columns.status,
+        rootIdentity: canonicalRoot !== undefined,
+      });
     }
 
     return outcome;
@@ -3734,6 +3851,42 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
 
     if (isErr(outcome)) {
       reportFailure('a session could not be read', operation, outcome.error, fields);
+    }
+
+    return outcome;
+  }
+
+  function getRootIdentity(sessionId: SessionId): Result<string | undefined> {
+    const operation = 'getRootIdentity';
+    const invalid = sessionIdError(operation, sessionId);
+
+    if (invalid !== undefined) {
+      return err(invalid);
+    }
+
+    const fields = { [LOG_BINDING_KEYS.sessionId]: sessionId };
+    const outcome = attempt(
+      operation,
+      (): Result<string | undefined> => {
+        const row = store.statement(SELECT_ROOT_IDENTITY_SQL).get(sessionId);
+
+        if (row === undefined) {
+          return ok(undefined);
+        }
+
+        // The table's `CHECK` and `STRICT` typing already refuse anything
+        // else; a row that still fails this was altered past both.
+        const canonicalRoot = row['canonical_root'];
+
+        return isCanonicalRootText(canonicalRoot)
+          ? ok(canonicalRoot)
+          : err(corruptRowError(operation, 'session_root_identities', fields));
+      },
+      fields,
+    );
+
+    if (isErr(outcome)) {
+      reportFailure('a session root identity could not be read', operation, outcome.error, fields);
     }
 
     return outcome;
@@ -5876,6 +6029,7 @@ export function createSessionsRepo(deps: SessionsRepoDeps): SessionsRepo {
     update,
     get,
     getAccessTarget,
+    getRootIdentity,
     setStatus,
     list,
     findLatestByDevServer,

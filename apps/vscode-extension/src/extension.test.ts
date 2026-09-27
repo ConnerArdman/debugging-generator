@@ -15,33 +15,63 @@
  * channel's sink is exercised the same way as the backstop for any record that
  * carries an `Error`: it must print the error's closed class and code only.
  *
+ * The last block drives the refused-credential prompt the client's
+ * `onUnauthorized` signal raises, through the real `activate()`. Rotation
+ * cannot repair a refused credential — `credentials.rotate` requires one the
+ * service accepts — so the prompt is pinned to lead with the restart:
+ *
+ * - a child of this window (`running`) is offered exactly "Restart service"
+ *   and "Retry"; any other process state "Retry" only, with a hint to restart
+ *   the service where it was started; the prompt never offers rotation;
+ * - "Restart service" confirms in a modal while a session is live (declining
+ *   restarts nothing), restarts once, reads `auth.json` once and reconnects
+ *   once, and only then shows one information notice whose single action is
+ *   "Rotate Service Token" — choosing it runs `debuggen.rotateServiceToken`,
+ *   dismissing it runs nothing;
+ * - a failed restart, or a failed re-read after it, is one error notice with
+ *   no re-read, reconnect or rotation offer after it;
+ * - "Retry" reads `auth.json` and reconnects, restarting nothing;
+ * - a window deactivated while the prompt is open acts on no answer;
+ * - no notification carries the token read back or a private setting.
+ *
  * ## What is real and what is substituted
  *
  * Real: `./extension` itself, `./service/client` (whose refusal of a private
  * URL is what the log projection reads), the `@debuggen/protocol` clients
- * behind it, `./state` and `./service/discovery`.
+ * behind it, `./state`, `./service/discovery` and `./commands/start-service`
+ * (the restart action, its live-session confirmation and the liveness rule).
+ * The client is wrapped in a proxy that records the refused-credential
+ * listeners activation registers (still registering them) and counts
+ * `connect()` instead of opening a socket.
  *
  * Substituted, because they need an editor or a process the suite does not
  * have: the `vscode` module (the editor supplies it at runtime and no package
  * provides it), and the collaborators whose behaviour is not under test —
- * `./commands`, both views, `./service/process` (every `ensureRunning()`
- * answers "no service", so no socket is ever opened), `./service/auth`,
- * `./source/open-location` and `./uri-handler`.
+ * `./commands` (its `registerCommands` hands back the store), both views,
+ * `./service/process` (every `ensureRunning()` answers "no service"; `status`
+ * reports a scripted state and `restart()` is counted and scriptable),
+ * `./service/auth` (`refresh()` is counted and finds a credential only when a
+ * case says so), `./source/open-location` and `./uri-handler`.
  *
  * The substitute `LogOutputChannel` records each call with its level; the host
  * logger runs at `trace` and the channel applies no threshold here, so every
  * record any host module emits is inspected. Start-up and notification
  * failures can be scripted, so the debug and error records `./extension`
- * writes are driven while the private settings are configured too.
+ * writes are driven while the private settings are configured too. Every
+ * `show*Message` call is recorded with its level, text, buttons and modal
+ * options, and answers with the next scripted choice (dismissed by default).
  */
 
 import * as vscode from 'vscode';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { WsUnauthorizedDetail } from '@debuggen/protocol';
 import { DebuggenError } from '@debuggen/shared';
 import type { Logger } from '@debuggen/shared';
 
 import { activate, deactivate } from './extension';
+import type * as ServiceClientModule from './service/client';
+import type { ExtensionState } from './state';
 
 /** Every method of the substitute channel that writes a line. */
 type ChannelLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'append';
@@ -83,6 +113,57 @@ interface HostState {
    * through the real sink.
    */
   processLogger: Logger | undefined;
+
+  /** Every `show*Message` call, in order, whether or not it was rejected. */
+  readonly notifications: ShownMessage[];
+
+  /**
+   * The answers to successive `show*Message` calls, consumed in order; a call
+   * past the end is dismissed (`undefined`). A promise answers when it settles.
+   */
+  readonly choices: Array<string | undefined | Promise<string | undefined>>;
+
+  /** Every `commands.executeCommand` id, in order. */
+  readonly executedCommands: string[];
+
+  /** The state `status.state` of the substitute process manager reports. */
+  serviceState: string;
+
+  /** How many times `restart()` was called. */
+  restartCalls: number;
+
+  /** Makes the next `restart()` resolve to this failure, then clears itself. */
+  restartFailure: DebuggenError | undefined;
+
+  /** How many times the editor credential was read again (`refresh()`). */
+  refreshCalls: number;
+
+  /** Whether `refresh()` finds a credential in `auth.json`; otherwise it fails. */
+  credentialOnDisk: boolean;
+
+  /**
+   * The token `refresh()` reads when {@link credentialOnDisk} is set. It
+   * contains `SENTINEL`, so the privacy check fails any line that carries it.
+   */
+  readonly editorToken: string;
+
+  /** How many times the client's `connect()` was called. */
+  connectCalls: number;
+
+  /** Every refused-credential listener activation registered on the client. */
+  readonly unauthorizedListeners: Array<(detail: WsUnauthorizedDetail) => void>;
+
+  /** The host store activation handed to `registerCommands`. */
+  commandState: ExtensionState | undefined;
+}
+
+/** One `show*Message` call the substitute editor received. */
+interface ShownMessage {
+  readonly level: 'error' | 'warning' | 'info';
+  readonly text: string;
+  readonly actions: readonly string[];
+  /** The `MessageOptions` argument, when one was passed (a modal). */
+  readonly options: { readonly modal?: boolean; readonly detail?: string } | undefined;
 }
 
 const host = vi.hoisted((): HostState => ({
@@ -92,6 +173,18 @@ const host = vi.hoisted((): HostState => ({
   startFailure: undefined,
   notificationFailure: undefined,
   processLogger: undefined,
+  notifications: [],
+  choices: [],
+  executedCommands: [],
+  serviceState: 'idle',
+  restartCalls: 0,
+  restartFailure: undefined,
+  refreshCalls: 0,
+  credentialOnDisk: false,
+  editorToken: ['SENTINEL', 'editor', 'token', 'on', 'disk'].join('-'),
+  connectCalls: 0,
+  unauthorizedListeners: [],
+  commandState: undefined,
 }));
 
 vi.mock('vscode', () => {
@@ -144,10 +237,21 @@ vi.mock('vscode', () => {
     fsPath,
     path: fsPath,
   });
-  const notify = (): Promise<undefined> =>
-    host.notificationFailure === undefined
-      ? Promise.resolve(undefined)
-      : Promise.reject(host.notificationFailure);
+  const notify =
+    (level: ShownMessage['level']) =>
+    (text: string, ...rest: readonly unknown[]): Promise<string | undefined> => {
+      const [first] = rest;
+      const options =
+        typeof first === 'object' && first !== null
+          ? (first as NonNullable<ShownMessage['options']>)
+          : undefined;
+      const actions = rest.filter((item): item is string => typeof item === 'string');
+      host.notifications.push({ level, text, actions, options });
+      if (host.notificationFailure !== undefined) {
+        return Promise.reject(host.notificationFailure);
+      }
+      return Promise.resolve(host.choices.shift());
+    };
 
   return {
     Disposable,
@@ -179,9 +283,9 @@ vi.mock('vscode', () => {
       createTreeView: inert,
       registerWebviewViewProvider: inert,
       onDidChangeActiveTextEditor: inert,
-      showErrorMessage: notify,
-      showWarningMessage: notify,
-      showInformationMessage: notify,
+      showErrorMessage: notify('error'),
+      showWarningMessage: notify('warning'),
+      showInformationMessage: notify('info'),
     },
     workspace: {
       workspaceFolders: undefined,
@@ -197,12 +301,52 @@ vi.mock('vscode', () => {
       onDidChangeWorkspaceFolders: inert,
     },
     commands: {
-      executeCommand: () => Promise.resolve(undefined),
+      executeCommand: (command: string): Promise<undefined> => {
+        host.executedCommands.push(command);
+        return Promise.resolve(undefined);
+      },
     },
   };
 });
 
-vi.mock('./commands', () => ({ registerCommands: vi.fn() }));
+vi.mock('./commands', () => ({
+  registerCommands: vi.fn((_context: unknown, deps: { readonly state: ExtensionState }) => {
+    host.commandState = deps.state;
+  }),
+}));
+
+/**
+ * The real client, behind a proxy that binds every member to the real
+ * instance (its private fields need it), records each refused-credential
+ * listener while still registering it, and replaces `connect()` with a
+ * counter, so no socket is ever opened.
+ */
+vi.mock('./service/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof ServiceClientModule>();
+  return {
+    ...actual,
+    createServiceClient: (
+      ...args: Parameters<typeof actual.createServiceClient>
+    ): ServiceClientModule.ServiceClient =>
+      new Proxy(actual.createServiceClient(...args), {
+        get(target, property): unknown {
+          if (property === 'connect') {
+            return (): void => {
+              host.connectCalls += 1;
+            };
+          }
+          if (property === 'onUnauthorized') {
+            return (listener: (detail: WsUnauthorizedDetail) => void): (() => void) => {
+              host.unauthorizedListeners.push(listener);
+              return target.onUnauthorized(listener);
+            };
+          }
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }),
+  };
+});
 
 vi.mock('./uri-handler', () => ({ registerDebuggenUriHandler: vi.fn() }));
 
@@ -232,25 +376,48 @@ vi.mock('./views/sessions-tree', () => ({
 }));
 
 vi.mock('./service/auth', async () => {
-  const { DebuggenError, err } = await import('@debuggen/shared');
+  const { DebuggenError, err, ok } = await import('@debuggen/shared');
   const absent = () =>
     Promise.resolve(err(new DebuggenError('UNAUTHORIZED', 'No editor credential in this suite.')));
   return {
     createEditorCredentialStore: () => ({
       token: () => undefined,
       read: absent,
-      refresh: absent,
+      refresh: () => {
+        host.refreshCalls += 1;
+        return host.credentialOnDisk ? Promise.resolve(ok(host.editorToken)) : absent();
+      },
       dispose: () => undefined,
     }),
   };
 });
 
 vi.mock('./service/process', async () => {
-  const { DebuggenError, err } = await import('@debuggen/shared');
+  const { DebuggenError, err, ok } = await import('@debuggen/shared');
+  /** A status snapshot in the scripted state; only `state` and `mode` are read. */
+  const statusOf = (state: string) => ({
+    state,
+    mode: state === 'external' ? 'external' : 'embedded',
+    pid: state === 'running' ? 4242 : undefined,
+    serviceUrl: 'http://127.0.0.1:43117',
+    restartAttempts: 0,
+    settingsChanged: false,
+    error: undefined,
+    since: 0,
+  });
   return {
     createServiceProcess: (deps: { readonly logger?: Logger | undefined }) => {
       host.processLogger = deps.logger;
       return {
+        get status() {
+          return statusOf(host.serviceState);
+        },
+        restart: () => {
+          host.restartCalls += 1;
+          const failure = host.restartFailure;
+          host.restartFailure = undefined;
+          return Promise.resolve(failure === undefined ? ok(statusOf('running')) : err(failure));
+        },
         ensureRunning: () => {
           const failure = host.startFailure;
           host.startFailure = undefined;
@@ -405,6 +572,17 @@ beforeEach(() => {
   host.startFailure = undefined;
   host.notificationFailure = undefined;
   host.processLogger = undefined;
+  host.notifications.length = 0;
+  host.choices.length = 0;
+  host.executedCommands.length = 0;
+  host.serviceState = 'idle';
+  host.restartCalls = 0;
+  host.restartFailure = undefined;
+  host.refreshCalls = 0;
+  host.credentialOnDisk = false;
+  host.connectCalls = 0;
+  host.unauthorizedListeners.length = 0;
+  host.commandState = undefined;
   host.settings.clear();
   host.settings.set('serviceUrl', PRIVATE_SERVICE_URL);
   host.settings.set('provider', PRIVATE_PROVIDER);
@@ -567,5 +745,304 @@ describe('the output channel sink: an error inside a record', () => {
       expect(line).not.toContain(INVENTED_CODE);
     }
     expectNothingPrivateWritten();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The refused-credential prompt
+// ---------------------------------------------------------------------------
+
+/** The prompt's headline, as the developer reads it. */
+const CREDENTIAL_REFUSED_HEADLINE = 'The Debug Generator service refused this editor’s credential.';
+
+/** The prompt's and the confirmation's restart button. */
+const RESTART_ACTION = 'Restart service';
+
+/** The prompt's re-read button. */
+const RETRY_ACTION = 'Retry';
+
+/** The post-restart notice's only button. */
+const ROTATE_ACTION = 'Rotate Service Token';
+
+describe('the refused-credential prompt', () => {
+  /**
+   * Activates, lets start-up settle, puts the process manager in
+   * `serviceState`, then reports a refused credential to every listener the
+   * activation registered — what the client does once its single re-read of
+   * `auth.json` found no different token — and lets the prompt's flow settle.
+   */
+  async function refuseCredential(serviceState: string): Promise<void> {
+    activateExtension();
+    await settle();
+    expect(host.notifications).toEqual([]);
+    expect(host.unauthorizedListeners.length).toBeGreaterThan(0);
+    host.serviceState = serviceState;
+    for (const listener of [...host.unauthorizedListeners]) {
+      listener({ code: 4401, reason: 'the credential was refused' });
+    }
+    await settle();
+  }
+
+  /** Every notification that offered rotation. */
+  function rotationOffers(): ShownMessage[] {
+    return host.notifications.filter((shown) => shown.actions.includes(ROTATE_ACTION));
+  }
+
+  afterEach(() => {
+    // Neither the token read from auth.json nor any private setting reaches
+    // a notification.
+    for (const { text } of host.notifications) {
+      expect(text).not.toContain(host.editorToken);
+      for (const fragment of PRIVATE_FRAGMENTS) {
+        expect(text).not.toContain(fragment);
+      }
+    }
+  });
+
+  it('leads with "Restart service", then "Retry", for a child of this window, and offers no rotation', async () => {
+    await refuseCredential('running');
+
+    expect(host.notifications).toHaveLength(1);
+    const prompt = host.notifications[0]!;
+    expect(prompt.level).toBe('warning');
+    expect(prompt.text.startsWith(CREDENTIAL_REFUSED_HEADLINE)).toBe(true);
+    expect(prompt.text).toContain('as it starts it re-issues the editor credential in auth.json');
+    expect(prompt.text).toContain('Retry reads auth.json again');
+    expect(prompt.actions).toEqual([RESTART_ACTION, RETRY_ACTION]);
+    expect(prompt.options).toBeUndefined();
+    expect(rotationOffers()).toEqual([]);
+    // Dismissed: nothing else happens.
+    expect(host.restartCalls).toBe(0);
+    expect(host.refreshCalls).toBe(0);
+    expect(host.connectCalls).toBe(0);
+    expect(host.executedCommands).toEqual([]);
+    expect(recordsOf('The service refused the editor credential')).toEqual([
+      { level: 'warn', fields: { code: 4401 } },
+    ]);
+  });
+
+  it.each(['external', 'starting', 'failed', 'stopped', 'idle'])(
+    'offers only "Retry" when the service process is %s, with a hint to restart it where it was started',
+    async (serviceState) => {
+      host.choices.push(RESTART_ACTION);
+      await refuseCredential(serviceState);
+
+      expect(host.notifications).toHaveLength(1);
+      const prompt = host.notifications[0]!;
+      expect(prompt.level).toBe('warning');
+      expect(prompt.text.startsWith(CREDENTIAL_REFUSED_HEADLINE)).toBe(true);
+      expect(prompt.text).toContain(
+        'Restart the service where it was started — a terminal or another VS Code window — so it re-issues the editor credential in auth.json, then choose Retry.',
+      );
+      expect(prompt.actions).toEqual([RETRY_ACTION]);
+      expect(rotationOffers()).toEqual([]);
+      // A "Restart service" answer the prompt never offered restarts nothing.
+      expect(host.restartCalls).toBe(0);
+      expect(host.refreshCalls).toBe(0);
+      expect(host.connectCalls).toBe(0);
+    },
+  );
+
+  it('restarts once, re-reads auth.json, reconnects, then offers rotation in one information notice', async () => {
+    host.credentialOnDisk = true;
+    host.choices.push(RESTART_ACTION);
+    await refuseCredential('running');
+
+    expect(host.restartCalls).toBe(1);
+    expect(host.refreshCalls).toBe(1);
+    expect(host.connectCalls).toBe(1);
+    expect(host.notifications).toHaveLength(2);
+    const notice = host.notifications[1]!;
+    expect(notice.level).toBe('info');
+    expect(notice.text).toContain(
+      'Restarted the Debug Generator service; this editor reconnects with the credential it issued.',
+    );
+    expect(notice.text).toContain(
+      'If anything other than Debug Generator changed auth.json, rotate the service token',
+    );
+    expect(notice.actions).toEqual([ROTATE_ACTION]);
+    expect(rotationOffers()).toEqual([notice]);
+    // Dismissed: no rotation runs.
+    expect(host.executedCommands).toEqual([]);
+    expect(recordsOf('The service was restarted to repair the editor credential')).toEqual([
+      { level: 'info', fields: { state: 'running' } },
+    ]);
+  });
+
+  it('runs debuggen.rotateServiceToken when "Rotate Service Token" is chosen after the restart', async () => {
+    host.credentialOnDisk = true;
+    host.choices.push(RESTART_ACTION, ROTATE_ACTION);
+    await refuseCredential('running');
+
+    expect(host.restartCalls).toBe(1);
+    expect(host.refreshCalls).toBe(1);
+    expect(host.connectCalls).toBe(1);
+    expect(host.notifications).toHaveLength(2);
+    expect(host.executedCommands).toEqual(['debuggen.rotateServiceToken']);
+  });
+
+  it('surfaces a failed restart once, and re-reads, connects and offers nothing', async () => {
+    host.credentialOnDisk = true;
+    host.restartFailure = new DebuggenError('INTERNAL', 'The restarted service did not answer.', {
+      hint: 'Open the "Debug Generator Service" output for the reason.',
+    });
+    host.choices.push(RESTART_ACTION);
+    await refuseCredential('running');
+
+    expect(host.restartCalls).toBe(1);
+    expect(host.refreshCalls).toBe(0);
+    expect(host.connectCalls).toBe(0);
+    expect(host.notifications).toHaveLength(2);
+    const failure = host.notifications[1]!;
+    expect(failure.level).toBe('error');
+    expect(failure.text).toBe(
+      'Could not restart the Debug Generator service: The restarted service did not answer. Open the "Debug Generator Service" output for the reason.',
+    );
+    expect(failure.actions).toEqual([]);
+    expect(rotationOffers()).toEqual([]);
+    expect(host.executedCommands).toEqual([]);
+    expect(recordsOf('The service could not be restarted to repair the editor credential')).toEqual(
+      [{ level: 'warn', fields: { code: 'INTERNAL' } }],
+    );
+  });
+
+  it('surfaces a failed re-read after the restart once, and connects and offers nothing', async () => {
+    host.choices.push(RESTART_ACTION);
+    await refuseCredential('running');
+
+    expect(host.restartCalls).toBe(1);
+    expect(host.refreshCalls).toBe(1);
+    expect(host.connectCalls).toBe(0);
+    expect(host.notifications).toHaveLength(2);
+    const failure = host.notifications[1]!;
+    expect(failure.level).toBe('error');
+    expect(failure.text).toBe(
+      'Could not read the editor credential: No editor credential in this suite.',
+    );
+    expect(rotationOffers()).toEqual([]);
+    expect(recordsOf('The editor credential could not be re-read')).toEqual([
+      { level: 'warn', fields: { code: 'UNAUTHORIZED' } },
+    ]);
+  });
+
+  it('"Retry" re-reads auth.json and reconnects, without restarting or offering rotation', async () => {
+    host.credentialOnDisk = true;
+    host.choices.push(RETRY_ACTION);
+    await refuseCredential('running');
+
+    expect(host.restartCalls).toBe(0);
+    expect(host.refreshCalls).toBe(1);
+    expect(host.connectCalls).toBe(1);
+    expect(host.notifications).toHaveLength(1);
+    expect(rotationOffers()).toEqual([]);
+    expect(host.executedCommands).toEqual([]);
+  });
+
+  it('"Retry" that cannot read auth.json surfaces one error and does not reconnect', async () => {
+    host.choices.push(RETRY_ACTION);
+    await refuseCredential('external');
+
+    expect(host.restartCalls).toBe(0);
+    expect(host.refreshCalls).toBe(1);
+    expect(host.connectCalls).toBe(0);
+    expect(host.notifications).toHaveLength(2);
+    expect(host.notifications[1]?.level).toBe('error');
+    expect(rotationOffers()).toEqual([]);
+  });
+
+  describe('while a session is live', () => {
+    /**
+     * Makes the store report an active session with no record yet — the
+     * state the restart confirmation errs on the side of asking in — and
+     * returns the function that removes it again before deactivation.
+     */
+    function withLiveSession(): () => void {
+      const state = host.commandState;
+      expect(state).toBeDefined();
+      Object.defineProperty(state, 'activeSessionId', {
+        configurable: true,
+        get: () => 'session-live',
+      });
+      return () => {
+        Reflect.deleteProperty(state!, 'activeSessionId');
+      };
+    }
+
+    it('asks the modal confirmation first, and restarts nothing when it is declined', async () => {
+      host.credentialOnDisk = true;
+      activateExtension();
+      await settle();
+      const restore = withLiveSession();
+      try {
+        host.serviceState = 'running';
+        host.choices.push(RESTART_ACTION, undefined);
+        for (const listener of [...host.unauthorizedListeners]) {
+          listener({ code: 4401, reason: 'the credential was refused' });
+        }
+        await settle();
+      } finally {
+        restore();
+      }
+
+      expect(host.notifications).toHaveLength(2);
+      const modal = host.notifications[1]!;
+      expect(modal.level).toBe('warning');
+      expect(modal.text).toBe('Restart the Debug Generator service while a session is active?');
+      expect(modal.options?.modal).toBe(true);
+      expect(modal.options?.detail).toContain('restores every file it instrumented');
+      expect(modal.actions).toEqual([RESTART_ACTION]);
+      expect(host.restartCalls).toBe(0);
+      expect(host.refreshCalls).toBe(0);
+      expect(host.connectCalls).toBe(0);
+      expect(rotationOffers()).toEqual([]);
+    });
+
+    it('restarts once the modal confirmation is accepted', async () => {
+      host.credentialOnDisk = true;
+      activateExtension();
+      await settle();
+      const restore = withLiveSession();
+      try {
+        host.serviceState = 'running';
+        host.choices.push(RESTART_ACTION, RESTART_ACTION);
+        for (const listener of [...host.unauthorizedListeners]) {
+          listener({ code: 4401, reason: 'the credential was refused' });
+        }
+        await settle();
+      } finally {
+        restore();
+      }
+
+      expect(host.notifications.map((shown) => shown.options?.modal === true)).toEqual([
+        false,
+        true,
+        false,
+      ]);
+      expect(host.restartCalls).toBe(1);
+      expect(host.refreshCalls).toBe(1);
+      expect(host.connectCalls).toBe(1);
+      expect(rotationOffers()).toHaveLength(1);
+    });
+  });
+
+  it('does nothing when the window deactivated while the prompt was open', async () => {
+    host.credentialOnDisk = true;
+    let answer: (choice: string | undefined) => void = () => undefined;
+    host.choices.push(
+      new Promise<string | undefined>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    await refuseCredential('running');
+    expect(host.notifications).toHaveLength(1);
+
+    await deactivate();
+    answer(RESTART_ACTION);
+    await settle();
+
+    expect(host.restartCalls).toBe(0);
+    expect(host.refreshCalls).toBe(0);
+    expect(host.connectCalls).toBe(0);
+    expect(host.notifications).toHaveLength(1);
   });
 });

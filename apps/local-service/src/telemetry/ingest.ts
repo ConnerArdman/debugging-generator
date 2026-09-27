@@ -19,28 +19,48 @@
  *    configured). Anything else is a typed `Err`; a batch is never truncated.
  *    An empty batch is answered with an empty report and touches nothing,
  *    unless it is a **loss-only** batch: no events beside a positive loss
- *    report, which a producer sends when no later batch will carry its loss (at
- *    a capture's end). A loss-only batch goes through steps 1, 2 and 2½ only,
- *    then straight to step 11.
+ *    report, which either producer sends when no later batch will carry its
+ *    loss (at a capture's end). A loss-only batch goes through steps 1, 2 and
+ *    2½ only, then straight to step 11.
  * 2. **Resolve attribution once.** `attributor.resolveBatch(context)` names the
  *    session and the open capture window from the batch's *transport* identity
  *    (the bound tab, or the `server-agent` credential's scoped project). A
  *    refusal is a drop: the whole batch is counted under its `DropReason` and
  *    **nothing is parsed, hashed, persisted or broadcast** — which is what makes
- *    "an unrelated plan collects no backend telemetry" true end to end.
- * 2½. **Account producer loss.** A relayed browser batch may say how many
- *    events its page agent discarded since its previous loss report (the
- *    agent's buffer is bounded at 5 000 events while the bridge is away, AAP
- *    §0.5.5). Once the batch is attributed, that count is handed to the
- *    store's optional loss ledger (`telemetry.recordProducerLoss`) against the
+ *    "an unrelated plan collects no backend telemetry" true end to end. A
+ *    batch of either transport whose `armedCaptureId` — the capture it was
+ *    recorded for — is not the open capture is refused here as
+ *    `stale-capture` (see `./attribute.ts`).
+ * 2½. **Account producer loss.** A batch of either transport may say how many
+ *    events its producer discarded since its previous loss report
+ *    (`droppedCount`): the page agent's buffer is bounded at 5 000 events
+ *    while the bridge is away, and the dev-server preload's
+ *    exporter caps its buffer and gives up on a batch it could not deliver.
+ *    Once the batch is attributed, that count is handed to the store's
+ *    optional loss ledger (`telemetry.recordProducerLoss`) against the
  *    **attributed** session and capture, so the capture's summary can say its
  *    evidence is incomplete rather than look whole. It is recorded here, before
  *    the batch's own events are processed, because the loss happened whatever
  *    becomes of them; a refused batch records nothing, since the capture its
  *    loss belongs to is exactly what could not be established — a loss-only
- *    batch included. A ledger failure is logged and never fails the batch. For
- *    a loss-only batch this is the whole of its work: no secret is read and
- *    nothing is parsed, persisted, correlated or tailed.
+ *    batch and a `stale-capture` batch included. A ledger failure is logged and
+ *    never fails the batch. For a loss-only batch this is the whole of its
+ *    work: no secret is read and nothing is parsed, persisted, correlated or
+ *    tailed.
+ *    A server batch may name its loss report (`lossReportId`): the preload's
+ *    exporter keeps one id for every retry and resend of the same report,
+ *    because it sends the same body again after a failure — including one
+ *    this pipeline had already recorded the loss of, before a later step
+ *    failed the batch or the acknowledgement was lost. A named report is
+ *    applied to a capture once: after the ledger has accepted it, a delivery
+ *    repeating the same attributed capture and id records nothing and adds
+ *    nothing to the report's `producerDropped`, while the rest of its batch is
+ *    processed as usual. Until the ledger has accepted it — no ledger, a
+ *    refusal or a failure — a repeat is recorded like a first delivery. An id
+ *    is only ever a de-duplication key, bounded by
+ *    {@link MAX_APPLIED_LOSS_REPORTS}: it attributes and authorizes nothing,
+ *    and no record carries it. A report without an id, or with a malformed
+ *    one, is recorded on every delivery.
  * 3. **One request-key hasher per batch.** The session's secret is read from
  *    the store and `createRequestKeyHasher` is called once, so the
  *    non-extractable HMAC key is imported once per batch, not once per event.
@@ -200,6 +220,9 @@
  *   projectRoot: body.projectRoot,
  *   scopedProjectRoot: principal.scope,
  *   events: body.events,
+ *   ...(body.armedCaptureId === undefined ? {} : { armedCaptureId: body.armedCaptureId }),
+ *   ...(body.droppedCount === undefined ? {} : { droppedCount: body.droppedCount }),
+ *   ...(body.lossReportId === undefined ? {} : { lossReportId: body.lossReportId }),
  * });
  * if (fromServer.ok) {
  *   return c.json(toIngestResponse(fromServer.value), 202);
@@ -458,6 +481,35 @@ export const MAX_LOCATE_BUDGET_MS = 10_000;
  */
 export const LOCATE_BUDGET_GRACE_MS = 100;
 
+/**
+ * How many applied loss reports one pipeline remembers: **4 096**
+ * `(capture, lossReportId)` keys, the oldest forgotten first.
+ *
+ * The keys exist so that a loss report the preload's exporter sends again is
+ * applied to its capture once (pipeline step 2½). A report is sent again only
+ * while it is still the exporter's to deliver: within one batch's bounded
+ * attempts, or on the next post for its capture after those attempts failed —
+ * and the exporter posts one batch at a time and reports loss only when it
+ * discarded events. So a repeat arrives after a handful of other reports have
+ * been applied, not thousands, and a key this bound forgets is one no producer
+ * still sends. Each key holds a capture id and an id of at most
+ * {@link MAX_LOSS_REPORT_ID_LENGTH} characters, so the whole set stays well
+ * under a megabyte.
+ *
+ * The keys live for the process, like the ledger they guard: the store's
+ * producer-loss ledger is itself in memory, so a service restart empties both,
+ * and the ledger then reports the open capture as unaccounted. No total
+ * outlives the keys that keep it from counting a report twice, and keys that
+ * outlived the ledger would protect nothing.
+ */
+export const MAX_APPLIED_LOSS_REPORTS = 4_096;
+
+/**
+ * The longest `lossReportId` step 2½ keys a report on: the bound
+ * `@debuggen/protocol` holds every identifier field of a telemetry body to.
+ */
+const MAX_LOSS_REPORT_ID_LENGTH = 64;
+
 /* -------------------------------------------------------------------------------------------------
  * Consumer-side ports
  *
@@ -518,9 +570,12 @@ export interface TelemetryRepoLike {
    * Optional: a store without a ledger still ingests every batch, and the
    * reported count still appears in {@link IngestReport.producerDropped}.
    * Called only with a positive count, only for an attributed batch, and at
-   * most once per batch. `ok` carries the ledger's count for the capture after
-   * the report, which ingest only logs; an `Err` is logged and never fails the
-   * batch.
+   * most once per batch — and never again for a named report
+   * (`lossReportId`) it has already answered `ok` for against the same
+   * capture. `ok` carries the ledger's count for the capture after the report,
+   * which ingest only logs, and is what marks a named report applied; an `Err`
+   * is logged, leaves a named report free to be recorded by a retry, and never
+   * fails the batch.
    *
    * @param report The attributed session and capture, and the count.
    * @returns The capture's recorded loss, or the refusal.
@@ -777,7 +832,9 @@ export interface IngestReport {
    * Events the producer reported discarding before this batch, accounted
    * against {@link captureId} (pipeline step 2½). Present only when the batch
    * was attributed and the count is above zero — whether or not the store has
-   * a loss ledger to record it in.
+   * a loss ledger to record it in — and absent when the batch repeats a named
+   * loss report the ledger already recorded against that capture, which is
+   * not new loss.
    */
   readonly producerDropped?: number;
 }
@@ -806,17 +863,46 @@ export interface AgentIngestInput extends Omit<BrowserIngestContext, 'origin'> {
 }
 
 /**
- * The server-agent transport's input: the ingest body's `projectRoot` and
- * `events`, and the credential's scope.
+ * The server-agent transport's input: the ingest body's `projectRoot`,
+ * `events` and delivery context, and the credential's scope.
  *
  * `scopedProjectRoot` is the project the presented `server-agent` credential
  * is bound to, as resolved by `../server/auth.ts` — **never** a value read
  * from the request body. The two roots must agree for anything to be stored
- * (AAP §0.5.6); the attributor enforces it.
+ * at all; the attributor enforces it. `armedCaptureId` and
+ * `droppedCount` are the body's delivery context, read exactly as the
+ * browser transport's are: the first is refusal-only (a batch naming another
+ * capture than the open one is dropped as `stale-capture`, see
+ * `./attribute.ts`), the second is the producer's loss report (pipeline
+ * step 2½). `lossReportId` is this transport's alone: the identity of that
+ * loss report, so a body the exporter sends again is accounted once.
  */
 export interface ServerAgentIngestInput extends Omit<ServerIngestContext, 'origin'> {
   /** The `events` of the `POST /telemetry/ingest` body, as received; validated here element by element. */
   readonly events: unknown;
+  /**
+   * The body's `droppedCount`: events the preload's exporter discarded since
+   * its previous loss report. Absent means none were reported; a value that
+   * is not a non-negative safe integer is ignored (and logged without its
+   * value).
+   */
+  readonly droppedCount?: number | undefined;
+  /**
+   * The body's `lossReportId`: the producer-chosen identity of the body's loss
+   * report, stable across every retry and resend of that report. One id names
+   * one report — one count, for one capture — so a producer that reports
+   * further loss names it with a new id.
+   *
+   * Used only to apply a report once (pipeline step 2½): a delivery whose
+   * attributed capture and id the ledger already accepted is not counted
+   * again. It never attributes a batch, chooses a session or a capture, or
+   * authorizes anything, and it is never logged. Read only beside a
+   * `droppedCount` above zero; a value that is not an identifier — a string of
+   * 1 to 64 characters without surrounding whitespace, as
+   * `telemetryIngestRequestSchema` requires — is ignored with a warning that
+   * omits it, and the loss is recorded as if the body named no report.
+   */
+  readonly lossReportId?: string | undefined;
 }
 
 /** The ingest pipeline of one service process. No method throws and no promise rejects. */
@@ -848,9 +934,13 @@ export interface TelemetryIngest {
   /**
    * Ingests a `POST /telemetry/ingest` body from the dev-server preload. The
    * caller is `../server/routes/telemetry.ts`. Builds a `server-agent` context
-   * carrying both project roots and delegates to {@link ingest}.
+   * carrying both project roots (and `armedCaptureId` when given), delegates
+   * to {@link ingest}'s pipeline and accounts `droppedCount` against the
+   * attributed capture — once per `lossReportId` when the body names its
+   * report.
    *
-   * @param input The body's project and events, and the credential's scope.
+   * @param input The body's project, events and delivery context, and the
+   * credential's scope.
    * @returns As {@link ingest}; a malformed `input` is a `PROTOCOL_INVALID_MESSAGE` `Err`.
    */
   ingestFromServerAgent(
@@ -1127,10 +1217,39 @@ function placeSources(
 
 /**
  * Whether `value` is a usable loss count: a non-negative safe integer, the
- * range `telemetryEventPayloadSchema.droppedCount` admits.
+ * range the `droppedCount` of both transports admits
+ * (`telemetryEventPayloadSchema`, `telemetryIngestRequestSchema`).
  */
 function isLossCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Whether `value` is a usable loss-report id: a non-empty string of at most
+ * {@link MAX_LOSS_REPORT_ID_LENGTH} characters with no leading or trailing
+ * whitespace — the identifier rule `telemetryIngestRequestSchema` holds the
+ * body's `lossReportId` to.
+ */
+function isLossReportId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= MAX_LOSS_REPORT_ID_LENGTH &&
+    value.trim().length === value.length
+  );
+}
+
+/**
+ * The key a named loss report is applied under: its attributed capture and its
+ * id. The capture id is length-prefixed, so no pair of values can spell
+ * another pair's key whatever characters the id holds. Held in memory only,
+ * never written.
+ *
+ * @param captureId The capture the reporting batch was attributed to.
+ * @param lossReportId The report's validated id.
+ */
+function lossReportKey(captureId: CaptureId, lossReportId: string): string {
+  return `${String(captureId.length)}:${captureId}:${lossReportId}`;
 }
 
 /**
@@ -1920,6 +2039,7 @@ const WARNING_CLASS = Object.freeze({
   secretUnavailable: 'secret-unavailable',
   malformedEvents: 'malformed-events',
   serviceKeysStripped: 'service-keys-stripped',
+  malformedLossReportId: 'malformed-loss-report-id',
   eventsDegraded: 'events-degraded',
   locateBudget: 'locate-budget',
   locateFailed: 'locate-failed',
@@ -1931,12 +2051,14 @@ const WARNING_CLASS = Object.freeze({
 
 /**
  * The classes of debug record the debug throttle admits: those of a batch
- * that stored nothing, which a producer can repeat as often as it sends.
+ * that stored nothing, and that of a loss report already applied — each of
+ * which a producer can repeat as often as it sends.
  */
 const DEBUG_CLASS = Object.freeze({
   emptyBatch: 'empty-batch',
   droppedBatch: 'dropped-batch',
   storedNothing: 'stored-nothing',
+  lossReportRepeated: 'loss-report-repeated',
 });
 
 /** How much of a project digest a throttle key keeps: 64 bits, ample to tell a machine's projects apart. */
@@ -2143,18 +2265,100 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
   }
 
   /**
+   * The named loss reports the ledger has accepted, as {@link lossReportKey}
+   * keys in the order they were accepted, at most
+   * {@link MAX_APPLIED_LOSS_REPORTS} of them. A `Set` iterates in insertion
+   * order, so its first key is the oldest — the one forgotten first. Owned by
+   * this pipeline and written only on the service's one event loop.
+   */
+  const appliedLossReports = new Set<string>();
+
+  /**
+   * Ledger writes of named loss reports still in progress, by the same key. A
+   * delivery of a report whose earlier delivery is still being recorded waits
+   * for that write to settle before it decides, so two concurrent deliveries
+   * of one report cannot both find it unapplied. An entry is the write itself
+   * (which, like every step here, does not reject) and is removed once it has
+   * settled, so there are never more entries than ingest calls in progress.
+   */
+  const lossReportsInFlight = new Map<string, Promise<void>>();
+
+  /**
+   * Marks a named report applied, forgetting the oldest keys past
+   * {@link MAX_APPLIED_LOSS_REPORTS}.
+   */
+  function rememberAppliedLossReport(key: string): void {
+    appliedLossReports.add(key);
+
+    while (appliedLossReports.size > MAX_APPLIED_LOSS_REPORTS) {
+      const oldest = appliedLossReports.values().next();
+
+      if (oldest.done === true) {
+        return;
+      }
+
+      appliedLossReports.delete(oldest.value);
+    }
+  }
+
+  /**
+   * The key a delivery's loss report is applied under, or `undefined` when the
+   * delivery names no usable report. A malformed id is ignored with a warning
+   * that omits it, so its loss is recorded as un-keyed rather than lost.
+   */
+  function lossReportKeyOf(
+    attribution: IngestAttribution,
+    reportedLossId: unknown,
+    state: RunState,
+    scoped: Logger,
+    originFields: LogFields,
+  ): string | undefined {
+    if (reportedLossId === undefined) {
+      return undefined;
+    }
+
+    if (!isLossReportId(reportedLossId)) {
+      emitThrottled(
+        scoped,
+        'warn',
+        throttleKey(WARNING_CLASS.malformedLossReportId, runScope(state)),
+        'a malformed producer loss report id was ignored; the loss is recorded without it',
+        originFields,
+      );
+      return undefined;
+    }
+
+    return lossReportKey(attribution.captureId, reportedLossId);
+  }
+
+  /**
    * Step 2½: the producer's loss report, accounted against the capture the
    * batch was just attributed to — never against one the producer named.
    *
    * `reportedLoss` is the transport's `droppedCount` as received: absent or
    * `0` is no report, anything but a non-negative safe integer is ignored with
-   * a warning that omits the value. A positive count is set on the report and
-   * handed to the store's ledger when the store has one. Nothing here fails the
-   * batch: a refused, failing or throwing ledger is logged with its code only.
+   * a warning that omits the value. `reportedLossId` is the report's
+   * `lossReportId` as received, read only beside a positive count: absent or
+   * malformed (ignored with a warning that omits it), the report is recorded
+   * on every delivery.
+   *
+   * A named report is applied once per attributed capture. A delivery whose
+   * `(capture, id)` the ledger has already accepted records nothing: it is
+   * logged at `debug` without the id, and the count is not set on the report,
+   * since it is not new loss. Otherwise the count is set on the report and
+   * handed to the store's ledger when the store has one, and the key is marked
+   * applied only when the ledger answers `ok` — without a ledger, or after a
+   * refusal or a failure, a retry of the report is still recorded. A delivery
+   * arriving while an earlier delivery's write of the same key is in progress
+   * waits for that write to settle first.
+   *
+   * Nothing here fails the batch: a refused, failing or throwing ledger is
+   * logged with its code only.
    */
   async function recordLoss(
     attribution: IngestAttribution,
     reportedLoss: unknown,
+    reportedLossId: unknown,
     state: RunState,
     scoped: Logger,
     originFields: LogFields,
@@ -2172,6 +2376,69 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       return;
     }
 
+    const key = lossReportKeyOf(attribution, reportedLossId, state, scoped, originFields);
+
+    if (key === undefined) {
+      await applyLoss(attribution, reportedLoss, state, scoped, originFields);
+      return;
+    }
+
+    // Re-read after every wait: a write that did not reach the ledger leaves
+    // the key free, and the next waiter to resume starts its own.
+    for (
+      let pending = lossReportsInFlight.get(key);
+      pending !== undefined;
+      pending = lossReportsInFlight.get(key)
+    ) {
+      await pending;
+    }
+
+    if (appliedLossReports.has(key)) {
+      emitDebugThrottled(
+        scoped,
+        throttleKey(DEBUG_CLASS.lossReportRepeated, runScope(state)),
+        'a repeated producer loss report was already recorded against the capture; not counted again',
+        { ...originFields, droppedEvents: reportedLoss },
+      );
+      return;
+    }
+
+    // Registered before the first await, so a concurrent delivery of the same
+    // report sees it; the key is marked inside the chain, before any waiter
+    // resumes, and only when the ledger accepted the report.
+    const write = applyLoss(attribution, reportedLoss, state, scoped, originFields).then(
+      (accepted) => {
+        if (accepted) {
+          rememberAppliedLossReport(key);
+        }
+      },
+    );
+    lossReportsInFlight.set(key, write);
+
+    try {
+      await write;
+    } finally {
+      if (lossReportsInFlight.get(key) === write) {
+        lossReportsInFlight.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Step 2½'s write: sets the count on the report and hands it to the store's
+   * ledger when the store has one.
+   *
+   * @returns `true` only when the ledger answered `ok` — the one outcome that
+   * marks a named report applied; `false` without a ledger (logged at `info`)
+   * and for a refused or throwing one (logged at `warn` with its code only).
+   */
+  async function applyLoss(
+    attribution: IngestAttribution,
+    reportedLoss: number,
+    state: RunState,
+    scoped: Logger,
+    originFields: LogFields,
+  ): Promise<boolean> {
     state.producerDropped = reportedLoss;
 
     const store = deps.telemetry;
@@ -2183,7 +2450,7 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
           ...originFields,
           droppedEvents: reportedLoss,
         });
-        return;
+        return false;
       }
 
       const recorded = await store.recordProducerLoss({
@@ -2199,7 +2466,7 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
           droppedEvents: reportedLoss,
           ...(isLossCount(recorded.value) ? { captureDroppedEvents: recorded.value } : {}),
         });
-        return;
+        return true;
       }
 
       code = asDebuggenError(recorded.error, 'recordProducerLoss', 'STORE_ERROR').code;
@@ -2212,6 +2479,7 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       code,
       droppedEvents: reportedLoss,
     });
+    return false;
   }
 
   /**
@@ -2494,15 +2762,22 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
 
   /**
    * The pipeline of the module notes, steps 1 to 11, in order — a loss-only
-   * batch runs steps 1, 2 and 2½, then 11.
+   * batch runs steps 1, 2 and 2½, then 11. A repeat of a named loss report
+   * already applied to the attributed capture records no loss at step 2½;
+   * the rest of its batch runs as any other, so a retried body's events are
+   * still stored when its first delivery failed after recording the loss.
    *
-   * @param reportedLoss The transport's `droppedCount`, as received; only the
-   * browser transport carries one (step 2½).
+   * @param reportedLoss The transport's `droppedCount`, as received — either
+   * transport may carry one (step 2½); `undefined` when it carried none.
+   * @param reportedLossId The transport's `lossReportId`, as received — only
+   * the server transport carries one (step 2½); `undefined` when it carried
+   * none.
    */
   async function run(
     context: IngestContext,
     events: unknown,
     reportedLoss: unknown,
+    reportedLossId: unknown,
   ): Promise<Result<IngestReport, DebuggenError>> {
     const startedAt = readClock();
     const origin = originOf(context);
@@ -2532,7 +2807,7 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     const { source, received } = bounded.value;
     const state = newRunState(received);
     // An event-less batch says something only as a loss report (see the module
-    // notes, step 1); only the browser transport carries one.
+    // notes, step 1), which either transport may carry.
     const lossOnly = received === 0 && isLossCount(reportedLoss) && reportedLoss > 0;
 
     if (received === 0 && !lossOnly) {
@@ -2586,8 +2861,9 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     state.captureId = attribution.captureId;
     const scoped = sessionLogger(log, sessionId, attribution.captureId);
 
-    // 2½. The producer's loss report, against the capture just resolved.
-    await recordLoss(attribution, reportedLoss, state, scoped, originFields);
+    // 2½. The producer's loss report, against the capture just resolved —
+    //     once per named report and capture.
+    await recordLoss(attribution, reportedLoss, reportedLossId, state, scoped, originFields);
 
     // A loss-only batch ends here, at step 11: it holds nothing to key, parse,
     // persist, correlate or tail, so the session's secret is not even read.
@@ -2794,14 +3070,15 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     return ok(toReport(state));
   }
 
-  /** {@link run} behind the never-rejects guarantee, with the transport's loss report. */
+  /** {@link run} behind the never-rejects guarantee, with the transport's loss report and its id. */
   async function execute(
     context: IngestContext,
     events: unknown,
     reportedLoss: unknown,
+    reportedLossId: unknown,
   ): Promise<Result<IngestReport, DebuggenError>> {
     try {
-      return await run(context, events, reportedLoss);
+      return await run(context, events, reportedLoss, reportedLossId);
     } catch {
       // Every step above guards its own dependency; reaching this is a defect,
       // reported as a typed error rather than a rejected promise.
@@ -2820,7 +3097,7 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     context: IngestContext,
     events: unknown,
   ): Promise<Result<IngestReport, DebuggenError>> {
-    return execute(context, events, undefined);
+    return execute(context, events, undefined, undefined);
   }
 
   function ingestFromAgent(input: AgentIngestInput): Promise<Result<IngestReport, DebuggenError>> {
@@ -2843,7 +3120,9 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       return Promise.resolve(err(invalidBatchError('unreadable-input')));
     }
 
-    return execute(context, events, reportedLoss);
+    // A relayed frame names no loss report — only the HTTP transport retries a
+    // body in place — so its loss is recorded on every delivery.
+    return execute(context, events, reportedLoss, undefined);
   }
 
   function ingestFromServerAgent(
@@ -2851,6 +3130,8 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
   ): Promise<Result<IngestReport, DebuggenError>> {
     let context: ServerIngestContext;
     let events: unknown;
+    let reportedLoss: unknown;
+    let reportedLossId: unknown;
 
     try {
       context = {
@@ -2858,15 +3139,20 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
         projectRoot: input.projectRoot,
         scopedProjectRoot: input.scopedProjectRoot,
         ...(input.producerId === undefined ? {} : { producerId: input.producerId }),
+        ...(input.armedCaptureId === undefined ? {} : { armedCaptureId: input.armedCaptureId }),
       };
       events = input.events;
+      reportedLoss = input.droppedCount;
+      reportedLossId = input.lossReportId;
     } catch {
       return Promise.resolve(err(invalidBatchError('unreadable-input')));
     }
 
-    // The ingest body names no capture and reports no loss (see ./attribute.ts,
-    // "The residual server-tier case").
-    return execute(context, events, undefined);
+    // The same delivery context as a relayed frame: the named capture is
+    // compared by the attributor (refusal-only), and the loss is accounted
+    // against the capture the batch is attributed to at step 2½ — once per
+    // `lossReportId`, which stays out of the context: it attributes nothing.
+    return execute(context, events, reportedLoss, reportedLossId);
   }
 
   return Object.freeze({ ingest, ingestFromAgent, ingestFromServerAgent });

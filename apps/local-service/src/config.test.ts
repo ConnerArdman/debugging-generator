@@ -2298,7 +2298,7 @@ describe('describeServiceConfig', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * The state root stays outside every project (AAP 0.4.2, CWE-200)
+ * The state root stays outside every project (CWE-200)
  * ---------------------------------------------------------------------------
  */
 

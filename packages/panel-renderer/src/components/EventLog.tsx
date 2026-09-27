@@ -1139,10 +1139,12 @@ function selectedEventLogRowKey(
  * identically in every row: the header row and each data row are separate
  * grid containers, so an intrinsic track would size itself from one row's own
  * content and stop sitting under its own header. And every role has a
- * non-zero floor, which `DataTable` sums into the grid's own minimum width, so
- * a surface narrower than their sum scrolls the log horizontally instead of
- * squeezing a column to its padding and letting its content paint over the
- * next one.
+ * non-zero floor, which `DataTable` sums into the grid's own width: a surface
+ * just too narrow for every floor narrows the truncating columns (`name`,
+ * `text`), never below the `--dg-column-yield` fraction of their floor, only
+ * as far as the log needs to fit, and a surface too narrow even for that keeps
+ * every floor and scrolls the log horizontally, instead of squeezing a column
+ * to its padding and letting its content paint over the next one.
  * ---------------------------------------------------------------------------
  */
 

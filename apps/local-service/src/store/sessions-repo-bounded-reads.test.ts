@@ -863,11 +863,12 @@ describe('schema version 4 creates and backfills the cleanup summary', () => {
       before = sessionRows(legacy);
     });
 
-    // A version-3 store climbs the whole ladder: step 4 (this summary) and
-    // step 5 (telemetry_events.clock_offset_ms), which leaves every session
-    // row and summary as step 4 wrote them.
+    // A version-3 store climbs the whole ladder: step 4 (this summary),
+    // step 5 (telemetry_events.clock_offset_ms) and step 6
+    // (session_root_identities), which leave every session row and summary
+    // as step 4 wrote them.
     expect(store.schemaVersion).toBe(STORE_SCHEMA_VERSION);
-    expect(STORE_SCHEMA_VERSION).toBe(5);
+    expect(STORE_SCHEMA_VERSION).toBe(6);
     expect(summaryOf(store.db, conflicted)).toEqual({
       status: 'conflict',
       completed_at: BASE_TIME + 6,
@@ -907,7 +908,12 @@ describe('schema version 4 creates and backfills the cleanup summary', () => {
     expect(logs.some((entry) => entry.message.startsWith('applied store migration 5 ('))).toBe(
       true,
     );
-    const warned = logs.filter((entry) => entry.level === 'warn');
+    // Step 6 warns separately, by its own count, about the sessions that carry
+    // no recorded project-root identity; this step's warning is the one that
+    // counts unsummarised sessions.
+    const warned = logs.filter(
+      (entry) => entry.level === 'warn' && entry.fields['unsummarisedSessions'] !== undefined,
+    );
     expect(warned).toHaveLength(1);
     expect(warned[0]?.fields).toMatchObject({ unsummarisedSessions: 2 });
     expect(JSON.stringify(logs)).not.toContain(notJson);
@@ -940,7 +946,7 @@ describe('schema version 4 creates and backfills the cleanup summary', () => {
       expect(outcome).toEqual({
         fromVersion: 0,
         toVersion: STORE_SCHEMA_VERSION,
-        applied: [2, 3, 4, 5],
+        applied: [2, 3, 4, 5, 6],
         adopted: true,
       });
       expect(summaryOf(legacy, conflicted)).toEqual({

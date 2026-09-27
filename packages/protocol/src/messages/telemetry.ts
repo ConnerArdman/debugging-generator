@@ -57,11 +57,19 @@
  * - **The event shape.** `@debuggen/telemetry` owns it, including the
  *   `TelemetryEventIngress`/`TelemetryEvent` split this module depends on.
  * - **The HTTP ingest body.** `POST /telemetry/ingest` takes
- *   `{ projectRoot, events: TelemetryEventIngress[] }` — the Node preload's
- *   route, which needs a project root because a launched dev server is scoped to
- *   one (AAP §0.4.2, §0.5.6). That schema is `telemetryIngestRequestSchema` and
- *   it belongs to `../http.ts`, which imports the ingress schema from
- *   `@debuggen/telemetry` directly. This module defines no HTTP body at all.
+ *   `{ projectRoot, events: TelemetryEventIngress[], armedCaptureId?, droppedCount?,
+ *   lossReportId? }` — the Node preload's route, which needs a project root
+ *   because a launched dev server is scoped to one. That
+ *   schema is `telemetryIngestRequestSchema` and it belongs to `../http.ts`,
+ *   which imports the ingress schema from `@debuggen/telemetry` directly. This
+ *   module defines no HTTP body at all; it exports the three rules both
+ *   transports of `telemetry.event` share — {@link armedCaptureIdSchema},
+ *   {@link droppedCountSchema} and {@link requireLossReportForEmptyBatch} — so
+ *   that the HTTP body embeds them rather than restating them, and a server
+ *   batch is refused for exactly what a browser batch is refused for, in the
+ *   same words. It also exports {@link lossReportIdSchema}, the identity of a
+ *   retried HTTP body's loss report, which only the ingest body carries and
+ *   which is built here because the identifier rule it applies is.
  * - **Redaction.** `packages/telemetry/src/redaction/**`, applied by
  *   `apps/local-service/src/telemetry/ingest.ts` before anything is persisted or
  *   broadcast (AAP §0.5.2).
@@ -182,14 +190,76 @@ function identifierSchema(): z.ZodString {
 }
 
 /**
+ * The `armedCaptureId` field of both `telemetry.event` transports: the capture a
+ * producer was armed for when it recorded a batch, as an
+ * {@link identifierSchema | identifier}.
+ *
+ * The page agent learns it from `agent.config` and the Node preload from
+ * `server-agent.config`, and on either transport it is **refusal-only**: the
+ * service attributes a batch from its own evidence — the tab's binding for a
+ * browser batch, the credential's project scope for a server batch — and the
+ * open capture window, and reads this value solely to refuse a batch that names
+ * a different capture. It can never choose a session or a capture.
+ *
+ * Exported so that `../http.ts` embeds this factory in the ingest body instead
+ * of restating the bound and its message; the WebSocket payload and the HTTP
+ * body therefore refuse the same values with the same sentence.
+ *
+ * @returns A required identifier schema; each body marks its field `.optional()`.
+ *
+ * @example
+ * ```ts
+ * const body = z.strictObject({ armedCaptureId: armedCaptureIdSchema().optional() });
+ * ```
+ */
+export function armedCaptureIdSchema(): z.ZodString {
+  return identifierSchema();
+}
+
+/**
+ * The `lossReportId` of the HTTP ingest body alone: a producer-chosen identity
+ * for one body's loss report, as an {@link identifierSchema | identifier}.
+ *
+ * The Node preload sends the same serialized body again after a timeout or a
+ * retryable failure, so a loss report the service already recorded — one whose
+ * first attempt was answered with a server error, or whose success reply never
+ * arrived — can reach the service again. The producer therefore keeps this
+ * value stable across every retry of the same report, and the service applies a
+ * report at most once per capture and `lossReportId`, so a retried
+ * `droppedCount` is counted once.
+ *
+ * **HTTP only.** The HTTP transport is the one that retries a body in place, so
+ * {@link telemetryEventPayloadSchema} declares no such field and its strict
+ * shape refuses one. The factory lives here, rather than in `../http.ts`, only
+ * because the identifier rule does: exporting it lets the ingest body embed that
+ * rule instead of restating its bound and message.
+ *
+ * It identifies a report — never a session or a capture — and authorizes
+ * nothing: the service attributes the body exactly as it would without it.
+ *
+ * @returns A required identifier schema; the ingest body marks its field
+ * `.optional()` and accepts it only beside a `droppedCount` above zero.
+ *
+ * @example
+ * ```ts
+ * const body = z.strictObject({ lossReportId: lossReportIdSchema().optional() });
+ * ```
+ */
+export function lossReportIdSchema(): z.ZodString {
+  return identifierSchema();
+}
+
+/**
  * What an empty `telemetry.event` batch that reports no loss is answered with.
  *
  * An empty batch is accepted only as a loss report: a `droppedCount` above zero
- * is the one thing an event-less frame can say (see
- * {@link telemetryEventPayloadSchema}). Without one, the frame costs a round
- * trip, an envelope, a parse and a log line to say nothing, so it is a producer
- * bug rather than a quiet no-op — worth naming as one, because a transport that
- * flushes on a timer is exactly the code that drifts into posting empty frames.
+ * is the one thing an event-less batch can say (see
+ * {@link telemetryEventPayloadSchema}, and `telemetryIngestRequestSchema` in
+ * `../http.ts`, which holds its body to the same rule). Without one, the batch
+ * costs a round trip — a frame and its envelope, or a request — a parse and a
+ * log line to say nothing, so it is a producer bug rather than a quiet no-op —
+ * worth naming as one, because a transport that flushes on a timer is exactly
+ * the code that drifts into posting empty batches.
  */
 const EVENTS_MIN_EXPECTATION =
   'expected at least one telemetry event: an empty batch is accepted only as a loss report with droppedCount above zero';
@@ -230,11 +300,20 @@ const DROPPED_COUNT_EXPECTATION =
   'expected droppedCount to be a whole number of events from 0 within the safe-integer range';
 
 /**
- * How many events a producer discarded before delivery, as a count field.
+ * How many events a producer discarded before delivery, as a count field: the
+ * `droppedCount` of both `telemetry.event` transports.
  *
- * @returns An integer schema from `0` to `Number.MAX_SAFE_INTEGER`.
+ * The page agent reports what its bounded buffer shed while the bridge was
+ * away; the Node preload reports what its exporter discarded for the capture it
+ * was armed for. On either transport the count covers the events lost since
+ * that producer's previous loss report, and the service adds it to the
+ * capture's ledger. Exported so that `../http.ts` embeds this factory in the
+ * ingest body rather than restating its bounds and message.
+ *
+ * @returns An integer schema from `0` to `Number.MAX_SAFE_INTEGER`; each body
+ * marks its field `.optional()`.
  */
-function droppedCountSchema(): z.ZodInt {
+export function droppedCountSchema(): z.ZodInt {
   return z
     .int({ error: DROPPED_COUNT_EXPECTATION })
     .min(0, { error: DROPPED_COUNT_EXPECTATION })
@@ -284,9 +363,21 @@ function nonEmptyEventBatchSchema<S extends z.ZodType>(element: S): z.ZodArray<S
  * own issue. The issue leaves `input` empty and its message is constant, so the
  * rejection names the rule and never a received value.
  *
- * @param parsed The payload's parse state, whose `value` is the parsed batch.
+ * Both transports apply it: {@link telemetryEventPayloadSchema} here, and
+ * `telemetryIngestRequestSchema` in `../http.ts`, which imports it. Any strict
+ * object with an `events` array and an optional `droppedCount` can take it,
+ * because it reads nothing else of the value.
+ *
+ * @param parsed The body's parse state, whose `value` is the parsed batch.
+ *
+ * @example
+ * ```ts
+ * const body = z
+ *   .strictObject({ events: z.array(element), droppedCount: droppedCountSchema().optional() })
+ *   .check(requireLossReportForEmptyBatch);
+ * ```
  */
-function requireLossReportForEmptyBatch(
+export function requireLossReportForEmptyBatch(
   parsed: z.core.ParsePayload<{
     readonly events: readonly unknown[];
     readonly droppedCount?: number | undefined;
@@ -324,10 +415,14 @@ function requireLossReportForEmptyBatch(
  * which validates, keys, redacts, attributes and stores each element. It is the
  * browser path only: the Node preload holds a WebSocket for its
  * `server-agent.config` control frames but posts its spans to
- * `POST /telemetry/ingest` instead, under the `{ projectRoot, events }` body
+ * `POST /telemetry/ingest` instead, under the
+ * `{ projectRoot, events, armedCaptureId?, droppedCount?, lossReportId? }` body
  * `../http.ts` owns — the project root is how a server producer's events are
  * attributed at all, and a credential scoped to one project is what makes that
- * claim trustworthy.
+ * claim trustworthy. The two optional fields and the loss-only rule below mean
+ * the same on that body as on this payload, because it embeds the same
+ * factories and the same check. `lossReportId` is that body's alone
+ * ({@link lossReportIdSchema}): this payload refuses it.
  *
  * **This payload has no `sessionId`, and that is deliberate — do not "fix" it.**
  * It is the only payload in this folder without one, for three independent
@@ -390,7 +485,7 @@ export const telemetryEventPayloadSchema = z
      * The capture the producer was armed for when it recorded these events.
      * Refusal-only context: never used to choose a session or a capture.
      */
-    armedCaptureId: identifierSchema().optional(),
+    armedCaptureId: armedCaptureIdSchema().optional(),
 
     /** Events the producer discarded before delivery since its previous loss report. */
     droppedCount: droppedCountSchema().optional(),

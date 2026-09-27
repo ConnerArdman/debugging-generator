@@ -32,7 +32,11 @@
  *
  * Every collaborator is an injected fake: no network, no filesystem, no child
  * process, no real dev server, and no real wait beyond a few milliseconds —
- * the bounded reload wait is driven by fake timers. The vocabulary is invented
+ * the bounded reload wait is driven by fake timers. The one exception is the
+ * browser-agent registry of one block, which is the service's own agent-ready
+ * ledger (`../main.ts`), fed as the WebSocket router and the binding route
+ * feed it, so a reload is proved end to end from its recorded navigation to
+ * the verdict. The vocabulary is invented
  * and generic — no path, component or route of any real application appears
  * here — and the one token-shaped value is assembled at run time from harmless
  * parts.
@@ -99,7 +103,9 @@ import {
 } from '../dev-server/detect.js';
 import type { LaunchedDevServer } from '../dev-server/launcher.js';
 import { LOG_ERROR_FIELD_KEY } from '../logging.js';
+import { createAgentReadyLedger } from '../main.js';
 import { createCaptureStage } from '../pipeline/stages/capture.js';
+import type { WsConnectionFacts } from '../server/ws.js';
 import {
   CAPTURE_SIGNAL_LABELS,
   FAILURE_COPY_BY_CODE,
@@ -2588,6 +2594,274 @@ describe('evaluateReadiness — the current document after a navigation', () => 
     expect(agents.waitCalls).toEqual([]);
     expect(verdict.satisfied).toBe(true);
     expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// evaluateReadiness — over the service's own agent-ready ledger
+// ---------------------------------------------------------------------------
+
+describe('evaluateReadiness — over the service’s agent-ready ledger', () => {
+  /**
+   * The ledger `../main.ts` hands readiness, written as production writes it:
+   * `agentReady` as the WebSocket router relays a report, `recordNavigation`
+   * as the binding route records a `tab.navigated`. It shares the suite's
+   * constant clock, so every write lands in one millisecond — the case the
+   * ledger's ordering has to get right.
+   */
+  const SETTLE_MS = 300;
+
+  /** The DevTools connection the reports are relayed under. */
+  const RELAY: WsConnectionFacts = {
+    id: 'cli_readinessledger',
+    kind: 'devtools',
+    principal: {
+      role: 'devtools',
+      tokenHash: 'e'.repeat(64),
+      scope: { kind: 'extension', extensionId: 'abcdefghijklmnopabcdefghijklmnop' },
+      issuedAt: 0,
+    },
+  };
+
+  const reactPlan = (): InstrumentationPlan =>
+    plan([action('react-render-tracking', PAGE_ADAPTER_ID)]);
+
+  /**
+   * One macrotask. Up to its verdict an evaluation queues only microtasks
+   * unless it waits on the ledger's timer, so afterwards it has either
+   * answered or is waiting (the control case below proves the first half).
+   */
+  const nextTask = (): Promise<void> =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+  /** Starts an evaluation over `ledger` and reports whether it has answered yet. */
+  function startEvaluation(
+    ledger: ReturnType<typeof createAgentReadyLedger>,
+    adapter: ReturnType<typeof pageAdapter>,
+    progress?: FakeProgress['progress'],
+  ): { readonly verdict: Promise<ReadinessVerdict>; readonly answered: () => boolean } {
+    let answered = false;
+    const verdict = evaluate(
+      {
+        adapters: registryOf(adapter),
+        agents: ledger,
+        navigationSettleMs: SETTLE_MS,
+        reloadWaitMs: 0,
+        ...(progress === undefined ? {} : { progress }),
+      },
+      { plan: reactPlan(), boundTab: BOUND_TAB },
+    ).then((result) => {
+      answered = true;
+      return result;
+    });
+
+    return { verdict, answered: () => answered };
+  }
+
+  it('distrusts the report a same-millisecond reload left behind, waits for the reloaded document and judges it', async () => {
+    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock });
+
+    try {
+      expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
+      // The reload: the URL is unchanged, so only the recorded navigation
+      // tells readiness that doc_first may be the document the tab left.
+      ledger.recordNavigation(TAB_ID);
+      expect(ledger.latestNavigationAt(TAB_ID)).toBe(NOW + 1);
+
+      const { progress, emit } = fakeProgress();
+      const adapter = pageAdapter();
+      const evaluation = startEvaluation(ledger, adapter, progress);
+
+      await nextTask();
+      expect(evaluation.answered()).toBe(false);
+      expect(adapter.calls).toHaveLength(0);
+
+      // The reloaded document reports while readiness waits, installed late.
+      expect(
+        isOk(
+          ledger.agentReady(
+            agentReady({
+              documentId: 'doc_second',
+              producerId: 'prd_second',
+              url: `${APP_ORIGIN}/widgets`,
+              installedBeforeReact: false,
+            }),
+            RELAY,
+          ),
+        ),
+      ).toBe(true);
+      const verdict = await evaluation.verdict;
+
+      expect(verdict.observed.browserAgent).toMatchObject({
+        documentId: 'doc_second',
+        installedBeforeReact: false,
+        observedAt: NOW + 1,
+      });
+      expect(adapter.calls).toHaveLength(1);
+      expect(adapter.calls[0]?.readiness.browserAgent?.documentId).toBe('doc_second');
+      expect(verdict.satisfied).toBe(false);
+      expect(remediationOf(verdict, 'reload-page')).toEqual({
+        kind: 'reload-page',
+        tabId: TAB_ID,
+        documentId: 'doc_second',
+      });
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(verdict)).not.toContain('doc_first');
+    } finally {
+      ledger.close();
+    }
+  });
+
+  it('trusts on sight a report the ledger received after the latest navigation, answering without a wait', async () => {
+    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock });
+
+    try {
+      ledger.recordNavigation(TAB_ID);
+      expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
+      expect(ledger.latestAgentReadyAt(TAB_ID)).toBe(ledger.latestNavigationAt(TAB_ID));
+
+      const adapter = pageAdapter();
+      const evaluation = startEvaluation(ledger, adapter);
+
+      await nextTask();
+      expect(evaluation.answered()).toBe(true);
+      const verdict = await evaluation.verdict;
+
+      expect(verdict.satisfied).toBe(true);
+      expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+      expect(verdict.remediations).toEqual([]);
+      expect(adapter.calls).toHaveLength(1);
+    } finally {
+      ledger.close();
+    }
+  });
+
+  /**
+   * The old document's report, relayed again after the reload was recorded —
+   * the Chrome side re-relays the report it retained for a tab (on a new
+   * binding, say), and a recorded navigation does not clear it there.
+   */
+  function replayFirstDocument(ledger: ReturnType<typeof createAgentReadyLedger>): void {
+    expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
+    ledger.recordNavigation(TAB_ID);
+    expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
+    // The replay confirms nothing: it keeps its pre-navigation receipt.
+    expect(ledger.latestAgentReadyAt(TAB_ID)).toBe(NOW);
+    expect(ledger.latestNavigationAt(TAB_ID)).toBe(NOW + 1);
+  }
+
+  it('still distrusts the report a reload left behind when it is replayed, waits, and judges the reloaded document', async () => {
+    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock });
+
+    try {
+      replayFirstDocument(ledger);
+
+      const { progress, emit } = fakeProgress();
+      const adapter = pageAdapter();
+      const evaluation = startEvaluation(ledger, adapter, progress);
+
+      await nextTask();
+      expect(evaluation.answered()).toBe(false);
+      expect(adapter.calls).toHaveLength(0);
+
+      expect(
+        isOk(
+          ledger.agentReady(
+            agentReady({
+              documentId: 'doc_second',
+              producerId: 'prd_second',
+              url: `${APP_ORIGIN}/widgets`,
+              installedBeforeReact: false,
+            }),
+            RELAY,
+          ),
+        ),
+      ).toBe(true);
+      const verdict = await evaluation.verdict;
+
+      expect(verdict.observed.browserAgent).toMatchObject({
+        documentId: 'doc_second',
+        installedBeforeReact: false,
+        observedAt: NOW + 1,
+      });
+      expect(adapter.calls).toHaveLength(1);
+      expect(adapter.calls[0]?.readiness.browserAgent?.documentId).toBe('doc_second');
+      expect(verdict.satisfied).toBe(false);
+      expect(remediationOf(verdict, 'reload-page')).toEqual({
+        kind: 'reload-page',
+        tabId: TAB_ID,
+        documentId: 'doc_second',
+      });
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(verdict)).not.toContain('doc_first');
+    } finally {
+      ledger.close();
+    }
+  });
+
+  it('waits the settle bound, and no longer, over a replayed report no new document follows, then keeps it', async () => {
+    useFakeTimeouts();
+    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock });
+
+    try {
+      replayFirstDocument(ledger);
+
+      const adapter = pageAdapter();
+      const evaluation = startEvaluation(ledger, adapter);
+
+      await nextTask();
+      expect(evaluation.answered()).toBe(false);
+      await vi.advanceTimersByTimeAsync(SETTLE_MS - 1);
+      await nextTask();
+      expect(evaluation.answered()).toBe(false);
+      expect(adapter.calls).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await nextTask();
+      expect(evaluation.answered()).toBe(true);
+      const verdict = await evaluation.verdict;
+
+      expect(vi.getTimerCount()).toBe(0);
+      // Nothing new announced itself, which readiness reads as a navigation
+      // that stayed within one document: the report is kept.
+      expect(verdict.observed.browserAgent).toMatchObject({
+        documentId: 'doc_first',
+        observedAt: NOW,
+      });
+      expect(verdict.satisfied).toBe(true);
+      expect(verdict.remediations).toEqual([]);
+      expect(adapter.calls).toHaveLength(1);
+    } finally {
+      ledger.close();
+    }
+  });
+
+  it('asks for a reload, not trusting a report on sight, once navigations of other tabs have churned its navigation out of the ledger', async () => {
+    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock, maxTabs: 2 });
+
+    try {
+      expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
+      ledger.recordNavigation(TAB_ID);
+      // Unrelated tabs navigate (recorded bound or not) until the bound tab's
+      // entry is the oldest beyond the bound: its report goes with its stamp.
+      ledger.recordNavigation(TAB_ID + 1);
+      ledger.recordNavigation(TAB_ID + 2);
+      expect(ledger.latestAgentReady(TAB_ID)).toBeUndefined();
+      expect(ledger.latestNavigationAt(TAB_ID)).toBeUndefined();
+
+      const adapter = pageAdapter();
+      const verdict = await startEvaluation(ledger, adapter).verdict;
+
+      expect(verdict.satisfied).toBe(false);
+      expect(verdict.observed.browserAgent).toBeUndefined();
+      expect(adapter.calls[0]?.readiness.browserAgent).toBeUndefined();
+      expect(remediationOf(verdict, 'reload-page')).toEqual({ kind: 'reload-page', tabId: TAB_ID });
+      expect(JSON.stringify(verdict)).not.toContain('doc_first');
+    } finally {
+      ledger.close();
+    }
   });
 });
 

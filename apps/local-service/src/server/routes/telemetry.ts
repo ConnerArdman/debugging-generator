@@ -28,6 +28,7 @@
  * | Credential | `server-agent`, scoped to exactly one `projectRoot` | `devtools`, scoped to the paired extension |
  * | Identity handed to ingest | the body's `projectRoot` **and** the credential's `scopedProjectRoot` | the acting `tabId`, once a live binding the connection's own credential made for that tab is found |
  * | Taken from the request | the claimed project (checked, never trusted) | the envelope's acting `tabId` (checked against the live binding table, never trusted) and its `sessionId` (which must be that binding's); the payload carries no routing |
+ * | Delivery context handed on unchanged | the body's optional `armedCaptureId`, `droppedCount` and `lossReportId` | the payload's optional `armedCaptureId` and `droppedCount` |
  *
  * Neither path accepts the other's context: a `devtools` or `vscode`
  * credential is refused on the HTTP route by `OPERATION_ROLES`, and a
@@ -48,6 +49,31 @@
  * refusal, not a drop: the preload's project root is fixed for its lifetime,
  * so every later batch would mismatch too, and the preload's exporter treats
  * `401`/`403` as "stop posting with this credential", which is exactly right.
+ *
+ * ### The revocation fence: a retired credential ingests nothing
+ *
+ * The principal is a snapshot the auth middleware resolved before the body
+ * was read, and reading a batch awaits the producer for as long as it takes
+ * to send it. A credential retired inside that gap — by a rotation, by the
+ * launcher's revocation when its dev server exits or is stopped, or by its
+ * lease's expiry — must not ingest. So once the body has arrived, and before
+ * the scope check and the delegation, the handler asks
+ * `AuthService.requireLiveCredential` whether that credential is still live;
+ * the fence, the synchronous scope check and the call into ingest follow one
+ * another with no `await` between them. A retired credential is answered
+ * `401`, which the preload's exporter reads as "stop posting with this
+ * credential" — correct for one that no longer exists. A fence that cannot
+ * give a verdict — a store failure, or a throw — fails closed with a
+ * retryable `500`, never a pass.
+ *
+ * The fence sits at the body read because that is the one wait the producer
+ * controls. Ingest's own awaits after it — attribution, request-key hashing
+ * and placement ahead of the write, all in `../../telemetry/ingest.ts` — are
+ * bounded by the service, not by the client, so a retirement landing during
+ * them races only the service's processing of a batch the credential was
+ * still live to deliver. The WebSocket frame path is not fenced here: it
+ * reads no body, and a DevTools credential is retired only by a rotation,
+ * which closes every socket with `4401`, so no later frame arrives on it.
  *
  * ### The relayed-tab rule
  *
@@ -77,28 +103,60 @@
  * The acting tab — and only it — is handed to ingest, which attributes the
  * batch to that tab's session's open capture.
  *
+ * ### The delivery context
+ *
+ * Both producers say which capture a batch was recorded for and how much they
+ * lost on the way, as the optional `armedCaptureId` and `droppedCount` of the
+ * ingest body and of the frame payload (protocol's
+ * `telemetryIngestRequestSchema` and `telemetryEventPayloadSchema`, which embed
+ * the same field schemas). The ingest body alone may also name its loss report,
+ * as the optional `lossReportId`. This module validates none of them beyond the
+ * schema and decides nothing with them: it hands each to ingest exactly as
+ * received, and omits each one the producer omitted.
+ *
+ * - `armedCaptureId` is **refusal-only**. Attribution still comes from the
+ *   transport identity above and the store's open capture window; the value
+ *   can only make ingest refuse a batch recorded for another capture — one a
+ *   producer retried across a capture stop and start — as `stale-capture`,
+ *   answered `202 { accepted: 0, rejected }`. It is producer-supplied, so it is
+ *   never logged or echoed here.
+ * - `droppedCount` is a **loss report**, which ingest adds to the ledger of the
+ *   capture the batch is attributed to. A body or payload with no events is
+ *   accepted only beside a `droppedCount` above zero (a loss-only report,
+ *   answered `202 { accepted: 0 }`); every other empty batch is a `400`.
+ * - `lossReportId` is the **identity of the body's loss report**, which the
+ *   preload keeps stable across every retry and resend of the same report —
+ *   it sends the same serialized body again after a timeout or a retryable
+ *   failure, so a report the service already recorded can arrive again.
+ *   Ingest uses it only to apply a report once per attributed capture; it
+ *   attributes nothing and authorizes nothing. It is accepted only beside a
+ *   `droppedCount` above zero — any other body carrying one is a `400` — and,
+ *   producer-supplied, it is never logged or echoed here.
+ *
  * ## Failure contract
  *
  * Nothing here throws and no returned promise rejects. A batch ingest
  * **dropped** in whole or in part — no open capture, an unresolvable session,
- * a tier its producer may not report — is not a failure: it is an honest
- * report, answered `202 { accepted, rejected }` over HTTP and `ok(report)` to
- * `../ws.ts`, and it is what makes "an unrelated plan collects no backend
- * telemetry" true end to end. Every real failure answers with protocol's error
- * payload at a status the producer can act on:
+ * a capture other than the one it was recorded for, a tier its producer may
+ * not report — is not a failure: it is an honest report, answered
+ * `202 { accepted, rejected }` over HTTP and `ok(report)` to `../ws.ts`, and
+ * it is what makes "an unrelated plan collects no backend telemetry" true end
+ * to end. Every real failure answers with protocol's error payload at a status
+ * the producer can act on:
  *
  * | Outcome | HTTP | Frame |
  * | --- | --- | --- |
  * | accepted (including drops) | `202 { accepted, rejected? }` | `ok(IngestReport)` |
  * | no resolved principal | `401` `UNAUTHORIZED` | — |
  * | wrong role | `403` `UNAUTHORIZED` | `err` `UNAUTHORIZED` |
+ * | credential retired or expired while the body was read | `401` `UNAUTHORIZED` | — |
  * | project outside the credential's scope | `403` `PATH_OUTSIDE_PROJECT` | — |
  * | no acting tab, a conflicting one, or one with no live binding by this credential for the envelope's session | — | `err` `TAB_NOT_BOUND` |
  * | tab's relay carried {@link MALFORMED_FRAME_LIMIT} malformed frames within {@link MALFORMED_FRAME_WINDOW_MS} | — | `err` `RATE_LIMITED`, unread, for that long |
  * | body larger than {@link MAX_TELEMETRY_INGEST_REQUEST_BODY_BYTES}, declared or as it arrives | `413` | — |
  * | body that did not arrive within `../http.ts`'s time ceiling | `408` | — |
  * | unreadable, non-JSON, off-schema or over-size batch | `400` `PROTOCOL_INVALID_MESSAGE` | `err` `PROTOCOL_INVALID_MESSAGE` |
- * | store or internal failure | `500` fixed message and its code | `err` with its code |
+ * | store or internal failure, including a revocation fence that gave no verdict | `500` fixed message and its code | `err` with its code |
  *
  * A `5xx` is reserved for failures a retry can fix: the store's
  * `ON CONFLICT(id) DO NOTHING` makes a retried batch idempotent, so a producer
@@ -109,10 +167,14 @@
  * The ingest body is validated against protocol's `telemetryIngestRequestSchema`
  * through `parseHttpRequest`. When every issue it reports lies *inside* an
  * element of `events` — the envelope (`projectRoot`, the array itself, its
- * bounds, no stray keys) being sound — the batch is not refused whole: the raw
- * array goes to ingest, which validates element by element, counts each
- * malformed element as `invalid` and stores the rest. The response's `rejected`
- * count says how many did not make it. Any envelope-level issue is a `400`.
+ * bounds, the optional `armedCaptureId`, `droppedCount` and `lossReportId`, no
+ * stray keys) being sound — the batch is not refused whole: the raw array goes
+ * to ingest, with the envelope's delivery context, and ingest validates element
+ * by element, counts each malformed element as `invalid` and stores the rest.
+ * The response's `rejected` count says how many did not make it. Any
+ * envelope-level issue — a malformed `armedCaptureId`, `droppedCount` or
+ * `lossReportId`, a `lossReportId` without a loss, or an empty `events` without
+ * a loss report, included — is a `400`.
  *
  * ## Privacy of what this module says
  *
@@ -120,10 +182,11 @@
  * captured is ever echoed. Log records carry an operation id, a status, an
  * error code, a drop reason, a connection id, a tab id and counts — never an
  * event, an attribute value, a URL, a `db.statement`, a `request_key`, a
- * project path or a credential. Validation failures are rendered by
- * protocol's `describeZodIssues` (issue paths and codes, never a rejected
- * value), `JSON.parse`'s own message (which quotes its input) is discarded, and
- * a `500` carries a fixed sentence rather than the failure's own words.
+ * `lossReportId`, a project path or a credential. Validation failures are
+ * rendered by protocol's `describeZodIssues` (issue paths and codes, never a
+ * rejected value), `JSON.parse`'s own message (which quotes its input) is
+ * discarded, and a `500` carries a fixed sentence rather than the failure's own
+ * words.
  *
  * Nor is it written at the rate a producer chooses: every warning and error
  * passes through ingest's `createLogThrottle` (a relayed-frame refusal keyed by
@@ -149,7 +212,7 @@
  *
  * @example Composition in `../http.ts` and `../ws.ts`
  * ```ts
- * const telemetry = createTelemetryRoutes({ ingest, bindings: clients, logger });
+ * const telemetry = createTelemetryRoutes({ ingest, bindings: clients, auth, logger });
  *
  * // http.ts — table-driven registration behind the auth middleware:
  * for (const operation of TELEMETRY_OPERATIONS) {
@@ -207,6 +270,7 @@ import {
 } from '../auth.js';
 import type {
   AuthFailureReason,
+  AuthService,
   AuthenticatedOperation,
   Principal,
   PrincipalRole,
@@ -309,6 +373,15 @@ const EVENTS_FIELD = 'events' satisfies keyof TelemetryIngestRequest;
 /** The field of the ingest body that names the project. */
 const PROJECT_ROOT_FIELD = 'projectRoot' satisfies keyof TelemetryIngestRequest;
 
+/** The optional field of the ingest body that names the capture the batch was recorded for. */
+const ARMED_CAPTURE_ID_FIELD = 'armedCaptureId' satisfies keyof TelemetryIngestRequest;
+
+/** The optional field of the ingest body that reports the producer's loss. */
+const DROPPED_COUNT_FIELD = 'droppedCount' satisfies keyof TelemetryIngestRequest;
+
+/** The optional field of the ingest body that names its loss report, stable across retries. */
+const LOSS_REPORT_ID_FIELD = 'lossReportId' satisfies keyof TelemetryIngestRequest;
+
 /**
  * The fixed message of a `500`: ingest failed for a reason a producer cannot
  * act on in its own words (a store or internal failure). The detail is in the
@@ -328,6 +401,17 @@ const RESPONSE_DRIFT_MESSAGE =
 /** The fixed message of an unexpected failure inside a handler of this module. */
 const HANDLER_FAILURE_MESSAGE =
   'The Debug Generator local service failed unexpectedly while taking a telemetry batch. Its log holds the reason.';
+
+/**
+ * The message of the internal failure a revocation fence that threw becomes.
+ * It never reaches a response body — the `500` carries
+ * {@link INGEST_UNAVAILABLE_MESSAGE} — and names no credential.
+ */
+const LIVE_CREDENTIAL_UNCONFIRMED_MESSAGE =
+  'The credential that authorized this telemetry batch could not be confirmed.';
+
+/** The `details.reason` of {@link LIVE_CREDENTIAL_UNCONFIRMED_MESSAGE}'s failure: not a refusal, so a `500`. */
+const CREDENTIAL_CHECK_THREW = 'credential-check-threw';
 
 /** The refusal message of a frame whose tab this connection's credential did not bind. */
 const FOREIGN_TAB_MESSAGE =
@@ -380,6 +464,16 @@ export interface TelemetryRoutesDeps {
    * credential bound, or for a tab no one has bound.
    */
   readonly bindings: Pick<ClientRegistry, 'bindingForTab' | 'bindingForSession'>;
+
+  /**
+   * The access boundary's revocation fence, consulted by the ingest route once
+   * its body has arrived: a credential retired or expired while the body was
+   * read is refused before anything is handed to ingest (see "The revocation
+   * fence" in the module notes). The field name `auth` matches the sibling
+   * route modules' slices of the same service, so `../http.ts`'s aggregate
+   * asks for one object that satisfies them all.
+   */
+  readonly auth: Pick<AuthService, 'requireLiveCredential'>;
 
   /**
    * Where this module's diagnostics go; defaults to the no-op logger. Records
@@ -623,18 +717,42 @@ function guardRefusalOf(
 }
 
 /**
- * An ingest body whose envelope is sound: the project it claims and the batch
- * to hand ingest.
+ * An ingest body whose envelope is sound: the project it claims, the batch to
+ * hand ingest, and the batch's delivery context.
  *
  * `events` is the validated array when the whole body parsed, and the raw
  * array when only elements failed (see {@link salvageElementFailures}) — in
- * which case ingest counts each malformed element as `invalid`.
+ * which case ingest counts each malformed element as `invalid`. The three
+ * optional fields are present exactly when the body carried them, each
+ * validated by protocol's field schema either way, and `lossReportId` only
+ * ever beside a `droppedCount` above zero.
  */
 interface IngestRequestEnvelope {
   /** The body's `projectRoot`, validated by protocol's field schema. */
   readonly projectRoot: string;
   /** The batch, for ingest to validate element by element. */
   readonly events: readonly unknown[];
+  /**
+   * The body's `armedCaptureId`: the capture the preload was armed for when it
+   * recorded the batch. Refusal-only context — ingest refuses a batch naming
+   * another capture than the open one as `stale-capture` and never uses it to
+   * choose a session or a capture. Producer-supplied, so never logged or echoed.
+   */
+  readonly armedCaptureId?: string;
+  /**
+   * The body's `droppedCount`: spans the preload discarded for that capture
+   * since its previous loss report — the loss report ingest adds to the
+   * attributed capture's ledger.
+   */
+  readonly droppedCount?: number;
+  /**
+   * The body's `lossReportId`: the identity of the body's loss report, which
+   * the preload keeps stable across every retry and resend of that report.
+   * Ingest uses it only to apply a report once per attributed capture; it
+   * attributes, chooses and authorizes nothing. Present only beside a
+   * `droppedCount` above zero. Producer-supplied, so never logged or echoed.
+   */
+  readonly lossReportId?: string;
   /** How many elements protocol's schema refused; `0` when the whole body parsed. */
   readonly refusedElements: number;
 }
@@ -684,9 +802,35 @@ function bodyNotJson(problem: 'unreadable' | 'not-json'): BodyRejection {
   return {
     status: 400,
     error: new DebuggenError('PROTOCOL_INVALID_MESSAGE', message, {
-      hint: 'Send { projectRoot, events } as a JSON object.',
+      hint: 'Send { projectRoot, events } as a JSON object, with the optional armedCaptureId, droppedCount and lossReportId beside them.',
       details: { operation: TELEMETRY_EVENT, problem },
     }),
+  };
+}
+
+/**
+ * The `problem` detail of a body naming a loss report beside no loss — the
+ * rule protocol's request schema states under the `lossReportId` path.
+ */
+const LOSS_REPORT_ID_WITHOUT_LOSS = 'loss-report-id-requires-loss';
+
+/**
+ * The refusal of a body whose elements alone failed protocol's schema but whose
+ * `lossReportId` stands beside no `droppedCount` above zero (see
+ * {@link salvageElementFailures}). It names the rule that refused the body
+ * whole, in constant words, and never the identifier received.
+ */
+function lossReportIdWithoutLoss(): BodyRejection {
+  return {
+    status: 400,
+    error: new DebuggenError(
+      'PROTOCOL_INVALID_MESSAGE',
+      `The ${TELEMETRY_EVENT} request body names a loss report (lossReportId) but reports no loss.`,
+      {
+        hint: 'Send lossReportId only beside a droppedCount above zero, or leave it out.',
+        details: { operation: TELEMETRY_EVENT, problem: LOSS_REPORT_ID_WITHOUT_LOSS },
+      },
+    ),
   };
 }
 
@@ -762,8 +906,10 @@ function readJsonProperty(value: unknown, key: string): unknown {
 
 /**
  * Whether a validation issue lies inside one element of `events` — as opposed
- * to the envelope: the root object, its keys, `projectRoot`, or the array
- * itself (its type or its length bounds).
+ * to the envelope: the root object, its keys, `projectRoot`, the optional
+ * `armedCaptureId`, `droppedCount` and `lossReportId`, or the array itself (its
+ * type, its length bound, or the loss-only rule for an empty one, which
+ * protocol reports under the bare `events` path).
  *
  * @param issue One issue of protocol's request-schema parse.
  */
@@ -780,36 +926,74 @@ function isElementIssue(issue: { readonly path: readonly PropertyKey[] }): boole
  *
  * Re-runs protocol's own request schema to read the structured issue paths,
  * and recovers the body only when **every** issue is element-level and the
- * envelope checks out on its own: `projectRoot` passes the schema's field
- * schema, and `events` is a non-empty array within ingest's ceiling. Nothing
- * is parsed element by element here — ingest does that, with the same strict
+ * envelope checks out on its own: `projectRoot`, `armedCaptureId`,
+ * `droppedCount` and `lossReportId` each pass the schema's own field schema
+ * (the three optional ones also when absent), and `events` is an array within
+ * ingest's ceiling. A malformed `armedCaptureId`, `droppedCount` or
+ * `lossReportId` is an envelope issue, so a body carrying one is never
+ * recovered: it is refused whole, and the value is never read past its field
+ * schema.
+ *
+ * **The loss-report rule is applied here, not read from the issues.** Protocol
+ * admits a `lossReportId` only beside a `droppedCount` above zero, by a check
+ * on the object that runs only on an otherwise valid body — so an element
+ * fault hides it from the issue list, and a body breaking it would otherwise be
+ * recovered with an identity that names no loss. Such a body is refused whole
+ * with {@link lossReportIdWithoutLoss}, which names the rule; the full parse —
+ * not this recovery — refuses it under protocol's own words when no element is
+ * at fault.
+ *
+ * An element-level issue implies at least one element, so the array here is
+ * never empty; the emptiness test states that precondition rather than
+ * trusting it, because an event-less body is legitimate only as a loss-only
+ * report, which the full parse — not this recovery — admits. Nothing is
+ * parsed element by element here — ingest does that, with the same strict
  * ingress schema, and counts each refused element.
  *
  * @param raw The parsed JSON body protocol's schema refused.
- * @returns The envelope to delegate, or `undefined` when the body must be refused whole.
+ * @param whole The refusal of the body as protocol's full parse stated it.
+ * @returns The envelope to delegate; or `whole` when the body must be refused
+ * whole, and the loss-report rule's refusal when that rule is what refuses it.
  */
-function salvageElementFailures(raw: unknown): IngestRequestEnvelope | undefined {
+function salvageElementFailures(
+  raw: unknown,
+  whole: BodyRejection,
+): Result<IngestRequestEnvelope, BodyRejection> {
   const parsed = INGEST_REQUEST_SCHEMA.safeParse(raw);
   if (parsed.success) {
-    return undefined;
+    return err(whole);
   }
 
   const issues = parsed.error.issues;
   if (issues.length === 0 || !issues.every(isElementIssue)) {
-    return undefined;
+    return err(whole);
   }
 
-  const projectRoot = INGEST_REQUEST_SCHEMA.shape.projectRoot.safeParse(
-    readJsonProperty(raw, PROJECT_ROOT_FIELD),
+  const { shape } = INGEST_REQUEST_SCHEMA;
+  const projectRoot = shape.projectRoot.safeParse(readJsonProperty(raw, PROJECT_ROOT_FIELD));
+  const armedCaptureId = shape.armedCaptureId.safeParse(
+    readJsonProperty(raw, ARMED_CAPTURE_ID_FIELD),
   );
+  const droppedCount = shape.droppedCount.safeParse(readJsonProperty(raw, DROPPED_COUNT_FIELD));
+  const lossReportId = shape.lossReportId.safeParse(readJsonProperty(raw, LOSS_REPORT_ID_FIELD));
   const events = readJsonProperty(raw, EVENTS_FIELD);
   if (
     !projectRoot.success ||
+    !armedCaptureId.success ||
+    !droppedCount.success ||
+    !lossReportId.success ||
     !Array.isArray(events) ||
     events.length === 0 ||
     events.length > MAX_INGEST_BATCH
   ) {
-    return undefined;
+    return err(whole);
+  }
+
+  if (
+    lossReportId.data !== undefined &&
+    (droppedCount.data === undefined || droppedCount.data <= 0)
+  ) {
+    return err(lossReportIdWithoutLoss());
   }
 
   const refused = new Set<number>();
@@ -821,17 +1005,26 @@ function salvageElementFailures(raw: unknown): IngestRequestEnvelope | undefined
   }
 
   const batch: readonly unknown[] = events;
-  return { projectRoot: projectRoot.data, events: batch, refusedElements: refused.size };
+  return ok({
+    projectRoot: projectRoot.data,
+    events: batch,
+    ...(armedCaptureId.data === undefined ? {} : { armedCaptureId: armedCaptureId.data }),
+    ...(droppedCount.data === undefined ? {} : { droppedCount: droppedCount.data }),
+    ...(lossReportId.data === undefined ? {} : { lossReportId: lossReportId.data }),
+    refusedElements: refused.size,
+  });
 }
 
 /**
  * Reads and validates the ingest body against protocol's route table, through
  * the same `parseHttpRequest` a client validates its outbound body with — so
  * the service accepts exactly what a producer can send — and recovers a body
- * whose only faults are inside elements.
+ * whose only faults are inside elements. The delivery context
+ * (`armedCaptureId`, `droppedCount`, `lossReportId`) is carried into the
+ * envelope exactly when the body held it.
  *
  * @param c The request context.
- * @returns The envelope to delegate, or the refusal (`400`/`413`).
+ * @returns The envelope to delegate, or the refusal (`400`/`408`/`413`).
  */
 async function readIngestRequest(
   c: Context<ServerEnv>,
@@ -843,15 +1036,18 @@ async function readIngestRequest(
 
   const parsed = parseHttpRequest(TELEMETRY_EVENT, raw.value);
   if (!isErr(parsed)) {
+    const { projectRoot, events, armedCaptureId, droppedCount, lossReportId } = parsed.value;
     return ok({
-      projectRoot: parsed.value.projectRoot,
-      events: parsed.value.events,
+      projectRoot,
+      events,
+      ...(armedCaptureId === undefined ? {} : { armedCaptureId }),
+      ...(droppedCount === undefined ? {} : { droppedCount }),
+      ...(lossReportId === undefined ? {} : { lossReportId }),
       refusedElements: 0,
     });
   }
 
-  const salvaged = salvageElementFailures(raw.value);
-  return salvaged === undefined ? err({ status: 400, error: parsed.error }) : ok(salvaged);
+  return salvageElementFailures(raw.value, { status: 400, error: parsed.error });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -893,6 +1089,7 @@ type TelemetryLogLevel = 'debug' | 'warn' | 'error';
  */
 const LOG_CLASS = Object.freeze({
   missingPrincipal: 'missing-principal',
+  credentialUnconfirmed: 'credential-unconfirmed',
   scopeRefused: 'scope-refused',
   ingestRefused: 'ingest-refused',
   scopeMismatch: 'scope-mismatch',
@@ -997,11 +1194,12 @@ function reportFields(report: IngestReport): LogFields {
  * {@link TelemetryRoutes.handleTelemetryEventFrame}. See the module notes for
  * the status table and the two authorization postures.
  *
- * @param deps The ingest entries, the live binding view and an optional logger.
+ * @param deps The ingest entries, the live binding view, the revocation fence
+ * and an optional logger.
  * @returns The HTTP handler (keyed and named) and the frame handler.
  */
 export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoutes {
-  const { ingest, bindings } = deps;
+  const { ingest, bindings, auth } = deps;
   // Guarded before the child is derived, so neither `child()` nor any level
   // method can throw: a failed write is dropped and counted by the shared
   // best-effort policy of `../../logging.ts`, and the handler's decision stands.
@@ -1183,9 +1381,30 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
   }
 
   /**
+   * The revocation fence: whether the credential that authorized an ingest
+   * request is still live. `requireLiveCredential` reports every failure as a
+   * `Result` and logs its own refusals and store failures; a throw is a defect
+   * below and fails closed — it becomes an `INTERNAL` failure, answered `500`,
+   * never a pass. As with every throw in this module, the thrown value is
+   * neither echoed nor attached.
+   */
+  function requireLive(principal: Principal): Result<void, DebuggenError> {
+    try {
+      return auth.requireLiveCredential(principal);
+    } catch {
+      return err(
+        new DebuggenError('INTERNAL', LIVE_CREDENTIAL_UNCONFIRMED_MESSAGE, {
+          details: { reason: CREDENTIAL_CHECK_THREW },
+        }),
+      );
+    }
+  }
+
+  /**
    * `POST /telemetry/ingest`, steps in order — the order is the security
-   * property: the role before the body is read, the project scope before
-   * anything touches the store.
+   * property: the role before the body is read, the credential's liveness as
+   * soon as the body has arrived, the project scope before anything touches
+   * the store.
    */
   async function serveIngest(c: Context<ServerEnv>): Promise<Response> {
     // The middleware sets `principal` for every non-exempt operation. Its
@@ -1224,9 +1443,32 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
       const body: HttpErrorResponse = toErrorPayload(request.error.error);
       return c.json(body, request.error.status);
     }
-    const { projectRoot, events, refusedElements } = request.value;
+    const { projectRoot, events, armedCaptureId, droppedCount, lossReportId, refusedElements } =
+      request.value;
 
-    // 3. The credential authorises exactly one project; the body's claim must be it.
+    // 3. The body was awaited; the credential that authorized the request may
+    //    have been retired meanwhile. From here to the call into ingest nothing
+    //    is awaited. A refusal is `401`; a fence with no verdict is a `500`.
+    const live = requireLive(agent.value);
+    if (isErr(live)) {
+      if (authFailureReasonOf(live.error) === undefined) {
+        emitThrottled(
+          'error',
+          throttleKey(LOG_CLASS.credentialUnconfirmed, TELEMETRY_EVENT, live.error.code),
+          'the revocation fence could not confirm a telemetry ingest credential; the batch was not taken',
+          { operation: TELEMETRY_EVENT, errorCode: live.error.code, received: events.length },
+        );
+      } else {
+        emit('debug', 'refused telemetry ingest for a credential retired while its body was read', {
+          operation: TELEMETRY_EVENT,
+          errorCode: live.error.code,
+          received: events.length,
+        });
+      }
+      return answerFailure(c, live.error);
+    }
+
+    // 4. The credential authorises exactly one project; the body's claim must be it.
     const scoped = requireProjectScope(agent.value, projectRoot);
     if (isErr(scoped)) {
       emitThrottled(
@@ -1238,11 +1480,19 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
       return answerFailure(c, scoped.error);
     }
 
-    // 4. Delegate: the scope comes from the principal, never from the body.
+    // 5. Delegate: the scope comes from the principal, never from the body.
+    //    The body's delivery context rides along unchanged, as a relayed
+    //    frame's does: `armedCaptureId` can only refuse a batch recorded for
+    //    another capture (`stale-capture`), never choose one, `droppedCount`
+    //    is the preload's loss report, and `lossReportId` only lets ingest
+    //    apply a retried report once.
     const result = await ingest.ingestFromServerAgent({
       projectRoot,
       scopedProjectRoot: agent.value.scope.projectRoot,
       events,
+      ...(armedCaptureId === undefined ? {} : { armedCaptureId }),
+      ...(droppedCount === undefined ? {} : { droppedCount }),
+      ...(lossReportId === undefined ? {} : { lossReportId }),
     });
     if (isErr(result)) {
       const status = telemetryIngestFailureStatus(result.error);
@@ -1278,7 +1528,7 @@ export function createTelemetryRoutes(deps: TelemetryRoutesDeps): TelemetryRoute
       return answerFailure(c, refusalFor('project-out-of-scope'));
     }
 
-    // 5. Answer with counts only: accepted, and rejected when any were.
+    // 6. Answer with counts only: accepted, and rejected when any were.
     const response = parseHttpResponse(TELEMETRY_EVENT, toIngestResponse(report));
     if (isErr(response)) {
       emitThrottled(

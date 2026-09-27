@@ -70,7 +70,19 @@
  * that committed while the mirror was held must stand — no row, no live
  * binding, no announcement, the drop answered as ignored — and the same
  * refused mirror on an open session must restore both stores exactly and
- * return the refusal.
+ * return the refusal. The rig hands the routes the real agent-ready ledger
+ * (`src/main.ts`) as their navigation recorder, as the service does.
+ *
+ * ## Navigations recorded for readiness
+ *
+ * Every `tab.navigated` the route accepts is recorded with the agent-ready
+ * ledger, which is how readiness tells a page-agent report a reload or a
+ * same-URL load left behind — the binding's URL cannot show either. The
+ * navigation suite proves it on the live service by the ledger's debug record
+ * (a reload of a bound tab and a navigation of an unbound tab are recorded, a
+ * foreign credential's and an editor's frame are not); a rig block proves the
+ * stamp itself — after the report the tab held, absent for a refused frame —
+ * and that a recorder which throws never stops the binding from following.
  *
  * ## Vocabulary
  *
@@ -141,11 +153,18 @@ import { DebuggenError, err, isErr, newPanelId, newSessionId } from '@debuggen/s
 import type { CaptureId, Result, SessionId } from '@debuggen/shared';
 import { REDACTION_MARKER, computeCaptureSummary, scrub } from '@debuggen/telemetry';
 
+import { createAgentReadyLedger } from '../../src/main.js';
+import type { AgentReadyLedger } from '../../src/main.js';
 import type { DevtoolsPrincipal } from '../../src/server/auth.js';
 import { SOCKET_READY_STATE_OPEN, createClientRegistry } from '../../src/server/clients.js';
 import type { ClientRegistry, ClientSocket, TabBindingView } from '../../src/server/clients.js';
 import { createBindingRoutes, redactSelectedTarget } from '../../src/server/routes/binding.js';
-import type { BindingConnection, BindingRoutes } from '../../src/server/routes/binding.js';
+import type {
+  BindingConnection,
+  BindingRoutes,
+  NavigationRecorder,
+} from '../../src/server/routes/binding.js';
+import type { WsConnectionFacts } from '../../src/server/ws.js';
 import { createSessionManager } from '../../src/sessions/manager.js';
 import type { SessionManager } from '../../src/sessions/manager.js';
 import { createSessionProgress } from '../../src/sessions/progress.js';
@@ -283,6 +302,14 @@ const BROWSER_ACTION_TYPES = [
  */
 const CONNECTION_CLOSED_LOG = 'a WebSocket connection closed';
 
+/**
+ * The agent-ready ledger's debug record for a committed navigation the binding
+ * route accepted (`src/main.ts`). A live service offers no other view of the
+ * ledger, so its count per tab is how the navigation suite proves the route
+ * feeds readiness's `latestNavigationAt` in production wiring.
+ */
+const NAVIGATION_RECORDED_LOG = 'recorded a committed navigation of a tab';
+
 /** The first tab id this suite hands out; every test takes fresh ones above it. */
 const FIRST_TAB_ID = 4100;
 
@@ -401,6 +428,13 @@ function recordOf(sessionId: SessionId): SessionRecord {
     throw new Error(`Session ${sessionId} does not exist.`);
   }
   return record;
+}
+
+/** Every {@link NAVIGATION_RECORDED_LOG} record the harness captured for `tabId`, in order. */
+function navigationRecordsOf(tabId: number): CapturedLogRecord[] {
+  return service()
+    .logger.withMessage(NAVIGATION_RECORDED_LOG)
+    .filter((record) => record.fields['tabId'] === tabId);
 }
 
 /** The durable binding row of a tab, through the harness's `SessionsRepo`. */
@@ -2243,6 +2277,73 @@ describe(TAB_NAVIGATED, () => {
     expect(announcementsSince(client, ignored.mark)).toEqual([]);
     expect(bindingRows()).toEqual(rowsBefore);
   });
+
+  it('records every navigation it accepts with the readiness ledger — a reload of the bound page, a navigation of an unbound tab — by tab id alone, and none it refuses', async () => {
+    const { created } = suite();
+    const tabId = freshTab();
+    const owner = await openPanel(tabId);
+    const url = pageOf(created, '/orders');
+    expectEstablished(
+      owner.client,
+      await bind(owner.client, { tabId, url }),
+      created.sessionId,
+      tabId,
+    );
+    expect(navigationRecordsOf(tabId)).toEqual([]);
+
+    // A reload commits the same URL again: the binding's URL cannot show it,
+    // so the ledger's record is the one sign readiness gets.
+    const reloaded = await sendSettled(
+      owner.client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId, url }),
+    );
+    expect(reloaded.errors).toEqual([]);
+    const [recorded, ...extra] = navigationRecordsOf(tabId);
+    expect(extra).toEqual([]);
+    expect(recorded?.level).toBe('debug');
+    expect(recorded?.fields['tabId']).toBe(tabId);
+    expect(recorded?.line).not.toContain(created.origin);
+    expect(recorded?.line).not.toContain('/orders');
+    expect(storedBindingOfTab(tabId)).toMatchObject({ sessionId: created.sessionId });
+
+    // A navigation of a tab no session is bound to is recorded too: its next
+    // bind must not inherit a report the navigation left behind.
+    const strayTab = freshTab();
+    const stray = await openPanel(strayTab);
+    const strayed = await sendSettled(
+      stray.client,
+      TAB_NAVIGATED,
+      tabNavigatedPayloadSchema.parse({ tabId: strayTab, url }),
+    );
+    expect(strayed.errors).toEqual([]);
+    expect(navigationRecordsOf(strayTab)).toHaveLength(1);
+    expect(storedBindingOfTab(strayTab)).toBeUndefined();
+
+    // Another extension's credential, on a connection whose hello claims the
+    // bound tab, is refused and records nothing: it has no say in the tab's
+    // readiness. Nor has an editor credential, which is no binding principal.
+    const intruder = await openPanel(tabId);
+    expect(intruder.credential.extensionId).not.toBe(owner.credential.extensionId);
+    expectRefused(
+      await sendSettled(
+        intruder.client,
+        TAB_NAVIGATED,
+        tabNavigatedPayloadSchema.parse({ tabId, url }),
+      ),
+      CODES.TAB_NOT_BOUND,
+    );
+    expectRefused(
+      await sendSettled(
+        created.editor,
+        TAB_NAVIGATED,
+        tabNavigatedPayloadSchema.parse({ tabId, url }),
+      ),
+      CODES.UNAUTHORIZED,
+    );
+    expect(navigationRecordsOf(tabId)).toHaveLength(1);
+    expect(storedBindingOfTab(tabId)).toMatchObject({ sessionId: created.sessionId });
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -2612,6 +2713,11 @@ interface RaceRig {
   /** The real manager: the route's mirrors reach it unless held, and the test ends sessions through it. */
   readonly manager: SessionManager;
   readonly clients: ClientRegistry;
+  /**
+   * The real agent-ready ledger, as the service wires it: the routes'
+   * navigation recorder unless {@link openRaceRig} was given another.
+   */
+  readonly ledger: AgentReadyLedger;
   readonly routes: BindingRoutes;
   /** The registered panel's credential. */
   readonly principal: DevtoolsPrincipal;
@@ -2629,14 +2735,20 @@ interface RaceRig {
  * Builds a {@link RaceRig}: a fresh store in its own `fs.mkdtemp` directory;
  * the real sessions and panels repositories, progress emitter, session manager
  * (configured as the service under test is), reopener and client registry over
- * it, all logging to the harness's capturing logger; and one registered
- * DevTools connection. Whatever was acquired is released should a step refuse.
+ * it, and the agent-ready ledger the service hands the routes as their
+ * navigation recorder, all logging to the harness's capturing logger; and one
+ * registered DevTools connection. Whatever was acquired is released should a
+ * step refuse.
+ *
+ * @param recorder The routes' navigation recorder in place of the ledger, for a
+ * case about a recorder that fails; the ledger is still built and released.
  */
-async function openRaceRig(): Promise<RaceRig> {
+async function openRaceRig(recorder?: NavigationRecorder): Promise<RaceRig> {
   const running = service();
   const logger = running.logger.root;
   const directory = await mkdtemp(join(realpathSync(tmpdir()), RACE_RIG_PREFIX));
   let store: Store | undefined;
+  const ledger = createAgentReadyLedger({ logger });
   try {
     const opened = unwrap(
       openStore({ databasePath: join(directory, 'sessions.sqlite'), logger }),
@@ -2694,6 +2806,7 @@ async function openRaceRig(): Promise<RaceRig> {
         },
       },
       progress,
+      navigations: recorder ?? ledger,
       logger,
     });
 
@@ -2727,6 +2840,7 @@ async function openRaceRig(): Promise<RaceRig> {
       sessions,
       manager,
       clients,
+      ledger,
       routes,
       principal,
       connection: { principal, clientId: panel.id },
@@ -2745,6 +2859,7 @@ async function openRaceRig(): Promise<RaceRig> {
       },
     };
   } catch (cause) {
+    ledger.close();
     if (store !== undefined && !store.isClosed) {
       store.close();
     }
@@ -2753,9 +2868,10 @@ async function openRaceRig(): Promise<RaceRig> {
   }
 }
 
-/** Releases a {@link RaceRig}: its connection, its store and its directory. */
+/** Releases a {@link RaceRig}: its connection, its ledger, its store and its directory. */
 async function closeRaceRig(rig: RaceRig): Promise<void> {
   rig.clients.closeAll();
+  rig.ledger.close();
   if (!rig.store.isClosed) {
     rig.store.close();
   }
@@ -3048,6 +3164,159 @@ describe('binding restoration racing session.end', () => {
       expect(current.armRequests).toEqual([]);
     });
   }
+});
+
+describe('the navigations the binding route records for readiness', () => {
+  let rig: RaceRig | undefined;
+
+  beforeEach(async () => {
+    rig = await openRaceRig();
+  });
+
+  afterEach(async () => {
+    const current = rig;
+    rig = undefined;
+    if (current !== undefined) {
+      await closeRaceRig(current);
+    }
+  });
+
+  /** The current case's rig. @throws Error When `beforeEach` did not build it. */
+  function currentRig(): RaceRig {
+    if (rig === undefined) {
+      throw new Error('The navigation case did not build its rig.');
+    }
+    return rig;
+  }
+
+  it('stamps a reload of a bound tab after the report the tab held, so readiness distrusts that report, and stamps nothing for a malformed or a foreign frame', async () => {
+    const current = currentRig();
+    const bound = await bindRigSession(current);
+    const clientId = current.connection.clientId;
+    if (clientId === undefined) {
+      throw new Error('The race rig registered its panel without a connection id.');
+    }
+    const connection: WsConnectionFacts = {
+      id: clientId,
+      kind: CLIENT_DEVTOOLS,
+      principal: current.principal,
+    };
+    unwrap(
+      current.ledger.agentReady(
+        {
+          tabId: bound.tabId,
+          documentId: 'doc-before-reload',
+          producerId: 'producer-before-reload',
+          url: bound.url,
+          installedBeforeReact: true,
+          reactDetected: true,
+        },
+        connection,
+      ),
+      'Recording the report of the document the reload leaves',
+    );
+    const reportedAt = current.ledger.latestAgentReadyAt(bound.tabId);
+    expect(current.ledger.latestNavigationAt(bound.tabId)).toBeUndefined();
+
+    // The reload: the same URL, kept. The ledger now dates the navigation
+    // after the report, which is what readiness compares.
+    expect(
+      unwrap(
+        await current.routes.handleTabNavigated(
+          tabNavigatedPayloadSchema.parse({ tabId: bound.tabId, url: bound.url }),
+          current.connection,
+        ),
+        'Reloading the bound tab',
+      ),
+    ).toMatchObject({ kind: 'kept' });
+    const navigatedAt = current.ledger.latestNavigationAt(bound.tabId);
+    if (navigatedAt === undefined || reportedAt === undefined) {
+      throw new Error('The ledger holds no report or no navigation for the reloaded tab.');
+    }
+    expect(navigatedAt).toBeGreaterThan(reportedAt);
+    expect(navigationRecordsOf(bound.tabId)).toHaveLength(1);
+
+    // A malformed frame is refused before anything is recorded.
+    const malformedTab = freshTab();
+    expect(
+      refusalOf(
+        await current.routes.handleTabNavigated(
+          { tabId: malformedTab, url: 'not an absolute url' },
+          current.connection,
+        ),
+        'A malformed navigation',
+      ).code,
+    ).toBe(CODES.PROTOCOL_INVALID_MESSAGE);
+    expect(current.ledger.latestNavigationAt(malformedTab)).toBeUndefined();
+    expect(navigationRecordsOf(malformedTab)).toEqual([]);
+
+    // So is a frame about the bound tab from a credential that did not bind it:
+    // the tab's stamp is the reload's, and no second navigation was recorded.
+    const foreign: DevtoolsPrincipal = {
+      ...current.principal,
+      tokenHash: randomBytes(TOKEN_HASH_BYTES).toString('hex'),
+    };
+    expect(
+      refusalOf(
+        await current.routes.handleTabNavigated(
+          tabNavigatedPayloadSchema.parse({ tabId: bound.tabId, url: bound.url }),
+          { principal: foreign },
+        ),
+        'A foreign navigation',
+      ).code,
+    ).toBe(CODES.TAB_NOT_BOUND);
+    expect(current.ledger.latestNavigationAt(bound.tabId)).toBe(navigatedAt);
+    expect(navigationRecordsOf(bound.tabId)).toHaveLength(1);
+    expect(current.armRequests).toEqual([]);
+  });
+
+  it('keeps the binding on a reload whose recorder throws, logging the fault by its name alone', async () => {
+    const failing = await openRaceRig({
+      recordNavigation: () => {
+        throw new RangeError('recorder-fault-sentinel');
+      },
+    });
+
+    try {
+      const bound = await bindRigSession(failing);
+      const logMark = service().logger.records.length;
+
+      expect(
+        unwrap(
+          await failing.routes.handleTabNavigated(
+            tabNavigatedPayloadSchema.parse({ tabId: bound.tabId, url: bound.url }),
+            failing.connection,
+          ),
+          'Reloading the bound tab past a failing recorder',
+        ),
+      ).toMatchObject({ kind: 'kept' });
+      expect(rigBindingRows(failing)).toEqual([
+        {
+          tabId: bound.tabId,
+          sessionId: bound.sessionId,
+          url: bound.url,
+          boundAt: bound.row.boundAt,
+        },
+      ]);
+      expect(rigRecordOf(failing, bound.sessionId).boundTab).toEqual({
+        tabId: bound.tabId,
+        url: bound.url,
+      });
+
+      const warned = bindingLogSince(logMark).filter(
+        (entry) =>
+          entry.level === 'warn' &&
+          entry.message === 'The navigation could not be recorded for readiness',
+      );
+      expect(warned).toHaveLength(1);
+      expect(warned[0]?.fields).toMatchObject({ tabId: bound.tabId, errorName: 'RangeError' });
+      expect(warned[0]?.line).not.toContain('recorder-fault-sentinel');
+      expect(warned[0]?.line).not.toContain(suite().created.origin);
+      expect(bindingLogSince(logMark).filter((entry) => entry.level === 'error')).toEqual([]);
+    } finally {
+      await closeRaceRig(failing);
+    }
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------

@@ -949,14 +949,13 @@ const XHR_SLOT_COUNT = 3;
  * Every `XMLHttpRequest.prototype` property this module has patched and not
  * yet put back, oldest install first.
  *
- * **This list replaces a single tracked prototype, and that is the fix for
- * R1-F23.** The earlier shape held one `xhrPrototype` and one saved original
- * per slot, so an install on a *replaced* constructor's prototype overwrote
- * the only reference to the previous prototype's original — and any patch
- * whose restoration had failed on that prototype became unremovable for the
- * life of the document, which AAP 0.5.1's reversibility guarantee forbids. A
- * record is per prototype *and* per slot, so a new install can never overwrite
- * an unresolved original: it appends.
+ * **A list, never a single tracked prototype.** One tracked `xhrPrototype`
+ * with one saved original per slot would let an install on a *replaced*
+ * constructor's prototype overwrite the only reference to the previous
+ * prototype's original — and any patch whose restoration had failed on that
+ * prototype would become unremovable for the life of the document, while
+ * every patch must stay removable. A record is per prototype *and* per slot,
+ * so a new install can never overwrite an unresolved original: it appends.
  *
  * The trade, stated: memory is held per unrestored patch rather than per
  * module, and the walk in {@link restoreXhrRecords} is O(records) at every

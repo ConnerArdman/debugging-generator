@@ -40,31 +40,53 @@
  *
  * ## Zero hardcoded values
  *
- * Every colour, spacing, radius, shadow, font, focus ring and stacking level
- * resolves to a `var(--dg-*)` token. The only literals permitted anywhere in
- * this package are `0`, `none`, `auto`, `inherit`, `currentColor` and
- * `transparent`. Nothing below uses a hexadecimal or functional colour
- * notation, an absolute or root-relative length, or a bare line-height — not
- * even inside the reset. A value with no token has no legal way to be
- * expressed: add it to the token source, never inline it here.
+ * Every colour, spacing, radius, shadow, font, focus ring, stacking level,
+ * proportion, stroke and extent resolves to a `var(--dg-*)` token. The only
+ * literals permitted anywhere in this package are `0`, `none`, `auto`,
+ * `inherit`, `currentColor` and `transparent`, so every number other than
+ * zero is a token: no declaration below writes a length of any unit, a
+ * percentage, a ratio, a factor, an angle or a bare line-height, and no
+ * hexadecimal or functional colour notation — not even inside the reset. A
+ * value with no token has no legal way to be expressed: add it to the token
+ * source, never inline it here. `src/tokens/tokens.test.ts` fails on any
+ * number other than zero written in a declaration value of either authored
+ * stylesheet, and on any border-width keyword.
  *
- * ## Structural values that are not design decisions
+ * ## Relationships are tokens and keywords, never numbers
  *
- * Purely relational forms encode no design decision and are permitted:
- * percentages such as `100%`, flex ratios such as `flex: 1 1 auto`,
- * `inset(50%)` and unitless SVG geometry (for example `stroke-dasharray`).
- * A duration is not among them: a transition or animation takes its timing
- * from the motion tokens. A visible size is not either: a glyph box takes
- * `--dg-icon-size`, which is font-relative in the token table itself. Nor is
- * an edge's weight: a hairline is `--dg-border-width-hairline` and an emphasis
- * edge `--dg-border-width-marker`, so no `thin`, `medium` or `thick` keyword
- * appears in a border or outline declaration. Nor is a share of a grid's spare
- * width, which is a `--dg-column-share-*` token, or the unit of a measured
- * number, which is `--dg-pixel-unit`. The one length literal in this file is
- * the `1em` clip box of `.dg-visually-hidden`, which paints nothing and so
- * encodes no visual dimension; `src/tokens/tokens.test.ts` names that
- * exemption exactly and fails on any other length literal and on any
- * border-width keyword.
+ * A value that only relates a box to its container or to its siblings is a
+ * design decision like any other, and is written the same way:
+ *
+ * - A share of the containing block is a proportion token:
+ *   `--dg-size-full` for a box that fills or is capped at its container,
+ *   `--dg-size-half` for an inset that meets itself in the middle, and
+ *   `--dg-radius-round` for the radius that turns a square into a circle.
+ * - Flexing is written with keywords. `flex: auto` grows and shrinks from the
+ *   content size and `flex: none` holds it; a rule that needs another basis or
+ *   no growth follows the keyword with only that longhand (`flex-basis: 0`,
+ *   `flex-grow: 0`), and a weighted split pane takes its basis, weight and
+ *   grow scale from the split-layout tokens.
+ * - A grid item that spans every track names the lines its grid declares —
+ *   `grid-column: full` against a template bracketed by
+ *   `[full-start] … [full-end]` — and never counts lines. A subgrid inherits
+ *   those names, so its items span the same way.
+ * - Drawn chart geometry is the SVG stroke tokens: `--dg-stroke-width-*` for
+ *   a weight and `--dg-stroke-dash-*` for a dash pattern.
+ * - A component extent — a scroll cap, the floor of a state box, a loading
+ *   silhouette, a tooltip's or a search field's widest, a chart's legible
+ *   minimum — is its own token, a multiple of a space step stated once in the
+ *   token table. A space step pulled the other way (an inward focus ring, a
+ *   bleed into a cell's padding) is `--dg-space-inverse-*`.
+ * - A duration and a rotation are motion tokens, and so is the extent of the
+ *   shimmer gradient a skeleton sweeps.
+ * - A glyph box takes `--dg-icon-size`, which is font-relative in the token
+ *   table itself, and the clip box of `.dg-visually-hidden` takes
+ *   `--dg-hidden-box-size`.
+ * - An edge's weight is its role: a hairline is `--dg-border-width-hairline`
+ *   and an emphasis edge `--dg-border-width-marker`, so no `thin`, `medium` or
+ *   `thick` keyword appears in a border or outline declaration.
+ * - A share of a grid's spare width is a `--dg-column-share-*` token, and the
+ *   unit of a measured number is `--dg-pixel-unit`.
  *
  * ## Type roles
  *
@@ -181,10 +203,10 @@
 }
 
 /* Replaced and drawn content: block layout removes the inline baseline gap, and
- * the relational cap keeps a wide asset inside its container. */
+ * the full-size cap keeps a wide asset inside its container. */
 :where(img, svg, canvas) {
   display: block;
-  max-width: 100%;
+  max-width: var(--dg-size-full);
 }
 
 [hidden] {
@@ -208,17 +230,17 @@
  * therefore freely overridable.
  * ========================================================================== */
 
-/* A relational anchor, and the reason the `min-height` below is meaningful: a
- * percentage min-height resolves against nothing unless the root box has a
- * definite height. */
+/* A relational anchor, and the reason the `min-height` below is meaningful:
+ * `--dg-size-full` is a percentage, and a percentage min-height resolves
+ * against nothing unless the root box has a definite height. */
 html {
-  height: 100%;
+  height: var(--dg-size-full);
 }
 
 html,
 body {
   /* Relational, so a short panel still paints the surface to the viewport. */
-  min-height: 100%;
+  min-height: var(--dg-size-full);
   background: var(--dg-surface-base);
   color: var(--dg-text-primary);
   /* Type roles are complete `font` shorthands; this is the interface body role. */
@@ -235,12 +257,12 @@ body {
 }
 
 /* The document inset. The user-agent body margin is a length no token governs,
- * and because it sits outside the `min-height: 100%` box above it made every
- * document one margin taller than its viewport, so a panel whose content fits
- * still showed a scrollbar. A token padding inside the border box replaces it:
- * the inset comes from the spacing scale and the surface fits the viewport
- * exactly. A host that composes its own body box (the VS Code webview) resets
- * both declarations in its own stylesheet. */
+ * and because it sits outside the full-height `min-height` box above it made
+ * every document one margin taller than its viewport, so a panel whose content
+ * fits still showed a scrollbar. A token padding inside the border box
+ * replaces it: the inset comes from the spacing scale and the surface fits the
+ * viewport exactly. A host that composes its own body box (the VS Code webview)
+ * resets both declarations in its own stylesheet. */
 body {
   margin: 0;
   padding: var(--dg-space-3);
@@ -349,16 +371,18 @@ body {
  * a table caption a sighted reader infers from the header row, the accessible
  * name of an icon-only control, a live region's status text.
  *
- * `clip-path` does the hiding, so the text stays rendered and announced.
- * `overflow` clips it, `white-space` stops a long string from reflowing the
- * clip box, and the `1em` square bounds the out-of-flow box so it can never
- * extend a scrollable area — relational values throughout, never the absolute
- * hairline or far-off-canvas idioms. */
+ * `clip-path` does the hiding, so the text stays rendered and announced: an
+ * inset of `--dg-size-half` from every side meets itself in the middle and
+ * leaves no visible area at all. `overflow` clips it, `white-space` stops a
+ * long string from reflowing the clip box, and the `--dg-hidden-box-size`
+ * square — font-relative — bounds the out-of-flow box so it can never extend a
+ * scrollable area: tokens throughout, never the absolute hairline or
+ * far-off-canvas idioms. */
 .dg-visually-hidden {
   position: absolute;
-  inline-size: 1em;
-  block-size: 1em;
-  clip-path: inset(50%);
+  inline-size: var(--dg-hidden-box-size);
+  block-size: var(--dg-hidden-box-size);
+  clip-path: inset(var(--dg-size-half));
   overflow: hidden;
   white-space: nowrap;
   border: 0;

@@ -27,9 +27,11 @@
  * state container; the worker's reload offer is read from `./state/connection`,
  * which holds it. The `useState` hooks below are presentation-only and
  * duplicate nothing — whether the developer dismissed the pairing dialog,
- * whether the live tail is collapsed, whether the reload notice's own consent
- * is in flight, and where the selection on screen was raised (the store keeps
- * the selection, not its origin; see {@link SelectionProvenance}).
+ * whether they asked for the service-address dialog, the service-address
+ * accessor resolved once for the document, whether the live tail is
+ * collapsed, whether the reload notice's own consent is in flight, and where
+ * the selection on screen was raised (the store keeps the selection, not its
+ * origin; see {@link SelectionProvenance}).
  *
  * ## Layout (AAP 0.7.3)
  *
@@ -37,7 +39,8 @@
  * Stack (vertical)                           the one top-level arrangement
  * ├── Header → <header>                      wordmark · ConnectionStatus · session title
  * │                                          and status badge · TargetPicker · CaptureControls
- * ├── PairDialog                             while the connection says "Not paired"
+ * ├── PairDialog                             while the connection says "Not paired", or
+ * │                                          in address mode on the developer's request
  * ├── Split                                  the body and the right drawer
  * │   ├── <main>                             lastError notice · EmptyPanel, or
  * │   │                                      the reload notice (while offered) +
@@ -65,11 +68,23 @@
  * the top-level `Stack`, outside every inert subtree; its own focus containment
  * catches focus that is moved programmatically. The renderer ships no overlay
  * primitive, so the dialog stays an in-flow card directly under the header —
- * modality comes from the inert background, not from a scrim.
+ * modality comes from the inert background, not from a scrim. All of this
+ * holds for both of the dialog's modes: one `modalOpen` flag drives every
+ * `inert` and the focus restoration below.
+ *
+ * The dialog opens in pairing mode by itself while the connection says "Not
+ * paired", and in address mode when the developer chooses the pill's "Change
+ * service address…" control — offered beside "Reconnecting…" and "Service not
+ * running", and only where this document has the extension storage the
+ * address is kept in — so a paired developer whose service moved to another
+ * port points the extension at it without pairing again. Not paired, the
+ * pairing mode takes precedence and the address request is withdrawn, so the
+ * address dialog never reopens on its own after a pairing episode.
  *
  * Focus on close lands on what opened the dialog — the connection pill's
- * "Pair…" control, whose `<header>` stops being inert in the same commit that
- * removes the dialog — or on `<main>` when the dialog opened by itself.
+ * "Pair…" or "Change service address…" control, whose `<header>` stops being
+ * inert in the same commit that removes the dialog — or on `<main>` when the
+ * dialog opened by itself or its opener has left the header.
  *
  * ## States (AAP 0.7.3, 0.5.5)
  *
@@ -93,7 +108,12 @@
  * - **Unbound, or the tab navigated away** — `ConnectionStatus` renders the
  *   binding line through `formatTabLeftMessage`; nothing here words it.
  * - **Not paired / service not running / reconnecting** — the pill's own
- *   recovery affordances, plus `PairDialog` for pairing.
+ *   recovery affordances, plus `PairDialog` for pairing and, once paired, for
+ *   changing the service address.
+ * - **A command failed** — the non-blocking `lastError` notice above the body,
+ *   with "Retry", which re-reads the session from the service (a renewed
+ *   failure sets the notice again), and "Dismiss". Either removes the notice
+ *   and moves focus to `<main>`, so focus is never dropped to the document.
  *
  * Every state renders with `chrome.devtools` undefined, which is how the browser
  * suite opens the panel page directly as an extension page: the element-target
@@ -159,7 +179,11 @@
  *
  * - No `WebSocket`, no `fetch`, no HTTP client: the port owned by
  *   `./state/connection` is the panel's only channel, and every request here is
- *   one of its typed port requests. Protocol usage is types only.
+ *   one of its typed port requests. Protocol usage is types only. The one
+ *   other thing the panel writes is the non-secret service-address setting in
+ *   `chrome.storage.local`, through the accessor `PairDialog` resolves; the
+ *   worker follows that setting from storage and moves its socket and every
+ *   HTTP call to the new address itself.
  * - No validation, normalisation or repair of panel specifications: the service
  *   validated what it pushed, and `PanelHost` renders validated specs only.
  * - No node filtering and no branching on a panel's title or the session's
@@ -170,7 +194,7 @@
  *   primitive. The raw elements are the landmarks no primitive renders:
  *   `<main>`, `<aside>` and the live tail's `<section>`; their only attributes
  *   beyond landmark semantics and focus management are `inert` while the
- *   pairing dialog is open.
+ *   dialog is open, in either mode.
  *
  * @module apps/chrome-extension/src/panel/App
  */
@@ -220,7 +244,8 @@ import type {
 } from './components/EventDetails';
 import { Header } from './components/Header';
 import { LiveTail } from './components/LiveTail';
-import { PairDialog } from './components/PairDialog';
+import { PairDialog, resolveServiceEndpointAccessor } from './components/PairDialog';
+import type { PairDialogMode } from './components/PairDialog';
 import { PanelView } from './components/PanelView';
 import type { PanelViewError, PanelViewStatus } from './components/PanelView';
 import { SessionSummary } from './components/SessionSummary';
@@ -320,6 +345,15 @@ const LAST_ERROR_TITLE = 'A Debug Generator request did not complete';
 
 /** The label of the control that dismisses the non-blocking failure notice. */
 const DISMISS_LABEL = 'Dismiss';
+
+/** The label of the non-blocking failure notice's retry control. */
+const LAST_ERROR_RETRY_LABEL = 'Retry';
+
+/**
+ * What the non-blocking failure notice's retry does, stated beneath its message: it re-reads the
+ * session rather than repeating the failed request, which only its own control can do.
+ */
+const LAST_ERROR_RETRY_HINT = 'Retry reloads this panel’s session state from the local service.';
 
 /** The retry control's label on the session-failure notice: it re-reads the session. */
 const RELOAD_SESSION_LABEL = 'Reload session state';
@@ -608,7 +642,7 @@ function isDevtoolsAvailable(): boolean {
  * presented in its own words: its code, message, hint and correlation `ref`
  * are kept. Those are the panel connection's rejections (whose `refused` form
  * carries the worker's schema-validated protocol error, worded by the service
- * without payloads, tokens or URL query values, AAP 0.5.2) and the panel's own
+ * without payloads, tokens or URL query values) and the panel's own
  * fixed-copy errors. Anything else — a plain `Error`, a thrown string, or a
  * value that only claims the error brand — is an unexpected exception whose
  * text could carry a file path, a SQL statement or a credential, so none of it
@@ -1762,7 +1796,7 @@ export type SelectionProvenance =
  * The panel a selection's stored lookup is bound to, or `undefined` for a
  * live read — the service answers a named panel from the capture that panel
  * was generated from, and an unnamed one from the open capture, else the most
- * recent (AAP §0.4.2).
+ * recent.
  *
  * - **Raised by a panel** → that panel, always. A panel's evidence is never
  *   read live, whatever the live tail holds.
@@ -2367,8 +2401,8 @@ function readLastError(): ErrorPayload | undefined {
 }
 
 /**
- * Return focus after a transient region — the drawer or the pairing dialog —
- * closed, unless the developer already moved it somewhere that still exists:
+ * Return focus after a transient region — the drawer or the dialog, in either
+ * mode — closed, unless the developer already moved it somewhere that still exists:
  * to `opener` while it is still in the document, otherwise to `fallback`.
  *
  * @param opener What held focus when the region opened, if anything.
@@ -2504,26 +2538,54 @@ export function App(props: AppProps): ReactElement {
   const sessionBound = connection.binding.kind === 'bound';
 
   // Presentation-only state, duplicating nothing in the store: the pairing
-  // dialog dismissed for the current connection episode, and the tail's
-  // disclosure. `lastChangeAt` moves on every connection change, so a
-  // dismissal holds only until the connection changes again.
+  // dialog dismissed for the current connection episode, whether the developer
+  // asked for the address dialog, and the tail's disclosure. `lastChangeAt`
+  // moves on every connection change, so a dismissal holds only until the
+  // connection changes again.
   const [pairDismissedAt, setPairDismissedAt] = useState<number | undefined>(undefined);
+  const [addressDialogRequested, setAddressDialogRequested] = useState(false);
   const [tailCollapsed, setTailCollapsed] = useState(false);
+
+  // The service-address setting, resolved once: whether this document has
+  // extension storage cannot change while it is loaded. It decides whether the
+  // pill offers "Change service address…" at all, and the dialog works with
+  // this same accessor in both of its modes.
+  const [serviceEndpoint] = useState(() => resolveServiceEndpointAccessor());
 
   const pairDialogOpen =
     connection.status === 'not-paired' && pairDismissedAt !== connection.lastChangeAt;
-  // What held focus when the developer asked for the pairing dialog — the
-  // connection pill's "Pair…" control. Recorded here, in the click handler and
-  // before the header turns inert, so the opener is known however the platform
-  // treats focus on an element that becomes inert; the close effect below
-  // returns focus to it and forgets it.
-  const pairOpenerRef = useRef<Element | null>(null);
+  // A pairing episode withdraws the address request, so the address dialog
+  // never reopens on its own once the pairing dialog has come and gone.
+  // Adjusted during render — React's documented pattern for state derived from
+  // a changed value — rather than in an effect, so no frame ever renders the
+  // withdrawn request.
+  if (addressDialogRequested && connection.status === 'not-paired') {
+    setAddressDialogRequested(false);
+  }
+  // Not paired, the pairing dialog — which carries the address field itself —
+  // takes precedence, so the two modes are never both open.
+  const addressDialogOpen = addressDialogRequested && connection.status !== 'not-paired';
+  const modalOpen = pairDialogOpen || addressDialogOpen;
+  const dialogMode: PairDialogMode = addressDialogOpen ? 'address' : 'pair';
+  // What held focus when the developer asked for a dialog — the connection
+  // pill's "Pair…" or "Change service address…" control. Recorded here, in the
+  // click handler and before the header turns inert, so the opener is known
+  // however the platform treats focus on an element that becomes inert; the
+  // close effect below returns focus to it and forgets it.
+  const modalOpenerRef = useRef<Element | null>(null);
   const openPairDialog = useCallback(() => {
-    pairOpenerRef.current = document.activeElement;
+    modalOpenerRef.current = document.activeElement;
     setPairDismissedAt(undefined);
   }, []);
   const closePairDialog = useCallback(() => {
     setPairDismissedAt(getPanelSnapshot().connection.lastChangeAt);
+  }, []);
+  const openAddressDialog = useCallback(() => {
+    modalOpenerRef.current = document.activeElement;
+    setAddressDialogRequested(true);
+  }, []);
+  const closeAddressDialog = useCallback(() => {
+    setAddressDialogRequested(false);
   }, []);
   const toggleTail = useCallback(() => {
     setTailCollapsed((collapsed) => !collapsed);
@@ -2569,26 +2631,43 @@ export function App(props: AppProps): ReactElement {
     [clearSelectedEvent],
   );
 
-  // Focus when the pairing dialog closes. `PairDialog` first returns focus to
-  // the element it found focused on open; this effect's cleanup runs after it
-  // (a child's effects are torn down before its parent's) and settles the
-  // rest: when focus still sits on the document body, it goes to the opener
+  // Focus when the dialog closes, in either mode. `PairDialog` first returns
+  // focus to the element it found focused on open; this effect's cleanup runs
+  // after it (a child's effects are torn down before its parent's) and settles
+  // the rest: when focus still sits on the document body, it goes to the opener
   // recorded above — no longer inert, because the header's `inert` was removed
   // in the same commit that removed the dialog — and, for a dialog that opened
-  // by itself, to the panel body. `restoreFocus` leaves focus alone once it
-  // rests anywhere else, so the two never contend.
+  // by itself or whose opener is gone (the address control leaves the header
+  // once the connection recovers), to the panel body. `restoreFocus` leaves
+  // focus alone once it rests anywhere else, so the two never contend. Keyed
+  // on the modal as a whole, so a switch from the address mode to pairing
+  // keeps the opener until the dialog finally closes.
   useEffect(() => {
-    if (!pairDialogOpen) {
+    if (!modalOpen) {
       // Closed: an opener recorded for an earlier dialog must not outlive it.
-      pairOpenerRef.current = null;
+      modalOpenerRef.current = null;
       return undefined;
     }
-    const opener = pairOpenerRef.current;
+    const opener = modalOpenerRef.current;
     const main = mainRef.current;
     return () => {
       restoreFocus(opener, main);
     };
-  }, [pairDialogOpen]);
+  }, [modalOpen]);
+
+  // The non-blocking failure notice's two controls. Either one removes the
+  // notice, and with it the focused control, so focus moves to the panel body
+  // rather than being dropped to the document. Retry re-reads the session from
+  // the service; a renewed failure sets the notice again.
+  const retryLastError = useCallback(() => {
+    setLastError(undefined);
+    mainRef.current?.focus();
+    reloadSessionState();
+  }, []);
+  const dismissLastErrorNotice = useCallback(() => {
+    dismissLastError();
+    mainRef.current?.focus();
+  }, []);
 
   const spec = panel?.spec;
   const sessionStatus = session?.status;
@@ -2653,7 +2732,7 @@ export function App(props: AppProps): ReactElement {
         ref={drawerRef}
         tabIndex={-1}
         aria-label={DRAWER_LABEL}
-        inert={pairDialogOpen}
+        inert={modalOpen}
         onKeyDown={handleDrawerKeyDown}
       >
         <Section variant="card">
@@ -2680,6 +2759,8 @@ export function App(props: AppProps): ReactElement {
             serviceStartCommand={SERVICE_START_COMMAND}
             pairingDialogOpen={pairDialogOpen}
             onRequestPairing={openPairDialog}
+            addressDialogOpen={addressDialogOpen}
+            onRequestAddressChange={serviceEndpoint === undefined ? undefined : openAddressDialog}
           />
         }
         targetPicker={
@@ -2707,22 +2788,28 @@ export function App(props: AppProps): ReactElement {
         }
         sessionTitle={session?.question}
         sessionStatus={sessionStatus}
-        inert={pairDialogOpen}
+        inert={modalOpen}
       />
 
       {/* Directly under the header, so the dialog is in view the moment the
-          connection reports "Not paired", whatever the body holds below it.
-          The only region never made inert: every sibling below and the header
-          above carry `inert` while it is open. */}
+          connection reports "Not paired" — or the developer asks to change
+          the service address — whatever the body holds below it. The only
+          region never made inert: every sibling below and the header above
+          carry `inert` while it is open. One dialog serves both modes; it
+          keys its body by the mode, so a switch from the address mode to
+          pairing (the connection reported "Not paired" meanwhile) starts a
+          fresh dialog. */}
       <PairDialog
-        open={pairDialogOpen}
-        onClose={closePairDialog}
+        mode={dialogMode}
+        open={modalOpen}
+        onClose={dialogMode === 'address' ? closeAddressDialog : closePairDialog}
         submitCode={submitPairingCode}
         onPaired={reloadSessionState}
+        serviceEndpoint={serviceEndpoint}
       />
 
       <Split weights={drawerOpen ? DRAWER_PANE_WEIGHTS : undefined} align="start">
-        <main ref={mainRef} tabIndex={-1} inert={pairDialogOpen}>
+        <main ref={mainRef} tabIndex={-1} inert={modalOpen}>
           <Stack direction="vertical" gap={3}>
             {lastError === undefined ? null : (
               <Stack direction="vertical" gap={2} align="start">
@@ -2730,9 +2817,12 @@ export function App(props: AppProps): ReactElement {
                   title={LAST_ERROR_TITLE}
                   message={lastError.message}
                   code={lastError.code}
+                  hint={LAST_ERROR_RETRY_HINT}
                   announce="polite"
+                  onRetry={retryLastError}
+                  retryLabel={LAST_ERROR_RETRY_LABEL}
                 />
-                <Button variant="secondary" size="sm" onClick={dismissLastError}>
+                <Button variant="secondary" size="sm" onClick={dismissLastErrorNotice}>
                   {DISMISS_LABEL}
                 </Button>
               </Stack>
@@ -2788,7 +2878,7 @@ export function App(props: AppProps): ReactElement {
       </Split>
 
       {hasSession ? (
-        <section aria-label={LIVE_TAIL_REGION_LABEL} inert={pairDialogOpen}>
+        <section aria-label={LIVE_TAIL_REGION_LABEL} inert={modalOpen}>
           <LiveTail
             events={liveTail}
             droppedCount={liveTailDropped}

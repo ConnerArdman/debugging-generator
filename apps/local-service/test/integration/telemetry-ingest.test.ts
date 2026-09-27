@@ -47,6 +47,23 @@
  *   its own repository instance, out of the suite's reach, so its total is
  *   read from the record ingest writes when the ledger accepts a report, then
  *   from the persisted coverage.
+ * - **Server-tier capture identity and loss.** A `POST /telemetry/ingest` body
+ *   naming the open capture as `armedCaptureId` is stored under it; one naming
+ *   a capture that has since closed — a preload batch retried across a stop and
+ *   a start — is dropped whole as `stale-capture` while the next capture is
+ *   open, storing nothing and recording none of its loss; a body naming no
+ *   capture is attributed as before; and a malformed `armedCaptureId` or
+ *   `droppedCount` is refused `400`. A body's `droppedCount`, beside events or
+ *   alone, reaches the open capture's ledger, so the stopped capture's
+ *   persisted coverage counts it and is not complete.
+ * - **A retried loss report counts once.** The same body sent again — events,
+ *   `droppedCount` and `lossReportId` byte for byte, as the preload retries a
+ *   post whose acknowledgement was lost — is answered `202` both times, stores
+ *   its events once and adds its loss to the ledger once. Two reports under
+ *   different ids both count, a report without an id counts on every
+ *   delivery, and a `lossReportId` beside no loss is refused `400` with
+ *   nothing stored or recorded. The stopped capture's persisted coverage holds
+ *   the single-counted total, and no report id is echoed or logged.
  *
  * ## The sentinel protocol (AAP §0.10 — no committed secrets)
  *
@@ -813,17 +830,30 @@ interface IngestResponse {
 }
 
 /**
- * Posts a batch to `POST /telemetry/ingest` as the dev-server preload would,
- * through the raw transport so the verbatim response body joins the leak
- * haystacks and a deliberately refused body (over-size, out of scope) can be
- * sent at all.
+ * The optional delivery context of an ingest body: the capture the preload was
+ * armed for, its loss report and that report's identity. Typed `unknown` so a
+ * deliberately malformed value can be sent too.
+ */
+interface IngestDeliveryContext {
+  readonly armedCaptureId?: unknown;
+  readonly droppedCount?: unknown;
+  readonly lossReportId?: unknown;
+}
+
+/**
+ * Posts a batch to `POST /telemetry/ingest` as the dev-server preload would —
+ * `{ projectRoot, events }`, with the delivery context's fields beside them
+ * when given — through the raw transport so the verbatim response body joins
+ * the leak haystacks and a deliberately refused body (over-size, out of scope,
+ * a malformed field) can be sent at all.
  */
 async function postIngest(
   token: string,
   projectRoot: string,
   events: readonly unknown[],
+  context: IngestDeliveryContext = {},
 ): Promise<IngestResponse> {
-  const body = { projectRoot, events: [...events] };
+  const body = { projectRoot, events: [...events], ...context };
   postedBodies.push(JSON.stringify(body));
   const response = await current().harness.rawFetch('telemetry.event', { token, body });
   httpBodies.push(response.text);
@@ -2221,9 +2251,37 @@ const STALE_LOSS = 11;
 const LOSS_RECORDED_MESSAGE = 'a producer reported discarded events; recorded against the capture';
 
 /**
- * Placed after every other suite on purpose: the stale-capture case below
- * writes the file's only `stale-capture` drop, and the drop-vocabulary case
- * above reads every drop record the file wrote before it ran.
+ * `records` without the trailing summaries an ingest log throttle may write
+ * for an earlier suite's held-back records: those report old batches, not
+ * the batch under test.
+ */
+function withoutTrailingSummaries(records: readonly CapturedLogRecord[]): CapturedLogRecord[] {
+  return records.filter((record) => record.fields.trailingSummary !== true);
+}
+
+/** The ledger totals ingest logged for `captureId` since `from`. */
+function recordedLossTotalsFor(from: number, captureId: string): unknown[] {
+  return ingestRecords(from)
+    .filter(
+      (record) => record.message === LOSS_RECORDED_MESSAGE && record.fields.captureId === captureId,
+    )
+    .map((record) => record.fields.captureDroppedEvents);
+}
+
+/**
+ * Every loss report ingest handed to its ledger since `from`, whichever
+ * capture and whatever the ledger answered: each such attempt is logged once
+ * with its `droppedEvents` count.
+ */
+function recordedLossReports(from: number): CapturedLogRecord[] {
+  return ingestRecords(from).filter((record) => typeof record.fields.droppedEvents === 'number');
+}
+
+/**
+ * Placed after every other suite but the server-tier one on purpose: the
+ * stale-capture case below writes a `stale-capture` drop, and the
+ * drop-vocabulary case above reads every drop record the file wrote before it
+ * ran.
  */
 describe('loss-only reports', () => {
   /** What the setup establishes for this suite. */
@@ -2257,33 +2315,9 @@ describe('loss-only reports', () => {
     return devtools.errorsFor(receipt.id).map((error) => error.code);
   }
 
-  /**
-   * `records` without the trailing summaries an ingest log throttle may write
-   * for an earlier suite's held-back records: those report old batches, not
-   * the frame under test.
-   */
-  function withoutTrailingSummaries(records: readonly CapturedLogRecord[]): CapturedLogRecord[] {
-    return records.filter((record) => record.fields.trailingSummary !== true);
-  }
-
   /** The ledger totals ingest logged for the suite's capture since `from`. */
   function recordedLossTotals(from: number): unknown[] {
-    const { captureId } = lossTabOf();
-    return ingestRecords(from)
-      .filter(
-        (record) =>
-          record.message === LOSS_RECORDED_MESSAGE && record.fields.captureId === captureId,
-      )
-      .map((record) => record.fields.captureDroppedEvents);
-  }
-
-  /**
-   * Every loss report ingest handed to its ledger since `from`, whichever
-   * capture and whatever the ledger answered: each such attempt is logged once
-   * with its `droppedEvents` count.
-   */
-  function recordedLossReports(from: number): CapturedLogRecord[] {
-    return ingestRecords(from).filter((record) => typeof record.fields.droppedEvents === 'number');
+    return recordedLossTotalsFor(from, lossTabOf().captureId);
   }
 
   beforeAll(async () => {
@@ -2437,5 +2471,665 @@ describe('loss-only reports', () => {
     // The connection speaks only for this tab, whose capture stored nothing:
     // no tail frame ever reached it, the stop barrier's wait included.
     expect(devtools.received.filter(isTailFrame), 'nothing was ever tailed').toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Server-tier capture identity and loss
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The inspected tab of the server-tier suite's first session. */
+const SERVER_FIRST_TAB_ID = 4_220;
+
+/** The inspected tab of the server-tier suite's second session, opened once the first ended. */
+const SERVER_SECOND_TAB_ID = 4_221;
+
+/** The loss the preload reports beside a batch for the open capture. */
+const SERVER_BATCH_LOSS = 5;
+
+/** The loss the preload reports alone, as a loss-only body for the open capture. */
+const SERVER_LOSS_ONLY = 2;
+
+/** The loss a retried stale batch claims: a different number, so the ledger total tells them apart. */
+const SERVER_STALE_LOSS = 13;
+
+/** The inspected tab of the replay session, opened on a project of its own. */
+const SERVER_REPLAY_TAB_ID = 4_222;
+
+/** The loss a loss-carrying body reports, sent again as the retry of a lost acknowledgement. */
+const REPLAYED_BATCH_LOSS = 3;
+
+/** The loss a loss-only body reports, sent again the same way. */
+const REPLAYED_LOSS_ONLY = 2;
+
+/** The loss each of two distinct reports claims: one count under two ids. */
+const DISTINCT_REPORT_LOSS = 4;
+
+/** The loss a report naming no `lossReportId` claims, sent twice. */
+const UNNAMED_REPORT_LOSS = 1;
+
+/**
+ * Placed last on purpose, like the loss-only suite: its stale-capture case
+ * writes a `stale-capture` drop, and the drop-vocabulary case above reads
+ * every drop record the file wrote before it ran.
+ *
+ * The narrative runs in declaration order, as a preload's life does. Capture
+ * A of one session is open and a batch naming it is stored under it. A is then
+ * stopped and its session ended — captures are exclusive per project, and a
+ * capture that holds evidence moves its session on to analysis, so the next
+ * capture on the project belongs to a second session — and capture B of that
+ * second session opens on the same project, under the same server-agent
+ * credential. A batch the preload recorded for A and retried now is refused
+ * rather than landing in B. Everything after that is posted while B is open.
+ */
+describe('server-tier capture identity and loss', () => {
+  /** One readied session of the suite and its open capture. */
+  interface ServerCapture {
+    readonly sessionId: string;
+    readonly captureId: string;
+  }
+
+  /** What the setup and the narrative establish, in order. */
+  interface ServerTier {
+    /** The project copy both sessions are opened on. */
+    readonly projectRoot: string;
+    /** The preload's server-agent credential, scoped to that project. */
+    readonly token: string;
+    /** The first session and its capture A, stopped by the stale-capture case. */
+    readonly first: ServerCapture;
+  }
+
+  let tier: ServerTier | undefined;
+  let second: ServerCapture | undefined;
+
+  /** The events stored under capture B by the narrative, in the order they were posted. */
+  const storedUnderSecond: string[] = [];
+
+  /** The suite's state, or a failure naming the setup that did not run. */
+  function tierOf(): ServerTier {
+    if (tier === undefined) {
+      throw new Error('The server-tier project was not set up.');
+    }
+    return tier;
+  }
+
+  /** The second session and its capture B, or a failure naming the case that opens it. */
+  function secondOf(): ServerCapture {
+    if (second === undefined) {
+      throw new Error('The second capture was not opened by the stale-capture case.');
+    }
+    return second;
+  }
+
+  /** Fails unless every event of `events` is stored under `capture`'s session and capture. */
+  function expectStoredUnder(
+    events: readonly TelemetryEventIngress[],
+    capture: ServerCapture,
+  ): void {
+    for (const event of events) {
+      const row = rawRow(event.id);
+      expect(row, `${event.id} was stored`).toBeDefined();
+      expect(row?.sessionId, `${event.id} belongs to the capture's session`).toBe(
+        capture.sessionId,
+      );
+      expect(row?.captureId, `${event.id} belongs to the capture`).toBe(capture.captureId);
+    }
+  }
+
+  /**
+   * Creates a session on the suite's project and brings it to `ready` the way
+   * the product does — a tab bound to it whose page agent reported a document
+   * hooked before React, with the preload's control connection already
+   * present — then opens its capture.
+   */
+  async function openCapture(projectRoot: string, tabId: number): Promise<ServerCapture> {
+    const { harness } = current();
+    const session = recordResponse(
+      await harness.createSession({ projectRoot, question: 'Why is the report slow to load?' }),
+    );
+
+    const { client: devtools } = await harness.connectDevtools({ tabId });
+    const bound = await harness.bindTab(devtools, {
+      tabId,
+      url: session.devServerUrl,
+      origin: new URL(session.devServerUrl).origin,
+      sessionId: session.id,
+    });
+    if (isErr(bound)) {
+      throw new Error(
+        `The server-tier tab was not bound (${bound.error.code}): ${bound.error.message}`,
+      );
+    }
+    const ready = devtools.send('agent.ready', {
+      tabId,
+      documentId: assemble('doc-', randomHex(8)),
+      producerId: newProducerId(),
+      url: session.devServerUrl,
+      installedBeforeReact: true,
+      reactDetected: true,
+    });
+    if (!(await devtools.flush()) || devtools.errorsFor(ready.id).length > 0) {
+      throw new Error(`agent.ready for the server-tier tab was refused: ${devtools.describe()}`);
+    }
+
+    const settled = await harness.waitForSession(
+      session.id,
+      (record: SessionRecord) => record.status === 'ready' || record.status === 'failed',
+    );
+    if (settled.status !== 'ready') {
+      throw new Error(`The server-tier session settled in "${settled.status}" instead of "ready".`);
+    }
+    const started = recordResponse(await harness.startCapture(session.id));
+    if (isErr(started)) {
+      throw new Error(
+        `The server-tier capture did not start (${started.error.code}): ${started.error.message}`,
+      );
+    }
+    return { sessionId: session.id, captureId: started.value.captureId };
+  }
+
+  beforeAll(async () => {
+    const { harness } = current();
+    // Captures are exclusive per project, so this suite gets a copy of its own.
+    const project = await harness.copyFixtureProject();
+    const launched = recordResponse(await harness.launchDevServer(project.root));
+    if (isErr(launched)) {
+      throw new Error(`The server-tier dev server did not launch: ${launched.error.message}`);
+    }
+    // One preload for the project's lifetime: one credential, one control connection.
+    const token = harness.issueServerAgentCredential(project.root).token;
+    await harness.ws({ client: 'server-agent', projectRoot: project.root, token });
+    await harness.editor(project.root);
+
+    const first = await openCapture(project.root, SERVER_FIRST_TAB_ID);
+    tier = { projectRoot: project.root, token, first };
+  });
+
+  it('stores a batch naming the open capture under that capture', async () => {
+    const { projectRoot, token, first } = tierOf();
+    const batch = freshCopies(SERVER_EVENTS);
+
+    const posted = await postIngest(token, projectRoot, batch, {
+      armedCaptureId: first.captureId,
+    });
+
+    expect(posted.status).toBe(202);
+    expect(posted.json).toEqual({ accepted: batch.length });
+    expectStoredUnder(batch, first);
+  });
+
+  it('drops a batch retried across a stop and a start as stale-capture, storing and recording nothing', async () => {
+    const { harness } = current();
+    const { projectRoot, token, first } = tierOf();
+    // Recorded while A was open, before the stop: the batch whose POST is retried.
+    const retried = freshCopies(SERVER_EVENTS);
+
+    const stopped = recordResponse(await harness.stopCapture(first.sessionId));
+    if (isErr(stopped)) {
+      throw new Error(
+        `capture.stop of A was refused (${stopped.error.code}): ${stopped.error.message}`,
+      );
+    }
+    const analysed = await harness.waitForSession(
+      first.sessionId,
+      (record: SessionRecord) => record.status === 'generated' || record.status === 'failed',
+    );
+    expect(analysed.status, 'capture A held evidence, so its session was analysed').toBe(
+      'generated',
+    );
+    const ended = recordResponse(await harness.endSession(first.sessionId));
+    if (isErr(ended)) {
+      throw new Error(`session.end of the first session was refused (${ended.error.code})`);
+    }
+    second = await openCapture(projectRoot, SERVER_SECOND_TAB_ID);
+    expect(second.captureId, 'B is a new capture').not.toBe(first.captureId);
+
+    const rowsBefore = tableRowCount();
+    const mark = harness.logger.records.length;
+    const posted = await postIngest(token, projectRoot, retried, {
+      armedCaptureId: first.captureId,
+      droppedCount: SERVER_STALE_LOSS,
+    });
+
+    expect(posted.status, 'a drop is an honest report, never a refusal').toBe(202);
+    expect(posted.json).toEqual({ accepted: 0, rejected: retried.length });
+    expect(tableRowCount(), 'nothing was stored, under B or anywhere').toBe(rowsBefore);
+    for (const event of retried) {
+      expect(rawRow(event.id), `${event.id} was not stored`).toBeUndefined();
+    }
+    const drops = withoutTrailingSummaries(dropRecords(mark));
+    expect(drops.map((record) => record.fields.reason)).toEqual(['stale-capture']);
+    expect(drops.map((record) => record.fields.received)).toEqual([retried.length]);
+    expect(recordedLossReports(mark), 'the loss belongs to no established capture').toEqual([]);
+    // `postIngest` kept the verbatim response body last; the drop record is the
+    // one line ingest wrote about the batch.
+    const responseText = httpBodies.at(-1) ?? '';
+    for (const text of [responseText, ...drops.map((record) => record.line)]) {
+      expect(text, 'the producer-named capture is never echoed').not.toContain(first.captureId);
+    }
+  });
+
+  it('stores a batch naming the new capture under it and adds its loss to that capture’s ledger', async () => {
+    const { harness } = current();
+    const { projectRoot, token } = tierOf();
+    const capture = secondOf();
+    const batch = freshCopies(SERVER_EVENTS);
+    const mark = harness.logger.records.length;
+
+    const posted = await postIngest(token, projectRoot, batch, {
+      armedCaptureId: capture.captureId,
+      droppedCount: SERVER_BATCH_LOSS,
+    });
+
+    expect(posted.status).toBe(202);
+    expect(posted.json).toEqual({ accepted: batch.length });
+    expectStoredUnder(batch, capture);
+    storedUnderSecond.push(...batch.map((event) => event.id));
+    expect(
+      recordedLossTotalsFor(mark, capture.captureId),
+      'the ledger holds the loss for B',
+    ).toEqual([SERVER_BATCH_LOSS]);
+  });
+
+  it('records a loss-only body naming the open capture, storing nothing', async () => {
+    const { harness } = current();
+    const { projectRoot, token } = tierOf();
+    const capture = secondOf();
+    const rowsBefore = tableRowCount();
+    const mark = harness.logger.records.length;
+
+    const posted = await postIngest(token, projectRoot, [], {
+      armedCaptureId: capture.captureId,
+      droppedCount: SERVER_LOSS_ONLY,
+    });
+
+    expect(posted.status).toBe(202);
+    expect(posted.json).toEqual({ accepted: 0 });
+    expect(tableRowCount(), 'nothing was persisted').toBe(rowsBefore);
+    expect(recordedLossTotalsFor(mark, capture.captureId), 'the ledger total grew').toEqual([
+      SERVER_BATCH_LOSS + SERVER_LOSS_ONLY,
+    ]);
+    expect(withoutTrailingSummaries(summaryRecords(mark)), 'no event pipeline ran').toEqual([]);
+    expect(withoutTrailingSummaries(dropRecords(mark)), 'nothing was dropped').toEqual([]);
+  });
+
+  it('refuses an event-less body that reports no loss with PROTOCOL_INVALID_MESSAGE, recording nothing', async () => {
+    const { harness } = current();
+    const { projectRoot, token } = tierOf();
+    const capture = secondOf();
+    const mark = harness.logger.records.length;
+
+    for (const context of [{ armedCaptureId: capture.captureId }, { droppedCount: 0 }]) {
+      const posted = await postIngest(token, projectRoot, [], context);
+      expect(posted.status).toBe(400);
+      expect(isRecord(posted.json) ? posted.json.code : undefined).toBe('PROTOCOL_INVALID_MESSAGE');
+    }
+    expect(recordedLossReports(mark), 'refused at the protocol boundary').toEqual([]);
+  });
+
+  it('still attributes a batch naming no capture to the open one', async () => {
+    const { projectRoot, token } = tierOf();
+    const capture = secondOf();
+    const batch = freshCopies(SERVER_EVENTS);
+
+    const posted = await postIngest(token, projectRoot, batch);
+
+    expect(posted.status).toBe(202);
+    expect(posted.json).toEqual({ accepted: batch.length });
+    expectStoredUnder(batch, capture);
+    storedUnderSecond.push(...batch.map((event) => event.id));
+  });
+
+  it('refuses a malformed armedCaptureId or droppedCount whole with PROTOCOL_INVALID_MESSAGE, storing nothing', async () => {
+    const { harness } = current();
+    const { projectRoot, token } = tierOf();
+    const padded = ` ${newCaptureId()} `;
+    const rowsBefore = tableRowCount();
+    const mark = harness.logger.records.length;
+
+    for (const context of [
+      { armedCaptureId: padded },
+      { armedCaptureId: 42 },
+      { armedCaptureId: secondOf().captureId, droppedCount: -1 },
+      { armedCaptureId: secondOf().captureId, droppedCount: 2.5 },
+    ]) {
+      const batch = freshCopies(SERVER_EVENTS);
+      const posted = await postIngest(token, projectRoot, batch, context);
+
+      expect(posted.status, JSON.stringify(context)).toBe(400);
+      expect(isRecord(posted.json) ? posted.json.code : undefined).toBe('PROTOCOL_INVALID_MESSAGE');
+      for (const event of batch) {
+        expect(rawRow(event.id), `${event.id} was not stored`).toBeUndefined();
+      }
+    }
+    expect(tableRowCount()).toBe(rowsBefore);
+    expect(recordedLossReports(mark), 'no loss was recorded').toEqual([]);
+    expect(httpBodies.join('\n'), 'the refused value is never echoed').not.toContain(padded.trim());
+    expect(harness.logger.text(), 'nor logged').not.toContain(padded.trim());
+  });
+
+  it('persists the server-tier loss in the stopped capture’s coverage, and none of the stale loss anywhere', async () => {
+    const { harness } = current();
+    const { first } = tierOf();
+    const capture = secondOf();
+
+    const stopped = recordResponse(await harness.stopCapture(capture.sessionId));
+    if (isErr(stopped)) {
+      throw new Error(
+        `capture.stop of B was refused (${stopped.error.code}): ${stopped.error.message}`,
+      );
+    }
+
+    // Only the accepted reports count: the stale batch's loss reached no ledger.
+    const expected = {
+      producerDroppedEvents: SERVER_BATCH_LOSS + SERVER_LOSS_ONLY,
+      complete: false,
+    };
+    expect(stopped.value.summary.captureId).toBe(capture.captureId);
+    expect(stopped.value.summary.eventCount).toBe(storedUnderSecond.length);
+    expect(stopped.value.summary.coverage).toMatchObject(expected);
+
+    const storedB = harness.repos.sessions.getCapture(capture.captureId);
+    if (isErr(storedB)) {
+      throw new Error(`Capture B could not be read: ${storedB.error.message}`);
+    }
+    expect(storedB.value?.sessionId).toBe(capture.sessionId);
+    expect(storedB.value?.capture.summary?.coverage, 'the persisted summary').toMatchObject(
+      expected,
+    );
+
+    const storedA = harness.repos.sessions.getCapture(first.captureId);
+    if (isErr(storedA)) {
+      throw new Error(`Capture A could not be read: ${storedA.error.message}`);
+    }
+    expect(storedA.value?.capture.summary?.eventCount, 'A kept exactly its own batch').toBe(
+      SERVER_EVENTS.length,
+    );
+    expect(
+      storedA.value?.capture.summary?.coverage,
+      'the stale loss never reached A',
+    ).toMatchObject({ producerDroppedEvents: 0, complete: true });
+
+    // The analysis of B's evidence runs on; let it settle before the harness is torn down.
+    const settled = await harness.waitForSession(
+      capture.sessionId,
+      (record: SessionRecord) => record.status === 'generated' || record.status === 'failed',
+    );
+    expect(settled.status).toBe('generated');
+  });
+
+  /**
+   * The preload's exporter sends the same serialized body again after a
+   * timeout or a retryable failure, so a loss report the service recorded but
+   * whose acknowledgement was lost arrives a second time. Its `lossReportId`,
+   * stable across those sends, is what makes ingest count it once.
+   *
+   * Run on a project, session and capture of their own, so every ledger total
+   * above stays exact and this suite's final coverage is its own sum. The
+   * cases run in declaration order and each reads the capture's running
+   * ledger total, which ingest logs whenever the ledger accepts a report.
+   */
+  describe('loss report replays', () => {
+    /** What the setup establishes for this suite. */
+    interface ReplayTier {
+      /** The project copy the replay session is opened on. */
+      readonly projectRoot: string;
+      /** The preload's server-agent credential, scoped to that project. */
+      readonly token: string;
+      /** The replay session and its open capture. */
+      readonly capture: ServerCapture;
+    }
+
+    let replay: ReplayTier | undefined;
+
+    /** The events stored under the replay capture, in the order they were posted. */
+    const storedUnderReplay: string[] = [];
+
+    /** Every loss-report id the suite sent: none may reach a response body or a record. */
+    const sentReportIds: string[] = [];
+
+    /** The suite's state, or a failure naming the setup that did not run. */
+    function replayOf(): ReplayTier {
+      if (replay === undefined) {
+        throw new Error('The replay project was not set up.');
+      }
+      return replay;
+    }
+
+    /** A fresh loss-report id, shaped as the exporter mints one: 16 random lowercase hex characters. */
+    function newLossReportId(): string {
+      const id = randomHex(8);
+      sentReportIds.push(id);
+      return id;
+    }
+
+    /** The ledger totals ingest logged for the replay capture since `from`. */
+    function replayLossTotals(from: number): unknown[] {
+      return recordedLossTotalsFor(from, replayOf().capture.captureId);
+    }
+
+    /**
+     * Posts one body twice, as the preload retries a post whose reply it never
+     * read, and requires the two requests to be byte-identical.
+     */
+    async function postTwice(
+      events: readonly unknown[],
+      context: IngestDeliveryContext,
+    ): Promise<readonly [IngestResponse, IngestResponse]> {
+      const { projectRoot, token } = replayOf();
+      const first = await postIngest(token, projectRoot, events, context);
+      const retry = await postIngest(token, projectRoot, events, context);
+      expect(postedBodies.at(-1), 'the retry is the same body').toBe(postedBodies.at(-2));
+      return [first, retry];
+    }
+
+    beforeAll(async () => {
+      const { harness } = current();
+      // Captures are exclusive per project, so the replays get a copy of their own.
+      const project = await harness.copyFixtureProject();
+      const launched = recordResponse(await harness.launchDevServer(project.root));
+      if (isErr(launched)) {
+        throw new Error(`The replay dev server did not launch: ${launched.error.message}`);
+      }
+      const token = harness.issueServerAgentCredential(project.root).token;
+      await harness.ws({ client: 'server-agent', projectRoot: project.root, token });
+      await harness.editor(project.root);
+
+      const capture = await openCapture(project.root, SERVER_REPLAY_TAB_ID);
+      replay = { projectRoot: project.root, token, capture };
+    });
+
+    it('stores a retried loss-carrying body’s events once and adds its loss to the ledger once', async () => {
+      const { harness } = current();
+      const { capture } = replayOf();
+      const batch = freshCopies(SERVER_EVENTS);
+      const rowsBefore = tableRowCount();
+      const mark = harness.logger.records.length;
+
+      const [first, retry] = await postTwice(batch, {
+        armedCaptureId: capture.captureId,
+        droppedCount: REPLAYED_BATCH_LOSS,
+        lossReportId: newLossReportId(),
+      });
+
+      expect(first.status).toBe(202);
+      expect(first.json).toEqual({ accepted: batch.length });
+      // The store keeps the first delivery's rows (`ON CONFLICT(id) DO NOTHING`),
+      // so the retry is answered as accepted, its events skipped.
+      expect(retry.status, 'a retry is answered, never refused').toBe(202);
+      expect(retry.json).toEqual({ accepted: batch.length });
+      expect(tableRowCount(), 'the events were stored once').toBe(rowsBefore + batch.length);
+      expectStoredUnder(batch, capture);
+      storedUnderReplay.push(...batch.map((event) => event.id));
+
+      const summaries = withoutTrailingSummaries(summaryRecords(mark)).map((record) => ({
+        inserted: record.fields.inserted,
+        skipped: record.fields.skipped,
+        producerDropped: record.fields.producerDropped,
+      }));
+      expect(
+        summaries,
+        'both deliveries ran the pipeline; only the first carried new loss',
+      ).toEqual([
+        { inserted: batch.length, skipped: 0, producerDropped: REPLAYED_BATCH_LOSS },
+        { inserted: 0, skipped: batch.length, producerDropped: undefined },
+      ]);
+      expect(replayLossTotals(mark), 'the ledger took the report once').toEqual([
+        REPLAYED_BATCH_LOSS,
+      ]);
+    });
+
+    it('adds a retried loss-only body’s loss to the ledger once, storing nothing', async () => {
+      const { harness } = current();
+      const { capture } = replayOf();
+      const rowsBefore = tableRowCount();
+      const mark = harness.logger.records.length;
+
+      const [first, retry] = await postTwice([], {
+        armedCaptureId: capture.captureId,
+        droppedCount: REPLAYED_LOSS_ONLY,
+        lossReportId: newLossReportId(),
+      });
+
+      for (const posted of [first, retry]) {
+        expect(posted.status).toBe(202);
+        expect(posted.json).toEqual({ accepted: 0 });
+      }
+      expect(tableRowCount(), 'nothing was persisted').toBe(rowsBefore);
+      expect(replayLossTotals(mark), 'the ledger took the report once').toEqual([
+        REPLAYED_BATCH_LOSS + REPLAYED_LOSS_ONLY,
+      ]);
+    });
+
+    it('counts two reports of the same loss under different ids as two reports', async () => {
+      const { harness } = current();
+      const { projectRoot, token, capture } = replayOf();
+      const mark = harness.logger.records.length;
+
+      for (const lossReportId of [newLossReportId(), newLossReportId()]) {
+        const posted = await postIngest(token, projectRoot, [], {
+          armedCaptureId: capture.captureId,
+          droppedCount: DISTINCT_REPORT_LOSS,
+          lossReportId,
+        });
+        expect(posted.status).toBe(202);
+        expect(posted.json).toEqual({ accepted: 0 });
+      }
+
+      const before = REPLAYED_BATCH_LOSS + REPLAYED_LOSS_ONLY;
+      expect(replayLossTotals(mark), 'each id is its own report').toEqual([
+        before + DISTINCT_REPORT_LOSS,
+        before + 2 * DISTINCT_REPORT_LOSS,
+      ]);
+    });
+
+    it('counts a report naming no lossReportId on every delivery: only a named report is applied once', async () => {
+      const { harness } = current();
+      const { capture } = replayOf();
+      const mark = harness.logger.records.length;
+
+      const [first, retry] = await postTwice([], {
+        armedCaptureId: capture.captureId,
+        droppedCount: UNNAMED_REPORT_LOSS,
+      });
+
+      for (const posted of [first, retry]) {
+        expect(posted.status).toBe(202);
+        expect(posted.json).toEqual({ accepted: 0 });
+      }
+      const before = REPLAYED_BATCH_LOSS + REPLAYED_LOSS_ONLY + 2 * DISTINCT_REPORT_LOSS;
+      expect(replayLossTotals(mark), 'without an id, a repeat is indistinguishable').toEqual([
+        before + UNNAMED_REPORT_LOSS,
+        before + 2 * UNNAMED_REPORT_LOSS,
+      ]);
+    });
+
+    it('refuses a lossReportId beside no positive droppedCount with PROTOCOL_INVALID_MESSAGE, storing and recording nothing', async () => {
+      const { harness } = current();
+      const { projectRoot, token, capture } = replayOf();
+      const rowsBefore = tableRowCount();
+      const mark = harness.logger.records.length;
+
+      for (const [label, context] of [
+        ['no droppedCount', { armedCaptureId: capture.captureId, lossReportId: newLossReportId() }],
+        [
+          'a droppedCount of zero',
+          { armedCaptureId: capture.captureId, droppedCount: 0, lossReportId: newLossReportId() },
+        ],
+      ] as const) {
+        // A sound batch; one whose only other fault is a malformed element,
+        // which would otherwise be recovered element by element; and none.
+        const sound = freshCopies(SERVER_EVENTS);
+        const besideFault = freshCopies(SERVER_EVENTS);
+        const withFault: readonly unknown[] = [...besideFault, { kind: 'not-a-span' }];
+        for (const batch of [sound, withFault, []]) {
+          const posted = await postIngest(token, projectRoot, batch, context);
+
+          expect(posted.status, `${label}, ${String(batch.length)} events`).toBe(400);
+          expect(isRecord(posted.json) ? posted.json.code : undefined).toBe(
+            'PROTOCOL_INVALID_MESSAGE',
+          );
+        }
+        for (const event of [...sound, ...besideFault]) {
+          expect(rawRow(event.id), `${event.id} was not stored`).toBeUndefined();
+        }
+      }
+
+      expect(tableRowCount(), 'nothing was stored').toBe(rowsBefore);
+      expect(recordedLossReports(mark), 'no loss was recorded').toEqual([]);
+      expect(withoutTrailingSummaries(summaryRecords(mark)), 'no event pipeline ran').toEqual([]);
+    });
+
+    it('persists the single-counted loss in the stopped capture’s coverage, and never echoes or logs a report id', async () => {
+      const { harness } = current();
+      const { capture } = replayOf();
+
+      const stopped = recordResponse(await harness.stopCapture(capture.sessionId));
+      if (isErr(stopped)) {
+        throw new Error(
+          `capture.stop of the replay capture was refused (${stopped.error.code}): ${stopped.error.message}`,
+        );
+      }
+
+      // Each named report once, the unnamed report on both deliveries.
+      const expected = {
+        producerDroppedEvents:
+          REPLAYED_BATCH_LOSS +
+          REPLAYED_LOSS_ONLY +
+          2 * DISTINCT_REPORT_LOSS +
+          2 * UNNAMED_REPORT_LOSS,
+        complete: false,
+      };
+      expect(stopped.value.summary.captureId).toBe(capture.captureId);
+      expect(stopped.value.summary.eventCount).toBe(storedUnderReplay.length);
+      expect(stopped.value.summary.coverage).toMatchObject(expected);
+
+      const stored = harness.repos.sessions.getCapture(capture.captureId);
+      if (isErr(stored)) {
+        throw new Error(`The replay capture could not be read: ${stored.error.message}`);
+      }
+      expect(stored.value?.sessionId).toBe(capture.sessionId);
+      expect(stored.value?.capture.summary?.coverage, 'the persisted summary').toMatchObject(
+        expected,
+      );
+
+      // Every id went out in a posted body, and none came back or was written.
+      const posted = postedBodies.join('\n');
+      const answered = httpBodies.join('\n');
+      const logged = harness.logger.text();
+      expect(sentReportIds.length).toBeGreaterThan(0);
+      for (const id of sentReportIds) {
+        expect(posted, 'the id was sent').toContain(id);
+        expect(answered, 'the id is never echoed').not.toContain(id);
+        expect(logged, 'nor logged').not.toContain(id);
+      }
+
+      // The analysis of the capture's evidence runs on; let it settle before teardown.
+      const settled = await harness.waitForSession(
+        capture.sessionId,
+        (record: SessionRecord) => record.status === 'generated' || record.status === 'failed',
+      );
+      expect(settled.status).toBe('generated');
+    });
   });
 });

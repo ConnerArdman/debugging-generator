@@ -538,9 +538,14 @@ const COLUMN_KEY = Object.freeze({
  *                         name ellipsizes inside its chip, and the chip's
  *                         tooltip still carries the full location
  *
- * Every role has a non-zero floor, and `DataTable` sums the floors into the
- * grid's minimum inline size (`--dgc-min-inline`), so a panel narrower than the
- * sum scrolls horizontally with every column still readable. A floorless
+ * Every role has a non-zero floor, and `DataTable` sums the columns' floors
+ * and minimums into the grid's width (`--dgc-readable-inline`,
+ * `--dgc-min-inline`). A panel just too narrow for every floor therefore
+ * narrows the statement (`text`) and caller (`name`) columns, never below the
+ * `--dg-column-yield` fraction of their floor, only as far as the table needs
+ * to fit: the statement wraps onto more lines and a caller chip ellipsizes. A
+ * panel too narrow even for that keeps every floor and scrolls horizontally
+ * with every column readable. A floorless
  * `minmax(0, …)` track would let each column shrink to its padding in a narrow
  * panel, where a chip covers the next column's value and the caller stack
  * spills outside its cell. And every role track is a token floor and a ratio

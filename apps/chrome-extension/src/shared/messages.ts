@@ -155,7 +155,10 @@
  * refused here (a UTF-8 byte count would be larger for non-ASCII text and
  * would drop valid batches); `telemetry.batch` carries `producerId`,
  * `documentId`, `batchSeq` and `droppedCount` beside `events`;
- * `target.described` answers `target: null` when nothing is describable; and
+ * `target.request` arms one interactive pick, or with `cancel: true` ends the
+ * active one; `target.described` answers every armed pick exactly once, with
+ * `target: null` when the pick ended without an element (cancelled,
+ * superseded, released) or the element could not be described; and
  * `agent.error` is recognised only by the closed vocabulary of Section G′.
  * ---------------------------------------------------------------------------
  *
@@ -265,6 +268,14 @@ function isOptionalPositiveInteger(value: unknown): value is number | undefined 
   return (
     value === undefined || (typeof value === 'number' && Number.isSafeInteger(value) && value > 0)
   );
+}
+
+/**
+ * Absent, or exactly `true`: a `target.request`'s `cancel` flag. `false` is
+ * refused rather than read as "arm", so a frame means one thing only.
+ */
+function isOptionalCancelFlag(value: unknown): value is true | undefined {
+  return value === undefined || value === true;
 }
 
 /**
@@ -380,7 +391,13 @@ function isNullableSelectedTargetShape(value: unknown): value is SelectedTarget 
  *
  * No separate host or port constant exists, and no environment variable is
  * read: an extension has no `process`, and a developer who runs the service
- * elsewhere changes the stored service URL, not this default.
+ * elsewhere changes the stored service URL, not this default. The DevTools
+ * panel's `PairDialog` is where that setting is entered: its "Service address"
+ * field while the panel is not paired, and — once paired — its address mode,
+ * opened by "Change service address…" beside the "Reconnecting…" or "Service
+ * not running" pill, which saves the address without pairing again. The
+ * service worker follows the stored value as it changes and moves its socket
+ * and every HTTP call there; a blank address restores this default.
  */
 export const DEFAULT_SERVICE_BASE_URL = 'http://127.0.0.1:43117';
 
@@ -785,7 +802,10 @@ export function isPanelReloadState(value: unknown): value is PanelReloadState {
  * - `capture.start` / `capture.stop` — the panel's capture controls; the worker
  *   calls the protocol's two capture routes and answers with their bodies.
  * - `target.pick` — the panel entering (`enabled: true`) or leaving element
- *   picker mode.
+ *   picker mode. Entering arms one interactive pick in the inspected page's
+ *   agent; leaving cancels it there and is always answered `active: false`.
+ *   The pick ending in the page — a click, Escape, the page hidden — is told
+ *   to the panel by a `picker` push ({@link PanelPickerState}).
  * - `target.selected` — the element the developer picked, forwarded as the
  *   protocol's `target.selected` frame.
  * - `pair.complete` — the one-time code typed into `PairDialog`. The worker
@@ -1108,8 +1128,38 @@ export interface PortReloadPush extends PortFrameBase<'push'> {
   readonly state: PanelReloadState;
 }
 
+/**
+ * The worker's statement of whether the inspected page's element picker is on.
+ *
+ * "Pick element" (or the service's relayed `target.request`) arms one
+ * interactive pick in the page agent, and the agent answers it exactly once —
+ * with the element the developer clicked, or with nothing when the developer
+ * pressed Escape in the page, the page was hidden, or the pick was cancelled
+ * or superseded. Only the worker sees that answer, so only the worker can tell
+ * the panel that picker mode is over.
+ *
+ * The worker only ever sends `active: false` today: the page's pick ended,
+ * with or without a picked element, or the document holding it went away.
+ * Picker mode is turned on by the panel's own `target.pick` answer, never by
+ * this push; `active` stays a boolean so the state reads the same way as that
+ * answer.
+ */
+export interface PanelPickerState {
+  /** Whether the inspected page's element picker is on. */
+  readonly active: boolean;
+}
+
+/** The inspected page's element picker turned on or off. */
+export interface PortPickerPush extends PortFrameBase<'push'> {
+  /** A picker-state change. */
+  readonly kind: 'picker';
+  /** The new state. */
+  readonly state: PanelPickerState;
+}
+
 /** An unsolicited worker → panel frame, discriminated on `kind`. */
-export type PortPush = PortProtocolPush | PortConnectionPush | PortBindingPush | PortReloadPush;
+export type PortPush =
+  PortProtocolPush | PortConnectionPush | PortBindingPush | PortReloadPush | PortPickerPush;
 
 /** Every frame on {@link PORT_PANEL}, discriminated on `direction`. */
 export type PanelPortMessage = PortRequest | PortResponse | PortPush;
@@ -1244,6 +1294,15 @@ function parsePanelReloadState(value: unknown): PanelReloadState | undefined {
   return value.kind === 'offered'
     ? { kind: 'offered', reason: value.reason }
     : { kind: value.kind };
+}
+
+/** A {@link PanelPickerState}, rebuilt from exactly its one boolean field. */
+function parsePanelPickerState(value: unknown): PanelPickerState | undefined {
+  if (!isRecord(value) || !hasExactKeys(value, ['active'])) {
+    return undefined;
+  }
+  const active = value.active;
+  return typeof active === 'boolean' ? { active } : undefined;
 }
 
 /** One of the three one-flag answers — `{ forwarded }`, `{ active }`, `{ accepted }` — read exactly. */
@@ -1518,6 +1577,7 @@ export const PORT_PUSH_KINDS = [
   'connection',
   'binding',
   'reload',
+  'picker',
 ] as const satisfies readonly PortPush['kind'][];
 
 /** One of {@link PORT_PUSH_KINDS}. */
@@ -1561,6 +1621,10 @@ export function parsePortPush(value: unknown): PortPush | undefined {
     }
     case 'reload': {
       const state = parsePanelReloadState(value.state);
+      return state === undefined ? undefined : { ...base, kind, state };
+    }
+    case 'picker': {
+      const state = parsePanelPickerState(value.state);
       return state === undefined ? undefined : { ...base, kind, state };
     }
     default:
@@ -1860,9 +1924,13 @@ export interface PageTelemetryBatchPayload {
 }
 
 /**
- * The page agent's `target.described` payload: the descriptor for an element
- * a relayed `target.request` asked about, or `null` when nothing describable
- * was focused. `requestId` echoes the request's.
+ * The page agent's `target.described` payload: the answer to one pick a
+ * `target.request` armed, sent exactly once per pick. `target` is the
+ * descriptor of the element the developer clicked, or `null` when the pick
+ * ended without one — cancelled by a `target.request { cancel: true }`,
+ * superseded by a newer pick, ended by Escape in the page or by the page
+ * being hidden — or when the clicked element could not be described.
+ * `requestId` echoes the id of the request that armed the pick.
  */
 export interface PageTargetDescribedPayload {
   /** The descriptor — the protocol's `SelectedTarget` — or `null`. */
@@ -1936,12 +2004,23 @@ export interface PageSnapshotRequestPayload {
 }
 
 /**
- * The bridge's `target.request` payload: describe the focused element. The
- * agent echoes `requestId` on its `target.described` answer.
+ * The bridge's `target.request` payload: arm one interactive pick, or cancel
+ * the active one.
+ *
+ * - Without `cancel`, the agent arms a pick: the next element the developer
+ *   clicks in the page is consumed by the agent (the page never sees that
+ *   click) and answered as `target.described` with this request's
+ *   `requestId`. A pick already active is superseded and answered first,
+ *   `{ target: null, requestId: <its id> }`.
+ * - With `cancel: true`, the agent ends its active pick and answers it
+ *   `{ target: null, requestId: <the pick's id> }` — the id of the request that
+ *   armed it, not this one's. Nothing is posted when no pick is active.
  */
 export interface PageTargetRequestPayload {
-  /** Correlates the answer with this request. */
+  /** Correlates the answer with the pick this request arms. */
   readonly requestId?: PortRequestId | undefined;
+  /** `true` ends the active pick instead of arming one; absent arms. */
+  readonly cancel?: true | undefined;
 }
 
 /** Every bridge → page frame type, mapped to its payload. */
@@ -2104,7 +2183,7 @@ function hasBridgeChannelPayload(
     case 'agent.snapshot':
       return hasSnapshotRequestPayload(payload);
     case 'target.request':
-      return isOptionalId(payload.requestId);
+      return isOptionalId(payload.requestId) && isOptionalCancelFlag(payload.cancel);
   }
 }
 
@@ -2458,13 +2537,18 @@ export type BridgeUpstreamMessage<Type extends AgentOutboundType = AgentOutbound
  *
  * Declared as an extension of the page channel's payloads so that the compiler
  * proves each one can be posted to the page unchanged. `target.request` narrows
- * its `requestId` to required: the worker always correlates its requests.
+ * its `requestId` to required: the worker always correlates its requests. It
+ * keeps the page channel's `cancel` flag: `cancel: true` ends the page's
+ * active pick, which the agent answers with that pick's own `requestId`.
  */
 export interface BridgeDownstreamPayloads extends Pick<
   BridgeChannelPayloads,
   'agent.config' | 'agent.snapshot' | 'target.request'
 > {
-  readonly 'target.request': { readonly requestId: PortRequestId };
+  readonly 'target.request': {
+    readonly requestId: PortRequestId;
+    readonly cancel?: true | undefined;
+  };
 }
 
 /** The frame types the worker sends the bridge. */
@@ -2531,7 +2615,7 @@ function hasBridgeDownstreamPayload(
     case 'agent.snapshot':
       return hasSnapshotRequestPayload(payload);
     case 'target.request':
-      return isNonEmptyString(payload.requestId);
+      return isNonEmptyString(payload.requestId) && isOptionalCancelFlag(payload.cancel);
   }
 }
 

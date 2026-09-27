@@ -1,8 +1,7 @@
 /**
  * `debuggen.showModifications` — reveals the Debug Generator view's file
  * modifications section, reads the active session's whole modification
- * journal into the store and reports how many records it holds
- * (AAP §0.4.2, §0.5.1, §0.7.3).
+ * journal into the store and reports how many records it holds.
  *
  * ## Why the command exists
  *
@@ -13,11 +12,10 @@
  * view's `ModificationsList` renders it, one row per record with a `DiffView`;
  * this command is how the developer gets there from the Command Palette, the
  * "Open diff" destination the conflict notice points at when a file was edited
- * while instrumented (AAP §0.5.5), and what the view's "Load all
- * modifications" control runs (the `loadModifications` request). Records
- * normally reach the view through `session.updated` and
- * `instrumentation.ready`; this read completes the list when no broadcast
- * reaches the window or the view knows records are missing.
+ * while instrumented, and what the view's "Load all modifications" control runs
+ * (the `loadModifications` request). Records normally reach the view through
+ * `session.updated` and `instrumentation.ready`; this read completes the list
+ * when no broadcast reaches the window or the view knows records are missing.
  *
  * ## Sequence
  *

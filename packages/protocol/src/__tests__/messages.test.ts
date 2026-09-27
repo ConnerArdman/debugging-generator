@@ -42,7 +42,7 @@
  * privacy rule, which applies to a rejected analysis exactly as it applies to a
  * rejected frame.
  *
- * ## The twenty-six payloads, and the one property that cannot be read
+ * ## The twenty-eight payloads, and the one property that cannot be read
  *
  * The third and largest part of this file — everything below the section banner
  * that names it — is one valid case and a set of refusals for every payload in
@@ -80,7 +80,7 @@
  *   the two decodes its receiver applies.
  *
  * Two cross-cutting suites follow. One is driven from
- * `MESSAGE_PAYLOAD_SCHEMAS` itself, so a twenty-seventh message cannot escape the
+ * `MESSAGE_PAYLOAD_SCHEMAS` itself, so a twenty-ninth message cannot escape the
  * JSON round trip or the no-transform check by being added without a test; the
  * other plants a sentinel in a refused field of several payloads — the
  * credential on `client.hello` included — and requires that nothing the
@@ -106,7 +106,7 @@
  * `sessionId` naming a different session than the payload does — its own
  * `sessionId`, or a session record's `id` — is refused at `sessionId` without
  * echoing either id, for every type whose fixture names a session, while the
- * six payloads that name none accept any routing key.
+ * eight payloads that name none accept any routing key.
  *
  * ## The parse helpers, one table
  *
@@ -194,6 +194,7 @@ import {
   PROGRESS_STAGES,
   PROGRESS_STATUSES,
   SELECTION_DOCUMENT_VERDICTS,
+  SERVICE_PONG_TIMEOUT_MS,
   SOURCE_MESSAGE_PAYLOADS,
   SOURCE_OPEN_EDITOR_TIMEOUT_MS,
   SOURCE_OPEN_RESULT_TIMEOUT_MS,
@@ -207,6 +208,7 @@ import {
   captureStoppedPayloadSchema,
   cleanupCompletedPayloadSchema,
   clientHelloPayloadSchema,
+  clientPingPayloadSchema,
   compareSelectionDocument,
   instrumentationFailedPayloadSchema,
   instrumentationPlanPayloadSchema,
@@ -214,15 +216,18 @@ import {
   panelGeneratedPayloadSchema,
   parseAgentConfigPayload,
   parseClientHelloPayload,
+  parseClientPingPayload,
   parseInstrumentationPlanPayload,
   parseInstrumentationReadyPayload,
   parsePanelGeneratedPayload,
+  parseServicePongPayload,
   parseSourceOpenPayload,
   parseSourceResultPayload,
   parseTargetSelectedPayload,
   parseTelemetryEventPayload,
   sameSelectedTarget,
   serverAgentConfigPayloadSchema,
+  servicePongPayloadSchema,
   sessionBindPayloadSchema,
   sessionBoundPayloadSchema,
   sessionCreatedPayloadSchema,
@@ -1461,6 +1466,12 @@ const SENTINEL = 'SENTINEL-do-not-leak-9c31';
 const SOURCE_OPEN_FRAME_ID = 'msg_8e2r4t6y1u3i5o7p';
 
 /**
+ * The envelope id of the `client.ping` the `service.pong` fixture answers, in
+ * the shape `newMessageId()` mints — the value its `ref` correlates by.
+ */
+const PING_FRAME_ID = 'msg_2p4i6n8g0f3r5a7m';
+
+/**
  * A `failed` source result with every optional field present.
  *
  * Typed as that one member of the union rather than as the whole payload, so
@@ -1709,7 +1720,7 @@ const CAPTURE_SUMMARY: CaptureSummary = computeCaptureSummary([validPersistedEve
  * The mapped type is the point twice over. It makes the table **exhaustive** — a
  * message added to the protocol without a fixture here is a compile error, which
  * is what stops the registry-driven suites at the end of this file from silently
- * covering twenty-six of twenty-seven frames. And it types every slot from the
+ * covering twenty-eight of twenty-nine frames. And it types every slot from the
  * *schema*, so placing an upstream value (a `SelectedTarget`, an
  * `InstrumentationAction`, a `TelemetryEvent`, a `SourceLocation`) into it is a
  * compile-time statement that the payload field is that same type rather than a
@@ -1727,6 +1738,8 @@ const VALID_PAYLOADS: { readonly [T in MessageType]: PayloadOf<T> } = {
     version: PROTOCOL_VERSION,
     token: TOKEN,
   },
+  'client.ping': {},
+  'service.pong': { ref: PING_FRAME_ID },
   'agent.ready': {
     tabId: TAB_ID,
     documentId: DOCUMENT_ID,
@@ -1809,6 +1822,8 @@ const VALID_PAYLOADS: { readonly [T in MessageType]: PayloadOf<T> } = {
  */
 const REGISTERED_SCHEMAS: { readonly [T in MessageType]: (typeof MESSAGE_PAYLOAD_SCHEMAS)[T] } = {
   'client.hello': clientHelloPayloadSchema,
+  'client.ping': clientPingPayloadSchema,
+  'service.pong': servicePongPayloadSchema,
   'agent.ready': agentReadyPayloadSchema,
   'agent.config': agentConfigPayloadSchema,
   'server-agent.config': serverAgentConfigPayloadSchema,
@@ -1928,6 +1943,89 @@ describe('client.hello — the frame that turns a socket into a participant', ()
     // by both extension clients, so they are part of this module's contract.
     expect(WS_CLOSE_UNAUTHORIZED).toBe(4401);
     expect(CLIENT_HELLO_TIMEOUT_MS).toBe(3000);
+  });
+});
+
+describe('client.ping and service.pong — a liveness pair with nothing to act on', () => {
+  it('accepts an empty ping and refuses a ping carrying any key at all', () => {
+    expect(clientPingPayloadSchema.parse(VALID_PAYLOADS['client.ping'])).toEqual({});
+
+    // The envelope id is the correlation key: a ping has no field to carry, so
+    // a session, a tab, a ref or anything else is a producer mistake, refused.
+    for (const payload of [
+      { ref: PING_FRAME_ID },
+      { sessionId: SESSION_ID },
+      { tabId: TAB_ID },
+      { ping: true },
+    ]) {
+      const parsed = clientPingPayloadSchema.safeParse(payload);
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) {
+        expect(parsed.error.issues.map((issue) => issue.code)).toEqual(['unrecognized_keys']);
+      }
+    }
+    for (const value of [undefined, null, [], 'ping', 0]) {
+      expect(clientPingPayloadSchema.safeParse(value).success).toBe(false);
+    }
+  });
+
+  it('requires a pong to name the ping it answers, bounded like every ref, and nothing else', () => {
+    const payload = VALID_PAYLOADS['service.pong'];
+    expect(servicePongPayloadSchema.parse(payload)).toEqual({ ref: PING_FRAME_ID });
+
+    // Sixty-four characters is the bound every correlation ref in the folder
+    // shares, so the longest id `newMessageId()` could ever mint fits and a
+    // payload smuggled through the field does not.
+    expect(servicePongPayloadSchema.safeParse({ ref: 'r'.repeat(64) }).success).toBe(true);
+    for (const ref of ['', 'r'.repeat(65), 7, null]) {
+      expect(servicePongPayloadSchema.safeParse({ ref }).success).toBe(false);
+    }
+    expect(servicePongPayloadSchema.safeParse({}).success).toBe(false);
+    expect(servicePongPayloadSchema.safeParse({ ...payload, sessionId: SESSION_ID }).success).toBe(
+      false,
+    );
+    expect(servicePongPayloadSchema.safeParse({ ...payload, status: 'ok' }).success).toBe(false);
+  });
+
+  it('refuses a malformed ping or pong through its parse helper without echoing what arrived', () => {
+    const cases: readonly {
+      readonly named: string;
+      readonly parsed: Result<unknown, DebuggenError>;
+    }[] = [
+      { named: 'unrecognized_keys keys=ref', parsed: parseClientPingPayload({ ref: SENTINEL }) },
+      {
+        named: 'ref (too_big origin=string max=64)',
+        parsed: parseServicePongPayload({ ref: `${SENTINEL}-${'x'.repeat(64)}` }),
+      },
+      {
+        named: 'unrecognized_keys keys=note',
+        parsed: parseServicePongPayload({ ref: PING_FRAME_ID, note: SENTINEL }),
+      },
+    ];
+
+    for (const { named, parsed } of cases) {
+      expect(isErr(parsed)).toBe(true);
+      if (!isErr(parsed)) {
+        continue;
+      }
+      expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(parsed.error.message).toContain(named);
+      expect(parsed.error.cause).toBeUndefined();
+      for (const rendered of [
+        parsed.error.message,
+        parsed.error.hint ?? '',
+        JSON.stringify(parsed.error.details),
+        JSON.stringify(parsed.error.toPayload()),
+      ]) {
+        expect(rendered).not.toContain(SENTINEL);
+      }
+    }
+  });
+
+  it('publishes the client budget for a pong', () => {
+    // The service answers on arrival; how long a pinging client waits before it
+    // treats the connection as dead is this one declared figure.
+    expect(SERVICE_PONG_TIMEOUT_MS).toBe(5000);
   });
 });
 
@@ -4250,14 +4348,14 @@ describe('cleanup.completed — the verdict, and what was left alone', () => {
 //
 // Everything below is driven from `MESSAGE_PAYLOAD_SCHEMAS` and `MESSAGE_TYPES`
 // rather than from a list written here, which is the only way these cases stay
-// true of a protocol that grows: a twenty-seventh message added to the registry
+// true of a protocol that grows: a twenty-ninth message added to the registry
 // without a fixture in `VALID_PAYLOADS` is a compile error, and one added with a
 // fixture is carried into the round-trip and no-transform cases without an edit —
 // and into the frame-level `parseMessage` cases that close the file, which also
 // need it an entry in `MISMATCHED_PAYLOADS`, again enforced by the compiler.
 //
 // `../messages/index.ts` proves four properties of the registries at compile
-// time — the WebSocket registry covers exactly the twenty-six types, the
+// time — the WebSocket registry covers exactly the twenty-eight types, the
 // `MESSAGE_TYPE` constants are exactly those types, the HTTP-only names overlap
 // them nowhere, and the HTTP-only tuple and map name the same five operations.
 // A type-level assertion is blind to a repeated tuple element, to two constants
@@ -4265,9 +4363,11 @@ describe('cleanup.completed — the verdict, and what was left alone', () => {
 // ---------------------------------------------------------------------------
 
 describe('MESSAGE_TYPES and MESSAGE_PAYLOAD_SCHEMAS — one registry, no gaps', () => {
-  it('lists the twenty-five names of AAP \u00a70.4.2 and source.result, in order and without duplicates', () => {
+  it('lists the twenty-five cross-component WebSocket message names, source.result and the liveness pair, in order and without duplicates', () => {
     expect([...MESSAGE_TYPES]).toEqual([
       'client.hello',
+      'client.ping',
+      'service.pong',
       'agent.ready',
       'agent.config',
       'server-agent.config',
@@ -4298,13 +4398,13 @@ describe('MESSAGE_TYPES and MESSAGE_PAYLOAD_SCHEMAS — one registry, no gaps', 
     // leaves the derived union unchanged, so the compile-time registry check
     // cannot see it, and the mistake would surface one file onward as a Zod
     // discriminated union with two members claiming the same discriminant.
-    expect(MESSAGE_TYPES).toHaveLength(26);
-    expect(new Set(MESSAGE_TYPES).size).toBe(26);
+    expect(MESSAGE_TYPES).toHaveLength(28);
+    expect(new Set(MESSAGE_TYPES).size).toBe(28);
   });
 
   it('holds a schema for every type and for no other name', () => {
     expect(Object.keys(MESSAGE_PAYLOAD_SCHEMAS).sort()).toEqual([...MESSAGE_TYPES].sort());
-    expect(Object.keys(MESSAGE_PAYLOAD_SCHEMAS)).toHaveLength(26);
+    expect(Object.keys(MESSAGE_PAYLOAD_SCHEMAS)).toHaveLength(28);
   });
 
   it('binds each type to the schema its own module exports, by identity', () => {
@@ -4334,7 +4434,7 @@ describe('MESSAGE_TYPES and MESSAGE_PAYLOAD_SCHEMAS — one registry, no gaps', 
     for (const [key, type] of Object.entries(MESSAGE_TYPE)) {
       expect(key, type).toBe(type.replace(/[.-]/g, '_').toUpperCase());
     }
-    expect(Object.keys(MESSAGE_TYPE)).toHaveLength(26);
+    expect(Object.keys(MESSAGE_TYPE)).toHaveLength(28);
     // None of the five HTTP operations has a WebSocket constant.
     const constants: ReadonlySet<string> = new Set(Object.values(MESSAGE_TYPE));
     expect(HTTP_ONLY_PAYLOAD_NAMES.filter((name) => constants.has(name))).toEqual([]);
@@ -4396,7 +4496,7 @@ describe('MESSAGE_TYPES and MESSAGE_PAYLOAD_SCHEMAS — one registry, no gaps', 
 
       // The envelope carries `payload` as an object for every frame, so a
       // primitive, an array or an absent payload is a rejection at each of the
-      // twenty-six schemas rather than at the envelope alone.
+      // twenty-eight schemas rather than at the envelope alone.
       for (const value of [undefined, null, 7, 'x', [], true]) {
         expect(schema.safeParse(value).success).toBe(false);
       }
@@ -4670,7 +4770,7 @@ describe('a rejected payload never echoes what it refused', () => {
 // `../envelope.ts`, which must select the one union member the frame's `type`
 // names and validate the payload against that member alone (AAP §0.4.2). Two
 // properties follow, and both are asserted for every member of `MESSAGE_TYPES`
-// by iterating the tuple itself: a twenty-seventh message is carried into every
+// by iterating the tuple itself: a twenty-ninth message is carried into every
 // case below automatically, and it cannot be added at all without a fixture in
 // `VALID_PAYLOADS` and an entry in `MISMATCHED_PAYLOADS`, each of which is a
 // compile error when missing:
@@ -4771,6 +4871,14 @@ const MISMATCHED_PAYLOADS: { readonly [T in MessageType]: MismatchedPayload<T> }
   'client.hello': {
     partner: 'agent.ready',
     payload: { ...VALID_PAYLOADS['agent.ready'], url: SENTINEL_URL },
+  },
+  // An empty ping refuses every key, so the one-key pong is its nearest lookalike.
+  'client.ping': { partner: 'service.pong', payload: { ref: SENTINEL } },
+  // The other frame that answers by `ref`: an error carries one too, beside two
+  // keys a pong refuses.
+  'service.pong': {
+    partner: 'error',
+    payload: { ...VALID_PAYLOADS.error, message: SENTINEL },
   },
   'agent.ready': { partner: 'client.hello', payload: CREDENTIAL_BEARING_HELLO },
   'agent.config': {
@@ -5089,7 +5197,7 @@ describe('parseMessage — a payload is accepted only under its own type', () =>
 
       // Every issue is located under `payload`: the frame was matched to the
       // member its `type` names and failed there, rather than failing at the
-      // envelope or being reported as twenty-five rejected branches.
+      // envelope or being reported as twenty-seven rejected branches.
       const paths = renderedIssuePaths(error);
 
       expect(paths).not.toHaveLength(0);
@@ -5163,6 +5271,8 @@ const OTHER_SESSION_ID = 'ses_0z9y8x7w6v5u4t3s';
  */
 const SUBJECTLESS_TYPES = [
   'client.hello',
+  'client.ping',
+  'service.pong',
   'agent.ready',
   'tab.navigated',
   'session.unbind',
@@ -5209,9 +5319,9 @@ const SUBJECT_TYPES = MESSAGE_TYPES.filter(
 // payload's subject is what a handler acts on. A devtools principal is
 // authorized only for its bound session, so every member of the
 // union must refuse a frame whose two answers differ — the rule lives in one
-// place in `../envelope.ts`, and this suite proves it reached all twenty-six.
+// place in `../envelope.ts`, and this suite proves it reached all twenty-eight.
 describe('parseMessage — every member refuses a routing key that contradicts its payload', () => {
-  it('partitions the registry into payloads that name a session and six that name none', () => {
+  it('partitions the registry into payloads that name a session and eight that name none', () => {
     const subjectless = MESSAGE_TYPES.filter(
       (type) => payloadSubjectOf(VALID_PAYLOADS[type]) === undefined,
     );
@@ -5330,6 +5440,16 @@ const PARSE_HELPER_CASES: { readonly [N in ParseHelperName]: ParseHelperCase<N> 
     valid: VALID_PAYLOADS['client.hello'],
     invalid: { ...VALID_PAYLOADS['client.hello'], token: SENTINEL, version: '1.0' },
     refusedFor: 'version (invalid_format format=regex)',
+  },
+  parseClientPingPayload: {
+    valid: VALID_PAYLOADS['client.ping'],
+    invalid: { ref: SENTINEL },
+    refusedFor: '<root> (unrecognized_keys keys=ref)',
+  },
+  parseServicePongPayload: {
+    valid: VALID_PAYLOADS['service.pong'],
+    invalid: { ...VALID_PAYLOADS['service.pong'], note: SENTINEL },
+    refusedFor: '<root> (unrecognized_keys keys=note)',
   },
   parseAgentReadyPayload: {
     valid: VALID_PAYLOADS['agent.ready'],

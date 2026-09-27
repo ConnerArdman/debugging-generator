@@ -1565,7 +1565,7 @@ describe('cleanup-conflict across a service restart', () => {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * AAP §0.5.1's `conflict` row — "retained, backup kept, re-reported" — for one record whose
+ * A `conflict` record is retained, its backup kept, and re-reported at every start; here, one whose
  * *report* changes while its id does not. Every start recomposes the report from the file and the
  * backup as they stand, and `session.cleanup` (`sessions.record`, what `GET /sessions/:id` reopens)
  * must carry that report rather than the first one: the developer's edit is `content-changed`; once

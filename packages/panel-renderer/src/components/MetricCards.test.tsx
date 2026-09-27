@@ -1919,15 +1919,22 @@ describe('MetricCards tile presentation', () => {
     expect(box?.classList.contains('dg-metric-cards__empty')).toBe(true);
     expect(box?.parentElement?.classList.contains('dg-metric-cards')).toBe(true);
 
+    // The tile grid names the lines before its first track and after its
+    // last, whatever number of tracks `auto-fit` settles on, and each state box
+    // spans from one to the other.
+    const template = declarationsFor('.dg-metric-cards')
+      .find((declaration) => declaration.startsWith('grid-template-columns:'))
+      ?.replace(/\s+/gu, ' ');
+    expect(template).toMatch(
+      /^grid-template-columns: \[full-start\] repeat\( ?auto-fit, .+\) \[full-end\]$/u,
+    );
     for (const state of ['empty', 'loading', 'error']) {
-      expect(declarationsFor(`.dg-metric-cards__${state}`)).toContain('grid-column: 1 / -1');
+      expect(declarationsFor(`.dg-metric-cards__${state}`)).toContain('grid-column: full');
     }
 
     // A column box whose state grows to fill it, so the copy is centred in the
     // node rather than shrink-wrapped at its inline start.
     expect(declarationsFor('.dg-metric-cards__empty')).toContain('flex-direction: column');
-    expect(declarationsFor('.dg-metric-cards__empty > .dg-empty-state')).toContain(
-      'flex: 1 1 auto',
-    );
+    expect(declarationsFor('.dg-metric-cards__empty > .dg-empty-state')).toContain('flex: auto');
   });
 });

@@ -93,6 +93,8 @@ import {
 import type { PanelConnectionStatus } from '@debuggen/chrome-extension/messages';
 import {
   DEVTOOLS_TOKEN_STORAGE_KEY,
+  parseServiceEndpoint,
+  SERVICE_ENDPOINT_STORAGE_KEY,
   STORED_CREDENTIAL_VERSION,
 } from '@debuggen/chrome-extension/auth';
 import { BINDING_STORAGE_KEY } from '@debuggen/chrome-extension/tab-registry';
@@ -244,6 +246,8 @@ const PANEL_STRINGS = Object.freeze({
   pairDialogTitle: 'Pair this panel with VS Code',
   /** `components/PairDialog.tsx` `PAIRING_FIELD_LABEL`. */
   pairingField: 'Pairing code',
+  /** `components/PairDialog.tsx` `SERVICE_ADDRESS_FIELD_LABEL`. */
+  serviceAddressField: 'Service address',
   /** `components/PairDialog.tsx` `PAIR_ACTION_LABEL`. */
   pairSubmit: 'Pair',
   /** `components/PairDialog.tsx` `CANCEL_ACTION_LABEL`. */
@@ -2492,7 +2496,71 @@ function describeStatus(status: PanelConnectionStatus | undefined): string {
 
 /** The failure for a worker that cannot reach the service. */
 function serviceUnreachable(dialled: string): string {
-  return `the service is not running for the extension: its worker only dials ${dialled} (DEFAULT_SERVICE_BASE_URL) and reports "${PANEL_CONNECTION_LABELS['service-not-running']}". Start the service there (the Playwright webServer runs node apps/local-service/dist/main.js; DEBUGGEN_HOST/DEBUGGEN_PORT must name ${dialled})`;
+  return `the service is not running for the extension: its worker dials ${dialled} (the pairing dialog's saved service address) and reports "${PANEL_CONNECTION_LABELS['service-not-running']}". Start the service there (the Playwright webServer runs node apps/local-service/dist/main.js on DEBUGGEN_HOST/DEBUGGEN_PORT)`;
+}
+
+/**
+ * The canonical service origin the extension would store for `address`, by the
+ * extension's own rule (`parseServiceEndpoint`: `http:` on `127.0.0.1` or
+ * `localhost`, the hosts its manifest grants). An address the worker cannot
+ * reach is named as a configuration error rather than left to time out.
+ */
+function serviceEndpointOf(address: string, source: string): string {
+  const parsed = parseServiceEndpoint(address);
+  if (!parsed.ok) {
+    throw new Error(
+      `ensurePaired: ${source} ${address} is not an address the extension's worker can dial: ${parsed.error.message} Set DEBUGGEN_HOST to 127.0.0.1 or localhost.`,
+    );
+  }
+  return parsed.value;
+}
+
+/**
+ * What the worker has saved under `SERVICE_ENDPOINT_STORAGE_KEY` — written by
+ * the pairing dialog's "Service address" field, absent when the default
+ * applies. The value is an origin, not a secret. `refused` when the stored
+ * value is one the extension itself would not dial.
+ */
+type StoredServiceEndpoint =
+  | { readonly kind: 'default' }
+  | { readonly kind: 'configured'; readonly origin: string }
+  | { readonly kind: 'refused' };
+
+async function readStoredServiceEndpoint(source: WorkerSource): Promise<StoredServiceEndpoint> {
+  const worker = await workerOf(source);
+  const stored: unknown = await worker.evaluate(async (key) => {
+    const host = globalThis as unknown as {
+      chrome: { storage: { local: { get(key: string): Promise<Record<string, unknown>> } } };
+    };
+    const items = await host.chrome.storage.local.get(key);
+    return items[key];
+  }, SERVICE_ENDPOINT_STORAGE_KEY);
+  if (stored === undefined) {
+    return { kind: 'default' };
+  }
+  const parsed = parseServiceEndpoint(stored);
+  return parsed.ok ? { kind: 'configured', origin: parsed.value } : { kind: 'refused' };
+}
+
+/** The origin the worker dials for `stored`, or `undefined` when the stored value is refused. */
+function dialledOrigin(stored: StoredServiceEndpoint, defaultOrigin: string): string | undefined {
+  switch (stored.kind) {
+    case 'default':
+      return defaultOrigin;
+    case 'configured':
+      return stored.origin;
+    case 'refused':
+      return undefined;
+  }
+}
+
+/**
+ * The value the dialog's "Service address" field shows once it has read the
+ * saved setting: the saved origin, or blank for the default and for a refused
+ * value (which the dialog reports as a field error instead).
+ */
+function prefilledAddress(stored: StoredServiceEndpoint): string {
+  return stored.kind === 'configured' ? stored.origin : '';
 }
 
 /**
@@ -2529,12 +2597,20 @@ async function pairingFailureReason(
  * the suite shares one context, `tests/browser/extension-connect.spec.ts`
  * leaves pairing established, and {@link resetExtensionState} keeps it.
  * Otherwise: `service.pairStart()` (the editor credential) yields the one-time
- * code; it is typed into the panel's `PairDialog` (opened through
- * `ConnectionStatus`'s "Pair…" action when not already open) and submitted;
- * the service worker then calls `POST /pair/complete` from its
- * `chrome-extension://<id>` origin and stores the devtools credential. This
+ * code; the panel's `PairDialog` is opened (through `ConnectionStatus`'s
+ * "Pair…" action when not already open), the suite's service origin is typed
+ * into its "Service address" field (blank when that origin is
+ * `DEFAULT_SERVICE_BASE_URL`) and the code is submitted; the dialog saves the
+ * address first, and the service worker then calls `POST /pair/complete` at
+ * that address from its `chrome-extension://<id>` origin and stores the
+ * devtools credential. A per-clone `DEBUGGEN_HOST`/`DEBUGGEN_PORT` therefore
+ * reaches the worker exactly as a developer's non-default port does. This
  * process never calls `/pair/complete`, and the code is never printed: it is
  * registered for scrubbing before it is typed.
+ *
+ * A stored credential counts as "already paired" only while the worker's saved
+ * address is the suite's service; one paired with another address is removed
+ * and pairing starts afresh.
  *
  * @throws {Error} Naming the cause: the service is unreachable, the code was
  * refused, or the panel never offered its pairing dialog (a UI regression).
@@ -2548,56 +2624,58 @@ export async function ensurePaired(
   if (panel.isClosed()) {
     throw new Error('ensurePaired: the panel handle is closed; open one with openPanelPage().');
   }
-  const dialled = originOf(DEFAULT_SERVICE_BASE_URL) ?? DEFAULT_SERVICE_BASE_URL;
-  if (originOf(service.baseUrl) !== dialled) {
-    throw new Error(
-      `ensurePaired: the extension's service worker only dials ${dialled} (DEFAULT_SERVICE_BASE_URL), but the suite's service listens on ${service.baseUrl}. Run the suite with DEBUGGEN_HOST/DEBUGGEN_PORT naming ${dialled}, or the worker can neither pair nor connect.`,
-    );
-  }
+  const target = serviceEndpointOf(service.baseUrl, "the suite's service address");
+  const defaultOrigin = serviceEndpointOf(
+    DEFAULT_SERVICE_BASE_URL,
+    "the extension's DEFAULT_SERVICE_BASE_URL",
+  );
   const timeoutMs = options.timeoutMs ?? PAIRING_TIMEOUT_MS;
   const source: WorkerSource = options.serviceWorker ?? panel.extension;
   const { locators } = panel;
+  const storedEndpoint = await readStoredServiceEndpoint(source);
 
-  // 1. Let the pill settle: a stored credential either connects or is refused
-  //    by the service (a rotated token, a fresh DEBUGGEN_HOME) and cleared by
-  //    the worker, which shows as "Not paired".
-  let settled: PanelConnectionStatus | undefined;
-  try {
-    await pollUntilReady(
-      async () => {
-        settled = await locators.connectionStatus();
-        return settled === 'connected' || settled === 'not-paired'
-          ? READY
-          : `the pill reads ${describeStatus(settled)}`;
-      },
-      timeoutMs,
-      (lastSeen) =>
-        `ensurePaired: the pill did not settle on "${PANEL_CONNECTION_LABELS.connected}" or "${PANEL_CONNECTION_LABELS['not-paired']}" within ${String(timeoutMs)} ms (${lastSeen}).${errorsSuffix(state)}`,
-    );
-  } catch (error) {
-    if (settled === 'service-not-running') {
-      throw new Error(`ensurePaired: ${serviceUnreachable(dialled)}.${errorsSuffix(state)}`, {
-        cause: error,
-      });
+  if (dialledOrigin(storedEndpoint, defaultOrigin) === target) {
+    // 1. The worker dials the suite's service. Let the pill settle: a stored
+    //    credential either connects or is refused by the service (a rotated
+    //    token, a fresh DEBUGGEN_HOME) and cleared by the worker, which shows
+    //    as "Not paired".
+    let settled: PanelConnectionStatus | undefined;
+    try {
+      await pollUntilReady(
+        async () => {
+          settled = await locators.connectionStatus();
+          return settled === 'connected' || settled === 'not-paired'
+            ? READY
+            : `the pill reads ${describeStatus(settled)}`;
+        },
+        timeoutMs,
+        (lastSeen) =>
+          `ensurePaired: the pill did not settle on "${PANEL_CONNECTION_LABELS.connected}" or "${PANEL_CONNECTION_LABELS['not-paired']}" within ${String(timeoutMs)} ms (${lastSeen}).${errorsSuffix(state)}`,
+      );
+    } catch (error) {
+      if (settled === 'service-not-running') {
+        throw new Error(`ensurePaired: ${serviceUnreachable(target)}.${errorsSuffix(state)}`, {
+          cause: error,
+        });
+      }
+      throw error;
     }
-    throw error;
-  }
-
-  const stored = await hasStoredDevtoolsCredential(source);
-  if (settled === 'connected') {
-    if (stored) {
-      return { paired: 'already' };
+    if (settled === 'connected') {
+      if (await hasStoredDevtoolsCredential(source)) {
+        return { paired: 'already' };
+      }
+      throw new Error(
+        `ensurePaired: the panel reports "${PANEL_CONNECTION_LABELS.connected}" but no devtools credential of the stored shape is under ${DEVTOOLS_TOKEN_STORAGE_KEY} in chrome.storage.local.`,
+      );
     }
-    throw new Error(
-      `ensurePaired: the panel reports "${PANEL_CONNECTION_LABELS.connected}" but no devtools credential of the stored shape is under ${DEVTOOLS_TOKEN_STORAGE_KEY} in chrome.storage.local.`,
-    );
   }
-  if (stored) {
-    // A credential the service no longer accepts, not yet cleared: remove it
-    // (by key; its value is never read) so the dialog pairs afresh.
+  if (await hasStoredDevtoolsCredential(source)) {
+    // A credential the suite's service does not accept — refused and not yet
+    // cleared, or paired with another address: remove it (by key; its value is
+    // never read) so the dialog pairs afresh.
     await removeWorkerStorage(await workerOf(source), 'local', DEVTOOLS_TOKEN_STORAGE_KEY);
-    await panel.waitForConnectionStatus('not-paired', { timeoutMs });
   }
+  await panel.waitForConnectionStatus('not-paired', { timeoutMs });
 
   // 2. The one-time code, registered for scrubbing before it goes anywhere.
   const { code } = await service.pairStart();
@@ -2615,6 +2693,13 @@ export async function ensurePaired(
       { cause: error },
     );
   }
+  // The dialog prefills the address field from the saved setting; typing only
+  // after that read has landed means the value submitted is the one typed
+  // here, never a late prefill over it.
+  await expect(locators.pairServiceAddressInput).toHaveValue(prefilledAddress(storedEndpoint), {
+    timeout: timeoutMs,
+  });
+  await locators.pairServiceAddressInput.fill(target === defaultOrigin ? '' : target);
   await locators.pairCodeInput.fill(code);
   await locators.pairSubmitButton.click();
 
@@ -2623,8 +2708,14 @@ export async function ensurePaired(
     await panel.waitForConnectionStatus('connected', { timeoutMs });
   } catch (error) {
     throw new Error(
-      `ensurePaired: pairing did not reach "${PANEL_CONNECTION_LABELS.connected}" within ${String(timeoutMs)} ms: ${await pairingFailureReason(panel, state, dialled)}.${errorsSuffix(state)}`,
+      `ensurePaired: pairing did not reach "${PANEL_CONNECTION_LABELS.connected}" within ${String(timeoutMs)} ms: ${await pairingFailureReason(panel, state, target)}.${errorsSuffix(state)}`,
       { cause: error },
+    );
+  }
+  const savedEndpoint = dialledOrigin(await readStoredServiceEndpoint(source), defaultOrigin);
+  if (savedEndpoint !== target) {
+    throw new Error(
+      `ensurePaired: pairing connected, but the worker's saved service address (${SERVICE_ENDPOINT_STORAGE_KEY}) is ${savedEndpoint ?? 'a value the extension refuses'}, not the suite's service ${target}.`,
     );
   }
   if (!(await hasStoredDevtoolsCredential(source))) {
@@ -3186,6 +3277,8 @@ export interface PanelLocators {
   readonly pairDialog: Locator;
   /** Its "Pairing code" field. */
   readonly pairCodeInput: Locator;
+  /** Its "Service address" field (the loopback origin the worker dials; blank = the default). */
+  readonly pairServiceAddressInput: Locator;
   /** Its "Pair" submit button. */
   readonly pairSubmitButton: Locator;
   /** Its "Cancel" button. */
@@ -3382,6 +3475,9 @@ export function panelLocators(page: Page): PanelLocators {
       .last(),
     pairDialog,
     pairCodeInput: pairDialog.getByRole('textbox', { name: PANEL_STRINGS.pairingField }),
+    pairServiceAddressInput: pairDialog.getByRole('textbox', {
+      name: PANEL_STRINGS.serviceAddressField,
+    }),
     pairSubmitButton: pairDialog.getByRole('button', {
       name: PANEL_STRINGS.pairSubmit,
       exact: true,

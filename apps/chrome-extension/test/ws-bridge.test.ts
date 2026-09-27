@@ -16,16 +16,17 @@
  *   `maxMs`); the `chrome.alarms` keepalive — owned by the bridge, never by the
  *   platform-neutral transport — revives an evicted worker's connection; while
  *   the socket is open, a heartbeat below the worker's idle window re-creates
- *   that alarm and probes the service, retiring a socket whose service stopped
- *   answering onto the curve; and every persisted tab binding is re-announced
- *   on each new socket (AAP §0.5.5, "Chrome disconnects").
+ *   that alarm and sends `client.ping` on the socket, retiring a socket whose
+ *   service leaves the ping without its `service.pong` for
+ *   `SERVICE_PONG_TIMEOUT_MS` onto the curve; and every persisted tab binding
+ *   is re-announced on each new socket.
  * - **The page agent's raw batches become protocol envelopes.** The MAIN-world
  *   agent never imports the protocol, so the bridge wraps its `{ events }` into
  *   `telemetry.event` frames — unchanged, in order, chunked to the receiver's
  *   own per-frame bound; an empty batch that reports loss is one loss-only
  *   frame, and one that reports none sends nothing — and inbound frames are
  *   validated by `@debuggen/protocol` before one is relayed to a panel or
- *   handed to a typed subscriber (AAP §0.4.2).
+ *   handed to a typed subscriber.
  * - **Every tab-scoped action names the tab it acts for.** One socket and one
  *   credential serve every inspected tab, so the hello announces no tab; each
  *   frame sent for a tab carries it as the envelope's acting `tabId`, each
@@ -95,6 +96,7 @@ import {
   PROTOCOL_VERSION,
   READ_PROOF_LENGTH,
   resolveWsUrl,
+  SERVICE_PONG_TIMEOUT_MS,
   sessionPath,
   telemetryEventPayloadSchema,
   WS_CLOSE_UNAUTHORIZED,
@@ -157,7 +159,6 @@ import { BINDING_STORAGE_KEY } from '../src/background/tab-registry';
 import type { DebugGeneratorWorker } from '../src/background/service-worker';
 import {
   createWsBridge,
-  SOCKET_HEARTBEAT_FAILURE_LIMIT,
   SOCKET_HEARTBEAT_INTERVAL_MS,
   TELEMETRY_ROUTE_WAIT_MS,
 } from '../src/background/ws-bridge';
@@ -428,8 +429,14 @@ interface FakeSocket extends WebSocketLike {
  * Build a recording socket constructor and the list every socket it constructs
  * is appended to. The class is declared inside the factory so each harness owns
  * its own list — there is no module-level state.
+ *
+ * @param answersPings Read on every write: while it answers `true`, the far
+ * side is a live service that answers each `client.ping` written to an open
+ * socket with the `service.pong` naming it, one turn later — so a case that
+ * holds a socket open past the heartbeat interval keeps it. Defaults to never:
+ * the heartbeat's own cases answer each ping by hand.
  */
-function createSocketFactory(): {
+function createSocketFactory(answersPings: () => boolean = () => false): {
   readonly ctor: WebSocketConstructorLike;
   readonly sockets: FakeSocket[];
 } {
@@ -478,6 +485,9 @@ function createSocketFactory(): {
         throw new Error('the fake socket died unnoticed');
       }
       this.sent.push(data);
+      if (answersPings()) {
+        this.answerPing(data);
+      }
       if (this.writesBeforeClosing !== undefined) {
         this.writesBeforeClosing -= 1;
         if (this.writesBeforeClosing <= 0) {
@@ -498,6 +508,20 @@ function createSocketFactory(): {
 
     stall(): void {
       this.stalled = true;
+    }
+
+    /** As a live service: answer a written `client.ping` one turn later, if still open. */
+    private answerPing(data: string): void {
+      const decoded = decodeMessage(data);
+      if (isErr(decoded) || decoded.value.type !== 'client.ping') {
+        return;
+      }
+      const ref = decoded.value.id;
+      void Promise.resolve().then(() => {
+        if (this.readyState === READY_STATE.open) {
+          this.receive(encodeMessage(createEnvelope('service.pong', { ref })));
+        }
+      });
     }
 
     listenerCount(): number {
@@ -578,6 +602,8 @@ interface HarnessState {
   bindings: TabBindingRecord[];
   /** What the credential store answers when told of a refusal. */
   unauthorizedAnswer: UnauthorizedHandling;
+  /** Whether the far side of every socket answers each `client.ping` like a live service. */
+  answersPings: boolean;
 }
 
 /** How a case configures its harness. */
@@ -598,6 +624,12 @@ interface HarnessOptions {
   readonly serviceBaseUrl?: string;
   /** What the credential store answers to a refusal. Defaults to `'cleared'`. */
   readonly unauthorizedAnswer?: UnauthorizedHandling;
+  /**
+   * Whether the far side answers each `client.ping` with its `service.pong`,
+   * as a live service does. Defaults to `false`: a case that crosses a
+   * heartbeat tick answers it by hand, or sees the socket retired.
+   */
+  readonly answersPings?: boolean;
   /**
    * The credential getter. Defaults to the store's: the token while one is
    * stored, `undefined` after the store cleared it.
@@ -658,10 +690,11 @@ function createHarness(options: HarnessOptions = {}): Harness {
     serviceUp: options.serviceUp ?? true,
     bindings: [...(options.bindings ?? [])],
     unauthorizedAnswer: options.unauthorizedAnswer ?? 'cleared',
+    answersPings: options.answersPings ?? false,
   };
   const logs: LogEntry[] = [];
   const logger = createRecordingLogger(logs);
-  const { ctor, sockets } = createSocketFactory();
+  const { ctor, sockets } = createSocketFactory(() => state.answersPings);
 
   // Opaque numeric handles over Vitest's faked `setTimeout`, as `TimerApi` requires.
   const delays: number[] = [];
@@ -1487,8 +1520,76 @@ function heartbeatHandles(h: Harness): number[] {
   });
 }
 
+/**
+ * The latest timer set on the injected timers, with its delay. Right after a
+ * tick has written its ping, this is the deadline of that ping's answer — told
+ * apart by when it was set, never by its delay, because the pong window and
+ * the socket's opening deadline are both five seconds.
+ */
+function latestTimer(h: Harness): { readonly handle: number; readonly ms: number } {
+  const index = h.setTimer.mock.calls.length - 1;
+  const call = h.setTimer.mock.calls[index];
+  const result = h.setTimer.mock.results[index];
+  if (call === undefined || result?.type !== 'return') {
+    throw new Error('no timer was set on the injected timers');
+  }
+  return { handle: result.value, ms: call[1] };
+}
+
+/** Every timer set on the injected timers from call index `from` on, with its delay, in order. */
+function timersSetSince(
+  h: Harness,
+  from: number,
+): { readonly handle: number; readonly ms: number }[] {
+  return h.setTimer.mock.calls.slice(from).flatMap(([, ms], offset) => {
+    const result = h.setTimer.mock.results[from + offset];
+    return result?.type === 'return' ? [{ handle: result.value, ms }] : [];
+  });
+}
+
+/** Every `client.ping` a socket carried, decoded and narrowed. */
+function pingsOf(socket: FakeSocket): MessageByType<'client.ping'>[] {
+  return framesOf(socket).flatMap((message) =>
+    isMessageOfType(message, 'client.ping') ? [message] : [],
+  );
+}
+
+/** The latest `client.ping` a socket carried. */
+function latestPing(socket: FakeSocket): MessageByType<'client.ping'> {
+  const ping = pingsOf(socket).at(-1);
+  if (ping === undefined) {
+    throw new Error('the socket carried no client.ping');
+  }
+  return ping;
+}
+
+/** The service answers on `socket` with a `service.pong` naming `ref`, and the answer is handled. */
+async function pong(socket: FakeSocket, ref: string): Promise<void> {
+  deliver(socket, createEnvelope('service.pong', { ref }));
+  await flush();
+}
+
+/** The close a socket the heartbeat retired receives. */
+const HEARTBEAT_RETIREMENT: CloseCall = {
+  code: NORMAL_CLOSURE,
+  reason: 'the local service stopped answering',
+};
+
+/** The shape of every id the bridge mints for a ping: a protocol message id. */
+const MINTED_MESSAGE_ID = /^msg_[0-9a-z]{16}$/;
+
+/** A message id no ping of the bridge's carries: the ref of an answer to some other frame. */
+const FOREIGN_FRAME_ID = 'msg_0000000000000000';
+
+/** The warn records a heartbeat files when it retires a socket, by message. */
+function retirementRecords(h: Harness): LogEntry[] {
+  return h.logs.filter(
+    (entry) => entry.level === 'warn' && entry.message.endsWith('; reconnecting'),
+  );
+}
+
 describe('the open-socket heartbeat: inside the MV3 idle window, and it notices a dead peer', () => {
-  it('ticks below the worker idle window and the keepalive period, on a delay no other timer uses', () => {
+  it('ticks below the worker idle window and waits for each answer well inside the interval, on a delay no other timer uses', () => {
     const { initialMs, maxMs } = DEFAULT_WS_BACKOFF;
 
     expect(SOCKET_HEARTBEAT_INTERVAL_MS).toBeLessThan(30_000);
@@ -1498,43 +1599,201 @@ describe('the open-socket heartbeat: inside the MV3 idle window, and it notices 
     expect([DEFAULT_WS_OPEN_TIMEOUT_MS, CLIENT_HELLO_TIMEOUT_MS, initialMs]).not.toContain(
       SOCKET_HEARTBEAT_INTERVAL_MS,
     );
-    expect(SOCKET_HEARTBEAT_FAILURE_LIMIT).toBe(2);
+    // The pong window ends before the next tick is due, so at most one ping
+    // is ever outstanding, and a dead peer is found inside the worker's idle
+    // window after the last answered ping.
+    expect(SERVICE_PONG_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(SERVICE_PONG_TIMEOUT_MS).toBeLessThan(SOCKET_HEARTBEAT_INTERVAL_MS);
+    expect(SOCKET_HEARTBEAT_INTERVAL_MS + SERVICE_PONG_TIMEOUT_MS).toBeLessThan(30_000);
   });
 
-  it('re-creates the keepalive alarm and probes the service every SOCKET_HEARTBEAT_INTERVAL_MS while open, writing nothing on the socket', async () => {
-    const h = createHarness();
+  it('re-creates the keepalive alarm and sends exactly one client.ping every SOCKET_HEARTBEAT_INTERVAL_MS while open — no tab, no session, a minted id — and probes no health route', async () => {
+    const h = createHarness({ bindings: [BINDING_A] });
     const socket = await connectAndOpen(h);
     const framesBefore = socket.sent.length;
     const probesBefore = healthProbeCount(h);
     expect(h.createAlarm).toHaveBeenCalledTimes(1);
     expect(h.bridge.getStatus().heartbeatActive).toBe(true);
 
+    const pingIds: string[] = [];
     for (let tick = 1; tick <= 3; tick += 1) {
       // Not a millisecond early…
       await advance(SOCKET_HEARTBEAT_INTERVAL_MS - 1);
       expect(h.createAlarm).toHaveBeenCalledTimes(tick);
-      expect(healthProbeCount(h)).toBe(probesBefore + tick - 1);
+      expect(pingsOf(socket)).toHaveLength(tick - 1);
       // …and exactly on the interval: an extension API call that resets the
-      // worker's idle timer, and one bounded health probe.
+      // worker's idle timer, then one ping on the socket it tests.
       await advance(1);
       expect(h.createAlarm).toHaveBeenCalledTimes(tick + 1);
       expect(h.createAlarm).toHaveBeenLastCalledWith(KEEPALIVE_ALARM_NAME, {
         periodInMinutes: KEEPALIVE_PERIOD_MINUTES,
       });
-      expect(healthProbeCount(h)).toBe(probesBefore + tick);
+      expect(pingsOf(socket)).toHaveLength(tick);
+      const ping = latestPing(socket);
+      expect(ping.payload).toEqual({});
+      expect(ping.id).toMatch(MINTED_MESSAGE_ID);
+      expect(Object.keys(ping)).not.toContain('tabId');
+      expect(Object.keys(ping)).not.toContain('sessionId');
+      expect(latestTimer(h).ms).toBe(SERVICE_PONG_TIMEOUT_MS);
+      // A tick awaiting its answer is a running heartbeat.
+      expect(h.bridge.getStatus().heartbeatActive).toBe(true);
+      expect(healthProbeCount(h)).toBe(probesBefore);
+      pingIds.push(ping.id);
+      await pong(socket, ping.id);
     }
 
-    // Armed on open, re-armed by each of the three ticks: one tick at a time.
+    // Armed on open, re-armed by each of the three answers: one tick at a time.
     expect(heartbeatHandles(h)).toHaveLength(4);
-    expect(socket.sent).toHaveLength(framesBefore);
+    expect(new Set(pingIds).size).toBe(3);
+    expect(typesOf(socket).slice(framesBefore)).toEqual([
+      'client.ping',
+      'client.ping',
+      'client.ping',
+    ]);
+    expect(healthProbeCount(h)).toBe(probesBefore);
     expect(socket.closeCalls).toHaveLength(0);
     expect(h.sockets).toHaveLength(1);
+    // A pong is the heartbeat's alone: no panel is handed one.
+    expect(h.relayPush.mock.calls.map(([message]) => message.type)).not.toContain('service.pong');
+    expect(retirementRecords(h)).toEqual([]);
     expect(h.bridge.getStatus()).toMatchObject({
       transport: 'open',
       heartbeatActive: true,
       keepaliveArmed: true,
     });
     expect(lastPushed(h).status).toBe<PanelConnectionStatus>('connected');
+  });
+
+  it('keeps the socket on the pong naming its ping, clears that ping’s deadline and schedules the next tick', async () => {
+    const h = createHarness();
+    const socket = await connectAndOpen(h);
+
+    await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
+    const ping = latestPing(socket);
+    const deadline = latestTimer(h);
+    expect(deadline.ms).toBe(SERVICE_PONG_TIMEOUT_MS);
+
+    await advance(SERVICE_PONG_TIMEOUT_MS - 1);
+    await pong(socket, ping.id);
+
+    expect(h.clearTimer).toHaveBeenCalledWith(deadline.handle);
+    expect(heartbeatHandles(h)).toHaveLength(2);
+    // The cleared deadline never fires: the socket outlives the pong window.
+    await advance(SERVICE_PONG_TIMEOUT_MS);
+    expect(socket.closeCalls).toHaveLength(0);
+    expect(h.sockets).toHaveLength(1);
+    expect(h.bridge.getStatus()).toMatchObject({ transport: 'open', heartbeatActive: true });
+    expect(retirementRecords(h)).toEqual([]);
+  });
+
+  it('does not count a pong naming another frame: the ping stays unanswered and its socket is retired at the deadline', async () => {
+    const h = createHarness();
+    const socket = await connectAndOpen(h);
+
+    await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
+    const ping = latestPing(socket);
+    await pong(socket, FOREIGN_FRAME_ID);
+
+    expect(ping.id).not.toBe(FOREIGN_FRAME_ID);
+    expect(heartbeatHandles(h)).toHaveLength(1);
+    expect(h.bridge.getStatus()).toMatchObject({ transport: 'open', heartbeatActive: true });
+    expect(socket.closeCalls).toHaveLength(0);
+
+    await advance(SERVICE_PONG_TIMEOUT_MS);
+    expect(socket.closeCalls).toEqual([HEARTBEAT_RETIREMENT]);
+    expect(h.bridge.getStatus().transport).toBe<ConnectionState>('reconnecting');
+    expect(h.relayPush).not.toHaveBeenCalled();
+  });
+
+  it('retires an open socket whose ping goes unanswered for SERVICE_PONG_TIMEOUT_MS, at once, onto the backoff curve, and the next open re-announces its bindings and runs its own heartbeat', async () => {
+    const h = createHarness({ bindings: [BINDING_A] });
+    const socket = await connectAndOpen(h);
+
+    // The service is gone, but no close frame arrived: the socket still reads open.
+    h.state.serviceUp = false;
+    await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
+    expect(pingsOf(socket)).toHaveLength(1);
+    await advance(SERVICE_PONG_TIMEOUT_MS - 1);
+    // Inside the pong window nothing is decided: the socket stays, and so does the pill.
+    expect(socket.closeCalls).toHaveLength(0);
+    expect(h.bridge.getStatus()).toMatchObject({ transport: 'open', heartbeatActive: true });
+    expect(lastPushed(h).status).toBe<PanelConnectionStatus>('connected');
+
+    // One missed pong is the proof: no second interval is waited.
+    await advance(1);
+    expect(socket.closeCalls).toEqual([HEARTBEAT_RETIREMENT]);
+    expect(socket.listenerCount()).toBe(0);
+    expect(h.bridge.getStatus()).toMatchObject({
+      transport: 'reconnecting',
+      heartbeatActive: false,
+    });
+    // On the jittered curve — never a tight loop against a service that is down.
+    expect(h.delays.at(-1)).toBe(nominalDelay(1));
+    expect(lastPushed(h).status).not.toBe<PanelConnectionStatus>('connected');
+    const retirements = retirementRecords(h);
+    expect(retirements.map((entry) => entry.message)).toEqual([
+      'the local service did not answer the heartbeat ping; reconnecting',
+    ]);
+    expect(retirements[0]?.fields).toMatchObject({ timeoutMs: SERVICE_PONG_TIMEOUT_MS });
+    expect(JSON.stringify(h.logs)).not.toContain(TOKEN);
+
+    // The service comes back: the curve reconnects, the bindings are
+    // re-announced, and the new connection has its own heartbeat.
+    h.state.serviceUp = true;
+    await advance(nominalDelay(1) - 1);
+    expect(h.sockets).toHaveLength(1);
+    await advance(1);
+    expect(h.sockets).toHaveLength(2);
+    const next = latestSocket(h);
+    next.accept();
+    await flush();
+
+    expect(typesOf(next)).toEqual(['client.hello', 'session.bind']);
+    expect(h.bridge.getStatus()).toMatchObject({ transport: 'open', heartbeatActive: true });
+    expect(lastPushed(h).status).toBe<PanelConnectionStatus>('connected');
+    expect(heartbeatHandles(h)).toHaveLength(2);
+
+    await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
+    expect(typesOf(next)).toEqual(['client.hello', 'session.bind', 'client.ping']);
+    await pong(next, latestPing(next).id);
+    expect(heartbeatHandles(h)).toHaveLength(3);
+    expect(next.closeCalls).toHaveLength(0);
+    expect(h.sockets).toHaveLength(2);
+  });
+
+  it('counts an error naming the ping as its answer — the refusal of a service that predates the liveness pair — and relays that error to no panel', async () => {
+    const h = createHarness();
+    const socket = await connectAndOpen(h);
+
+    await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
+    const ping = latestPing(socket);
+    deliver(
+      socket,
+      createEnvelope('error', {
+        code: 'PROTOCOL_INVALID_MESSAGE',
+        message: 'The frame names a message type this service does not know.',
+        ref: ping.id,
+      }),
+    );
+    await flush();
+
+    expect(heartbeatHandles(h)).toHaveLength(2);
+    expect(h.relayPush).not.toHaveBeenCalled();
+    await advance(SERVICE_PONG_TIMEOUT_MS);
+    expect(socket.closeCalls).toHaveLength(0);
+    expect(h.bridge.getStatus()).toMatchObject({ transport: 'open', heartbeatActive: true });
+
+    // An error about any other frame is still the panels' to see.
+    const other = createEnvelope('error', {
+      code: 'PROTOCOL_INVALID_MESSAGE',
+      message: 'The frame could not be read.',
+      ref: FOREIGN_FRAME_ID,
+    });
+    deliver(socket, other);
+    await flush();
+    expect(h.relayPush).toHaveBeenCalledTimes(1);
+    expect(h.relayPush.mock.calls[0]?.[0]).toEqual(other);
+    expect(retirementRecords(h)).toEqual([]);
   });
 
   it('never runs while the socket is not open: a connection whose upgrade stalls is retried by its opening deadline instead', async () => {
@@ -1549,74 +1808,73 @@ describe('the open-socket heartbeat: inside the MV3 idle window, and it notices 
       heartbeatActive: false,
     });
     expect(heartbeatHandles(h)).toEqual([]);
+    expect(h.sockets.flatMap((socket) => pingsOf(socket))).toEqual([]);
     expect(h.createAlarm).toHaveBeenCalledTimes(1);
   });
 
-  it('retires an open socket whose service left SOCKET_HEARTBEAT_FAILURE_LIMIT probes in a row unanswered, onto the backoff curve, and starts again on the next open', async () => {
-    const h = createHarness({ bindings: [BINDING_A] });
+  it('retires, without writing a ping, a socket that cannot take the write while the client still reports it open', async () => {
+    const h = createHarness();
     const socket = await connectAndOpen(h);
 
-    // The service is gone, but no close frame arrived: the socket still reads open.
-    h.state.serviceUp = false;
-    for (let failure = 1; failure < SOCKET_HEARTBEAT_FAILURE_LIMIT; failure += 1) {
-      await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
-      // One unanswered probe is not proof: the socket stays, and so does the pill.
-      expect(socket.closeCalls).toHaveLength(0);
-      expect(h.bridge.getStatus()).toMatchObject({ transport: 'open', heartbeatActive: true });
-      expect(lastPushed(h).status).toBe<PanelConnectionStatus>('connected');
-    }
+    // The far side starts closing after the next write, and no event fires yet.
+    socket.startClosingAfter(1);
+    expect(isErr(h.bridge.send('tab.navigated', { tabId: TAB_A, url: APP_URL }))).toBe(false);
+    expect(h.bridge.getStatus().transport).toBe<ConnectionState>('open');
+
     await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
 
-    expect(socket.closeCalls).toEqual([
-      { code: NORMAL_CLOSURE, reason: 'the local service stopped answering' },
-    ]);
-    expect(socket.listenerCount()).toBe(0);
+    expect(pingsOf(socket)).toEqual([]);
+    expect(socket.closeCalls).toEqual([HEARTBEAT_RETIREMENT]);
     expect(h.bridge.getStatus()).toMatchObject({
       transport: 'reconnecting',
       heartbeatActive: false,
     });
-    // On the jittered curve — never a tight loop against a service that is down.
-    expect(h.delays.at(-1)).toBe(nominalDelay(1));
-    expect(lastPushed(h).status).not.toBe<PanelConnectionStatus>('connected');
-    expect(JSON.stringify(h.logs)).not.toContain(TOKEN);
-
-    // The service comes back: the curve reconnects, the bindings are
-    // re-announced, and the new connection has its own heartbeat.
-    h.state.serviceUp = true;
-    await advance(nominalDelay(1) - 1);
-    expect(h.sockets).toHaveLength(1);
-    await advance(1);
-    expect(h.sockets).toHaveLength(2);
-    latestSocket(h).accept();
-    await flush();
-
-    expect(typesOf(latestSocket(h))).toEqual(['client.hello', 'session.bind']);
-    expect(h.bridge.getStatus()).toMatchObject({ transport: 'open', heartbeatActive: true });
-    expect(lastPushed(h).status).toBe<PanelConnectionStatus>('connected');
-    expect(heartbeatHandles(h)).toHaveLength(SOCKET_HEARTBEAT_FAILURE_LIMIT + 1);
+    const retirements = retirementRecords(h);
+    expect(retirements.map((entry) => entry.message)).toEqual([
+      'the open socket cannot take the heartbeat ping; reconnecting',
+    ]);
+    expect(retirements[0]?.fields).toMatchObject({ transport: 'open' });
   });
 
-  it('counts only consecutive failures: one answered probe resets the count', async () => {
+  it('retires a socket whose ping the client queued instead of writing, clearing its deadline; the pong the flushed ping earns on the next connection is ignored', async () => {
     const h = createHarness();
     const socket = await connectAndOpen(h);
 
-    for (let round = 0; round < 3; round += 1) {
-      h.state.serviceUp = false;
-      await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
-      h.state.serviceUp = true;
-      await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
-    }
+    // The connection died without the platform noticing: every write throws
+    // while readyState still reads OPEN, so the client queues the ping.
+    socket.stall();
+    const timersBefore = h.setTimer.mock.calls.length;
+    await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
 
-    expect(socket.closeCalls).toHaveLength(0);
-    expect(h.sockets).toHaveLength(1);
+    // The tick set the ping's deadline, then the restart set the reconnect.
+    const [deadline, reconnect] = timersSetSince(h, timersBefore);
+    expect(deadline?.ms).toBe(SERVICE_PONG_TIMEOUT_MS);
+    expect(reconnect?.ms).toBe(nominalDelay(1));
+    expect(h.clearTimer).toHaveBeenCalledWith(deadline?.handle);
+    expect(socket.closeCalls).toEqual([HEARTBEAT_RETIREMENT]);
+    expect(h.bridge.getStatus()).toMatchObject({
+      transport: 'reconnecting',
+      heartbeatActive: false,
+    });
+    const retirements = retirementRecords(h);
+    expect(retirements.map((entry) => entry.message)).toEqual([
+      'the heartbeat ping was not written to the open socket; reconnecting',
+    ]);
+    expect(retirements[0]?.fields).toMatchObject({ outcome: 'queued' });
+
+    // The client keeps its queue across the restart, so the stale ping is
+    // flushed after the next hello; its answer names no outstanding ping.
+    await advance(nominalDelay(1));
+    const next = latestSocket(h);
+    next.accept();
+    await flush();
+    expect(typesOf(next)).toEqual(['client.hello', 'client.ping']);
+    await pong(next, latestPing(next).id);
+
+    expect(heartbeatHandles(h)).toHaveLength(2);
+    expect(next.closeCalls).toHaveLength(0);
+    expect(h.relayPush).not.toHaveBeenCalled();
     expect(h.bridge.getStatus()).toMatchObject({ transport: 'open', heartbeatActive: true });
-
-    h.state.serviceUp = false;
-    for (let failure = 1; failure <= SOCKET_HEARTBEAT_FAILURE_LIMIT; failure += 1) {
-      await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
-    }
-    expect(socket.closeCalls).toHaveLength(1);
-    expect(h.bridge.getStatus().transport).toBe<ConnectionState>('reconnecting');
   });
 
   it.each<[string, (h: Harness) => Promise<void>]>([
@@ -1653,41 +1911,112 @@ describe('the open-socket heartbeat: inside the MV3 idle window, and it notices 
     expect(heartbeatHandles(h)).toEqual(handles);
   });
 
-  it('abandons a tick whose connection ended while its probe was in flight: it neither re-arms nor counts against the next connection', async () => {
+  it.each<[string, (h: Harness) => Promise<void>]>([
+    ['the socket dropping', (h) => dropLatest(h)],
+    [
+      'a 4401 refusal',
+      async (h) => {
+        latestSocket(h).drop(WS_CLOSE_UNAUTHORIZED, REFUSED_REASON);
+        await flush();
+      },
+    ],
+    [
+      'the credential being removed',
+      async (h) => {
+        h.state.credentialStored = false;
+        h.bridge.handlePairingState('not-paired');
+        await flush();
+      },
+    ],
+    ['close()', (h) => h.bridge.close()],
+  ])(
+    'stops on %s while a ping awaits its answer: the deadline is cleared, and nothing is retired or re-armed',
+    async (_cause, stop) => {
+      const h = createHarness();
+      const socket = await connectAndOpen(h);
+      await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
+      expect(pingsOf(socket)).toHaveLength(1);
+      const deadline = latestTimer(h);
+      expect(deadline.ms).toBe(SERVICE_PONG_TIMEOUT_MS);
+      expect(h.bridge.getStatus().heartbeatActive).toBe(true);
+      const handles = heartbeatHandles(h);
+      const alarmsBefore = h.createAlarm.mock.calls.length;
+
+      await stop(h);
+
+      expect(h.clearTimer).toHaveBeenCalledWith(deadline.handle);
+      expect(h.bridge.getStatus().heartbeatActive).toBe(false);
+      await advance(SERVICE_PONG_TIMEOUT_MS + SOCKET_HEARTBEAT_INTERVAL_MS);
+      expect(h.sockets.flatMap((each) => each.closeCalls)).not.toContainEqual(HEARTBEAT_RETIREMENT);
+      expect(retirementRecords(h)).toEqual([]);
+      expect(heartbeatHandles(h)).toEqual(handles);
+      expect(h.createAlarm).toHaveBeenCalledTimes(alarmsBefore);
+    },
+  );
+
+  it('abandons a tick whose connection ended while its ping awaited the answer: the old deadline neither fires nor retires the next connection', async () => {
     const h = createHarness();
-    await connectAndOpen(h);
-    const probesBefore = healthProbeCount(h);
-    // The service takes the probe and never answers it.
-    h.routes.set(healthPath(), () => new Promise<HttpResponseLike>(() => {}));
+    const socket = await connectAndOpen(h);
 
     await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
-    expect(healthProbeCount(h)).toBe(probesBefore + 1);
-    // A tick awaiting its probe is a running heartbeat.
-    expect(h.bridge.getStatus().heartbeatActive).toBe(true);
-
+    expect(pingsOf(socket)).toHaveLength(1);
     await dropLatest(h);
     expect(h.bridge.getStatus().heartbeatActive).toBe(false);
-    h.routes.set(healthPath(), () => Promise.resolve(jsonResponse(200, HEALTH_BODY)));
     await advance(nominalDelay(1));
-    latestSocket(h).accept();
+    const next = latestSocket(h);
+    next.accept();
     await flush();
     expect(heartbeatHandles(h)).toHaveLength(2);
 
-    // The orphaned probe runs out of time: its tick does nothing further.
-    await advance(CLIENT_HELLO_TIMEOUT_MS);
+    // The first ping's window runs out: nothing happens to the new socket.
+    await advance(SERVICE_PONG_TIMEOUT_MS);
+    expect(next.closeCalls).toHaveLength(0);
     expect(heartbeatHandles(h)).toHaveLength(2);
-    expect(latestSocket(h).closeCalls).toHaveLength(0);
     expect(h.bridge.getStatus()).toMatchObject({ transport: 'open', heartbeatActive: true });
 
-    // Its failure was not carried over: one unanswered probe on the new
-    // connection is still only one.
-    h.state.serviceUp = false;
-    await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
-    expect(latestSocket(h).closeCalls).toHaveLength(0);
-    expect(h.bridge.getStatus().transport).toBe<ConnectionState>('open');
+    // The new connection's own tick pings it, and its answer keeps it.
+    await advance(SOCKET_HEARTBEAT_INTERVAL_MS - SERVICE_PONG_TIMEOUT_MS);
+    expect(typesOf(next)).toEqual(['client.hello', 'client.ping']);
+    await pong(next, latestPing(next).id);
+    expect(heartbeatHandles(h)).toHaveLength(3);
+    expect(next.closeCalls).toHaveLength(0);
+    expect(retirementRecords(h)).toEqual([]);
   });
 
-  it('runs on the platform timers when none are injected, reading them only once a timer is set', async () => {
+  it('abandons a tick whose connection ended while its alarm call was in flight: it pings neither socket', async () => {
+    const h = createHarness();
+    const socket = await connectAndOpen(h);
+    let finishAlarm: (() => void) | undefined;
+    h.createAlarm.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishAlarm = resolve;
+        }),
+    );
+
+    await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
+    expect(finishAlarm).toBeDefined();
+    // A tick awaiting its alarm call is a running heartbeat.
+    expect(h.bridge.getStatus().heartbeatActive).toBe(true);
+    expect(pingsOf(socket)).toEqual([]);
+
+    await dropLatest(h);
+    await advance(nominalDelay(1));
+    const next = latestSocket(h);
+    next.accept();
+    await flush();
+
+    finishAlarm?.();
+    await flush();
+
+    expect(pingsOf(socket)).toEqual([]);
+    expect(typesOf(next)).toEqual(['client.hello']);
+    expect(heartbeatHandles(h)).toHaveLength(2);
+    expect(next.closeCalls).toHaveLength(0);
+    expect(h.bridge.getStatus()).toMatchObject({ transport: 'open', heartbeatActive: true });
+  });
+
+  it('runs on the platform timers when none are injected, reading them only once a timer is set, and leaves none behind on close', async () => {
     const h = createHarness({ platformTimers: true });
     expect(vi.getTimerCount()).toBe(0);
 
@@ -1697,13 +2026,20 @@ describe('the open-socket heartbeat: inside the MV3 idle window, and it notices 
 
     expect(h.setTimer).not.toHaveBeenCalled();
     expect(h.createAlarm).toHaveBeenCalledTimes(2);
-    expect(healthProbeCount(h)).toBe(probesBefore + 1);
+    expect(pingsOf(socket)).toHaveLength(1);
+    expect(healthProbeCount(h)).toBe(probesBefore);
+    await pong(socket, latestPing(socket).id);
     expect(socket.closeCalls).toHaveLength(0);
 
+    // A second ping is outstanding when the bridge is disposed: its deadline
+    // goes with it.
+    await advance(SOCKET_HEARTBEAT_INTERVAL_MS);
+    expect(pingsOf(socket)).toHaveLength(2);
     await h.bridge.close();
     expect(vi.getTimerCount()).toBe(0);
     await advance(SOCKET_HEARTBEAT_INTERVAL_MS * 2);
-    expect(h.createAlarm).toHaveBeenCalledTimes(2);
+    expect(h.createAlarm).toHaveBeenCalledTimes(3);
+    expect(socket.closeCalls).not.toContainEqual(HEARTBEAT_RETIREMENT);
   });
 });
 
@@ -3130,8 +3466,9 @@ describe('awaitTabRoute — the service-confirmed route telemetry waits for', ()
   });
 
   it('times out on the injected timers after TELEMETRY_ROUTE_WAIT_MS, or after the bound its caller gives', async () => {
-    const h = createHarness();
-    await connectAndOpen(h);
+    // A live service: the wait outlasts a heartbeat tick, and the socket stays open throughout.
+    const h = createHarness({ answersPings: true });
+    const socket = await connectAndOpen(h);
     const timersBefore = vi.getTimerCount();
     const bounded = observeRoute(h, TAB_A, SESSION_A);
     const shorter = observeRoute(h, TAB_B, SESSION_B, { timeoutMs: 1_000 });
@@ -3150,6 +3487,10 @@ describe('awaitTabRoute — the service-confirmed route telemetry waits for', ()
     expect(errCode(await bounded.promise)).toBe('TRANSPORT_DISCONNECTED');
     expect(cancelledBy(bounded.result())).toBe('timeout');
     expect(vi.getTimerCount()).toBe(timersBefore);
+    expect(pingsOf(socket)).toHaveLength(1);
+    expect(socket.closeCalls).toHaveLength(0);
+    expect(h.sockets).toHaveLength(1);
+    expect(h.bridge.getStatus().transport).toBe<ConnectionState>('open');
   });
 
   it('treats every reconnect as a new generation: an earlier confirmation no longer counts', async () => {

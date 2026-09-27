@@ -101,7 +101,10 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
+  renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -905,6 +908,12 @@ interface ContextInput {
 
   /** Cancellation, for the abort cases. */
   readonly signal?: AbortSignal | undefined;
+
+  /**
+   * The canonical path the service admitted the root under, for the cases that
+   * prove it reaches the patcher. Omitted, the context carries none.
+   */
+  readonly canonicalProjectRoot?: string | undefined;
 }
 
 /** The state root a non-writing case names but no case may create. */
@@ -940,6 +949,9 @@ function contextFor(input: ContextInput): InstrumentationContext {
     now: input.now ?? frozenClock,
     ...(input.project.loaded === undefined ? {} : { loaded: input.project.loaded }),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
+    ...(input.canonicalProjectRoot === undefined
+      ? {}
+      : { canonicalProjectRoot: input.canonicalProjectRoot }),
   };
 }
 
@@ -2320,6 +2332,27 @@ function stubPatcher(options: PatcherOptions, seen: InstrumentationAction[][]): 
 }
 
 /**
+ * Whether this host lets the suite create a symbolic link.
+ *
+ * The admitted-root refusal case needs one, and a platform that refuses the
+ * plant (Windows without developer mode) cannot host it. Probed once rather
+ * than selected by platform name.
+ */
+const CAN_CREATE_SYMLINKS = ((): boolean => {
+  const probe = mkdtempSync(join(tmpdir(), 'debuggen-nextjs-link-probe-'));
+
+  try {
+    symlinkSync(join(probe, 'absent'), join(probe, 'link'));
+
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+})();
+
+/**
  * A hand-written action, for the cases that hand this adapter something a plan
  * would not have proposed.
  *
@@ -2701,6 +2734,85 @@ describe('install with the preload attached', () => {
     expect(changedPaths(world.before, treeSnapshot(world.projectRoot))).toEqual([]);
     expect(journal.events).toEqual([]);
   });
+
+  it('hands the patcher the admitted canonical root the context carries, and none when it carries none', async () => {
+    const world = await sandbox();
+    const actions = await smallPlan(world.project);
+    const readiness = preloadPresets(world.projectRoot).fresh;
+    const canonicalProjectRoot = toPosix(realpathSync.native(world.projectRoot));
+    const admitted = writableContext(world, { readiness, canonicalProjectRoot });
+    const spelledOnly = writableContext(world, { readiness });
+    const factory = vi.fn((options: PatcherOptions): Patcher => stubPatcher(options, []));
+    const adapter = createNextJsAdapter({ patcherFactory: factory });
+
+    await adapter.install(actions, admitted.context);
+    await adapter.install(actions, spelledOnly.context);
+
+    expect(factory).toHaveBeenCalledTimes(2);
+
+    const [withRoot, withoutRoot] = factory.mock.calls.map(([options]) => options);
+
+    // The canonical path travels beside the spelled root, never instead of it:
+    // preload matching and relaunch hints stay on the root the session records.
+    expect(withRoot?.canonicalRoot).toBe(admitted.context.canonicalProjectRoot);
+    expect(withRoot?.canonicalRoot).toBe(canonicalProjectRoot);
+    expect(withRoot?.projectRoot).toBe(world.projectRoot);
+    expect(withoutRoot?.canonicalRoot).toBeUndefined();
+    expect(withoutRoot?.projectRoot).toBe(world.projectRoot);
+    expect(changedPaths(world.before, treeSnapshot(world.projectRoot))).toEqual([]);
+  });
+
+  it('applies every planned target inside the admitted canonical root through the real patcher', async () => {
+    const world = await sandbox();
+    const canonicalProjectRoot = toPosix(realpathSync.native(world.projectRoot));
+    const { context } = writableContext(world, {
+      readiness: preloadPresets(world.projectRoot).fresh,
+      canonicalProjectRoot,
+    });
+    const actions = await smallPlan(world.project);
+    const result = await createNextJsAdapter().install(actions, context);
+
+    expect(result.failure).toBeUndefined();
+    expect(result.applied).toHaveLength(actions.length);
+
+    for (const record of result.applied) {
+      expect(record.status).toBe('applied');
+      expect(sha256Hex(readFileSync(join(canonicalProjectRoot, record.file)))).toBe(
+        record.instrumentedHash,
+      );
+    }
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'reports a patch refused, and writes nothing, once the admitted root has been replaced by a link (requires symlink creation)',
+    async () => {
+      const world = await sandbox();
+      const decoy = await sandbox('decoy');
+      const canonicalProjectRoot = toPosix(realpathSync.native(world.projectRoot));
+      const { context, journal } = writableContext(world, {
+        readiness: preloadPresets(world.projectRoot).fresh,
+        canonicalProjectRoot,
+      });
+      const actions = await smallPlan(world.project);
+      const moved = `${world.projectRoot}-moved`;
+
+      // Admitted and planned; only now is the project directory moved aside
+      // and a link to a full copy of it planted where it was.
+      renameSync(world.projectRoot, moved);
+      symlinkSync(decoy.projectRoot, world.projectRoot);
+
+      const result = await createNextJsAdapter().install(actions, context);
+
+      expect(result.applied).toEqual([]);
+      expect(result.failure?.error.code).toBe('PATH_OUTSIDE_PROJECT');
+      expect(result.failure?.error.details?.['reason']).toBe('project-root-moved');
+      expect(result.failure?.record).toBeUndefined();
+      expect(journal.events).toEqual([]);
+      expect(backupEntries(world)).toEqual([]);
+      expect(changedPaths(decoy.before, treeSnapshot(decoy.projectRoot))).toEqual([]);
+      expect(changedPaths(world.before, treeSnapshot(moved))).toEqual([]);
+    },
+  );
 
   it('ignores actions it does not claim, and builds no patcher for them', async () => {
     const world = await sandbox();

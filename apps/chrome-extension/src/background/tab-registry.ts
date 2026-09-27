@@ -480,11 +480,11 @@ export const UNBIND_TOMBSTONE_TTL_MS = 24 * 60 * 60_000;
  * able to make a restarted worker carry an unbounded map.
  *
  * **Why 256.** A binding is one DevTools-inspected tab per live session — one
- * session accepts one bound tab at a time (AAP §0.2.3) — so the count in use is
- * the number of sessions a developer runs at once with DevTools open on each:
- * a handful. 256 is two orders of magnitude of headroom over that, and small
- * enough that validating and sorting a full snapshot on every worker revival
- * costs nothing noticeable.
+ * session accepts one bound tab at a time — so the count in use is the number
+ * of sessions a developer runs at once with DevTools open on each: a handful.
+ * 256 is two orders of magnitude of headroom over that, and small enough that
+ * validating and sorting a full snapshot on every worker revival costs nothing
+ * noticeable.
  *
  * **At the limit.** A bind request of a tab holding no slot is refused
  * (`RATE_LIMITED`, nothing sent); a confirmation that needs a slot first

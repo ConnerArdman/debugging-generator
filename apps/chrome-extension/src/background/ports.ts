@@ -228,9 +228,18 @@ export const PORT_REQUEST_TIMEOUT_MS = 20_000;
  * How long a worker → bridge round trip ({@link PortHub.requestFromBridge})
  * waits for the page agent's correlated answer, in milliseconds.
  *
- * The agent answers a `target.request` synchronously inside its `message`
- * dispatch, so five seconds only elapses when the page is frozen, navigating
- * or has no agent — all of which the caller treats as "agent not ready".
+ * A `target.request` arms an interactive pick, and the agent answers it only
+ * when that pick ends: the developer clicks an element, presses Escape in the
+ * page, the page is hidden, or a cancelling or newer `target.request` ends it.
+ * The answer therefore waits on the developer, not only on the page, and five
+ * seconds elapses whenever the developer has not picked within them — as
+ * well as when the page is frozen, navigating or has no agent, all of which
+ * the caller treats as "agent not ready". That is why the worker's own picker
+ * (`target.pick`) never waits here: it posts its request with
+ * {@link PortHub.sendToBridge} and settles the answer when its
+ * `target.described` arrives. A timed-out round trip leaves its pick armed in
+ * the page; a caller that stops waiting ends it with a
+ * `target.request { cancel: true }`.
  * Overridable per hub through {@link PortHubDeps.bridgeRequestTimeoutMs}.
  */
 export const BRIDGE_REQUEST_TIMEOUT_MS = 5_000;
@@ -614,8 +623,12 @@ export interface PortHub {
 
   /**
    * A worker-initiated round trip to one tab's page agent: send
-   * `target.request` with a fresh correlation id and resolve with the
-   * matching `target.described` payload.
+   * `target.request` with a fresh correlation id — which arms one interactive
+   * pick in the page — and resolve with the matching `target.described`
+   * payload, sent when that pick ends (the developer's click, or `null` for
+   * Escape, a hidden page, a cancel or a newer pick). The wait is bounded by
+   * {@link BRIDGE_REQUEST_TIMEOUT_MS}, which the developer's own pace can
+   * exceed; see there for why the worker's picker does not use this.
    *
    * Rejects with a typed `DebuggenError` — `AGENT_NOT_READY` when no bridge is
    * attached or the agent does not answer in time, `TRANSPORT_DISCONNECTED`

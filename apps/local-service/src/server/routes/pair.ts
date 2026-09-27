@@ -22,6 +22,18 @@
  * checked before the body is even read, so a DevTools or server-agent caller
  * learns nothing about pairing state.
  *
+ * That principal is a snapshot of a credential that existed when the request
+ * arrived, and reading the body awaits the client for as long as it takes to
+ * send it. A credential retired inside that gap — by a rotation, a revocation
+ * or an expiry — must not mint a pairing code, so once the body is read the
+ * handler asks {@link AuthService.requireLiveCredential} (the revocation
+ * fence) whether it is still live, immediately before
+ * {@link AuthService.startPairing} and with no `await` between the two. Both
+ * are synchronous, and so is every retirement, so none can interleave. A
+ * credential retired meanwhile is answered `401`; a fence that cannot give a
+ * verdict — a store failure, or a throw — fails closed with a `500`, never a
+ * pass.
+ *
  * `pair.complete` is the least privileged call in the service and its only
  * state-changing unauthenticated operation (protocol's `AUTH_EXEMPT_OPERATIONS`):
  * the one-time code **is** the capability being presented. Exempt means "no
@@ -48,7 +60,9 @@
  * the code used. This file generates no code, counts no failure,
  * hashes nothing and reads no credential file; it is an authorization-correct,
  * leak-free HTTP shell over {@link AuthService.startPairing} and
- * {@link AuthService.completePairing}. It registers nothing either: it returns
+ * {@link AuthService.completePairing}, with the revocation fence
+ * ({@link AuthService.requireLiveCredential}) in front of the first. It
+ * registers nothing either: it returns
  * its two handlers, keyed by operation id, for `../http.ts` to register from
  * protocol's route table behind the auth middleware.
  *
@@ -191,8 +205,10 @@ const LOG_SUBSYSTEM = 'server.pair';
 
 /**
  * The fixed message of a `500` from `pair.start`: the access boundary failed
- * for a reason other than a refusal (a store failure, a failed random draw).
- * The detail is in the service log, which `../auth.ts` already wrote.
+ * for a reason other than a refusal (a store failure, a failed random draw,
+ * a revocation fence that could not give a verdict). The detail is in the
+ * service log, which `../auth.ts` already wrote — or, for a fence that threw,
+ * this module.
  */
 const PAIRING_START_UNAVAILABLE_MESSAGE =
   'The Debug Generator local service could not issue a pairing code. Its log holds the reason.';
@@ -222,11 +238,15 @@ const RESPONSE_DRIFT_MESSAGE =
  */
 export interface PairRoutesDeps {
   /**
-   * The access boundary's two pairing operations. Everything that makes pairing
-   * safe — code generation, expiry, single use, lockout, hash-only storage and
-   * credential issuance — happens inside these two calls.
+   * The access boundary's two pairing operations and its revocation fence.
+   * Everything that makes pairing safe — code generation, expiry, single use,
+   * lockout, hash-only storage and credential issuance — happens inside the
+   * two pairing calls; `requireLiveCredential` refuses a `pair.start` whose
+   * credential was retired while its body was read. The field name `auth`
+   * matches the sibling route modules' slices of the same service, so
+   * `../http.ts`'s aggregate asks for one object that satisfies them all.
    */
-  readonly auth: Pick<AuthService, 'startPairing' | 'completePairing'>;
+  readonly auth: Pick<AuthService, 'startPairing' | 'completePairing' | 'requireLiveCredential'>;
 
   /**
    * Where this module's diagnostics go; defaults to the no-op logger. Records
@@ -537,18 +557,20 @@ function answerResponseDrift(c: Context<ServerEnv>): Response {
  *
  * | Outcome | `pair.start` | `pair.complete` |
  * | --- | --- | --- |
- * | success | `200 { code, expiresAt }` | `200 { token }` |
+ * | success | `200 { code, expiresAt }` | `200 { token, readProof }` |
  * | no resolved principal | `401` (`missing-credential`) | — |
  * | not the editor role | `403` (`role-not-permitted`) | — |
  * | oversized body, declared or as it arrives | `413` | `413` |
  * | body not arrived within `../http.ts`'s time ceiling | `408` | `408` |
  * | unreadable / non-JSON / off-schema body | `400` | `400` |
+ * | credential retired or expired while the body was read | `401` (`unknown-credential` / `expired-credential` / `corrupt-credential`) | — |
  * | origin not `chrome-extension://<id>` | — | `403` (auth.ts's verdict) |
  * | wrong, used or expired code | — | `401` uniform `PAIRING_INVALID` |
  * | lockout | — | `429` `RATE_LIMITED` |
- * | store / random-source / drift failure | `500` fixed message | `500` fixed message |
+ * | store / random-source / revocation-fence / drift failure | `500` fixed message | `500` fixed message |
  *
- * @param deps The access boundary's pairing operations and an optional logger.
+ * @param deps The access boundary's pairing operations and revocation fence,
+ * and an optional logger.
  * @returns The two handlers, keyed by operation id.
  *
  * @example
@@ -566,12 +588,39 @@ export function createPairRoutes(deps: PairRoutesDeps): PairRouteHandlers {
   const logger = subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM);
 
   /**
+   * The revocation fence: whether the credential that authorized a
+   * `pair.start` is still live. `requireLiveCredential` reports every failure
+   * as a `Result` and logs its own refusals and store failures; a throw is a
+   * defect below and fails closed — it is logged here by operation and code
+   * and answered as the access boundary's `500`, never as a pass. The thrown
+   * value is kept as the cause for a debugger, never logged or answered.
+   */
+  const requireLive = (principal: Principal): Result<void, DebuggenError> => {
+    try {
+      return auth.requireLiveCredential(principal);
+    } catch (caught) {
+      logger.error('the revocation fence threw while a pairing request was checked', {
+        operation: PAIR_START,
+        errorCode: 'INTERNAL',
+      });
+      return err(
+        new DebuggenError(
+          'INTERNAL',
+          'The credential that authorized this pairing request could not be confirmed.',
+          { details: { reason: 'credential-check-threw' }, cause: caught },
+        ),
+      );
+    }
+  };
+
+  /**
    * `POST /pair/start` — editor credential required.
    *
    * Order is the security property: the principal and its role are checked
    * before the body is read, so a caller without the editor role is refused
    * without learning anything about pairing; only then is the (empty) body
-   * validated and a code minted.
+   * validated, the credential's liveness confirmed — it may have been retired
+   * while the body was awaited — and a code minted.
    */
   const startPairing: PairRouteHandler = async (c) => {
     c.header(CACHE_CONTROL_HEADER, NO_STORE);
@@ -602,6 +651,15 @@ export function createPairRoutes(deps: PairRoutesDeps): PairRouteHandlers {
         errorCode: request.error.error.code,
       });
       return answerBodyRejection(c, request.error);
+    }
+
+    // The body was awaited; the credential that authorized the request may
+    // have been retired meanwhile. Nothing awaits between this check and the
+    // minting, and both are synchronous. A refusal is answered `401` by
+    // auth.ts's table; any other failure is a fixed `500`.
+    const live = requireLive(principal);
+    if (isErr(live)) {
+      return answerAccessBoundaryError(c, live.error, PAIRING_START_UNAVAILABLE_MESSAGE);
     }
 
     const issued = auth.startPairing();

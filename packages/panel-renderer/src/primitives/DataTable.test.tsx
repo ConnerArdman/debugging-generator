@@ -28,7 +28,12 @@
  *   never for the reader's own activation, an unrelated re-render or an environment that measures
  *   nothing. It coexists with the reveal of a newly expanded row.
  *
- * The column width roles and the horizontal-scroll floor they sum to are pinned as well.
+ * The column width roles - the full floor of a compact role, the fit-to-panel track of a truncating
+ * one - and the grid floor they sum to are pinned as well, both as the token expressions the rows
+ * consume and, through a small evaluator of those expressions, as the widths they resolve to
+ * across a sweep of panel widths: a table that fits at its readable floors keeps them, one just too
+ * narrow truncates exactly as far as it must to fit, and one too narrow even for its minimums
+ * takes its floors back and scrolls.
  *
  * ## How the measured path is driven under happy-dom
  *
@@ -49,6 +54,10 @@
  * `useVirtualizer` after recording four of its fields, so every test in this file - including the
  * measured path - runs against the real virtualizer rather than a stand-in.
  */
+
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { act, fireEvent, render } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -1904,15 +1913,18 @@ function kebabOf(key: string): string {
 }
 
 /**
- * The value a `var(--dg-…)` reference resolves to in the default theme.
+ * The value a `var(--dg-…)` reference resolves to in one theme.
  *
  * @param reference A single `var(--dg-…)` reference.
- * @returns The referenced token's dark value.
+ * @param values The theme's token values; the default theme when omitted.
+ * @returns The referenced token's value in that theme.
  */
-function tokenValueOf(reference: string): string {
+function tokenValueOf(
+  reference: string,
+  values: Readonly<Record<string, string>> = DESIGN_TOKENS.dark,
+): string {
   const property = /^var\((--dg-[a-z0-9-]+)\)$/u.exec(reference)?.[1];
-  const key = Object.keys(DESIGN_TOKENS.dark).find((name) => `--dg-${kebabOf(name)}` === property);
-  const values: Readonly<Record<string, string>> = DESIGN_TOKENS.dark;
+  const key = Object.keys(values).find((name) => `--dg-${kebabOf(name)}` === property);
 
   if (key === undefined) {
     throw new Error(`${reference} references no token the table declares`);
@@ -1921,8 +1933,434 @@ function tokenValueOf(reference: string): string {
   return values[key] ?? '';
 }
 
+/** The roles whose content truncates, and which narrow first when the floors do not fit. */
+const TRUNCATING_ROLES: readonly DataTableColumnWidth[] = ['name', 'text'];
+
+/** The roles whose content does not survive being cut, and which keep their full floor. */
+const COMPACT_ROLES: readonly DataTableColumnWidth[] = [
+  'ordinal',
+  'count',
+  'quantity',
+  'status',
+  'label',
+  'standard',
+];
+
+/** The yield token's reference, spelled here rather than through the product's `cssVar`. */
+const YIELD_REFERENCE = 'var(--dg-column-yield)';
+
+/** Every theme's token values, each of which must give every role a usable minimum. */
+const THEME_VALUES: readonly (readonly [string, Readonly<Record<string, string>>])[] = [
+  ['dark', DESIGN_TOKENS.dark],
+  ['light', DESIGN_TOKENS.light],
+  ['highContrast', DESIGN_TOKENS.highContrast],
+];
+
+/**
+ * A role's readable-floor reference, spelled independently of the product's `cssVar`.
+ *
+ * @param role A column width role.
+ * @returns `var(--dg-column-min-<role>)`.
+ */
+function floorReferenceOf(role: string): string {
+  return `var(--dg-column-min-${role})`;
+}
+
+/**
+ * A truncating role's guaranteed minimum: its readable floor scaled by the yield token.
+ *
+ * @param role A column width role.
+ * @returns `calc(var(--dg-column-min-<role>) * var(--dg-column-yield))`.
+ */
+function yieldedFloorOf(role: string): string {
+  return `calc(${floorReferenceOf(role)} * ${YIELD_REFERENCE})`;
+}
+
+/**
+ * The grid-published properties a truncating track reads, besides tokens. Nothing else may appear
+ * in a track: a column's geometry is tokens and the grid's own sums.
+ */
+const GRID_PROPERTY_NAMES: ReadonlySet<string> = new Set([
+  '--dgc-readable-inline',
+  '--dgc-min-inline',
+  '--dgc-yield-count',
+  '--dgc-column-count',
+]);
+
+/**
+ * A truncating role's track, spelled out independently of the product: the floor less this
+ * column's part of the shortfall (an equal share, or what the other truncating columns cannot
+ * absorb), clamped between the yielded minimum and the floor.
+ *
+ * @param role A truncating column width role.
+ * @param share The role's `--dg-column-share-*` suffix.
+ * @returns The track the role must resolve to.
+ */
+function yieldingTrackOf(role: string, share: string): string {
+  const floor = floorReferenceOf(role);
+  const minimum = yieldedFloorOf(role);
+  const shortfall =
+    '(var(--dgc-readable-inline) + var(--dgc-column-count) * var(--dg-space-2) - ' +
+    'var(--dg-space-2) - var(--dg-size-full))';
+  const capacity = '(var(--dgc-readable-inline) - var(--dgc-min-inline))';
+
+  return (
+    `minmax(clamp(${minimum}, ${floor} - max(${shortfall} / var(--dgc-yield-count), ` +
+    `${shortfall} - ${capacity} + ${floor} - ${minimum}), ${floor}), ` +
+    `var(--dg-column-share-${share}))`
+  );
+}
+
+/**
+ * The component stylesheet, read from disk relative to this file. Joined with `node:path` rather
+ * than resolved with `new URL(…)`: under happy-dom the global `URL` is the DOM's, which Node's
+ * `fileURLToPath` rejects.
+ */
+const COMPONENT_STYLESHEET = readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'styles', 'components.css'),
+  'utf8',
+);
+
+/** The grid floor declaration, read from the stylesheet on first use. */
+let cachedGridFloorDeclaration: string | undefined;
+
+/**
+ * The grid's `min-inline-size` as the stylesheet declares it - the half of the fit rule the rows
+ * cannot state, since it sizes the grid element they sit in.
+ *
+ * @returns The declaration's value, whitespace collapsed.
+ */
+function gridFloorDeclaration(): string {
+  cachedGridFloorDeclaration ??= readGridFloorDeclaration();
+  return cachedGridFloorDeclaration;
+}
+
+/**
+ * Reads the grid's `min-inline-size` declaration out of the stylesheet.
+ *
+ * @returns The declaration's value, whitespace collapsed.
+ */
+function readGridFloorDeclaration(): string {
+  const selector = "\n.dg-data-table [role='grid'] {";
+  const start = COMPONENT_STYLESHEET.indexOf(selector);
+
+  if (start === -1) {
+    throw new Error('the grid rule is missing from components.css');
+  }
+
+  const body = COMPONENT_STYLESHEET.slice(
+    start + selector.length,
+    COMPONENT_STYLESHEET.indexOf('\n}', start),
+  );
+  const value = /min-inline-size:([^;]*);/u.exec(body)?.[1];
+
+  if (value === undefined) {
+    throw new Error('the grid rule declares no min-inline-size');
+  }
+
+  return value.replace(/\s+/gu, ' ').trim();
+}
+
+/** A fixed `ch` width for the evaluator: only proportions matter, so any positive width will do. */
+const CH_IN_PX = 7;
+
+/**
+ * The inline width of the row's inline-start edge, `--dg-border-width-marker` (`medium`, which a
+ * browser draws three pixels wide). The stylesheet covers it with `--dg-space-1`, so the row's
+ * content box is the grid's width less this.
+ */
+const ROW_EDGE_PX = 3;
+
+/** What one evaluation substitutes: the theme's tokens, the grid's properties and `100%`. */
+interface EvaluationScope {
+  readonly tokens: Readonly<Record<string, string>>;
+  readonly properties: Readonly<Record<string, string>>;
+  readonly percentBase: number;
+}
+
+/**
+ * The index of the parenthesis that closes the one opened at `open`.
+ *
+ * @param text The expression.
+ * @param open The index of an opening parenthesis.
+ * @returns The index of its match.
+ */
+function closingParenthesisOf(text: string, open: number): number {
+  let depth = 0;
+
+  for (let index = open; index < text.length; index += 1) {
+    if (text[index] === '(') {
+      depth += 1;
+    } else if (text[index] === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+
+  throw new Error(`unbalanced parentheses in ${text}`);
+}
+
+/**
+ * The index of the first comma at the top level of a function's argument list.
+ *
+ * @param text The text between a function's parentheses.
+ * @returns The comma's index, or `-1` when there is none.
+ */
+function topLevelCommaOf(text: string): number {
+  let depth = 0;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (character === '(') {
+      depth += 1;
+    } else if (character === ')') {
+      depth -= 1;
+    } else if (character === ',' && depth === 0) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+/** Each theme's token values keyed by custom property name, built once per theme. */
+const TOKEN_PROPERTY_VALUES = new WeakMap<object, ReadonlyMap<string, string>>();
+
+/**
+ * A theme's token values keyed by the custom property each is published as.
+ *
+ * @param tokens The theme's token values.
+ * @returns The values by `--dg-*` property name.
+ */
+function tokenPropertiesOf(tokens: Readonly<Record<string, string>>): ReadonlyMap<string, string> {
+  let byProperty = TOKEN_PROPERTY_VALUES.get(tokens);
+
+  if (byProperty === undefined) {
+    byProperty = new Map(
+      Object.entries(tokens).map(([key, value]) => [`--dg-${kebabOf(key)}`, value]),
+    );
+    TOKEN_PROPERTY_VALUES.set(tokens, byProperty);
+  }
+
+  return byProperty;
+}
+
+/**
+ * Every `var()` reference replaced, innermost values first, by what it resolves to: a grid
+ * property's published value, a token's theme value, or the reference's own fallback.
+ *
+ * @param text An expression that may contain `var()` references.
+ * @param scope The values to substitute.
+ * @returns The expression with no `var()` left, each substitution parenthesized.
+ */
+function resolveReferences(text: string, scope: EvaluationScope): string {
+  let resolved = '';
+  let cursor = 0;
+
+  for (;;) {
+    const at = text.indexOf('var(', cursor);
+    if (at === -1) {
+      return resolved + text.slice(cursor);
+    }
+
+    const close = closingParenthesisOf(text, at + 'var'.length);
+    const inner = text.slice(at + 'var('.length, close);
+    const comma = topLevelCommaOf(inner);
+    const name = (comma === -1 ? inner : inner.slice(0, comma)).trim();
+    const value =
+      scope.properties[name] ??
+      tokenPropertiesOf(scope.tokens).get(name) ??
+      (comma === -1 ? undefined : inner.slice(comma + 1));
+
+    if (value === undefined) {
+      throw new Error(`${name} resolves to nothing and has no fallback`);
+    }
+
+    resolved += `${text.slice(cursor, at)}(${resolveReferences(value, scope)})`;
+    cursor = close + 1;
+  }
+}
+
+/**
+ * The CSS math expression evaluated to CSS pixels: `calc()`, `min()`, `max()` and `clamp()` over
+ * `+`, `-`, `*` and `/`, with `ch`, `px` and `%` lengths and unitless numbers.
+ *
+ * @param expression A length expression, `var()` references included.
+ * @param scope The values its references and its percentages resolve against.
+ * @returns The length in CSS pixels.
+ */
+function evaluateLength(expression: string, scope: EvaluationScope): number {
+  const source = resolveReferences(expression, scope);
+  const tokens = [...source.matchAll(/(\d+(?:\.\d+)?|\.\d+)(ch|px|%)?|[a-z]+(?=\()|[-+*/(),]/gu)];
+  let position = 0;
+
+  // Nothing may be skipped: a keyword or a unit the evaluator does not know would otherwise drop
+  // out of the expression silently and still yield a number.
+  if (tokens.map((token) => token[0]).join('') !== source.replace(/\s+/gu, '')) {
+    throw new Error(`${source} holds input this evaluator does not understand`);
+  }
+
+  const peek = (): string | undefined => tokens[position]?.[0];
+  const take = (expected?: string): string => {
+    const token = tokens[position]?.[0];
+    if (token === undefined || (expected !== undefined && token !== expected)) {
+      throw new Error(`expected ${expected ?? 'a token'} at ${String(position)} in ${source}`);
+    }
+    position += 1;
+    return token;
+  };
+
+  function sum(): number {
+    let value = product();
+    while (peek() === '+' || peek() === '-') {
+      value = take() === '+' ? value + product() : value - product();
+    }
+    return value;
+  }
+
+  function product(): number {
+    let value = operand();
+    while (peek() === '*' || peek() === '/') {
+      value = take() === '*' ? value * operand() : value / operand();
+    }
+    return value;
+  }
+
+  function operand(): number {
+    const match = tokens[position];
+    const token = take();
+
+    if (token === '(') {
+      const value = sum();
+      take(')');
+      return value;
+    }
+    if (token === '-') {
+      return -operand();
+    }
+    if (/^[a-z]+$/u.test(token)) {
+      take('(');
+      const argumentsOf: number[] = [sum()];
+      while (peek() === ',') {
+        take(',');
+        argumentsOf.push(sum());
+      }
+      take(')');
+      return applyMathFunction(token, argumentsOf);
+    }
+
+    const magnitude = Number(match?.[1]);
+    switch (match?.[2]) {
+      case 'ch':
+        return magnitude * CH_IN_PX;
+      case '%':
+        return (magnitude * scope.percentBase) / 100;
+      default:
+        return magnitude;
+    }
+  }
+
+  const value = sum();
+  if (position !== tokens.length) {
+    throw new Error(`unparsed input after ${String(position)} in ${source}`);
+  }
+  return value;
+}
+
+/**
+ * One CSS math function applied to its evaluated arguments.
+ *
+ * @param name `calc`, `min`, `max` or `clamp`.
+ * @param values Its arguments, in pixels.
+ * @returns The function's result.
+ */
+function applyMathFunction(name: string, values: readonly number[]): number {
+  const [first = Number.NaN, second = Number.NaN, third = Number.NaN] = values;
+
+  switch (name) {
+    case 'calc':
+      return first;
+    case 'min':
+      return Math.min(...values);
+    case 'max':
+      return Math.max(...values);
+    case 'clamp':
+      return Math.max(first, Math.min(second, third));
+    default:
+      throw new Error(`${name}() is not a math function this evaluator knows`);
+  }
+}
+
+/**
+ * A track's minimum sizing function: the first argument of its `minmax()`, or the whole track for
+ * a fixed one.
+ *
+ * @param track A grid track.
+ * @returns Its minimum.
+ */
+function trackMinimumOf(track: string): string {
+  if (!track.startsWith('minmax(')) {
+    return track;
+  }
+
+  const inner = track.slice('minmax('.length, closingParenthesisOf(track, 'minmax'.length));
+  return inner.slice(0, topLevelCommaOf(inner)).trim();
+}
+
+/**
+ * The magnitude of a `ch` length token value.
+ *
+ * @param value A resolved token value such as `24ch`.
+ * @returns Its number of `ch`.
+ */
+function chOf(value: string): number {
+  const magnitude = /^(\d+(?:\.\d+)?)ch$/u.exec(value)?.[1];
+
+  if (magnitude === undefined) {
+    throw new Error(`${value} is not a ch length`);
+  }
+
+  return Number(magnitude);
+}
+
+/**
+ * The yield token's factor in one theme: a unitless number, because it scales a `ch` floor inside
+ * a `calc()` and a length times a length is no valid CSS.
+ *
+ * @param values The theme's token values.
+ * @returns The factor.
+ */
+function yieldFactorOf(values: Readonly<Record<string, string>>): number {
+  const value = tokenValueOf(YIELD_REFERENCE, values);
+
+  if (!/^\d+(?:\.\d+)?$/u.test(value)) {
+    throw new Error(`the column yield ${value} is not a unitless factor`);
+  }
+
+  return Number(value);
+}
+
+/**
+ * A track minimum resolved against one theme, in `ch`: the floor token's magnitude, scaled by the
+ * yield factor when the minimum is a yielded floor.
+ *
+ * @param minimum A `DataTableColumnTrack` minimum: a floor reference or a yielded floor.
+ * @param values The theme's token values.
+ * @returns The minimum's width in `ch`.
+ */
+function resolvedMinimumCh(minimum: string, values: Readonly<Record<string, string>>): number {
+  const yieldedFloor =
+    /^calc\((var\(--dg-column-min-[a-z]+\)) \* var\(--dg-column-yield\)\)$/u.exec(minimum)?.[1];
+
+  return yieldedFloor === undefined
+    ? chOf(tokenValueOf(minimum, values))
+    : chOf(tokenValueOf(yieldedFloor, values)) * yieldFactorOf(values);
+}
+
 describe('DataTable column width roles and the horizontal-scroll floor', () => {
-  it("publishes each role's token-built track, the sum of the floors and the column count", () => {
+  it("publishes each role's token-built track, both sums and both counts", () => {
     const widths = ['name', 'quantity', undefined, 'ordinal', 'text', 'status'] as const;
     const { container } = render(
       <DataTable
@@ -1937,23 +2375,54 @@ describe('DataTable column width roles and the horizontal-scroll floor', () => {
     // Pinned literally as well as through the exported table, so the token form the rows consume is
     // asserted and not only whatever the table currently holds.
     expect(grid.style.getPropertyValue('--dgc-columns')).toBe(
-      'minmax(var(--dg-column-min-name), var(--dg-column-share-wide)) ' +
+      `${yieldingTrackOf('name', 'wide')} ` +
         'minmax(var(--dg-column-min-quantity), var(--dg-column-share-compact)) ' +
         'minmax(var(--dg-column-min-standard), var(--dg-column-share-default)) ' +
         'var(--dg-column-min-ordinal) ' +
-        'minmax(var(--dg-column-min-text), var(--dg-column-share-widest)) ' +
+        `${yieldingTrackOf('text', 'widest')} ` +
         'minmax(var(--dg-column-min-status), var(--dg-column-share-compact))',
     );
     expect(grid.style.getPropertyValue('--dgc-columns')).toBe(
       widths.map((width) => DATA_TABLE_COLUMN_TRACKS[width ?? 'standard'].track).join(' '),
     );
-    // Every column contributes its floor, so a dock narrower than the sum scrolls horizontally.
+    // Every column contributes its guaranteed minimum - the yielded floor of the name and text
+    // columns, the full floor of every other - to the width below which nothing fits ...
     expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe(
-      'calc(var(--dg-column-min-name) + var(--dg-column-min-quantity) + ' +
-        'var(--dg-column-min-standard) + var(--dg-column-min-ordinal) + var(--dg-column-min-text) + ' +
+      'calc(calc(var(--dg-column-min-name) * var(--dg-column-yield)) + ' +
+        'var(--dg-column-min-quantity) + var(--dg-column-min-standard) + ' +
+        'var(--dg-column-min-ordinal) + ' +
+        'calc(var(--dg-column-min-text) * var(--dg-column-yield)) + ' +
         'var(--dg-column-min-status))',
     );
+    // ... and its readable floor to the width at which every column reads in full.
+    expect(grid.style.getPropertyValue('--dgc-readable-inline')).toBe(
+      'calc(var(--dg-column-min-name) + var(--dg-column-min-quantity) + ' +
+        'var(--dg-column-min-standard) + var(--dg-column-min-ordinal) + ' +
+        'var(--dg-column-min-text) + var(--dg-column-min-status))',
+    );
+    expect(grid.style.getPropertyValue('--dgc-yield-count')).toBe('2');
     expect(grid.style.getPropertyValue('--dgc-column-count')).toBe(String(widths.length));
+  });
+
+  it('publishes no readable sum or truncating count when no column truncates', () => {
+    const widths = ['status', 'quantity', 'label'] as const;
+    const { container } = render(
+      <DataTable
+        caption="Compact"
+        rows={makeRows(1)}
+        rowKey={(row) => row.id}
+        columns={columnsWithWidths(widths)}
+      />,
+    );
+    const grid = gridOf(container);
+
+    // Both sums would be equal, so only the one the stylesheet falls back to is written.
+    expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe(
+      'calc(var(--dg-column-min-status) + var(--dg-column-min-quantity) + ' +
+        'var(--dg-column-min-label))',
+    );
+    expect(grid.style.getPropertyValue('--dgc-readable-inline')).toBe('');
+    expect(grid.style.getPropertyValue('--dgc-yield-count')).toBe('');
   });
 
   it('gives every unsized column the token-backed standard role', () => {
@@ -2006,35 +2475,389 @@ describe('DataTable column width roles and the horizontal-scroll floor', () => {
     const grid = gridOf(container);
 
     expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe('');
+    expect(grid.style.getPropertyValue('--dgc-readable-inline')).toBe('');
     expect(grid.style.getPropertyValue('--dgc-column-count')).toBe('0');
   });
 
-  for (const [role, { track, minimum }] of Object.entries(DATA_TABLE_COLUMN_TRACKS)) {
+  for (const [role, { track, floor, minimum }] of Object.entries(DATA_TABLE_COLUMN_TRACKS)) {
     it(`builds the ${role} role from catalogued column tokens alone`, () => {
       const references = [...track.matchAll(/var\((--[a-z0-9-]+)\)/gu)].map((m) => m[1] ?? '');
 
       expect(references.length, `${role} reads no token at all`).toBeGreaterThan(0);
-      expect(references.filter((name) => !TOKEN_PROPERTY_NAMES.has(name))).toEqual([]);
-      // Nothing but token references and the minmax() frame: no number, no unit, no keyword.
-      expect(track.replace(/var\(--[a-z0-9-]+\)/gu, '')).toMatch(/^(?:minmax\(, \))?$/u);
-      expect(minimum, `${role}'s minimum must be its floor token`).toMatch(
-        /^var\(--dg-column-min-[a-z]+\)$/u,
+      expect(
+        references.filter(
+          (name) => !TOKEN_PROPERTY_NAMES.has(name) && !GRID_PROPERTY_NAMES.has(name),
+        ),
+      ).toEqual([]);
+      // Nothing but token and grid references inside math frames: no number, no unit, no
+      // keyword, and no function beyond the four the track needs.
+      const residue = track.replace(/var\(--[a-z0-9-]+\)/gu, '');
+      expect(residue).toMatch(/^[a-z(), +*/-]*$/u);
+      expect(
+        [...residue.matchAll(/[a-z]+/gu)]
+          .map((m) => m[0])
+          .filter((name) => !['minmax', 'clamp', 'calc', 'max'].includes(name)),
+      ).toEqual([]);
+      expect(floor).toBe(floorReferenceOf(role));
+      expect(minimum.replace(/var\(--[a-z0-9-]+\)/gu, '')).toMatch(/^(?:|calc\( \* \))$/u);
+      expect(minimum, `${role}'s minimum must open on its floor token`).toContain(
+        floorReferenceOf(role),
       );
-      expect(track.startsWith(minimum) || track.startsWith(`minmax(${minimum}, `)).toBe(true);
+      expect(track === floor || track.startsWith('minmax(')).toBe(true);
     });
 
-    it(`keeps a narrow dock readable: the ${role} role has a non-zero ch floor`, () => {
-      const [, magnitude] = /^(\d+(?:\.\d+)?)ch$/u.exec(tokenValueOf(minimum)) ?? [];
-
-      expect(magnitude, `${role}'s floor must resolve to a ch length`).toBeDefined();
-      expect(Number(magnitude)).toBeGreaterThan(0);
+    it(`keeps the ${role} role readable: a non-zero ch floor and minimum in every theme`, () => {
+      for (const [theme, values] of THEME_VALUES) {
+        expect(
+          chOf(tokenValueOf(floorReferenceOf(role), values)),
+          `${role}'s ${theme} floor`,
+        ).toBeGreaterThan(0);
+        expect(resolvedMinimumCh(minimum, values), `${role}'s ${theme} minimum`).toBeGreaterThan(0);
+      }
     });
   }
 
-  it('offers exactly the documented roles', () => {
+  for (const [role, share] of [
+    ['name', 'wide'],
+    ['text', 'widest'],
+  ] as const) {
+    it(`fits the truncating ${role} role to its panel, between its yielded minimum and its floor`, () => {
+      const { track, floor, minimum, yields } = DATA_TABLE_COLUMN_TRACKS[role];
+
+      expect(yields).toBe(true);
+      expect(floor).toBe(floorReferenceOf(role));
+      expect(minimum).toBe(yieldedFloorOf(role));
+      expect(track).toBe(yieldingTrackOf(role, share));
+
+      // Resolved, the minimum is a real yield: narrower than the readable floor, never nothing.
+      for (const [theme, values] of THEME_VALUES) {
+        const floorCh = chOf(tokenValueOf(floorReferenceOf(role), values));
+
+        expect(resolvedMinimumCh(minimum, values), `${role}'s ${theme} minimum`).toBeLessThan(
+          floorCh,
+        );
+        expect(resolvedMinimumCh(minimum, values)).toBeCloseTo(floorCh * yieldFactorOf(values));
+      }
+    });
+  }
+
+  it('lists exactly the truncating roles as the ones that yield', () => {
+    expect(
+      Object.entries(DATA_TABLE_COLUMN_TRACKS)
+        .filter(([, entry]) => entry.yields)
+        .map(([role]) => role)
+        .sort(),
+    ).toEqual([...TRUNCATING_ROLES].sort());
+  });
+
+  for (const role of COMPACT_ROLES) {
+    it(`keeps the compact ${role} role at its bare floor, in its track and its minimum`, () => {
+      const { track, floor, minimum, yields } = DATA_TABLE_COLUMN_TRACKS[role];
+
+      expect(yields).toBe(false);
+      expect(minimum).toBe(floorReferenceOf(role));
+      expect(floor).toBe(minimum);
+      expect(track === minimum || track.startsWith(`minmax(${minimum}, `)).toBe(true);
+      expect(track).not.toContain(YIELD_REFERENCE);
+      expect(track).not.toContain('--dgc-');
+    });
+  }
+
+  it('sums the yielded floors of name and text columns and the bare floors of the rest', () => {
+    // The shape of the editor's modifications list (a file name and two status columns), with a
+    // free-text and a count column besides.
+    const widths = ['name', 'status', 'status', 'text', 'count'] as const;
+    const { container } = render(
+      <DataTable
+        caption="Yield"
+        rows={makeRows(2)}
+        rowKey={(row) => row.id}
+        columns={columnsWithWidths(widths)}
+      />,
+    );
+    const grid = gridOf(container);
+    const minimumInline = grid.style.getPropertyValue('--dgc-min-inline');
+
+    expect(minimumInline).toBe(
+      `calc(${yieldedFloorOf('name')} + ${floorReferenceOf('status')} + ` +
+        `${floorReferenceOf('status')} + ${yieldedFloorOf('text')} + ${floorReferenceOf('count')})`,
+    );
+    expect(grid.style.getPropertyValue('--dgc-readable-inline')).toBe(
+      `calc(${widths.map((role) => floorReferenceOf(role)).join(' + ')})`,
+    );
+    expect(grid.style.getPropertyValue('--dgc-yield-count')).toBe('2');
+
+    // Resolved in every theme, the table's minimum is every compact floor whole plus the yield of
+    // every truncating floor - strictly less than the sum of the readable floors, so a panel
+    // between the two narrows its names and free text instead of scrolling its status columns
+    // away.
+    for (const [theme, values] of THEME_VALUES) {
+      const floorOf = (role: DataTableColumnWidth): number =>
+        chOf(tokenValueOf(floorReferenceOf(role), values));
+      const readableFloors = widths.reduce((sum, role) => sum + floorOf(role), 0);
+      const expected =
+        floorOf('status') * 2 +
+        floorOf('count') +
+        (floorOf('name') + floorOf('text')) * yieldFactorOf(values);
+      const resolved = widths.reduce(
+        (sum, role) => sum + resolvedMinimumCh(DATA_TABLE_COLUMN_TRACKS[role].minimum, values),
+        0,
+      );
+
+      expect(resolved, `${theme} table minimum`).toBeCloseTo(expected);
+      expect(resolved, `${theme} table minimum`).toBeLessThan(readableFloors);
+    }
+  });
+
+  it('publishes a template and a floor with no digit outside a token reference', () => {
+    const widths = [...TRUNCATING_ROLES, ...COMPACT_ROLES];
+    const { container } = render(
+      <DataTable
+        caption="Every role"
+        rows={makeRows(1)}
+        rowKey={(row) => row.id}
+        columns={columnsWithWidths(widths)}
+      />,
+    );
+    const grid = gridOf(container);
+
+    for (const property of ['--dgc-columns', '--dgc-min-inline', '--dgc-readable-inline']) {
+      const value = grid.style.getPropertyValue(property);
+      const references = [...value.matchAll(/var\((--[a-z0-9-]+)\)/gu)].map((m) => m[1] ?? '');
+      // Only the template may read the grid's own sums; the sums themselves are tokens alone.
+      const allowed = (name: string): boolean =>
+        TOKEN_PROPERTY_NAMES.has(name) ||
+        (property === '--dgc-columns' && GRID_PROPERTY_NAMES.has(name));
+
+      expect(references.length, `${property} reads no token at all`).toBeGreaterThan(0);
+      expect(references.filter((name) => !allowed(name))).toEqual([]);
+      expect(value.replace(/var\(--[a-z0-9-]+\)/gu, ''), property).not.toMatch(/\d/u);
+    }
+  });
+
+  it('offers exactly the documented roles, each either truncating or compact', () => {
     expect(Object.keys(DATA_TABLE_COLUMN_TRACKS).sort()).toEqual(
       ['count', 'label', 'name', 'ordinal', 'quantity', 'standard', 'status', 'text'].sort(),
     );
+    expect([...TRUNCATING_ROLES, ...COMPACT_ROLES].sort()).toEqual(
+      Object.keys(DATA_TABLE_COLUMN_TRACKS).sort(),
+    );
+  });
+});
+
+/** One panel width's resolved geometry: the grid, the row box and every track's minimum. */
+interface ResolvedGeometry {
+  readonly grid: number;
+  readonly row: number;
+  readonly minimums: readonly number[];
+}
+
+/**
+ * The geometry a table of the given column roles resolves to in a viewport of the given width, from
+ * the properties the rendered grid publishes, the stylesheet's grid floor and the role tracks.
+ *
+ * @param properties The grid's published `--dgc-*` properties.
+ * @param widths The columns' roles, in order.
+ * @param viewport The viewport's content width, in CSS pixels.
+ * @param tokens The theme's token values.
+ * @returns The grid's width, its rows' content width and each track's resolved minimum.
+ */
+function resolveGeometry(
+  properties: Readonly<Record<string, string>>,
+  widths: readonly DataTableColumnWidth[],
+  viewport: number,
+  tokens: Readonly<Record<string, string>>,
+): ResolvedGeometry {
+  const grid = evaluateLength(gridFloorDeclaration(), {
+    tokens,
+    properties,
+    percentBase: viewport,
+  });
+  const row = grid - ROW_EDGE_PX;
+  const minimums = widths.map((role) =>
+    evaluateLength(trackMinimumOf(DATA_TABLE_COLUMN_TRACKS[role].track), {
+      tokens,
+      properties,
+      percentBase: row,
+    }),
+  );
+
+  return { grid, row, minimums };
+}
+
+describe('DataTable fit-to-panel geometry, resolved', () => {
+  // Four shapes: the editor's modifications list (one truncating column), two truncating columns of
+  // unequal floors, three of equal floors, and a table with none.
+  const CASES: readonly (readonly DataTableColumnWidth[])[] = [
+    ['name', 'status', 'status'],
+    ['name', 'quantity', 'text', 'status', 'count'],
+    ['text', 'text', 'text', 'count'],
+    ['status', 'quantity', 'label'],
+  ];
+
+  for (const widths of CASES) {
+    it(`keeps, fits or hands back the floors of [${widths.join(', ')}] at every panel width`, () => {
+      const { container } = render(
+        <DataTable
+          caption="Geometry"
+          rows={makeRows(1)}
+          rowKey={(row) => row.id}
+          columns={columnsWithWidths(widths)}
+        />,
+      );
+      const style = gridOf(container).style;
+      const properties: Record<string, string> = {};
+      for (const name of GRID_PROPERTY_NAMES) {
+        const value = style.getPropertyValue(name);
+        if (value !== '') {
+          properties[name] = value;
+        }
+      }
+
+      for (const [theme, tokens] of THEME_VALUES) {
+        const px = (expression: string): number =>
+          evaluateLength(expression, { tokens, properties, percentBase: 0 });
+        const floors = widths.map((role) => px(DATA_TABLE_COLUMN_TRACKS[role].floor));
+        const minimums = widths.map((role) => px(DATA_TABLE_COLUMN_TRACKS[role].minimum));
+        const gaps = (widths.length - 1) * px('var(--dg-space-2)');
+        const edge = px('var(--dg-space-1)');
+        const readableRow = floors.reduce((sum, value) => sum + value, 0) + gaps;
+        const minimumRow = minimums.reduce((sum, value) => sum + value, 0) + gaps;
+        const capacity = readableRow - minimumRow;
+        const knee = minimumRow + edge;
+        // Below the knee the grid grows by the return scale per pixel of shortfall, so the table is
+        // back at its readable floors this far below it.
+        const cliff = knee - capacity / px('var(--dg-column-yield-return-scale)');
+        const at = (viewport: number): ResolvedGeometry =>
+          resolveGeometry(properties, widths, viewport, tokens);
+
+        expect(edge, 'the edge allowance covers the row edge').toBeGreaterThanOrEqual(ROW_EDGE_PX);
+        expect(knee - cliff, 'the change of regime spans less than a pixel').toBeLessThan(1);
+
+        const sweep = new Set<number>([
+          knee,
+          (knee + cliff) / 2,
+          cliff,
+          knee - capacity,
+          readableRow + edge,
+          readableRow,
+        ]);
+        for (
+          let viewport = Math.floor(knee - capacity - 40);
+          viewport <= readableRow + 80;
+          viewport += 1
+        ) {
+          sweep.add(viewport);
+        }
+
+        let previous: ResolvedGeometry | undefined;
+        for (const viewport of [...sweep].sort((a, b) => a - b)) {
+          const geometry = at(viewport);
+          const label = `${theme} [${widths.join(', ')}] at ${String(viewport)}px`;
+          const used = geometry.minimums.reduce((sum, value) => sum + value, 0) + gaps;
+
+          // Every track stays between its minimum and its floor, and a compact one at its floor.
+          geometry.minimums.forEach((value, index) => {
+            expect(value, label).toBeGreaterThanOrEqual((minimums[index] ?? 0) - 1e-6);
+            expect(value, label).toBeLessThanOrEqual((floors[index] ?? 0) + 1e-6);
+            if (!DATA_TABLE_COLUMN_TRACKS[widths[index] ?? 'standard'].yields) {
+              expect(value, label).toBeCloseTo(floors[index] ?? 0, 6);
+            }
+          });
+          // The row always holds every column: no track is pushed past the grid's edge.
+          expect(used, label).toBeLessThanOrEqual(geometry.row + 1e-6);
+          // The grid is never narrower than its viewport.
+          expect(geometry.grid, label).toBeGreaterThanOrEqual(viewport - 1e-6);
+
+          if (viewport >= readableRow + edge) {
+            // Room for every readable floor: the table lays out at its floors, unscrolled.
+            expect(geometry.grid, label).toBeCloseTo(viewport, 6);
+            geometry.minimums.forEach((value, index) => {
+              expect(value, label).toBeCloseTo(floors[index] ?? 0, 6);
+            });
+          } else if (viewport >= knee) {
+            // Just too narrow: the table does not scroll, and its truncating columns narrow
+            // exactly as far as the row needs - it is filled to the pixel.
+            expect(geometry.grid, label).toBeCloseTo(viewport, 6);
+            expect(used, label).toBeCloseTo(Math.min(geometry.row, readableRow), 6);
+          } else if (viewport <= cliff) {
+            // Too narrow even for the minimums: truncating no longer buys a fit, so every column is
+            // back at its readable floor and the table scrolls, exactly as with no truncating
+            // column at all.
+            expect(geometry.grid, label).toBeCloseTo(readableRow + edge, 6);
+            geometry.minimums.forEach((value, index) => {
+              expect(value, label).toBeCloseTo(floors[index] ?? 0, 6);
+            });
+          } else {
+            // Within the sub-pixel change of regime the grid grows by the return scale per pixel
+            // of shortfall, and the tracks take back exactly what it grows by.
+            expect(geometry.grid, label).toBeCloseTo(
+              knee + (knee - viewport) * px('var(--dg-column-yield-return-scale)'),
+              6,
+            );
+            expect(used, label).toBeCloseTo(Math.min(geometry.row, readableRow), 6);
+          }
+
+          // Narrowing the viewport never widens a column while the table still fits, and below the
+          // knee never narrows one: the yield is spent on fitting and nothing else.
+          if (previous !== undefined) {
+            const widening = viewport <= knee;
+            geometry.minimums.forEach((value, index) => {
+              const before = previous?.minimums[index] ?? 0;
+              if (widening) {
+                expect(value, label).toBeLessThanOrEqual(before + 1e-6);
+              } else {
+                expect(value, label).toBeGreaterThanOrEqual(before - 1e-6);
+              }
+            });
+          }
+          previous = geometry;
+        }
+      }
+    });
+  }
+
+  it('fits three or more truncating columns of unequal floors to within one column yield', () => {
+    // The shape of the state-transition table: names and free text alternating.
+    const widths = ['name', 'text', 'name', 'text', 'label'] as const;
+    const { container } = render(
+      <DataTable
+        caption="Unequal"
+        rows={makeRows(1)}
+        rowKey={(row) => row.id}
+        columns={columnsWithWidths(widths)}
+      />,
+    );
+    const style = gridOf(container).style;
+    const properties: Record<string, string> = {};
+    for (const name of GRID_PROPERTY_NAMES) {
+      properties[name] = style.getPropertyValue(name);
+    }
+    const tokens = DESIGN_TOKENS.dark;
+    const px = (expression: string): number =>
+      evaluateLength(expression, { tokens, properties, percentBase: 0 });
+    const gaps = (widths.length - 1) * px('var(--dg-space-2)');
+    const edge = px('var(--dg-space-1)');
+    const minimumRow =
+      widths.reduce((sum, role) => sum + px(DATA_TABLE_COLUMN_TRACKS[role].minimum), 0) + gaps;
+    const readableRow =
+      widths.reduce((sum, role) => sum + px(DATA_TABLE_COLUMN_TRACKS[role].floor), 0) + gaps;
+    const smallestYield = px('var(--dg-column-min-name)') - px(yieldedFloorOf('name'));
+
+    for (
+      let viewport = Math.ceil(minimumRow + edge);
+      viewport <= readableRow + edge;
+      viewport += 1
+    ) {
+      const geometry = resolveGeometry(properties, widths, viewport, tokens);
+      const used = geometry.minimums.reduce((sum, value) => sum + value, 0) + gaps;
+
+      // Equal shares with the remainder left to the others are exact for one or two truncating
+      // columns and for equal floors; with more of unequal floors a column that reaches its
+      // minimum early can leave a remainder no other absorbs, which the table then scrolls by.
+      expect(geometry.grid).toBeCloseTo(viewport, 6);
+      expect(used - geometry.row, `at ${String(viewport)}px`).toBeLessThan(smallestYield);
+    }
   });
 });
 

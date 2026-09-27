@@ -3,8 +3,8 @@
  * or an analysis is stored.
  *
  * A follow-up answered from existing evidence stores version *n + 1* of both
- * documents with `supersedes` naming version *n* (AAP 0.4.2). The store is where
- * that chain is kept true: it is the one place every writer passes, and the one
+ * documents with `supersedes` naming version *n*. The store is where that
+ * chain is kept true: it is the one place every writer passes, and the one
  * place that sees the rows a write lands beside, because its checks run inside
  * the insert's `BEGIN IMMEDIATE` transaction. The suite pins, for **both**
  * ladders — `panels` and `analyses` share one implementation, and a rule that

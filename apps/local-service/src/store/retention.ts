@@ -64,8 +64,8 @@
  * ## Scoped sweeps
  *
  * An on-demand purge acts for one editor, whose credential may act only on
- * projects under the workspace folders it announced (AAP 0.5.6), so it must
- * not remove another workspace's state (CWE-863). {@link RetentionOptions.scope}
+ * projects under the workspace folders it announced, so it must not remove
+ * another workspace's state (CWE-863). {@link RetentionOptions.scope}
  * narrows every rule to the projects the scope admits, and to state whose
  * project is known:
  *
@@ -350,8 +350,8 @@ export type RetentionScope = (projectRoot: string) => boolean | Promise<boolean>
 export interface RetentionOptions {
   /**
    * Limits the sweep to the state of the projects the scope admits — how
-   * `session.purge` runs it for one editor's announced workspace (AAP 0.5.6;
-   * CWE-863). Absent, as on the start-up path, the sweep is machine-wide. The
+   * `session.purge` runs it for one editor's announced workspace (CWE-863).
+   * Absent, as on the start-up path, the sweep is machine-wide. The
    * module overview's "Scoped sweeps" states what each rule then keeps; in
    * short, nothing whose project is unknown or outside the scope is removed,
    * read beyond its owner, or reported, and an index-cache entry is removed

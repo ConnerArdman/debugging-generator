@@ -171,9 +171,15 @@ const FIELD_PLACEHOLDER = 'For example: why does this interaction feel slow?';
 /** Visible line count reserved for the question before the text area scrolls. */
 const FIELD_ROWS = 4;
 
-/** The DevTools targeting hint of AAP 0.7.3. */
+/**
+ * The hint to select an element in DevTools. The DevTools panel picks an
+ * element only for the session its tab is bound to, and the service records
+ * the pick on that session, whose follow-up questions then use it; a new
+ * question starts a session without one. So the hint places the pick after
+ * the question, never before it.
+ */
 const DEVTOOLS_HINT =
-  'To target a specific element, select it in the Debug Generator panel in Chrome DevTools before asking.';
+  'To target a specific element, pick it in the Debug Generator panel in Chrome DevTools once your session is running; follow-up questions use it.';
 
 /** Label of the submit control; also its accessible name. */
 const SUBMIT_LABEL = 'Ask question';

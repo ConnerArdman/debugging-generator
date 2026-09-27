@@ -1,6 +1,6 @@
 /**
- * `EmptyPanel` — the DevTools panel's no-session state (AAP 0.7.3), shown while
- * the inspected tab is bound to no debugging session. It is the single owner of
+ * `EmptyPanel` — the DevTools panel's no-session state, shown while the
+ * inspected tab is bound to no debugging session. It is the single owner of
  * that state's copy: the headline and the three workflow steps.
  *
  * - The headline is announced through `EmptyState`'s polite `role="status"`.

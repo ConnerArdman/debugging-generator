@@ -99,9 +99,11 @@ describe('QuestionForm — default state', () => {
     expect(label?.textContent).toBe(FIELD_NAME);
     expect(field.getAttribute('aria-label')).toBeNull();
 
-    expect(
-      screen.getByText(/select it in the Debug Generator panel in Chrome DevTools/),
-    ).toBeTruthy();
+    // The pick belongs to the running session, so the hint never asks for it
+    // before the question.
+    const hint = screen.getByText(/pick it in the Debug Generator panel in Chrome DevTools/);
+    expect(hint.textContent).toContain('once your session is running');
+    expect(hint.textContent).not.toContain('before asking');
 
     const submit = getSubmit();
     expect(submit.type).toBe('button');

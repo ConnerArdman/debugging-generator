@@ -22,7 +22,7 @@
  *   WebSocket text frame, a `window.postMessage` hop and a `chrome.runtime`
  *   port, so a payload that only works in memory — a `Date`, a `Map`, a class
  *   instance, a `NaN` — is a defect that shows up on one transport and not the
- *   others. The round-trip case builds a real frame for each of the twenty-six
+ *   others. The round-trip case builds a real frame for each of the twenty-eight
  *   types and proves the decoded value is deep-equal to the frame that was
  *   sent — no key dropped, added or retyped. Byte equality is not the claim:
  *   a validated frame comes back in the schema's key order.
@@ -30,9 +30,9 @@
  *   at compile time that its registry and its tuple agree; this suite proves at
  *   run time that the union has one member per name, no duplicate and no extra,
  *   and that the tuple still holds the twenty-five specified WebSocket message
- *   names plus `source.result`, the answer to `source.open` — written out
- *   literally below so drift fails loudly rather than quietly redefining the
- *   protocol. The five names that are HTTP operations rather than frames are
+ *   names plus `source.result`, the answer to `source.open`, and the
+ *   `client.ping` / `service.pong` liveness pair — written out literally below
+ *   so drift fails loudly rather than quietly redefining the protocol. The five names that are HTTP operations rather than frames are
  *   asserted to be exactly that, so no name from the vocabulary is lost in
  *   either direction.
  * - **A stray field is a violation, not extra information.** The envelope is a
@@ -394,7 +394,7 @@ const ANALYSIS: AnalysisResult = {
  *
  * The mapped type is the point: a missing key, or a payload of the wrong shape
  * for its type, is a compile error — so this table cannot fall behind the
- * registry it mirrors, and a twenty-seventh message type fails `tsc -b` here as
+ * registry it mirrors, and a twenty-ninth message type fails `tsc -b` here as
  * well as in `../messages/index.ts`.
  */
 const VALID_PAYLOADS: { readonly [K in MessageType]: MessagePayload<K> } = {
@@ -404,6 +404,8 @@ const VALID_PAYLOADS: { readonly [K in MessageType]: MessagePayload<K> } = {
     version: PROTOCOL_VERSION,
     token: CREDENTIAL_PLACEHOLDER,
   },
+  'client.ping': {},
+  'service.pong': { ref: MESSAGE_ID },
   'agent.ready': {
     tabId: TAB_ID,
     documentId: DOCUMENT_ID,
@@ -632,6 +634,14 @@ const AAP_WEBSOCKET_MESSAGE_NAMES = [
 const ANSWER_MESSAGE_NAMES = ['source.result'] as const;
 
 /**
+ * The liveness pair this protocol adds, written out for the same reason:
+ * `client.ping`, the one client frame with no effect, and `service.pong`, the
+ * service's answer to its sender alone — the application-level ping a client
+ * whose platform hides WebSocket control frames can see answered.
+ */
+const LIVENESS_MESSAGE_NAMES = ['client.ping', 'service.pong'] as const;
+
+/**
  * The five names from the same AAP list that are **HTTP operations**, not
  * frames.
  *
@@ -770,7 +780,7 @@ function issuesOf(schema: z.ZodType, value: unknown): z.core.$ZodIssue[] {
 describe('protocolMessageSchema — one member per declared message type', () => {
   it('has exactly as many options as there are message types', () => {
     expect(protocolMessageSchema.options).toHaveLength(MESSAGE_TYPES.length);
-    expect(MESSAGE_TYPES).toHaveLength(26);
+    expect(MESSAGE_TYPES).toHaveLength(28);
   });
 
   it('discriminates on exactly the declared type names, with no duplicate or extra', () => {
@@ -784,18 +794,24 @@ describe('protocolMessageSchema — one member per declared message type', () =>
     expect(new Set(MESSAGE_TYPES).size).toBe(MESSAGE_TYPES.length);
   });
 
-  it('names exactly the WebSocket messages AAP 0.4.2 specifies, plus source.result', () => {
+  it('names exactly the specified cross-component WebSocket messages, plus source.result and the liveness pair', () => {
     // The literal lists are checked first, so a typo in the expectation cannot
-    // pass by being mirrored in the tuple, and the addition cannot hide inside
+    // pass by being mirrored in the tuple, and the additions cannot hide inside
     // the specified list.
-    const expected = [...AAP_WEBSOCKET_MESSAGE_NAMES, ...ANSWER_MESSAGE_NAMES];
+    const expected = [
+      ...AAP_WEBSOCKET_MESSAGE_NAMES,
+      ...ANSWER_MESSAGE_NAMES,
+      ...LIVENESS_MESSAGE_NAMES,
+    ];
 
     expect(new Set(AAP_WEBSOCKET_MESSAGE_NAMES).size).toBe(25);
-    expect(new Set(expected).size).toBe(26);
+    expect(new Set(expected).size).toBe(28);
     expect([...MESSAGE_TYPES].sort()).toEqual([...expected].sort());
     expect(Object.keys(MESSAGE_PAYLOAD_SCHEMAS).sort()).toEqual([...expected].sort());
     // The answer sits in its request's domain, directly after it.
     expect(MESSAGE_TYPES.indexOf('source.result')).toBe(MESSAGE_TYPES.indexOf('source.open') + 1);
+    // The liveness pair sits directly after the handshake it keeps alive.
+    expect(MESSAGE_TYPES.slice(0, 3)).toEqual(['client.hello', 'client.ping', 'service.pong']);
   });
 
   it('keeps the five HTTP operation names out of the union and in the route table', () => {
@@ -1362,6 +1378,8 @@ describe('parseMessage — the routing key agrees with the session the payload n
 
   it.each([
     'client.hello',
+    'client.ping',
+    'service.pong',
     'agent.ready',
     'tab.navigated',
     'session.unbind',

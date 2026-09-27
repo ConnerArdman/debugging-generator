@@ -62,12 +62,36 @@
  * stopped that the store does not hold, and no competing session is admitted
  * to a project whose window is still open.
  *
+ * ## The project root's identity
+ *
+ * The pipeline indexes and patches a session's project long after the
+ * `session.create` request that admitted its root has answered. A symbolic
+ * link on the root's path retargeted in between — even to another directory
+ * inside the workspace, which a scope check alone admits — would otherwise be
+ * followed (CWE-367). So the manager stores, with each session, the canonical
+ * identity the create route admitted the root under
+ * ({@link CreateSessionInput.admittedRoot}) — in the same store transaction as
+ * the session's insert — and {@link SessionManager.confirmProjectRoot}
+ * re-proves it synchronously for a sink immediately before the sink acts in its
+ * canonical root. The stored identity is the authority, so a restarted process
+ * holds a session to the directory it was admitted as; an in-memory registry
+ * caches it per live session and is released when the session ends. A session
+ * with no recorded identity — stored before the store recorded one, or created
+ * without a proof — is refused at every sink rather than identified after the
+ * fact.
+ *
  * ## Layering
  *
  * This module imports the protocol, instrumentation, telemetry and shared
- * packages, its two siblings, the store repository and the service's config
- * and logging modules — and nothing from `hono`, `ws`, `node:*`,
- * `../server/**`, `../pipeline/**`, `../cleanup/**`, `../instrumentation/**` or
+ * packages, its two siblings, the store repository, the service's config and
+ * logging modules, and from `../server/auth.ts` exactly the access boundary's
+ * principal-free root-identity primitives (`reconfirmRootIdentity`, the
+ * `unrecordedProjectRootIdentity` refusal and their `AdmittedProjectRoot`
+ * type) — the product's one canonicalisation rule and its refusals, which a
+ * second copy here could let drift from the ones admission applies. `auth.ts`
+ * imports nothing from this folder, so the edge closes no cycle. Nothing else
+ * comes from `../server/**`, and nothing from `hono`, `ws`, `node:*`,
+ * `../pipeline/**`, `../cleanup/**`, `../instrumentation/**` or
  * `../telemetry/**`. Transport and orchestration wire **into** this layer
  * through the two ports declared below, never the reverse, so the integration
  * suites (`session-lifecycle`, `followup`, `concurrency`, `binding`) drive it
@@ -76,10 +100,12 @@
  *
  * ## What this module never does
  *
- * - It never touches a file of the developer's project: cleanup is delegated
- *   to the injected {@link SessionCleanupRunner}, and the modification journal
- *   stays owned by `../store/modifications-repo.ts` and
- *   `@debuggen/instrumentation`.
+ * - It never reads or writes a file of the developer's project: cleanup is
+ *   delegated to the injected {@link SessionCleanupRunner}, and the
+ *   modification journal stays owned by `../store/modifications-repo.ts` and
+ *   `@debuggen/instrumentation`. The one question it asks of the disk is
+ *   where the project root's path leads, through the access boundary's
+ *   resolver ({@link SessionManager.confirmProjectRoot}).
  * - It never reads, logs or copies the per-session request-key secret
  *   (`SessionsRepo.getOrCreateRequestKeySecret`), which lives in the store
  *   only (AAP §0.5.2).
@@ -159,6 +185,11 @@ import type { CaptureSummary } from '@debuggen/telemetry';
 
 import { PROVIDER_REQUIREMENTS, type ServiceConfig } from '../config.js';
 import { describeException, guardLogger, sessionLogger, subsystemLogger } from '../logging.js';
+import {
+  reconfirmRootIdentity,
+  unrecordedProjectRootIdentity,
+  type AdmittedProjectRoot,
+} from '../server/auth.js';
 import {
   MAX_SESSION_LIST_LIMIT,
   type ListSessionsOptions,
@@ -343,6 +374,28 @@ export interface CreateSessionInput {
   readonly provider?: SessionProvider | undefined;
   /** The prompt versions already resolved; defaults to `{}`. */
   readonly promptVersions?: PromptVersions | undefined;
+  /**
+   * The proof the `session.create` route took for {@link projectRoot}: what
+   * `admitProjectRoot` returned for the request's principal, re-proved with
+   * `reconfirmProjectRoot` just before this call, with no `await` between the
+   * two.
+   *
+   * Its `projectRoot` must name this input's root, normalised alike, or the
+   * create is refused before anything is stored (`INTERNAL`,
+   * `admitted-root-mismatch`: a proof for another root is a defect in the
+   * caller, never something the developer did). Its canonical path is stored
+   * with the session, in the transaction that inserts it — a proof the store
+   * cannot record refuses the create with nothing stored — and every later
+   * {@link SessionManager.confirmProjectRoot}, in this process or one started
+   * after it, holds the root to the canonical path proven here: a link
+   * retargeted between this request and the pipeline's indexing or patching,
+   * or while the service was down, is refused rather than followed.
+   *
+   * Absent for a caller that holds no admission (a unit context); the session
+   * is stored with no recorded identity, and every sink that would index or
+   * patch it is refused.
+   */
+  readonly admittedRoot?: AdmittedProjectRoot | undefined;
 }
 
 /**
@@ -602,11 +655,65 @@ export interface SessionManager {
   /**
    * Creates a session in status `created` and broadcasts `session.created`.
    * Emits no progress row: the pipeline owns stage events.
+   *
+   * With {@link CreateSessionInput.admittedRoot}, the proof must name the
+   * input's root (else `INTERNAL`, `admitted-root-mismatch`, and nothing is
+   * stored); its canonical path is stored with the session in one store
+   * transaction, and the proof is cached for
+   * {@link SessionManager.confirmProjectRoot} once that transaction commits.
    */
   create(input: CreateSessionInput): Promise<Result<SessionRecord, DebuggenError>>;
 
   /** Reads one session; `ok(undefined)` when none has this id. */
   get(sessionId: SessionId): Result<SessionRecord | undefined, DebuggenError>;
+
+  /**
+   * Re-proves that the session's project root still resolves to the directory
+   * it was admitted under, and answers that identity. The pipeline's sinks
+   * that act on the project after the create request answered — indexing and
+   * patching — call this immediately before they act, with no `await` in
+   * between, and then act in the answered `canonicalRoot`, never through the
+   * links of the spelled root again.
+   *
+   * **Why.** Between admission and a background act, a link on the root's
+   * path can be retargeted — to another directory inside the workspace, which
+   * a scope check alone admits, or out of it — and a sink that re-resolves the
+   * spelled root would follow it (a time-of-check/time-of-use race,
+   * CWE-367). The sinks hold no principal after the request, so identity alone
+   * is re-proved (`reconfirmRootIdentity` in `../server/auth.ts`); scope was
+   * proven at admission, and `requireSessionAccess` re-runs it on every later
+   * request that names the session.
+   *
+   * **Synchronous** — unlike the manager's other operations — because an
+   * asynchronous answer would reopen the window it closes: the caller must be
+   * able to act in the same turn the identity was proven in.
+   *
+   * **Across a restart.** The proof ({@link CreateSessionInput.admittedRoot})
+   * is stored with the session, so the identity a sink is held to is the one
+   * admitted, whichever process asks. A session this process holds no proof
+   * for in memory — one read back from the store after a restart — is held to
+   * the canonical path stored with it (`SessionsRepo.getRootIdentity`), cached
+   * from then on: a link retargeted while the service was down is refused like
+   * any other. **Fail closed:** a session with no recorded identity — stored by
+   * a build that predates the record, or created without a proof — is refused
+   * (`unrecordedProjectRootIdentity` in `../server/auth.ts`), and its root is
+   * never identified after the fact, which would accept wherever its links
+   * lead by then.
+   *
+   * The cached identity is released when the session ends. Every refusal is
+   * logged at `warn` with its error code only, never a path.
+   *
+   * @param sessionId The session whose root a sink is about to act on.
+   * @returns The identity — the same object for as long as the root keeps
+   * resolving to it — or `Err`: `SESSION_NOT_FOUND` for an unknown id; the
+   * store's error when the record or its recorded identity cannot be read;
+   * `SESSION_INVALID_STATE` (`session-ended`) for an ended session;
+   * `PATH_OUTSIDE_PROJECT` (`project-out-of-scope`) when no identity is
+   * recorded for the session, when the root now resolves to another directory,
+   * or when where it leads can no longer be established; `INTERNAL`
+   * (`admitted-root-mismatch`) when the recorded proof names another root.
+   */
+  confirmProjectRoot(sessionId: SessionId): Result<AdmittedProjectRoot, DebuggenError>;
 
   /**
    * Lists sessions from their indexed projections, most recently updated
@@ -956,6 +1063,39 @@ function invalidState(
   });
 }
 
+/**
+ * The refusal of an admission proof that names another root than the session
+ * it belongs to — at create, a proof handed with another root; later, a
+ * recorded proof that no longer names the stored record's root. Either is a
+ * defect in the caller, never something the developer did, so it is
+ * `INTERNAL`; it names no path, and `reason` tells it apart.
+ */
+function admittedRootMismatch(): DebuggenError {
+  return new DebuggenError(
+    'INTERNAL',
+    authorProductText('The project root this session was admitted for is not the root it names.'),
+    {
+      hint: authorProductText(
+        'Start the session again from the folder in VS Code; the service log holds the reason.',
+      ),
+      details: { reason: 'admitted-root-mismatch' },
+    },
+  );
+}
+
+/**
+ * Whether `admitted` — a proof a caller supplied, which the compiler may not
+ * have checked — carries the two strings of an `AdmittedProjectRoot` and
+ * names `projectRoot`, compared in the manager's own normalised spelling.
+ */
+function admittedRootNames(admitted: AdmittedProjectRoot, projectRoot: string): boolean {
+  return (
+    typeof admitted.projectRoot === 'string' &&
+    typeof admitted.canonicalRoot === 'string' &&
+    projectKey(admitted.projectRoot) === projectKey(projectRoot)
+  );
+}
+
 /** The refusal for a mutation of a session that has ended. */
 function sessionEnded(sessionId: SessionId, operation: string): DebuggenError {
   return invalidState(
@@ -1149,8 +1289,9 @@ function settle<T>(body: () => T): Promise<T> {
  *
  * @param deps The store repository, the broadcaster, the progress emitter and,
  * optionally, the cleanup runner, configuration, logger, clock and id factory.
- * @returns The manager. Its only state is the capture-owner index and the set
- * of `end` calls in flight; everything else lives in the store.
+ * @returns The manager. Its only state is the capture-owner index, the
+ * project-root identity registry and the set of `end` calls in flight;
+ * everything else lives in the store.
  */
 export function createSessionManager(deps: SessionManagerDeps): SessionManager {
   const { sessions, broadcaster, progress } = deps;
@@ -1182,6 +1323,23 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
 
   /** `end` calls in flight, so concurrent calls share one cleanup run. */
   const endsInFlight = new Map<SessionId, Promise<Result<SessionEndResult, DebuggenError>>>();
+
+  /**
+   * The project-root identity cache: session id → the canonical identity its
+   * root was admitted under, which {@link confirmProjectRoot} holds every
+   * later sink to (see {@link SessionManager.confirmProjectRoot}).
+   *
+   * The store is the authority: `create` writes the admitted canonical path
+   * with the session in one transaction, and caches the proof here only once
+   * that transaction has committed. A session with no entry — one read back
+   * after a restart — is cached from its stored identity at its first sink,
+   * never identified from where its root leads then; a session with no stored
+   * identity is refused and never cached. An entry is released when the
+   * session ends, and dropped when its record is found gone (purged by
+   * retention). Bounded by the sessions this process has touched that have
+   * not ended.
+   */
+  const identities = new Map<SessionId, AdmittedProjectRoot>();
 
   /**
    * The injected clock's reading. A clock that throws or answers something
@@ -1814,6 +1972,18 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     }
 
     const projectRoot = normalizePosix(posix);
+    const { admittedRoot } = input;
+
+    // A proof for another root would hold the session's sinks to the wrong
+    // directory, so it refuses the create before anything is stored.
+    if (admittedRoot !== undefined && !admittedRootNames(admittedRoot, projectRoot)) {
+      const mismatch = admittedRootMismatch();
+      log.error('a new session was handed an admission proof for another root and was not stored', {
+        code: mismatch.code,
+      });
+      return err(mismatch);
+    }
+
     const basename = basenamePosix(projectRoot);
     const createdAt = stamp();
     const candidate: SessionRecord = {
@@ -1847,14 +2017,41 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
       return parsed;
     }
 
-    const stored = sessions.insert(parsed.value);
+    // `admitProjectRoot` answers a frozen proof, kept as it is; any other is
+    // copied and frozen first, so the path stored with the session and the
+    // proof cached for it are one value the caller can no longer move.
+    const proof: AdmittedProjectRoot | undefined =
+      admittedRoot === undefined || Object.isFrozen(admittedRoot)
+        ? admittedRoot
+        : Object.freeze({
+            projectRoot: admittedRoot.projectRoot,
+            canonicalRoot: admittedRoot.canonicalRoot,
+          });
+
+    // The session and its admitted identity are one store write: a session
+    // created with a proof never exists without it, in this process or after
+    // a restart.
+    const stored = sessions.insert(
+      parsed.value,
+      proof === undefined ? {} : { canonicalRoot: proof.canonicalRoot },
+    );
 
     if (isErr(stored)) {
       return stored;
     }
 
     const session = stored.value;
-    scoped(session.id).info('session created', { status: session.status });
+
+    // Cached only once the write committed, so no identity outlives a create
+    // the store refused.
+    if (proof !== undefined) {
+      identities.set(session.id, proof);
+    }
+
+    scoped(session.id).info('session created', {
+      status: session.status,
+      rootIdentity: proof === undefined ? 'unrecorded' : 'admitted',
+    });
     send(session.id, MESSAGE_TYPE.SESSION_CREATED, () =>
       createEnvelope(MESSAGE_TYPE.SESSION_CREATED, { session }, { ts: stamp() }),
     );
@@ -1869,6 +2066,110 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
   function list(options?: ListSessionsOptions): Result<readonly SessionListItem[], DebuggenError> {
     const page = sessions.list(options);
     return isErr(page) ? page : ok(page.value.items);
+  }
+
+  // -------------------------------------------------------------------------
+  // The project root's identity
+  // -------------------------------------------------------------------------
+
+  /**
+   * Forgets the session's recorded root identity, logging the release at
+   * `debug` when there was one to release.
+   */
+  function releaseIdentity(sessionId: SessionId, operation: string): void {
+    if (identities.delete(sessionId)) {
+      scoped(sessionId).debug('the project root identity of the session was released', {
+        operation,
+      });
+    }
+  }
+
+  /** Logs a refused confirmation by its error code only, and answers the refusal. */
+  function refuseConfirmation(
+    sessionId: SessionId,
+    error: DebuggenError,
+  ): Result<AdmittedProjectRoot, DebuggenError> {
+    scoped(sessionId).warn('the project root could not be confirmed for a sink', {
+      code: error.code,
+    });
+    return err(error);
+  }
+
+  function confirmProjectRoot(sessionId: SessionId): Result<AdmittedProjectRoot, DebuggenError> {
+    const loaded = load(sessionId);
+
+    if (isErr(loaded)) {
+      // A record found gone was purged (or never stored): no sink acts on it
+      // again, so its identity goes with it.
+      if (loaded.error.code === 'SESSION_NOT_FOUND') {
+        releaseIdentity(sessionId, 'confirmProjectRoot');
+      }
+      return refuseConfirmation(sessionId, loaded.error);
+    }
+
+    const record = loaded.value;
+
+    if (record.status === 'ended') {
+      releaseIdentity(sessionId, 'confirmProjectRoot');
+      return refuseConfirmation(sessionId, sessionEnded(sessionId, 'confirmProjectRoot'));
+    }
+
+    // The proof this process cached, else the one stored with the session —
+    // never an identity taken from where the root leads now.
+    const cached = identities.get(sessionId);
+    const recorded =
+      cached === undefined ? persistedIdentity(sessionId, record.projectRoot) : ok(cached);
+
+    if (isErr(recorded)) {
+      return refuseConfirmation(sessionId, recorded.error);
+    }
+
+    // The identity fields are not patchable, so this holds for every record
+    // the manager wrote; a proof that stopped naming the record's root is a
+    // defect, refused rather than re-identified.
+    if (!admittedRootNames(recorded.value, record.projectRoot)) {
+      return refuseConfirmation(sessionId, admittedRootMismatch());
+    }
+
+    const confirmed = reconfirmRootIdentity(recorded.value);
+
+    return isErr(confirmed) ? refuseConfirmation(sessionId, confirmed.error) : confirmed;
+  }
+
+  /**
+   * The identity stored with the session, for a session this process holds no
+   * proof for in memory — one read back after a restart — frozen and cached,
+   * so every later sink is held to the same object. Fails closed: a session
+   * with no stored identity is refused ({@link unrecordedProjectRootIdentity}),
+   * never identified from where its root leads now, and a store that cannot be
+   * read refuses with its own error. Nothing is cached for either refusal, so
+   * each later sink asks the store again.
+   *
+   * @param sessionId The session a sink is about to act on.
+   * @param projectRoot The root its stored record names.
+   * @returns The recorded identity, or the refusal.
+   */
+  function persistedIdentity(
+    sessionId: SessionId,
+    projectRoot: string,
+  ): Result<AdmittedProjectRoot, DebuggenError> {
+    const persisted = sessions.getRootIdentity(sessionId);
+
+    if (isErr(persisted)) {
+      return persisted;
+    }
+
+    if (persisted.value === undefined) {
+      return err(unrecordedProjectRootIdentity());
+    }
+
+    const identity: AdmittedProjectRoot = Object.freeze({
+      projectRoot,
+      canonicalRoot: persisted.value,
+    });
+    identities.set(sessionId, identity);
+
+    return ok(identity);
   }
 
   function transitionTo(
@@ -2921,6 +3222,8 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
         });
       }
 
+      releaseIdentity(sessionId, 'end');
+
       return ok({ session: record, cleanup: outcomeOf(record.cleanup, record.updatedAt) });
     }
 
@@ -3024,6 +3327,9 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     }
 
     const ended = announceTransition(moved.value);
+
+    // Stored `ended`: no sink acts on the project for this session again.
+    releaseIdentity(sessionId, 'end');
 
     if (reported !== outcome.value) {
       completeWhenReleased(sessionId, outcome.value);
@@ -3286,11 +3592,14 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
   // The store is synchronous, so every operation but `end` completes in one
   // turn; `settle` gives each the asynchronous contract the interface states,
   // so a caller's code does not change if one of them ever gains an await.
+  // `confirmProjectRoot` is the deliberate exception: its caller must act in
+  // the turn the identity was proven in.
   return Object.freeze({
     hydrate: () => settle(hydrate),
     settleIncompleteCleanups,
     create: (input) => settle(() => create(input)),
     get,
+    confirmProjectRoot,
     list,
     transitionTo: (sessionId, to, context) => settle(() => transitionTo(sessionId, to, context)),
     patch: (sessionId, changes) => settle(() => patch(sessionId, changes)),

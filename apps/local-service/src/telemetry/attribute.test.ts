@@ -12,7 +12,9 @@
  * 2. **Server origin and credential scope (AAP §0.5.6).** A preload batch
  *    belongs to the capture owner of the project its credential is scoped to,
  *    and the project the body names must be *exactly* that project after POSIX
- *    normalisation — never a subtree, never a prefix-sharing sibling.
+ *    normalisation — never a subtree, never a prefix-sharing sibling. When the
+ *    body names the capture its spans were recorded in, that must be the
+ *    owner's open capture (`stale-capture` again), on both owner lookups.
  * 3. **Per-event stamping.** Identity is added, nothing else changes, the input
  *    is never touched, `ingestSeq` is left to the store, and the tier gate keeps
  *    a page from reporting server or database spans (and a dev server from
@@ -1384,6 +1386,336 @@ describe('resolveBatch: repository fallback when no session manager is injected'
     );
     expect(repo.calls.list).toStrictEqual([]);
   });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * resolveBatch — the preload's capture identity (stale-capture), on both owner lookups
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('resolveBatch: the preload’s armed capture', () => {
+  /** Which owner lookup a case runs through: the session manager, or the repository fallback. */
+  type OwnerPath = 'manager' | 'repository';
+
+  /** Both owner lookups, so every case below runs once through each. */
+  const OWNER_PATHS: readonly OwnerPath[] = ['manager', 'repository'];
+
+  /** A server world whose open capture can be replaced mid-case. */
+  interface RearmableServerWorld {
+    readonly sessionId: SessionId;
+    readonly first: CaptureId;
+    readonly second: CaptureId;
+    readonly repo: FakeRepo;
+    /** The session manager on the manager path; `undefined` on the repository fallback. */
+    readonly manager: FakeManager | undefined;
+    readonly setOpen: (captureId: CaptureId | undefined) => void;
+    readonly log: LogCapture;
+    readonly attributor: IngestAttributor;
+  }
+
+  /**
+   * One session capturing {@link PROJECT_ONE}, whose open capture is `first`
+   * until a case replaces it, the way a Stop followed by a Start does. On the
+   * manager path the owner index follows the store's capture row, as the real
+   * manager's does; on the repository path the session is the one capturing
+   * session the fallback lists.
+   */
+  function rearmableServerWorld(path: OwnerPath): RearmableServerWorld {
+    const sessionId = newSessionId();
+    const first = newCaptureId();
+    const second = newCaptureId();
+    let open: CaptureId | undefined = first;
+    const repo = fakeRepo({
+      sessions: [{ id: sessionId, projectRoot: PROJECT_ONE }],
+      listed: [{ id: sessionId, projectRoot: PROJECT_ONE }],
+      getActiveCapture: (id) =>
+        ok(id === sessionId && open !== undefined ? { capture: { id: open } } : undefined),
+    });
+    const manager =
+      path === 'manager'
+        ? fakeManager((projectRoot) =>
+            projectRoot === PROJECT_ONE && open !== undefined
+              ? { sessionId, captureId: open }
+              : undefined,
+          )
+        : undefined;
+    const log = recordingLogger();
+    const attributor = createIngestAttributor({
+      sessions: repo,
+      ...(manager === undefined ? {} : { sessionManager: manager }),
+      logger: log.logger,
+      now: fixedClock,
+    });
+
+    return {
+      sessionId,
+      first,
+      second,
+      repo,
+      manager,
+      setOpen: (captureId) => {
+        open = captureId;
+      },
+      log,
+      attributor,
+    };
+  }
+
+  /** The server context of a preload for `projectRoot` that names `armedCaptureId`. */
+  function armedServerContext(armedCaptureId: CaptureId, projectRoot: string = PROJECT_ONE) {
+    return { ...serverContext(projectRoot), armedCaptureId } as const satisfies IngestContext;
+  }
+
+  /** Asserts the owner was looked up exactly once, the way an attributed batch looks it up. */
+  function expectOneOwnerLookup(world: RearmableServerWorld): void {
+    if (world.manager === undefined) {
+      expect(world.repo.calls.list).toHaveLength(1);
+    } else {
+      expect(world.manager.calls).toStrictEqual([PROJECT_ONE]);
+      expect(world.repo.calls.list).toStrictEqual([]);
+    }
+    expect(world.repo.calls.getActiveCapture).toStrictEqual([world.sessionId]);
+  }
+
+  it.each(OWNER_PATHS)(
+    'attributes a batch naming the open capture exactly as one that names none (%s lookup)',
+    async (path) => {
+      const world = rearmableServerWorld(path);
+
+      const named = expectResolved(
+        await world.attributor.resolveBatch(armedServerContext(world.first)),
+      );
+      const unnamed = expectResolved(
+        await world.attributor.resolveBatch(serverContext(PROJECT_ONE)),
+      );
+      const explicitlyAbsent = expectResolved(
+        await world.attributor.resolveBatch({
+          ...serverContext(PROJECT_ONE),
+          armedCaptureId: undefined,
+        }),
+      );
+
+      // Naming the open capture adds nothing: the identity still comes from the
+      // credential's project, its capture owner and the store's open row.
+      expect(named).toStrictEqual({
+        sessionId: world.sessionId,
+        captureId: world.first,
+        origin: 'server-agent',
+        projectRoot: PROJECT_ONE,
+        producerId: PRODUCER,
+        resolvedAt: FIXED_NOW,
+      });
+      expect(unnamed).toStrictEqual(named);
+      expect(explicitlyAbsent).toStrictEqual(named);
+      expect(
+        expectAttributed(world.attributor.attributeEvent(makeIngress({ tier: 'server' }), named))
+          .captureId,
+      ).toBe(world.first);
+    },
+  );
+
+  // The defect this check exists for on the server tier: a POST of capture A's
+  // spans, retried in place after Stop and Start, must never be filed under B.
+  it.each(OWNER_PATHS)(
+    'refuses a batch recorded for the previous capture after the next one opened, whole (%s lookup)',
+    async (path) => {
+      const world = rearmableServerWorld(path);
+
+      const during = expectResolved(
+        await world.attributor.resolveBatch(armedServerContext(world.first)),
+      );
+      expect(during.captureId).toBe(world.first);
+
+      world.setOpen(world.second);
+      const late = expectDrop(
+        await world.attributor.resolveBatch(armedServerContext(world.first)),
+        'stale-capture',
+      );
+      const current = expectResolved(
+        await world.attributor.resolveBatch(armedServerContext(world.second)),
+      );
+
+      expect(current.captureId).toBe(world.second);
+      expect(late.code).toBe(DROP_REASON_ERROR_CODES['stale-capture']);
+      expect(late.code).toBe('SESSION_INVALID_STATE');
+      expect(late.details).toMatchObject({
+        origin: 'server-agent',
+        sessionId: world.sessionId,
+        // The refusal names the capture it protected — never the one the body named.
+        captureId: world.second,
+      });
+      expect(late.details).not.toHaveProperty('fault');
+      expect(late.details).not.toHaveProperty('tabId');
+      expect(errorText(late)).not.toContain(world.first);
+
+      // Logged once, at warn, under the open capture's binding only.
+      const dropped = world.log.lines.filter((line) => line.message === 'telemetry batch dropped');
+      expect(dropped).toHaveLength(1);
+      expect(dropped[0]?.level).toBe('warn');
+      expect(dropped[0]?.fields).toMatchObject({
+        reason: 'stale-capture',
+        code: 'SESSION_INVALID_STATE',
+        origin: 'server-agent',
+      });
+      expect(dropped[0]?.fields['sessionId']).toBe(world.sessionId);
+      expect(dropped[0]?.fields['captureId']).toBe(world.second);
+      expect(JSON.stringify(dropped)).not.toContain(world.first);
+      expect(
+        world.log.lines.filter((line) => line.message === 'telemetry batch resolved'),
+      ).toHaveLength(2);
+    },
+  );
+
+  it.each(OWNER_PATHS)(
+    'refuses a batch naming any capture other than the open one after the usual owner lookup (%s lookup)',
+    async (path) => {
+      const world = rearmableServerWorld(path);
+
+      const error = expectDrop(
+        await world.attributor.resolveBatch(armedServerContext(newCaptureId())),
+        'stale-capture',
+      );
+
+      expect(error.details?.['captureId']).toBe(world.first);
+      expect(error.details?.['sessionId']).toBe(world.sessionId);
+      // The owner was found and confirmed exactly as for an attributed batch.
+      expectOneOwnerLookup(world);
+      expect(world.log.lines.map((line) => line.message)).not.toContain('telemetry batch resolved');
+    },
+  );
+
+  it.each(OWNER_PATHS)(
+    'refuses a malformed armed capture as stale-capture with its fault, never attributing it (%s lookup)',
+    async (path) => {
+      for (const malformed of ['', 42, null, { id: 'capture' }]) {
+        const world = rearmableServerWorld(path);
+
+        const error = expectDrop(
+          await world.attributor.resolveBatch(
+            armedServerContext(malformed as unknown as CaptureId),
+          ),
+          'stale-capture',
+        );
+
+        expect(error.code).toBe('SESSION_INVALID_STATE');
+        expect(error.details?.['fault']).toBe('invalid-armed-capture');
+        expect(error.details?.['captureId']).toBe(world.first);
+        expect(error.details?.['sessionId']).toBe(world.sessionId);
+      }
+    },
+  );
+
+  it.each(OWNER_PATHS)(
+    'never echoes the producer-supplied capture name or the project path into the refusal (%s lookup)',
+    async (path) => {
+      const world = rearmableServerWorld(path);
+
+      const error = expectDrop(
+        await world.attributor.resolveBatch(armedServerContext(SENTINEL)),
+        'stale-capture',
+      );
+
+      expectNoSentinel(error.message);
+      expectNoSentinel(error.hint ?? '');
+      expectNoSentinel(JSON.stringify(error.toPayload()));
+      expectNoSentinel(errorText(error));
+      expectNoSentinel(world.log.text());
+      expect(errorText(error)).not.toContain('project-one');
+      expect(world.log.text()).not.toContain('project-one');
+      // The refusal's own words name no identifier at all.
+      expect(error.message).not.toContain(world.first);
+      expect(error.hint ?? '').not.toContain(world.first);
+    },
+  );
+
+  it.each(OWNER_PATHS)(
+    'answers a named capture while none is open as no-active-capture, the routine boundary flush (%s lookup)',
+    async (path) => {
+      const world = rearmableServerWorld(path);
+      world.setOpen(undefined);
+
+      for (const named of [world.first, SENTINEL]) {
+        const error = expectDrop(
+          await world.attributor.resolveBatch(armedServerContext(named)),
+          'no-active-capture',
+        );
+
+        expect(error.code).toBe(DROP_REASON_ERROR_CODES['no-active-capture']);
+        expect(error.details).not.toHaveProperty('captureId');
+        expect(error.details).not.toHaveProperty('fault');
+      }
+
+      const dropped = world.log.lines.filter((line) => line.message === 'telemetry batch dropped');
+      expect(dropped.map((line) => line.level)).toStrictEqual(['debug', 'debug']);
+      expectNoSentinel(world.log.text());
+    },
+  );
+
+  it('keeps an unconfirmed owner a capture-owner-mismatch whatever the batch names (manager lookup)', async () => {
+    for (const owner of ['closed', 'changed'] as const) {
+      const world = serverWorld(owner);
+
+      for (const named of [world.captureId, newCaptureId()]) {
+        const error = expectDrop(
+          await world.attributor.resolveBatch({
+            ...serverContext(PROJECT_ONE),
+            armedCaptureId: named,
+          }),
+          'capture-owner-mismatch',
+        );
+
+        expect(error.details?.['owningSessionId']).toBe(world.sessionId);
+        expect(error.details).not.toHaveProperty('captureId');
+      }
+    }
+  });
+
+  it('keeps two capturing owners a capture-owner-mismatch whatever the batch names (repository lookup)', async () => {
+    const first = newSessionId();
+    const second = newSessionId();
+    const firstCapture = newCaptureId();
+    const repo = fakeRepo({
+      listed: [
+        { id: first, projectRoot: PROJECT_ONE },
+        { id: second, projectRoot: PROJECT_ONE },
+      ],
+      activeCaptures: [
+        [first, firstCapture],
+        [second, newCaptureId()],
+      ],
+    });
+    const attributor = createIngestAttributor({ sessions: repo, now: fixedClock });
+
+    for (const named of [firstCapture, newCaptureId()]) {
+      const error = expectDrop(
+        await attributor.resolveBatch({ ...serverContext(PROJECT_ONE), armedCaptureId: named }),
+        'capture-owner-mismatch',
+      );
+
+      expect(error.details?.['fault']).toBe('ambiguous-owner');
+    }
+  });
+
+  it.each(OWNER_PATHS)(
+    'applies the credential scope before the owner lookup and before the capture comparison (%s lookup)',
+    async (path) => {
+      const world = rearmableServerWorld(path);
+
+      for (const projectRoot of [PROJECT_TWO, '/tmp/project-one/packages/app']) {
+        const error = expectDrop(
+          await world.attributor.resolveBatch(armedServerContext(newCaptureId(), projectRoot)),
+          'project-scope-mismatch',
+        );
+
+        expect(error.code).toBe(DROP_REASON_ERROR_CODES['project-scope-mismatch']);
+        expect(error.details).not.toHaveProperty('captureId');
+      }
+
+      // Neither owner lookup was consulted for an out-of-scope batch.
+      expect(world.manager?.calls ?? []).toStrictEqual([]);
+      expect(world.repo.calls.list).toStrictEqual([]);
+      expect(world.repo.calls.getActiveCapture).toStrictEqual([]);
+    },
+  );
 });
 
 /* -------------------------------------------------------------------------------------------------

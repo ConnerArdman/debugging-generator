@@ -9,7 +9,7 @@
  * `vscode.commands.executeCommand('debuggen.openSource', …)`. Both reach the
  * editor only through the canonical gate of step 3. The DevTools panel's
  * source chips travel the same contract over WebSocket `source.open` and end in
- * the same opener (AAP §0.2.3, §0.4.2).
+ * the same opener.
  *
  * ## What it does — and deliberately nothing more
  *

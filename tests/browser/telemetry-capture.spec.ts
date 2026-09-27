@@ -2,7 +2,10 @@
  * `telemetry-capture` — the browser project's proof that the page agent observes one real
  * interaction end to end — the agent is injected before React, and a click produces interaction,
  * render and fetch events that share one `traceId` — on a freshly loaded page, across a reload
- * during a capture, and on a page that was already open before the extension was enabled.
+ * during a capture, and on a page that was already open before the extension was enabled; and that
+ * the same agent's element picker, armed by "Pick element" in the panel or relayed from VS Code,
+ * makes the element the developer clicks the session's target while the page never acts on that
+ * click.
  *
  * ## What each test proves
  *
@@ -28,7 +31,28 @@
  *    `apps/chrome-extension/src/panel/state/session-store.ts`), and `LiveTail.tsx` words it
  *    (`NOTICE_LABELS`). The list's name and that wording are module-private in a React component
  *    module, so `fixtures.ts` types them and exposes the entries as `panel.pageReloadedNotices`.
- * 4. **A page that was open before the extension.** Such a page carries no agent, so readiness
+ * 4. **"Pick element" selects the clicked element, and only the picker sees that click.** With a
+ *    bound session, the panel's toggle turns picker mode on (`aria-pressed`, the "Picker on"
+ *    badge), and hovering the widget's button shows the agent's highlight over exactly that
+ *    button: a `div` attached to `document.documentElement` rather than inside `body`,
+ *    `aria-hidden`, fixed and click-through. A trusted click on the button then becomes the
+ *    session's target in the service record — the button's tag, a selector that resolves in the
+ *    page to that button, its text, the widget's display name as the nearest component, the
+ *    page's URL — and the panel shows it. The click was the picker's alone: no event of the gesture
+ *    reached the document, the fixture route was not requested and the widget shows no result. The
+ *    pick is over everywhere — toggle released, badge and highlight gone — and the next click
+ *    reaches the application as it always does, leaving the target as picked.
+ * 5. **Escape cancels.** Escape pressed in the page ends an armed pick without an element: the
+ *    worker releases the panel's toggle, the highlight leaves the page, the next click reaches the
+ *    application, and the session record still names no target.
+ * 6. **The toggle cancels.** Pressing "Pick element" again ends the armed pick in the page — its
+ *    highlight leaves — so the next click on the button reaches the application and the session
+ *    target stays unset.
+ * 7. **VS Code's route arms the same pick.** `POST /sessions/:id/target/request` with the editor
+ *    credential (`service.requestTarget`) is answered with the session's bound tab, and the
+ *    service's relayed `target.request` puts that tab's panel into picker mode without a press;
+ *    the page's pick then behaves exactly as in test 4.
+ * 8. **A page that was open before the extension.** Such a page carries no agent, so readiness
  *    cannot be met; the service asks the developer to reload and the panel offers its own reload
  *    action, and nothing reloads the page — no document load, no `chrome.tabs.reload` from the
  *    worker — until the developer clicks that action. The click is the consent: the worker makes
@@ -56,8 +80,16 @@
  *   handshake offer on `window`, keeps the private channel node it carries, and records every
  *   agent frame dispatched on that node without ever claiming one, so `agent.ready` is read
  *   exactly as the bridge relays it. No page script that starts after `document_start` can do this.
+ * - **The picker is observed where it acts.** Its highlight is read from the page's DOM by the
+ *   traits the agent gives it (`packages/telemetry/src/browser/dom-target.ts`, "Element picker"),
+ *   and a read before any pick proves the application renders nothing like it. What reached the
+ *   application is recorded by a capture-phase listener on `document` — the node after `window`,
+ *   where the picker consumes the gesture — for the platform's click-gesture event types, and by
+ *   the page's `request` events for the fixture route. Picker mode is the toggle's `aria-pressed`
+ *   and its "Picker on" badge, whose module-private names `fixtures.ts` types; the target is the
+ *   service's session record (`GET /sessions/:id`), polled until it names one.
  *
- * ## How the "already open" state of test 4 is provoked
+ * ## How the "already open" state of test 8 is provoked
  *
  * The tab is opened while the extension is disabled, through `chrome.management` on
  * `chrome://extensions` (the browser's own control), and the extension is enabled afterwards.
@@ -95,14 +127,17 @@
  * One Chromium context, one service and one `DEBUGGEN_HOME` serve the whole suite, so every query
  * and assertion is scoped to the test's own session and capture, every session is ended by the
  * fixture's tracked teardown (and every capture is stopped by `sessions.capture` even on failure),
- * the planted cookie is removed, and bindings are reset with `resetExtensionState()`. Test 4
- * disables and re-enables the extension, which replaces its MV3 worker; it is declared last and
- * always re-enables the extension, and the fixtures reach the worker through their live-worker
- * lookup, so later tests start from a paired, running extension.
+ * the planted cookie is removed, and bindings are reset with `resetExtensionState()`. Every pick a
+ * test arms ends inside that test — picked, escaped or toggled off, each proven by the released
+ * toggle and the removed highlight — and one a failure leaves armed ends with the test's tab and
+ * with its session's unbinding, which cancels it in the page. Test 8 disables and re-enables the
+ * extension, which replaces its MV3 worker; it is declared last and always re-enables the
+ * extension, and the fixtures reach the worker through their live-worker lookup, so later tests
+ * start from a paired, running extension.
  */
 import { randomBytes } from 'node:crypto';
 
-import type { BrowserContext, Page, Request, Worker } from '@playwright/test';
+import type { BrowserContext, Locator, Page, Request, Worker } from '@playwright/test';
 
 import {
   AGENT_SOURCE_TAG,
@@ -117,6 +152,7 @@ import { DATA_QUERY_MAX_LIMIT } from '@debuggen/panel-schema';
 import type {
   ProgressStage,
   ProgressStatus,
+  SelectedTarget,
   SessionRecord,
   TelemetryEvent,
 } from '@debuggen/protocol';
@@ -253,6 +289,12 @@ const CAPTURE_TEST_TIMEOUT_MS = 180_000;
 
 /** The pre-extension test adds an extension disable/enable cycle and a reload wait. */
 const RELOAD_TEST_TIMEOUT_MS = 240_000;
+
+/** A picker test covers pipeline readiness, one pick settled through page, worker, service and panel, and one ordinary click. */
+const PICKER_TEST_TIMEOUT_MS = 150_000;
+
+/** How far the picker's highlight may sit from the box of the element it covers: both are `getBoundingClientRect` reads of one layout, so this absorbs sub-pixel rounding only. */
+const HIGHLIGHT_BOX_TOLERANCE_PX = 1;
 
 // ---------------------------------------------------------------------------
 // Planted privacy probes (random per run; never a credential literal)
@@ -1601,6 +1643,428 @@ async function readDocumentMarker(page: Page): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------
+// The element picker ("Pick element"): the page, the panel and the service
+// ---------------------------------------------------------------------------
+
+/**
+ * The events one primary-button click dispatches to a page, in dispatch order — the platform's own
+ * vocabulary (`DocumentEventMap`). An armed pick consumes each of them on `window` in the capture
+ * phase, so none reaches the document; once the pick has ended, a click delivers every one.
+ */
+const CLICK_GESTURE_EVENT_TYPES = [
+  'pointerdown',
+  'mousedown',
+  'pointerup',
+  'mouseup',
+  'click',
+] as const satisfies readonly (keyof DocumentEventMap)[];
+
+/** The page global the gesture recorder writes to — spec-owned, disjoint from every product global. */
+const GESTURE_STORE_KEY = '__telemetryCaptureSpecGestures';
+
+/** What the in-page gesture recorder is told; serialised into the page, so plain data only. */
+interface GestureRecorderArgs {
+  readonly storeKey: string;
+  readonly types: readonly string[];
+}
+
+/**
+ * Runs in the page's current document (a `page.evaluate` callback, so it names nothing outside
+ * itself). Records the type of every trusted click-gesture event that reaches `document` in the
+ * capture phase. `document` is the node after `window` on every event path, so an event the picker
+ * consumed on `window` never reaches this listener, and every event the application's own listeners
+ * could see does. It never consumes anything; installing it twice keeps the first recorder.
+ */
+function installGestureRecorder(args: GestureRecorderArgs): void {
+  const scope = window as unknown as Record<string, unknown>;
+  if (Array.isArray(scope[args.storeKey])) {
+    return;
+  }
+  const seen: string[] = [];
+  Object.defineProperty(window, args.storeKey, { value: seen, configurable: true });
+  for (const type of args.types) {
+    document.addEventListener(
+      type,
+      (event: Event) => {
+        if (event.isTrusted) {
+          seen.push(event.type);
+        }
+      },
+      { capture: true },
+    );
+  }
+}
+
+/** What reached the application from the developer's clicks, observed in the page and on the wire. */
+interface ApplicationClickObserver {
+  /** The type of every trusted click-gesture event that reached the document, in order. */
+  gestures(): Promise<readonly string[]>;
+  /** How many requests of the fixture route the page has issued. */
+  routeRequests(): number;
+  dispose(): void;
+}
+
+/**
+ * Observe what the application receives from clicks in `page`'s current document: the gesture
+ * events that reach its document (an in-page recorder) and the requests of the fixture route it
+ * issues (the browser's own `request` events). The widget's handler calls `fetch` synchronously in
+ * its click handler, so a click that reached the application shows up on both.
+ */
+async function observeApplicationClicks(
+  page: Page,
+  contract: FixtureContract,
+  baseUrl: string,
+): Promise<ApplicationClickObserver> {
+  await page.evaluate(installGestureRecorder, {
+    storeKey: GESTURE_STORE_KEY,
+    types: [...CLICK_GESTURE_EVENT_TYPES],
+  });
+  const origin = new URL(baseUrl).origin;
+  let routeRequests = 0;
+  const onRequest = (request: Request): void => {
+    const url = new URL(request.url());
+    if (url.origin === origin && url.pathname === contract.pingPath) {
+      routeRequests += 1;
+    }
+  };
+  page.on('request', onRequest);
+  return {
+    async gestures() {
+      const raw: unknown = await page.evaluate((key) => {
+        const seen = (window as unknown as Record<string, unknown>)[key];
+        // The evaluation result is serialised, so the live record is handed back as a copy.
+        return Array.isArray(seen) ? (seen as unknown[]) : null;
+      }, GESTURE_STORE_KEY);
+      if (!Array.isArray(raw)) {
+        throw new Error(
+          `The gesture recorder is not installed in ${page.url()}: the document it was installed in has been replaced.`,
+        );
+      }
+      return raw.filter((type): type is string => typeof type === 'string');
+    },
+    routeRequests: () => routeRequests,
+    dispose() {
+      page.off('request', onRequest);
+    },
+  };
+}
+
+/** A box in viewport CSS pixels, as `getBoundingClientRect` measures it. */
+interface ViewportBox {
+  readonly top: number;
+  readonly left: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/** One element with the traits of the picker's highlight, as the page lays it out. */
+interface HighlightView extends ViewportBox {
+  /** Its computed `display` — `none` only for a highlight a refused teardown could merely hide. */
+  readonly display: string;
+}
+
+/**
+ * Every element of the page with the traits the agent gives its picker highlight
+ * (`packages/telemetry/src/browser/dom-target.ts`, "Element picker"): a `div` that is a direct child
+ * of `document.documentElement` — outside `body`, where no application markup sits — marked
+ * `aria-hidden="true"` and laid out `position: fixed` with `pointer-events: none`. The agent gives
+ * the node no id or class, so it is recognised by those traits, and a read before any pick proves
+ * the application renders nothing that shares them.
+ */
+async function readPickerHighlights(page: Page): Promise<readonly HighlightView[]> {
+  return page.evaluate(() =>
+    Array.from(document.documentElement.children)
+      .filter((element) => {
+        if (
+          element.tagName.toLowerCase() !== 'div' ||
+          element.getAttribute('aria-hidden') !== 'true'
+        ) {
+          return false;
+        }
+        const style = getComputedStyle(element);
+        return style.position === 'fixed' && style.pointerEvents === 'none';
+      })
+      .map((element) => {
+        const box = element.getBoundingClientRect();
+        return {
+          display: getComputedStyle(element).display,
+          top: box.top,
+          left: box.left,
+          width: box.width,
+          height: box.height,
+        };
+      }),
+  );
+}
+
+/** Whether `highlight` covers `box` within {@link HIGHLIGHT_BOX_TOLERANCE_PX} on every edge. */
+function coversBox(highlight: ViewportBox, box: ViewportBox): boolean {
+  return (
+    Math.abs(highlight.top - box.top) <= HIGHLIGHT_BOX_TOLERANCE_PX &&
+    Math.abs(highlight.left - box.left) <= HIGHLIGHT_BOX_TOLERANCE_PX &&
+    Math.abs(highlight.width - box.width) <= HIGHLIGHT_BOX_TOLERANCE_PX &&
+    Math.abs(highlight.height - box.height) <= HIGHLIGHT_BOX_TOLERANCE_PX
+  );
+}
+
+/**
+ * Aim at `target` and wait until the picker highlights it: exactly one highlight, shown, over
+ * `target`'s own box — the page-side proof that a pick is armed in the current document. A pick
+ * reaches the page asynchronously (panel → worker → bridge → agent), and the highlight follows only
+ * a pointer *entering* an element, so every attempt first moves the pointer to the viewport's
+ * corner, off `target`, and then onto it again; what is polled is the highlight itself.
+ */
+async function expectPickerHighlights(page: Page, target: Locator): Promise<void> {
+  // Written from the poll's callback, so held in an object flow analysis does not narrow.
+  const seen: { box: ViewportBox | undefined; highlights: readonly HighlightView[] } = {
+    box: undefined,
+    highlights: [],
+  };
+  try {
+    await expect
+      .poll(
+        async () => {
+          await page.mouse.move(0, 0);
+          await target.hover();
+          const box = await target.evaluate((element): ViewportBox => {
+            const rect = element.getBoundingClientRect();
+            return { top: rect.top, left: rect.left, width: rect.width, height: rect.height };
+          });
+          seen.box = box;
+          seen.highlights = await readPickerHighlights(page);
+          const [only] = seen.highlights;
+          return (
+            seen.highlights.length === 1 &&
+            only !== undefined &&
+            only.display !== 'none' &&
+            coversBox(only, box)
+          );
+        },
+        {
+          message: 'the armed pick never highlighted the hovered element',
+          timeout: DEFAULT_WAIT_TIMEOUT_MS,
+        },
+      )
+      .toBe(true);
+  } catch (error) {
+    // The poll's message is fixed when the poll starts; the last observation is named here.
+    throw new Error(
+      `The armed pick never highlighted the hovered element, so it did not reach the page's agent: the element's box was ${JSON.stringify(seen.box)} and the page held ${String(seen.highlights.length)} highlight(s) ${JSON.stringify(seen.highlights)}.`,
+      { cause: error },
+    );
+  }
+}
+
+/**
+ * Assert the panel is in picker mode and the worker took the request: the toggle is pressed and
+ * shows "Picker on", is no longer busy, and is still pressed — a request the worker refused would
+ * have released it again.
+ */
+async function expectPickerOn(panel: PanelHandle): Promise<void> {
+  const toggle = panel.pickElementButton;
+  await expect(toggle, 'picker mode is on').toHaveAttribute('aria-pressed', 'true', {
+    timeout: DEFAULT_WAIT_TIMEOUT_MS,
+  });
+  await expect(toggle, 'the pick request was answered').not.toHaveAttribute('aria-busy', 'true', {
+    timeout: DEFAULT_WAIT_TIMEOUT_MS,
+  });
+  await expect(toggle, 'the worker armed the pick rather than refusing it').toHaveAttribute(
+    'aria-pressed',
+    'true',
+  );
+  await expect(panel.pickerOnBadge, 'the panel says picker mode is on').toBeVisible();
+}
+
+/**
+ * Press the panel's "Pick element" once it is offered for the bound session, and wait until picker
+ * mode is on ({@link expectPickerOn}).
+ */
+async function armPickerFromPanel(panel: PanelHandle): Promise<void> {
+  const toggle = panel.pickElementButton;
+  await expect(toggle, 'the panel offers "Pick element"').toBeVisible({
+    timeout: DEFAULT_WAIT_TIMEOUT_MS,
+  });
+  // An unavailable toggle is `aria-disabled` and ignores presses, so it is waited out first.
+  await expect(toggle, '"Pick element" is available for the bound session').not.toHaveAttribute(
+    'aria-disabled',
+    'true',
+    { timeout: DEFAULT_WAIT_TIMEOUT_MS },
+  );
+  await expect(toggle, 'picker mode starts off').toHaveAttribute('aria-pressed', 'false');
+  await expect(panel.pickerOnBadge).toBeHidden();
+  await toggle.click();
+  await expectPickerOn(panel);
+}
+
+/**
+ * Assert the pick is over everywhere it showed: the panel's toggle released and its "Picker on"
+ * badge gone, and the page's highlight removed from the document.
+ */
+async function expectPickerEnded(panel: PanelHandle, page: Page): Promise<void> {
+  await expect(panel.pickElementButton, '"Pick element" is released').toHaveAttribute(
+    'aria-pressed',
+    'false',
+    { timeout: DEFAULT_WAIT_TIMEOUT_MS },
+  );
+  await expect(panel.pickerOnBadge, 'the "Picker on" badge is gone').toBeHidden({
+    timeout: DEFAULT_WAIT_TIMEOUT_MS,
+  });
+  await expect
+    .poll(() => readPickerHighlights(page), {
+      message: 'the picker highlight is still in the page after the pick ended',
+      timeout: DEFAULT_WAIT_TIMEOUT_MS,
+    })
+    .toEqual([]);
+}
+
+/** Poll the service's session record until it names a target, and return it. */
+async function waitForSessionTarget(
+  service: ServiceHandle,
+  sessionId: string,
+): Promise<SelectedTarget> {
+  // Written from the poll's callback, so held in an object flow analysis does not narrow.
+  const latest: { target: SelectedTarget | undefined } = { target: undefined };
+  await expect
+    .poll(
+      async () => {
+        latest.target = (await service.getSession(sessionId)).target;
+        return latest.target !== undefined;
+      },
+      {
+        message: `session ${sessionId} never recorded a target: the pick did not reach the service (page → bridge → worker → service)`,
+        timeout: DEFAULT_WAIT_TIMEOUT_MS,
+      },
+    )
+    .toBe(true);
+  if (latest.target === undefined) {
+    throw new Error(`session ${sessionId} recorded no target`);
+  }
+  return latest.target;
+}
+
+/**
+ * Assert `target` describes the widget's button as the page renders it: the button's own tag name
+ * (compared case-insensitively, as the descriptor contract allows), a selector that resolves in the
+ * page to exactly that button, its visible text, the widget as the nearest component of the chain,
+ * and the page's own document.
+ */
+async function expectTargetIsButton(
+  target: SelectedTarget,
+  expected: {
+    readonly page: Page;
+    readonly button: Locator;
+    readonly contract: FixtureContract;
+    readonly baseUrl: string;
+  },
+): Promise<void> {
+  const rendered = await expected.button.evaluate((element, selector) => {
+    const matches = document.querySelectorAll(selector);
+    return {
+      tagName: element.tagName,
+      text: (element.textContent ?? '').replace(/\s+/g, ' ').trim(),
+      resolvesToButton: matches.length === 1 && matches[0] === element,
+      matchCount: matches.length,
+    };
+  }, target.selector);
+  expect(target.tagName.toLowerCase(), 'the target is the clicked button').toBe(
+    rendered.tagName.toLowerCase(),
+  );
+  expect(
+    rendered.resolvesToButton,
+    `the target's selector ${target.selector} resolves in the page to exactly the clicked button (it matches ${String(rendered.matchCount)} element(s))`,
+  ).toBe(true);
+  expect(target.text, "the target carries the button's visible text").toBe(rendered.text);
+  expect(target.componentChain, 'the component chain names the widget').toContain(
+    expected.contract.widgetName,
+  );
+  expect(target.componentChain[0], 'the nearest component is the widget rendering the button').toBe(
+    expected.contract.widgetName,
+  );
+  const targetUrl = new URL(target.url);
+  expect(targetUrl.origin, "the target is of the app's origin").toBe(
+    new URL(expected.baseUrl).origin,
+  );
+  expect(targetUrl.pathname, "the target is of the page's document").toBe(
+    new URL(expected.page.url()).pathname,
+  );
+}
+
+/**
+ * With a pick armed in `page`, highlight and click the widget's button — a trusted click through
+ * the browser's input pipeline — and assert the pick did what "Pick element" promises: the session's
+ * target is that button, and the panel shows it; the pick is over in the panel and the page; and
+ * the click was the picker's alone — no event of it reached the document, the route was not
+ * requested and the widget shows no result. One ordinary click then proves the page is back to
+ * normal: it reaches the application, which fetches its route and renders the reply, and the target
+ * stays the picked one.
+ */
+async function pickButtonAndExpectConsumed(input: {
+  readonly page: Page;
+  readonly panel: PanelHandle;
+  readonly service: ServiceHandle;
+  readonly sessionId: string;
+  readonly contract: FixtureContract;
+  readonly baseUrl: string;
+  readonly clicks: ApplicationClickObserver;
+}): Promise<void> {
+  const { page, panel, service, sessionId, contract, baseUrl, clicks } = input;
+  const button = page.getByTestId(PING_BUTTON_TEST_ID);
+  await expectPickerHighlights(page, button);
+  await button.click();
+
+  const target = await waitForSessionTarget(service, sessionId);
+  await expectTargetIsButton(target, { page, button, contract, baseUrl });
+  await expect(
+    panel.header.getByText(target.selector, { exact: true }),
+    "the panel shows the picked element's selector",
+  ).toBeVisible({ timeout: DEFAULT_WAIT_TIMEOUT_MS });
+  await expectPickerEnded(panel, page);
+
+  expect(await clicks.gestures(), 'no event of the picking click reached the page').toEqual([]);
+  expect(clicks.routeRequests(), 'the picking click issued no request').toBe(0);
+  await expect(
+    page.getByTestId(PING_RESULT_TEST_ID),
+    'the widget never acted on the picking click',
+  ).toHaveText('');
+
+  await runCheck(page, contract);
+  expect(await clicks.gestures(), 'the next click reaches the application').toEqual(
+    expect.arrayContaining([...CLICK_GESTURE_EVENT_TYPES]),
+  );
+  expect(clicks.routeRequests(), 'the next click issues its request').toBe(1);
+  expect((await service.getSession(sessionId)).target, 'an ordinary click selects nothing').toEqual(
+    target,
+  );
+}
+
+/**
+ * After a pick ended without an element, assert the page is back to normal and nothing was
+ * selected: the first click on the widget's button reaches the application — every gesture event,
+ * one request, the reply rendered — and the session record still names no target. The record is
+ * read after that click's reply, a full round trip after the pick's own answer left the page.
+ */
+async function expectNoPickAndClickReachesApp(input: {
+  readonly page: Page;
+  readonly service: ServiceHandle;
+  readonly sessionId: string;
+  readonly contract: FixtureContract;
+  readonly clicks: ApplicationClickObserver;
+}): Promise<void> {
+  const { page, service, sessionId, contract, clicks } = input;
+  expect(await clicks.gestures(), 'no click has reached the page before this one').toEqual([]);
+  expect(clicks.routeRequests(), 'no request was issued before this click').toBe(0);
+  await runCheck(page, contract);
+  expect(await clicks.gestures(), 'the click reached the application').toEqual(
+    expect.arrayContaining([...CLICK_GESTURE_EVENT_TYPES]),
+  );
+  expect(clicks.routeRequests(), 'the click issued its request').toBe(1);
+  expect(
+    (await service.getSession(sessionId)).target,
+    'the pick ended without selecting anything',
+  ).toBeUndefined();
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1877,6 +2341,185 @@ test.describe('telemetry capture', () => {
       record.captures.map((capture) => capture.id),
       'the reload opened no second capture',
     ).toEqual([outcome.captureId]);
+  });
+
+  test('"Pick element" in the panel selects the element clicked in the page, and the page never receives that click', async ({
+    appPage,
+    editorClient,
+    fixtureApp,
+    openPanelPage,
+    pairing,
+    service,
+    sessions,
+  }) => {
+    test.setTimeout(PICKER_TEST_TIMEOUT_MS);
+    editorClient.clear();
+    const contract = await loadFixtureContract(fixtureApp.baseUrl);
+    await pairing.ensurePaired();
+    const { session, panel } = await bindReadySession({
+      page: appPage,
+      sessions,
+      openPanelPage,
+      editorClient,
+    });
+    expect(session.target, 'a session created without a target has none').toBeUndefined();
+    expect(
+      await readPickerHighlights(appPage),
+      'the application renders nothing with the traits of the picker highlight',
+    ).toEqual([]);
+
+    const clicks = await observeApplicationClicks(appPage, contract, fixtureApp.baseUrl);
+    try {
+      await armPickerFromPanel(panel);
+      await pickButtonAndExpectConsumed({
+        page: appPage,
+        panel,
+        service,
+        sessionId: session.id,
+        contract,
+        baseUrl: fixtureApp.baseUrl,
+        clicks,
+      });
+    } finally {
+      clicks.dispose();
+    }
+  });
+
+  test('Escape in the page leaves picker mode without selecting anything', async ({
+    appPage,
+    editorClient,
+    fixtureApp,
+    openPanelPage,
+    pairing,
+    service,
+    sessions,
+  }) => {
+    test.setTimeout(PICKER_TEST_TIMEOUT_MS);
+    editorClient.clear();
+    const contract = await loadFixtureContract(fixtureApp.baseUrl);
+    await pairing.ensurePaired();
+    const { session, panel } = await bindReadySession({
+      page: appPage,
+      sessions,
+      openPanelPage,
+      editorClient,
+    });
+    expect(session.target).toBeUndefined();
+
+    const clicks = await observeApplicationClicks(appPage, contract, fixtureApp.baseUrl);
+    try {
+      await armPickerFromPanel(panel);
+      await expectPickerHighlights(appPage, appPage.getByTestId(PING_BUTTON_TEST_ID));
+
+      // A trusted Escape in the page: the agent ends the pick and answers it without an element,
+      // and the worker releases the panel's toggle.
+      await appPage.keyboard.press('Escape');
+      await expectPickerEnded(panel, appPage);
+
+      await expectNoPickAndClickReachesApp({
+        page: appPage,
+        service,
+        sessionId: session.id,
+        contract,
+        clicks,
+      });
+    } finally {
+      clicks.dispose();
+    }
+  });
+
+  test('pressing "Pick element" again leaves picker mode without selecting anything', async ({
+    appPage,
+    editorClient,
+    fixtureApp,
+    openPanelPage,
+    pairing,
+    service,
+    sessions,
+  }) => {
+    test.setTimeout(PICKER_TEST_TIMEOUT_MS);
+    editorClient.clear();
+    const contract = await loadFixtureContract(fixtureApp.baseUrl);
+    await pairing.ensurePaired();
+    const { session, panel } = await bindReadySession({
+      page: appPage,
+      sessions,
+      openPanelPage,
+      editorClient,
+    });
+    expect(session.target).toBeUndefined();
+
+    const clicks = await observeApplicationClicks(appPage, contract, fixtureApp.baseUrl);
+    try {
+      await armPickerFromPanel(panel);
+      await expectPickerHighlights(appPage, appPage.getByTestId(PING_BUTTON_TEST_ID));
+
+      // The toggle's second press cancels the pick in the page; the highlight leaving the page is
+      // the proof the cancel arrived there, so nothing below can race a still-armed pick.
+      await panel.pickElementButton.click();
+      await expectPickerEnded(panel, appPage);
+
+      await expectNoPickAndClickReachesApp({
+        page: appPage,
+        service,
+        sessionId: session.id,
+        contract,
+        clicks,
+      });
+    } finally {
+      clicks.dispose();
+    }
+  });
+
+  test("the editor's pick request, relayed by the service, puts the panel in picker mode and the clicked element becomes the target", async ({
+    appPage,
+    editorClient,
+    fixtureApp,
+    openPanelPage,
+    pairing,
+    service,
+    sessions,
+  }) => {
+    test.setTimeout(PICKER_TEST_TIMEOUT_MS);
+    editorClient.clear();
+    const contract = await loadFixtureContract(fixtureApp.baseUrl);
+    await pairing.ensurePaired();
+    const { session, panel } = await bindReadySession({
+      page: appPage,
+      sessions,
+      openPanelPage,
+      editorClient,
+    });
+    expect(session.target).toBeUndefined();
+    await expect(panel.pickElementButton, 'picker mode starts off').toHaveAttribute(
+      'aria-pressed',
+      'false',
+      { timeout: DEFAULT_WAIT_TIMEOUT_MS },
+    );
+
+    const clicks = await observeApplicationClicks(appPage, contract, fixtureApp.baseUrl);
+    try {
+      // VS Code's "Pick element": the editor asks the service, which pushes `target.request` to
+      // the session's bound tab — the panel enters picker mode without being pressed.
+      const delivered = await service.requestTarget(session.id);
+      expect(delivered, 'the request was handed to the bound tab').toEqual({
+        sessionId: session.id,
+        tabId: panel.tabId,
+      });
+      await expectPickerOn(panel);
+
+      await pickButtonAndExpectConsumed({
+        page: appPage,
+        panel,
+        service,
+        sessionId: session.id,
+        contract,
+        baseUrl: fixtureApp.baseUrl,
+        clicks,
+      });
+    } finally {
+      clicks.dispose();
+    }
   });
 
   // Declared last: it disables and re-enables the extension, which replaces its MV3 worker.

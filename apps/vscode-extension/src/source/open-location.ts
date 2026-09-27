@@ -39,8 +39,8 @@
  *   view's `openFile` frame that dispatches to it. Its policy is the
  *   **session's `projectRoot`**, proved here even though
  *   `apps/local-service`'s `source/open.ts` already checked a forwarded frame:
- *   the location is untrusted at every hop, and defence in depth is the stated
- *   design (AAP §0.2.3).
+ *   the location is untrusted at every hop, so this sink proves containment
+ *   itself instead of trusting an upstream verdict.
  *
  * ## The canonical, identity-pinned gate
  *
@@ -1203,7 +1203,7 @@ const CLICK_AGAIN_HINT = 'Click the source link again so the file is checked as 
  * check — the code the service's `source/open.ts` reports for the same
  * symbolic-link escape, so both hops name one failure alike. Absence inside
  * the project is `PROJECT_NOT_FOUND`, as it is for the reveal primitive and the
- * service. Nothing here quotes an absolute path or a link target (AAP §0.5.2).
+ * service. Nothing here quotes an absolute path or a link target.
  */
 const GATE_REFUSALS: Readonly<Record<GateRefusalReason, GateRefusalCopy>> = Object.freeze({
   'project-root-missing': {
@@ -1300,7 +1300,7 @@ const ERRNO_PATTERN = /^E[A-Z0-9]{1,31}$/;
  *
  * Only the code is kept: a Node filesystem error's `message` and `path` quote
  * the absolute path the call was made with, and neither may reach a log line,
- * an error's details or a notification (AAP §0.5.2).
+ * an error's details or a notification.
  */
 function errnoOf(caught: unknown): string | undefined {
   if (typeof caught !== 'object' || caught === null || !('code' in caught)) {
@@ -1778,7 +1778,7 @@ export function forwardedSourcePin(
  * checked containment and `realpath` for a forwarded frame, and this function
  * proves it all again anyway, because that verdict was true only at the
  * instant it was computed and the frame then crossed a socket; and the command
- * and the webview have no service verdict at all (AAP §0.2.3).
+ * and the webview have no service verdict at all.
  *
  * The gate, in order, with no editor call before step 8 and nothing shown
  * before step 9:
@@ -1812,7 +1812,7 @@ export function forwardedSourcePin(
  * its outside target exists, so the answer is no filesystem oracle. No
  * refusal's message, details or log line holds an absolute path or a link
  * target: the project-relative `file:line:column` and an errno code are all
- * that is reported (AAP §0.5.2).
+ * that is reported.
  *
  * Every failure is reported exactly once, as a warning notification and as an
  * `Err`; nothing throws (AAP §0.5.5).

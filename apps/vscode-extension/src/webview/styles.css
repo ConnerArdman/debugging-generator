@@ -8,13 +8,18 @@
  * `var(--dg-*)` reference; focus, elevation and stacking are left to the
  * design system. Apart from property keywords such as `flex` and `ellipsis`,
  * those properties take only the literals `0`, `none`, `auto`, `inherit` and
- * `transparent`, and one shape: `border-radius: 100%` turns the token-sized
- * capture dot into a circle, as the design system's spinner ring does. Sizes
- * and placement, which the token table does not model, use the relational
- * forms the design system's `base.css` permits: `100%`,
- * `calc(100% - <token>)`, the flex ratios `1 1 auto` and `0 1 auto`,
- * `max-content` and `grid-column: 2`. A grid's spare-width share is a
- * `--dg-column-share-*` token, and no length literal is written.
+ * `transparent`.
+ *
+ * No number other than zero is written, with or without a unit. A size or cap
+ * against the containing block is the proportion token `--dg-size-full`, and
+ * the capture dot is rounded by `--dg-radius-round`, the design system's
+ * radius for a circle. Flex sizing is a keyword: `auto` fills and shrinks,
+ * `none` holds, and `auto` with `flex-grow: 0` shrinks without growing. Grid
+ * placement uses named lines, and a grid's spare-width share is a
+ * `--dg-column-share-*` token. `./styles.test.ts` enforces this with the rest
+ * of the contract: no custom property declared here, no token read that the
+ * design system does not catalogue, no colour literal and no border-width
+ * keyword.
  *
  * The `dgv-*` namespace is consumed only by `src/webview/App.tsx` and
  * `src/webview/components/**`; every `dg-*` block belongs to the design system
@@ -33,7 +38,7 @@
 
 html,
 body {
-  block-size: 100%;
+  block-size: var(--dg-size-full);
   overflow: hidden;
 }
 
@@ -49,7 +54,7 @@ body {
 #root {
   display: flex;
   flex-direction: column;
-  block-size: 100%;
+  block-size: var(--dg-size-full);
   min-block-size: 0;
   min-inline-size: 0;
 }
@@ -68,9 +73,9 @@ body {
    * long one extends `PanelShell`'s scroll range, bottom padding included. A
    * definite height would pin it to one screen and push the last card flush
    * against the viewport edge. */
-  flex: 1 1 auto;
+  flex: auto;
   flex-direction: column;
-  min-block-size: 100%;
+  min-block-size: var(--dg-size-full);
   min-inline-size: 0;
 }
 
@@ -89,7 +94,7 @@ body {
 
 .dgv-view__body {
   display: flex;
-  flex: 1 1 auto;
+  flex: auto;
   flex-direction: column;
   /* The rhythm between sections; spacing inside one comes from `Stack`,
    * `Split`, `Section` and `Toolbar`. */
@@ -161,7 +166,7 @@ body {
 .dgv-notice__text {
   /* Takes the room the dismiss control does not, and may shrink, so a long
    * message wraps inside the notice instead of widening the view. */
-  flex: 1 1 auto;
+  flex: auto;
   min-inline-size: 0;
   color: var(--dg-text-primary);
 }
@@ -184,7 +189,7 @@ body {
 /* The root `Stack`: a flex item of `.dgv-view__header` that takes the strip's
  * free space, above an optional `ErrorState` for a hard failure. */
 .dgv-status-bar {
-  flex: 1 1 auto;
+  flex: auto;
   min-inline-size: 0;
   color: var(--dg-text-secondary);
   font: var(--dg-text-xs);
@@ -199,7 +204,8 @@ body {
 /* One side of the row. It may shrink below its content's width so a long
  * service URL truncates instead of widening the view. */
 .dgv-status-bar__group {
-  flex: 0 1 auto;
+  flex: auto;
+  flex-grow: 0;
   min-inline-size: 0;
 }
 
@@ -209,7 +215,7 @@ body {
 .dgv-status-bar__item {
   display: block;
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -272,7 +278,7 @@ body {
 .dgv-target__chain-item {
   display: block;
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
   overflow: hidden;
   color: var(--dg-text-secondary);
   font: var(--dg-text-xs);
@@ -337,9 +343,13 @@ body {
   font: var(--dg-text-md);
 }
 
+/* The marker track, then the label track between the `detail` lines, which
+ * place a detail line under its label by name. */
 .dgv-progress__row {
   display: grid;
-  grid-template-columns: max-content minmax(0, var(--dg-column-share-default));
+  grid-template-columns:
+    max-content
+    [detail-start] minmax(0, var(--dg-column-share-default)) [detail-end];
   align-items: baseline;
   gap: var(--dg-space-2);
   min-inline-size: 0;
@@ -380,8 +390,9 @@ body {
 }
 
 .dgv-progress__detail {
-  /* Under the label; inert when the detail is nested inside the label. */
-  grid-column: 2;
+  /* Between the row's `detail` lines, so under the label; inert when the
+   * detail is nested inside the label. */
+  grid-column: detail;
   min-inline-size: 0;
   color: var(--dg-text-secondary);
   font: var(--dg-text-xs);
@@ -457,7 +468,7 @@ body {
   align-items: center;
   gap: var(--dg-space-2);
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
 }
 
 .dgv-files__score {
@@ -467,7 +478,7 @@ body {
 .dgv-files__path {
   display: block;
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -493,7 +504,7 @@ body {
 /* The identity column, a flex item of the flex-row cell: it takes the cell's
  * width and may shrink, which lets the path ellipsize. */
 .dgv-modifications__identity {
-  flex: 1 1 auto;
+  flex: auto;
   min-inline-size: 0;
 }
 
@@ -503,7 +514,7 @@ body {
 .dgv-modifications__file {
   display: flex;
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
   overflow: hidden;
   white-space: nowrap;
 }
@@ -513,7 +524,8 @@ body {
  * character plus the glyph. `--dg-space-5` is the smallest space token wider
  * than two `--dg-mono-sm` characters. */
 .dgv-modifications__directory {
-  flex: 0 1 auto;
+  flex: auto;
+  flex-grow: 0;
   min-inline-size: var(--dg-space-5);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -524,13 +536,13 @@ body {
  * precedes it — and ellipsizes on its own. */
 .dgv-modifications__name {
   flex: none;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .dgv-modifications__directory + .dgv-modifications__name {
-  max-inline-size: calc(100% - var(--dg-space-5));
+  max-inline-size: calc(var(--dg-size-full) - var(--dg-space-5));
 }
 
 /* Plan version, layering and time on one wrapping line (a horizontal Stack). */
@@ -548,20 +560,13 @@ body {
 /* The disclosure and open-file buttons (a horizontal, wrapping Stack): they
  * sit side by side when the track allows and stack when it does not. */
 .dgv-modifications__actions {
-  flex: 1 1 auto;
+  flex: auto;
   min-inline-size: 0;
 }
 
-/* The expanded detail: preserved original, hashes, then the diff. It fills the
- * single full-width cell of the design system's detail row. */
+/* The expanded detail: the hashes row, then the diff. It fills the single
+ * full-width cell of the design system's detail row. */
 .dgv-modifications__detail {
-  min-inline-size: 0;
-}
-
-/* A conflicting file's preserved original. The path inside wraps through
- * `Code wrap`; the sentence keeps the reading colour of the note above. */
-.dgv-modifications__preserved {
-  margin: 0;
   min-inline-size: 0;
 }
 
@@ -700,13 +705,14 @@ body {
   font: var(--dg-text-sm);
 }
 
-/* A space-token square with a full radius: a dot with no length of its own. */
+/* A space-token square rounded by the round radius token: a dot with no length
+ * of its own. */
 .dgv-capture__indicator {
   flex: none;
   inline-size: var(--dg-space-2);
   block-size: var(--dg-space-2);
   background: var(--dg-border-strong);
-  border-radius: 100%;
+  border-radius: var(--dg-radius-round);
 }
 
 .dgv-capture__indicator--capturing {
@@ -716,7 +722,7 @@ body {
 /* The error, busy and unavailable states replace the row and take the full
  * line; shrunk to its padding, the busy skeleton bar would collapse. */
 .dgv-capture__placeholder {
-  flex: 1 1 auto;
+  flex: auto;
   min-inline-size: 0;
 }
 
@@ -850,7 +856,7 @@ body {
 .dgv-cleanup__conflict-file {
   display: block;
   min-inline-size: 0;
-  max-inline-size: 100%;
+  max-inline-size: var(--dg-size-full);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

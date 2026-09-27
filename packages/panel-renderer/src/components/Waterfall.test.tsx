@@ -4718,8 +4718,17 @@ describe('Waterfall time axis', () => {
 /** The class of the scroll viewport the axis and the rows share. */
 const VIEWPORT_CLASS = 'dg-waterfall__viewport';
 
-/** The derived form a token-backed track minimum takes: `calc(<token> * n)`. */
-const TOKEN_MULTIPLE_MINIMUM = /^minmax\(calc\(var\((--dg-[a-z0-9-]+)\) \* (\d+)\), \d+fr\)$/u;
+/**
+ * A track whose minimum and share are both tokens:
+ * `minmax(var(<floor token>), var(<share token>))`.
+ */
+const TOKEN_TRACK = /^minmax\(var\((--dg-[a-z0-9-]+)\), var\((--dg-[a-z0-9-]+)\)\)$/u;
+
+/** A track that may give way entirely, whose share is a token: `minmax(0, var(<share token>))`. */
+const FLOORLESS_TOKEN_TRACK = /^minmax\(0, var\((--dg-[a-z0-9-]+)\)\)$/u;
+
+/** The form an extent token's value takes: a multiple of a space token, `calc(<token> * n)`. */
+const SPACE_MULTIPLE = /^calc\(var\((--dg-[a-z0-9-]+)\) \* (\d+)\)$/u;
 
 /** A token value written as a whole number of pixels, e.g. `24px`. */
 const PIXEL_VALUE = /^(\d+(?:\.\d+)?)px$/u;
@@ -4764,7 +4773,7 @@ function declaredValue(body: string, property: string): string {
 
 /**
  * The top-level tracks of a `grid-template-columns` value: split on the spaces
- * outside any function, so `minmax(0, 2fr)` stays one track.
+ * outside any function, so `minmax(0, var(--dg-waterfall-label-share))` stays one track.
  *
  * @param template The declared template.
  * @returns The tracks, in order.
@@ -4877,23 +4886,45 @@ describe('Waterfall axis floor and scroll viewport', () => {
   it('floors the time track at the design strip in every theme, from a space token', () => {
     const [rowRule, ...otherRowRules] = rulesSelecting('.dg-waterfall__row');
     expect(otherRowRules).toHaveLength(0);
-    const tracks = topLevelTracks(declaredValue(rowRule ?? '', 'grid-template-columns'));
+    // The template may be laid out over several lines; a track boundary is
+    // any run of whitespace outside a function.
+    const tracks = topLevelTracks(
+      declaredValue(rowRule ?? '', 'grid-template-columns').replace(/\s+/gu, ' '),
+    );
 
     // Label, time and duration: the label track may still give way, the time
     // track may not.
     expect(tracks).toHaveLength(3);
-    expect(tracks[0]).toBe('minmax(0, 2fr)');
+    const label = FLOORLESS_TOKEN_TRACK.exec(tracks[0] ?? '');
+    const [, labelShareName = ''] = label ?? [];
+    expect(label, 'the label track has no floor').not.toBeNull();
     expect(tracks[2]).toBe('max-content');
-    const floor = TOKEN_MULTIPLE_MINIMUM.exec(tracks[1] ?? '');
-    const [, tokenName = '', multiplier = ''] = floor ?? [];
-    expect(floor).not.toBeNull();
-    const spaceKey = tokenKeyOf(tokenName);
-    expect(spaceKey).toMatch(/^space\d+$/u);
+    const time = TOKEN_TRACK.exec(tracks[1] ?? '');
+    const [, floorName = '', barShareName = ''] = time ?? [];
+    expect(time, 'the time track is floored by a token').not.toBeNull();
+    const floorKey = tokenKeyOf(floorName);
+    const labelShareKey = tokenKeyOf(labelShareName);
+    const barShareKey = tokenKeyOf(barShareName);
 
     const themes = Object.keys(DESIGN_TOKENS) as (keyof DesignTokens)[];
     expect(themes).toHaveLength(3);
     for (const theme of themes) {
       const values = DESIGN_TOKENS[theme];
+      // Above their floors the label and the time track divide the spare
+      // width two to five.
+      expect(values[labelShareKey], `${theme}: the label track's share`).toBe('2fr');
+      expect(values[barShareKey], `${theme}: the time track's share`).toBe('5fr');
+
+      // The floor is a whole multiple of a space token, so it stays on the
+      // design scale, and it clears the strip the ticks are fitted to.
+      const multiple = SPACE_MULTIPLE.exec(values[floorKey]);
+      const [, spaceName = '', multiplier = ''] = multiple ?? [];
+      expect(
+        multiple,
+        `${theme}: the time track's floor is a multiple of a space token`,
+      ).not.toBeNull();
+      const spaceKey = tokenKeyOf(spaceName);
+      expect(spaceKey).toMatch(/^space\d+$/u);
       const floorPx = pixelsIn(values[spaceKey], PIXEL_VALUE) * Number(multiplier);
       const labelFontPx = pixelsIn(values.textXs, FONT_SHORTHAND_SIZE);
       expect(
@@ -4911,7 +4942,13 @@ describe('Waterfall axis floor and scroll viewport', () => {
     expect(scrolling).toHaveLength(1);
     const own = bodies.find((body) => !scrolling.includes(body)) ?? '';
     expect(declaredValue(own, 'display')).toBe('grid');
-    expect(declaredValue(own, 'grid-template-columns')).toBe('minmax(min-content, 1fr)');
+    expect(declaredValue(own, 'grid-template-columns')).toBe(
+      'minmax(min-content, var(--dg-column-share-default))',
+    );
+    // That share is the whole of the viewport's spare width, in every theme.
+    for (const theme of Object.keys(DESIGN_TOKENS) as (keyof DesignTokens)[]) {
+      expect(DESIGN_TOKENS[theme].columnShareDefault, theme).toBe('1fr');
+    }
     expect(declaredValue(own, 'min-inline-size')).toBe('0');
 
     // The axis strip takes the track's floor from the row grid, not a minimum

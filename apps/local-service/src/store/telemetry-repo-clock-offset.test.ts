@@ -475,12 +475,14 @@ describe('schema version 5: telemetry_events.clock_offset_ms', () => {
     store.close();
 
     // Turn the file back into what a version-4 build left behind: stamped 4,
-    // with no clock_offset_ms column, every row intact.
+    // with no clock_offset_ms column and none of the tables later rungs add
+    // (version 6's session_root_identities), every row intact.
     const legacy = new DatabaseSync(databasePath);
     let rowsBefore: Record<string, unknown>[];
 
     try {
       legacy.exec(`ALTER TABLE telemetry_events DROP COLUMN ${COLUMN}`);
+      legacy.exec('DROP TABLE IF EXISTS session_root_identities');
       legacy.exec('PRAGMA user_version = 4');
 
       expect(offsetColumn(legacy)).toBeUndefined();

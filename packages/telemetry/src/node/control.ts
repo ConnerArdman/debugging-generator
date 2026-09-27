@@ -2370,10 +2370,12 @@ export class ServerAgentControl implements CaptureGate {
    *    the same frame retries instead of being swallowed.
    * 2. **A different capture?** Flush first, while the outgoing capture is
    *    still the one the service has open. An ingest event carries no capture
-   *    id — the service assigns it on arrival — so evidence that leaves after
-   *    the switch is filed under the new capture. Flushing here is what gets
-   *    the finished spans out in time; the generation bump in step 5 is what
-   *    rejects the ones that were still running.
+   *    id — the service assigns it on arrival — and each post names the
+   *    capture its events were recorded in, which the service refuses once
+   *    that capture has closed, so evidence that leaves after the switch is
+   *    lost rather than stored. Flushing here is what gets the finished spans
+   *    out in time; the generation bump in step 5 is what rejects the ones
+   *    that were still running.
    * 3. **Install the provider.** The first capture of a process finds one
    *    already registered by `register.ts`; a capture that follows a teardown
    *    finds none and builds one, and a capture that follows a teardown which

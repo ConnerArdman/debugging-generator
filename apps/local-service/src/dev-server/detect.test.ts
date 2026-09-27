@@ -3,7 +3,7 @@
  * one-file manifest read, framework-generic dev-script selection, the relaunch
  * command and its developer-facing hint, and the `detectDevServer` matrix.
  *
- * Six things are on trial here, each for a reason the plan states.
+ * Seven things are on trial here, each for a reason the plan states.
  *
  * - **The probe is loopback-only, and the refusal comes first.** A dev-server
  *   URL reaches this service over HTTP, so a probe that would dial any host
@@ -23,6 +23,13 @@
  *   it survives beyond the four `TargetManifest` fields; no error echoes file
  *   content (AAP §0.5.2). Reader spies prove no `.env*` file and no lockfile is
  *   ever read through this module.
+ * - **Files are read where the caller acts; the project is named as the
+ *   session spells it (CWE-367).** With a `readRoot`, the manifest and the
+ *   lockfiles come from that directory — the launcher's re-proved canonical
+ *   root — while the result's `projectRoot`, the preload lookup, the relaunch
+ *   command and every note keep `projectRoot`. A `readRoot` that is not an
+ *   absolute path reads nothing rather than falling back to `projectRoot`, and
+ *   an absent one changes nothing.
  * - **Selection is by shape.** A dev script is found by the binary and
  *   subcommand it invokes, never by a whole-command or project-specific
  *   literal, which is what lets detection work on any Next.js project
@@ -3168,6 +3175,198 @@ describe('detectDevServer: the dev-server script names', () => {
 
     expect(detection.devServerScripts).toStrictEqual(['web:dev']);
     expect(JSON.parse(JSON.stringify(detection))).toStrictEqual(detection);
+  });
+});
+
+describe('detectDevServer: readRoot is where project files are read, projectRoot what is reported', () => {
+  /**
+   * Two real project directories side by side: `spelled`, the root as the
+   * session names it, holding a decoy manifest (a `deploy` script that runs
+   * `next dev`) and a Yarn lockfile; and `canonical`, the directory a caller
+   * re-proved, holding the real manifest and a pnpm lockfile. Whichever one
+   * detection reads is visible in every answer it gives.
+   */
+  function sideBySide(): { readonly spelled: string; readonly canonical: string } {
+    const sandbox = makeSandbox();
+    const spelled = join(sandbox, 'spelled');
+    const canonical = join(sandbox, 'canonical');
+    mkdirSync(spelled);
+    mkdirSync(canonical);
+    writeManifest(spelled, { name: 'decoy', scripts: { deploy: 'next dev' } });
+    writeFileSync(join(spelled, 'yarn.lock'), '# yarn lockfile v1\n');
+    writeManifest(canonical, {
+      ...UNPINNED_MANIFEST,
+      scripts: { ...UNPINNED_MANIFEST.scripts, deploy: 'vercel deploy --prod' },
+    });
+    writeFileSync(join(canonical, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
+    return { spelled, canonical };
+  }
+
+  it('reads package.json and the lockfiles under readRoot, while the result, relaunch command, preload lookup and log keep projectRoot', async () => {
+    const { spelled, canonical } = sideBySide();
+    const readManifest = spyingDiskReader();
+    const agents = presence(false);
+    const { logger, records } = recordingLogger();
+
+    const detection = await detectDevServer(
+      { projectRoot: spelled, readRoot: canonical, devServerUrl: DEV_URL },
+      {
+        readManifest,
+        config: SERVICE_CONFIG,
+        preloadPath: PRELOAD_PATH,
+        fetchImpl: refusing(),
+        serverAgents: agents.serverAgents,
+        logger,
+      },
+    );
+
+    // Read: the canonical manifest and its pnpm lockfile — never the decoy's.
+    expect(readManifest.mock.calls).toEqual([[join(canonical, 'package.json')]]);
+    expect(detection).toMatchObject({
+      packageManager: 'pnpm',
+      packageManagerSource: 'code-analysis',
+      devScript: { name: 'dev', command: 'next dev' },
+      devServerScripts: ['dev'],
+      canLaunch: true,
+    });
+    // Reported: the session's spelling, everywhere.
+    expect(detection.projectRoot).toBe(spelled);
+    expect(detection.relaunchCommand).toBe(expectedCommand(spelled, 'pnpm run dev'));
+    expect(detection.relaunchHint).toContain(detection.relaunchCommand);
+    expect(agents.hasServerAgentForProject.mock.calls).toEqual([[spelled]]);
+    expect(JSON.stringify(detection)).not.toContain(canonical);
+    // Detection's own record names the session's spelling. (Code-analysis's
+    // debug diagnostics name the directory they searched, which is readRoot.)
+    const finished = records.filter((record) => record.message === 'Dev-server detection finished');
+    expect(finished).toHaveLength(1);
+    expect(finished[0]?.fields).toMatchObject({ subsystem: 'dev-server', projectRoot: spelled });
+    expect(JSON.stringify(finished)).not.toContain(canonical);
+  });
+
+  it('names the file under projectRoot in a note when the manifest under readRoot is unusable', async () => {
+    const { spelled, canonical } = sideBySide();
+    writeFileSync(join(canonical, 'package.json'), '{ "scripts": ');
+
+    const detection = await detectDevServer(
+      { projectRoot: spelled, readRoot: canonical },
+      { readManifest: spyingDiskReader() },
+    );
+
+    expect(detection.notes).toContainEqual(
+      expect.stringMatching(/package\.json was not used: .* is not valid JSON/),
+    );
+    expect(detection.notes.join('\n')).toContain(join(spelled, 'package.json'));
+    expect(detection.notes.join('\n')).not.toContain(canonical);
+    expect('devServerScripts' in detection).toBe(false);
+    // The decoy beside it was not read in its place.
+    expect('devScript' in detection).toBe(false);
+  });
+
+  it('names a missing manifest by the session spelling too', async () => {
+    const readManifest = vi.fn<ManifestReader>(() => {
+      throw Object.assign(new Error('not found'), { code: 'ENOENT' });
+    });
+
+    const detection = await detectDevServer(
+      { projectRoot: PROJECT_ROOT, readRoot: '/srv/checkouts/acme-portal' },
+      portalDeps({ readManifest }),
+    );
+
+    expect(readManifest.mock.calls).toEqual([['/srv/checkouts/acme-portal/package.json']]);
+    expect(detection.notes).toContainEqual(
+      `The project's package.json was not used: No package.json was found at ${PROJECT_ROOT}/package.json.`,
+    );
+    expect(detection.notes.join('\n')).not.toContain('/srv/checkouts');
+  });
+
+  it('hands an injected package-manager resolver the directory it read, with the manifest read there', async () => {
+    const resolvePackageManager = vi.fn<PackageManagerResolver>(() => 'npm');
+    const readManifest = servingManifest({ ...UNPINNED_MANIFEST, packageManager: 'yarn@4.5.0' });
+
+    const detection = await detectDevServer(
+      { projectRoot: PROJECT_ROOT, readRoot: '/srv/checkouts/acme-portal' },
+      portalDeps({ readManifest, resolvePackageManager }),
+    );
+
+    expect(readManifest.mock.calls).toEqual([['/srv/checkouts/acme-portal/package.json']]);
+    const received = resolvePackageManager.mock.calls[0]?.[0];
+    expect(received?.projectRoot).toBe('/srv/checkouts/acme-portal');
+    expect(received?.manifest?.packageManagerField).toBe('yarn@4.5.0');
+    expect(detection).toMatchObject({ projectRoot: PROJECT_ROOT, packageManager: 'npm' });
+    expect(detection.relaunchCommand).toBe(expectedCommand(PROJECT_ROOT, 'npm run dev'));
+  });
+
+  it.each([
+    { label: 'the empty string', readRoot: '' },
+    { label: 'whitespace only', readRoot: '   ' },
+    { label: 'a relative path', readRoot: 'checkouts/acme-portal' },
+    // A JavaScript caller can hand over anything.
+    { label: 'a non-string', readRoot: 42 as unknown as string },
+    { label: 'null', readRoot: null as unknown as string },
+  ])(
+    'reads nothing through a readRoot that is $label — never falling back to projectRoot — and degrades to notes',
+    async ({ readRoot }) => {
+      const readManifest = servingManifest(PORTAL_MANIFEST);
+
+      const detection = await detectDevServer(
+        { projectRoot: PROJECT_ROOT, readRoot, devServerUrl: DEV_URL },
+        portalDeps({ readManifest, fetchImpl: refusing() }),
+      );
+
+      expect(readManifest).not.toHaveBeenCalled();
+      expect(detection).toMatchObject({
+        projectRoot: PROJECT_ROOT,
+        running: false,
+        packageManager: 'unknown',
+        packageManagerSource: 'unknown',
+        canLaunch: false,
+      });
+      expect('devServerScripts' in detection).toBe(false);
+      expect(detection.notes).toContainEqual(
+        expect.stringMatching(
+          /package\.json was not used: The project root must be an absolute path/,
+        ),
+      );
+      expect(detection.notes).toContainEqual(
+        expect.stringMatching(
+          /package manager was not detected because the project root is not absolute/,
+        ),
+      );
+      expect(detection.relaunchCommand.startsWith(`cd ${PROJECT_ROOT} && `)).toBe(true);
+    },
+  );
+
+  it('behaves exactly as before when readRoot is absent, undefined or projectRoot itself', async () => {
+    const root = makeSandbox();
+    writeManifest(root, UNPINNED_MANIFEST);
+    writeFileSync(join(root, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
+    const detectWith = async (
+      input: Parameters<typeof detectDevServer>[0],
+    ): Promise<{ readonly detection: DevServerDetection; readonly reads: unknown[][] }> => {
+      const readManifest = spyingDiskReader();
+      const detection = await detectDevServer(input, {
+        readManifest,
+        config: SERVICE_CONFIG,
+        preloadPath: PRELOAD_PATH,
+      });
+      return { detection, reads: readManifest.mock.calls };
+    };
+
+    const absent = await detectWith({ projectRoot: root });
+    const undefinedReadRoot = await detectWith({ projectRoot: root, readRoot: undefined });
+    const same = await detectWith({ projectRoot: root, readRoot: root });
+
+    expect(absent.reads).toEqual([[join(root, 'package.json')]]);
+    expect(absent.detection).toMatchObject({
+      projectRoot: root,
+      packageManager: 'pnpm',
+      packageManagerSource: 'code-analysis',
+      devScript: { name: 'dev', command: 'next dev' },
+    });
+    for (const other of [undefinedReadRoot, same]) {
+      expect(other.reads).toEqual(absent.reads);
+      expect(other.detection).toStrictEqual(absent.detection);
+    }
   });
 });
 

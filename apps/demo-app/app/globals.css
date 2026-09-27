@@ -65,8 +65,16 @@
    * and tints an interactive border; --ls-focus draws the focus ring every module writes as
    * `outline: 2px solid var(--ls-focus)` and measures 5.5:1 against --ls-surface. The accent is a
    * fill or a decorative accent: text over it is --ls-ink (8.3:1), and it is never a text colour
-   * on a light surface nor the only indicator of a state. */
+   * on a light surface nor the only indicator of a state.
+   *
+   * --ls-accent-strong is the accent drawn as a line: a selection frame or ring that is the
+   * visible mark of a state, and so must clear the 3:1 non-text minimum (WCAG 1.4.11) against the
+   * light surfaces around it. The amber accent measures only 2.1:1 on --ls-surface, so a line
+   * that marks a state reads this darker amber instead - 5.0:1 on --ls-surface and 4.8:1 on
+   * --ls-surface-sunken - and the accent itself keeps its value, which the brand mark fixes and
+   * which ink-on-accent fills depend on. */
   --ls-accent: var(--ls-amber);
+  --ls-accent-strong: #b45309;
   --ls-focus: var(--ls-teal);
 
   /* Status. The canonical four, shared by Badge, Pill, Alert and the toast region; each clears

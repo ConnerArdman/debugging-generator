@@ -33,7 +33,7 @@
  * | `vscode` | the session's project root lies under a workspace folder its principal announced; while the project is not yet known, when the client explicitly attached to the session | editor-bound pushes for a project its scope covers ({@link ClientRegistry.sendToEditors}) |
  * | `devtools` | it is the connection carrying the tab bound to the session by **its own** credential ({@link ClientRegistry.bindTab}) | frames with no session, or for a session its credential has bound |
  * | `agent` | never directly: the MAIN-world page agent owns no socket and no credential, so its frames travel "under the tab's connection" (AAP §0.4.2) — a fan-out or delivery addressed to the `agent` kind is carried by the bound tab's DevTools connection, and relayed `agent.ready` / telemetry batches arrive on that same connection | — |
- * | `server-agent` | never: a dev-server preload is not a session client | only its own project's `server-agent.config` ({@link ClientRegistry.sendToServerAgent}), and an `error` reply to a frame it sent |
+ * | `server-agent` | never: a dev-server preload is not a session client | only its own project's `server-agent.config` ({@link ClientRegistry.sendToServerAgent}), and the `error` or `service.pong` reply to a frame it sent |
  *
  * The filter lives inside the registry, so no caller can bypass it by
  * accident: a caller names a session, a project or a connection, and the
@@ -118,6 +118,7 @@ import {
   encodeMessage,
   errorPayloadSchema,
   serverAgentConfigPayloadSchema,
+  servicePongPayloadSchema,
   sessionBoundPayloadSchema,
 } from '@debuggen/protocol';
 import type { BindingReason, ClientKind, MessageType, ProtocolMessage } from '@debuggen/protocol';
@@ -259,7 +260,7 @@ const DROP_REASONS: ReadonlySet<BindingReason> = new Set<BindingReason>([
  * Resolves the message type whose payload schema is `schema`, by object
  * identity in protocol's registry.
  *
- * This is how the module names the three message types its policy depends on
+ * This is how the module names the four message types its policy depends on
  * without spelling a message name: protocol registers each domain's schema
  * objects in `MESSAGE_PAYLOAD_SCHEMAS`, so the schema is the key and the name
  * is looked up rather than restated.
@@ -290,6 +291,13 @@ const BINDING_ANNOUNCEMENT_TYPE = messageTypeForSchema(
 
 /** The generic failure reply, which any connection may receive in answer to its own frame. */
 const ERROR_REPLY_TYPE = messageTypeForSchema(errorPayloadSchema, 'error');
+
+/**
+ * The liveness answer, which any connection may receive in answer to its own
+ * `client.ping`: session-less, carrying only the ping's id, and sent by
+ * `ws.ts` to the pinging connection alone.
+ */
+const LIVENESS_REPLY_TYPE = messageTypeForSchema(servicePongPayloadSchema, 'liveness reply');
 
 /* -------------------------------------------------------------------------------------------------
  * Public types
@@ -1583,11 +1591,18 @@ export function createClientRegistry(deps: ClientRegistryDeps = {}): ClientRegis
   /**
    * The principal filter of a direct delivery: which frames one connection may
    * be sent regardless of fan-out.
+   *
+   * A server-agent connection is pushed its own project's configuration and
+   * nothing else, except the two session-less replies to a frame it sent: the
+   * `error` refusing it and the `service.pong` answering its `client.ping`.
+   * Both carry only the sender's own frame id, so admitting them discloses
+   * nothing about any session. Every other connection receives a session-less
+   * frame unconditionally below.
    */
   function mayReceiveDirect(entry: ClientEntry, message: ProtocolMessage, now: number): boolean {
     const principal = entry.principal;
     if (principal.role === KIND_SERVER_AGENT) {
-      if (message.type === ERROR_REPLY_TYPE) {
+      if (message.type === ERROR_REPLY_TYPE || message.type === LIVENESS_REPLY_TYPE) {
         return true;
       }
       return (

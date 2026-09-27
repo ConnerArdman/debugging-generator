@@ -11,7 +11,7 @@
  *
  * The cases group into what can actually go wrong:
  *
- * - **The table itself.** All twenty-one `(operation, method, pattern)` triples
+ * - **The table itself.** All twenty-two `(operation, method, pattern)` triples
  *   are written out literally below and compared against `HTTP_ROUTES`, so that
  *   adding, renaming or re-pathing a route is a deliberate edit in two places
  *   rather than an accident in one. A duplicated `(method, pattern)` pair is
@@ -62,12 +62,14 @@
  *   `nextOffset` reassembles the complete set, and a page that ignores its
  *   window — every value whatever the limit — is refused.
  * - **The administrative operations.** `devServer.credential`,
- *   `credentials.rotate` and `session.purge` are table rows like any other, so
- *   no process registers or calls a route this module does not declare. Their
- *   bodies are checked at their bounds: the credential request names one
- *   project and nothing else, the two report bodies refuse a negative count,
- *   and the purge report's retained-session list must be the truncation of its
- *   total at `SESSION_PURGE_MAX_REPORTED_SESSIONS`.
+ *   `credentials.release`, `credentials.rotate` and `session.purge` are table
+ *   rows like any other, so no process registers or calls a route this module
+ *   does not declare. Their bodies are checked at their bounds: the credential
+ *   request names one project and nothing else, the release request names one
+ *   token and nothing else and is answered with one flag, the two report
+ *   bodies refuse a negative count, and the purge report's retained-session
+ *   list must be the truncation of its total at
+ *   `SESSION_PURGE_MAX_REPORTED_SESSIONS`.
  * - **The shared error body.** A non-2xx reply carries `./messages/error.ts`'s
  *   payload unchanged — a code from the closed vocabulary, a message, an
  *   optional `ref`, and no `hint` — so one renderer serves a failed request and
@@ -75,7 +77,12 @@
  * - **Ingress versus persisted events.** The ingest body must refuse an event
  *   carrying `sessionId`, `captureId` or `ingestSeq`: attribution is the
  *   service's to assign, and a producer that could claim a session could write
- *   into someone else's capture.
+ *   into someone else's capture. The body's optional delivery context — the
+ *   refusal-only `armedCaptureId` and the `droppedCount` loss report — is held
+ *   to the WebSocket payload's own rules, issue for issue, and an event-less
+ *   body is accepted only as a loss-only report. The body's own `lossReportId`,
+ *   the identity a retried loss report keeps, is held to the identifier rule
+ *   `armedCaptureId` applies and accepted only beside a loss.
  * - **Leak freedom.** A rejected body is unvalidated data from another process
  *   and holds project paths, the developer's question, redacted URLs and
  *   parameterized SQL. None of it may appear in the error, and the
@@ -87,6 +94,7 @@
  */
 
 import { describe, expect, expectTypeOf, it } from 'vitest';
+import type { ZodType } from 'zod';
 
 // Both entries of the owning package, on purpose: the root is what the local
 // service imports and `./schema` is what this package's modules import, and the
@@ -134,6 +142,9 @@ import {
   captureStopResponseSchema,
   captureStartPath,
   captureStopPath,
+  credentialsReleasePath,
+  credentialsReleaseRequestSchema,
+  credentialsReleaseResponseSchema,
   credentialsRotatePath,
   credentialsRotateRequestSchema,
   credentialsRotateResponseSchema,
@@ -190,6 +201,7 @@ import type {
   HttpOperationId,
   HttpRequestBody,
   HttpResponseBody,
+  TelemetryIngestRequest,
 } from '../http.js';
 // Type-only, so the barrel is never loaded at run time: what is on trial is
 // that a consumer importing from the package's one door can name the type.
@@ -198,6 +210,10 @@ import type {
   HttpOperationId as BarrelHttpOperationId,
 } from '../index.js';
 import { sessionBindPayloadSchema } from '../messages/binding.js';
+// The WebSocket half of `telemetry.event`, so the ingest body's delivery
+// context can be held to the very rules that payload applies.
+import { telemetryEventPayloadSchema } from '../messages/telemetry.js';
+import type { TelemetryEventPayload } from '../messages/telemetry.js';
 import { CLEANUP_STATUSES } from '../session-record.js';
 import { PROTOCOL_VERSION } from '../version.js';
 // The paged listings' contract, Section C.1 of `../http.ts`.
@@ -235,6 +251,12 @@ const SESSION_ID = 'ses_4k2p9dq7m1zx0c3v';
 
 /** The capture window those events were recorded in. */
 const CAPTURE_ID = 'cap_7f3q0m2zk1x8ab9c';
+
+/**
+ * The identity of one ingest body's loss report, kept across its retries.
+ * Opaque: the producer chooses its spelling, so no product prefix is implied.
+ */
+const LOSS_REPORT_ID = 'loss-report-7c2e9a41';
 
 /** The panel generated from it. */
 const PANEL_ID = 'pan_6h2j8k4l0z5x1c7v';
@@ -561,6 +583,7 @@ const VALID_REQUESTS: { readonly [O in HttpOperationId]: HttpRequestBody<O> } = 
   'pair.start': {},
   'pair.complete': { code: 'PAIR2X7Q' },
   'credentials.rotate': {},
+  'credentials.release': { token: SERVER_AGENT_TOKEN },
 };
 
 /**
@@ -611,6 +634,7 @@ const VALID_RESPONSES: { readonly [O in HttpOperationId]: HttpResponseBody<O> } 
   'pair.start': { code: 'PAIR2X7Q', expiresAt: START_TIME + 300_000 },
   'pair.complete': { token: 'devtools-credential-placeholder', readProof: READ_PROOF_PLACEHOLDER },
   'credentials.rotate': { credentialsDeleted: 3, socketsClosed: 2 },
+  'credentials.release': { released: true },
 };
 
 /**
@@ -764,7 +788,7 @@ function withoutPagingEcho(result: DataResult): Record<string, unknown> {
 // The route table
 // ---------------------------------------------------------------------------
 
-describe('HTTP_ROUTES — the twenty-one routes, pinned', () => {
+describe('HTTP_ROUTES — the twenty-two routes, pinned', () => {
   /**
    * The expected table, written out literally.
    *
@@ -794,9 +818,10 @@ describe('HTTP_ROUTES — the twenty-one routes, pinned', () => {
     ['pair.start', 'POST', '/pair/start'],
     ['pair.complete', 'POST', '/pair/complete'],
     ['credentials.rotate', 'POST', '/credentials/rotate'],
+    ['credentials.release', 'POST', '/credentials/release'],
   ];
 
-  it('holds exactly those twenty-one operations, with those methods and paths', () => {
+  it('holds exactly those twenty-two operations, with those methods and paths', () => {
     expect(
       Object.entries(HTTP_ROUTES).map(([operation, route]) => [
         operation,
@@ -804,12 +829,12 @@ describe('HTTP_ROUTES — the twenty-one routes, pinned', () => {
         route.pattern,
       ]),
     ).toEqual(EXPECTED.map((triple) => [...triple]));
-    expect(Object.keys(HTTP_ROUTES)).toHaveLength(21);
+    expect(Object.keys(HTTP_ROUTES)).toHaveLength(22);
   });
 
   it('lists every route in HTTP_OPERATIONS, once, in the table’s order', () => {
     expect([...HTTP_OPERATIONS]).toEqual(Object.keys(HTTP_ROUTES));
-    expect(new Set(HTTP_OPERATIONS).size).toBe(21);
+    expect(new Set(HTTP_OPERATIONS).size).toBe(22);
   });
 
   it('registers no method and path twice', () => {
@@ -924,6 +949,7 @@ describe('HttpOperationId — the canonical operation-id type', () => {
       'pair.start': 'POST',
       'pair.complete': 'POST',
       'credentials.rotate': 'POST',
+      'credentials.release': 'POST',
     };
 
     for (const operation of HTTP_OPERATIONS) {
@@ -970,7 +996,7 @@ describe('AUTH_EXEMPT_OPERATIONS — exactly GET /health and POST /pair/complete
     ).toEqual(['GET /health', 'POST /pair/complete']);
   });
 
-  it('answers isAuthExemptOperation from the route flag for all twenty-one', () => {
+  it('answers isAuthExemptOperation from the route flag for all twenty-two', () => {
     for (const operation of HTTP_OPERATIONS) {
       expect(isAuthExemptOperation(operation)).toBe(HTTP_ROUTES[operation].authExempt);
     }
@@ -986,16 +1012,18 @@ describe('AUTH_EXEMPT_OPERATIONS — exactly GET /health and POST /pair/complete
     // the editor credential like every other session route.
     expect(isAuthExemptOperation('target.request')).toBe(false);
     expect(HTTP_OPERATIONS.filter((operation) => !isAuthExemptOperation(operation))).toHaveLength(
-      19,
+      20,
     );
   });
 
-  it('requires a credential on the three administrative operations', () => {
-    // Minting a server-agent credential, revoking every credential and purging
-    // the store are the most consequential calls in the table; an exemption on
-    // any of them would hand a local web page the machine's debugging state.
+  it('requires a credential on the four administrative operations', () => {
+    // Minting a server-agent credential, revoking one or every credential and
+    // purging the store are the most consequential calls in the table; an
+    // exemption on any of them would hand a local web page the machine's
+    // debugging state, or a way to cut a running dev server's telemetry off.
     for (const operation of [
       'devServer.credential',
+      'credentials.release',
       'credentials.rotate',
       'session.purge',
     ] as const) {
@@ -2059,6 +2087,410 @@ describe('the telemetry ingest body', () => {
     expect(telemetryIngestRequestSchema.safeParse({ events: [INGRESS_EVENT] }).success).toBe(false);
   });
 
+  /** One refused issue as `[code, dotted path, message]`: what a producer is told. */
+  type IssueRow = readonly [code: string, path: string, message: string];
+
+  /**
+   * The issues a schema raises for a value, or `undefined` when it accepts it.
+   *
+   * @param schema The body schema on trial.
+   * @param value The body to parse.
+   * @returns Each issue's code, path and message, in the order they were raised.
+   */
+  function issuesOf(schema: ZodType, value: unknown): IssueRow[] | undefined {
+    const parsed = schema.safeParse(value);
+    return parsed.success
+      ? undefined
+      : parsed.error.issues.map((issue): IssueRow => [
+          issue.code,
+          issue.path.map(String).join('.'),
+          issue.message,
+        ]);
+  }
+
+  it('accepts each optional field of delivery context beside a batch of events', () => {
+    // The capture the preload was armed for, and the spans it lost for it: both
+    // optional, each on its own and together, and returned exactly as sent.
+    for (const context of [
+      { armedCaptureId: CAPTURE_ID },
+      { droppedCount: 0 },
+      { droppedCount: 7 },
+      { droppedCount: Number.MAX_SAFE_INTEGER },
+      { armedCaptureId: 'c'.repeat(64), droppedCount: 7 },
+    ]) {
+      const body = { projectRoot: PROJECT_ROOT, events: [INGRESS_EVENT], ...context };
+
+      expect(issuesOf(telemetryIngestRequestSchema, body), JSON.stringify(context)).toBeUndefined();
+      expect(telemetryIngestRequestSchema.parse(body)).toStrictEqual(body);
+    }
+  });
+
+  it('accepts an event-less body as a loss-only report, and round-trips it through JSON', () => {
+    // What the preload posts when no later batch will carry its loss — at a
+    // capture's end, say — so the count still reaches the capture's ledger.
+    const lossOnly = { projectRoot: PROJECT_ROOT, events: [], droppedCount: 3 };
+    const armedLossOnly = { ...lossOnly, armedCaptureId: CAPTURE_ID };
+
+    for (const body of [lossOnly, armedLossOnly]) {
+      const parsed = telemetryIngestRequestSchema.parse(body);
+
+      expect(parsed).toStrictEqual(body);
+      // Every field is a JSON primitive or a plain array, so the body arrives
+      // at the service exactly as the preload built it.
+      expect(throughJson(parsed)).toStrictEqual(body);
+      expect(telemetryIngestRequestSchema.parse(throughJson(parsed))).toStrictEqual(body);
+    }
+  });
+
+  it('refuses an empty batch that reports no loss by the rule the WebSocket payload applies', () => {
+    // Naming the capture adds nothing, and a zero count is no loss at all. The
+    // one issue is the loss-only rule under `events`, in the words the
+    // WebSocket payload uses for the same batch.
+    for (const context of [
+      {},
+      { droppedCount: 0 },
+      { armedCaptureId: CAPTURE_ID },
+      { armedCaptureId: CAPTURE_ID, droppedCount: 0 },
+    ]) {
+      const issues = issuesOf(telemetryIngestRequestSchema, {
+        projectRoot: PROJECT_ROOT,
+        events: [],
+        ...context,
+      });
+
+      expect(
+        issues?.map(([code, path]) => [code, path]),
+        JSON.stringify(context),
+      ).toEqual([['custom', 'events']]);
+      expect(issues).toEqual(issuesOf(telemetryEventPayloadSchema, { events: [], ...context }));
+    }
+  });
+
+  it('refuses a malformed armed capture id exactly as the WebSocket payload does', () => {
+    for (const armedCaptureId of [
+      '',
+      'c'.repeat(65),
+      ` ${CAPTURE_ID}`,
+      `${CAPTURE_ID}\n`,
+      42,
+      null,
+      { id: CAPTURE_ID },
+    ]) {
+      const issues = issuesOf(telemetryIngestRequestSchema, {
+        projectRoot: PROJECT_ROOT,
+        events: [INGRESS_EVENT],
+        armedCaptureId,
+      });
+
+      expect(issues, JSON.stringify(armedCaptureId)).toBeDefined();
+      expect(issues?.every(([, path]) => path === 'armedCaptureId')).toBe(true);
+      // The same factory, so the same issues in the same words.
+      expect(issues).toEqual(
+        issuesOf(telemetryEventPayloadSchema, { events: [INGRESS_EVENT], armedCaptureId }),
+      );
+    }
+  });
+
+  it('refuses a malformed loss count exactly as the WebSocket payload does, by its own issue', () => {
+    for (const droppedCount of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '3', null, Number.NaN]) {
+      for (const events of [[INGRESS_EVENT], []]) {
+        const label = `${String(droppedCount)} with ${String(events.length)} events`;
+        const issues = issuesOf(telemetryIngestRequestSchema, {
+          projectRoot: PROJECT_ROOT,
+          events,
+          droppedCount,
+        });
+
+        expect(issues, label).toBeDefined();
+        // Reported once, where it is: on an event-less body the loss-only rule
+        // does not pile a second, derived issue on top.
+        expect(
+          issues?.every(([, path]) => path === 'droppedCount'),
+          label,
+        ).toBe(true);
+        expect(issues).toEqual(issuesOf(telemetryEventPayloadSchema, { events, droppedCount }));
+      }
+    }
+  });
+
+  it('accepts a loss-report identity beside a droppedCount above zero, and round-trips it', () => {
+    // The identity a retried body keeps for its loss report: beside a batch of
+    // events or on a loss-only report, with or without the armed capture, at
+    // the identifier bound, and returned exactly as sent — by the schema,
+    // through JSON, and through the route table the service reads.
+    const lossReport = { projectRoot: PROJECT_ROOT, droppedCount: 7, lossReportId: LOSS_REPORT_ID };
+
+    for (const body of [
+      { ...lossReport, events: [INGRESS_EVENT] },
+      { ...lossReport, events: [INGRESS_EVENT], armedCaptureId: CAPTURE_ID },
+      { ...lossReport, events: [] },
+      { ...lossReport, events: [], armedCaptureId: CAPTURE_ID },
+      { ...lossReport, events: [INGRESS_EVENT], lossReportId: 'r'.repeat(64) },
+      { ...lossReport, events: [], droppedCount: Number.MAX_SAFE_INTEGER },
+    ]) {
+      const label = JSON.stringify({ ...body, events: body.events.length });
+
+      expect(issuesOf(telemetryIngestRequestSchema, body), label).toBeUndefined();
+
+      const parsed = telemetryIngestRequestSchema.parse(body);
+
+      expect(parsed, label).toStrictEqual(body);
+      expect(throughJson(parsed), label).toStrictEqual(body);
+      expect(telemetryIngestRequestSchema.parse(throughJson(parsed)), label).toStrictEqual(body);
+
+      const routed = parseHttpRequest('telemetry.event', body);
+
+      expect(routed.ok ? routed.value : routed.error.message, label).toStrictEqual(body);
+    }
+  });
+
+  it('refuses a loss-report identity on a body that reports no loss, by one constant rule', () => {
+    // An identity names a loss report, so a body without a droppedCount above
+    // zero has nothing for it to name — alone, beside a zero count, beside the
+    // armed capture. One issue, under `lossReportId`, whose message is the same
+    // whichever identity was sent and quotes none of them.
+    const messages = new Set<string>();
+
+    for (const lossReportId of [LOSS_REPORT_ID, 'r'.repeat(64)]) {
+      for (const context of [
+        {},
+        { droppedCount: 0 },
+        { armedCaptureId: CAPTURE_ID },
+        { armedCaptureId: CAPTURE_ID, droppedCount: 0 },
+      ]) {
+        const label = JSON.stringify({ lossReportId, ...context });
+        const issues = issuesOf(telemetryIngestRequestSchema, {
+          projectRoot: PROJECT_ROOT,
+          events: [INGRESS_EVENT],
+          lossReportId,
+          ...context,
+        });
+
+        expect(
+          issues?.map(([code, path]) => [code, path]),
+          label,
+        ).toEqual([['custom', 'lossReportId']]);
+
+        for (const [, , message] of issues ?? []) {
+          expect(message, label).not.toContain(lossReportId);
+          messages.add(message);
+        }
+      }
+    }
+
+    expect(messages.size).toBe(1);
+
+    // An event-less body that names a report but reports no loss breaks the
+    // loss-only rule first, and is refused by that rule alone: no second,
+    // derived issue under `lossReportId`.
+    for (const context of [{}, { droppedCount: 0 }, { armedCaptureId: CAPTURE_ID }]) {
+      expect(
+        issuesOf(telemetryIngestRequestSchema, {
+          projectRoot: PROJECT_ROOT,
+          events: [],
+          lossReportId: LOSS_REPORT_ID,
+          ...context,
+        })?.map(([code, path]) => [code, path]),
+        JSON.stringify(context),
+      ).toEqual([['custom', 'events']]);
+    }
+
+    // Through the route table the rule is named by its label, never a value.
+    const refused = parseHttpRequest('telemetry.event', {
+      projectRoot: PROJECT_ROOT,
+      events: [INGRESS_EVENT],
+      lossReportId: LOSS_REPORT_ID,
+    });
+
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) {
+      expect(refused.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(refused.error.message).toContain(
+        'lossReportId (custom label=loss-report-id-requires-loss)',
+      );
+      expect(refused.error.message).not.toContain(LOSS_REPORT_ID);
+    }
+  });
+
+  it('refuses a malformed loss-report identity by the identifier rule armedCaptureId applies', () => {
+    for (const lossReportId of [
+      '',
+      'r'.repeat(65),
+      ` ${LOSS_REPORT_ID}`,
+      `${LOSS_REPORT_ID}\n`,
+      42,
+      null,
+      { id: LOSS_REPORT_ID },
+    ]) {
+      // The same rule, so the same issues in the same words: only the path
+      // differs from the armed capture id's refusal of the same value.
+      const armedIssues = issuesOf(telemetryIngestRequestSchema, {
+        projectRoot: PROJECT_ROOT,
+        events: [INGRESS_EVENT],
+        armedCaptureId: lossReportId,
+      });
+
+      expect(armedIssues, JSON.stringify(lossReportId)).toBeDefined();
+
+      for (const events of [[INGRESS_EVENT], []]) {
+        for (const context of [{ droppedCount: 3 }, { droppedCount: 0 }, {}]) {
+          const label = JSON.stringify({ lossReportId, events: events.length, ...context });
+          const issues = issuesOf(telemetryIngestRequestSchema, {
+            projectRoot: PROJECT_ROOT,
+            events,
+            lossReportId,
+            ...context,
+          });
+
+          // Reported once, where it is: neither cross-field rule piles a
+          // derived issue on top of the malformed field.
+          expect(
+            issues?.map(([code, path, message]) => [
+              code,
+              path.replace('lossReportId', ''),
+              message,
+            ]),
+            label,
+          ).toEqual(
+            armedIssues?.map(([code, path, message]) => [
+              code,
+              path.replace('armedCaptureId', ''),
+              message,
+            ]),
+          );
+          expect(
+            issues?.every(([, path]) => path === 'lossReportId'),
+            label,
+          ).toBe(true);
+        }
+      }
+    }
+  });
+
+  it('is the ingest body’s own field: the WebSocket payload refuses a loss-report identity', () => {
+    // The HTTP transport is the one that retries a body in place, so only its
+    // body names a loss report; the strict WebSocket payload refuses the key.
+    expect(Object.keys(telemetryEventPayloadSchema.shape)).not.toContain('lossReportId');
+    expect(
+      issuesOf(telemetryEventPayloadSchema, {
+        events: [INGRESS_EVENT],
+        droppedCount: 3,
+        lossReportId: LOSS_REPORT_ID,
+      })?.map(([code, path]) => [code, path]),
+    ).toEqual([['unrecognized_keys', '']]);
+  });
+
+  it('stays strict: a key beside the five it declares is refused, attribution above all', () => {
+    // A producer that could name the capture or the session outright would be
+    // attributing its own batch, which is the service's job alone.
+    for (const extra of [{ captureId: CAPTURE_ID }, { sessionId: SESSION_ID }, { dropped: 3 }]) {
+      const issues = issuesOf(telemetryIngestRequestSchema, {
+        projectRoot: PROJECT_ROOT,
+        events: [INGRESS_EVENT],
+        armedCaptureId: CAPTURE_ID,
+        droppedCount: 1,
+        lossReportId: LOSS_REPORT_ID,
+        ...extra,
+      });
+
+      expect(
+        issues?.map(([code, path]) => [code, path]),
+        JSON.stringify(extra),
+      ).toEqual([['unrecognized_keys', '']]);
+    }
+  });
+
+  it('keeps its shape and its batch bound readable where the service reads them', () => {
+    // The service reads `shape.events` for the batch bound and each field's
+    // schema from `shape`, so both cross-field rules must be checks on the
+    // object that leave every field where it was — with no minimum left on the
+    // array to contradict the loss-only rule.
+    expect(Object.keys(telemetryIngestRequestSchema.shape)).toEqual([
+      'projectRoot',
+      'events',
+      'armedCaptureId',
+      'droppedCount',
+      'lossReportId',
+    ]);
+    expect(telemetryIngestRequestSchema.shape.lossReportId.safeParse(LOSS_REPORT_ID).success).toBe(
+      true,
+    );
+    expect(telemetryIngestRequestSchema.shape.lossReportId.safeParse(undefined).success).toBe(true);
+
+    const checks = telemetryIngestRequestSchema.shape.events.def.checks ?? [];
+    const maxima = checks.flatMap((check) =>
+      check._zod.def.check === 'max_length' && 'maximum' in check._zod.def
+        ? [check._zod.def.maximum]
+        : [],
+    );
+
+    expect(maxima).toEqual([5000]);
+    expect(checks.some((check) => check._zod.def.check === 'min_length')).toBe(false);
+    expect(telemetryIngestRequestSchema.shape.projectRoot.safeParse(PROJECT_ROOT).success).toBe(
+      true,
+    );
+
+    // An oversized batch is refused by its bound alone, loss report or not.
+    const oversized = Array.from({ length: 5001 }, () => INGRESS_EVENT);
+
+    expect(
+      issuesOf(telemetryIngestRequestSchema, {
+        projectRoot: PROJECT_ROOT,
+        events: oversized,
+        droppedCount: 3,
+      })?.map(([code, path]) => [code, path]),
+    ).toEqual([['too_big', 'events']]);
+  });
+
+  it('types the delivery context exactly as the WebSocket payload does', () => {
+    expectTypeOf<TelemetryIngestRequest['armedCaptureId']>().toEqualTypeOf<
+      TelemetryEventPayload['armedCaptureId']
+    >();
+    expectTypeOf<TelemetryIngestRequest['droppedCount']>().toEqualTypeOf<
+      TelemetryEventPayload['droppedCount']
+    >();
+    expectTypeOf<TelemetryIngestRequest['armedCaptureId']>().toEqualTypeOf<string | undefined>();
+    expectTypeOf<TelemetryIngestRequest['droppedCount']>().toEqualTypeOf<number | undefined>();
+    expectTypeOf<TelemetryIngestRequest['events']>().toEqualTypeOf<TelemetryEventIngress[]>();
+  });
+
+  it('types the loss-report identity as an optional string only the ingest body has', () => {
+    expectTypeOf<TelemetryIngestRequest['lossReportId']>().toEqualTypeOf<string | undefined>();
+    expectTypeOf<TelemetryIngestRequest>().toHaveProperty('lossReportId');
+    expectTypeOf<TelemetryEventPayload>().not.toHaveProperty('lossReportId');
+  });
+
+  it('is what parseHttpRequest validates telemetry.event against', () => {
+    // The service reads its body through the route table, so the new shapes
+    // must pass there, and the loss-only rule must be enforced there too.
+    for (const body of [
+      { projectRoot: PROJECT_ROOT, events: [INGRESS_EVENT], armedCaptureId: CAPTURE_ID },
+      { projectRoot: PROJECT_ROOT, events: [INGRESS_EVENT], droppedCount: 2 },
+      { projectRoot: PROJECT_ROOT, events: [], droppedCount: 3 },
+      { projectRoot: PROJECT_ROOT, events: [], droppedCount: 3, armedCaptureId: CAPTURE_ID },
+      { projectRoot: PROJECT_ROOT, events: [], droppedCount: 3, lossReportId: LOSS_REPORT_ID },
+      {
+        projectRoot: PROJECT_ROOT,
+        events: [INGRESS_EVENT],
+        armedCaptureId: CAPTURE_ID,
+        droppedCount: 2,
+        lossReportId: LOSS_REPORT_ID,
+      },
+    ]) {
+      const parsed = parseHttpRequest('telemetry.event', body);
+
+      expect(parsed.ok ? parsed.value : parsed.error.message).toStrictEqual(body);
+    }
+
+    const refused = parseHttpRequest('telemetry.event', { projectRoot: PROJECT_ROOT, events: [] });
+
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) {
+      expect(refused.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(refused.error.message).toContain('events (custom label=empty-batch-reports-loss)');
+    }
+  });
+
   it('answers with an accepted count and an optional rejected count', () => {
     expect(parseHttpResponse('telemetry.event', { accepted: 0 }).ok).toBe(true);
     expect(parseHttpResponse('telemetry.event', { accepted: 3, rejected: 1 }).ok).toBe(true);
@@ -2364,6 +2796,114 @@ describe('the credentials.rotate bodies — revoke everything, name nothing', ()
     expect(response.ok).toBe(true);
     if (response.ok) {
       expect(response.value).toEqual(reply);
+    }
+  });
+});
+
+describe('the credentials.release bodies — one token in, one flag out', () => {
+  /** The longest token the transport admits, matching every other opaque token field. */
+  const LONGEST_TOKEN = 't'.repeat(512);
+
+  it('binds the route to its own two schemas, behind a credential', () => {
+    expect(HTTP_ROUTES['credentials.release'].request).toBe(credentialsReleaseRequestSchema);
+    expect(HTTP_ROUTES['credentials.release'].response).toBe(credentialsReleaseResponseSchema);
+    expect(HTTP_ROUTES['credentials.release'].params).toEqual([]);
+    expect(HTTP_ROUTES['credentials.release'].authExempt).toBe(false);
+    expect(credentialsReleasePath()).toBe('/credentials/release');
+    // Exactly one row claims the path, beside the rotation it sits next to.
+    expect(
+      HTTP_OPERATIONS.filter(
+        (operation) => HTTP_ROUTES[operation].pattern === '/credentials/release',
+      ),
+    ).toEqual(['credentials.release']);
+  });
+
+  it('accepts exactly one token, up to the opaque-token bound', () => {
+    expect(parseHttpRequest('credentials.release', { token: SERVER_AGENT_TOKEN }).ok).toBe(true);
+    expect(parseHttpRequest('credentials.release', { token: LONGEST_TOKEN }).ok).toBe(true);
+  });
+
+  it('refuses an extra key, an empty, over-long or non-string token, and a missing one', () => {
+    // A project, a role or a wildcard named here would widen the release past
+    // the one credential its holder already has.
+    expect(
+      parseHttpRequest('credentials.release', { token: SERVER_AGENT_TOKEN, projectRoot: '/work' })
+        .ok,
+    ).toBe(false);
+    expect(
+      parseHttpRequest('credentials.release', { token: SERVER_AGENT_TOKEN, all: true }).ok,
+    ).toBe(false);
+    expect(parseHttpRequest('credentials.release', { token: '' }).ok).toBe(false);
+    expect(parseHttpRequest('credentials.release', { token: `${LONGEST_TOKEN}t` }).ok).toBe(false);
+    expect(parseHttpRequest('credentials.release', { token: 42 }).ok).toBe(false);
+    expect(parseHttpRequest('credentials.release', { token: null }).ok).toBe(false);
+    expect(parseHttpRequest('credentials.release', {}).ok).toBe(false);
+    expect(parseHttpRequest('credentials.release', undefined).ok).toBe(false);
+  });
+
+  it('answers with one boolean flag, either value a success', () => {
+    expect(parseHttpResponse('credentials.release', { released: true }).ok).toBe(true);
+    expect(parseHttpResponse('credentials.release', { released: false }).ok).toBe(true);
+  });
+
+  it.each([
+    ['a string', 'true'],
+    ['a number', 1],
+    ['null', null],
+  ])('refuses a released flag that is %s', (_label, released) => {
+    const rejected = parseHttpResponse('credentials.release', { released });
+
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(rejected.error.message).toContain('released');
+    }
+  });
+
+  it('refuses a missing flag and any field beside it: nothing rides back with the answer', () => {
+    expect(parseHttpResponse('credentials.release', {}).ok).toBe(false);
+    expect(
+      parseHttpResponse('credentials.release', { released: true, token: SERVER_AGENT_TOKEN }).ok,
+    ).toBe(false);
+    expect(
+      parseHttpResponse('credentials.release', { released: true, projectRoot: PROJECT_ROOT }).ok,
+    ).toBe(false);
+  });
+
+  it('round-trips both bodies through JSON unchanged', () => {
+    const body = VALID_REQUESTS['credentials.release'];
+    const request = parseHttpRequest('credentials.release', throughJson(body));
+    expect(request.ok).toBe(true);
+    if (request.ok) {
+      expect(request.value).toEqual(body);
+    }
+
+    for (const reply of [{ released: true }, { released: false }]) {
+      const response = parseHttpResponse('credentials.release', throughJson(reply));
+      expect(response.ok).toBe(true);
+      if (response.ok) {
+        expect(response.value).toEqual(reply);
+      }
+    }
+  });
+
+  it('never echoes the token of a refused request', () => {
+    for (const body of [
+      { token: SERVER_AGENT_TOKEN, role: 'vscode' },
+      { token: `${SERVER_AGENT_TOKEN}${LONGEST_TOKEN}` },
+    ]) {
+      const rejected = parseHttpRequest('credentials.release', body);
+
+      expect(rejected.ok).toBe(false);
+      if (!rejected.ok) {
+        expect(
+          JSON.stringify({
+            message: rejected.error.message,
+            hint: rejected.error.hint,
+            details: rejected.error.details,
+          }),
+        ).not.toContain(SERVER_AGENT_TOKEN);
+        expect(JSON.stringify(rejected.error.toPayload())).not.toContain(SERVER_AGENT_TOKEN);
+      }
     }
   });
 });
@@ -2920,6 +3460,7 @@ describe('buildPath — substitution, encoding and a loud failure', () => {
       '/pair/start',
       '/pair/complete',
       '/credentials/rotate',
+      '/credentials/release',
     ]);
   });
 
@@ -2995,6 +3536,8 @@ describe('buildPath — substitution, encoding and a loud failure', () => {
     expect(pairCompletePath()).toBe('/pair/complete');
     expect(credentialsRotatePath()).toBe('/credentials/rotate');
     expect(credentialsRotatePath()).toBe(buildPath('credentials.rotate'));
+    expect(credentialsReleasePath()).toBe('/credentials/release');
+    expect(credentialsReleasePath()).toBe(buildPath('credentials.release'));
   });
 
   it('publishes the WebSocket path beside the routes', () => {
@@ -3095,6 +3638,36 @@ describe('a rejected body never becomes a leak', () => {
       expect(exposedText(rejected.error)).not.toContain(SENTINEL);
       expect(rejected.error.message).toContain('events[0].traceId');
       expect(DEBUGGEN_ERROR_CODES).toContain(rejected.error.code);
+    }
+  });
+
+  it('reports a refused ingest delivery context without echoing it', () => {
+    // The armed capture id is producer-supplied text; a padded or oversized
+    // one is named by its field and the rule it broke, never quoted. A
+    // well-formed one on an empty batch without a loss is refused by the
+    // loss-only rule, which carries no received value at all.
+    for (const [body, field] of [
+      [{ events: [INGRESS_EVENT], armedCaptureId: ` ${SENTINEL}` }, 'armedCaptureId'],
+      [{ events: [INGRESS_EVENT], armedCaptureId: SENTINEL.repeat(3) }, 'armedCaptureId'],
+      [{ events: [], armedCaptureId: SENTINEL }, 'events'],
+      [{ events: [], armedCaptureId: SENTINEL, droppedCount: SENTINEL }, 'droppedCount'],
+      // The loss-report identity is producer-supplied text as well: refused
+      // when malformed, when it names no loss, and on an event-less body
+      // without one, each time by field and rule alone.
+      [{ events: [INGRESS_EVENT], droppedCount: 3, lossReportId: ` ${SENTINEL}` }, 'lossReportId'],
+      [{ events: [], droppedCount: 3, lossReportId: SENTINEL.repeat(3) }, 'lossReportId'],
+      [{ events: [INGRESS_EVENT], lossReportId: SENTINEL }, 'lossReportId'],
+      [{ events: [INGRESS_EVENT], droppedCount: 0, lossReportId: SENTINEL }, 'lossReportId'],
+      [{ events: [], lossReportId: SENTINEL }, 'events'],
+    ] as const) {
+      const rejected = parseHttpRequest('telemetry.event', { projectRoot: PROJECT_ROOT, ...body });
+
+      expect(rejected.ok, JSON.stringify(body)).toBe(false);
+      if (!rejected.ok) {
+        expect(exposedText(rejected.error)).not.toContain(SENTINEL);
+        expect(rejected.error.message).toContain(field);
+        expect(rejected.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      }
     }
   });
 

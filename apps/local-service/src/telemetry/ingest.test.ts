@@ -32,11 +32,15 @@
  *    context the attributor sees, and the server scope comes from the
  *    credential, never from the body; the ingest route's response reports the
  *    accepted rows, and rejected ones only when there are any.
- * 7. **Delivery context of a relayed batch.** The capture the page agent was
- *    armed for and the producer's loss report travel with a batch: the armed
- *    capture is handed to attribution, and a reported loss is recorded once,
- *    against the attributed session and capture, before the batch is
- *    processed.
+ * 7. **Delivery context of either transport.** The capture the producer was
+ *    armed for and its loss report travel with a relayed frame and with an
+ *    ingest body alike: the armed capture is handed to attribution (and a
+ *    batch naming another capture is dropped whole), and a reported loss is
+ *    recorded once, against the attributed session and capture, before the
+ *    batch is processed — or, for a loss-only batch, instead of processing.
+ *    A server body that names its loss report (`lossReportId`) is accounted
+ *    once per capture however often it is delivered, and only once the
+ *    ledger has accepted it.
  * 8. **The log throttle (CWE-400).** Hundreds of malformed batches write one
  *    warning per key per interval, the next record carries the count held
  *    back, and a ceiling across keys holds however many sessions a flood spans.
@@ -141,6 +145,7 @@ import {
   LOCATE_BUDGET_GRACE_MS,
   LOG_THROTTLE_INTERVAL_MS,
   LOG_THROTTLE_MAX_RECORDS_PER_INTERVAL,
+  MAX_APPLIED_LOSS_REPORTS,
   MAX_INGEST_BATCH,
   MAX_LOCATE_BUDGET_MS,
   createLogThrottle,
@@ -159,6 +164,7 @@ import type {
   LiveTailLike,
   LogThrottleSummary,
   ProducerLossReportLike,
+  ServerAgentIngestInput,
   TelemetryIngest,
   TelemetryRepoLike,
   TraceCorrelatorLike,
@@ -2627,7 +2633,7 @@ describe('toIngestResponse', () => {
 });
 
 /* =================================================================================================
- * 7. Delivery context of a relayed batch: the armed capture and the producer's loss report
+ * 7. Delivery context of either transport: the armed capture and the producer's loss report
  * ============================================================================================== */
 
 /** How the loss-ledger double answers `recordProducerLoss`. */
@@ -2666,15 +2672,27 @@ function lossLedger(log: CallTag[], behaviour: LedgerBehaviour) {
 }
 
 /**
- * The file's pipeline over the same doubles as {@link harness}, except that
- * the telemetry store also carries a loss ledger.
+ * The file's pipeline over the same doubles as {@link harness} — the privacy
+ * spies, the correlator and the live tail included, all answering `ok` —
+ * except that the telemetry store also carries a loss ledger.
+ *
+ * @param behaviour How the ledger answers.
+ * @param options `attributor` replaces either attributor method, as in
+ * {@link harness}; a case that moves the open capture between deliveries
+ * uses it.
  */
-function ledgerHarness(behaviour: LedgerBehaviour = 'ok') {
+function ledgerHarness(
+  behaviour: LedgerBehaviour = 'ok',
+  options: { readonly attributor?: AttributorOptions } = {},
+) {
   const log: CallTag[] = [];
   const repo = fakeTelemetryRepo(log);
   const ledger = lossLedger(log, behaviour);
   const sessions = fakeSessionsRepo(log);
-  const attributor = attributorSpy(log);
+  const privacy = privacySpies(log);
+  const attributor = attributorSpy(log, options.attributor);
+  const correlator = correlatorSpy(log, 'ok');
+  const tail = tailSpy(log, 'ok');
   const { logger, entries } = recordingLogger();
   const telemetry: TelemetryRepoLike = {
     insertMany: (events) => repo.insertMany(events),
@@ -2685,11 +2703,25 @@ function ledgerHarness(behaviour: LedgerBehaviour = 'ok') {
     telemetry,
     sessions,
     attributor,
+    correlator: correlator.correlator,
+    liveTail: tail.liveTail,
     logger,
     now: fixedClock,
+    privacy: privacy.primitives,
   });
 
-  return { ingest, log, repo, ledger, sessions, attributor, logs: entries };
+  return {
+    ingest,
+    log,
+    repo,
+    ledger,
+    sessions,
+    privacy,
+    attributor,
+    correlator,
+    tail,
+    logs: entries,
+  };
 }
 
 describe('delivery context: the armed capture', () => {
@@ -2884,21 +2916,758 @@ describe('delivery context: the producer’s loss report', () => {
       expect(h.logs.filter((entry) => entry.level === 'warn')).toHaveLength(1);
     }
   });
+});
 
-  it('never reads a loss report from a server-agent batch', async () => {
-    const h = ledgerHarness();
+describe('delivery context: a server-agent batch', () => {
+  /** The ingest body's identity for {@link PROJECT_ONE}, as the route hands it over. */
+  const SERVER_INPUT = {
+    projectRoot: PROJECT_ONE,
+    scopedProjectRoot: PROJECT_ONE,
+  } as const satisfies Omit<ServerAgentIngestInput, 'events'>;
+
+  it('hands the armed capture to attribution only when the body names one', async () => {
+    const named = harness();
+    const unnamed = harness();
+    const explicitlyAbsent = harness();
 
     const report = expectReport(
-      await h.ingest.ingestFromServerAgent({
-        projectRoot: PROJECT_ONE,
-        scopedProjectRoot: PROJECT_ONE,
+      await named.ingest.ingestFromServerAgent({
+        ...SERVER_INPUT,
+        armedCaptureId: CAPTURE,
+        events: [makeServerIngress()],
+      }),
+    );
+    expectReport(
+      await unnamed.ingest.ingestFromServerAgent({
+        ...SERVER_INPUT,
+        events: [makeServerIngress()],
+      }),
+    );
+    expectReport(
+      await explicitlyAbsent.ingest.ingestFromServerAgent({
+        ...SERVER_INPUT,
+        armedCaptureId: undefined,
         events: [makeServerIngress()],
       }),
     );
 
+    expect(named.attributor.contexts).toStrictEqual([
+      { origin: 'server-agent', ...SERVER_INPUT, armedCaptureId: CAPTURE },
+    ]);
+    // Absent and explicitly undefined build the same context: no key at all.
+    for (const h of [unnamed, explicitlyAbsent]) {
+      expect(h.attributor.contexts).toStrictEqual([{ origin: 'server-agent', ...SERVER_INPUT }]);
+      expect(Object.hasOwn(h.attributor.contexts[0] ?? {}, 'armedCaptureId')).toBe(false);
+      expect(onlyRow(h.repo).captureId).toBe(CAPTURE);
+    }
     expect(report.persisted).toBe(1);
-    expect(report.producerDropped).toBeUndefined();
+    expect(report.captureId).toBe(CAPTURE);
+    expect(onlyRow(named.repo).captureId).toBe(CAPTURE);
+    expect(report.dropped).toEqual(dropCounts());
+  });
+
+  it('drops a batch recorded for another capture whole, as stale-capture, storing nothing and recording no loss', async () => {
+    const h = ledgerHarness();
+    const stale = newCaptureId();
+    const batch = [makeServerIngress(), makeDbIngress('SELECT id FROM widgets WHERE qty = 1')];
+
+    const report = expectReport(
+      await h.ingest.ingestFromServerAgent({
+        ...SERVER_INPUT,
+        armedCaptureId: stale,
+        droppedCount: 4,
+        events: batch,
+      }),
+    );
+
+    expect(report.dropped).toEqual(dropCounts({ 'stale-capture': batch.length }));
+    expect(report.batchDropReason).toBe('stale-capture');
+    expect(report.batchDropCode).toBe(DROP_REASON_ERROR_CODES['stale-capture']);
+    expect(report.batchDropCode).toBe('SESSION_INVALID_STATE');
+    expect(report.persisted).toBe(0);
+    expect(report.sessionId).toBeUndefined();
+    expect(report.captureId).toBeUndefined();
+    // The loss belongs to the capture the batch names, which is not the open
+    // one: it is recorded nowhere rather than against the wrong capture.
     expect(h.ledger.recordProducerLoss).not.toHaveBeenCalled();
+    expect(report.producerDropped).toBeUndefined();
+    // Refused before anything is read, hashed, stored, correlated or broadcast.
+    expect(h.log).toEqual(['resolve']);
+    expect(h.sessions.requested).toEqual([]);
+    expect(h.privacy.redactInputs).toEqual([]);
+    expect(h.repo.calls).toEqual([]);
+    expect(h.correlator.onEventsPersisted).not.toHaveBeenCalled();
+    expect(h.tail.push).not.toHaveBeenCalled();
+    expect(toIngestResponse(report)).toEqual({ accepted: 0, rejected: batch.length });
+    expect(JSON.stringify(h.logs)).not.toContain(stale);
+  });
+
+  it('records a reported loss exactly once, against the attributed session and capture, before the batch is processed', async () => {
+    const h = ledgerHarness();
+    const event = makeServerIngress();
+
+    const report = expectReport(
+      await h.ingest.ingestFromServerAgent({
+        ...SERVER_INPUT,
+        producerId: PRODUCER,
+        armedCaptureId: CAPTURE,
+        droppedCount: 11,
+        events: [event],
+      }),
+    );
+
+    expect(h.ledger.reports).toStrictEqual([
+      { sessionId: SESSION, captureId: CAPTURE, producerId: PRODUCER, droppedEvents: 11 },
+    ]);
+    expect(h.ledger.recordProducerLoss).toHaveBeenCalledTimes(1);
+    // After attribution, before the secret is read or anything is stored.
+    expect(h.ledger.logBefore).toStrictEqual([['resolve']]);
+    expect(report.producerDropped).toBe(11);
+    expect(report.persisted).toBe(1);
+    expect(report.sessionId).toBe(SESSION);
+    expect(report.captureId).toBe(CAPTURE);
+    expect(insertedRows(h.repo).map((row) => row.id)).toEqual([event.id]);
+
+    const recorded = h.logs.filter((entry) => entry.fields['droppedEvents'] === 11);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]?.fields).toMatchObject({
+      origin: 'server-agent',
+      sessionId: SESSION,
+      captureId: CAPTURE,
+      captureDroppedEvents: 11,
+    });
+
+    // Without an announced producer id, the ledger entry carries none.
+    const anonymous = ledgerHarness();
+    expectReport(
+      await anonymous.ingest.ingestFromServerAgent({
+        ...SERVER_INPUT,
+        droppedCount: 2,
+        events: [makeServerIngress()],
+      }),
+    );
+    expect(anonymous.ledger.reports).toStrictEqual([
+      { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 2 },
+    ]);
+  });
+
+  it('accounts a loss-only batch against the open capture, and reads, stores, correlates and tails nothing', async () => {
+    const h = ledgerHarness();
+
+    const report = expectReport(
+      await h.ingest.ingestFromServerAgent({
+        ...SERVER_INPUT,
+        armedCaptureId: CAPTURE,
+        droppedCount: 6,
+        events: [],
+      }),
+    );
+
+    expect(h.ledger.reports).toStrictEqual([
+      { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 6 },
+    ]);
+    expect(report.producerDropped).toBe(6);
+    expect(report.received).toBe(0);
+    expect(report.persisted).toBe(0);
+    expect(report.sessionId).toBe(SESSION);
+    expect(report.captureId).toBe(CAPTURE);
+    expect(report.batchDropReason).toBeUndefined();
+    expect(report.dropped).toEqual(dropCounts());
+    // Resolution only: no secret, no parse, no key, no store, no correlation, no tail.
+    expect(h.log).toEqual(['resolve']);
+    expect(h.sessions.requested).toEqual([]);
+    expect(h.privacy.redactInputs).toEqual([]);
+    expect(h.repo.calls).toEqual([]);
+    expect(h.correlator.onEventsPersisted).not.toHaveBeenCalled();
+    expect(h.tail.push).not.toHaveBeenCalled();
+    expect(toIngestResponse(report)).toEqual({ accepted: 0 });
+    expect(
+      h.logs.filter((entry) => entry.message === 'loss-only telemetry batch accounted'),
+    ).toHaveLength(1);
+  });
+
+  it('records nothing for a batch attribution refused, loss-only or not, whatever loss it reports', async () => {
+    const cases = [
+      // No capture owner for the credential's project.
+      {
+        input: {
+          projectRoot: PROJECT_TWO,
+          scopedProjectRoot: PROJECT_TWO,
+          armedCaptureId: CAPTURE,
+        },
+        reason: 'no-active-capture',
+      },
+      // The body names a project the credential is not scoped to.
+      {
+        input: { projectRoot: PROJECT_ONE, scopedProjectRoot: PROJECT_TWO },
+        reason: 'project-scope-mismatch',
+      },
+      // The body names a capture other than the open one.
+      { input: { ...SERVER_INPUT, armedCaptureId: newCaptureId() }, reason: 'stale-capture' },
+    ] as const;
+
+    for (const { input, reason } of cases) {
+      for (const events of [[makeServerIngress()], []]) {
+        const h = ledgerHarness();
+
+        const report = expectReport(
+          await h.ingest.ingestFromServerAgent({ ...input, droppedCount: 5, events }),
+        );
+
+        expect(report.batchDropReason).toBe(reason);
+        expect(report.dropped).toEqual(dropCounts({ [reason]: events.length }));
+        expect(h.ledger.recordProducerLoss).not.toHaveBeenCalled();
+        expect(report.producerDropped).toBeUndefined();
+        expect(report.persisted).toBe(0);
+        expect(h.log).toEqual(['resolve']);
+        expect(h.repo.calls).toEqual([]);
+        expect(h.tail.push).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it('treats an absent or zero count as no report, and ignores a malformed one with a warning that omits its value', async () => {
+    const quiet = ledgerHarness();
+
+    const absent = expectReport(
+      await quiet.ingest.ingestFromServerAgent({ ...SERVER_INPUT, events: [makeServerIngress()] }),
+    );
+    const zero = expectReport(
+      await quiet.ingest.ingestFromServerAgent({
+        ...SERVER_INPUT,
+        droppedCount: 0,
+        events: [makeServerIngress()],
+      }),
+    );
+
+    expect(quiet.ledger.recordProducerLoss).not.toHaveBeenCalled();
+    for (const report of [absent, zero]) {
+      expect(report.producerDropped).toBeUndefined();
+      expect(report.persisted).toBe(1);
+    }
+    expect(quiet.logs.filter((entry) => entry.level === 'warn')).toEqual([]);
+
+    const marker = sentinel('loss-count');
+    for (const malformed of [
+      -1,
+      1.5,
+      424_242.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      marker,
+      null,
+    ]) {
+      const h = ledgerHarness();
+
+      const report = expectReport(
+        await h.ingest.ingestFromServerAgent({
+          ...SERVER_INPUT,
+          droppedCount: malformed as unknown as number,
+          events: [makeServerIngress()],
+        }),
+      );
+
+      expect(h.ledger.recordProducerLoss).not.toHaveBeenCalled();
+      expect(report.producerDropped).toBeUndefined();
+      expect(report.persisted).toBe(1);
+
+      const warned = h.logs.filter((entry) => entry.level === 'warn');
+      expect(warned).toHaveLength(1);
+      expect(warned[0]?.message).toBe('a malformed producer loss report was ignored');
+      expect(warned[0]?.fields).toMatchObject({ origin: 'server-agent' });
+      expect(Object.values(warned[0]?.fields ?? {})).not.toContain(malformed);
+
+      const serialised = JSON.stringify(h.logs);
+      expect(serialised).not.toContain(marker);
+      expect(serialised).not.toContain('424242.5');
+    }
+  });
+
+  it('answers an unreadable delivery context with a typed error instead of throwing', async () => {
+    const unreadableLoss: ServerAgentIngestInput = {
+      ...SERVER_INPUT,
+      events: [makeServerIngress()],
+      get droppedCount(): number {
+        throw new Error('the ingest body is revoked');
+      },
+    };
+    const unreadableCapture: ServerAgentIngestInput = {
+      ...SERVER_INPUT,
+      events: [makeServerIngress()],
+      get armedCaptureId(): CaptureId {
+        throw new Error('the ingest body is revoked');
+      },
+    };
+    const unreadableReportId: ServerAgentIngestInput = {
+      ...SERVER_INPUT,
+      droppedCount: 3,
+      events: [makeServerIngress()],
+      get lossReportId(): string {
+        throw new Error('the ingest body is revoked');
+      },
+    };
+
+    for (const input of [unreadableLoss, unreadableCapture, unreadableReportId]) {
+      const h = ledgerHarness();
+
+      const error = expectError(await h.ingest.ingestFromServerAgent(input));
+
+      expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(error.message).not.toContain('revoked');
+      expect(h.log).toEqual([]);
+      expect(h.ledger.recordProducerLoss).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('delivery context: a named server loss report', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** The ingest body's identity for {@link PROJECT_ONE}, as the route hands it over. */
+  const SERVER_BODY = {
+    projectRoot: PROJECT_ONE,
+    scopedProjectRoot: PROJECT_ONE,
+  } as const satisfies Omit<ServerAgentIngestInput, 'events'>;
+
+  /** The debug record of a delivery whose named report the ledger already accepted. */
+  const REPEATED_REPORT =
+    'a repeated producer loss report was already recorded against the capture; not counted again';
+
+  /** The warning for a `lossReportId` that is not an identifier. */
+  const MALFORMED_REPORT_ID =
+    'a malformed producer loss report id was ignored; the loss is recorded without it';
+
+  /** The record of a loss the ledger accepted. */
+  const LOSS_RECORDED = 'a producer reported discarded events; recorded against the capture';
+
+  /** The record of a loss reported to a store without a ledger. */
+  const NO_LEDGER = 'a producer reported discarded events; no loss ledger is wired';
+
+  /**
+   * A producer-chosen report id. The service treats it as opaque, so any
+   * identifier does; the index keeps a long sequence of them distinct.
+   */
+  function reportIdAt(index: number): string {
+    return `report-${String(index).padStart(6, '0')}`;
+  }
+
+  it('records a named report once when the same body is delivered twice, and stores both batches', async () => {
+    const h = ledgerHarness();
+    const lossReportId = reportIdAt(1);
+    const first = makeServerIngress();
+    const second = makeServerIngress();
+    const body = { ...SERVER_BODY, armedCaptureId: CAPTURE, droppedCount: 8, lossReportId };
+
+    const firstReport = expectReport(
+      await h.ingest.ingestFromServerAgent({ ...body, events: [first] }),
+    );
+    const repeatReport = expectReport(
+      await h.ingest.ingestFromServerAgent({ ...body, events: [second] }),
+    );
+
+    expect(h.ledger.recordProducerLoss).toHaveBeenCalledTimes(1);
+    expect(h.ledger.reports).toStrictEqual([
+      { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 8 },
+    ]);
+    expect(firstReport.producerDropped).toBe(8);
+    // Not new loss: the repeat reports nothing discarded.
+    expect(repeatReport.producerDropped).toBeUndefined();
+    expect(repeatReport.captureId).toBe(CAPTURE);
+    // The id de-duplicates the loss only: both batches' events are stored.
+    expect(h.repo.calls.map((rows) => rows.map((row) => row.id))).toEqual([
+      [first.id],
+      [second.id],
+    ]);
+    expect(recordsOf(h.logs, 'info', LOSS_RECORDED)).toHaveLength(1);
+
+    const repeated = recordsOf(h.logs, 'debug', REPEATED_REPORT);
+    expect(repeated).toHaveLength(1);
+    expect(repeated[0]?.fields).toMatchObject({
+      origin: 'server-agent',
+      sessionId: SESSION,
+      captureId: CAPTURE,
+      droppedEvents: 8,
+    });
+    // The id attributes nothing, so attribution never sees it, and no record carries it.
+    expect(h.attributor.contexts).toHaveLength(2);
+    for (const context of h.attributor.contexts) {
+      expect(Object.hasOwn(context, 'lossReportId')).toBe(false);
+    }
+    expect(JSON.stringify(h.logs)).not.toContain(lossReportId);
+  });
+
+  it('records the loss once, and stores the events on the retry, when the first delivery failed after recording it', async () => {
+    const h = ledgerHarness();
+    const event = makeServerIngress();
+    // The exporter sends the very same body again after a failure.
+    const body: ServerAgentIngestInput = {
+      ...SERVER_BODY,
+      armedCaptureId: CAPTURE,
+      droppedCount: 5,
+      lossReportId: reportIdAt(2),
+      events: [event],
+    };
+    vi.spyOn(h.sessions, 'getOrCreateRequestKeySecret').mockReturnValueOnce(
+      err(new DebuggenError('STORE_ERROR', 'The session key could not be read.')),
+    );
+
+    const failed = expectError(await h.ingest.ingestFromServerAgent(body));
+
+    expect(failed.code).toBe('STORE_ERROR');
+    // The loss reached the ledger before the secret was read; nothing was stored.
+    expect(h.ledger.reports).toStrictEqual([
+      { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 5 },
+    ]);
+    expect(h.repo.calls).toEqual([]);
+
+    const retried = expectReport(await h.ingest.ingestFromServerAgent(body));
+
+    expect(h.ledger.recordProducerLoss).toHaveBeenCalledTimes(1);
+    expect(h.ledger.reports).toHaveLength(1);
+    expect(retried.producerDropped).toBeUndefined();
+    expect(retried.persisted).toBe(1);
+    expect(insertedRows(h.repo).map((row) => row.id)).toEqual([event.id]);
+    expect(h.correlator.onEventsPersisted).toHaveBeenCalledTimes(1);
+    expect(h.tail.push).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a retry record a named report the ledger refused or failed on, and applies it once from then on', async () => {
+    for (const behaviour of ['err', 'throw'] as const) {
+      const h = ledgerHarness();
+      const body: ServerAgentIngestInput = {
+        ...SERVER_BODY,
+        droppedCount: 9,
+        lossReportId: reportIdAt(3),
+        events: [],
+      };
+      h.ledger.recordProducerLoss.mockImplementationOnce(() => {
+        if (behaviour === 'throw') {
+          throw new Error(`the loss ledger is locked ${sentinel('ledger-throw')}`);
+        }
+
+        return err(new DebuggenError('STORE_ERROR', `ledger refused ${sentinel('ledger-err')}`));
+      });
+
+      const refused = expectReport(await h.ingest.ingestFromServerAgent(body));
+      const retried = expectReport(await h.ingest.ingestFromServerAgent(body));
+      const repeated = expectReport(await h.ingest.ingestFromServerAgent(body));
+
+      expect(h.ledger.recordProducerLoss).toHaveBeenCalledTimes(2);
+      // Only the retry reached the running total.
+      expect(h.ledger.reports).toStrictEqual([
+        { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 9 },
+      ]);
+      expect(refused.producerDropped).toBe(9);
+      expect(retried.producerDropped).toBe(9);
+      expect(repeated.producerDropped).toBeUndefined();
+
+      const warned = h.logs.filter((entry) => entry.level === 'warn');
+      expect(warned).toHaveLength(1);
+      expect(warned[0]?.fields['code']).toBe('STORE_ERROR');
+      expect(recordsOf(h.logs, 'debug', REPEATED_REPORT)).toHaveLength(1);
+    }
+  });
+
+  it('reports every delivery of a named report when the store has no loss ledger to accept it', async () => {
+    const h = harness();
+    const body: ServerAgentIngestInput = {
+      ...SERVER_BODY,
+      droppedCount: 4,
+      lossReportId: reportIdAt(4),
+      events: [makeServerIngress()],
+    };
+
+    for (let delivery = 0; delivery < 2; delivery += 1) {
+      const report = expectReport(await h.ingest.ingestFromServerAgent(body));
+      expect(report.producerDropped).toBe(4);
+      expect(report.persisted).toBe(1);
+    }
+
+    expect(recordsOf(h.logs, 'info', NO_LEDGER)).toHaveLength(2);
+    expect(recordsOf(h.logs, 'debug', REPEATED_REPORT)).toEqual([]);
+  });
+
+  it('keys a report by the capture it is attributed to, so one id is applied to each capture once', async () => {
+    const next = newCaptureId();
+    let open: CaptureId = CAPTURE;
+    const h = ledgerHarness('ok', {
+      attributor: {
+        resolveBatch: (context) =>
+          Promise.resolve(ok({ sessionId: SESSION, captureId: open, origin: context.origin })),
+      },
+    });
+    const body: ServerAgentIngestInput = {
+      ...SERVER_BODY,
+      droppedCount: 3,
+      lossReportId: reportIdAt(5),
+      events: [],
+    };
+
+    const before = expectReport(await h.ingest.ingestFromServerAgent(body));
+    // The capture stopped and the project's next capture opened.
+    open = next;
+    const after = expectReport(await h.ingest.ingestFromServerAgent(body));
+    const again = expectReport(await h.ingest.ingestFromServerAgent(body));
+
+    expect(h.ledger.reports).toStrictEqual([
+      { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 3 },
+      { sessionId: SESSION, captureId: next, droppedEvents: 3 },
+    ]);
+    expect(
+      [before, after, again].map((report) => [report.captureId, report.producerDropped]),
+    ).toEqual([
+      [CAPTURE, 3],
+      [next, 3],
+      [next, undefined],
+    ]);
+  });
+
+  it('records every distinct report of one capture', async () => {
+    const h = ledgerHarness();
+
+    for (const [index, droppedCount] of [2, 5].entries()) {
+      const report = expectReport(
+        await h.ingest.ingestFromServerAgent({
+          ...SERVER_BODY,
+          droppedCount,
+          lossReportId: reportIdAt(10 + index),
+          events: [],
+        }),
+      );
+      expect(report.producerDropped).toBe(droppedCount);
+    }
+
+    expect(h.ledger.reports).toStrictEqual([
+      { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 2 },
+      { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 5 },
+    ]);
+    expect(
+      recordsOf(h.logs, 'info', LOSS_RECORDED).map((entry) => entry.fields['captureDroppedEvents']),
+    ).toEqual([2, 7]);
+  });
+
+  it('ignores a malformed id with a warning that omits it, and records the loss of every delivery', async () => {
+    const marker = sentinel('loss-report-id');
+
+    for (const malformed of [
+      '',
+      ` ${marker}`,
+      `${marker}\n`,
+      marker.padEnd(65, 'x'),
+      42,
+      null,
+      { marker },
+    ]) {
+      const h = ledgerHarness();
+      const body: ServerAgentIngestInput = {
+        ...SERVER_BODY,
+        droppedCount: 6,
+        lossReportId: malformed as unknown as string,
+        events: [makeServerIngress()],
+      };
+
+      const first = expectReport(await h.ingest.ingestFromServerAgent(body));
+
+      expect(h.ledger.reports).toStrictEqual([
+        { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 6 },
+      ]);
+      expect(first.producerDropped).toBe(6);
+      expect(first.persisted).toBe(1);
+
+      const warned = h.logs.filter((entry) => entry.level === 'warn');
+      expect(warned).toHaveLength(1);
+      expect(warned[0]?.message).toBe(MALFORMED_REPORT_ID);
+      expect(warned[0]?.fields).toMatchObject({ origin: 'server-agent', sessionId: SESSION });
+      expect(Object.values(warned[0]?.fields ?? {})).not.toContain(malformed);
+
+      // Un-keyed, like a report that names no id: the next delivery records again.
+      const second = expectReport(await h.ingest.ingestFromServerAgent(body));
+
+      expect(second.producerDropped).toBe(6);
+      expect(h.ledger.reports).toHaveLength(2);
+      expect(JSON.stringify(h.logs)).not.toContain(marker);
+    }
+  });
+
+  it('records every delivery of a report that names no id, on either transport, as before', async () => {
+    const absent = ledgerHarness();
+    const explicitlyAbsent = ledgerHarness();
+    const relayed = ledgerHarness();
+
+    for (let delivery = 0; delivery < 2; delivery += 1) {
+      const reports = [
+        await absent.ingest.ingestFromServerAgent({
+          ...SERVER_BODY,
+          droppedCount: 7,
+          events: [makeServerIngress()],
+        }),
+        await explicitlyAbsent.ingest.ingestFromServerAgent({
+          ...SERVER_BODY,
+          droppedCount: 7,
+          lossReportId: undefined,
+          events: [makeServerIngress()],
+        }),
+        await relayed.ingest.ingestFromAgent({
+          tabId: TAB_ID,
+          droppedCount: 7,
+          events: [makeIngress()],
+        }),
+      ];
+
+      for (const result of reports) {
+        expect(expectReport(result).producerDropped).toBe(7);
+      }
+    }
+
+    for (const h of [absent, explicitlyAbsent, relayed]) {
+      expect(h.ledger.reports).toStrictEqual([
+        { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 7 },
+        { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 7 },
+      ]);
+      expect(recordsOf(h.logs, 'debug', REPEATED_REPORT)).toEqual([]);
+      expect(h.logs.filter((entry) => entry.level === 'warn')).toEqual([]);
+    }
+  });
+
+  it('accounts a replayed loss-only report once, and still reads, stores and tails nothing', async () => {
+    const h = ledgerHarness();
+    const body: ServerAgentIngestInput = {
+      ...SERVER_BODY,
+      armedCaptureId: CAPTURE,
+      droppedCount: 12,
+      lossReportId: reportIdAt(6),
+      events: [],
+    };
+
+    const first = expectReport(await h.ingest.ingestFromServerAgent(body));
+    const replay = expectReport(await h.ingest.ingestFromServerAgent(body));
+
+    expect(h.ledger.reports).toStrictEqual([
+      { sessionId: SESSION, captureId: CAPTURE, droppedEvents: 12 },
+    ]);
+    expect(first.producerDropped).toBe(12);
+    expect(replay.producerDropped).toBeUndefined();
+    for (const report of [first, replay]) {
+      expect(report).toMatchObject({
+        received: 0,
+        persisted: 0,
+        sessionId: SESSION,
+        captureId: CAPTURE,
+      });
+      expect(report.batchDropReason).toBeUndefined();
+      expect(toIngestResponse(report)).toEqual({ accepted: 0 });
+    }
+    // Resolution only, both times: no secret, no parse, no store, no tail.
+    expect(h.log).toEqual(['resolve', 'resolve']);
+    expect(h.sessions.requested).toEqual([]);
+    expect(h.repo.calls).toEqual([]);
+    expect(h.tail.push).not.toHaveBeenCalled();
+    expect(recordsOf(h.logs, 'debug', REPEATED_REPORT)).toHaveLength(1);
+  });
+
+  it('applies a report once when its retry arrives while the first delivery is still being recorded', async () => {
+    vi.useFakeTimers();
+
+    for (const firstAnswer of ['ok', 'err'] as const) {
+      const log: CallTag[] = [];
+      const repo = fakeTelemetryRepo(log);
+      const { logger, entries } = recordingLogger();
+      const reports: ProducerLossReportLike[] = [];
+      const held: ((answer: Result<number, DebuggenError>) => void)[] = [];
+      let markReached: () => void = () => undefined;
+      const reached = new Promise<void>((resolve) => {
+        markReached = resolve;
+      });
+      // A ledger that answers only when the case says so.
+      const recordProducerLoss = vi.fn(
+        (report: ProducerLossReportLike): Promise<Result<number, DebuggenError>> => {
+          reports.push(report);
+          markReached();
+          return new Promise((resolve) => {
+            held.push(resolve);
+          });
+        },
+      );
+      const ingest = createTelemetryIngest({
+        telemetry: { insertMany: (events) => repo.insertMany(events), recordProducerLoss },
+        sessions: fakeSessionsRepo(log),
+        attributor: attributorSpy(log),
+        logger,
+        now: fixedClock,
+      });
+      const body: ServerAgentIngestInput = {
+        ...SERVER_BODY,
+        droppedCount: 4,
+        lossReportId: reportIdAt(7),
+        events: [],
+      };
+
+      const firstDelivery = ingest.ingestFromServerAgent(body);
+      await reached;
+      const retry = ingest.ingestFromServerAgent(body);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The retry waits for the write in progress instead of racing it.
+      expect(reports).toStrictEqual([{ sessionId: SESSION, captureId: CAPTURE, droppedEvents: 4 }]);
+
+      if (firstAnswer === 'ok') {
+        held[0]?.(ok(4));
+        const [first, second] = [expectReport(await firstDelivery), expectReport(await retry)];
+
+        expect(recordProducerLoss).toHaveBeenCalledTimes(1);
+        expect(first.producerDropped).toBe(4);
+        expect(second.producerDropped).toBeUndefined();
+        expect(recordsOf(entries, 'debug', REPEATED_REPORT)).toHaveLength(1);
+        continue;
+      }
+
+      held[0]?.(err(new DebuggenError('STORE_ERROR', 'The loss ledger refused the report.')));
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The first write did not reach the ledger, so the retry makes its own.
+      expect(reports).toHaveLength(2);
+      expect(reports[1]).toStrictEqual(reports[0]);
+      held[1]?.(ok(4));
+      const [first, second] = [expectReport(await firstDelivery), expectReport(await retry)];
+
+      expect(first.producerDropped).toBe(4);
+      expect(second.producerDropped).toBe(4);
+      expect(recordsOf(entries, 'debug', REPEATED_REPORT)).toEqual([]);
+      expect(recordsOf(entries, 'info', LOSS_RECORDED)).toHaveLength(1);
+    }
+  });
+
+  it('forgets the oldest applied report once the bound is passed, and only that one', async () => {
+    const h = ledgerHarness();
+
+    /** Delivers one loss-only report under `lossReportId`. */
+    async function deliver(lossReportId: string): Promise<IngestReport> {
+      return expectReport(
+        await h.ingest.ingestFromServerAgent({
+          ...SERVER_BODY,
+          droppedCount: 1,
+          lossReportId,
+          events: [],
+        }),
+      );
+    }
+
+    for (let index = 0; index <= MAX_APPLIED_LOSS_REPORTS; index += 1) {
+      await deliver(reportIdAt(index));
+    }
+    const applied = MAX_APPLIED_LOSS_REPORTS + 1;
+    expect(h.ledger.recordProducerLoss).toHaveBeenCalledTimes(applied);
+
+    // Still remembered: the oldest key the bound kept, and the newest.
+    expect((await deliver(reportIdAt(1))).producerDropped).toBeUndefined();
+    expect((await deliver(reportIdAt(MAX_APPLIED_LOSS_REPORTS))).producerDropped).toBeUndefined();
+    expect(h.ledger.recordProducerLoss).toHaveBeenCalledTimes(applied);
+
+    // Forgotten: the first report applied is recorded as if delivered for the first time.
+    expect((await deliver(reportIdAt(0))).producerDropped).toBe(1);
+    expect(h.ledger.recordProducerLoss).toHaveBeenCalledTimes(applied + 1);
   });
 });
 

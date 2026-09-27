@@ -11,7 +11,8 @@
  *    verifier's replacements, an immutable-headers reply, `HEAD`, and the Node
  *    listener's own fallbacks over a real socket — carries
  *    `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, and none
- *    carries `Access-Control-Allow-Origin` (AAP §0.5.6) or a `Server` banner.
+ *    carries `Access-Control-Allow-Origin` (so no web page can read a reply) or
+ *    a `Server` banner.
  *
  * Every collaborator a test does not supply is a stand-in that throws one
  * chosen `DebuggenError`, so a failure arrives at `app.onError` exactly as a

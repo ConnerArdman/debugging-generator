@@ -1892,11 +1892,13 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
  * Every role track is a floor and a ratio, which resolves identically in every
  * row — `DataTable` warns that an intrinsic track sizes itself from one row's
  * own content and so stops lining up with its own header, and these cells
- * hold values of wildly varying width. `DataTable` sums the floors into the
- * grid's own minimum width, so a surface narrower than their sum scrolls the
- * table horizontally with every column still readable, instead of squeezing
- * each one to its padding and letting a cell's content paint over its
- * neighbour.
+ * hold values of wildly varying width. `DataTable` sums the columns' floors
+ * and minimums into the grid's own width: a surface just too narrow for every
+ * floor narrows the `name` and `text` columns, never below the
+ * `--dg-column-yield` fraction of their floor, only as far as the table needs
+ * to fit, and a surface too narrow even for that keeps every floor and scrolls
+ * the table horizontally with every column readable, instead of squeezing each
+ * one to its padding and letting a cell's content paint over its neighbour.
  * ---------------------------------------------------------------------------
  */
 

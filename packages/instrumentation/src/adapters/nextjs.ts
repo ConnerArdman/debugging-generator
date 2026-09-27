@@ -2011,8 +2011,13 @@ export function createNextJsAdapter(options?: NextJsAdapterOptions): NextJsAdapt
       // to this plan version, and the chain parent for a file an earlier plan
       // version already instrumented is resolved through the journal by the
       // patcher itself (AAP §0.4.2) — chaining is never re-implemented here.
+      // The admitted canonical root travels with the spelled one, so the
+      // patcher resolves, pins and writes inside the directory the service
+      // admitted and refuses a patch once that directory has been replaced by
+      // a link; absent, the patcher resolves the spelled root itself.
       const patcher = resolved.patcherFactory({
         projectRoot: context.projectRoot,
+        canonicalRoot: context.canonicalProjectRoot,
         sessionId: context.sessionId,
         planVersion: context.planVersion,
         journal: context.journal,

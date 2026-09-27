@@ -16,11 +16,25 @@
  *
  * ## Guarantees
  *
- * - **Read-only.** It reads exactly one file — `<projectRoot>/package.json`,
+ * - **Read-only.** It reads exactly one file — `<readRoot>/package.json`,
  *   through a no-follow reader — and performs at most one loopback HTTP probe.
  *   It never writes anywhere, never reads `.env*`, never spawns a process.
  *   Package-manager detection is reused from `@debuggen/code-analysis`, which
  *   inspects lockfiles by `stat` only and never through this module's reader.
+ * - **It reads where the caller acts.** Every project file it consults — the
+ *   manifest, the lockfiles, the workspace root above them — is looked up
+ *   under {@link DetectDevServerInput.readRoot}, which defaults to the project
+ *   root. The launcher hands it the canonical root it has just re-proved, the
+ *   directory its child will run in, so a symbolic link on the spelled root
+ *   retargeted while the probe is awaited cannot substitute another
+ *   directory's `package.json` for the scripts it judges a command against
+ *   (CWE-367). Everything that names the project — the returned
+ *   `projectRoot`, the preload lookup, the relaunch command and hint, every
+ *   note and this module's log line — keeps
+ *   {@link DetectDevServerInput.projectRoot}, the root as the session spells
+ *   it, because that is the spelling a preload's `DEBUGGEN_PROJECT_ROOT` must
+ *   match. Only code-analysis's own debug diagnostics name `readRoot`, the
+ *   directory they actually searched.
  * - **Loopback only.** {@link probeDevServer} refuses any URL whose host is not
  *   `127.0.0.1`, `localhost` or `[::1]` *before* any request is made, so the
  *   service can never be turned into an outbound request engine for a URL that
@@ -465,6 +479,10 @@ export interface DevScriptSelection {
  * token, an `Authorization` value or any environment value.
  */
 export interface DevServerDetection {
+  /**
+   * The project as the session spells it — {@link DetectDevServerInput.projectRoot},
+   * never the {@link DetectDevServerInput.readRoot} the project files were read from.
+   */
   readonly projectRoot: string;
   /** The probed dev-server URL (origin and pathname), when one was known and valid. */
   readonly devServerUrl?: string;
@@ -542,8 +560,43 @@ export interface DevServerDetection {
 
 /** Input of {@link detectDevServer}. */
 export interface DetectDevServerInput {
-  /** Absolute path of the project being debugged. */
+  /**
+   * Absolute path of the project being debugged, as the session spells it: the
+   * project's identity. It is what {@link DevServerDetection.projectRoot}
+   * reports, what the {@link ServerAgentPresence} port is asked about, what the
+   * relaunch command `cd`s into and assigns to `DEBUGGEN_PROJECT_ROOT`, and
+   * what notes and log fields name — never necessarily where files are read.
+   */
   readonly projectRoot: string;
+  /**
+   * The absolute directory whose `package.json` and lockfiles detection reads
+   * — the manifest, and the package-manager evidence code-analysis looks up
+   * from there (lockfiles, and the workspace root above it). Default:
+   * {@link DetectDevServerInput.projectRoot}.
+   *
+   * A caller that has re-proved the project root's canonical identity passes
+   * that canonical directory, in the platform's native spelling, so what
+   * detection reads after its probe is awaited is the directory the caller
+   * acts in — not whatever a symbolic link on the spelled root leads to by
+   * then (CWE-367). Nothing that names the project follows it: identity and
+   * display stay on `projectRoot`.
+   *
+   * Validated like `projectRoot`: a value that is not an absolute path is not
+   * read through at all — never replaced by `projectRoot` — and degrades to
+   * notes (no manifest, package manager unknown), never to a throw.
+   *
+   * @example
+   * ```ts
+   * await detectDevServer({
+   *   // A link, as the session spells the project: reported and named.
+   *   projectRoot: '/home/dev/work/storefront',
+   *   // Its re-proved canonical target: where package.json and lockfiles are read.
+   *   readRoot: '/srv/checkouts/storefront',
+   *   devServerUrl: 'http://127.0.0.1:3000/',
+   * });
+   * ```
+   */
+  readonly readRoot?: string | undefined;
   /**
    * The session's dev-server URL (from the `debuggen.devServerUrl` setting or
    * a previous launch). Without one, nothing is probed and `running` is false.
@@ -619,7 +672,13 @@ export type ManifestReader = (absolutePath: string) => Uint8Array | string;
 
 /** Input of a {@link PackageManagerResolver}. */
 export interface PackageManagerResolverInput {
+  /**
+   * The directory detection reads — {@link DetectDevServerInput.readRoot},
+   * which defaults to the project root — so the answer concerns the same
+   * directory `manifest` was read from.
+   */
   readonly projectRoot: string;
+  /** The manifest detection read under `projectRoot`, when it could. */
   readonly manifest?: TargetManifest | undefined;
 }
 
@@ -1040,11 +1099,24 @@ export function readTargetManifest(
   projectRoot: string,
   deps: DevServerDetectDeps = {},
 ): Result<TargetManifest, DebuggenError> {
-  if (
-    typeof projectRoot !== 'string' ||
-    projectRoot.trim().length === 0 ||
-    !isAbsolute(projectRoot)
-  ) {
+  return readManifestUnder(projectRoot, projectRoot, deps);
+}
+
+/**
+ * {@link readTargetManifest}, reading `<readRoot>/package.json` while every
+ * message and `details.path` names the file under `displayRoot` — the project
+ * as the session spells it — so a detection that reads a re-proved canonical
+ * root still reports in the spelling the developer knows. `readRoot` alone is
+ * validated and read: a `readRoot` that is not an absolute path is refused,
+ * never replaced by `displayRoot`. A `displayRoot` that is not a non-blank
+ * string (a JavaScript caller's mistake) names the file under `readRoot`.
+ */
+function readManifestUnder(
+  readRoot: string,
+  displayRoot: string,
+  deps: DevServerDetectDeps,
+): Result<TargetManifest, DebuggenError> {
+  if (typeof readRoot !== 'string' || readRoot.trim().length === 0 || !isAbsolute(readRoot)) {
     return err(
       new DebuggenError(
         'PROJECT_NOT_FOUND',
@@ -1057,13 +1129,16 @@ export function readTargetManifest(
     );
   }
 
-  const manifestPath = join(projectRoot, MANIFEST_FILE_NAME);
-  if (!isWithin(toPosix(projectRoot), toPosix(manifestPath))) {
+  const manifestPath = join(readRoot, MANIFEST_FILE_NAME);
+  const shownRoot =
+    typeof displayRoot === 'string' && displayRoot.trim().length > 0 ? displayRoot : readRoot;
+  const shownPath = shownRoot === readRoot ? manifestPath : join(shownRoot, MANIFEST_FILE_NAME);
+  if (!isWithin(toPosix(readRoot), toPosix(manifestPath))) {
     return err(
       new DebuggenError(
         'PATH_OUTSIDE_PROJECT',
-        `The package.json path for ${projectRoot} resolves outside the project root.`,
-        { details: { reason: 'manifest-outside-project', path: manifestPath } },
+        `The package.json path for ${shownRoot} resolves outside the project root.`,
+        { details: { reason: 'manifest-outside-project', path: shownPath } },
       ),
     );
   }
@@ -1073,7 +1148,7 @@ export function readTargetManifest(
   try {
     raw = reader(manifestPath);
   } catch (error) {
-    return err(manifestReadError(error, manifestPath));
+    return err(manifestReadError(error, shownPath));
   }
 
   const size = typeof raw === 'string' ? Buffer.byteLength(raw, 'utf8') : raw.byteLength;
@@ -1081,8 +1156,8 @@ export function readTargetManifest(
     return err(
       new DebuggenError(
         'PROJECT_NOT_FOUND',
-        `${manifestPath} is ${size} bytes; a package.json larger than ${MAX_MANIFEST_BYTES} bytes is not parsed.`,
-        { details: { reason: 'manifest-too-large', path: manifestPath, size } },
+        `${shownPath} is ${size} bytes; a package.json larger than ${MAX_MANIFEST_BYTES} bytes is not parsed.`,
+        { details: { reason: 'manifest-too-large', path: shownPath, size } },
       ),
     );
   }
@@ -1098,10 +1173,10 @@ export function readTargetManifest(
     return err(
       new DebuggenError(
         'PROJECT_NOT_FOUND',
-        `${manifestPath} is not valid JSON (${position.description}).`,
+        `${shownPath} is not valid JSON (${position.description}).`,
         {
           hint: 'Fix the syntax error in package.json, then retry.',
-          details: { reason: 'manifest-invalid-json', path: manifestPath, ...position.details },
+          details: { reason: 'manifest-invalid-json', path: shownPath, ...position.details },
         },
       ),
     );
@@ -1109,9 +1184,9 @@ export function readTargetManifest(
 
   if (!isRecord(parsed)) {
     return err(
-      new DebuggenError('PROJECT_NOT_FOUND', `${manifestPath} does not contain a JSON object.`, {
+      new DebuggenError('PROJECT_NOT_FOUND', `${shownPath} does not contain a JSON object.`, {
         hint: 'A package.json must be a JSON object with a "scripts" field.',
-        details: { reason: 'manifest-not-object', path: manifestPath },
+        details: { reason: 'manifest-not-object', path: shownPath },
       }),
     );
   }
@@ -1762,21 +1837,29 @@ function preloadGapReason(situation: HintSituation): string {
  *      not found answering (that is the fact, whatever the registry says),
  *      otherwise `'server-agent-connected'`, `'no-server-agent-connection'`,
  *      or `'unknown'` when no registry was injected or it failed.
- * 3. **Manifest and dev script** with {@link readTargetManifest} and
- *    {@link selectDevScript}.
+ * 3. **Manifest and dev script** with {@link readTargetManifest}'s checks and
+ *    {@link selectDevScript}, reading `<readRoot>/package.json`.
  * 4. **Package manager**, by precedence: the injected `projectSummary` or
  *    `resolvePackageManager` (`'project-summary'`); the manifest's own
  *    `packageManager` field (`'manifest-field'`); code-analysis's lockfile and
- *    workspace-root detection (`'code-analysis'`); else `'unknown'` with a note.
+ *    workspace-root detection from `readRoot` (`'code-analysis'`); else
+ *    `'unknown'` with a note.
  * 5. **Relaunch command and hint** with {@link formatRelaunchCommand} and the
  *    {@link buildRelaunchHint} wording for this situation.
+ *
+ * Steps 3 and 4 are the only ones that touch the project's files, and they
+ * run after the probe is awaited, so they read under
+ * {@link DetectDevServerInput.readRoot} (default: `projectRoot`), fixed when
+ * the call began. Steps 2 and 5, the result's `projectRoot`, every note and
+ * the log line name `projectRoot`, the session's spelling.
  *
  * Never throws and never rejects: detection failure must not fail the session,
  * because capture proceeds with whichever signals are available (AAP §0.5.5).
  * Logs one `info` line under `subsystem: "dev-server"` — origin and pathname
  * only, never a query, a token or an environment value.
  *
- * @param input The project root and, when known, the session's dev-server URL.
+ * @param input The project root, the directory to read (when it differs) and,
+ * when known, the session's dev-server URL.
  * @param deps Every collaborator is optional; see {@link DevServerDetectDeps}.
  */
 export async function detectDevServer(
@@ -1826,12 +1909,20 @@ async function runDetection(
   logger: Logger,
 ): Promise<DevServerDetection> {
   const notes: string[] = [];
+  // Identity and display: what the result, the preload lookup, the relaunch
+  // command and every note name.
   const projectRoot = input.projectRoot;
+  // Where project files are read. Fixed before the probe is awaited, so what
+  // is read afterwards is the directory the caller handed over, whatever a
+  // link on the spelled root leads to by then. Only an absent `readRoot`
+  // defaults: any other value that is not an absolute path (a JavaScript
+  // caller's `null` included) is refused by the reads below, never replaced.
+  const readRoot = input.readRoot === undefined ? projectRoot : input.readRoot;
 
   const probe = await probeSessionUrl(input.devServerUrl, deps, notes);
   const presence = observePreload(projectRoot, probe, deps.serverAgents, notes);
 
-  const manifest = readManifestForDetection(projectRoot, deps, notes);
+  const manifest = readManifestForDetection(readRoot, projectRoot, deps, notes);
   const devScript = manifest === undefined ? undefined : selectDevScript(manifest);
   if (manifest !== undefined && devScript === undefined) {
     notes.push(
@@ -1844,7 +1935,7 @@ async function runDetection(
     );
   }
 
-  const packageManager = resolvePackageManagerFor(projectRoot, manifest, deps, logger, notes);
+  const packageManager = resolvePackageManagerFor(readRoot, manifest, deps, logger, notes);
 
   const relaunchCommand = formatRelaunchCommand({
     projectRoot,
@@ -2022,13 +2113,17 @@ function occupiedNote(answer: DevServerProbeResult, connected: RegistryAnswer): 
     : unidentified;
 }
 
-/** Step 3: the manifest, or a note explaining why there is none. */
+/**
+ * Step 3: the manifest read under `readRoot`, or a note — naming the file
+ * under `projectRoot`, the session's spelling — explaining why there is none.
+ */
 function readManifestForDetection(
+  readRoot: string,
   projectRoot: string,
   deps: DevServerDetectDeps,
   notes: string[],
 ): TargetManifest | undefined {
-  const manifest = readTargetManifest(projectRoot, deps);
+  const manifest = readManifestUnder(readRoot, projectRoot, deps);
   if (isErr(manifest)) {
     notes.push(`The project's package.json was not used: ${manifest.error.message}`);
     return undefined;
@@ -2057,9 +2152,14 @@ const NO_FILES_PROBE: ProjectProbe = Object.freeze({
   directoryExists: (): boolean => false,
 });
 
-/** Step 4: the package manager, by the documented precedence. */
+/**
+ * Step 4: the package manager, by the documented precedence. Every route that
+ * consults the project's files — the injected resolver and code-analysis's
+ * lockfile and workspace-root detection — is asked about `readRoot`, the
+ * directory the manifest was read from, never the spelled root.
+ */
 function resolvePackageManagerFor(
-  projectRoot: string,
+  readRoot: string,
   manifest: TargetManifest | undefined,
   deps: DevServerDetectDeps,
   logger: Logger,
@@ -2073,7 +2173,7 @@ function resolvePackageManagerFor(
   if (deps.resolvePackageManager !== undefined) {
     try {
       const resolved = deps.resolvePackageManager({
-        projectRoot,
+        projectRoot: readRoot,
         ...(manifest === undefined ? {} : { manifest }),
       });
       if (isKnownPackageManager(resolved)) {
@@ -2086,13 +2186,13 @@ function resolvePackageManagerFor(
     }
   }
 
-  if (typeof projectRoot !== 'string' || !isAbsolute(projectRoot)) {
+  if (typeof readRoot !== 'string' || !isAbsolute(readRoot)) {
     notes.push('The package manager was not detected because the project root is not absolute.');
     return UNKNOWN_PACKAGE_MANAGER;
   }
 
   try {
-    const detected = detectThroughCodeAnalysis(projectRoot, manifest, logger);
+    const detected = detectThroughCodeAnalysis(readRoot, manifest, logger);
     if (detected !== undefined) {
       return detected;
     }
@@ -2115,9 +2215,12 @@ function resolvePackageManagerFor(
  * workspace root's field and lockfiles (a membership-checked monorepo root,
  * never merely the nearest ancestor with a lockfile). Mirrors how
  * `summarizeProject` wires the same detection, so the two cannot disagree.
+ * The lockfiles and the workspace root are looked up from `readRoot`, the
+ * directory a launched child runs in, whose ancestors are the ones its
+ * package manager will search.
  */
 function detectThroughCodeAnalysis(
-  projectRoot: string,
+  readRoot: string,
   manifest: TargetManifest | undefined,
   logger: Logger,
 ): PackageManagerAnswer | undefined {
@@ -2131,7 +2234,7 @@ function detectThroughCodeAnalysis(
     return { id: declared, source: 'manifest-field' };
   }
 
-  const workspace = findWorkspaceRoot(projectRoot, { logger });
+  const workspace = findWorkspaceRoot(readRoot, { logger });
   const fallback: WorkspacePackageManagerFallback | undefined =
     workspace === undefined
       ? undefined
@@ -2140,11 +2243,7 @@ function detectThroughCodeAnalysis(
           probe: createProjectProbe(workspace.root, logger),
         };
 
-  const detected = detectPackageManager(
-    evidence,
-    createProjectProbe(projectRoot, logger),
-    fallback,
-  );
+  const detected = detectPackageManager(evidence, createProjectProbe(readRoot, logger), fallback);
   return detected === 'unknown' ? undefined : { id: detected, source: 'code-analysis' };
 }
 

@@ -28,7 +28,7 @@
  *   records at `debug`);
  * - a DevTools socket that drops mid-capture keeps its session, binding and
  *   capture, and a reconnect with the same credential carries the traffic
- *   again without a re-bind (the MV3 service-worker suspension of §0.5.5);
+ *   again without a re-bind (an MV3 service worker suspends when idle);
  * - the upgrade gate admits unauthenticated sockets only within its per-peer,
  *   global and open-socket quotas — past them an upgrade is answered 429 or
  *   503 over bare HTTP, with `Retry-After`, and no WebSocket is created — and
@@ -46,11 +46,11 @@
  *
  * {@link ROUTES} is keyed by protocol's closed `MessageType` union and checked
  * against `MESSAGE_TYPES` both by the compiler (`satisfies`) and at run time,
- * so a twenty-sixth message type fails this suite until it is classified. The
+ * so a twenty-ninth message type fails this suite until it is classified. The
  * inbound set is `MESSAGE_TYPES` filtered through that table, and the final
  * describe block fails unless every inbound type was proved dispatched by a
- * live test and every service-only push — and the reply-only `error` — was
- * proved refused when a client sends it. Each message name and client kind is
+ * live test and every service-only push — and the two sender-only replies,
+ * `error` and `service.pong` — was proved refused when a client sends it. Each message name and client kind is
  * written exactly once, in {@link T} and {@link KIND}, compile-checked against
  * protocol's vocabulary.
  *
@@ -196,6 +196,8 @@ type AssertTrue<Condition extends true> = Condition;
  */
 const T = Object.freeze({
   hello: 'client.hello',
+  ping: 'client.ping',
+  pong: 'service.pong',
   agentReady: 'agent.ready',
   agentConfig: 'agent.config',
   serverAgentConfig: 'server-agent.config',
@@ -416,6 +418,9 @@ const TO_INTERFACES: MessageRoute = Object.freeze({
  */
 const ROUTES = Object.freeze({
   [T.hello]: INBOUND_ONLY,
+  // Any authenticated connection may ping; the answer goes to it alone.
+  [T.ping]: INBOUND_ONLY,
+  [T.pong]: { inbound: false, pushedTo: 'sender', mustReach: [] },
   [T.agentReady]: INBOUND_ONLY,
   [T.agentConfig]: { inbound: false, pushedTo: [KIND.devtools], mustReach: [KIND.devtools] },
   [T.serverAgentConfig]: {
@@ -454,7 +459,7 @@ function routeOf(type: MessageType): MessageRoute {
   return ROUTES[type];
 }
 
-/** The kinds a push of `type` may reach — none for the reply-only `error`. */
+/** The kinds a push of `type` may reach — none for the sender-only `error` and `service.pong`. */
 function allowedKinds(type: MessageType): readonly ClientKind[] {
   const { pushedTo } = routeOf(type);
   return pushedTo === 'sender' ? [] : pushedTo;
@@ -463,7 +468,7 @@ function allowedKinds(type: MessageType): readonly ClientKind[] {
 /** The types the service dispatches: `MESSAGE_TYPES` filtered through {@link ROUTES}. */
 const INBOUND_TYPES: readonly MessageType[] = MESSAGE_TYPES.filter((type) => routeOf(type).inbound);
 
-/** The types the service pushes to a kind (the reply-only `error` excluded). */
+/** The types the service pushes to a kind (the sender-only replies excluded). */
 const PUSHED_TYPES: readonly MessageType[] = MESSAGE_TYPES.filter(
   (type) => allowedKinds(type).length > 0,
 );
@@ -472,6 +477,16 @@ const PUSHED_TYPES: readonly MessageType[] = MESSAGE_TYPES.filter(
 const SERVICE_ONLY_TYPES: readonly MessageType[] = PUSHED_TYPES.filter(
   (type) => !routeOf(type).inbound,
 );
+
+/**
+ * The replies the service sends only to the connection whose frame they
+ * answer, and that no client may send: the `error` refusal and the
+ * `service.pong` liveness answer.
+ */
+const REPLY_ONLY_TYPES: readonly MessageType[] = MESSAGE_TYPES.filter((type) => {
+  const route = routeOf(type);
+  return !route.inbound && route.pushedTo === 'sender';
+});
 
 /**
  * The facets an inbound type must be proved on. `tab.navigated` has two
@@ -491,6 +506,7 @@ const proved = {
   inbound: new Map<MessageType, Set<string>>(),
   refusedWhenSentByClient: new Set<MessageType>(),
   clientErrorFrameRefused: false,
+  clientPongFrameRefused: false,
 };
 
 /** Records that an inbound type's facet was proved by a live test. */
@@ -1102,8 +1118,9 @@ describe('the protocol vocabulary this suite classifies', () => {
     expect(TELEMETRY_TIERS).toContain(BROWSER_TIER);
   });
 
-  it('partitions the vocabulary into inbound types, service-only pushes and the reply-only error', () => {
-    const classified = [...INBOUND_TYPES, ...SERVICE_ONLY_TYPES, T.error];
+  it('partitions the vocabulary into inbound types, service-only pushes and the sender-only replies', () => {
+    expect(REPLY_ONLY_TYPES).toEqual([T.pong, T.error]);
+    const classified = [...INBOUND_TYPES, ...SERVICE_ONLY_TYPES, ...REPLY_ONLY_TYPES];
     expect(classified).toHaveLength(MESSAGE_TYPES.length);
     expect(new Set(classified)).toEqual(new Set(MESSAGE_TYPES));
     expect(
@@ -1111,12 +1128,14 @@ describe('the protocol vocabulary this suite classifies', () => {
     ).toEqual([]);
   });
 
-  it('dispatches exactly the nine inbound kinds, so an error frame is never inbound', () => {
-    // The eight client-sent kinds of AAP §0.4.2, plus `source.result`: the
+  it('dispatches exactly the ten inbound kinds, so neither sender-only reply is ever inbound', () => {
+    // The eight specified client-to-service kinds, plus `source.result` — the
     // editor's answer to a forwarded `source.open`, which the service relays to
-    // that `source.open`'s sender alone.
+    // that `source.open`'s sender alone — and `client.ping`, the liveness probe
+    // any authenticated connection may send.
     const specified: readonly MessageType[] = [
       T.hello,
+      T.ping,
       T.agentReady,
       T.bind,
       T.navigated,
@@ -1129,6 +1148,7 @@ describe('the protocol vocabulary this suite classifies', () => {
     expect(INBOUND_TYPES).toHaveLength(specified.length);
     expect(new Set(INBOUND_TYPES)).toEqual(new Set(specified));
     expect(INBOUND_TYPES).not.toContain(T.error);
+    expect(INBOUND_TYPES).not.toContain(T.pong);
   });
 
   it('routes nothing to the page-agent kind and requires no kind a route may not reach', () => {
@@ -1211,6 +1231,66 @@ describe('routing across a live multi-client topology', () => {
     expect(isUnauthorizedClose(refusal), agent.describe()).toBe(true);
     expect(agent.received).toEqual([]);
     await agent.close();
+  });
+
+  it('answers client.ping from the editor, the DevTools worker and the server agent with one service.pong to that sender alone', async () => {
+    const listeners = Object.freeze({
+      editor,
+      devtools,
+      idleDevtools,
+      serverAgent,
+      foreignEditor,
+      foreignServerAgent,
+    });
+    const labelled = Object.entries(listeners);
+    const senders = [
+      ['editor', editor],
+      ['devtools', devtools],
+      ['serverAgent', serverAgent],
+    ] as const;
+
+    for (const [label, sender] of senders) {
+      const from = new Map(
+        labelled.map(([, client]): [HarnessWsClient, number] => [client, client.received.length]),
+      );
+      const closes = sender.closes.length;
+
+      const ping = sender.send(T.ping, {});
+      expect(isErr(ping.result), `${label} wrote its ping`).toBe(false);
+      // Every connection has drained what the service wrote before its
+      // barrier, the pong included: frames are answered in arrival order.
+      for (const [, client] of labelled) {
+        expect(await client.flush(), client.describe()).toBe(true);
+      }
+
+      const pongs = messagesOf(sender, T.pong, from.get(sender) ?? 0);
+      expect(
+        pongs.map((pong) => pong.payload),
+        `${label}'s pong`,
+      ).toEqual([{ ref: ping.id }]);
+      // Session-less, so it names nothing about any session.
+      expect(Object.hasOwn(pongs[0] ?? {}, 'sessionId'), `${label}'s pong`).toBe(false);
+      expect(sender.errorsFor(ping.id), `${label}'s ping was refused`).toEqual([]);
+
+      // The pong is the ping's whole effect: the sender heard nothing else, and
+      // no other connection — the unbound tab, the other project's editor and
+      // server agent included — heard anything at all.
+      expect(
+        Object.fromEntries(
+          labelled.map(([other, client]) => [
+            other,
+            client.received.slice(from.get(client) ?? 0).map((message) => message.type),
+          ]),
+        ),
+        `after ${label}'s ping`,
+      ).toEqual(
+        Object.fromEntries(
+          labelled.map(([other, client]) => [other, client === sender ? [T.pong] : []]),
+        ),
+      );
+      expect(sender.closes, sender.describe()).toHaveLength(closes);
+    }
+    proveInbound(T.ping);
   });
 
   it('announces session.create to the project’s editor, which the hello registered', async () => {
@@ -1951,6 +2031,75 @@ describe('malformed input on a live connection', () => {
     expect(devtools.closes).toHaveLength(closes);
     expectNoErrors(editor);
     proved.clientErrorFrameRefused = true;
+  });
+
+  it('refuses a service.pong a client sends back with one error naming it, on a connection that stays open', async () => {
+    // A pong the service really sent this connection, echoed under a fresh id:
+    // valid by construction, so only its direction is wrong.
+    const pongFrom = devtools.received.length;
+    const ping = devtools.send(T.ping, {});
+    expect(await devtools.flush(), devtools.describe()).toBe(true);
+    const [pong] = messagesOf(devtools, T.pong, pongFrom);
+    expect(pong?.payload).toEqual({ ref: ping.id });
+    const echoed = createEnvelope(T.pong, pong?.payload ?? { ref: ping.id });
+    const from = devtools.received.length;
+    const closes = devtools.closes.length;
+
+    devtools.sendRaw(encodeMessage(echoed));
+    expect(await devtools.flush(), devtools.describe()).toBe(true);
+
+    const replies: readonly ErrorPayload[] = messagesOf(devtools, T.error, from).map(
+      (message) => message.payload,
+    );
+    expect(replies).toHaveLength(1);
+    expect(replies[0]?.code).toBe(CODE.invalidMessage);
+    expect(replies[0]?.ref).toBe(echoed.id);
+    // Refused, not answered: no pong answers a pong, and nothing cascades.
+    expect(messagesOf(devtools, T.pong, from)).toEqual([]);
+    expect(await devtools.flush(), devtools.describe()).toBe(true);
+    expect(messagesOf(devtools, T.error, from)).toHaveLength(1);
+    expect(devtools.closes).toHaveLength(closes);
+    expectNoErrors(editor);
+    proved.clientPongFrameRefused = true;
+  });
+
+  it('refuses a client.ping whose id is too long to be a pong ref with one error under a minted ref, and answers the next ping', async () => {
+    const h = harness();
+    const from = devtools.received.length;
+    const closes = devtools.closes.length;
+    const logFrom = h.logger.records.length;
+    // Inside the envelope's own id bound, beyond the one a pong's `ref` has.
+    const overBound = createEnvelope(
+      T.ping,
+      {},
+      { id: `msg_${'x'.repeat(OVER_REF_BOUND_ID_LENGTH)}` },
+    );
+
+    devtools.sendRaw(encodeMessage(overBound));
+    expect(await devtools.flush(), devtools.describe()).toBe(true);
+
+    const replies: readonly ErrorPayload[] = messagesOf(devtools, T.error, from).map(
+      (message) => message.payload,
+    );
+    expect(replies.map((reply) => reply.code)).toEqual([CODE.invalidMessage]);
+    const ref = replies[0]?.ref ?? '';
+    // The id cannot be echoed, so the reply names the service's own record of
+    // the refusal instead — and no pong was sent that its sender would refuse.
+    expect(ref).toMatch(MINTED_MESSAGE_ID);
+    expect(ref).not.toBe(overBound.id);
+    expect(messagesOf(devtools, T.pong, from)).toEqual([]);
+    expect(
+      wsRecordsFor(h, ref, logFrom).map((record) => [record.level, record.fields['code']]),
+    ).toEqual([['debug', CODE.invalidMessage]]);
+
+    // The connection is still served, and a ping under a protocol id is answered.
+    const ping = devtools.send(T.ping, {});
+    expect(await devtools.flush(), devtools.describe()).toBe(true);
+    expect(messagesOf(devtools, T.pong, from).map((pong) => pong.payload)).toEqual([
+      { ref: ping.id },
+    ]);
+    expect(devtools.errorsFor(ping.id)).toEqual([]);
+    expect(devtools.closes).toHaveLength(closes);
   });
 
   it('files concurrent same-code failures under distinct refs, each shared by its reply and its log record', async () => {
@@ -3423,5 +3572,9 @@ describe('coverage of the protocol surface', () => {
 
   it('proved a client-sent error frame is refused with an error that names it', () => {
     expect(proved.clientErrorFrameRefused).toBe(true);
+  });
+
+  it('proved a client-sent service.pong is refused with an error that names it', () => {
+    expect(proved.clientPongFrameRefused).toBe(true);
   });
 });

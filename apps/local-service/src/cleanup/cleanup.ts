@@ -1359,12 +1359,13 @@ function combinedSignal(...signals: readonly (AbortSignal | undefined)[]): Abort
  * *what* it found, and so never make a stored report stale.
  *
  * The engine stamps `detectedAt` afresh on every pass that re-reports a
- * retained conflict (AAP §0.5.1: "retained, backup kept, re-reported"), so
- * comparing it would rewrite every conflicted session on every start. The
- * stored stamp stays truthful — it is when this unchanged conflict was first
- * detected — and as soon as any other field changes, the new report is written
- * with its own stamp. Typed against the schema's keys, so renaming the field
- * there fails to compile here instead of silently comparing it again.
+ * retained conflict (a conflict record keeps its backup and is re-reported on
+ * every pass until the developer resolves it), so comparing it would rewrite
+ * every conflicted session on every start. The stored stamp stays truthful —
+ * it is when this unchanged conflict was first detected — and as soon as any
+ * other field changes, the new report is written with its own stamp. Typed
+ * against the schema's keys, so renaming the field there fails to compile here
+ * instead of silently comparing it again.
  */
 const PASS_CLOCK_CONFLICT_FIELDS: ReadonlySet<string> = new Set<keyof ModificationConflict>([
   'detectedAt',
@@ -1446,7 +1447,7 @@ function sameJsonValue(left: unknown, right: unknown): boolean {
  * says when a pass ran, and every pass has a new one. A record id alone is not
  * enough — the same record re-reported as `backup-missing` after reading
  * `content-changed`, or with a new digest after a second edit, is a different
- * verdict the session must carry (AAP §0.5.1).
+ * verdict the session must carry.
  */
 function cleanupUnchanged(stored: SessionRecord['cleanup'], next: SessionCleanupOutcome): boolean {
   if (stored.status !== next.status || stored.conflicts.length !== next.conflicts.length) {

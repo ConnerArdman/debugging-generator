@@ -30,7 +30,7 @@
  * | Message | Effect |
  * | --- | --- |
  * | `session.bind` | Only a `devtools` principal binds. The payload's `origin` must be the origin of its `url`. Without `sessionId` the tab binds to the most recently updated non-ended session whose dev-server origin equals the tab's origin; with `sessionId` it binds to that session only if its dev-server origin matches — a mismatch is a refusal, never a silent bind. |
- * | `tab.navigated` | Same origin keeps the binding, records the new URL and re-arms the agent the new document started dormant — reporting `Page reloaded during capture` when a capture is open; a different origin drops the binding. A navigation of an unbound tab is a no-op. |
+ * | `tab.navigated` | Every accepted navigation — kept, dropped, or of a tab not yet bound — is first recorded with the injected {@link NavigationRecorder}, so readiness can tell a page-agent report a reload or a same-URL load left behind. Same origin then keeps the binding, records the new URL and re-arms the agent the new document started dormant — reporting `Page reloaded during capture` when a capture is open; a different origin drops the binding. A navigation of an unbound tab changes no binding. |
  * | `session.unbind` | Drops the binding. Idempotent: an unbound tab is a no-op. It never ends the session, cancels a capture or disarms instrumentation. |
  *
  * **Cardinality** (AAP §0.2.3): one tab binds to at most one session and one
@@ -169,6 +169,7 @@
  *   reopener,
  *   arming: instrumentationService,
  *   progress: sessionProgress,
+ *   navigations: agentReadyLedger,
  *   logger,
  * });
  * // inside ws.ts's exhaustive switch over the parsed message type:
@@ -436,6 +437,31 @@ const UNEXPECTED_FAILURE_HINT =
 export type AgentArmingPort = Pick<InstrumentationService, 'armCapture'>;
 
 /**
+ * Where the route records every committed navigation it accepts: a
+ * `tab.navigated` from a DevTools principal, well formed, for a tab that is
+ * unbound or bound by that principal's own credential — the rule `../ws.ts`
+ * applies before it accepts an `agent.ready` for the tab.
+ *
+ * Satisfied structurally by `../../main.ts`'s agent-ready ledger, which
+ * answers the readiness gate's `latestNavigationAt` from these records
+ * (`../../instrumentation/readiness.ts`). A navigation is the one sign of a
+ * reload or of a load of the same URL, which the binding's URL cannot show:
+ * without it, readiness would trust the page-agent report of the document the
+ * tab just left, when after a reload mid-session it must rest on the report of
+ * the bound tab's current document.
+ *
+ * Carries the tab id only — never the URL, which is page-shaped text.
+ */
+export interface NavigationRecorder {
+  /**
+   * Records that `tabId` committed a navigation now. Synchronous, and must
+   * not throw; the route contains a throw regardless, so a recorder fault
+   * never changes what the navigation does to the binding.
+   */
+  recordNavigation(tabId: number): void;
+}
+
+/**
  * Everything {@link createBindingRoutes} is given; all of it is injected and
  * each field is narrowed to the members this module calls.
  */
@@ -481,6 +507,13 @@ export interface BindingRoutesDeps {
    * emitter in production; omitted, the reload is logged only.
    */
   readonly progress?: Pick<SessionProgress, 'emit'> | undefined;
+  /**
+   * Where every accepted `tab.navigated` is recorded before the binding is
+   * kept or dropped; the service's agent-ready ledger in production. Required,
+   * so a composition that forgets it does not compile rather than leaving
+   * readiness blind to reloads.
+   */
+  readonly navigations: NavigationRecorder;
   /** The service logger; bound to `subsystem: "binding"`. Defaults to silence. */
   readonly logger?: Logger | undefined;
   /** The clock bindings and frames are stamped with, in epoch milliseconds. Defaults to `nowEpochMs`. */
@@ -542,7 +575,7 @@ export interface SessionBindOutcome {
 
 /** What a `tab.navigated` did. */
 export type TabNavigatedOutcome =
-  /** The tab is not bound: nothing to do. */
+  /** The tab is not bound: no binding changes (the navigation itself is still recorded). */
   | { readonly kind: 'ignored' }
   /** Same origin: the binding was kept, its URL recorded and the agent re-armed. */
   | {
@@ -584,7 +617,8 @@ export interface BindingRoutes {
   ): Promise<Result<SessionBindOutcome, DebuggenError>>;
 
   /**
-   * `tab.navigated`: keep and re-arm on the same origin, drop on another.
+   * `tab.navigated`: record the navigation with the {@link NavigationRecorder},
+   * then keep and re-arm on the same origin, drop on another.
    *
    * @returns What was done; `UNAUTHORIZED` for a non-DevTools principal;
    * `TAB_NOT_BOUND` when the tab is bound by another credential;
@@ -914,7 +948,7 @@ function pairOfRow(row: StoredTabBinding): { readonly tabId: number; readonly se
 /**
  * Whether a session can no longer hold a binding: its record is gone
  * (purged by retention) or its status is terminal by the state machine's rule
- * (`ended`). AAP §0.2.3: an ended session is no recipient.
+ * (`ended`). An ended session is no recipient of tab-bound messages.
  */
 function isClosedSession(record: SessionRecord | undefined): boolean {
   return record === undefined || isTerminalSessionStatus(record.status);
@@ -947,11 +981,12 @@ type DropRestoration = 'restored' | 'session-closed';
  * Constructing it has no side effect: no timer, no socket, no store access.
  *
  * @param deps The registry, the repository, the manager, the reopener, the
- * arming port and the optional logger and clock.
+ * arming port, the navigation recorder, and the optional progress port,
+ * logger and clock.
  * @returns The three handlers `../ws.ts` dispatches to.
  */
 export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
-  const { clients, sessions, manager, reopener, arming } = deps;
+  const { clients, sessions, manager, reopener, arming, navigations } = deps;
   const clock = deps.now ?? nowEpochMs;
   const log = subsystemLogger(deps.logger ?? noopLogger, LOG_SUBSYSTEM);
 
@@ -1663,17 +1698,17 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
    * the same transaction (it found none: the drop had already deleted it). The
    * binding queue and the manager's end do not serialize with each other, so
    * restoring either store then would leave an ended session durably and
-   * live-bound after `session.end` answered success (AAP §0.2.3: an ended
-   * session is no recipient). The session is therefore read first: ended or
-   * vanished, neither the live binding nor the row is restored and
-   * `session-closed` is answered — the end's outcome stands. Otherwise the
-   * live binding is re-established — under the credential that made it, with
-   * its URL and bound-at stamp — and then the durable row exactly as it was
-   * read before the drop (none is written when the tab had none), through
-   * {@link restoreRow}, whose transaction checks its session again. The status
-   * read and both restorations run in one synchronous turn: the service is
-   * single-threaded and one process owns the store, so no end can commit
-   * between the check and the writes.
+   * live-bound after `session.end` answered success, although an ended
+   * session is no recipient of tab-bound messages. The session is therefore
+   * read first: ended or vanished, neither the live binding nor the row is
+   * restored and `session-closed` is answered — the end's outcome stands.
+   * Otherwise the live binding is re-established — under the credential that
+   * made it, with its URL and bound-at stamp — and then the durable row
+   * exactly as it was read before the drop (none is written when the tab had
+   * none), through {@link restoreRow}, whose transaction checks its session
+   * again. The status read and both restorations run in one synchronous turn:
+   * the service is single-threaded and one process owns the store, so no end
+   * can commit between the check and the writes.
    *
    * When the status read itself fails, the live binding is still restored —
    * `session.end` removes only the durable row, never a live binding, so this
@@ -1953,6 +1988,26 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     return ok({ kind: 'kept', announced: announced.value, rearm });
   }
 
+  /**
+   * Tells the {@link NavigationRecorder} that `tabId` committed a navigation.
+   *
+   * Called once the frame is accepted and before either store is touched,
+   * whatever the stores then make of it: the tab left its document even when
+   * the binding cannot follow. A recorder that throws is logged by the
+   * thrown value's name alone — never its message, never a URL — and the
+   * navigation proceeds; readiness then merely lacks this one sign.
+   */
+  function recordCommittedNavigation(tabId: number): void {
+    try {
+      navigations.recordNavigation(tabId);
+    } catch (thrown) {
+      log.warn('The navigation could not be recorded for readiness', {
+        tabId,
+        errorName: thrownName(thrown),
+      });
+    }
+  }
+
   async function navigated(
     payload: TabNavigatedPayload,
     connection: BindingConnection,
@@ -1971,6 +2026,10 @@ export function createBindingRoutes(deps: BindingRoutesDeps): BindingRoutes {
     if (isErr(authorized)) {
       return authorized;
     }
+    // Accepted: the tab is unbound or bound by this credential. A refused frame
+    // — another role, a malformed payload, another credential's tab — records
+    // nothing, so it cannot make readiness distrust a report it has no say in.
+    recordCommittedNavigation(tabId);
     const binding = authorized.value;
     if (binding === undefined) {
       log.debug('A navigation of an unbound tab was ignored', { tabId });

@@ -236,26 +236,44 @@
  * writes `aria-sort` on the cell and nothing about sorting into a class: the state has exactly one
  * representation.
  *
- * Six component-scoped custom properties carry the values only this module can know - computed
+ * Eight component-scoped custom properties carry the values only this module can know - computed
  * geometry, which `../styles/base.css` sanctions inline for exactly this purpose - and they are
  * the only thing any `style` attribute here contains:
  *
  *   --dgc-columns         the grid track template, consumed by each row as
  *                         `grid-template-columns: var(--dgc-columns, …)`. Every track is one of
- *                         {@link DATA_TABLE_COLUMN_TRACKS}, built from `--dg-column-min-*` and
- *                         `--dg-column-share-*` tokens only. The header row and each data row are
- *                         SEPARATE grid containers - a positioned row cannot share a parent's
- *                         tracks - so a track only lines a header up with its column because every
- *                         role track resolves to the same width in every row; see
+ *                         {@link DATA_TABLE_COLUMN_TRACKS}, built from `--dg-column-min-*`,
+ *                         `--dg-column-share-*` and `--dg-column-yield` tokens and the three
+ *                         properties below only. The header row and each data row are SEPARATE
+ *                         grid containers - a positioned row cannot share a parent's tracks - so
+ *                         a track only lines a header up with its column because every role
+ *                         track resolves to the same width in every row; see
  *                         {@link DataTableColumn.width}.
- *   --dgc-min-inline      the sum of the tracks' MINIMUMS
+ *   --dgc-min-inline      the sum of the tracks' guaranteed MINIMUMS
+ *                         (`calc(calc(var(--dg-column-min-name) * var(--dg-column-yield)) +
+ *                         var(--dg-column-min-quantity) + …)`),
+ *   --dgc-readable-inline the sum of the tracks' readable FLOORS
  *                         (`calc(var(--dg-column-min-name) + var(--dg-column-min-quantity) + …)`),
- *                         and
- *   --dgc-column-count    the number of tracks, which together give the grid its floor:
- *                         `min-inline-size: max(100%, <minimums> + <gaps> + <row edge>)`. A table
- *                         narrower than that floor keeps every column at its readable minimum and
- *                         SCROLLS HORIZONTALLY inside its viewport, instead of squeezing tracks to
- *                         nothing and painting one cell's content over the next.
+ *                         written only when a truncating column makes it differ from the first,
+ *   --dgc-yield-count     the number of truncating tracks, written under the same condition, and
+ *   --dgc-column-count    the number of tracks. Together they give the grid its floor and each
+ *                         truncating track its minimum, under one rule: a TRUNCATING column
+ *                         (`name`, `text`) gives up width only when that makes the whole table
+ *                         fit. A panel wide enough for every readable floor lays the table out
+ *                         at those floors. A narrower panel narrows its names and free text -
+ *                         each by an equal share of the shortfall, never below
+ *                         `--dg-column-yield` of its floor - just far enough for the table to
+ *                         fit, while every compact column (a figure, a status, a label, a row's
+ *                         action control) keeps its full floor and stays in view. Below the
+ *                         width at which even the yielded minimums fit, narrowing no longer
+ *                         saves the scroll, so the columns take the yield back at once -
+ *                         within a fraction of a pixel, `--dg-column-yield-return-scale` -
+ *                         and the table SCROLLS HORIZONTALLY inside its viewport with every
+ *                         column at its readable floor, exactly as a table with no truncating
+ *                         column does - never squeezing tracks to nothing and painting one
+ *                         cell's content over the next. `../styles/components.css`
+ *                         states the grid half of the rule; {@link DATA_TABLE_COLUMN_TRACKS}
+ *                         the track half.
  *   --dgc-virtual-total   the canvas height as a UNITLESS number, consumed as
  *                         `min-block-size: calc(var(--dgc-virtual-total, 0) * var(--dg-pixel-unit))`
  *   --dgc-virtual-start   a row's offset as a UNITLESS number, consumed as
@@ -328,8 +346,10 @@ import { Text } from './Text';
  *   quantity   a formatted measurement with its unit: a duration, a time, an offset, a byte size
  *   status     a short status word or badge, a tier, or one compact action control
  *   label      a short categorical label: a kind chip, an attribute key, a system or hook name
- *   name       an identifier: a component, operation or file name, a source-location chip
- *   text       long free text that truncates: a statement, a URL, a value preview, a caller list
+ *   name       an identifier: a component, operation or file name, a source-location chip.
+ *              TRUNCATING: it yields width first in a narrow panel (see below)
+ *   text       long free text that truncates: a statement, a URL, a value preview, a caller list.
+ *              TRUNCATING, like `name`
  *   standard   the role of a column declared with none: room for a short label or a figure
  *
  * Each role resolves, through {@link DATA_TABLE_COLUMN_TRACKS}, to a grid track built from the
@@ -337,6 +357,25 @@ import { Text } from './Text';
  * declares for it (`../tokens/tokens.ts`). That is what makes column geometry a design-system
  * decision rather than a per-component one: both extension surfaces and every visualization table
  * agree on how wide a duration or a path column is, and one token edit re-densifies all of them.
+ *
+ * The floor is the width at which a role's content reads in full. How a column behaves in a panel
+ * narrower than the sum of its table's floors depends on whether its content survives being cut:
+ *
+ *   - `name` and `text` are TRUNCATING roles. Their content ellipsizes or wraps and stays
+ *     identifiable, so each can give up width, down to a guaranteed minimum of
+ *     `--dg-column-yield` of its floor.
+ *   - Every other role is COMPACT: a figure, a status, a label or an action control does not
+ *     survive being cut, so the column keeps its full floor.
+ *
+ * A truncating column gives up width only when that makes the table fit its panel, and only as
+ * much as the fit needs: the shortfall is shared equally by the truncating columns, and one that
+ * reaches its minimum leaves the rest of the shortfall to the others. A panel just too narrow for
+ * every floor therefore truncates its names and free text while its figures, statuses and row
+ * controls stay in view, and does not scroll. A panel so narrow that even the minimums overflow
+ * gains nothing from truncating, so its columns keep their readable floors and the table
+ * scrolls, exactly as a table without truncating columns does. A table with three or more
+ * truncating columns of unequal floors can, in the narrowest part of the range in which it fits,
+ * overflow by a fraction of one floor's yield and scroll by that much.
  */
 export type DataTableColumnWidth =
   'ordinal' | 'count' | 'quantity' | 'status' | 'label' | 'name' | 'text' | 'standard';
@@ -346,34 +385,130 @@ export type DataTableColumnWidth =
  */
 export interface DataTableColumnTrack {
   /**
-   * The CSS grid track the column takes in every row: `minmax(<floor>, <share>)`, or the bare
-   * floor for a fixed role. Token references only - it carries no number of its own.
+   * The CSS grid track the column takes in every row. A compact role takes
+   * `minmax(<floor>, <share>)`, or the bare floor for a fixed role. A truncating role takes
+   * `minmax(<applied minimum>, <share>)`, where the applied minimum is
+   * `clamp(<minimum>, <floor> - <this column's part of the shortfall>, <floor>)`: the shortfall
+   * is the readable floors plus the gaps between tracks less the row's own width (`100%` inside a
+   * track is the row's content box), read from `--dgc-readable-inline`, `--dgc-min-inline`,
+   * `--dgc-yield-count` and `--dgc-column-count`. Token and property references inside math
+   * frames only - it carries no number of its own.
    */
   readonly track: string;
 
   /**
-   * The track's guaranteed MINIMUM, a `var(--dg-column-min-*)` reference. The table sums every
-   * column's minimum into its own floor (`--dgc-min-inline`), which is what makes a surface
-   * narrower than the columns need scroll horizontally instead of squeezing a column to nothing.
+   * The column's readable FLOOR, `var(--dg-column-min-<role>)`: the width at which its content
+   * reads in full. The table sums every floor into `--dgc-readable-inline`.
+   */
+  readonly floor: string;
+
+  /**
+   * The track's guaranteed MINIMUM, as token references: the narrowest it ever becomes. For a
+   * compact role it is the floor itself; for a truncating role (`name`, `text`) it is that floor
+   * scaled by the yield, `calc(var(--dg-column-min-<role>) * var(--dg-column-yield))`.
+   *
+   * The table sums every column's minimum into `--dgc-min-inline`, the width below which no
+   * narrowing can make it fit - see this module's header for how the grid uses the two sums.
    */
   readonly minimum: string;
+
+  /**
+   * Whether the column is TRUNCATING - it may give up width, down to its minimum, so the table
+   * fits its panel - or COMPACT, holding its floor at every width.
+   */
+  readonly yields: boolean;
 }
+
+/**
+ * How a role's column behaves in a panel too narrow for every column's readable floor.
+ *
+ *   holds    the column never narrows below its readable floor: a figure, a status, a label or an
+ *            action control, none of which survives being cut
+ *   yields   the column may narrow to `--dg-column-yield` of its readable floor when that makes the
+ *            table fit: a name or free text, which ellipsizes or wraps and stays identifiable, so
+ *            it gives up width while the compact columns beside it keep theirs
+ */
+type FloorBehaviour = 'holds' | 'yields';
+
+/**
+ * The three sums a truncating track reads from its grid, which carries them as component-scoped
+ * properties (see this module's header). Rows inherit them, so every row resolves the same track.
+ */
+const READABLE_INLINE = 'var(--dgc-readable-inline)';
+const MINIMUM_INLINE = 'var(--dgc-min-inline)';
+const YIELD_COUNT = 'var(--dgc-yield-count)';
+const COLUMN_COUNT = 'var(--dgc-column-count)';
+
+/**
+ * How far the readable floors overrun the row: the floors, plus one `--dg-space-2` gap between
+ * each pair of tracks (the row's `gap` in `../styles/components.css`), less the row's content box.
+ * Inside a track, `100%` - `--dg-size-full` - is that content box, so the expression is negative
+ * whenever every readable floor fits.
+ */
+const SHORTFALL = `(${READABLE_INLINE} + ${COLUMN_COUNT} * ${cssVar('space2')} - ${cssVar(
+  'space2',
+)} - ${cssVar('sizeFull')})`;
+
+/**
+ * What all the truncating columns together can give up: the readable floors less the minimums.
+ * Compact columns contribute nothing, since their minimum is their floor.
+ */
+const YIELD_CAPACITY = `(${READABLE_INLINE} - ${MINIMUM_INLINE})`;
 
 /**
  * One role's track, built from its floor token and, for a role that shares spare width, its share
  * token.
  *
- * @param minimum The `columnMin*` token that is the role's readable floor.
+ * A yielding role's minimum scales the floor by the `columnYield` token inside a `calc()`, so the
+ * yielded width stays a design-system value: no factor is written here, and one token edit that
+ * changes the yield changes every truncating column in the product at once.
+ *
+ * A yielding role's track minimum is the floor less this column's part of the shortfall, clamped
+ * between its minimum and its floor. Its part is an equal share of the shortfall or, when the
+ * other truncating columns cannot absorb theirs, whatever of the shortfall they leave:
+ * `max(shortfall / count, shortfall - (capacity - own capacity))`. With a negative shortfall (every
+ * floor fits) the clamp returns the floor, and the track is the compact form's.
+ *
+ * @param floorToken The `columnMin*` token that is the role's readable floor.
  * @param share The `columnShare*` token that is its share of spare width, or `undefined` for a
  *   fixed role that takes its floor and nothing more.
- * @returns The role's track and minimum, as token references.
+ * @param behaviour Whether the column keeps its full floor (`holds`) or may narrow to its yielded
+ *   minimum (`yields`) when that makes the table fit.
+ * @returns The role's track, floor and minimum, as token references.
+ *
+ * @example
+ * roleTrack('columnMinStatus', 'columnShareCompact', 'holds');
+ * // floor = minimum: 'var(--dg-column-min-status)'
+ * // track:           'minmax(var(--dg-column-min-status), var(--dg-column-share-compact))'
+ * roleTrack('columnMinName', 'columnShareWide', 'yields');
+ * // minimum: 'calc(var(--dg-column-min-name) * var(--dg-column-yield))'
+ * // track:   'minmax(clamp(<minimum>, <floor> - max(…), <floor>), var(--dg-column-share-wide))'
  */
-function roleTrack(minimum: TokenKey, share: TokenKey | undefined): DataTableColumnTrack {
-  const floor = cssVar(minimum);
+function roleTrack(
+  floorToken: TokenKey,
+  share: TokenKey | undefined,
+  behaviour: FloorBehaviour,
+): DataTableColumnTrack {
+  const floor = cssVar(floorToken);
+
+  if (behaviour === 'holds') {
+    return {
+      track: share === undefined ? floor : `minmax(${floor}, ${cssVar(share)})`,
+      floor,
+      minimum: floor,
+      yields: false,
+    };
+  }
+
+  const minimum = `calc(${floor} * ${cssVar('columnYield')})`;
+  const part = `max(${SHORTFALL} / ${YIELD_COUNT}, ${SHORTFALL} - ${YIELD_CAPACITY} + ${floor} - ${minimum})`;
+  const applied = `clamp(${minimum}, ${floor} - ${part}, ${floor})`;
 
   return {
-    track: share === undefined ? floor : `minmax(${floor}, ${cssVar(share)})`,
-    minimum: floor,
+    track: share === undefined ? applied : `minmax(${applied}, ${cssVar(share)})`,
+    floor,
+    minimum,
+    yields: true,
   };
 }
 
@@ -383,19 +518,22 @@ function roleTrack(minimum: TokenKey, share: TokenKey | undefined): DataTableCol
  *
  * Figures (counts, quantities, statuses) take the compact share of spare width, labels and unsized
  * columns an equal part, names twice that and free text the most, so a wide panel spends its room
- * where content is longest while a narrow dock keeps every column at its readable floor and scrolls.
+ * where content is longest. In a dock just too narrow for every floor, names and free text narrow
+ * - never below their yielded minimum - exactly as far as the table needs to fit, while every
+ * figure, status, label and row control keeps its readable floor. When even the minimums would
+ * not fit, every column keeps its floor and the table scrolls.
  */
 export const DATA_TABLE_COLUMN_TRACKS: Readonly<
   Record<DataTableColumnWidth, DataTableColumnTrack>
 > = {
-  ordinal: roleTrack('columnMinOrdinal', undefined),
-  count: roleTrack('columnMinCount', 'columnShareCompact'),
-  quantity: roleTrack('columnMinQuantity', 'columnShareCompact'),
-  status: roleTrack('columnMinStatus', 'columnShareCompact'),
-  label: roleTrack('columnMinLabel', 'columnShareDefault'),
-  name: roleTrack('columnMinName', 'columnShareWide'),
-  text: roleTrack('columnMinText', 'columnShareWidest'),
-  standard: roleTrack('columnMinStandard', 'columnShareDefault'),
+  ordinal: roleTrack('columnMinOrdinal', undefined, 'holds'),
+  count: roleTrack('columnMinCount', 'columnShareCompact', 'holds'),
+  quantity: roleTrack('columnMinQuantity', 'columnShareCompact', 'holds'),
+  status: roleTrack('columnMinStatus', 'columnShareCompact', 'holds'),
+  label: roleTrack('columnMinLabel', 'columnShareDefault', 'holds'),
+  name: roleTrack('columnMinName', 'columnShareWide', 'yields'),
+  text: roleTrack('columnMinText', 'columnShareWidest', 'yields'),
+  standard: roleTrack('columnMinStandard', 'columnShareDefault', 'holds'),
 };
 
 /**
@@ -523,14 +661,19 @@ export interface DataTableColumn<Row> {
    * number chosen here would be a visual value outside the token table, and every visual value
    * resolves to a `--dg-*` token. Choose the role by the column's CONTENT - the smallest role whose
    * floor keeps that content readable - and the design system decides how wide that is,
-   * identically on every surface.
+   * identically on every surface. Content that must never be cut - a figure, a status, a row's
+   * action control - takes a compact role, never `name` or `text`: only those two truncating roles
+   * yield width in a narrow panel.
    *
-   * Every role has a non-zero floor, and the table sums the floors into its own minimum width
-   * (`--dgc-min-inline`, see this module's header), so a surface narrower than the sum scrolls
-   * horizontally with every column still readable instead of painting one cell over the next. And
-   * every role track is a floor and a ratio, which resolves identically in every row - the header
-   * row and each data row are separate grid containers, so an intrinsic track sized from one row's
-   * own content would stop sitting under its header.
+   * Every role has a non-zero floor, and the table sums the floors and the minimums into its own
+   * width (`--dgc-readable-inline`, `--dgc-min-inline`, see this module's header). A surface just
+   * too narrow for the readable floors narrows its `name` and `text` columns, never below
+   * `--dg-column-yield` of their floor, exactly as far as the table needs to fit, while every other
+   * column keeps its floor; a surface too narrow even for the minimums keeps every floor and
+   * scrolls horizontally, instead of painting one cell over the next. And every role track is a
+   * minimum and a ratio, which resolves identically in every row - the header row and each data
+   * row are separate grid containers, so an intrinsic track sized from one row's own content would
+   * stop sitting under its header.
    */
   width?: DataTableColumnWidth | undefined;
 
@@ -913,14 +1056,15 @@ const DEFAULT_OVERSCAN_ROWS = 8;
  *
  *   It comfortably exceeds the window the virtualizer settles on, so the bound never shows the
  *   reader fewer rows than the viewport can hold. `../styles/components.css` caps this table's
- *   scroll container at `max-block-size: calc(var(--dg-space-7) * 18)`, which resolves to 432 CSS
+ *   scroll container at `max-block-size: var(--dg-scroll-cap-lg)`, which resolves to 432 CSS
  *   pixels; at {@link DEFAULT_ESTIMATED_ROW_HEIGHT} that is about thirteen rows, and
  *   {@link DEFAULT_OVERSCAN_ROWS} beyond each edge brings the settled window to roughly thirty.
  *
  * Expressed as a row count rather than as a second pixel figure on purpose: the JSDoc on
  * {@link DEFAULT_ESTIMATED_ROW_HEIGHT} states that it is the only numeric layout hint in this
- * package, and that has to stay true. The 432-pixel cap named above lives in the stylesheet, where
- * the token system can see it, and is read here only as the reasoning behind a count.
+ * package, and that has to stay true. The 432-pixel cap named above lives in the token table
+ * (`scrollCapLg`), under every check the token suite applies, and is read here only as the reasoning
+ * behind a count.
  */
 const DEFAULT_UNMEASURED_WINDOW_ROWS = AUTO_VIRTUALIZE_ROW_THRESHOLD;
 
@@ -1813,12 +1957,16 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
     };
   }, [rows, rowKey, expandedRowKeys, canExpand]);
 
-  // The grid track template, inherited by every row through `--dgc-columns`, and the floor the grid
-  // may not shrink below, `--dgc-min-inline`: the sum of every column's floor. Both are token
-  // references only: a column's `width` is a semantic role, never a CSS value, because every
-  // visual value resolves to a `--dg-*` token.
-  const { columnTemplate, minimumInlineSize } = useMemo(() => {
+  // The grid track template, inherited by every row through `--dgc-columns`, and the sums the grid
+  // and its truncating tracks size themselves by: `--dgc-min-inline`, every column's guaranteed
+  // minimum (the yielded floor of a `name` or `text` column, the full floor of every other), and -
+  // only when a truncating column makes the two differ - `--dgc-readable-inline`, every column's
+  // readable floor, with `--dgc-yield-count`, the number of truncating columns. All are token
+  // references only: a column's `width` is a semantic role, never a CSS value, because every visual
+  // value resolves to a `--dg-*` token.
+  const { columnTemplate, minimumInlineSize, readableInlineSize, yieldCount } = useMemo(() => {
     const tracks = columns.map((column) => resolveColumnTrack(column.width));
+    const yielding = tracks.filter((entry) => entry.yields).length;
 
     return {
       columnTemplate: tracks.map((entry) => entry.track).join(' '),
@@ -1826,6 +1974,9 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
         tracks.length === 0
           ? undefined
           : `calc(${tracks.map((entry) => entry.minimum).join(' + ')})`,
+      readableInlineSize:
+        yielding === 0 ? undefined : `calc(${tracks.map((entry) => entry.floor).join(' + ')})`,
+      yieldCount: yielding,
     };
   }, [columns]);
 
@@ -2522,12 +2673,20 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   }, [isVirtualized, selectedIndex, selectedRowKey, virtualizer]);
 
   // The grid carries the track template every row inherits and, when any track states a minimum,
-  // the floor that turns a too-narrow surface into a horizontal scroll (`../styles/components.css`
-  // adds the gaps between tracks and the row's inline-start edge to it).
+  // the sums that decide whether a too-narrow surface truncates to fit or scrolls
+  // (`../styles/components.css` adds the gaps between tracks and the row's inline-start edge to
+  // them). The readable sum and the truncating count are written only when a truncating column
+  // exists: without one the two sums are equal, and the stylesheet falls back to the one it has.
   const gridStyle: CssVariableStyle = {
     '--dgc-columns': columnTemplate,
     '--dgc-column-count': String(columnCount),
     ...(minimumInlineSize === undefined ? {} : { '--dgc-min-inline': minimumInlineSize }),
+    ...(readableInlineSize === undefined
+      ? {}
+      : {
+          '--dgc-readable-inline': readableInlineSize,
+          '--dgc-yield-count': String(yieldCount),
+        }),
   };
 
   // The canvas carries the scroll range of the WHOLE result, and it has to do so from the first

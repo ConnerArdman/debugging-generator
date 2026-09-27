@@ -23,7 +23,7 @@
  *   `client/ws-client.ts` reconnects with backoff and a receiver needs a stable
  *   handle to correlate a reply with a request (`error.ref`) or to notice a
  *   duplicate.
- * - `type` — the discriminant, one of the twenty-six names `./messages/index.ts`
+ * - `type` — the discriminant, one of the twenty-eight names `./messages/index.ts`
  *   declares in `MESSAGE_TYPES`.
  * - `sessionId` — the service's **routing** key, present when the frame belongs
  *   to a session. Optional because a handshake (`client.hello`) and a tab-level
@@ -56,7 +56,7 @@
  * `MESSAGE_PAYLOAD_SCHEMAS`. Nothing here lists a message by hand, so a message
  * added to `messages/**` cannot be forgotten in the union: it arrives through
  * the registry, and `messages/index.ts` proves at compile time that the registry
- * and the tuple name the same twenty-six types.
+ * and the tuple name the same twenty-eight types.
  *
  * The direction of that dependency is load bearing and runs one way only:
  * **`messages/*.ts` must never import this file** — this file imports them.
@@ -220,7 +220,7 @@ const identifierSchema = z
 /**
  * The four envelope fields every message shares, as a Zod shape record.
  *
- * Written once and spread into all twenty-six union members, so the envelope
+ * Written once and spread into all twenty-eight union members, so the envelope
  * cannot end up meaning something slightly different for one message type. It
  * is exported for the same reason: `apps/local-service/src/server/ws.ts` and the
  * two extension transports occasionally need to describe an envelope without
@@ -363,7 +363,7 @@ export type MessageByType<K extends MessageType> = Envelope<K, MessagePayload<K>
 export type ProtocolMessageMap = { readonly [K in MessageType]: MessageByType<K> };
 
 /**
- * Any frame of this protocol: the union of all twenty-six envelope types.
+ * Any frame of this protocol: the union of all twenty-eight envelope types.
  *
  * The return type of {@link parseMessage} and {@link decodeMessage}, the
  * argument type of {@link encodeMessage}, and the type a transport hands to its
@@ -727,7 +727,7 @@ type EnvelopeSchemaTuple<T extends readonly MessageType[]> = {
  * build — `Object.keys` would agree today and is not a contract.
  *
  * The assertion is the one unavoidable cast in this module: `Array.prototype.map`
- * yields an array, and no runtime expression can produce a twenty-six-element
+ * yields an array, and no runtime expression can produce a twenty-eight-element
  * tuple type. It is not taken on trust, and the two halves of the guarantee are
  * checked in two different places, deliberately:
  *
@@ -788,7 +788,7 @@ export type ProtocolMessageSchema = typeof protocolMessageSchema;
  *
  * The tuple wrappers stop a union from distributing, so this answers about the
  * two types as written rather than about their members — which is the point
- * here, since both operands are unions of twenty-six object types.
+ * here, since both operands are unions of twenty-eight object types.
  */
 type MutuallyAssignable<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 
@@ -927,7 +927,7 @@ const NOT_JSON_HINT =
  *   neither side crashes or acts on a message it does not understand.
  * - A frame whose `type` is known but whose payload is wrong is validated
  *   against that one member, so the issue paths name the offending payload
- *   fields rather than reporting twenty-six failed branches.
+ *   fields rather than reporting twenty-eight failed branches.
  * - Either way the failure is a value, not an exception. This function never
  *   throws, never logs and never echoes its input: the message and `details`
  *   come from `protocolParseError`, which renders issue paths, issue codes and
@@ -1095,7 +1095,7 @@ export interface CreateEnvelopeOptions {
 /**
  * Reads a routable `sessionId` off a payload, if it has one.
  *
- * Structural rather than type-driven on purpose: the twenty-six payload schemas
+ * Structural rather than type-driven on purpose: the twenty-eight payload schemas
  * are owned by eleven separate modules and most, but not all, carry a
  * `sessionId`. Asking the value — is it a plain record, is its `sessionId` a
  * string — keeps this one function correct for every payload without a
@@ -1324,7 +1324,7 @@ export function isMessageOfType<K extends MessageType>(
  *
  * Call it in the `default` arm of an exhaustive `switch` over `message.type`: in
  * a complete switch the parameter is `never`, so the call compiles; add a
- * twenty-seventh message type and the arm receives a real frame, the parameter
+ * twenty-ninth message type and the arm receives a real frame, the parameter
  * stops being `never`, and `tsc -b` reports the unhandled case at the router
  * rather than letting a frame fall through it at run time.
  *
