@@ -141,8 +141,9 @@
  * The follow-up question is passed through to the context builder, the
  * analysis port and the panel port verbatim; it is never compared, searched or
  * switched on. Its redacted text is handed to `./understand.js`'s generic
- * tokenizer, and the identifier candidates the tokenizer returns are resolved
- * through exact declaration lookups in the code graph: the decision reads
+ * tokenizer and path reader, and what they return is resolved through exact
+ * declaration lookups in the code graph — identifier candidates anywhere, plain
+ * words only inside a source file the question names: the decision reads
  * names the graph holds, never the wording. No adapter id, route, file,
  * symbol, component or application name appears here, and no plan or panel is
  * authored: every addition comes from the validated decision, every resolution
@@ -164,6 +165,7 @@
  * @module
  */
 
+import { CODE_QUERY_LIMITS } from '@debuggen/code-analysis';
 import type { CodeNodeKind } from '@debuggen/code-analysis';
 import {
   INSTRUMENTATION_ACTION_TYPES,
@@ -235,10 +237,11 @@ import type { SessionFailure } from '../../sessions/state-machine.js';
 import type { ModificationsRepo } from '../../store/modifications-repo.js';
 import type { PanelsRepo } from '../../store/panels-repo.js';
 import type { SessionsRepo } from '../../store/sessions-repo.js';
-import { redactQuestionText } from '../context-builder.js';
+import { boundedFollowUpFocus, redactQuestionText } from '../context-builder.js';
 import type {
   ContextBuilder,
   FollowUpDeclarationCandidate,
+  FollowUpFocus,
   PipelineCodeHandles,
   PipelineStageContext,
   StagePlaceholder,
@@ -247,7 +250,8 @@ import type {
 import type { AnalyzeStageInput, AnalyzeStageResult } from './analyze.js';
 import { authoredPlanShape, refusedFieldPath } from './plan.js';
 import { buildFollowUpDecisionSchema } from './reply-schemas.js';
-import { tokenizeQuestion } from './understand.js';
+import { pathCandidatesOf, tokenizeQuestion } from './understand.js';
+import type { QuestionTokens } from './understand.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Vocabulary
@@ -1002,6 +1006,7 @@ export interface PanelRegenerationPort {
    * capture, answering the follow-up question.
    *
    * @param request The session, the stored capture, both questions, the
+   * follow-up's structured focus when it has one (`followUpFocus`), the
    * regenerated analysis, the capture summary, the recorded prompt version,
    * the panel the new one must supersede (`expectedPredecessor`) and the
    * cancellation signal.
@@ -1031,8 +1036,9 @@ export interface AnalysisRegenerationPort {
   /**
    * Regenerates and stores the next analysis version of a stored capture.
    *
-   * @param context The run's stage context, carrying the follow-up question and
-   * the stored capture's id.
+   * @param context The run's stage context, carrying the follow-up question,
+   * its structured focus (`followUpFocus`, `undefined` when the follow-up names
+   * no category and no declaration) and the stored capture's id.
    * @param input The capture, the session's understanding, the recorded prompt
    * version, `regenerate: true` and the analysis to supersede.
    * @returns The stored analysis, or the failing subsystem's typed error.
@@ -1434,6 +1440,14 @@ const PROGRESS_FAILED_LOG =
 const NAMES_UNRESOLVED_LOG =
   'The declarations the follow-up names could not be resolved through the code graph; the decision proceeds from the stored evidence alone.';
 
+/**
+ * Warn record of a code-graph lookup that failed while a follow-up's focus
+ * was derived for an analysis or a panel. The focus then carries the
+ * follow-up's category hints alone. Fields: stage, error code.
+ */
+const FOCUS_NAMES_UNRESOLVED_LOG =
+  'The declarations a follow-up names could not be resolved through the code graph; its focus carries its category hints alone.';
+
 /** Which progress row a {@link PROGRESS_FAILED_LOG} record is about. */
 type ProgressRowKind = 'started' | 'completed' | 'failed';
 
@@ -1464,36 +1478,70 @@ const DECLARATION_KINDS = Object.freeze([
 const MAX_NAMED_DECLARATIONS = 8;
 
 /**
- * Resolves a follow-up's identifier candidates to the declarations the code
- * graph holds for them.
+ * The most matches a plain word's lookup reads before the named-file filter
+ * runs: the query engine's own ceiling. A common name may be declared in many
+ * files, and the declaration in the file the question names must not be lost
+ * to the first {@link MAX_NAMED_DECLARATIONS} of them.
+ */
+const MAX_PLAIN_WORD_MATCHES = CODE_QUERY_LIMITS.maxResults;
+
+/** The filter of an identifier candidate's lookup: a name in identifier form stands on its own. */
+const ANY_FILE = (): boolean => true;
+
+/**
+ * Whether a file the code graph holds is a path the question names: the same
+ * path, or the same file written against another root — the named path ending
+ * in the graph's (`<package>/src/a.ts` for a project rooted at the package) or
+ * the graph's ending in the named one (`a.ts`, `lib/a.ts`). Both sides are
+ * project-relative POSIX paths and every comparison is whole-segment, so
+ * `lib/a.ts` never matches `lib/data.ts`.
+ */
+function isNamedFile(file: string, named: string): boolean {
+  return file === named || file.endsWith(`/${named}`) || named.endsWith(`/${file}`);
+}
+
+/**
+ * Resolves the names a follow-up carries to the declarations the code graph
+ * holds for them.
+ *
+ * Two kinds of name, looked up in this order:
+ *
+ * 1. **Identifier candidates** (`useThing`, `thing_id`): each stands on its
+ *    own, so every declaration of it is kept.
+ * 2. **Plain words** — the tokenizer's content tokens, such as a lower-case
+ *    function name written as an ordinary word — only when the question names
+ *    at least one source path, and a match is kept only when it is declared in
+ *    one of those files ({@link isNamedFile}). A plain English word is a
+ *    declaration only where the developer pointed at one; without a named file
+ *    it never resolves, so an ordinary question about the evidence stays on the
+ *    evidence.
  *
  * Each name is looked up exactly (`findByName` with `exact: true`, a
  * constant-time index read), restricted to {@link DECLARATION_KINDS}; the
  * matches are kept in name order then graph rank, de-duplicated by file and
- * symbol, and capped at {@link MAX_NAMED_DECLARATIONS}. The names are the
- * tokenizer's output — sorted, de-duplicated and capped — so two phrasings that
- * name the same identifiers resolve to the same list. Nothing here reads the
- * question itself.
+ * symbol, and capped at {@link MAX_NAMED_DECLARATIONS}. The names and paths are
+ * the tokenizer's output — sorted, de-duplicated and capped — so two phrasings
+ * that name the same identifiers, words and files resolve to the same list.
+ * Nothing here reads the question itself.
  *
  * @param queries The run's read-only code-graph queries.
- * @param names The identifier candidates, as the tokenizer ordered them.
+ * @param hints The tokenizer's identifier candidates and content tokens.
+ * @param paths The source paths the question names (`pathCandidatesOf`).
  * @returns The declarations, in resolution order.
  */
 function resolveNamedDeclarations(
   queries: PipelineCodeHandles['queries'],
-  names: readonly string[],
+  hints: Pick<QuestionTokens, 'identifierCandidates' | 'tokens'>,
+  paths: readonly string[],
 ): FollowUpDeclarationCandidate[] {
   const declarations: FollowUpDeclarationCandidate[] = [];
   const seen = new Set<string>();
-  for (const name of names) {
-    const matches = queries.findByName(name, {
-      exact: true,
-      kinds: DECLARATION_KINDS,
-      limit: MAX_NAMED_DECLARATIONS,
-    });
+  /** Keeps the matches of one exact lookup that `admits`; `true` once the cap is reached. */
+  const collect = (name: string, limit: number, admits: (file: string) => boolean): boolean => {
+    const matches = queries.findByName(name, { exact: true, kinds: DECLARATION_KINDS, limit });
     for (const match of matches) {
       const identity = `${match.file}\u0000${match.name}`;
-      if (seen.has(identity)) {
+      if (seen.has(identity) || !admits(match.file)) {
         continue;
       }
       seen.add(identity);
@@ -1504,11 +1552,173 @@ function resolveNamedDeclarations(
         score: match.score ?? 1,
       });
       if (declarations.length >= MAX_NAMED_DECLARATIONS) {
-        return declarations;
+        return true;
       }
+    }
+    return false;
+  };
+
+  for (const name of hints.identifierCandidates) {
+    if (collect(name, MAX_NAMED_DECLARATIONS, ANY_FILE)) {
+      return declarations;
+    }
+  }
+  if (paths.length === 0) {
+    return declarations;
+  }
+  const inNamedFile = (file: string): boolean => paths.some((named) => isNamedFile(file, named));
+  for (const word of hints.tokens) {
+    if (collect(word, MAX_PLAIN_WORD_MATCHES, inNamedFile)) {
+      return declarations;
     }
   }
   return declarations;
+}
+
+/** What a follow-up question names, as the decision and the follow-up focus read it. */
+interface FollowUpNames {
+  /** The generic tokenizer's projection of the redacted question. */
+  readonly hints: QuestionTokens;
+  /** The source paths the redacted question names. */
+  readonly paths: readonly string[];
+  /** The declarations those names resolve to, or why the code-graph lookup failed. */
+  readonly resolved: Result<FollowUpDeclarationCandidate[], DebuggenError>;
+}
+
+/**
+ * Cuts a follow-up question into the names it carries and resolves them: the
+ * redacted text — redacted exactly as it is before it is rendered, so a value
+ * the developer pasted never becomes a name — is handed to `./understand.js`'s
+ * tokenizer and path reader (each bounds its own read), and the result to
+ * {@link resolveNamedDeclarations}. A lookup that throws is returned as its
+ * error, never raised.
+ *
+ * @param asked The follow-up question, verbatim; passed on as a value, never read here.
+ * @param queries The run's read-only code-graph queries.
+ */
+function namesInFollowUp(asked: string, queries: PipelineCodeHandles['queries']): FollowUpNames {
+  const redacted = redactQuestionText(asked, Number.POSITIVE_INFINITY).text;
+  const hints = tokenizeQuestion(redacted);
+  const paths = pathCandidatesOf(redacted);
+  const resolved = tryCatch(() => resolveNamedDeclarations(queries, hints, paths), 'INTERNAL');
+  return { hints, paths, resolved };
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The follow-up focus — what a follow-up asks about, as structured input of its analysis and panel
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The focus the names of a follow-up make: the tokenizer's category hints,
+ * verbatim, and the resolved declarations without their scores, held to
+ * `boundedFollowUpFocus`'s caps; `undefined` when both are empty.
+ */
+function focusFrom(
+  names: FollowUpNames,
+  declarations: readonly FollowUpDeclarationCandidate[],
+): FollowUpFocus | undefined {
+  return boundedFollowUpFocus({
+    categoryHints: names.hints.categoryHints,
+    declarations: declarations.map(({ file, symbol, kind }) => ({ file, symbol, kind })),
+  });
+}
+
+/**
+ * The structured focus of a follow-up question — the `followUpFocus` section
+ * the analyze and generate-panel requests carry for it (`FollowUpFocus` in
+ * `../context-builder.js`).
+ *
+ * The question is redacted, cut by `./understand.js`'s tokenizer and path
+ * reader, and its names resolved exactly as the decision resolves them
+ * ({@link resolveNamedDeclarations}): the focus holds the tokenizer's category
+ * hints and those declarations, never a word of the question. Deterministic:
+ * the same question over the same graph yields a deeply equal focus. A graph
+ * lookup that fails is logged at `warn` and leaves the category hints alone.
+ *
+ * @param asked The follow-up question, verbatim; handed on as a value, never searched here.
+ * @param queries The run's read-only code-graph queries.
+ * @param logger Receives the lookup-failure record; none by default.
+ * @returns The focus, frozen, or `undefined` when the question names no
+ * category and no declaration.
+ *
+ * @example
+ * ```ts
+ * const focus = followUpFocusOf(asked, context.code.queries, log);
+ * // { categoryHints: ['performance'], declarations: [{ file, symbol, kind }] } or undefined
+ * ```
+ */
+export function followUpFocusOf(
+  asked: string,
+  queries: PipelineCodeHandles['queries'],
+  logger: Logger = noopLogger,
+): FollowUpFocus | undefined {
+  const names = namesInFollowUp(asked, queries);
+  if (!names.resolved.ok) {
+    logger.warn(FOCUS_NAMES_UNRESOLVED_LOG, {
+      stage: FOLLOW_UP_STAGE,
+      code: names.resolved.error.code,
+    });
+  }
+  return focusFrom(names, names.resolved.ok ? names.resolved.value : []);
+}
+
+/**
+ * The follow-up a capture answers: the latest follow-up recorded as needing a
+ * new capture whose plan version is the one the capture ran under — the plan
+ * version that follow-up installed (AAP §0.4.2, the Follow-up row's
+ * new-capture path). Versions are compared, never text. `undefined` when the
+ * run names no capture, the session does not hold it, or the capture ran
+ * under a plan no follow-up installed, such as the first question's.
+ */
+function governingFollowUpOf(
+  session: SessionRecord,
+  captureId: string | undefined,
+): SessionRecord['followUps'][number] | undefined {
+  if (captureId === undefined) {
+    return undefined;
+  }
+  const capture = session.captures.find((entry) => entry.id === captureId);
+  if (capture === undefined) {
+    return undefined;
+  }
+  return session.followUps.findLast(
+    (entry) => entry.needsNewCapture === true && entry.planVersion === capture.planVersion,
+  );
+}
+
+/**
+ * The follow-up focus that governs a pipeline run, for the analyze and
+ * generate-panel stages to place in their requests. In order:
+ *
+ * 1. the focus the context already carries — the existing-evidence path sets
+ *    the one its decision resolved on the context of the analysis it
+ *    regenerates;
+ * 2. the focus of the context's follow-up question;
+ * 3. the focus of the follow-up the context's capture answers
+ *    ({@link governingFollowUpOf}) — the capture a new-capture follow-up's
+ *    plan version was installed for, analysed by the orchestrator without the
+ *    follow-up question;
+ * 4. none: the run answers the session's first question, and its requests
+ *    carry no focus at all.
+ *
+ * @param context The run's stage context: the stored session record, the
+ * capture, the follow-up question when there is one, and the code handles.
+ * @param logger Receives a lookup-failure record; the context's logger by default.
+ * @returns The bounded focus, or `undefined` when no follow-up governs the run
+ * or its focus is empty.
+ */
+export function followUpFocusFor(
+  context: PipelineStageContext,
+  logger: Logger = context.logger,
+): FollowUpFocus | undefined {
+  if (context.followUpFocus !== undefined) {
+    return boundedFollowUpFocus(context.followUpFocus);
+  }
+  const { followUpQuestion: asked, session, captureId } = context;
+  const governing = asked ?? governingFollowUpOf(session, captureId)?.question;
+  return governing === undefined
+    ? undefined
+    : followUpFocusOf(governing, context.code.queries, logger);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -2455,6 +2665,11 @@ interface DecidedFollowUp {
   readonly path: FollowUpPath;
   readonly summary: FollowUpDecisionSummary;
   readonly build: StageRequestBuild;
+  /**
+   * The follow-up's focus, from the same names the decision resolved: what
+   * the existing-evidence regeneration hands the analysis and the panel.
+   */
+  readonly focus: FollowUpFocus | undefined;
 }
 
 /** Plan version n + 1 after the deterministic gate, not yet installed or recorded. */
@@ -2760,19 +2975,16 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
     // The follow-up's words reach the structured input only as the generic
     // tokenizer's identifier candidates, cut from the redacted text exactly as
     // Stage 1 cuts its hints (the tokenizer bounds its own read), and as the
-    // declarations the code graph holds for them. A lookup that fails leaves the
-    // decision to the stored evidence alone.
-    const hints = tokenizeQuestion(
-      redactQuestionText(input.followUpQuestion, Number.POSITIVE_INFINITY).text,
-    );
-    const resolved = tryCatch(
-      () => resolveNamedDeclarations(stageContext.code.queries, hints.identifierCandidates),
-      'INTERNAL',
-    );
+    // declarations the code graph holds for them — its identifier candidates
+    // anywhere, its plain words only inside the files it names. A lookup that
+    // fails leaves the decision to the stored evidence alone.
+    const named = namesInFollowUp(input.followUpQuestion, stageContext.code.queries);
+    const { hints, resolved } = named;
     if (!resolved.ok) {
       log.warn(NAMES_UNRESOLVED_LOG, { stage: FOLLOW_UP_STAGE, code: resolved.error.code });
     }
     const namedDeclarations = resolved.ok ? resolved.value : [];
+    const focus = focusFrom(named, namedDeclarations);
 
     // The builder has already run the outbound guard: an `Err` here means the
     // payload must not leave the machine, so the provider is never called.
@@ -2840,7 +3052,10 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
       accepted: delta.accepted.length,
       rejected: countsByReason(delta.rejected),
       identifierCandidates: hints.identifierCandidates.length,
+      pathCandidates: named.paths.length,
       namedDeclarations: namedDeclarations.length,
+      focusCategoryHints: focus === undefined ? 0 : focus.categoryHints.length,
+      focusDeclarations: focus === undefined ? 0 : focus.declarations.length,
       repairs,
       attempts,
       promptVersion,
@@ -2853,7 +3068,7 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
       truncatedSections: built.value.truncated.length,
     } satisfies LogFields);
 
-    return ok({ delta, path, summary, build: built.value });
+    return ok({ delta, path, summary, build: built.value, focus });
   };
 
   /**
@@ -2913,10 +3128,13 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
 
     // The analysis: re-derived from the stored capture as the next version. The
     // analysis port owns the `analyze` rows, the gate, the evidence check and the store write.
+    // It answers this follow-up, so its context carries the focus the decision resolved — set
+    // explicitly, so no focus of another follow-up can ride along on the spread context.
     enterDelegated(state, ANALYZE_STAGE);
     const regenerationContext: PipelineStageContext = {
       ...context,
       followUpQuestion: input.followUpQuestion,
+      followUpFocus: decided.focus,
       captureId,
     };
     const analysed = await settle(
@@ -2968,8 +3186,10 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
     // The panel: regenerated from the same stored capture, answering the follow-up question, as
     // the version superseding exactly the panel the follow-up was decided against. The port
     // refuses — before its model call and inside the store's insert transaction — a session whose
-    // latest panel moved on meanwhile, so a stale refusal arrives here as its error.
+    // latest panel moved on meanwhile, so a stale refusal arrives here as its error. The focus the
+    // decision resolved travels with it, so the panel is composed for the follow-up.
     openGroup(context, log, state, GENERATE_PANEL_STAGE);
+    const { focus } = decided;
     const generated = await settle(
       () =>
         deps.panelRegeneration.regenerate({
@@ -2977,6 +3197,7 @@ export function createFollowUpStage(deps: FollowUpStageDeps): FollowUpStage {
           captureId,
           question: context.question,
           followUpQuestion: input.followUpQuestion,
+          ...(focus === undefined ? {} : { followUpFocus: focus }),
           analysis,
           summary: analysed.value.summary,
           promptVersion: context.promptVersions[GENERATE_PANEL_STAGE],

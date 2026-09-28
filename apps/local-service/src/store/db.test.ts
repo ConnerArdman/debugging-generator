@@ -50,9 +50,14 @@
  *    without the main connection checkpointing, and a worker that crashes or
  *    exits hands `wal_autocheckpoint` back at SQLite's default. `checkpoint()`
  *    truncates the log while the worker runs; `close()` — twice, or straight
- *    after the open — leaves no sidecar and no worker behind. The worker is
- *    the real one; `node:worker_threads` is wrapped only to record it, and, for
- *    the crash case alone, to give it failing source.
+ *    after the open — leaves no sidecar and no worker behind. A store opened
+ *    with `backgroundCheckpoint: false` spawns no worker and keeps SQLite's
+ *    threshold, and a suspension of the commit-time checkpoint composes with
+ *    the worker whenever its handover or hand-back lands: it restores `0`
+ *    beside a worker that took over while it was held, and SQLite's default
+ *    once that worker has failed. The worker is the real one;
+ *    `node:worker_threads` is wrapped only to record it, and, for the crash
+ *    case alone, to give it failing source.
  * 7. **A close says what its checkpoint achieved.** Closing a store writes one
  *    `info` record after the connection closes, naming the write-ahead log
  *    checkpoint's outcome — `completed`, `busy`, `failed` or `no-wal` — with
@@ -65,7 +70,9 @@
  *    log answers `busy`; the in-memory store, a closed store and a database
  *    path that has become a link offer no checkpointer; a path that names
  *    another inode is refused by the thread; and overlapping suspensions
- *    restore the connection's threshold only when the last one ends.
+ *    restore the connection's threshold only when the last one ends. Every
+ *    case that asserts an exact outcome or threshold opens its store without
+ *    the background worker, so no checkpoint but the case's own can race it.
  *
  * Every case works inside its own `mkdtemp` sandbox, resolved through `realpath`
  * so a temp directory reached through a link (as on macOS) cannot fail a chain
@@ -1464,6 +1471,10 @@ describe('the connection pragmas and the background write-ahead-log checkpointer
   const FAILED_MESSAGE =
     'the session store background checkpointer stopped; commits checkpoint the write-ahead log themselves again';
 
+  /** The message the store logs when the caller opened it without a background checkpointer. */
+  const NOT_STARTED_MESSAGE =
+    'the session store background checkpointer was not started, as the caller asked; commits checkpoint the write-ahead log themselves';
+
   /** One numeric column of a single-row pragma on the store's own connection. */
   function pragmaNumber(store: Store, sql: string, column: string): number {
     const row: Record<string, unknown> | undefined = store.db.prepare(sql).get();
@@ -1727,6 +1738,97 @@ describe('the connection pragmas and the background write-ahead-log checkpointer
     },
     CASE_TIMEOUT_MS,
   );
+
+  it('spawns no worker for a file-backed store opened with backgroundCheckpoint: false, whose commits keep checkpointing', () => {
+    const store = openedStore({
+      databasePath,
+      logger: recordingLogger(),
+      backgroundCheckpoint: false,
+    });
+
+    expect(workerSpy.spawned).toHaveLength(0);
+    expect(autocheckpointOf(store)).toBe(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+    expect(logged(NOT_STARTED_MESSAGE)).toHaveLength(1);
+    expect(logged(NOT_STARTED_MESSAGE)[0]).toMatchObject({
+      level: 'debug',
+      fields: { subsystem: 'store', thresholdPages: DEFAULT_WAL_AUTOCHECKPOINT_PAGES },
+    });
+
+    // SQLite's own commit-time checkpoint folded the grown log in.
+    writeBallast(store);
+    expect(autocheckpointOf(store)).toBe(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+    expect(walOf(store).checkpointed).toBeGreaterThan(0);
+
+    store.close();
+    expectNoSidecarsBeside(databasePath);
+    expect(workerSpy.spawned).toHaveLength(0);
+    expect(logged(RUNNING_MESSAGE)).toEqual([]);
+    expect(logged(FAILED_MESSAGE)).toEqual([]);
+  });
+
+  it(
+    'leaves the commit-time checkpoint off when the worker takes it over while a suspension taken before the handover is held',
+    async () => {
+      const store = openedStore({ databasePath, logger: recordingLogger() });
+      // Synchronously after the open: the worker's ready message can only be
+      // delivered by a later turn of the event loop, so the handover is still
+      // to come and the suspension records SQLite's own threshold.
+      const suspension = suspendAutoCheckpoint(store);
+      expect(suspension?.previousPages).toBe(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+      expect(logged(RUNNING_MESSAGE)).toEqual([]);
+      expect(autocheckpointOf(store)).toBe(0);
+
+      await vi.waitFor(() => {
+        expect(logged(RUNNING_MESSAGE)).toHaveLength(1);
+      }, WORKER_WAIT);
+      expect(suspension?.restore()).toBe(true);
+
+      // Restoring the recorded 1 000 would have the connection checkpoint on
+      // `COMMIT` again beside a worker that runs; the handover is what stays.
+      expect(suspension?.previousPages).toBe(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+      expect(autocheckpointOf(store)).toBe(0);
+      expect(onlyWorker().threadId).toBeGreaterThan(0);
+
+      writeBallast(store);
+      expect(walOf(store).log).toBeGreaterThanOrEqual(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+      await vi.waitFor(() => {
+        const wal = walOf(store);
+        expect(wal.log).toBeGreaterThanOrEqual(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+        expect(wal.checkpointed).toBe(wal.log);
+      }, WORKER_WAIT);
+      expect(logged(FAILED_MESSAGE)).toEqual([]);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'leaves SQLite’s own threshold in force when the worker fails while a suspension is held, whatever the suspension recorded',
+    async () => {
+      const store = openedStore({ databasePath, logger: recordingLogger() });
+      const suspension = suspendAutoCheckpoint(store);
+      await vi.waitFor(() => {
+        expect(logged(RUNNING_MESSAGE)).toHaveLength(1);
+      }, WORKER_WAIT);
+
+      // The handover retargeted the suspension to `0`; the hand-back after the
+      // crash must still be what the restore leaves, or the connection would
+      // be left with no checkpoint at all.
+      await onlyWorker().terminate();
+      await vi.waitFor(() => {
+        expect(logged(FAILED_MESSAGE)).toHaveLength(1);
+      }, WORKER_WAIT);
+      expect(logged(FAILED_MESSAGE)[0]).toMatchObject({
+        level: 'warn',
+        fields: { subsystem: 'store', operation: 'exit' },
+      });
+      expect(suspension?.restore()).toBe(true);
+
+      expect(autocheckpointOf(store)).toBe(DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
+      writeBallast(store);
+      expect(walOf(store).checkpointed).toBeGreaterThan(0);
+    },
+    CASE_TIMEOUT_MS,
+  );
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -1945,6 +2047,21 @@ describe('background checkpoints of a file-backed store', () => {
     return checkpointer;
   }
 
+  /**
+   * Opens a store without its background checkpointer, for a case that
+   * asserts a checkpoint's exact outcome or the connection's threshold.
+   *
+   * The store's own worker checkpoints `PASSIVE` on its interval and takes the
+   * threshold over asynchronously, so beside it a request can answer `failed`
+   * with the concurrent-checkpoint reason and a restored threshold can read
+   * `0`, depending on when the handover lands. Without it, every checkpoint of
+   * the file is the case's own or a commit's. How the two compose is proved
+   * beside the worker's own cases, in the pragmas describe above.
+   */
+  function storeWithoutWorker(options: Partial<OpenStoreOptions> = {}): Store {
+    return openedStore({ databasePath, backgroundCheckpoint: false, ...options });
+  }
+
   beforeEach(() => {
     checkpointers = [];
   });
@@ -1956,7 +2073,7 @@ describe('background checkpoints of a file-backed store', () => {
   });
 
   it('folds the log in on a connection of its own, truncating it and keeping every row, while the commit-time checkpoint is suspended', async () => {
-    const store = openedStore({ databasePath });
+    const store = storeWithoutWorker();
     const suspension = suspendAutoCheckpoint(store);
     expect(suspension?.previousPages).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
     expect(autoCheckpointOf(store)).toBe(0);
@@ -1984,7 +2101,7 @@ describe('background checkpoints of a file-backed store', () => {
   });
 
   it('answers busy while a reader holds the log back, and completes once the reader lets go', async () => {
-    const store = openedStore({ databasePath });
+    const store = storeWithoutWorker();
     writeBulk(store, 100);
     const checkpointer = tracked(openWalCheckpointer(store));
 
@@ -2029,7 +2146,7 @@ describe('background checkpoints of a file-backed store', () => {
   });
 
   it('answers every request after close as closed, closes twice harmlessly, and leaves the rows alone', async () => {
-    const store = openedStore({ databasePath });
+    const store = storeWithoutWorker();
     writeBulk(store, 10);
     const checkpointer = tracked(openWalCheckpointer(store));
 
@@ -2042,7 +2159,7 @@ describe('background checkpoints of a file-backed store', () => {
   });
 
   it('answers a request still in flight as closed and releases the thread at once when closed', async () => {
-    const store = openedStore({ databasePath });
+    const store = storeWithoutWorker();
     writeBulk(store, 100);
     const checkpointer = tracked(openWalCheckpointer(store));
     // Started first, so the request below is the one the thread is serving.
@@ -2067,7 +2184,7 @@ describe('background checkpoints of a file-backed store', () => {
   });
 
   it('closes the store without claiming a clean checkpoint while the thread is still checkpointing', async () => {
-    const store = openedStore({ databasePath, logger: recordingLogger() });
+    const store = storeWithoutWorker({ logger: recordingLogger() });
     // No wait: the close must answer at once, whoever holds the log.
     store.db.exec('PRAGMA busy_timeout = 0;');
     writeBulk(store, 100);
@@ -2106,7 +2223,7 @@ describe('background checkpoints of a file-backed store', () => {
   });
 
   it('refuses to checkpoint through a path that no longer names the file the store opened', async () => {
-    const store = openedStore({ databasePath });
+    const store = storeWithoutWorker();
     writeBulk(store, 10);
     store.checkpoint();
     const checkpointer = tracked(openWalCheckpointer(store));
@@ -2138,7 +2255,7 @@ describe('background checkpoints of a file-backed store', () => {
   );
 
   it('restores the commit-time checkpoint only when the last overlapping suspension ends', () => {
-    const store = openedStore({ databasePath });
+    const store = storeWithoutWorker();
     const first = suspendAutoCheckpoint(store);
     const second = suspendAutoCheckpoint(store);
     expect(first?.previousPages).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);

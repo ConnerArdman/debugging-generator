@@ -15,6 +15,9 @@
  *   sent: the service's own probe must get an answer, and the preload is
  *   attributed to the process there only through the launcher's own evidence
  *   (`preloadServesAt`) — never through some connected agent of the project.
+ *   A URL the real `probeDevServer` will not dial is refused before any
+ *   request, in registered product words that name `devServerUrl` and quote
+ *   no part of the URL.
  */
 
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -29,13 +32,18 @@ import { DebuggenError, isErr, noopLogger, ok } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 
 import { loadServiceConfig } from '../../config.js';
-import type { DevServerProbeResult } from '../../dev-server/detect.js';
+import { probeDevServer } from '../../dev-server/detect.js';
+import type { DevServerProbeResult, FetchLike } from '../../dev-server/detect.js';
 import { createSessionManager } from '../../sessions/manager.js';
 import type { SessionBroadcaster, SessionManager } from '../../sessions/manager.js';
-import { createSessionProgress } from '../../sessions/progress.js';
+import { createSessionProgress, isProductAuthoredText } from '../../sessions/progress.js';
 import { openStore } from '../../store/db.js';
 import { createSessionsRepo } from '../../store/sessions-repo.js';
-import { devServerLookupFromLaunches, joinLaunchedDevServer } from './sessions.js';
+import {
+  REQUESTED_DEV_SERVER_URL_REFUSED_MESSAGE,
+  devServerLookupFromLaunches,
+  joinLaunchedDevServer,
+} from './sessions.js';
 import type {
   SessionDevServerHold,
   SessionDevServerLookup,
@@ -296,6 +304,46 @@ describe('devServerLookupFromLaunches: a URL the editor sent', () => {
     const refused = await verify(lookup, HELD_URL);
 
     expect(isErr(refused) ? refused.error.code : undefined).toBe('DEV_SERVER_UNAVAILABLE');
+  });
+
+  it('refuses an address the probe will not dial, in product words naming the field and never the URL', async () => {
+    const secret = 'UV-SENTINEL-3f9c-never-echo-me';
+    const fetches = vi.fn<FetchLike>(() =>
+      Promise.reject(new Error('The probe dialled a URL it must refuse before any request.')),
+    );
+    const lookup = devServerLookupFromLaunches(
+      { list: () => [], preloadServesAt: () => true },
+      { probe: (url) => probeDevServer(url, { fetchImpl: fetches }) },
+    );
+
+    for (const url of [
+      'http://example.com/',
+      `https://example.com:8443/admin/orders?token=${secret}#summary`,
+      'http://0.0.0.0:3000/',
+    ]) {
+      const refused = await verify(lookup, url);
+      if (!isErr(refused)) {
+        throw new Error(`expected ${url} to be refused`);
+      }
+      const { error } = refused;
+
+      expect(error.code, url).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(error.message, url).toBe(REQUESTED_DEV_SERVER_URL_REFUSED_MESSAGE);
+      expect(error.message, url).toMatch(/\bdevServerUrl\b/u);
+      // Registered as it was built, so the route answers it verbatim.
+      expect(isProductAuthoredText(error.message), url).toBe(true);
+      expect(error.details, url).toStrictEqual({ reason: 'requested-url-refused' });
+      expect(error.hint, url).toMatch(/\bdebuggen\.devServerUrl\b/u);
+      const described = JSON.stringify({
+        message: error.message,
+        hint: error.hint,
+        details: error.details,
+      });
+      for (const fragment of ['example.com', '0.0.0.0', '8443', '/admin/orders', secret]) {
+        expect(described, url).not.toContain(fragment);
+      }
+    }
+    expect(fetches).not.toHaveBeenCalled();
   });
 
   it('acquires the launched dev server through the registry’s hold', () => {

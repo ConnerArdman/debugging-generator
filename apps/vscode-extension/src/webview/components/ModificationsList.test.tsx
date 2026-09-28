@@ -34,6 +34,12 @@
  *     in item order and leaves after the last, and Shift+Tab walks back.
  *   - **The open-file payload is untouched**, and the control exists only when
  *     a callback is supplied.
+ *   - **Chained records on one file never share a control name**: when a
+ *     follow-up plan layers a record onto an earlier one, every per-item
+ *     action ("View diff" / "Hide diff", "Open diff", "Open file", "Copy
+ *     path") continues its name with ", change ‹k› of ‹n›, plan v‹N›" — still
+ *     starting with its visible text, which is unchanged — while a file the
+ *     list names once keeps its plain name exactly.
  *   - **A conflict is never reported as a revert**: its callout states AAP
  *     0.5.5's message exactly — "‹file› was edited while instrumented. Debug
  *     Generator will not overwrite it. Original saved at ‹backup path›." — with
@@ -1167,6 +1173,302 @@ describe('ModificationsList open file', () => {
 
     expect(screen.queryByRole('button', { name: /^Open file/u })).toBeNull();
     expect(screen.getAllByRole('button', { name: /^View diff of /u })).toHaveLength(RECORDS.length);
+  });
+});
+
+describe('ModificationsList chained records on one file', () => {
+  /** The file a follow-up plan instruments twice. */
+  const CHAINED = 'src/lib/shared/service.ts';
+
+  /** A file the list names once. */
+  const UNIQUE = 'src/app/entry/route.ts';
+
+  /** Plan v1's record on the chained file. */
+  const FIRST = numberedRecord(31, CHAINED, 'applied');
+
+  /** Plan v1's record on the file named once, between the two layers. */
+  const ALONE = numberedRecord(32, UNIQUE, 'applied');
+
+  /**
+   * Plan v2's record, layered on {@link FIRST}: it continues from FIRST's
+   * instrumented bytes and has a backup of its own.
+   */
+  const LAYERED = numberedRecord(33, CHAINED, 'applied', {
+    planVersion: 2,
+    previousRecordId: FIRST.id,
+    originalHash: digest('b'),
+    instrumentedHash: digest('c'),
+    backupPath: `/home/dev/.debuggen/backups/ses_fixture/${digest('b')}`,
+  });
+
+  /** The disambiguators the two layers' names end with. */
+  const FIRST_ROW = ', change 1 of 2, plan v1';
+  const LAYERED_ROW = ', change 2 of 2, plan v2';
+
+  /** A per-item action's accessible name: its visible text, then what it acts on. */
+  const ROW_ACTION = /^(?:View diff|Hide diff|Open diff|Open file|Copy path) /u;
+
+  /** The per-item actions under `root`, in document order. */
+  function rowActions(root: HTMLElement): HTMLElement[] {
+    return within(root).getAllByRole('button', { name: ROW_ACTION });
+  }
+
+  /** Their accessible names, in document order. */
+  function rowActionNames(root: HTMLElement): string[] {
+    return rowActions(root).map((button) => button.getAttribute('aria-label') ?? '');
+  }
+
+  /**
+   * Asserts that no two per-item actions under `root` share a name and that
+   * each name starts with its control's visible text (WCAG 2.5.3).
+   */
+  function expectDistinctLabelledNames(root: HTMLElement): void {
+    const names = rowActionNames(root);
+    expect(new Set(names).size).toBe(names.length);
+    for (const button of rowActions(root)) {
+      const text = button.textContent ?? '';
+      expect(text).not.toBe('');
+      expect(button.getAttribute('aria-label')?.startsWith(`${text} `)).toBe(true);
+    }
+  }
+
+  /** A content-changed conflict entry for `record`, with a diff of the edit. */
+  function conflictFor(record: ModificationRecord, edited: string): ModificationConflict {
+    return makeConflict({
+      recordId: record.id,
+      file: record.file,
+      expectedHash: record.instrumentedHash,
+      backupPath: record.backupPath,
+      message: `'${record.file}' was changed after it was instrumented, so nothing was written to it.`,
+      diffs: {
+        instrumentedToCurrent: diffFor(record.file, 'const instrumented = true;', edited),
+        originalToCurrent: diffFor(record.file, 'const original = true;', edited),
+      },
+    });
+  }
+
+  it('are records and conflicts the protocol itself accepts', () => {
+    const ready = parseMessage(
+      createEnvelope('instrumentation.ready', {
+        sessionId: 'ses_fixture',
+        applied: [FIRST, ALONE, LAYERED],
+        runtimeHooks: [],
+        unavailable: [],
+      }),
+    );
+    expect(ready.ok).toBe(true);
+
+    const cleaned = parseMessage(
+      createEnvelope('cleanup.completed', {
+        sessionId: 'ses_fixture',
+        status: 'conflict',
+        conflicts: [FIRST, ALONE, LAYERED].map((record) =>
+          conflictFor(record, 'const edited = 1;'),
+        ),
+      }),
+    );
+    expect(cleaned.ok).toBe(true);
+  });
+
+  it('gives each layer’s controls a distinct name, and a file named once its plain one', () => {
+    const { container } = render(
+      <ModificationsList modifications={[FIRST, ALONE, LAYERED]} onOpenFile={vi.fn()} />,
+    );
+
+    const first = itemAt(container, 0);
+    const alone = itemAt(container, 1);
+    const layered = itemAt(container, 2);
+    expect(rowActionNames(first)).toEqual([
+      `View diff of ${CHAINED}${FIRST_ROW}`,
+      `Open file ${CHAINED}${FIRST_ROW}`,
+    ]);
+    expect(rowActionNames(alone)).toEqual([`View diff of ${UNIQUE}`, `Open file ${UNIQUE}`]);
+    expect(rowActionNames(layered)).toEqual([
+      `View diff of ${CHAINED}${LAYERED_ROW}`,
+      `Open file ${CHAINED}${LAYERED_ROW}`,
+    ]);
+
+    // The names are exact, so the plain one still resolves as it always has.
+    expect(screen.getByRole('button', { name: `View diff of ${UNIQUE}` })).toBe(
+      rowActions(alone)[0],
+    );
+    expect(screen.queryByRole('button', { name: `View diff of ${CHAINED}` })).toBeNull();
+    expect(screen.queryByRole('button', { name: `Open file ${CHAINED}` })).toBeNull();
+
+    expectDistinctLabelledNames(container);
+    // Only the names change: nothing painted carries the disambiguator.
+    expect(rowActions(container).map((button) => button.textContent)).toEqual([
+      'View diff',
+      'Open file',
+      'View diff',
+      'Open file',
+      'View diff',
+      'Open file',
+    ]);
+    expect(container.textContent ?? '').not.toContain('change 1 of 2');
+    expect(container.textContent ?? '').not.toContain('change 2 of 2');
+  });
+
+  it('keeps the disambiguator on "Hide diff" and opens the layer that was activated', async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <ModificationsList modifications={[FIRST, ALONE, LAYERED]} onOpenFile={vi.fn()} />,
+    );
+
+    const layeredToggle = screen.getByRole('button', {
+      name: `View diff of ${CHAINED}${LAYERED_ROW}`,
+    });
+    await user.click(layeredToggle);
+
+    expect(screen.getByRole('button', { name: `Hide diff of ${CHAINED}${LAYERED_ROW}` })).toBe(
+      layeredToggle,
+    );
+    expect(layeredToggle.textContent).toBe('Hide diff');
+    expect(layeredToggle.getAttribute('aria-expanded')).toBe('true');
+    const detail = onlyDetail(container);
+    expect(detail.closest('.dgv-modifications__item')).toBe(itemAt(container, 2));
+    expect(diffLineTexts(detail, 'added')).toEqual(['+  const marker33 = true;']);
+    expect(
+      screen
+        .getByRole('button', { name: `View diff of ${CHAINED}${FIRST_ROW}` })
+        .getAttribute('aria-expanded'),
+    ).toBe('false');
+    expectDistinctLabelledNames(container);
+
+    // Moving the disclosure to the earlier layer swaps both names back.
+    const firstToggle = screen.getByRole('button', { name: `View diff of ${CHAINED}${FIRST_ROW}` });
+    await user.click(firstToggle);
+
+    expect(screen.getByRole('button', { name: `Hide diff of ${CHAINED}${FIRST_ROW}` })).toBe(
+      firstToggle,
+    );
+    expect(screen.getByRole('button', { name: `View diff of ${CHAINED}${LAYERED_ROW}` })).toBe(
+      layeredToggle,
+    );
+    expect(diffLineTexts(onlyDetail(container), 'added')).toEqual(['+  const marker31 = true;']);
+    expectDistinctLabelledNames(container);
+  });
+
+  it('opens the file exactly as received from either layer', async () => {
+    const user = userEvent.setup();
+    const onOpenFile = vi.fn<(file: string) => void>();
+    render(<ModificationsList modifications={[FIRST, ALONE, LAYERED]} onOpenFile={onOpenFile} />);
+
+    await user.click(screen.getByRole('button', { name: `Open file ${CHAINED}${LAYERED_ROW}` }));
+    await user.click(screen.getByRole('button', { name: `Open file ${CHAINED}${FIRST_ROW}` }));
+
+    expect(onOpenFile.mock.calls).toEqual([[CHAINED], [CHAINED]]);
+  });
+
+  it('disambiguates a conflict layer’s "Open diff" and "Copy path" the same way', async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn<(text: string) => Promise<void>>(() => Promise.resolve());
+    stubClipboard(writeText);
+    const first = { ...FIRST, status: 'conflict' } satisfies ModificationRecord;
+    const alone = { ...ALONE, status: 'conflict' } satisfies ModificationRecord;
+    const layered = { ...LAYERED, status: 'conflict' } satisfies ModificationRecord;
+    const { container } = render(
+      <ModificationsList
+        modifications={[first, alone, layered]}
+        conflicts={[
+          conflictFor(first, 'const firstEdit = 1;'),
+          conflictFor(alone, 'const aloneEdit = 2;'),
+          conflictFor(layered, 'const layeredEdit = 3;'),
+        ]}
+        onOpenFile={vi.fn()}
+      />,
+    );
+
+    expect(rowActionNames(itemAt(container, 0))).toEqual([
+      `Copy path of the saved original of ${CHAINED}${FIRST_ROW}`,
+      `Open diff of your edit to ${CHAINED}${FIRST_ROW}`,
+      `View diff of ${CHAINED}${FIRST_ROW}`,
+      `Open file ${CHAINED}${FIRST_ROW}`,
+    ]);
+    expect(rowActionNames(itemAt(container, 1))).toEqual([
+      `Copy path of the saved original of ${UNIQUE}`,
+      `Open diff of your edit to ${UNIQUE}`,
+      `View diff of ${UNIQUE}`,
+      `Open file ${UNIQUE}`,
+    ]);
+    expect(rowActionNames(itemAt(container, 2))).toEqual([
+      `Copy path of the saved original of ${CHAINED}${LAYERED_ROW}`,
+      `Open diff of your edit to ${CHAINED}${LAYERED_ROW}`,
+      `View diff of ${CHAINED}${LAYERED_ROW}`,
+      `Open file ${CHAINED}${LAYERED_ROW}`,
+    ]);
+    expectDistinctLabelledNames(container);
+
+    const openEdit = screen.getByRole('button', {
+      name: `Open diff of your edit to ${CHAINED}${LAYERED_ROW}`,
+    });
+    expect(openEdit.textContent).toBe('Open diff');
+    await user.click(openEdit);
+
+    expect(
+      screen.getByRole('button', { name: `Hide diff of your edit to ${CHAINED}${LAYERED_ROW}` }),
+    ).toBe(openEdit);
+    const detail = onlyDetail(container);
+    expect(detail.closest('.dgv-modifications__item')).toBe(itemAt(container, 2));
+    expect(diffLineTexts(detail, 'added')).toEqual(['+  const layeredEdit = 3;']);
+    expectDistinctLabelledNames(container);
+
+    // Each layer's "Copy path" copies the file's pristine original: for the layer on
+    // plan v1's record, that is its chain root's (FIRST's) backup, never its own.
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: `Copy path of the saved original of ${CHAINED}${LAYERED_ROW}`,
+      }),
+    );
+    await settleCopy();
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: `Copy path of the saved original of ${CHAINED}${FIRST_ROW}`,
+      }),
+    );
+    await settleCopy();
+
+    expect(writeText.mock.calls).toEqual([[FIRST.backupPath], [FIRST.backupPath]]);
+  });
+
+  it('disambiguates a failed layer’s "Copy path" even when it is the file’s only one', () => {
+    const first = { ...FIRST, status: 'reverted' } satisfies ModificationRecord;
+    const layered = { ...LAYERED, status: 'failed' } satisfies ModificationRecord;
+    const { container } = render(<ModificationsList modifications={[first, ALONE, layered]} />);
+
+    expect(rowActionNames(itemAt(container, 0))).toEqual([`View diff of ${CHAINED}${FIRST_ROW}`]);
+    expect(rowActionNames(itemAt(container, 2))).toEqual([
+      `Copy path of the saved original of ${CHAINED}${LAYERED_ROW}`,
+      `View diff of ${CHAINED}${LAYERED_ROW}`,
+    ]);
+    expectDistinctLabelledNames(container);
+  });
+
+  it('numbers the layers in list order and recomputes when the list changes', () => {
+    const third = numberedRecord(34, CHAINED, 'applied', {
+      planVersion: 3,
+      previousRecordId: LAYERED.id,
+      originalHash: digest('c'),
+      instrumentedHash: digest('d'),
+    });
+    const { container, rerender } = render(
+      <ModificationsList modifications={[FIRST, ALONE, LAYERED, third]} />,
+    );
+
+    expect(rowActionNames(container)).toEqual([
+      `View diff of ${CHAINED}, change 1 of 3, plan v1`,
+      `View diff of ${UNIQUE}`,
+      `View diff of ${CHAINED}, change 2 of 3, plan v2`,
+      `View diff of ${CHAINED}, change 3 of 3, plan v3`,
+    ]);
+
+    // With one layer left, the file is named once again and so is its control.
+    rerender(<ModificationsList modifications={[LAYERED, ALONE]} />);
+
+    expect(rowActionNames(container)).toEqual([
+      `View diff of ${CHAINED}`,
+      `View diff of ${UNIQUE}`,
+    ]);
   });
 });
 

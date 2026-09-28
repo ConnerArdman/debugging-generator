@@ -214,9 +214,9 @@ function createLedger(): FakeLedger {
     (options.afterDocumentId === undefined || report.documentId !== options.afterDocumentId);
 
   const registry: BrowserAgentRegistry = {
-    latestAgentReady: (tabId) => (latest?.tabId === tabId ? latest : undefined),
+    latestAgentReady: ({ tabId }) => (latest?.tabId === tabId ? latest : undefined),
     latestAgentReadyAt: () => NOW,
-    waitForAgentReady(tabId, options) {
+    waitForAgentReady({ tabId }, options) {
       waits.push(options);
 
       if (answers(latest, tabId, options)) {

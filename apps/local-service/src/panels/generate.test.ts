@@ -52,6 +52,7 @@ import {
 import { TELEMETRY_TIERS, computeCaptureSummary, isTierAllowedForKind } from '@debuggen/telemetry';
 import type { CaptureSummary, TelemetryEvent } from '@debuggen/telemetry';
 
+import type { FollowUpFocus } from '../pipeline/context-builder.js';
 import { createFallbackPanelBuilder } from './fallback.js';
 import {
   PANEL_PROMPT_PLACEHOLDERS,
@@ -521,6 +522,86 @@ describe('the panel framing: what the session settled, as structured data only',
     }
   });
 
+  it('adds the declared chain members at the top level, in chain order, and only members of the chain', () => {
+    const framing = panelFramingOf(sessionRecordWith('rendering'));
+    const declared = buildPanelStageContext(ANALYSIS, SUMMARY, {
+      ...framing,
+      // Out of chain order, repeated, and one name the chain does not carry.
+      declaredComponents: ['TallyBoard', 'TallyTile', 'TallyBoard', 'ElsewherePanel'],
+    });
+    const undeclared = buildPanelStageContext(ANALYSIS, SUMMARY, framing);
+
+    expect(declared.input['declaredComponents']).toEqual([...TARGET_CHAIN]);
+    expect(JSON.stringify(declared.input)).not.toContain('ElsewherePanel');
+    expect(Object.hasOwn(undeclared.input, 'declaredComponents')).toBe(false);
+    // The rendered sections are those of the undeclared context, byte for byte.
+    expect(declared.analysisText).toBe(undeclared.analysisText);
+    expect(declared.captureOverviewText).toBe(undeclared.captureOverviewText);
+
+    for (const names of [[], ['ElsewherePanel']]) {
+      const none = buildPanelStageContext(ANALYSIS, SUMMARY, {
+        ...framing,
+        declaredComponents: names,
+      });
+      expect(none.input).toEqual(undeclared.input);
+    }
+    // Without a chain there is nothing a declaration could name.
+    const chainless = buildPanelStageContext(ANALYSIS, SUMMARY, {
+      declaredComponents: [...TARGET_CHAIN],
+    });
+    expect(Object.hasOwn(chainless.input, 'declaredComponents')).toBe(false);
+  });
+
+  it('joins the request’s declared members to the stored framing on both paths, never the prompt', async () => {
+    const created = harness(undefined, sessionsHolding(sessionRecordWith('rendering')));
+    const first = sentRequest(
+      created,
+      await created.generator.generate({
+        sessionId: SESSION,
+        captureId: CAPTURE,
+        question: PLAIN_QUESTION,
+        analysis: ANALYSIS,
+        summary: SUMMARY,
+        declaredComponents: ['TallyBoard'],
+      }),
+    );
+    const followed = harness(
+      await previousPanel(),
+      sessionsHolding(sessionRecordWith('rendering')),
+    );
+    const followUp = sentRequest(
+      followed,
+      await followed.generator.regenerate({
+        sessionId: SESSION,
+        captureId: CAPTURE,
+        question: PLAIN_QUESTION,
+        followUpQuestion: 'Which tile renders most?',
+        analysis: ANALYSIS,
+        summary: SUMMARY,
+        declaredComponents: ['TallyBoard'],
+      }),
+    );
+    const sessionless = harness(undefined);
+    const alone = sentRequest(
+      sessionless,
+      await sessionless.generator.generate({
+        sessionId: SESSION,
+        captureId: CAPTURE,
+        question: PLAIN_QUESTION,
+        analysis: ANALYSIS,
+        summary: SUMMARY,
+        declaredComponents: ['TallyBoard'],
+      }),
+    );
+
+    for (const request of [first, followUp]) {
+      expect(request.input['declaredComponents']).toEqual(['TallyBoard']);
+      expect(request.prompt).not.toContain('declaredComponents');
+    }
+    // A session without a stored chain gives the declarations nothing to name.
+    expect(Object.hasOwn(alone.input, 'declaredComponents')).toBe(false);
+  });
+
   it('composes from the capture alone when the session is absent or cannot be read', async () => {
     const failing: PanelSessionPort = {
       get: () => err(new DebuggenError('STORE_ERROR', 'The store double is closed.')),
@@ -554,5 +635,110 @@ describe('the panel framing: what the session settled, as structured data only',
       );
       expect(warnings).toHaveLength(warns ? 1 : 0);
     }
+  });
+});
+
+describe('the follow-up focus: structured data only, and only when a follow-up governs', () => {
+  /** An invented declaration name that nothing else in these fixtures spells. */
+  const FOCUS_SYMBOL = 'tallysettle';
+  const FOCUS_DECLARATION = Object.freeze({
+    file: 'src/tally/board.tsx',
+    symbol: FOCUS_SYMBOL,
+    kind: 'component',
+  });
+  const FOCUS: FollowUpFocus = Object.freeze({
+    categoryHints: Object.freeze(['rendering', 'performance']),
+    declarations: Object.freeze([FOCUS_DECLARATION]),
+  });
+
+  /** The structured input without its `followUpFocus` member. */
+  function withoutFocus(input: ModelRequest['input']): Record<string, unknown> {
+    return Object.fromEntries(Object.entries(input).filter(([key]) => key !== 'followUpFocus'));
+  }
+
+  it('adds the focus to the structured input beside the analysis, and to no rendered text', () => {
+    const focused = buildPanelStageContext(ANALYSIS, SUMMARY, {}, FOCUS);
+    const bare = buildPanelStageContext(ANALYSIS, SUMMARY);
+
+    expect(focused.input['followUpFocus']).toEqual(FOCUS);
+    expect(Object.hasOwn(bare.input, 'followUpFocus')).toBe(false);
+    expect(withoutFocus(focused.input)).toEqual(bare.input);
+    // The rendered sections are those of the unfocused context, byte for byte.
+    expect(focused.analysisText).toBe(bare.analysisText);
+    expect(focused.captureOverviewText).toBe(bare.captureOverviewText);
+    for (const text of [focused.analysisText, focused.captureOverviewText]) {
+      expect(text).not.toContain(FOCUS_SYMBOL);
+    }
+  });
+
+  it('carries no focus member for no focus or an empty one, and bounds what it carries', () => {
+    const bare = buildPanelStageContext(ANALYSIS, SUMMARY);
+    for (const focus of [undefined, { categoryHints: [], declarations: [] }]) {
+      const context = buildPanelStageContext(ANALYSIS, SUMMARY, {}, focus);
+      expect(Object.hasOwn(context.input, 'followUpFocus')).toBe(false);
+      expect(context.input).toEqual(bare.input);
+    }
+
+    const bounded = buildPanelStageContext(ANALYSIS, SUMMARY, panelFramingOf(undefined), {
+      categoryHints: ['rendering', 'rendering', ''],
+      declarations: [
+        { file: '../outside/escape.tsx', symbol: FOCUS_SYMBOL, kind: 'component' },
+        FOCUS_DECLARATION,
+        FOCUS_DECLARATION,
+      ],
+    });
+    expect(bounded.input['followUpFocus']).toEqual({
+      categoryHints: ['rendering'],
+      declarations: [FOCUS_DECLARATION],
+    });
+    expect(JSON.stringify(bounded.input)).not.toContain('escape.tsx');
+  });
+
+  it('sends the focus in the structured input of both paths, never in the prompt', async () => {
+    const created = harness(undefined);
+    const first = sentRequest(
+      created,
+      await created.generator.generate({
+        sessionId: SESSION,
+        captureId: CAPTURE,
+        question: PLAIN_QUESTION,
+        analysis: ANALYSIS,
+        summary: SUMMARY,
+        followUpFocus: FOCUS,
+      }),
+    );
+    const plain = harness(undefined);
+    const unfocused = sentRequest(
+      plain,
+      await plain.generator.generate({
+        sessionId: SESSION,
+        captureId: CAPTURE,
+        question: PLAIN_QUESTION,
+        analysis: ANALYSIS,
+        summary: SUMMARY,
+      }),
+    );
+    const followed = harness(await previousPanel());
+    const followUp = sentRequest(
+      followed,
+      await followed.generator.regenerate({
+        sessionId: SESSION,
+        captureId: CAPTURE,
+        question: PLAIN_QUESTION,
+        followUpQuestion: 'Which tile renders most?',
+        analysis: ANALYSIS,
+        summary: SUMMARY,
+        followUpFocus: FOCUS,
+      }),
+    );
+
+    for (const request of [first, followUp]) {
+      expect(request.input['followUpFocus']).toEqual(FOCUS);
+      expect(request.prompt).not.toContain(FOCUS_SYMBOL);
+      expect(request.prompt).not.toContain('followUpFocus');
+    }
+    expect(Object.hasOwn(unfocused.input, 'followUpFocus')).toBe(false);
+    expect(withoutFocus(first.input)).toEqual(unfocused.input);
+    expect(first.prompt).toBe(unfocused.prompt);
   });
 });

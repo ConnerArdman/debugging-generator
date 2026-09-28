@@ -1878,8 +1878,10 @@ export function createPlanStage(deps: PlanStageDeps): PlanStage {
       return fail(context, log, DebuggenError.from(thrown, 'INTERNAL'), INSTRUMENT_STAGE);
     }
     if (!installed.ok) {
-      // The instrumentation service has already sent `instrumentation.failed`
-      // and the instrument stage's `failed` row; it is not repeated here.
+      // The instrumentation service has already reported the outcome — for a
+      // failure, `instrumentation.failed` (the `failed` row comes with the
+      // session's move to `failed`); for a cancelled install, neither, since
+      // the orchestrator reports the cancellation — so nothing is repeated here.
       return fail(context, log, installed.error, INSTRUMENT_STAGE, false);
     }
 

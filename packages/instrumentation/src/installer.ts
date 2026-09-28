@@ -716,6 +716,14 @@ interface AdapterLookup {
  * Reverse application order is what keeps a chain over one file unwound
  * strictly last-applied-first.
  *
+ * A rollback that restored everything, measured against a second listing,
+ * also removes `$DEBUGGEN_HOME/backups/<sessionId>/` through the backup store
+ * when the session's journal then holds nothing but `reverted` records — the
+ * unwound first install of a session leaves no empty directory behind. A
+ * failed delta keeps it, with the earlier plan versions' backups inside. That
+ * removal is housekeeping: its failure is logged at `warn` and never changes
+ * the returned error.
+ *
  * Rollback outcomes are collected, never swallowed and never retried in a
  * loop: each record is attempted once, a file that may not be restored is
  * reported as a conflict with its backup retained, and every restore failure is
@@ -3213,6 +3221,141 @@ async function rollbackApplied(
 }
 
 /**
+ * The facts a log line about a thrown value may carry: a coded error's `code`,
+ * or the runtime's own `errno` code, never its message — a filesystem error
+ * spells the absolute path, and an arbitrary exception may say anything.
+ *
+ * @param caught What was thrown.
+ * @returns `{ code }` for a `DebuggenError`, `{ errno }` otherwise.
+ */
+function thrownFacts(caught: unknown): Record<string, string> {
+  if (DebuggenError.is(caught)) {
+    return { code: caught.code };
+  }
+
+  const errno: unknown =
+    typeof caught === 'object' && caught !== null ? (caught as { code?: unknown }).code : undefined;
+
+  return { errno: isNonEmptyString(errno) ? errno : 'unknown' };
+}
+
+/**
+ * Removes this session's backup directory once an unwound install has
+ * returned the project to no instrumentation at all.
+ *
+ * `restoreModification` deletes each record's backup once the restored bytes
+ * verify, but never `backups/<sessionId>/` itself, which the store created on
+ * the first `put`. Without this step the first install of a session that was
+ * unwound left that directory behind, empty, past the session's end, start-up
+ * reconciliation and every retention sweep. The directory goes through the
+ * backup-store port, {@link InstrumentationContext.backups} — whose
+ * `removeSessionDirectory` (`./patch/backup-store.ts`) unlinks only the
+ * digest-named files the store created and then the emptied directory,
+ * non-recursively and fail-closed — and only when nothing can still need
+ * anything in it. The caller has established that the rollback was intact (no
+ * conflict, whose original stays where the developer is pointed, and no failed
+ * restore, whose backup reconciliation still needs) and that the journal was
+ * listed again after the adapters answered (so no record written past the
+ * adapters' journal can still reference a backup). This function adds two
+ * more conditions:
+ *
+ * - the store is this session's own — one scoped to another session would
+ *   reach that session's backups, and is the very condition an adapter may
+ *   have been rejected for;
+ * - a fresh listing of the session's journal succeeds and **every** record in
+ *   it is `reverted`. A delta's rollback leaves the earlier plan versions'
+ *   records applied, and their backups are what cleanup restores from, so the
+ *   directory and those backups stay.
+ *
+ * Never fails the install and never changes its error: the project is already
+ * back, so a listing the journal refuses, an entry the store will not delete
+ * or a filesystem error is logged at `warn` with identifiers and codes only.
+ * Retention's orphan rule removes a directory left empty this way once its
+ * session is at rest.
+ *
+ * @param context The session's context, with the session's own journal and
+ * backup store.
+ * @param attempted How many records the rollback reversed, for the log line.
+ *
+ * @example What an unwound first install leaves in the state directory
+ * ```text
+ * before the install     $DEBUGGEN_HOME/backups/            (no session directory)
+ * after one patch        $DEBUGGEN_HOME/backups/ses_…/<originalHash>
+ * after the rollback     $DEBUGGEN_HOME/backups/            (restored, backup deleted, directory removed)
+ * ```
+ */
+async function removeUnwoundSessionDirectory(
+  context: InstrumentationContext,
+  attempted: number,
+): Promise<void> {
+  const facts = { sessionId: context.sessionId, planVersion: context.planVersion, attempted };
+  const store = context.backups;
+
+  if (store.sessionId !== context.sessionId) {
+    context.logger.debug(
+      'the backup directory was left in place: the backup store belongs to another session',
+      facts,
+    );
+
+    return;
+  }
+
+  const listed = await readSessionJournal(context);
+
+  if (isErr(listed)) {
+    context.logger.warn(
+      'the session backup directory was left in place: the modification journal could not be listed after the rollback',
+      { ...facts, code: listed.error.code },
+    );
+
+    return;
+  }
+
+  const unsettled = listed.value.filter((record) => record.status !== 'reverted').length;
+
+  if (unsettled > 0) {
+    // The ordinary outcome of a delta's rollback: the earlier plan versions'
+    // records still stand over their backups.
+    context.logger.debug(
+      'the session backup directory is kept: records of this session still hold their backups',
+      { ...facts, unsettled },
+    );
+
+    return;
+  }
+
+  let removed: Result<number>;
+
+  try {
+    removed = await store.removeSessionDirectory();
+  } catch (caught) {
+    context.logger.warn('the session backup directory was not removed after the rollback', {
+      ...facts,
+      ...thrownFacts(caught),
+    });
+
+    return;
+  }
+
+  if (isErr(removed)) {
+    const reason: unknown = removed.error.details?.['reason'];
+
+    context.logger.warn('the session backup directory was not removed after the rollback', {
+      ...facts,
+      code: removed.error.code,
+      ...(isNonEmptyString(reason) ? { reason } : {}),
+    });
+
+    return;
+  }
+
+  context.logger.debug('the session backup directory was removed after the rollback', {
+    ...facts,
+    deleted: removed.value,
+  });
+}
+
+/**
  * The sentence describing what an unwound install left behind.
  *
  * When the second journal listing failed, the set came from the install's
@@ -3412,6 +3555,12 @@ async function unwind(
  * second journal listing failed points at the journal store, whose start-up
  * reconciliation settles any record the ledger could not have seen.
  *
+ * Once the error is built and logged, an intact rollback whose second listing
+ * was taken hands the session's backup directory to
+ * {@link removeUnwoundSessionDirectory}, which removes it when every record of
+ * the session is `reverted` — never when an earlier plan version's records
+ * still stand — and whose outcome never reaches the returned error.
+ *
  * @param set The records to reverse-restore, from {@link collectRollbackSet}.
  * @param context The session's context, with the session's own journal.
  * @param input Why the install stopped.
@@ -3488,6 +3637,13 @@ async function unwindCollected(
   );
 
   context.logger.error(error.message, { sessionId: context.sessionId, ...details });
+
+  // Housekeeping after the error is final: an intact rollback that was
+  // measured against a fresh listing may have emptied the session's backup
+  // directory, and nothing below can change what is returned.
+  if (intact && set.reread === 'listed') {
+    await removeUnwoundSessionDirectory(context, set.records.length);
+  }
 
   return error;
 }

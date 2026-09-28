@@ -1404,6 +1404,78 @@ const CASCADE_PROJECT: Readonly<Record<string, string>> = {
     '}',
   ),
 
+  // Function-local delegates of inline handlers, in every shape the delegate
+  // rule claims or declines. `useCallback` and `useMemo` are left unresolved
+  // on purpose: the rule reads their names, never their definitions.
+  'components/Delegates.tsx': moduleText(
+    "import { record } from '../lib/core';",
+    '',
+    'export function Checkout() {',
+    '  async function send(): Promise<void> {',
+    "    record('delegate-declaration');",
+    "    await Promise.resolve().then(() => record('delegate-callback'));",
+    '  }',
+    '',
+    '  const sendMemo = useCallback(',
+    '    async () => {',
+    "      record('delegate-memoised');",
+    '    },',
+    "    [record('delegate-dependency')],",
+    '  );',
+    '',
+    '  const sendArrow = (): void => {',
+    "    record('delegate-arrow');",
+    '  };',
+    '',
+    '  function shared(): void {',
+    "    record('delegate-two-handlers');",
+    '  }',
+    '',
+    '  function leaked(): void {',
+    "    record('delegate-also-called-in-body');",
+    '  }',
+    '',
+    '  function passed(): void {',
+    "    record('delegate-passed-as-value');",
+    '  }',
+    '',
+    '  function bound(): void {',
+    "    record('delegate-named-binding');",
+    '  }',
+    '',
+    '  function outer(): void {',
+    '    inner();',
+    '  }',
+    '',
+    '  function inner(): void {',
+    "    record('delegate-second-level');",
+    '  }',
+    '',
+    '  const memoised = useMemo(() => {',
+    "    record('delegate-memo-factory');",
+    '    return (): void => undefined;',
+    '  }, []);',
+    '',
+    '  const api = { send: 1 };',
+    '  void api.send;',
+    '  leaked();',
+    '',
+    '  return (',
+    '    <form onSubmit={(event) => { event.preventDefault(); void send(); }}>',
+    '      <button onClick={() => { void sendMemo(); sendArrow(); }} />',
+    '      <button onSelect={(send: () => void) => send()} />',
+    '      <button onFocus={() => shared()} />',
+    '      <button onBlur={() => shared()} />',
+    '      <button onKeyDown={() => leaked()} />',
+    '      <button onKeyUp={() => [1].forEach(passed)} />',
+    '      <button onReset={() => bound()} onInput={bound} />',
+    '      <button onChange={() => outer()} />',
+    '      <button onCopy={() => memoised()} />',
+    '    </form>',
+    '  );',
+    '}',
+  ),
+
   // App Router modules step 2 names, each in a different spelling.
   'app/(group)/@slot/items/[id]/route.ts': appHandlerModule('grouped-dynamic-route'),
   'app/route.ts': appHandlerModule('root-route'),
@@ -3072,6 +3144,7 @@ describe('serverFunctionsExtractor: component owners and component modules', () 
     'components/Anonymous.tsx',
     'components/Shapes.tsx',
     'components/Handlers.tsx',
+    'components/Delegates.tsx',
   ])('emits no server-function node from the component module %s', (file) => {
     expect(serverFunctionsOf(cascade, file)).toStrictEqual([]);
   });
@@ -3174,6 +3247,103 @@ describe('serverFunctionsExtractor: markup-bound handlers', () => {
         'a derived handler id must be one the handler extractor emitted',
       ).toBe(true);
     }
+  });
+});
+
+/** The module every delegate-rule row below reads. */
+const DELEGATES_MODULE = 'components/Delegates.tsx';
+
+/** Where the delegates module's component is anchored. */
+const DELEGATES_COMPONENT: OwnerAnchor = ['export function Checkout(', 'Checkout'];
+
+/** Where the delegates module's `onSubmit` arrow is anchored. */
+const DELEGATES_SUBMIT_ARROW: OwnerAnchor = [
+  '(event) => { event.preventDefault(); void send(); }',
+  '(',
+];
+
+/** Where the delegates module's `onClick` arrow is anchored. */
+const DELEGATES_CLICK_ARROW: OwnerAnchor = ['() => { void sendMemo(); sendArrow(); }', '('];
+
+/**
+ * Owners in a module whose inline handlers delegate to function-local
+ * functions, in every shape the delegate rule claims or declines.
+ */
+const DELEGATE_OWNERS: readonly OwnerRow[] = [
+  // Claimed: each delegate is called from one inline handler and from nowhere
+  // else, so its calls — including one inside an anonymous callback — are the
+  // handler's. A parameter of the same name shadows `send` in `onSelect`, and
+  // `api.send` names a property, so neither is a reference to it.
+  [DELEGATES_MODULE, 'delegate-declaration', 'handler onSubmit', DELEGATES_SUBMIT_ARROW],
+  [DELEGATES_MODULE, 'delegate-callback', 'handler onSubmit', DELEGATES_SUBMIT_ARROW],
+  [DELEGATES_MODULE, 'delegate-memoised', 'handler onClick', DELEGATES_CLICK_ARROW],
+  [DELEGATES_MODULE, 'delegate-arrow', 'handler onClick', DELEGATES_CLICK_ARROW],
+  // Declined: the delegate is called from two inline handlers, is also called
+  // from the component body, is passed as a value rather than called, only
+  // another delegate calls it, or its declarator holds what a `useMemo`
+  // factory returns rather than the factory. A call in a dependency list sits
+  // outside the memoised function altogether.
+  [DELEGATES_MODULE, 'delegate-two-handlers', 'component Checkout', DELEGATES_COMPONENT],
+  [DELEGATES_MODULE, 'delegate-also-called-in-body', 'component Checkout', DELEGATES_COMPONENT],
+  [DELEGATES_MODULE, 'delegate-passed-as-value', 'component Checkout', DELEGATES_COMPONENT],
+  [DELEGATES_MODULE, 'delegate-second-level', 'component Checkout', DELEGATES_COMPONENT],
+  [DELEGATES_MODULE, 'delegate-memo-factory', 'component Checkout', DELEGATES_COMPONENT],
+  [DELEGATES_MODULE, 'delegate-dependency', 'component Checkout', DELEGATES_COMPONENT],
+  // A named binding keeps precedence over the delegate rule: `bound` is both
+  // bound by name and called from an inline arrow, and is its own handler node.
+  [DELEGATES_MODULE, 'delegate-named-binding', 'handler bound', ['function bound(', 'bound']],
+];
+
+describe('serverFunctionsExtractor: function-local delegates of inline handlers', () => {
+  it.each(DELEGATE_OWNERS)('in %s, attributes the call labelled %s to the %s node', (...row) => {
+    expectOwner(row);
+  });
+
+  it('starts every delegate-owned edge at a handler node ./event-handlers.ts emits', () => {
+    const handlerIds = new Set(
+      eventHandlersExtractor
+        .extract(
+          contextFor(cascade.loaded, sourceFileOf(cascade, DELEGATES_MODULE), DELEGATES_MODULE),
+        )
+        .nodes.filter((node) => node.kind === 'handler')
+        .map((node) => node.id),
+    );
+    const handlerOwned = resultFor(cascade, DELEGATES_MODULE).edges.filter(
+      (edge) => nodeById(cascade, edge.from).kind === 'handler',
+    );
+
+    expect(handlerOwned.map((edge) => nodeById(cascade, edge.from).name)).toStrictEqual([
+      'onSubmit',
+      'onSubmit',
+      'onClick',
+      'onClick',
+      'bound',
+    ]);
+    for (const edge of handlerOwned) {
+      expect(
+        handlerIds.has(edge.from),
+        'a delegate-owned edge must start at a handler node the handler extractor emitted',
+      ).toBe(true);
+    }
+    expect(
+      cascade.graph.diagnostics.filter(
+        (entry) => entry.code === 'dangling-edge' && entry.file === DELEGATES_MODULE,
+      ),
+    ).toStrictEqual([]);
+  });
+
+  it('leaves the component with only the calls the rule declined, and the arrow calling nothing named', () => {
+    // The delegates themselves are function-local, so the calls the inline
+    // arrows write (`send()`, `shared()`) reach no node and produce no edge:
+    // the only edges from the handler nodes are the ones credited through the
+    // rule, and the component keeps exactly the six calls it declined.
+    const edges = resultFor(cascade, DELEGATES_MODULE).edges;
+    const componentOwned = edges.filter(
+      (edge) => nodeById(cascade, edge.from).kind === 'component',
+    );
+
+    expect(componentOwned).toHaveLength(6);
+    expect(edges).toHaveLength(DELEGATE_OWNERS.length);
   });
 });
 

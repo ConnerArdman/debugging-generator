@@ -280,7 +280,7 @@ The demo contains deliberately seeded, non-trivial defects — a slow multi-tier
 - **Recorded before written.** Before any write, the original content and its SHA-256 hash are saved under `~/.debuggen/backups/`, and the change is journalled together with the hash the file is expected to have afterwards; the write itself is atomic.
 - **Visible.** Every modification is listed under **File modifications** in the Session view, each with **View diff**.
 - **Restored.** Ending the session — or closing VS Code, or the next service start after a crash — restores every file byte for byte and verifies the restored hash.
-- **Never overwrites your edits.** A file you edit while it is instrumented is reported as a conflict and left exactly as you wrote it; its original stays in the backup directory.
+- **Never overwrites your edits.** A file you edit while it is instrumented is reported as a conflict and left exactly as you wrote it; its pristine original — the file as it was before the session first instrumented it — stays in the backup directory, at the path the conflict message names ([resolving a conflict](#troubleshooting)).
 
 The full guarantees, and what stays loaded in a launched dev server afterwards, are in [docs/SECURITY.md](docs/SECURITY.md#6-generated-instrumentation-risks-and-reversibility-guarantees).
 
@@ -392,7 +392,7 @@ Everything the tool keeps for itself lives under `DEBUGGEN_HOME` (default `~/.de
 
 Your project's own files are the exception. Named-function timing edits tracked source files in place, so while a session is instrumented each patched file shows as modified in `git status`. Cleanup restores it byte for byte and it is clean again; a file you edited while it was instrumented is reported as a conflict and stays modified with your edit, because the tool never overwrites it ([what it changes, and how it undoes it](#what-it-changes-in-your-project-and-how-it-undoes-it)).
 
-Directories are created with mode `0700` and files with `0600`. Sessions older than `DEBUGGEN_RETENTION_DAYS` (30 days by default) are purged on service start, and **Debug Generator: Purge Stored Sessions** runs the same purge on demand; backups of unresolved conflicts are kept until the conflict is resolved. End every session before deleting the directory yourself — the backups are the record of what your files contained. Details: [docs/SECURITY.md](docs/SECURITY.md#8-session-data-at-rest).
+Directories are created with mode `0700` and files with `0600`. Sessions older than `DEBUGGEN_RETENTION_DAYS` (30 days by default) are purged on service start, and **Debug Generator: Purge Stored Sessions** runs the same purge on demand; backups of unresolved conflicts are kept until the conflict is resolved — once the file matches its pristine original again, the next cleanup closes it (see [Troubleshooting](#troubleshooting)). End every session before deleting the directory yourself — the backups are the record of what your files contained. Details: [docs/SECURITY.md](docs/SECURITY.md#8-session-data-at-rest).
 
 ## Troubleshooting
 
@@ -442,7 +442,10 @@ Walkthrough-specific cases are in [docs/DEMO.md](docs/DEMO.md#10-if-something-do
 **A file is reported as edited while instrumented.**
 
 - **Cause:** you changed a file the session had patched. This is a conflict, reported rather than resolved for you.
-- **Fix:** nothing is lost — the tool does not overwrite your edit, and the original is kept at the backup path shown with the message; use **Open diff** to compare and restore what you need.
+- **Fix:** nothing is lost — the tool does not overwrite your edit.
+  - The path shown with the message ("Original saved at …") is the file's **pristine original**: the file as it was before the session first instrumented it. For a file a follow-up instrumented again, that is the first plan version's backup (the chain root's), never a later backup that still carries the instrumentation.
+  - To go back to the original, copy that file over yours: it carries no instrumentation, and when the file had no uncommitted changes before the session it is also the version-control copy. **Open diff** only shows what you changed, so it is safe at any time.
+  - Once the file matches that original again, end the session — or, if it has already ended, restart the local service — and cleanup closes the conflict without writing to the file.
 
 **Install or build errors that mention engines, or an unsupported Node.js or pnpm version.**
 

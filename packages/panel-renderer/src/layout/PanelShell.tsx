@@ -1,9 +1,9 @@
 /**
  * The outermost layout primitive of the in-repo design system
- * `@debuggen/panel-renderer`: the theme root, and the panel's scrolling
+ * `@debuggen/panel-renderer`: the theme root, and the panel's named scrolling
  * region.
  *
- * Three properties define this module, and all three are deliberate.
+ * Four properties define this module, and all four are deliberate.
  *
  * ## 1. It is the theme root
  *
@@ -48,6 +48,34 @@
  * panning. Anything else that reaches for `overflow` is working around a layout
  * it should be composing with `Stack`, `Split` and `Section` instead.
  *
+ * ## 4. Its scrolling region is named, or it is no tab stop
+ *
+ * A region that scrolls must be reachable by keyboard, so the viewport is a
+ * focus stop. A focus stop with no accessible name, though, is announced as
+ * nothing at all: a keyboard or screen-reader user lands on an anonymous
+ * container as the first stop of the surface and is told neither what it is
+ * nor why it took focus. The shell therefore makes naming part of its type —
+ * every caller states the name, in one of two forms:
+ *
+ * - `labelledBy` — the `id` of a heading the caller already renders inside the
+ *   content, such as the summary header's visible panel title or a surface's
+ *   own visually hidden view title. The region is named by the product's own
+ *   title and no second heading is added to the outline. This is the usual
+ *   form.
+ * - `label` — a string for a surface whose content carries no heading that
+ *   names it. The shell renders it as a visually hidden heading and names the
+ *   region after that.
+ *
+ * Either form makes the viewport a `region` labelled by its heading and a tab
+ * stop. The runtime invariant is the one that matters to a reader and is
+ * enforced here rather than trusted to the type: the viewport is a keyboard
+ * focus stop **only** while it carries a name. A blank value — an empty or
+ * whitespace-only `label` or `labelledBy`, which only an untyped or computed
+ * caller can produce — renders a plain container with no role, no
+ * `aria-labelledby` and no `tabIndex`, never an unnamed tab stop. The name is
+ * never invented here: default wording chosen inside a library would be copy
+ * the product never wrote.
+ *
  * ## Class-name contract implemented by `../styles/components.css`
  *
  * No value — no length, colour, font, shadow or z-index — is written in this
@@ -61,9 +89,9 @@
  *   establishes the panel's stacking base, and binds the themed scroll
  *   behaviour (the same four declarations as the global `dg-scroll` helper) so
  *   the block and its viewport together form one scrolling region.
- * - `dg-panel-shell__viewport` — the content flow region inside the block, and
- *   the region's focus stop. The focus indicator comes from the global
- *   `:focus-visible` rule in `../styles/base.css`, which also owns the reset,
+ * - `dg-panel-shell__viewport` — the content flow region inside the block, and,
+ *   while it is named, the region's focus stop. The focus indicator comes from
+ *   the global `:focus-visible` rule in `../styles/base.css`, which also owns the reset,
  *   the document-level surface and font bindings, the reduced-motion block and
  *   the `dg-visually-hidden` utility this module reuses through `Heading`;
  *   none of that is restated here.
@@ -83,17 +111,19 @@
  * scrolls nothing programmatically; a surface that needs such a policy owns it
  * above this component.
  *
- * @example The common case: a panel in the default theme, named by its own
- * visible heading further down the tree.
+ * @example The common case: a panel in the default theme whose scroll region is
+ * named by the visible title the summary header renders further down the tree.
  * ```tsx
- * <PanelShell>
- *   <SummaryHeader … />
+ * const titleId = useId();
+ *
+ * <PanelShell labelledBy={titleId}>
+ *   <SummaryHeader titleId={titleId} … />
  *   <Stack>{nodes}</Stack>
  * </PanelShell>
  * ```
  *
- * @example A host that has resolved its theme, and a scroll region that needs an
- * accessible name of its own.
+ * @example A host that has resolved its theme, over content that renders no
+ * heading of its own, so the shell renders the naming heading itself.
  * ```tsx
  * <PanelShell theme={themeFromDevToolsThemeName(hostThemeName)} label="Generated view">
  *   {children}
@@ -116,14 +146,14 @@ import {
 import type { PanelTheme } from '../tokens/theme';
 
 /**
- * Props of {@link PanelShell}.
+ * The props of {@link PanelShell} other than the name of its scroll region.
  *
  * Deliberately narrow. There is no `style` prop, no `ref`, no data or query
  * prop, no interaction callback and no `onThemeChange`: the component is a pure
  * applier of a theme it is handed, and every other concern — data, actions,
  * focus, the visible title — belongs to a component above or below it.
  */
-export interface PanelShellProps {
+interface PanelShellFrameProps {
   /**
    * The token value set to render. Omitted, it is {@link DEFAULT_PANEL_THEME},
    * which is the product default and also the set the generated stylesheet
@@ -144,20 +174,6 @@ export interface PanelShellProps {
   children?: ReactNode | undefined;
 
   /**
-   * An accessible name for the scroll region.
-   *
-   * Supplying it makes the viewport a named `region` landmark labelled by a
-   * heading that is present in the document outline and in the accessibility
-   * tree but not on the visual surface. Omitting it — the usual case — leaves
-   * the viewport a plain container, which is the correct outcome rather than a
-   * gap: an unnamed `region` is an ARIA anti-pattern, and a default name
-   * invented inside a library would be wording the product never chose. A
-   * panel's *visible* title is rendered by the summary header inside the
-   * content, so the two never compete for the same accessible name.
-   */
-  label?: string | undefined;
-
-  /**
    * Additional class names for the block, appended after the system's own so a
    * caller can position the shell inside its host frame without displacing the
    * contract above.
@@ -170,6 +186,60 @@ export interface PanelShellProps {
    */
   id?: string | undefined;
 }
+
+/**
+ * The scroll region named by a string the shell renders itself.
+ *
+ * For content that carries no heading naming the surface. The shell renders
+ * the string as a heading that is present in the document outline and in the
+ * accessibility tree but not on the visual surface, immediately before the
+ * viewport, and labels the viewport with it.
+ */
+interface PanelShellLabelNaming {
+  /**
+   * The accessible name of the scroll region, in the product's own words.
+   * Rendered as a visually hidden level-2 heading; a blank value names nothing
+   * and leaves the viewport a plain, unfocusable container.
+   */
+  label: string;
+
+  /** Excluded: the region has exactly one name. */
+  labelledBy?: undefined;
+}
+
+/**
+ * The scroll region named by a heading the content already renders.
+ *
+ * The usual form: the summary header's visible panel title, or a surface's own
+ * visually hidden view title, names the region, so no second heading enters
+ * the outline and the region's name is the title a reader already sees or
+ * hears.
+ */
+interface PanelShellLabelledByNaming {
+  /**
+   * The `id` of the heading, rendered inside `children`, that names the scroll
+   * region — typically produced by `useId` in the caller and handed both here
+   * and to the heading. The caller guarantees the heading exists and has text
+   * for as long as the shell is mounted; a blank value names nothing and
+   * leaves the viewport a plain, unfocusable container.
+   */
+  labelledBy: string;
+
+  /** Excluded: the region has exactly one name. */
+  label?: undefined;
+}
+
+/**
+ * Props of {@link PanelShell}: the frame props, plus the name of the scroll
+ * region in exactly one of its two forms — `label` or `labelledBy`.
+ *
+ * The name is required by the type because the viewport is a keyboard focus
+ * stop, and an unnamed focus stop is announced as nothing (see "Its scrolling
+ * region is named, or it is no tab stop" in this module's header). Supplying
+ * both forms, or neither, does not compile.
+ */
+export type PanelShellProps = PanelShellFrameProps &
+  (PanelShellLabelNaming | PanelShellLabelledByNaming);
 
 /**
  * The theme attribute as a spreadable single-property object.
@@ -201,48 +271,62 @@ function panelThemeAttribute(theme: PanelTheme): PanelThemeAttribute {
  * outermost element.
  *
  * Renders exactly two nested elements — the themed block and its viewport —
- * plus, only when {@link PanelShellProps.label} is supplied, a visually hidden
- * heading that names the viewport. The heading sits inside the block and
- * immediately before the viewport: the utility that hides it takes it out of
- * flow, so it can neither add a row to the block's layout nor extend the
- * scrollable area, and `aria-labelledby` resolves to it from anywhere in the
- * document.
+ * plus, only for the `label` form of the name, a visually hidden heading that
+ * names the viewport. The heading sits inside the block and immediately before
+ * the viewport: the utility that hides it takes it out of flow, so it can
+ * neither add a row to the block's layout nor extend the scrollable area, and
+ * `aria-labelledby` resolves to it from anywhere in the document. The
+ * `labelledBy` form adds no element: the viewport points at the heading the
+ * content already renders.
  *
- * The viewport carries `tabIndex={0}` unconditionally. A region that scrolls but
- * cannot receive focus is unreachable by keyboard: everything below the fold
- * becomes inaccessible to anyone not using a pointer, because arrow keys scroll
- * the nearest scrollable ancestor of the focused element and there is no way to
- * put focus inside it when the content itself holds no control. The scrollable
- * block form of the `Code` primitive is focusable for exactly the same reason.
- * The focus ring is the global `:focus-visible` indicator, so a pointer user
- * never sees it.
+ * A named viewport is a `region` and carries `tabIndex={0}`. A region that
+ * scrolls but cannot receive focus is unreachable by keyboard: everything below
+ * the fold becomes inaccessible to anyone not using a pointer, because arrow
+ * keys scroll the nearest scrollable ancestor of the focused element and there
+ * is no way to put focus inside it when the content itself holds no control.
+ * The scrollable block form of the `Code` primitive is focusable for exactly
+ * the same reason. The focus ring is the global `:focus-visible` indicator, so
+ * a pointer user never sees it.
+ *
+ * A viewport whose name turned out blank is neither: no role, no
+ * `aria-labelledby` and no `tabIndex`, because a focus stop that announces as
+ * nothing costs every keyboard user a stop and tells them nothing (see "Its
+ * scrolling region is named, or it is no tab stop" in this module's header).
  *
  * @param props - See {@link PanelShellProps}.
  * @returns The themed panel shell wrapping its content in the scroll viewport.
  */
 export function PanelShell(props: PanelShellProps): ReactElement {
-  const { theme = DEFAULT_PANEL_THEME, children, label, className, id } = props;
+  const { theme = DEFAULT_PANEL_THEME, children, label, labelledBy, className, id } = props;
 
-  // Called unconditionally, as a hook must be, and used only when a label was
-  // supplied. A blank or whitespace-only label is treated as no label: it would
-  // produce a named region whose name announces as nothing, which is worse for
-  // a screen-reader user than the unnamed container.
+  // Called unconditionally, as a hook must be, and used only for the `label`
+  // form. A blank or whitespace-only value in either form is treated as no name
+  // at all: a region whose name announces as nothing is worse for a
+  // screen-reader user than a plain container, and a focus stop with no name is
+  // worse for a keyboard user than none. The type admits exactly one form; were
+  // an untyped caller to pass both, the heading the shell renders itself wins,
+  // because it is the one name this component can vouch for.
   const generatedId = useId();
-  const named = label !== undefined && label.trim() !== '';
-  const headingId = named ? generatedId : undefined;
+  const ownHeading = label !== undefined && label.trim() !== '';
+  const nameId = ownHeading
+    ? generatedId
+    : labelledBy !== undefined && labelledBy.trim() !== ''
+      ? labelledBy
+      : undefined;
+  const named = nameId !== undefined;
 
   return (
     <div className={clsx('dg-panel-shell', className)} {...panelThemeAttribute(theme)} id={id}>
-      {named ? (
-        <Heading level={2} visuallyHidden id={headingId}>
+      {ownHeading ? (
+        <Heading level={2} visuallyHidden id={generatedId}>
           {label}
         </Heading>
       ) : null}
       <div
         className="dg-panel-shell__viewport"
-        tabIndex={0}
+        tabIndex={named ? 0 : undefined}
         role={named ? 'region' : undefined}
-        aria-labelledby={headingId}
+        aria-labelledby={nameId}
       >
         {children}
       </div>

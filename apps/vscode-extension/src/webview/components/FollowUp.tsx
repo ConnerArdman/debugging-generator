@@ -50,6 +50,17 @@
  * saying longer text is cut off once the draft is full. The submit chord pressed on a blank draft
  * marks the field invalid with a short message, cleared as soon as the draft holds text.
  *
+ * ## The shortcut hint
+ *
+ * The actions row says how the keyboard works, in the same words and the same form as the question
+ * field of `QuestionForm.tsx`: "Press Ctrl+Enter (Cmd+Enter on macOS) to ask. Enter starts a new
+ * line." Every key is a `Kbd` chip, whose chord separators are hidden from assistive technology,
+ * so the hint is heard as exactly that sentence; "Cmd" is spelled out because every screen reader
+ * speaks it, which a "⌘" glyph does not guarantee. It is a muted `Text` placed immediately before
+ * the submit button and it describes the field through `aria-describedby`, after the counter and
+ * the retry hint. The two components share no runtime module, so each declares the key constants
+ * and the sentence itself; `FollowUp.test.tsx` renders both hints and fails when they drift apart.
+ *
  * ## Focus
  *
  * While a follow-up is pending, `App.tsx` replaces the field with the busy state, so the control
@@ -98,6 +109,7 @@ import {
   EmptyState,
   ErrorState,
   Input,
+  Kbd,
   LoadingState,
   Stack,
   Text,
@@ -193,8 +205,14 @@ const ROOT_CLASS = 'dgv-followup';
 /** The visible label of the field, rendered as a real `<label htmlFor>` by `Input`. */
 const FIELD_LABEL = 'Follow-up question';
 
-/** Persistent help under the field, announced with it through `aria-describedby`. */
-const FIELD_HINT = 'Press Ctrl+Enter (⌘+Enter on macOS) to ask. Enter starts a new line.';
+/**
+ * The keys the shortcut hint prints through `Kbd`: the two submit chords — Ctrl+Enter, then
+ * Cmd+Enter for macOS — and the lone Enter that inserts a new line. `QuestionForm.tsx` declares the
+ * same three and prints the same sentence (see the module note).
+ */
+const SUBMIT_CHORD_CTRL: readonly string[] = ['Ctrl', 'Enter'];
+const SUBMIT_CHORD_CMD: readonly string[] = ['Cmd', 'Enter'];
+const NEW_LINE_KEY = 'Enter';
 
 /** Visible line count of the field; a follow-up is usually a sentence or two. */
 const FIELD_ROWS = 3;
@@ -476,6 +494,7 @@ export function FollowUp(props: FollowUpProps): ReactElement {
   const fieldId = useId();
   const retryHintId = useId();
   const counterId = useId();
+  const shortcutId = useId();
 
   // React's "adjust state while rendering" pattern: a new outcome is applied here, once per
   // `seq`, and React re-renders before committing, so neither a stale draft nor a second
@@ -542,6 +561,12 @@ export function FollowUp(props: FollowUpProps): ReactElement {
   // one state the counter warns about.
   const atLimit = draft.length >= MAX_WEBVIEW_QUESTION_LENGTH;
   const blankShown = blankAttempted && isBlank;
+  // The field's own descriptions, in reading order: the counter, the retry hint while it shows,
+  // then the shortcut hint of the actions row. `Input` appends the blank-draft message's id while
+  // the field is marked invalid.
+  const fieldDescription = retryHintShown
+    ? `${counterId} ${retryHintId} ${shortcutId}`
+    : `${counterId} ${shortcutId}`;
 
   /**
    * Replace the draft with what the field now holds, and retire the blank-draft message as soon as
@@ -599,14 +624,13 @@ export function FollowUp(props: FollowUpProps): ReactElement {
         fullWidth
         rows={FIELD_ROWS}
         label={FIELD_LABEL}
-        hint={FIELD_HINT}
         maxLength={MAX_WEBVIEW_QUESTION_LENGTH}
         value={draft}
         onValueChange={changeDraft}
         onKeyDown={handleKeyDown}
         invalid={blankShown}
         errorMessage={BLANK_DRAFT_MESSAGE}
-        aria-describedby={retryHintShown ? `${counterId} ${retryHintId}` : counterId}
+        aria-describedby={fieldDescription}
       />
       {/* Described by the field, not live: announced with it, never once per keystroke. */}
       <Text as="p" size="xs" tone={atLimit ? 'warning' : 'muted'} numeric id={counterId}>
@@ -618,6 +642,12 @@ export function FollowUp(props: FollowUpProps): ReactElement {
         </Text>
       ) : null}
       <div className="dgv-followup__actions">
+        {/* Reads "Press Ctrl+Enter (Cmd+Enter on macOS) to ask. Enter starts a new line.", word
+            for word the question field's hint. */}
+        <Text size="xs" tone="muted" id={shortcutId}>
+          Press <Kbd keys={SUBMIT_CHORD_CTRL} /> (<Kbd keys={SUBMIT_CHORD_CMD} /> on macOS) to ask.{' '}
+          <Kbd>{NEW_LINE_KEY}</Kbd> starts a new line.
+        </Text>
         <Button variant="secondary" disabled={isBlank} onClick={submitDraft}>
           {SUBMIT_LABEL}
         </Button>

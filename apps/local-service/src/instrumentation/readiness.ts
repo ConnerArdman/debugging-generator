@@ -174,6 +174,12 @@
  * - **It knows no project.** Nothing here names a file, component, function or
  *   route of any application, and nothing reads the developer's question
  *   (AAP §0.5.4).
+ * - **It reads one session's evidence.** A Chrome tab id is unique only
+ *   within one browser, so every registry read and wait names the session's
+ *   {@link BoundTabRef}, bound once per entry point: another paired browser's
+ *   tab of the same id, bound to another session, never lends this session
+ *   its page-agent report or its navigations (AAP §0.5.6, §0.7.1 Group 2 —
+ *   readiness rests on the *bound* tab's current document).
  * - **It is side-effect free at load time**: no environment read, no console,
  *   no timer, no global. Every collaborator is injected.
  * - **It logs no page-supplied identifier.** A relayed `agent.ready` is shaped
@@ -477,22 +483,51 @@ export interface WaitForAgentReadyOptions {
 }
 
 /**
- * The relayed page-agent facts, per tab — the consumer-declared port this
- * module reads browser readiness through.
+ * The bound tab a {@link BrowserAgentRegistry} is asked about: the session
+ * whose binding it is, and that tab's id.
+ *
+ * A Chrome tab id is unique only within one browser, so two paired browsers
+ * inspect tabs whose ids collide, each bound to its own session. Evidence is
+ * therefore read for the session's binding — the tab of that id the binding's
+ * own DevTools credential reported from — never for a bare tab id, which would
+ * lend one browser's page-agent report to another browser's session (AAP
+ * §0.5.6: a DevTools credential acts only for the session bound to its tab).
+ *
+ * @example
+ * ```ts
+ * const ref: BoundTabRef = { sessionId: context.sessionId, tabId: boundTab.tabId };
+ * agents.latestAgentReady(ref); // this session's bound tab only
+ * ```
+ */
+export interface BoundTabRef {
+  /** The session whose bound tab is asked about. */
+  readonly sessionId: string;
+
+  /** The id of that session's bound tab, as the binding records it. */
+  readonly tabId: number;
+}
+
+/**
+ * The relayed page-agent facts, per bound tab — the consumer-declared port
+ * this module reads browser readiness through.
  *
  * Satisfied structurally by `../main.ts`'s agent-ready ledger, which is written
  * from two sides: the WebSocket router (`../server/ws.ts`) stores every
  * `agent.ready` the Chrome service worker relays under a tab's connection,
  * and the binding route (`../server/routes/binding.ts`) stamps
- * every `tab.navigated` it accepts. Declared here, where it is consumed,
- * following the precedent of `ServerAgentPresence` in
- * `../dev-server/detect.ts`, so this module builds and tests without the
- * transport layer.
+ * every `tab.navigated` it accepts — each under the relaying DevTools
+ * credential as well as the tab id. Every read names a {@link BoundTabRef}: the
+ * ledger answers with the evidence the session's binding credential reported
+ * for that tab, and with nothing when the session's live binding is not that
+ * tab. Declared here, where it is consumed, following the precedent of
+ * `ServerAgentPresence` in `../dev-server/detect.ts`, so this module builds
+ * and tests without the transport layer.
  */
 export interface BrowserAgentRegistry {
   /**
-   * The newest relayed `agent.ready` for `tabId`; absent when no page agent has
-   * reported from the tab.
+   * The newest relayed `agent.ready` for the session's bound tab; absent when
+   * no page agent has reported from it — including when another browser's tab
+   * of the same id has.
    *
    * The relaying layer replaces the stored report when a new document's
    * `agent.ready` arrives. A navigation does not replace or clear it, so the
@@ -500,18 +535,20 @@ export interface BrowserAgentRegistry {
    * module judges currency against the binding's URL (see "The current
    * document" in the module overview) rather than trusting the port to know.
    */
-  latestAgentReady(tabId: number): AgentReadyPayload | undefined;
+  latestAgentReady(tab: BoundTabRef): AgentReadyPayload | undefined;
 
   /**
-   * Resolves with the next `agent.ready` for `tabId` whose `documentId` differs
-   * from `options.afterDocumentId`, or `undefined` on timeout or abort.
+   * Resolves with the next `agent.ready` for the session's bound tab whose
+   * `documentId` differs from `options.afterDocumentId`, or `undefined` on
+   * timeout or abort. A report from another browser's tab of the same id
+   * never resolves it.
    *
    * Never rejects for a timeout. This module additionally races the promise
    * against its own backstop timer, so an implementation that ignores
    * `timeoutMs` still cannot make a readiness evaluation unbounded.
    */
   waitForAgentReady(
-    tabId: number,
+    tab: BoundTabRef,
     options: WaitForAgentReadyOptions,
   ): Promise<AgentReadyPayload | undefined>;
 
@@ -520,17 +557,18 @@ export interface BrowserAgentRegistry {
    * milliseconds. Optional: without it the report is stamped with the time it
    * was read, which an adapter's staleness window then measures from.
    */
-  latestAgentReadyAt?(tabId: number): number | undefined;
+  latestAgentReadyAt?(tab: BoundTabRef): number | undefined;
 
   /**
-   * When the tab last committed a navigation, in epoch milliseconds, as the
-   * binding route (`../server/routes/binding.ts`) recorded it: every
-   * `tab.navigated` it accepts for the tab — kept, dropped, or of a tab not
-   * yet bound — including a reload and a load of the same URL, which the
-   * binding's URL alone cannot show. The service's ledger always implements
-   * it; optional for other implementations (a test double, for instance),
-   * without which readiness can tell that a report may be stale only from the
-   * binding's URL.
+   * When the session's bound tab last committed a navigation, in epoch
+   * milliseconds, as the binding route (`../server/routes/binding.ts`)
+   * recorded it: every `tab.navigated` it accepts for the tab — kept, dropped,
+   * or of a tab not yet bound — including a reload and a load of the same URL,
+   * which the binding's URL alone cannot show. Another browser's navigation of
+   * a tab with the same id is never answered. The service's ledger always
+   * implements it; optional for other implementations (a test double, for
+   * instance), without which readiness can tell that a report may be stale
+   * only from the binding's URL.
    *
    * Compared with the report's receipt time ({@link latestAgentReadyAt}): a
    * report received before the latest navigation describes a document the tab
@@ -539,7 +577,49 @@ export interface BrowserAgentRegistry {
    * report it follows and a report no earlier than the navigation it follows,
    * so the comparison holds when both land within one millisecond.
    */
+  latestNavigationAt?(tab: BoundTabRef): number | undefined;
+}
+
+/**
+ * A {@link BrowserAgentRegistry} bound to one session: the same reads, by the
+ * bound tab's id alone, each asked of the registry with the session's
+ * {@link BoundTabRef}.
+ *
+ * Built once at each entry point ({@link collectReadinessEvidence},
+ * {@link evaluateReadiness}, {@link waitForNextAgentReady}) by
+ * {@link sessionAgentsOf}, so the helpers below read the one session's
+ * evidence without threading its id through every call. An optional registry
+ * method stays absent here, which is how a helper tells a registry that
+ * cannot answer from one that answers nothing.
+ */
+interface SessionAgentView {
+  latestAgentReady(tabId: number): AgentReadyPayload | undefined;
+  waitForAgentReady(
+    tabId: number,
+    options: WaitForAgentReadyOptions,
+  ): Promise<AgentReadyPayload | undefined>;
+  latestAgentReadyAt?(tabId: number): number | undefined;
   latestNavigationAt?(tabId: number): number | undefined;
+}
+
+/**
+ * Binds `agents` to `sessionId` ({@link SessionAgentView}). Every call is
+ * forwarded synchronously with the registry as its receiver, so a registry
+ * that throws still throws where the helper that asked contains it.
+ */
+function sessionAgentsOf(agents: BrowserAgentRegistry, sessionId: string): SessionAgentView {
+  const refOf = (tabId: number): BoundTabRef => ({ sessionId, tabId });
+
+  return {
+    latestAgentReady: (tabId) => agents.latestAgentReady(refOf(tabId)),
+    waitForAgentReady: (tabId, options) => agents.waitForAgentReady(refOf(tabId), options),
+    ...(agents.latestAgentReadyAt === undefined
+      ? {}
+      : { latestAgentReadyAt: (tabId: number) => agents.latestAgentReadyAt?.(refOf(tabId)) }),
+    ...(agents.latestNavigationAt === undefined
+      ? {}
+      : { latestNavigationAt: (tabId: number) => agents.latestNavigationAt?.(refOf(tabId)) }),
+  };
 }
 
 /**
@@ -1243,7 +1323,7 @@ function isOnBoundPage(agent: ObservedBrowserAgent, boundTab: BoundTab): boolean
  * that is not an epoch time, gives no such sign.
  */
 function navigatedSinceReport(
-  agents: BrowserAgentRegistry,
+  agents: SessionAgentView,
   tabId: number,
   agent: ObservedBrowserAgent,
 ): boolean {
@@ -1266,7 +1346,7 @@ function navigatedSinceReport(
  * binding records, and no navigation was recorded after it arrived.
  */
 function isTrustedOnSight(
-  agents: BrowserAgentRegistry,
+  agents: SessionAgentView,
   agent: ObservedBrowserAgent,
   boundTab: BoundTab,
 ): boolean {
@@ -1280,7 +1360,7 @@ function isTrustedOnSight(
  * report is for the tab's current document is judged by the caller.
  */
 function readBoundTabAgent(
-  agents: BrowserAgentRegistry,
+  agents: SessionAgentView,
   boundTab: BoundTab,
   clock: () => number,
   notes: string[],
@@ -1532,21 +1612,21 @@ export async function collectReadinessEvidence(
   const log = bindLogger(deps.logger, sessionId);
   const clock = totalClock(deps.now, log);
   const notes: string[] = [];
+  // The evidence of this session's binding only: another browser's tab of the
+  // same id is never read (see BoundTabRef).
+  const agents = sessionAgentsOf(deps.agents, sessionId);
 
   let browserAgent: ObservedBrowserAgent | undefined;
 
   if (request.boundTab === undefined) {
     notes.push('No tab is bound to this session.');
   } else {
-    browserAgent = readBoundTabAgent(deps.agents, request.boundTab, clock, notes, log);
+    browserAgent = readBoundTabAgent(agents, request.boundTab, clock, notes, log);
 
     // Collection stays a synchronous read: the report is kept as observed, and
     // evaluateReadiness — run again at capture start — decides whether it is
     // the current document.
-    if (
-      browserAgent !== undefined &&
-      !isTrustedOnSight(deps.agents, browserAgent, request.boundTab)
-    ) {
+    if (browserAgent !== undefined && !isTrustedOnSight(agents, browserAgent, request.boundTab)) {
       notes.push(
         'The latest page-agent report predates the page the binding records now; readiness confirms the current document before capture.',
       );
@@ -2320,9 +2400,16 @@ function askForReload(
   return true;
 }
 
-/** What one bounded wait for a tab's next `agent.ready` is about. */
+/** What one bounded wait for a session's bound tab's next `agent.ready` is about. */
 export interface NextAgentReadyWait {
-  /** The tab whose next report is awaited. */
+  /**
+   * The session whose bound tab is awaited. Only a report from that session's
+   * binding answers — never one from another browser's tab of the same id
+   * (see {@link BoundTabRef}).
+   */
+  readonly sessionId: string;
+
+  /** The tab whose next report is awaited: the session's bound tab. */
   readonly tabId: number;
 
   /**
@@ -2343,36 +2430,49 @@ export interface NextAgentReadyWait {
 }
 
 /**
- * Waits, bounded, for a tab's next `agent.ready` — the one wait behind the
- * navigation settle ({@link settleCurrentDocument}), the reload, and the
- * instrumentation service's later refresh of its signal report.
+ * Waits, bounded, for a session's bound tab's next `agent.ready` — the one
+ * wait behind the navigation settle ({@link settleCurrentDocument}), the
+ * reload, and the instrumentation service's later refresh of its signal
+ * report.
  *
- * The port is asked for the next report whose document differs from
- * `afterDocumentId`. Its promise is raced against a backstop timer that fires
- * {@link WAIT_BACKSTOP_GRACE_MS} after the port's own deadline and against the
- * abort signal, and a rejection is contained — so this never waits longer than
- * the stated bound and never throws. The timer and listener are always
- * released.
+ * The port is asked, for the session's {@link BoundTabRef}, for the next report
+ * whose document differs from `afterDocumentId`. Its promise is raced against
+ * a backstop timer that fires {@link WAIT_BACKSTOP_GRACE_MS} after the port's
+ * own deadline and against the abort signal, and a rejection is contained — so
+ * this never waits longer than the stated bound and never throws. The timer
+ * and listener are always released.
  *
  * Exported so `./service.ts` waits for a page exactly as this module does,
  * rather than keeping a second backstop of its own.
  *
  * @param agents The relayed page-agent reports.
- * @param wait The tab, the known document, the bound and the abort signal.
+ * @param wait The session and its tab, the known document, the bound and the abort signal.
  * @param log Where a rejecting port is noted, by the error's closed shape only.
  * @returns The report that answered, or `undefined` for none within the bound.
  *
  * @example
  * ```ts
  * const next = await waitForNextAgentReady(agents, {
- *   tabId, afterDocumentId: undefined, timeoutMs: 1_500, signal,
+ *   sessionId, tabId, afterDocumentId: undefined, timeoutMs: 1_500, signal,
  *   failureMessage: 'Waiting for the page agent failed',
  * }, log);
  * ```
  */
-export async function waitForNextAgentReady(
+export function waitForNextAgentReady(
   agents: BrowserAgentRegistry,
   wait: NextAgentReadyWait,
+  log: Logger,
+): Promise<AgentReadyPayload | undefined> {
+  return awaitNextAgentReady(sessionAgentsOf(agents, wait.sessionId), wait, log);
+}
+
+/**
+ * {@link waitForNextAgentReady} over a registry already bound to the session
+ * ({@link sessionAgentsOf}), so the session is not named twice.
+ */
+async function awaitNextAgentReady(
+  agents: SessionAgentView,
+  wait: Omit<NextAgentReadyWait, 'sessionId'>,
   log: Logger,
 ): Promise<AgentReadyPayload | undefined> {
   const { tabId, afterDocumentId, timeoutMs, signal } = wait;
@@ -2427,7 +2527,7 @@ export async function waitForNextAgentReady(
  * the report with its own clock instead.
  */
 function receivedAtOf(
-  agents: BrowserAgentRegistry,
+  agents: SessionAgentView,
   tabId: number,
   documentId: string,
 ): number | undefined {
@@ -2449,7 +2549,8 @@ function receivedAtOf(
 
 /** What {@link settleCurrentDocument} confirms, and with what. */
 interface CurrentDocumentCheck {
-  readonly agents: BrowserAgentRegistry;
+  /** The session's view of the registry ({@link sessionAgentsOf}). */
+  readonly agents: SessionAgentView;
   readonly boundTab: BoundTab;
   /** The bound tab's latest report, as {@link readBoundTabAgent} read it. */
   readonly agent: ObservedBrowserAgent | undefined;
@@ -2486,7 +2587,7 @@ async function awaitFirstReport(
 ): Promise<ObservedBrowserAgent | undefined> {
   const { agents, boundTab, settleMs, signal, clock, log } = check;
   const waited = settleMs > 0 && signal?.aborted !== true;
-  const first = await waitForNextAgentReady(
+  const first = await awaitNextAgentReady(
     agents,
     {
       tabId: boundTab.tabId,
@@ -2567,7 +2668,7 @@ async function settleCurrentDocument(
   }
 
   const waited = settleMs > 0 && signal?.aborted !== true;
-  const next = await waitForNextAgentReady(
+  const next = await awaitNextAgentReady(
     agents,
     {
       tabId: boundTab.tabId,
@@ -2604,7 +2705,8 @@ async function settleCurrentDocument(
 
 /** What {@link awaitReactRecheck} gives its window to, and with what. */
 interface ReactRecheck {
-  readonly agents: BrowserAgentRegistry;
+  /** The session's view of the registry ({@link sessionAgentsOf}). */
+  readonly agents: SessionAgentView;
   readonly boundTab: BoundTab;
   /** The report the page gate is about to judge — the settled current document. */
   readonly agent: ObservedBrowserAgent;
@@ -2900,6 +3002,9 @@ export async function evaluateReadiness(
   const clock = totalClock(deps.now, log);
   const planned = derivePlannedSignals(plan.instrumentationTargets);
   const selection = selectAdapters(deps.adapters, context, plan.instrumentationTargets, log);
+  // Every read and wait below is of this session's binding only: another
+  // browser's tab of the same id never answers (see BoundTabRef).
+  const agents = sessionAgentsOf(deps.agents, sessionId);
 
   const passInput = (browserAgent: ObservedBrowserAgent | undefined): PassInput => ({
     context,
@@ -2928,7 +3033,7 @@ export async function evaluateReadiness(
     agent === undefined || boundTab === undefined
       ? agent
       : awaitReactRecheck({
-          agents: deps.agents,
+          agents,
           boundTab,
           agent,
           browserSignals: planned.browser,
@@ -2943,9 +3048,9 @@ export async function evaluateReadiness(
       ? undefined
       : await afterReactRecheck(
           await settleCurrentDocument({
-            agents: deps.agents,
+            agents,
             boundTab,
-            agent: readBoundTabAgent(deps.agents, boundTab, clock, [], log),
+            agent: readBoundTabAgent(agents, boundTab, clock, [], log),
             settleMs: resolveWaitMs(
               deps.navigationSettleMs,
               DEFAULT_NAVIGATION_SETTLE_MS,
@@ -2969,8 +3074,8 @@ export async function evaluateReadiness(
   ) {
     reloadRequested = askForReload(deps, sessionId, reload, log);
 
-    const next = await waitForNextAgentReady(
-      deps.agents,
+    const next = await awaitNextAgentReady(
+      agents,
       {
         tabId: reload.tabId,
         afterDocumentId: reload.documentId,

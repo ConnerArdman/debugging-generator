@@ -165,6 +165,7 @@ export function isCodeToolName(value: unknown): value is CodeToolName {
  */
 const PATH_DIRECTIONS = Object.freeze([
   'out',
+  'in',
   'both',
 ] as const satisfies readonly CodePathDirection[]);
 
@@ -263,7 +264,10 @@ export interface PathBetweenRequest {
   readonly to: CodePathEndpoint;
   /** Follow only these edge kinds, from the upstream `CODE_EDGE_KINDS` vocabulary. */
   readonly edgeKinds?: readonly CodeEdgeKind[] | undefined;
-  /** `'out'` (downstream, the default) or `'both'` (undirected). */
+  /**
+   * `'out'` (downstream, the default), `'in'` (upstream only, to what reaches
+   * the start) or `'both'` (undirected).
+   */
   readonly direction?: CodePathDirection | undefined;
   /** At most this many hops, clamped to `maxPathDepth`. */
   readonly maxDepth?: number | undefined;
@@ -880,7 +884,8 @@ export const CODE_TOOL_DESCRIPTORS: { readonly [N in CodeToolName]: CodeToolDesc
           name: 'direction',
           type: 'string',
           required: false,
-          description: 'out follows relationships downstream; both also follows them backwards.',
+          description:
+            'out follows relationships downstream; in follows them backwards only, to what reaches the start; both follows them either way.',
           allowed: PATH_DIRECTIONS,
         },
         {

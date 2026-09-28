@@ -60,7 +60,9 @@
  *
  * Only the third line keeps the record in `conflict`, and only it keeps the
  * backup: a conflict backup survives for exactly as long as the divergence it
- * was kept for.
+ * was kept for. For a chained record the second line reaches further down the
+ * chain — see the chain close below — which is how a conflict closes once the
+ * developer puts back the pristine file the chain root recorded.
  *
  * ## Chains across plan versions
  *
@@ -76,6 +78,76 @@
  * **stops at the first conflict** rather than skipping ahead to an earlier
  * record whose expectation cannot hold any more.
  *
+ * Only the chain root — the root-most live record the links reach — backed up
+ * the pristine file; every later link's backup holds an earlier plan version's
+ * instrumented output, which still carries the tool's wrapper. So every
+ * conflict a chained record produces names the root's backup as the report's
+ * `originalBackupPath` — the path "Original saved at ‹path›" quotes — and its
+ * diff views start from the root's verified backup: the walk resolves each
+ * record's root with `findChainRoot` over the file's live records and hands it
+ * to `./patch/conflict.ts` with every verdict and report it asks for. The
+ * root's backup is kept for as long as the chain is open, because the root is
+ * retained, never reverted, while a record above it conflicts.
+ *
+ * ### The chain beneath a conflict
+ *
+ * A walk that stops at a conflict says nothing yet about the records beneath
+ * the one it judged, and leaving them in their status would be a claim: an
+ * `applied` record says the tool's bytes are on disk, and the patcher treats
+ * exactly that claim as another session holding the file. So when the
+ * judged record's report proves the file holds none of the chain's output,
+ * the rest of the chain goes into `conflict` with it:
+ *
+ * ```text
+ * judged record → conflict, reason content-changed | file-missing
+ * the file's digest is no record's instrumentedHash (the judged one included),
+ * or there is no file at all
+ *   → every open record beneath it in the chain moves to `conflict`
+ *     (applied | pending | failed → conflict; a record already in `conflict`
+ *     stays there), keeps its backup and is reported as retained
+ * ```
+ *
+ * No further report is composed for them: the judged record's report already
+ * covers the file and names the root's backup as `originalBackupPath`. The
+ * rule does not apply when the walk stopped for any other reason — an unusable
+ * backup, a failed verification, a refused fork, a scope or journal failure,
+ * an abort — because none of those proves what the file no longer holds; the
+ * records beneath are then `skipped` with their status untouched, as they are
+ * after a journal that refuses one of the transitions above. Every later pass
+ * judges the chain again, and a `conflict` status serves both ways out of it:
+ * the chain close below settles the whole chain once the file is put back to
+ * an earlier original, and a file whose edit was undone is restored link by
+ * link, because a record in `conflict` is restored the moment its file
+ * hashes to its `instrumentedHash`.
+ *
+ * ### The chain close
+ *
+ * Stopping at a conflict must not mean stopping forever. Once the developer
+ * resolves an edited chain by putting back an earlier version of the file —
+ * typically the pristine file from version control, which is the chain root's
+ * original — the head's own two digests no longer describe anything on disk,
+ * and judging it alone would re-report it on every pass while the records
+ * beneath it stay open. So the walk reads the head's verdict one level deeper:
+ *
+ * ```text
+ * head status pending | failed | conflict            (a status that closes over a pristine file)
+ * head verdict content-changed, file hash === originalHash of a record R beneath it
+ * every link head → … → R hash-consistent            (child.previousRecordId === parent.id,
+ *                                                     child.originalHash === parent.instrumentedHash)
+ *   → close the head and every record down to and including R without a write
+ *     (each → reverted), then continue the walk with the record beneath R
+ * ```
+ *
+ * The file then holds the bytes from before R, so nothing any of those
+ * records wrote is on disk to restore or to lose, and the record beneath R —
+ * whose output those bytes are — is restorable as usual. R's backup is deleted
+ * as verified, because the file hashes to its `originalHash`; the backups of
+ * the superseded records above it are not, because their digests are not on
+ * disk, and they leave with the session's backup directory once a pass leaves
+ * the session clean. An `applied` head is excluded exactly as the per-record
+ * table excludes it from closing over a pristine file: content that is not its
+ * own is reported as a conflict first, and the next pass closes the chain.
+ *
  * Reverse order only exists for a **single linear chain**. The service's
  * journal refuses to append a second record onto one parent or a second open
  * chain over one file, but a journal written before it did — or by a writer
@@ -90,6 +162,75 @@
  * and the refusal is reported as a {@link ChainFork} whose reason is
  * {@link RECORD_CHAIN_FORK_REASON}. The other files of the same pass are
  * restored as usual.
+ *
+ * ## Another session's bytes are never this session's to restore
+ *
+ * A digest cannot tell identical bytes apart, and the transform is
+ * deterministic. A session whose chain ended in a conflict leaves its records
+ * in `conflict`; once the developer puts the pristine file back, the next
+ * session over the same file reproduces the old chain's output byte for byte.
+ * Judged on the digest alone, the old chain's head is then `restorable`, and a
+ * pass over the old session — a repeated end, or a start-up reconciliation
+ * that reaches its records first — would write its backups over the new
+ * session's live patch and leave the new session reporting an edit nobody
+ * made. So before a `restorable` verdict becomes a write, the pass asks
+ * whether the bytes on disk are another session's live claim:
+ *
+ * ```text
+ * another session's record Q, same normalised file
+ *   status applied | pending | failed               (the patcher's holding set; never conflict or reverted)
+ *   Q.instrumentedHash === the digest the verdict read
+ *   the judged record R is in conflict, or Q.appliedAt >= R.appliedAt
+ *   Q placed at the same canonical file as R         (its project root, from the pass's resolver)
+ *
+ * pristine original of Q's chain === pristine original of R's chain
+ *   → R and every open record beneath it in its chain are closed without a write
+ *     (each → reverted, reported as closed, no verified backup deletion queued)
+ * a different pristine original, or a Q the pass cannot place
+ *   → nothing is written: R and everything beneath it stay open, pinned and skipped,
+ *     with the refusal recorded as a failure
+ * ```
+ *
+ * The pristine original of a chain is its root's `originalHash` — the root
+ * {@link findChainRoot} resolves among the session's live records — or the
+ * record's own for an unchained record. When the two originals agree, the
+ * other session's own cleanup restores exactly the bytes this chain would
+ * have, so nothing of this chain is left to restore or to lose; its backups
+ * leave with the session's backup directory once a pass leaves it clean.
+ *
+ * Three parts of the rule are load-bearing:
+ *
+ * - **Only a holding status claims bytes.** Another session's record in
+ *   `conflict` is never deferred to — its file held the developer's edit when
+ *   it was judged — so the new session's own end restores normally while the
+ *   old chain sits in `conflict`. A session never defers to itself.
+ * - **A live record yields only to a claim that is not older than it.** Two
+ *   sessions' holding records over one file with identical bytes exist only
+ *   when one of them went stale — the patcher refuses to patch a file another
+ *   session holds — and the later writer is the one whose bytes are on disk.
+ *   So a record that is itself `applied`, `pending` or `failed` treats another
+ *   session's claim as live only when that claim was journaled at or after its
+ *   own; a record already in `conflict` claims nothing and yields to any.
+ * - **A claim counts only in the same project.** Records carry
+ *   project-relative paths, and two copies of one project instrumented alike
+ *   hold identical bytes under identical paths. Closing this session's records
+ *   because of a copy elsewhere would leave its own project instrumented with
+ *   the journal saying otherwise, so the claim's project root is resolved —
+ *   through {@link ReconcileOptions.scopeFor} or
+ *   {@link CleanupContext.projectRootOf} — and compared as canonical paths. A
+ *   claim in another project is not a claim on this file. A claim the pass
+ *   cannot place proves nothing either way, so it is refused: never written
+ *   over and never closed beside.
+ *
+ * The other sessions' open records come from one `ModificationJournal.listOpen`
+ * per pass, read lazily at the first `restorable` verdict (a pass that writes
+ * nothing never asks) and kept current as the pass's own walks move records.
+ * A listing that fails refuses every write that needed it — a failure is
+ * recorded and nothing is written blind. A `file-missing` verdict carries no
+ * digest, so no bytes on disk can be anyone's claim and it is recreated as
+ * before. The rule changes no verdict: every other branch — the chain close,
+ * the chain beneath a conflict, the fork refusal, scope, abort and the backup
+ * ledger — reads exactly as described above.
  *
  * ## Start-up reconciliation dispatches on the record, never on the session
  *
@@ -163,6 +304,7 @@
  */
 
 import { realpathSync } from 'node:fs';
+import { lstat } from 'node:fs/promises';
 
 import {
   DebuggenError,
@@ -193,6 +335,7 @@ import type {
   FileSnapshot,
 } from '@debuggen/shared/node';
 
+import { findChainRoot } from './schema/modification.js';
 import type {
   ModificationConflict,
   ModificationConflictReason,
@@ -205,8 +348,17 @@ import type {
   BackupStoreFailureReason,
   RecordedBackup,
 } from './patch/backup-store.js';
-import { buildConflictReport, detectConflict, isConflictVerdict } from './patch/conflict.js';
-import type { ConflictDetectionContext, ConflictFileReader } from './patch/conflict.js';
+import {
+  buildConflictReport,
+  detectConflict,
+  isConflictVerdict,
+  isUsableChainRoot,
+} from './patch/conflict.js';
+import type {
+  ConflictDetectionContext,
+  ConflictFileReader,
+  ConflictVerdict,
+} from './patch/conflict.js';
 
 // ---------------------------------------------------------------------------
 // The vocabulary a pass reports in.
@@ -220,12 +372,16 @@ import type { ConflictDetectionContext, ConflictFileReader } from './patch/confl
  * - `already-original` — the file already held the recorded original, so
  *   nothing was written and the record was closed. This is the "nothing was
  *   written" branch of the reconciliation table: a crash between the journal
- *   append and the rename leaves exactly this state.
+ *   append and the rename leaves exactly this state. A chain close reports
+ *   each record it settles the same way — the file holds content from before
+ *   the record, which is its original or older — and so does a close beside
+ *   another session's live claim on the same bytes, whose own cleanup
+ *   restores the original this record's chain recorded.
  * - `conflict` — no write was authorised. The file and the backup are untouched
  *   and {@link RestoreOutcome.conflict} carries the report.
  * - `skipped` — nothing was attempted: the record was already `reverted`, or the
- *   pass was aborted, or an earlier record in the same chain conflicted and
- *   restoring this one could not be justified.
+ *   pass was aborted, or a later plan version of the same chain stopped the
+ *   walk and restoring this one could not be justified.
  *
  * Frozen because it is a module-level table read by consumers that switch over
  * it; a mutation would widen what every reader has to handle.
@@ -248,7 +404,11 @@ export type RestoreOutcomeKind = (typeof RESTORE_OUTCOME_KINDS)[number];
  * - `retained` — the backup is still there, deliberately: the record
  *   conflicted, or another open record in the same pass is filed under the same
  *   digest (backups are content-addressed, so two records that saw identical
- *   original bytes share one file), or the caller asked for it to be kept.
+ *   original bytes share one file), or the caller asked for it to be kept, or
+ *   the record was a superseded layer of a chain close, or was closed beside
+ *   another session's live claim, whose `originalHash` is not on disk to
+ *   verify a deletion against — that backup leaves with the session's backup
+ *   directory.
  * - `absent` — there was nothing to delete, which is a success: a retried
  *   cleanup pass finds its own earlier work done.
  * - `untouched` — the pass never got as far as the backup.
@@ -400,6 +560,12 @@ const STORED_DIGEST_MISMATCH = 'stored-digest-mismatch' satisfies BackupStoreFai
  *   file back at the original has nothing left to lose or to report.
  * - `none` — nothing to do, and nothing is read: the record is finished
  *   business.
+ *
+ * The two dispositions that close over a pristine file — `restore-or-close`
+ * and `retain` — also close a **chain** over one: when the head of what
+ * remains of a chain finds its file at the `originalHash` of a record beneath
+ * it, the head and every record down to that one are closed without a write
+ * (see the module overview). `restore-only` never does.
  */
 export const RECONCILE_DISPOSITIONS = Object.freeze([
   'restore-or-close',
@@ -426,7 +592,36 @@ export type ReconcileDisposition = (typeof RECONCILE_DISPOSITIONS)[number];
  *                    hash === originalHash      → close the record (nothing was written)
  *                    otherwise                  → retained, backup kept, re-reported
  * reverted           nothing to do
+ *
+ * chain head, pending | failed | conflict
+ *                    hash === originalHash of a record R beneath it, every link
+ *                    hash-consistent            → close the head and every record down to R
+ *                                                 (nothing of theirs is on disk), then go on
+ *                                                 beneath R
+ *
+ * beneath a record whose conflict is content-changed | file-missing
+ *                    hash is no record's instrumentedHash, or no file
+ *                                               → applied | pending | failed → conflict,
+ *                                                 backup kept (nothing of theirs is on disk)
+ *
+ * any status, before a restore from the backup
+ *                    hash === instrumentedHash of another session's live claim
+ *                    on the same file (applied | pending | failed, not older
+ *                    than a live record, placed in the same project)
+ *                      same pristine original   → close the record and every record beneath it
+ *                                                 (the bytes are that session's to restore)
+ *                      otherwise, or unplaced   → nothing written, left open, not clean
  * ```
+ *
+ * The chain-head rule is the chain-level form of the `hash === originalHash`
+ * line, applied by the walk rather than per record; `applied` is left out of
+ * it for the same reason it is left out of that line. The chain-beneath rule
+ * is the chain-level form of the `otherwise → conflict` lines: once the walk
+ * has proved the file holds none of the chain's output, no record of the
+ * chain is left claiming its bytes are on disk. The last rule qualifies every
+ * `→ restore from the backup` line: a digest that is also another session's
+ * live claim does not authorise this session's write. All three are applied
+ * by the walk; see the module overview.
  *
  * The left column is this function; the hash comparisons are
  * `./patch/conflict.ts`, which owns the restore-versus-conflict decision for
@@ -479,6 +674,10 @@ export function reconcileDispositionFor(status: ModificationStatus): ReconcileDi
  * has been reported once and a file that is now byte-identical to its original
  * has nothing left to lose or to report. `restore-only` does not: for an
  * `applied` record that state is news the developer is told about first.
+ *
+ * The same answer gates the chain close: a head whose disposition closes over a
+ * pristine file closes the chain beneath it over the original of a record
+ * further down, and a head that does not is reported first.
  *
  * @param disposition What the record's status entitles it to.
  * @returns Whether a pristine target closes the record.
@@ -733,6 +932,31 @@ export interface CleanupContext {
    * the same digests.
    */
   readonly files?: CleanupFileSystem | undefined;
+
+  /**
+   * The absolute project root of another session, for the one question a
+   * pass asks about a session it did not come for: are the bytes it is about
+   * to write over that session's live claim on **this** project's file?
+   *
+   * Records carry project-relative paths, so two copies of one project
+   * instrumented alike hold identical bytes under identical paths; only the
+   * owning session's root tells a claim on this file from a claim on a copy
+   * (see the module overview). The service answers from each session row's
+   * `projectRoot`. Consulted only for another session's record whose digest
+   * matches a file about to be restored, after
+   * {@link ReconcileOptions.scopeFor} where a pass has one, and memoised per
+   * session for the pass.
+   *
+   * Absent — or answering `undefined`, or throwing — means the claim cannot
+   * be placed, and a claim that cannot be placed is never written over and
+   * never closed beside: the record it stood against stays open for a pass
+   * that can place it, or for the other session's own cleanup to settle.
+   *
+   * @param sessionId The session whose project is wanted.
+   * @returns Its absolute project root, or `undefined` when it is not known.
+   */
+  readonly projectRootOf?:
+    ((sessionId: string) => string | undefined | Promise<string | undefined>) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -899,25 +1123,42 @@ export interface ChainRestoreOutcome {
   /** The project-relative file this chain belongs to; `''` for an empty call. */
   readonly file: string;
 
-  /** One outcome per record, in the order they were processed — reverse order. */
+  /**
+   * One outcome per record the walk judged or a chain close settled, in the
+   * order they were processed — reverse order. A record behind the record
+   * that stopped the walk has none: it was never judged.
+   */
   readonly outcomes: RestoreOutcome[];
 
   /** Records whose backup was written back and verified. */
   readonly restored: ModificationRecord[];
 
-  /** Records closed without a write because the file already held the original. */
+  /**
+   * Records closed without a write because the file already held the
+   * original — each record's own, or, for the records a chain close settled,
+   * content from before them — or because the file holds another session's
+   * live claim on the same pristine original, which that session restores.
+   */
   readonly closed: ModificationRecord[];
 
   /**
-   * Records whose file was left exactly as it is: a conflict this walk detected,
-   * or a record that arrived in `conflict` and was re-reported.
+   * Records whose file was left exactly as it is: a conflict this walk
+   * detected, a record that arrived in `conflict` and was re-reported, and
+   * every open record beneath a conflict that proves the file holds none of
+   * the chain's output — moved to `conflict` with it (or kept there) and
+   * covered by that conflict's report rather than one of its own. See the
+   * module overview.
    */
   readonly retained: ModificationRecord[];
 
   /** Every conflict report the chain produced, in detection order. */
   readonly conflicts: ModificationConflict[];
 
-  /** Records the chain did not attempt, including everything behind a conflict. */
+  /**
+   * Records the chain did not attempt: everything behind a stop that does not
+   * prove the file holds none of their output — a failure, an abort, an
+   * unusable backup, a failed verification — with their status untouched.
+   */
   readonly skipped: ModificationRecord[];
 
   /** Records the chain could not finish, with their errors. */
@@ -928,10 +1169,11 @@ export interface ChainRestoreOutcome {
    *
    * A conflict or a failure at plan version *n* makes every earlier version's
    * expectation unsatisfiable — the file no longer holds what those records
-   * wrote — so the walk halts here instead of skipping ahead, and the earlier
-   * records are reported as skipped rather than as conflicts of their own. For
-   * a refused fork it is the first record in restoration order: the walk
-   * stopped before it began.
+   * wrote — so the walk halts here instead of skipping ahead, and no earlier
+   * record gets a report of its own: it is `retained` in `conflict` beside a
+   * conflict that proves its output is gone from the file, and `skipped`
+   * otherwise. For a refused fork it is the first record in restoration
+   * order: the walk stopped before it began.
    */
   readonly stoppedAt: ModificationRecord | undefined;
 
@@ -958,12 +1200,13 @@ export interface CleanupSessionOptions {
   /**
    * Keep the session's backup directory even after a clean pass.
    *
-   * By default a pass that restored everything and left no conflict removes the
-   * now-empty directory, which is the housekeeping half of "a session never
-   * pollutes the developer's working tree": the tree was never touched, and the
-   * product's own state directory does not keep growing either. A pass that
-   * conflicted never removes it — that copy is what the developer was told
-   * about.
+   * By default a pass that leaves every record of the session `reverted` — the
+   * ones it restored or closed itself, and the ones an install rollback or an
+   * earlier pass already had — removes the directory, which is the housekeeping
+   * half of "a session never pollutes the developer's working tree": the tree
+   * was never touched, and the product's own state directory does not keep
+   * growing either. A pass that conflicted never removes it — that copy is what
+   * the developer was told about.
    */
   readonly keepBackupDirectory?: boolean | undefined;
 }
@@ -986,7 +1229,9 @@ export interface CleanupOutcome {
 
   /**
    * Every record that ended `reverted`: restored from its backup, or closed
-   * because the file already held the recorded original.
+   * because the file already held the recorded original — the record's own,
+   * or, for a chain close, content from before it — or closed beside another
+   * session's live claim on the same pristine original.
    *
    * Both mean the same thing to a session — this record is finished and its
    * file holds its original bytes — which is why they share one list here,
@@ -1003,9 +1248,11 @@ export interface CleanupOutcome {
 
   /**
    * Records this pass deliberately did not restore: a retained `conflict`
-   * record, everything behind a conflict in the same file's chain, every
-   * record of a file whose records do not form a single chain, everything
-   * after an abort, and any record the pass could not finish.
+   * record, everything behind a conflict in the same file's chain (in
+   * `conflict` with it when the conflict proves the file holds none of the
+   * chain's output, untouched otherwise), every record of a file whose records
+   * do not form a single chain, everything after an abort, and any record the
+   * pass could not finish.
    */
   readonly skipped: ModificationRecord[];
 
@@ -1063,12 +1310,19 @@ export interface ReconcileOutcome {
   /** Records restored from their backups and verified. */
   readonly restored: ModificationRecord[];
 
-  /** Records closed without a write: nothing had been written for them. */
+  /**
+   * Records closed without a write: nothing had been written for them, the
+   * file had been put back to content from before them (a chain close), or
+   * the file holds another session's live claim on the same pristine
+   * original, which that session's own records restore.
+   */
   readonly closed: ModificationRecord[];
 
   /**
    * Records whose file was left exactly as it is: a conflict detected by this
-   * pass, or one carried over from an earlier one and re-reported.
+   * pass, one carried over from an earlier one and re-reported, or a record
+   * beneath such a conflict in the same chain, in `conflict` with it. See
+   * {@link ChainRestoreOutcome.retained}.
    */
   readonly retained: ModificationRecord[];
 
@@ -1191,7 +1445,7 @@ export async function restoreModification(
     return scope;
   }
 
-  return await restoreOne(record, context, {
+  const step = await restoreStep(record, context, {
     scope: scope.value,
     files,
     logger,
@@ -1201,7 +1455,17 @@ export async function restoreModification(
       options.closeWhenTargetIsOriginal ?? closesPristineTarget(disposition),
     retainBackup: options.retainBackup ?? false,
     conflictMessage: options.conflictMessage,
+    // One record on its own carries no chain: neither its root nor the records
+    // beneath it are in view, so it is judged, and closed, alone.
+    chainRoot: undefined,
+    chain: undefined,
+    // One record is one pass: the other sessions' claims are read for it, and
+    // only if its verdict would authorise a write.
+    claims: new OpenClaims(context, undefined, undefined),
   });
+
+  // A step without a chain settles exactly the record it judged.
+  return isErr(step) ? step : ok(step.value.judged.outcome);
 }
 
 /**
@@ -1311,8 +1575,19 @@ export function orderRestorationChain(
  * is no longer what this product wrote, so every earlier version's expectation
  * is unsatisfiable — skipping ahead could only produce either another refusal
  * or, if the digests happened to line up, a write in the wrong order. The
- * remaining records are reported as skipped, stay open, and are re-examined by
- * the next pass once the developer has resolved the conflict.
+ * remaining records stay open and are re-examined by the next pass once the
+ * developer has resolved the conflict. Behind a `content-changed` or
+ * `file-missing` conflict whose file holds no record's output they are moved
+ * to `conflict` and retained, so none of them goes on claiming its bytes are
+ * on disk; behind any other stop they are skipped with their status
+ * untouched — see the module overview.
+ *
+ * **A resolved conflict closes the chain beneath it.** When a record whose
+ * status closes over a pristine file finds the file at the `originalHash` of a
+ * record beneath it, over hash-consistent links, the file holds content from
+ * before all of them: they are closed without a write and the walk continues
+ * beneath them — see the module overview. That is still reverse order: nothing
+ * is written for a record while a later one's content is on disk.
  *
  * **A fork is refused before the walk starts.** Records that do not form a
  * single linear chain — two naming the same `previousRecordId`, or more than
@@ -1352,6 +1627,7 @@ export async function restoreChain(
     scope: options.scope,
     scopeFor: undefined,
     conflictMessage: options.conflictMessage,
+    claims: new OpenClaims(context, undefined, undefined),
   });
 
   await ledger.sweep(logger);
@@ -1379,6 +1655,14 @@ export async function restoreChain(
  * and the pass ends `conflict` whether or not they were, because the refused
  * fork is an outstanding conflict (see {@link CLEANUP_STATUSES}).
  *
+ * A conflict the developer has since resolved by putting the original back is
+ * closed by the next call rather than reported again — for a file instrumented
+ * by several plan versions, that is the original from before the first of them
+ * (the chain root's backup, which the conflict report named as
+ * `originalBackupPath`), and every record of the chain closes with it, without
+ * a write. So ending an already-ended session again is how a resolved conflict
+ * is settled.
+ *
  * Called on `session.end`, on editor deactivation (the extension's
  * `deactivate()` ends the active session), and — through
  * {@link reconcileModifications} — on service start, so that a file left
@@ -1388,20 +1672,33 @@ export async function restoreChain(
  * ## Idempotent, by construction
  *
  * A second call finds every record `reverted`, has nothing to do, touches no
- * file, writes nothing to the journal and reports `clean`. That is not a
- * special case in the code — a `reverted` record's disposition is `none`, so it
- * is never even read from disk — which is what makes a retried cleanup after a
- * crashed service safe.
+ * project file, writes nothing to the journal and reports `clean`. That is not
+ * a special case in the code — a `reverted` record's disposition is `none`, so
+ * it is never even read from disk — which is what makes a retried cleanup after
+ * a crashed service safe. Its only look at the disk is whether the session's
+ * backup directory is still there; once it is gone, the store is not asked
+ * anything either.
  *
  * ## Housekeeping
  *
  * Backups of successfully restored files are deleted only after their restored
  * content verified against `originalHash`, and a backup shared by two records —
  * the store is content-addressed, so records that saw identical original bytes
- * share one file — survives until its last holder is done. A pass that restored
- * everything and left no conflict then removes the session's now-empty backup
- * directory; a pass that conflicted keeps it, because that copy is the one the
- * developer was pointed at.
+ * share one file — survives until its last holder is done.
+ *
+ * A pass that ends `clean` for a session the journal holds records of — every
+ * one of them now `reverted` — then removes the session's backup directory,
+ * **whether or not this pass reverted any of them**. A session whose every
+ * record an install rollback already reverted restores nothing here, and is
+ * exactly the session whose emptied `backups/<sessionId>/` would otherwise
+ * outlive it; so is one whose chain close left a superseded layer's backup for
+ * the directory's removal and whose removal then failed. A pass that conflicted
+ * keeps the directory, because that copy is the one the developer was pointed
+ * at, and so does a caller that asks to with
+ * {@link CleanupSessionOptions.keepBackupDirectory}. A session the journal holds
+ * no record of is not this pass's to tidy. The removal relies on what the
+ * restore itself relies on: the session's installs have stopped before its
+ * cleanup runs.
  *
  * Never rejects and never throws. A journal that will not answer is reported as
  * a failure with no record attributed to it, and the status is `partial` —
@@ -1480,11 +1777,15 @@ export async function cleanupSession(
     scope: options.scope,
     scopeFor: undefined,
     conflictMessage: options.conflictMessage,
+    // Listed lazily: a pass none of whose verdicts authorises a write never
+    // asks the journal for anything but this session's records.
+    claims: new OpenClaims(context, undefined, undefined),
   };
 
   for (const group of groupsInReverseApplicationOrder(work)) {
     const chain = await restoreFileChain(group, context, pass);
 
+    pass.claims.observe(chain);
     restored.push(...chain.restored, ...chain.closed);
     conflicts.push(...chain.conflicts);
     skipped.push(...chain.retained, ...chain.skipped);
@@ -1501,8 +1802,14 @@ export async function cleanupSession(
   // this pass leaves open.
   const status = statusFor({ conflicts, forks, outstanding: skipped, failures });
 
-  if (status === 'clean' && restored.length > 0 && options.keepBackupDirectory !== true) {
-    await removeSessionBackups(sessionId, context, options.scope, logger);
+  // Keyed off the journal's listing rather than this pass's restorations: a
+  // clean pass leaves every record of the session `reverted`, including the
+  // ones an install rollback reverted before it — whose session restores
+  // nothing here and would otherwise keep its emptied directory for good.
+  const ownsRecords = listed.value.some((record) => record.sessionId === sessionId);
+
+  if (status === 'clean' && ownsRecords && options.keepBackupDirectory !== true) {
+    await removeSessionBackups(sessionId, context, options.scope, logger, restored.length > 0);
   }
 
   logger.info('session cleanup finished', {
@@ -1643,11 +1950,18 @@ export async function reconcileModifications(
     scopeFor: options.scopeFor,
     conflictMessage: options.conflictMessage,
     stores,
+    // The listing this pass already holds is every session's open records —
+    // taken before any session filter — so the claims are read from it rather
+    // than asked for twice, and placed with the same resolver.
+    claims: new OpenClaims(context, options.scopeFor, listed.value),
   };
 
   for (const group of groupsInReverseApplicationOrder(work, true)) {
     const chain = await restoreFileChain(group, context, pass);
 
+    // A later group may belong to another session over the same file, and
+    // must judge the claims as this group left them.
+    pass.claims.observe(chain);
     restored.push(...chain.restored);
     closed.push(...chain.closed);
     retained.push(...chain.retained);
@@ -1749,6 +2063,12 @@ interface PassSettings {
    * never one composed afresh. Absent for a pass that removes no directory.
    */
   readonly stores?: Map<string, BackupStore> | undefined;
+
+  /**
+   * Every other session's open claim on a file, read once for the pass and
+   * kept current as its walks move records. See {@link OpenClaims}.
+   */
+  readonly claims: OpenClaims;
 }
 
 /** What restoring one record needs. */
@@ -1779,17 +2099,135 @@ interface RestoreSettings {
 
   /** The conflict wording override. */
   readonly conflictMessage: string | undefined;
+
+  /**
+   * The record's chain root — the root-most live record its `previousRecordId`
+   * links reach among the file's records — or `undefined` for an unchained
+   * record and for a record restored on its own.
+   *
+   * Its backup is the file's pristine original, so every conflict report of a
+   * chained record names it as `originalBackupPath`, diffs from it, and the
+   * wording below points there rather than at the record's own backup, which
+   * holds an earlier plan version's instrumented output.
+   */
+  readonly chainRoot: ModificationRecord | undefined;
+
+  /**
+   * What remains of the record's chain beneath it, for a step of a chain walk;
+   * `undefined` for a record restored on its own, which is never closed
+   * together with anything. See {@link closeSupersededChain}.
+   */
+  readonly chain: ChainStepSettings | undefined;
+
+  /**
+   * The pass's view of every other session's open records, consulted before
+   * a `restorable` verdict becomes a write. See {@link foreignClaimsOn}.
+   */
+  readonly claims: OpenClaims;
+}
+
+/** What a step of a chain walk knows about the records beneath the one it judges. */
+interface ChainStepSettings {
+  /**
+   * The live records the walk has still to reach after this one, in
+   * restoration order: the rest of the file's single chain.
+   */
+  readonly beneath: readonly ModificationRecord[];
+
+  /**
+   * Whether a record's backup must survive its own verified close — the pass
+   * ledger's answer, asked for the record a chain close matched.
+   */
+  readonly retains: (record: ModificationRecord) => boolean;
+}
+
+/** One record a step settled, as the walk accounts for it. */
+interface SettledRecord {
+  /** The record as the walk was handed it, whose ledger keys the walk releases or pins. */
+  readonly record: ModificationRecord;
+
+  /** What became of it. */
+  readonly outcome: RestoreOutcome;
+
+  /**
+   * Whether it was closed as a **superseded** layer of a chain close: the file
+   * holds content from before it, so its `originalHash` is not on disk, its
+   * backup cannot be deleted as verified, and the ledger must release it
+   * without queueing a deletion.
+   */
+  readonly superseded: boolean;
+}
+
+/**
+ * What one step of a walk did: the judged record, then every record beneath it
+ * a chain close settled in the same step, in restoration order.
+ */
+interface StepResult {
+  /** The record the step judged. */
+  readonly judged: SettledRecord;
+
+  /**
+   * The records beneath it a chain close settled with it, in restoration
+   * order; empty for every other step.
+   */
+  readonly beneath: readonly SettledRecord[];
+
+  /**
+   * A record beneath the judged one whose close the journal refused, which
+   * stopped a chain close part-way, with the journal's error; `undefined`
+   * otherwise. The judged record and everything in
+   * {@link StepResult.beneath} were closed before it.
+   */
+  readonly refused:
+    { readonly record: ModificationRecord; readonly error: DebuggenError } | undefined;
 }
 
 /**
  * What reporting a conflict needs from a step's settings: the clock reading the
- * report and the transition share, the logger, and the wording override.
+ * report and the transition share, the logger, the wording override and the
+ * record's chain root.
  *
  * Narrower than {@link RestoreSettings} on purpose, so a refused fork — which
  * resolves no scope and reads no file — reports through the same two functions
  * as every other conflict.
  */
-type ConflictSettings = Pick<RestoreSettings, 'logger' | 'now' | 'conflictMessage'>;
+type ConflictSettings = Pick<RestoreSettings, 'logger' | 'now' | 'conflictMessage' | 'chainRoot'>;
+
+/**
+ * The records a walk is moving into `conflict` beneath the conflicted record
+ * that stopped it, and the tally its single log line reports.
+ *
+ * Created by {@link chainRetentionFor} only when that record's report proves
+ * the file holds none of the chain's output, and consulted by the walk for
+ * each record behind the stop. Mutable on purpose: it is local to one walk of
+ * one file and never escapes it.
+ */
+interface ChainRetention {
+  /** The judged record whose conflict stopped the walk. */
+  readonly head: ModificationRecord;
+
+  /** Its report's reason: `content-changed` or `file-missing`. */
+  readonly reason: ModificationConflictReason;
+
+  /**
+   * The clock reading of the head's step — its report's `detectedAt` — which
+   * every transition beneath it carries, so the chain moved into `conflict` at
+   * one instant.
+   */
+  readonly now: number;
+
+  /** How many records beneath the head the journal moved into `conflict`. */
+  moved: number;
+
+  /** How many were already in `conflict` and stayed there without a write. */
+  kept: number;
+
+  /**
+   * The record whose transition the journal refused, which ends the retention:
+   * it and every record beneath it are skipped with their status untouched.
+   */
+  refused: ModificationRecord | undefined;
+}
 
 /**
  * Unwinds one file's records in reverse order, halting at the first record that
@@ -1804,6 +2242,15 @@ type ConflictSettings = Pick<RestoreSettings, 'logger' | 'now' | 'conflictMessag
  * duplicate id or a cycle), and records that order but do not form a single
  * chain — a fork, which {@link refuseForkedChain} reports. Only a single linear
  * chain reaches the walk.
+ *
+ * Behind the record that stops the walk, every record keeps its backup. When
+ * that record's conflict proves the file holds none of the chain's output
+ * ({@link chainRetentionFor}), the open records behind it move into `conflict`
+ * and are `retained` ({@link retainBehindConflict}); behind any other stop, or
+ * once the journal refuses one of those transitions, they are `skipped` with
+ * their status untouched. Abort is not consulted between those transitions:
+ * they follow from one observation of the file, write nothing to it, and a
+ * chain left half in `conflict` would only be finished by the next pass.
  */
 async function restoreFileChain(
   records: readonly ModificationRecord[],
@@ -1909,13 +2356,48 @@ async function restoreFileChain(
     return await refuseForkedChain(ordered.value, fork, context, pass);
   }
 
+  // The records a chain root is looked up among: the live ones, because a
+  // reverted ancestor's backup has been deleted and cannot be named as the
+  // original. Resolved once, from the records as the walk was handed them.
+  const live = liveRecordsOf(ordered.value);
+  // Records a chain close already settled in an earlier step of this walk.
+  const settledIds = new Set<string>();
   let stoppedAt: ModificationRecord | undefined;
+  // Set only by a stop whose conflict proves the file holds none of the
+  // chain's output: the records behind it then move into `conflict`.
+  let retention: ChainRetention | undefined;
 
-  for (const record of ordered.value) {
+  for (const [index, record] of ordered.value.entries()) {
+    if (settledIds.has(record.id)) {
+      continue;
+    }
+
     if (stoppedAt !== undefined) {
-      // Every earlier plan version expects content the file no longer holds.
-      skipped.push(record);
+      // Every earlier plan version expects content the file no longer holds,
+      // so none of them is restored and every backup is kept.
       pass.ledger.pin(record);
+
+      if (
+        retention !== undefined &&
+        retention.refused === undefined &&
+        reconcileDispositionFor(record.status) !== 'none'
+      ) {
+        const held = await retainBehindConflict(record, retention, context);
+
+        if (isErr(held)) {
+          // Recorded, never thrown: this record and every one behind it keep
+          // their status for the next pass, exactly as behind any failure.
+          retention.refused = record;
+          skipped.push(record);
+          failures.push(failureOf(record, held.error));
+        } else {
+          retained.push(held.value);
+        }
+
+        continue;
+      }
+
+      skipped.push(record);
       continue;
     }
 
@@ -1943,7 +2425,10 @@ async function restoreFileChain(
     pass.stores?.set(record.sessionId, scope.value.backups);
 
     const disposition = reconcileDispositionFor(record.status);
-    const result = await restoreOne(record, context, {
+    const beneath = liveRecordsOf(ordered.value.slice(index + 1)).filter(
+      (candidate) => !settledIds.has(candidate.id),
+    );
+    const result = await restoreStep(record, context, {
       scope: scope.value,
       files: pass.files,
       logger: pass.logger,
@@ -1952,6 +2437,12 @@ async function restoreFileChain(
       closeWhenTargetIsOriginal: closesPristineTarget(disposition),
       retainBackup: pass.ledger.holds(record),
       conflictMessage: pass.conflictMessage,
+      chainRoot: findChainRoot(record, live),
+      chain: {
+        beneath,
+        retains: (candidate: ModificationRecord): boolean => pass.ledger.holds(candidate),
+      },
+      claims: pass.claims,
     });
 
     if (isErr(result)) {
@@ -1962,43 +2453,87 @@ async function restoreFileChain(
       continue;
     }
 
-    const outcome = result.value;
+    for (const settled of [result.value.judged, ...result.value.beneath]) {
+      const { outcome } = settled;
 
-    outcomes.push(outcome);
+      settledIds.add(settled.record.id);
+      outcomes.push(outcome);
 
-    switch (outcome.kind) {
-      case 'restored':
-        restored.push(outcome.record);
-        pass.ledger.release(record, scope.value.backups, outcome.backup === 'retained');
-        break;
+      switch (outcome.kind) {
+        case 'restored':
+          restored.push(outcome.record);
+          pass.ledger.release(settled.record, scope.value.backups, outcome.backup === 'retained');
+          break;
 
-      case 'already-original':
-        closed.push(outcome.record);
-        pass.ledger.release(record, scope.value.backups, outcome.backup === 'retained');
-        break;
+        case 'already-original':
+          closed.push(outcome.record);
+          // A superseded layer's backup is not what the file holds, so no
+          // verified deletion may be queued for it; the clean pass's removal of
+          // the session directory takes it with the rest.
+          pass.ledger.release(
+            settled.record,
+            scope.value.backups,
+            !settled.superseded && outcome.backup === 'retained',
+          );
+          break;
 
-      case 'conflict':
-        retained.push(outcome.record);
+        case 'conflict':
+          retained.push(outcome.record);
 
-        if (outcome.conflict !== undefined) {
-          conflicts.push(outcome.conflict);
-        }
+          if (outcome.conflict !== undefined) {
+            conflicts.push(outcome.conflict);
+          }
 
-        pass.ledger.pin(record);
-        stoppedAt = record;
-        break;
+          pass.ledger.pin(settled.record);
+          stoppedAt = settled.record;
+          // Only a judged record reaches a conflict — a chain close settles the
+          // records beneath it without one — so `beneath` is the rest of its
+          // chain.
+          retention = chainRetentionFor(settled.record, outcome, beneath);
+          break;
 
-      case 'skipped':
-        skipped.push(outcome.record);
-        pass.ledger.pin(record);
-        break;
+        case 'skipped':
+          skipped.push(outcome.record);
+          pass.ledger.pin(settled.record);
+          break;
 
-      default:
-        assertNever(
-          outcome.kind,
-          'A restore outcome reached the chain walker that it does not classify. Add the case in packages/instrumentation/src/cleanup.ts.',
-        );
+        default:
+          assertNever(
+            outcome.kind,
+            'A restore outcome reached the chain walker that it does not classify. Add the case in packages/instrumentation/src/cleanup.ts.',
+          );
+      }
     }
+
+    const refused = result.value.refused;
+
+    if (refused !== undefined) {
+      // A chain close stopped part-way: what it closed above this record stays
+      // closed, and this record and everything beneath it stay open for the
+      // next pass, exactly as behind any failure.
+      settledIds.add(refused.record.id);
+      skipped.push(refused.record);
+      pass.ledger.pin(refused.record);
+      failures.push(failureOf(refused.record, refused.error));
+      stoppedAt = refused.record;
+    }
+  }
+
+  if (retention !== undefined) {
+    // One line per chain, identifiers and counts only: the head's own warning
+    // already carries the file and the backup the developer is pointed at.
+    pass.logger.info(
+      'the records beneath a conflicted modification were moved to conflict with it; their backups are kept',
+      {
+        recordId: retention.head.id,
+        sessionId: retention.head.sessionId,
+        reason: retention.reason,
+        moved: retention.moved,
+        kept: retention.kept,
+        refused: retention.refused === undefined ? 0 : 1,
+        ...(retention.refused === undefined ? {} : { refusedRecordId: retention.refused.id }),
+      },
+    );
   }
 
   return {
@@ -2013,6 +2548,126 @@ async function restoreFileChain(
     stoppedAt,
     fork: undefined,
   };
+}
+
+/**
+ * Whether the conflict that stopped a walk proves the file holds none of the
+ * output of the records beneath the judged one, and so moves them into
+ * `conflict` with it; the retention to apply when it does, `undefined`
+ * otherwise.
+ *
+ * Two report reasons describe the file rather than the tool's own bookkeeping:
+ *
+ * - `file-missing` — there is no file, so it holds nobody's output;
+ * - `content-changed` — the file holds bytes the judged record did not write.
+ *
+ * Each is read against the digests beside it, not taken on its reason alone.
+ * A `content-changed` report is also what an `applied` record whose file went
+ * back to the bytes it replaced produces, and in a chain those bytes are the
+ * output of the record beneath it — still on disk, still that record's to
+ * restore. So the report's digest must be no record's `instrumentedHash` —
+ * the judged record's or any record's beneath it — and a report without one
+ * qualifies only when the file is gone. Every other reason (`backup-missing`,
+ * `backup-corrupt`, `restore-verification-failed`, `record-chain-fork`) is
+ * about a backup or a write, says nothing about which output the file holds,
+ * and never qualifies.
+ *
+ * @param head The judged record whose conflict stopped the walk, as the walk
+ * was handed it.
+ * @param outcome Its conflict outcome, carrying the report.
+ * @param beneath The open records still to be walked behind it, in
+ * restoration order: the rest of its single chain.
+ * @returns The retention, or `undefined` when the records beneath are to be
+ * skipped with their status untouched.
+ */
+function chainRetentionFor(
+  head: ModificationRecord,
+  outcome: RestoreOutcome,
+  beneath: readonly ModificationRecord[],
+): ChainRetention | undefined {
+  const report = outcome.conflict;
+
+  if (report === undefined || beneath.length === 0) {
+    return undefined;
+  }
+
+  switch (report.reason) {
+    case 'content-changed':
+    case 'file-missing': {
+      const observed = report.actualHash;
+      const holdsNoOutput =
+        observed === undefined
+          ? report.reason === 'file-missing'
+          : observed !== head.instrumentedHash &&
+            beneath.every((record) => record.instrumentedHash !== observed);
+
+      return holdsNoOutput
+        ? {
+            head,
+            reason: report.reason,
+            now: outcome.completedAt,
+            moved: 0,
+            kept: 0,
+            refused: undefined,
+          }
+        : undefined;
+    }
+
+    case 'backup-missing':
+    case 'backup-corrupt':
+    case 'restore-verification-failed':
+    case 'record-chain-fork':
+      return undefined;
+
+    default:
+      return assertNever(
+        report.reason,
+        'A conflict reason reached the chain walker that it does not classify. Add the case to chainRetentionFor() in packages/instrumentation/src/cleanup.ts.',
+      );
+  }
+}
+
+/**
+ * Moves one record beneath a conflicted record of its chain into `conflict`,
+ * or leaves it there when it already is, and returns it as the journal now
+ * holds it.
+ *
+ * The same transition {@link recordConflict} journals, with the head's clock
+ * reading, and legal from every open status that can reach it (`applied`,
+ * `pending` and `failed` → `conflict`). A record already in `conflict` is not
+ * re-written — the journal has no `conflict → conflict` transition and the row
+ * already says what it has to. No report is composed and nothing is read or
+ * written in the project: the head's report covers the file, and the caller
+ * pins the record's backup.
+ *
+ * @param record The record behind the head, still open.
+ * @param retention The chain's retention, whose tally this updates.
+ * @param context The pass's context, for the journal.
+ * @returns The record in `conflict`, or `err(STORE_ERROR)` for a transition
+ * the journal refused.
+ */
+async function retainBehindConflict(
+  record: ModificationRecord,
+  retention: ChainRetention,
+  context: CleanupContext,
+): Promise<Result<ModificationRecord>> {
+  if (record.status === 'conflict') {
+    retention.kept += 1;
+
+    return ok(record);
+  }
+
+  const marked = await context.journal.updateStatus(record.id, 'conflict', {
+    appliedAt: retention.now,
+  });
+
+  if (isErr(marked)) {
+    return err(journalTransitionFailed(record, 'conflict', marked.error));
+  }
+
+  retention.moved += 1;
+
+  return ok(marked.value);
 }
 
 /**
@@ -2130,7 +2785,12 @@ async function refuseForkedChain(
     logger: pass.logger,
     now: clockReading(context, pass.logger),
     conflictMessage: pass.conflictMessage,
+    chainRoot: undefined,
   };
+  // Every record of a fork still has one ancestry of its own through its
+  // `previousRecordId`, so each report names the pristine original that record
+  // descends from.
+  const live = liveRecordsOf(ordered);
 
   pass.logger.error(
     'the modification records for one file do not form a single chain; nothing was written to it',
@@ -2173,14 +2833,15 @@ async function refuseForkedChain(
       continue;
     }
 
+    const chainRoot = findChainRoot(record, live);
     const reported = await reportSynthesizedConflict(
       record,
       undefined,
       CHAIN_FORK_CONFLICT_REASON,
       undefined,
-      chainForkMessage(record, fork),
+      chainForkMessage(record, fork, chainRoot),
       context,
-      settings,
+      { ...settings, chainRoot },
     );
 
     if (isErr(reported)) {
@@ -2213,7 +2874,9 @@ async function refuseForkedChain(
 
 /**
  * Restores one record: the sequence of the module overview, with the verdict
- * from `./patch/conflict.ts` choosing the branch.
+ * from `./patch/conflict.ts` choosing the branch — and, for a step of a chain
+ * walk, closes the chain beneath it when the file already holds content from
+ * before it.
  *
  * Shared by {@link restoreModification} and {@link restoreFileChain} so that a
  * record restored on its own and a record restored as part of a chain take
@@ -2225,12 +2888,42 @@ async function refuseForkedChain(
  * `already-reverted` once the file is back at the original, and a conflicting
  * verdict while the edit is still there. Only the last keeps it in `conflict`;
  * {@link recordConflict} then renews its report without a journal write.
+ *
+ * ## The chain close
+ *
+ * One conflicting verdict has a chain-level reading. When the judged record is
+ * the head of what remains of its chain, its disposition closes a record over a
+ * pristine file ({@link closesPristineTarget}: `pending`, `failed`,
+ * `conflict`), and the file hashes to the `originalHash` of a record beneath it
+ * — over links whose hashes agree, see {@link supersededLayersBeneath} — the
+ * file holds content from before every write from the head down to that
+ * record. Nothing of those writes is left to restore or to lose, so the head
+ * and each of those records are closed without a write
+ * ({@link closeSupersededChain}) and the walk continues with the record beneath
+ * them, which the file now holds the output of. The lookahead reuses the
+ * digest the verdict already took — the file is read once — so the head never
+ * passes through `conflict` and no "not reverted" warning is logged for it. An
+ * `applied` head is never closed this way: for it, content that is not its own
+ * is news, reported as a conflict first, and the next pass — the head then in
+ * `conflict` — closes the chain.
+ *
+ * ## Another session's claim
+ *
+ * A `restorable` verdict is the only one that authorises a write from an
+ * observed digest, so it is the one checked against the other sessions' open
+ * records first ({@link foreignClaimsOn}). A digest that is also another
+ * session's live claim in the same project, over the same pristine original,
+ * closes the record and what remains of its chain without a write
+ * ({@link closeClaimedChain}); a claim over a different original, one the pass
+ * cannot place, or a listing that cannot be read refuses the write with
+ * nothing journaled, which the walk records as a failure and a stop. See the
+ * module overview.
  */
-async function restoreOne(
+async function restoreStep(
   record: ModificationRecord,
   context: CleanupContext,
   settings: RestoreSettings,
-): Promise<Result<RestoreOutcome>> {
+): Promise<Result<StepResult>> {
   if (settings.disposition === 'none') {
     // A reverted record is finished business: nothing is resolved, read or
     // hashed, which is what makes a repeated pass free as well as safe.
@@ -2239,7 +2932,7 @@ async function restoreOne(
       file: record.file,
     });
 
-    return ok(skippedOutcome(record, settings.now));
+    return ok(judgedOnly(record, skippedOutcome(record, settings.now)));
   }
 
   const target = resolveTargetPath(record, settings);
@@ -2257,6 +2950,60 @@ async function restoreOne(
 
   const judgement = verdict.value;
 
+  if (
+    judgement.kind === 'content-changed' &&
+    settings.closeWhenTargetIsOriginal &&
+    settings.chain !== undefined
+  ) {
+    const superseded = supersededLayersBeneath(
+      record,
+      judgement.actualHash,
+      settings.chain.beneath,
+    );
+
+    if (superseded !== undefined) {
+      return await closeSupersededChain(
+        record,
+        superseded,
+        judgement.actualHash,
+        path,
+        context,
+        settings,
+        settings.chain,
+      );
+    }
+  }
+
+  if (judgement.kind === 'restorable') {
+    // The bytes this verdict would write over may be another session's live
+    // patch that merely hashes like this record's own output.
+    const claims = await foreignClaimsOn(record, judgement.actualHash, path, settings);
+
+    if (isErr(claims)) {
+      return claims;
+    }
+
+    if (claims.value.length > 0) {
+      return await closeClaimedChain(record, claims.value, path, context, settings);
+    }
+  }
+
+  const acted = await actOnVerdict(record, judgement, path, context, settings);
+
+  return isErr(acted) ? acted : ok(judgedOnly(record, acted.value));
+}
+
+/**
+ * Acts on one record's verdict: the restore, the close, or the conflict it
+ * authorises. The per-record half of {@link restoreStep}.
+ */
+async function actOnVerdict(
+  record: ModificationRecord,
+  judgement: ConflictVerdict,
+  path: string,
+  context: CleanupContext,
+  settings: RestoreSettings,
+): Promise<Result<RestoreOutcome>> {
   if (settings.disposition === 'retain' && !isConflictVerdict(judgement)) {
     // The conflict described the file as it was when the divergence was seen.
     // It now hashes to a recorded digest again — the developer undid the edit,
@@ -2295,7 +3042,7 @@ async function restoreOne(
 
     case 'already-reverted':
       if (settings.closeWhenTargetIsOriginal) {
-        return await closeRecord(record, path, context, settings);
+        return await closeRecord(record, path, context, settings, judgement.actualHash);
       }
 
       return await reportSynthesizedConflict(
@@ -2303,7 +3050,7 @@ async function restoreOne(
         path,
         'content-changed',
         judgement.actualHash,
-        pristineTargetMessage(record),
+        pristineTargetMessage(record, settings.chainRoot),
         context,
         settings,
       );
@@ -2318,6 +3065,253 @@ async function restoreOne(
         'A conflict verdict reached cleanup that it does not handle. Add the case in packages/instrumentation/src/cleanup.ts.',
       );
   }
+}
+
+/** The result of a step that settled only the record it judged. */
+function judgedOnly(record: ModificationRecord, outcome: RestoreOutcome): StepResult {
+  return {
+    judged: { record, outcome, superseded: false },
+    beneath: [],
+    refused: undefined,
+  };
+}
+
+/**
+ * The records a chain close settles beneath a head whose file hashes to
+ * `actualHash`, or `undefined` when no chain close applies.
+ *
+ * Walks down from the head through `previousRecordId` among the live records
+ * still to be walked, and requires every link it crosses to be
+ * **hash-consistent** — the child names the parent (`previousRecordId ===
+ * parent.id`), belongs to the same session, and replaced exactly the bytes the
+ * parent wrote (`child.originalHash === parent.instrumentedHash`) — which is
+ * what makes "the file holds the bytes from before this record" provable from
+ * the journal alone. The first record whose `originalHash` equals the file's
+ * digest ends the walk: the file holds the content from before it, so every
+ * write from the head down to it is gone from disk. A link that is missing,
+ * inconsistent, crosses sessions or loops ends the walk with `undefined`, and
+ * the head is judged on its own terms as ever.
+ *
+ * The head's own `originalHash` is not compared: a file that holds it is an
+ * `already-reverted` verdict, never a `content-changed` one.
+ *
+ * @param head The record whose verdict was `content-changed`.
+ * @param actualHash The digest the verdict took of the file.
+ * @param beneath The live records the walk has still to reach, in restoration
+ * order. Records of the same file by construction.
+ * @returns The records beneath the head, from its parent down to and including
+ * the record whose `originalHash` the file holds, in restoration order.
+ */
+function supersededLayersBeneath(
+  head: ModificationRecord,
+  actualHash: string,
+  beneath: readonly ModificationRecord[],
+): ModificationRecord[] | undefined {
+  const byId = new Map<string, ModificationRecord>();
+
+  for (const record of beneath) {
+    if (!byId.has(record.id)) {
+      byId.set(record.id, record);
+    }
+  }
+
+  const layers: ModificationRecord[] = [];
+  const visited = new Set<string>([head.id]);
+  let child = head;
+
+  // Each iteration moves to a record not yet visited or ends, so the walk is
+  // bounded by the number of records beneath the head.
+  while (child.previousRecordId !== undefined && !visited.has(child.previousRecordId)) {
+    const parent = byId.get(child.previousRecordId);
+
+    if (
+      parent === undefined ||
+      parent.sessionId !== head.sessionId ||
+      child.originalHash !== parent.instrumentedHash
+    ) {
+      return undefined;
+    }
+
+    visited.add(parent.id);
+    layers.push(parent);
+
+    if (parent.originalHash === actualHash) {
+      return layers;
+    }
+
+    child = parent;
+  }
+
+  return undefined;
+}
+
+/**
+ * Closes the head of a chain and the records beneath it down to the one whose
+ * original the file holds — all without writing a byte.
+ *
+ * Reached from {@link restoreStep} only, once {@link supersededLayersBeneath}
+ * has proved from hash-consistent links that the file holds the content from
+ * before every one of those writes. Each record goes `→ reverted` through
+ * {@link closeRecord}, top-down, the head first, so a journal that refuses part
+ * of the way leaves exactly what an ordinary halted walk leaves: the records
+ * closed so far are closed, and the refused record and everything beneath it
+ * stay open for the next pass, which judges the refused record as the new
+ * head.
+ *
+ * The backups differ by what the file proves:
+ *
+ * - the **matched** record — the lowest one, whose `originalHash` the file
+ *   hashes to — has its backup disposed of exactly as an already-original
+ *   close does, through the verified deletion the digest just taken
+ *   authorises, or retained by the ledger when another record shares it;
+ * - every **superseded** record above it — the head included — has an
+ *   `originalHash` that is *not* on disk, so its backup cannot be deleted as
+ *   verified without lying to the store's interlock. It is left where it is,
+ *   released from the ledger without a queued deletion, and removed with the
+ *   session's backup directory by the pass that leaves the session clean.
+ *
+ * Abort is not consulted between the closes: the step is one decision about
+ * one file, taken on one observation, and writes nothing, so splitting it would
+ * only leave a half-closed chain for the next pass to finish.
+ */
+async function closeSupersededChain(
+  head: ModificationRecord,
+  layers: readonly ModificationRecord[],
+  actualHash: string,
+  path: string,
+  context: CleanupContext,
+  settings: RestoreSettings,
+  chain: ChainStepSettings,
+): Promise<Result<StepResult>> {
+  const matched = layers[layers.length - 1];
+
+  settings.logger.info(
+    'a chained file holds content from before these modifications; they are closed without a write',
+    {
+      recordId: head.id,
+      sessionId: head.sessionId,
+      file: head.file,
+      status: head.status,
+      matchedRecordId: matched?.id,
+      closed: layers.length + 1,
+    },
+  );
+
+  const closedHead = await closeRecord(head, path, context, settings, undefined);
+
+  if (isErr(closedHead)) {
+    return closedHead;
+  }
+
+  const beneath: SettledRecord[] = [];
+
+  for (const layer of layers) {
+    const isMatched = layer === matched;
+    const closed = await closeRecord(
+      layer,
+      path,
+      context,
+      { ...settings, retainBackup: isMatched && chain.retains(layer) },
+      isMatched ? actualHash : undefined,
+    );
+
+    if (isErr(closed)) {
+      return ok({
+        judged: { record: head, outcome: closedHead.value, superseded: true },
+        beneath,
+        refused: { record: layer, error: closed.error },
+      });
+    }
+
+    beneath.push({ record: layer, outcome: closed.value, superseded: !isMatched });
+  }
+
+  return ok({
+    judged: { record: head, outcome: closedHead.value, superseded: true },
+    beneath,
+    refused: undefined,
+  });
+}
+
+/**
+ * Closes a record whose file holds another session's live claim on the same
+ * pristine original, and every open record beneath it in its chain — all
+ * without writing a byte.
+ *
+ * Reached from {@link restoreStep} only, once {@link foreignClaimsOn} has
+ * placed every matching claim at this record's own file and found each one
+ * descending from the pristine original this record's chain recorded. The
+ * bytes on disk are then that session's to unwind, and its unwinding ends at
+ * exactly the original this chain would have written back, so nothing of this
+ * chain is left to restore or to lose. Writing its backups instead would put
+ * the pristine file under the other session's live patch and leave that
+ * session reporting an edit nobody made.
+ *
+ * Each record goes `→ reverted` through {@link closeRecord}, the transition
+ * every close journals, top-down with the judged record first, so a journal
+ * that refuses part of the way leaves exactly what a halted chain close
+ * leaves: the records closed so far stay closed, and the refused record and
+ * everything beneath it stay open for the next pass. Every record is settled
+ * as **superseded**: its `originalHash` is not what the file holds, so no
+ * verified deletion may be queued for its backup, and the backups leave with
+ * the session's backup directory once a pass leaves the session clean. The
+ * decision is logged once, with identifiers and a count only.
+ *
+ * @param record The judged record, whose verdict was `restorable`.
+ * @param holders The other sessions' records whose claim the file holds.
+ * @param path The resolved target, for the outcomes.
+ * @param context The pass's context, for the journal.
+ * @param settings The judged record's step settings.
+ * @returns The judged record and the records beneath it, closed.
+ */
+async function closeClaimedChain(
+  record: ModificationRecord,
+  holders: readonly ModificationRecord[],
+  path: string,
+  context: CleanupContext,
+  settings: RestoreSettings,
+): Promise<Result<StepResult>> {
+  const layers = settings.chain?.beneath ?? [];
+
+  settings.logger.info(
+    'another session holds these bytes over the same original; this session’s modifications are closed without a write',
+    {
+      recordId: record.id,
+      sessionId: record.sessionId,
+      status: record.status,
+      holderRecordIds: holders.map((holder) => holder.id),
+      holderSessionIds: sessionIdsOf(holders),
+      closed: layers.length + 1,
+    },
+  );
+
+  const closedHead = await closeRecord(record, path, context, settings, undefined, false);
+
+  if (isErr(closedHead)) {
+    return closedHead;
+  }
+
+  const beneath: SettledRecord[] = [];
+
+  for (const layer of layers) {
+    const closed = await closeRecord(layer, path, context, settings, undefined, false);
+
+    if (isErr(closed)) {
+      return ok({
+        judged: { record, outcome: closedHead.value, superseded: true },
+        beneath,
+        refused: { record: layer, error: closed.error },
+      });
+    }
+
+    beneath.push({ record: layer, outcome: closed.value, superseded: true });
+  }
+
+  return ok({
+    judged: { record, outcome: closedHead.value, superseded: true },
+    beneath,
+    refused: undefined,
+  });
 }
 
 /**
@@ -2497,7 +3491,7 @@ async function writeRestoration(
           path,
           'file-missing',
           undefined,
-          missingDirectoryMessage(record),
+          missingDirectoryMessage(record, settings.chainRoot),
           context,
           settings,
         );
@@ -2634,20 +3628,32 @@ async function reportUnusableBackup(
 }
 
 /**
- * Closes a record whose file already holds the recorded original, without
- * writing a byte.
+ * Closes a record whose file already holds the recorded original — or, in a
+ * chain close, content from before it — without writing a byte.
  *
  * The "nothing was written" branch of the reconciliation table: a crash between
  * the journal append and the atomic rename leaves exactly this state, and the
  * file needs no repair. The backup may be deleted because the hash comparison
  * that got here *is* the verification the deletion requires — the bytes on disk
  * hash to `originalHash`.
+ *
+ * @param verifiedHash The digest the file was just observed to hold, equal to
+ * the record's `originalHash`, which authorises the backup's verified deletion;
+ * `undefined` for a superseded layer of a chain close, whose `originalHash` the
+ * file does not hold. Such a backup is left where it is and reported
+ * `retained`, for the clean pass's removal of the session directory.
+ * @param logged Whether the close is logged per record. {@link closeClaimedChain}
+ * passes `false`: it logs its one decision for the whole chain, and the
+ * per-record wording — "content from before it" — would not describe a file
+ * that holds another session's bytes.
  */
 async function closeRecord(
   record: ModificationRecord,
   path: string,
   context: CleanupContext,
   settings: RestoreSettings,
+  verifiedHash: string | undefined,
+  logged = true,
 ): Promise<Result<RestoreOutcome>> {
   const marked = await context.journal.updateStatus(record.id, 'reverted', {
     appliedAt: settings.now,
@@ -2657,15 +3663,23 @@ async function closeRecord(
     return err(journalTransitionFailed(record, 'reverted', marked.error));
   }
 
-  const disposition = await disposeBackup(record, settings, record.originalHash);
+  const disposition: BackupDisposition =
+    verifiedHash === undefined ? 'retained' : await disposeBackup(record, settings, verifiedHash);
 
-  settings.logger.info('a modification was closed without a write: the file held the original', {
-    recordId: record.id,
-    sessionId: record.sessionId,
-    file: record.file,
-    status: record.status,
-    backup: disposition,
-  });
+  if (logged) {
+    settings.logger.info(
+      verifiedHash === undefined
+        ? 'a superseded modification was closed without a write: the file holds content from before it'
+        : 'a modification was closed without a write: the file held the original',
+      {
+        recordId: record.id,
+        sessionId: record.sessionId,
+        file: record.file,
+        status: record.status,
+        backup: disposition,
+      },
+    );
+  }
 
   return ok({
     kind: 'already-original',
@@ -2710,6 +3724,7 @@ async function reportSynthesizedConflict(
     detectedAt: settings.now,
     message: settings.conflictMessage ?? message,
     ...(actualHash === undefined ? {} : { actualHash }),
+    chainRoot: settings.chainRoot,
   });
 
   if (isErr(report)) {
@@ -2751,7 +3766,7 @@ async function reportRaceConflict(
     path,
     'content-changed',
     observedHash ?? second.value.actualHash,
-    concurrentWriteMessage(record, staleReason),
+    concurrentWriteMessage(record, staleReason, settings.chainRoot),
     context,
     settings,
   );
@@ -2795,6 +3810,9 @@ async function recordConflict(
     file: record.file,
     reason: conflict.reason,
     backupPath: record.backupPath,
+    ...(conflict.originalBackupPath === undefined
+      ? {}
+      : { originalBackupPath: conflict.originalBackupPath }),
   });
 
   return ok({
@@ -3002,6 +4020,7 @@ function conflictContextOf(settings: RestoreSettings): ConflictDetectionContext 
     now: (): number => settings.now,
     files: settings.files,
     ...(settings.conflictMessage === undefined ? {} : { message: settings.conflictMessage }),
+    ...(settings.chainRoot === undefined ? {} : { chainRoot: settings.chainRoot }),
   };
 }
 
@@ -3043,6 +4062,419 @@ async function scopeOf(
   }
 
   return err(noScopeForSession(record, context.backups.sessionId));
+}
+
+// ---------------------------------------------------------------------------
+// Another session's claim on a file.
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a record in this status claims that its session's bytes are on
+ * disk: `applied`, and the `pending` and `failed` rows whose write may have
+ * landed.
+ *
+ * The same three statuses as `HOLDING_STATUSES` in `./patch/patcher.ts`, whose
+ * hold check this mirrors from the restoring side. `conflict` claims nothing —
+ * its file held the developer's edit when it was judged, which is theirs
+ * rather than any session's — so a pass never defers to it, and a new
+ * session's own end restores normally while an old chain over the same file
+ * sits in `conflict`. `reverted` holds nothing at all. Written as an
+ * exhaustive `switch` so a status added to `./schema/modification.ts` fails to
+ * compile here until somebody decides whether it claims a file.
+ *
+ * @param status A record's status.
+ * @returns Whether the record claims its bytes are on disk.
+ */
+function claimsFileBytes(status: ModificationStatus): boolean {
+  switch (status) {
+    case 'applied':
+    case 'pending':
+    case 'failed':
+      return true;
+
+    case 'conflict':
+    case 'reverted':
+      return false;
+
+    default:
+      return assertNever(
+        status,
+        'A modification status reached the claim check that it does not classify. Add the case to claimsFileBytes() in packages/instrumentation/src/cleanup.ts.',
+      );
+  }
+}
+
+/**
+ * The digest of the pristine file a record's chain started from: its chain
+ * root's `originalHash`, or the record's own when it has no root in view.
+ *
+ * @param record The record.
+ * @param root Its chain root, as `findChainRoot` resolved it.
+ * @returns The pristine original's digest.
+ */
+function pristineOriginalOf(
+  record: ModificationRecord,
+  root: ModificationRecord | undefined,
+): string {
+  return (root ?? record).originalHash;
+}
+
+/**
+ * Where a claim of another session stands relative to the file a record is
+ * about to restore.
+ *
+ * - `same-file` — its project resolves the claim's path to the canonical file
+ *   the record's own path resolved to: it is a claim on these bytes.
+ * - `elsewhere` — its project is known and the claim's file is another file
+ *   (a copy of the project, or nothing at that path): not a claim on these.
+ * - `unplaced` — its project is not known, or its path could not be resolved
+ *   safely, so nothing can be concluded either way.
+ */
+type ClaimPlacement = 'same-file' | 'elsewhere' | 'unplaced';
+
+/**
+ * One pass's view of every open record in the journal, for the claim check of
+ * {@link foreignClaimsOn}.
+ *
+ * - **Read once, and only when needed.** The listing is
+ *   `ModificationJournal.listOpen`, asked for at the pass's first `restorable`
+ *   verdict and memoised — success or failure — for the rest of it;
+ *   {@link reconcileModifications} seeds it with the listing it already holds.
+ *   A pass that writes nothing never asks, so a repeated end still reads the
+ *   journal once, by session, and does nothing else.
+ * - **Kept current.** Each walk's settled records replace their listed rows
+ *   ({@link OpenClaims.observe}), so a later file of the same pass never takes
+ *   a claim this pass already restored, closed or moved into `conflict` for a
+ *   live one.
+ * - **Placed per session.** A claimant's project root is resolved at most once
+ *   per session per pass: through the pass's {@link RecordScopeResolver} when
+ *   it has one, then {@link CleanupContext.projectRootOf}. A resolver that
+ *   answers `err` or `undefined`, or throws, leaves the session unplaced.
+ *
+ * Private to this module and local to one pass: it never outlives the call
+ * that created it.
+ */
+class OpenClaims {
+  /**
+   * The pass's context: its journal, which the listing is read from, and its
+   * project-root resolver, called as a member of the context it came with.
+   */
+  private readonly context: CleanupContext;
+
+  /** The pass's record placement, when it has one. */
+  private readonly scopeFor: RecordScopeResolver | undefined;
+
+  /** The memoised listing; `undefined` until the first claim check asks. */
+  private listing: Promise<Result<readonly ModificationRecord[]>> | undefined;
+
+  /** Rows this pass has since moved, by id, overriding the listing. */
+  private readonly observed = new Map<string, ModificationRecord>();
+
+  /** Each claimant session's project root, memoised per session. */
+  private readonly roots = new Map<string, Promise<string | undefined>>();
+
+  /**
+   * @param context The pass's context: its journal and its project-root resolver.
+   * @param scopeFor The pass's record placement, tried first for a claimant.
+   * @param seed A listing the pass already read from `listOpen`, used instead
+   * of asking again.
+   */
+  constructor(
+    context: CleanupContext,
+    scopeFor: RecordScopeResolver | undefined,
+    seed: readonly ModificationRecord[] | undefined,
+  ) {
+    this.context = context;
+    this.scopeFor = scopeFor;
+    this.listing = seed === undefined ? undefined : Promise.resolve(ok(seed));
+  }
+
+  /**
+   * Takes in the records one walk settled — restored, closed or retained — as
+   * the journal now holds them.
+   *
+   * @param chain What the walk did.
+   */
+  observe(chain: Pick<ChainRestoreOutcome, 'restored' | 'closed' | 'retained'>): void {
+    for (const record of [...chain.restored, ...chain.closed, ...chain.retained]) {
+      this.observed.set(record.id, record);
+    }
+  }
+
+  /**
+   * Every open record, as the journal listed it and as this pass has since
+   * moved it.
+   *
+   * @returns The records, or the listing's error — the same one every later
+   * call of the pass answers.
+   */
+  async open(): Promise<Result<readonly ModificationRecord[]>> {
+    this.listing ??= listOpenRecords(this.context.journal);
+
+    const listed = await this.listing;
+
+    if (isErr(listed)) {
+      return listed;
+    }
+
+    return ok(listed.value.map((record) => this.observed.get(record.id) ?? record));
+  }
+
+  /**
+   * The absolute project root of a claimant's session, or `undefined` when the
+   * pass cannot place it.
+   *
+   * @param claimant Another session's record.
+   * @param logger Where a resolver's refusal is noted.
+   * @returns The root, memoised for the claimant's session.
+   */
+  projectRootOf(claimant: ModificationRecord, logger: Logger): Promise<string | undefined> {
+    const known = this.roots.get(claimant.sessionId);
+
+    if (known !== undefined) {
+      return known;
+    }
+
+    const resolved = this.resolveRoot(claimant, logger);
+
+    this.roots.set(claimant.sessionId, resolved);
+
+    return resolved;
+  }
+
+  /** The uncached half of {@link OpenClaims.projectRootOf}. */
+  private async resolveRoot(
+    claimant: ModificationRecord,
+    logger: Logger,
+  ): Promise<string | undefined> {
+    if (this.scopeFor !== undefined) {
+      try {
+        const scope = await this.scopeFor(claimant);
+
+        if (!isErr(scope)) {
+          return scope.value.projectRoot;
+        }
+
+        logger.debug('the pass could not place another session holding matching bytes', {
+          recordId: claimant.id,
+          sessionId: claimant.sessionId,
+          code: scope.error.code,
+        });
+      } catch (error) {
+        logger.debug('the pass could not place another session holding matching bytes', {
+          recordId: claimant.id,
+          sessionId: claimant.sessionId,
+          code: DebuggenError.from(error).code,
+        });
+      }
+    }
+
+    if (this.context.projectRootOf !== undefined) {
+      try {
+        const root = await this.context.projectRootOf(claimant.sessionId);
+
+        if (typeof root === 'string' && root.length > 0) {
+          return root;
+        }
+      } catch (error) {
+        logger.debug('the project root of another session could not be resolved', {
+          sessionId: claimant.sessionId,
+          code: DebuggenError.from(error).code,
+        });
+      }
+    }
+
+    return undefined;
+  }
+}
+
+/**
+ * `ModificationJournal.listOpen`, with a throw turned into the `err` the port
+ * promises, so the claim check never rejects a pass that must not throw.
+ *
+ * @param journal The journal.
+ * @returns Every open record, or the error that stopped the listing.
+ */
+async function listOpenRecords(
+  journal: ModificationJournal,
+): Promise<Result<readonly ModificationRecord[]>> {
+  try {
+    return await journal.listOpen();
+  } catch (error) {
+    return err(DebuggenError.from(error, 'STORE_ERROR'));
+  }
+}
+
+/**
+ * Where a claim of another session stands relative to the canonical file a
+ * record is about to restore. See {@link ClaimPlacement}.
+ *
+ * The claimant's path is resolved the way this module resolves every record's
+ * — contained in its project and canonicalised through every symbolic link —
+ * so two spellings of one project directory compare equal, and two copies of
+ * one project never do.
+ *
+ * @param claimant Another session's record whose digest matched.
+ * @param path The canonical path the judged record resolved to.
+ * @param settings The judged record's step settings, for the claims index,
+ * the filesystem seam and the logger.
+ * @returns The placement.
+ */
+async function placeClaim(
+  claimant: ModificationRecord,
+  path: string,
+  settings: RestoreSettings,
+): Promise<ClaimPlacement> {
+  const root = await settings.claims.projectRootOf(claimant, settings.logger);
+
+  if (root === undefined) {
+    return 'unplaced';
+  }
+
+  const canonical = resolveRealPathWithinProject(root, claimant.file, settings.files.realPath);
+
+  if (isErr(canonical)) {
+    // Nothing at the claim's path in its own project cannot be the file just
+    // read here; any other refusal says nothing about where the claim lives.
+    return detailsReasonOf(canonical.error) === 'path-not-resolvable' ? 'elsewhere' : 'unplaced';
+  }
+
+  return canonical.value.path === path ? 'same-file' : 'elsewhere';
+}
+
+/**
+ * The other sessions' live claims on the bytes a `restorable` verdict read:
+ * `ok([])` when there are none and the write may proceed, `ok(holders)` when
+ * the record is to be closed beside them, and `err` when the write is refused.
+ *
+ * The rule of the module overview, in order:
+ *
+ * 1. **Candidates** — every open record of another session, in a status that
+ *    claims its bytes ({@link claimsFileBytes}), over the same normalised file,
+ *    whose `instrumentedHash` is the digest just read. When the judged record
+ *    itself claims its bytes, a candidate journaled before it is stale — it
+ *    could not have been patched over while this record held the file — and is
+ *    not a candidate; a record in `conflict` claims nothing and yields to any.
+ * 2. **Placement** — each candidate's project resolves its path to this very
+ *    file, to another one, or cannot be placed ({@link placeClaim}).
+ * 3. **Decision** — a candidate that cannot be placed, or that is placed here
+ *    but descends from a different pristine original, refuses the write; the
+ *    rest placed here are the holders; with none, the write proceeds.
+ *
+ * Every refusal is logged once at `warn` with identifiers only, and is an
+ * `err` the walk records as a failure beside the skipped chain — the pass is
+ * not clean, nothing is journaled, and every backup stays pinned.
+ *
+ * @param record The judged record.
+ * @param digest The digest the verdict read, equal to its `instrumentedHash`.
+ * @param path The canonical path its file resolved to.
+ * @param settings Its step settings.
+ * @returns The holders, or the refusal.
+ */
+async function foreignClaimsOn(
+  record: ModificationRecord,
+  digest: string,
+  path: string,
+  settings: RestoreSettings,
+): Promise<Result<readonly ModificationRecord[]>> {
+  const open = await settings.claims.open();
+
+  if (isErr(open)) {
+    settings.logger.warn(
+      'the other sessions’ open modifications could not be read; nothing was written',
+      {
+        recordId: record.id,
+        sessionId: record.sessionId,
+        code: open.error.code,
+      },
+    );
+
+    return err(claimsUnreadable(record, open.error));
+  }
+
+  const file = fileKeyOf(record);
+  const recordClaims = claimsFileBytes(record.status);
+  const candidates = open.value.filter(
+    (other) =>
+      other.sessionId !== record.sessionId &&
+      claimsFileBytes(other.status) &&
+      other.instrumentedHash === digest &&
+      fileKeyOf(other) === file &&
+      (!recordClaims || other.appliedAt >= record.appliedAt),
+  );
+
+  if (candidates.length === 0) {
+    return ok([]);
+  }
+
+  const holders: ModificationRecord[] = [];
+  const unplaced: ModificationRecord[] = [];
+
+  for (const candidate of candidates) {
+    const placement = await placeClaim(candidate, path, settings);
+
+    switch (placement) {
+      case 'same-file':
+        holders.push(candidate);
+        break;
+
+      case 'elsewhere':
+        break;
+
+      case 'unplaced':
+        unplaced.push(candidate);
+        break;
+
+      default:
+        assertNever(
+          placement,
+          'A claim placement reached the claim check that it does not handle. Add the case to foreignClaimsOn() in packages/instrumentation/src/cleanup.ts.',
+        );
+    }
+  }
+
+  const pristine = pristineOriginalOf(
+    record,
+    settings.chainRoot ?? findChainRoot(record, open.value),
+  );
+  const otherOriginal = holders.filter(
+    (holder) => pristineOriginalOf(holder, findChainRoot(holder, open.value)) !== pristine,
+  );
+
+  if (unplaced.length > 0 || otherOriginal.length > 0) {
+    const reason: ClaimRefusalReason =
+      unplaced.length > 0 ? 'claim-unplaced' : 'claim-over-another-original';
+    const withheldBy = [...unplaced, ...otherOriginal];
+
+    settings.logger.warn(
+      'another session holds the bytes this restore would replace; nothing was written',
+      {
+        recordId: record.id,
+        sessionId: record.sessionId,
+        status: record.status,
+        reason,
+        holderRecordIds: withheldBy.map((holder) => holder.id),
+        holderSessionIds: sessionIdsOf(withheldBy),
+      },
+    );
+
+    return err(claimRefusal(record, withheldBy, reason));
+  }
+
+  if (holders.length === 0) {
+    settings.logger.debug('matching bytes of another session belong to another project', {
+      recordId: record.id,
+      sessionId: record.sessionId,
+      candidates: candidates.length,
+    });
+  }
+
+  return ok(holders);
+}
+
+/** The distinct session ids of some records, sorted, for a log line or an error's details. */
+function sessionIdsOf(records: readonly ModificationRecord[]): string[] {
+  return [...new Set(records.map((record) => record.sessionId))].sort();
 }
 
 // ---------------------------------------------------------------------------
@@ -3191,6 +4623,18 @@ function fileKeyOf(record: ModificationRecord): string {
   return normalizePosix(toPosix(record.file));
 }
 
+/**
+ * The records a pass may still act on — every one whose disposition is not
+ * `none` — in the order given.
+ *
+ * The set a chain root is resolved in: a `reverted` ancestor is finished
+ * history whose backup was deleted once its restore verified, so it can be
+ * neither the pristine original a report names nor a link a chain close walks.
+ */
+function liveRecordsOf(records: readonly ModificationRecord[]): ModificationRecord[] {
+  return records.filter((record) => reconcileDispositionFor(record.status) !== 'none');
+}
+
 /** The records of the named sessions, in the order they were given. */
 function filterBySession(
   records: readonly ModificationRecord[],
@@ -3255,18 +4699,29 @@ function statusFor(remainder: PassRemainder): CleanupStatus {
 /**
  * Removes a session's backup directory after a clean pass.
  *
- * Only reached when every record was reverted and nothing conflicted, and it
- * touches nothing in the developer's project: the directory is the product's
- * own, under `$DEBUGGEN_HOME/backups`. The store refuses to remove anything it
- * did not create and reports what it retained, which is logged rather than
- * escalated — a leftover file in the product's state directory is housekeeping,
- * not a cleanup failure, and the session's files are already back.
+ * Only reached when every record of the session is `reverted` and nothing
+ * conflicted, and it touches nothing in the developer's project: the directory
+ * is the product's own, under `$DEBUGGEN_HOME/backups`. The store refuses to
+ * remove anything it did not create and reports what it retained, which is
+ * logged rather than escalated — a leftover file in the product's state
+ * directory is housekeeping, not a cleanup failure, and the session's files are
+ * already back.
+ *
+ * A pass that reverted records asks the store unconditionally. A pass that
+ * found every record already reverted — the session an install rollback
+ * unwound, or a repeated end — asks it only while something is still at the
+ * directory's path ({@link sessionDirectoryPresent}), so the first such pass
+ * removes a directory the rollback emptied and every later one stays free of
+ * store calls.
+ *
+ * @param revertedThisPass Whether this pass restored or closed any record.
  */
 async function removeSessionBackups(
   sessionId: string,
   context: CleanupContext,
   scope: RecordScope | undefined,
   logger: Logger,
+  revertedThisPass: boolean,
 ): Promise<void> {
   const store =
     scope?.backups.sessionId === sessionId
@@ -3279,7 +4734,39 @@ async function removeSessionBackups(
     return;
   }
 
+  if (!revertedThisPass && !(await sessionDirectoryPresent(store))) {
+    logger.debug('the session backup directory is already gone', {
+      directory: store.sessionDirectory,
+    });
+
+    return;
+  }
+
   await removeBackupDirectory(store, logger);
+}
+
+/**
+ * Whether anything is at a session's backup directory path, looked at without
+ * following a link.
+ *
+ * Only an `ENOENT` answers "no". Anything else — a directory, a link or a file
+ * planted in its place, a permission change on the state root — answers "yes",
+ * because the store is the one that judges what is there and reports what it
+ * will not remove: asking it is never less safe than not asking, while skipping
+ * it on a guess could leave a directory behind for good. Read-only; nothing is
+ * created or changed.
+ *
+ * @param store The session's backup store, whose `sessionDirectory` is probed.
+ * @returns `false` only when the path does not exist.
+ */
+async function sessionDirectoryPresent(store: BackupStore): Promise<boolean> {
+  try {
+    await lstat(store.sessionDirectory);
+
+    return true;
+  } catch (error) {
+    return errnoCodeOf(error) !== 'ENOENT';
+  }
 }
 
 /** What a finished reconciliation pass left behind, per record, for its housekeeping. */
@@ -3823,6 +5310,88 @@ function noScopeForSession(record: ModificationRecord, contextSessionId: string)
 }
 
 /**
+ * Why a restore was withheld beside another session's claim on the same
+ * bytes, as the `details.reason` of {@link claimRefusal}.
+ *
+ * - `claim-unplaced` — the claimant's project could not be resolved, so the
+ *   bytes may be its live patch of this very file.
+ * - `claim-over-another-original` — the claimant is placed at this file, but
+ *   its chain started from a different pristine file than this record's, so
+ *   neither session's backups can stand in for the other's.
+ */
+type ClaimRefusalReason = 'claim-unplaced' | 'claim-over-another-original';
+
+/**
+ * The error for a restore withheld because another session holds the bytes it
+ * would replace: code `CLEANUP_PARTIAL`, identifiers only.
+ *
+ * Recorded as the pass's failure for the record, which stays open with its
+ * status untouched, as does every record beneath it in its chain, and every
+ * backup is kept: the other session's own cleanup settles the file, and the
+ * next pass over this record then finds it at a recorded digest again.
+ *
+ * @param record The record whose restore was withheld.
+ * @param holders The other sessions' records the refusal stands on.
+ * @param reason Which half of the rule refused.
+ */
+function claimRefusal(
+  record: ModificationRecord,
+  holders: readonly ModificationRecord[],
+  reason: ClaimRefusalReason,
+): DebuggenError {
+  const holderSessionIds = sessionIdsOf(holders);
+  const sessions = holderSessionIds.join(', ');
+
+  return new DebuggenError(
+    'CLEANUP_PARTIAL',
+    reason === 'claim-unplaced'
+      ? 'Another session has a live modification of the same file with the same bytes, and this pass cannot tell which project it belongs to, so nothing was restored.'
+      : 'Another session has a live modification over the bytes this restore would replace, and it was instrumented from a different original, so nothing was restored.',
+    {
+      hint: `End session ${sessions} first: its cleanup restores the file, and the next pass closes this record. Nothing was written and every backup was kept.`,
+      details: {
+        reason,
+        recordId: record.id,
+        sessionId: record.sessionId,
+        file: record.file,
+        holderRecordIds: holders.map((holder) => holder.id),
+        holderSessionIds,
+      },
+    },
+  );
+}
+
+/**
+ * The error for a claim check whose listing of the other sessions' open
+ * records failed: code `STORE_ERROR`, with the journal's own error as the
+ * cause.
+ *
+ * Without the listing, a `restorable` verdict cannot be told apart from
+ * another session's identical bytes, so the write is refused rather than made
+ * blind; the record stays open with its status untouched.
+ *
+ * @param record The record whose restore was withheld.
+ * @param cause The journal's error.
+ */
+function claimsUnreadable(record: ModificationRecord, cause: DebuggenError): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    'The open modifications of other sessions could not be read, so a restore was not written.',
+    {
+      hint: 'Nothing was written and the backup was kept. The record stays open and is reconciled by the next pass that can read the modification journal.',
+      details: {
+        reason: 'open-records-unreadable',
+        recordId: record.id,
+        sessionId: record.sessionId,
+        file: record.file,
+        cause: cause.code,
+      },
+      cause,
+    },
+  );
+}
+
+/**
  * The error for a journal that refused a status transition: code
  * `STORE_ERROR`, with the store's own error as the cause.
  *
@@ -3903,8 +5472,45 @@ function filesystemFailure(
 // `conflictMessage`.
 // ---------------------------------------------------------------------------
 
-/** A file that already holds the recorded original, for a record that was applied. */
-function pristineTargetMessage(record: ModificationRecord): string {
+/**
+ * Where the wording tells the developer the file's pristine original is: the
+ * chain root's backup for a chained record whose root the pass resolved, and
+ * the record's own backup otherwise.
+ *
+ * A chained record's own backup is the previous plan version's instrumented
+ * output, so a sentence that called it "the original" would send the
+ * developer to bytes that still carry the tool's wrapper. The same gate the
+ * conflict report applies decides, so the message and the report's
+ * `originalBackupPath` can never name two different files.
+ */
+function pristineBackupPathOf(
+  record: ModificationRecord,
+  chainRoot: ModificationRecord | undefined,
+): string {
+  return chainRoot !== undefined && isUsableChainRoot(record, chainRoot)
+    ? chainRoot.backupPath
+    : record.backupPath;
+}
+
+/**
+ * A file that already holds the bytes this record replaced, for a record that
+ * was applied.
+ *
+ * For an unchained record those bytes are the pristine original. For a chained
+ * one they are an earlier plan version's instrumented output, which is still
+ * this tool's to restore, so the wording says so and points at the chain
+ * root's backup for the pristine file.
+ */
+function pristineTargetMessage(
+  record: ModificationRecord,
+  chainRoot: ModificationRecord | undefined,
+): string {
+  const pristine = pristineBackupPathOf(record, chainRoot);
+
+  if (pristine !== record.backupPath) {
+    return `${record.file} no longer holds the instrumented content: it currently matches the content this modification replaced — an earlier plan version's instrumented output — so no content was lost, but the change did not come from this tool. The record is kept open and the original from before this file was first instrumented stays at ${pristine}.`;
+  }
+
   return `${record.file} no longer holds the instrumented content: it currently matches the original Debug Generator recorded, so no content was lost, but the change did not come from this tool. The record is kept open and the original stays at ${record.backupPath}.`;
 }
 
@@ -3924,29 +5530,48 @@ function verificationFailedMessage(record: ModificationRecord): string {
 }
 
 /** A missing file whose directory is missing too. */
-function missingDirectoryMessage(record: ModificationRecord): string {
-  return `${record.file} and the directory containing it are gone, so Debug Generator did not recreate it. The original is still at ${record.backupPath}; the modification record is ${record.id}.`;
+function missingDirectoryMessage(
+  record: ModificationRecord,
+  chainRoot: ModificationRecord | undefined,
+): string {
+  return `${record.file} and the directory containing it are gone, so Debug Generator did not recreate it. The original is still at ${pristineBackupPathOf(record, chainRoot)}; the modification record is ${record.id}.`;
 }
 
 /** A file written by something else between the verdict and the restore. */
 function concurrentWriteMessage(
   record: ModificationRecord,
   staleReason: string | undefined,
+  chainRoot: ModificationRecord | undefined,
 ): string {
   const observed =
     staleReason === undefined
       ? 'while it was being restored'
       : `while it was being restored (${staleReason})`;
 
-  return `${record.file} changed ${observed}, so Debug Generator will not overwrite it. Nothing was written and the original is still at ${record.backupPath}.`;
+  return `${record.file} changed ${observed}, so Debug Generator will not overwrite it. Nothing was written and the original is still at ${pristineBackupPathOf(record, chainRoot)}.`;
 }
 
-/** A record of a file whose records do not form a single chain. */
-function chainForkMessage(record: ModificationRecord, fork: ChainFork): string {
+/**
+ * A record of a file whose records do not form a single chain.
+ *
+ * Names the record's own backup, which is what a developer untangling the fork
+ * by hand needs per record, and — for a chained record — the pristine original
+ * it descends from, which is what restoring the file by hand needs.
+ */
+function chainForkMessage(
+  record: ModificationRecord,
+  fork: ChainFork,
+  chainRoot: ModificationRecord | undefined,
+): string {
   const shape =
     fork.sharedPreviousRecordIds.length > 0
       ? 'two or more of its modification records are layered on the same earlier record'
       : 'it has more than one open chain of modification records';
+  const pristine = pristineBackupPathOf(record, chainRoot);
+  const pristineClause =
+    pristine === record.backupPath
+      ? ''
+      : ` The original from before this file was first instrumented is at ${pristine}.`;
 
-  return `${record.file} was not restored: ${shape}, so Debug Generator cannot tell which of them the file holds and did not write to it. Every backup was kept; this record's original is at ${record.backupPath} and the modification record is ${record.id}.`;
+  return `${record.file} was not restored: ${shape}, so Debug Generator cannot tell which of them the file holds and did not write to it. Every backup was kept; this record's original is at ${record.backupPath} and the modification record is ${record.id}.${pristineClause}`;
 }

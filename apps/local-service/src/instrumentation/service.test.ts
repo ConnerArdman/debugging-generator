@@ -87,6 +87,7 @@ import {
   CAPTURE_SIGNALS,
   DISABLED_SERVER_AGENT_SIGNALS,
   DORMANT_AGENT_HOOK_CONFIG,
+  PATCH_TARGET_HELD_REASON,
   READINESS_HINT_MAX_LENGTH,
   READINESS_REASON_MAX_LENGTH,
   SERVER_AGENT_SIGNAL_KEYS,
@@ -165,6 +166,7 @@ import {
   INSTRUMENTATION_ROW_ORDER,
   authorProductText,
   buildInstrumentationRows,
+  buildStageCancelledRow,
   isProductAuthoredText,
   publicFailureCopy,
   type InstalledSignals,
@@ -758,7 +760,7 @@ function healthyAgentReady(): AgentReadyPayload {
 
 function createAgents(): BrowserAgentRegistry {
   return {
-    latestAgentReady: (tabId) => (tabId === TAB_ID ? healthyAgentReady() : undefined),
+    latestAgentReady: ({ tabId }) => (tabId === TAB_ID ? healthyAgentReady() : undefined),
     waitForAgentReady: () => Promise.resolve(undefined),
     latestAgentReadyAt: () => NOW,
   };
@@ -1803,13 +1805,82 @@ describe('degradation', () => {
 
   it('emits no notice when every planned signal was enabled', async () => {
     const h = createHarness({
-      script: (call) => Promise.resolve(ok(cleanResult(call.context.debuggenHome, call.plan))),
+      script: (call) => {
+        const clean = cleanResult(call.context.debuggenHome, call.plan);
+
+        // Every planned signal armed — the database signals the sentinel's
+        // preload set leaves off included — so nothing is left to report.
+        return Promise.resolve(
+          ok({ ...clean, serverSignals: { ...clean.serverSignals, prisma: true, pg: true } }),
+        );
+      },
     });
 
     const outcome = await h.service.install(installRequest(h, buildPlan()));
 
     expect(isOk(outcome) && outcome.value.degradations).toEqual([]);
+    expect(failedRows(first(h.progress.installed))).toEqual([]);
     expect(h.progress.emitted).toEqual([]);
+  });
+
+  it('reports a planned signal nothing armed as a degradation too, byte for byte its ✗ row', async () => {
+    // The installer reports no gap, but the plan's database signals are armed
+    // by no preload flag: readiness withdraws both, and their shared label is
+    // one ✗ row — and so one degradation sentence, never none.
+    const h = createHarness({
+      script: (call) => Promise.resolve(ok(cleanResult(call.context.debuggenHome, call.plan))),
+    });
+
+    const outcome = await h.service.install(installRequest(h, buildPlan()));
+
+    const messages = failedRows(first(h.progress.installed)).map((row) => row.message);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.startsWith(`Could not enable ${labelOf('pg')}.`)).toBe(true);
+    expect(isOk(outcome) && outcome.value.degradations).toStrictEqual(messages);
+  });
+
+  it('reports a label its adapter and the readiness gate both explain once, for the gate’s reason, without a preload', async () => {
+    // The dev server runs without the preload. The Prisma adapter words the
+    // `prisma` gap its own way, while the readiness gate judges every server
+    // signal — both database signals included — by the service's own
+    // detection: "Database tracing" is reported once, for the gate's reason,
+    // never twice for two contradictory ones.
+    const adapterReason =
+      'the dev server is not running with the Debug Generator Node preload, so Prisma query spans cannot be produced';
+    const h = createHarness({
+      serverAgents: createAbsentServerAgents(),
+      detectDevServer: detectWithoutPreload,
+      script: (call) => {
+        const clean = cleanResult(call.context.debuggenHome, call.plan);
+
+        return Promise.resolve(
+          ok({
+            ...clean,
+            unavailable: [{ signal: 'prisma', reason: adapterReason, hint: RELAUNCH_HINT }],
+            serverSignals: deriveServerAgentSignals(call.plan.instrumentationTargets),
+          }),
+        );
+      },
+    });
+
+    const outcome = unwrap(await h.service.install(installRequest(h, buildPlan())));
+
+    const gateGap = outcome.readiness.degraded.find((gap) => gap.signal === 'prisma');
+    expect(gateGap).toBeDefined();
+    expect(gateGap?.reason).not.toBe(adapterReason);
+
+    const rows = failedRows(first(h.progress.installed));
+    const labels = rows.map((row) => /^Could not enable ([^:.]+)/u.exec(row.message)?.[1]);
+    expect(new Set(labels).size).toBe(labels.length);
+
+    const database = rows.filter((row) =>
+      row.message.startsWith(`Could not enable ${labelOf('prisma')}: `),
+    );
+    expect(database).toHaveLength(1);
+    expect(database[0]?.message).toContain(gateGap?.reason.replace(/[\s.]+$/u, '') ?? '');
+    expect(database[0]?.message).not.toContain(adapterReason);
+    expect(database[0]?.detail).toBe(gateGap?.hint);
+    expect(outcome.degradations).toStrictEqual(rows.map((row) => row.message));
   });
 });
 
@@ -2436,6 +2507,148 @@ describe('failure', () => {
     expect(payload.error.hint).toBe(copy.hint);
     expect(first(h.progress.failures).hint).toBe(copy.hint);
     expect(JSON.stringify(payload)).not.toContain(sentinel);
+  });
+
+  describe('a target another session holds', () => {
+    const heldFile = 'src/server/report.ts';
+    const liveHint = `${heldFile} is already instrumented by session ${OTHER_SESSION_ID}. End that session — its cleanup restores the file — then ask again.`;
+    const endedHint = `${heldFile} is still instrumented by session ${OTHER_SESSION_ID}, which is no longer running. Restart the Debug Generator service — its start-up reconciliation restores or closes the file's records — then ask again.`;
+    /** The patch layer's own sentence — not product text, so never shown. */
+    const patchLayerHint = `End session ${OTHER_SESSION_ID} — its cleanup restores ${heldFile} — then ask again to time listReports in this session.`;
+
+    /**
+     * The installer's failure for a plan whose only target the other session
+     * holds, naming the holder the way each source does: the nothing-enabled
+     * failure's `details.heldTargets`, or — for a hold the installer had to
+     * treat as fatal — the patch layer's refusal as the error's cause.
+     */
+    function heldTargetError(source: 'listed' | 'cause'): DebuggenError {
+      const holder = { file: heldFile, symbol: 'listReports', owningSessionId: OTHER_SESSION_ID };
+
+      return source === 'listed'
+        ? new DebuggenError(
+            'INSTRUMENTATION_INSTALL_FAILED',
+            'No planned signal could be enabled for this sample project.',
+            { hint: patchLayerHint, details: { heldTargets: [holder], heldTargetCount: 1 } },
+          )
+        : new DebuggenError(
+            'INSTRUMENTATION_INSTALL_FAILED',
+            'The sample adapter could not finish its actions.',
+            {
+              hint: patchLayerHint,
+              cause: new DebuggenError(
+                'PATCH_UNSUPPORTED',
+                `${heldFile} is already instrumented by session ${OTHER_SESSION_ID}.`,
+                {
+                  hint: patchLayerHint,
+                  details: { reason: PATCH_TARGET_HELD_REASON, ...holder, recordId: 'mod_sample' },
+                },
+              ),
+            },
+          );
+    }
+
+    /**
+     * A harness whose installer succeeds for the other session and, for this
+     * one, answers with the held-target failure — so whether the holder is a
+     * live session of this service is the only thing a test varies.
+     */
+    function heldTargetHarness(
+      source: 'listed' | 'cause',
+      otherInstall?: Promise<Result<AggregateInstallResult>>,
+    ): Harness {
+      return createHarness({
+        script: (call) =>
+          call.plan.sessionId === OTHER_SESSION_ID
+            ? (otherInstall ??
+              Promise.resolve(ok(cleanResult(call.context.debuggenHome, call.plan))))
+            : Promise.resolve(err(heldTargetError(source))),
+      });
+    }
+
+    /** Asserts the one failure reported for this session carries `hint`, as product text. */
+    async function expectFailedWith(h: Harness, hint: string): Promise<void> {
+      const outcome = await h.service.install(installRequest(h, buildPlan()));
+
+      expect(isErr(outcome)).toBe(true);
+      if (!isErr(outcome)) return;
+      expect(outcome.error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+      expect(outcome.error.hint).toBe(hint);
+      expect(isProductAuthoredText(outcome.error.hint)).toBe(true);
+
+      const failed = framesOf(allMessages(h), 'instrumentation.failed');
+      expect(failed).toHaveLength(1);
+      const payload = first(failed).payload;
+      expect(payload.sessionId).toBe(SESSION_ID);
+      expect(payload.error.hint).toBe(hint);
+      expect(JSON.stringify(payload)).not.toContain('to time listReports');
+      expect(instrumentationFailedPayloadSchema.safeParse(payload).success).toBe(true);
+
+      expect(h.progress.failures).toHaveLength(1);
+      expect(first(h.progress.failures).hint).toBe(hint);
+      expect(h.service.arming(SESSION_ID)).toBeUndefined();
+    }
+
+    it.each(['listed', 'cause'] as const)(
+      'names ending the holder while that session is live (%s)',
+      async (source) => {
+        const h = heldTargetHarness(source);
+        expect(
+          isOk(
+            await h.service.install(installRequest(h, buildPlan({ sessionId: OTHER_SESSION_ID }))),
+          ),
+        ).toBe(true);
+
+        await expectFailedWith(h, liveHint);
+      },
+    );
+
+    it.each(['listed', 'cause'] as const)(
+      'names ending the holder while that session’s install is still running (%s)',
+      async (source) => {
+        const gate = deferred<Result<AggregateInstallResult>>();
+        const h = heldTargetHarness(source, gate.promise);
+        const otherPlan = buildPlan({ sessionId: OTHER_SESSION_ID });
+        const holding = h.service.install(installRequest(h, otherPlan));
+        await vi.waitFor(() => {
+          expect(h.service.isInstalling(OTHER_SESSION_ID)).toBe(true);
+        });
+
+        await expectFailedWith(h, liveHint);
+
+        gate.resolve(ok(cleanResult(h.home, otherPlan)));
+        expect(isOk(await holding)).toBe(true);
+      },
+    );
+
+    it.each(['listed', 'cause'] as const)(
+      'names a restart once the holder has ended, since ending it again cannot restore the file (%s)',
+      async (source) => {
+        const h = heldTargetHarness(source);
+        expect(
+          isOk(
+            await h.service.install(installRequest(h, buildPlan({ sessionId: OTHER_SESSION_ID }))),
+          ),
+        ).toBe(true);
+        // The end of a session runs its cleanup and then stops it here.
+        await h.service.stopSession(OTHER_SESSION_ID);
+
+        await expectFailedWith(h, endedHint);
+        expect(endedHint).not.toContain('End that session');
+      },
+    );
+
+    it.each(['listed', 'cause'] as const)(
+      'names a restart when the holder is no session this service runs (%s)',
+      async (source) => {
+        // A record left by a session of an earlier process: nothing here ever
+        // installed it, so there is no session to end.
+        const h = heldTargetHarness(source);
+
+        await expectFailedWith(h, endedHint);
+        expect(h.installer.calls.map((call) => call.plan.sessionId)).toEqual([SESSION_ID]);
+      },
+    );
   });
 
   it('leaves the failed row to a caller that reports the stage failure itself', async () => {
@@ -3177,6 +3390,93 @@ describe('cancellation', () => {
     expect(first(h.installer.calls).context.signal).toBe(controller.signal);
     expect(framesOf(allMessages(h), 'instrumentation.failed')).toHaveLength(1);
     expect(h.service.isInstalling(SESSION_ID)).toBe(false);
+  });
+
+  /** The installer's answer for an install whose signal was aborted: its own classification. */
+  const abortedInstall = (): InstallScript => (call) =>
+    Promise.resolve(
+      call.context.signal?.aborted === true
+        ? err(
+            new DebuggenError(
+              'INSTRUMENTATION_INSTALL_FAILED',
+              'Installing instrumentation was cancelled before it finished. Nothing was applied.',
+              {
+                hint: "Start the session's instrumentation again when you are ready to capture.",
+                details: { reason: 'aborted', planVersion: call.plan.planVersion },
+              },
+            ),
+          )
+        : ok(cleanResult(call.context.debuggenHome, call.plan)),
+    );
+
+  it('reports an install the installer classified as cancelled as a cancellation, never as a failure', async () => {
+    const h = createHarness({ script: abortedInstall() });
+    const controller = new AbortController();
+    controller.abort();
+
+    const outcome = await h.service.install(
+      installRequest(h, buildPlan(), { signal: controller.signal }),
+    );
+
+    // The caller still sees the cancellation, with the plan version it concerns.
+    expect(isErr(outcome)).toBe(true);
+    if (isErr(outcome)) {
+      expect(outcome.error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+      expect(outcome.error.details?.['reason']).toBe('aborted');
+      expect(outcome.error.details?.['planVersion']).toBe(1);
+    }
+
+    // No failure is sent, kept or rowed: no instrumentation.failed, no failed
+    // row, no preload-gap ✗ row — only the stage's cancellation row.
+    expect(framesOf(allMessages(h), 'instrumentation.failed')).toHaveLength(0);
+    expect(framesOf(allMessages(h), 'instrumentation.ready')).toHaveLength(0);
+    expect(h.progress.failures).toEqual([]);
+    expect(progressCalls(h, 'reportInstrumentation')).toHaveLength(0);
+    expect(progressCalls(h, 'readyToCapture')).toHaveLength(0);
+    expect(h.progress.emitted).toStrictEqual([buildStageCancelledRow('instrument', 'cancelled')]);
+    expect(first(h.progress.emitted)).toStrictEqual({
+      stage: 'instrument',
+      status: 'done',
+      message: 'Preparing instrumentation was cancelled before it finished.',
+      detail: 'Run the step again when you are ready.',
+    });
+    expect(h.service.arming(SESSION_ID)).toBeUndefined();
+    expect(h.service.isInstalling(SESSION_ID)).toBe(false);
+
+    // A panel that binds later is not told a failure that never happened.
+    expect(h.service.replaySignalReport({ sessionId: SESSION_ID, kinds: UI_KINDS })).toStrictEqual(
+      ok('nothing-to-replay'),
+    );
+    expect(framesOf(allMessages(h), 'instrumentation.failed')).toHaveLength(0);
+
+    // Logged once, at info, by code and plan version — never as a failure.
+    const cancelled = h.log.filter(
+      (entry) => entry.message === 'The instrumentation install was cancelled',
+    );
+    expect(cancelled.map((entry) => entry.level)).toEqual(['info']);
+    expect(first(cancelled).fields).toMatchObject({
+      code: 'INSTRUMENTATION_INSTALL_FAILED',
+      planVersion: 1,
+    });
+    expect(h.log.filter((entry) => entry.message === 'The instrumentation install failed')).toEqual(
+      [],
+    );
+  });
+
+  it('leaves the cancellation row to a caller that reports the stage itself', async () => {
+    const h = createHarness({ script: abortedInstall() });
+    const controller = new AbortController();
+    controller.abort();
+
+    const outcome = await h.service.install(
+      installRequest(h, buildPlan(), { signal: controller.signal, reportStageFailure: false }),
+    );
+
+    expect(isErr(outcome) && outcome.error.details?.['reason']).toBe('aborted');
+    expect(framesOf(allMessages(h), 'instrumentation.failed')).toHaveLength(0);
+    expect(h.progress.failures).toEqual([]);
+    expect(h.progress.emitted).toEqual([]);
+    expect(progressCalls(h, 'stageStarted')).toHaveLength(1);
   });
 });
 

@@ -120,7 +120,9 @@ import type {
   StopCaptureOptions,
 } from '../sessions/manager.js';
 import {
+  CANCELLATION_COPY_BY_CAUSE,
   authorProductText,
+  buildStageCancelledRow,
   isProductAuthoredText,
   type ProgressRow,
   type SessionProgress,
@@ -3313,6 +3315,42 @@ describe('regate', () => {
     expect(evaluateReadiness).toHaveBeenCalledTimes(1);
     expect(transitionRequests(h, 'failed')).toBe(0);
   });
+
+  it('drops a re-gate deferred mid-run when the session’s end withdraws the run, leaving nothing for the end to wait out', async () => {
+    const evaluateReadiness = vi.fn<EvaluateReadinessFn>(() => Promise.resolve(ok(verdict(true))));
+    const h = harness({ script: { install: { satisfied: false } }, evaluateReadiness });
+    const entered = deferred();
+    h.instrumentation.install.mockImplementationOnce(async (request) => {
+      entered.resolve();
+      await new Promise<void>((resolve) => {
+        request.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      return err(
+        new DebuggenError('INTERNAL', 'Installing instrumentation was cancelled.', {
+          details: { reason: 'aborted' },
+        }),
+      );
+    });
+
+    const pending = h.orchestrator.run({ sessionId: SESSION_ID });
+    await entered.promise;
+    expect(expectOk(await h.orchestrator.regate({ sessionId: SESSION_ID })).outcome).toBe(
+      'deferred',
+    );
+
+    expect(h.orchestrator.cancel(SESSION_ID)).toBe(true);
+    expectErr(await pending);
+    // Every microtask the settled run queued has run, and none started a re-gate.
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+
+    expect(h.orchestrator.activeRun(SESSION_ID)).toBeUndefined();
+    expect(evaluateReadiness).not.toHaveBeenCalled();
+    expect(h.manager.current().status).toBe('instrumenting');
+    expect(transitionRequests(h, 'ready')).toBe(0);
+    expect(transitionRequests(h, 'failed')).toBe(0);
+  });
 });
 
 describe('concurrency, cancellation and lifecycle', () => {
@@ -3435,7 +3473,35 @@ describe('concurrency, cancellation and lifecycle', () => {
     }
   });
 
-  it('cancel aborts the in-flight stage, files the cancellation at a stable status and releases the handles', async () => {
+  /**
+   * The cancellation rows the orchestrator sent — a `done` row whose message
+   * closes with one of the cancellation clauses — as the emitter received them.
+   */
+  function cancellationRows(h: Harness): Pick<ProgressCall, 'stage' | 'status' | 'message'>[] {
+    const clauses = Object.values(CANCELLATION_COPY_BY_CAUSE).map((copy) => copy.clause);
+    return orchestratorRows(h)
+      .filter(
+        (call) =>
+          call.method === 'emit' &&
+          clauses.some((clause) => call.message?.endsWith(clause) === true),
+      )
+      .map(({ stage, status, message }) => ({ stage, status, message }));
+  }
+
+  /** The one row `buildStageCancelledRow` words for a stage the session's end cancelled. */
+  function endedRow(stage: ProgressStage): Pick<ProgressCall, 'stage' | 'status' | 'message'> {
+    const row = buildStageCancelledRow(stage, 'session-ended');
+    return { stage: row.stage, status: row.status, message: row.message };
+  }
+
+  /** The info records of an operation the session's end withdrew. */
+  function endCancelledRecords(h: Harness): LoggedRecord[] {
+    return h.records.filter(
+      (entry) => entry.level === 'info' && entry.message.includes('the session is ending'),
+    );
+  }
+
+  it('cancel withdraws the in-flight stage for the session’s end: the status it had, one cancellation row, no failure, the handles released', async () => {
     const h = harness();
     const entered = deferred<PipelineStageContext>();
     h.stages.understand.mockImplementationOnce(parkUntilAborted(entered, 'understand'));
@@ -3445,17 +3511,23 @@ describe('concurrency, cancellation and lifecycle', () => {
     expect(h.orchestrator.cancel(SESSION_ID)).toBe(true);
     const error = expectErr(await pending);
 
+    // The caller still learns the operation was cancelled …
     expect(error.details?.['reason']).toBe('aborted');
-    expect(h.manager.current().status).toBe('failed');
-    expect(failuresOf(h).map((failure) => failure.stage)).toEqual(['understand']);
+    // … but the session is left where it was, for the end that follows.
+    expect(h.manager.current().status).toBe('understanding');
+    expect(transitionRequests(h, 'failed')).toBe(0);
     expect(transitionRequests(h, 'generated')).toBe(0);
+    expect(failuresOf(h)).toEqual([]);
+    expect(failedRows(h)).toEqual([]);
+    expect(cancellationRows(h)).toEqual([endedRow('understand')]);
+    expect(endCancelledRecords(h).map((entry) => entry.fields['stage'])).toEqual(['understand']);
     expect(h.codeIndex.invalidate).toHaveBeenCalledWith(PROJECT_ROOT);
     expect(h.stages.investigate).not.toHaveBeenCalled();
     expect(h.orchestrator.cancel(SESSION_ID)).toBe(false);
     expect(h.orchestrator.activeRun(SESSION_ID)).toBeUndefined();
   });
 
-  it('files a cancellation observed between stages under the next stage, which never runs', async () => {
+  it('reports a cancellation observed between stages under the next stage, which never runs', async () => {
     const h = harness();
     h.stages.understand.mockImplementationOnce(() => {
       h.orchestrator.cancel(SESSION_ID);
@@ -3465,9 +3537,96 @@ describe('concurrency, cancellation and lifecycle', () => {
     const error = expectErr(await h.orchestrator.run({ sessionId: SESSION_ID }));
 
     expect(error.details).toMatchObject({ reason: 'aborted', stage: 'investigate' });
-    expect(failuresOf(h).map((failure) => failure.stage)).toEqual(['investigate']);
     expect(h.stages.investigate).not.toHaveBeenCalled();
-    expect(h.manager.current().status).toBe('failed');
+    expect(h.manager.current().status).toBe('investigating');
+    expect(failuresOf(h)).toEqual([]);
+    expect(failedRows(h)).toEqual([]);
+    expect(cancellationRows(h)).toEqual([endedRow('investigate')]);
+  });
+
+  it('reports an install the session’s end cancelled as a cancelled instrument stage, never as a failed install', async () => {
+    const h = harness();
+    const entered = deferred();
+    h.instrumentation.install.mockImplementationOnce(
+      (request) =>
+        new Promise((resolve) => {
+          request.signal?.addEventListener(
+            'abort',
+            () => {
+              // The installer's own classification of a cancelled install,
+              // tagged with its stage as the plan stage tags it.
+              resolve(
+                err(
+                  new DebuggenError(
+                    'INSTRUMENTATION_INSTALL_FAILED',
+                    'Installing instrumentation was cancelled before it finished.',
+                    { details: { stage: 'instrument', reason: 'aborted', planVersion: 1 } },
+                  ),
+                ),
+              );
+            },
+            { once: true },
+          );
+          entered.resolve();
+        }),
+    );
+
+    const pending = h.orchestrator.run({ sessionId: SESSION_ID });
+    await entered.promise;
+    expect(h.orchestrator.activeRun(SESSION_ID)).toBe('instrument');
+    expect(h.orchestrator.cancel(SESSION_ID)).toBe(true);
+    const error = expectErr(await pending);
+
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('aborted');
+    expect(h.manager.current().status).toBe('instrumenting');
+    expect(transitionRequests(h, 'failed')).toBe(0);
+    expect(transitionRequests(h, 'ready')).toBe(0);
+    expect(failuresOf(h)).toEqual([]);
+    expect(failedRows(h)).toEqual([]);
+    expect(cancellationRows(h)).toEqual([endedRow('instrument')]);
+    expect(endedRow('instrument').message).toBe(
+      'Preparing instrumentation cancelled: the session was ended.',
+    );
+  });
+
+  it('reports planning the session’s end cut short as cancelled, whatever words the model boundary chose for the abandoned call', async () => {
+    const h = harness();
+    const entered = deferred();
+    // The model boundary reports an abandoned call as MODEL_UNAVAILABLE, with
+    // no `reason: "aborted"` — the words a planning stage then returns.
+    h.stages.plan.mockImplementationOnce(
+      (context) =>
+        new Promise((resolve) => {
+          context.signal?.addEventListener(
+            'abort',
+            () => {
+              resolve(err(modelUnavailable('plan')));
+            },
+            { once: true },
+          );
+          entered.resolve();
+        }),
+    );
+
+    const pending = h.orchestrator.run({ sessionId: SESSION_ID });
+    await entered.promise;
+    expect(h.orchestrator.cancel(SESSION_ID)).toBe(true);
+    const error = expectErr(await pending);
+
+    expect(error.code).toBe('MODEL_UNAVAILABLE');
+    expect(h.manager.current().status).toBe('planning');
+    expect(transitionRequests(h, 'failed')).toBe(0);
+    expect(failuresOf(h)).toEqual([]);
+    expect(failedRows(h)).toEqual([]);
+    expect(cancellationRows(h)).toEqual([endedRow('plan')]);
+    expect(endCancelledRecords(h).map((entry) => entry.fields)).toEqual([
+      expect.objectContaining({
+        stage: 'plan',
+        code: 'MODEL_UNAVAILABLE',
+        stageReportedCancellation: false,
+      }),
+    ]);
   });
 
   it('never reaches generated after a cancellation, even when the last stage completes', async () => {
@@ -3491,8 +3650,53 @@ describe('concurrency, cancellation and lifecycle', () => {
 
     expect(error.details?.['reason']).toBe('aborted');
     expect(transitionRequests(h, 'generated')).toBe(0);
+    expect(transitionRequests(h, 'failed')).toBe(0);
+    expect(h.manager.current().status).toBe('analyzing');
+    expect(failuresOf(h)).toEqual([]);
+    expect(cancellationRows(h)).toEqual([endedRow('generate-panel')]);
+  });
+
+  it('arms nothing again for a capture window the session’s end is about to close', async () => {
+    const h = harness();
+    await toCapturing(h);
+    h.stages.complete.mockImplementationOnce((context) => {
+      h.orchestrator.cancel(SESSION_ID);
+      return Promise.resolve(
+        err(
+          new DebuggenError('INTERNAL', 'The capture stage was cancelled before it finished.', {
+            details: { stage: 'capture', reason: 'aborted', sessionId: context.sessionId },
+          }),
+        ),
+      );
+    });
+    const armsBefore = h.instrumentation.armCapture.mock.calls.length;
+
+    const error = expectErr(await h.orchestrator.completeCapture({ sessionId: SESSION_ID }));
+
+    expect(error.details?.['reason']).toBe('aborted');
+    expect(h.manager.current().status).toBe('capturing');
+    expect(h.manager.current().captures.at(-1)?.stoppedAt).toBeUndefined();
+    expect(h.instrumentation.armCapture.mock.calls.slice(armsBefore)).toEqual([]);
+    expect(transitionRequests(h, 'failed')).toBe(0);
+    expect(cancellationRows(h)).toEqual([endedRow('capture')]);
+  });
+
+  it('still files a cancellation that is not the session’s end — the caller’s own signal — as a failure of its stage', async () => {
+    const h = harness();
+    const entered = deferred<PipelineStageContext>();
+    const controller = new AbortController();
+    h.stages.understand.mockImplementationOnce(parkUntilAborted(entered, 'understand'));
+
+    const pending = h.orchestrator.run({ sessionId: SESSION_ID, signal: controller.signal });
+    await entered.promise;
+    controller.abort();
+    const error = expectErr(await pending);
+
+    expect(error.details?.['reason']).toBe('aborted');
     expect(h.manager.current().status).toBe('failed');
-    expect(failuresOf(h).map((failure) => failure.stage)).toEqual(['generate-panel']);
+    expect(failuresOf(h).map((failure) => failure.stage)).toEqual(['understand']);
+    expect(cancellationRows(h)).toEqual([]);
+    expect(endCancelledRecords(h)).toEqual([]);
   });
 
   it('refuses an operation whose signal is already aborted, without moving the session', async () => {
@@ -3523,6 +3727,10 @@ describe('concurrency, cancellation and lifecycle', () => {
 
     expect(h.orchestrator.activeRun(SESSION_ID)).toBeUndefined();
     expect(expectErr(await pending).details?.['reason']).toBe('aborted');
+    // A shutdown is not the session's end: the stage it stopped is filed failed.
+    expect(h.manager.current().status).toBe('failed');
+    expect(failuresOf(h).map((failure) => failure.stage)).toEqual(['understand']);
+    expect(cancellationRows(h)).toEqual([]);
     expect(h.codeIndex.invalidate).toHaveBeenCalledWith(PROJECT_ROOT);
     const released = h.codeIndex.invalidate.mock.calls.length;
 

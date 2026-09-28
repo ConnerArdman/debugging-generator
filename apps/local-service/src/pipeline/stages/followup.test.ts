@@ -49,6 +49,7 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
+import { CODE_QUERY_LIMITS } from '@debuggen/code-analysis';
 import {
   ACTION_ID_PATTERN,
   CAPTURE_SIGNALS,
@@ -150,6 +151,8 @@ import {
   createFollowUpStage,
   diffAdditionalActions,
   followUpDecisionSchema,
+  followUpFocusFor,
+  followUpFocusOf,
   followUpPathFor,
   isFollowUpAdditionalAction,
   isFollowUpDecision,
@@ -163,6 +166,7 @@ import {
   type FollowUpStageResult,
 } from './followup.js';
 import { authoredPlanShape } from './plan.js';
+import { tokenizeQuestion } from './understand.js';
 
 // The real normaliser, feasibility gate and identity helper run unchanged;
 // wrapping them in spies is what makes their calls observable (the precedent
@@ -524,6 +528,42 @@ function fakeCode(): PipelineCodeHandles {
     routeMap: {} as unknown as PipelineCodeHandles['routeMap'],
     projectSummary: {} as unknown as PipelineCodeHandles['projectSummary'],
   };
+}
+
+/** One `findByName` call the stage made, as the fake graph received it. */
+interface NameLookup {
+  readonly name: string;
+  readonly options: unknown;
+}
+
+/**
+ * Code handles whose graph declares `declarations` by name, recording every
+ * `findByName` lookup; `throwing` makes every lookup throw instead.
+ */
+function codeDeclaring(
+  declarations: ReadonlyMap<string, readonly { file: string; kind: string }[]>,
+  lookups: NameLookup[],
+  throwing = false,
+): PipelineCodeHandles {
+  const base = fakeCode();
+  const queries = {
+    hasSymbol: (file: string, symbol: string): boolean => INDEX.get(file) === symbol,
+    findByName: (name: string, options?: unknown): readonly unknown[] => {
+      lookups.push({ name, options });
+      if (throwing) {
+        throw new Error(`The fake graph was told to throw ${SENTINEL}.`);
+      }
+      return (declarations.get(name) ?? []).map(({ file, kind }, index) => ({
+        nodeId: `node-${name}-${String(index)}`,
+        kind,
+        name,
+        file,
+        location: { file, line: 1, column: 1, resolvedBy: 'code-graph', confidence: 1 },
+        score: 1,
+      }));
+    },
+  };
+  return { ...base, queries: queries as unknown as PipelineCodeHandles['queries'] };
 }
 
 /** A stand-in that records every read and holds nothing: the stage must never reach it. */
@@ -2288,42 +2328,6 @@ describe('createFollowUpStage — the existing-evidence path', () => {
     expect(request?.metadata?.promptVersion).toBe(RECORDED_PROMPT_VERSIONS.followup);
   });
 
-  /** One `findByName` call the stage made, as the fake graph received it. */
-  interface NameLookup {
-    readonly name: string;
-    readonly options: unknown;
-  }
-
-  /**
-   * Code handles whose graph declares `declarations` by name, recording every
-   * `findByName` lookup; `throwing` makes every lookup throw instead.
-   */
-  function codeDeclaring(
-    declarations: ReadonlyMap<string, readonly { file: string; kind: string }[]>,
-    lookups: NameLookup[],
-    throwing = false,
-  ): PipelineCodeHandles {
-    const base = fakeCode();
-    const queries = {
-      hasSymbol: (file: string, symbol: string): boolean => INDEX.get(file) === symbol,
-      findByName: (name: string, options?: unknown): readonly unknown[] => {
-        lookups.push({ name, options });
-        if (throwing) {
-          throw new Error(`The fake graph was told to throw ${SENTINEL}.`);
-        }
-        return (declarations.get(name) ?? []).map(({ file, kind }, index) => ({
-          nodeId: `node-${name}-${String(index)}`,
-          kind,
-          name,
-          file,
-          location: { file, line: 1, column: 1, resolvedBy: 'code-graph', confidence: 1 },
-          score: 1,
-        }));
-      },
-    };
-    return { ...base, queries: queries as unknown as PipelineCodeHandles['queries'] };
-  }
-
   it('hands the builder the redacted follow-up’s identifier candidates and the declarations they resolve to', async () => {
     const lookups: NameLookup[] = [];
     const declarations = new Map([
@@ -2758,6 +2762,313 @@ describe('createFollowUpStage — the existing-evidence path', () => {
         'The follow-up outcome links could not be recorded; the stored artifacts stand.',
       ),
     ).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4a. The names a follow-up carries: identifier candidates anywhere, plain
+//     words only inside a file the question names
+// ---------------------------------------------------------------------------
+
+describe('createFollowUpStage — a plain word resolves only inside a file the follow-up names', () => {
+  /** A plain-word name the invented graph declares in both indexed files. */
+  const PLAIN_NAME = 'settle';
+
+  /** The graph: `settle` declared once in each indexed file. */
+  const DECLARED = new Map([
+    [
+      PLAIN_NAME,
+      [
+        { file: OTHER_FILE, kind: 'symbol' },
+        { file: INDEXED_FILE, kind: 'symbol' },
+      ],
+    ],
+  ]);
+
+  /** The lookup every plain word gets: exact, declarations only, read to the engine's ceiling. */
+  const PLAIN_LOOKUP = {
+    exact: true,
+    kinds: ['symbol', 'component', 'server-function'],
+    limit: CODE_QUERY_LIMITS.maxResults,
+  };
+
+  it.each([
+    ['as the graph holds it', INDEXED_FILE],
+    ['under a parent root', `packages/${PROJECT_NAME}/${INDEXED_FILE}`],
+    ['by its file name', 'totals.ts'],
+  ])(
+    'resolves a plain word named with its file %s, and the decision input carries it',
+    async (_label, named) => {
+      const lookups: NameLookup[] = [];
+      const h = harness({ outcomes: [answer(FETCH_DECISION)] });
+      const context: PipelineStageContext = {
+        ...h.context,
+        code: codeDeclaring(DECLARED, lookups),
+      };
+      const question = `Why does ${PLAIN_NAME} in \`${named}\` take so long?`;
+
+      const value = expectPath(
+        expectOk(await h.stage.run(context, followUpInput({ followUpQuestion: question }))),
+        'new-capture',
+      );
+
+      const [call] = h.builder.calls;
+      // No identifier candidate: the name is an ordinary lower-case word.
+      expect(call?.questionHints).toStrictEqual({ identifierCandidates: [] });
+      // Only the declaration in the named file; the same name elsewhere is not the one asked about.
+      expect(call?.candidates).toStrictEqual([
+        { file: INDEXED_FILE, symbol: PLAIN_NAME, kind: 'symbol', score: 1 },
+      ]);
+      // One exact lookup per content token, in the tokenizer's order, and nothing else.
+      const hints = tokenizeQuestion(question);
+      expect(lookups).toStrictEqual(hints.tokens.map((name) => ({ name, options: PLAIN_LOOKUP })));
+      expect(value.decision.needsNewCapture).toBe(true);
+      expect(recordsWith(h.log.records, 'Follow-up decided.')[0]?.fields).toMatchObject({
+        identifierCandidates: 0,
+        pathCandidates: 1,
+        namedDeclarations: 1,
+      });
+    },
+  );
+
+  it.each([
+    ['a declared plain word', `Why does ${PLAIN_NAME} take so long?`],
+    ['an ordinary evidence question', 'Why did this query run twice?'],
+  ])('never looks up %s when the follow-up names no file', async (_label, question) => {
+    const lookups: NameLookup[] = [];
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    const context: PipelineStageContext = {
+      ...h.context,
+      code: codeDeclaring(
+        new Map([...DECLARED, ['query', [{ file: OTHER_FILE, kind: 'symbol' }]]]),
+        lookups,
+      ),
+    };
+
+    const value = expectOk(
+      await h.stage.run(context, followUpInput({ followUpQuestion: question })),
+    );
+
+    expect(value.path).toBe('existing-evidence');
+    expect(lookups).toStrictEqual([]);
+    expect(h.builder.calls[0]?.candidates).toStrictEqual([]);
+  });
+
+  it('keeps an identifier candidate wherever it is declared, beside a plain word in the named file', async () => {
+    const lookups: NameLookup[] = [];
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    const context: PipelineStageContext = {
+      ...h.context,
+      code: codeDeclaring(
+        new Map([...DECLARED, [OTHER_SYMBOL, [{ file: OTHER_FILE, kind: 'server-function' }]]]),
+        lookups,
+      ),
+    };
+    const question = `Does ${OTHER_SYMBOL} wait for ${PLAIN_NAME} in ${INDEXED_FILE}?`;
+
+    expectOk(await h.stage.run(context, followUpInput({ followUpQuestion: question })));
+
+    expect(h.builder.calls[0]?.candidates).toStrictEqual([
+      { file: OTHER_FILE, symbol: OTHER_SYMBOL, kind: 'server-function', score: 1 },
+      { file: INDEXED_FILE, symbol: PLAIN_NAME, kind: 'symbol', score: 1 },
+    ]);
+    expect(lookups[0]).toStrictEqual({
+      name: OTHER_SYMBOL,
+      options: { ...PLAIN_LOOKUP, limit: 8 },
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4a (continued). The follow-up focus: what a follow-up asks about, as
+//     structured input of the analysis and the panel it governs
+// ---------------------------------------------------------------------------
+
+describe('the follow-up focus', () => {
+  /** A plain-word name the invented graph declares in both indexed files. */
+  const FOCUS_NAME = 'settle';
+
+  /** A follow-up naming that word in one indexed file: one performance hint, one declaration. */
+  const FOCUS_QUESTION = `Why does ${FOCUS_NAME} in ${INDEXED_FILE} take so long?`;
+
+  /** The graph: the name declared once in each indexed file. */
+  const DECLARED = new Map([
+    [
+      FOCUS_NAME,
+      [
+        { file: OTHER_FILE, kind: 'symbol' },
+        { file: INDEXED_FILE, kind: 'symbol' },
+      ],
+    ],
+  ]);
+
+  /** The focus of {@link FOCUS_QUESTION} over {@link DECLARED}. */
+  const EXPECTED_FOCUS = {
+    categoryHints: ['performance'],
+    declarations: [{ file: INDEXED_FILE, symbol: FOCUS_NAME, kind: 'symbol' }],
+  };
+
+  /** A stage context over `session` and the invented graph, with `extra` laid over it. */
+  function contextOver(
+    session: SessionRecord,
+    extra: Partial<PipelineStageContext> = {},
+    lookups: NameLookup[] = [],
+  ): PipelineStageContext {
+    return { ...stageContext(session), code: codeDeclaring(DECLARED, lookups), ...extra };
+  }
+
+  it('hands the focus the decision resolved to the analysis and the panel regeneration alike', async () => {
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    const context: PipelineStageContext = { ...h.context, code: codeDeclaring(DECLARED, []) };
+
+    expectPath(
+      expectOk(await h.stage.run(context, followUpInput({ followUpQuestion: FOCUS_QUESTION }))),
+      'existing-evidence',
+    );
+
+    const [analysisContext] = h.analysisRun.mock.calls[0] ?? [];
+    expect(analysisContext?.followUpFocus).toStrictEqual(EXPECTED_FOCUS);
+    // The analysis port reads exactly that focus back from its context.
+    expect(analysisContext === undefined ? undefined : followUpFocusFor(analysisContext)).toEqual(
+      EXPECTED_FOCUS,
+    );
+    const [panelRequest] = h.regenerate.mock.calls[0] ?? [];
+    expect(panelRequest?.followUpFocus).toStrictEqual(EXPECTED_FOCUS);
+    // Structure only: category hints and names the graph holds, never the rest of the wording.
+    const serialized = JSON.stringify(panelRequest?.followUpFocus);
+    for (const word of ['take', 'long', 'Why']) {
+      expect(serialized).not.toContain(word);
+    }
+    expect(recordsWith(h.log.records, 'Follow-up decided.')[0]?.fields).toMatchObject({
+      focusCategoryHints: 1,
+      focusDeclarations: 1,
+    });
+  });
+
+  it('hands neither port a focus when the follow-up names no category and no declaration', async () => {
+    const h = harness({ outcomes: [answer(EXISTING_EVIDENCE_DECISION)] });
+    // A focus some earlier caller left on the context must not ride along either.
+    const context: PipelineStageContext = {
+      ...h.context,
+      followUpFocus: { categoryHints: ['rendering'], declarations: [] },
+    };
+
+    expectOk(await h.stage.run(context, followUpInput({ followUpQuestion: 'And then?' })));
+
+    const [analysisContext] = h.analysisRun.mock.calls[0] ?? [];
+    expect(analysisContext).toBeDefined();
+    expect(analysisContext?.followUpFocus).toBeUndefined();
+    expect(analysisContext === undefined ? 'unreached' : followUpFocusFor(analysisContext)).toBe(
+      undefined,
+    );
+    const [panelRequest] = h.regenerate.mock.calls[0] ?? [];
+    expect(panelRequest).toBeDefined();
+    expect(Object.hasOwn(panelRequest ?? {}, 'followUpFocus')).toBe(false);
+  });
+
+  it('followUpFocusOf: the category hints and the declarations the names resolve to, whatever the wording', () => {
+    const focus = followUpFocusOf(FOCUS_QUESTION, codeDeclaring(DECLARED, []).queries);
+    expect(focus).toStrictEqual(EXPECTED_FOCUS);
+    expect(Object.isFrozen(focus)).toBe(true);
+    expect(
+      followUpFocusOf(
+        `${INDEXED_FILE}: why does ${FOCUS_NAME} take SO long`,
+        codeDeclaring(DECLARED, []).queries,
+      ),
+    ).toStrictEqual(EXPECTED_FOCUS);
+    expect(followUpFocusOf('And then?', codeDeclaring(DECLARED, []).queries)).toBeUndefined();
+  });
+
+  it('followUpFocusOf: a failed graph lookup leaves the category hints and logs no question text', () => {
+    const log = capturedLogger();
+    const focus = followUpFocusOf(
+      `${FOCUS_QUESTION} ${SENTINEL}`,
+      codeDeclaring(DECLARED, [], true).queries,
+      log.logger,
+    );
+
+    expect(focus).toStrictEqual({ categoryHints: ['performance'], declarations: [] });
+    const [warned, ...more] = recordsWith(
+      log.records,
+      'The declarations a follow-up names could not be resolved through the code graph; its focus carries its category hints alone.',
+    );
+    expect(more).toStrictEqual([]);
+    expect(warned?.fields).toMatchObject({ stage: FOLLOW_UP_STAGE, code: 'INTERNAL' });
+    expect(log.records.map(serializeRecord).join('\n')).not.toContain(SENTINEL);
+  });
+
+  describe('followUpFocusFor: the follow-up that governs a run', () => {
+    const CAPTURE_V1 = { id: 'capture-plan-v1', planVersion: 1, startedAt: FIXED_EPOCH_MS };
+    const CAPTURE_V2 = { id: 'capture-plan-v2', planVersion: 2, startedAt: FIXED_EPOCH_MS + 30 };
+
+    /** A session whose second plan version a new-capture follow-up installed. */
+    const GOVERNED = sessionRecord({
+      captures: [CAPTURE_V1, CAPTURE_V2],
+      followUps: [
+        {
+          question: 'Why is exportRows slow after the totals request?',
+          askedAt: FIXED_EPOCH_MS + 10,
+          needsNewCapture: true,
+          planVersion: 2,
+        },
+        {
+          question: FOCUS_QUESTION,
+          askedAt: FIXED_EPOCH_MS + 20,
+          needsNewCapture: true,
+          planVersion: 2,
+        },
+        // Answered from the stored evidence: it installed nothing, so it governs no capture.
+        {
+          question: 'Did the totals query run twice?',
+          askedAt: FIXED_EPOCH_MS + 40,
+          needsNewCapture: false,
+          captureId: CAPTURE_V2.id,
+        },
+      ],
+    });
+
+    it('prefers the focus the context carries, held to the one bound', () => {
+      const lookups: NameLookup[] = [];
+      const carried = {
+        categoryHints: ['data', 'data'],
+        declarations: [
+          { file: OTHER_FILE, symbol: OTHER_SYMBOL, kind: 'symbol' },
+          { file: '../outside/escape.ts', symbol: FOCUS_NAME, kind: 'symbol' },
+        ],
+      };
+      const context = contextOver(
+        GOVERNED,
+        { followUpFocus: carried, followUpQuestion: FOCUS_QUESTION, captureId: CAPTURE_V2.id },
+        lookups,
+      );
+
+      expect(followUpFocusFor(context)).toStrictEqual({
+        categoryHints: ['data'],
+        declarations: [{ file: OTHER_FILE, symbol: OTHER_SYMBOL, kind: 'symbol' }],
+      });
+      expect(lookups).toStrictEqual([]);
+    });
+
+    it('derives the focus of the context’s follow-up question', () => {
+      const context = contextOver(sessionRecord(), { followUpQuestion: FOCUS_QUESTION });
+      expect(followUpFocusFor(context)).toStrictEqual(EXPECTED_FOCUS);
+    });
+
+    it('derives the focus of the latest new-capture follow-up of the plan version the capture ran under', () => {
+      const context = contextOver(GOVERNED, { captureId: CAPTURE_V2.id });
+      expect(followUpFocusFor(context)).toStrictEqual(EXPECTED_FOCUS);
+    });
+
+    it.each([
+      ['a capture taken under the first question’s plan', CAPTURE_V1.id],
+      ['a capture the session does not hold', 'capture-not-held'],
+      ['a run without a capture', undefined],
+    ])('derives none for %s', (_label, captureId) => {
+      const lookups: NameLookup[] = [];
+      const context = contextOver(GOVERNED, captureId === undefined ? {} : { captureId }, lookups);
+      expect(followUpFocusFor(context)).toBeUndefined();
+      expect(lookups).toStrictEqual([]);
+    });
   });
 });
 

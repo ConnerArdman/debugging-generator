@@ -973,6 +973,27 @@ describe('B. dispatch and delegation', () => {
     );
   });
 
+  it('offers every engine traversal direction and forwards an upstream one unchanged', async () => {
+    const direction = CODE_TOOL_DESCRIPTORS.pathBetween.args.find(
+      (arg) => arg.name === 'direction',
+    );
+    expect(direction?.allowed).toStrictEqual(['out', 'in', 'both']);
+    expect(direction?.description).toBe(
+      'out follows relationships downstream; in follows them backwards only, to what reaches the start; both follows them either way.',
+    );
+
+    const harness = makeHarness();
+    const request = { ...VALID_REQUESTS.pathBetween, direction: 'in' };
+    const result = expectResult(await toolsFor(harness).runCodeTool(request), 'pathBetween');
+    expect(result.clamped).toStrictEqual([]);
+    expect(result.request.direction).toBe('in');
+    expect(harness.mocks.pathBetween).toHaveBeenCalledWith(
+      VALID_REQUESTS.pathBetween.from,
+      VALID_REQUESTS.pathBetween.to,
+      { direction: 'in', maxDepth: CODE_TOOL_LIMITS.maxPathDepth },
+    );
+  });
+
   it('clamps excerpt context and end line so the window fits maxExcerptLines', async () => {
     const harness = makeHarness({ loaded: true });
     const tools = toolsFor(harness);
@@ -1544,6 +1565,11 @@ describe('C. malformed model output', () => {
           direction: 'both',
           maxDepth: CODE_TOOL_LIMITS.maxPathDepth,
         },
+      ],
+      [
+        'normalises the upstream direction',
+        { tool: 'pathBetween', from: 'node-alpha', to: { kind: 'component' }, direction: ' In ' },
+        { tool: 'pathBetween', from: 'node-alpha', to: { kind: 'component' }, direction: 'in' },
       ],
       [
         'clamps excerpt context lines so the anchor survives the line cap',

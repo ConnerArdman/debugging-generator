@@ -110,6 +110,7 @@ import { MAX_SUMMARY_EVENTS, SUMMARY_PAGE_SIZE } from '../../src/pipeline/stages
 import { createSessionManager } from '../../src/sessions/manager.js';
 import type { SessionBroadcaster } from '../../src/sessions/manager.js';
 import {
+  CANCELLATION_COPY_BY_CAUSE,
   CAPTURE_SIGNAL_LABELS,
   FAILURE_COPY_BY_CODE,
   INSTRUMENTATION_ROW_ORDER,
@@ -121,6 +122,7 @@ import {
   STAGE_FAILURE_LOG_MESSAGE,
   buildInstrumentationRows,
   buildInvestigationRows,
+  buildStageCancelledRow,
   createSessionProgress,
 } from '../../src/sessions/progress.js';
 import type { ProgressRow } from '../../src/sessions/progress.js';
@@ -2534,5 +2536,157 @@ describe('a classified interaction question whose capture holds only background 
     expect(framesOf(editor, 'panel.generated', session.id)).toHaveLength(1);
 
     await endAndVerify(classified, ready);
+  }, 120_000);
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Ending a session while its pipeline is still running is a cancellation, never a failure
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The real rules-based provider, except that Stage 3's model call is held
+ * until the call's own signal aborts — standing in for a plan the model is
+ * still writing when the developer ends the session — and is then passed to
+ * the rules, which answer an abandoned call as the model boundary does
+ * (`MODEL_UNAVAILABLE`, with no `reason: "aborted"`). Every other stage answers
+ * as under `DEBUGGEN_PROVIDER=deterministic`. `planning` resolves once the
+ * held call has been made, so a suite can end the session while the pipeline
+ * is certainly still planning.
+ */
+function planHoldingProvider(): {
+  readonly provider: ModelProvider;
+  readonly planning: Promise<void>;
+  readonly held: () => number;
+} {
+  const rules = createDeterministicProvider();
+  if (isErr(rules)) {
+    throw new Error(`The rules-based provider could not be built (${rules.error.code}).`);
+  }
+  const base = rules.value;
+  let announce: () => void = () => undefined;
+  const planning = new Promise<void>((resolve) => {
+    announce = resolve;
+  });
+  let held = 0;
+  const generateStructured: ModelProvider['generateStructured'] = async (schema, request) => {
+    if (request.metadata.stage !== STAGE.plan) {
+      return base.generateStructured(schema, request);
+    }
+    const { signal } = request;
+    if (signal === undefined) {
+      return err(
+        new DebuggenError('INTERNAL', 'The planning call carried no signal to be held on.'),
+      );
+    }
+    held += 1;
+    announce();
+    if (!signal.aborted) {
+      await new Promise<void>((resolve) => {
+        signal.addEventListener(
+          'abort',
+          () => {
+            resolve();
+          },
+          { once: true },
+        );
+      });
+    }
+    return base.generateStructured(schema, request);
+  };
+  return {
+    provider: {
+      id: base.id,
+      generateText: (request) => base.generateText(request),
+      generateStructured,
+      callTools: (request, tools) => base.callTools(request, tools),
+    },
+    planning,
+    held: () => held,
+  };
+}
+
+describe(`a ${route('session.end')} while the pipeline is still planning`, () => {
+  /** A service whose Stage 3 model call waits for the session's end. */
+  let holding: Harness;
+  let planner: ReturnType<typeof planHoldingProvider>;
+
+  beforeAll(async () => {
+    planner = planHoldingProvider();
+    holding = await startHarness({ provider: planner.provider });
+  }, HARNESS_TIMEOUTS.boot * 2);
+
+  afterAll(async () => {
+    await holding.assertNoLeaks();
+  });
+
+  it('reports the planning stage as cancelled by the end — never instrumentation.failed, never failed — and ends clean', async () => {
+    const copy = await holding.copyFixtureProject();
+    const before = await snapshotTree(copy.root);
+    const launched = await holding.launchDevServer(copy.root);
+    if (isErr(launched)) {
+      throw new Error(`the dev server did not launch (${launched.error.code})`);
+    }
+    const editor = await holding.editor(copy.root);
+    const created = await holding.createSession({ projectRoot: copy.root, question: QUESTION });
+
+    // The pipeline is inside Stage 3, waiting on its model call.
+    await planner.planning;
+    await waitForRecord(editor, created.id, (record) => record.status === STATUS.planning);
+
+    const ended = await holding.endSession(created.id);
+    if (isErr(ended)) {
+      throw new Error(`session.end was refused (${ended.error.code}): ${ended.error.message}`);
+    }
+    expect(ended.value.cleanup).toBe(CLEANUP.clean);
+    await waitForRecord(editor, created.id, (record) => record.status === STATUS.ended);
+    expect(await editor.flush()).toBe(true);
+    expect(planner.held()).toBe(1);
+
+    // The status went from planning straight to ended: nothing filed it failed.
+    const trail = statusTrail(editor, created.id);
+    expect(trail.slice(-2)).toEqual([STATUS.planning, STATUS.ended]);
+    expect(trail).not.toContain(STATUS.failed);
+
+    // No failure was sent or stored — neither a failed row nor instrumentation.failed.
+    const rows = progressRows(editor, created.id);
+    expect(rows.filter((row) => row.status === ROW.failed)).toEqual([]);
+    expect(framesOf(editor, 'instrumentation.failed', created.id)).toEqual([]);
+    const stored = holding.repos.sessions.listProgress(created.id);
+    if (isErr(stored)) {
+      throw new Error('the stored progress could not be read');
+    }
+    expect(stored.value.filter((entry) => entry.status === ROW.failed)).toEqual([]);
+
+    // The stage the end stopped is reported once, as cancelled, inside the
+    // "Preparing instrumentation" group — before the session is announced ended.
+    const cancelled = buildStageCancelledRow(STAGE.plan, 'session-ended');
+    const expected: ProgressRow = { ...cancelled, stage: PROGRESS_STAGE_GROUPS[cancelled.stage] };
+    expect(expected).toStrictEqual({
+      stage: STAGE.instrument,
+      status: ROW.done,
+      message: 'Planning instrumentation cancelled: the session was ended.',
+      detail: CANCELLATION_COPY_BY_CAUSE['session-ended'].detail,
+    });
+    const clauses = Object.values(CANCELLATION_COPY_BY_CAUSE).map((copy) => copy.clause);
+    expect(
+      rows.filter((row) => clauses.some((clause) => row.message.endsWith(clause))),
+    ).toStrictEqual([expected]);
+    const cancelledAt = indexOfFrame(
+      editor,
+      'session.progress',
+      created.id,
+      (frame) => frame.payload.message === expected.message,
+    );
+    const endedAt = indexOfFrame(
+      editor,
+      'session.updated',
+      created.id,
+      (frame) => frame.payload.session.status === STATUS.ended,
+    );
+    expect(cancelledAt).toBeGreaterThanOrEqual(0);
+    expect(cancelledAt).toBeLessThan(endedAt);
+
+    // Nothing of the session remains in the project.
+    await assertTreeUnchanged(copy.root, before);
   }, 120_000);
 });

@@ -822,6 +822,9 @@ interface ContextOverrides {
 
   /** A clock, for the one case that asserts an unusable reading is refused. */
   readonly now?: () => number;
+
+  /** The judged record's chain root, for the chained-record cases. */
+  readonly chainRoot?: ModificationRecord;
 }
 
 /**
@@ -840,6 +843,7 @@ function contextOf(world: World, overrides: ContextOverrides = {}): ConflictDete
     now: overrides.now ?? ((): number => FIXED_NOW),
     files: overrides.files ?? world.files.files,
     ...(overrides.message === undefined ? {} : { message: overrides.message }),
+    ...(overrides.chainRoot === undefined ? {} : { chainRoot: overrides.chainRoot }),
   };
 }
 
@@ -2132,6 +2136,187 @@ describe('a chain of plan versions over one file', () => {
     expectFileBytes(world.backupPathOf(second.record.originalHash), first.instrumentedBytes);
     expectDetectionWroteNothing(world);
   });
+
+  it('names the chain root’s backup as the pristine original when a chained record is edited', async () => {
+    const { world, first, second } = await makeChain();
+    const editedBytes = developerEdits(second.path);
+
+    world.resetLogs();
+
+    const verdict = contentChangedVerdictOf(
+      verdictOf(await detectConflict(second.record, contextOf(world, { chainRoot: first.record }))),
+    );
+    const report = verdict.conflict;
+
+    // The verdict is still this record's own: judged against its digests,
+    // with its own backup's state.
+    expect(verdict.expectedHash).toBe(second.record.instrumentedHash);
+    expect(verdict.originalHash).toBe(second.record.originalHash);
+    expect(verdict.actualHash).toBe(sha256Hex(editedBytes));
+    expect(verdict.backup.path).toBe(second.record.backupPath);
+
+    // The record's own backup holds version 1's instrumented output; the
+    // pristine file is the chain root's, and that is the path the report
+    // points the developer at.
+    expect(report.backupPath).toBe(second.record.backupPath);
+    expect(report.originalBackupPath).toBe(first.record.backupPath);
+    expect(report.originalBackupPath).toBe(world.backupPathOf(first.record.originalHash));
+    expect(readFileSync(second.record.backupPath, 'utf8')).toContain(SPAN_HELPER_GLOBAL);
+    expect(readFileSync(first.record.backupPath, 'utf8')).not.toContain(SPAN_HELPER_GLOBAL);
+    expect(report.message).toContain(first.record.backupPath);
+    expect(report.message).not.toContain(second.record.backupPath);
+
+    // Original → instrumented starts from the pristine file and spans both
+    // plan versions: none of the lines it removes carries the tool's marker,
+    // and it is not the record's own diff, which starts from version 1's bytes.
+    const toolChange = viewOf(verdict, 'originalToInstrumented');
+
+    expect(toolChange).not.toBe(second.record.diff);
+    expect(removedLinesOf(toolChange).some((line) => line.includes(SPAN_HELPER_GLOBAL))).toBe(
+      false,
+    );
+    expect(applyView(textOf(first.originalBytes), toolChange)).toBe(
+      textOf(second.instrumentedBytes),
+    );
+
+    // Original → current is the net divergence from the pristine file, and
+    // instrumented → current is still the developer's edit alone.
+    expect(applyView(textOf(first.originalBytes), viewOf(verdict, 'originalToCurrent'))).toBe(
+      textOf(editedBytes),
+    );
+    expect(
+      applyView(textOf(second.instrumentedBytes), viewOf(verdict, 'instrumentedToCurrent')),
+    ).toBe(textOf(editedBytes));
+    expect(verdict.omittedDiffs).toEqual([]);
+
+    // The root's backup was read back to explain the conflict — read-only.
+    expect(world.backups.log.reads).toContain(first.record.originalHash);
+    expectSchemaValidConflict(verdict);
+    expectFileBytes(second.path, editedBytes);
+    expectFileBytes(first.record.backupPath, first.originalBytes);
+    expectDetectionWroteNothing(world);
+  });
+
+  it('reads the chain root’s backup only to explain a conflict, never to reach a verdict', async () => {
+    const { world, first, second } = await makeChain();
+
+    world.resetLogs();
+
+    const tip = restorableVerdictOf(
+      verdictOf(await detectConflict(second.record, contextOf(world, { chainRoot: first.record }))),
+    );
+
+    expect(tip.actualHash).toBe(second.record.instrumentedHash);
+    expect(world.backups.log.reads).toEqual([second.record.originalHash]);
+    expectDetectionWroteNothing(world);
+  });
+
+  it('omits both views that start from the original when the root’s backup is gone, rather than diffing from the intermediate bytes', async () => {
+    const { world, first, second } = await makeChain();
+    const editedBytes = developerEdits(second.path);
+
+    unlinkSync(world.backupPathOf(first.record.originalHash));
+    world.resetLogs();
+
+    const verdict = contentChangedVerdictOf(
+      verdictOf(await detectConflict(second.record, contextOf(world, { chainRoot: first.record }))),
+    );
+
+    expect(verdict.conflict.originalBackupPath).toBe(first.record.backupPath);
+    expect(verdict.conflict.backupPath).toBe(second.record.backupPath);
+    expect(omissionOf(verdict, 'originalToInstrumented')).toBe('text-unavailable');
+    expect(omissionOf(verdict, 'originalToCurrent')).toBe('text-unavailable');
+    expect(verdict.conflict.diffs?.originalToInstrumented).toBeUndefined();
+    expect(verdict.conflict.diffs?.originalToCurrent).toBeUndefined();
+
+    // The record's own backup still reconstructs what the tool wrote, so the
+    // developer's edit on top of it is still shown.
+    expect(
+      applyView(textOf(second.instrumentedBytes), viewOf(verdict, 'instrumentedToCurrent')),
+    ).toBe(textOf(editedBytes));
+
+    // And the message says what became of the pristine original.
+    expect(verdict.conflict.message).toContain('could not be read back');
+    expect(verdict.conflict.message).toContain(first.record.backupPath);
+    expectSchemaValidConflict(verdict);
+    expectDetectionWroteNothing(world);
+  });
+
+  it('keeps describing the record’s own backup when that is what cannot be used', async () => {
+    const { world, first, second } = await makeChain();
+
+    // The file still holds version 2's output, but version 2's own backup —
+    // version 1's output — is gone, so nothing verified can be written back.
+    unlinkSync(world.backupPathOf(second.record.originalHash));
+    world.resetLogs();
+
+    const verdict = backupUnavailableVerdictOf(
+      verdictOf(await detectConflict(second.record, contextOf(world, { chainRoot: first.record }))),
+    );
+
+    expect(verdict.conflict.reason).toBe('backup-missing');
+    expect(verdict.conflict.backupPath).toBe(second.record.backupPath);
+    expect(verdict.conflict.originalBackupPath).toBe(first.record.backupPath);
+    expect(verdict.conflict.message).toContain(second.record.backupPath);
+
+    // Original → instrumented is still rendered from the pristine root.
+    expect(applyView(textOf(first.originalBytes), viewOf(verdict, 'originalToInstrumented'))).toBe(
+      textOf(second.instrumentedBytes),
+    );
+    expectSchemaValidConflict(verdict);
+    expectDetectionWroteNothing(world);
+  });
+
+  it('ignores a chain root that is not the record’s own, and reports exactly as without one', async () => {
+    const { world, first, second } = await makeChain();
+
+    developerEdits(second.path);
+    world.resetLogs();
+
+    const baseline = contentChangedVerdictOf(
+      verdictOf(await detectConflict(second.record, contextOf(world))),
+    );
+
+    // Without a root, the chained record's report is what it always was.
+    expect(baseline.conflict.originalBackupPath).toBeUndefined();
+    expect(viewOf(baseline, 'originalToInstrumented')).toBe(second.record.diff);
+
+    const unusable: readonly (readonly [string, ModificationRecord])[] = [
+      ['the record itself', second.record],
+      ['another session’s record', { ...first.record, sessionId: 'ses_elsewhere' }],
+      ['another file’s record', { ...first.record, file: JS_FILE }],
+    ];
+
+    for (const [label, chainRoot] of unusable) {
+      world.logs.records.length = 0;
+
+      const verdict = contentChangedVerdictOf(
+        verdictOf(await detectConflict(second.record, contextOf(world, { chainRoot }))),
+      );
+
+      expect(verdict.conflict, label).toEqual(baseline.conflict);
+      expect(
+        world.logs.records.some(
+          (record) =>
+            record.level === 'warn' &&
+            record.message ===
+              'conflict detection ignored a chain root that does not belong to the record' &&
+            record.fields['recordId'] === second.record.id,
+        ),
+        label,
+      ).toBe(true);
+    }
+
+    // A root offered for an unchained record is ignored too: its own backup
+    // already is the pristine file.
+    const unchained = contentChangedVerdictOf(
+      verdictOf(await detectConflict(first.record, contextOf(world, { chainRoot: second.record }))),
+    );
+
+    expect(unchained.conflict.originalBackupPath).toBeUndefined();
+    expect(unchained.conflict.backupPath).toBe(first.record.backupPath);
+    expectDetectionWroteNothing(world);
+  });
 });
 
 /*
@@ -2375,6 +2560,39 @@ describe('composing a report for a failure only a writer can see', () => {
     expect(result.error).toBeInstanceOf(DebuggenError);
     expect(result.error.code).toBe('INTERNAL');
     expect(result.error.details?.reason).toBe('blank-conflict-message');
+  });
+
+  it('names a chained record’s root backup as the original, and only for a root that is its own', async () => {
+    const { world, first, second } = await makeChain();
+    const message = 'The restored content did not hash to the recorded original.';
+    const compose = (
+      record: ModificationRecord,
+      chainRoot: ModificationRecord,
+    ): ModificationConflict =>
+      reportOf(
+        buildConflictReport({
+          record,
+          reason: 'restore-verification-failed',
+          detectedAt: FIXED_NOW,
+          message,
+          chainRoot,
+        }),
+      );
+
+    const chained = compose(second.record, first.record);
+
+    expect(chained.backupPath).toBe(second.record.backupPath);
+    expect(chained.originalBackupPath).toBe(world.backupPathOf(first.record.originalHash));
+    expect(modificationConflictSchema.safeParse(chained).success).toBe(true);
+
+    // An unchained record, a root that is the record itself, and another
+    // session's record all leave the field out.
+    expect('originalBackupPath' in compose(first.record, second.record)).toBe(false);
+    expect('originalBackupPath' in compose(second.record, second.record)).toBe(false);
+    expect(
+      'originalBackupPath' in
+        compose(second.record, { ...first.record, sessionId: 'ses_elsewhere' }),
+    ).toBe(false);
   });
 });
 

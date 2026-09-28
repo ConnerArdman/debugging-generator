@@ -35,7 +35,14 @@
  *    record to another session's directory. The grace window exists because the
  *    patcher writes the backup *before* it journals the record: a crash in
  *    between leaves a legitimately unreferenced file, and a concurrent install
- *    may be about to claim a younger one.
+ *    may be about to claim a younger one. A session directory left with no
+ *    entry at all — emptied by this rule, or found empty, as an unwound
+ *    install or an interrupted cleanup leaves it — is removed as well. One
+ *    found empty goes only while its session cannot be about to write into
+ *    it: its row is gone, or it is at rest (not in an in-flight status) and
+ *    the caller does not report it in use. It holds no data, so no window
+ *    applies; the removal is an atomic `rmdir`, which a backup written in the
+ *    meantime refuses.
  * 3. **Index caches.** An entry of the code-index cache whose project has not
  *    been opened inside the window is deleted, and so — whatever its age — is
  *    one nothing will read again: an entry written under an older envelope
@@ -689,7 +696,8 @@ export interface RetentionReport {
 
   /**
    * How many backup directories were removed: the directories of purged
-   * sessions, and session directories the orphan rule left empty.
+   * sessions, session directories the orphan rule left empty, and empty
+   * session directories whose session could not be about to write into them.
    */
   readonly backupDirsDeleted: number;
 
@@ -812,6 +820,11 @@ export interface RetentionDeps {
    * without its evidence.
    * Synchronous, because the transaction it runs in is; a predicate that
    * throws is taken to mean "in use".
+   *
+   * The orphan rule asks it too, outside any transaction, before it removes a
+   * `backups/<sessionId>/` directory it found empty: `true` keeps the
+   * directory, because a session a live component holds may be about to file
+   * a backup in it.
    */
   readonly isSessionInUse?: ((sessionId: SessionId) => boolean) | undefined;
 
@@ -2902,6 +2915,97 @@ async function judgeCandidates(
   }
 }
 
+/** Why an empty `backups/<sessionId>` directory was kept rather than removed. */
+type EmptyDirectoryHold = 'in-flight' | 'in-use' | 'unreadable';
+
+/**
+ * The issue for an empty session backup directory kept because its session's
+ * state could not be read. A repository's own coded error is kept; an engine
+ * error is wrapped in a fixed sentence, so no engine message — which may quote
+ * a value — reaches the report.
+ */
+function emptyDirectoryUndecided(target: string, sessionId: string, cause: unknown): DebuggenError {
+  if (DebuggenError.is(cause)) {
+    return cause;
+  }
+  return new DebuggenError(
+    'STORE_ERROR',
+    `The state of session ${sessionId} could not be read from the session store, so its empty backup directory ${target} was kept.`,
+    {
+      hint: 'The next start or purge looks at the directory again.',
+      details: {
+        subsystem: SUBSYSTEM,
+        component: COMPONENT,
+        sessionId,
+        target,
+        operation: 'read-session-state',
+      },
+      cause,
+    },
+  );
+}
+
+/**
+ * Whether anything may be about to write into the empty `backups/<sessionId>`
+ * directory the walk found — the one question its removal waits on, because
+ * the backup store creates the directory on its first `put` and writes the
+ * backup a moment later, so an install running now may have just created it.
+ *
+ * Read synchronously, straight from the store ({@link SESSION_STATE_SQL}), as
+ * the walk reaches the directory:
+ *
+ * - a session **in flight** ({@link IN_FLIGHT_SESSION_STATUSES}) may be
+ *   instrumenting right now, and a status this build cannot read is treated
+ *   the same way (`in-flight`);
+ * - a session the caller reports **in use** ({@link RetentionDeps.isSessionInUse})
+ *   may be about to (`in-use`); the question is asked whether or not the row
+ *   still exists, and a predicate that throws is read as "in use";
+ * - a read the store refuses keeps the directory and is recorded as an issue
+ *   (`unreadable`).
+ *
+ * A session whose row is gone — purged, or never a session's — and one at rest
+ * that nobody claims write nothing into it any more, and the answer is
+ * `undefined`. `rmdir` is what makes the removal itself safe against a backup
+ * written in the meantime; this is what keeps the directory an install has
+ * just created, and not yet written into, from being taken from under it.
+ *
+ * @returns Why the directory must stay, or `undefined` when it may go.
+ */
+function emptyDirectoryHold(
+  context: SweepContext,
+  state: SweepState,
+  sessionId: SessionId,
+  target: string,
+): EmptyDirectoryHold | undefined {
+  if (!storeUsable(context, state, 'sessions.status')) {
+    return 'unreadable';
+  }
+  let row: Record<string, unknown> | undefined;
+  try {
+    row = context.deps.store.statement(SESSION_STATE_SQL).get(sessionId);
+  } catch (caught) {
+    recordIssue(
+      context,
+      state,
+      'backup',
+      target,
+      emptyDirectoryUndecided(target, sessionId, caught),
+    );
+    return 'unreadable';
+  }
+  if (row !== undefined) {
+    const status = row['status'];
+    if (
+      typeof status !== 'string' ||
+      !isSessionStatus(status) ||
+      IN_FLIGHT_STATUS_SET.has(status)
+    ) {
+      return 'in-flight';
+    }
+  }
+  return claimedInUse(context, sessionId) ? 'in-use' : undefined;
+}
+
 /**
  * Walks one `backups/<sessionId>` directory — exactly one level, the level the
  * backup store writes `<originalHash>` files at — and judges its old files in
@@ -2915,6 +3019,14 @@ async function judgeCandidates(
  * walk removed, the directory itself is removed; a directory that still holds
  * anything — a referenced backup, a young orphan, a subdirectory, a link — is
  * left alone, as is one a failed probe covered.
+ *
+ * A directory the walk finds **empty** — nothing in it to judge, the directory
+ * an unwound install or an interrupted cleanup left behind — is removed too,
+ * unless its session may be about to write into it
+ * ({@link emptyDirectoryHold}): in flight, reported in use, or unreadable. It
+ * is counted in {@link RetentionReport.backupDirsDeleted}; a dry run counts it
+ * and keeps it. The removal is an atomic `rmdir`, so a backup written into the
+ * directory in the meantime keeps it.
  */
 async function walkBackupDirectory(
   context: SweepContext,
@@ -2985,8 +3097,21 @@ async function walkBackupDirectory(
     await judgeCandidates(context, state, directory, batch);
   }
 
-  if (directory.blocked || !directory.removedAny || directory.remaining > 0) {
+  if (directory.blocked || directory.remaining > 0) {
     return;
+  }
+  if (!directory.removedAny) {
+    // Found empty rather than emptied: nothing of it was judged, so what keeps
+    // it is whether its session may be about to write into it.
+    const hold = emptyDirectoryHold(context, state, directory.sessionId, target);
+    if (hold !== undefined) {
+      context.logger.debug('an empty session backup directory is kept', {
+        sessionId: directory.sessionId,
+        target,
+        reason: hold,
+      });
+      return;
+    }
   }
   if (!dryRun) {
     const removed = await removeEmptyDirectoryWithin(home, path, backupsRoot, identity);
@@ -3012,7 +3137,9 @@ function linkLeftInPlace(entry: string): DebuggenError {
 
 /**
  * Rule 3: removes backup files no journal row references once they are older
- * than the grace window, then any session directory that left empty.
+ * than the grace window, then any session directory that left empty — and any
+ * found empty whose session cannot be about to write into it
+ * ({@link walkBackupDirectory}).
  *
  * The walk is bounded to the layout the backup store writes —
  * `backups/<sessionId>/<originalHash>` — which keeps it cheap and keeps it from

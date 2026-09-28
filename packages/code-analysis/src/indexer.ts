@@ -222,9 +222,16 @@ import type { RouteMap } from './route-map.js';
  * symbol" for a declaration the patcher can now wrap. `indexer/1.2.0` is the
  * bump for `./extractors/db-calls.ts` recognising the transaction client an
  * interactive `$transaction` callback receives, which adds the call sites
- * written on that client to the graph over unchanged source.
+ * written on that client to the graph over unchanged source. `indexer/1.3.0`
+ * is the bump for the delegate rule `./extractors/server-functions.ts` and
+ * `./extractors/api-calls.ts` added to their owner cascades: the calls of a
+ * function-local function only one inline handler calls now start at that
+ * handler's node instead of the enclosing component's, which moves `calls`
+ * edges over unchanged source — so every index written by `indexer/1.2.0`
+ * has to become unreachable, or a cached graph would keep a path from the
+ * interaction to its request that never passes through the handler.
  */
-export const INDEXER_VERSION: string = 'indexer/1.2.0';
+export const INDEXER_VERSION: string = 'indexer/1.3.0';
 
 /**
  * The extractors an index is built from, in the fixed order they run in.

@@ -1241,6 +1241,63 @@ const CASCADE_MODULES: Readonly<Record<string, string>> = {
     '',
   ].join('\n'),
 
+  // Function-local delegates of inline handlers, in every shape the delegate
+  // rule claims or declines. `useCallback` and `useMemo` are left unresolved
+  // on purpose: the rule reads their names, never their definitions.
+  'src/components/DelegateForms.tsx': [
+    'export function DelegateForm() {',
+    '  async function send(): Promise<void> {',
+    "    await fetch('/scratch/delegate-declaration');",
+    "    await Promise.resolve().then(() => fetch('/scratch/delegate-callback'));",
+    '  }',
+    '',
+    '  const sendMemo = useCallback(',
+    '    async () => {',
+    "      await fetch('/scratch/delegate-memoised');",
+    '    },',
+    "    [fetch('/scratch/delegate-dependency')],",
+    '  );',
+    '',
+    "  const sendArrow = (): void => { void fetch('/scratch/delegate-arrow'); };",
+    '',
+    "  function shared(): void { void fetch('/scratch/delegate-two-handlers'); }",
+    '',
+    "  function leaked(): void { void fetch('/scratch/delegate-also-called-in-body'); }",
+    '',
+    "  function passed(): void { void fetch('/scratch/delegate-passed-as-value'); }",
+    '',
+    "  function bound(): void { void fetch('/scratch/delegate-named-binding'); }",
+    '',
+    '  function outer(): void { inner(); }',
+    '',
+    "  function inner(): void { void fetch('/scratch/delegate-second-level'); }",
+    '',
+    '  const memoised = useMemo(() => {',
+    "    void fetch('/scratch/delegate-memo-factory');",
+    '    return (): void => undefined;',
+    '  }, []);',
+    '',
+    '  const api = { send: 1 };',
+    '  void api.send;',
+    '  leaked();',
+    '',
+    '  return (',
+    '    <form onSubmit={(event) => { event.preventDefault(); void send(); }}>',
+    '      <button onClick={() => { void sendMemo(); sendArrow(); }} />',
+    '      <button onSelect={(send: () => void) => send()} />',
+    '      <button onFocus={() => shared()} />',
+    '      <button onBlur={() => shared()} />',
+    '      <button onKeyDown={() => leaked()} />',
+    '      <button onKeyUp={() => [1].forEach(passed)} />',
+    '      <button onReset={() => bound()} onInput={bound} />',
+    '      <button onChange={() => outer()} />',
+    '      <button onCopy={() => memoised()} />',
+    '    </form>',
+    '  );',
+    '}',
+    '',
+  ].join('\n'),
+
   // Every `XMLHttpRequest` binding rule, one function per rule.
   'src/lib/xhr-bindings.ts': [
     'declare const spare: XMLHttpRequest;',
@@ -2646,6 +2703,66 @@ describe('apiCallsExtractor: class, namespace and function-local owners', () => 
     expect(
       cascadeOwnerOf('src/components/HandlerForms.tsx', '/scratch/handler-parameter-component'),
     ).toStrictEqual({ kind: 'symbol', name: 'ParameterForm', symbol: 'ParameterForm' });
+  });
+
+  it.each([
+    ['a function declaration', '/scratch/delegate-declaration', 'onSubmit'],
+    ['a callback inside a function declaration', '/scratch/delegate-callback', 'onSubmit'],
+    ['a useCallback-memoised arrow', '/scratch/delegate-memoised', 'onClick'],
+    ['a declared arrow', '/scratch/delegate-arrow', 'onClick'],
+  ])(
+    'attributes a request in %s only one inline handler calls to that handler node',
+    (_label, url, name) => {
+      // A parameter of the same name shadows `send` in `onSelect`, and
+      // `api.send` names a property, so neither counts as a reference to it.
+      expect(cascadeOwnerOf('src/components/DelegateForms.tsx', url)).toStrictEqual({
+        kind: 'handler',
+        name,
+        symbol: name,
+      });
+    },
+  );
+
+  it('keeps a named binding ahead of the delegate rule', () => {
+    // `bound` is bound by name and also called from an inline arrow: the named
+    // binding's own handler node owns its request, exactly as before the rule.
+    expect(
+      cascadeOwnerOf('src/components/DelegateForms.tsx', '/scratch/delegate-named-binding'),
+    ).toStrictEqual({ kind: 'handler', name: 'bound', symbol: 'bound' });
+  });
+
+  it.each([
+    ['a function two inline handlers call', '/scratch/delegate-two-handlers'],
+    ['a function the component body calls too', '/scratch/delegate-also-called-in-body'],
+    ['a function passed as a value', '/scratch/delegate-passed-as-value'],
+    ['a function only another delegate calls', '/scratch/delegate-second-level'],
+    ['a useMemo factory, whose value is what it returns', '/scratch/delegate-memo-factory'],
+    ['a dependency list, outside the memoised function', '/scratch/delegate-dependency'],
+  ])('declines the delegate rule for a request in %s', (_label, url) => {
+    expect(cascadeOwnerOf('src/components/DelegateForms.tsx', url)).toStrictEqual({
+      kind: 'symbol',
+      name: 'DelegateForm',
+      symbol: 'DelegateForm',
+    });
+  });
+
+  it('starts every delegate-owned request at a handler node the handler extractor emitted', () => {
+    const project = cascadeFixture();
+    const file = 'src/components/DelegateForms.tsx';
+    const handlerOwned = edgesOf(project, file).filter(
+      (edge) => ownerNodeOf(project.graph, edge).kind === 'handler',
+    );
+
+    expect(handlerOwned.map((edge) => ownerNodeOf(project.graph, edge).name)).toStrictEqual([
+      'onSubmit',
+      'onSubmit',
+      'onClick',
+      'onClick',
+      'bound',
+    ]);
+    for (const edge of handlerOwned) {
+      expect(project.index.edges.some((indexed) => indexed.id === edge.id)).toBe(true);
+    }
   });
 
   it('assembles the whole cascade project with no dangling edge and no other finding', () => {

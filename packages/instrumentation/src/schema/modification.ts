@@ -73,6 +73,28 @@
  * a {@link ModificationConflict} with a three-way diff, which is what makes
  * "Debug Generator will not overwrite it" (AAP §0.5.5) a true statement.
  *
+ * For a follow-up chain (below) the `hash === originalHash` line has a
+ * chain-level counterpart, applied by `../cleanup.ts` to the head of what
+ * remains of a chain when its status may close a record over a pristine file
+ * (`pending`, `failed`, `conflict`): a file that hashes to the `originalHash`
+ * of a record *beneath* the head, over links whose hashes agree, holds content
+ * from before every write down to that record, so the head and each of those
+ * records are closed without a write and the unwind continues beneath them.
+ * That is how a conflict closes once the developer puts back the pristine
+ * file — the chain root's original — rather than being re-reported forever.
+ *
+ * The `otherwise → conflict` lines have a chain-level counterpart too. When a
+ * record's conflict is `'content-changed'` or `'file-missing'` and the file
+ * holds no record's `instrumentedHash` (or is gone), it holds none of the
+ * chain's output, so every open record beneath that one in the chain moves to
+ * `conflict` with it (`applied`, `pending` or `failed` → `conflict`; one
+ * already there stays) and keeps its backup, covered by that one conflict
+ * report. So no record of the chain goes on claiming, as `applied`, bytes the
+ * file no longer holds — a claim the patcher would read as another session
+ * still holding the file. A stop for any other reason (an unusable backup, a
+ * failed verification, a refused fork, a failure, an abort) leaves the records
+ * beneath with their status untouched.
+ *
  * ## Follow-up chains (AAP §0.4.2)
  *
  * A follow-up question can produce a new plan version whose delta touches a
@@ -84,6 +106,15 @@
  * currently hashes to *that* record's `instrumentedHash` before writing *that*
  * record's backup. Without the link, reverse-order restoration cannot be
  * verified hash by hash, which is the only reason the field exists.
+ *
+ * Only the **chain root** — the first record of the chain, the one with no
+ * `previousRecordId` — backs up the pristine file. Every later link's backup
+ * holds the previous plan version's instrumented output, which still contains
+ * the tool's wrapper, so it is never what a developer should restore by hand.
+ * {@link findChainRoot} resolves a record's root from the records beside it,
+ * and a conflict about a chained record names the root's backup as
+ * {@link ModificationConflict.originalBackupPath}: that is the path "Original
+ * saved at ‹path›" (AAP §0.5.5) quotes, and the "original" side of its diff.
  *
  * ## Two constraints on this module, both load-bearing
  *
@@ -161,11 +192,16 @@ import type { Result } from '@debuggen/shared';
  *   the **backup is retained**, because reconciliation may still have to
  *   restore from it.
  * - `conflict` — the developer edited the file while it was instrumented, or a
- *   hash did not match where it had to. The **backup is retained** and the
- *   file is left exactly as the developer left it for as long as it diverges;
+ *   hash did not match where it had to — or, for a record beneath such a
+ *   record in a follow-up chain, the file was shown to hold none of the
+ *   chain's output, so this record's bytes are not on disk either. The
+ *   **backup is retained** and the file is left exactly as the developer left
+ *   it for as long as it diverges;
  *   every cleanup or reconciliation pass judges it again, restoring it once the
  *   file hashes to `instrumentedHash` (the edit was undone) and closing it once
- *   it hashes to `originalHash`, either way ending `reverted`.
+ *   it hashes to `originalHash` — or, for a chained record, to the
+ *   `originalHash` of a record beneath it, which closes those records too —
+ *   either way ending `reverted`.
  *
  * Frozen because it is a module-level table read on every validation: a
  * mutation would widen or narrow what every process in the product accepts.
@@ -632,17 +668,23 @@ export const modificationRecordSchema = z
     originalHash: sha256HexSchema,
 
     /**
-     * Where the original bytes were copied, before anything was written.
+     * Where the bytes this record replaced were copied, before anything was
+     * written.
      *
      * `$DEBUGGEN_HOME/backups/<sessionId>/<originalHash>`, absolute and
      * **outside every checkout** (AAP §0.2.3) so a session never shows up in
      * the developer's `git status`. Created `0600` under a `0700` directory and
      * `fsync`ed by `../patch/backup-store.ts`.
      *
+     * For the first record of a file this is the pristine file. For a chained
+     * record (`previousRecordId`) it is the previous plan version's
+     * instrumented output — still wrapped by this tool — and the pristine file
+     * is the chain root's backup instead (see {@link findChainRoot}).
+     *
      * The backup is deleted only after a restore has been verified against
-     * `originalHash`. A `failed` or `conflict` record keeps its backup — that
-     * is the copy the developer is told about in the AAP §0.5.5 message, and
-     * the copy reconciliation needs on the next start.
+     * `originalHash`. A `failed` or `conflict` record keeps its backup — the
+     * copy reconciliation needs on the next start, and, for an unchained
+     * record, the copy the developer is told about in the AAP §0.5.5 message.
      */
     backupPath: backupPathSchema,
 
@@ -1019,7 +1061,10 @@ export const modificationConflictReasonSchema = z.enum(MODIFICATION_CONFLICT_REA
  * across a process boundary. It is embedded by `cleanup.completed
  * { sessionId, status, conflicts }` (AAP §0.4.2) and rendered by the VS Code
  * `DiffView` and the DevTools `SessionSummary`, so every field is a JSON
- * primitive and no `Error` instance appears anywhere in it.
+ * primitive and no `Error` instance appears anywhere in it. The ‹backup path›
+ * of that sentence is `originalBackupPath` when the report carries one (a
+ * chained record: the chain root's backup, the pristine file) and
+ * `backupPath` otherwise.
  *
  * Produced by `../patch/conflict.ts`, which is a *verdict* module: a conflict
  * is data, not a failure. It is returned as a successful result and reported to
@@ -1071,16 +1116,37 @@ export const modificationConflictSchema = z.strictObject({
   actualHash: sha256HexSchema.optional(),
 
   /**
-   * Where the original bytes still are.
+   * Where this record's own backup is: the {@link ModificationRecord.backupPath}
+   * of the record the conflict is about.
    *
-   * The conflict path **retains** the backup (AAP §0.5.1), and this is the path
-   * the AAP §0.5.5 message quotes so the developer can recover the pristine
-   * file by hand if they choose to. Present even for `'backup-missing'`, where
-   * it records the path that was expected and is the only useful thing left to
-   * say, and for `'backup-corrupt'`, where it names the untrusted file that was
-   * kept for inspection.
+   * The conflict path **retains** the backup (AAP §0.5.1). For an unchained
+   * record it holds the pristine file, and this is the path the AAP §0.5.5
+   * message quotes so the developer can recover it by hand if they choose to.
+   * For a chained record (`previousRecordId`) it holds the previous plan
+   * version's instrumented output — the bytes this record replaced, still
+   * wrapped by this tool — and the pristine file is at
+   * {@link ModificationConflict.originalBackupPath} instead. Present even for
+   * `'backup-missing'`, where it records the path that was expected and is the
+   * only useful thing left to say, and for `'backup-corrupt'`, where it names
+   * the untrusted file that was kept for inspection.
    */
   backupPath: backupPathSchema,
+
+  /**
+   * Where the pristine original of the file is: the backup of the record's
+   * **chain root**, the first record of its follow-up chain.
+   *
+   * Present only for a chained record (`previousRecordId`) whose root the
+   * producer resolved (`findChainRoot`), and absent — never blank — otherwise,
+   * because {@link ModificationConflict.backupPath} is then already the
+   * pristine file. "Original saved at ‹path›" (AAP §0.5.5) names this path
+   * when it is present and `backupPath` when it is not; a surface that quoted
+   * `backupPath` for a chained record would point the developer at bytes that
+   * still carry the instrumentation. Like `backupPath`, it is reported even
+   * when the backup it names could not be read back, and the report's
+   * `message` says so.
+   */
+  originalBackupPath: backupPathSchema.optional(),
 
   /** When the conflict was detected, in epoch milliseconds. */
   detectedAt: epochMillisecondsSchema,
@@ -1108,6 +1174,12 @@ export const modificationConflictSchema = z.strictObject({
    * - `instrumentedToCurrent` — what the developer changed on top of it, the
    *   most useful hunk set for the "Open diff" action;
    * - `originalToCurrent` — the net divergence from the pristine file.
+   *
+   * "Original" is the pristine file in both views that name it: for a chained
+   * record, the chain root's backup ({@link ModificationConflict.originalBackupPath}),
+   * never the intermediate, still-instrumented bytes the record itself backed
+   * up — so `originalToInstrumented` spans every plan version up to and
+   * including this record's.
    *
    * The object and every member are optional, because a conflict may leave
    * nothing to diff: `'file-missing'` has no current text, and
@@ -1146,6 +1218,90 @@ export const modificationConflictSchema = z.strictObject({
 export type ModificationConflict = z.infer<typeof modificationConflictSchema>;
 
 /**
+ * Finds the chain root of a record: the root-most ancestor reachable through
+ * `previousRecordId` among the records given.
+ *
+ * A follow-up chain (AAP §0.4.2) links each later plan version's record to the
+ * record it was layered on, and only the first record of the chain backed up
+ * the pristine file; every later link's backup holds the previous version's
+ * instrumented output. The root is therefore where "Original saved at ‹path›"
+ * (AAP §0.5.5) has to point for a chained record, and where the "original"
+ * side of its conflict diff comes from — see
+ * {@link ModificationConflict.originalBackupPath}.
+ *
+ * Pure, synchronous and browser-safe: it reads only the records it is handed,
+ * so the service, the watcher, cleanup and a user interface holding a
+ * session's modification list all resolve the same root the same way.
+ *
+ * - Only records of the **same session** and the **same file** (compared in
+ *   normalised POSIX form, so `./src/a.ts` and `src/a.ts` are one file) are
+ *   followed: a chain never crosses either boundary, and a link that seemed to
+ *   would be naming a record that does not describe this file's bytes.
+ * - A **missing parent** ends the walk: the deepest ancestor that is present is
+ *   the root. The caller chooses which records count — cleanup passes the live
+ *   ones, so an ancestor already reverted is not a root whose backup can still
+ *   be named.
+ * - A **cycle** (`A → B → A`, which spans records the schema never sees
+ *   together) ends the walk at the last record before it would repeat, and the
+ *   walk is bounded by the number of candidate records, so a malformed journal
+ *   can neither hang it nor make it answer with the record itself.
+ * - When two candidates share an id, the first one given is used.
+ *
+ * @param record The record whose root is wanted.
+ * @param records The records to look the ancestors up in — typically the other
+ * records of the same session. May include `record` itself.
+ * @returns The root-most ancestor, or `undefined` when `record` has no
+ * `previousRecordId` or its parent is not among `records`.
+ *
+ * @example
+ * ```ts
+ * const root = findChainRoot(record, sessionRecords);
+ * const originalPath = root?.backupPath ?? record.backupPath;
+ * ```
+ */
+export function findChainRoot(
+  record: ModificationRecord,
+  records: Iterable<ModificationRecord>,
+): ModificationRecord | undefined {
+  if (record.previousRecordId === undefined) {
+    return undefined;
+  }
+
+  const file = normalizePosix(toPosix(record.file));
+  const candidates = new Map<string, ModificationRecord>();
+
+  for (const candidate of records) {
+    if (
+      candidate.sessionId === record.sessionId &&
+      normalizePosix(toPosix(candidate.file)) === file &&
+      !candidates.has(candidate.id)
+    ) {
+      candidates.set(candidate.id, candidate);
+    }
+  }
+
+  const visited = new Set<string>([record.id]);
+  let root: ModificationRecord | undefined;
+  let parentId: string | undefined = record.previousRecordId;
+
+  // Each iteration either moves to a record not yet visited or stops, so the
+  // walk takes at most one step per candidate.
+  while (parentId !== undefined && !visited.has(parentId)) {
+    const parent = candidates.get(parentId);
+
+    if (parent === undefined) {
+      break;
+    }
+
+    visited.add(parent.id);
+    root = parent;
+    parentId = parent.previousRecordId;
+  }
+
+  return root;
+}
+
+/**
  * Validates an unknown value as a {@link ModificationConflict}, without
  * throwing.
  *
@@ -1170,7 +1326,7 @@ export function parseModificationConflict(value: unknown): Result<ModificationCo
       'PROTOCOL_INVALID_MESSAGE',
       'A value did not match the modification conflict schema.',
       {
-        hint: 'A conflict needs the record id, the session id, the project-relative file, a known reason, the expected hash, the backup path, an epoch-millisecond detection time and a non-empty message.',
+        hint: "A conflict needs the record id, the session id, the project-relative file, a known reason, the expected hash, the record's own backup path, an epoch-millisecond detection time and a non-empty message; a chained record may add its chain root's backup path as originalBackupPath.",
         details: { issues: collectIssues(parsed.error) },
       },
     ),
@@ -1193,8 +1349,10 @@ export function parseModificationConflict(value: unknown): Result<ModificationCo
  *   revised before the write (a re-rendered patch); never after a rename, since
  *   the recorded value is what reconciliation compares against;
  * - `diff` — the same case, and the truncation the patcher may apply;
- * - `backupPath` — where a backup was relocated, which keeps a `conflict`
- *   record's "Original saved at ‹path›" message accurate.
+ * - `backupPath` — where a backup was relocated, which keeps every path a
+ *   conflict report quotes accurate: its own `backupPath`, and — when the
+ *   relocated record is a chain root — the `originalBackupPath` of every
+ *   chained record's report, which "Original saved at ‹path›" names.
  *
  * Every member is optional and `readonly`: a patch says only what changed.
  */

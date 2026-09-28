@@ -82,7 +82,10 @@
  * redaction guard walks it field by field. Following the pipeline convention of
  * `pipeline/context-builder.ts`, the developer's question travels in the prompt
  * only — never in the structured context — so two questions that differ only in
- * wording give the same structured input (AAP 0.5.4). Nothing here compares,
+ * wording give the same structured input (AAP 0.5.4). A follow-up reaches the
+ * structured context only as the request's `followUpFocus` — category hints
+ * and graph-resolved declarations the follow-up stage derived — so a
+ * follow-up's panel is composed for what it asks. Nothing here compares,
  * searches or switches on the question text.
  *
  * ## Privacy
@@ -174,7 +177,12 @@ import type {
 } from '@debuggen/telemetry';
 
 import { sessionLogger, subsystemLogger } from '../logging.js';
-import { redactEmbeddedUrlsDeep, redactQuestionText } from '../pipeline/context-builder.js';
+import {
+  boundedFollowUpFocus,
+  redactEmbeddedUrlsDeep,
+  redactQuestionText,
+} from '../pipeline/context-builder.js';
+import type { FollowUpFocus } from '../pipeline/context-builder.js';
 import type { SessionBroadcaster } from '../sessions/manager.js';
 import type { PanelsRepo, PanelsRepoFailureReason } from '../store/panels-repo.js';
 import type { SessionsRepo } from '../store/sessions-repo.js';
@@ -390,6 +398,25 @@ export interface PanelGenerationRequest {
    * the capture path does.
    */
   readonly expectedPredecessor?: PanelId | undefined;
+  /**
+   * The structured focus of the follow-up this panel answers — its category
+   * hints and the declarations it names (`FollowUpFocus`) — when a follow-up
+   * governs the generation: the existing-evidence regeneration, or a capture
+   * taken under the plan version a new-capture follow-up installed. Bounded
+   * with `boundedFollowUpFocus` and placed as the top-level `followUpFocus` of
+   * the structured input only; no rendered section changes. Absent — the
+   * session's first question — the input carries no such member.
+   */
+  readonly followUpFocus?: FollowUpFocus | undefined;
+  /**
+   * The members of the selected target's owner chain that the project's code
+   * graph declares as components, nearest first — the pipeline stage's
+   * `declaredChainComponents`. Joined to the session's framing (see
+   * {@link PanelFraming.declaredComponents}) so a rules-based author titles
+   * the panel by the first application component of the chain. Absent, the
+   * panel is titled from the chain alone.
+   */
+  readonly declaredComponents?: readonly string[] | undefined;
   /** Cancels the generation; nothing is stored or broadcast once it aborts. */
   readonly signal?: AbortSignal | undefined;
 }
@@ -804,6 +831,12 @@ export interface PanelFraming {
   readonly componentChain?: readonly string[] | undefined;
   /** The selected element's tag name. */
   readonly tagName?: string | undefined;
+  /**
+   * The members of {@link PanelFraming.componentChain} the project declares
+   * as components, from {@link PanelGenerationRequest.declaredComponents}; a
+   * name outside the chain is dropped when the framing is rendered.
+   */
+  readonly declaredComponents?: readonly string[] | undefined;
 }
 
 /**
@@ -838,11 +871,18 @@ export function panelFramingOf(record: SessionRecord | undefined): PanelFraming 
 /**
  * The framing half of the structured input: `understanding` and `target`,
  * each present only when the framing carries something for it, in the field
- * names the rules-based provider reads a category and a target label from.
+ * names the rules-based provider reads a category and a target label from,
+ * and `declaredComponents` — the chain members the project declares, in
+ * chain order — present only when one of them is.
  */
 function framingContext(framing: PanelFraming): Readonly<Record<string, unknown>> {
   const chain = framing.componentChain ?? [];
+  const declaredNames = new Set(framing.declaredComponents ?? []);
+  const declared = chain.filter(
+    (name, index) => declaredNames.has(name) && chain.indexOf(name) === index,
+  );
   return {
+    ...(declared.length === 0 ? {} : { declaredComponents: declared }),
     ...(framing.category === undefined
       ? {}
       : {
@@ -872,9 +912,15 @@ function framingContext(framing: PanelFraming): Readonly<Record<string, unknown>
  *   `describeCatalogForPrompt`;
  * - `populatedSources` and `capture` → `{{captureOverview}}`, the two halves of
  *   the overview: how much each data source holds, and the bounded sections;
- * - `understanding` and `target` → no placeholder: the {@link PanelFraming} of
- *   the session, structured data for a rules-based author (the model reads the
- *   question itself), present only when the session has them.
+ * - `understanding`, `target` and `declaredComponents` → no placeholder: the
+ *   {@link PanelFraming} of the session, structured data for a rules-based
+ *   author (the model reads the question itself), present only when the
+ *   session has them;
+ * - `followUpFocus` → no placeholder: the structured focus of the follow-up
+ *   the panel answers (`FollowUpFocus` of `../pipeline/context-builder.ts`),
+ *   present only when a follow-up governs the generation, so a follow-up's
+ *   panel is composed for what it asks while a first question's input is
+ *   unchanged.
  *
  * `analysis` and `capture` have every embedded URL's query values masked
  * (`redactEmbeddedUrlsDeep`) before either the input or the text is derived,
@@ -898,12 +944,16 @@ export interface PanelStageContext {
  * @param analysis The validated analysis of the capture.
  * @param summary The capture's summary.
  * @param framing What the session's earlier stages settled; empty by default.
+ * @param followUpFocus The focus of the follow-up the panel answers, when one
+ * governs it; bounded here with `boundedFollowUpFocus`, and left out of the
+ * input entirely when absent or empty.
  * @returns The structured input and the two data sections rendered from it.
  */
 export function buildPanelStageContext(
   analysis: AnalysisResult,
   summary: CaptureSummary,
   framing: PanelFraming = {},
+  followUpFocus?: FollowUpFocus,
 ): PanelStageContext {
   // The analysis is model-authored prose and the overview carries captured
   // names and addresses, so either can quote a queried URL (`/api/x?id=7`). The
@@ -925,10 +975,15 @@ export function buildPanelStageContext(
   const populatedSources = toJsonObject(populatedSourceCounts(summary));
   const capture = redactEmbeddedUrlsDeep(toJsonObject(captureContext(summary)));
   const framed = toJsonObject(framingContext(framing));
+  // Category hints and graph-resolved declarations only — no question text — held to the same
+  // bound the analysis request applies, so the follow-up's analysis and panel read one focus.
+  const focus = boundedFollowUpFocus(followUpFocus);
+  const focused = focus === undefined ? undefined : toJsonValue(focus, 0, new Set<object>());
 
   return {
     input: {
       ...framed,
+      ...(focused === undefined ? {} : { followUpFocus: focused }),
       analysis: analysisSection,
       nodeCatalog: nodeCatalog ?? [],
       populatedSources,
@@ -1683,10 +1738,16 @@ export function createPanelGenerator(deps: PanelGeneratorDeps): PanelGenerator {
       return err(schemaText.error);
     }
 
+    // The declarations are joined to the stored framing, never trusted beyond
+    // it: only a member of the framing's own bounded chain is rendered.
+    const framing = framingFor(sessionId, sessionLog);
     const stageContext = buildPanelStageContext(
       analysis.value,
       summary.value,
-      framingFor(sessionId, sessionLog),
+      request.declaredComponents === undefined
+        ? framing
+        : { ...framing, declaredComponents: [...request.declaredComponents] },
+      request.followUpFocus,
     );
     const values: PanelPromptValues = {
       question: questionTextFor(request.question, followUpQuestion),

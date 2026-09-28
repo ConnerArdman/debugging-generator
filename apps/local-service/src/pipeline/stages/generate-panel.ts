@@ -32,7 +32,12 @@
  *    single source of truth), the capture, the validated analysis, the optional
  *    summary, the prompt version — the caller's, else the one the session
  *    recorded — the panel the caller expects to be superseded, as the
- *    request's `expectedPredecessor`, and the context's cancellation signal.
+ *    request's `expectedPredecessor`, the structured focus of the follow-up
+ *    that governs the run when one does (`followUpFocusFor` of `./followup.js`,
+ *    which reads the session record and resolves names through the context's
+ *    code graph; it authors nothing), the members of the selected target's
+ *    owner chain the code graph declares ({@link declaredChainComponents}),
+ *    and the context's cancellation signal.
  * 2. **Delegate.** `generate` for a new panel; `regenerate` on the follow-up
  *    existing-evidence path (AAP §0.4.2, Follow-up row), which stores the next
  *    panel version superseding the previous one rather than touching a row.
@@ -82,7 +87,7 @@
 
 import type { PanelSpec } from '@debuggen/panel-schema';
 import type { AnalysisResult, ProgressStage } from '@debuggen/protocol';
-import { DebuggenError, err, noopLogger, ok } from '@debuggen/shared';
+import { DebuggenError, err, noopLogger, ok, tryCatch } from '@debuggen/shared';
 import type { LogFields, Logger, Result } from '@debuggen/shared';
 import type { CaptureSummary } from '@debuggen/telemetry';
 
@@ -97,6 +102,7 @@ import type {
 import type { SessionProgress } from '../../sessions/progress.js';
 import type { SessionFailure } from '../../sessions/state-machine.js';
 import type { PipelineStageContext } from '../context-builder.js';
+import { followUpFocusFor } from './followup.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Vocabulary
@@ -321,11 +327,92 @@ function durationFields(now: () => number, startedAt: number | undefined): LogFi
   return endedAt === undefined ? {} : { durationMs: Math.max(0, Math.round(endedAt - startedAt)) };
 }
 
-/** The panel subsystem's request, built from the stage context and the stage input. */
+/**
+ * The nearest owner-chain members checked against the project's declarations:
+ * the panel framing's own chain bound (`../../panels/generate.ts`), so every
+ * member the framing carries can be answered for.
+ */
+export const MAX_DECLARED_CHAIN_MEMBERS = 8;
+
+/** Log message when the code graph cannot answer which chain members it declares. Fields: stage, code. */
+const DECLARATIONS_UNREADABLE_LOG =
+  "The project's component declarations could not be read; the panel is titled from the owner chain alone.";
+
+/** The empty answer of {@link declaredChainComponents}. */
+const NO_DECLARED_COMPONENTS: readonly string[] = Object.freeze([]);
+
+/**
+ * The members of the selected target's owner chain that the project's code
+ * graph declares as components: those a `component` node of the graph names —
+ * by its declared name, its runtime display name or the implementation it
+ * wraps — compared exactly, in chain order, each once.
+ *
+ * An owner chain interleaves the application's components with the
+ * framework's boundaries and the libraries' parts, and only the application's
+ * are declared in the project the graph indexes; the rules-based author reads
+ * the list (the request's `declaredComponents`) to title a panel by the first
+ * application component rather than by a building block or a framework
+ * boundary. Code identifiers the chain already carries, nothing more.
+ *
+ * Total: no chain answers the empty list without reading the graph, and a
+ * graph that cannot answer is logged at `warn` (stage and code only) and
+ * answers the empty list, which titles the panel from the chain alone.
+ *
+ * @param context The stage context: its target and its code handles.
+ * @param log The run's logger.
+ * @returns The declared members, frozen; empty when none is declared.
+ */
+export function declaredChainComponents(
+  context: Pick<PipelineStageContext, 'target' | 'code'>,
+  log: Logger,
+): readonly string[] {
+  const chain = (context.target?.componentChain ?? []).slice(0, MAX_DECLARED_CHAIN_MEMBERS);
+  if (chain.length === 0) {
+    return NO_DECLARED_COMPONENTS;
+  }
+  const names = tryCatch(() => {
+    const declared = new Set<string>();
+    for (const node of context.code.graph.nodesByKind('component')) {
+      declared.add(node.name);
+      declared.add(node.data.displayName);
+      if (node.data.implementation !== undefined) {
+        declared.add(node.data.implementation);
+      }
+    }
+    return declared;
+  }, 'INTERNAL');
+  if (!names.ok) {
+    log.warn(DECLARATIONS_UNREADABLE_LOG, {
+      stage: GENERATE_PANEL_STAGE,
+      code: names.error.code,
+    });
+    return NO_DECLARED_COMPONENTS;
+  }
+  const kept: string[] = [];
+  for (const member of chain) {
+    if (names.value.has(member) && !kept.includes(member)) {
+      kept.push(member);
+    }
+  }
+  return kept.length === 0 ? NO_DECLARED_COMPONENTS : Object.freeze(kept);
+}
+
+/**
+ * The panel subsystem's request, built from the stage context and the stage
+ * input. The follow-up focus is the one that governs the run
+ * (`followUpFocusFor`): the context's follow-up on a regeneration, the
+ * follow-up whose plan version the capture ran under on the capture path, and
+ * none — no member at all — for the session's first question. The declared
+ * chain components ({@link declaredChainComponents}) travel only when there
+ * is one.
+ */
 function toRequest(
   context: PipelineStageContext,
   input: GeneratePanelStageInput,
+  log: Logger,
 ): PanelGenerationRequest {
+  const followUpFocus = followUpFocusFor(context, log);
+  const declaredComponents = declaredChainComponents(context, log);
   return {
     sessionId: context.sessionId,
     captureId: input.captureId,
@@ -334,6 +421,8 @@ function toRequest(
     summary: input.summary,
     promptVersion: input.promptVersion ?? context.promptVersions[GENERATE_PANEL_STAGE],
     expectedPredecessor: input.supersedes,
+    ...(followUpFocus === undefined ? {} : { followUpFocus }),
+    ...(declaredComponents.length === 0 ? {} : { declaredComponents }),
     signal: context.signal,
   };
 }
@@ -459,8 +548,9 @@ export function createGeneratePanelStage(deps: GeneratePanelStageDeps): Generate
   const delegate = (
     context: PipelineStageContext,
     input: GeneratePanelStageInput,
+    log: Logger,
   ): Promise<Result<PanelGenerationResult, DebuggenError>> => {
-    const request = toRequest(context, input);
+    const request = toRequest(context, input, log);
     if (input.regenerate !== true) {
       return deps.panelGenerator.generate(request);
     }
@@ -492,7 +582,7 @@ export function createGeneratePanelStage(deps: GeneratePanelStageDeps): Generate
       return fail(context, log, captureMismatchError(), startedAt, group.opened);
     }
 
-    const generated = await delegate(context, input);
+    const generated = await delegate(context, input, log);
     if (!generated.ok) {
       return fail(context, log, generated.error, startedAt, group.opened);
     }

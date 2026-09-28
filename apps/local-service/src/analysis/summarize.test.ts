@@ -34,6 +34,7 @@ import {
 } from '@debuggen/telemetry';
 
 import { MAX_AGGREGATE_INPUT_EVENTS } from '../panels/data.js';
+import type { FollowUpFocus } from '../pipeline/context-builder.js';
 import { buildFactCandidates } from './facts.js';
 import {
   ANALYSIS_INPUT_LIMITS,
@@ -664,5 +665,33 @@ describe('analysis input: deterministic, plain JSON, and one read per build', ()
     });
     const built = await summarizer.buildStageInput(request);
     expect(!built.ok && built.error).toBe(failure);
+  });
+
+  it('carries a follow-up focus exactly when one is given, leaving every other section as it was', async () => {
+    const focus: FollowUpFocus = {
+      categoryHints: ['rendering'],
+      declarations: [{ file: 'src/ledger/rows.tsx', symbol: 'ListRow', kind: 'component' }],
+    };
+    const plain = expectOk(await summarizerOver(events).summarizer.buildStageInput(request));
+    expect(Object.hasOwn(plain.input, 'followUpFocus')).toBe(false);
+    const unset = expectOk(
+      await summarizerOver(events).summarizer.buildStageInput({
+        ...request,
+        followUpFocus: undefined,
+      }),
+    );
+    expect(Object.hasOwn(unset.input, 'followUpFocus')).toBe(false);
+    expect(JSON.stringify(unset.input)).toBe(JSON.stringify(plain.input));
+
+    const focused = expectOk(
+      await summarizerOver(events).summarizer.buildStageInput({ ...request, followUpFocus: focus }),
+    );
+    expect(focused.input.followUpFocus).toStrictEqual(focus);
+    const serialised = JSON.stringify(focused.input);
+    expect(JSON.parse(serialised)).toStrictEqual(focused.input);
+    const { followUpFocus: carried, ...rest } = focused.input;
+    expect(carried).toStrictEqual(focus);
+    expect(JSON.stringify(rest)).toBe(JSON.stringify(plain.input));
+    expect(focused.summary).toStrictEqual(plain.summary);
   });
 });

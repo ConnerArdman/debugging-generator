@@ -1248,6 +1248,8 @@ describe('the conflict path', () => {
       backupPath: ledger.backupPath,
       detectedAt: NOW,
     });
+    // An unchained record's own backup is the pristine file: no chain root is named.
+    expect(conflict.originalBackupPath).toBeUndefined();
 
     // The notice: the one sentence, verbatim, and its action.
     expect(notice.message).toBe(buildConflictMessage(record, conflict));
@@ -1746,6 +1748,248 @@ describe('chain heads, suspend/resume and refresh', () => {
     });
     expect(blank.ok ? undefined : blank.error.code).toBe('SESSION_NOT_FOUND');
     expect(harness.probe.opened).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Chained records: the conflict names the chain root's pristine original
+// ---------------------------------------------------------------------------
+
+/** The ledger as plan version 1 left it: the root's instrumented output, still wrapped. */
+const LEDGER_INTERMEDIATE = instrumentedOf(LEDGER_ORIGINAL);
+
+/** The ledger as plan version 2 left it: the chain head's instrumented output. */
+const LEDGER_CHAINED = instrumentedOf(LEDGER_INTERMEDIATE, DELTA_LINE);
+
+/** The "timing" line both views starting from the pristine file must show as an addition. */
+const PROBE_ADDITION = `+${PROBE_LINE}`;
+
+/**
+ * A two-link follow-up chain over the ledger file, as the patcher leaves one:
+ * the root backs up the pristine file, while the head — layered on the root
+ * through `previousRecordId` — backs up the root's still-instrumented output.
+ */
+async function instrumentLedgerChain(
+  harness: Harness,
+): Promise<{ readonly root: ModificationRecord; readonly head: ModificationRecord }> {
+  const root = await instrument(harness, {
+    file: LEDGER_FILE,
+    original: LEDGER_ORIGINAL,
+    instrumented: LEDGER_INTERMEDIATE,
+  });
+  const head = await instrument(harness, {
+    file: LEDGER_FILE,
+    original: LEDGER_INTERMEDIATE,
+    instrumented: LEDGER_CHAINED,
+    planVersion: 2,
+    previous: root,
+  });
+
+  return { root, head };
+}
+
+/** The lines of a unified diff that mention the probe line, whatever their prefix. */
+function probeLinesOf(patch: string | undefined): string[] {
+  return (patch ?? '').split('\n').filter((line) => line.includes(PROBE_LINE));
+}
+
+/** Asserts that no log record carries either backup path, the sandbox root or a digest. */
+function expectPathFreeLogs(harness: Harness, records: readonly ModificationRecord[]): void {
+  const logText = JSON.stringify(harness.logs);
+
+  expect(logText).not.toMatch(DIGEST_PATTERN);
+  expect(logText).not.toContain(harness.sandbox.root);
+
+  for (const record of records) {
+    expect(logText).not.toContain(record.backupPath);
+  }
+}
+
+describe('chained records name the chain root’s pristine original', () => {
+  it('names the root’s backup — never the intermediate one — in the sentence, the notice, the report and its diff', async () => {
+    const harness = await createHarness();
+    const { root, head } = await instrumentLedgerChain(harness);
+    await startWatching(harness, [LEDGER_FILE]);
+
+    // The QA scenario: the head's own backup is the root's instrumented output.
+    expect(head.previousRecordId).toBe(root.id);
+    expect(head.backupPath).not.toBe(root.backupPath);
+    expect(await readFile(root.backupPath, 'utf8')).toBe(LEDGER_ORIGINAL);
+    expect(await readFile(head.backupPath, 'utf8')).toContain(PROBE_LINE);
+
+    const edited = `${LEDGER_CHAINED}${DEVELOPER_LINE}\n`;
+    await appendFile(harness.pathOf(LEDGER_FILE), `${DEVELOPER_LINE}\n`);
+    await waitForConflicts(harness, 1);
+
+    const { record, conflict, notice } = onlyConflict(harness);
+    expect(record.id).toBe(head.id);
+    expect(conflictTransitions(harness).map((call) => call.id)).toEqual([head.id]);
+    expect(harness.journal.current(root.id)?.status).toBe('applied');
+
+    // The sentence and the notice name the pristine original.
+    const sentence = CONFLICT_SENTENCE.exec(notice.message);
+    expect(sentence?.[1]).toBe(LEDGER_FILE);
+    expect(sentence?.[2]).toBe(root.backupPath);
+    expect(notice.message).not.toContain(head.backupPath);
+    expect(notice.message).toBe(buildConflictMessage(record, conflict));
+    expect(notice).toMatchObject({
+      action: 'open-diff',
+      recordId: head.id,
+      file: LEDGER_FILE,
+      backupPath: root.backupPath,
+      reason: 'content-changed',
+      observation: 'content-changed',
+      backupVerified: true,
+    });
+    expect(rowMessages(harness)).toEqual([notice.message]);
+
+    // The report keeps the head's own backup and adds the root's as the original.
+    expect(parseModificationConflict(conflict).ok).toBe(true);
+    expect(conflict).toMatchObject({
+      recordId: head.id,
+      reason: 'content-changed',
+      expectedHash: head.instrumentedHash,
+      actualHash: sha256Hex(edited),
+      backupPath: head.backupPath,
+      originalBackupPath: root.backupPath,
+      message: notice.message,
+    });
+
+    // "Original → instrumented" starts from the pristine text: both layers are
+    // additions, and the first layer's wrapper is never context or a removal.
+    const toInstrumented = conflict.diffs?.originalToInstrumented;
+    expect(toInstrumented).not.toBe(head.diff);
+    expect(toInstrumented?.split('\n')).toContain(`+${DELTA_LINE}`);
+    expect(probeLinesOf(toInstrumented)).toEqual([PROBE_ADDITION]);
+    expect(probeLinesOf(head.diff)).toEqual([` ${PROBE_LINE}`]);
+    expect(conflict.diffs?.originalToCurrent?.split('\n')).toEqual(
+      expect.arrayContaining([PROBE_ADDITION, `+${DELTA_LINE}`, `+${DEVELOPER_LINE}`]),
+    );
+    expect(conflict.diffs?.instrumentedToCurrent?.split('\n')).toContain(`+${DEVELOPER_LINE}`);
+
+    expectPathFreeLogs(harness, [root, head]);
+  });
+
+  it('words a chained file put back to the root’s pristine original as reverted to the original', async () => {
+    const harness = await createHarness();
+    const { root, head } = await instrumentLedgerChain(harness);
+    await startWatching(harness, [LEDGER_FILE]);
+
+    await writeFile(harness.pathOf(LEDGER_FILE), LEDGER_ORIGINAL);
+    await waitForConflicts(harness, 1);
+
+    const { conflict, notice } = onlyConflict(harness);
+    expect(conflict.actualHash).toBe(root.originalHash);
+    expect(conflict.originalBackupPath).toBe(root.backupPath);
+    expect(notice).toMatchObject({
+      recordId: head.id,
+      backupPath: root.backupPath,
+      observation: 'reverted-to-original',
+      backupVerified: true,
+    });
+    expect(notice.detail).toContain('original, uninstrumented contents');
+    expect(CONFLICT_SENTENCE.exec(notice.message)?.[2]).toBe(root.backupPath);
+    expect(probeLinesOf(conflict.diffs?.originalToInstrumented)).toEqual([PROBE_ADDITION]);
+    expect(conflict.diffs?.originalToCurrent).toBeUndefined();
+    expect(await readFile(harness.pathOf(LEDGER_FILE), 'utf8')).toBe(LEDGER_ORIGINAL);
+  });
+
+  it('never calls the previous version’s still-instrumented bytes the original, nor offers the head’s diff as one', async () => {
+    const harness = await createHarness();
+    const { root, head } = await instrumentLedgerChain(harness);
+    await startWatching(harness, [LEDGER_FILE]);
+
+    await writeFile(harness.pathOf(LEDGER_FILE), LEDGER_INTERMEDIATE);
+    await waitForConflicts(harness, 1);
+
+    const { conflict, notice } = onlyConflict(harness);
+    expect(conflict.actualHash).toBe(head.originalHash);
+    expect(conflict.originalBackupPath).toBe(root.backupPath);
+    expect(conflict.diffs).toBeUndefined();
+    expect(notice).toMatchObject({
+      recordId: head.id,
+      backupPath: root.backupPath,
+      observation: 'content-changed',
+      backupVerified: true,
+    });
+    expect(notice.detail).not.toContain('original, uninstrumented contents');
+    expect(CONFLICT_SENTENCE.exec(notice.message)?.[2]).toBe(root.backupPath);
+  });
+
+  it('reports the root’s backup — not the head’s — as unverified when the pristine original is gone', async () => {
+    const harness = await createHarness();
+    const { root, head } = await instrumentLedgerChain(harness);
+    await startWatching(harness, [LEDGER_FILE]);
+
+    await rm(root.backupPath);
+    await appendFile(harness.pathOf(LEDGER_FILE), `${DEVELOPER_LINE}\n`);
+    await waitForConflicts(harness, 1);
+
+    const { conflict, notice } = onlyConflict(harness);
+    expect(await readFile(head.backupPath, 'utf8')).toBe(LEDGER_INTERMEDIATE);
+    expect(conflict.originalBackupPath).toBe(root.backupPath);
+    expect(notice).toMatchObject({ backupPath: root.backupPath, backupVerified: false });
+    expect(notice.detail).toContain('The saved original is missing');
+    expect(CONFLICT_SENTENCE.exec(notice.message)?.[2]).toBe(root.backupPath);
+    // No view is rendered from the intermediate bytes in the original's place.
+    expect(conflict.diffs?.originalToInstrumented).toBeUndefined();
+    expect(conflict.diffs?.originalToCurrent).toBeUndefined();
+    expect(conflict.diffs?.instrumentedToCurrent?.split('\n')).toContain(`+${DEVELOPER_LINE}`);
+  });
+
+  it.each(['journal-error', 'journal-throws', 'root-not-open'] as const)(
+    'falls back to the head’s own backup when the chain root cannot be resolved (%s), warning without a path',
+    async (failure) => {
+      const journal = createJournal();
+      const harness = await createHarness({ journal });
+      const { root, head } = await instrumentLedgerChain(harness);
+      await startWatching(harness, [LEDGER_FILE]);
+
+      // Only the chain-root lookup is affected: the watch set is already built.
+      if (failure === 'root-not-open') {
+        journal.setStatus(root.id, 'reverted');
+      } else {
+        journal.listBySession = () =>
+          failure === 'journal-error'
+            ? Promise.resolve(err(new DebuggenError('STORE_ERROR', 'The journal is unavailable.')))
+            : Promise.reject(new Error('the journal exploded'));
+      }
+
+      await appendFile(harness.pathOf(LEDGER_FILE), `${DEVELOPER_LINE}\n`);
+      await waitForConflicts(harness, 1);
+
+      // The conflict is still reported, naming the only backup that is known.
+      const { conflict, notice } = onlyConflict(harness);
+      expect(conflictTransitions(harness).map((call) => call.id)).toEqual([head.id]);
+      expect(conflict.backupPath).toBe(head.backupPath);
+      expect(conflict.originalBackupPath).toBeUndefined();
+      expect(notice.backupPath).toBe(head.backupPath);
+      expect(CONFLICT_SENTENCE.exec(notice.message)?.[2]).toBe(head.backupPath);
+
+      const warnings = harness.logs.filter(
+        (log) => log.level === 'warn' && log.message.includes('chain root'),
+      );
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.fields).toMatchObject({
+        recordId: head.id,
+        previousRecordId: root.id,
+        ...(failure === 'root-not-open' ? {} : { code: 'STORE_ERROR' }),
+      });
+      expectPathFreeLogs(harness, [root, head]);
+    },
+  );
+
+  it('does not look a chain root up for an unchained record', async () => {
+    const harness = await createHarness();
+    await instrumentLedgerAndTally(harness);
+    await startWatching(harness, [LEDGER_FILE, TALLY_FILE]);
+    const listsBefore = harness.journal.reads.listBySession;
+
+    await appendFile(harness.pathOf(LEDGER_FILE), `${DEVELOPER_LINE}\n`);
+    await waitForConflicts(harness, 1);
+
+    expect(harness.journal.reads.listBySession).toBe(listsBefore);
+    expect(harness.logs.filter((log) => log.message.includes('chain root'))).toEqual([]);
   });
 });
 

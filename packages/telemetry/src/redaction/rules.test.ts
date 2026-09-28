@@ -366,6 +366,26 @@ const SPACED_CARD_NUMBER = grouped(CARD_NUMBER, 4, ' ');
 const LABELLED_VALUE = 'k3y-' + cycle(LOWER_LETTERS, 6) + '-2026';
 
 /**
+ * A labelled value written with the special characters people put in
+ * passwords (`@`, `/`, `%`), which once ended the value at its first symbol
+ * and left the whole of it in the text (QA F04).
+ */
+const SPECIAL_LABELLED_VALUE = 'p@ss/w0rd%21';
+
+/**
+ * A labelled value with no digit, identified by the symbol inside it: the
+ * shape the digit-only evidence rule never masked (QA F04).
+ */
+const SYMBOL_LABELLED_VALUE = 'x-y.z_!q';
+
+/**
+ * The special characters a labelled value may carry, each of which must be
+ * read as part of the value; the last two are the rest of the interior-symbol
+ * set `rules.ts` accepts as evidence.
+ */
+const VALUE_SYMBOLS: readonly string[] = ['@', '!', '$', '#', '%', '&', '^', '*'];
+
+/**
  * Every credential-shaped fixture, driven as a set by the property suites
  * (idempotence, non-leakage, detector agreement) so a class added to
  * `rules.ts` is covered by all of them the moment it is listed here.
@@ -391,6 +411,18 @@ const SECRET_FIXTURES: readonly Fixture[] = [
   { label: 'an unspaced card number', value: CARD_NUMBER },
   { label: 'a spaced labelled value', value: 'token ' + LABELLED_VALUE },
   { label: 'an assigned labelled value', value: 'DB_PASSWORD=' + LABELLED_VALUE },
+  {
+    label: 'a labelled value written with special characters',
+    value: 'password=' + SPECIAL_LABELLED_VALUE,
+  },
+  {
+    label: 'a digit-free labelled value with an interior symbol',
+    value: 'token: ' + SYMBOL_LABELLED_VALUE,
+  },
+  {
+    label: 'a labelled value followed by another form-encoded pair',
+    value: 'login password=hunter2&remember=1',
+  },
 ];
 
 // --- Clean fixtures -------------------------------------------------------
@@ -434,6 +466,12 @@ const CLEAN_FIXTURES: readonly Fixture[] = [
   },
   { label: 'credential words in prose', value: 'Invalid token provided; password: Required' },
   { label: 'a token count', value: 'max_tokens: 2048' },
+  { label: 'a validation message ending in a symbol', value: 'password: Required!' },
+  { label: 'a placeholder between percent signs', value: 'password=%PASSWORD%' },
+  {
+    label: 'positional SQL placeholders after labels',
+    value: 'UPDATE t SET token = $1::uuid WHERE id = $2',
+  },
   { label: 'the redaction marker itself', value: REDACTION_MARKER },
   {
     label: 'an already-redacted bearer header value',
@@ -1012,6 +1050,146 @@ describe('scrub', () => {
       );
     });
 
+    it('replaces the whole of each labelled value the QA report found passing (F04)', () => {
+      // Before, the value ended at its first special character: the first
+      // passed unchanged, the next two kept their `!` tail, and the last — no
+      // digit at all — was never masked.
+      const cases: readonly (readonly [string, string, readonly string[]])[] = [
+        ['password=' + SPECIAL_LABELLED_VALUE, 'password=', ['p@ss', 'w0rd', '%21']],
+        ['passwd: hunter2!!!', 'passwd: ', ['hunter2', '!!!']],
+        ['secret: s3cr3tValue!!', 'secret: ', ['s3cr3t', 'Value', '!!']],
+        ['token: ' + SYMBOL_LABELLED_VALUE, 'token: ', ['x-y.z', '!q']],
+      ];
+      for (const [value, label, fragments] of cases) {
+        const scrubbed = scrub(value);
+
+        expect(scrubbed, value).toBe(label + REDACTION_MARKER);
+        for (const fragment of fragments) {
+          expect(scrubbed, value).not.toContain(fragment);
+        }
+        expect(findDeniedRules(value), value).toEqual(['labelled-secret']);
+        expect(containsDenied(value), value).toBe(true);
+        expect(scrub(scrubbed), value).toBe(scrubbed);
+        expect(findDeniedRules(scrubbed), value).toEqual([]);
+      }
+    });
+
+    it('reads every special character as part of the value, with or without a digit', () => {
+      // One value per symbol with a digit in it, and one without, whose only
+      // evidence is the symbol between two letters. Each is tried in every
+      // form the rule reads: assigned, spaced, and JSON plain and escaped.
+      for (const symbol of VALUE_SYMBOLS) {
+        for (const written of ['ab' + symbol + 'cd12', 'ab' + symbol + 'cdef']) {
+          const cases: readonly (readonly [string, string])[] = [
+            ['password=' + written, 'password=' + REDACTION_MARKER],
+            ['token: ' + written, 'token: ' + REDACTION_MARKER],
+            ['token ' + written, 'token ' + REDACTION_MARKER],
+            ['{"password":"' + written + '"}', '{"password":"' + REDACTION_MARKER + '"}'],
+            [
+              '{\\"password\\":\\"' + written + '\\"}',
+              '{\\"password\\":\\"' + REDACTION_MARKER + '\\"}',
+            ],
+          ];
+          for (const [value, expected] of cases) {
+            const scrubbed = scrub(value);
+
+            expect(scrubbed, value).toBe(expected);
+            expect(scrubbed, value).not.toContain(written);
+            expect(scrubbed, value).not.toContain(symbol + 'cd');
+            expect(findDeniedRules(value), value).toEqual(['labelled-secret']);
+            expect(scrub(scrubbed), value).toBe(scrubbed);
+          }
+        }
+      }
+    });
+
+    it('ends a value at whitespace, a quote, a backslash or a delimiter, and keeps what follows', () => {
+      const cases: readonly (readonly [string, string])[] = [
+        ['token: ab1!x next', 'token: ' + REDACTION_MARKER + ' next'],
+        ["password='ab1!x' next", "password='" + REDACTION_MARKER + "' next"],
+        ['token: ab1!x`next', 'token: ' + REDACTION_MARKER + '`next'],
+        ['token: ab1!x,next=2', 'token: ' + REDACTION_MARKER + ',next=2'],
+        ['token: ab1!x;next', 'token: ' + REDACTION_MARKER + ';next'],
+        ['(password=ab1!x)', '(password=' + REDACTION_MARKER + ')'],
+        ['[token: ab1!x]', '[token: ' + REDACTION_MARKER + ']'],
+        ['{token: ab1!x}', '{token: ' + REDACTION_MARKER + '}'],
+        ['<p>token: ab1!x</p>', '<p>token: ' + REDACTION_MARKER + '</p>'],
+        ['| token: ab1!x |', '| token: ' + REDACTION_MARKER + ' |'],
+        ['token: ab1!x\\nnext', 'token: ' + REDACTION_MARKER + '\\nnext'],
+        // A value ends at whitespace, so a quoted value holding a space is
+        // masked only up to it — the residual docs/SECURITY.md §3.4 states.
+        ["password: 'p@ss w0rd'", "password: '" + REDACTION_MARKER + " w0rd'"],
+      ];
+      for (const [value, expected] of cases) {
+        expect(scrub(value), value).toBe(expected);
+        expect(scrub(expected), value).toBe(expected);
+        expect(findDeniedRules(value), value).toEqual(['labelled-secret']);
+      }
+    });
+
+    it('ends a value at an & or # that opens another pair, and reads any other as the value', () => {
+      const cases: readonly (readonly [string, string])[] = [
+        ['password=hunter2&remember=1', 'password=' + REDACTION_MARKER + '&remember=1'],
+        ['login password=hunter2&remember=1', 'login password=' + REDACTION_MARKER + '&remember=1'],
+        ['password=hunter2#section=2', 'password=' + REDACTION_MARKER + '#section=2'],
+        ['/search?q=token:abc1&page=2', '/search?q=token:' + REDACTION_MASK + '&page=2'],
+        ['{"password":"p@ss!1","next":2}', '{"password":"' + REDACTION_MARKER + '","next":2}'],
+        ['token: p@ss&word1', 'token: ' + REDACTION_MARKER],
+        ['token: abc#1x', 'token: ' + REDACTION_MARKER],
+        ['token: ab12&x=', 'token: ' + REDACTION_MARKER + '&x='],
+      ];
+      for (const [value, expected] of cases) {
+        const scrubbed = scrub(value);
+
+        expect(scrubbed, value).toBe(expected);
+        expect(scrub(scrubbed), value).toBe(scrubbed);
+        expect(findDeniedRules(value), value).toEqual(['labelled-secret']);
+      }
+    });
+
+    it('keeps a bare SQL positional placeholder after a label, and masks a written value', () => {
+      // `./sql.ts` scrubs a raw statement before scanning it, and AAP §0.5.2
+      // keeps `$1`-style placeholders, so one after a credential word is
+      // structure. A value that merely starts with `$` is not a placeholder.
+      for (const statement of [
+        'UPDATE t SET token = $1::uuid WHERE id = $2',
+        'SELECT id FROM t WHERE password = $100',
+        'UPDATE t SET api_key = $1, secret = $2::text WHERE id = $3',
+        'SELECT id FROM t WHERE token = $1::text::uuid',
+        'SELECT id FROM t WHERE token = $1::uuid[]',
+      ]) {
+        expect(scrub(statement), statement).toBe(statement);
+        expect(findDeniedRules(statement), statement).toEqual([]);
+      }
+      for (const value of ['password=$12!x9', 'token: $1abc', 'secret=$99999x']) {
+        expect(scrub(value), value).toMatch(/^[a-z]+(?:=|: )\[redacted\]$/);
+        expect(findDeniedRules(value), value).toEqual(['labelled-secret']);
+      }
+    });
+
+    it('leaves prose, placeholders and masks whose symbols sit at the edge of a word', () => {
+      // An interior symbol only counts between two value characters, and the
+      // one after it must be a letter or digit: validation messages end in
+      // their symbols, hashtags and placeholders open with theirs, and a mask
+      // of asterisks has no letter or digit at all.
+      for (const value of [
+        'password: Required!',
+        'password: hunter!!',
+        'token: #hashtag',
+        'api_key=YOUR_API_KEY',
+        'password=%PASSWORD%',
+        'password: ********',
+        'Invalid token provided!',
+        'token: n/a',
+        'password: $PASSWORD$',
+        'secret: $SECRET_VALUE',
+        'token: @mention',
+      ]) {
+        expect(scrub(value), value).toBe(value);
+        expect(findDeniedRules(value), value).toEqual([]);
+      }
+    });
+
     it('leaves prose after a credential word when the word introduces no digit-bearing value', () => {
       for (const value of [
         'Invalid token provided',
@@ -1026,13 +1204,37 @@ describe('scrub', () => {
     });
 
     it('leaves a query or fragment parameter to the URL handler', () => {
-      // `./url.ts` masks these values positionally to `?`.
+      // `./url.ts` masks these values positionally to `?`. A label directly
+      // after `?`, `&` or `#` is a parameter wherever it is written: the
+      // pattern decides it alone, because a context read from text in front of
+      // the label could change once that text is masked.
       for (const value of [
         '/reset?token=' + LABELLED_VALUE,
         '/cb?state=1&access_token=' + LABELLED_VALUE,
         '/cb#access_token=' + LABELLED_VALUE,
+        '/cb?state=1&password=' + SPECIAL_LABELLED_VALUE,
+        '/cb#state=1&token=' + SYMBOL_LABELLED_VALUE,
+        'see /cb?state=1&x=2&token=' + LABELLED_VALUE + ' now',
       ]) {
         expect(scrub(value), value).toBe(value);
+        expect(findDeniedRules(value), value).toEqual([]);
+      }
+    });
+
+    it('stays idempotent when a masked value holds the ? or # a later pair follows', () => {
+      // The value before `&token=` holds a `#` (or a `?`) that the first pass
+      // removes. Were the label after `&` judged by a query opener earlier in
+      // the token, the first pass would call it a URL parameter and the second
+      // — with the opener gone — would mask it, so `scrub` would not be a
+      // fixed point. The boundary is the pattern's alone, so both passes agree
+      // and leave the pair to the URL rules, as docs/SECURITY.md §3.4 states.
+      for (const opener of ['#', '?']) {
+        const value = 'password=abc' + opener + '1&token=x9y9';
+        const scrubbed = scrub(value);
+
+        expect(scrubbed, value).toBe('password=' + REDACTION_MARKER + '&token=x9y9');
+        expect(scrub(scrubbed), value).toBe(scrubbed);
+        expect(findDeniedRules(scrubbed), value).toEqual([]);
       }
     });
 
@@ -2011,6 +2213,24 @@ const CROSSING_CASES: readonly CrossingCase[] = [
     keeps: 'token: ',
     secret: LABELLED_VALUE,
   },
+  {
+    label: 'a labelled value written with special characters',
+    credential: 'password=' + SPECIAL_LABELLED_VALUE,
+    // The cut lands after `p@s`: the head alone is a value too short to mask,
+    // so only reading the value whole across the cut removes it.
+    inHead: 'password='.length + 3,
+    keeps: 'password=',
+    secret: SPECIAL_LABELLED_VALUE,
+  },
+  {
+    label: 'a digit-free labelled value whose interior symbol lies past the cut',
+    credential: 'token: ' + SYMBOL_LABELLED_VALUE + 'rstu',
+    // The cut lands after `x-y`, before the `!q` that is the value's only
+    // evidence, so the head carries none of it.
+    inHead: 'token: '.length + 3,
+    keeps: 'token: ',
+    secret: SYMBOL_LABELLED_VALUE + 'rstu',
+  },
 ];
 
 describe('properties', () => {
@@ -2243,6 +2463,22 @@ describe('properties', () => {
     const crowdedHeaderLine = 'x Cookie:a '.repeat(1_400) + '\n' + 'y'.repeat(20_000);
     // A header name whose separator is out of reach of every bounded run.
     const farSeparator = 'Cookie' + ' '.repeat(MAX_SCAN_LENGTH + 4_000) + ':' + SHORT_CREDENTIAL;
+    // Labels whose values are runs of `&`/`#` and edge symbols with no
+    // evidence in them, so every label reads its whole evidence window and
+    // fails, within one scan-bound value.
+    const labelledSymbolRuns = ('token:' + '&#'.repeat(24) + '!@$%^*'.repeat(8) + ' ').repeat(
+      Math.ceil(MAX_SCAN_LENGTH / 103),
+    );
+    // Values made of `&` and 63-character names that never reach an `=`, so
+    // every `&` runs its pair lookahead to the next one.
+    const labelledPairNames = ('token:' + ('&' + 'a'.repeat(63)).repeat(4) + ' ').repeat(
+      Math.ceil(MAX_SCAN_LENGTH / 263),
+    );
+    // Labels after `&` inside URL queries, each a parameter the rule's
+    // boundary declines, with a digit-bearing value the evidence window
+    // reads: detection walks the whole 200 KB value label by label.
+    const queryBlock = '?' + '&token=ab12'.repeat(90);
+    const declinedQueryLabels = queryBlock.repeat(Math.ceil(200_000 / queryBlock.length));
     const hostile: readonly Fixture[] = [
       { label: '200 KB of dense punctuated text', value: noise },
       { label: 'a truncated key header before a long single-character run', value: openedPem },
@@ -2250,6 +2486,9 @@ describe('properties', () => {
       { label: 'a bearer scheme before 10 000 credential characters', value: longBearer },
       { label: '1 400 header lines crowded onto one line', value: crowdedHeaderLine },
       { label: 'a header name separated from its colon by 20 000 spaces', value: farSeparator },
+      { label: 'labels before runs of pair openers and symbols', value: labelledSymbolRuns },
+      { label: 'labels before runs of unterminated pair names', value: labelledPairNames },
+      { label: '200 KB of query parameters named like labels', value: declinedQueryLabels },
     ];
 
     for (const { label, value } of hostile) {

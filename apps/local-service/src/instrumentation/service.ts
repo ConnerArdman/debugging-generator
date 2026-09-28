@@ -94,17 +94,22 @@
  *   disarmed there — its credential predates the service, or predates the
  *   project's last arming — is sent the capture-less configuration when it
  *   connects.
- * - **Reports degradation honestly** (AAP §0.5.5): every unavailable signal is
- *   one sentence — "Could not enable ‹signal›: ‹reason›. Continuing with:
- *   ‹enabled list›.", composed by `../sessions/progress.ts`'s
- *   `unavailableSignalMessage` — shown as exactly one terminal ✗ (`failed`)
- *   progress row of the `instrument` stage: the checklist's row at install
- *   time, and a row of the same shape for a server signal the capture lost
+ * - **Reports degradation honestly** (AAP §0.5.5): every label that could not
+ *   be enabled is one sentence — "Could not enable ‹signal›: ‹reason›.
+ *   Continuing with: ‹enabled list›.", composed by `../sessions/progress.ts`'s
+ *   `unavailableSignalMessage` over its `mergeUnavailableByLabel` (so neither
+ *   signals sharing a label nor an adapter and the readiness gate reporting
+ *   one signal give a label two contradictory rows) — shown as exactly one
+ *   terminal ✗ (`failed`) progress row of the `instrument` stage: the
+ *   checklist's row at install time, and a row of the same shape for a server
+ *   signal the capture lost
  *   because the preload could not be reached. No `running` row precedes it, so
  *   no client merging rows by stage and message is left with a spinner. A
  *   degradation is never a session failure — no `stageFailed`, no
  *   `instrumentation.failed`. The only failure is the installer's own `Err`,
- *   which is what "nothing at all could be enabled" means.
+ *   which is what "nothing at all could be enabled" means — unless the
+ *   install was cancelled through its signal: that `Err` is reported as a
+ *   cancellation, never as a failure.
  *   When that failure includes a preload gap and the detection found the
  *   preload missing, the failure's hint is the exact relaunch command
  *   whichever signal the installer named, and each preload gap ("Could not
@@ -263,7 +268,9 @@ import {
   CAPTURE_SIGNAL_LABELS,
   INSTRUMENTATION_ROW_ORDER,
   authorProductText,
+  buildStageCancelledRow,
   isProductAuthoredText,
+  mergeUnavailableByLabel,
   publicFailureCopy,
   unavailableSignalMessage,
   type InstalledSignals,
@@ -476,7 +483,12 @@ export interface InstrumentationServiceDeps {
   readonly serverAgentChannel: ServerAgentConfigChannel;
   /** The live conflict detector the install brackets. */
   readonly watcher: InstrumentationWatcher;
-  /** The relayed `agent.ready` reports, per tab. */
+  /**
+   * The relayed `agent.ready` reports, kept per DevTools credential and tab
+   * and read for a session's bound tab (`BoundTabRef` in `./readiness.ts`):
+   * another paired browser's tab of the same id never answers for this
+   * session.
+   */
   readonly agents: BrowserAgentRegistry;
   /** Whether the dev-server preload of a project is connected, and when it last spoke. */
   readonly serverAgents: ServerAgentReadinessSource;
@@ -579,16 +591,22 @@ export interface InstallRequest {
   readonly announcePlan?: boolean | undefined;
   /**
    * Whether a failed install emits the instrument stage's `failed` progress
-   * row. Default `true`. A caller that moves the session to `failed` through the
-   * manager — which emits the same row as part of that transition — passes
-   * `false`, so the row is not shown twice.
+   * row — and a cancelled one its cancellation row. Default `true`. A caller
+   * that files the outcome on the session itself — moving it to `failed`
+   * through the manager, which emits the same row as part of that transition,
+   * or reporting the cancellation as the pipeline does — passes `false`, so the
+   * row is not shown twice.
    */
   readonly reportStageFailure?: boolean | undefined;
   /** Whether the readiness gate may ask for a page reload. Default `true`. */
   readonly allowReloadPrompt?: boolean | undefined;
   /** Whether a missing preload blocks readiness when server signals are planned. Default `false`. */
   readonly requireServerAgent?: boolean | undefined;
-  /** Cancels the install; the installer unwinds what the call applied. */
+  /**
+   * Cancels the install; the installer unwinds what the call applied. A
+   * cancelled install is reported as cancelled, never as failed: no
+   * `instrumentation.failed` is sent (see {@link InstrumentationService.install}).
+   */
   readonly signal?: AbortSignal | undefined;
   /**
    * Re-proves that the session's project root still resolves to the canonical
@@ -675,8 +693,10 @@ export interface InstrumentationOutcome {
   /** The readiness gate's verdict for the installed plan version. */
   readonly readiness: ReadinessVerdict;
   /**
-   * The degradation sentences, one per unavailable signal: byte for byte the
-   * messages of the checklist's ✗ rows for {@link unavailable}.
+   * The degradation sentences, one per label that could not be enabled: byte
+   * for byte the messages of the checklist's ✗ rows, which fold
+   * {@link unavailable} and the readiness report's unavailable signals into
+   * one row per label (`mergeUnavailableByLabel` in `../sessions/progress.ts`).
    */
   readonly degradations: readonly string[];
 }
@@ -848,11 +868,19 @@ export interface InstrumentationService {
    * before the install first acts on it and immediately before the installer,
    * and the install runs inside the confirmed canonical root.
    *
+   * An install whose {@link InstallRequest.signal} was aborted — the
+   * installer's error then carries `details.reason: "aborted"` — is a
+   * cancellation, not a failure: it sends no `instrumentation.failed`, keeps
+   * no failure report for a panel that binds later and emits no preload-gap ✗
+   * row; with {@link InstallRequest.reportStageFailure} left on, the stage is
+   * closed by its cancellation row instead of a `failed` one.
+   *
    * @returns The outcome, or `Err` when the installer reported that nothing
    * could be enabled, when a delta failed part-way (the error's
-   * `details.activePlanVersion` is the previous version), when another install
-   * for the session is still running, when the root's confirmation refused or
-   * could not stand, or when a collaborator threw.
+   * `details.activePlanVersion` is the previous version), when the install was
+   * cancelled, when another install for the session is still running, when
+   * the root's confirmation refused or could not stand, or when a collaborator
+   * threw.
    */
   install(request: InstallRequest): Promise<Result<InstrumentationOutcome, DebuggenError>>;
 
@@ -1841,6 +1869,28 @@ function loggableReasonOf(error: DebuggenError): string | undefined {
 }
 
 /**
+ * The `details.reason` the installer (`packages/instrumentation/src/installer.ts`)
+ * gives the error of an install whose context's signal was aborted — before
+ * the first adapter was asked, or between two asks — after it unwound what the
+ * call applied.
+ */
+const INSTALL_ABORTED_REASON = 'aborted';
+
+/**
+ * Whether an install error reports a cancelled install rather than a failed
+ * one, by the installer's own classification ({@link INSTALL_ABORTED_REASON}).
+ * The service's re-issues of an installer error ({@link withServiceRelaunchHint},
+ * {@link withHeldTargetHint}, {@link withPlanVersions}) keep its details, so
+ * the classification survives them.
+ *
+ * @param error An install error, as `prepareInstall` answered it.
+ * @returns `true` when the install was cancelled.
+ */
+function isCancelledInstall(error: DebuggenError): boolean {
+  return error.details?.['reason'] === INSTALL_ABORTED_REASON;
+}
+
+/**
  * Re-issues an install error with the plan versions it concerns in its details,
  * keeping its code, message, hint and the original as its cause, so a caller —
  * and a suite — can read which version the session was left at.
@@ -2261,8 +2311,8 @@ function findHeldTarget(error: DebuggenError): HeldTargetFacts | undefined {
 /**
  * Re-issues an installer error with a hint this service words itself when the
  * install failed because a target is held by another session on the same
- * project, so the developer is told which session to end (AAP §0.5.5: if
- * nothing could be enabled, `instrumentation.failed` carries the hint).
+ * project, so the developer is told how to release it (AAP §0.5.5: if nothing
+ * could be enabled, `instrumentation.failed` carries the hint).
  *
  * The installer's own hint for that case is the patch layer's sentence, which
  * {@link toFailedError} must not show — it is not proven product text, and a
@@ -2271,10 +2321,27 @@ function findHeldTarget(error: DebuggenError): HeldTargetFacts | undefined {
  * in the debug log. The hint is instead composed here from two validated
  * identifiers (see {@link findHeldTarget}) and registered with
  * `authorProductText` at the point of composition, which is what lets
- * `instrumentation.failed` and the instrument stage's failed row show it:
+ * `instrumentation.failed` and the instrument stage's failed row show it.
  *
- * > ‹file› is already instrumented by session ‹id›. End that session — its
- * > cleanup restores the file — then ask again.
+ * Which recovery it names depends on whether the holder is still a live
+ * session of this service — one it installed and has not stopped, or one
+ * whose install is running (`isLive`):
+ *
+ * - **Live** — ending it runs its cleanup, which restores the file:
+ *
+ *   > ‹file› is already instrumented by session ‹id›. End that session — its
+ *   > cleanup restores the file — then ask again.
+ *
+ * - **Not live** — the holder already ended (its cleanup ran and left this
+ *   record claiming the bytes; ending it again answers from its stored
+ *   verdict), or it belongs to a process that is gone. Ending it cannot
+ *   release the file, so the step is the one that can: a restart, whose
+ *   start-up reconciliation judges every open record whatever its session's
+ *   state (AAP §0.5.1):
+ *
+ *   > ‹file› is still instrumented by session ‹id›, which is no longer
+ *   > running. Restart the Debug Generator service — its start-up
+ *   > reconciliation restores or closes the file's records — then ask again.
  *
  * The code, message and details are kept, and the original error is the
  * cause, so the local diagnostic still holds what the installer said. The
@@ -2286,15 +2353,22 @@ function findHeldTarget(error: DebuggenError): HeldTargetFacts | undefined {
  * when no held target with safely quotable facts is found.
  *
  * @param error The installer's error, after {@link withServiceRelaunchHint}.
+ * @param isLive Whether this service still runs the session with that id.
  * @returns The error to report.
  *
  * @example
  * ```ts
- * const reported = withHeldTargetHint(withServiceRelaunchHint(installed.error, devServer).error);
+ * const reported = withHeldTargetHint(
+ *   withServiceRelaunchHint(installed.error, devServer).error,
+ *   (id) => sessions.has(id) || inFlight.has(id),
+ * );
  * // reported.hint === 'src/server/report.ts is already instrumented by session ses_abc. End that session — its cleanup restores the file — then ask again.'
  * ```
  */
-function withHeldTargetHint(error: DebuggenError): DebuggenError {
+function withHeldTargetHint(
+  error: DebuggenError,
+  isLive: (sessionId: string) => boolean,
+): DebuggenError {
   if (isProductAuthoredText(error.hint)) {
     return error;
   }
@@ -2307,7 +2381,9 @@ function withHeldTargetHint(error: DebuggenError): DebuggenError {
 
   return new DebuggenError(error.code, error.message, {
     hint: authorProductText(
-      `${held.file} is already instrumented by session ${held.owningSessionId}. End that session — its cleanup restores the file — then ask again.`,
+      isLive(held.owningSessionId)
+        ? `${held.file} is already instrumented by session ${held.owningSessionId}. End that session — its cleanup restores the file — then ask again.`
+        : `${held.file} is still instrumented by session ${held.owningSessionId}, which is no longer running. Restart the Debug Generator service — its start-up reconciliation restores or closes the file's records — then ask again.`,
     ),
     ...(error.details === undefined ? {} : { details: error.details }),
     cause: error,
@@ -3929,9 +4005,17 @@ export function createInstrumentationService(
     if (isErr(installed)) {
       // The relaunch command first, then — when that did not apply — the
       // session holding a target this plan needed; each keeps a proven hint.
+      // A holder is live while this service still tracks it — installed, or
+      // with its install running (its pending records hold the target) —
+      // and `stopSession` forgets a session once its cleanup has run.
       const reported = withServiceRelaunchHint(installed.error, evidence.value.devServer);
       failedPreloadGaps.push(...reported.preloadGaps);
-      return err(withHeldTargetHint(reported.error));
+      return err(
+        withHeldTargetHint(
+          reported.error,
+          (holder) => sessions.has(holder) || inFlight.has(holder),
+        ),
+      );
     }
 
     return ok({
@@ -4471,6 +4555,7 @@ export function createInstrumentationService(
       const next = await waitForNextAgentReady(
         deps.agents,
         {
+          sessionId,
           tabId: tab.tabId,
           afterDocumentId,
           timeoutMs: MAX_RELOAD_WAIT_MS,
@@ -4896,12 +4981,14 @@ export function createInstrumentationService(
    *    configuration, signal set or runtime hooks, whose label rule would
    *    re-add a ✓ for a signal readiness withdrew (a `Database tracing`
    *    runtime hook with no connected preload). The checklist is the one
-   *    report of each unavailable signal: its terminal ✗ row, worded
-   *    "Could not enable ‹signal›: ‹reason›. Continuing with: ‹confirmed
-   *    labels›." with the hint as detail. No other row is emitted for it.
+   *    report of each label that could not be enabled: its terminal ✗ row,
+   *    worded "Could not enable ‹signal›: ‹reason›. Continuing with:
+   *    ‹confirmed labels›." with the hint as detail — one per label, the
+   *    gate's verdict superseding an adapter's own words for the same signal
+   *    (`mergeUnavailableByLabel`). No other row is emitted for it.
    * 5. Returns as `degradations` the same sentences
-   *    ({@link buildDegradationNotice} over the confirmed labels), byte for
-   *    byte the messages of those ✗ rows.
+   *    ({@link buildDegradationNotice} over the same per-label merge and the
+   *    confirmed labels), byte for byte the messages of those ✗ rows.
    * 6. Emits "Ready to capture" once, last, and only for a satisfied verdict.
    *
    * When readiness cannot be evaluated — a collaborator threw, or it answered
@@ -5126,21 +5213,29 @@ export function createInstrumentationService(
     const awaitingPage = new Set<CaptureSignal>(verdict.value.awaitingPageSignals ?? []);
     const rowGaps = rowGapsOf(ready.unavailable, report.shares, awaitingPage);
     const enabledLabels = labelsOfSignals(confirmed);
+    const readiness = buildConfirmedReadiness(
+      verdict.value,
+      confirmed,
+      rowGaps,
+      clock,
+      awaitingPage,
+    );
     // The checklist below derives its ✓ labels — and so every ✗ row's
     // "Continuing with:" list — from `confirmed` alone (none of them is
     // withdrawn: `confirmedSignals` removed the installer's gaps, and the
     // aggregate readiness marks every confirmed signal available or degraded),
-    // so these sentences are byte for byte the messages of its ✗ rows for the
-    // gaps it shows.
-    const degradations = buildDegradationNotice(rowGaps, enabledLabels);
+    // and its ✗ rows from the same per-label merge of the gaps and the
+    // readiness report, so these sentences are byte for byte the messages of
+    // its ✗ rows: one per label, the gate's verdict superseding an adapter's
+    // own words for the same signal.
+    const degradations = buildDegradationNotice(
+      mergeUnavailableByLabel({ unavailable: rowGaps, readiness }),
+      enabledLabels,
+    );
     const waiting = waitingRowsOf(verdict.value, awaitingPage, new Set<string>(enabledLabels));
 
     emitChecklistRows(failures, log, sessionId, waiting, 'running');
-    reportChecklist({
-      signals: confirmed,
-      unavailable: rowGaps,
-      readiness: buildConfirmedReadiness(verdict.value, confirmed, rowGaps, clock, awaitingPage),
-    });
+    reportChecklist({ signals: confirmed, unavailable: rowGaps, readiness });
 
     report = { ...report, awaitingPage: [...awaitingPage], confirmed, waiting };
     writeState();
@@ -5217,6 +5312,10 @@ export function createInstrumentationService(
    * a `warn` record, written at the default levels, where the serializer emits
    * the closed error shape; and its `debug` twin with the same reference and
    * error, where the serializer adds the redacted message, hint and stack.
+   *
+   * A cancelled install ({@link isCancelledInstall}) takes
+   * {@link cancelInstall} instead: it did not fail, so none of the above is
+   * sent.
    */
   function failInstall(
     failures: CollaboratorFailure[],
@@ -5230,6 +5329,14 @@ export function createInstrumentationService(
     const { sessionId, plan } = checked;
     const planVersion = plan.planVersion;
     const activePlanVersion = request.previousPlanVersion ?? prior?.activePlanVersion;
+
+    if (isCancelledInstall(error)) {
+      return cancelInstall(failures, log, request, sessionId, error, {
+        planVersion,
+        activePlanVersion,
+      });
+    }
+
     const ref = newMessageId();
     const failed = toFailedError(error, ref);
     const payload = parseInstrumentationFailedPayload({ sessionId, error: failed });
@@ -5291,6 +5398,57 @@ export function createInstrumentationService(
     });
 
     return err(withPlanVersions(error, { planVersion, activePlanVersion }));
+  }
+
+  /**
+   * The cancellation branch of {@link failInstall}: an install whose signal
+   * was aborted — for the pipeline, the session is being ended — did not
+   * fail, and is not reported as failing (AAP §0.5.5 reserves
+   * `instrumentation.failed` for an install that could enable nothing).
+   *
+   * - No `instrumentation.failed` is sent and no failure report is kept for a
+   *   panel that binds later. The installer unwound what the call applied, so
+   *   the service's record of the session stays as the previous install left
+   *   it — including a report of an earlier failure, which still describes the
+   *   latest install that ran to an outcome.
+   * - No preload-gap ✗ row is emitted: a gap is a signal the capture proceeds
+   *   without, and no capture proceeds from a cancelled install.
+   * - With {@link InstallRequest.reportStageFailure} left on, the instrument
+   *   stage is closed by its cancellation row
+   *   (`buildStageCancelledRow(INSTRUMENT_STAGE, 'cancelled')`) instead of a
+   *   `failed` row. The pipeline passes `false` and reports the cancellation
+   *   itself, naming the session's end as its cause.
+   *
+   * Logged at `info` by code and plan versions only. The error — with its plan
+   * versions, as {@link withPlanVersions} adds them — is returned, so the
+   * caller still sees the cancellation (`details.reason: "aborted"`).
+   */
+  function cancelInstall(
+    failures: CollaboratorFailure[],
+    log: Logger,
+    request: InstallRequest,
+    sessionId: string,
+    error: DebuggenError,
+    versions: { readonly planVersion: number; readonly activePlanVersion: number | undefined },
+  ): Result<never, DebuggenError> {
+    if (request.reportStageFailure !== false) {
+      noteProgress(
+        log,
+        'stageCancelled',
+        attempt(failures, log, 'progress', 'stageCancelled', () =>
+          deps.progress.emit(sessionId, buildStageCancelledRow(INSTRUMENT_STAGE, 'cancelled')),
+        ),
+      );
+    }
+
+    log.info('The instrumentation install was cancelled', {
+      code: error.code,
+      planVersion: versions.planVersion,
+      activePlanVersion: versions.activePlanVersion,
+      collaboratorFailures: failures.length,
+    });
+
+    return err(withPlanVersions(error, versions));
   }
 
   /** One install, from the stage header to the outcome. */

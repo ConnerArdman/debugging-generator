@@ -28,9 +28,9 @@
  *   `eslint --max-warnings 0` and `prettier --check .` programs.
  * - **No committed secret.** Every credential is minted at run time through the
  *   harness's real auth service; no token-shaped literal appears below.
- * - **Closed dependency set.** `vitest`, the `@debuggen/*` packages the service
- *   itself may import (never `panel-renderer`), the service's own modules and
- *   the harness. No `zod`, no DOM types.
+ * - **Closed dependency set.** `vitest`, Node's own modules, the `@debuggen/*`
+ *   packages the service itself may import (never `panel-renderer`), the
+ *   service's own modules and the harness. No `zod`, no DOM types.
  *
  * ## Two sessions, one patch target
  *
@@ -53,7 +53,10 @@
  * the developer is told why — `instrumentation.failed` and the failed progress
  * row carry the service's own hint naming the holding session and the held
  * file — and that a new tab bound by origin goes to a live session, never to
- * the failed one.
+ * the failed one. The same plan against a holder that has already **ended** —
+ * its patch left on disk and its journal still claiming it, as a cleanup that
+ * could not finish leaves them — names a restart instead: ending that session
+ * again cannot restore the file, and the start-up reconciliation can.
  *
  * ## The narrative
  *
@@ -68,7 +71,9 @@
  * fails on the first copy while A still holds its patch; sessions D and E are
  * opened on the first copy once A has ended — D
  * patches, E's patch target is held by D — for the races, and are then
- * reused, both back in `ready`, for the store-failure checks.
+ * reused, both back in `ready`, for the store-failure checks. Last, a session
+ * on a third copy ends, and the next plan of its targets there meets the claim
+ * it left behind.
  *
  * ## Injected store failures
  *
@@ -84,10 +89,13 @@
  * @module
  */
 
+import { readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { DISABLED_SERVER_AGENT_SIGNALS } from '@debuggen/instrumentation';
-import type { InstrumentationPlanInput } from '@debuggen/instrumentation';
+import { DISABLED_SERVER_AGENT_SIGNALS, createModificationRecord } from '@debuggen/instrumentation';
+import type { InstrumentationPlanInput, ModificationRecord } from '@debuggen/instrumentation';
 import { parseInstrumentationPlanInput } from '@debuggen/instrumentation/schema';
 import { createDeterministicProvider } from '@debuggen/model-provider';
 import type { ModelProvider, PromptStage } from '@debuggen/model-provider';
@@ -101,6 +109,7 @@ import {
 import type { ServerAgentConfigPayload, SessionRecord } from '@debuggen/protocol';
 import { isErr, newEventId, newId, newProducerId, newTraceId, ok } from '@debuggen/shared';
 import type { DebuggenError, Result } from '@debuggen/shared';
+import { sha256Hex } from '@debuggen/shared/node';
 import type { TelemetryEventIngress } from '@debuggen/telemetry';
 
 import { sessionOnAnotherProjectThan } from '../../src/instrumentation/service.js';
@@ -180,6 +189,17 @@ const NOTHING_ENABLED_CODE = 'INSTRUMENTATION_UNAVAILABLE' as const;
  */
 function heldTargetHint(file: string, owningSessionId: string): string {
   return `${file} is already instrumented by session ${owningSessionId}. End that session — its cleanup restores the file — then ask again.`;
+}
+
+/**
+ * The hint the service words instead when the session holding the target is
+ * no longer one it runs — it has ended, so ending it again cannot restore the
+ * file, and the recovery is the start-up reconciliation a restart runs.
+ * Restated from `withHeldTargetHint` for the same reason as
+ * {@link heldTargetHint}.
+ */
+function endedHolderHint(file: string, owningSessionId: string): string {
+  return `${file} is still instrumented by session ${owningSessionId}, which is no longer running. Restart the Debug Generator service — its start-up reconciliation restores or closes the file's records — then ask again.`;
 }
 
 /** Every telemetry row one trace left in the store, in ingest order. */
@@ -1498,5 +1518,126 @@ describe('one capture per project root, across the real service boundary', () =>
     expect(activeCaptureId(orphaned.id)).toBeUndefined();
     expect(ownerOf(primary.root)).toBeUndefined();
     expect(openCaptures(primary.root)).toBe(0);
+  });
+
+  it('names a restart rather than an end when the session holding the target has already ended', async () => {
+    // A third copy, so nothing of the sessions above stands on it.
+    const copy = await harness.copyFixtureProject();
+    const tertiary = await prepareProject(copy.root);
+    const editor = await harness.editor(tertiary.root);
+    const holder = await openSession(tertiary, 'deterministic');
+
+    const journaled = await harness.repos.modifications.listBySession(holder.id);
+    if (isErr(journaled)) {
+      throw new Error(`The records of ${holder.id} could not be listed (${journaled.error.code}).`);
+    }
+    const file = journaled.value[0]?.file;
+    if (file === undefined) {
+      throw new Error(`Session ${holder.id} journaled no modification.`);
+    }
+    const ofFile = journaled.value.filter((record) => record.file === file);
+    const root = ofFile.find((record) => record.previousRecordId === undefined);
+    const head = ofFile.find(
+      (record) => !ofFile.some((other) => other.previousRecordId === record.id),
+    );
+    if (root === undefined || head === undefined) {
+      throw new Error(`The records of ${file} do not form a chain.`);
+    }
+    const path = join(tertiary.root, file);
+    const instrumented = await readFile(path);
+    expect(sha256Hex(instrumented)).toBe(head.instrumentedHash);
+
+    // The holder ends: its cleanup restores the file, and this service stops running it.
+    const ended = await harness.endSession(holder.id);
+    if (isErr(ended)) {
+      throw new Error(`session.end was refused (${ended.error.code}): ${ended.error.message}`);
+    }
+    expect(ended.value.cleanup).toBe('clean');
+    expect(storedSession(holder.id).status).toBe('ended');
+    const pristine = await readFile(path);
+    expect(sha256Hex(pristine)).toBe(root.originalHash);
+
+    // What a cleanup that could not finish leaves behind: the ended session's patch still on disk,
+    // and its journal still claiming those bytes — appended through the product's own journal,
+    // whose checks admit it once every earlier record of the file is reverted.
+    await writeFile(path, instrumented);
+    const built = createModificationRecord({
+      sessionId: holder.id,
+      planVersion: head.planVersion,
+      file,
+      originalHash: root.originalHash,
+      backupPath: root.backupPath,
+      instrumentedHash: head.instrumentedHash,
+      diff: head.diff,
+      status: 'applied',
+    });
+    if (isErr(built)) {
+      throw new Error(`The stale claim could not be built (${built.error.code}).`);
+    }
+    const stale: ModificationRecord = built.value;
+    const appended = await harness.repos.modifications.append(stale);
+    if (isErr(appended)) {
+      throw new Error(`The stale claim was refused (${appended.error.code}).`);
+    }
+
+    try {
+      // A plan of nothing but the ended session's own targets in that file.
+      const heldTargets = (
+        storedSession(holder.id).plans.at(-1)?.instrumentationTargets ?? []
+      ).filter((action) => action.mode === 'patch' && action.file === file);
+      expect(heldTargets.length).toBeGreaterThan(0);
+      planQueue.enqueue({
+        objective: 'Time the functions an ended session left instrumented',
+        capture: ['function timing'],
+        instrumentationTargets: heldTargets.map(({ symbol, type }) => ({ file, symbol, type })),
+      });
+
+      const created = await harness.createSession({
+        projectRoot: tertiary.root,
+        question: QUESTION,
+      });
+      const reached = await harness.waitForSession(
+        created.id,
+        (record) => record.status === 'failed' || record.status === 'ready',
+      );
+      expect(reached.status).toBe('failed');
+      expect(planQueue.pending()).toBe(0);
+      expect(reached.modifications).toEqual([]);
+
+      // Ending the holder again cannot restore the file — it answers from its stored verdict — so
+      // both surfaces name the step that can: a restart, whose start-up reconciliation judges
+      // every open record whatever its session's state.
+      const failedFrame = await waitFor(
+        editor,
+        'instrumentation.failed',
+        (message) => message.payload.sessionId === created.id,
+      );
+      expect(failedFrame.payload.error.code).toBe(NOTHING_ENABLED_CODE);
+      const expectedHint = endedHolderHint(file, holder.id);
+      expect(failedFrame.payload.error.hint).toBe(expectedHint);
+      expect(failedFrame.payload.error.hint).not.toBe(heldTargetHint(file, holder.id));
+      expect(failedFrame.payload.error.message).not.toContain(file);
+      const progress = harness.repos.sessions.listProgress(created.id);
+      if (isErr(progress)) {
+        throw new Error(
+          `The progress of ${created.id} could not be read (${progress.error.code}).`,
+        );
+      }
+      const failedRows = progress.value.filter((row) => row.status === 'failed');
+      expect(failedRows).toHaveLength(1);
+      const failedDetail = String(failedRows[0]?.detail);
+      expect(
+        failedDetail.startsWith(`${expectedHint} (error code: ${NOTHING_ENABLED_CODE}, ref: msg_`),
+        failedDetail,
+      ).toBe(true);
+
+      // Nothing was written over the ended session's bytes.
+      expect(sha256Hex(await readFile(path))).toBe(head.instrumentedHash);
+    } finally {
+      // The developer's way back, done by hand here: the original on disk and the claim closed.
+      await writeFile(path, pristine);
+      const closed = await harness.repos.modifications.updateStatus(stale.id, 'reverted');
+      expect(isErr(closed) ? closed.error.code : 'ok').toBe('ok');
+    }
   });
 });

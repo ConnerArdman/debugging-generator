@@ -55,6 +55,14 @@
  * application and nothing is mutated in place, so a reopened session replays
  * exactly what the developer saw (AAP §0.4.2, Follow-up row).
  *
+ * Whenever a follow-up governs the analysis — that regeneration, or a capture
+ * taken under the plan version a new-capture follow-up installed — its
+ * structured focus (`followUpFocusFor` of `./followup.js`: category hints and
+ * graph-resolved declarations, never question text) is handed to the
+ * summarizer, and the context builder places it at the top level of the
+ * request. An analysis no follow-up governs carries none, so its input is
+ * exactly what it was.
+ *
  * ## Boundaries
  *
  * - No hardcoded behaviour (AAP §0.5.4): the developer's question is passed
@@ -105,6 +113,7 @@ import type { SessionProgress } from '../../sessions/progress.js';
 import type { SessionFailure } from '../../sessions/state-machine.js';
 import type { PanelsRepo } from '../../store/panels-repo.js';
 import type { ContextBuilder, PipelineStageContext, StagePlaceholder } from '../context-builder.js';
+import { followUpFocusFor } from './followup.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Vocabulary
@@ -782,12 +791,18 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
   const buildInput = async (
     context: PipelineStageContext,
     captureId: string,
+    log: Logger,
   ): Promise<Result<BuiltAnalysisInput, DebuggenError>> => {
+    // The follow-up this analysis answers, when one governs it — the one the context names, or
+    // the one whose plan version the capture ran under — as structured data, so the analysis is
+    // drawn for the follow-up rather than for the session's first question. None otherwise.
+    const followUpFocus = followUpFocusFor(context, log);
     const built = await deps.summarizer.buildStageInput({
       sessionId: context.sessionId,
       captureId,
       question: context.question,
       followUpQuestion: context.followUpQuestion,
+      ...(followUpFocus === undefined ? {} : { followUpFocus }),
       codeQueries: context.code.queries,
       options: {
         signal: context.signal,
@@ -834,7 +849,7 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
     //    under — so the metrics stored below, the fact candidates and the panel's own aggregates
     //    share one event set. A stored summary covering fewer events (partial coverage) is not
     //    cited: the summarizer replaces it with the summary of the aggregated events.
-    const built = await buildInput(context, input.captureId);
+    const built = await buildInput(context, input.captureId, log);
     if (!built.ok) {
       return fail(context, log, built.error, startedAt);
     }

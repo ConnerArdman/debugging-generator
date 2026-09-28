@@ -1,7 +1,7 @@
 /**
  * Unit suite for `./installer.ts` — the ordered installation driver.
  *
- * Ten of its promises cannot be read off the type system, and each one is a
+ * Eleven of its promises cannot be read off the type system, and each one is a
  * product guarantee rather than an implementation detail:
  *
  * 1. **Runtime hooks are armed before the first byte is written.** A capture
@@ -61,6 +61,12 @@
  *    route-handler spans stay armed as preload residue; and when nothing else
  *    could be enabled the failure carries the holder as structured
  *    `heldTargets`, bounded like every other detail list.
+ * 11. **An unwound first install leaves no backup directory behind.** Once the
+ *    rollback has returned every record of the session to `reverted`, the
+ *    session's `backups/<sessionId>/` is gone; an unwound delta keeps it with
+ *    the earlier plan version's original inside; a store that will not remove
+ *    it, or throws, changes nothing about the returned error and is logged by
+ *    code; and a store scoped to another session is never asked.
  *
  * Three habits here are deliberate.
  *
@@ -133,6 +139,7 @@ import type {
 import { installPlan } from './installer.js';
 import type { AggregateInstallResult, InstallPlanOptions } from './installer.js';
 import { createBackupStore } from './patch/backup-store.js';
+import type { BackupStore } from './patch/backup-store.js';
 import { PATCH_TARGET_HELD_REASON, createPatcher, describeTargetYield } from './patch/patcher.js';
 import type { Patcher, PatchStageObserver } from './patch/patcher.js';
 import type {
@@ -2302,6 +2309,370 @@ describe('a patch failing part-way', () => {
     // the record is not claimed to be reverted.
     expect(readFileSync(pathIn(workspace, TARGETS.cones.file), 'utf8')).toBe(developerEdit);
     expect(journal.rows().map((row) => row.status)).not.toContain('reverted');
+  }, 30_000);
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The session's backup directory after a rollback
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The failure every case of this group's failing adapter rejects with. */
+const UNWIND_FAILURE = new DebuggenError('PATCH_UNSUPPORTED', 'The declaration cannot be wrapped.');
+
+/** The warning a directory the rollback could not remove is logged under. */
+const DIRECTORY_NOT_REMOVED = 'the session backup directory was not removed after the rollback';
+
+/**
+ * A backup store that behaves exactly like `store` except for
+ * `removeSessionDirectory`, which does what the case supplies — how a store
+ * that retains an entry, or a filesystem that refuses the removal, looks to
+ * the installer. Every other member delegates as a method call, so the patcher
+ * writes, and the rollback restores, through the real store.
+ *
+ * @param store The real store.
+ * @param removeSessionDirectory What the directory removal does instead.
+ * @returns The store.
+ */
+function storeRemovingWith(
+  store: BackupStore,
+  removeSessionDirectory: () => Promise<Result<number>>,
+): BackupStore {
+  return {
+    sessionId: store.sessionId,
+    sessionDirectory: store.sessionDirectory,
+    locate: (digest) => store.locate(digest),
+    locateRecorded: (recordedPath, digest) => store.locateRecorded(recordedPath, digest),
+    put: (digest, content) => store.put(digest, content),
+    read: (digest) => store.read(digest),
+    readRecorded: (recordedPath, digest) => store.readRecorded(recordedPath, digest),
+    has: (digest) => store.has(digest),
+    verify: (digest) => store.verify(digest),
+    remove: (digest, options) => store.remove(digest, options),
+    removeRecorded: (recordedPath, digest, options) =>
+      store.removeRecorded(recordedPath, digest, options),
+    removeSessionDirectory,
+  };
+}
+
+/** What one unwound first install left behind. */
+interface UnwoundFirstInstall {
+  /** The error the install returned. */
+  readonly error: DebuggenError;
+
+  /** The journal it wrote through. */
+  readonly journal: FakeJournal;
+
+  /** Everything the install logged. */
+  readonly logs: RecordingLogger['records'];
+
+  /** The workspace it patched. */
+  readonly workspace: Workspace;
+
+  /** `<debuggenHome>/backups/<sessionId>`. */
+  readonly sessionDirectory: string;
+
+  /** Whether that directory existed when the failing adapter was asked. */
+  readonly directoryDuringInstall: boolean;
+}
+
+/**
+ * A session's first install that patches one file through the production
+ * patcher — which files the original under `backups/<sessionId>/` — and is
+ * then failed by the next adapter, so the rollback restores that file.
+ *
+ * @param backupsFor Replaces the context's real store, when a case needs its
+ * directory removal to behave otherwise.
+ * @returns What the install returned and left behind.
+ */
+async function unwindFirstInstall(
+  backupsFor?: (store: BackupStore) => BackupStore,
+): Promise<UnwoundFirstInstall> {
+  const workspace = makeWorkspace();
+  const journal = fakeJournal();
+  const recorded = recordingLogger();
+  const base = makeContext({ workspace, journal, logger: recorded.logger });
+  const context: InstrumentationContext =
+    backupsFor === undefined ? base : { ...base, backups: backupsFor(base.backups) };
+  const sessionDirectory = join(workspace.debuggenHome, 'backups', SESSION_ID);
+  const calls: string[] = [];
+  let directoryDuringInstall = false;
+
+  const error = expectErr(
+    await installPlan(
+      planWith([
+        action({
+          adapter: 'writer',
+          id: 'act_0000000000000461',
+          type: 'function-timing',
+          mode: 'patch',
+          ...TARGETS.cones,
+        }),
+        action({
+          adapter: 'thrower',
+          id: 'act_0000000000000462',
+          type: 'function-timing',
+          mode: 'patch',
+          ...TARGETS.coneProfile,
+        }),
+      ]),
+      context,
+      {
+        adapters: [
+          patchingAdapter('writer', calls),
+          throwingPatchAdapter('thrower', calls, UNWIND_FAILURE, () => {
+            directoryDuringInstall = existsSync(sessionDirectory);
+          }),
+        ],
+        skipFeasibility: true,
+      },
+    ),
+  );
+
+  expect(calls).toEqual(['writer', 'thrower']);
+
+  return {
+    error,
+    journal,
+    logs: recorded.records,
+    workspace,
+    sessionDirectory,
+    directoryDuringInstall,
+  };
+}
+
+/**
+ * The parts of an install error a developer and the service see, with the
+ * record-id list reduced to its length: ids are minted per record, so two
+ * otherwise identical installs never share them.
+ *
+ * @param error The install's error.
+ * @returns Its code, message, hint, cause and details.
+ */
+function errorFacts(error: DebuggenError): Record<string, unknown> {
+  const { restored, ...details } = error.details ?? {};
+
+  return {
+    code: error.code,
+    message: error.message,
+    hint: error.hint,
+    cause: error.cause,
+    details: { ...details, restored: Array.isArray(restored) ? restored.length : restored },
+  };
+}
+
+describe('the session backup directory after a rollback', () => {
+  it('removes it once an unwound first install leaves every record of the session reverted', async () => {
+    const unwound = await unwindFirstInstall();
+
+    // The directory was real: the patch filed the original in it before the
+    // failing adapter was asked.
+    expect(unwound.directoryDuringInstall).toBe(true);
+    expect(unwound.error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(unwound.error.details?.['reason']).toBe('adapter-failed');
+    expect(unwound.error.details?.['restoredCount']).toBe(1);
+    expect(unwound.error.details?.['journalReread']).toBe('listed');
+    expect(unwound.error.message).toContain('this install left no instrumentation in the project');
+    expect(unwound.journal.rows().map((row) => row.status)).toEqual(['reverted']);
+    expect(digestIn(unwound.workspace, TARGETS.cones.file)).toBe(
+      FIXTURE_DIGESTS[TARGETS.cones.file],
+    );
+
+    // Nothing of the session is left in the state directory.
+    expect(existsSync(unwound.sessionDirectory)).toBe(false);
+    expect(
+      unwound.logs.some(
+        (entry) =>
+          entry.level === 'debug' &&
+          entry.message === 'the session backup directory was removed after the rollback' &&
+          entry.fields?.['sessionId'] === SESSION_ID,
+      ),
+    ).toBe(true);
+    expect(unwound.logs.filter((entry) => entry.message === DIRECTORY_NOT_REMOVED)).toEqual([]);
+  }, 30_000);
+
+  it('keeps it, with the earlier plan version\u2019s backup, when an unwound delta leaves that version applied', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const recorded = recordingLogger();
+    const sessionDirectory = join(workspace.debuggenHome, 'backups', SESSION_ID);
+    const previousAction = action({
+      adapter: 'framework',
+      id: 'act_0000000000000471',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.plannerSegments,
+    });
+    const previousRecord = onlyRecord(
+      expectOk(
+        await installPlan(
+          planWith([previousAction], 1),
+          makeContext({ workspace, journal, planVersion: 1 }),
+          { adapters: [patchingAdapter('framework', [])], skipFeasibility: true },
+        ),
+      ).applied,
+    );
+    const previousBackup = readFileSync(previousRecord.backupPath);
+    const deltaAction = action({
+      adapter: 'writer',
+      id: 'act_0000000000000472',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const failingAction = action({
+      adapter: 'thrower',
+      id: 'act_0000000000000473',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.coneProfile,
+    });
+    const calls: string[] = [];
+
+    const error = expectErr(
+      await installPlan(
+        planWith([previousAction, deltaAction, failingAction], 2),
+        makeContext({ workspace, journal, planVersion: 2, logger: recorded.logger }),
+        {
+          adapters: [
+            patchingAdapter('writer', calls),
+            throwingPatchAdapter('thrower', calls, UNWIND_FAILURE),
+          ],
+          delta: { previousPlanVersion: 1, actionIds: [deltaAction.id, failingAction.id] },
+          skipFeasibility: true,
+        },
+      ),
+    );
+
+    expect(calls).toEqual(['writer', 'thrower']);
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['restoredCount']).toBe(1);
+    expect(error.message).toContain('plan version 1');
+    expect(journal.rows().map((row) => [row.planVersion, row.status])).toEqual([
+      [1, 'applied'],
+      [2, 'reverted'],
+    ]);
+
+    // Plan version 1 still stands over its original, and that original is
+    // still where cleanup restores it from, byte for byte.
+    expect(existsSync(sessionDirectory)).toBe(true);
+    expect(Buffer.compare(readFileSync(previousRecord.backupPath), previousBackup)).toBe(0);
+    expect(sha256Hex(readFileSync(previousRecord.backupPath))).toBe(previousRecord.originalHash);
+
+    // The delta's own backup went with its verified restore.
+    const deltaRecord = journal.rows().find((row) => row.planVersion === 2);
+
+    expect(deltaRecord).toBeDefined();
+    expect(existsSync(deltaRecord?.backupPath ?? sessionDirectory)).toBe(false);
+    expect(
+      recorded.records.some(
+        (entry) =>
+          entry.level === 'debug' &&
+          entry.message ===
+            'the session backup directory is kept: records of this session still hold their backups' &&
+          entry.fields?.['unsettled'] === 1,
+      ),
+    ).toBe(true);
+    expect(recorded.records.filter((entry) => entry.message === DIRECTORY_NOT_REMOVED)).toEqual([]);
+  }, 30_000);
+
+  it('returns the very same error, and logs a warning by code, when the store keeps the directory', async () => {
+    const baseline = await unwindFirstInstall();
+    const kept = await unwindFirstInstall((store) =>
+      storeRemovingWith(store, () =>
+        Promise.resolve(
+          err(
+            new DebuggenError('CLEANUP_PARTIAL', 'The suite store keeps the directory.', {
+              details: { reason: 'session-directory-not-emptied' },
+            }),
+          ),
+        ),
+      ),
+    );
+
+    expect(errorFacts(kept.error)).toEqual(errorFacts(baseline.error));
+    expect(kept.error.cause).toBe(UNWIND_FAILURE);
+    expect(kept.journal.rows().map((row) => row.status)).toEqual(['reverted']);
+    expect(existsSync(kept.sessionDirectory)).toBe(true);
+
+    const warnings = kept.logs.filter(
+      (entry) => entry.level === 'warn' && entry.message === DIRECTORY_NOT_REMOVED,
+    );
+
+    expect(warnings.map((entry) => entry.fields)).toEqual([
+      {
+        sessionId: SESSION_ID,
+        planVersion: PLAN_VERSION,
+        attempted: 1,
+        code: 'CLEANUP_PARTIAL',
+        reason: 'session-directory-not-emptied',
+      },
+    ]);
+  }, 30_000);
+
+  it('returns the very same error, and logs only the errno, when removing the directory throws', async () => {
+    const baseline = await unwindFirstInstall();
+    const refusal = Object.assign(
+      new Error("EACCES: permission denied, rmdir '/private/state/backups/ses_refused'"),
+      { code: 'EACCES' },
+    );
+    const refused = await unwindFirstInstall((store) =>
+      storeRemovingWith(store, () => Promise.reject(refusal)),
+    );
+
+    expect(errorFacts(refused.error)).toEqual(errorFacts(baseline.error));
+    expect(existsSync(refused.sessionDirectory)).toBe(true);
+
+    const warnings = refused.logs.filter(
+      (entry) => entry.level === 'warn' && entry.message === DIRECTORY_NOT_REMOVED,
+    );
+
+    expect(warnings.map((entry) => entry.fields)).toEqual([
+      { sessionId: SESSION_ID, planVersion: PLAN_VERSION, attempted: 1, errno: 'EACCES' },
+    ]);
+    // The runtime's message spells a path; only its code is logged.
+    expect(JSON.stringify(refused.logs)).not.toContain('permission denied');
+  }, 30_000);
+
+  it('never reaches another session\u2019s backups through a store scoped to that session', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    const otherSession = 'ses_installer_other_0002';
+    const otherStore = createBackupStore({
+      debuggenHome: workspace.debuggenHome,
+      sessionId: otherSession,
+    });
+    const original = readFileSync(pathIn(workspace, TARGETS.cones.file));
+    const digest = sha256Hex(original);
+
+    // The other session holds an original of its own.
+    expect(isOk(await otherStore.put(digest, original))).toBe(true);
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'writer',
+            id: 'act_0000000000000481',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+        ]),
+        { ...makeContext({ workspace, journal }), backups: otherStore },
+        { adapters: [patchingAdapter('writer', calls)], skipFeasibility: true },
+      ),
+    );
+
+    // An intact rollback of nothing, measured against a fresh listing whose
+    // records are all (vacuously) reverted — and still the other session's
+    // directory and its backup are untouched.
+    expect(calls).toEqual(['writer']);
+    expect(error.details?.['reason']).toBe('adapter-failed');
+    expect(error.details?.['journalReread']).toBe('listed');
+    expect(
+      sha256Hex(readFileSync(join(workspace.debuggenHome, 'backups', otherSession, digest))),
+    ).toBe(digest);
   }, 30_000);
 });
 

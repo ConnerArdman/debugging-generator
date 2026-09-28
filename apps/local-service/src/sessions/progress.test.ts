@@ -16,7 +16,11 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { PROGRESS_STAGES, type ProtocolMessage } from '@debuggen/protocol';
+import {
+  PROGRESS_STAGES,
+  parseSessionProgressPayload,
+  type ProtocolMessage,
+} from '@debuggen/protocol';
 import {
   DEBUGGEN_ERROR_CODES,
   DebuggenError,
@@ -34,6 +38,7 @@ import type { ServiceConfig } from '../config.js';
 import { LOG_ERROR_FIELD_KEY, createServiceLogger } from '../logging.js';
 import type { AppendProgressInput } from '../store/sessions-repo.js';
 import {
+  CANCELLATION_COPY_BY_CAUSE,
   FAILURE_COPY_BY_CODE,
   PROGRESS_RECIPIENT_KINDS,
   PROGRESS_STAGE_GROUPS,
@@ -41,10 +46,12 @@ import {
   PRODUCT_TEXT_MAX_LENGTH,
   PRODUCT_TEXT_REGISTRY_LIMIT,
   READY_TO_CAPTURE_MESSAGE,
+  STAGE_CANCELLATION_CAUSES,
   STAGE_FAILURE_DIAGNOSTIC_MESSAGE,
   STAGE_FAILURE_LOG_MESSAGE,
   authorProductText,
   buildInvestigationRows,
+  buildStageCancelledRow,
   carriesWrappedExceptionText,
   createSessionProgress,
   isProductAuthoredText,
@@ -1018,6 +1025,88 @@ describe('the Step-8 groups', () => {
       expect(probe.appended.at(-1)?.stage).toBe(stage);
     },
   );
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The cancellation row: a stage withdrawn before it finished is reported, never failed
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('the cancellation row', () => {
+  it('words every stage and every cause from the stage title and the cause’s copy, as a done row', () => {
+    expect([...STAGE_CANCELLATION_CAUSES].sort()).toEqual(
+      Object.keys(CANCELLATION_COPY_BY_CAUSE).sort(),
+    );
+    for (const stage of PROGRESS_STAGES) {
+      for (const cause of STAGE_CANCELLATION_CAUSES) {
+        const copy = CANCELLATION_COPY_BY_CAUSE[cause];
+        const row = buildStageCancelledRow(stage, cause);
+
+        expect(row, `${stage}/${cause}`).toStrictEqual({
+          stage,
+          status: 'done',
+          message: `${PROGRESS_STAGE_TITLES[stage]} ${copy.clause}`,
+          detail: copy.detail,
+        });
+        expect(Object.isFrozen(row)).toBe(true);
+        expect(row.message.toLowerCase()).not.toContain('failed');
+        expect(
+          parseSessionProgressPayload({ sessionId: newSessionId(), ...row }).ok,
+          `${stage}/${cause} satisfies the session.progress schema`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it('says the session was ended, and what that means, when the session’s end cancelled the stage', () => {
+    expect(buildStageCancelledRow('instrument', 'session-ended')).toStrictEqual({
+      stage: 'instrument',
+      status: 'done',
+      message: 'Preparing instrumentation cancelled: the session was ended.',
+      detail:
+        'Ending the session removes any instrumentation it applied; ask the question again in a new session to continue.',
+    });
+    expect(buildStageCancelledRow('plan', 'session-ended').message).toBe(
+      'Planning instrumentation cancelled: the session was ended.',
+    );
+  });
+
+  it('says the step was cancelled, and that it can run again, for any other cause', () => {
+    expect(buildStageCancelledRow('instrument', 'cancelled')).toStrictEqual({
+      stage: 'instrument',
+      status: 'done',
+      message: 'Preparing instrumentation was cancelled before it finished.',
+      detail: 'Run the step again when you are ready.',
+    });
+  });
+
+  it('falls back to generic copy for a stage or cause outside the vocabulary, never echoing it', () => {
+    const outside = buildStageCancelledRow(
+      '/home/dev/project' as (typeof PROGRESS_STAGES)[number],
+      "SELECT 'secret'" as (typeof STAGE_CANCELLATION_CAUSES)[number],
+    );
+    expect(outside.message).toBe(`This step ${CANCELLATION_COPY_BY_CAUSE.cancelled.clause}`);
+    expect(outside.detail).toBe(CANCELLATION_COPY_BY_CAUSE.cancelled.detail);
+    expect(JSON.stringify(outside)).not.toContain('secret');
+    expect(buildStageCancelledRow('plan', 'toString' as 'cancelled').message).toBe(
+      `${PROGRESS_STAGE_TITLES.plan} ${CANCELLATION_COPY_BY_CAUSE.cancelled.clause}`,
+    );
+  });
+
+  it('is filed under the cancelled stage’s group, like any other row that is not a failure', () => {
+    const sessionId = newSessionId();
+    const probe = emitter();
+
+    probe.progress.stageStarted(sessionId, 'plan');
+    const sent = probe.progress.emit(sessionId, buildStageCancelledRow('plan', 'session-ended'));
+
+    expect(sent.ok).toBe(true);
+    expect(storedRows(probe)).toEqual([
+      ['instrument', 'running', PROGRESS_STAGE_TITLES.instrument],
+      ['instrument', 'done', 'Planning instrumentation cancelled: the session was ended.'],
+    ]);
+    expect(probe.appended.at(-1)?.detail).toBe(CANCELLATION_COPY_BY_CAUSE['session-ended'].detail);
+    expect(probe.logs.filter((record) => record.message === STAGE_FAILURE_LOG_MESSAGE)).toEqual([]);
+  });
 });
 
 describe('the investigation’s class rows', () => {

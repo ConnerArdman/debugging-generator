@@ -137,9 +137,11 @@
  * }
  * broadcast({ type: 'session.updated', payload: { session: parsed.value } });
  *
- * // User-interface side: render without branching on `undefined`.
+ * // User-interface side: render without branching on `undefined` — except the
+ * // pristine original, which a record layered on an earlier plan version's
+ * // names as `originalBackupPath` (its own `backupPath` is still instrumented).
  * for (const conflict of session.cleanup.conflicts) {
- *   showConflict(conflict.file, conflict.backupPath);
+ *   showConflict(conflict.file, conflict.originalBackupPath ?? conflict.backupPath);
  * }
  * ```
  */

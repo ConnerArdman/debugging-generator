@@ -78,17 +78,20 @@
  * reply, and `cleanup.completed` cannot reach a window whose socket is closed.
  * So, before the notice, the owning service is asked for the session's
  * authoritative record (`GET /sessions/:id`, whose `cleanup.conflicts[]`
- * carry each `file` and `backupPath`) and, concurrently, its whole
- * modification journal (`GET /sessions/:id/modifications`, walked page by page
- * by `readModificationJournal` within {@link CLEANUP_DETAIL_TIMEOUT_MS}), and
- * both are projected into the store (`applySessionRecord`, and
- * `applyModificationJournal` once with every gathered record and the
- * journal's `total`, so a read that stopped early shows as incomplete in the
- * view rather than as the whole journal). The notice then names
- * every conflicted file, one sentence each and at most
+ * carry each `file`, its `backupPath` and, for a record layered on an earlier
+ * plan version's, the chain root's `originalBackupPath`) and, concurrently,
+ * its whole modification journal (`GET /sessions/:id/modifications`, walked
+ * page by page by `readModificationJournal` within
+ * {@link CLEANUP_DETAIL_TIMEOUT_MS}), and both are projected into the store
+ * (`applySessionRecord`, and `applyModificationJournal` once with every
+ * gathered record and the journal's `total`, so a read that stopped early
+ * shows as incomplete in the view rather than as the whole journal). The
+ * notice then names every conflicted file, one sentence each and at most
  * {@link MAX_CONFLICT_SENTENCES}: "‹file› was edited while instrumented. Debug
  * Generator will not overwrite it. Original saved at ‹backup path›." for a
- * file the developer changed, the service's own message for any other reason,
+ * file the developer changed (the path of its pristine original:
+ * `originalBackupPath` when the report carries one, `backupPath` otherwise),
+ * the service's own message for any other reason,
  * with "Open diff". When those details cannot be loaded, the notice falls back
  * to the status alone and "Open diff" reveals the modifications section. No
  * file name or path is ever invented here.
@@ -421,11 +424,31 @@ function noticeFor(status: CleanupStatus, live: boolean): CommandNotice {
  * and where its original is. A file edited while instrumented gets the
  * AAP §0.5.5 wording verbatim; any other reason gets the service's own
  * message, which names the file and the backup too.
+ *
+ * "Original saved at" names the pristine file: {@link originalBackupPathOf}.
  */
 function conflictSentence(conflict: ModificationConflict): string {
   return conflict.reason === EDITED_WHILE_INSTRUMENTED
-    ? `${conflict.file} was edited while instrumented. Debug Generator will not overwrite it. Original saved at ${conflict.backupPath}.`
+    ? `${conflict.file} was edited while instrumented. Debug Generator will not overwrite it. Original saved at ${originalBackupPathOf(conflict)}.`
     : conflict.message;
+}
+
+/**
+ * Where a conflicted file's pristine original is saved: the report's
+ * `originalBackupPath` when it carries one, its `backupPath` otherwise.
+ *
+ * A record layered on an earlier plan version's (`previousRecordId`) backed up
+ * that version's instrumented output, which still carries the tool's wrapper;
+ * only its chain root backed up the file as it was before the session first
+ * instrumented it, and the service reports that backup as `originalBackupPath`.
+ * Quoting `backupPath` for such a record would send the developer to bytes
+ * that re-introduce the instrumentation if they restored them.
+ *
+ * @param conflict The service's conflict report.
+ * @returns The path "Original saved at" quotes.
+ */
+function originalBackupPathOf(conflict: ModificationConflict): string {
+  return conflict.originalBackupPath ?? conflict.backupPath;
 }
 
 /**

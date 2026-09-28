@@ -87,6 +87,7 @@ import {
   ModificationsList,
   copyBackupPathLabel,
   modificationStatusLabel,
+  originalBackupPathOf,
 } from './components/ModificationsList';
 import { PairingCode } from './components/PairingCode';
 import { ProgressSteps } from './components/ProgressSteps';
@@ -789,10 +790,41 @@ interface SessionEndProps {
 }
 
 /**
+ * Where a cleanup conflict's pristine original is saved — the path its "Original saved at" names.
+ *
+ * The conflict's `originalBackupPath` when the service reported one: the chain root's backup,
+ * resolved over the whole journal, for a record layered on an earlier plan version's. A report
+ * without it names its own `backupPath`, which for a chained record holds that earlier version's
+ * instrumented output; so when the conflict's record is listed and chained, its chain is walked
+ * through the listed records instead (`originalBackupPathOf`), which is also the path the
+ * modifications list shows for it. Any other conflict keeps its own `backupPath`.
+ *
+ * @param conflict The service's conflict report.
+ * @param records The session's listed modification records.
+ * @returns The path to show and copy.
+ */
+function conflictOriginalBackupPath(
+  conflict: ModificationConflict,
+  records: readonly ModificationRecord[],
+): string {
+  if (conflict.originalBackupPath !== undefined) {
+    return conflict.originalBackupPath;
+  }
+  const record = records.find((candidate) => candidate.id === conflict.recordId);
+  return record?.previousRecordId === undefined
+    ? conflict.backupPath
+    : originalBackupPathOf(record, records);
+}
+
+/**
  * One file in a cleanup list: its path, then — unless the service reported the backup missing —
  * "Original saved at" with the backup path and its "Copy path" control. Both paths are shown in
  * full, wrapped across lines rather than ellipsized, so the reader can read, select and copy the
  * exact value they need to restore a file by hand.
+ *
+ * `backupPath` is the path of the file's pristine original, never an intermediate version: for a
+ * record layered on an earlier plan version's, whose own backup still carries that version's
+ * instrumentation, it is the chain root's backup. The caller resolves it.
  */
 function CleanupFileEntry(props: {
   readonly file: string;
@@ -842,8 +874,11 @@ function CleanupFileEntry(props: {
  * after the session ends — reversibility is a product guarantee, not a toast (AAP 0.5.1, 0.5.5).
  *
  * A conflict or partial cleanup lists every file left untouched, from the result's conflicts,
- * with the backup its original is preserved in. A partial cleanup also names every other record
- * that is not `reverted` — the files it could not restore — with its status and backup. When the
+ * with the backup its pristine original is preserved in ({@link conflictOriginalBackupPath}): the
+ * conflict's `originalBackupPath` when it carries one (a record layered on an earlier plan
+ * version's), its `backupPath` otherwise. A partial cleanup also names every other record that
+ * is not `reverted` — the files it could not restore — with its status and the backup of its
+ * pristine original, resolved through the record's chain by `originalBackupPathOf`. When the
  * complete journal shows that nothing is outstanding, the partial sentence says that every file
  * was restored instead of pointing at files, because the unfinished step was not a file restore.
  * Each list spans the cleanup column's full width, and every path wraps with a "Copy path"
@@ -893,7 +928,9 @@ function SessionEnd(props: SessionEndProps): ReactElement {
                 <CleanupFileEntry
                   file={conflict.file}
                   backupPath={
-                    conflict.reason === 'backup-missing' ? undefined : conflict.backupPath
+                    conflict.reason === 'backup-missing'
+                      ? undefined
+                      : conflictOriginalBackupPath(conflict, modifications)
                   }
                   pathId={`${idPrefix}-conflict-${String(index)}`}
                 />
@@ -907,7 +944,7 @@ function SessionEnd(props: SessionEndProps): ReactElement {
               <li key={record.id}>
                 <CleanupFileEntry
                   file={record.file}
-                  backupPath={record.backupPath}
+                  backupPath={originalBackupPathOf(record, modifications)}
                   status={record.status}
                   pathId={`${idPrefix}-unrestored-${String(index)}`}
                 />
@@ -942,6 +979,12 @@ function SessionEnd(props: SessionEndProps): ReactElement {
  */
 export function App(): ReactElement {
   const theme = useWebviewTheme();
+
+  // The id of the view's visually hidden title, which every state below renders and hands to
+  // `PanelShell` as `labelledBy`: the shell's scroll region is the first stop in the view's tab
+  // order, and naming it after the view's own title is what stops it announcing as an anonymous
+  // container. Declared before the early returns, as every hook here must be.
+  const viewTitleId = useId();
 
   // Read once: the channel either exists for the life of the document or never does.
   const [hostAvailable] = useState<boolean>(isVsCodeApiAvailable);
@@ -1301,9 +1344,9 @@ export function App(): ReactElement {
 
   if (!hostAvailable) {
     return (
-      <PanelShell theme={theme}>
+      <PanelShell theme={theme} labelledBy={viewTitleId}>
         <div className="dgv-view">
-          <Heading level={1} visuallyHidden>
+          <Heading level={1} visuallyHidden id={viewTitleId}>
             {VIEW_TITLE}
           </Heading>
           <main className="dgv-view__body">
@@ -1320,9 +1363,9 @@ export function App(): ReactElement {
 
   if (state === undefined) {
     return (
-      <PanelShell theme={theme}>
+      <PanelShell theme={theme} labelledBy={viewTitleId}>
         <div className="dgv-view">
-          <Heading level={1} visuallyHidden>
+          <Heading level={1} visuallyHidden id={viewTitleId}>
             {VIEW_TITLE}
           </Heading>
           <main className="dgv-view__body">
@@ -1350,9 +1393,9 @@ export function App(): ReactElement {
     phase.armed && latestFollowUp !== undefined && latestFollowUp.needsNewCapture !== false;
 
   return (
-    <PanelShell theme={theme}>
+    <PanelShell theme={theme} labelledBy={viewTitleId}>
       <div className="dgv-view">
-        <Heading level={1} visuallyHidden>
+        <Heading level={1} visuallyHidden id={viewTitleId}>
           {VIEW_TITLE}
         </Heading>
         <header className="dgv-view__header">

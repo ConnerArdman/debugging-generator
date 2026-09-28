@@ -67,6 +67,7 @@ import {
   buildConflictReport,
   createBackupStore,
   createPatcher,
+  findChainRoot,
   needsHelperTypeAlias,
   parseModificationRecord,
 } from '@debuggen/instrumentation';
@@ -348,14 +349,22 @@ function received<K extends MessageType>(
 /**
  * A schema-valid conflict report about `record`, built by `@debuggen/instrumentation`'s own
  * `buildConflictReport`. The reason is immaterial to the sentence below, which names only the file
- * and the backup path, so the first member of the closed vocabulary is used.
+ * and the pristine original's backup path, so the first member of the closed vocabulary is used.
+ *
+ * `records` are the session's records, among which a chained record's **chain root** is resolved
+ * with the product's own `findChainRoot`: only the root backed up the pristine file, so the report
+ * names the root's backup as `originalBackupPath`, exactly as the watcher's and cleanup's do.
  */
-function conflictReportFor(record: ModificationRecord): ModificationConflict {
+function conflictReportFor(
+  record: ModificationRecord,
+  records: readonly ModificationRecord[],
+): ModificationConflict {
   const report = buildConflictReport({
     record,
     reason: MODIFICATION_CONFLICT_REASONS[0],
     detectedAt: record.appliedAt,
     message: `${record.file} diverged from the instrumented content.`,
+    chainRoot: findChainRoot(record, records),
   });
   if (isErr(report)) {
     throw new Error(`A conflict report could not be composed: ${report.error.message}`);
@@ -367,18 +376,23 @@ function conflictReportFor(record: ModificationRecord): ModificationConflict {
  * The AAP §0.5.5 sentence the watcher sends for a conflict on `record` — "‹file› was edited while
  * instrumented. Debug Generator will not overwrite it. Original saved at ‹backup path›." — composed
  * by the service's own `buildConflictMessage`, so the suite never carries a copy of the wording.
+ * For a chained record the path is its chain root's backup, resolved among `records`.
  */
-function conflictSentence(record: ModificationRecord): string {
-  return buildConflictMessage(record, conflictReportFor(record));
+function conflictSentence(
+  record: ModificationRecord,
+  records: readonly ModificationRecord[],
+): string {
+  return buildConflictMessage(record, conflictReportFor(record, records));
 }
 
 /** The `session.progress` rows carrying the conflict sentence for `record`. */
 function conflictRows(
   client: HarnessWsClient,
   record: ModificationRecord,
+  records: readonly ModificationRecord[],
   from = 0,
 ): HarnessMessage<'session.progress'>[] {
-  const sentence = conflictSentence(record);
+  const sentence = conflictSentence(record, records);
   return received(client, 'session.progress', from).filter(
     (row) => row.payload.sessionId === record.sessionId && row.payload.message === sentence,
   );
@@ -826,7 +840,9 @@ async function endWithConflicts(
     expect(conflict.diffs?.instrumentedToCurrent).toContain(file.line);
     expect(conflict.diffs?.originalToCurrent).toContain(file.line);
     // The sentence the watcher sent while the file was live is the one this report composes to.
-    expect(buildConflictMessage(file.record, conflict)).toBe(conflictSentence(file.record));
+    expect(buildConflictMessage(file.record, conflict)).toBe(
+      conflictSentence(file.record, driven.records),
+    );
   }
   return payload;
 }
@@ -856,12 +872,69 @@ async function expectOneConflictNotice(
   ];
   for (const [client, mark] of clients) {
     // Filtered on the exact sentence `buildConflictMessage` composes for this record.
-    const rows = conflictRows(client, record, mark);
+    const rows = conflictRows(client, record, driven.records, mark);
     expect(rows).toHaveLength(1);
     const [row] = rows;
     // The "Open diff" action: the second line points at the record whose stored diff it opens.
     expect(row?.payload.detail).toContain(record.id);
     expect(row?.payload.detail).toMatch(/open diff/i);
+  }
+}
+
+/**
+ * Proves the record-driven views — the editor's modification badge, the DevTools session summary —
+ * learn of the conflict when the watcher reports it, not at the session's next change: with no
+ * other action taken since `marks`, both user interfaces have received a `session.updated`, sent
+ * after the conflict's progress row, whose mirrored entry for `record` is the journal's `conflict`
+ * row verbatim. The session keeps its status, `cleanup` stays `pending` with nothing refused (it is
+ * written only when a cleanup pass runs), and every `untouched` record is still `applied` in it.
+ * Call it after {@link expectOneConflictNotice}, which has already listened past the quiet period.
+ */
+async function expectConflictReflectedInSession(
+  h: Harness,
+  driven: DrivenSession,
+  record: ModificationRecord,
+  untouched: readonly ModificationRecord[],
+  marks: { readonly editor: number; readonly devtools: number },
+): Promise<void> {
+  const { devtools } = driven;
+  if (devtools === undefined) {
+    throw new Error('A conflict update is asserted on both user interfaces; bind a tab first.');
+  }
+  const conflicted = await journalRecord(h, record.id);
+  expect(conflicted.status).toBe(MODIFICATION.conflict);
+
+  const clients: readonly (readonly [HarnessWsClient, number])[] = [
+    [driven.editor, marks.editor],
+    [devtools, marks.devtools],
+  ];
+  for (const [client, mark] of clients) {
+    const update = await waitFor(
+      client,
+      'session.updated',
+      (message, index) =>
+        index >= mark &&
+        message.payload.session.id === driven.sessionId &&
+        message.payload.session.modifications.some(
+          (entry) => entry.id === record.id && entry.status === MODIFICATION.conflict,
+        ),
+    );
+    const { session } = update.payload;
+    expect(session.status).toBe(driven.session.status);
+    expect(session.cleanup.status).toBe(CLEANUP.pending);
+    expect(session.cleanup.conflicts).toEqual([]);
+
+    const mirrored = session.modifications.find((entry) => entry.id === record.id);
+    expect(mirrored === undefined ? undefined : parsedRecord(mirrored)).toEqual(conflicted);
+    for (const other of untouched) {
+      const entry = session.modifications.find((candidate) => candidate.id === other.id);
+      expect(entry?.status).toBe(MODIFICATION.applied);
+    }
+
+    // The progress row first, then the record: the watcher's own order, with nothing in between.
+    const [row] = conflictRows(client, record, driven.records, mark);
+    expect(row).toBeDefined();
+    expect(client.received.indexOf(update)).toBeGreaterThan(client.received.indexOf(row!));
   }
 }
 
@@ -1037,8 +1110,8 @@ describe('cleanup-conflict within one service lifetime', () => {
       await sleep(QUIET_PERIOD_MS);
       for (const record of driven.records) {
         expect((await journalRecord(harness, record.id)).status).toBe(MODIFICATION.reverted);
-        expect(conflictRows(editor, record)).toEqual([]);
-        expect(conflictRows(devtools, record)).toEqual([]);
+        expect(conflictRows(editor, record, driven.records)).toEqual([]);
+        expect(conflictRows(devtools, record, driven.records)).toEqual([]);
       }
 
       const dormant = received(devtools, 'agent.config', marks.devtools).filter(
@@ -1091,6 +1164,7 @@ describe('cleanup-conflict within one service lifetime', () => {
       const line = developerLine();
       await editInPlace(projectFile(project.root, file), line);
       await expectOneConflictNotice(harness, driven, record, marks);
+      await expectConflictReflectedInSession(harness, driven, record, untouched, marks);
       for (const other of untouched) {
         expect((await journalRecord(harness, other.id)).status).toBe(MODIFICATION.applied);
       }
@@ -1149,10 +1223,11 @@ describe('cleanup-conflict within one service lifetime', () => {
       const line = developerLine();
       await editInPlace(projectFile(project.root, editedFile), line);
       await expectOneConflictNotice(harness, driven, record, marks);
+      await expectConflictReflectedInSession(harness, driven, record, untouched, marks);
       // The file nobody touched is not mistaken for an edit.
       for (const other of untouched) {
         expect((await journalRecord(harness, other.id)).status).toBe(MODIFICATION.applied);
-        expect(conflictRows(driven.editor, other)).toEqual([]);
+        expect(conflictRows(driven.editor, other, driven.records)).toEqual([]);
       }
 
       const editedHash = await hashOf(project.root, editedFile);
@@ -1245,6 +1320,96 @@ describe('cleanup-conflict within one service lifetime', () => {
         );
         expect(cleanupReports(devtools, driven.sessionId)).toHaveLength(1);
       }
+    });
+  });
+
+  /**
+   * An install the installer unwinds: the two-tier plan journals a chain on its service module, and
+   * the journal refuses the chained record (a `TEMP` trigger on the service's own connection, gone
+   * with the case), so the adapter's action fails after the plan's other patches — the chain's root
+   * among them — were applied and backed up. The installer reverse-restores every one of them, and
+   * with nothing of the session left open `$DEBUGGEN_HOME/backups/<sessionId>/` goes with the
+   * rollback, never left empty past the failure or the session's end.
+   */
+  describe('an install the installer rolls back', () => {
+    it('leaves no backup directory for the session after instrumentation.failed or after its end', async () => {
+      const project = await harness.copyFixtureProject();
+      const home = harness.config.debuggenHome;
+      const launched = await harness.launchDevServer(project.root);
+      if (isErr(launched)) {
+        throw new Error(`The dev server could not be launched: ${launched.error.message}`);
+      }
+      const editor = await harness.editor(project.root);
+
+      const trigger = 'cleanup_conflict_refuses_chained_records';
+      harness.store.db.exec(
+        `CREATE TEMP TRIGGER ${trigger} BEFORE INSERT ON modifications WHEN NEW.previous_record_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'chained records are refused by the rollback case'); END`,
+      );
+      let sessionId: string;
+      try {
+        const created = await harness.createSession({
+          projectRoot: project.root,
+          question: QUESTIONS.twoTierLatency,
+        });
+        sessionId = created.id;
+        const failed = await waitFor(
+          editor,
+          'instrumentation.failed',
+          (message) => message.payload.sessionId === created.id,
+          HARNESS_TIMEOUTS.pipeline,
+        );
+        expect(failed.payload.error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+      } finally {
+        harness.store.db.exec(`DROP TRIGGER IF EXISTS temp.${trigger};`);
+      }
+      const sessionDirectory = join(home, 'backups', sessionId);
+
+      // The install wrote and backed up real patches before the refusal — the chain's root among
+      // them, in the session's own backup directory — and unwound every one of them.
+      const records = await journalOf(harness, sessionId);
+      expect(records.length).toBeGreaterThan(0);
+      expect(records.every((record) => record.previousRecordId === undefined)).toBe(true);
+      for (const record of records) {
+        expect(dirname(record.backupPath)).toBe(sessionDirectory);
+        expect(record.status).toBe(MODIFICATION.reverted);
+        expect(await exists(record.backupPath)).toBe(false);
+      }
+      await assertTreeUnchanged(project.root, project.snapshot);
+      // The directory was never refused: no warning that it was left in place or not removed.
+      expect(
+        harness.logger.records.filter(
+          (record) =>
+            record.fields['sessionId'] === sessionId &&
+            record.level === 'warn' &&
+            record.message.includes('session backup directory'),
+        ),
+      ).toEqual([]);
+
+      // Nothing is left of the session in the state directory once the failure is reported: the
+      // rollback itself removed the directory it had emptied …
+      const removals = harness.logger.records.filter(
+        (record) =>
+          record.fields['sessionId'] === sessionId &&
+          record.message === 'the session backup directory was removed after the rollback',
+      );
+      expect(removals).toHaveLength(1);
+      expect(removals[0]?.fields['attempted']).toBe(records.length);
+      expect(await exists(sessionDirectory)).toBe(false);
+      const failedSession = await harness.waitForSession(
+        sessionId,
+        (record) => record.status === SESSION.failed,
+      );
+      expect(failedSession.status).toBe(SESSION.failed);
+
+      // … and it stays gone after the session's end, which finds every record already reverted and
+      // restores nothing.
+      expect(await endSession(harness, sessionId)).toBe(CLEANUP.clean);
+      expect(await exists(sessionDirectory)).toBe(false);
+      expect(await exists(join(home, 'backups'))).toBe(true);
+      await assertTreeUnchanged(project.root, project.snapshot);
+      const ended = storedSession(harness, sessionId);
+      expect(ended?.status).toBe(SESSION.ended);
+      expect(ended?.cleanup).toMatchObject({ status: CLEANUP.clean, conflicts: [] });
     });
   });
 });
@@ -2223,6 +2388,298 @@ describe('an instrumented session the service never ended', () => {
       }),
     ]);
     expect(storedSession(second, abandoned.sessionId)?.status).toBe(SESSION.failed);
+
+    await stopLifetime(second);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * A chained record's conflict: the pristine original, and the developer's way back
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The two-tier plan patches two functions of one service module, so that file carries a follow-up
+ * **chain**: the root patched the pristine file, and the head was layered on the root's output.
+ * Only the root backed up the pristine file — the head's own backup is the root's instrumented
+ * output, wrapper and all — so every place a conflict on that file points the developer at "the
+ * original" must name the root's backup (AAP §0.5.5: "Original saved at ‹backup path›"), and
+ * restoring from it must be a complete recovery (AAP §0.5.1):
+ *
+ * 1. an edit while instrumented is reported with the chain root's backup, which holds exactly the
+ *    pre-session bytes; `backupPath` stays the head's own, and the whole chain is `conflict` after
+ *    the end, never `applied` beneath it;
+ * 2. once the developer puts that original back, a new session asking the same question installs
+ *    on the file again — its deterministic first patch reproduces the ended session's root bytes
+ *    exactly, which must not read as that session still holding the file — and ends clean;
+ * 3. the next start closes the first session's chain over the pristine file without a write and
+ *    records it clean, leaving nothing of it behind.
+ */
+describe('a chained record’s conflict, resolved from the original it names', () => {
+  /** The caller-owned `$DEBUGGEN_HOME` every lifetime of this block shares, as a crash leaves it. */
+  let home: string;
+  /** Caller-owned project copies, so `Harness.stop()` leaves them for the next lifetime. */
+  const projects: FixtureProjectCopy[] = [];
+  /** Every lifetime started, for teardown. */
+  const lifetimes: Harness[] = [];
+  /** The one project copy every session of this block works on. */
+  let project: FixtureProjectCopy;
+  /** The session ended in conflict over its chain. */
+  let conflicted: DrivenSession;
+  /** The chain's file, and its root and head as the first install journaled them. */
+  let chainFile: string;
+  let root: ModificationRecord;
+  let head: ModificationRecord;
+  /** The conflict `cleanup.completed` carried for the head. */
+  let reported: ModificationConflict;
+  /** The lifetime both sessions run in, stopped before the restart. */
+  let first: Harness;
+  /** The session that instruments the file again once its original is back. */
+  let again: DrivenSession;
+  /** The chained file's inode and modification time when the first lifetime stops. */
+  let atStop: { readonly ino: number; readonly mtimeMs: number };
+  /** Where the next lifetime's clock resumes, so every stamp it writes is later than the last. */
+  let resumeAt: number;
+  let lastTabId = 700;
+
+  const nextTabId = (): number => {
+    lastTabId += 1;
+    return lastTabId;
+  };
+
+  /** One service lifetime over the shared home, its clock seeded at `seedMs` when given. */
+  const startLifetime = async (seedMs?: number): Promise<Harness> => {
+    const lifetime = await startHarness({
+      env: { DEBUGGEN_HOME: home },
+      fixtureProject: false,
+      now: seedMs === undefined ? undefined : createHarnessClock(seedMs).now,
+    });
+    lifetimes.push(lifetime);
+    expect(lifetime.config.debuggenHome).toBe(home);
+    return lifetime;
+  };
+
+  /**
+   * Stops a lifetime the way a crash would find it — live sessions open, journal untouched — and
+   * moves the next lifetime's clock past this one.
+   */
+  const stopLifetime = async (lifetime: Harness): Promise<void> => {
+    resumeAt = lifetime.now() + 60_000;
+    await lifetime.service.close({ liveSessions: 'retain' });
+    expect(await lifetime.stop()).toEqual({ clean: true, problems: [] });
+    await lifetime.assertNoLeaks();
+  };
+
+  /** The error-level end-state verification reports a lifetime logged; `[]` when every check held. */
+  const verificationErrors = (lifetime: Harness): unknown[] =>
+    lifetime.logger.records.filter(
+      (record) => record.level === 'error' && record.message.includes('end-state verification'),
+    );
+
+  beforeAll(async () => {
+    home = await mkdtemp(join(realpathSync(tmpdir()), SHARED_HOME_PREFIX));
+  });
+
+  afterAll(async () => {
+    for (const lifetime of lifetimes) {
+      await lifetime.stop();
+    }
+    for (const each of projects) {
+      await each.dispose();
+      expect(await exists(each.container)).toBe(false);
+    }
+    await rm(home, { recursive: true, force: true });
+    expect(await exists(home)).toBe(false);
+  });
+
+  it('names the chain root’s pristine backup in the notice, the report and its diff', async () => {
+    first = await startLifetime();
+    project = await copyFixtureProject();
+    projects.push(project);
+    conflicted = await driveSession(first, project.root, QUESTIONS.twoTierLatency, {
+      tabId: nextTabId(),
+    });
+
+    // The chain: the one file of the plan with two records, the head layered on the root.
+    const chained = [...recordsByFile(conflicted.records).entries()].filter(
+      ([, records]) => records.length === 2,
+    );
+    expect(chained).toHaveLength(1);
+    const [file, records] = chained[0]!;
+    chainFile = file;
+    root = chainRoot(records);
+    head = chainHead(records);
+    expect(head.previousRecordId).toBe(root.id);
+    expect(head.originalHash).toBe(root.instrumentedHash);
+    expect(findChainRoot(head, conflicted.records)).toEqual(root);
+    // The root backed up the pre-session bytes; the head backed up the root's instrumented output.
+    expect(root.originalHash).toBe(project.snapshot.get(chainFile));
+    expect(await sha256OfFile(root.backupPath)).toBe(root.originalHash);
+    expect(await readFile(head.backupPath, 'utf8')).toContain(SPAN_HELPER_GLOBAL);
+    const untouched = conflicted.records.filter((record) => record.file !== chainFile);
+    expect(untouched.length).toBeGreaterThan(0);
+
+    // The developer edits the chained file while it is instrumented.
+    const marks = {
+      editor: conflicted.editor.received.length,
+      devtools: conflicted.devtools?.received.length ?? 0,
+    };
+    const line = developerLine();
+    await editInPlace(projectFile(project.root, chainFile), line);
+    await expectOneConflictNotice(first, conflicted, head, marks);
+    // The live notice's "Original saved at ‹path›" is the root's backup, never the head's own.
+    const [notice] = conflictRows(conflicted.editor, head, conflicted.records, marks.editor);
+    expect(notice?.payload.message).toContain(`Original saved at ${root.backupPath}.`);
+    expect(notice?.payload.message).not.toContain(head.backupPath);
+
+    const editedHash = await hashOf(project.root, chainFile);
+    const payload = await endWithConflicts(
+      first,
+      project,
+      conflicted,
+      [{ record: head, line, editedHash }],
+      untouched,
+    );
+
+    // The service re-read both backups the report names — the head's own and the chain root's —
+    // in its independent end-state verification, and found nothing that did not hold.
+    expect(verificationErrors(first)).toEqual([]);
+
+    // One report covers the chain: the head's, carrying both backups.
+    expect(payload.conflicts).toHaveLength(1);
+    const [conflict] = payload.conflicts;
+    if (conflict === undefined) {
+      throw new Error('cleanup.completed carried no conflict for the chained file.');
+    }
+    reported = conflict;
+    expect(reported.recordId).toBe(head.id);
+    expect(reported.backupPath).toBe(head.backupPath);
+    expect(reported.originalBackupPath).toBe(root.backupPath);
+    expect(reported.message).toContain(root.backupPath);
+    // What that path holds is the pre-session file, with no instrumentation in it.
+    const original = reported.originalBackupPath ?? '';
+    expect(await exists(original)).toBe(true);
+    expect(await sha256OfFile(original)).toBe(root.originalHash);
+    expect(await sha256OfFile(original)).toBe(project.snapshot.get(chainFile));
+    const originalText = await readFile(original, 'utf8');
+    for (const marker of INSTRUMENTATION_MARKERS) {
+      expect(originalText).not.toContain(marker);
+    }
+    // "Open diff": the original side is the pristine file, so the tool's side spans the chain.
+    expect(reported.diffs?.originalToCurrent).toContain(line);
+    expect(reported.diffs?.originalToInstrumented).toContain(SPAN_HELPER_GLOBAL);
+
+    // The whole chain is `conflict` — nothing beneath the head goes on claiming the file — and
+    // both backups are kept.
+    for (const record of [root, head]) {
+      const after = await journalRecord(first, record.id);
+      expect(after.status).toBe(MODIFICATION.conflict);
+      expect(await exists(after.backupPath)).toBe(true);
+    }
+    expect(storedSession(first, conflicted.sessionId)?.cleanup.conflicts).toEqual(
+      payload.conflicts,
+    );
+  });
+
+  it('instruments the file for a new session once that original is back, and ends it clean', async () => {
+    // The developer resolves the conflict by copying back the original the report names.
+    const path = projectFile(project.root, chainFile);
+    await writeFile(path, await readFile(reported.originalBackupPath ?? ''));
+    await assertTreeUnchanged(project.root, project.snapshot);
+    // Nothing re-judges an ended session's records until the next start: the chain is still
+    // `conflict`, and a `conflict` record claims no bytes on disk.
+    for (const record of [root, head]) {
+      expect((await journalRecord(first, record.id)).status).toBe(MODIFICATION.conflict);
+    }
+
+    again = await driveSession(first, project.root, QUESTIONS.twoTierLatency, {
+      tabId: nextTabId(),
+    });
+    expect(again.sessionId).not.toBe(conflicted.sessionId);
+    expect(again.session.status).toBe(SESSION.ready);
+    expect(
+      received(again.editor, 'instrumentation.failed').filter(
+        (message) => message.payload.sessionId === again.sessionId,
+      ),
+    ).toEqual([]);
+
+    // The same question patches the same file the same way: its first patch reproduces the ended
+    // chain root's bytes exactly, and is installed rather than refused as held by that session.
+    const records = recordsByFile(again.records).get(chainFile) ?? [];
+    expect(records).toHaveLength(2);
+    const againRoot = chainRoot(records);
+    const againHead = chainHead(records);
+    expect(againRoot.instrumentedHash).toBe(root.instrumentedHash);
+    expect(againHead.instrumentedHash).toBe(head.instrumentedHash);
+    for (const record of again.records) {
+      expect((await journalRecord(first, record.id)).status).toBe(MODIFICATION.applied);
+    }
+    expect(await hashOf(project.root, chainFile)).toBe(againHead.instrumentedHash);
+
+    // Its end restores every file it patched, the chained one included, and leaves nothing.
+    expect(await endSession(first, again.sessionId)).toBe(CLEANUP.clean);
+    await assertTreeUnchanged(project.root, project.snapshot);
+    await expectNoMarkers(project.root, chainFile);
+    for (const record of again.records) {
+      const after = await journalRecord(first, record.id);
+      expect(after.status).toBe(MODIFICATION.reverted);
+      expect(await exists(after.backupPath)).toBe(false);
+    }
+    expect(await exists(join(home, 'backups', again.sessionId))).toBe(false);
+    const ended = storedSession(first, again.sessionId);
+    expect(ended?.status).toBe(SESSION.ended);
+    expect(ended?.cleanup).toMatchObject({ status: CLEANUP.clean, conflicts: [] });
+    expect(verificationErrors(first)).toEqual([]);
+
+    // The first session's chain was left to the next start, with both of its backups.
+    for (const record of [root, head]) {
+      const after = await journalRecord(first, record.id);
+      expect(after.status).toBe(MODIFICATION.conflict);
+      expect(await exists(after.backupPath)).toBe(true);
+    }
+
+    const facts = await stat(path);
+    atStop = { ino: facts.ino, mtimeMs: facts.mtimeMs };
+    await stopLifetime(first);
+  });
+
+  it('closes the first session’s chain over the pristine file on the next start, without a write', async () => {
+    const second = await startLifetime(resumeAt);
+    const report = second.service.startup.reconciliation;
+
+    expect(report.errors).toEqual([]);
+    // The head's file holds its root's original, so the whole chain closes: nothing to restore.
+    expect(report.bySession[conflicted.sessionId]).toMatchObject({
+      scanned: 2,
+      restored: 0,
+      closed: 2,
+      conflicts: 0,
+      skipped: 0,
+      failed: 0,
+      status: CLEANUP.clean,
+    });
+    expect(report.bySession[again.sessionId]).toBeUndefined();
+
+    for (const record of [root, head]) {
+      expect((await journalRecord(second, record.id)).status).toBe(MODIFICATION.reverted);
+    }
+    expect(await allOpenRecords(second)).toEqual([]);
+    // Not a byte written: the developer's copy of the original is the file on disk.
+    const path = projectFile(project.root, chainFile);
+    const facts = await stat(path);
+    expect({ ino: facts.ino, mtimeMs: facts.mtimeMs }).toEqual(atStop);
+    await assertTreeUnchanged(project.root, project.snapshot);
+    // Nothing of the session is retained: the verified original and the superseded head's backup
+    // leave with its backup directory.
+    expect(await exists(root.backupPath)).toBe(false);
+    expect(await exists(join(home, 'backups', conflicted.sessionId))).toBe(false);
+    expect(await exists(join(home, 'backups'))).toBe(true);
+
+    // The ended session now carries the clean verdict.
+    const stored = storedSession(second, conflicted.sessionId);
+    expect(stored?.status).toBe(SESSION.ended);
+    expect(stored?.cleanup.status).toBe(CLEANUP.clean);
+    expect(stored?.cleanup.conflicts).toEqual([]);
+    expect(verificationErrors(second)).toEqual([]);
 
     await stopLifetime(second);
   });

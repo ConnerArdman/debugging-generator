@@ -3488,8 +3488,10 @@ async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promis
     },
     async waitForPanelSpec(options) {
       const timeoutMs = options?.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
-      // `PanelHost` names no landmark after the panel (its `PanelShell` gets no
-      // label); the title is the summary head's heading inside the panel block.
+      // `PanelHost`'s `PanelShell` viewport is a region named after the panel
+      // (`aria-labelledby` the summary head's title heading), but that region is
+      // the shell around the panel block, not the block itself; the block is
+      // matched by the title heading it contains.
       const target =
         options?.title === undefined
           ? panelView.first()

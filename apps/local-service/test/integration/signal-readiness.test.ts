@@ -26,8 +26,18 @@
  *   signals it now confirms. A re-bind of the same tab replays the corrected
  *   report, never the stale one.
  *
- * Both routes end with every modification removed by the real cleanup and the
- * copied corpus byte-identical to its snapshot.
+ * And one boundary the report must keep (AAP §0.5.6, §0.7.1 Group 2):
+ *
+ * - **Two paired browsers whose bound tabs share an id.** Chrome numbers tabs
+ *   per browser, so two DevTools credentials each bind *their own* tab of one
+ *   id to two sessions served from one dev-server origin. Readiness rests on
+ *   the bound tab's own page agent: one browser's `agent.ready` makes its own
+ *   session ready and leaves the other session `instrumenting`, with no
+ *   "Ready to capture" and no corrected report, until the other browser's
+ *   page agent reports for itself.
+ *
+ * Every route ends with every modification removed by the real cleanup and
+ * the copied corpus byte-identical to its snapshot.
  *
  * ## Rules ruling
  *
@@ -51,6 +61,8 @@
  *
  * @module
  */
+
+import { createServer } from 'node:http';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -86,6 +98,7 @@ function memberOf<const T extends string>(vocabulary: readonly T[], value: NoInf
 }
 
 const STATUS_READY = memberOf(SESSION_STATUSES, 'ready');
+const STATUS_INSTRUMENTING = memberOf(SESSION_STATUSES, 'instrumenting');
 const INSTRUMENT_STAGE = memberOf(PROGRESS_STAGES, 'instrument');
 const ROW_DONE = memberOf(PROGRESS_STATUSES, 'done');
 const ROW_FAILED = memberOf(PROGRESS_STATUSES, 'failed');
@@ -95,7 +108,16 @@ const CLEANUP_CLEAN = memberOf(CLEANUP_STATUSES, 'clean');
 const QUESTION = 'Why is this interaction slow?';
 
 /** The inspected tabs, one per route, distinct from every other suite's. */
-const TAB = Object.freeze({ lateAgent: 4_711, lateBind: 4_712 });
+const TAB = Object.freeze({ lateAgent: 4_711, lateBind: 4_712, collidingIds: 4_713 });
+
+/**
+ * How long a session is watched for a `ready` it must not reach. The path it
+ * guards against — a report of the other browser's tab answering this
+ * session's pending readiness wait — moves the session to `ready` within
+ * milliseconds of that report, so this window covers it many times over
+ * while staying well inside the gate's own reload wait.
+ */
+const NOT_READY_WINDOW_MS = 2_000;
 
 /** The message the instrumentation service logs once an install has settled. */
 const INSTALLED_LOG = 'Instrumentation installed';
@@ -236,6 +258,82 @@ async function openSession(): Promise<OpenSession> {
   return { copy, origin: new URL(launched.value.devServerUrl).origin, editor, record };
 }
 
+/** A loopback HTTP server standing in for one dev server several sessions are pointed at. */
+interface SharedDevServer {
+  /** Where it answers, in the `origin/` form a session records. */
+  readonly url: string;
+  /** Stops it and drops every connection. Idempotent. */
+  close(): Promise<void>;
+}
+
+/** Starts a {@link SharedDevServer} on an ephemeral loopback port. */
+async function startSharedDevServer(): Promise<SharedDevServer> {
+  const server = createServer((_request, response) => {
+    response.end('shared dev server');
+  });
+  await new Promise<void>((resolve) => {
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === 'string') {
+    throw new Error('The shared dev server did not bind a TCP port.');
+  }
+  let closing: Promise<void> | undefined;
+  return {
+    url: `http://127.0.0.1:${String(address.port)}/`,
+    close: () => {
+      closing ??= new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => {
+          resolve();
+        });
+      });
+      return closing;
+    },
+  };
+}
+
+/**
+ * Creates a session over a fresh copy of the corpus, recording `devServerUrl`
+ * as its dev server — so several sessions share one dev-server origin — with a
+ * server-agent connection standing for the copy's preload and an editor
+ * announcing the copy's root. No tab is bound here.
+ */
+async function openSessionServedBy(devServerUrl: string): Promise<OpenSession> {
+  const copy = await harness.copyFixtureProject();
+  const credential = harness.issueServerAgentCredential(copy.root);
+  const serverAgent = await harness.ws({
+    client: 'server-agent',
+    projectRoot: copy.root,
+    token: credential.token,
+  });
+  expect(serverAgent.authenticated).toBe(true);
+  const editor = await harness.editor(copy.root);
+  const record = await harness.createSession({
+    projectRoot: copy.root,
+    question: QUESTION,
+    devServerUrl,
+  });
+  return { copy, origin: new URL(devServerUrl).origin, editor, record };
+}
+
+/** The session's status as the manager holds it now. */
+function statusOf(sessionId: string): SessionRecord['status'] | undefined {
+  const record = harness.manager.get(sessionId);
+  if (isErr(record)) {
+    throw new Error(`the session record was unreadable (${record.error.code})`);
+  }
+  return record.value?.status;
+}
+
+/** Whether a client received the "Ready to capture" row for `sessionId`. */
+function announcedReady(client: HarnessWsClient, sessionId: string): boolean {
+  return instrumentRowsOf(client, sessionId).some(
+    (frame) =>
+      frame.payload.status === ROW_DONE && frame.payload.message === READY_TO_CAPTURE_MESSAGE,
+  );
+}
+
 /** Binds `tabId` to the session through `client`, failing the test on a refusal. */
 async function bind(client: HarnessWsClient, session: OpenSession, tabId: number): Promise<void> {
   const bound = await harness.bindTab(client, {
@@ -249,17 +347,22 @@ async function bind(client: HarnessWsClient, session: OpenSession, tabId: number
   }
 }
 
-/** Relays the tab's page-agent report on its DevTools connection, as the service worker does. */
+/**
+ * Relays the tab's page-agent report on its DevTools connection, as the
+ * service worker does. `producerId` defaults to one per tab id; two browsers
+ * whose tab ids collide pass their own.
+ */
 async function reportPageAgent(
   client: HarnessWsClient,
   session: OpenSession,
   tabId: number,
   documentId: string,
+  producerId = `prd_signalready_${String(tabId)}`,
 ): Promise<void> {
   const report = client.send('agent.ready', {
     tabId,
     documentId,
-    producerId: `prd_signalready_${String(tabId)}`,
+    producerId,
     url: `${session.origin}/`,
     installedBeforeReact: true,
     reactDetected: true,
@@ -424,5 +527,102 @@ describe('a panel that binds after the install', () => {
     expect(rebound[0]?.payload).toEqual(corrected?.payload);
 
     await endAndVerify(session);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Two paired browsers whose bound tabs share an id
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('two paired browsers whose bound tabs share an id, on one dev-server origin', () => {
+  it('makes a session ready on its own browser’s page-agent report only, never on the other browser’s', async () => {
+    const devServer = await startSharedDevServer();
+    try {
+      const first = await openSessionServedBy(devServer.url);
+      const second = await openSessionServedBy(devServer.url);
+      expect(second.origin).toBe(first.origin);
+      expect(second.copy.root).not.toBe(first.copy.root);
+
+      // Two paired extensions, each with its own credential. Chrome numbers
+      // tabs per browser, so each inspects — and binds — its own tab 4713.
+      const tabId = TAB.collidingIds;
+      const firstCredential = harness.issueDevtoolsCredential();
+      const secondCredential = harness.issueDevtoolsCredential();
+      expect(secondCredential.extensionId).not.toBe(firstCredential.extensionId);
+      const { client: firstBrowser } = await harness.connectDevtools({
+        tabId,
+        credential: firstCredential,
+      });
+      const { client: secondBrowser } = await harness.connectDevtools({
+        tabId,
+        credential: secondCredential,
+      });
+      await bind(firstBrowser, first, tabId);
+      await bind(secondBrowser, second, tabId);
+
+      // Both installs asked their adapters before any page agent reported, and
+      // both sessions wait for their bound tab's page.
+      const [firstStale] = await waitForReadyFrames(firstBrowser, first.record.id, 1);
+      const [secondStale] = await waitForReadyFrames(secondBrowser, second.record.id, 1);
+      expect(firstStale?.payload.unavailable.length).toBeGreaterThan(0);
+      expect(secondStale?.payload.unavailable.length).toBeGreaterThan(0);
+      expect(statusOf(first.record.id)).toBe(STATUS_INSTRUMENTING);
+      expect(statusOf(second.record.id)).toBe(STATUS_INSTRUMENTING);
+
+      // Only the first browser's page agent reports: its own session is ready …
+      await reportPageAgent(
+        firstBrowser,
+        first,
+        tabId,
+        'doc_signalready_firstbrowser01',
+        'prd_signalready_firstbrowser',
+      );
+      await harness.waitForSession(first.record.id, (record) => record.status === STATUS_READY);
+      await waitForInstalled(first.record.id);
+
+      // … and the other browser's session is not: it keeps waiting on its own
+      // page agent, with no "Ready to capture" and no corrected report.
+      const becameReady = await harness
+        .waitForSession(second.record.id, (record) => record.status === STATUS_READY, {
+          timeoutMs: NOT_READY_WINDOW_MS,
+        })
+        .then(
+          () => true,
+          () => false,
+        );
+      expect(becameReady).toBe(false);
+      expect(statusOf(second.record.id)).toBe(STATUS_INSTRUMENTING);
+      for (const client of [second.editor, secondBrowser]) {
+        expect(await client.flush()).toBe(true);
+        expect(announcedReady(client, second.record.id)).toBe(false);
+        expect(readyFramesOf(client, second.record.id)).toHaveLength(1);
+      }
+      expect(readyFramesOf(secondBrowser, second.record.id)[0]?.payload).toEqual(
+        secondStale?.payload,
+      );
+      expect(await first.editor.flush()).toBe(true);
+      expect(announcedReady(first.editor, first.record.id)).toBe(true);
+
+      // The second browser's own page agent reports: now its session is ready.
+      await reportPageAgent(
+        secondBrowser,
+        second,
+        tabId,
+        'doc_signalready_secondbrowser01',
+        'prd_signalready_secondbrowser',
+      );
+      await harness.waitForSession(second.record.id, (record) => record.status === STATUS_READY);
+      await waitForInstalled(second.record.id);
+      await second.editor.until(
+        () => (announcedReady(second.editor, second.record.id) ? true : undefined),
+        HARNESS_TIMEOUTS.pipeline,
+        () => `the "${READY_TO_CAPTURE_MESSAGE}" row of ${second.record.id}`,
+      );
+
+      await endAndVerify(first);
+      await endAndVerify(second);
+    } finally {
+      await devServer.close();
+    }
   });
 });

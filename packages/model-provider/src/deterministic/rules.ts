@@ -126,6 +126,8 @@ import {
   duplicateRequestFact,
   errorCountFact,
   flowPathLabel,
+  focusSubjectLabel,
+  focusedDeclarationFact,
   formatDurationMs,
   codeRelevanceReason,
   instrumentationActionRationale,
@@ -2069,13 +2071,122 @@ function understandingBag(root: JsonObject): JsonObject | undefined {
 }
 
 /**
+ * The words of a component name, split at its camel-case boundaries: an
+ * upper-case run standing before a capitalised word (an acronym), a
+ * capitalised or lower-case word, a remaining upper-case run, or a digit run.
+ * Unicode letter classes, so the split does not depend on a locale.
+ */
+const NAME_WORD_PATTERN = /\p{Lu}+(?=\p{Lu}\p{Ll})|\p{Lu}?\p{Ll}+|\p{Lu}+|\p{N}+/gu;
+
+/** A component name as a declaration spells it: a capitalised identifier, no namespace member. */
+const COMPONENT_IDENTIFIER_PATTERN = /^\p{Lu}[\p{L}\p{N}]*$/u;
+
+/** A word of a component name made of letters. */
+const LETTER_WORD_PATTERN = /^\p{L}+$/u;
+
+/** The fewest letters a word must have to qualify a component name. */
+const MIN_QUALIFYING_WORD_LETTERS = 2;
+
+/** The fewest qualifying words a domain-qualified component name has. */
+const MIN_QUALIFIED_NAME_WORDS = 2;
+
+/**
+ * Whether a component name is domain-qualified: a capitalised identifier of
+ * {@link MIN_QUALIFIED_NAME_WORDS} or more camel-case words of at least
+ * {@link MIN_QUALIFYING_WORD_LETTERS} letters each — a noun qualified by what
+ * it is for (`‹Domain›‹Widget›`) rather than a bare building block
+ * (`‹Widget›`).
+ *
+ * Structure only, and deliberately so: no list of design-system, framework or
+ * application names is consulted, so the rule reads every project the same
+ * way. A namespaced member (`‹Namespace›.‹member›`, the spelling of context
+ * providers and compound library parts) is not a declaration's own name, and a
+ * minified name's single-letter words qualify nothing.
+ *
+ * @param name A member of a component chain.
+ * @returns `true` when the name is domain-qualified.
+ * @example
+ * // isQualifiedComponentName('‹Widget›') === false
+ * // isQualifiedComponentName('TallyTile') === true
+ */
+function isQualifiedComponentName(name: string): boolean {
+  if (!COMPONENT_IDENTIFIER_PATTERN.test(name)) {
+    return false;
+  }
+  const words = (name.match(NAME_WORD_PATTERN) ?? []).filter(
+    (word) => LETTER_WORD_PATTERN.test(word) && word.length >= MIN_QUALIFYING_WORD_LETTERS,
+  );
+  return words.length >= MIN_QUALIFIED_NAME_WORDS;
+}
+
+/**
+ * The component names a context reports the project declares — its
+ * `declaredComponents`, at the top level, in the understanding or beside the
+ * selected target's chain.
+ *
+ * The service derives the list from the project's code graph: the members of
+ * the owner chain a `component` node of the project declares. It is the
+ * structural fact that separates the application's own components from the
+ * framework's and the libraries' in an owner chain, which a React tree
+ * interleaves; names only, compared exactly.
+ *
+ * @param root The structured context.
+ * @returns The declared names; empty when the context reports none.
+ */
+function readDeclaredComponents(root: JsonObject): ReadonlySet<string> {
+  const target =
+    readObjectField(root, 'target', 'selectedTarget') ??
+    readObjectField(understandingBag(root), 'target', 'selectedTarget');
+  return new Set([
+    ...readStringSet(root, 'declaredComponents'),
+    ...readStringSet(understandingBag(root), 'declaredComponents'),
+    ...readStringSet(target, 'declaredComponents'),
+  ]);
+}
+
+/**
+ * The component a list of component names — an owner chain or an
+ * understanding's `component` entities, nearest first — points at, for a
+ * label: the first application component.
+ *
+ * The chain starts at the component that rendered the element, which in a
+ * project built on a design system is usually a bare building block, and it
+ * ends in the framework's own boundaries; the application component that
+ * placed the element is the one a developer recognises. So the nearest name
+ * the project declares ({@link readDeclaredComponents}) that is
+ * domain-qualified ({@link isQualifiedComponentName}) comes first — the
+ * application component rather than its building block — then the nearest
+ * declared name — a single-word application component rather than a
+ * framework boundary above it — and, when the context reports no declaration
+ * among the names, the nearest domain-qualified name, then the nearest name.
+ *
+ * @param names The names, nearest first.
+ * @param declared The names the project declares.
+ * @returns The name, or `undefined` for an empty list.
+ */
+function pointedComponentName(
+  names: readonly string[],
+  declared: ReadonlySet<string>,
+): string | undefined {
+  return (
+    names.find((name) => declared.has(name) && isQualifiedComponentName(name)) ??
+    names.find((name) => declared.has(name)) ??
+    names.find(isQualifiedComponentName) ??
+    names[0]
+  );
+}
+
+/**
  * The selected-target descriptor of a context.
  *
- * The label prefers the nearest component of the resolved chain, then the
- * element's own accessible text, then its tag name, then its selector — in that
- * order, because that is the order of decreasing usefulness to a developer
- * reading a panel title. Every one of them comes from the descriptor the
- * DevTools surface built from the selection; none comes from prose.
+ * The label is the first application component of the resolved chain
+ * ({@link pointedComponentName}). Without a chain it falls back to the
+ * element's own accessible text, then its tag name, then its selector — in
+ * that order, because that is the order of decreasing usefulness to a
+ * developer reading a panel title. Every one of them comes from the
+ * descriptor the DevTools surface built from the selection or from the
+ * project's code graph; none comes from prose. The chain itself is kept as
+ * carried, nearest first.
  *
  * @param root The structured context.
  * @returns The target view, or `undefined` when nothing was selected.
@@ -2093,7 +2204,7 @@ function readTarget(root: JsonObject): TargetView | undefined {
     MAX_ENTITIES,
   );
   const label =
-    chain[0] ??
+    pointedComponentName(chain, readDeclaredComponents(root)) ??
     asString(readField(bag, 'text', 'label', 'accessibleName')) ??
     asString(bag.tagName) ??
     asString(bag.selector);
@@ -2102,6 +2213,45 @@ function readTarget(root: JsonObject): TargetView | undefined {
     ...(label !== undefined ? { label } : {}),
     chain,
   };
+}
+
+/**
+ * The label of the component a plan is about, for a context that carries the
+ * validated understanding rather than the selected target — the plan
+ * stage's.
+ *
+ * A context that carries its target keeps that target's label. Otherwise the
+ * selected element's owner chain the context carries as `selectedComponents`
+ * names it — the selection itself, which may have arrived after the
+ * understanding was settled — and without one the understanding's
+ * `component` entities do, which the understand rules list with the owner
+ * chain first, nearest first. Either list is read with {@link readTarget}'s
+ * rule ({@link pointedComponentName}) and the declarations the caller knows
+ * of — the plan stage's are the symbols its investigation resolved in the
+ * project's code graph.
+ *
+ * @param root The structured context.
+ * @param understanding The context's understanding view.
+ * @param declared The component names the project declares.
+ * @returns The label, or `undefined` when no target, chain or component
+ * entity was carried.
+ */
+function pointedComponentLabel(
+  root: JsonObject,
+  understanding: UnderstandingView,
+  declared: ReadonlySet<string>,
+): string | undefined {
+  if (understanding.target?.label !== undefined) {
+    return understanding.target.label;
+  }
+  const selected = asStringArray(root['selectedComponents']).slice(0, MAX_ENTITIES);
+  if (selected.length > 0) {
+    return pointedComponentName(selected, declared);
+  }
+  const components = understanding.entityRecords
+    .filter((record) => record.kind === 'component')
+    .map((record) => record.name);
+  return pointedComponentName(components, declared);
 }
 
 /**
@@ -2255,6 +2405,177 @@ function readTraceId(root: JsonObject): string | undefined {
 }
 
 /* -------------------------------------------------------------------------------------------------
+ * follow-up focus
+ *
+ * A follow-up that regenerates an analysis and a panel asks a narrower
+ * question than the one the session started with, and the analyze and
+ * generate-panel contexts say which, structurally, in one optional top-level
+ * field the follow-up stage fills:
+ *
+ *     followUpFocus: {
+ *       categoryHints: string[],                              // best supported first
+ *       declarations: { file, symbol, kind }[],               // graph-resolved
+ *     }
+ *
+ * The hints are problem categories in the understanding vocabulary, classified
+ * by the stage from the follow-up's lexical hints; the declarations are the
+ * ones the follow-up named, already resolved through the code graph. Neither
+ * carries any of the follow-up's wording, so a focus is a function of what was
+ * classified and resolved, and two phrasings that classify and resolve alike
+ * build byte-identical answers. A context without the field — every first
+ * question — is answered exactly as it always was: every use of the focus below
+ * is gated on its presence.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The problem categories a follow-up focus may name: the understanding
+ * vocabulary ({@link UNDERSTANDING_CATEGORIES}) less its unclassified member,
+ * which focuses on nothing. A hint outside it is ignored rather than read as
+ * `'other'`.
+ */
+const FOCUS_CATEGORIES: ReadonlySet<string> = new Set([
+  'performance',
+  'rendering',
+  'network',
+  'data',
+  'state',
+  'error',
+  'correctness',
+]);
+
+/** Declarations one follow-up focus is read with, at most. */
+const MAX_FOCUS_DECLARATIONS = 8;
+
+/** One declaration a follow-up named, as the code graph resolved it. */
+interface FocusDeclaration {
+  /** The declaring file, project-relative and contained, when the focus carried one. */
+  readonly file?: string;
+  /** The declaration's name, as the graph reports it. */
+  readonly symbol: string;
+  /** The graph's node kind for it, or the empty string. */
+  readonly kind: string;
+}
+
+/** What a follow-up asks the analysis and the panel to concentrate on. */
+interface FollowUpFocusView {
+  /** Members of {@link FOCUS_CATEGORIES}, best supported first, without repeats. */
+  readonly categories: readonly string[];
+  /** At most {@link MAX_FOCUS_DECLARATIONS} declarations, in carried order, without repeats. */
+  readonly declarations: readonly FocusDeclaration[];
+}
+
+/**
+ * Reads the follow-up focus of a context, tolerantly.
+ *
+ * Probed as `followUpFocus` on the root, then inside the understanding bag for
+ * a stage that nests it there. Category hints outside {@link FOCUS_CATEGORIES}
+ * are ignored and repeats dropped, keeping the carried order — the order is the
+ * stage's "best supported first". A declaration needs a name; its file is kept
+ * only when it is a contained project path, and a repeat of an earlier
+ * `file|symbol` pair is dropped. A focus left with neither a category nor a
+ * declaration focuses on nothing and reads as absent.
+ *
+ * @param root The structured context.
+ * @returns The focus, or `undefined` when the context carries none.
+ */
+function readFollowUpFocus(root: JsonObject): FollowUpFocusView | undefined {
+  const bag =
+    readObjectField(root, 'followUpFocus') ??
+    readObjectField(understandingBag(root), 'followUpFocus');
+  if (bag === undefined) {
+    return undefined;
+  }
+
+  const categories: string[] = [];
+  for (const hint of asStringArray(readField(bag, 'categoryHints', 'categories'))) {
+    if (FOCUS_CATEGORIES.has(hint) && !categories.includes(hint)) {
+      categories.push(hint);
+    }
+  }
+
+  const declarations: FocusDeclaration[] = [];
+  const seen = new Set<string>();
+  for (const record of asObjectArray(readField(bag, 'declarations', 'symbols')) ?? []) {
+    if (declarations.length >= MAX_FOCUS_DECLARATIONS) {
+      break;
+    }
+    const symbol = asString(readField(record, 'symbol', 'name'));
+    if (symbol === undefined) {
+      continue;
+    }
+    const file = asProjectPath(readField(record, 'file', 'path'));
+    const key = `${file ?? ''}|${symbol}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    declarations.push({
+      ...(file !== undefined ? { file } : {}),
+      symbol,
+      kind: asString(readField(record, 'kind', 'nodeKind')) ?? '',
+    });
+  }
+
+  if (categories.length === 0 && declarations.length === 0) {
+    return undefined;
+  }
+  return { categories, declarations };
+}
+
+/**
+ * The category a focus leads with: its best-supported hint.
+ *
+ * @param focus The context's focus, if any.
+ * @returns The first category hint, or `undefined` when there is no focus or
+ * it names declarations only.
+ */
+function leadingFocusCategory(focus: FollowUpFocusView | undefined): string | undefined {
+  return focus?.categories[0];
+}
+
+/**
+ * Separators a qualified span name joins an owner and a member with: a dotted
+ * member (`‹owner›.‹member›`) and the private-member spelling
+ * (`‹owner›#‹member›`).
+ */
+const QUALIFIED_NAME_SEPARATORS: readonly string[] = Object.freeze(['.', '#']);
+
+/**
+ * Whether a recorded name names a declaration: equal to its symbol, or that
+ * symbol qualified by an owner.
+ *
+ * @param name A span's name, or the symbol its source location records.
+ * @param symbol The declaration's symbol.
+ * @returns `true` when `name` names the declaration.
+ */
+function namesDeclaration(name: string, symbol: string): boolean {
+  if (name === symbol) {
+    return true;
+  }
+  return QUALIFIED_NAME_SEPARATORS.some((separator) => name.endsWith(`${separator}${symbol}`));
+}
+
+/**
+ * Whether a source location lies in a focused declaration: in its file when
+ * both name one, and at its symbol when the location records one. A location
+ * that records no symbol lies in the declaration only by file, so a
+ * declaration that carries no file matches no symbol-less location.
+ *
+ * @param location A validated location.
+ * @param declaration A focused declaration.
+ * @returns `true` when the location lies in the declaration.
+ */
+function locationInDeclaration(location: SourceLocation, declaration: FocusDeclaration): boolean {
+  if (declaration.file !== undefined && location.file !== declaration.file) {
+    return false;
+  }
+  if (location.symbol !== undefined) {
+    return namesDeclaration(location.symbol, declaration.symbol);
+  }
+  return declaration.file !== undefined;
+}
+
+/* -------------------------------------------------------------------------------------------------
  * capture-aggregate readers
  *
  * One view type per class of deterministic fact candidate, each keeping the
@@ -2373,22 +2694,176 @@ function readSpans(aggregates: JsonObject): readonly SpanView[] {
 
   const spans: SpanView[] = [];
   for (const node of nodes) {
-    const duration = asDurationMs(readField(node, 'duration', 'durationMs', 'elapsedMs'));
-    if (duration === undefined) {
-      continue;
+    const span = readSpanView(node);
+    if (span !== undefined) {
+      spans.push(span);
     }
-    const name = asString(readField(node, 'name', 'operation', 'label')) ?? '';
-    const tier = asString(node.tier);
-    const kind = asString(node.kind);
-    spans.push({
-      node,
-      name,
-      duration,
-      ...(tier !== undefined ? { tier } : {}),
-      ...(kind !== undefined ? { kind } : {}),
-    });
   }
   return spans;
+}
+
+/**
+ * One measured operation, read from its aggregate node.
+ *
+ * @param node A span row or trace node.
+ * @returns The view, or `undefined` when the node carries no usable duration.
+ */
+function readSpanView(node: JsonObject): SpanView | undefined {
+  const duration = asDurationMs(readField(node, 'duration', 'durationMs', 'elapsedMs'));
+  if (duration === undefined) {
+    return undefined;
+  }
+  const name = asString(readField(node, 'name', 'operation', 'label')) ?? '';
+  const tier = asString(node.tier);
+  const kind = asString(node.kind);
+  return {
+    node,
+    name,
+    duration,
+    ...(tier !== undefined ? { tier } : {}),
+    ...(kind !== undefined ? { kind } : {}),
+  };
+}
+
+/**
+ * Every measured operation a capture carries anywhere: the flat span lists and
+ * every trace tree, each operation once.
+ *
+ * {@link readSpans} reads the flat list *or* the trees, because a list of the
+ * slowest operations is what the ranked facts want. A declaration a follow-up
+ * named need not be among the slowest, so the operations that measure it are
+ * looked for in both, and a row the flat list and a tree both carry — the same
+ * event, the same span — is counted once: keyed by its event, else by its span
+ * identifier. A row carrying neither is kept as it is, since nothing says it
+ * repeats another.
+ *
+ * @param aggregates The capture-aggregate bag.
+ * @returns The operations, flat lists first, each in carried order.
+ */
+function readAllSpans(aggregates: JsonObject): readonly SpanView[] {
+  const nodes: JsonObject[] = [];
+  for (const field of DATA_SOURCE_FIELDS.spans ?? []) {
+    nodes.push(...(asObjectArray(aggregates[field]) ?? []));
+  }
+  for (const field of DATA_SOURCE_FIELDS.trace ?? []) {
+    nodes.push(...flattenNodes(aggregates[field]));
+  }
+
+  const spans: SpanView[] = [];
+  const seen = new Set<string>();
+  for (const node of nodes) {
+    const key = singleEvidenceOf(node) ?? asString(node['spanId']);
+    if (key !== undefined) {
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+    }
+    const span = readSpanView(node);
+    if (span !== undefined) {
+      spans.push(span);
+    }
+  }
+  return spans;
+}
+
+/**
+ * What a capture measured of one focused declaration.
+ *
+ * `spans` are the operations that measure it, longest first; `count` is how
+ * many there are, and `totalMs` the time they took, summed over the outermost
+ * ones only — a run nested inside another run of the same declaration is
+ * counted as a run but its time is already inside its caller's, so summing it
+ * again would claim more time than was spent.
+ */
+interface FocusedMeasurement {
+  /** The declaration measured. */
+  readonly declaration: FocusDeclaration;
+  /** The operations that measure it, ordered by {@link sortSpans}. */
+  readonly spans: readonly SpanView[];
+  /** How many operations measure it. */
+  readonly count: number;
+  /**
+   * The time they took, in milliseconds: every operation's duration except one
+   * whose parent span is itself one of these operations, which the capture
+   * links by `parentSpanId`.
+   */
+  readonly totalMs: number;
+}
+
+/**
+ * Whether an operation measures a focused declaration.
+ *
+ * A located operation outside the declaration's file never does. One whose
+ * location records the symbol it measured is decided by that symbol, the
+ * record a timing patch makes of what it wrapped; otherwise its own name
+ * decides — the declaration's symbol, or that symbol qualified by an owner
+ * ({@link namesDeclaration}).
+ *
+ * @param span A measured operation.
+ * @param declaration A focused declaration.
+ * @returns `true` when the operation measures the declaration.
+ */
+function spanMeasuresDeclaration(span: SpanView, declaration: FocusDeclaration): boolean {
+  const location = readSourceLocation(span.node);
+  if (
+    location !== undefined &&
+    declaration.file !== undefined &&
+    location.file !== declaration.file
+  ) {
+    return false;
+  }
+  if (location?.symbol !== undefined) {
+    return namesDeclaration(location.symbol, declaration.symbol);
+  }
+  return span.name.length > 0 && namesDeclaration(span.name, declaration.symbol);
+}
+
+/**
+ * What the capture measured of each focused declaration, in the focus's order;
+ * a declaration the capture holds no operation of is left out, because a
+ * measurement nobody took is not one to report.
+ *
+ * @param focus The context's focus.
+ * @param aggregates The capture-aggregate bag.
+ * @returns One measurement per measured declaration.
+ */
+function focusedMeasurements(
+  focus: FollowUpFocusView,
+  aggregates: JsonObject,
+): readonly FocusedMeasurement[] {
+  if (focus.declarations.length === 0) {
+    return [];
+  }
+  const spans = sortSpans(readAllSpans(aggregates));
+  const measurements: FocusedMeasurement[] = [];
+  for (const declaration of focus.declarations) {
+    const matched = spans.filter((span) => spanMeasuresDeclaration(span, declaration));
+    if (matched.length === 0) {
+      continue;
+    }
+    const ids = new Set<string>();
+    for (const span of matched) {
+      const id = asString(span.node['spanId']);
+      if (id !== undefined) {
+        ids.add(id);
+      }
+    }
+    let totalMs = 0;
+    for (const span of matched) {
+      const parent = asString(span.node['parentSpanId']);
+      if (parent === undefined || !ids.has(parent)) {
+        totalMs += span.duration;
+      }
+    }
+    measurements.push({
+      declaration,
+      spans: matched,
+      count: matched.length,
+      totalMs: roundValue(totalMs, METRIC_DECIMALS),
+    });
+  }
+  return measurements;
 }
 
 /**
@@ -3520,6 +3995,13 @@ interface CandidateView {
   readonly symbol: string;
   /** The node kind the graph reported, or the empty string. */
   readonly kind: string;
+  /**
+   * The node kind the relevance frame words the candidate as: {@link kind},
+   * or, for a candidate reported without one, the kind of the code-graph node
+   * the query log returned for the same file and symbol. Wording only — the
+   * score, the action types and the shortlist read {@link kind} alone.
+   */
+  readonly reasonKind: string;
   /** The relevance score, either reported or computed. */
   readonly score: number;
   /** What the candidate matched, for the relevance frame. */
@@ -3611,6 +4093,9 @@ function readCandidates(
   const entityNames = new Set(understanding.entities);
   const chain = new Set(understanding.target?.chain ?? []);
   const traced = tracedPathMembers(root);
+  const hopSites = tracedHopSites(root);
+  const queried = queriedFromMembers(root);
+  const loggedKinds = loggedNodeKinds(root);
 
   const candidates: CandidateView[] = [];
   for (const node of nodes) {
@@ -3632,7 +4117,10 @@ function readCandidates(
     const matchedSignals = declaredSignals.filter((signal) => neededSignals.has(signal));
     const matchedEntities = sortStrings([symbol, ...stems].filter((name) => entityNames.has(name)));
     const inChain = chain.has(symbol);
-    const tracedFrom = traced.get(pathMemberKey(file, symbol));
+    const memberKey = pathMemberKey(file, symbol);
+    const onTracedPath = traced.has(memberKey);
+    const tracedFrom = traced.get(memberKey) ?? hopSites.get(memberKey);
+    const queriedFrom = queried.get(memberKey);
     const knownKind = Object.hasOwn(CODE_KIND_ACTION_TYPES, kind);
 
     const reported = asFiniteNumber(readField(node, 'score', 'relevance', 'weight'));
@@ -3641,25 +4129,32 @@ function readCandidates(
       matchedSignals.length * SCORE_SIGNAL_MATCH +
       (matchedEntities.length > 0 ? SCORE_ENTITY_MATCH : 0) +
       (inChain ? SCORE_TARGET_CHAIN_MATCH : 0) +
-      (tracedFrom !== undefined ? SCORE_TRACED_PATH_MATCH : 0) +
+      (onTracedPath ? SCORE_TRACED_PATH_MATCH : 0) +
       (knownKind ? SCORE_KNOWN_KIND : 0);
     const score =
       reported === undefined
         ? roundValue(clampRange(computed, 0, SCORE_MAX), SCORE_DECIMALS)
         : roundValue(reported, SCORE_DECIMALS);
 
+    // What the relevance frame names, most specific first: a named entity, a
+    // needed then a declared signal, the far end of a traced path (or, for a
+    // declaration a traced hop is written in, the node the hop leaves), then
+    // the entity the query that returned the candidate looked up. Blank only
+    // for a candidate none of them relates to anything else, which the frame
+    // words without an entity.
     const relatedLabel =
       matchedEntities[0] ??
       (matchedSignals[0] !== undefined
         ? captureSignalLabel(matchedSignals[0])
         : declaredSignals[0] !== undefined
           ? captureSignalLabel(declaredSignals[0])
-          : (tracedFrom ?? ''));
+          : (tracedFrom ?? queriedFrom ?? ''));
 
     candidates.push({
       file,
       symbol,
       kind,
+      reasonKind: kind === '' ? (loggedKinds.get(memberKey) ?? '') : kind,
       score,
       relatedLabel,
       actionTypes: (CODE_KIND_ACTION_TYPES[kind] ?? DEFAULT_CODE_KIND_ACTION_TYPES).filter(
@@ -3765,20 +4260,36 @@ function readFlowSteps(value: JsonValue | undefined): readonly string[] {
  * say is where a click *goes*. The walk below follows the code graph from what
  * the log already resolved — the "found the component, traced the event
  * handler, found the route, found the database dependency" walk the session's
- * progress view reports (docs/ARCHITECTURE.md, "Progress from real findings"):
+ * progress view reports (docs/ARCHITECTURE.md, "Progress from real findings").
  *
- * 1. **Request trace.** The followed components — the selected element's owner
- *    chain, innermost first, or, when the understanding names no component the
- *    log found, the components the log's name lookups returned by exactly the
- *    name looked up — are traced along their calls to the API route a call
- *    site reaches, one component per turn, until one reaches a route: that
- *    component is the one whose own code issues the request.
- * 2. **Handler trace.** When no followed component's calls reach a route, each
+ * The followed components are the selected element's owner chain, innermost
+ * first, or, when the understanding names no component the log found, the
+ * components the log's name lookups returned by exactly the name looked up.
+ *
+ * 1. **Handler-issued request.** When the question is one the developer's input
+ *    reproduces ({@link CategoryProfile.inputDriven}: a latency, data or error
+ *    question), the request that matters is the one the interaction issues, and
+ *    an interaction issues its request from an event handler. So the event
+ *    handlers of each followed component's module are traced first, along
+ *    their calls to the API route a call site reaches, one component per turn,
+ *    until one reaches a route: that component's handler issues the
+ *    interaction's request, and the path found holds the handler. Tracing the
+ *    component's own calls first would instead follow a request its body
+ *    issues as it renders — one the interaction never sends — to that
+ *    request's route, and leave the interaction's route unfound. When none
+ *    reaches a route — or the question is not input-driven, where the request
+ *    a component issues as it renders is the one asked about — the walk
+ *    proceeds with steps 2 to 5 exactly as it would without this step.
+ * 2. **Request trace.** The followed components are traced along their calls
+ *    to the API route a call site reaches, one component per turn, until one
+ *    reaches a route: that component is the one whose own code issues the
+ *    request.
+ * 3. **Handler trace.** When no followed component's calls reach a route, each
  *    is traced again through the event handlers it binds, one per turn, so a
  *    click handler that issues the request itself lies on the path found.
- * 3. **Data layer.** Each route a trace reached is traced on to its data-layer
- *    call.
- * 4. **Handler binding.** When no path found so far holds an event handler,
+ * 4. **Data layer.** Each route a trace of steps 1 to 3 reached is traced on to
+ *    its data-layer call.
+ * 5. **Handler binding.** When no path found so far holds an event handler,
  *    the handler the element's nearest owner binds is looked up, one owner per
  *    turn, nearest first, until one binds a handler: owners nearer the element
  *    than the component that issues the request (the handler of a control
@@ -3786,12 +4297,14 @@ function readFlowSteps(value: JsonValue | undefined): readonly string[] {
  *    issues one. The owner that issues the
  *    request is never asked: its request leaves from its own code, and the
  *    first of the many handlers such a component binds would be an arbitrary
- *    claim rather than a traced one.
- * 5. **Resolved routes.** When no component was followed at all — a question
+ *    claim rather than a traced one. After a handler-issued request (step 1)
+ *    this step never runs: that path already holds the handler.
+ * 6. **Resolved routes.** When no component was followed at all — a question
  *    asked without a selected element — the API routes the log resolved are
- *    followed both ways instead: downstream to their data-layer call, and back
- *    against the call direction to the component whose code issues the
- *    request.
+ *    followed both ways instead: downstream to their data-layer call, and
+ *    upstream, against the direction of every edge, to the component whose
+ *    code issues the request — through the event handler that issues it, when
+ *    a handler does.
  *
  * Every step is derived from the structured context alone (the
  * understanding, the candidates the log holds, the requests already run),
@@ -3810,6 +4323,33 @@ const PATH_BETWEEN_TOOL = 'pathBetween';
 const FIND_BY_NAME_TOOL = 'findByName';
 const ROUTE_FOR_URL_TOOL = 'routeForUrl';
 
+/**
+ * The other lookups of the code tools' vocabulary whose request names what
+ * they looked up, which {@link queriedEntityLabel} relates their results to.
+ */
+const FIND_SYMBOL_TOOL = 'findSymbol';
+const WHO_CALLS_TOOL = 'whoCalls';
+const COMPONENTS_RENDERING_TOOL = 'componentsRendering';
+const HANDLERS_FOR_TOOL = 'handlersFor';
+
+/**
+ * The key the service's context builder never descends into while it projects
+ * candidates from the query log: the request a result echoes, whose names were
+ * asked for rather than found (`QUERY_REQUEST_KEY` of
+ * `apps/local-service/src/pipeline/context-builder.ts`).
+ */
+const QUERY_REQUEST_KEY = 'request';
+
+/**
+ * The deepest {@link queriedFromMembers} walks into one payload: the context
+ * builder's own projection bound (`maxDepth` of its default limits), restated
+ * for the layering reason given at {@link MAX_PATH_QUERIES}. The builder counts
+ * from the log above the payload, so every code node its projection reaches
+ * lies within this bound; a node deeper than that is no candidate and needs no
+ * relation.
+ */
+const MAX_PAYLOAD_DEPTH = 16;
+
 /** The code-graph node kinds the walk moves between. */
 const COMPONENT_NODE_KIND = 'component';
 const HANDLER_NODE_KIND = 'handler';
@@ -3825,11 +4365,13 @@ const DB_CALL_NODE_KIND = 'db-call';
 const REQUEST_HANDLER_ROUTE_KIND = 'route-handler';
 
 /**
- * The two traversal directions of a path query: downstream only (the engine's
- * default, what an absent `direction` means) and undirected, which may follow
- * an edge against its direction.
+ * The three traversal directions of a path query: downstream only (the
+ * engine's default, what an absent `direction` means), upstream only — incoming
+ * edges alone, so every hop is travelled against its edge's direction — and
+ * undirected, which may follow an edge either way.
  */
 const DOWNSTREAM_DIRECTION = 'out';
+const UPSTREAM_DIRECTION = 'in';
 const UNDIRECTED_DIRECTION = 'both';
 
 /**
@@ -3919,28 +4461,109 @@ function pathMemberKey(file: string, symbol: string): string {
 
 /**
  * Every code node on a path an executed `pathBetween` query found, mapped to
- * the name of that path's first node — what the member was traced from.
+ * the name of the node at the path's other end — what the member was traced
+ * against.
+ *
+ * Each path is read downstream ({@link executedPaths}). A member after the
+ * first is mapped to the path's first node, the one it was traced from; the
+ * first node itself is mapped to the path's last, the one it was traced to —
+ * mapping it to its own name would relate it to itself. A name equal to the
+ * member's own symbol or file relates it to nothing either (a one-node path, or
+ * a path ending at a namesake), so such a member is kept without a relation:
+ * it still lies on a traced path, which is what {@link readCandidates} scores,
+ * and the relevance frame then takes its next source. The first path that
+ * relates a member names it.
  *
  * @param root The structured context.
- * @returns The members; empty when the context ran no path query.
+ * @returns The members, each with its relation or `undefined`; empty when the
+ * context ran no path query.
  */
-function tracedPathMembers(root: JsonObject): ReadonlyMap<string, string> {
-  const members = new Map<string, string>();
+function tracedPathMembers(root: JsonObject): ReadonlyMap<string, string | undefined> {
+  const members = new Map<string, string | undefined>();
   for (const path of executedPaths(root)) {
     const nodes = asObjectArray(asObject(path)?.nodes) ?? [];
-    const origin = asString(nodes[0]?.name) ?? asString(nodes[0]?.symbol);
-    for (const node of nodes) {
+    const first = nodes[0];
+    const last = nodes[nodes.length - 1];
+    const origin = asString(first?.name) ?? asString(first?.symbol);
+    if (origin === undefined) {
+      continue;
+    }
+    const end = asString(last?.name) ?? asString(last?.symbol);
+    for (const [position, node] of nodes.entries()) {
       const file = asProjectPath(node.file);
       const symbol = asString(node.symbol) ?? asString(node.name);
-      if (file !== undefined && symbol !== undefined && origin !== undefined) {
-        const key = pathMemberKey(file, symbol);
-        if (!members.has(key)) {
-          members.set(key, origin);
-        }
+      if (file === undefined || symbol === undefined) {
+        continue;
+      }
+      const counterpart = position === 0 ? end : origin;
+      const related =
+        counterpart === undefined || counterpart === symbol || counterpart === file
+          ? undefined
+          : counterpart;
+      const key = pathMemberKey(file, symbol);
+      if (!members.has(key) || (members.get(key) === undefined && related !== undefined)) {
+        members.set(key, related);
       }
     }
   }
   return members;
+}
+
+/**
+ * The declaration each hop of a traced flow is written in, mapped to the name
+ * of the node the hop leaves — what that declaration was traced through.
+ *
+ * A hop's `location` is the site of its relationship, and the site belongs to
+ * the relationship's own `from` node, whichever way the search travelled it: a
+ * route's call into a service function is written inside the route module's
+ * method handler, so that handler is related to the route although it is no
+ * node of the path. Only paths {@link orientedPath} reads as flows are used,
+ * as for {@link tracedPathMembers}, and a site naming its own hop's node
+ * relates it to nothing. The first flow that relates a site names it. Unlike a
+ * path member, a hop site earns no score: it is how a candidate is worded, not
+ * whether it was traced.
+ *
+ * @param root The structured context.
+ * @returns The sites, keyed as {@link pathMemberKey} keys them; empty when no
+ * executed path query found a flow.
+ */
+function tracedHopSites(root: JsonObject): ReadonlyMap<string, string> {
+  const sites = new Map<string, string>();
+  for (const run of readExecutedRuns(root)) {
+    if (pathQueryIdentity(run.request) === undefined || orientedPath(run.payload) === undefined) {
+      continue;
+    }
+    const path = asObject(run.payload);
+    const names = new Map<string, string>();
+    for (const node of asObjectArray(path?.nodes) ?? []) {
+      const id = asString(node.nodeId);
+      const name = asString(node.name) ?? asString(node.symbol);
+      if (id !== undefined && name !== undefined && !names.has(id)) {
+        names.set(id, name);
+      }
+    }
+    for (const hop of asObjectArray(path?.edges) ?? []) {
+      const location = asObject(hop.location);
+      const file = asProjectPath(location?.file);
+      const symbol = asString(location?.symbol);
+      const from = asString(hop.from);
+      const owner = from === undefined ? undefined : names.get(from);
+      if (
+        file === undefined ||
+        symbol === undefined ||
+        owner === undefined ||
+        owner === symbol ||
+        owner === file
+      ) {
+        continue;
+      }
+      const key = pathMemberKey(file, symbol);
+      if (!sites.has(key)) {
+        sites.set(key, owner);
+      }
+    }
+  }
+  return sites;
 }
 
 /** One query of the log: its request, and the payload of a successful run or the code of a refused one. */
@@ -3974,9 +4597,147 @@ function readExecutedRuns(root: JsonObject): readonly ExecutedRun[] {
 }
 
 /**
+ * The entity one successful query looked up, as the relevance frame names it:
+ * the name, symbol or component its request asked about, or, for a URL lookup,
+ * the route path the route map resolved — the URL as asked when it resolved
+ * none. A path query relates its nodes to one another, which
+ * {@link tracedPathMembers} reads, and an excerpt looks nothing up, so neither
+ * names an entity here; nor does a tool outside the code tools' vocabulary.
+ *
+ * @param run A run of the log.
+ * @returns The label, or `undefined` when the run names no entity.
+ */
+function queriedEntityLabel(run: ExecutedRun): string | undefined {
+  const request = run.request;
+  switch (asString(request?.tool)) {
+    case FIND_BY_NAME_TOOL:
+      return asString(request?.name);
+    case FIND_SYMBOL_TOOL:
+      return asString(request?.symbol) ?? asString(request?.name);
+    case WHO_CALLS_TOOL:
+      return asString(request?.symbol);
+    case COMPONENTS_RENDERING_TOOL:
+      return asString(request?.component);
+    case ROUTE_FOR_URL_TOOL:
+      return asString(asObject(run.payload)?.routePath) ?? asString(request?.url);
+    case HANDLERS_FOR_TOOL:
+      return asString(request?.url);
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Calls `visit` for every code node `value` holds, walking nested lists and
+ * objects the way the service's context builder projects the candidates of an
+ * investigate turn (`candidatesFrom` in
+ * `apps/local-service/src/pipeline/context-builder.ts`): every object with a
+ * project-relative `file` and a `symbol`, or failing that a `name`, is a code
+ * node — nested ones too, such as the `location` a URL lookup's route carries,
+ * the `caller` of a call site or the `location` of a path's hop — no
+ * {@link QUERY_REQUEST_KEY} is entered, and the walk stops at
+ * {@link MAX_PAYLOAD_DEPTH}.
+ *
+ * @param value A payload, or a value nested in one.
+ * @param depth How deep `value` sits in its payload.
+ * @param visit Receives each code node with its normalised file and symbol.
+ */
+function forEachPayloadNode(
+  value: JsonValue | undefined,
+  depth: number,
+  visit: (node: JsonObject, file: string, symbol: string) => void,
+): void {
+  if (depth > MAX_PAYLOAD_DEPTH) {
+    return;
+  }
+  const list = asArray(value);
+  if (list !== undefined) {
+    for (const item of list) {
+      forEachPayloadNode(item, depth + 1, visit);
+    }
+    return;
+  }
+  const node = asObject(value);
+  if (node === undefined) {
+    return;
+  }
+  const file = asProjectPath(node.file);
+  const symbol = asString(node.symbol) ?? asString(node.name);
+  if (file !== undefined && symbol !== undefined) {
+    visit(node, file, symbol);
+  }
+  for (const [key, entry] of Object.entries(node)) {
+    if (key !== QUERY_REQUEST_KEY) {
+      forEachPayloadNode(entry, depth + 1, visit);
+    }
+  }
+}
+
+/**
+ * Every code node an executed query returned, mapped to the entity the first
+ * query that returned it looked up ({@link queriedEntityLabel}) — the one
+ * relation a candidate that only a query result produced has.
+ *
+ * Payloads are walked by {@link forEachPayloadNode}, runs in log order, and
+ * refused runs are skipped. A label equal to the node's own symbol or file
+ * relates it to nothing (a route node found by its own route path), so the node
+ * is left for a later query to name.
+ *
+ * @param root The structured context.
+ * @returns The relations; empty when the context carries no query log.
+ */
+function queriedFromMembers(root: JsonObject): ReadonlyMap<string, string> {
+  const members = new Map<string, string>();
+  for (const run of readExecutedRuns(root)) {
+    const label = run.payload === undefined ? undefined : queriedEntityLabel(run);
+    if (label === undefined) {
+      continue;
+    }
+    forEachPayloadNode(run.payload, 0, (_node, file, symbol) => {
+      const key = pathMemberKey(file, symbol);
+      if (label !== symbol && label !== file && !members.has(key)) {
+        members.set(key, label);
+      }
+    });
+  }
+  return members;
+}
+
+/**
+ * The kind of every code-graph node the executed queries returned, by file
+ * and symbol: what words a candidate the context supplied without a kind.
+ *
+ * The context builder keeps the first object it meets for a file and symbol,
+ * and a path's hop `location` — which names the declaration holding the hop's
+ * site but carries no kind — can be met before the path's own node for that
+ * declaration, so a traced handler or component can arrive kind-less although
+ * the log holds its node. Only an object with a kind of its own is read here
+ * (a graph node, never a location); runs are read in log order, refused runs
+ * are skipped, and the first kind found for a file and symbol wins.
+ *
+ * @param root The structured context.
+ * @returns The kinds; empty when the context carries no query log.
+ */
+function loggedNodeKinds(root: JsonObject): ReadonlyMap<string, string> {
+  const kinds = new Map<string, string>();
+  for (const run of readExecutedRuns(root)) {
+    forEachPayloadNode(run.payload, 0, (node, file, symbol) => {
+      const kind = asString(node.kind);
+      const key = pathMemberKey(file, symbol);
+      if (kind !== undefined && !kinds.has(key)) {
+        kinds.set(key, kind);
+      }
+    });
+  }
+  return kinds;
+}
+
+/**
  * The identity of a path query: its tool, both endpoints' selector fields, its
- * edge filter and its direction (downstream when absent, as the engine reads
- * it). Two requests with the same identity ask the same question.
+ * edge filter and its direction — {@link UPSTREAM_DIRECTION} or
+ * {@link UNDIRECTED_DIRECTION} as written, and downstream for anything else,
+ * absence included, as the engine reads it. Two requests with the same identity
+ * ask the same question.
  *
  * @param request A query request.
  * @returns The identity, or `undefined` for a query that is not a path query.
@@ -3995,12 +4756,13 @@ function pathQueryIdentity(request: JsonObject | undefined): string | undefined 
       .map((field) => asString(selector?.[field]) ?? '')
       .join('|');
   };
+  const direction = asString(request.direction);
   return [
     endpoint(request.from),
     endpoint(request.to),
     sortStrings([...asStringArray(request.edgeKinds)]).join(','),
-    asString(request.direction) === UNDIRECTED_DIRECTION
-      ? UNDIRECTED_DIRECTION
+    direction === UPSTREAM_DIRECTION || direction === UNDIRECTED_DIRECTION
+      ? direction
       : DOWNSTREAM_DIRECTION,
   ].join('>');
 }
@@ -4146,8 +4908,16 @@ function dataLayerTrace(file: string): JsonObject {
 
 /**
  * The trace from an API route back to the component whose code issues its
- * request: undirected, along {@link CALLER_TRACE_EDGE_KINDS}. The path it finds
- * is read downstream by {@link orientedPath}.
+ * request: upstream along {@link CALLER_TRACE_EDGE_KINDS}, so every hop follows
+ * an edge into the node the walk stands on — the call site that reaches the
+ * route, the function that makes the call, the event handler that calls it,
+ * the component that binds the handler — and never out of it. The path it
+ * finds lists the route first and is read downstream by {@link orientedPath}.
+ *
+ * Upstream rather than undirected on purpose: an undirected search from a route
+ * expands the route's own downstream calls — services, helpers, data-layer
+ * calls — before it reaches the callers, and exhausts the engine's node budget
+ * there, whereas the upstream search expands only what leads to the route.
  *
  * @param file The route's module file.
  * @returns The path query.
@@ -4158,20 +4928,45 @@ function callerTrace(file: string): JsonObject {
     from: { file, kind: API_ROUTE_NODE_KIND },
     to: { kind: COMPONENT_NODE_KIND },
     edgeKinds: [...CALLER_TRACE_EDGE_KINDS],
-    direction: UNDIRECTED_DIRECTION,
+    direction: UPSTREAM_DIRECTION,
+  };
+}
+
+/**
+ * The trace from the event handlers a component's module binds to the API
+ * route a call site reaches, along {@link REQUEST_TRACE_EDGE_KINDS}: what finds
+ * the request a control's interaction issues — the handler calls the function
+ * that makes the request — rather than one the component's body issues while
+ * it renders.
+ *
+ * The source is every `handler` node of the component's file, which is how the
+ * code graph places the handlers a component binds; a handler is a binding
+ * site, not a declaration a name selector could address.
+ *
+ * @param file The component's module file.
+ * @returns The path query.
+ */
+function handlerRequestTrace(file: string): JsonObject {
+  return {
+    tool: PATH_BETWEEN_TOOL,
+    from: { file, kind: HANDLER_NODE_KIND },
+    to: { kind: API_ROUTE_NODE_KIND },
+    edgeKinds: [...REQUEST_TRACE_EDGE_KINDS],
   };
 }
 
 /**
  * The follow-up queries the log still lacks, or none once the walk is done.
  *
- * The five steps of the walk described above this section, each proposed only
- * once the step before it has run: request traces, then handler traces, then
- * data-layer traces for the routes they reached, then the handler binding of
- * the element's nearest owner, then — when no component was followed — the
- * resolved routes both ways. Nothing is proposed without remaining budget,
- * past {@link MAX_PATH_QUERIES} path queries, after a path query was refused
- * for budget, or when every step already ran.
+ * The six steps of the walk described above this section, each proposed only
+ * once the step before it has run: for a question reproduced by input, the
+ * followed components' handler-issued requests; then, unless one of those
+ * reached a route, request traces and handler traces; then data-layer traces
+ * for the routes they reached; then the handler binding of the element's
+ * nearest owner; then — when no component was followed — the resolved routes
+ * both ways. Nothing is proposed without remaining budget, past
+ * {@link MAX_PATH_QUERIES} path queries, after a path query was refused for
+ * budget, or when every step already ran.
  *
  * @param root The structured context.
  * @param understanding The understanding the context carries.
@@ -4209,10 +5004,11 @@ function followUpQueries(root: JsonObject, understanding: UnderstandingView): Js
 
   // The followed components, innermost first: the owner chain the log found,
   // or the components the log's lookups returned by exactly the name asked for.
-  const found = new Set<string>();
+  // Each is kept with the file of its first candidate, where its handlers sit.
+  const found = new Map<string, string>();
   for (const candidate of readCandidates(root, understanding)) {
-    if (candidate.kind === COMPONENT_NODE_KIND) {
-      found.add(candidate.symbol);
+    if (candidate.kind === COMPONENT_NODE_KIND && !found.has(candidate.symbol)) {
+      found.set(candidate.symbol, candidate.file);
     }
   }
   const chain = tracedComponentNames(understanding).filter((component) => found.has(component));
@@ -4221,10 +5017,34 @@ function followUpQueries(root: JsonObject, understanding: UnderstandingView): Js
     MAX_TRACED_COMPONENTS,
   );
 
-  // Step 1 — request traces, one component per turn, until one reaches a route.
-  const requestTraces = components.map((component) =>
-    requestTrace(component, REQUEST_TRACE_EDGE_KINDS),
-  );
+  // Step 1 — for a question reproduced by input, the request each followed
+  // component's event handlers issue: one component file per turn, innermost
+  // first, until one reaches a route.
+  const handlerFiles =
+    categoryProfile(understanding.category)?.inputDriven === true
+      ? components.flatMap((component) => {
+          const file = found.get(component);
+          return file === undefined ? [] : [file];
+        })
+      : [];
+  const handlerRequests = [...new Set(handlerFiles)].map(handlerRequestTrace);
+  let handlerIssued = false;
+  for (const query of handlerRequests) {
+    const run = runOf(query);
+    if (run === undefined) {
+      return pending([query]);
+    }
+    if (reachedRouteFile(run) !== undefined) {
+      handlerIssued = true;
+      break;
+    }
+  }
+
+  // Step 2 — request traces, one component per turn, until one reaches a route;
+  // skipped once a handler issued the interaction's request.
+  const requestTraces = handlerIssued
+    ? []
+    : components.map((component) => requestTrace(component, REQUEST_TRACE_EDGE_KINDS));
   let issuer = -1;
   for (const [index, query] of requestTraces.entries()) {
     const run = runOf(query);
@@ -4237,9 +5057,9 @@ function followUpQueries(root: JsonObject, understanding: UnderstandingView): Js
     }
   }
 
-  // Step 2 — handler traces, only when no component's own calls reached a route.
+  // Step 3 — handler traces, only when no trace so far reached a route.
   const handlerTraces =
-    issuer === -1
+    !handlerIssued && issuer === -1
       ? components.map((component) => requestTrace(component, HANDLER_TRACE_EDGE_KINDS))
       : [];
   for (const query of handlerTraces) {
@@ -4252,9 +5072,9 @@ function followUpQueries(root: JsonObject, understanding: UnderstandingView): Js
     }
   }
 
-  // Step 3 — each route a trace reached, on to its data-layer call.
+  // Step 4 — each route a trace reached, on to its data-layer call.
   const routeFiles: string[] = [];
-  for (const query of [...requestTraces, ...handlerTraces]) {
+  for (const query of [...handlerRequests, ...requestTraces, ...handlerTraces]) {
     const run = runOf(query);
     const file = run === undefined ? undefined : reachedRouteFile(run);
     if (file !== undefined && !routeFiles.includes(file)) {
@@ -4266,9 +5086,10 @@ function followUpQueries(root: JsonObject, understanding: UnderstandingView): Js
     return dataLayer;
   }
 
-  // Step 4 — the handler the element's nearest owner binds, when no path holds
-  // one yet: one owner per turn, nearest first, until one binds a handler.
-  if (!executedPaths(root).some(holdsHandler)) {
+  // Step 5 — the handler the element's nearest owner binds, when no path holds
+  // one yet: one owner per turn, nearest first, until one binds a handler. A
+  // handler-issued request's path starts at its handler, so it never runs then.
+  if (!handlerIssued && !executedPaths(root).some(holdsHandler)) {
     const owners = issuer === -1 ? components : components.slice(0, issuer);
     for (const owner of owners) {
       const query = handlerBinding(owner);
@@ -4282,7 +5103,7 @@ function followUpQueries(root: JsonObject, understanding: UnderstandingView): Js
     }
   }
 
-  // Step 5 — without a followed component, the routes the log resolved, both ways.
+  // Step 6 — without a followed component, the routes the log resolved, both ways.
   if (components.length > 0) {
     return [];
   }
@@ -4297,15 +5118,20 @@ function followUpQueries(root: JsonObject, understanding: UnderstandingView): Js
  * An executed path as a flow: its nodes in the order the code runs them, or
  * `undefined` when the path is no flow.
  *
- * A downstream path is one already, and so is an undirected path every hop of
- * which it travelled along the edge's direction. An undirected path every hop
- * of which it travelled against the edge's direction — a caller trace, found
- * from a route back to the component that issues it — is the flow read
- * backwards, and is reversed so it reads from the component down to the
- * route. A path that mixes the two relates its endpoints without either
- * reaching the other through it (two functions joined through a helper both
- * call), so rendering it as a chain of calls would assert a flow the code does
- * not contain.
+ * Decided by the hops the path reports, whichever direction its search took:
+ *
+ * - a path none of whose hops was travelled against its edge's direction — any
+ *   downstream path, or an undirected one that happened to go with every edge —
+ *   is a flow already and is returned as it is;
+ * - a path every hop of which was travelled against its edge's direction — an
+ *   upstream caller trace, found from a route back to the component whose code
+ *   issues its request, or an undirected search that went the same way — is
+ *   the flow read backwards, and is reversed so it reads from the component
+ *   down to the route;
+ * - a path that mixes the two relates its endpoints without either reaching the
+ *   other through it (two functions joined through a helper both call), so
+ *   rendering it as a chain of calls would assert a flow the code does not
+ *   contain.
  *
  * @param payload The run's payload.
  * @returns The path, reoriented where needed, or `undefined`.
@@ -4315,9 +5141,6 @@ function orientedPath(payload: JsonValue | undefined): JsonObject | undefined {
   const nodes = asArray(path?.nodes);
   if (path === undefined || nodes === undefined || nodes.length === 0) {
     return undefined;
-  }
-  if (asBoolean(path.undirected) !== true) {
-    return path;
   }
   const reversedHops = (asArray(path.edges) ?? []).map(
     (hop) => asBoolean(asObject(hop)?.traversedAgainstDirection) === true,
@@ -4453,7 +5276,7 @@ export function buildInvestigation(input: JsonValue | undefined): JsonValue | un
   const relevantFiles: JsonValue[] = candidates.map((candidate) => ({
     file: candidate.file,
     symbol: candidate.symbol,
-    reason: codeRelevanceReason(codeSymbolKindLabel(candidate.kind), candidate.relatedLabel),
+    reason: codeRelevanceReason(codeSymbolKindLabel(candidate.reasonKind), candidate.relatedLabel),
     score: candidate.score,
   }));
 
@@ -4759,6 +5582,26 @@ function planFlowSteps(root: JsonObject): readonly (readonly string[])[] {
 }
 
 /**
+ * The routes the context's flows pass through ({@link ROUTE_STEP_PATTERN}),
+ * each once, in flow order and then step order — the server entry points the
+ * plan objective names beside the selected target.
+ *
+ * @param root The structured context of a plan-stage request.
+ * @returns The route steps; empty when no flow names a route.
+ */
+function tracedRoutes(root: JsonObject): readonly string[] {
+  const routes: string[] = [];
+  for (const steps of planFlowSteps(root)) {
+    for (const step of steps) {
+      if (ROUTE_STEP_PATTERN.test(step) && !routes.includes(step)) {
+        routes.push(step);
+      }
+    }
+  }
+  return routes;
+}
+
+/**
  * Places every step name of the context's flows relative to the routes they
  * pass through (see {@link FlowPlacements}). A flow that names no route places
  * nothing: its steps are all neutral.
@@ -4881,7 +5724,12 @@ function admittedByCategory(candidate: CandidateView, category: string | undefin
  * Builds the instrumentation plan of a request from its structured context.
  *
  * The objective comes from the plan-objective frame, filled with the category
- * label and the selected target's label — never with the developer's wording.
+ * label, the label of the component the plan is about — the selection's, else
+ * the understanding's ({@link pointedComponentLabel}) — how the capture
+ * reproduces the behaviour (an interaction for an input-driven category,
+ * {@link CategoryProfile.inputDriven}, else observing the page) and the routes
+ * the investigation's flows traced ({@link tracedRoutes}) — never with the
+ * developer's wording.
  * The capture list is the signals the understanding asked for, the signals its
  * category observes whenever the page is observed ({@link plannedSignals}) and
  * the signals the chosen targets contribute, intersected with what the adapter
@@ -4977,10 +5825,27 @@ export function buildPlanInput(input: JsonValue | undefined): JsonValue | undefi
   }
 
   const hypotheses = readCarriedHypotheses(root);
+  // Reproduced by an interaction — with the component the understanding points
+  // at, when it points at one — when the category's behaviour is input-driven,
+  // or, for a category without a profile, when the understanding needs the
+  // interaction signal; otherwise the capture observes the page. A symbol the
+  // investigation resolved is one the project declares.
+  const targetLabel = pointedComponentLabel(
+    root,
+    understanding,
+    new Set([...readDeclaredComponents(root), ...candidates.map((candidate) => candidate.symbol)]),
+  );
+  const profile = categoryProfile(understanding.category);
+  const interactive =
+    profile === undefined
+      ? understanding.signals.includes(INTERACTION_SIGNAL)
+      : profile.inputDriven;
   return {
     objective: planObjective(
       problemCategoryLabel(understanding.category ?? ''),
-      understanding.target?.label,
+      targetLabel,
+      interactive ? 'interaction' : 'page',
+      tracedRoutes(root),
     ),
     capture: capture.slice(0, MAX_CAPTURE_SIGNALS),
     instrumentationTargets: targets,
@@ -5011,7 +5876,8 @@ type FactClass =
   | 'unknownTrigger'
   | 'tierSplit'
   | 'longTask'
-  | 'errors';
+  | 'errors'
+  | 'focusedDeclaration';
 
 /**
  * How much each class of fact is worth on a crowded panel.
@@ -5027,6 +5893,11 @@ type FactClass =
  * finding and the unchanged-input renders are usually their children, so the
  * cascade's facts must survive {@link MAX_OBSERVED_FACTS} even when the
  * slowest operations and the unchanged-input facts fill most of it.
+ *
+ * `focusedDeclaration` — what the capture measured of a declaration a
+ * follow-up named ({@link focusFactCandidates}) — outweighs every other class,
+ * and exists only when a follow-up focus names a declaration the capture
+ * measured, so it never displaces anything in a first question's analysis.
  */
 const FACT_CLASS_WEIGHTS: Readonly<Record<FactClass, number>> = Object.freeze({
   slowestSpan: 95,
@@ -5040,7 +5911,57 @@ const FACT_CLASS_WEIGHTS: Readonly<Record<FactClass, number>> = Object.freeze({
   tierSplit: 50,
   longTask: 40,
   errors: 30,
+  focusedDeclaration: 100,
 });
+
+/**
+ * The fact classes that answer each focus category, for the boost a follow-up
+ * focus gives them ({@link factFocusBoost}).
+ *
+ * Keyed by {@link FOCUS_CATEGORIES}: a latency focus asks where the time went,
+ * a query focus about the repeated statement shapes, a request focus about the
+ * duplicated requests and where they came from, a render or state focus about
+ * the renders and what triggered them, an error focus about the failures.
+ * `correctness` names no class of measurement, so it boosts none.
+ */
+const FOCUS_FACT_CLASSES: Readonly<Record<string, readonly FactClass[]>> = Object.freeze({
+  performance: ['slowestSpan', 'tierSplit', 'longTask'],
+  data: ['repeatedQuery'],
+  network: ['duplicateRequests', 'sharedOrigin'],
+  rendering: ['contextRenders', 'unchangedRenders', 'renderCount', 'unknownTrigger'],
+  state: ['contextRenders', 'unchangedRenders', 'renderCount', 'unknownTrigger'],
+  error: ['errors'],
+  correctness: [],
+});
+
+/**
+ * The tier whose timing facts answer a focus category beyond its own classes:
+ * a query focus also asks how long the database took, so the database tier's
+ * share of the time and the slowest operations recorded there are boosted with
+ * the repeated statement shapes.
+ */
+const FOCUS_TIMING_TIERS: Readonly<Record<string, string>> = Object.freeze({
+  data: 'db',
+});
+
+/** The fact classes {@link FOCUS_TIMING_TIERS} reads a tier from. */
+const TIERED_FACT_CLASSES: ReadonlySet<FactClass> = new Set<FactClass>([
+  'slowestSpan',
+  'tierSplit',
+]);
+
+/**
+ * One rank step of a focus boost.
+ *
+ * Larger than the whole spread of {@link FACT_CLASS_WEIGHTS}, so a boosted
+ * class outranks every unboosted one whatever their weights, while candidates
+ * with the same boost keep their weighted order. Additive, and zero without a
+ * focus, which is what keeps a first question's ranking exactly as it was.
+ */
+const FOCUS_RANK_STEP = 1000;
+
+/** Facts about focused declarations one analysis reports, at most. */
+const MAX_FOCUSED_DECLARATION_FACTS = 3;
 
 /** Slowest operations reported as facts. */
 const MAX_SLOWEST_SPAN_FACTS = 2;
@@ -5088,6 +6009,8 @@ interface FactCandidate {
   readonly statement: string;
   /** The references this candidate would cite, before filtering. */
   readonly references: readonly string[];
+  /** The tier a timing fact is about, for {@link FOCUS_TIMING_TIERS}; absent otherwise. */
+  readonly tier?: string;
 }
 
 /** Fields shared by every evidence-pattern detection. */
@@ -5368,6 +6291,7 @@ function factCandidates(
         magnitude: span.duration,
         statement: slowestSpanFact(operationLabel(span), span.duration, totalMs),
         references: evidenceOf(span.node),
+        ...(span.tier !== undefined ? { tier: span.tier } : {}),
       });
     }
 
@@ -5391,6 +6315,7 @@ function factCandidates(
         magnitude: elapsed,
         statement: tierTimeSplitFact(telemetryTierLabel(tier), elapsed, totalMs),
         references,
+        tier,
       });
     }
   }
@@ -5532,6 +6457,108 @@ function factCandidates(
   }
 
   return candidates;
+}
+
+/**
+ * The fact candidates a follow-up focus adds: for each focused declaration the
+ * capture measured, in the focus's order, how often it ran and how long it
+ * took, citing the operations that measured it.
+ *
+ * The share of the interaction is stated only when the runs fit inside the
+ * interaction's measured total: runs spread over several interactions, or
+ * overlapping one another, sum to more than any one of them took, and a share
+ * above the whole would misstate both numbers. A declaration the capture holds
+ * no operation of yields nothing — the absence of a measurement is not a
+ * finding — and at most {@link MAX_FOCUSED_DECLARATION_FACTS} are reported.
+ *
+ * @param focus The context's focus, if any.
+ * @param aggregates The capture-aggregate bag.
+ * @param totalMs The interaction's measured total, when there is one.
+ * @returns The candidates; empty without a focus.
+ */
+function focusFactCandidates(
+  focus: FollowUpFocusView | undefined,
+  aggregates: JsonObject,
+  totalMs: number | undefined,
+): readonly FactCandidate[] {
+  if (focus === undefined) {
+    return [];
+  }
+  const candidates: FactCandidate[] = [];
+  for (const measurement of focusedMeasurements(focus, aggregates).slice(
+    0,
+    MAX_FOCUSED_DECLARATION_FACTS,
+  )) {
+    const references: string[] = [];
+    for (const span of measurement.spans) {
+      references.push(...evidenceOf(span.node));
+    }
+    const share =
+      totalMs !== undefined && totalMs > 0 && measurement.totalMs <= totalMs ? totalMs : undefined;
+    candidates.push({
+      factClass: 'focusedDeclaration',
+      magnitude: measurement.totalMs,
+      statement: focusedDeclarationFact(
+        measurement.declaration.symbol,
+        measurement.count,
+        measurement.totalMs,
+        share,
+      ),
+      references,
+    });
+  }
+  return candidates;
+}
+
+/**
+ * Whether a fact candidate answers a focus category ({@link FOCUS_FACT_CLASSES},
+ * {@link FOCUS_TIMING_TIERS}).
+ *
+ * @param candidate A fact candidate.
+ * @param category A member of {@link FOCUS_CATEGORIES}.
+ * @returns `true` when the candidate is of a class, or about a tier, the
+ * category asks about.
+ */
+function factAnswersCategory(candidate: FactCandidate, category: string): boolean {
+  const classes = Object.hasOwn(FOCUS_FACT_CLASSES, category)
+    ? FOCUS_FACT_CLASSES[category]
+    : undefined;
+  if (classes?.includes(candidate.factClass) === true) {
+    return true;
+  }
+  const tier = Object.hasOwn(FOCUS_TIMING_TIERS, category)
+    ? FOCUS_TIMING_TIERS[category]
+    : undefined;
+  return (
+    tier !== undefined && candidate.tier === tier && TIERED_FACT_CLASSES.has(candidate.factClass)
+  );
+}
+
+/**
+ * The boost a follow-up focus adds to a fact candidate's class weight.
+ *
+ * A fact about a focused declaration ranks above everything; a fact answering
+ * a focus category ranks above every fact that answers none, and above one
+ * answering a less-supported category — the hints arrive best supported first.
+ * {@link FOCUS_RANK_STEP} per rank, so each rank dominates the class weights
+ * beneath it, and zero without a focus.
+ *
+ * @param candidate A fact candidate.
+ * @param focus The context's focus, if any.
+ * @returns The boost; `0` when there is no focus or the candidate answers none of it.
+ */
+function factFocusBoost(candidate: FactCandidate, focus: FollowUpFocusView | undefined): number {
+  if (focus === undefined) {
+    return 0;
+  }
+  const ranks = focus.categories.length;
+  if (candidate.factClass === 'focusedDeclaration') {
+    return FOCUS_RANK_STEP * (ranks + 1);
+  }
+  const position = focus.categories.findIndex((category) =>
+    factAnswersCategory(candidate, category),
+  );
+  return position === -1 ? 0 : FOCUS_RANK_STEP * (ranks - position);
 }
 
 /**
@@ -6032,6 +7059,75 @@ function causeDetections(
 }
 
 /**
+ * The evidence patterns that answer each focus category, for the order a
+ * follow-up focus gives the likely causes ({@link causeFocusBoost}).
+ *
+ * Keyed by {@link FOCUS_CATEGORIES} and valued in the shared
+ * {@link EvidencePattern} vocabulary: a query focus is answered by a repeated
+ * statement shape, a request focus by duplicated requests, a render or state
+ * focus by the two render patterns, a latency focus by one operation
+ * dominating the time. The error and correctness categories name no pattern.
+ */
+const FOCUS_CAUSE_PATTERNS: Readonly<Record<string, readonly EvidencePattern[]>> = Object.freeze({
+  performance: ['dominant-span'],
+  data: ['repeated-query-shape'],
+  network: ['duplicate-requests'],
+  rendering: ['unchanged-input-renders', 'context-change-renders'],
+  state: ['unchanged-input-renders', 'context-change-renders'],
+  error: [],
+  correctness: [],
+});
+
+/**
+ * Whether a detection is about a focused declaration: suggested at a location
+ * inside it ({@link locationInDeclaration}), or, for one operation dominating
+ * the time, naming it.
+ *
+ * @param detection A detected pattern.
+ * @param focus The context's focus.
+ * @returns `true` when the detection is about one of the focus's declarations.
+ */
+function detectionInFocusedDeclaration(
+  detection: CauseDetection,
+  focus: FollowUpFocusView,
+): boolean {
+  const { location } = detection;
+  return focus.declarations.some(
+    (declaration) =>
+      (location !== undefined && locationInDeclaration(location, declaration)) ||
+      (detection.pattern === 'dominant-span' &&
+        namesDeclaration(detection.operation, declaration.symbol)),
+  );
+}
+
+/**
+ * The rank a follow-up focus gives a likely cause, ahead of its strength: a
+ * cause about a focused declaration first, then causes whose pattern answers a
+ * focus category, best-supported category first, then the rest.
+ *
+ * @param detection A detected pattern.
+ * @param focus The context's focus, if any.
+ * @returns The rank, higher first; `0` when there is no focus or the cause
+ * answers none of it.
+ */
+function causeFocusBoost(detection: CauseDetection, focus: FollowUpFocusView | undefined): number {
+  if (focus === undefined) {
+    return 0;
+  }
+  const ranks = focus.categories.length;
+  if (detectionInFocusedDeclaration(detection, focus)) {
+    return ranks + 1;
+  }
+  const position = focus.categories.findIndex((category) =>
+    (Object.hasOwn(FOCUS_CAUSE_PATTERNS, category)
+      ? (FOCUS_CAUSE_PATTERNS[category] ?? [])
+      : []
+    ).includes(detection.pattern),
+  );
+  return position === -1 ? 0 : ranks - position;
+}
+
+/**
  * Builds the analysis of a capture from its structured context.
  *
  * Facts first, causes second, and both filtered against the references the
@@ -6045,6 +7141,13 @@ function causeDetections(
  * "capture yielded nothing" path, and it is why this builder does not fall back
  * to `undefined` for an empty bag: the session has a result, and the result is
  * that there is nothing to report yet.
+ *
+ * A follow-up that regenerates the analysis carries its structured focus
+ * ({@link readFollowUpFocus}). The focus adds one fact per declaration it names
+ * that the capture measured, ranks the facts of the classes its categories ask
+ * about ahead of the rest ({@link factFocusBoost}), and orders the causes that
+ * answer it first ({@link causeFocusBoost}). Every fact still cites evidence
+ * the capture carries, and the caps still apply.
  *
  * @param input The structured context of an analyze-stage request.
  * @returns The analysis as plain JSON, or `undefined` when the context is not
@@ -6060,14 +7163,21 @@ export function buildAnalysis(input: JsonValue | undefined): JsonValue | undefin
   const aggregates = aggregatesBag(root);
   const spans = sortSpans(readSpans(aggregates));
   const totalMs = readTotalDuration(root, reading, spans);
+  // A follow-up's structured focus, when one governs this analysis: it adds the
+  // facts about the declarations it named and ranks the facts and causes that
+  // answer it first. Absent — every first question — it changes nothing.
+  const focus = readFollowUpFocus(root);
   // References are harvested from the whole context, and described only from
   // the capture's own event records ({@link describeEvidence}).
   const index = indexEvidence([aggregates, root], aggregates);
 
   const observed: JsonValue[] = [];
-  const ranked = [...factCandidates(root, reading, spans, totalMs)].sort((left, right) => {
-    const leftWeight = FACT_CLASS_WEIGHTS[left.factClass];
-    const rightWeight = FACT_CLASS_WEIGHTS[right.factClass];
+  const ranked = [
+    ...factCandidates(root, reading, spans, totalMs),
+    ...focusFactCandidates(focus, aggregates, totalMs),
+  ].sort((left, right) => {
+    const leftWeight = FACT_CLASS_WEIGHTS[left.factClass] + factFocusBoost(left, focus);
+    const rightWeight = FACT_CLASS_WEIGHTS[right.factClass] + factFocusBoost(right, focus);
     if (leftWeight !== rightWeight) {
       return rightWeight - leftWeight;
     }
@@ -6093,14 +7203,18 @@ export function buildAnalysis(input: JsonValue | undefined): JsonValue | undefin
     observed.push({ statement: candidate.statement, evidence });
   }
 
-  // Strongest first; two equally strong causes by the time each accounts for,
-  // so the one that cost the interaction more leads, and then by the fixed
-  // precedence of their patterns; the statement last, which is unique among
-  // the detections because each pattern yields at most one.
+  // Under a follow-up focus, the causes that answer it lead ({@link
+  // causeFocusBoost}); then strongest first; two equally strong causes by the
+  // time each accounts for, so the one that cost the interaction more leads,
+  // and then by the fixed precedence of their patterns; the statement last,
+  // which is unique among the detections because each pattern yields at most
+  // one. Without a focus every cause's focus rank is zero, so the order is
+  // exactly the unfocused one.
   const likelyCauses: JsonValue[] = [];
   const causes = causeDetections(root, reading, spans, totalMs)
     .map((detection) => ({
       statement: causeStatement(detection),
+      focusRank: causeFocusBoost(detection, focus),
       strength: boundedSteps(detection.rankingSteps ?? detection.steps),
       accountedMs: detection.accountedMs ?? 0,
       precedence: CAUSE_PATTERN_PRECEDENCE[detection.pattern],
@@ -6110,6 +7224,9 @@ export function buildAnalysis(input: JsonValue | undefined): JsonValue | undefin
     }))
     .filter((cause) => cause.evidence.length > 0)
     .sort((left, right) => {
+      if (left.focusRank !== right.focusRank) {
+        return right.focusRank - left.focusRank;
+      }
       if (left.strength !== right.strength) {
         return right.strength - left.strength;
       }
@@ -6199,6 +7316,15 @@ interface CatalogEntryView {
   readonly metrics: readonly string[];
   /** Whether the entry is a leaf that carries a location instead of a query. */
   readonly wantsLocation: boolean;
+  /**
+   * Whether the entry declares no telemetry kinds of its own — neither default
+   * filter kinds nor the kinds it is designed around — so it ranks whatever
+   * records its source holds. A follow-up focus on a declaration narrows such
+   * a view over the flat span list to the work a declaration is measured as
+   * ({@link FOCUS_DECLARATION_KINDS}); a view designed around kinds of its own
+   * keeps them.
+   */
+  readonly kindIndifferent: boolean;
 }
 
 /**
@@ -6286,19 +7412,22 @@ function readNodeCatalog(root: JsonObject): readonly CatalogEntryView[] {
     const declaredLocation = asBoolean(
       readField(entry, 'location', 'requiresLocation', 'carriesLocation'),
     );
+    const kinds = readOrderedStrings(entry, 'defaultKinds', 'kinds', 'filterKinds');
 
     return {
       index,
       type,
       sources,
       supportsFilter: asBoolean(entry.supportsFilter) ?? filterKeys.length > 0,
-      kinds: readOrderedStrings(entry, 'defaultKinds', 'kinds', 'filterKinds'),
+      kinds,
       ...(sort !== undefined ? { sort } : {}),
       ...(limit !== undefined ? { limit } : {}),
       metrics: readOrderedStrings(entry, 'metrics', 'metricIds', 'allowedMetrics'),
       wantsLocation:
         declaredLocation === true ||
         (sources.length === 0 && (reads.includes('source') || reads.includes('location'))),
+      kindIndifferent:
+        kinds.length === 0 && readOrderedStrings(entry, 'telemetryKinds').length === 0,
     };
   });
 }
@@ -6804,10 +7933,17 @@ const PATTERN_METRIC_IDS: Readonly<Record<EvidencePattern, readonly ComputedMetr
  * captures give identical rows, and a metric the capture did not report is
  * never named: an empty card is not evidence.
  *
+ * Under a follow-up focus the metrics that measure it ({@link focusMetricIds})
+ * lead the row, in the focus's order, and the headline row is chosen from that
+ * reordered list, so a query focus opens on the query count and the database
+ * time whatever the tuple puts first. Without one the row is the tuple's.
+ *
  * @param entry The catalog entry for the card node.
  * @param reading The metric reading.
  * @param patterns The evidence patterns the capture exhibits.
  * @param lens The active lens.
+ * @param focusMetrics The metrics a follow-up focus asks about, first; empty
+ * without a focus.
  * @returns The metric ids.
  */
 function metricCardIds(
@@ -6815,17 +7951,37 @@ function metricCardIds(
   reading: MetricReading,
   patterns: readonly EvidencePattern[],
   lens: PanelLens,
+  focusMetrics: readonly ComputedMetricId[] = [],
 ): readonly string[] {
   const permitted = new Set(entry.metrics);
-  const reported = COMPUTED_METRIC_IDS.filter(
-    (id) =>
-      metricInLens(id, lens) &&
-      reading.values.has(id) &&
-      (permitted.size === 0 || permitted.has(id)),
+  const reported = focusFirst(
+    COMPUTED_METRIC_IDS.filter(
+      (id) =>
+        metricInLens(id, lens) &&
+        reading.values.has(id) &&
+        (permitted.size === 0 || permitted.has(id)),
+    ),
+    focusMetrics,
   );
   const chosen = new Set<string>(reported.slice(0, MAX_METRIC_CARDS));
   const quantifying = new Set<string>(patterns.flatMap((pattern) => PATTERN_METRIC_IDS[pattern]));
   return reported.filter((id) => chosen.has(id) || quantifying.has(id));
+}
+
+/**
+ * A list reordered so the members a focus names come first, in the focus's
+ * order, and every other member follows in its own order.
+ *
+ * @param items The list, in its own order.
+ * @param focused The members to lead with, in their order; empty keeps `items` as it is.
+ * @returns A new list holding exactly the members of `items`.
+ */
+function focusFirst<T>(items: readonly T[], focused: readonly T[]): T[] {
+  if (focused.length === 0) {
+    return [...items];
+  }
+  const leading = [...new Set(focused)].filter((item) => items.includes(item));
+  return [...leading, ...items.filter((item) => !leading.includes(item))];
 }
 
 /**
@@ -6949,6 +8105,267 @@ function flatTraceNode(
   };
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * stage 6 — a follow-up's focus composes the panel it regenerates
+ *
+ * A follow-up that regenerates a panel from a capture ({@link readFollowUpFocus})
+ * asks something narrower than the session's question, so its panel is
+ * composed for that: through the focus category's lens while that lens has
+ * material; with the views over the focus's own sources first; with the
+ * metrics that measure the focus leading the cards and the headline; titled by
+ * the focus; and with the headline naming it. A focus on a declaration also
+ * narrows the span ranking to the work a declaration is measured as, draws the
+ * trace views over the interaction that holds its slowest run, and points the
+ * source link at where that run was recorded. Everything is read from the
+ * focus's structure and the capture — nothing from any wording.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The data sources whose views answer each focus category first, in order.
+ *
+ * Keyed by {@link FOCUS_CATEGORIES}: a query focus is answered by the query
+ * groups, a request focus by the request groups, a render focus by the render
+ * statistics and the component tree, a state focus by the state transitions,
+ * a latency focus by the correlated trace and the span list. The error and
+ * correctness categories name no source of their own.
+ */
+const FOCUS_CATEGORY_SOURCES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  performance: ['trace', 'spans'],
+  data: ['queries'],
+  network: ['requests'],
+  rendering: ['renders', 'componentTree'],
+  state: ['stateTransitions'],
+  error: [],
+  correctness: [],
+});
+
+/**
+ * The data sources whose views answer a focus on declarations first: the span
+ * list the declaration's runs are rows of, then the trace they sit in.
+ */
+const FOCUS_DECLARATION_SOURCES: readonly string[] = Object.freeze([
+  FLAT_TRACE_SOURCE,
+  TRACE_SOURCE,
+]);
+
+/**
+ * The telemetry kinds a named declaration's work is recorded as: a timed
+ * function, a route handler, and the statements it issues. Product vocabulary,
+ * restated from `@debuggen/telemetry`'s kind list with the others in
+ * {@link EVIDENCE_REF_KINDS}.
+ */
+const FOCUS_DECLARATION_KINDS: readonly string[] = Object.freeze([
+  'function',
+  'route.handler',
+  'db.query',
+]);
+
+/** The order a span ranking focused on a declaration lists its rows in: longest first. */
+const FOCUS_DECLARATION_SORT = 'duration_desc';
+
+/**
+ * The computed metrics that measure each focus category, in the order its
+ * cards and headline lead with them.
+ */
+const FOCUS_METRIC_IDS: Readonly<Record<string, readonly ComputedMetricId[]>> = Object.freeze({
+  performance: ['total_duration', 'frontend_duration', 'backend_duration', 'database_duration'],
+  data: ['query_count', 'database_duration'],
+  network: ['request_count', 'duplicate_request_count', 'transferred_bytes'],
+  rendering: ['render_count', 'unchanged_render_count', 'render_trigger_unknown_count'],
+  state: ['render_count', 'unchanged_render_count'],
+  error: ['error_count'],
+  correctness: [],
+});
+
+/**
+ * An own-property read of a table keyed by {@link FOCUS_CATEGORIES}.
+ *
+ * @param table The table.
+ * @param category A focus category.
+ * @returns The category's entry, or an empty list.
+ */
+function focusTableEntry<T>(
+  table: Readonly<Record<string, readonly T[]>>,
+  category: string,
+): readonly T[] {
+  return Object.hasOwn(table, category) ? (table[category] ?? []) : [];
+}
+
+/**
+ * The metrics a focus asks about, best-supported category first, without
+ * repeats.
+ *
+ * @param focus The context's focus, if any.
+ * @returns The metric ids; empty without a focus.
+ */
+function focusMetricIds(focus: FollowUpFocusView | undefined): readonly ComputedMetricId[] {
+  const ids: ComputedMetricId[] = [];
+  for (const category of focus?.categories ?? []) {
+    for (const id of focusTableEntry(FOCUS_METRIC_IDS, category)) {
+      if (!ids.includes(id)) {
+        ids.push(id);
+      }
+    }
+  }
+  return ids;
+}
+
+/**
+ * The lens a panel is composed through under a follow-up focus: the leading
+ * focus category's lens while the capture holds material for that category;
+ * otherwise, and always without a focus category, the lens the session would
+ * be composed through ({@link composedLens}).
+ *
+ * A category that names sources of its own ({@link FOCUS_CATEGORY_SOURCES})
+ * has material when one of them does — a render focus over a capture that
+ * rendered nothing has nothing to show through the component lens, however
+ * many events and graph nodes that lens could otherwise draw, so the session's
+ * lens is kept. A category that names none has material when its lens does.
+ *
+ * A focus identical in effect to the session — the same category — therefore
+ * keeps the session's lens, which is the honest answer: the question is the
+ * same class of question.
+ *
+ * @param focus The context's focus, if any.
+ * @param category The session's classified category, if any.
+ * @param counts The per-source counts of the context.
+ * @param patterns The evidence patterns the capture exhibits.
+ * @returns The lens.
+ */
+function focusedLens(
+  focus: FollowUpFocusView | undefined,
+  category: string | undefined,
+  counts: ReadonlyMap<string, number>,
+  patterns: readonly EvidencePattern[],
+): PanelLens {
+  const leading = leadingFocusCategory(focus);
+  const named = leading === undefined ? undefined : categoryProfile(leading)?.lens;
+  if (leading !== undefined && named !== undefined) {
+    const own = focusTableEntry(FOCUS_CATEGORY_SOURCES, leading);
+    const material =
+      own.length > 0
+        ? own.some((source) => isMaterialSource(source, counts))
+        : lensHasMaterial(named, counts);
+    if (material) {
+      return named;
+    }
+  }
+  return composedLens(category, counts, patterns);
+}
+
+/**
+ * The catalog, reordered so the entries designed around the focus's own
+ * sources come first.
+ *
+ * The sources a focus leads with are the declaration sources when it names a
+ * declaration ({@link FOCUS_DECLARATION_SOURCES}), then each category's own
+ * ({@link FOCUS_CATEGORY_SOURCES}), best-supported first. An entry ranks by
+ * the position of its primary source — the one it is designed around — in
+ * that list; entries of equal rank, and every entry the focus does not rank,
+ * keep the catalog's order, so the reordering is stable and total.
+ *
+ * @param catalog The catalog, in its own order.
+ * @param focus The context's focus, if any.
+ * @returns The catalog in layout order; unchanged without a focus.
+ */
+function focusOrderedCatalog(
+  catalog: readonly CatalogEntryView[],
+  focus: FollowUpFocusView | undefined,
+): readonly CatalogEntryView[] {
+  if (focus === undefined) {
+    return catalog;
+  }
+  const leading: string[] = [];
+  for (const source of [
+    ...(focus.declarations.length > 0 ? FOCUS_DECLARATION_SOURCES : []),
+    ...focus.categories.flatMap((category) => focusTableEntry(FOCUS_CATEGORY_SOURCES, category)),
+  ]) {
+    if (!leading.includes(source)) {
+      leading.push(source);
+    }
+  }
+  const rankOf = (entry: CatalogEntryView): number => {
+    const position = entry.sources[0] === undefined ? -1 : leading.indexOf(entry.sources[0]);
+    return position === -1 ? leading.length : position;
+  };
+  return catalog
+    .map((entry, order) => ({ entry, order, rank: rankOf(entry) }))
+    .sort((left, right) =>
+      left.rank === right.rank ? left.order - right.order : left.rank - right.rank,
+    )
+    .map(({ entry }) => entry);
+}
+
+/** What a panel reads from the declarations a follow-up focused on. */
+interface DeclarationFocusView {
+  /** Whether the focus names a declaration at all. */
+  readonly named: boolean;
+  /** Whether the capture measured any of them. */
+  readonly measured: boolean;
+  /** The trace holding the slowest measured run, when the capture names a usable one. */
+  readonly traceId?: string;
+  /** Where the slowest located run was recorded, when the capture located one. */
+  readonly location?: SourceLocation;
+}
+
+/**
+ * What the capture holds of the declarations a focus names, for the panel.
+ *
+ * The trace and the location are those of the first focused declaration, in
+ * the focus's order, whose runs supply one — its longest run's first — so a
+ * trace view narrowed to it shows the interaction where that declaration took
+ * the most time. A trace identifier is used only when it is well formed
+ * ({@link isTraceId}): a filter naming an identifier that cannot exist selects
+ * nothing.
+ *
+ * @param focus The context's focus, if any.
+ * @param aggregates The capture-aggregate bag.
+ * @returns The view; nothing named without a focus on declarations.
+ */
+function declarationFocus(
+  focus: FollowUpFocusView | undefined,
+  aggregates: JsonObject,
+): DeclarationFocusView {
+  if (focus === undefined || focus.declarations.length === 0) {
+    return { named: false, measured: false };
+  }
+  const measurements = focusedMeasurements(focus, aggregates);
+  let traceId: string | undefined;
+  let location: SourceLocation | undefined;
+  for (const measurement of measurements) {
+    for (const span of measurement.spans) {
+      if (traceId === undefined) {
+        const candidate = asString(span.node['traceId']);
+        if (candidate !== undefined && isTraceId(candidate)) {
+          traceId = candidate;
+        }
+      }
+      location ??= readSourceLocation(span.node);
+    }
+  }
+  return {
+    named: true,
+    measured: measurements.length > 0,
+    ...(traceId !== undefined ? { traceId } : {}),
+    ...(location !== undefined ? { location } : {}),
+  };
+}
+
+/**
+ * What a panel under a follow-up focus is titled and headlined by: the
+ * declarations it names ({@link focusSubjectLabel}), else its leading category.
+ *
+ * @param focus The context's focus.
+ * @returns The label, or `undefined` when the focus names neither.
+ */
+function focusHeadlineLabel(focus: FollowUpFocusView): string | undefined {
+  if (focus.declarations.length > 0) {
+    return focusSubjectLabel(focus.declarations.map((declaration) => declaration.symbol));
+  }
+  const leading = leadingFocusCategory(focus);
+  return leading === undefined ? undefined : problemCategoryLabel(leading);
+}
+
 /**
  * Builds the panel specification of a capture from its structured context.
  *
@@ -6962,6 +8379,16 @@ function flatTraceNode(
  * evidence lens) whose declared sources the capture has material for, in the
  * catalog's own order; the headline of a timing panel also names any tier the
  * capture recorded nothing in.
+ *
+ * A follow-up that regenerates the panel carries its structured focus
+ * ({@link readFollowUpFocus}), and the panel is composed for it: the focus
+ * category's lens ({@link focusedLens}), the views over the focus's own sources
+ * first ({@link focusOrderedCatalog}), the focus's metrics leading the cards and
+ * the headline counts, a title naming the focus, and a closing headline
+ * sentence naming it. A focus on a declaration also narrows the span ranking,
+ * the trace views and the source link to what the capture measured of it
+ * ({@link declarationFocus}). Without a focus the specification is exactly the
+ * unfocused one.
  *
  * @param input The structured context of a panel-generation request.
  * @returns The specification in its authoring shape, or `undefined` when the
@@ -6984,12 +8411,25 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
   const patterns = causeDetections(root, reading, spans, totalMs).map(
     (detection) => detection.pattern,
   );
-  const lens = composedLens(understanding.category, counts, patterns);
+  // A follow-up's structured focus, when one governs this panel; absent — every
+  // first question — each focus-driven choice below reduces to the unfocused one.
+  const focus = readFollowUpFocus(root);
+  const declared = declarationFocus(focus, aggregatesBag(root));
+  const focusMetrics = focusMetricIds(focus);
+  const lens = focusedLens(focus, understanding.category, counts, patterns);
   const admitted = new Set(patterns.flatMap((pattern) => PATTERN_ADMITTED_SOURCES[pattern]));
+  // A measured focused declaration's runs are rows of the flat span list, so the
+  // span views are admitted beside the lens's own, whatever the lens.
+  const layoutAdmitted: ReadonlySet<string> = declared.measured
+    ? new Set([...admitted, FLAT_TRACE_SOURCE])
+    : admitted;
   const flatTraceKinds = LENS_FLAT_TRACE_KINDS[lens];
 
-  const catalog = [...readNodeCatalog(root)].sort((left, right) =>
-    left.index === right.index ? compareStrings(left.type, right.type) : left.index - right.index,
+  const catalog = focusOrderedCatalog(
+    [...readNodeCatalog(root)].sort((left, right) =>
+      left.index === right.index ? compareStrings(left.type, right.type) : left.index - right.index,
+    ),
+    focus,
   );
 
   const layout: JsonValue[] = [];
@@ -7013,7 +8453,7 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
     if (
       primary === TRACE_SOURCE &&
       flatTraceKinds !== undefined &&
-      !lensAdmits(TRACE_SOURCE, lens, admitted)
+      !lensAdmits(TRACE_SOURCE, lens, layoutAdmitted)
     ) {
       const node = flatTraceNode(entry, flatTraceKinds, counts, root);
       if (node !== undefined) {
@@ -7025,18 +8465,18 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
     if (
       primary !== undefined &&
       primary !== METRICS_SOURCE &&
-      !lensAdmits(primary, lens, admitted)
+      !lensAdmits(primary, lens, layoutAdmitted)
     ) {
       continue;
     }
     const source = entry.sources.find(
       (candidate) =>
         isMaterialSource(candidate, counts) &&
-        (candidate === METRICS_SOURCE || lensAdmits(candidate, lens, admitted)),
+        (candidate === METRICS_SOURCE || lensAdmits(candidate, lens, layoutAdmitted)),
     );
 
     if (source === METRICS_SOURCE) {
-      const metrics = metricCardIds(entry, reading, patterns, lens);
+      const metrics = metricCardIds(entry, reading, patterns, lens, focusMetrics);
       if (metrics.length === 0) {
         continue;
       }
@@ -7049,7 +8489,9 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
       if (!entry.wantsLocation) {
         continue;
       }
-      const location = readSuggestedLocation(root, lens, admitted);
+      // A focused declaration's recorded run is where its source link points;
+      // otherwise the lens's own suggestion.
+      const location = declared.location ?? readSuggestedLocation(root, lens, admitted);
       if (location === undefined) {
         continue;
       }
@@ -7058,33 +8500,57 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
       continue;
     }
 
+    // A focus on a declaration turns a kind-indifferent ranking over the flat
+    // span list into a ranking of the work a declaration is measured as, longest
+    // first; a view designed around kinds of its own keeps them.
+    const rankedForDeclaration =
+      declared.named &&
+      primary === FLAT_TRACE_SOURCE &&
+      source === FLAT_TRACE_SOURCE &&
+      entry.kindIndifferent;
+    const declarationKinds = rankedForDeclaration
+      ? reportedKindsAmong(FOCUS_DECLARATION_KINDS, root)
+      : [];
     // The lens narrows a source it reads through a fixed kind set (the render
     // views' event log, say) whatever the catalog declares about filters, since
     // every query accepts a kinds filter; otherwise the entry's own declared
     // kinds and the capture's trace apply where the entry declares filters.
     const lensKinds = reportedKindsAmong(lensKindsFor(lens, source), root);
     const kinds =
-      lensKinds.length > 0 ? lensKinds : entry.supportsFilter ? filterKindsFor(entry, root) : [];
+      declarationKinds.length > 0
+        ? declarationKinds
+        : lensKinds.length > 0
+          ? lensKinds
+          : entry.supportsFilter
+            ? filterKindsFor(entry, root)
+            : [];
+    // A trace view under a focus on a declaration shows the interaction holding
+    // that declaration's slowest run, whatever the entry declares about filters.
+    const narrowedTraceId =
+      (source === TRACE_SOURCE ? declared.traceId : undefined) ??
+      (entry.supportsFilter ? traceId : undefined);
     const filter: JsonObject = {
-      ...(entry.supportsFilter && traceId !== undefined ? { traceId } : {}),
+      ...(narrowedTraceId !== undefined ? { traceId: narrowedTraceId } : {}),
       ...(kinds.length > 0 ? { kinds: [...kinds] } : {}),
     };
     const hasFilter = Object.keys(filter).length > 0;
+    const sort = rankedForDeclaration ? FOCUS_DECLARATION_SORT : entry.sort;
 
     emittedTypes.add(entry.type);
     layout.push({
       type: entry.type,
       source,
       ...(hasFilter ? { filter } : {}),
-      ...(entry.sort !== undefined ? { sort: entry.sort } : {}),
+      ...(sort !== undefined ? { sort } : {}),
       ...(entry.limit !== undefined ? { limit: entry.limit } : {}),
     });
   }
 
   const material = [...counts.keys()].some((source) => isMaterialSource(source, counts));
-  // The headline counts what the cards measure: the active lens's counts.
+  // The headline counts what the cards measure: the active lens's counts, the
+  // ones a follow-up focus asks about first.
   const countedNouns: CountedNoun[] = [];
-  for (const id of COMPUTED_METRIC_IDS) {
+  for (const id of focusFirst(COMPUTED_METRIC_IDS, focusMetrics)) {
     const value = reading.values.get(id);
     if (value === undefined || !metricInLens(id, lens) || !Object.hasOwn(METRIC_COUNT_NOUNS, id)) {
       continue;
@@ -7099,14 +8565,24 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
   // nothing in is named rather than left to read as a missing view.
   const silent = lens === 'timing' ? silentTiers(root).map(telemetryTierLabel) : [];
   const summary = material
-    ? panelSummaryHeadline(countedNouns, totalMs, silent)
+    ? panelSummaryHeadline(
+        countedNouns,
+        totalMs,
+        silent,
+        focus === undefined ? undefined : focusHeadlineLabel(focus),
+      )
     : EMPTY_CAPTURE_NOTICE;
 
+  // Titled by what the panel answers: the focus's leading category, else the
+  // session's; the declarations the focus names, else the selected target.
+  const titleCategory = leadingFocusCategory(focus) ?? understanding.category ?? '';
+  const titleSubject =
+    focus !== undefined && focus.declarations.length > 0
+      ? focusSubjectLabel(focus.declarations.map((declaration) => declaration.symbol))
+      : understanding.target?.label;
+
   return {
-    title: panelTitle(
-      problemCategoryLabel(understanding.category ?? ''),
-      understanding.target?.label,
-    ),
+    title: panelTitle(problemCategoryLabel(titleCategory), titleSubject),
     summary,
     layout,
   };
@@ -7337,6 +8813,59 @@ function runtimeActionTypeFor(
 }
 
 /**
+ * The candidates of a follow-up context, with the declarations its structured
+ * focus names added as candidates of their own.
+ *
+ * A follow-up context may carry the declarations its wording named in its
+ * `followUpFocus` as well as, or instead of, in its `candidates`; either way
+ * they are graph-resolved declarations, and one named in either place is a
+ * candidate. A focus declaration without a file cannot be instrumented and is
+ * skipped, as is one the candidates already carry (`file|symbol`). An added
+ * candidate is scored as a named entity of a known kind would be
+ * ({@link readCandidates}' structure-only scoring), and its action-type
+ * preference is its kind's, with the timings kept only for a symbol that
+ * spells a declaration.
+ *
+ * @param candidates The candidates the context carries.
+ * @param focus The context's focus, if any.
+ * @returns The candidates, unordered; exactly `candidates` without a focus.
+ */
+function withFocusCandidates(
+  candidates: readonly CandidateView[],
+  focus: FollowUpFocusView | undefined,
+): readonly CandidateView[] {
+  if (focus === undefined || focus.declarations.length === 0) {
+    return candidates;
+  }
+  const known = new Set(candidates.map((candidate) => `${candidate.file}|${candidate.symbol}`));
+  const added: CandidateView[] = [];
+  for (const declaration of focus.declarations) {
+    const { file, symbol, kind } = declaration;
+    if (file === undefined || known.has(`${file}|${symbol}`)) {
+      continue;
+    }
+    known.add(`${file}|${symbol}`);
+    const preference = Object.hasOwn(CODE_KIND_ACTION_TYPES, kind)
+      ? CODE_KIND_ACTION_TYPES[kind]
+      : undefined;
+    const score =
+      SCORE_BASE + SCORE_ENTITY_MATCH + (preference !== undefined ? SCORE_KNOWN_KIND : 0);
+    added.push({
+      file,
+      symbol,
+      kind,
+      reasonKind: kind,
+      score: roundValue(clampRange(score, 0, SCORE_MAX), SCORE_DECIMALS),
+      relatedLabel: symbol,
+      actionTypes: (preference ?? DEFAULT_CODE_KIND_ACTION_TYPES).filter(
+        (type) => !TARGET_REQUIRED_TYPES.has(type) || isDeclarationSpelling(symbol),
+      ),
+    });
+  }
+  return [...candidates, ...added];
+}
+
+/**
  * Builds the follow-up decision of a request from its structured context.
  *
  * The decision is made from what the context reports about the **existing**
@@ -7442,7 +8971,9 @@ export function buildFollowUpDecision(input: JsonValue | undefined): JsonValue |
   const emptyCapture = capturePresent && (reportedEvents === 0 || !material);
 
   const installed = readInstalledActions(root);
-  const candidates = sortCandidates(readCandidates(root, understanding));
+  const candidates = sortCandidates(
+    withFocusCandidates(readCandidates(root, understanding), readFollowUpFocus(root)),
+  );
 
   // A declaration the follow-up names that only a wrapper can measure, and
   // that no installed timing already wraps, is evidence the stored capture

@@ -47,6 +47,12 @@
  * records the failure instead of sending it, and installs are asked not to
  * report their own failure row (`reportStageFailure: false`).
  *
+ * Ending a session is not a failure. When `session.end` withdraws an operation
+ * ({@link PipelineOrchestrator.cancel}), the stage it stopped is reported by
+ * one cancellation row from `../sessions/progress.ts`'s
+ * `buildStageCancelledRow`, the session keeps its status for the end that
+ * follows, and neither a `failed` row nor `instrumentation.failed` is sent.
+ *
  * ## Code-index handle lifetime
  *
  * An operation that needs the project's code loads its handles through the
@@ -168,7 +174,11 @@ import type { ExceptionDescription } from '../logging.js';
 import type { PanelGenerator } from '../panels/generate.js';
 import { placeFollowUpAttempt } from '../sessions/manager.js';
 import type { SessionBroadcaster, SessionManager, SessionPatch } from '../sessions/manager.js';
-import { PROGRESS_STAGE_TITLES, isProductAuthoredText } from '../sessions/progress.js';
+import {
+  PROGRESS_STAGE_TITLES,
+  buildStageCancelledRow,
+  isProductAuthoredText,
+} from '../sessions/progress.js';
 import type { SessionProgress } from '../sessions/progress.js';
 import { isTerminalSessionStatus, statusForStage, transition } from '../sessions/state-machine.js';
 import type { SessionFailure, SessionTransitionContext } from '../sessions/state-machine.js';
@@ -679,11 +689,38 @@ export interface PipelineOrchestrator {
   regate(request: RegateRequest): Promise<Result<RegateOutcome, DebuggenError>>;
 
   /**
-   * Aborts the session's in-flight operation, if any. The operation settles
-   * with the session at a stable status — `failed` with the cancellation, or
-   * the status it had before a refused step — and never at `generated`.
+   * Withdraws the session's in-flight operation, if any, because the session
+   * is being ended. The `session.end` route is its caller: it cancels, waits
+   * for the operation to settle — so cleanup never runs beside a stage still
+   * writing — and then ends the session.
+   *
+   * The operation's signal is aborted and the operation settles leaving the
+   * session at the status it had: never `failed`, because ending a session is
+   * not a failure of the stage it interrupted, and never `generated`. The
+   * stage the cancellation stopped is reported by one cancellation row
+   * (`buildStageCancelledRow(stage, 'session-ended')` from
+   * `../sessions/progress.ts`) instead of a `failed` row, and the session's end
+   * then removes whatever the operation applied. The operation still answers
+   * its own caller with what it settled with — the stages' cancellation
+   * (`details.reason: "aborted"`), or the words of the layer that saw the
+   * abort, such as a provider's `MODEL_UNAVAILABLE` for the abandoned model
+   * call — and none of it is filed on the session, which is ending. A
+   * {@link regate} deferred while the operation ran is dropped, never started
+   * once it settles, so the end waits out nothing but the operation itself.
+   *
+   * A cancellation that reaches an operation any other way — its caller's own
+   * signal, or {@link dispose} at shutdown — is filed as a failure of the stage
+   * it stopped.
    *
    * @returns Whether an operation was in flight.
+   *
+   * @example
+   * ```ts
+   * if (pipeline.cancel(sessionId)) {
+   *   await untilIdle(() => pipeline.activeRun(sessionId) === undefined);
+   * }
+   * await manager.end(sessionId); // from the status the operation left
+   * ```
    */
   cancel(sessionId: string): boolean;
 
@@ -1183,8 +1220,20 @@ const STAGE_COMPLETED_LOG = 'Pipeline stage completed.';
  */
 const STAGE_FAILED_LOG = 'Pipeline stage failed; the session is filed as failed at that stage.';
 
-/** Info record of a cancelled operation. Fields: stage, error code. */
+/**
+ * Info record of an operation cancelled other than by the session's end — its
+ * caller's signal, or {@link PipelineOrchestrator.dispose}. Fields: stage,
+ * error code.
+ */
 const CANCELLED_LOG = 'Pipeline operation cancelled; the session is filed as failed at that stage.';
+
+/**
+ * Info record of an operation {@link PipelineOrchestrator.cancel} withdrew so
+ * the session could end. Fields: stage, error code, and whether the stage
+ * reported the cancellation itself (`stageReportedCancellation`).
+ */
+const END_CANCELLED_LOG =
+  'Pipeline operation cancelled because the session is ending; its status is kept and the stage is reported as cancelled.';
 
 /** Info record of a refused operation that changed nothing. Fields: operation, error code. */
 const REFUSED_LOG = 'Pipeline operation refused; the session is unchanged.';
@@ -1278,6 +1327,16 @@ interface ActiveOperation {
   stage: PipelineStageKey;
   /** Aborted by {@link PipelineOrchestrator.cancel} and {@link PipelineOrchestrator.dispose}. */
   readonly controller: AbortController;
+  /**
+   * Whether {@link PipelineOrchestrator.cancel} aborted the operation because
+   * the session is being ended. Set before the abort, so every stage that
+   * observes the cancellation sees it. Whatever such an operation settles with
+   * is reported as its cancellation (`failStage`), never filed as a failure;
+   * a capture window it leaves open is not armed again (`rearmOpenWindow`),
+   * and a re-gate deferred while it ran is dropped rather than run once it
+   * settles (`execute`): the session's end closes both.
+   */
+  endRequested: boolean;
   /** The operation's signal: the controller's, joined with the caller's. */
   readonly signal: AbortSignal;
   /** The session-bound logger; re-bound with the capture id once the operation knows it. */
@@ -1604,6 +1663,23 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
    * hint under the stage the error names (or the stage running). A session
    * already `failed` keeps its status and still shows the new row; an ended
    * session is left alone.
+   *
+   * The one exception is an operation {@link PipelineOrchestrator.cancel}
+   * withdrew because the session is being ended
+   * ({@link ActiveOperation.endRequested}): nothing is filed. The session
+   * keeps the status it had — the end that follows takes it to `ended` — the
+   * stage's recorded failure is dropped, and the stage is reported by one
+   * cancellation row (`buildStageCancelledRow(stage, 'session-ended')`) under
+   * the stage the failure names, unless the session is already terminal.
+   * `error` is still returned unchanged.
+   *
+   * That holds for whatever the withdrawn operation settles with, not only for
+   * the stages' own cancellation (`details.reason: "aborted"`): the layer that
+   * saw the abort may word it its own way — the structured-output boundary and
+   * both providers report an abandoned model call as `MODEL_UNAVAILABLE` — and
+   * a failure the abort cut short has no recovery a session about to end could
+   * take. The record logged says whether the stage reported the cancellation
+   * itself (`stageReportedCancellation`), with the error's code.
    */
   async function failStage(
     op: ActiveOperation,
@@ -1613,6 +1689,21 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     const reported = recordedFailures.get(op.sessionId);
     recordedFailures.delete(op.sessionId);
     const failure = reported ?? failureOf(stageOfFailure(error, stage), error);
+
+    if (op.endRequested) {
+      op.log.info(END_CANCELLED_LOG, {
+        stage: failure.stage,
+        code: error.code,
+        stageReportedCancellation: isCancellation(error),
+      });
+      const current = readSession(op.sessionId);
+      if (current.ok && !isTerminalSessionStatus(current.value.status)) {
+        sendRow(op, failure.stage, () =>
+          progress.emit(op.sessionId, buildStageCancelledRow(failure.stage, 'session-ended')),
+        );
+      }
+      return err(error);
+    }
 
     if (isCancellation(error)) {
       op.log.info(CANCELLED_LOG, { stage: failure.stage, code: error.code });
@@ -1859,12 +1950,18 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
    * developer can keep reproducing and stop again.
    *
    * Nothing is armed once the session has left `capturing` — its window closed
-   * with that move — or when the record shows no open window. Arming edits no
-   * file; the instrumentation service refuses a window the project's owner
-   * does not hold. The outcome is logged by capture id and code only and never
-   * changes the failure the operation reports.
+   * with that move — or when the record shows no open window. Nor is anything
+   * armed for an operation {@link PipelineOrchestrator.cancel} withdrew so the
+   * session could end: its cancellation keeps the session `capturing`, and the
+   * end that follows closes the window and disarms both producers. Arming
+   * edits no file; the instrumentation service refuses a window the project's
+   * owner does not hold. The outcome is logged by capture id and code only and
+   * never changes the failure the operation reports.
    */
   function rearmOpenWindow(op: ActiveOperation): void {
+    if (op.endRequested) {
+      return;
+    }
     const current = readSession(op.sessionId);
     if (!current.ok || current.value.status !== CAPTURING_STATUS) {
       return;
@@ -2124,6 +2221,7 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
       operation,
       stage,
       controller,
+      endRequested: false,
       signal:
         callerSignal === undefined
           ? controller.signal
@@ -2158,12 +2256,18 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
           active.delete(sessionId);
         }
         recordedFailures.delete(sessionId);
+        // A re-gate deferred while this operation ran is owed once it settles —
+        // except when `cancel` withdrew it for the session's end. That session
+        // keeps its status (`instrumenting`, say) for the end that follows, and
+        // a re-gate started now would be a new operation the end must wait
+        // out, evaluating readiness for a session about to close; it is
+        // dropped instead.
+        const regateOwed = pendingRegates.delete(sessionId) && !op.endRequested;
         if (op.sessionReleased) {
           // The session was released (it ended) while this operation ran:
           // nothing more is kept for it, and no re-gate is owed.
           verdicts.delete(sessionId);
-          pendingRegates.delete(sessionId);
-        } else if (pendingRegates.delete(sessionId) && !disposed) {
+        } else if (regateOwed && !disposed) {
           // After this operation has fully released the session.
           queueMicrotask(() => {
             void regate({ sessionId }).then((outcome) => {
@@ -2784,6 +2888,9 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     if (op === undefined) {
       return false;
     }
+    // Marked before the abort: a stage observes the abort synchronously, and
+    // its cancellation must reach `failStage` as the session's end.
+    op.endRequested = true;
     op.controller.abort();
     return true;
   }

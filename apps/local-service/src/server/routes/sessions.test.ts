@@ -50,6 +50,15 @@
  * the admitted directory. Its links are real, under a realpath'd `mkdtemp`
  * sandbox, and each retarget renames a fresh link over the old one.
  *
+ * The dev-server URL suite covers a `devServerUrl` the editor sent that the
+ * service will not dial — another host, `0.0.0.0` — refused through the
+ * production composition: `devServerLookupFromLaunches` over the real
+ * `probeDevServer`, whose network is a double that fails the test if it is
+ * ever reached. The `400` must name the field in the route's own constant
+ * words rather than the generic malformed-message copy, quote no part of the
+ * URL in the reply or the log, and leave nothing stored, broadcast or started;
+ * every other refusal of the same field names it too.
+ *
  * Fixtures are neutral (`/w/…`, `src/moduleN.ts`); no environment variable is
  * read and nothing under `$DEBUGGEN_HOME` is touched.
  */
@@ -92,6 +101,8 @@ import { DebuggenError, err, newSessionId, ok, unwrap } from '@debuggen/shared';
 import type { LogFields, LogLevel, Logger, Result, SessionId } from '@debuggen/shared';
 
 import { STATE_HOME_OVERLAP_MESSAGE } from '../../config.js';
+import { probeDevServer } from '../../dev-server/detect.js';
+import type { FetchLike } from '../../dev-server/detect.js';
 import { createSessionManager } from '../../sessions/manager.js';
 import type { SessionBroadcaster, SessionManager } from '../../sessions/manager.js';
 import { FAILURE_COPY_BY_CODE, createSessionProgress } from '../../sessions/progress.js';
@@ -110,7 +121,12 @@ import type {
   ServerEnv,
   TabBinding,
 } from '../auth.js';
-import { SESSION_REQUEST_REFUSED_LOG_MESSAGE, createSessionRoutes } from './sessions.js';
+import {
+  REQUESTED_DEV_SERVER_URL_REFUSED_MESSAGE,
+  SESSION_REQUEST_REFUSED_LOG_MESSAGE,
+  createSessionRoutes,
+  devServerLookupFromLaunches,
+} from './sessions.js';
 import type {
   SessionDevServerHold,
   SessionDevServerLookup,
@@ -1993,5 +2009,264 @@ describe('POST /sessions re-proves the admitted project root before storing it, 
     const admitted = await createFor(harness.app, link);
     expect(admitted.status).toBe(200);
     expect(devServerUrlFor).toHaveBeenCalledTimes(1);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * POST /sessions refuses a sent dev-server URL the service will not dial, naming the field
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('POST /sessions refuses a sent devServerUrl the service will not dial, naming the field', () => {
+  /** The question every create asks; nothing may branch on it. */
+  const QUESTION = 'Why is handlerAlpha slow?';
+
+  /**
+   * A query value the refused URLs carry: no answer and no log record may
+   * ever quote it.
+   */
+  const URL_SECRET = 'UV-SENTINEL-8e2a-never-echo-me';
+
+  /**
+   * URLs protocol's schema accepts — absolute `http:`/`https:`, no user
+   * information — that the probe refuses before any request is made, because
+   * they name a host other than this machine's loopback.
+   */
+  const UNDIALLED_URLS = [
+    'http://example.com/',
+    `https://example.com:8443/admin/orders?token=${URL_SECRET}#summary`,
+    'http://0.0.0.0:3000/',
+  ] as const;
+
+  /** Parts of {@link UNDIALLED_URLS} that neither the reply nor the log may contain. */
+  const URL_FRAGMENTS = ['example.com', '0.0.0.0', '8443', '/admin/orders', URL_SECRET] as const;
+
+  /** The realpath'd sandbox of the running test; the project folder lives in it. */
+  let sandbox: string;
+  /** The project every create names: a real folder the editor announced. */
+  let project: string;
+
+  beforeEach(() => {
+    sandbox = realpathSync(mkdtempSync(join(tmpdir(), 'debuggen-session-dev-server-url-')));
+    project = join(sandbox, 'shop');
+    mkdirSync(project, { recursive: true });
+    principal = editor([project]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+    expect(existsSync(sandbox)).toBe(false);
+  });
+
+  /** `POST /sessions` over a real session manager, and what the test observes of it. */
+  interface UrlRefusalHarness {
+    readonly app: Hono<ServerEnv>;
+    /** The real manager the route would store through. */
+    readonly manager: SessionManager;
+    /** The route's calls of `SessionManager.create`, each forwarded to {@link manager}. */
+    readonly create: Mock<SessionRoutesDeps['manager']['create']>;
+    /** The pipeline runs the route started. */
+    readonly run: Mock<SessionRoutesDeps['orchestrator']['run']>;
+    /** The probe's network: a refused URL must never reach it. */
+    readonly fetches: Mock<FetchLike>;
+    /** The type of every frame the manager broadcast, in order. */
+    readonly frames: string[];
+  }
+
+  /**
+   * Builds `POST /sessions` exactly as `main.ts` composes its dev-server
+   * lookup — `devServerLookupFromLaunches` over `probeDevServer`, here with an
+   * empty launcher registry, the suite's capturing logger, and a `fetch` that
+   * rejects — over a real {@link createSessionManager} on the suite's store.
+   * The pipeline is only observed being started: its run never settles.
+   *
+   * @returns The application and its observed collaborators.
+   */
+  function urlRefusalHarness(): UrlRefusalHarness {
+    const frames: string[] = [];
+    const broadcaster: SessionBroadcaster = {
+      broadcast: (_sessionId, message) => {
+        frames.push(message.type);
+      },
+      broadcastToKinds: (_sessionId, _kinds, message) => {
+        frames.push(message.type);
+      },
+    };
+    const progress = createSessionProgress({ sessions, broadcaster, now: () => BASE_TIME });
+    const manager = createSessionManager({
+      sessions,
+      broadcaster,
+      progress,
+      config: { provider: 'deterministic' },
+      now: () => BASE_TIME,
+    });
+    const create = vi.fn<SessionRoutesDeps['manager']['create']>((input) => manager.create(input));
+    const run = vi.fn<SessionRoutesDeps['orchestrator']['run']>(
+      () => new Promise<never>(() => undefined),
+    );
+    const fetches = vi.fn<FetchLike>(() =>
+      Promise.reject(new Error('The probe dialled a URL it must refuse before any request.')),
+    );
+    const probeLogger = createCapturingLogger(logs);
+
+    const routes: SessionRoutes = createSessionRoutes({
+      manager: {
+        create,
+        get: (sessionId) => manager.get(sessionId),
+        list: (listOptions) => manager.list(listOptions),
+        end: unused,
+        fail: unused,
+        patch: unused,
+      },
+      reopener: { reopen: unused },
+      orchestrator: {
+        run,
+        beginCapture: unused,
+        completeCapture: unused,
+        followUp: unused,
+        cancel: unused,
+        activeRun: unused,
+        releaseSession: unused,
+      },
+      sessions: {
+        getActiveCapture: unused,
+        getCapture: unused,
+        listWithinFolders: unused,
+        getAccessTarget: unused,
+      },
+      panels: { getLatestPanel: unused, getPanel: unused },
+      modifications,
+      bindings: { bindingForSession: () => undefined, sendToBoundTab: unused },
+      devServers: devServerLookupFromLaunches(
+        { list: () => [] },
+        { probe: (url) => probeDevServer(url, { fetchImpl: fetches, logger: probeLogger }) },
+      ),
+      retention: { purge: unused },
+      auth: { requireLiveCredential: () => ok(undefined) },
+      logger: createCapturingLogger(logs),
+    });
+
+    const target = new Hono<ServerEnv>();
+    target.use('*', async (c, next) => {
+      if (principal !== undefined) {
+        c.set('principal', principal);
+      }
+      await next();
+    });
+    target.post(HTTP_ROUTES['session.create'].pattern, routes['session.create']);
+    return { app: target, manager, create, run, fetches, frames };
+  }
+
+  /**
+   * Sends one `POST /sessions` for the suite's project carrying `devServerUrl`.
+   *
+   * @param target The application.
+   * @param devServerUrl The dev-server URL the editor sends.
+   * @returns The answer.
+   */
+  async function createWith(target: Hono<ServerEnv>, devServerUrl: string): Promise<Answer> {
+    const response = await target.request(HTTP_ROUTES['session.create'].pattern, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectRoot: project, question: QUESTION, devServerUrl }),
+    });
+    return {
+      status: response.status,
+      cacheControl: response.headers.get('cache-control'),
+      body: await response.json(),
+    };
+  }
+
+  /**
+   * Asserts that neither `answer` nor any log record quotes a part of a
+   * refused URL, and that the refused create left no trace: the probe never
+   * dialled, the manager was never asked to store, nothing is stored, no frame
+   * was broadcast and no pipeline started.
+   *
+   * @param harness The harness the create ran through.
+   * @param answer The refusal.
+   * @param label What the failure message of an assertion names.
+   */
+  function expectRefusedWithoutTrace(
+    harness: UrlRefusalHarness,
+    answer: Answer,
+    label: string,
+  ): void {
+    const replied = JSON.stringify(answer.body);
+    const logged = JSON.stringify(logs);
+    for (const fragment of URL_FRAGMENTS) {
+      expect(replied, label).not.toContain(fragment);
+      expect(logged, label).not.toContain(fragment);
+    }
+    expect(harness.fetches, label).not.toHaveBeenCalled();
+    expect(harness.create, label).not.toHaveBeenCalled();
+    expect(unwrap(harness.manager.list()), label).toEqual([]);
+    expect(harness.frames, label).toEqual([]);
+    expect(harness.run, label).not.toHaveBeenCalled();
+  }
+
+  it('answers 400 in its own words naming devServerUrl, with no ref and no part of the URL', async () => {
+    const harness = urlRefusalHarness();
+
+    for (const devServerUrl of UNDIALLED_URLS) {
+      const logged = logs.length;
+      const answer = await createWith(harness.app, devServerUrl);
+
+      expect(answer.status, devServerUrl).toBe(400);
+      expect(answer.cacheControl, devServerUrl).toBe('no-store');
+      // Exactly protocol's error body in the route's constant words: not the
+      // generic malformed-message copy, and so no diagnostic `ref` either.
+      expect(answer.body, devServerUrl).toStrictEqual({
+        code: 'PROTOCOL_INVALID_MESSAGE',
+        message: REQUESTED_DEV_SERVER_URL_REFUSED_MESSAGE,
+      });
+      expect(httpErrorResponseSchema.safeParse(answer.body).success, devServerUrl).toBe(true);
+      expect(REQUESTED_DEV_SERVER_URL_REFUSED_MESSAGE).not.toBe(
+        FAILURE_COPY_BY_CODE.PROTOCOL_INVALID_MESSAGE.summary,
+      );
+      expect(REQUESTED_DEV_SERVER_URL_REFUSED_MESSAGE).toMatch(/\bdevServerUrl\b/u);
+
+      const refusals = logs
+        .slice(logged)
+        .filter((entry) => entry.message === SESSION_REQUEST_REFUSED_LOG_MESSAGE);
+      expect(refusals, devServerUrl).toHaveLength(1);
+      expect(refusals[0]?.level, devServerUrl).toBe('warn');
+      expect(refusals[0]?.fields, devServerUrl).toMatchObject({
+        operation: 'session.create',
+        status: 400,
+        errorCode: 'PROTOCOL_INVALID_MESSAGE',
+        reason: 'requested-url-refused',
+      });
+      // Answered in its own words, so no diagnostic reference was minted.
+      expect(refusals[0]?.fields, devServerUrl).not.toHaveProperty('ref');
+      expectRefusedWithoutTrace(harness, answer, devServerUrl);
+    }
+  });
+
+  it('names devServerUrl in every refusal of the field, whichever layer refuses it', async () => {
+    const harness = urlRefusalHarness();
+    // Embedded credentials, on another host too: protocol's own refinement.
+    // Assembled through `URL` so no credentialed literal is committed.
+    const credentialed = new URL('http://example.com/');
+    credentialed.username = 'dev';
+    credentialed.password = URL_SECRET;
+    const refusedBySchema = [
+      credentialed.href,
+      // A scheme the schema does not accept.
+      'file:///etc/passwd',
+    ];
+
+    for (const devServerUrl of [...refusedBySchema, ...UNDIALLED_URLS]) {
+      const answer = await createWith(harness.app, devServerUrl);
+
+      expect(answer.status, devServerUrl).toBe(400);
+      const body = httpErrorResponseSchema.parse(answer.body);
+      expect(body.code, devServerUrl).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(body.message, devServerUrl).not.toBe(
+        FAILURE_COPY_BY_CODE.PROTOCOL_INVALID_MESSAGE.summary,
+      );
+      expect(body.message, devServerUrl).toMatch(/\bdevServerUrl\b/u);
+      expect(JSON.stringify(answer.body), devServerUrl).not.toContain('/etc/passwd');
+      expectRefusedWithoutTrace(harness, answer, devServerUrl);
+    }
   });
 });

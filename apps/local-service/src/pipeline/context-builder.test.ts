@@ -102,6 +102,7 @@ import {
   ABSENT_VALUE,
   CONTEXT_BUILDER_STAGES,
   CONTEXT_LIMITS,
+  FOLLOW_UP_FOCUS_LIMITS,
   INVESTIGATE_QUERY_BATCH_FIELD,
   PAYLOAD_BUDGET_STEPS,
   PROTECTED_PAYLOAD_SECTIONS,
@@ -109,6 +110,7 @@ import {
   STAGE_PLACEHOLDERS,
   TRUNCATION_MARKER,
   applyPayloadBudget,
+  boundedFollowUpFocus,
   capExcerpt,
   capList,
   capText,
@@ -127,6 +129,7 @@ import {
   type ContextBuilderDeps,
   type ContextBuilderStage,
   type FollowUpDeclarationCandidate,
+  type FollowUpFocus,
   type PipelineCodeHandles,
   type PipelineStageContext,
   type StageRequestBuild,
@@ -1341,6 +1344,30 @@ describe('suite fixtures', () => {
     expect(context.followUpQuestion).toBe(FOLLOW_UP_QUESTION);
   });
 
+  it('carries a follow-up focus only when the caller gives one', () => {
+    const focus: FollowUpFocus = {
+      categoryHints: ['data'],
+      declarations: [{ file: 'src/ledger/totals.ts', symbol: 'settleTotals', kind: 'symbol' }],
+    };
+    const session = sessionRecord({ question: BASE_QUESTION, target: TARGET, promptVersions: {} });
+    const focused = expectOk(
+      createPipelineStageContext({
+        session,
+        code: codeHandles([]),
+        logger: capturedLogger().logger,
+        followUpFocus: focus,
+      }),
+    );
+    expect(focused.followUpFocus).toBe(focus);
+    expect(Object.hasOwn(stageContext().context, 'followUpFocus')).toBe(false);
+    expect(
+      Object.hasOwn(
+        stageContext({ followUpQuestion: FOLLOW_UP_QUESTION }).context,
+        'followUpFocus',
+      ),
+    ).toBe(false);
+  });
+
   it('refuses a session whose project root is not absolute, naming the field only', () => {
     const session = sessionRecord({
       question: BASE_QUESTION,
@@ -2391,6 +2418,48 @@ describe('caps: enforced by every stage builder', () => {
     expect(build.truncated).toEqual(['investigation']);
   });
 
+  it('carries the selected owner chain as structured data only, bounded, and never as a target', () => {
+    const { builder } = builderFixture(probeLibrary());
+    const selected = stageContext();
+    const build = expectOk(
+      builder.buildPlanRequest({
+        context: selected.context,
+        understanding: UNDERSTANDING,
+        investigation: { relevantFiles: [], flows: [] },
+        adapterCatalog: ADAPTER_CATALOG,
+      }),
+    );
+    expect(build.request.input['selectedComponents']).toEqual([...TARGET.componentChain]);
+    // A `target` beside the understanding would change how the plan scores its candidates.
+    expect(Object.hasOwn(build.request.input, 'target')).toBe(false);
+    expect(build.request.prompt).not.toContain(TARGET.componentChain[1] ?? '');
+    expect(build.truncated).toEqual([]);
+    expect(selected.codeReads).toEqual([]);
+
+    const unselected = expectOk(
+      builder.buildPlanRequest({
+        context: stageContext({ withoutTarget: true }).context,
+        understanding: UNDERSTANDING,
+        investigation: { relevantFiles: [], flows: [] },
+        adapterCatalog: ADAPTER_CATALOG,
+      }),
+    );
+    expect(Object.hasOwn(unselected.request.input, 'selectedComponents')).toBe(false);
+    expect(unselected.request.prompt).toBe(build.request.prompt);
+
+    const { builder: tight } = builderFixture(probeLibrary(), { limits: { maxListItems: 2 } });
+    const capped = expectOk(
+      tight.buildPlanRequest({
+        context: stageContext().context,
+        understanding: UNDERSTANDING,
+        investigation: { relevantFiles: [], flows: [] },
+        adapterCatalog: ADAPTER_CATALOG,
+      }),
+    );
+    expect(capped.request.input['selectedComponents']).toEqual(TARGET.componentChain.slice(0, 2));
+    expect(capped.truncated).toEqual(['selectedComponents']);
+  });
+
   it('maxExcerpts and maxExcerptLines bound the analysis excerpts, keeping their locations', () => {
     const { builder } = builderFixture(probeLibrary(), {
       limits: { maxExcerpts: 2, maxExcerptLines: 3 },
@@ -2779,6 +2848,177 @@ describe('evidence survival', () => {
       .sort();
     expect(Object.keys(isRecord(summary) ? summary : {}).sort()).toEqual(expectedKeys);
     expect(build.request.input['codeExcerpts']).toEqual(stageInput.excerpts);
+  });
+});
+
+describe('the follow-up focus (AAP §0.4.2, Follow-up row; §0.5.4)', () => {
+  /** An invented declaration name that nothing else in these fixtures spells. */
+  const FOCUS_SYMBOL = 'marmotsettle';
+  const FOCUS_DECLARATION = deepFreeze({
+    file: 'src/ledger/totals.ts',
+    symbol: FOCUS_SYMBOL,
+    kind: 'symbol',
+  });
+  const FOCUS: FollowUpFocus = deepFreeze({
+    categoryHints: ['performance', 'data'],
+    declarations: [FOCUS_DECLARATION],
+  });
+
+  /** Builds an analyze request over the committed prompts for `stageInput`. */
+  function analyzeBuild(stageInput: AnalysisStageInput): StageRequestBuild {
+    const { builder } = builderFixture(committedLibrary());
+    return expectOk(
+      builder.buildAnalyzeRequest({
+        context: stageContext().context,
+        understanding: UNDERSTANDING,
+        stageInput,
+      }),
+    );
+  }
+
+  /** The structured input without its `followUpFocus` section. */
+  function withoutFocus(input: JsonObject): JsonObject {
+    return Object.fromEntries(Object.entries(input).filter(([key]) => key !== 'followUpFocus'));
+  }
+
+  it('an analyze request carries the focus at the top level of its input, beside the evidence and outside the prompt', () => {
+    const bare = analyzeBuild(deepFreeze(analysisStageInput([])));
+    const focused = analyzeBuild(deepFreeze({ ...analysisStageInput([]), followUpFocus: FOCUS }));
+
+    const focus = focused.request.input['followUpFocus'];
+    expect(focus).toEqual(FOCUS);
+    expect(Object.keys(isRecord(focus) ? focus : {})).toEqual(['categoryHints', 'declarations']);
+    const declarations = isRecord(focus) ? focus['declarations'] : undefined;
+    const first: unknown = Array.isArray(declarations) ? (declarations as unknown[])[0] : undefined;
+    expect(Object.keys(isRecord(first) ? first : {})).toEqual(['file', 'kind', 'symbol']);
+
+    const summary = focused.request.input['captureSummary'];
+    expect(Object.hasOwn(isRecord(summary) ? summary : {}, 'followUpFocus')).toBe(false);
+    expect(withoutFocus(focused.request.input)).toEqual(bare.request.input);
+    expect(focused.request.prompt).toBe(bare.request.prompt);
+    expect(focused.request.prompt).not.toContain(FOCUS_SYMBOL);
+    expect(focused.truncated).toEqual([]);
+  });
+
+  it('an analyze request no follow-up governs carries no focus key, nor one whose lists are empty', () => {
+    const bare = analyzeBuild(analysisStageInput([]));
+    expect(Object.hasOwn(bare.request.input, 'followUpFocus')).toBe(false);
+
+    const empty = analyzeBuild({
+      ...analysisStageInput([]),
+      followUpFocus: { categoryHints: [], declarations: [] },
+    });
+    expect(Object.hasOwn(empty.request.input, 'followUpFocus')).toBe(false);
+    expect(empty.request.input).toEqual(bare.request.input);
+    expect(empty.truncated).toEqual([]);
+  });
+
+  it('an analyze request holds the focus to its bound and names it among what it truncated', () => {
+    const scored = { ...FOCUS_DECLARATION, score: 3 };
+    const build = analyzeBuild({
+      ...analysisStageInput([]),
+      followUpFocus: {
+        categoryHints: ['data', 'data', '   '],
+        declarations: [
+          { file: '../outside/escape.ts', symbol: FOCUS_SYMBOL, kind: 'symbol' },
+          scored,
+          { ...FOCUS_DECLARATION, kind: 'component' },
+        ],
+      },
+    });
+    expect(build.request.input['followUpFocus']).toEqual({
+      categoryHints: ['data'],
+      declarations: [FOCUS_DECLARATION],
+    });
+    expect(build.truncated).toEqual(['followUpFocus']);
+    expect(JSON.stringify(build.request.input)).not.toContain('escape.ts');
+  });
+
+  it('FOLLOW_UP_FOCUS_LIMITS is frozen and follows the vocabulary and the string cap', () => {
+    expect(Object.isFrozen(FOLLOW_UP_FOCUS_LIMITS)).toBe(true);
+    expect(FOLLOW_UP_FOCUS_LIMITS.maxCategoryHints).toBe(PROBLEM_CATEGORIES.length);
+    expect(FOLLOW_UP_FOCUS_LIMITS.maxDeclarations).toBe(8);
+    expect(FOLLOW_UP_FOCUS_LIMITS.maxTextChars).toBe(CONTEXT_LIMITS.maxStringChars);
+  });
+
+  it('boundedFollowUpFocus keeps a focus in order, projected onto its contract, frozen and unmodified', () => {
+    const given = deepFreeze({
+      categoryHints: ['network', 'performance'],
+      declarations: [
+        { ...FOCUS_DECLARATION, score: 2 },
+        { file: 'src/ledger/export.ts', symbol: FOCUS_SYMBOL, kind: 'server-function' },
+      ],
+    });
+    const before = structuredClone(given);
+    const bounded = boundedFollowUpFocus(given);
+    expect(bounded).toEqual({
+      categoryHints: ['network', 'performance'],
+      declarations: [
+        FOCUS_DECLARATION,
+        { file: 'src/ledger/export.ts', symbol: FOCUS_SYMBOL, kind: 'server-function' },
+      ],
+    });
+    expect(Object.isFrozen(bounded)).toBe(true);
+    expect(Object.isFrozen(bounded?.categoryHints)).toBe(true);
+    expect(Object.isFrozen(bounded?.declarations)).toBe(true);
+    expect(bounded?.declarations.every((entry) => Object.isFrozen(entry))).toBe(true);
+    expect(given).toEqual(before);
+  });
+
+  it('boundedFollowUpFocus yields nothing for no focus, empty or blank lists, or malformed members', () => {
+    expect(boundedFollowUpFocus(undefined)).toBeUndefined();
+    expect(boundedFollowUpFocus({ categoryHints: [], declarations: [] })).toBeUndefined();
+    expect(boundedFollowUpFocus({ categoryHints: ['', ' \t'], declarations: [] })).toBeUndefined();
+    const malformed = { categoryHints: 'data', declarations: null } as unknown as FollowUpFocus;
+    expect(boundedFollowUpFocus(malformed)).toBeUndefined();
+    const members = {
+      categoryHints: [7, null],
+      declarations: [null, 'src/a.ts', { file: 'src/a.ts', symbol: 9, kind: 'symbol' }],
+    } as unknown as FollowUpFocus;
+    expect(boundedFollowUpFocus(members)).toBeUndefined();
+  });
+
+  it('boundedFollowUpFocus drops a declaration outside the project rather than carry its path', () => {
+    for (const file of ['../escape.ts', '/abs/escape.ts', 'C:/escape.ts', 'src\\escape.ts', ' ']) {
+      expect(
+        boundedFollowUpFocus({
+          categoryHints: [],
+          declarations: [{ file, symbol: FOCUS_SYMBOL, kind: 'symbol' }],
+        }),
+      ).toBeUndefined();
+    }
+  });
+
+  it('boundedFollowUpFocus drops an over-long value rather than cut it, and caps both lists', () => {
+    const { maxTextChars, maxCategoryHints, maxDeclarations } = FOLLOW_UP_FOCUS_LIMITS;
+    const atCap = boundedFollowUpFocus({
+      categoryHints: ['h'.repeat(maxTextChars), 'h'.repeat(maxTextChars + 1)],
+      declarations: [
+        { ...FOCUS_DECLARATION, symbol: 's'.repeat(maxTextChars + 1) },
+        { ...FOCUS_DECLARATION, symbol: 's'.repeat(maxTextChars) },
+      ],
+    });
+    expect(atCap?.categoryHints).toEqual(['h'.repeat(maxTextChars)]);
+    expect(atCap?.declarations).toEqual([
+      { ...FOCUS_DECLARATION, symbol: 's'.repeat(maxTextChars) },
+    ]);
+
+    const many = boundedFollowUpFocus({
+      categoryHints: Array.from(
+        { length: maxCategoryHints + 4 },
+        (_unused, index) => `hint${index}`,
+      ),
+      declarations: Array.from({ length: maxDeclarations + 4 }, (_unused, index) => ({
+        ...FOCUS_DECLARATION,
+        symbol: `${FOCUS_SYMBOL}${index}`,
+      })),
+    });
+    expect(many?.categoryHints).toEqual(
+      Array.from({ length: maxCategoryHints }, (_unused, index) => `hint${index}`),
+    );
+    expect(many?.declarations.map((entry) => entry.symbol)).toEqual(
+      Array.from({ length: maxDeclarations }, (_unused, index) => `${FOCUS_SYMBOL}${index}`),
+    );
   });
 });
 

@@ -22,8 +22,9 @@
  *    an editor is connected to display a pairing code.
  * 5. **Shutdown** is idempotent, closes sockets with the going-away code and
  *    folds the write-ahead log back into the database.
- * 6. The composition adapters this file owns — the agent-readiness ledger and
- *    the entry guard — directly.
+ * 6. The composition adapters this file owns — the agent-readiness ledger, the
+ *    conflict reflection that carries a watcher conflict into the session
+ *    record, and the entry guard — directly.
  * 7. **The state root stays outside every project.** A start whose stored
  *    sessions' projects contain `$DEBUGGEN_HOME` or lie inside it is refused
  *    after crash recovery restored their files, so is one whose stored
@@ -50,7 +51,11 @@
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
-import { createBackupStore, createModificationRecord } from '@debuggen/instrumentation';
+import {
+  buildConflictReport,
+  createBackupStore,
+  createModificationRecord,
+} from '@debuggen/instrumentation';
 import type { ModificationRecord } from '@debuggen/instrumentation';
 import {
   AUTHORIZATION_HEADER,
@@ -63,6 +68,7 @@ import {
   encodeMessage,
   formatBearer,
   healthResponseSchema,
+  parseSessionRecord,
   type AgentReadyPayload,
   type SessionStatus,
 } from '@debuggen/protocol';
@@ -74,6 +80,7 @@ import {
   isOk,
   newEventId,
   newProducerId,
+  newSessionId,
   newSpanId,
   newTraceId,
   noopLogger,
@@ -117,7 +124,10 @@ import {
 import { createDevServerLauncher } from './dev-server/launcher.js';
 import type { DevServerLauncher, DevServerTerminationReport } from './dev-server/launcher.js';
 import { fingerprintDocumentId } from './instrumentation/document-fingerprint.js';
+import type { BoundTabRef } from './instrumentation/readiness.js';
 import type { ArmingSnapshot } from './instrumentation/service.js';
+import { buildConflictMessage } from './instrumentation/watcher.js';
+import type { ModificationConflictListener } from './instrumentation/watcher.js';
 import { LOG_BINDING_KEYS, createServiceLogger } from './logging.js';
 import {
   DEV_SERVER_STOP_GRACE_MS,
@@ -130,6 +140,7 @@ import {
   SHUTDOWN_BUDGET,
   STORED_PROJECT_UNRESOLVABLE_STARTUP_HINT,
   STORED_PROJECT_UNRESOLVABLE_STARTUP_MESSAGE,
+  conflictReflectingListener,
   createAgentReadyLedger,
   createIngestSourceLocator,
   createLimitedServer,
@@ -139,6 +150,7 @@ import {
   regatingReadinessPort,
   releaseParts,
   startService,
+  type AgentReadyLedgerDeps,
   type HttpServerLimits,
   type ServiceHandle,
   type ServiceLoggers,
@@ -150,6 +162,7 @@ import type { PipelineCodeHandles } from './pipeline/context-builder.js';
 import type { RegateRequest } from './pipeline/orchestrator.js';
 import { createAuthService } from './server/auth.js';
 import { DEFAULT_MAX_CLIENTS, WS_CLOSE_GOING_AWAY } from './server/clients.js';
+import type { TabBindingView } from './server/clients.js';
 import { DEFAULT_REQUEST_BODY_TIMEOUT_MS } from './server/http.js';
 import type {
   BindingConnection,
@@ -2251,6 +2264,207 @@ describe('startService — shutdown reports launched dev servers still running',
   });
 });
 
+describe('conflictReflectingListener', () => {
+  /** The listener's input, as the watcher's `announce` hands it over. */
+  type ConflictInput = Parameters<ModificationConflictListener['onModificationConflict']>[0];
+
+  /** One call the recording manager received. */
+  type ReflectCall = readonly [sessionId: string, record: ModificationRecord];
+
+  /** The project-relative file every synthetic record names; never allowed into a log record. */
+  const FILE = 'src/checkout.ts';
+
+  /** A journal record the watcher has just moved to `conflict`, of a session no store holds. */
+  function conflictedRecord(): ModificationRecord {
+    const sessionId = newSessionId();
+    const originalHash = sha256Hex('export const total = 1;\n');
+    return unwrap(
+      createModificationRecord({
+        sessionId,
+        planVersion: 1,
+        file: FILE,
+        originalHash,
+        backupPath: join(tmpdir(), 'debuggen-home', 'backups', sessionId, originalHash),
+        instrumentedHash: sha256Hex('export const total = (globalThis, 1);\n'),
+        diff: [
+          `--- a/${FILE}`,
+          `+++ b/${FILE}`,
+          '@@ -1 +1 @@',
+          '-export const total = 1;',
+          '+export const total = (globalThis, 1);',
+          '',
+        ].join('\n'),
+        status: 'conflict',
+      }),
+    );
+  }
+
+  /** The structured conflict and notice the watcher composes for `record`. */
+  function conflictInput(record: ModificationRecord): ConflictInput {
+    const conflict = unwrap(
+      buildConflictReport({
+        record,
+        reason: 'content-changed',
+        detectedAt: record.appliedAt,
+        message: `${record.file} diverged from the instrumented content.`,
+      }),
+    );
+    return {
+      sessionId: record.sessionId,
+      record,
+      conflict,
+      notice: {
+        message: buildConflictMessage(record, conflict),
+        detail: `Open diff for ${record.id}.`,
+        action: 'open-diff',
+        recordId: record.id,
+        file: record.file,
+        backupPath: record.backupPath,
+        reason: conflict.reason,
+        observation: 'content-changed',
+        backupVerified: true,
+      },
+    };
+  }
+
+  /** A logger keeping every record, at every level. */
+  function recordingLogger(): { readonly logger: Logger; readonly records: LogRecord[] } {
+    const records: LogRecord[] = [];
+    const logger = createConsoleLogger({
+      level: 'trace',
+      sink: (record) => {
+        records.push(record);
+      },
+    });
+    return { logger, records };
+  }
+
+  /** Asserts that no record names the conflict's file or its backup path (AAP §0.5.2). */
+  function expectNoPathLogged(records: readonly LogRecord[], record: ModificationRecord): void {
+    const text = JSON.stringify(records);
+    expect(text).not.toContain(record.file);
+    expect(text).not.toContain(record.backupPath);
+  }
+
+  it('logs and drops a conflict that arrives before the session manager exists', async () => {
+    const { logger, records } = recordingLogger();
+    const record = conflictedRecord();
+    const listener = conflictReflectingListener({}, logger);
+
+    await expect(listener.onModificationConflict(conflictInput(record))).resolves.toBeUndefined();
+
+    expect(records).toHaveLength(1);
+    expect(records[0]?.level).toBe('warn');
+    expect(records[0]?.fields).toEqual({ sessionId: record.sessionId, recordId: record.id });
+    expectNoPathLogged(records, record);
+  });
+
+  it('hands the session id and the record to the manager, and logs its refusal by code only', async () => {
+    const { logger, records } = recordingLogger();
+    const record = conflictedRecord();
+    const calls: ReflectCall[] = [];
+    const listener = conflictReflectingListener(
+      {
+        current: {
+          recordModificationConflict: (sessionId, reflected) => {
+            calls.push([sessionId, reflected]);
+            return Promise.resolve(
+              err(
+                new DebuggenError('SESSION_NOT_FOUND', 'No debugging session with this id exists.'),
+              ),
+            );
+          },
+        },
+      },
+      logger,
+    );
+
+    await expect(listener.onModificationConflict(conflictInput(record))).resolves.toBeUndefined();
+
+    expect(calls).toEqual([[record.sessionId, record]]);
+    expect(records).toHaveLength(1);
+    expect(records[0]?.level).toBe('warn');
+    expect(records[0]?.fields).toEqual({
+      sessionId: record.sessionId,
+      recordId: record.id,
+      code: 'SESSION_NOT_FOUND',
+    });
+    expectNoPathLogged(records, record);
+  });
+
+  it('leaves a rejection to the watcher, which catches every listener failure', async () => {
+    const { logger, records } = recordingLogger();
+    const record = conflictedRecord();
+    const listener = conflictReflectingListener(
+      {
+        current: {
+          recordModificationConflict: () =>
+            Promise.reject(new Error('the store connection closed')),
+        },
+      },
+      logger,
+    );
+
+    await expect(listener.onModificationConflict(conflictInput(record))).rejects.toThrow(
+      'the store connection closed',
+    );
+    expect(records).toEqual([]);
+  });
+
+  it('reaches a manager bound after it was built, which rewrites the stored record', async () => {
+    const { container, stateRoot } = makeStateRoot();
+    const handle = await started(stateRoot);
+    const { session, record } = await instrumentFileOf(
+      handle,
+      stateRoot,
+      join(container, 'project'),
+    );
+    unwrap(await handle.manager.patch(session.id, { modifications: [record] }));
+    const conflicted = unwrap(
+      await createModificationsRepo({ store: handle.store }).updateStatus(record.id, 'conflict'),
+    );
+    /** The mirrored statuses of the written `sessions.record` document, read around the overlay. */
+    const writtenStatuses = (): unknown => {
+      const row: unknown = handle.store
+        .statement('SELECT record FROM sessions WHERE id = ?')
+        .get(session.id);
+      if (
+        typeof row !== 'object' ||
+        row === null ||
+        !('record' in row) ||
+        typeof row.record !== 'string'
+      ) {
+        throw new Error(`session ${session.id} has no stored document`);
+      }
+      const document: unknown = JSON.parse(row.record);
+      return unwrap(parseSessionRecord(document)).modifications.map((entry) => entry.status);
+    };
+    expect(writtenStatuses()).toEqual(['applied']);
+
+    const { logger, records } = recordingLogger();
+    const calls: ReflectCall[] = [];
+    const managerRef: {
+      current?: Pick<ServiceHandle['manager'], 'recordModificationConflict'>;
+    } = {};
+    const listener = conflictReflectingListener(managerRef, logger);
+    // Bound after the listener exists, exactly as `startService` fills its cell.
+    managerRef.current = {
+      recordModificationConflict: (sessionId, reflected) => {
+        calls.push([sessionId, reflected]);
+        return handle.manager.recordModificationConflict(sessionId, reflected);
+      },
+    };
+
+    await listener.onModificationConflict(conflictInput(conflicted));
+
+    expect(calls).toEqual([[session.id, conflicted]]);
+    expect(writtenStatuses()).toEqual(['conflict']);
+    const current = unwrap(handle.manager.get(session.id));
+    expect(current?.cleanup).toEqual({ status: 'pending', conflicts: [] });
+    expect(records).toEqual([]);
+  });
+});
+
 describe('SERVICE_VERSION', () => {
   it('is the version apps/local-service/package.json declares', () => {
     expect(SERVICE_VERSION).toBe(manifestVersion());
@@ -2280,22 +2494,52 @@ describe('createAgentReadyLedger', () => {
     };
   }
 
+  /** The credential `connection` presents: the holder of every binding a case names no other for. */
+  const HOLDER = connection.principal.tokenHash;
+
+  /**
+   * The live bindings every ledger of this suite resolves a session's holder
+   * through, by session id, as the client registry holds them.
+   */
+  const liveBindings = new Map<string, TabBindingView>();
+  const bindings: AgentReadyLedgerDeps['bindings'] = {
+    bindingForSession: (sessionId) => liveBindings.get(sessionId),
+  };
+
+  /**
+   * The session bound to `tabId` by `holder` (`connection`'s credential unless
+   * named), recorded in {@link liveBindings} and returned as the ref readiness
+   * asks the ledger with.
+   */
+  function boundTab(tabId: number, holder = HOLDER): BoundTabRef {
+    const sessionId = `ses_${holder.slice(0, 6)}_${String(tabId)}`;
+    liveBindings.set(sessionId, {
+      tabId,
+      sessionId,
+      url: 'http://127.0.0.1:3000/',
+      boundBy: holder,
+      boundAt: 0,
+      online: true,
+    });
+    return { sessionId, tabId };
+  }
+
   function silentLedger(now = (): number => 1_000): ReturnType<typeof createAgentReadyLedger> {
-    return createAgentReadyLedger({ logger: noopLogger, now });
+    return createAgentReadyLedger({ logger: noopLogger, bindings, now });
   }
 
   it('keeps the newest report per tab and stamps when it arrived', () => {
     let clock = 1_000;
     const ledger = silentLedger(() => clock);
-    expect(ledger.latestAgentReady(7)).toBeUndefined();
+    expect(ledger.latestAgentReady(boundTab(7))).toBeUndefined();
 
     expect(isOk(ledger.agentReady(report(7, 'doc-a'), connection))).toBe(true);
     clock = 2_000;
     expect(isOk(ledger.agentReady(report(7, 'doc-b'), connection))).toBe(true);
 
-    expect(ledger.latestAgentReady(7)?.documentId).toBe('doc-b');
-    expect(ledger.latestAgentReadyAt(7)).toBe(2_000);
-    expect(ledger.latestAgentReady(8)).toBeUndefined();
+    expect(ledger.latestAgentReady(boundTab(7))?.documentId).toBe('doc-b');
+    expect(ledger.latestAgentReadyAt(boundTab(7))).toBe(2_000);
+    expect(ledger.latestAgentReady(boundTab(8))).toBeUndefined();
     ledger.close();
   });
 
@@ -2303,7 +2547,10 @@ describe('createAgentReadyLedger', () => {
     const ledger = silentLedger();
     ledger.agentReady(report(3, 'doc-a'), connection);
 
-    const waiting = ledger.waitForAgentReady(3, { timeoutMs: 1_000, afterDocumentId: 'doc-a' });
+    const waiting = ledger.waitForAgentReady(boundTab(3), {
+      timeoutMs: 1_000,
+      afterDocumentId: 'doc-a',
+    });
     ledger.agentReady(report(3, 'doc-a'), connection);
     ledger.agentReady(report(3, 'doc-b'), connection);
 
@@ -2315,7 +2562,7 @@ describe('createAgentReadyLedger', () => {
     const ledger = silentLedger();
     ledger.agentReady(report(4, 'doc-new'), connection);
 
-    const answered = await ledger.waitForAgentReady(4, {
+    const answered = await ledger.waitForAgentReady(boundTab(4), {
       timeoutMs: 1_000,
       afterDocumentId: 'doc-old',
     });
@@ -2326,14 +2573,17 @@ describe('createAgentReadyLedger', () => {
   it('resolves undefined on timeout, on abort and on close, and refuses reports after close', async () => {
     const ledger = silentLedger();
 
-    expect(await ledger.waitForAgentReady(5, { timeoutMs: 10 })).toBeUndefined();
+    expect(await ledger.waitForAgentReady(boundTab(5), { timeoutMs: 10 })).toBeUndefined();
 
     const controller = new AbortController();
-    const aborted = ledger.waitForAgentReady(5, { timeoutMs: 1_000, signal: controller.signal });
+    const aborted = ledger.waitForAgentReady(boundTab(5), {
+      timeoutMs: 1_000,
+      signal: controller.signal,
+    });
     controller.abort();
     expect(await aborted).toBeUndefined();
 
-    const pending = ledger.waitForAgentReady(5, { timeoutMs: 1_000 });
+    const pending = ledger.waitForAgentReady(boundTab(5), { timeoutMs: 1_000 });
     ledger.close();
     expect(await pending).toBeUndefined();
 
@@ -2342,13 +2592,14 @@ describe('createAgentReadyLedger', () => {
     if (isErr(refused)) {
       expect(refused.error.code).toBe('TRANSPORT_DISCONNECTED');
     }
-    expect(ledger.latestAgentReady(5)).toBeUndefined();
+    expect(ledger.latestAgentReady(boundTab(5))).toBeUndefined();
   });
 
   it('logs a forged document id only as its fingerprint, and still matches on the raw id', async () => {
     const forged = '/account/PRIVATE-SENTINEL?token=forged';
     const records: LogRecord[] = [];
     const ledger = createAgentReadyLedger({
+      bindings,
       logger: createConsoleLogger({
         level: 'trace',
         sink: (record) => {
@@ -2358,12 +2609,15 @@ describe('createAgentReadyLedger', () => {
       now: () => 1_000,
     });
 
-    const waiting = ledger.waitForAgentReady(9, { timeoutMs: 1_000, afterDocumentId: 'doc-old' });
+    const waiting = ledger.waitForAgentReady(boundTab(9), {
+      timeoutMs: 1_000,
+      afterDocumentId: 'doc-old',
+    });
     const recorded = ledger.agentReady(report(9, forged), connection);
 
     expect(isOk(recorded) ? recorded.value.documentId : undefined).toBe(forged);
     expect((await waiting)?.documentId).toBe(forged);
-    expect(ledger.latestAgentReady(9)?.documentId).toBe(forged);
+    expect(ledger.latestAgentReady(boundTab(9))?.documentId).toBe(forged);
 
     const noted = records.filter(
       (record) => record.message === 'recorded a page-agent readiness report',
@@ -2388,20 +2642,20 @@ describe('createAgentReadyLedger', () => {
   it('knows no navigation until the binding route records one, then stamps it with the clock, per tab', () => {
     let clock = 5_000;
     const ledger = silentLedger(() => clock);
-    expect(ledger.latestNavigationAt(7)).toBeUndefined();
+    expect(ledger.latestNavigationAt(boundTab(7))).toBeUndefined();
 
-    ledger.recordNavigation(7);
-    expect(ledger.latestNavigationAt(7)).toBe(5_000);
-    expect(ledger.latestNavigationAt(8)).toBeUndefined();
+    ledger.recordNavigation(HOLDER, 7);
+    expect(ledger.latestNavigationAt(boundTab(7))).toBe(5_000);
+    expect(ledger.latestNavigationAt(boundTab(8))).toBeUndefined();
 
     clock = 6_000;
-    ledger.recordNavigation(8);
+    ledger.recordNavigation(HOLDER, 8);
     clock = 7_000;
-    ledger.recordNavigation(7);
-    expect(ledger.latestNavigationAt(7)).toBe(7_000);
-    expect(ledger.latestNavigationAt(8)).toBe(6_000);
+    ledger.recordNavigation(HOLDER, 7);
+    expect(ledger.latestNavigationAt(boundTab(7))).toBe(7_000);
+    expect(ledger.latestNavigationAt(boundTab(8))).toBe(6_000);
     // A navigation replaces no report: readiness judges the pair.
-    expect(ledger.latestAgentReady(7)).toBeUndefined();
+    expect(ledger.latestAgentReady(boundTab(7))).toBeUndefined();
     ledger.close();
   });
 
@@ -2409,25 +2663,25 @@ describe('createAgentReadyLedger', () => {
     const ledger = silentLedger(() => 1_000);
 
     ledger.agentReady(report(7, 'doc-a'), connection);
-    expect(ledger.latestAgentReadyAt(7)).toBe(1_000);
+    expect(ledger.latestAgentReadyAt(boundTab(7))).toBe(1_000);
 
     // A reload in the same tick: stamped strictly after the report it leaves,
     // so readiness's `navigatedAt > observedAt` distrusts doc-a.
-    ledger.recordNavigation(7);
-    const navigatedAt = ledger.latestNavigationAt(7);
+    ledger.recordNavigation(HOLDER, 7);
+    const navigatedAt = ledger.latestNavigationAt(boundTab(7));
     expect(navigatedAt).toBe(1_001);
     expect(navigatedAt).toBeGreaterThan(1_000);
 
     // The reloaded document reports in that same tick: never dated before the
     // navigation, so readiness trusts doc-b on sight.
     ledger.agentReady(report(7, 'doc-b'), connection);
-    expect(ledger.latestAgentReady(7)?.documentId).toBe('doc-b');
-    expect(ledger.latestAgentReadyAt(7)).toBe(1_001);
-    expect(ledger.latestNavigationAt(7)).toBe(1_001);
+    expect(ledger.latestAgentReady(boundTab(7))?.documentId).toBe('doc-b');
+    expect(ledger.latestAgentReadyAt(boundTab(7))).toBe(1_001);
+    expect(ledger.latestNavigationAt(boundTab(7))).toBe(1_001);
 
     // A second reload in the tick again lands after the report it leaves.
-    ledger.recordNavigation(7);
-    expect(ledger.latestNavigationAt(7)).toBe(1_002);
+    ledger.recordNavigation(HOLDER, 7);
+    expect(ledger.latestNavigationAt(boundTab(7))).toBe(1_002);
     ledger.close();
   });
 
@@ -2437,11 +2691,11 @@ describe('createAgentReadyLedger', () => {
 
     ledger.agentReady(report(7, 'doc-a'), connection);
     clock = 1_500;
-    ledger.recordNavigation(7);
-    expect(ledger.latestNavigationAt(7)).toBe(1_500);
+    ledger.recordNavigation(HOLDER, 7);
+    expect(ledger.latestNavigationAt(boundTab(7))).toBe(1_500);
     clock = 1_800;
     ledger.agentReady(report(7, 'doc-b'), connection);
-    expect(ledger.latestAgentReadyAt(7)).toBe(1_800);
+    expect(ledger.latestAgentReadyAt(boundTab(7))).toBe(1_800);
     ledger.close();
   });
 
@@ -2462,9 +2716,12 @@ describe('createAgentReadyLedger', () => {
 
       ledger.agentReady(report(7, 'doc-a'), connection);
       clock += step;
-      ledger.recordNavigation(7);
-      const navigatedAt = ledger.latestNavigationAt(7);
-      const waiting = ledger.waitForAgentReady(7, { timeoutMs: 1_000, afterDocumentId: 'doc-a' });
+      ledger.recordNavigation(HOLDER, 7);
+      const navigatedAt = ledger.latestNavigationAt(boundTab(7));
+      const waiting = ledger.waitForAgentReady(boundTab(7), {
+        timeoutMs: 1_000,
+        afterDocumentId: 'doc-a',
+      });
 
       // The Chrome side re-relays the report it retained for the tab; the
       // reload may already have replaced that document.
@@ -2472,15 +2729,15 @@ describe('createAgentReadyLedger', () => {
       const replayed: AgentReadyPayload = { ...report(7, 'doc-a'), installedBeforeReact: false };
       expect(isOk(ledger.agentReady(replayed, connection))).toBe(true);
 
-      expect(ledger.latestAgentReady(7)).toEqual(replayed);
-      expect(ledger.latestAgentReadyAt(7)).toBe(1_000);
-      expect(ledger.latestNavigationAt(7)).toBe(navigatedAt);
+      expect(ledger.latestAgentReady(boundTab(7))).toEqual(replayed);
+      expect(ledger.latestAgentReadyAt(boundTab(7))).toBe(1_000);
+      expect(ledger.latestNavigationAt(boundTab(7))).toBe(navigatedAt);
       expect(navigatedAt).toBeGreaterThan(1_000);
 
       // A second replay confirms no more than the first.
       clock += step;
       ledger.agentReady(report(7, 'doc-a'), connection);
-      expect(ledger.latestAgentReadyAt(7)).toBe(1_000);
+      expect(ledger.latestAgentReadyAt(boundTab(7))).toBe(1_000);
 
       // Neither answered the wait for a document other than doc-a.
       ledger.agentReady(report(7, 'doc-b'), connection);
@@ -2497,18 +2754,18 @@ describe('createAgentReadyLedger', () => {
 
       ledger.agentReady(report(7, 'doc-a'), connection);
       clock += step;
-      ledger.recordNavigation(7);
+      ledger.recordNavigation(HOLDER, 7);
       clock += step;
       ledger.agentReady(report(7, 'doc-a'), connection);
       clock += step;
       ledger.agentReady(report(7, 'doc-b'), connection);
 
-      const navigatedAt = ledger.latestNavigationAt(7);
-      const receivedAt = ledger.latestAgentReadyAt(7);
+      const navigatedAt = ledger.latestNavigationAt(boundTab(7));
+      const receivedAt = ledger.latestAgentReadyAt(boundTab(7));
       if (navigatedAt === undefined || receivedAt === undefined) {
         throw new Error('The ledger holds no navigation or no report for tab 7.');
       }
-      expect(ledger.latestAgentReady(7)?.documentId).toBe('doc-b');
+      expect(ledger.latestAgentReady(boundTab(7))?.documentId).toBe('doc-b');
       expect(receivedAt).toBeGreaterThanOrEqual(navigatedAt);
       expect(receivedAt).toBe(Math.max(clock, navigatedAt));
       ledger.close();
@@ -2520,13 +2777,13 @@ describe('createAgentReadyLedger', () => {
     const ledger = silentLedger(() => clock);
 
     // A navigation recorded before the stored report is not "in between".
-    ledger.recordNavigation(7);
+    ledger.recordNavigation(HOLDER, 7);
     clock = 1_200;
     ledger.agentReady(report(7, 'doc-a'), connection);
-    expect(ledger.latestAgentReadyAt(7)).toBe(1_200);
+    expect(ledger.latestAgentReadyAt(boundTab(7))).toBe(1_200);
     clock = 2_000;
     ledger.agentReady(report(7, 'doc-a'), connection);
-    expect(ledger.latestAgentReadyAt(7)).toBe(2_000);
+    expect(ledger.latestAgentReadyAt(boundTab(7))).toBe(2_000);
     ledger.close();
   });
 
@@ -2534,77 +2791,92 @@ describe('createAgentReadyLedger', () => {
     const ledger = silentLedger(() => 3_000);
 
     ledger.agentReady(report(8, 'doc-a'), connection);
-    ledger.recordNavigation(8);
+    ledger.recordNavigation(HOLDER, 8);
     ledger.agentReady(report(8, 'doc-b'), connection);
-    expect(ledger.latestAgentReadyAt(8)).toBe(3_001);
+    expect(ledger.latestAgentReadyAt(boundTab(8))).toBe(3_001);
 
     // doc-b arrived after the navigation, so its replay is not left behind by
     // it: the receipt is refreshed, never dated back before the navigation.
     ledger.agentReady(report(8, 'doc-b'), connection);
-    expect(ledger.latestAgentReadyAt(8)).toBe(3_001);
-    expect(ledger.latestNavigationAt(8)).toBe(3_001);
+    expect(ledger.latestAgentReadyAt(boundTab(8))).toBe(3_001);
+    expect(ledger.latestNavigationAt(boundTab(8))).toBe(3_001);
     ledger.close();
   });
 
   it('remembers navigations for at most maxTabs tabs, forgetting the least recently navigated first', () => {
     let clock = 1_000;
-    const ledger = createAgentReadyLedger({ logger: noopLogger, now: () => clock, maxTabs: 2 });
+    const ledger = createAgentReadyLedger({
+      logger: noopLogger,
+      bindings,
+      now: () => clock,
+      maxTabs: 2,
+    });
 
-    ledger.recordNavigation(1);
+    ledger.recordNavigation(HOLDER, 1);
     clock += 1;
-    ledger.recordNavigation(2);
+    ledger.recordNavigation(HOLDER, 2);
     clock += 1;
     // Refreshing tab 1 makes tab 2 the oldest.
-    ledger.recordNavigation(1);
+    ledger.recordNavigation(HOLDER, 1);
     clock += 1;
-    ledger.recordNavigation(3);
+    ledger.recordNavigation(HOLDER, 3);
 
-    expect(ledger.latestNavigationAt(2)).toBeUndefined();
-    expect(ledger.latestNavigationAt(1)).toBe(1_002);
-    expect(ledger.latestNavigationAt(3)).toBe(1_003);
+    expect(ledger.latestNavigationAt(boundTab(2))).toBeUndefined();
+    expect(ledger.latestNavigationAt(boundTab(1))).toBe(1_002);
+    expect(ledger.latestNavigationAt(boundTab(3))).toBe(1_003);
     ledger.close();
   });
 
   it('forgets a report together with its navigation when navigations of other tabs churn the bound', () => {
     let clock = 1_000;
-    const ledger = createAgentReadyLedger({ logger: noopLogger, now: () => clock, maxTabs: 2 });
+    const ledger = createAgentReadyLedger({
+      logger: noopLogger,
+      bindings,
+      now: () => clock,
+      maxTabs: 2,
+    });
 
     ledger.agentReady(report(1, 'doc-a'), connection);
     clock += 1;
-    ledger.recordNavigation(1);
+    ledger.recordNavigation(HOLDER, 1);
     clock += 1;
     // Navigations of unrelated (even unbound) tabs: tab 1 is the oldest entry.
-    ledger.recordNavigation(2);
+    ledger.recordNavigation(HOLDER, 2);
     clock += 1;
-    ledger.recordNavigation(3);
+    ledger.recordNavigation(HOLDER, 3);
 
     // Neither half outlives the other: a surviving report with its
     // navigation forgotten would read as current on sight.
-    expect(ledger.latestAgentReady(1)).toBeUndefined();
-    expect(ledger.latestAgentReadyAt(1)).toBeUndefined();
-    expect(ledger.latestNavigationAt(1)).toBeUndefined();
-    expect(ledger.latestNavigationAt(2)).toBe(1_002);
-    expect(ledger.latestNavigationAt(3)).toBe(1_003);
+    expect(ledger.latestAgentReady(boundTab(1))).toBeUndefined();
+    expect(ledger.latestAgentReadyAt(boundTab(1))).toBeUndefined();
+    expect(ledger.latestNavigationAt(boundTab(1))).toBeUndefined();
+    expect(ledger.latestNavigationAt(boundTab(2))).toBe(1_002);
+    expect(ledger.latestNavigationAt(boundTab(3))).toBe(1_003);
     ledger.close();
   });
 
   it('forgets a navigation together with its report when reports of other tabs churn the bound', () => {
     let clock = 1_000;
-    const ledger = createAgentReadyLedger({ logger: noopLogger, now: () => clock, maxTabs: 2 });
+    const ledger = createAgentReadyLedger({
+      logger: noopLogger,
+      bindings,
+      now: () => clock,
+      maxTabs: 2,
+    });
 
     ledger.agentReady(report(1, 'doc-a'), connection);
     clock += 1;
-    ledger.recordNavigation(1);
+    ledger.recordNavigation(HOLDER, 1);
     clock += 1;
     ledger.agentReady(report(2, 'doc-b'), connection);
     clock += 1;
     ledger.agentReady(report(3, 'doc-c'), connection);
 
-    expect(ledger.latestAgentReady(1)).toBeUndefined();
-    expect(ledger.latestAgentReadyAt(1)).toBeUndefined();
-    expect(ledger.latestNavigationAt(1)).toBeUndefined();
-    expect(ledger.latestAgentReady(2)?.documentId).toBe('doc-b');
-    expect(ledger.latestAgentReady(3)?.documentId).toBe('doc-c');
+    expect(ledger.latestAgentReady(boundTab(1))).toBeUndefined();
+    expect(ledger.latestAgentReadyAt(boundTab(1))).toBeUndefined();
+    expect(ledger.latestNavigationAt(boundTab(1))).toBeUndefined();
+    expect(ledger.latestAgentReady(boundTab(2))?.documentId).toBe('doc-b');
+    expect(ledger.latestAgentReady(boundTab(3))?.documentId).toBe('doc-c');
     ledger.close();
   });
 
@@ -2612,7 +2884,7 @@ describe('createAgentReadyLedger', () => {
     {
       label: 'a navigation',
       write: (ledger: ReturnType<typeof createAgentReadyLedger>): void => {
-        ledger.recordNavigation(1);
+        ledger.recordNavigation(HOLDER, 1);
       },
       kept: { documentId: 'doc-a', receivedAt: 1_000, navigatedAt: 1_004 },
     },
@@ -2627,41 +2899,46 @@ describe('createAgentReadyLedger', () => {
     'refreshes a tab’s recency on $label, forgetting the oldest other tab whole',
     ({ write, kept }) => {
       let clock = 1_000;
-      const ledger = createAgentReadyLedger({ logger: noopLogger, now: () => clock, maxTabs: 2 });
+      const ledger = createAgentReadyLedger({
+        logger: noopLogger,
+        bindings,
+        now: () => clock,
+        maxTabs: 2,
+      });
 
       ledger.agentReady(report(1, 'doc-a'), connection);
       clock += 1;
-      ledger.recordNavigation(1);
+      ledger.recordNavigation(HOLDER, 1);
       clock += 1;
       ledger.agentReady(report(2, 'doc-b'), connection);
       clock += 1;
-      ledger.recordNavigation(2);
+      ledger.recordNavigation(HOLDER, 2);
       clock += 1;
       // Tab 1 is the oldest entry until this write makes it the newest.
       write(ledger);
       clock += 1;
-      ledger.recordNavigation(3);
+      ledger.recordNavigation(HOLDER, 3);
 
-      expect(ledger.latestAgentReady(2)).toBeUndefined();
-      expect(ledger.latestAgentReadyAt(2)).toBeUndefined();
-      expect(ledger.latestNavigationAt(2)).toBeUndefined();
-      expect(ledger.latestAgentReady(1)?.documentId).toBe(kept.documentId);
-      expect(ledger.latestAgentReadyAt(1)).toBe(kept.receivedAt);
-      expect(ledger.latestNavigationAt(1)).toBe(kept.navigatedAt);
-      expect(ledger.latestNavigationAt(3)).toBe(1_005);
+      expect(ledger.latestAgentReady(boundTab(2))).toBeUndefined();
+      expect(ledger.latestAgentReadyAt(boundTab(2))).toBeUndefined();
+      expect(ledger.latestNavigationAt(boundTab(2))).toBeUndefined();
+      expect(ledger.latestAgentReady(boundTab(1))?.documentId).toBe(kept.documentId);
+      expect(ledger.latestAgentReadyAt(boundTab(1))).toBe(kept.receivedAt);
+      expect(ledger.latestNavigationAt(boundTab(1))).toBe(kept.navigatedAt);
+      expect(ledger.latestNavigationAt(boundTab(3))).toBe(1_005);
       ledger.close();
     },
   );
 
   it('forgets every navigation on close and ignores one recorded after it', () => {
     const ledger = silentLedger();
-    ledger.recordNavigation(7);
-    expect(ledger.latestNavigationAt(7)).toBe(1_000);
+    ledger.recordNavigation(HOLDER, 7);
+    expect(ledger.latestNavigationAt(boundTab(7))).toBe(1_000);
 
     ledger.close();
-    expect(ledger.latestNavigationAt(7)).toBeUndefined();
-    ledger.recordNavigation(7);
-    expect(ledger.latestNavigationAt(7)).toBeUndefined();
+    expect(ledger.latestNavigationAt(boundTab(7))).toBeUndefined();
+    ledger.recordNavigation(HOLDER, 7);
+    expect(ledger.latestNavigationAt(boundTab(7))).toBeUndefined();
   });
 
   it.each([
@@ -2672,6 +2949,7 @@ describe('createAgentReadyLedger', () => {
   ])('ignores a navigation of a tab id that is %s', (_label, tabId) => {
     const records: LogRecord[] = [];
     const ledger = createAgentReadyLedger({
+      bindings,
       logger: createConsoleLogger({
         level: 'trace',
         sink: (record) => {
@@ -2681,9 +2959,9 @@ describe('createAgentReadyLedger', () => {
       now: () => 1_000,
     });
 
-    ledger.recordNavigation(tabId);
+    ledger.recordNavigation(HOLDER, tabId);
 
-    expect(ledger.latestNavigationAt(tabId)).toBeUndefined();
+    expect(ledger.latestNavigationAt(boundTab(tabId))).toBeUndefined();
     expect(records).toEqual([]);
     ledger.close();
   });
@@ -2691,6 +2969,7 @@ describe('createAgentReadyLedger', () => {
   it('notes a navigation at debug by tab id alone', () => {
     const records: LogRecord[] = [];
     const ledger = createAgentReadyLedger({
+      bindings,
       logger: createConsoleLogger({
         level: 'trace',
         sink: (record) => {
@@ -2700,7 +2979,7 @@ describe('createAgentReadyLedger', () => {
       now: () => 1_000,
     });
 
-    ledger.recordNavigation(9);
+    ledger.recordNavigation(HOLDER, 9);
 
     const noted = records.filter(
       (record) => record.message === 'recorded a committed navigation of a tab',
@@ -2708,10 +2987,274 @@ describe('createAgentReadyLedger', () => {
     expect(noted).toHaveLength(1);
     expect(noted[0]?.level).toBe('debug');
     // Beside the subsystem binding every ledger record carries, the tab id is
-    // the one field: no URL, no document id, no connection.
+    // the one field: no URL, no document id, no connection, no credential.
     const { [LOG_BINDING_KEYS.subsystem]: subsystem, ...fields } = noted[0]?.fields ?? {};
     expect(typeof subsystem).toBe('string');
     expect(fields).toEqual({ tabId: 9 });
+    expect(JSON.stringify(records)).not.toContain(HOLDER);
+    ledger.close();
+  });
+
+  it.each([
+    { label: 'a negative tab id', tabId: -1, holder: HOLDER },
+    { label: 'a fractional tab id', tabId: 1.5, holder: HOLDER },
+    { label: 'a tab id that is not a number', tabId: Number.NaN, holder: HOLDER },
+    {
+      label: 'a tab id beyond the safe integers',
+      tabId: Number.MAX_SAFE_INTEGER + 1,
+      holder: HOLDER,
+    },
+    { label: 'an empty credential', tabId: 7, holder: '' },
+  ])(
+    'takes no entry for a navigation with $label: the one entry the bound holds survives it',
+    ({ tabId, holder }) => {
+      const ledger = createAgentReadyLedger({
+        logger: noopLogger,
+        bindings,
+        now: () => 1_000,
+        maxTabs: 1,
+      });
+
+      ledger.agentReady(report(8, 'doc-kept'), connection);
+      ledger.recordNavigation(holder, tabId);
+
+      expect(ledger.latestAgentReady(boundTab(8))?.documentId).toBe('doc-kept');
+      expect(ledger.latestNavigationAt(boundTab(8))).toBeUndefined();
+      ledger.close();
+    },
+  );
+
+  /* ---- one paired browser's evidence never answers for another's session ---- */
+
+  /** A second paired browser: its own credential, inspecting tabs whose ids collide with the first's. */
+  const otherConnection: WsConnectionFacts = {
+    id: 'cli_other',
+    kind: 'devtools',
+    principal: {
+      role: 'devtools',
+      tokenHash: 'a'.repeat(64),
+      scope: { kind: 'extension', extensionId: 'ponmlkjihgfedcbaponmlkjihgfedcba' },
+      issuedAt: 0,
+    },
+  };
+  const OTHER = otherConnection.principal.tokenHash;
+
+  it('keeps two credentials’ reports, receipt times and navigations of the same tab id apart', () => {
+    let clock = 1_000;
+    const ledger = silentLedger(() => clock);
+    const first = boundTab(7);
+    const second = boundTab(7, OTHER);
+
+    ledger.agentReady(report(7, 'doc-first-browser'), connection);
+    expect(ledger.latestAgentReady(first)?.documentId).toBe('doc-first-browser');
+    expect(ledger.latestAgentReady(second)).toBeUndefined();
+    expect(ledger.latestAgentReadyAt(second)).toBeUndefined();
+
+    clock = 2_000;
+    ledger.agentReady(report(7, 'doc-second-browser'), otherConnection);
+    expect(ledger.latestAgentReady(first)?.documentId).toBe('doc-first-browser');
+    expect(ledger.latestAgentReadyAt(first)).toBe(1_000);
+    expect(ledger.latestAgentReady(second)?.documentId).toBe('doc-second-browser');
+    expect(ledger.latestAgentReadyAt(second)).toBe(2_000);
+
+    clock = 3_000;
+    ledger.recordNavigation(OTHER, 7);
+    expect(ledger.latestNavigationAt(second)).toBe(3_000);
+    expect(ledger.latestNavigationAt(first)).toBeUndefined();
+    ledger.close();
+  });
+
+  it('does not let one credential’s navigation make another credential’s report of the same tab id read as left behind', () => {
+    // A constant clock: were the entries shared, the navigation would be
+    // stamped one past the second browser's report and distrust it.
+    const ledger = silentLedger(() => 1_000);
+    const first = boundTab(7);
+    const second = boundTab(7, OTHER);
+
+    ledger.agentReady(report(7, 'doc-first-browser'), connection);
+    ledger.agentReady(report(7, 'doc-second-browser'), otherConnection);
+    ledger.recordNavigation(HOLDER, 7);
+
+    expect(ledger.latestNavigationAt(first)).toBe(1_001);
+    expect(ledger.latestNavigationAt(second)).toBeUndefined();
+    expect(ledger.latestAgentReadyAt(second)).toBe(1_000);
+    // A repeat by the second browser follows no navigation of its own, so it
+    // is no replay after a navigation, and nothing reads as after it.
+    ledger.agentReady(report(7, 'doc-second-browser'), otherConnection);
+    expect(ledger.latestAgentReadyAt(second)).toBe(1_000);
+    expect(ledger.latestNavigationAt(second)).toBeUndefined();
+    ledger.close();
+  });
+
+  it('wakes a wait only for a report from its own session’s binding credential', async () => {
+    const ledger = silentLedger();
+    const second = boundTab(7, OTHER);
+
+    let answered: AgentReadyPayload | undefined;
+    let settled = false;
+    const waiting = ledger.waitForAgentReady(second, { timeoutMs: 1_000 }).then((payload) => {
+      answered = payload;
+      settled = true;
+      return payload;
+    });
+
+    // The first browser's report of its own tab 7 answers no wait of the second's session.
+    ledger.agentReady(report(7, 'doc-first-browser'), connection);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(answered).toBeUndefined();
+
+    ledger.agentReady(report(7, 'doc-second-browser'), otherConnection);
+    expect((await waiting)?.documentId).toBe('doc-second-browser');
+    ledger.close();
+  });
+
+  it('answers a wait at once only from its own session’s binding credential’s report on file', async () => {
+    const ledger = silentLedger();
+    const first = boundTab(7);
+    const second = boundTab(7, OTHER);
+    ledger.agentReady(report(7, 'doc-first-browser'), connection);
+
+    expect((await ledger.waitForAgentReady(first, { timeoutMs: 10 }))?.documentId).toBe(
+      'doc-first-browser',
+    );
+    expect(await ledger.waitForAgentReady(second, { timeoutMs: 10 })).toBeUndefined();
+    ledger.close();
+  });
+
+  it('resolves the holder when a report arrives, so a session bound after its wait began is woken by its own browser alone', async () => {
+    const ledger = silentLedger();
+    const sessionId = 'ses_bound_after_wait';
+    const waiting = ledger.waitForAgentReady({ sessionId, tabId: 7 }, { timeoutMs: 1_000 });
+
+    // Bound by the second browser only now, after the wait began.
+    liveBindings.set(sessionId, {
+      tabId: 7,
+      sessionId,
+      url: 'http://127.0.0.1:3000/',
+      boundBy: OTHER,
+      boundAt: 0,
+      online: true,
+    });
+    ledger.agentReady(report(7, 'doc-first-browser'), connection);
+    ledger.agentReady(report(7, 'doc-second-browser'), otherConnection);
+
+    expect((await waiting)?.documentId).toBe('doc-second-browser');
+    liveBindings.delete(sessionId);
+    ledger.close();
+  });
+
+  it('reads nothing for a session with no live binding, or whose binding is another tab', async () => {
+    const ledger = silentLedger();
+    ledger.agentReady(report(7, 'doc-a'), connection);
+    ledger.recordNavigation(HOLDER, 7);
+    // The session is bound, by the same credential, to tab 8 — not tab 7.
+    const onAnotherTab = boundTab(8);
+
+    for (const ref of [
+      { sessionId: 'ses_never_bound', tabId: 7 },
+      { sessionId: onAnotherTab.sessionId, tabId: 7 },
+    ]) {
+      expect(ledger.latestAgentReady(ref)).toBeUndefined();
+      expect(ledger.latestAgentReadyAt(ref)).toBeUndefined();
+      expect(ledger.latestNavigationAt(ref)).toBeUndefined();
+      expect(await ledger.waitForAgentReady(ref, { timeoutMs: 10 })).toBeUndefined();
+    }
+    expect(ledger.latestAgentReady(boundTab(7))?.documentId).toBe('doc-a');
+    ledger.close();
+  });
+
+  it('reads nothing, and logs the fault by its name alone, when the binding lookup throws', () => {
+    const records: LogRecord[] = [];
+    const ledger = createAgentReadyLedger({
+      bindings: {
+        bindingForSession: () => {
+          throw new RangeError(`lookup-fault-sentinel ${HOLDER}`);
+        },
+      },
+      logger: createConsoleLogger({
+        level: 'trace',
+        sink: (record) => {
+          records.push(record);
+        },
+      }),
+      now: () => 1_000,
+    });
+    ledger.agentReady(report(7, 'doc-a'), connection);
+
+    expect(ledger.latestAgentReady({ sessionId: 'ses_any', tabId: 7 })).toBeUndefined();
+
+    const faults = records.filter(
+      (record) =>
+        record.message ===
+        'the binding of a session could not be read; its tab reads as unreported',
+    );
+    expect(faults).toHaveLength(1);
+    expect(faults[0]?.fields).toMatchObject({ tabId: 7, errorName: 'RangeError' });
+    const serialized = JSON.stringify(records);
+    expect(serialized).not.toContain('lookup-fault-sentinel');
+    expect(serialized).not.toContain(HOLDER);
+    ledger.close();
+  });
+
+  it('bounds its entries per credential and tab, forgetting the least recently written holder’s entry whole', () => {
+    let clock = 1_000;
+    const ledger = createAgentReadyLedger({
+      logger: noopLogger,
+      bindings,
+      now: () => clock,
+      maxTabs: 2,
+    });
+    const first = boundTab(7);
+    const second = boundTab(7, OTHER);
+
+    ledger.agentReady(report(7, 'doc-first-browser'), connection);
+    clock += 1;
+    ledger.agentReady(report(7, 'doc-second-browser'), otherConnection);
+    clock += 1;
+    // Two entries for one tab id: a third entry forgets the older holder's.
+    ledger.recordNavigation(HOLDER, 8);
+
+    expect(ledger.latestAgentReady(first)).toBeUndefined();
+    expect(ledger.latestAgentReady(second)?.documentId).toBe('doc-second-browser');
+    expect(ledger.latestNavigationAt(boundTab(8))).toBe(1_002);
+    ledger.close();
+  });
+
+  it('writes no credential digest to any log line — reports, navigations and evictions alike', () => {
+    const records: LogRecord[] = [];
+    const ledger = createAgentReadyLedger({
+      bindings,
+      logger: createConsoleLogger({
+        level: 'trace',
+        sink: (record) => {
+          records.push(record);
+        },
+      }),
+      now: () => 1_000,
+      maxTabs: 1,
+    });
+
+    ledger.agentReady(report(7, 'doc-first-browser'), connection);
+    ledger.recordNavigation(OTHER, 7);
+    ledger.agentReady(report(7, 'doc-second-browser'), otherConnection);
+    ledger.recordNavigation(HOLDER, 9);
+
+    const forgotten = records.filter(
+      (record) =>
+        record.message === 'forgot the readiness evidence of the least recently written tab',
+    );
+    expect(forgotten.length).toBeGreaterThan(0);
+    for (const record of forgotten) {
+      const { [LOG_BINDING_KEYS.subsystem]: subsystem, ...fields } = record.fields;
+      expect(typeof subsystem).toBe('string');
+      expect(Object.keys(fields)).toEqual(['tabId']);
+      expect(typeof fields['tabId']).toBe('number');
+    }
+    const serialized = JSON.stringify(records);
+    expect(serialized).not.toContain(HOLDER);
+    expect(serialized).not.toContain(OTHER);
     ledger.close();
   });
 });
@@ -2742,7 +3285,11 @@ describe('regatingReadinessPort', () => {
   ): { port: ReturnType<typeof regatingReadinessPort>; regated: string[]; recorded: number[] } {
     const regated: string[] = [];
     const recorded: number[] = [];
-    const ledger = createAgentReadyLedger({ logger: noopLogger, now: () => 1_000 });
+    const ledger = createAgentReadyLedger({
+      logger: noopLogger,
+      bindings: { bindingForSession: () => undefined },
+      now: () => 1_000,
+    });
     const port = regatingReadinessPort(
       {
         agentReady: (payload, client) => {

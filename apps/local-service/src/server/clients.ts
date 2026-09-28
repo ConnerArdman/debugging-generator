@@ -874,9 +874,13 @@ export interface ClientRegistry {
    * Whether a live binding of `tabId` exists and none of them was made by
    * `principal`'s credential: the tab id is in use by other paired browsers
    * only. What a report about an unbound tab of this id — a committed
-   * navigation, a page-agent readiness report — is refused on, because the
-   * service's readiness evidence is keyed by tab id alone and could not tell
-   * that report from one about the other browser's bound tab.
+   * navigation, a page-agent readiness report — is refused on: a credential
+   * acts on a tab id another paired browser's live binding holds only once it
+   * has bound its own, whereupon its service worker relays the tab's latest
+   * report again. The service's readiness evidence is kept per credential and
+   * read for a session's own binding (`../main.ts`'s agent-ready ledger), so
+   * the refusal is that relay rule, not what keeps one browser's report from
+   * standing for another's bound tab.
    */
   tabHeldByAnotherCredential(tabId: number, principal: Principal): boolean;
 

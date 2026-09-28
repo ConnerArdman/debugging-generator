@@ -150,6 +150,7 @@ import {
 } from '@debuggen/code-analysis';
 import type { JsonObject } from '@debuggen/model-provider';
 import { MAX_AGGREGATE_INPUT_EVENTS } from '../panels/data.js';
+import type { FollowUpFocus } from '../pipeline/context-builder.js';
 import type { TelemetryRepo } from '../store/telemetry-repo.js';
 import type { SessionsRepo } from '../store/sessions-repo.js';
 import type { PanelsRepo } from '../store/panels-repo.js';
@@ -1087,6 +1088,14 @@ export type AnalysisStageInput = {
   readonly question: string;
   /** The follow-up question, verbatim, on the follow-up path. */
   readonly followUpQuestion?: string;
+  /**
+   * The structured focus of the follow-up this analysis answers, passed
+   * through as the caller derived it; present only when a follow-up governs
+   * the analysis. Like the questions it is not capture evidence: the context
+   * builder bounds it and places it at the top level of the request, beside
+   * the capture sections rather than among them.
+   */
+  readonly followUpFocus?: FollowUpFocus;
   /** The selected element, redacted. */
   readonly target?: AnalysisTargetFacet;
   /** Capture identity, window and counts. */
@@ -1305,6 +1314,12 @@ export type AnalysisStageInputRequest = {
   readonly question: string;
   /** The follow-up question, passed through verbatim. */
   readonly followUpQuestion?: string | undefined;
+  /**
+   * The structured focus of the follow-up the analysis answers, passed through
+   * to {@link AnalysisStageInput.followUpFocus}; absent when no follow-up
+   * governs the analysis, and then the input carries no such field.
+   */
+  readonly followUpFocus?: FollowUpFocus | undefined;
   /** Code queries of the session's project (overrides the injected default). */
   readonly codeQueries?: CodeExcerptPort | undefined;
   /** Assembly options. */
@@ -2562,9 +2577,10 @@ export type ByteBudgetResult = {
 /** An input under construction: the optional sections as explicit, possibly undefined, fields. */
 type AnalysisInputDraft = Omit<
   AnalysisStageInput,
-  'followUpQuestion' | 'target' | 'componentTree' | 'dependencyGraph'
+  'followUpQuestion' | 'followUpFocus' | 'target' | 'componentTree' | 'dependencyGraph'
 > & {
   readonly followUpQuestion: string | undefined;
+  readonly followUpFocus: FollowUpFocus | undefined;
   readonly target: AnalysisTargetFacet | undefined;
   readonly componentTree: AnalysisComponentTreeSection | undefined;
   readonly dependencyGraph: AnalysisDependencyGraphSection | undefined;
@@ -2575,6 +2591,7 @@ function toDraft(input: AnalysisStageInput): AnalysisInputDraft {
   return {
     ...input,
     followUpQuestion: input.followUpQuestion,
+    followUpFocus: input.followUpFocus,
     target: input.target,
     componentTree: input.componentTree,
     dependencyGraph: input.dependencyGraph,
@@ -2588,6 +2605,7 @@ function composeInput(draft: AnalysisInputDraft): AnalysisStageInput {
     captureId: draft.captureId,
     question: draft.question,
     ...(draft.followUpQuestion === undefined ? {} : { followUpQuestion: draft.followUpQuestion }),
+    ...(draft.followUpFocus === undefined ? {} : { followUpFocus: draft.followUpFocus }),
     ...(draft.target === undefined ? {} : { target: draft.target }),
     capture: draft.capture,
     metrics: draft.metrics,
@@ -3481,6 +3499,7 @@ export function createAnalysisSummarizer(deps: AnalysisSummarizerDeps): Analysis
         captureId,
         question: request.question,
         followUpQuestion: request.followUpQuestion,
+        followUpFocus: request.followUpFocus,
         target: targetFacet,
         capture: captureFacet,
         metrics,

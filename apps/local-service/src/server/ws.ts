@@ -3327,10 +3327,15 @@ export function createWsServer(deps: WsServerDeps): Result<WsServer, DebuggenErr
       return ownTab;
     }
     // A tab id is unique only within one browser: bindings are this
-    // credential's own (`bindingForTab(tabId, principal)`). A tab id that only
-    // another credential holds a binding of is refused, because readiness
-    // keeps its evidence by tab id alone and could not tell this report from
-    // one about the other browser's bound tab.
+    // credential's own (`bindingForTab(tabId, principal)`), and the readiness
+    // ledger keeps every report under the relaying credential and reads it for
+    // a session's own binding, so this report can never stand for the other
+    // browser's bound tab. A tab id that only another credential holds a
+    // binding of is still refused — the relay rule the binding route applies
+    // to `tab.navigated` as well: a credential acts on a tab id another paired
+    // browser's live binding holds only once it has bound its own. Nothing is
+    // lost: once it binds, its service worker relays the tab's latest report
+    // again.
     const tabBinding = clients.bindingForTab(payload.tabId, principal);
     if (tabBinding === undefined && clients.tabHeldByAnotherCredential(payload.tabId, principal)) {
       return refusal('TAB_NOT_BOUND', MISSING_BINDING_MESSAGE);

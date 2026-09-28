@@ -110,7 +110,11 @@
  * {@link PATCH_TARGET_HELD_REASON}, before anything is backed up, journaled or
  * written. The digest comparison, not the path, is what makes the check exact:
  * two copies of a project share every relative path, and only the copy holding
- * the patched bytes is held. {@link Patcher.patchActions} runs the same check
+ * the patched bytes is held. Bytes this session's own record also claims are
+ * never held against it: the transform is deterministic, so a session patching
+ * a file restored after another session's conflict reproduces that session's
+ * digest exactly, and its own claim over the bytes it wrote is the one that
+ * stands. {@link Patcher.patchActions} runs the same check
  * over a whole batch before it attempts anything, and
  * {@link describeTargetYield} turns the refusal into the gap `../installer.ts`
  * reports while it installs everything else (AAP §0.5.5).
@@ -1995,6 +1999,9 @@ class SequencedPatcher implements Patcher {
       // written. The comparison is the digest just taken against that
       // record's `instrumentedHash`, which is what makes it exact for this
       // project: another copy of it shares the relative path, not the bytes.
+      // Bytes this session's own record also claims are this session's —
+      // a deterministic transform can reproduce another session's digest —
+      // so they are held by nobody else (see `findHoldingRecord`).
       const holder = await this.#holderOf(file, originalHash, probe);
 
       if (isErr(holder)) {
@@ -2344,7 +2351,8 @@ class SequencedPatcher implements Patcher {
 
   /**
    * The other session's record whose instrumented bytes the file holds, or
-   * `undefined` when it holds nobody else's.
+   * `undefined` when it holds nobody else's — including when this session's own
+   * record claims the same bytes, which {@link findHoldingRecord} lets win.
    *
    * The open records of every session — `ModificationJournal.listOpen`, which
    * reaches across sessions by contract — are read for an attempt, or taken
@@ -2811,7 +2819,9 @@ function unreconciledRecord(file: string, record: ModificationRecord): DebuggenE
  *
  * The cheap half of the batch's up-front hold check: only an action whose file
  * is in this set is worth reading, so a batch over files nobody else touched
- * costs one listing and nothing more.
+ * costs one listing and nothing more. Membership makes a file a candidate
+ * only; the probe's {@link findHoldingRecord} decides from the bytes, and
+ * clears a file whose bytes this session's own record claims.
  *
  * @param records Every open record, as `ModificationJournal.listOpen` returned it.
  * @param sessionId This patcher's session, whose own records never hold a file
@@ -2846,11 +2856,37 @@ function filesHeldElsewhere(
  * only the latest of them describes its bytes; should more than one record
  * match, the last one listed — the latest appended — is named.
  *
+ * **This session's own claim over the same bytes wins.** When this session
+ * has a record in {@link HOLDING_STATUSES} for the same file whose
+ * `instrumentedHash` is also `currentHash`, nobody else holds the file and the
+ * answer is `undefined`, whatever another session's records say. A digest
+ * cannot tell identical bytes apart, and the transform is deterministic, so
+ * another session's record can match bytes this session wrote itself. Cleanup
+ * moves every record beneath a conflicted chain head to `conflict`, which holds
+ * nothing, but a journal written before that rule — or an ended session whose
+ * cleanup did not finish — can still carry an `applied` chain root over the
+ * first patch of the file; the developer restores the pristine original; the
+ * next session's first patch of the file reproduces that root's
+ * `instrumentedHash` exactly, and without this rule its own second patch of the
+ * file would be refused as held by the ended session — every later install on
+ * the file failing the same way. The own claim is the authoritative one:
+ * this session only ever patches bytes no other session held at the time (the
+ * check this function serves), so its record describes the write that put
+ * these bytes here, and its own chain unwinds them to the original it
+ * recorded. Nothing is layered over bytes whose only way back lives in another
+ * session. An own claim that is `pending` or `failed` opens no path either:
+ * the session's chain lookup that follows refuses a file carrying such a record
+ * as unreconciled (`MODIFICATION_CONFLICT`, `'unreconciled-record'`), and an
+ * explicitly supplied parent is layered on only once `./conflict.js` confirms
+ * the file holds that parent's bytes — both before anything is written.
+ *
  * @param records Every open record, as `ModificationJournal.listOpen` returned it.
- * @param sessionId This patcher's session.
+ * @param sessionId This patcher's session, whose own matching record means the
+ * file is held by nobody else.
  * @param file The target's project-relative POSIX path.
  * @param currentHash The digest of the target's current bytes.
- * @returns The holding record, or `undefined`.
+ * @returns The other session's holding record, or `undefined` when no other
+ * session's record matches or this session's own record claims the bytes.
  */
 function findHoldingRecord(
   records: readonly ModificationRecord[],
@@ -2862,13 +2898,20 @@ function findHoldingRecord(
 
   for (const record of records) {
     if (
-      record.sessionId !== sessionId &&
-      HOLDING_STATUSES.has(record.status) &&
-      record.instrumentedHash === currentHash &&
-      normalizePosix(toPosix(record.file)) === file
+      !HOLDING_STATUSES.has(record.status) ||
+      record.instrumentedHash !== currentHash ||
+      normalizePosix(toPosix(record.file)) !== file
     ) {
-      holder = record;
+      continue;
     }
+
+    // These bytes are this session's own recorded write, so no other
+    // session's record over the same digest can hold them against it.
+    if (record.sessionId === sessionId) {
+      return undefined;
+    }
+
+    holder = record;
   }
 
   return holder;

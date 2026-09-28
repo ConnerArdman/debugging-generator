@@ -2481,6 +2481,407 @@ describe('invariant 2 — verified deletion, retained conflict backups', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Invariant 2, for chains: the pristine original a chained conflict names, and
+// finished files another session's open record still claims
+// ---------------------------------------------------------------------------
+
+/** A two-record follow-up chain over one file, the head edited by hand. */
+interface SeededChain {
+  readonly root: ModificationRecord;
+  readonly head: ModificationRecord;
+
+  /** The absolute path of the project file. */
+  readonly path: string;
+
+  /** The file before anything was instrumented: what the root backed up. */
+  readonly pristineBytes: string;
+
+  /** The root's instrumented output: what the head backed up. */
+  readonly onceBytes: string;
+}
+
+/**
+ * Journals a chain — the root patching the pristine file, the head layered on
+ * the root's output — files both backups in the session's real store, leaves
+ * the developer's edit on disk, and scripts the head as the pass's conflict
+ * with the root left open beneath it, as the engine reports a chain whose
+ * head was edited.
+ *
+ * The head's report names `originalBackupPath` — the root's backup by default,
+ * or whatever `namedOriginal` says for the cases that prove a wrong name is
+ * caught.
+ */
+async function seedEditedChain(
+  h: Harness,
+  sessionId: string,
+  file: string,
+  namedOriginal?: (chain: { root: ModificationRecord; head: ModificationRecord }) => string,
+): Promise<SeededChain> {
+  const label = `${sessionId}:${file}`;
+  const pristineBytes = `export const face = '${label}'; // ${CONTENT_MARKER} pristine\n`;
+  const onceBytes = `export const face = '${label}'; // ${CONTENT_MARKER} instrumented once\n`;
+  const twiceBytes = `export const face = '${label}'; // ${CONTENT_MARKER} instrumented twice\n`;
+  const editedBytes = `export const face = '${label}'; // ${CONTENT_MARKER} edited over the chain\n`;
+  const store = createBackupStore({ debuggenHome: h.home, sessionId });
+  const pristineHash = sha256Hex(pristineBytes);
+  const onceHash = sha256Hex(onceBytes);
+
+  unwrap(await store.put(pristineHash, Buffer.from(pristineBytes, 'utf8')));
+  unwrap(await store.put(onceHash, Buffer.from(onceBytes, 'utf8')));
+
+  const path = join(h.project, file);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, editedBytes);
+
+  const diff = `--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@ ${DIFF_MARKER}\n`;
+  const root = unwrap(
+    createModificationRecord(
+      {
+        sessionId,
+        planVersion: 1,
+        file,
+        originalHash: pristineHash,
+        backupPath: unwrap(store.locate(pristineHash)),
+        instrumentedHash: onceHash,
+        diff,
+        status: 'applied',
+      },
+      { newId: () => h.mintId(), now: () => SEEDED_AT },
+    ),
+  );
+  const head = unwrap(
+    createModificationRecord(
+      {
+        sessionId,
+        planVersion: 2,
+        file,
+        originalHash: onceHash,
+        backupPath: unwrap(store.locate(onceHash)),
+        instrumentedHash: sha256Hex(twiceBytes),
+        diff,
+        status: 'applied',
+        previousRecordId: root.id,
+      },
+      { newId: () => h.mintId(), now: () => SEEDED_AT + 1 },
+    ),
+  );
+
+  h.modifications.seed(root);
+  h.modifications.seed(head);
+  h.verdicts.set(root.id, 'skip');
+  h.verdicts.set(head.id, 'conflict');
+  h.conflicts.set(
+    head.id,
+    unwrap(
+      parseModificationConflict({
+        ...conflictFor(head, editedBytes),
+        originalBackupPath: namedOriginal?.({ root, head }) ?? root.backupPath,
+      }),
+    ),
+  );
+
+  return { root, head, path, pristineBytes, onceBytes };
+}
+
+/** The end-state issues the module logged, or `[]` when every check held. */
+function loggedIssues(h: Harness): unknown[] {
+  const report = h.logs.find(
+    (record) => record.level === 'error' && record.message.includes('end-state verification'),
+  );
+  const issues = report?.fields['issues'];
+
+  return Array.isArray(issues) ? issues : [];
+}
+
+/** A journal whose cross-session `listOpen()` refuses to answer, every other call as `inner`. */
+function withUnansweredListOpen(inner: MemoryModifications): ModificationsRepo {
+  return {
+    ...inner,
+    listOpen: (sessionId) =>
+      sessionId === undefined
+        ? Promise.resolve(err(new DebuggenError('STORE_ERROR', 'The synthetic journal refused.')))
+        : inner.listOpen(sessionId),
+  };
+}
+
+describe('invariant 2 — a chained conflict points at the pristine original, verified', () => {
+  it('reads the chain root’s backup back and checks it against the root’s original', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    const chain = await seedEditedChain(h, SESSION.generated, FILE.dial);
+
+    const outcome = unwrap(await makeRunner(h).run(SESSION.generated));
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.conflicts.map((conflict) => conflict.originalBackupPath)).toEqual([
+      chain.root.backupPath,
+    ]);
+    expect(loggedIssues(h)).toEqual([]);
+    // Both backups the developer could be pointed at were read: the head's own,
+    // under its own original, and the root's, under the pristine digest.
+    const reads = callsOf(h, 'backups', 'readRecorded').map((call) => call.args);
+    expect(reads).toContainEqual([chain.head.backupPath, chain.head.originalHash]);
+    expect(reads).toContainEqual([chain.root.backupPath, chain.root.originalHash]);
+    expect(readFileSync(chain.root.backupPath, 'utf8')).toBe(chain.pristineBytes);
+  });
+
+  it('reports a chain root’s original that is gone as a conflict-backup issue, at the end and at start-up', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    const chain = await seedEditedChain(h, SESSION.generated, FILE.dial);
+    rmSync(chain.root.backupPath);
+
+    const outcome = unwrap(await makeRunner(h).run(SESSION.generated));
+
+    // A conflict is already the worst verdict; the issue is what the log says.
+    expect(outcome.status).toBe('conflict');
+    expect(loggedIssues(h)).toEqual([
+      {
+        check: 'conflict-backup',
+        recordId: chain.head.id,
+        file: FILE.dial,
+        reason: 'original-backup-missing',
+        code: 'STORE_ERROR',
+      },
+    ]);
+
+    const report = unwrap(await reconcileModificationsOnStartup(startupDeps(h)));
+
+    expect(report.bySession[SESSION.generated]).toMatchObject({
+      status: 'conflict',
+      conflicts: 1,
+      failed: 1,
+    });
+  });
+
+  it('reports a chain root’s original whose bytes are not the pristine file', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    const chain = await seedEditedChain(h, SESSION.generated, FILE.dial);
+    writeFileSync(chain.root.backupPath, chain.onceBytes);
+
+    unwrap(await makeRunner(h).run(SESSION.generated));
+
+    expect(loggedIssues(h)).toEqual([
+      {
+        check: 'conflict-backup',
+        recordId: chain.head.id,
+        file: FILE.dial,
+        reason: 'original-backup-corrupt',
+      },
+    ]);
+  });
+
+  it('catches a report that names the head’s own, still-instrumented backup as the original', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    const chain = await seedEditedChain(
+      h,
+      SESSION.generated,
+      FILE.dial,
+      ({ head }) => head.backupPath,
+    );
+
+    unwrap(await makeRunner(h).run(SESSION.generated));
+
+    // The intermediate backup holds the root's instrumented output: pointing a
+    // developer at it would re-introduce the instrumentation.
+    expect(readFileSync(chain.head.backupPath, 'utf8')).toBe(chain.onceBytes);
+    expect(loggedIssues(h)).toEqual([
+      {
+        check: 'conflict-backup',
+        recordId: chain.head.id,
+        file: FILE.dial,
+        reason: 'chain-root-mismatch',
+      },
+    ]);
+  });
+
+  it('resolves a chain root the pass did not report through the journal', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    const chain = await seedEditedChain(h, SESSION.generated, FILE.dial);
+    // The root is no longer open, so the engine neither reports nor lists it;
+    // its backup is still where the report says.
+    const index = h.modifications.records.findIndex((record) => record.id === chain.root.id);
+    h.modifications.records[index] = { ...chain.root, status: 'reverted' };
+
+    unwrap(await makeRunner(h).run(SESSION.generated));
+
+    expect(callsOf(h, 'modifications', 'get').map((call) => call.args[0])).toContain(chain.root.id);
+    expect(loggedIssues(h)).toEqual([]);
+  });
+
+  it('reports an original it cannot trace to any chain root', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    const chain = await seedEditedChain(h, SESSION.generated, FILE.dial);
+    // The root's row is gone: the link names a record the journal cannot answer.
+    h.modifications.records.splice(
+      h.modifications.records.findIndex((record) => record.id === chain.root.id),
+      1,
+    );
+
+    unwrap(await makeRunner(h).run(SESSION.generated));
+
+    expect(loggedIssues(h)).toEqual([
+      {
+        check: 'conflict-backup',
+        recordId: chain.head.id,
+        file: FILE.dial,
+        reason: 'chain-root-unknown',
+      },
+    ]);
+  });
+});
+
+describe('invariant 2 — a finished file another session on the project still claims', () => {
+  /**
+   * Session `generated` closed its record without a write while the file holds
+   * the bytes session `capturing` instrumented — both on the same project, as
+   * the engine leaves a file whose current digest another session's open
+   * record claims.
+   */
+  async function seedClaimedFile(
+    h: Harness,
+    claimant: { readonly status?: ModificationStatus } = {},
+  ): Promise<{ readonly closed: Seeded; readonly claiming: Seeded }> {
+    addSession(h, SESSION.generated, 'generated');
+    addSession(h, SESSION.capturing, 'capturing');
+    const closed = await seedRecord(h, {
+      sessionId: SESSION.generated,
+      file: FILE.dial,
+      verdict: 'close',
+    });
+    const claiming = await seedRecord(h, {
+      sessionId: SESSION.capturing,
+      file: FILE.dial,
+      fileState: 'instrumented',
+      status: claimant.status ?? 'applied',
+      verdict: 'skip',
+    });
+
+    expect(await sha256OfFile(closed.path)).toBe(claiming.record.instrumentedHash);
+    expect(await sha256OfFile(closed.path)).not.toBe(closed.record.originalHash);
+    return { closed, claiming };
+  }
+
+  it('does not count those bytes against the pass, and says whose they are', async () => {
+    const h = createHarness();
+    const { closed, claiming } = await seedClaimedFile(h);
+
+    const outcome = unwrap(await makeRunner(h).run(SESSION.generated));
+
+    expect(outcome.status).toBe('clean');
+    expect(loggedIssues(h)).toEqual([]);
+    const note = h.logs.find((record) => record.message.includes('another session on the project'));
+    expect(note?.level).toBe('info');
+    expect(note?.fields['claimed']).toEqual([
+      {
+        recordId: closed.record.id,
+        file: FILE.dial,
+        claimantSessionId: SESSION.capturing,
+        claimantRecordId: claiming.record.id,
+      },
+    ]);
+    // The claims come from one listing across every session.
+    expect(callsOf(h, 'modifications', 'listOpen').map((call) => call.args)).toEqual([[undefined]]);
+  });
+
+  it('weighs the claims at start-up against the journal as that session’s pass left it', async () => {
+    const h = createHarness();
+    await seedClaimedFile(h);
+
+    const report = unwrap(await reconcileModificationsOnStartup(startupDeps(h)));
+
+    expect(report.bySession[SESSION.generated]).toMatchObject({
+      status: 'clean',
+      closed: 1,
+      failed: 0,
+    });
+    expect(loggedIssues(h)).toEqual([]);
+  });
+
+  it.each(['conflict', 'reverted'] as const)(
+    'still reports the file when the other session’s record is %s, which claims no bytes',
+    async (status) => {
+      const h = createHarness();
+      const { closed } = await seedClaimedFile(h, { status });
+
+      const outcome = unwrap(await makeRunner(h).run(SESSION.generated));
+
+      expect(outcome.status).toBe('partial');
+      expect(loggedIssues(h)).toEqual([
+        {
+          check: 'restored-content',
+          recordId: closed.record.id,
+          file: FILE.dial,
+          reason: 'hash-mismatch',
+        },
+      ]);
+    },
+  );
+
+  it('still reports the file when the claiming session is on another project', async () => {
+    const h = createHarness();
+    const { closed } = await seedClaimedFile(h);
+    const claimant = h.sessions.rows.get(SESSION.capturing);
+    if (claimant === undefined) {
+      throw new Error('The claiming session was not seeded.');
+    }
+    h.sessions.rows.set(SESSION.capturing, {
+      ...claimant,
+      projectRoot: join(h.root, 'another-copy'),
+    });
+
+    const outcome = unwrap(await makeRunner(h).run(SESSION.generated));
+
+    expect(outcome.status).toBe('partial');
+    expect(loggedIssues(h)).toEqual([
+      {
+        check: 'restored-content',
+        recordId: closed.record.id,
+        file: FILE.dial,
+        reason: 'hash-mismatch',
+      },
+    ]);
+  });
+
+  it('excuses nothing when the claims cannot be read, and says so', async () => {
+    const h = createHarness();
+    await seedClaimedFile(h);
+
+    const outcome = unwrap(
+      await makeRunner(h, { modifications: withUnansweredListOpen(h.modifications) }).run(
+        SESSION.generated,
+      ),
+    );
+
+    expect(outcome.status).toBe('partial');
+    expect(loggedIssues(h)).toHaveLength(1);
+    expect(
+      h.logs.some(
+        (record) =>
+          record.level === 'warn' &&
+          record.message.includes('open records of other sessions could not be read') &&
+          record.fields['code'] === 'STORE_ERROR',
+      ),
+    ).toBe(true);
+  });
+
+  it('reads no claim when every finished file holds its original', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial, verdict: 'close' });
+
+    const outcome = unwrap(await makeRunner(h).run(SESSION.generated));
+
+    expect(outcome.status).toBe('clean');
+    expect(callsOf(h, 'modifications', 'listOpen')).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // aggregateCleanupStatus
 // ---------------------------------------------------------------------------
 
@@ -3241,6 +3642,100 @@ describe('createCleanupContextFactory', () => {
     const result = await factory(request);
 
     expect(isErr(result) ? result.error.code : undefined).toBe('SESSION_NOT_FOUND');
+  });
+
+  it('places another session’s claim by its stored project root, and places none it cannot read', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.failed, 'failed');
+    addSession(h, SESSION.capturing, 'capturing');
+    h.sessions.unreadable.add(SESSION.capturing);
+    const factory = createCleanupContextFactory({
+      modifications: h.modifications,
+      sessions: h.sessions,
+      config: { debuggenHome: h.home },
+      logger: h.logger,
+      now,
+    });
+
+    const context = unwrap(await factory({ sessionId: SESSION.generated, projectRoot: h.project }));
+    const projectRootOf = context.projectRootOf;
+
+    expect(projectRootOf).toBeTypeOf('function');
+    expect(await projectRootOf?.(SESSION.failed)).toBe(h.project);
+    // An unknown session and an unreadable row are claims the engine cannot place.
+    expect(await projectRootOf?.(SESSION.missing)).toBeUndefined();
+    expect(await projectRootOf?.(SESSION.capturing)).toBeUndefined();
+    expect(callsOf(h, 'sessions', 'get').map((call) => call.args)).toEqual([
+      [SESSION.failed],
+      [SESSION.missing],
+      [SESSION.capturing],
+    ]);
+
+    const warned = h.logs.filter((record) => record.message.includes('its claim is not placed'));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]?.level).toBe('warn');
+    expect(warned[0]?.fields).toMatchObject({
+      claimantSessionId: SESSION.capturing,
+      code: 'STORE_ERROR',
+    });
+    expect(JSON.stringify(warned)).not.toContain(h.root);
+    expect(readdirSync(h.home)).toEqual([]);
+  });
+
+  it('answers no project root for a session store that throws', async () => {
+    const h = createHarness();
+    const factory = createCleanupContextFactory({
+      modifications: h.modifications,
+      sessions: {
+        get: () => {
+          throw new Error('The synthetic session store is closed.');
+        },
+      },
+      config: { debuggenHome: h.home },
+      logger: h.logger,
+    });
+
+    const context = unwrap(await factory({ sessionId: SESSION.generated, projectRoot: h.project }));
+
+    expect(await context.projectRootOf?.(SESSION.failed)).toBeUndefined();
+    expect(h.logs.some((record) => record.message.includes('its claim is not placed'))).toBe(true);
+  });
+
+  it('offers the engine no project roots without a session store', async () => {
+    const h = createHarness();
+    const factory = createCleanupContextFactory({
+      modifications: h.modifications,
+      config: { debuggenHome: h.home },
+    });
+
+    const context = unwrap(await factory({ sessionId: SESSION.generated, projectRoot: h.project }));
+
+    expect(context.projectRootOf).toBeUndefined();
+  });
+
+  it('hands the session store to the default factory of a runner and of start-up reconciliation', async () => {
+    const h = createHarness();
+    addSession(h, SESSION.generated, 'generated');
+    addSession(h, SESSION.failed, 'failed');
+    await seedRecord(h, { sessionId: SESSION.generated, file: FILE.dial, status: 'applied' });
+    const contexts: CleanupContext[] = [];
+    vi.mocked(cleanupSession).mockImplementation((sessionId, context) => {
+      contexts.push(context);
+      return scriptedCleanupSession(h, sessionId, context);
+    });
+    vi.mocked(reconcileModifications).mockImplementation((context, options) => {
+      contexts.push(context);
+      return scriptedReconcile(h, context, options);
+    });
+
+    await makeRunner(h, { buildContext: undefined }).run(SESSION.generated);
+    await seedRecord(h, { sessionId: SESSION.failed, file: FILE.needle, status: 'applied' });
+    unwrap(await reconcileModificationsOnStartup(startupDeps(h, { buildContext: undefined })));
+
+    expect(contexts.length).toBeGreaterThanOrEqual(2);
+    for (const context of contexts) {
+      expect(await context.projectRootOf?.(SESSION.failed)).toBe(h.project);
+    }
   });
 });
 

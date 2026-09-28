@@ -29,7 +29,7 @@
  * | `pending`  | cleanup has not run. The state a session is in from creation until a pass completes, and the one status this message rarely carries — a finished pass has a verdict. | wait, or end the session |
  * | `clean`    | every non-reverted record was restored, and each restored file's bytes were hashed and matched the `originalHash` recorded before the patch was written. The backups of those files are then deleted. | nothing. The tree is as it was |
  * | `partial`  | some records were restored and some could not be attempted — a pass that was interrupted, or a record whose file the pass could not reach. Nothing was overwritten; what was not restored is still recorded in the journal and is reported again on the next service start. | re-run cleanup, or end the session again |
- * | `conflict` | at least one instrumented file had been edited after the patch was applied, so its current hash matched neither the instrumented content nor anything the tool may overwrite. **That file was left exactly as the developer left it**, its pristine original is retained in the backup directory, and the conflict entry names both. | open the diff, keep or discard the tool's wrapper by hand, then delete the backup |
+ * | `conflict` | at least one instrumented file had been edited after the patch was applied, so its current hash matched neither the instrumented content nor anything the tool may overwrite. **That file was left exactly as the developer left it**, its pristine original is retained in the backup directory, and the conflict entry names both — the pristine original as `originalBackupPath` when the record was layered on an earlier plan version's, and as `backupPath` otherwise. | open the diff, keep or discard the tool's wrapper by hand, then delete the backup |
  *
  * The asymmetry in the last row is the safety property, and it is worth being
  * explicit about: a restore is authorised **only** when the file on disk still
@@ -227,8 +227,11 @@ export const cleanupCompletedPayloadSchema = z.strictObject({
 
   /**
    * The modifications the pass refused to overwrite, each naming the file, the
-   * hash it expected, the hash it found, the backup the developer's original is
-   * still in, and the three-way view behind the "Open diff" action.
+   * hash it expected, the hash it found, the record's own backup, the backup
+   * the developer's pristine original is still in — `originalBackupPath` for a
+   * record layered on an earlier plan version's, whose own backup holds that
+   * version's instrumented output, and `backupPath` otherwise — and the
+   * three-way view behind the "Open diff" action.
    *
    * **Required, and empty rather than absent** when there are none. That choice
    * is for the two user interfaces: an empty array renders "no conflicts"

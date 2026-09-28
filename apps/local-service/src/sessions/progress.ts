@@ -23,8 +23,9 @@
  * ✓ Server spans
  * ✓ Database tracing
  * ✗ Could not enable ‹signal›: ‹reason›. Continuing with: ‹enabled list›.
- *                                ← one terminal `failed` row per unavailable
- *                                  signal, naming the ✓ labels above
+ *                                ← one terminal `failed` row per label that
+ *                                  could not be enabled, naming the ✓ labels
+ *                                  above
  *
  * Ready to capture               ← the `instrument` stage's closing `done` row
  * ```
@@ -45,6 +46,12 @@
  * one. Both user interfaces group whatever the service sent by stage and draw
  * it in arrival order, so neither of them restates a title, a label or a step
  * list.
+ *
+ * A stage withdrawn before it finished — the developer ended the session while
+ * it ran — is reported by a **cancellation row**
+ * ({@link buildStageCancelledRow}): a `done` row naming the stage and why it
+ * stopped, never a `failed` one, because a cancellation is not a failure
+ * (AAP §0.5.5).
  *
  * ## The rows are rendered from findings, never from canned text
  *
@@ -241,7 +248,8 @@ function progressGroupOf(stage: ProgressStage): ProgressStage {
  * "React renders", request tracing "Network tracing", the incoming-request and
  * route-handler signals "Server spans", and both database signals "Database
  * tracing". Several signals legitimately share a label, which is why
- * {@link buildInstrumentationRows} de-duplicates by label.
+ * {@link buildInstrumentationRows} de-duplicates its ✓ rows by label and folds
+ * its ✗ rows into one per label ({@link mergeUnavailableByLabel}).
  *
  * **Declaration order is display order.** The five labels come first, in the
  * prompt's order, so the Step-8 group reads as printed whenever those signals
@@ -498,13 +506,111 @@ export function publicFailureCopy(
   stage: ProgressStage,
   code: DebuggenErrorCode,
 ): PublicStageFailure {
-  const title: string = Object.hasOwn(PROGRESS_STAGE_TITLES, stage)
-    ? PROGRESS_STAGE_TITLES[stage]
-    : 'This step';
+  const title = stageTitleOf(stage);
   const copy: PublicFailureCopy = Object.hasOwn(FAILURE_COPY_BY_CODE, code)
     ? FAILURE_COPY_BY_CODE[code]
     : FAILURE_COPY_BY_CODE.INTERNAL;
   return { message: `${title} failed: ${copy.summary}`, hint: copy.hint };
+}
+
+/**
+ * The title a stage's public copy names it by: its {@link PROGRESS_STAGE_TITLES}
+ * entry, or the generic "This step" for a stage read from outside the type
+ * system that is not in the vocabulary — never the value itself.
+ */
+function stageTitleOf(stage: ProgressStage): string {
+  return Object.hasOwn(PROGRESS_STAGE_TITLES, stage) ? PROGRESS_STAGE_TITLES[stage] : 'This step';
+}
+
+/**
+ * Why a stage stopped before it finished **without failing** — the causes
+ * {@link buildStageCancelledRow} reports.
+ *
+ * - `session-ended` — the developer ended the session (`session.end`) while
+ *   the stage ran. The pipeline withdrew the stage so the session could end,
+ *   and the session's cleanup removes whatever instrumentation it applied.
+ * - `cancelled` — the stage's caller withdrew it for any other reason, such as
+ *   its own abort signal; nothing of the step remains, and it can be run again.
+ *
+ * Neither is a failure (AAP §0.5.5 reserves `failed` for a stage that could
+ * not do its work), so neither is ever reported through
+ * {@link SessionProgress.stageFailed} or `instrumentation.failed`.
+ */
+export const STAGE_CANCELLATION_CAUSES = Object.freeze(['session-ended', 'cancelled'] as const);
+
+/** One cause of {@link STAGE_CANCELLATION_CAUSES}. */
+export type StageCancellationCause = (typeof STAGE_CANCELLATION_CAUSES)[number];
+
+/** The public text of one cancellation cause. */
+export interface StageCancellationCopy {
+  /** What follows the stage's title in the row's message, closing the sentence. */
+  readonly clause: string;
+  /** The developer's next step, shown as the row's detail. */
+  readonly detail: string;
+}
+
+/**
+ * The only text a stage's cancellation row carries, keyed by
+ * {@link StageCancellationCause}. Exhaustive over the causes (`satisfies`), so
+ * a cause added there is a compile error here until it has copy. Written in
+ * the same plain, generic voice as {@link FAILURE_COPY_BY_CODE}; it names the
+ * product's own pipeline and nothing of the project being debugged.
+ */
+export const CANCELLATION_COPY_BY_CAUSE = Object.freeze({
+  'session-ended': {
+    clause: 'cancelled: the session was ended.',
+    detail:
+      'Ending the session removes any instrumentation it applied; ask the question again in a new session to continue.',
+  },
+  cancelled: {
+    clause: 'was cancelled before it finished.',
+    detail: 'Run the step again when you are ready.',
+  },
+} as const satisfies Readonly<Record<StageCancellationCause, StageCancellationCopy>>);
+
+/**
+ * Builds the row that reports `stage` as cancelled by `cause`: a `done` row —
+ * the protocol's statuses are `running`, `done` and `failed`, and a
+ * cancellation is not a failure — whose message is the stage's title followed
+ * by the cause's {@link CANCELLATION_COPY_BY_CAUSE} clause, and whose detail is
+ * the cause's next step.
+ *
+ * The row keeps the cancelled stage; {@link SessionProgress.emit} files it
+ * under that stage's Step-8 group like any other non-failed row, so a planning
+ * step cancelled by the session's end reads inside "Preparing
+ * instrumentation". It never changes a session's status (see the module
+ * overview): the caller that withdrew the stage decides what the session does
+ * next.
+ *
+ * Pure and total, like {@link publicFailureCopy}: a stage outside the
+ * vocabulary is named "This step", and a cause outside it is worded as
+ * `cancelled`, so whatever a caller passes, the row is product copy.
+ *
+ * @param stage The stage that was withdrawn before it finished.
+ * @param cause Why it was withdrawn.
+ * @returns The frozen row.
+ *
+ * @example
+ * ```ts
+ * buildStageCancelledRow('instrument', 'session-ended');
+ * // { stage: 'instrument', status: 'done',
+ * //   message: 'Preparing instrumentation cancelled: the session was ended.',
+ * //   detail: 'Ending the session removes any instrumentation it applied; ask the question again in a new session to continue.' }
+ *
+ * buildStageCancelledRow('plan', 'cancelled');
+ * // { stage: 'plan', status: 'done',
+ * //   message: 'Planning instrumentation was cancelled before it finished.',
+ * //   detail: 'Run the step again when you are ready.' }
+ * ```
+ */
+export function buildStageCancelledRow(
+  stage: ProgressStage,
+  cause: StageCancellationCause,
+): ProgressRow {
+  const copy: StageCancellationCopy = Object.hasOwn(CANCELLATION_COPY_BY_CAUSE, cause)
+    ? CANCELLATION_COPY_BY_CAUSE[cause]
+    : CANCELLATION_COPY_BY_CAUSE.cancelled;
+  return makeRow(stage, 'done', `${stageTitleOf(stage)} ${copy.clause}`, copy.detail);
 }
 
 /**
@@ -897,8 +1003,10 @@ export interface InstalledSignals {
   readonly unavailable?: readonly UnavailableSignal[];
   /**
    * The aggregated readiness report. A row `unavailable` here withdraws the
-   * signal's ✓ row (and reports it as ✗ when no `unavailable` entry already
-   * did); a `degraded` row keeps the ✓ and explains itself in the detail.
+   * signal's ✓ row and is reported in its label's ✗ row — superseding the
+   * `unavailable` entries for the same signal when it says why, since it is
+   * the gate's verdict ({@link mergeUnavailableByLabel}); a `degraded` row
+   * keeps the ✓ and explains itself in the detail.
    */
   readonly readiness?: Readiness;
 }
@@ -1539,7 +1647,9 @@ function labelForReportedSignal(signal: unknown): string {
  * `../instrumentation/service.ts`) and its capture-time preload-gap rows all
  * call this, so one unavailable signal reads the same wherever it is reported
  * and a client that keys progress rows on `(stage, message)` sees one row for
- * it, never a second, differently worded one left behind.
+ * it, never a second, differently worded one left behind. The first two
+ * word {@link mergeUnavailableByLabel}'s entries, one per label, so they
+ * also agree with each other when several signals share a label.
  *
  * - **‹label›** — one line of display text, bounded as a finding name.
  * - **‹reason›** — one line of display text within protocol's readiness reason
@@ -1621,7 +1731,9 @@ export function unavailableSignalMessage(
 }
 
 /**
- * The AAP §0.5.5 ✗ row of one unavailable signal: a terminal `failed` row
+ * The AAP §0.5.5 ✗ row of one unavailable signal — or, as
+ * {@link buildInstrumentationRows} calls it, of one label's merged entry
+ * ({@link mergeUnavailableByLabel}): a terminal `failed` row
  * whose message is {@link unavailableSignalMessage}'s sentence over
  * `enabledLabels` and whose detail is the adapter's hint. An entry that does
  * not even name its signal yields no row, since its failure still reaches both
@@ -1643,6 +1755,173 @@ function unavailableRow(
 }
 
 /**
+ * Separator between the distinct reasons one label's ✗ row gives, when the
+ * signals behind the label were reported unavailable for different reasons.
+ */
+const REASON_LIST_SEPARATOR = '; ';
+
+/** One reported gap, before it is folded into its label's entry. */
+interface ReportedGap {
+  readonly signal: UnavailableSignal['signal'];
+  readonly reason: unknown;
+  readonly hint: unknown;
+}
+
+/** The gaps of one label, as {@link mergeUnavailableByLabel} folds them. */
+interface LabelGaps {
+  /** The first signal reported for the label: the merged entry's signal. */
+  readonly signal: UnavailableSignal['signal'];
+  /** The label's distinct reasons, normalised, in the order first reported. */
+  readonly reasons: string[];
+  /** The first hint that is not blank, as reported; `''` while there is none. */
+  hint: string;
+}
+
+/**
+ * Folds everything reported unavailable — the installer's `unavailable`
+ * entries and the `unavailable` rows of the readiness report — into **one
+ * entry per display label** ({@link CAPTURE_SIGNAL_LABELS}), which is what the
+ * instrumentation stage's ✗ rows ({@link buildInstrumentationRows}) and the
+ * service's degradation notices are built from, so a label is never reported
+ * twice with two different reasons.
+ *
+ * Several signals share a label — `prisma` and `pg` are both "Database
+ * tracing", and `fetch` is reported by the page's share and the server's — and
+ * each source words its own gap: an adapter says why *it* could not arm a hook,
+ * while the readiness gate says why the signal has no producer. Reported as
+ * "Could not enable ‹label›" rows of their own, they would show one label
+ * failing twice for two contradictory reasons. So:
+ *
+ * 1. **Per signal, the gate's verdict wins.** An `unavailable` readiness row
+ *    whose reason is not blank is the gate's judgement of that signal, and it
+ *    supersedes the installer's entries for the same signal — their reasons
+ *    and their hints. Otherwise the signal's entries stand, and a readiness
+ *    row for a signal no entry reported stands on its own, reason or not.
+ * 2. **Per label, in order of first appearance** (the installer's entries
+ *    first, then the readiness rows), one entry: its `signal` is the first
+ *    signal reported for the label, its `reason` the label's distinct
+ *    reasons — normalised to one line, trailing full stops dropped, identical
+ *    ones once — joined with `"; "` and bounded by protocol's readiness reason
+ *    bound, and its `hint` the first hint that is not blank (`''` when none
+ *    is).
+ *
+ * An entry whose signal names no label (blank after normalisation) is
+ * dropped: no sentence can be about it. A third-party adapter's own signal is
+ * its own label.
+ *
+ * Pure, synchronous and I/O-free; identical input gives identical output.
+ *
+ * @param installed The installer's unavailable entries and the readiness
+ * report, as {@link buildInstrumentationRows} reads them.
+ * @returns One entry per label, in a frozen array of frozen entries.
+ *
+ * @example
+ * ```ts
+ * mergeUnavailableByLabel({
+ *   unavailable: [{ signal: 'prisma', reason: 'the adapter saw no preload', hint: 'Relaunch' }],
+ *   readiness: buildReadiness({
+ *     signals: [
+ *       { signal: 'prisma', status: 'unavailable', reason: 'no dev-server preload is attached', hint: 'Relaunch' },
+ *       { signal: 'pg', status: 'unavailable', reason: 'no dev-server preload is attached', hint: 'Relaunch' },
+ *     ],
+ *     now,
+ *   }),
+ * });
+ * // [{ signal: 'prisma', reason: 'no dev-server preload is attached', hint: 'Relaunch' }]
+ * ```
+ */
+export function mergeUnavailableByLabel(
+  installed: Pick<InstalledSignals, 'unavailable' | 'readiness'>,
+): readonly UnavailableSignal[] {
+  const entries = installed.unavailable ?? [];
+  const readinessRows = installed.readiness?.signals ?? [];
+
+  // The gate's verdict per signal: the first `unavailable` row that says why.
+  const verdicts = new Map<string, ReportedGap>();
+
+  for (const row of readinessRows) {
+    if (
+      row.status === 'unavailable' &&
+      !verdicts.has(row.signal) &&
+      toDisplayText(row.reason, READINESS_REASON_MAX_LENGTH).length > 0
+    ) {
+      verdicts.set(row.signal, { signal: row.signal, reason: row.reason, hint: row.hint });
+    }
+  }
+
+  // Every gap in reporting order: each installer entry — or, once per signal,
+  // the verdict that supersedes it — then each readiness row no entry reported.
+  const gaps: ReportedGap[] = [];
+  const reported = new Set<string>();
+
+  for (const entry of entries) {
+    const verdict = verdicts.get(entry.signal);
+
+    if (verdict === undefined) {
+      gaps.push(entry);
+    } else if (!reported.has(entry.signal)) {
+      gaps.push(verdict);
+    }
+
+    reported.add(entry.signal);
+  }
+
+  for (const row of readinessRows) {
+    if (row.status === 'unavailable' && !reported.has(row.signal)) {
+      reported.add(row.signal);
+      gaps.push({ signal: row.signal, reason: row.reason, hint: row.hint });
+    }
+  }
+
+  const byLabel = new Map<string, LabelGaps>();
+
+  for (const gap of gaps) {
+    const label = labelForReportedSignal(gap.signal);
+
+    if (label.length === 0) {
+      continue;
+    }
+
+    let folded = byLabel.get(label);
+
+    if (folded === undefined) {
+      folded = { signal: gap.signal, reasons: [], hint: '' };
+      byLabel.set(label, folded);
+    }
+
+    const reason = toDisplayText(gap.reason, READINESS_REASON_MAX_LENGTH).replace(
+      TRAILING_PUNCTUATION_PATTERN,
+      '',
+    );
+
+    if (reason.length > 0 && !folded.reasons.includes(reason)) {
+      folded.reasons.push(reason);
+    }
+
+    if (
+      folded.hint.length === 0 &&
+      typeof gap.hint === 'string' &&
+      toDisplayText(gap.hint, READINESS_HINT_MAX_LENGTH).length > 0
+    ) {
+      folded.hint = gap.hint;
+    }
+  }
+
+  return Object.freeze(
+    [...byLabel.values()].map((folded) =>
+      Object.freeze({
+        signal: folded.signal,
+        reason: toDisplayText(
+          folded.reasons.join(REASON_LIST_SEPARATOR),
+          READINESS_REASON_MAX_LENGTH,
+        ),
+        hint: folded.hint,
+      }),
+    ),
+  );
+}
+
+/**
  * Builds the instrumentation stage's rows from what the installer actually
  * armed and what it could not.
  *
@@ -1654,15 +1933,20 @@ function unavailableRow(
  *   `unavailable` readiness row — is withdrawn, so a ✓ is never shown beside
  *   its own ✗; a `degraded` readiness row keeps the ✓ and puts its reason in
  *   the detail.
- * - **✗ rows** — one terminal `failed` row per `unavailable` entry, in input
- *   order, as AAP §0.5.5 words it
+ * - **✗ rows** — one terminal `failed` row per **label** reported unavailable,
+ *   as AAP §0.5.5 words it
  *   (`` `Could not enable ${label}: ${reason}. Continuing with: ${enabled}.` ``,
- *   composed by {@link unavailableSignalMessage}, the hint as detail), plus one
- *   per `unavailable` readiness row whose signal no entry already reported.
- *   The `‹enabled›` list is exactly this build's ✓ labels, in their display
- *   order, less the row's own label — so what a ✗ row says the capture
- *   continues with is what the ✓ rows above it show. Byte-identical rows are
- *   collapsed onto the first. A ✗ row is the only row reported for its signal:
+ *   composed by {@link unavailableSignalMessage}, the hint as detail), over
+ *   {@link mergeUnavailableByLabel}'s entries and in their order: the
+ *   `unavailable` entries first, then the `unavailable` readiness rows no entry
+ *   reported. A readiness row that says why its signal is unavailable is the
+ *   gate's verdict and supersedes the installer's entries for that signal, and
+ *   signals sharing a label (`prisma` and `pg`, the page's and the server's
+ *   `fetch`) give one row whose reason lists their distinct reasons — so a
+ *   label never fails twice for two contradictory reasons. The `‹enabled›`
+ *   list is exactly this build's ✓ labels, in their display order, less the
+ *   row's own label — so what a ✗ row says the capture continues with is what
+ *   the ✓ rows above it show. A ✗ row is the only row reported for its label:
  *   no `running` row precedes it, so nothing is left spinning beside it.
  *
  * When nothing at all could be enabled there are no ✓ rows; the caller
@@ -1732,32 +2016,15 @@ export function buildInstrumentationRows(installed: InstalledSignals): readonly 
     makeRow('instrument', 'done', label, degradedReasons.get(label)),
   );
 
+  // One ✗ row per label: signals that share a label, and the installer and the
+  // readiness gate reporting one signal, are folded before any row is worded.
   const failedRows: ProgressRow[] = [];
-  const seenFailures = new Set<string>();
-  const reported = new Set<string>();
 
-  const pushFailure = (row: ProgressRow | undefined): void => {
-    if (row === undefined) {
-      return;
-    }
+  for (const entry of mergeUnavailableByLabel(installed)) {
+    const row = unavailableRow(entry.signal, entry.reason, entry.hint, continuing);
 
-    const key = `${row.message}\n${row.detail ?? ''}`;
-
-    if (!seenFailures.has(key)) {
-      seenFailures.add(key);
+    if (row !== undefined) {
       failedRows.push(row);
-    }
-  };
-
-  for (const entry of unavailable) {
-    reported.add(entry.signal);
-    pushFailure(unavailableRow(entry.signal, entry.reason, entry.hint, continuing));
-  }
-
-  for (const row of readinessRows) {
-    if (row.status === 'unavailable' && !reported.has(row.signal)) {
-      reported.add(row.signal);
-      pushFailure(unavailableRow(row.signal, row.reason, row.hint, continuing));
     }
   }
 

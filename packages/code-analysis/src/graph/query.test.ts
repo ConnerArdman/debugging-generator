@@ -88,15 +88,24 @@ import {
 import type { LogLevelSetting, LogRecord, Logger, SourceLocation } from '@debuggen/shared';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
-import { buildIndex } from '../indexer.js';
+import { INDEXER_VERSION, buildIndex } from '../indexer.js';
 import { openProject } from '../project.js';
 import { matchRoute, routeMapFromIndex } from '../route-map.js';
 import type { LoadedProject } from '../project.js';
 
-import { CodeGraph } from './graph.js';
+import { CodeGraph, makeEdgeId, makeNodeId } from './graph.js';
 import { CODE_QUERY_LIMITS, createCodeQueries } from './query.js';
-import type { CodeMatch, CodeQueries } from './query.js';
-import type { CodeIndex, CodeNodeKind, CodeNodeOf, ReferenceResolver } from './types.js';
+import type { CodeMatch, CodePath, CodeQueries } from './query.js';
+import { CODE_INDEX_SCHEMA_VERSION } from './types.js';
+import type {
+  CodeEdge,
+  CodeEdgeKind,
+  CodeIndex,
+  CodeNode,
+  CodeNodeKind,
+  CodeNodeOf,
+  ReferenceResolver,
+} from './types.js';
 
 /* -------------------------------------------------------------------------------------------------
  * The corpus, and the handles a case needs on it
@@ -1262,6 +1271,301 @@ describe('pathBetween', () => {
       expect(node.location.confidence).toBe(DEFAULT_RESOLUTION_CONFIDENCE['code-graph']);
     }
   }, 120_000);
+
+  it('walks back upstream from a route to the component whose handler issues its request', () => {
+    const route = { file: 'app/api/gauges/route.ts', kind: 'api-route' } as const;
+    const callerKinds: readonly CodeEdgeKind[] = ['routes-to', 'calls', 'handles'];
+    const upstream = assertDefined(
+      queries.pathBetween(
+        route,
+        { kind: 'component' },
+        { edgeKinds: callerKinds, direction: 'in' },
+      ),
+      'the upstream path from the route to a component',
+    );
+
+    // "What reaches this": the same flow the downstream search finds, found
+    // from the other end, so the node list runs from the `from` endpoint to
+    // the `to` endpoint and every hop points back the way the walk came.
+    expect(stepsOf(upstream.nodes)).toStrictEqual([
+      'api-route:/api/gauges',
+      'api-call:fetch',
+      'handler:handleReadoutClick',
+      'component:GaugeReadout',
+    ]);
+    expect(upstream.undirected).toBe(false);
+    expect(upstream.truncated).toBe(false);
+    expect(upstream.edges.map((edge) => edge.traversedAgainstDirection)).toStrictEqual([
+      true,
+      true,
+      true,
+    ]);
+    for (const [position, hop] of upstream.edges.entries()) {
+      expect(hop.to).toBe(upstream.nodes[position]?.nodeId);
+      expect(hop.from).toBe(upstream.nodes[position + 1]?.nodeId);
+    }
+
+    // Reversed, it is exactly the downstream flow from that component.
+    const downstream = assertDefined(
+      queries.pathBetween({ name: 'GaugeReadout', kind: 'component' }, route, {
+        edgeKinds: callerKinds,
+      }),
+      'the downstream path from the component to the route',
+    );
+    const relationships = (path: CodePath): readonly string[] =>
+      path.edges.map((edge) => `${edge.kind} ${edge.from} ${edge.to}`);
+
+    expect(upstream.nodes.map((node) => node.nodeId).reverse()).toStrictEqual(
+      downstream.nodes.map((node) => node.nodeId),
+    );
+    expect([...relationships(upstream)].reverse()).toStrictEqual(relationships(downstream));
+    expect(downstream.edges.every((edge) => !edge.traversedAgainstDirection)).toBe(true);
+  });
+
+  it('follows incoming edges only upstream, and never the way the relationships point', () => {
+    const route = { file: 'app/api/gauges/route.ts', kind: 'api-route' } as const;
+    const component = { name: 'GaugeReadout', kind: 'component' } as const;
+
+    // The route's database call is downstream of it and the route is
+    // downstream of the component, so an upstream search reaches neither,
+    // while the downstream search reaches both.
+    expect(queries.pathBetween(route, { kind: 'db-call' }, { direction: 'in' })).toBeUndefined();
+    expect(queries.pathBetween(route, { kind: 'db-call' })).toBeDefined();
+    expect(queries.pathBetween(component, route, { direction: 'in' })).toBeUndefined();
+    expect(queries.pathBetween(component, route)).toBeDefined();
+
+    // A single-node path is directed whichever directed search asked for it.
+    const query = corpusNode('db-call', 'pool.query');
+    expect(queries.pathBetween(query.id, query.id, { direction: 'in' })).toMatchObject({
+      depth: 0,
+      undirected: false,
+      edges: [],
+    });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * pathBetween: the node budget is spent only on nodes that can lead somewhere
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The file of the hand-built form component and every handler it binds. */
+const FORM_FILE = 'src/widgets/Form.tsx';
+
+/** How many leaf handlers the form binds: more than the default node budget. */
+const LEAF_HANDLER_COUNT = CODE_QUERY_LIMITS.maxPathNodes + 8;
+
+/**
+ * A node of the hand-built graph, with its id derived through the real
+ * {@link makeNodeId} so the canonical order the search expands in is the one
+ * a real index has.
+ */
+function formNode<K extends CodeNodeKind>(
+  kind: K,
+  file: string,
+  name: string,
+  line: number,
+  data: CodeNodeOf<K>['data'],
+): CodeNodeOf<K> {
+  return {
+    id: makeNodeId({ kind, file, name, line, column: 1 }),
+    kind,
+    name,
+    file,
+    line,
+    column: 1,
+    data,
+  } as CodeNodeOf<K>;
+}
+
+/** An edge of the hand-built graph, sited in the file of its origin. */
+function formEdge(kind: CodeEdgeKind, from: CodeNode, to: CodeNode): CodeEdge {
+  return {
+    id: makeEdgeId({ kind, from: from.id, to: to.id, line: from.line, column: 1 }),
+    kind,
+    from: from.id,
+    to: to.id,
+    file: from.file,
+    line: from.line,
+    column: 1,
+  };
+}
+
+describe('pathBetween: the node budget is spent only on nodes that can lead somewhere', () => {
+  /*
+   * A form that binds many inline handlers only one of which does anything:
+   *
+   *   Form --handles--> onBlur ×LEAF_HANDLER_COUNT   (leaves: no outgoing edge)
+   *   Form --handles--> onSubmit --calls--> fetch --routes-to--> /api/widgets
+   *
+   * Every `onBlur` id sorts ahead of `onSubmit`'s, so a search seeded with
+   * every handler of the file expands the leaves first. Before dead ends were
+   * left off the frontier, that spent the whole default budget on leaves and
+   * the route was never reached.
+   */
+  const form = formNode('component', FORM_FILE, 'Form', 1, {
+    isClient: true,
+    isDefaultExport: false,
+    displayName: 'Form',
+  });
+  const leaves = Array.from({ length: LEAF_HANDLER_COUNT }, (_unused, index) =>
+    formNode('handler', FORM_FILE, 'onBlur', index + 2, {
+      event: 'blur',
+      boundTo: 'input',
+      inline: true,
+    }),
+  );
+  const submit = formNode('handler', FORM_FILE, 'onSubmit', 90, {
+    event: 'submit',
+    boundTo: 'form',
+    inline: true,
+  });
+  const request = formNode('api-call', FORM_FILE, 'fetch', 91, {
+    url: '/api/widgets',
+    dynamic: false,
+    method: 'POST',
+  });
+  const route = formNode('api-route', 'app/api/widgets/route.ts', '/api/widgets', 1, {
+    routePath: '/api/widgets',
+    router: 'app',
+    kind: 'route-handler',
+    methods: ['POST'],
+  });
+  const index: CodeIndex = {
+    schemaVersion: CODE_INDEX_SCHEMA_VERSION,
+    projectRoot: '/tmp/project',
+    indexerVersion: INDEXER_VERSION,
+    generatedAt: 0,
+    nodes: [form, ...leaves, submit, request, route],
+    edges: [
+      ...leaves.map((leaf) => formEdge('handles', form, leaf)),
+      formEdge('handles', form, submit),
+      formEdge('calls', submit, request),
+      formEdge('routes-to', request, route),
+    ],
+    files: [],
+  };
+  const graph = CodeGraph.fromIndex(index);
+  const handlerSources = { file: FORM_FILE, kind: 'handler' } as const;
+  const requestKinds: readonly CodeEdgeKind[] = ['calls', 'routes-to'];
+
+  it('builds the graph it describes, with every leaf ahead of the productive handler', () => {
+    expect(graph.diagnostics).toStrictEqual([]);
+    expect(leaves.every((leaf) => leaf.id < submit.id)).toBe(true);
+    expect(leaves.length).toBeGreaterThan(CODE_QUERY_LIMITS.maxPathNodes);
+  });
+
+  it('reaches the route through the one productive source within the default budget', () => {
+    const path = assertDefined(
+      createCodeQueries(graph).pathBetween(
+        handlerSources,
+        { kind: 'api-route' },
+        {
+          edgeKinds: requestKinds,
+        },
+      ),
+      'the path from the submitting handler to its route',
+    );
+
+    expect(stepsOf(path.nodes)).toStrictEqual([
+      'handler:onSubmit',
+      'api-call:fetch',
+      'api-route:/api/widgets',
+    ]);
+    expect(path.truncated).toBe(false);
+
+    // The same answer a search seeded with that handler alone gives: pruning
+    // changes which nodes are expanded, never which path is found.
+    expect(
+      createCodeQueries(graph).pathBetween(
+        submit.id,
+        { kind: 'api-route' },
+        {
+          edgeKinds: requestKinds,
+        },
+      ),
+    ).toStrictEqual(path);
+  });
+
+  it('counts only the nodes that lead somewhere against the budget', () => {
+    const queriesOver = createCodeQueries(graph);
+
+    // Two expansions — the handler, then the request — reach the route, however
+    // many leaves were seeded before them; one is not enough.
+    expect(
+      queriesOver.pathBetween(
+        handlerSources,
+        { kind: 'api-route' },
+        {
+          edgeKinds: requestKinds,
+          maxNodes: 2,
+        },
+      ),
+    ).toBeDefined();
+    expect(
+      queriesOver.pathBetween(
+        handlerSources,
+        { kind: 'api-route' },
+        {
+          edgeKinds: requestKinds,
+          maxNodes: 1,
+        },
+      ),
+    ).toBeUndefined();
+  });
+
+  it('reads the same flow upstream from the route, through the productive handler', () => {
+    const path = assertDefined(
+      createCodeQueries(graph).pathBetween(
+        route.id,
+        { kind: 'component' },
+        {
+          edgeKinds: ['routes-to', 'calls', 'handles'],
+          direction: 'in',
+        },
+      ),
+      'the upstream path from the route to the form',
+    );
+
+    expect(stepsOf(path.nodes)).toStrictEqual([
+      'api-route:/api/widgets',
+      'api-call:fetch',
+      'handler:onSubmit',
+      'component:Form',
+    ]);
+    expect(path.undirected).toBe(false);
+    expect(path.edges.every((edge) => edge.traversedAgainstDirection)).toBe(true);
+  });
+
+  it('sets truncated only where a bound cut short a node that could lead somewhere', () => {
+    const { logger, records } = capturingLogger('trace');
+    const logged = createCodeQueries(graph, { logger });
+
+    // Along `handles` alone every handler is a leaf, so none is queued at the
+    // depth bound and the miss is exhaustive rather than cut short.
+    expect(
+      logged.pathBetween(form.id, { kind: 'api-route' }, { edgeKinds: ['handles'], maxDepth: 1 }),
+    ).toBeUndefined();
+    // Along the whole chain the submitting handler leads on, so stopping it at
+    // the depth bound is a truncation.
+    expect(
+      logged.pathBetween(
+        form.id,
+        { kind: 'api-route' },
+        {
+          edgeKinds: ['handles', 'calls', 'routes-to'],
+          maxDepth: 1,
+        },
+      ),
+    ).toBeUndefined();
+
+    const misses = records.filter((record) => record.message === PATH_MISS_LOG);
+    expect(misses.map((record) => [record.fields.expanded, record.fields.truncated])).toStrictEqual(
+      [
+        [1, false],
+        [1, true],
+      ],
+    );
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------

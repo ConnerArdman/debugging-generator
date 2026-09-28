@@ -91,6 +91,7 @@ import { createBackupStore } from './patch/backup-store.js';
 import type { BackupStore, RecordedBackup } from './patch/backup-store.js';
 import { createPatcher } from './patch/patcher.js';
 import type { PatchOutcome } from './patch/patcher.js';
+import { SPAN_HELPER_GLOBAL } from './patch/wrap-template.js';
 import { MODIFICATION_STATUSES } from './schema/modification.js';
 import type {
   ModificationConflictReason,
@@ -1140,6 +1141,156 @@ describe('applying a patch and reverting it', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * The backup directory of an ended session
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * `store` with its directory removals counted, everything else delegated.
+ *
+ * @param store The session's store.
+ * @returns The counting store and a reading of how often it was asked.
+ */
+function countingDirectoryRemovals(store: BackupStore): {
+  readonly store: BackupStore;
+  readonly removals: () => number;
+} {
+  let removals = 0;
+
+  return {
+    store: {
+      ...store,
+      removeSessionDirectory: () => {
+        removals += 1;
+
+        return store.removeSessionDirectory();
+      },
+    },
+    removals: () => removals,
+  };
+}
+
+describe('the backup directory of an ended session', () => {
+  it('is removed once an install rollback reverted every record, though the pass restores nothing', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    // The installer unwinding a failed install: the record is reverted and its
+    // backup deleted as verified, which leaves the session's directory empty.
+    expect(
+      expectOk(await restoreModification(patched.record, world.context), 'the rollback').kind,
+    ).toBe('restored');
+    expect(world.journal.row(patched.record.id).status).toBe('reverted');
+    expect(readdirSync(world.backups.sessionDirectory)).toEqual([]);
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const counted = countingDirectoryRemovals(world.backups);
+    const outcome = await cleanupSession(world.sessionId, {
+      ...world.context,
+      backups: counted.store,
+    });
+
+    expect(outcome.status).toBe('clean');
+    expect(outcome.restored).toEqual([]);
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+
+    // Nothing of the project was looked at, nothing journaled, no backup
+    // deleted — only the emptied directory went.
+    expectNoFileSystemAccess(world.log);
+    expect(world.journal.transitions(mark)).toEqual([]);
+    expect(world.removals).toEqual([]);
+    expect(counted.removals()).toBe(1);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+    expectFileBytes(patched.path, patched.originalBytes);
+
+    // Once it is gone, a repeated end does not ask the store anything.
+    const again = await cleanupSession(world.sessionId, {
+      ...world.context,
+      backups: counted.store,
+    });
+
+    expect(again.status).toBe('clean');
+    expect(counted.removals()).toBe(1);
+    expectNoFileSystemAccess(world.log);
+  });
+
+  it('keeps a rollback-emptied directory when the caller asks for it', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    expectOk(await restoreModification(patched.record, world.context), 'the rollback');
+
+    const outcome = await cleanupSession(world.sessionId, world.context, {
+      keepBackupDirectory: true,
+    });
+
+    expect(outcome.status).toBe('clean');
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+    expect(readdirSync(world.backups.sessionDirectory)).toEqual([]);
+  });
+
+  it('takes a superseded layer’s backup a chain close left behind with the directory on the next end', async () => {
+    const world = makeWorld();
+    const pristine = readFileSync(world.pathOf(TARGET_FILE));
+    const first = await patchSymbol(world, {
+      file: TARGET_FILE,
+      symbol: TARGET_SYMBOL,
+      planVersion: 1,
+    });
+    const second = await patchSymbol(world, {
+      file: TARGET_FILE,
+      symbol: SECOND_SYMBOL,
+      planVersion: 2,
+    });
+
+    // A chain walked on its own closes over the pristine file and removes no
+    // directory: the tip's backup — content the file does not hold — stays.
+    world.journal.arrange({ ...world.journal.row(second.record.id), status: 'pending' });
+    writeFileSync(second.path, pristine);
+
+    const chain = await restoreChain(
+      [first.record, second.record].map((record) => world.journal.row(record.id)),
+      world.context,
+    );
+
+    expect(chain.closed.map((record) => record.id)).toEqual([second.record.id, first.record.id]);
+    expect(readdirSync(world.backups.sessionDirectory)).toEqual([second.record.originalHash]);
+
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('clean');
+    expect(outcome.restored).toEqual([]);
+    expectNoFileSystemAccess(world.log);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+    expectFileBytes(second.path, pristine);
+  });
+
+  it('leaves alone the directory of a session the journal holds no record of', async () => {
+    const world = makeWorld();
+    const stranger = nextSessionId('stranger');
+    const store = world.storeFor(stranger);
+    const bytes = Buffer.from('a backup whose record was never journaled\n', 'utf8');
+
+    // A backup is written before its record is appended, so a directory with no
+    // record behind it may belong to an install still in flight.
+    expectOk(await store.put(sha256Hex(bytes), bytes), 'a backup with no record');
+
+    const outcome = await cleanupSession(stranger, { ...world.context, backups: store });
+
+    expect(outcome.status).toBe('clean');
+    expect(outcome.restored).toEqual([]);
+    expect(readdirSync(store.sessionDirectory)).toEqual([sha256Hex(bytes)]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * A developer edit after the patch
  * ---------------------------------------------------------------------------
  */
@@ -1513,7 +1664,7 @@ describe('a chain of plan versions over one file', () => {
     expect(existsSync(world.backups.sessionDirectory)).toBe(false);
   });
 
-  it('stops at the middle link when the file is edited after link 3 is restored, leaving link 1 unresolved', async () => {
+  it('stops at the middle link when the file is edited after link 3 is restored, moving link 1 into conflict with it', async () => {
     let interference: Buffer | undefined;
 
     const world = makeWorld({
@@ -1554,15 +1705,17 @@ describe('a chain of plan versions over one file', () => {
     ]);
     expectFileBytes(world.pathOf(OTHER_FILE), interference ?? Buffer.alloc(0));
 
-    // Link 3 closed, link 2 reported, link 1 not even asked: still open with no
-    // transition, so the next pass judges it again once link 2 is resolved.
+    // Link 3 closed, link 2 reported, link 1 never judged: the file holds none
+    // of its output either, so it moves into `conflict` beside link 2 rather
+    // than staying `applied`, and the next pass judges both again.
     expect(world.journal.transitions(mark)).toEqual([
       { recordId: third.record.id, status: 'reverted' },
       { recordId: second.record.id, status: 'conflict' },
+      { recordId: first.record.id, status: 'conflict' },
     ]);
     expect(world.journal.row(third.record.id).status).toBe('reverted');
     expect(world.journal.row(second.record.id).status).toBe('conflict');
-    expect(world.journal.row(first.record.id).status).toBe('applied');
+    expect(world.journal.row(first.record.id).status).toBe('conflict');
 
     // Only link 3's backup was deleted; links 2 and 1 keep theirs.
     expect(world.removals.map((removal) => removal.digest)).toEqual([third.record.originalHash]);
@@ -1702,22 +1855,97 @@ describe('a chain of plan versions over one file', () => {
     expect(chain.stoppedAt?.id).toBe(second.record.id);
     expect(chain.restored).toEqual([]);
     expect(chain.closed).toEqual([]);
-    expect(chain.retained.map((record) => record.id)).toEqual([second.record.id]);
+    expect(chain.retained.map((record) => record.id)).toEqual([second.record.id, first.record.id]);
+    expect(chain.retained.map((record) => record.status)).toEqual(['conflict', 'conflict']);
     expect(chain.conflicts.map((report) => report.recordId)).toEqual([second.record.id]);
-    expect(chain.skipped.map((record) => record.id)).toEqual([first.record.id]);
+    expect(chain.skipped).toEqual([]);
     expect(chain.failures).toEqual([]);
     expect(chain.outcomes.map((outcome) => outcome.kind)).toEqual(['conflict']);
 
-    // Nothing was written, and the record behind the conflict was not even
-    // asked: its expectation cannot hold while the file is what it now is.
+    // Nothing was written, and the record behind the conflict was not judged:
+    // its expectation cannot hold while the file is what it now is, so it is
+    // moved into `conflict` with the tip instead of being left `applied`.
     expectNothingWritten(world.log);
     expectFileBytes(world.pathOf(TARGET_FILE), edited);
-    expect(world.journal.row(first.record.id).status).toBe('applied');
+    expect(world.journal.row(first.record.id).status).toBe('conflict');
     expect(world.journal.transitions(mark)).toEqual([
       { recordId: second.record.id, status: 'conflict' },
+      { recordId: first.record.id, status: 'conflict' },
     ]);
     expect(existsSync(world.backupPathOf(first.record.originalHash))).toBe(true);
     expect(existsSync(world.backupPathOf(second.record.originalHash))).toBe(true);
+  });
+
+  it('points the conflict of an edited chain at the chain root’s pristine backup, not the tip’s own', async () => {
+    const world = makeWorld();
+    const pristine = readFileSync(world.pathOf(TARGET_FILE));
+    const first = await patchSymbol(world, {
+      file: TARGET_FILE,
+      symbol: TARGET_SYMBOL,
+      planVersion: 1,
+    });
+    const second = await patchSymbol(world, {
+      file: TARGET_FILE,
+      symbol: SECOND_SYMBOL,
+      planVersion: 2,
+    });
+    const edited = developerEdits(world.pathOf(TARGET_FILE));
+
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.restored).toEqual([]);
+    expect(outcome.skipped.map((record) => record.id)).toEqual([second.record.id, first.record.id]);
+    expectNothingWritten(world.log);
+    expectFileBytes(world.pathOf(TARGET_FILE), edited);
+
+    const conflict = only(outcome.conflicts, 'conflict report');
+
+    // The tip's own backup is plan version 1's output — it still carries the
+    // wrapper — so the pristine file the developer is pointed at is the chain
+    // root's backup.
+    expect(conflict.recordId).toBe(second.record.id);
+    expect(conflict.backupPath).toBe(second.record.backupPath);
+    expect(conflict.originalBackupPath).toBe(first.record.backupPath);
+    expect(readFileSync(second.record.backupPath, 'utf8')).toContain(SPAN_HELPER_GLOBAL);
+    expectFileBytes(first.record.backupPath, pristine);
+    expect(conflict.message).toContain(first.record.backupPath);
+    expect(conflict.message).not.toContain(second.record.backupPath);
+
+    // "Open diff" starts from the pristine file: nothing the tool-change view
+    // removes carries the marker, and the net divergence is shown from it too.
+    const toolChange = conflict.diffs?.originalToInstrumented ?? '';
+    const netChange = conflict.diffs?.originalToCurrent ?? '';
+
+    expect(toolChange).not.toBe('');
+    expect(toolChange).not.toBe(second.record.diff);
+    expect(
+      toolChange
+        .split('\n')
+        .some(
+          (line) =>
+            line.startsWith('-') && !line.startsWith('---') && line.includes(SPAN_HELPER_GLOBAL),
+        ),
+    ).toBe(false);
+    expect(netChange).toContain(DEVELOPER_EDIT.trim());
+    expect(
+      netChange
+        .split('\n')
+        .some(
+          (line) =>
+            line.startsWith('-') && !line.startsWith('---') && line.includes(SPAN_HELPER_GLOBAL),
+        ),
+    ).toBe(false);
+
+    // The root gets no report of its own — the tip's covers the file — but it
+    // is no longer left `applied` behind it: it is in `conflict` too, and its
+    // pristine backup is kept with the directory it lives in.
+    expect(world.journal.row(first.record.id).status).toBe('conflict');
+    expect(world.journal.row(second.record.id).status).toBe('conflict');
+    expect(world.removals).toEqual([]);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
   });
 });
 
@@ -1869,10 +2097,13 @@ describe('a conflict whose file comes back to a recorded digest', () => {
 
     const blocked = await cleanupSession(world.sessionId, world.context);
 
+    // The edit holds none of the chain's output, so the whole chain is in
+    // `conflict` — and a record in `conflict` is still restored the moment its
+    // file hashes to what it wrote.
     expect(blocked.status).toBe('conflict');
     expect(world.journal.row(third.record.id).status).toBe('conflict');
-    expect(world.journal.row(second.record.id).status).toBe('applied');
-    expect(world.journal.row(first.record.id).status).toBe('applied');
+    expect(world.journal.row(second.record.id).status).toBe('conflict');
+    expect(world.journal.row(first.record.id).status).toBe('conflict');
 
     writeFileSync(third.path, third.instrumentedBytes);
     world.resetLog();
@@ -1984,6 +2215,1716 @@ describe('a conflict whose file comes back to a recorded digest', () => {
     }
     expect(twinAtRemoval).toEqual(world.removals.map(() => digest));
     expect(existsSync(world.backupPathOf(digest))).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A conflicted chain whose file is put back to an earlier version's original
+ * ---------------------------------------------------------------------------
+ */
+
+/** Two real plan versions over {@link TARGET_FILE}, and the bytes from before either. */
+interface TwoLinkChain {
+  /** The file as the session found it: what the chain root backed up. */
+  readonly pristine: Buffer;
+
+  /** Plan version 1, the chain root. */
+  readonly first: PatchedFile;
+
+  /** Plan version 2, layered on version 1's output. */
+  readonly second: PatchedFile;
+}
+
+/**
+ * Patches {@link TARGET_FILE} twice with the real patcher, the shape one plan
+ * wrapping two functions of one file leaves behind: a chain root holding the
+ * pristine backup, and a tip whose backup is the root's instrumented output.
+ *
+ * @param world The sandbox to patch inside.
+ * @returns Both links and the pristine bytes.
+ */
+async function patchTwoLinks(world: World): Promise<TwoLinkChain> {
+  const pristine = readFileSync(world.pathOf(TARGET_FILE));
+  const first = await patchSymbol(world, {
+    file: TARGET_FILE,
+    symbol: TARGET_SYMBOL,
+    planVersion: 1,
+  });
+  const second = await patchSymbol(world, {
+    file: TARGET_FILE,
+    symbol: SECOND_SYMBOL,
+    planVersion: 2,
+  });
+
+  expect(second.record.previousRecordId).toBe(first.record.id);
+  expect(second.record.originalHash).toBe(first.record.instrumentedHash);
+
+  return { pristine, first, second };
+}
+
+/**
+ * Ends the session over an edited tip — the conflict a developer saving the
+ * file mid-session produces — and asserts what that leaves: the tip in
+ * `conflict` with the only report, the root moved into `conflict` behind it
+ * (the edit holds none of the chain's output, so nothing may go on claiming
+ * the file is `applied`), both backups kept.
+ *
+ * @param world The sandbox.
+ * @param chain The two links over the file.
+ */
+async function conflictOnTip(world: World, chain: TwoLinkChain): Promise<void> {
+  developerEdits(chain.second.path);
+
+  const ended = await cleanupSession(world.sessionId, world.context);
+
+  expect(ended.status).toBe('conflict');
+  expect(only(ended.conflicts, 'conflict report').originalBackupPath).toBe(
+    chain.first.record.backupPath,
+  );
+  expect(world.journal.row(chain.second.record.id).status).toBe('conflict');
+  expect(world.journal.row(chain.first.record.id).status).toBe('conflict');
+  expectFileBytes(chain.first.record.backupPath, chain.pristine);
+  expect(existsSync(chain.second.record.backupPath)).toBe(true);
+}
+
+describe('a conflicted chain whose file is put back to an earlier plan version’s original', () => {
+  /** The ids of a pass's list, in the order the pass reported them. */
+  const ids = (records: readonly ModificationRecord[]): string[] =>
+    records.map((record) => record.id);
+
+  it('closes every record without a write once the file saved as the original is put back', async () => {
+    const records: LogRecord[] = [];
+    const logger = createConsoleLogger({
+      level: 'trace',
+      sink: (record) => {
+        records.push(record);
+      },
+    });
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    await conflictOnTip(world, chain);
+
+    // What the conflict notice tells the developer to do: put back the file
+    // saved at its `originalBackupPath`.
+    writeFileSync(second.path, readFileSync(first.record.backupPath));
+    expect(digestOf(second.path)).toBe(first.record.originalHash);
+
+    world.watch(TARGET_FILE);
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, { ...world.context, logger });
+
+    expect(outcome.status).toBe('clean');
+    expect(ids(outcome.restored)).toEqual([second.record.id, first.record.id]);
+    expect(outcome.restored.map((record) => record.status)).toEqual(['reverted', 'reverted']);
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+    expect(outcome.forks).toEqual([]);
+
+    // The file already is the original: nothing to write, and nothing was.
+    expectNothingWritten(world.log);
+    expectFileBytes(second.path, chain.pristine);
+
+    // `conflict → reverted` for the tip and for the root the edit had moved
+    // into `conflict` with it: neither is left open behind a resolved conflict.
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: second.record.id, status: 'reverted' },
+      { recordId: first.record.id, status: 'reverted' },
+    ]);
+
+    // Only the root's backup is deleted as verified — the file hashes to its
+    // original. The tip's backup, which the file does not hold, is removed with
+    // the session directory rather than through the verified deletion.
+    const removal = only(world.removals, 'verified backup deletion');
+    expect(removal.digest).toBe(first.record.originalHash);
+    expect(removal.restoredContentHash).toBe(first.record.originalHash);
+    expect(removal.watchedDigest).toBe(first.record.originalHash);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+
+    // One decision, logged once, and no "not reverted" warning for the tip.
+    const close = records.filter(
+      (record) =>
+        record.message ===
+        'a chained file holds content from before these modifications; they are closed without a write',
+    );
+    expect(close).toHaveLength(1);
+    expect(close[0]?.fields['recordId']).toBe(second.record.id);
+    expect(close[0]?.fields['matchedRecordId']).toBe(first.record.id);
+    expect(
+      records.some(
+        (record) =>
+          record.message === 'a modification was not reverted; the file was left exactly as it is',
+      ),
+    ).toBe(false);
+
+    // Ending the session once more is the idempotent no-op it always was.
+    world.resetLog();
+
+    const again = await cleanupSession(world.sessionId, world.context);
+
+    expect(again.status).toBe('clean');
+    expect(again.restored).toEqual([]);
+    expectNoFileSystemAccess(world.log);
+  });
+
+  it('is closed the same way by a start-up reconciliation', async () => {
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    await conflictOnTip(world, chain);
+    writeFileSync(second.path, chain.pristine);
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await reconcileModifications(world.context);
+
+    expect(outcome.status).toBe('clean');
+    expect(outcome.examined).toBe(2);
+    expect(ids(outcome.closed)).toEqual([second.record.id, first.record.id]);
+    expect(outcome.restored).toEqual([]);
+    expect(outcome.retained).toEqual([]);
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+    expectNothingWritten(world.log);
+    expectFileBytes(second.path, chain.pristine);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: second.record.id, status: 'reverted' },
+      { recordId: first.record.id, status: 'reverted' },
+    ]);
+    expect(only(world.removals, 'verified backup deletion').restoredContentHash).toBe(
+      first.record.originalHash,
+    );
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+
+  it('closes the layers above the version the file was put back to, then restores the rest in reverse', async () => {
+    const world = makeWorld();
+    const pristine = readFileSync(world.pathOf(OTHER_FILE));
+    const [first, second, third] = await patchThreeLinks(world);
+
+    developerEdits(third.path);
+    expect((await cleanupSession(world.sessionId, world.context)).status).toBe('conflict');
+    expect(world.journal.row(third.record.id).status).toBe('conflict');
+
+    // Put back to plan version 1's output — what version 2 replaced — rather
+    // than to the pristine file.
+    writeFileSync(third.path, first.instrumentedBytes);
+    expect(digestOf(third.path)).toBe(second.record.originalHash);
+
+    world.watch(OTHER_FILE);
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('clean');
+    // Restored records first, then the closed ones, as the session outcome
+    // always lists them.
+    expect(ids(outcome.restored)).toEqual([first.record.id, third.record.id, second.record.id]);
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+
+    // Versions 3 and 2 closed without a write; version 1's backup then went
+    // back over the output it wrote, conditional on exactly that output.
+    const write = only(world.log.writes, 'conditional write');
+    expect(write.expectedHash).toBe(first.record.instrumentedHash);
+    expect(write.contentHash).toBe(first.record.originalHash);
+    expect(world.log.creates).toEqual([]);
+    expectFileBytes(third.path, pristine);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: third.record.id, status: 'reverted' },
+      { recordId: second.record.id, status: 'reverted' },
+      { recordId: first.record.id, status: 'reverted' },
+    ]);
+
+    // Version 2's backup was deleted as verified while the file held exactly
+    // it, and version 1's once its own restore verified; version 3's backup —
+    // content the file never held again — left with the session directory.
+    expect(world.removals.map((removal) => removal.digest)).toEqual([
+      second.record.originalHash,
+      first.record.originalHash,
+    ]);
+    expect(world.removals.map((removal) => removal.restoredContentHash)).toEqual([
+      second.record.originalHash,
+      first.record.originalHash,
+    ]);
+    expect(world.removals.map((removal) => removal.watchedDigest)).toEqual([
+      second.record.originalHash,
+      first.record.originalHash,
+    ]);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+
+  it.each(['pending', 'failed'] as const)(
+    'closes a %s head over the pristine file on the first pass, never through conflict',
+    async (status) => {
+      const world = makeWorld();
+      const chain = await patchTwoLinks(world);
+      const { first, second } = chain;
+
+      world.journal.arrange({ ...world.journal.row(second.record.id), status });
+      writeFileSync(second.path, chain.pristine);
+      world.watch(TARGET_FILE);
+      world.resetLog();
+
+      const mark = world.mark();
+      const outcome = await restoreChain(
+        [first.record, second.record].map((record) => world.journal.row(record.id)),
+        world.context,
+      );
+
+      expect(outcome.file).toBe(TARGET_FILE);
+      expect(outcome.stoppedAt).toBeUndefined();
+      expect(outcome.fork).toBeUndefined();
+      expect(outcome.outcomes.map((step) => step.kind)).toEqual([
+        'already-original',
+        'already-original',
+      ]);
+      expect(ids(outcome.closed)).toEqual([second.record.id, first.record.id]);
+      expect(outcome.restored).toEqual([]);
+      expect(outcome.retained).toEqual([]);
+      expect(outcome.conflicts).toEqual([]);
+      expect(outcome.skipped).toEqual([]);
+      expect(outcome.failures).toEqual([]);
+
+      // The head's backup is not what the file holds, so it is kept for the
+      // session directory's removal; the root's goes as verified.
+      expect(outcome.outcomes.map((step) => step.backup)).toEqual(['retained', 'deleted']);
+      expectFileBytes(second.record.backupPath, first.instrumentedBytes);
+      expect(existsSync(first.record.backupPath)).toBe(false);
+      expect(only(world.removals, 'verified backup deletion').watchedDigest).toBe(
+        first.record.originalHash,
+      );
+
+      expectNothingWritten(world.log);
+      expect(world.journal.transitions(mark)).toEqual([
+        { recordId: second.record.id, status: 'reverted' },
+        { recordId: first.record.id, status: 'reverted' },
+      ]);
+    },
+  );
+
+  it('reports an applied head over the pristine file as a conflict first, and closes the chain on the next pass', async () => {
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    // Put back behind the tool's back while the tip was still `applied`: news
+    // to a record that believes its bytes are on disk, so reported first.
+    writeFileSync(second.path, chain.pristine);
+    world.resetLog();
+
+    const firstMark = world.mark();
+    const reported = await cleanupSession(world.sessionId, world.context);
+
+    expect(reported.status).toBe('conflict');
+    expect(reported.restored).toEqual([]);
+    expect(ids(reported.skipped)).toEqual([second.record.id, first.record.id]);
+
+    const conflict = only(reported.conflicts, 'conflict report');
+    expect(conflict.recordId).toBe(second.record.id);
+    expect(conflict.reason).toBe('content-changed');
+    expect(conflict.actualHash).toBe(first.record.originalHash);
+    expect(conflict.backupPath).toBe(second.record.backupPath);
+    expect(conflict.originalBackupPath).toBe(first.record.backupPath);
+    expectNothingWritten(world.log);
+    // The pristine file is not the root's output either, so the root goes into
+    // `conflict` with the tip instead of staying `applied` over bytes that are
+    // not on disk.
+    expect(world.journal.transitions(firstMark)).toEqual([
+      { recordId: second.record.id, status: 'conflict' },
+      { recordId: first.record.id, status: 'conflict' },
+    ]);
+    expect(world.journal.row(first.record.id).status).toBe('conflict');
+    expect(world.removals).toEqual([]);
+
+    world.resetLog();
+
+    const secondMark = world.mark();
+    const closed = await cleanupSession(world.sessionId, world.context);
+
+    expect(closed.status).toBe('clean');
+    expect(ids(closed.restored)).toEqual([second.record.id, first.record.id]);
+    expectNothingWritten(world.log);
+    expectFileBytes(second.path, chain.pristine);
+    expect(world.journal.transitions(secondMark)).toEqual([
+      { recordId: second.record.id, status: 'reverted' },
+      { recordId: first.record.id, status: 'reverted' },
+    ]);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+
+  it('does not close a chain whose links disagree about the bytes between them', async () => {
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    await conflictOnTip(world, chain);
+
+    // The root's journaled output is no longer what the tip replaced, so the
+    // journal cannot prove the file holds the content from before both.
+    world.journal.arrange({
+      ...world.journal.row(first.record.id),
+      instrumentedHash: sha256Hex(Buffer.from('not what plan version 2 replaced', 'utf8')),
+    });
+    writeFileSync(second.path, chain.pristine);
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.restored).toEqual([]);
+    expect(ids(outcome.skipped)).toEqual([second.record.id, first.record.id]);
+
+    const conflict = only(outcome.conflicts, 'conflict report');
+    expect(conflict.recordId).toBe(second.record.id);
+    expect(conflict.reason).toBe('content-changed');
+    expect(conflict.actualHash).toBe(first.record.originalHash);
+
+    expectNothingWritten(world.log);
+    expectFileBytes(second.path, chain.pristine);
+    // Both records were already in `conflict` from the first end, and stay
+    // there without a journal write.
+    expect(world.journal.transitions(mark)).toEqual([]);
+    expect(world.journal.row(second.record.id).status).toBe('conflict');
+    expect(world.journal.row(first.record.id).status).toBe('conflict');
+    expect(world.removals).toEqual([]);
+    expectFileBytes(first.record.backupPath, chain.pristine);
+    expect(existsSync(second.record.backupPath)).toBe(true);
+  });
+
+  it('keeps the rest of the chain open when the journal refuses to close part of it', async () => {
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    await conflictOnTip(world, chain);
+    writeFileSync(second.path, chain.pristine);
+
+    const refusal = new DebuggenError('STORE_ERROR', 'The suite journal refuses this write.', {
+      details: { recordId: first.record.id },
+    });
+    const journal: ModificationJournal = {
+      ...world.journal,
+      updateStatus: (id, status, patch) =>
+        id === first.record.id
+          ? Promise.resolve(err(refusal))
+          : world.journal.updateStatus(id, status, patch),
+    };
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, { ...world.context, journal });
+
+    // The tip closed; the root could not be, is reported as a failure rather
+    // than with a report of its own, and keeps its pristine backup and its
+    // directory. It is still in `conflict` — where the first end put it —
+    // and an open `conflict` record keeps the verdict `conflict`.
+    expect(outcome.status).toBe('conflict');
+    expect(ids(outcome.restored)).toEqual([second.record.id]);
+    expect(ids(outcome.skipped)).toEqual([first.record.id]);
+    expect(outcome.conflicts).toEqual([]);
+
+    const failure = only(outcome.failures, 'failure');
+    expect(failure.recordId).toBe(first.record.id);
+    expect(failure.error.code).toBe('STORE_ERROR');
+    expect(failure.error.details?.['reason']).toBe('journal-transition-failed');
+
+    expectNothingWritten(world.log);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: second.record.id, status: 'reverted' },
+    ]);
+    expect(world.journal.row(first.record.id).status).toBe('conflict');
+    expect(world.removals).toEqual([]);
+    expectFileBytes(first.record.backupPath, chain.pristine);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+
+    // With a journal that answers, the root — now the head, in `conflict` over
+    // its own original — is closed without a write by the very next pass.
+    world.resetLog();
+
+    const settled = await cleanupSession(world.sessionId, world.context);
+
+    expect(settled.status).toBe('clean');
+    expect(ids(settled.restored)).toEqual([first.record.id]);
+    expectNothingWritten(world.log);
+    expectFileBytes(second.path, chain.pristine);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The chain beneath a conflicted record
+ * ---------------------------------------------------------------------------
+ */
+
+/** The one line a walk logs when it moves the records beneath a conflict into `conflict`. */
+const CHAIN_RETENTION_LOG =
+  'the records beneath a conflicted modification were moved to conflict with it; their backups are kept';
+
+/**
+ * A logger that keeps every record it is handed, at every level.
+ *
+ * @returns The logger and the records, in emission order.
+ */
+function capturingLogger(): {
+  readonly logger: ReturnType<typeof createConsoleLogger>;
+  readonly records: LogRecord[];
+} {
+  const records: LogRecord[] = [];
+  const logger = createConsoleLogger({
+    level: 'trace',
+    sink: (record) => {
+      records.push(record);
+    },
+  });
+
+  return { logger, records };
+}
+
+/** The chain-retention lines among `records`. */
+function retentionLines(records: readonly LogRecord[]): LogRecord[] {
+  return records.filter((record) => record.message === CHAIN_RETENTION_LOG);
+}
+
+describe('the chain beneath a conflicted record', () => {
+  /** The ids of a pass's list, in the order the pass reported them. */
+  const ids = (records: readonly ModificationRecord[]): string[] =>
+    records.map((record) => record.id);
+
+  it('moves the root into conflict with an edited tip, keeps its pristine backup and reports the file once', async () => {
+    const { logger, records } = capturingLogger();
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+    const edited = developerEdits(second.path);
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, { ...world.context, logger });
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.restored).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+    expect(outcome.forks).toEqual([]);
+    // A session outcome lists its retained records with the skipped ones: the
+    // tip and the root, both now in `conflict`.
+    expect(ids(outcome.skipped)).toEqual([second.record.id, first.record.id]);
+    expect(outcome.skipped.map((record) => record.status)).toEqual(['conflict', 'conflict']);
+
+    // One report for the file: the tip's, naming the root's pristine backup.
+    const conflict = only(outcome.conflicts, 'conflict report');
+    expect(conflict.recordId).toBe(second.record.id);
+    expect(conflict.reason).toBe('content-changed');
+    expect(conflict.actualHash).toBe(sha256Hex(edited));
+    expect(conflict.originalBackupPath).toBe(first.record.backupPath);
+
+    // The root no longer claims the file is `applied`: it moved to `conflict`
+    // at the same instant the tip was reported.
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: second.record.id, status: 'conflict' },
+      { recordId: first.record.id, status: 'conflict' },
+    ]);
+    expect(world.journal.row(first.record.id).status).toBe('conflict');
+    expect(world.journal.row(first.record.id).appliedAt).toBe(FIXED_NOW);
+
+    // Nothing was written, and every backup is where it was.
+    expectNothingWritten(world.log);
+    expectFileBytes(second.path, edited);
+    expect(world.removals).toEqual([]);
+    expectFileBytes(first.record.backupPath, chain.pristine);
+    expectFileBytes(second.record.backupPath, first.instrumentedBytes);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+
+    // One line for the chain, identifiers and counts only.
+    const line = only(retentionLines(records), 'chain retention log line');
+    expect(line.level).toBe('info');
+    expect(line.fields).toEqual({
+      sessionId: world.sessionId,
+      recordId: second.record.id,
+      reason: 'content-changed',
+      moved: 1,
+      kept: 0,
+      refused: 0,
+    });
+
+    // A walk of the chain as it now stands partitions it as retained, not
+    // skipped, and journals nothing: the root is already in `conflict`.
+    world.resetLog();
+
+    const repeatMark = world.mark();
+    const repeat = await restoreChain(
+      [first.record, second.record].map((record) => world.journal.row(record.id)),
+      { ...world.context, logger },
+    );
+
+    expect(ids(repeat.retained)).toEqual([second.record.id, first.record.id]);
+    expect(repeat.skipped).toEqual([]);
+    expect(repeat.failures).toEqual([]);
+    expect(repeat.stoppedAt?.id).toBe(second.record.id);
+    expect(only(repeat.conflicts, 'renewed report').recordId).toBe(second.record.id);
+    expect(world.journal.transitions(repeatMark)).toEqual([]);
+    expectNothingWritten(world.log);
+    expect(retentionLines(records).at(-1)?.fields).toMatchObject({ moved: 0, kept: 1 });
+    expect(existsSync(first.record.backupPath)).toBe(true);
+  });
+
+  it('closes the whole chain without a write once the file is put back to the root’s original', async () => {
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    await conflictOnTip(world, chain);
+
+    // Resolved the way version control resolves it: the committed file.
+    const committed = readFileSync(join(FIXTURE_PROJECT, TARGET_FILE));
+
+    expect(sha256Hex(committed)).toBe(first.record.originalHash);
+    writeFileSync(second.path, committed);
+    world.watch(TARGET_FILE);
+    world.resetLog();
+
+    const mark = world.mark();
+    const settled = await cleanupSession(world.sessionId, world.context);
+
+    expect(settled.status).toBe('clean');
+    expect(ids(settled.restored)).toEqual([second.record.id, first.record.id]);
+    expect(settled.restored.map((record) => record.status)).toEqual(['reverted', 'reverted']);
+    expect(settled.conflicts).toEqual([]);
+    expect(settled.skipped).toEqual([]);
+    expect(settled.failures).toEqual([]);
+
+    // Both `conflict → reverted`, without a byte written: the file already is
+    // the original, and stays exactly the developer's copy of it.
+    expectNothingWritten(world.log);
+    expectFileBytes(second.path, committed);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: second.record.id, status: 'reverted' },
+      { recordId: first.record.id, status: 'reverted' },
+    ]);
+    expect(only(world.removals, 'verified backup deletion').watchedDigest).toBe(
+      first.record.originalHash,
+    );
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+
+  it('restores the chain link by link once the developer undoes the edit on the tip', async () => {
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    await conflictOnTip(world, chain);
+
+    writeFileSync(second.path, second.instrumentedBytes);
+    world.watch(TARGET_FILE);
+    world.resetLog();
+
+    const mark = world.mark();
+    const settled = await cleanupSession(world.sessionId, world.context);
+
+    expect(settled.status).toBe('clean');
+    expect(ids(settled.restored)).toEqual([second.record.id, first.record.id]);
+    expect(settled.conflicts).toEqual([]);
+    expect(settled.skipped).toEqual([]);
+    expect(settled.failures).toEqual([]);
+
+    // A root in `conflict` is restored like any record whose file holds what
+    // it wrote: each write conditional on that link's own output.
+    expect(world.log.writes.map((write) => write.expectedHash)).toEqual([
+      second.record.instrumentedHash,
+      first.record.instrumentedHash,
+    ]);
+    expect(world.log.writes.map((write) => write.contentHash)).toEqual([
+      second.record.originalHash,
+      first.record.originalHash,
+    ]);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: second.record.id, status: 'reverted' },
+      { recordId: first.record.id, status: 'reverted' },
+    ]);
+    expectFileBytes(second.path, chain.pristine);
+    expect(existsSync(first.record.backupPath)).toBe(false);
+    expect(existsSync(second.record.backupPath)).toBe(false);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+
+  it('moves the root into conflict the same way in a start-up reconciliation', async () => {
+    const world = makeWorld();
+
+    world.journal.noteSessionStatus(world.sessionId, 'generated');
+
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+    const edited = developerEdits(second.path);
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await reconcileModifications(world.context);
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.examined).toBe(2);
+    expect(ids(outcome.retained)).toEqual([second.record.id, first.record.id]);
+    expect(outcome.retained.map((record) => record.status)).toEqual(['conflict', 'conflict']);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.restored).toEqual([]);
+    expect(outcome.closed).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+
+    const conflict = only(outcome.conflicts, 'conflict report');
+    expect(conflict.recordId).toBe(second.record.id);
+    expect(conflict.originalBackupPath).toBe(first.record.backupPath);
+
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: second.record.id, status: 'conflict' },
+      { recordId: first.record.id, status: 'conflict' },
+    ]);
+    expectNothingWritten(world.log);
+    expectFileBytes(second.path, edited);
+    expectFileBytes(first.record.backupPath, chain.pristine);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+    expect(world.journal.sessionStatusOf(world.sessionId)).toBe('generated');
+  });
+
+  it('moves every link beneath an edited tip into conflict, however deep the chain, and closes them all together', async () => {
+    const world = makeWorld();
+    const pristine = readFileSync(world.pathOf(OTHER_FILE));
+    const [first, second, third] = await patchThreeLinks(world);
+    const edited = developerEdits(third.path);
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const chain = await restoreChain(
+      [first.record, second.record, third.record].map((record) => world.journal.row(record.id)),
+      world.context,
+    );
+
+    expect(chain.stoppedAt?.id).toBe(third.record.id);
+    expect(chain.outcomes.map((outcome) => outcome.kind)).toEqual(['conflict']);
+    expect(ids(chain.retained)).toEqual([third.record.id, second.record.id, first.record.id]);
+    expect(chain.retained.map((record) => record.status)).toEqual([
+      'conflict',
+      'conflict',
+      'conflict',
+    ]);
+    expect(chain.skipped).toEqual([]);
+    expect(chain.failures).toEqual([]);
+
+    const conflict = only(chain.conflicts, 'conflict report');
+    expect(conflict.recordId).toBe(third.record.id);
+    expect(conflict.originalBackupPath).toBe(first.record.backupPath);
+
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: third.record.id, status: 'conflict' },
+      { recordId: second.record.id, status: 'conflict' },
+      { recordId: first.record.id, status: 'conflict' },
+    ]);
+    expectNothingWritten(world.log);
+    expectFileBytes(third.path, edited);
+
+    for (const link of [first, second, third]) {
+      expectFileBytes(link.record.backupPath, link.originalBytes);
+    }
+
+    // Put back to the pristine file: a start-up pass closes all three at once.
+    writeFileSync(third.path, pristine);
+    world.resetLog();
+
+    const closeMark = world.mark();
+    const closed = await reconcileModifications(world.context);
+
+    expect(closed.status).toBe('clean');
+    expect(ids(closed.closed)).toEqual([third.record.id, second.record.id, first.record.id]);
+    expect(closed.retained).toEqual([]);
+    expect(closed.conflicts).toEqual([]);
+    expectNothingWritten(world.log);
+    expectFileBytes(third.path, pristine);
+    expect(world.journal.transitions(closeMark)).toEqual([
+      { recordId: third.record.id, status: 'reverted' },
+      { recordId: second.record.id, status: 'reverted' },
+      { recordId: first.record.id, status: 'reverted' },
+    ]);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+
+  it.each(['pending', 'failed'] as const)(
+    'moves a %s record beneath an edited tip into conflict as well',
+    async (status) => {
+      const world = makeWorld();
+      const chain = await patchTwoLinks(world);
+      const { first, second } = chain;
+
+      world.journal.arrange({ ...world.journal.row(first.record.id), status });
+      developerEdits(second.path);
+      world.resetLog();
+
+      const mark = world.mark();
+      const outcome = await restoreChain(
+        [first.record, second.record].map((record) => world.journal.row(record.id)),
+        world.context,
+      );
+
+      expect(ids(outcome.retained)).toEqual([second.record.id, first.record.id]);
+      expect(outcome.skipped).toEqual([]);
+      expect(world.journal.transitions(mark)).toEqual([
+        { recordId: second.record.id, status: 'conflict' },
+        { recordId: first.record.id, status: 'conflict' },
+      ]);
+      expectNothingWritten(world.log);
+      expectFileBytes(first.record.backupPath, chain.pristine);
+    },
+  );
+
+  it('moves the root into conflict when the tip’s file and its directory are gone', async () => {
+    const { logger, records } = capturingLogger();
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    rmSync(dirname(second.path), { recursive: true, force: true });
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await restoreChain(
+      [first.record, second.record].map((record) => world.journal.row(record.id)),
+      { ...world.context, logger },
+    );
+
+    const conflict = only(outcome.conflicts, 'conflict report');
+    expect(conflict.recordId).toBe(second.record.id);
+    expect(conflict.reason).toBe('file-missing');
+    expect(conflict.actualHash).toBeUndefined();
+
+    expect(ids(outcome.retained)).toEqual([second.record.id, first.record.id]);
+    expect(outcome.skipped).toEqual([]);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: second.record.id, status: 'conflict' },
+      { recordId: first.record.id, status: 'conflict' },
+    ]);
+    expectNothingWritten(world.log);
+    expect(existsSync(second.path)).toBe(false);
+    expectFileBytes(first.record.backupPath, chain.pristine);
+    expect(only(retentionLines(records), 'chain retention log line').fields).toMatchObject({
+      reason: 'file-missing',
+      moved: 1,
+    });
+  });
+
+  it('leaves the root applied and skipped when the tip’s backup cannot be read back', async () => {
+    const { logger, records } = capturingLogger();
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    // The file still holds the tip's output, so it is not the file that says
+    // anything about the root: only the tip's original is gone.
+    rmSync(second.record.backupPath);
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await restoreChain(
+      [first.record, second.record].map((record) => world.journal.row(record.id)),
+      { ...world.context, logger },
+    );
+
+    expect(only(outcome.conflicts, 'conflict report').reason).toBe('backup-missing');
+    expect(ids(outcome.retained)).toEqual([second.record.id]);
+    expect(ids(outcome.skipped)).toEqual([first.record.id]);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: second.record.id, status: 'conflict' },
+    ]);
+    expect(world.journal.row(first.record.id).status).toBe('applied');
+    expectNothingWritten(world.log);
+    expectFileBytes(second.path, second.instrumentedBytes);
+    expectFileBytes(first.record.backupPath, chain.pristine);
+    expect(retentionLines(records)).toEqual([]);
+  });
+
+  it('leaves the root applied when an applied tip’s file holds the bytes it replaced — the root’s own output', async () => {
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    // Put back to plan version 1's output behind the tool's back: reported for
+    // the `applied` tip as `content-changed`, but the root's bytes are on disk
+    // and the root must stay restorable as it is.
+    writeFileSync(second.path, first.instrumentedBytes);
+    world.resetLog();
+
+    const mark = world.mark();
+    const reported = await cleanupSession(world.sessionId, world.context);
+
+    expect(reported.status).toBe('conflict');
+
+    const conflict = only(reported.conflicts, 'conflict report');
+    expect(conflict.recordId).toBe(second.record.id);
+    expect(conflict.reason).toBe('content-changed');
+    expect(conflict.actualHash).toBe(first.record.instrumentedHash);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: second.record.id, status: 'conflict' },
+    ]);
+    expect(world.journal.row(first.record.id).status).toBe('applied');
+    expectNothingWritten(world.log);
+
+    // The next pass closes the tip over the bytes it replaced and restores the
+    // root from its own backup.
+    world.resetLog();
+
+    const settleMark = world.mark();
+    const settled = await cleanupSession(world.sessionId, world.context);
+
+    expect(settled.status).toBe('clean');
+    expect(ids(settled.restored)).toEqual([first.record.id, second.record.id]);
+    expect(only(world.log.writes, 'conditional write').expectedHash).toBe(
+      first.record.instrumentedHash,
+    );
+    expect(world.journal.transitions(settleMark)).toEqual([
+      { recordId: second.record.id, status: 'reverted' },
+      { recordId: first.record.id, status: 'reverted' },
+    ]);
+    expectFileBytes(second.path, chain.pristine);
+  });
+
+  it('keeps a record whose move into conflict the journal refused, and every record beneath it, as they were', async () => {
+    const { logger, records } = capturingLogger();
+    const world = makeWorld();
+    const [first, second, third] = await patchThreeLinks(world);
+
+    developerEdits(third.path);
+
+    const refusal = new DebuggenError('STORE_ERROR', 'The suite journal refuses this write.', {
+      details: { recordId: second.record.id },
+    });
+    const journal: ModificationJournal = {
+      ...world.journal,
+      updateStatus: (id, status, patch) =>
+        id === second.record.id && status === 'conflict'
+          ? Promise.resolve(err(refusal))
+          : world.journal.updateStatus(id, status, patch),
+    };
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, { ...world.context, journal, logger });
+
+    // The pass resolved rather than threw: the tip's conflict is reported, the
+    // refusal is a failure of the middle link, and the root was not touched.
+    expect(outcome.status).toBe('conflict');
+    expect(only(outcome.conflicts, 'conflict report').recordId).toBe(third.record.id);
+    expect(ids(outcome.skipped)).toEqual([third.record.id, second.record.id, first.record.id]);
+
+    const failure = only(outcome.failures, 'failure');
+    expect(failure.recordId).toBe(second.record.id);
+    expect(failure.error.code).toBe('STORE_ERROR');
+    expect(failure.error.details?.['reason']).toBe('journal-transition-failed');
+    expect(failure.error.details?.['status']).toBe('conflict');
+
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: third.record.id, status: 'conflict' },
+    ]);
+    expect(world.journal.row(second.record.id).status).toBe('applied');
+    expect(world.journal.row(first.record.id).status).toBe('applied');
+    expectNothingWritten(world.log);
+
+    for (const link of [first, second, third]) {
+      expect(existsSync(link.record.backupPath)).toBe(true);
+    }
+
+    expect(only(retentionLines(records), 'chain retention log line').fields).toMatchObject({
+      recordId: third.record.id,
+      moved: 0,
+      kept: 0,
+      refused: 1,
+      refusedRecordId: second.record.id,
+    });
+
+    // With a journal that answers, the next pass finishes the move.
+    const retryMark = world.mark();
+    const retried = await cleanupSession(world.sessionId, world.context);
+
+    expect(retried.status).toBe('conflict');
+    expect(retried.failures).toEqual([]);
+    expect(world.journal.transitions(retryMark)).toEqual([
+      { recordId: second.record.id, status: 'conflict' },
+      { recordId: first.record.id, status: 'conflict' },
+    ]);
+  });
+
+  it('lets a new session instrument the file again once the developer restores it', async () => {
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const { first, second } = chain;
+
+    await conflictOnTip(world, chain);
+
+    // The developer restores the committed file, and the next session plans
+    // the same two wraps before anybody ends the old session again. Its first
+    // patch reproduces the old root's output byte for byte — a deterministic
+    // transform — and that root, in `conflict`, holds nothing.
+    writeFileSync(second.path, chain.pristine);
+
+    const next = nextSessionId('next');
+    const nextFirst = await patchSymbol(world, {
+      file: TARGET_FILE,
+      symbol: TARGET_SYMBOL,
+      sessionId: next,
+    });
+    const nextSecond = await patchSymbol(world, {
+      file: TARGET_FILE,
+      symbol: SECOND_SYMBOL,
+      planVersion: 2,
+      sessionId: next,
+    });
+
+    expect(nextFirst.record.instrumentedHash).toBe(first.record.instrumentedHash);
+    expect(nextSecond.record.previousRecordId).toBe(nextFirst.record.id);
+    expect(nextSecond.record.status).toBe('applied');
+
+    // The new session's end puts the file back, and a repeated end of the old
+    // one then closes its chain over the pristine file.
+    const nextEnded = await cleanupSession(next, {
+      ...world.context,
+      backups: world.storeFor(next),
+    });
+
+    expect(nextEnded.status).toBe('clean');
+    expectFileBytes(second.path, chain.pristine);
+
+    const oldEnded = await cleanupSession(world.sessionId, world.context);
+
+    expect(oldEnded.status).toBe('clean');
+    expect(ids(oldEnded.restored)).toEqual([second.record.id, first.record.id]);
+    expectFileBytes(second.path, chain.pristine);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Another session's live claim on the same bytes
+ * ---------------------------------------------------------------------------
+ */
+
+/** The line a pass logs once when it closes a chain beside another session's claim. */
+const CLAIM_CLOSE_LOG =
+  'another session holds these bytes over the same original; this session’s modifications are closed without a write';
+
+/** The line a pass logs once when it withholds a restore because of another session's claim. */
+const CLAIM_REFUSAL_LOG =
+  'another session holds the bytes this restore would replace; nothing was written';
+
+/**
+ * An old session's chain in `conflict` under a later session's identical,
+ * live chain over the same file — the state the documented recovery from a
+ * conflict leads to: restore the committed file, then start a new session.
+ */
+interface StaleChainUnderLiveSession {
+  /** The old session's chain, both links in `conflict`; its session is the world's. */
+  readonly stale: TwoLinkChain;
+
+  /** The later session. */
+  readonly liveSessionId: string;
+
+  /** The later session's first link, byte-identical to the stale root's output. */
+  readonly liveFirst: PatchedFile;
+
+  /** The later session's second link, byte-identical to the stale tip's output. */
+  readonly liveSecond: PatchedFile;
+}
+
+/**
+ * Builds {@link StaleChainUnderLiveSession} with the real patcher: the world's
+ * session chains two wraps over {@link TARGET_FILE}, ends over an edit (both
+ * links move to `conflict`), the developer puts the committed file back, and a
+ * new session plans the same two wraps. The deterministic transform makes the
+ * new chain reproduce the old one's digests exactly, and the file holds the
+ * new tip's bytes — which are also the old tip's `instrumentedHash`.
+ *
+ * @param world The sandbox.
+ * @returns Both chains.
+ */
+async function staleChainUnderLiveSession(world: World): Promise<StaleChainUnderLiveSession> {
+  const stale = await patchTwoLinks(world);
+
+  await conflictOnTip(world, stale);
+  writeFileSync(stale.second.path, stale.pristine);
+
+  const liveSessionId = nextSessionId('live');
+  const liveFirst = await patchSymbol(world, {
+    file: TARGET_FILE,
+    symbol: TARGET_SYMBOL,
+    sessionId: liveSessionId,
+  });
+  const liveSecond = await patchSymbol(world, {
+    file: TARGET_FILE,
+    symbol: SECOND_SYMBOL,
+    planVersion: 2,
+    sessionId: liveSessionId,
+  });
+
+  expect(liveFirst.record.instrumentedHash).toBe(stale.first.record.instrumentedHash);
+  expect(liveSecond.record.instrumentedHash).toBe(stale.second.record.instrumentedHash);
+  expect(liveSecond.record.previousRecordId).toBe(liveFirst.record.id);
+  expect(liveSecond.record.status).toBe('applied');
+  expect(digestOf(stale.second.path)).toBe(stale.second.record.instrumentedHash);
+
+  return { stale, liveSessionId, liveFirst, liveSecond };
+}
+
+/**
+ * The world's context with every session placed in the world's one project,
+ * which is where every patch of these cases landed.
+ *
+ * @param world The sandbox.
+ * @param sessionId Whose backup store the context carries; the world's own by default.
+ * @returns The context.
+ */
+function placedContext(world: World, sessionId = world.sessionId): CleanupContext {
+  return {
+    ...world.context,
+    backups: world.storeFor(sessionId),
+    projectRootOf: (): string => world.projectRoot,
+  };
+}
+
+/**
+ * A scope resolver placing every session's records in the world's one project,
+ * each with its own session's backup store.
+ *
+ * @param world The sandbox.
+ * @returns The resolver.
+ */
+function worldScopes(world: World): (record: ModificationRecord) => Result<RecordScope> {
+  return (record: ModificationRecord): Result<RecordScope> =>
+    ok({ projectRoot: world.projectRoot, backups: world.storeFor(record.sessionId) });
+}
+
+/** How many times a pass asked the journal for every open record, from `from` on. */
+function openListings(world: World, from: number): number {
+  return world.journal.calls.slice(from).filter((call) => call.kind === 'listOpen').length;
+}
+
+/** A journal that answers every call like `journal`, except `listOpen`, which fails. */
+function journalWithoutListing(journal: TestJournal): {
+  readonly journal: ModificationJournal;
+  readonly listings: () => number;
+} {
+  let listings = 0;
+
+  return {
+    journal: {
+      append: (record) => journal.append(record),
+      updateStatus: (id, status, patch) => journal.updateStatus(id, status, patch),
+      listBySession: (sessionId) => journal.listBySession(sessionId),
+      listOpen: (): Promise<Result<ModificationRecord[]>> => {
+        listings += 1;
+
+        return Promise.resolve(
+          err(
+            new DebuggenError('STORE_ERROR', 'The suite journal cannot list open records.', {
+              hint: 'A case failing the cross-session listing on purpose.',
+            }),
+          ),
+        );
+      },
+    },
+    listings: (): number => listings,
+  };
+}
+
+describe('another session’s live claim on the bytes a restore would replace', () => {
+  /** The ids of a pass's list, in the order the pass reported them. */
+  const ids = (records: readonly ModificationRecord[]): string[] =>
+    records.map((record) => record.id);
+
+  it('closes a stale chain reached first by a start-up reconciliation without a write, then restores the live one', async () => {
+    const samples: string[] = [];
+    const records: LogRecord[] = [];
+    const world = makeWorld();
+    const { stale, liveSessionId, liveFirst, liveSecond } = await staleChainUnderLiveSession(world);
+    const path = stale.second.path;
+    const logger = createConsoleLogger({
+      level: 'trace',
+      sink: (record) => {
+        records.push(record);
+
+        // The file as it stands when the stale chain's decision is taken.
+        if (record.message === CLAIM_CLOSE_LOG) {
+          samples.push(digestOf(path));
+        }
+      },
+    });
+
+    // The stale session's group is the latest-touched, so the pass reaches it
+    // before the live session's.
+    const later = Math.max(liveFirst.record.appliedAt, liveSecond.record.appliedAt) + 60_000;
+
+    for (const link of [stale.first, stale.second]) {
+      world.journal.arrange({ ...world.journal.row(link.record.id), appliedAt: later });
+    }
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await reconcileModifications(
+      { ...world.context, logger },
+      { scopeFor: worldScopes(world) },
+    );
+
+    expect(outcome.status).toBe('clean');
+    expect(outcome.examined).toBe(4);
+    expect(ids(outcome.closed)).toEqual([stale.second.record.id, stale.first.record.id]);
+    expect(ids(outcome.restored)).toEqual([liveSecond.record.id, liveFirst.record.id]);
+    expect(outcome.retained).toEqual([]);
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+
+    // The stale chain closed first, and wrote nothing: the file still held the
+    // live tip's bytes when it was decided, and the only two writes are the
+    // live session's own restores, which then took the file back to pristine.
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: stale.second.record.id, status: 'reverted' },
+      { recordId: stale.first.record.id, status: 'reverted' },
+      { recordId: liveSecond.record.id, status: 'reverted' },
+      { recordId: liveFirst.record.id, status: 'reverted' },
+    ]);
+    expect(samples).toEqual([liveSecond.record.instrumentedHash]);
+    expect(world.log.writes.map((write) => write.expectedHash)).toEqual([
+      liveSecond.record.instrumentedHash,
+      liveFirst.record.instrumentedHash,
+    ]);
+    expectFileBytes(path, stale.pristine);
+
+    // No false conflict for the live session, one listing for the whole pass,
+    // and one decision line carrying identifiers only.
+    expect(world.journal.row(liveSecond.record.id).status).toBe('reverted');
+    expect(openListings(world, mark)).toBe(1);
+    expect(
+      only(
+        records.filter((record) => record.message === CLAIM_CLOSE_LOG),
+        'claim close line',
+      ).fields,
+    ).toEqual({
+      recordId: stale.second.record.id,
+      sessionId: world.sessionId,
+      status: 'conflict',
+      holderRecordIds: [liveSecond.record.id],
+      holderSessionIds: [liveSessionId],
+      closed: 2,
+    });
+
+    // Both sessions left clean, so both backup directories are gone.
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+    expect(existsSync(world.storeFor(liveSessionId).sessionDirectory)).toBe(false);
+  });
+
+  it('is clean in one pass when the live session’s group comes first: restored, then the stale chain closes', async () => {
+    const world = makeWorld();
+    const { stale, liveFirst, liveSecond } = await staleChainUnderLiveSession(world);
+    const earlier = Math.min(liveFirst.record.appliedAt, liveSecond.record.appliedAt) - 60_000;
+
+    for (const link of [stale.first, stale.second]) {
+      world.journal.arrange({ ...world.journal.row(link.record.id), appliedAt: earlier });
+    }
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await reconcileModifications(world.context, { scopeFor: worldScopes(world) });
+
+    expect(outcome.status).toBe('clean');
+    expect(ids(outcome.restored)).toEqual([liveSecond.record.id, liveFirst.record.id]);
+    expect(ids(outcome.closed)).toEqual([stale.second.record.id, stale.first.record.id]);
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: liveSecond.record.id, status: 'reverted' },
+      { recordId: liveFirst.record.id, status: 'reverted' },
+      { recordId: stale.second.record.id, status: 'reverted' },
+      { recordId: stale.first.record.id, status: 'reverted' },
+    ]);
+    expect(world.log.writes).toHaveLength(2);
+    expectFileBytes(stale.second.path, stale.pristine);
+    expect(openListings(world, mark)).toBe(1);
+  });
+
+  it('closes a stale chain on its session’s end while the live session holds the bytes, and leaves the live chain alone', async () => {
+    const { logger, records } = capturingLogger();
+    const world = makeWorld();
+    const { stale, liveSessionId, liveFirst, liveSecond } = await staleChainUnderLiveSession(world);
+    const liveRows = [liveFirst, liveSecond].map((link) => world.journal.row(link.record.id));
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, { ...placedContext(world), logger });
+
+    expect(outcome.status).toBe('clean');
+    expect(ids(outcome.restored)).toEqual([stale.second.record.id, stale.first.record.id]);
+    expect(outcome.restored.map((record) => record.status)).toEqual(['reverted', 'reverted']);
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+
+    // Not a byte written: the file is still the live session's patch, and the
+    // live session's records are exactly as they were.
+    expectNothingWritten(world.log);
+    expectFileBytes(stale.second.path, liveSecond.instrumentedBytes);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: stale.second.record.id, status: 'reverted' },
+      { recordId: stale.first.record.id, status: 'reverted' },
+    ]);
+    expect([liveFirst, liveSecond].map((link) => world.journal.row(link.record.id))).toEqual(
+      liveRows,
+    );
+
+    // No verified deletion was queued — the file does not hold the stale
+    // chain's original — and its backups left with its directory.
+    expect(world.removals).toEqual([]);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+    expect(existsSync(liveFirst.record.backupPath)).toBe(true);
+    expect(existsSync(liveSecond.record.backupPath)).toBe(true);
+
+    // One lazy listing, one decision line, no per-record close wording and no
+    // warning.
+    expect(openListings(world, mark)).toBe(1);
+    expect(records.filter((record) => record.message === CLAIM_CLOSE_LOG)).toHaveLength(1);
+    expect(
+      records.some((record) => record.message.startsWith('a superseded modification was closed')),
+    ).toBe(false);
+    expect(records.filter((record) => record.level === 'warn')).toEqual([]);
+
+    // The live session's own end then restores the file.
+    const liveEnded = await cleanupSession(liveSessionId, placedContext(world, liveSessionId));
+
+    expect(liveEnded.status).toBe('clean');
+    expect(ids(liveEnded.restored)).toEqual([liveSecond.record.id, liveFirst.record.id]);
+    expect(liveEnded.conflicts).toEqual([]);
+    expectFileBytes(stale.second.path, stale.pristine);
+    expect(existsSync(world.storeFor(liveSessionId).sessionDirectory)).toBe(false);
+  });
+
+  it('closes a single stale record the same way, and the live session’s end restores the file', async () => {
+    const world = makeWorld();
+    const stale = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    developerEdits(stale.path);
+    expect((await cleanupSession(world.sessionId, world.context)).status).toBe('conflict');
+    expect(world.journal.row(stale.record.id).status).toBe('conflict');
+    writeFileSync(stale.path, stale.originalBytes);
+
+    const liveSessionId = nextSessionId('live');
+    const live = await patchSymbol(world, {
+      file: TARGET_FILE,
+      symbol: TARGET_SYMBOL,
+      sessionId: liveSessionId,
+    });
+
+    expect(live.record.instrumentedHash).toBe(stale.record.instrumentedHash);
+    expect(live.record.previousRecordId).toBeUndefined();
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, placedContext(world));
+
+    expect(outcome.status).toBe('clean');
+    expect(ids(outcome.restored)).toEqual([stale.record.id]);
+    expect(outcome.failures).toEqual([]);
+    expectNothingWritten(world.log);
+    expectFileBytes(stale.path, live.instrumentedBytes);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: stale.record.id, status: 'reverted' },
+    ]);
+    expect(world.journal.row(live.record.id).status).toBe('applied');
+    expect(world.removals).toEqual([]);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+
+    const liveEnded = await cleanupSession(liveSessionId, placedContext(world, liveSessionId));
+
+    expect(liveEnded.status).toBe('clean');
+    expect(ids(liveEnded.restored)).toEqual([live.record.id]);
+    expectFileBytes(stale.path, stale.originalBytes);
+  });
+
+  it('writes nothing and closes nothing beside a claim that descends from a different original', async () => {
+    const { logger, records } = capturingLogger();
+    const world = makeWorld();
+    const { stale, liveSessionId, liveFirst, liveSecond } = await staleChainUnderLiveSession(world);
+
+    // The live chain's root is journaled as having started from other bytes
+    // than the stale chain's pristine file. No run of the deterministic
+    // transform produces that beside identical output — a wrap records where
+    // its function sat in the file it was given — so the journal is arranged
+    // the way another tool version or a hand-edited journal could leave it:
+    // the two sessions' backups then cannot stand in for each other.
+    const otherOriginal = sha256Hex(Buffer.concat([stale.pristine, Buffer.from(DEVELOPER_EDIT)]));
+
+    world.journal.arrange({
+      ...world.journal.row(liveFirst.record.id),
+      originalHash: otherOriginal,
+    });
+
+    const liveRows = [liveFirst, liveSecond].map((link) => world.journal.row(link.record.id));
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const context = { ...placedContext(world), logger };
+    const outcome = await cleanupSession(world.sessionId, context);
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.restored).toEqual([]);
+    expect(outcome.conflicts).toEqual([]);
+    expect(ids(outcome.skipped)).toEqual([stale.second.record.id, stale.first.record.id]);
+    expect(outcome.skipped.map((record) => record.status)).toEqual(['conflict', 'conflict']);
+
+    const failure = only(outcome.failures, 'withheld restore');
+    expect(failure.recordId).toBe(stale.second.record.id);
+    expect(failure.error.code).toBe('CLEANUP_PARTIAL');
+    expect(failure.error.details).toMatchObject({
+      reason: 'claim-over-another-original',
+      recordId: stale.second.record.id,
+      holderRecordIds: [liveSecond.record.id],
+      holderSessionIds: [liveSessionId],
+    });
+
+    // Nothing written, nothing journaled, every backup where it was, and the
+    // live chain exactly as it stood.
+    expectNothingWritten(world.log);
+    expectFileBytes(stale.second.path, liveSecond.instrumentedBytes);
+    expect(world.journal.transitions(mark)).toEqual([]);
+    expect(world.removals).toEqual([]);
+    expectFileBytes(stale.first.record.backupPath, stale.pristine);
+    expect(existsSync(stale.second.record.backupPath)).toBe(true);
+    expect([liveFirst, liveSecond].map((link) => world.journal.row(link.record.id))).toEqual(
+      liveRows,
+    );
+    expect(
+      only(
+        records.filter((record) => record.message === CLAIM_REFUSAL_LOG),
+        'refusal line',
+      ).fields,
+    ).toEqual({
+      recordId: stale.second.record.id,
+      sessionId: world.sessionId,
+      status: 'conflict',
+      reason: 'claim-over-another-original',
+      holderRecordIds: [liveSecond.record.id],
+      holderSessionIds: [liveSessionId],
+    });
+
+    // The other two entry points refuse the same write the same way, and so
+    // does the same pass run again: the refusal is state, not luck.
+    const rows = [stale.first, stale.second].map((link) => world.journal.row(link.record.id));
+    const chained = await restoreChain(rows, context);
+
+    expect(chained.restored).toEqual([]);
+    expect(chained.closed).toEqual([]);
+    expect(ids(chained.skipped)).toEqual([stale.second.record.id, stale.first.record.id]);
+    expect(only(chained.failures, 'withheld chain restore').error.details?.['reason']).toBe(
+      'claim-over-another-original',
+    );
+
+    const single = refusalOf(
+      await restoreModification(world.journal.row(stale.second.record.id), context),
+      'the stale tip on its own',
+    );
+
+    expect(single.details?.['reason']).toBe('claim-over-another-original');
+
+    const again = await cleanupSession(world.sessionId, context);
+
+    expect(again.status).toBe('conflict');
+    expect(only(again.failures, 'withheld restore, again').error.details?.['reason']).toBe(
+      'claim-over-another-original',
+    );
+    expectNothingWritten(world.log);
+    expect(world.journal.transitions(mark)).toEqual([]);
+    expectFileBytes(stale.second.path, liveSecond.instrumentedBytes);
+  });
+
+  it('never defers to another session’s record in conflict: the live session’s own end restores normally', async () => {
+    const world = makeWorld();
+    const { stale, liveSessionId, liveFirst, liveSecond } = await staleChainUnderLiveSession(world);
+
+    // Journaled after the live chain, so only their status — not their age —
+    // keeps the stale records from counting as a claim.
+    const later = Math.max(liveFirst.record.appliedAt, liveSecond.record.appliedAt) + 60_000;
+
+    for (const link of [stale.first, stale.second]) {
+      world.journal.arrange({ ...world.journal.row(link.record.id), appliedAt: later });
+    }
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const liveEnded = await cleanupSession(liveSessionId, placedContext(world, liveSessionId));
+
+    expect(liveEnded.status).toBe('clean');
+    expect(ids(liveEnded.restored)).toEqual([liveSecond.record.id, liveFirst.record.id]);
+    expect(liveEnded.failures).toEqual([]);
+    expect(world.log.writes.map((write) => write.expectedHash)).toEqual([
+      liveSecond.record.instrumentedHash,
+      liveFirst.record.instrumentedHash,
+    ]);
+    expectFileBytes(stale.second.path, stale.pristine);
+
+    // The stale chain was neither written for nor touched.
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: liveSecond.record.id, status: 'reverted' },
+      { recordId: liveFirst.record.id, status: 'reverted' },
+    ]);
+    expect(world.journal.row(stale.second.record.id).status).toBe('conflict');
+    expect(world.journal.row(stale.first.record.id).status).toBe('conflict');
+  });
+
+  it('refuses every write that needs the listing when the other sessions’ records cannot be read', async () => {
+    const world = makeWorld();
+    const chain = await patchTwoLinks(world);
+    const other = await patchSymbol(world, { file: OTHER_FILE, symbol: OTHER_SYMBOL });
+    const failing = journalWithoutListing(world.journal);
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, {
+      ...world.context,
+      journal: failing.journal,
+    });
+
+    expect(outcome.status).toBe('partial');
+    expect(outcome.restored).toEqual([]);
+    expect(outcome.conflicts).toEqual([]);
+    expect(ids(outcome.skipped)).toEqual([
+      other.record.id,
+      chain.second.record.id,
+      chain.first.record.id,
+    ]);
+    expect(outcome.failures.map((failure) => failure.recordId)).toEqual([
+      other.record.id,
+      chain.second.record.id,
+    ]);
+
+    for (const failure of outcome.failures) {
+      expect(failure.error.code).toBe('STORE_ERROR');
+      expect(failure.error.details?.['reason']).toBe('open-records-unreadable');
+    }
+
+    // One listing for the pass, however many files needed it, and nothing
+    // written or journaled for any of them.
+    expect(failing.listings()).toBe(1);
+    expectNothingWritten(world.log);
+    expect(world.journal.transitions(mark)).toEqual([]);
+    expect(world.removals).toEqual([]);
+    expectFileBytes(chain.second.path, chain.second.instrumentedBytes);
+    expectFileBytes(other.path, other.instrumentedBytes);
+
+    for (const record of [other.record, chain.first.record, chain.second.record]) {
+      expect(world.journal.row(record.id).status).toBe('applied');
+      expect(existsSync(record.backupPath)).toBe(true);
+    }
+
+    // The installer's single-record rollback refuses the same way.
+    const single = refusalOf(
+      await restoreModification(world.journal.row(other.record.id), {
+        ...world.context,
+        journal: failing.journal,
+      }),
+      'a rollback without the listing',
+    );
+
+    expect(single.details?.['reason']).toBe('open-records-unreadable');
+    expectNothingWritten(world.log);
+
+    // A journal that answers again restores everything.
+    expect((await cleanupSession(world.sessionId, world.context)).status).toBe('clean');
+    expectFileBytes(chain.second.path, chain.pristine);
+    expectFileBytes(other.path, other.originalBytes);
+  });
+
+  it('refuses a claim it cannot place, in the per-session shape a start-up pass takes, writing and closing nothing', async () => {
+    const world = makeWorld();
+    const { stale, liveSessionId, liveSecond } = await staleChainUnderLiveSession(world);
+
+    world.resetLog();
+
+    const mark = world.mark();
+
+    // The service's start-up shape: one session at a time, no resolver.
+    const reconciled = await reconcileModifications(world.context, {
+      sessionIds: [world.sessionId],
+    });
+
+    expect(reconciled.status).toBe('conflict');
+    expect(reconciled.closed).toEqual([]);
+    expect(reconciled.restored).toEqual([]);
+    expect(ids(reconciled.skipped)).toEqual([stale.second.record.id, stale.first.record.id]);
+    expect(only(reconciled.failures, 'unplaced claim').error.details).toMatchObject({
+      reason: 'claim-unplaced',
+      holderRecordIds: [liveSecond.record.id],
+      holderSessionIds: [liveSessionId],
+    });
+
+    const ended = await cleanupSession(world.sessionId, world.context);
+
+    expect(ended.status).toBe('conflict');
+    expect(ended.restored).toEqual([]);
+    expect(only(ended.failures, 'unplaced claim').error.details?.['reason']).toBe('claim-unplaced');
+    expectNothingWritten(world.log);
+    expect(world.journal.transitions(mark)).toEqual([]);
+    expectFileBytes(stale.second.path, liveSecond.instrumentedBytes);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+
+    // The live session's end restores the file; the stale chain then closes
+    // over the pristine file on its next pass, still without a resolver.
+    const liveEnded = await cleanupSession(liveSessionId, {
+      ...world.context,
+      backups: world.storeFor(liveSessionId),
+    });
+
+    expect(liveEnded.status).toBe('clean');
+    expectFileBytes(stale.second.path, stale.pristine);
+
+    const again = await cleanupSession(world.sessionId, world.context);
+
+    expect(again.status).toBe('clean');
+    expect(ids(again.restored)).toEqual([stale.second.record.id, stale.first.record.id]);
+    expectFileBytes(stale.second.path, stale.pristine);
+  });
+
+  it('restores its own project over identical bytes another session holds in a copy of it', async () => {
+    const world = makeWorld();
+    const copy = join(world.root, 'copy');
+
+    cpSync(FIXTURE_PROJECT, copy, { recursive: true });
+
+    const own = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const elsewhere = nextSessionId('copy');
+    const patched = await createPatcher({
+      projectRoot: copy,
+      sessionId: elsewhere,
+      planVersion: 1,
+      backups: world.storeFor(elsewhere),
+      journal: world.journal,
+    }).patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const theirs = expectOk(patched, 'the copy’s patch').record;
+    const copyBytes = readFileSync(join(copy, TARGET_FILE));
+
+    expect(theirs.file).toBe(own.record.file);
+    expect(theirs.instrumentedHash).toBe(own.record.instrumentedHash);
+    expect(theirs.appliedAt).toBeGreaterThanOrEqual(own.record.appliedAt);
+
+    world.resetLog();
+
+    // Unplaced, the copy's claim could be this very file: nothing is written.
+    const unplaced = await cleanupSession(world.sessionId, world.context);
+
+    expect(unplaced.status).toBe('partial');
+    expect(only(unplaced.failures, 'unplaced claim').error.details?.['reason']).toBe(
+      'claim-unplaced',
+    );
+    expectNothingWritten(world.log);
+    expectFileBytes(own.path, own.instrumentedBytes);
+
+    // Placed, it is another file: this project is restored, the copy is not
+    // touched.
+    const placed = await cleanupSession(world.sessionId, {
+      ...world.context,
+      projectRootOf: (sessionId: string): string =>
+        sessionId === elsewhere ? copy : world.projectRoot,
+    });
+
+    expect(placed.status).toBe('clean');
+    expect(ids(placed.restored)).toEqual([own.record.id]);
+    expect(placed.failures).toEqual([]);
+    expectFileBytes(own.path, own.originalBytes);
+    expectFileBytes(join(copy, TARGET_FILE), copyBytes);
+    expect(world.journal.row(theirs.id).status).toBe('applied');
+  });
+
+  it('restores a live record over an older claim of another session that went stale', async () => {
+    const world = makeWorld();
+    const staleSessionId = nextSessionId('stale');
+    const stale = await patchSymbol(world, {
+      file: TARGET_FILE,
+      symbol: TARGET_SYMBOL,
+      sessionId: staleSessionId,
+    });
+
+    // The developer put the committed file back while that record still says
+    // `applied` — the state a journal written before chain retention can hold.
+    writeFileSync(stale.path, stale.originalBytes);
+
+    const live = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    expect(live.record.instrumentedHash).toBe(stale.record.instrumentedHash);
+    world.journal.arrange({
+      ...world.journal.row(stale.record.id),
+      appliedAt: live.record.appliedAt - 60_000,
+    });
+    world.resetLog();
+
+    // The installer unwinding the live record it just applied.
+    const rolledBack = expectOk(
+      await restoreModification(world.journal.row(live.record.id), placedContext(world)),
+      'the rollback of the live record',
+    );
+
+    expect(rolledBack.kind).toBe('restored');
+    expect(rolledBack.wrote).toBe(true);
+    expectFileBytes(live.path, live.originalBytes);
+    expect(world.journal.row(stale.record.id).status).toBe('applied');
+  });
+
+  it('closes a stale applied record beside a newer live claim of another session on the same original', async () => {
+    const world = makeWorld();
+    const staleSessionId = nextSessionId('stale');
+    const stale = await patchSymbol(world, {
+      file: TARGET_FILE,
+      symbol: TARGET_SYMBOL,
+      sessionId: staleSessionId,
+    });
+
+    writeFileSync(stale.path, stale.originalBytes);
+
+    const live = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    world.journal.arrange({
+      ...world.journal.row(stale.record.id),
+      appliedAt: live.record.appliedAt - 60_000,
+    });
+    world.resetLog();
+
+    const staleEnded = await cleanupSession(staleSessionId, placedContext(world, staleSessionId));
+
+    expect(staleEnded.status).toBe('clean');
+    expect(ids(staleEnded.restored)).toEqual([stale.record.id]);
+    expectNothingWritten(world.log);
+    expectFileBytes(live.path, live.instrumentedBytes);
+    expect(world.journal.row(live.record.id).status).toBe('applied');
+
+    const liveEnded = await cleanupSession(world.sessionId, placedContext(world));
+
+    expect(liveEnded.status).toBe('clean');
+    expect(ids(liveEnded.restored)).toEqual([live.record.id]);
+    expectFileBytes(live.path, live.originalBytes);
   });
 });
 
@@ -2104,6 +4045,19 @@ describe('a file whose records do not form a single chain', () => {
       expect(conflict.detectedAt).toBe(FIXED_NOW);
       expect(conflict.message).toContain('layered on the same earlier record');
       expect(conflict.message).toContain(conflict.recordId);
+
+      // Each branch still descends from one pristine original — the parent's
+      // backup — and its report names it beside the branch's own backup, which
+      // holds the parent's instrumented output. The parent's own backup already
+      // is the pristine file, so its report adds nothing.
+      if (conflict.recordId === fork.parent.record.id) {
+        expect(conflict.originalBackupPath).toBeUndefined();
+        expect(conflict.backupPath).toBe(fork.parent.record.backupPath);
+      } else {
+        expect(conflict.originalBackupPath).toBe(fork.parent.record.backupPath);
+        expect(conflict.backupPath).toBe(world.backupPathOf(fork.right.record.originalHash));
+        expect(conflict.message).toContain(fork.parent.record.backupPath);
+      }
     }
 
     // The structured account, with the stable reason.

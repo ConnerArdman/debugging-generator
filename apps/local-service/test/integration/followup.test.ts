@@ -3045,6 +3045,158 @@ describe('a follow-up naming a declaration the real provider times as a chained 
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * A follow-up refines the panel it answers (AAP §0.8.1 slice 11, "follow-up refines the panel")
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The inspected tab of the session whose follow-ups refine its panel. */
+const REFINEMENT_TAB = 47;
+
+/** The analyze stage, as the provider's request metadata names it. */
+const ANALYZE_REQUEST_STAGE = 'analyze';
+
+/** The generate-panel stage, as the provider's request metadata names it. */
+const PANEL_REQUEST_STAGE = 'generate-panel';
+
+/** The structured `input` of the latest provider request made for `stage` since call index `from`. */
+function latestStageInputSince(stage: string, from: number): Readonly<Record<string, unknown>> {
+  const call = last(
+    scripted.calls.slice(from).filter((entry) => entry.stage === stage),
+    `${stage} request since call ${String(from)}`,
+  );
+  return structuredInputOf(call.request);
+}
+
+/** The node types of a panel's top-level layout, in layout order. */
+function layoutTypesOf(panel: PanelSpec): string[] {
+  return panel.layout.map((node) => node.type);
+}
+
+/** The statements of an analysis's observed facts, in their order. */
+function observedStatementsOf(analysis: AnalysisResult): string[] {
+  return analysis.observed.map((fact) => fact.statement);
+}
+
+describe('a follow-up that refines the panel it answers', () => {
+  /** The session both refinements are asked on. */
+  let session: LiveSession;
+
+  beforeAll(async () => {
+    const project = await harness.copyFixtureProject();
+    session = await openReadySession(project, REFINEMENT_TAB, REAL_SESSION_QUESTION);
+    await captureAndSettle(session, fullCoverageCapture());
+  });
+
+  afterEach(releaseRealDecisionClaims);
+
+  it('regenerates a query-focused panel from the stored evidence for a follow-up about queries', async () => {
+    const question = 'Why did these database queries run so often?';
+    const analysesBefore = analysesOf(session.id);
+    const panelsBefore = panelsOf(session.id);
+    const previousAnalysis = last(analysesBefore, 'analysis');
+    const previousPanel = last(panelsBefore, 'panel');
+    const callsBefore = scripted.calls.length;
+
+    // The first question's panel carried no focus: nothing governed it but its own capture.
+    const firstPanelInput = latestStageInputSince(PANEL_REQUEST_STAGE, 0);
+    expect(firstPanelInput['followUpFocus']).toBeUndefined();
+
+    await askRealFollowUp(session, question);
+    await waitForStored(
+      session.id,
+      (record) =>
+        record.status === STATUS.generated &&
+        record.analyses.length === analysesBefore.length + 1 &&
+        record.panelIds.length === panelsBefore.length + 1,
+      'the query follow-up regenerated the analysis and the panel from the stored capture',
+    );
+    expect(realDecisionsPending).toBe(0);
+
+    // Both regenerations read the follow-up's structured focus — its category, and no
+    // declaration, since the question names none — and never a word of the question.
+    const expectedFocus = { categoryHints: ['data'], declarations: [] };
+    for (const stage of [ANALYZE_REQUEST_STAGE, PANEL_REQUEST_STAGE]) {
+      const input = latestStageInputSince(stage, callsBefore);
+      expect(input['followUpFocus']).toEqual(expectedFocus);
+      expect(JSON.stringify(input)).not.toContain(question);
+    }
+
+    const analysis = last(analysesOf(session.id), 'analysis');
+    const panel = last(panelsOf(session.id), 'panel');
+    expect(analysis.supersedes).toBe(previousAnalysis.id);
+    expect(analysis.captureId).toBe(previousAnalysis.captureId);
+    expect(panel.supersedes).toBe(previousPanel.id);
+    unwrap(validatePanelSpec(panel), 'validatePanelSpec');
+
+    // The refinement is visible: a different title naming the queried class of work, a
+    // query-first layout, a headline that says what it focuses on, and the observed facts
+    // re-ranked for the question — all drawn from the same stored capture.
+    expect(panel.title).not.toBe(previousPanel.title);
+    expect(panel.title.startsWith('Database queries')).toBe(true);
+    expect(panel.summary.headline ?? '').toMatch(/Focused on database queries\.$/u);
+    expect(layoutTypesOf(panel)).not.toEqual(layoutTypesOf(previousPanel));
+    expect(layoutTypesOf(panel).filter((type) => type !== 'metricCards')[0]).toBe('queryTable');
+    expect(observedStatementsOf(analysis)).not.toEqual(observedStatementsOf(previousAnalysis));
+    expect(panel.summary.observed).toEqual(analysis.observed);
+  });
+
+  it('titles and leads the panel of the new capture with the declaration a follow-up named', async () => {
+    const question = 'How long does loadTrailReport take on its own?';
+    const plansBefore = plansOf(session.id);
+
+    await askRealFollowUp(session, question);
+    await waitForStored(
+      session.id,
+      (record) => record.status === STATUS.ready && record.plans.length === plansBefore.length + 1,
+      'the named function is timed by plan version n + 1',
+    );
+    expect(realDecisionsPending).toBe(0);
+    const plan = last(plansOf(session.id), 'plan version');
+    expect(
+      plan.instrumentationTargets.some(
+        (action) =>
+          action.file === CORPUS.serviceFile &&
+          action.symbol === CORPUS.loadSymbol &&
+          action.type === ACTION_TYPE.functionTiming,
+      ),
+    ).toBe(true);
+
+    // The next capture ran under the follow-up's plan version, so the orchestrator's analyze and
+    // generate-panel runs — which carry no follow-up question — still answer the follow-up.
+    const callsBefore = scripted.calls.length;
+    await captureAndSettle(session, fullCoverageCapture());
+    for (const stage of [ANALYZE_REQUEST_STAGE, PANEL_REQUEST_STAGE]) {
+      const input = latestStageInputSince(stage, callsBefore);
+      expect(input['followUpFocus']).toEqual({
+        categoryHints: ['performance'],
+        declarations: [
+          expect.objectContaining({ file: CORPUS.serviceFile, symbol: CORPUS.loadSymbol }),
+        ],
+      });
+      expect(JSON.stringify(input)).not.toContain(question);
+    }
+
+    const panel = last(panelsOf(session.id), 'panel');
+    const analysis = last(analysesOf(session.id), 'analysis');
+    unwrap(validatePanelSpec(panel), 'validatePanelSpec');
+    expect(panel.title).toBe(`Latency — ${CORPUS.loadSymbol}`);
+    expect(panel.summary.headline ?? '').toMatch(
+      new RegExp(`Focused on ${CORPUS.loadSymbol}\\.$`, 'u'),
+    );
+    // The named function's own measurement leads the observed facts, citing the captured spans.
+    const lead = analysis.observed[0];
+    expect(lead?.statement.startsWith(`${CORPUS.loadSymbol} ran `)).toBe(true);
+    expect(lead?.evidence.length ?? 0).toBeGreaterThan(0);
+  });
+
+  it('ends the session with every patch restored and the copy byte-identical', async () => {
+    const ended = unwrap(await harness.endSession(session.id), 'session.end');
+    expect(ended.cleanup).toBe(CLEANUP.clean);
+    await assertTreeUnchanged(session.project.root, session.project.snapshot);
+    expect(storedSession(session.id).status).toBe(STATUS.ended);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
  * The followups log and the session record: one durable history
  * ---------------------------------------------------------------------------------------------- */
 

@@ -954,3 +954,86 @@ describe('analyze stage: the stored metrics, the fact candidates and the result 
     expect(accepted).toBe(0);
   });
 });
+
+describe('analyze stage: the follow-up focus the summarizer is handed (AAP §0.4.2, Follow-up row)', () => {
+  /** An invented follow-up about a failing request: error and network hints, no declaration. */
+  const FOLLOW_UP = 'Why did the tally request fail?';
+  const FOLLOW_UP_FOCUS = { categoryHints: ['error', 'network'], declarations: [] };
+
+  /** Runs the stage over `context` and returns the one request its summarizer received. */
+  async function summarizerRequestFor(
+    context: PipelineStageContext,
+  ): Promise<AnalysisStageInputRequest | undefined> {
+    const requests: AnalysisStageInputRequest[] = [];
+    const build = fakeBuild({ metrics: [] } as unknown as CaptureSummary);
+    const stage = createAnalyzeStage(
+      deps({
+        summarizer: {
+          buildStageInput: (request) => {
+            requests.push(request);
+            return Promise.resolve(ok(build));
+          },
+        },
+      }),
+    );
+    const result = await stage.run(context, RUN_INPUT);
+    expect(result.ok).toBe(true);
+    expect(requests).toHaveLength(1);
+    return requests[0];
+  }
+
+  /** The suite's context over a session whose capture ran under `planVersion`. */
+  function capturedUnder(
+    planVersion: number,
+    followUps: SessionRecord['followUps'],
+  ): PipelineStageContext {
+    const base = stageContext();
+    return {
+      ...base,
+      captureId: CAPTURE_ID,
+      session: {
+        ...base.session,
+        captures: [{ id: CAPTURE_ID, planVersion, startedAt: FIXED_EPOCH_MS }],
+        followUps,
+      },
+    };
+  }
+
+  it('hands no focus member for the session’s first question', async () => {
+    const request = await summarizerRequestFor(stageContext());
+    expect(Object.hasOwn(request ?? {}, 'followUpFocus')).toBe(false);
+
+    const firstCapture = await summarizerRequestFor(
+      capturedUnder(1, [
+        { question: FOLLOW_UP, askedAt: FIXED_EPOCH_MS, needsNewCapture: true, planVersion: 2 },
+      ]),
+    );
+    expect(Object.hasOwn(firstCapture ?? {}, 'followUpFocus')).toBe(false);
+  });
+
+  it('hands the focus of the follow-up the context names, beside the follow-up itself', async () => {
+    const request = await summarizerRequestFor({ ...stageContext(), followUpQuestion: FOLLOW_UP });
+    expect(request?.followUpFocus).toStrictEqual(FOLLOW_UP_FOCUS);
+    expect(request?.followUpQuestion).toBe(FOLLOW_UP);
+  });
+
+  it('hands the focus of the new-capture follow-up whose plan version the capture ran under', async () => {
+    const request = await summarizerRequestFor(
+      capturedUnder(2, [
+        { question: FOLLOW_UP, askedAt: FIXED_EPOCH_MS, needsNewCapture: true, planVersion: 2 },
+      ]),
+    );
+    expect(request?.followUpFocus).toStrictEqual(FOLLOW_UP_FOCUS);
+    expect(request?.followUpQuestion).toBeUndefined();
+    expect(JSON.stringify(request?.followUpFocus)).not.toMatch(/tally|fail|Why/u);
+  });
+
+  it('hands the focus the context carries unchanged in content', async () => {
+    const carried = {
+      categoryHints: ['data'],
+      declarations: [{ file: 'src/ledger/totals.ts', symbol: 'settleTotals', kind: 'symbol' }],
+    };
+    const request = await summarizerRequestFor({ ...stageContext(), followUpFocus: carried });
+    expect(request?.followUpFocus).toStrictEqual(carried);
+  });
+});

@@ -41,7 +41,12 @@
  * 8. **A sweep keeps the write-ahead log bounded off the event loop.** While a
  *    real sweep deletes, the connection's commit-time checkpoint is suspended
  *    and the sweep waits for background checkpoints instead; the threshold is
- *    restored however the sweep ends, and a dry run leaves it alone.
+ *    restored however the sweep ends, and a dry run leaves it alone. Those
+ *    exact outcomes are asserted on a store opened without its own background
+ *    checkpointer, so every checkpoint of the file is one the sweep asked for;
+ *    beside that checkpointer, a sweep still deletes what it should, never
+ *    fails a wait, and leaves the commit-time checkpoint with the worker
+ *    whenever its handover lands.
  *
  * The store is the real one: `openStore` against a file in an `mkdtemp`
  * sandbox — never `:memory:` — so WAL and the `foreign_keys` pragma behave as
@@ -127,7 +132,7 @@ import { SECURE_DIR_MODE, sha256OfFileSync } from '@debuggen/shared/node';
 import { canonicalizePath } from '../config.js';
 import { openStore } from './db.js';
 import type * as DbModule from './db.js';
-import type { Store, WalCheckpointer } from './db.js';
+import type { OpenStoreOptions, Store, WalCheckpointer } from './db.js';
 import {
   SELECT_SESSION_BACKUP_REFERENCES_SQL,
   createModificationsRepo,
@@ -172,7 +177,9 @@ import type { PersistableTelemetryEvent, TelemetryRepo } from './telemetry-repo.
  * How many of the sweep's next background checkpoints answer as if another
  * connection held the checkpoint lock, the way the store's own background
  * checkpointer does when its interval meets a sweep's wait. `0` everywhere but
- * the test that sets it, so every other checkpoint passes through untouched.
+ * the test that sets it, so every other checkpoint passes through untouched;
+ * the write-ahead-log describes reset it before and after each of their tests,
+ * so not even a test that fails before its own `finally` can leak it.
  */
 const walContention = vi.hoisted(() => ({ remaining: 0 }));
 
@@ -372,8 +379,12 @@ let h: Harness;
  * the journal is spelled exactly as the sweep's own directory walk spells it,
  * and so the store's own canonical-path check holds on hosts whose temporary
  * directory is reached through a link.
+ *
+ * @param options `backgroundCheckpoint` is forwarded to `openStore`: `false`
+ * opens the store without its own background checkpointer, for the tests that
+ * assert every checkpoint of the file exactly. The default is the service's.
  */
-function createHarness(): Harness {
+function createHarness(options: Pick<OpenStoreOptions, 'backgroundCheckpoint'> = {}): Harness {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'debuggen-retention-')));
   const home = join(root, 'home');
   const backupsDir = join(home, 'backups');
@@ -386,7 +397,13 @@ function createHarness(): Harness {
 
   const logs: CapturedLog[] = [];
   const logger = createCapturingLogger(logs);
-  const store = unwrap(openStore({ databasePath: join(home, 'sessions.sqlite'), logger }));
+  const store = unwrap(
+    openStore({
+      databasePath: join(home, 'sessions.sqlite'),
+      logger,
+      backgroundCheckpoint: options.backgroundCheckpoint,
+    }),
+  );
   const clock = { now: NOW };
   const now = (): number => clock.now;
 
@@ -1978,6 +1995,175 @@ describe('Rule 3: orphan backups', () => {
     expect(report.backupDirsDeleted).toBe(1);
     expect(report.orphanBackupsDeleted).toBe(0);
     expect(present(join(h.backupsDir, sessionId))).toBe(false);
+  });
+
+  /**
+   * `backups/<sessionId>/`, created private and left empty — what an unwound
+   * install leaves once its restore has deleted the only backup in it.
+   */
+  function makeEmptyBackupDirectory(harness: Harness, sessionId: SessionId): string {
+    const directory = join(harness.backupsDir, sessionId);
+    mkdirSync(directory, { mode: SECURE_DIR_MODE });
+    return directory;
+  }
+
+  /** The debug records of empty directories the orphan rule kept, as `[sessionId, reason]`. */
+  function keptEmptyDirectories(harness: Harness): (readonly [unknown, unknown])[] {
+    return harness.logs
+      .filter((log) => log.message === 'an empty session backup directory is kept')
+      .map((log) => [log.fields['sessionId'], log.fields['reason']] as const);
+  }
+
+  it('removes an empty session directory whose session is at rest or gone, and counts it', async () => {
+    const resting = RESTING_STATUSES.map((status) => seedSession(h, { status }));
+    const ghost = fixedSessionId('emptyghost');
+    const directories = [...resting, ghost].map((sessionId) =>
+      makeEmptyBackupDirectory(h, sessionId),
+    );
+
+    const report = await sweep(h);
+
+    expect(report.backupDirsDeleted).toBe(directories.length);
+    expect(report.orphanBackupsDeleted).toBe(0);
+    expect(report.sessionsDeleted).toBe(0);
+    expect(report.errors).toEqual([]);
+    for (const directory of directories) {
+      expect(present(directory)).toBe(false);
+    }
+    // Only the directories went: every session's row is exactly where it was.
+    for (const sessionId of resting) {
+      expect(sessionExists(h, sessionId)).toBe(true);
+    }
+    expect(present(h.backupsDir)).toBe(true);
+    expect(keptEmptyDirectories(h)).toEqual([]);
+  });
+
+  it('keeps the empty directory of a session in flight, which may be about to file its first backup', async () => {
+    const inFlight = IN_FLIGHT_SESSION_STATUSES.map((status) => seedSession(h, { status }));
+    const directories = inFlight.map((sessionId) => makeEmptyBackupDirectory(h, sessionId));
+
+    const report = await sweep(h);
+
+    expect(report.backupDirsDeleted).toBe(0);
+    expect(report.errors).toEqual([]);
+    for (const directory of directories) {
+      expect(present(directory)).toBe(true);
+    }
+    expect(keptEmptyDirectories(h)).toEqual(
+      [...inFlight].sort().map((sessionId) => [sessionId, 'in-flight'] as const),
+    );
+  });
+
+  it('keeps the empty directory of a session reported in use, and reads a failing answer as in use', async () => {
+    const claimed = seedSession(h, { status: 'ended' });
+    const unanswered = seedSession(h, { status: 'failed' });
+    const free = seedSession(h, { status: 'ended' });
+    const claimedGhost = fixedSessionId('claimedghost');
+    for (const sessionId of [claimed, unanswered, free, claimedGhost]) {
+      makeEmptyBackupDirectory(h, sessionId);
+    }
+    const asked: SessionId[] = [];
+
+    const report = await sweep(
+      h,
+      {},
+      {
+        isSessionInUse: (sessionId) => {
+          asked.push(sessionId);
+          if (sessionId === unanswered) {
+            throw new Error(SENTINEL);
+          }
+          return sessionId === claimed || sessionId === claimedGhost;
+        },
+      },
+    );
+
+    expect(report.backupDirsDeleted).toBe(1);
+    expect(report.errors).toEqual([]);
+    expect(present(join(h.backupsDir, free))).toBe(false);
+    for (const sessionId of [claimed, unanswered, claimedGhost]) {
+      expect(present(join(h.backupsDir, sessionId))).toBe(true);
+    }
+    // The caller is asked about every empty directory's session, a row or not.
+    expect(asked.sort()).toEqual([claimed, unanswered, free, claimedGhost].sort());
+    expect(keptEmptyDirectories(h)).toEqual(
+      [claimed, unanswered, claimedGhost].sort().map((sessionId) => [sessionId, 'in-use'] as const),
+    );
+    expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
+  });
+
+  it('counts an empty directory on a dry run and keeps it, and the real sweep then removes it', async () => {
+    const sessionId = seedSession(h, { status: 'ended' });
+    const directory = makeEmptyBackupDirectory(h, sessionId);
+    const treeBefore = snapshotTree(h);
+
+    const dry = await sweep(h, { dryRun: true });
+
+    expect(dry.backupDirsDeleted).toBe(1);
+    expect(present(directory)).toBe(true);
+    expect(snapshotTree(h)).toEqual(treeBefore);
+
+    const report = await sweep(h);
+
+    expect(comparable(report)).toEqual(comparable(dry));
+    expect(present(directory)).toBe(false);
+  });
+
+  it('still leaves a directory holding only a young file untouched, whatever its session', async () => {
+    const resting = seedSession(h, { status: 'ended' });
+    const ghost = fixedSessionId('youngghost');
+    const young = [resting, ghost].map((sessionId) =>
+      writeLooseBackup(h, sessionId, hashOf(h, `young:${sessionId}`), daysAgo(1)),
+    );
+
+    const report = await sweep(h);
+
+    expect(report.backupDirsDeleted).toBe(0);
+    expect(report.orphanBackupsDeleted).toBe(0);
+    expect(report.errors).toEqual([]);
+    for (const file of young) {
+      expect(present(file)).toBe(true);
+    }
+    expect(keptEmptyDirectories(h)).toEqual([]);
+  });
+
+  it('keeps an empty directory, and records the failure by a fixed sentence, when its session cannot be read', async () => {
+    const sessionId = seedSession(h, { status: 'ended' });
+    const directory = makeEmptyBackupDirectory(h, sessionId);
+    // The sweep's own read of a session's state; the repositories keep the
+    // real store, so only that read fails.
+    const failing = new Proxy(h.store, {
+      get(target, key): unknown {
+        if (key === 'statement') {
+          return (sql: string): StatementSync => {
+            if (sql === 'SELECT updated_at, status FROM sessions WHERE id = ?') {
+              throw new Error(SENTINEL);
+            }
+            return target.statement(sql);
+          };
+        }
+        const value: unknown = Reflect.get(target, key);
+        return typeof value === 'function'
+          ? (value as (...args: unknown[]) => unknown).bind(target)
+          : value;
+      },
+    });
+
+    const report = await sweep(h, {}, { store: failing });
+
+    const target = relativeToHome(h, directory);
+    expect(present(directory)).toBe(true);
+    expect(report.backupDirsDeleted).toBe(0);
+    expect(issuesAt(report, 'backup', target)).toEqual([
+      {
+        scope: 'backup',
+        target,
+        message: `The state of session ${sessionId} could not be read from the session store, so its empty backup directory ${target} was kept.`,
+      },
+    ]);
+    expect(keptEmptyDirectories(h)).toEqual([[sessionId, 'unreadable']]);
+    expect(JSON.stringify(report)).not.toContain(SENTINEL);
+    expect(JSON.stringify(h.logs)).not.toContain(SENTINEL);
   });
 });
 
@@ -4418,8 +4604,22 @@ describe('scoped sweeps: a directory-shaped cache entry is inspected whole', () 
  * The write-ahead log during a sweep
  * ---------------------------------------------------------------------------------------------- */
 
-/** SQLite's default commit-time checkpoint threshold, which the store never changes. */
+/**
+ * SQLite's default commit-time checkpoint threshold: what a store opened
+ * without its background checkpointer keeps, and what a sweep over it
+ * restores. A store with that checkpointer running holds it at `0` instead.
+ */
 const DEFAULT_AUTOCHECKPOINT_PAGES = 1_000;
+
+/**
+ * How long a test waits for the store's own background checkpointer to take
+ * over: generous, because the worker's thread and connection start on a host
+ * that may be loaded.
+ */
+const HANDOVER_WAIT = { timeout: 15_000, interval: 20 } as const;
+
+/** The timeout of a test that waits for that handover: {@link HANDOVER_WAIT} and room for the sweep. */
+const HANDOVER_TEST_TIMEOUT_MS = 30_000;
 
 /** The debug record of each background checkpoint the sweep waited for. */
 const BACKGROUND_CHECKPOINT_MESSAGE =
@@ -4444,7 +4644,33 @@ function walFileBytes(harness: Harness): number {
   return existsSync(wal) ? statSync(wal).size : 0;
 }
 
+/**
+ * The records of the waits a sweep made for a background checkpoint: completed
+ * or busy, pre-empted by another connection, or failed. Only those carry the
+ * log's size, `walBytes`; the store's own checkpoint records do not.
+ */
+function sweepWaits(harness: Harness): CapturedLog[] {
+  return harness.logs.filter(
+    (log) => typeof log.fields['walBytes'] === 'number' && 'checkpoint' in log.fields,
+  );
+}
+
 describe('the write-ahead log during a sweep', () => {
+  beforeEach(() => {
+    // The store's own background checkpointer checkpoints `PASSIVE` on its
+    // interval, and takes the commit-time checkpoint over whenever its worker
+    // is ready; beside it a wait can be pre-empted and a restored threshold
+    // read `0`. Without it, every checkpoint of the file is the sweep's, so the
+    // exact outcomes below hold on any host. The file-wide harness is still in
+    // `harnesses`, and `afterEach` disposes both.
+    h = createHarness({ backgroundCheckpoint: false });
+    walContention.remaining = 0;
+  });
+
+  afterEach(() => {
+    walContention.remaining = 0;
+  });
+
   it('documents the bound a sweep keeps the log to', () => {
     expect(RETENTION_WAL_CHECKPOINT_BYTES).toBe(32 * 1024 * 1024);
   });
@@ -4627,4 +4853,93 @@ describe('the write-ahead log during a sweep', () => {
     expect(sessionExists(h, aged)).toBe(true);
     expect(autoCheckpointOf(h)).toBe(DEFAULT_AUTOCHECKPOINT_PAGES);
   });
+});
+
+/**
+ * The same sweeps on the file-wide harness, whose store runs its own
+ * background checkpointer as the service's does. When that worker's handover
+ * lands, and whether its interval meets one of the sweep's waits, depends on
+ * the host, so only what holds for every interleaving is asserted: the
+ * deletion, the suspension, the threshold the worker is left with, and that a
+ * wait is only ever completed, busy or pre-empted — never failed.
+ */
+describe('the write-ahead log during a sweep, beside the store’s own background checkpointer', () => {
+  beforeEach(() => {
+    walContention.remaining = 0;
+  });
+
+  afterEach(() => {
+    walContention.remaining = 0;
+  });
+
+  /** Asserts that every wait the sweep made was completed, busy or pre-empted, and was counted so. */
+  function expectOnlyCompletedOrPreemptedWaits(harness: Harness): void {
+    const waits = sweepWaits(harness);
+    for (const wait of waits) {
+      expect([BACKGROUND_CHECKPOINT_MESSAGE, CONTENDED_CHECKPOINT_MESSAGE]).toContain(wait.message);
+      expect(wait.level).toBe('debug');
+      expect(wait.fields['checkpoint']).toBeOneOf(
+        wait.message === CONTENDED_CHECKPOINT_MESSAGE ? ['failed'] : ['completed', 'busy'],
+      );
+    }
+    expect(harness.logs.filter((log) => log.message === FAILED_CHECKPOINT_MESSAGE)).toEqual([]);
+    const counted = waits.filter((wait) => wait.message === BACKGROUND_CHECKPOINT_MESSAGE);
+    expect(finishedFields(harness)).toMatchObject({ walCheckpoints: counted.length });
+  }
+
+  it(
+    'drains with the commit-time checkpoint suspended and leaves it with the worker, whenever the handover lands',
+    async () => {
+      const { sessionId } = await seedFullSession(h, AGED_AT);
+      seedTelemetry(h, sessionId, AGED_AT, LARGE_TELEMETRY);
+      const seen: unknown[] = [];
+
+      const report = await sweep(
+        h,
+        { walCheckpointBytes: 0 },
+        {
+          isSessionInUse: () => {
+            seen.push(autoCheckpointOf(h));
+            return false;
+          },
+        },
+      );
+
+      expect(report.sessionsDeleted).toBe(1);
+      expect(report.errors).toEqual([]);
+      expect(sessionExists(h, sessionId)).toBe(false);
+      // Suspended by the sweep, or already handed to the worker: `0` either way.
+      expect(seen.length).toBeGreaterThanOrEqual(2);
+      expect(new Set(seen)).toEqual(new Set([0]));
+      // Before, during or after the sweep, the handover is what stays: the
+      // sweep's restore never hands the commit-time checkpoint back to a
+      // connection whose worker runs.
+      await vi.waitFor(() => {
+        expect(autoCheckpointOf(h)).toBe(0);
+      }, HANDOVER_WAIT);
+      expectOnlyCompletedOrPreemptedWaits(h);
+    },
+    LARGE_FIXTURE_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    'leaves the commit-time checkpoint with the worker after a start-up sweep that deletes nothing',
+    async () => {
+      seedSession(h, { updatedAt: RECENT_AT });
+
+      // Straight after the open, as the service's start-up sweep runs: the
+      // worker's handover can land before, during or after this sweep's
+      // suspension, and the worker must keep the checkpoint in every case.
+      const report = await sweep(h);
+
+      expect(report.sessionsDeleted).toBe(0);
+      expect(report.errors).toEqual([]);
+      await vi.waitFor(() => {
+        expect(autoCheckpointOf(h)).toBe(0);
+      }, HANDOVER_WAIT);
+      expectOnlyCompletedOrPreemptedWaits(h);
+      expect(finishedFields(h)).toMatchObject({ walCheckpoints: 0 });
+    },
+    HANDOVER_TEST_TIMEOUT_MS,
+  );
 });

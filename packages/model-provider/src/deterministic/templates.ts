@@ -197,6 +197,30 @@ export const TRUNCATION_MARKER = '…';
  */
 export const STATEMENT_MAX_LENGTH = 300;
 
+/**
+ * Longest plan objective {@link planObjective} emits, in characters: **500**.
+ *
+ * The bound `@debuggen/instrumentation`'s plan schemas put on `objective`
+ * (`MAX_OBJECTIVE_LENGTH`), restated here for the same layering reason as
+ * {@link STATEMENT_MAX_LENGTH}. An objective names the selected target twice
+ * and the routes the investigation traced, each a label of up to
+ * {@link LABEL_MAX_LENGTH} characters, so a pathological set of labels would
+ * otherwise push it past the schema and fail the plan stage over its wording.
+ */
+export const OBJECTIVE_MAX_LENGTH = 500;
+
+/**
+ * Longest panel headline {@link panelSummaryHeadline} emits once a follow-up's
+ * focus sentence closes it, in characters: **500**.
+ *
+ * The bound `@debuggen/panel-schema` puts on a string summary
+ * (`MAX_HEADLINE_LENGTH`), restated here for the same layering reason as
+ * {@link STATEMENT_MAX_LENGTH}: the focus sentence names up to
+ * {@link FOCUS_SUBJECT_MAX_ITEMS} declarations, so its label is shortened
+ * rather than let a long focus push the headline past the schema.
+ */
+export const HEADLINE_MAX_LENGTH = 500;
+
 /** Separator between two steps of a rendered flow path. */
 export const FLOW_PATH_SEPARATOR = ' → ';
 
@@ -238,9 +262,6 @@ export const UNNAMED_COMPONENT_LABEL = 'an unnamed component';
 
 /** Rendered in place of a symbol name that arrived blank. */
 export const UNNAMED_SYMBOL_LABEL = 'an unnamed symbol';
-
-/** Rendered in place of a related signal or entity name that arrived blank. */
-export const UNNAMED_ENTITY_LABEL = 'an unnamed entity';
 
 /** Rendered in place of a `file:line` call-site label that arrived blank. */
 export const UNRESOLVED_CALL_SITE_LABEL = 'an unresolved call site';
@@ -349,23 +370,28 @@ export function truncateLabel(value: string, maxLength: number = LABEL_MAX_LENGT
  * @param labels Every cleaned label the frame interpolates.
  * @param frame Builds the sentence, passing each of those labels through the
  * `fit` it is handed.
- * @returns One sentence of at most {@link STATEMENT_MAX_LENGTH} characters.
+ * @param maxLength The bound the sentence must fit; {@link STATEMENT_MAX_LENGTH}
+ * by default, the bound of every fact and hypothesis. A frame whose output lands
+ * in a field with a bound of its own — the plan objective's
+ * {@link OBJECTIVE_MAX_LENGTH} — passes that bound instead.
+ * @returns One sentence of at most `maxLength` characters.
  */
 function fitStatement(
   labels: readonly string[],
   frame: (fit: (label: string) => string) => string,
+  maxLength: number = STATEMENT_MAX_LENGTH,
 ): string {
   let sentence = frame((label) => label);
   let cap = labels.reduce((longest, label) => Math.max(longest, label.length), 0);
-  while (sentence.length > STATEMENT_MAX_LENGTH && cap > TRUNCATION_MARKER.length) {
-    const overflow = sentence.length - STATEMENT_MAX_LENGTH;
+  while (sentence.length > maxLength && cap > TRUNCATION_MARKER.length) {
+    const overflow = sentence.length - maxLength;
     const current = cap;
     const atCap = Math.max(1, labels.filter((label) => label.length >= current).length);
     cap = Math.max(TRUNCATION_MARKER.length, cap - Math.ceil(overflow / atCap));
     const limit = cap;
     sentence = frame((label) => truncateLabel(label, limit));
   }
-  return truncateLabel(sentence, STATEMENT_MAX_LENGTH);
+  return truncateLabel(sentence, maxLength);
 }
 
 /**
@@ -827,11 +853,16 @@ export const CAPTURE_SIGNAL_FALLBACK_LABEL = 'runtime signals';
  * components, event handlers, request call sites, route handlers, server
  * functions and database call sites — so, like the action types, they are
  * product vocabulary rather than anything a target project names.
+ *
+ * An event handler arrives under two spellings: `handler`, the node kind the
+ * code graph's event-handler extractor emits, and `event-handler`, the
+ * spelled-out form a structured context may carry. Both read the same.
  */
 export type CodeSymbolKind =
   | 'file'
   | 'symbol'
   | 'component'
+  | 'handler'
   | 'event-handler'
   | 'api-call'
   | 'api-route'
@@ -843,6 +874,7 @@ export const CODE_SYMBOL_KIND_LABELS: Readonly<Record<CodeSymbolKind, string>> =
   file: 'file',
   symbol: 'symbol',
   component: 'component',
+  handler: 'event handler',
   'event-handler': 'event handler',
   'api-call': 'request call site',
   'api-route': 'route handler',
@@ -1102,34 +1134,91 @@ export function metricCountNoun(metricId: string): NounForms {
  * planning frames
  * ---------------------------------------------------------------------------------------------- */
 
+/** Traced routes {@link planObjective} names before it counts the remainder. */
+export const OBJECTIVE_MAX_ROUTES = 3;
+
+/**
+ * How the behaviour a plan is for is reproduced while its capture runs, for
+ * the closing clause of {@link planObjective}:
+ *
+ * - `interaction` — by the developer's input: the category's behaviour is
+ *   reproduced by an interaction, with the selected target when there is one;
+ * - `page` — by observing the page: the behaviour shows without input.
+ */
+export type ObjectiveReproduction = 'interaction' | 'page';
+
 /**
  * The plan's objective sentence.
  *
  * This stands in for the prose objective a model would write, and it is built
- * from a category label plus an optional target label — never from the
- * developer's wording, which is the whole point: two requests that differ only
- * in phrasing classify to the same category and therefore produce the same
+ * from structured facts only — the category label, the selected target's
+ * label, how the behaviour is reproduced and the routes the investigation
+ * traced — never from the developer's wording, which is the whole point: two
+ * requests that differ only in phrasing classify to the same category, select
+ * the same target and trace the same flows, and therefore produce the same
  * objective, character for character.
  *
- * The absent-target case is a separate branch rather than an interpolated empty
- * string, so both readings are complete sentences instead of one sentence with
- * a gap where a target would have been.
+ * The sentence names where the time or the behaviour is recorded — the target
+ * first, then up to {@link OBJECTIVE_MAX_ROUTES} traced routes with the rest
+ * counted — and how the capture reproduces it. With nothing to name, the
+ * location is left out rather than interpolated as an empty string, and an
+ * interaction without a target to name reads as "the interaction", so every
+ * reading is a complete sentence. The labels are shortened, never the
+ * wording, when the sentence would exceed {@link OBJECTIVE_MAX_LENGTH}.
  *
  * @param categoryLabel Wording from {@link problemCategoryLabel}.
  * @param targetLabel Wording for the selected element or component, when one
  * was selected. A blank value is treated as absent.
+ * @param reproduction How the behaviour is reproduced; `page` by default.
+ * @param routeLabels The routes the investigation's flows traced, in their
+ * order. Blank ones, repeats and one equal to the target are dropped.
  * @returns One sentence stating what the capture is meant to settle.
  * @example
- * // planObjective(problemCategoryLabel('slow-interaction'), '‹component›')
- * // planObjective(problemCategoryLabel('slow-interaction'))
+ * // planObjective(problemCategoryLabel('performance'), '‹component›', 'interaction', ['POST /‹route›'])
+ * //   === 'Determine what accounts for the latency recorded at ‹component› and POST /‹route› while an interaction with ‹component› is reproduced.'
+ * // planObjective(problemCategoryLabel('rendering'), '‹component›')
+ * //   === 'Determine what accounts for the render activity recorded at ‹component› while the page is observed.'
  */
-export function planObjective(categoryLabel: string, targetLabel?: string): string {
+export function planObjective(
+  categoryLabel: string,
+  targetLabel?: string,
+  reproduction: ObjectiveReproduction = 'page',
+  routeLabels: readonly string[] = [],
+): string {
   const category = sanitizeLabel(categoryLabel, PROBLEM_CATEGORY_FALLBACK_LABEL);
   const target = optionalLabel(targetLabel);
-  if (target === undefined) {
-    return `Determine what accounts for the ${category} recorded while the reported behaviour is reproduced.`;
+
+  const routes: string[] = [];
+  for (const label of routeLabels) {
+    const route = optionalLabel(label);
+    if (route !== undefined && route !== target && !routes.includes(route)) {
+      routes.push(route);
+    }
   }
-  return `Determine what accounts for the ${category} recorded at ${target} while the reported behaviour is reproduced.`;
+  const shownRoutes = routes.slice(0, OBJECTIVE_MAX_ROUTES);
+  const hiddenRoutes = routes.length - shownRoutes.length;
+  const places = target === undefined ? shownRoutes : [target, ...shownRoutes];
+
+  return fitStatement(
+    places,
+    (fit) => {
+      const named = places.map(fit);
+      const listed =
+        hiddenRoutes > 0 ? [...named, `${formatCount(hiddenRoutes)} ${LIST_OVERFLOW_WORD}`] : named;
+      // Every listed place is a cleaned, non-blank label, so the list's fallback
+      // wording is never reached; it is the target's, the first place named.
+      const where =
+        listed.length === 0 ? '' : ` at ${joinWithConjunction(listed, UNNAMED_COMPONENT_LABEL)}`;
+      const how =
+        reproduction === 'page'
+          ? 'while the page is observed'
+          : target === undefined
+            ? 'while the interaction is reproduced'
+            : `while an interaction with ${fit(target)} is reproduced`;
+      return `Determine what accounts for the ${category} recorded${where} ${how}.`;
+    },
+    OBJECTIVE_MAX_LENGTH,
+  );
 }
 
 /**
@@ -1164,16 +1253,33 @@ export function instrumentationActionRationale(
  * The sentence is about the graph, not about the project's behaviour: the
  * relationship it states is the one the index recorded, and nothing follows
  * from it about what the capture will show. `./rules.ts` supplies the second
- * label from whatever produced the match — a needed signal or a named entity.
+ * label from whatever produced the match — a named entity, a needed or
+ * declared signal, the far end of a traced path, or the entity an executed
+ * query looked up.
+ *
+ * A candidate nothing named — a code node a query result carried without any
+ * of those relations — takes the separate, entity-free branch rather than an
+ * interpolated placeholder: a sentence asserting an association with "an
+ * unnamed" something states a relation the graph never recorded, while the
+ * entity-free sentence states exactly what is known, that the graph returned
+ * the node while the investigation queried it.
  *
  * @param symbolKindLabel Wording from {@link codeSymbolKindLabel}.
  * @param relatedLabel The signal or entity this symbol was matched against. A
- * blank value falls back to {@link UNNAMED_ENTITY_LABEL}.
+ * blank or absent value takes the entity-free branch.
  * @returns One sentence suitable for a relevant file's `reason` field.
+ * @example
+ * // codeRelevanceReason(codeSymbolKindLabel('component'), '‹route›')
+ * //   === 'The code graph associates this component with ‹route›.'
+ * // codeRelevanceReason(codeSymbolKindLabel('file'), '  ')
+ * //   === "The code graph returned this file in the investigation's query results."
  */
-export function codeRelevanceReason(symbolKindLabel: string, relatedLabel: string): string {
+export function codeRelevanceReason(symbolKindLabel: string, relatedLabel?: string): string {
   const kind = sanitizeLabel(symbolKindLabel, CODE_SYMBOL_KIND_FALLBACK_LABEL);
-  const related = sanitizeLabel(relatedLabel, UNNAMED_ENTITY_LABEL);
+  const related = optionalLabel(relatedLabel);
+  if (related === undefined) {
+    return `The code graph returned this ${kind} in the investigation's query results.`;
+  }
   return `The code graph associates this ${kind} with ${related}.`;
 }
 
@@ -1503,6 +1609,73 @@ export function errorCountFact(count: number): string {
   return `The capture recorded ${countLabel(count, METRIC_COUNT_NOUNS.error_count)} during the interaction.`;
 }
 
+/** The whole-percent multiplier of a share. */
+const PERCENT_SCALE = 100;
+
+/** Rendered for a positive share that rounds to no whole percent. */
+const UNDER_ONE_PERCENT_LABEL = 'less than 1%';
+
+/**
+ * Renders the share one measurement is of another as a whole percentage.
+ *
+ * Rounded to the nearest whole percent with `Math.round` — no locale, no
+ * `Intl` — and bounded to `[0, 100]`, so a sentence never claims more than all
+ * of a total. A positive share that rounds to zero reads as
+ * {@link UNDER_ONE_PERCENT_LABEL} rather than as `0%`, which would contradict
+ * the measured time the same sentence states.
+ *
+ * @param partMs The measured part, in milliseconds.
+ * @param wholeMs The total it is a share of, in milliseconds; a non-positive
+ * total yields `0%`.
+ * @returns The share, as `‹n›%`.
+ */
+function formatShare(partMs: number, wholeMs: number): string {
+  const part = Number.isFinite(partMs) ? clampNonNegative(partMs) : 0;
+  const whole = Number.isFinite(wholeMs) ? clampNonNegative(wholeMs) : 0;
+  if (whole === 0) {
+    return '0%';
+  }
+  const percent = Math.min(PERCENT_SCALE, Math.round((part / whole) * PERCENT_SCALE));
+  return percent === 0 && part > 0 ? UNDER_ONE_PERCENT_LABEL : `${formatCount(percent)}%`;
+}
+
+/**
+ * How often a declaration a follow-up named ran, and how long it took, as the
+ * capture measured it.
+ *
+ * `./rules.ts` calls this only for a declaration the follow-up's structured
+ * focus names and the capture holds spans of — the spans a timing of that
+ * declaration recorded — and cites exactly those spans. It restates the count
+ * and the summed time and stops: whether that time is too much is the
+ * likely-cause frames' question, not this one's.
+ *
+ * @param symbolLabel The declaration's name. A blank value falls back to
+ * {@link UNNAMED_SYMBOL_LABEL}.
+ * @param count How many times the capture recorded it running.
+ * @param measuredMs The time those runs took, summed, in milliseconds.
+ * @param interactionMs The interaction's measured total, when the runs fit
+ * inside it; omitted leaves the sentence without a share.
+ * @returns One descriptive sentence, at most {@link STATEMENT_MAX_LENGTH}
+ * characters.
+ * @example
+ * // focusedDeclarationFact('‹symbol›', 3, 900, 1200)
+ * //   === '‹symbol› ran 3 times for 900.00 ms in total (75% of the 1.200 s recorded for the interaction).'
+ */
+export function focusedDeclarationFact(
+  symbolLabel: string,
+  count: number,
+  measuredMs: number,
+  interactionMs?: number,
+): string {
+  const symbol = sanitizeLabel(symbolLabel, UNNAMED_SYMBOL_LABEL);
+  const ran = `ran ${countLabel(count, TIME_NOUN)} for ${formatDurationMs(measuredMs)} in total`;
+  return fitStatement([symbol], (fit) =>
+    interactionMs === undefined
+      ? `${fit(symbol)} ${ran}.`
+      : `${fit(symbol)} ${ran} (${formatShare(measuredMs, interactionMs)} of the ${formatDurationMs(interactionMs)} recorded for the interaction).`,
+  );
+}
+
 /* -------------------------------------------------------------------------------------------------
  * likely-cause frames
  *
@@ -1709,6 +1882,59 @@ export function panelTitle(categoryLabel: string, targetLabel?: string): string 
   return target === undefined ? category : `${category} — ${target}`;
 }
 
+/** Declarations a focus subject names before it counts the rest. */
+export const FOCUS_SUBJECT_MAX_ITEMS = 3;
+
+/**
+ * The declarations a follow-up focused on, as one short list for a panel title
+ * or headline.
+ *
+ * The names come from the follow-up's structured focus — declarations the code
+ * graph resolved — never from its wording. At most
+ * {@link FOCUS_SUBJECT_MAX_ITEMS} are named, in the order given, and any
+ * further ones are counted as `‹n› more`, so a title stays short however many
+ * declarations a follow-up named. Blank names are dropped.
+ *
+ * @param symbolLabels The declarations' names, in the focus's order.
+ * @returns The list, or {@link UNNAMED_SYMBOL_LABEL} when no name is usable.
+ * @example
+ * // focusSubjectLabel(['‹a›', '‹b›']) === '‹a› and ‹b›'
+ * // focusSubjectLabel(['‹a›', '‹b›', '‹c›', '‹d›']) === '‹a›, ‹b›, ‹c› and 1 more'
+ */
+export function focusSubjectLabel(symbolLabels: readonly string[]): string {
+  const named: string[] = [];
+  for (const label of symbolLabels) {
+    const cleaned = optionalLabel(label);
+    if (cleaned !== undefined) {
+      named.push(cleaned);
+    }
+  }
+  const shown = named.slice(0, FOCUS_SUBJECT_MAX_ITEMS);
+  const hidden = named.length - shown.length;
+  return joinWithConjunction(
+    hidden > 0 ? [...shown, `${formatCount(hidden)} ${LIST_OVERFLOW_WORD}`] : shown,
+    UNNAMED_SYMBOL_LABEL,
+  );
+}
+
+/**
+ * The headline sentence that names what a follow-up's panel concentrates on.
+ *
+ * Non-evidentiary by construction, like the rest of the headline: it names the
+ * focus — a class of behaviour from {@link problemCategoryLabel}, or the
+ * declarations from {@link focusSubjectLabel} — and claims nothing that would
+ * need citing.
+ *
+ * @param focusLabel What the panel is focused on. A blank value falls back to
+ * {@link PROBLEM_CATEGORY_FALLBACK_LABEL}.
+ * @returns One sentence.
+ * @example
+ * // panelFocusSentence(problemCategoryLabel('data')) === 'Focused on database queries.'
+ */
+export function panelFocusSentence(focusLabel: string): string {
+  return `Focused on ${sanitizeLabel(focusLabel, PROBLEM_CATEGORY_FALLBACK_LABEL)}.`;
+}
+
 /** The most silent tiers a headline names: there are three tiers. */
 const SILENT_TIER_MAX_ITEMS = 3;
 
@@ -1742,17 +1968,24 @@ const SILENT_TIER_MAX_ITEMS = 3;
  * @param silentTierLabels Wording from {@link telemetryTierLabel} for each tier
  * the panel's views cover but the capture recorded nothing in, in tier order.
  * Omitted or empty adds no second sentence.
- * @returns One or two descriptive sentences.
+ * @param focusLabel What a follow-up's panel concentrates on, when a follow-up
+ * governs it: stated last, as {@link panelFocusSentence}, its label shortened
+ * should the headline otherwise exceed {@link HEADLINE_MAX_LENGTH}. Omitted or
+ * blank adds no sentence, so a first question's headline is unchanged.
+ * @returns One to three descriptive sentences.
  * @example
  * // panelSummaryHeadline([{ count: 4, noun: metricCountNoun('request_count') }], 1175)
  * //   === 'The capture recorded 4 requests across 1.175 s.'
  * // panelSummaryHeadline([{ count: 4, noun: metricCountNoun('request_count') }], 1175, ['database'])
  * //   === 'The capture recorded 4 requests across 1.175 s. No database telemetry was recorded, so the views show no work in that tier.'
+ * // panelSummaryHeadline([{ count: 4, noun: metricCountNoun('request_count') }], 1175, [], '‹symbol›')
+ * //   === 'The capture recorded 4 requests across 1.175 s. Focused on ‹symbol›.'
  */
 export function panelSummaryHeadline(
   counts: readonly CountedNoun[],
   totalDurationMs?: number,
   silentTierLabels: readonly string[] = [],
+  focusLabel?: string,
 ): string {
   const rendered = counts.map((entry) => countLabel(entry.count, entry.noun));
   const list = joinWithConjunction(rendered, NO_MEASURED_ACTIVITY_LABEL);
@@ -1763,12 +1996,23 @@ export function panelSummaryHeadline(
   const silent = silentTierLabels
     .slice(0, SILENT_TIER_MAX_ITEMS)
     .map((label) => sanitizeLabel(label, TELEMETRY_TIER_FALLBACK_LABEL));
-  if (silent.length === 0) {
-    return counted;
-  }
-  const tiers = alternativesLabel(silent);
+  const tiers = silent.length === 0 ? '' : alternativesLabel(silent);
   const referent = silent.length === 1 ? 'that tier' : 'those tiers';
-  return `${counted} No ${tiers} telemetry was recorded, so the views show no work in ${referent}.`;
+  const unfocused =
+    silent.length === 0
+      ? counted
+      : `${counted} No ${tiers} telemetry was recorded, so the views show no work in ${referent}.`;
+  const focus = optionalLabel(focusLabel);
+  if (focus === undefined) {
+    return unfocused;
+  }
+  // The focus sentence is the one part of the headline whose length a label
+  // decides, so it is the part shortened should the whole outgrow the bound.
+  return fitStatement(
+    [focus],
+    (fit) => `${unfocused} ${panelFocusSentence(fit(focus))}`,
+    HEADLINE_MAX_LENGTH,
+  );
 }
 
 /**

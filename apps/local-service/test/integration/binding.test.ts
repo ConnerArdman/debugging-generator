@@ -192,6 +192,7 @@ import { sha256Hex } from '@debuggen/shared/node';
 import { REDACTION_MARKER, computeCaptureSummary, scrub } from '@debuggen/telemetry';
 import type { TelemetryEventIngress } from '@debuggen/telemetry';
 
+import type { BoundTabRef } from '../../src/instrumentation/readiness.js';
 import { createAgentReadyLedger } from '../../src/main.js';
 import type { AgentReadyLedger } from '../../src/main.js';
 import { AUTH_FAILURE_REASONS } from '../../src/server/auth.js';
@@ -1571,9 +1572,11 @@ describe(SESSION_BIND, () => {
       ),
       CODES.TAB_NOT_BOUND,
     );
-    // Nor may it report a page agent ready in "its" tab: readiness keeps its
-    // evidence by tab id, and could not tell that report from one about the
-    // owner's bound tab of the same id.
+    // Nor may it report a page agent ready in "its" tab. Readiness keeps each
+    // credential's evidence apart, so such a report could never stand for the
+    // owner's bound tab; the refusal is the relay rule — a credential acts on
+    // a tab id another paired browser's live binding holds only once it has
+    // bound its own, whereupon its service worker relays the report again.
     expectRefused(
       await sendSettled(intruder.client, AGENT_READY, newDocumentReport(tabId, url)),
       CODES.TAB_NOT_BOUND,
@@ -3088,7 +3091,7 @@ describe(TAB_NAVIGATED, () => {
     expect(bindingRows()).toEqual(rowsBefore);
   });
 
-  it('records every navigation it accepts with the readiness ledger — a reload of the bound page, a navigation of an unbound tab — by tab id alone, and none it refuses', async () => {
+  it('records every navigation it accepts with the readiness ledger — a reload of the bound page, a navigation of an unbound tab — under the navigating credential, logging the tab id alone, and none it refuses', async () => {
     const { created } = suite();
     const tabId = freshTab();
     const owner = await openPanel(tabId);
@@ -3115,6 +3118,8 @@ describe(TAB_NAVIGATED, () => {
     expect(recorded?.fields['tabId']).toBe(tabId);
     expect(recorded?.line).not.toContain(created.origin);
     expect(recorded?.line).not.toContain('/orders');
+    // Kept under the navigating credential, whose digest is a key, never logged.
+    expect(recorded?.line).not.toContain(holderOf(owner.credential));
     expect(storedBindingOfTab(tabId)).toMatchObject({ sessionId: created.sessionId });
 
     // A navigation of a tab no session is bound to is recorded too: its next
@@ -3803,7 +3808,10 @@ async function openRaceRig(
   const logger = running.logger.root;
   const directory = await mkdtemp(join(realpathSync(tmpdir()), RACE_RIG_PREFIX));
   let store: Store | undefined;
-  const ledger = createAgentReadyLedger({ logger });
+  // The ledger reads a session's live binding to know whose evidence answers
+  // for it, so the registry exists first (as in `../../src/main.ts`).
+  const clients = createClientRegistry({ logger });
+  const ledger = createAgentReadyLedger({ logger, bindings: clients });
   try {
     const opened = unwrap(
       openStore({ databasePath: join(directory, 'sessions.sqlite'), logger }),
@@ -3811,7 +3819,6 @@ async function openRaceRig(
     );
     store = opened;
     const sessions = createSessionsRepo({ store: opened, logger });
-    const clients = createClientRegistry({ logger });
     const progress = createSessionProgress({ sessions, broadcaster: clients, logger });
     const manager = createSessionManager({
       sessions,
@@ -3915,6 +3922,7 @@ async function openRaceRig(
       },
     };
   } catch (cause) {
+    clients.closeAll();
     ledger.close();
     if (store !== undefined && !store.isClosed) {
       store.close();
@@ -4484,6 +4492,9 @@ describe('the navigations the binding route records for readiness', () => {
       kind: CLIENT_DEVTOOLS,
       principal: current.principal,
     };
+    // Readiness asks the ledger about the session's bound tab: the evidence
+    // the binding's own credential reported for it.
+    const boundTab: BoundTabRef = { sessionId: bound.sessionId, tabId: bound.tabId };
     unwrap(
       current.ledger.agentReady(
         {
@@ -4498,8 +4509,8 @@ describe('the navigations the binding route records for readiness', () => {
       ),
       'Recording the report of the document the reload leaves',
     );
-    const reportedAt = current.ledger.latestAgentReadyAt(bound.tabId);
-    expect(current.ledger.latestNavigationAt(bound.tabId)).toBeUndefined();
+    const reportedAt = current.ledger.latestAgentReadyAt(boundTab);
+    expect(current.ledger.latestNavigationAt(boundTab)).toBeUndefined();
 
     // The reload: the same URL, kept. The ledger now dates the navigation
     // after the report, which is what readiness compares.
@@ -4512,26 +4523,32 @@ describe('the navigations the binding route records for readiness', () => {
         'Reloading the bound tab',
       ),
     ).toMatchObject({ kind: 'kept' });
-    const navigatedAt = current.ledger.latestNavigationAt(bound.tabId);
+    const navigatedAt = current.ledger.latestNavigationAt(boundTab);
     if (navigatedAt === undefined || reportedAt === undefined) {
       throw new Error('The ledger holds no report or no navigation for the reloaded tab.');
     }
     expect(navigatedAt).toBeGreaterThan(reportedAt);
     expect(navigationRecordsOf(bound.tabId)).toHaveLength(1);
+    // Logged by the tab id alone: the credential it is kept under is never written.
+    expect(navigationRecordsOf(bound.tabId)[0]?.line).not.toContain(current.principal.tokenHash);
 
-    // A malformed frame is refused before anything is recorded.
+    // A malformed frame is refused before anything is recorded — for a tab no
+    // session holds, and for the bound tab, whose stamp stays the reload's.
     const malformedTab = freshTab();
-    expect(
-      refusalOf(
-        await current.routes.handleTabNavigated(
-          { tabId: malformedTab, url: 'not an absolute url' },
-          current.connection,
-        ),
-        'A malformed navigation',
-      ).code,
-    ).toBe(CODES.PROTOCOL_INVALID_MESSAGE);
-    expect(current.ledger.latestNavigationAt(malformedTab)).toBeUndefined();
+    for (const tabId of [malformedTab, bound.tabId]) {
+      expect(
+        refusalOf(
+          await current.routes.handleTabNavigated(
+            { tabId, url: 'not an absolute url' },
+            current.connection,
+          ),
+          'A malformed navigation',
+        ).code,
+      ).toBe(CODES.PROTOCOL_INVALID_MESSAGE);
+    }
     expect(navigationRecordsOf(malformedTab)).toEqual([]);
+    expect(current.ledger.latestNavigationAt(boundTab)).toBe(navigatedAt);
+    expect(navigationRecordsOf(bound.tabId)).toHaveLength(1);
 
     // So is a frame about the bound tab from a credential that did not bind it:
     // the tab's stamp is the reload's, and no second navigation was recorded.
@@ -4548,7 +4565,7 @@ describe('the navigations the binding route records for readiness', () => {
         'A foreign navigation',
       ).code,
     ).toBe(CODES.TAB_NOT_BOUND);
-    expect(current.ledger.latestNavigationAt(bound.tabId)).toBe(navigatedAt);
+    expect(current.ledger.latestNavigationAt(boundTab)).toBe(navigatedAt);
     expect(navigationRecordsOf(bound.tabId)).toHaveLength(1);
     expect(current.armRequests).toEqual([]);
   });

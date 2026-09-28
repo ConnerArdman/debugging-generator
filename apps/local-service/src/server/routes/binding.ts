@@ -30,7 +30,7 @@
  * | Message | Effect |
  * | --- | --- |
  * | `session.bind` | Only a `devtools` principal binds. The payload's `origin` must be the origin of its `url`. Without `sessionId` the tab binds to the most recently updated live session — neither ended nor failed — whose dev-server origin equals the tab's origin, and to the most recently updated failed one only when no live session serves that origin; with `sessionId` it binds to that session only if its dev-server origin matches — a mismatch is a refusal, never a silent bind. A named session that ended or vanished is refused, and the injected {@link EndedSessionAgentPort} is told so the page disarm it owes is settled. |
- * | `tab.navigated` | Every accepted navigation — kept, dropped, or of a tab not yet bound — is first recorded with the injected {@link NavigationRecorder}, so readiness can tell a page-agent report a reload or a same-URL load left behind. Same origin then keeps the binding, records the new URL, announces it as the binding now stands (`reason: 'bound'`) and re-arms the agent a new document starts dormant; a different origin drops the binding. A navigation of an unbound tab changes no binding. A navigation of a tab id that only another credential holds a binding of is refused `TAB_NOT_BOUND` and records nothing: readiness keys its evidence by tab id, and could not tell it from the other browser's bound tab. |
+ * | `tab.navigated` | Every accepted navigation — kept, dropped, or of a tab not yet bound — is first recorded with the injected {@link NavigationRecorder}, under the navigating credential and the tab id, so readiness can tell a page-agent report a reload or a same-URL load left behind — of that browser's tab only. Same origin then keeps the binding, records the new URL, announces it as the binding now stands (`reason: 'bound'`) and re-arms the agent a new document starts dormant; a different origin drops the binding. A navigation of an unbound tab changes no binding. A navigation of a tab id that only another credential holds a binding of is refused `TAB_NOT_BOUND` and records nothing. Readiness keeps each credential's evidence apart, so this is not what isolates the other browser's bound tab; it is the relay rule `../ws.ts` applies to `agent.ready` as well: a credential acts on a tab id another paired browser's live binding holds only once it has bound its own, and once it binds, its service worker relays the tab's latest page-agent report again. |
  * | page-agent report | Every `agent.ready` the readiness path accepts reaches {@link BindingDocumentObserver.documentReported}. A report naming a document other than the one the tab showed before its kept navigation proves that navigation a reload: it is announced (`reason: 'navigated'`) and, while its capture is open, reported as `Page reloaded during capture`. |
  * | `session.unbind` | Drops the sending credential's binding of the tab. Idempotent: a tab that credential has not bound is a no-op, even when another browser's tab with the same id is bound. It never ends the session, cancels a capture or disarms instrumentation. |
  *
@@ -616,15 +616,24 @@ export type EndedSessionAgentPort = Pick<ProducerReconciler, 'pageAgentReleased'
  * tab just left, when after a reload mid-session it must rest on the report of
  * the bound tab's current document.
  *
- * Carries the tab id only — never the URL, which is page-shaped text.
+ * A Chrome tab id is unique only within one browser, so a navigation is
+ * recorded under the navigating credential as well as the tab id: the ledger
+ * keeps each credential's tab as its own entry, and one browser's reload never
+ * makes readiness distrust another browser's report of a tab with the same id.
+ *
+ * Carries the credential digest and the tab id only — never the URL, which is
+ * page-shaped text.
  */
 export interface NavigationRecorder {
   /**
-   * Records that `tabId` committed a navigation now. Synchronous, and must
-   * not throw; the route contains a throw regardless, so a recorder fault
+   * Records that `tabId`, in the browser of the credential `holder`, committed
+   * a navigation now. `holder` is the navigating connection's
+   * `principal.tokenHash` — the same key discipline as `../clients.ts`'s
+   * `heldTabKey`: compared and used as a key, never logged. Synchronous, and
+   * must not throw; the route contains a throw regardless, so a recorder fault
    * never changes what the navigation does to the binding.
    */
-  recordNavigation(tabId: number): void;
+  recordNavigation(holder: string, tabId: number): void;
 }
 
 /**
@@ -2765,17 +2774,20 @@ export function createBindingRoutes(
   }
 
   /**
-   * Tells the {@link NavigationRecorder} that `tabId` committed a navigation.
+   * Tells the {@link NavigationRecorder} that `tabId`, in the browser of the
+   * credential `holder` (the navigating principal's `tokenHash`), committed a
+   * navigation.
    *
    * Called once the frame is accepted and before either store is touched,
    * whatever the stores then make of it: the tab left its document even when
    * the binding cannot follow. A recorder that throws is logged by the
-   * thrown value's name alone — never its message, never a URL — and the
-   * navigation proceeds; readiness then merely lacks this one sign.
+   * thrown value's name alone — never its message, never a URL, never the
+   * holder — and the navigation proceeds; readiness then merely lacks this
+   * one sign.
    */
-  function recordCommittedNavigation(tabId: number): void {
+  function recordCommittedNavigation(holder: string, tabId: number): void {
     try {
-      navigations.recordNavigation(tabId);
+      navigations.recordNavigation(holder, tabId);
     } catch (thrown) {
       log.warn('The navigation could not be recorded for readiness', {
         tabId,
@@ -2805,9 +2817,12 @@ export function createBindingRoutes(
     const binding = authorized.value;
     if (binding === undefined && clients.tabHeldByAnotherCredential(tabId, principal)) {
       // The credential holds no binding of this tab id while another browser's
-      // tab with the same id is bound. The navigation recorder keys readiness
-      // by tab id alone, so accepting it would let this browser's navigation
-      // make readiness distrust the other browser's bound tab: refused, and
+      // tab with the same id is bound. The recorder keeps each credential's
+      // tab apart, so this could not touch the other browser's evidence; the
+      // refusal is the relay rule `../ws.ts` applies to `agent.ready` too — a
+      // credential acts on a tab id another paired browser's live binding
+      // holds only once it has bound its own; once it binds, its service
+      // worker relays the tab's latest page-agent report again. Refused, and
       // nothing is recorded.
       log.debug('A navigation of a tab id only another credential holds was refused', { tabId });
       return foreignTabRefusal();
@@ -2815,7 +2830,8 @@ export function createBindingRoutes(
     // Accepted: the tab is unbound or bound by this credential. A refused frame
     // — another role, a malformed payload, another credential's tab — records
     // nothing, so it cannot make readiness distrust a report it has no say in.
-    recordCommittedNavigation(tabId);
+    // It is recorded under this credential alone.
+    recordCommittedNavigation(principal.tokenHash, tabId);
     if (binding === undefined) {
       log.debug('A navigation of an unbound tab was ignored', { tabId });
       return ok({ kind: 'ignored' });

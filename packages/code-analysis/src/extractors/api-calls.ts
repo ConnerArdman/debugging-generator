@@ -153,7 +153,12 @@
  *
  * 1. the enclosing declaration is referenced by an `on[A-Z]` markup attribute
  *    in this file (or *is* the inline function in one) → the **handler** node
- *    (`./event-handlers.ts`);
+ *    (`./event-handlers.ts`). A named **function-local delegate** that only
+ *    one inline handler of this file ever calls counts as bound by that
+ *    handler, so a request written in `send` — declared in the component body
+ *    and called only from `onSubmit={(event) => { void send(event); }}` — is
+ *    the inline handler's request (the delegate rule, {@link delegateHandlerOf},
+ *    kept in step with `./server-functions.ts`'s);
  * 2. otherwise, in a request-handling route module, the declaration that
  *    answers the route — an HTTP-method export under the App Router, the
  *    default export of a legacy `pages/api/**` module → the **api-route**
@@ -187,7 +192,10 @@
  * `./event-handlers.ts` emits a `handler` node for it because the markup binds
  * it. Checking the handler index only for module-level declarations would
  * attribute every memoised handler's requests to the component instead, which
- * is precisely the attribution the product needs to be right.
+ * is precisely the attribution the product needs to be right. The delegate
+ * rule is independent of it for the same reason: a delegate is function-local
+ * too, and the inline arrow that calls it is the only node that says which
+ * interaction issues its requests.
  *
  * ### How steps 2 and 3 name a node this module may not ask about
  *
@@ -304,7 +312,7 @@
  * @packageDocumentation
  */
 
-import { Node, SyntaxKind } from 'ts-morph';
+import { Node, SyntaxKind, VariableDeclarationKind } from 'ts-morph';
 import type {
   CallExpression,
   ExportAssignment,
@@ -456,6 +464,20 @@ const UNDEFINED_IDENTIFIER = 'undefined';
 
 /** The method whose result is the receiving function itself. */
 const BIND_METHOD_NAME = 'bind';
+
+/**
+ * The React hooks whose result **is** the function they are handed, which is
+ * what lets the delegate rule read `const send = useCallback(async () => …,
+ * [deps])` as a declaration of that function.
+ *
+ * Deliberately not every call the ancestor walk steps over: the value
+ * `useMemo(() => …)` holds is what the callback *returns*, and the callback
+ * itself runs while the component renders, so a request written inside it is
+ * never issued by whichever handler later calls the memoised value. Matched by
+ * name only, bare or qualified — the same list `./server-functions.ts` keeps
+ * for the same rule.
+ */
+const MEMOISED_CALLBACK_NAMES: readonly string[] = Object.freeze(['useCallback']);
 
 /** The assignment operator that binds a construction to an existing name. */
 const ASSIGNMENT_OPERATOR = '=';
@@ -3904,6 +3926,362 @@ function declarationAnchorOf(node: Node): Node | undefined {
 }
 
 /**
+ * A declaration with the shape of a delegate, reduced to what the delegate
+ * rule reads: the function it declares, its name and the block it is declared
+ * in.
+ */
+interface DelegateShape {
+  /** The function the declaration holds: the declaration itself, or its initialiser's function. */
+  readonly fn: Node;
+
+  /** The declared identifier, which is also the anchor {@link resolveInScopes} answers with. */
+  readonly nameNode: Identifier;
+
+  /** The block the declaration sits directly in: the scope of every reference to it. */
+  readonly block: Node;
+}
+
+/**
+ * The function a delegate's initialiser holds: the expression itself, looked
+ * through the transparent wrappers and a {@link MEMOISED_CALLBACK_NAMES} call's
+ * first argument, bounded by {@link MAX_UNWRAP_DEPTH}.
+ *
+ * @param expression The initialiser, or an inner expression while unwrapping.
+ * @param depth How many wrappers have already been unwrapped.
+ * @returns The function node, or `undefined` when the initialiser is not one.
+ */
+function delegatedFunctionOf(expression: Node, depth: number): Node | undefined {
+  if (Node.isArrowFunction(expression) || Node.isFunctionExpression(expression)) {
+    return expression;
+  }
+
+  if (depth >= MAX_UNWRAP_DEPTH) {
+    return undefined;
+  }
+
+  if (
+    Node.isParenthesizedExpression(expression) ||
+    Node.isAsExpression(expression) ||
+    Node.isSatisfiesExpression(expression) ||
+    Node.isNonNullExpression(expression)
+  ) {
+    return delegatedFunctionOf(expression.getExpression(), depth + 1);
+  }
+
+  if (Node.isCallExpression(expression)) {
+    const callee = expression.getExpression();
+    const calleeName = Node.isIdentifier(callee)
+      ? callee.getText()
+      : Node.isPropertyAccessExpression(callee)
+        ? callee.getName()
+        : undefined;
+    const [first] = expression.getArguments();
+
+    return calleeName !== undefined &&
+      MEMOISED_CALLBACK_NAMES.includes(calleeName) &&
+      first !== undefined
+      ? delegatedFunctionOf(first, depth + 1)
+      : undefined;
+  }
+
+  return undefined;
+}
+
+/**
+ * The delegate shape of a walk ancestor, or `undefined` when it has none.
+ *
+ * The two ways a component body declares a named function, each directly in a
+ * block — the body of the component or of any function or statement in it:
+ *
+ * - a **function declaration** that is not exported (so a namespace cannot
+ *   publish it to callers the block does not contain);
+ * - a **`const` or `let` declarator** named by a plain identifier and
+ *   initialised with a function, directly or through
+ *   {@link delegatedFunctionOf}'s wrappers. A `var` declarator is refused: it
+ *   is scoped to the whole enclosing function rather than to its block, so a
+ *   reference outside the block would go unseen.
+ *
+ * A module-level declaration is never a delegate — its parent is the source
+ * file, not a block — because the graph already names it.
+ *
+ * @param node The ancestor to read.
+ * @returns The shape, or `undefined`.
+ */
+function delegateShapeOf(node: Node): DelegateShape | undefined {
+  if (Node.isFunctionDeclaration(node)) {
+    const nameNode = node.getNameNode();
+    const parent = node.getParent();
+
+    return nameNode !== undefined && !node.hasExportKeyword() && Node.isBlock(parent)
+      ? { fn: node, nameNode, block: parent }
+      : undefined;
+  }
+
+  if (!Node.isVariableDeclaration(node)) {
+    return undefined;
+  }
+
+  const nameNode = node.getNameNode();
+  const statement = node.getVariableStatement();
+  const parent = statement?.getParent();
+
+  if (
+    !Node.isIdentifier(nameNode) ||
+    statement === undefined ||
+    !Node.isBlock(parent) ||
+    statement.getDeclarationKind() === VariableDeclarationKind.Var
+  ) {
+    return undefined;
+  }
+
+  const initializer = node.getInitializer();
+  const fn = initializer === undefined ? undefined : delegatedFunctionOf(initializer, 0);
+
+  return fn === undefined ? undefined : { fn, nameNode, block: parent };
+}
+
+/**
+ * Whether an identifier names a member rather than reading a binding: a
+ * property after a dot or in a qualified type name, the key of a property
+ * assignment, a markup attribute, a class, object or interface member, an enum
+ * member, or the property side of a destructuring element.
+ *
+ * `form.send()` calls a property that merely shares a delegate's spelling, and
+ * counting it as a reference would refuse every delegate named like a common
+ * method. Everything not listed here that resolves to the delegate counts as a
+ * reference, which is the direction that refuses rather than claims. The same
+ * list `./server-functions.ts` applies to the same rule.
+ *
+ * @param identifier The identifier.
+ * @returns `true` when it is a member name.
+ */
+function isMemberNamePosition(identifier: Node): boolean {
+  const parent = identifier.getParent();
+
+  if (parent === undefined) {
+    return false;
+  }
+
+  if (Node.isPropertyAccessExpression(parent)) {
+    return parent.getNameNode().compilerNode === identifier.compilerNode;
+  }
+
+  if (Node.isQualifiedName(parent)) {
+    return parent.getRight().compilerNode === identifier.compilerNode;
+  }
+
+  if (Node.isBindingElement(parent)) {
+    return parent.getPropertyNameNode()?.compilerNode === identifier.compilerNode;
+  }
+
+  if (
+    Node.isPropertyAssignment(parent) ||
+    Node.isJsxAttribute(parent) ||
+    Node.isMethodDeclaration(parent) ||
+    Node.isPropertyDeclaration(parent) ||
+    Node.isGetAccessorDeclaration(parent) ||
+    Node.isSetAccessorDeclaration(parent) ||
+    Node.isPropertySignature(parent) ||
+    Node.isMethodSignature(parent) ||
+    Node.isEnumMember(parent)
+  ) {
+    return parent.getNameNode().compilerNode === identifier.compilerNode;
+  }
+
+  return false;
+}
+
+/**
+ * Whether a function expression is *declared*: the initialiser of a declarator
+ * with a plain name, a class property's value, or an `export default`'s
+ * expression — looked through the transparent wrappers and any call it is an
+ * argument of, which is how `useCallback(() => …)` reaches its declarator.
+ *
+ * `./server-functions.ts`'s candidate for a function expression answers the
+ * same question the same way; a function expression this answers `false` for
+ * is an anonymous callback, which owns nothing of its own.
+ *
+ * @param fn The arrow function or function expression.
+ * @returns `true` when a declaration names it.
+ */
+function isDeclaredFunctionExpression(fn: Node): boolean {
+  let current: Node = fn;
+
+  for (let depth = 0; depth <= MAX_UNWRAP_DEPTH; depth += 1) {
+    const parent = current.getParent();
+
+    if (parent === undefined) {
+      return false;
+    }
+
+    if (Node.isVariableDeclaration(parent)) {
+      return Node.isIdentifier(parent.getNameNode());
+    }
+
+    if (Node.isPropertyDeclaration(parent)) {
+      return true;
+    }
+
+    if (Node.isExportAssignment(parent)) {
+      return !parent.isExportEquals();
+    }
+
+    const child = current;
+    const transparent =
+      Node.isParenthesizedExpression(parent) ||
+      Node.isAsExpression(parent) ||
+      Node.isSatisfiesExpression(parent) ||
+      Node.isNonNullExpression(parent) ||
+      (Node.isCallExpression(parent) &&
+        parent.getArguments().some((argument) => argument.compilerNode === child.compilerNode));
+
+    if (!transparent) {
+      return false;
+    }
+
+    current = parent;
+  }
+
+  return false;
+}
+
+/**
+ * The inline handler a reference to a delegate is called from, or `undefined`
+ * when it is not called from exactly one.
+ *
+ * The reference must be the callee of a call. From that call the enclosing
+ * functions are walked innermost first: an anonymous callback
+ * ({@link isDeclaredFunctionExpression} answers `false`) is stepped over, and
+ * the first inline handler of this file's markup is the answer — an arrow or
+ * function expression's own start is only ever an inline handler's key in
+ * {@link ModuleFacts.handlers}, since a named binding is keyed by an
+ * identifier. Any named function in between — a declaration, a declared arrow,
+ * a method, an accessor, a constructor — owns the call itself, so the walk
+ * refuses rather than skip past it.
+ *
+ * @param reference The identifier that resolved to the delegate.
+ * @param facts What this module's own syntax says.
+ * @returns The inline handler's index entry, or `undefined`.
+ */
+function inlineHandlerCalling(reference: Node, facts: ModuleFacts): HandlerRef | undefined {
+  const call = reference.getParent();
+
+  if (
+    !Node.isCallExpression(call) ||
+    call.getExpression().compilerNode !== reference.compilerNode
+  ) {
+    return undefined;
+  }
+
+  for (const ancestor of call.getAncestors()) {
+    if (Node.isSourceFile(ancestor)) {
+      return undefined;
+    }
+
+    if (!Node.isFunctionLikeDeclaration(ancestor)) {
+      continue;
+    }
+
+    if (
+      (!Node.isArrowFunction(ancestor) && !Node.isFunctionExpression(ancestor)) ||
+      isDeclaredFunctionExpression(ancestor)
+    ) {
+      return undefined;
+    }
+
+    const inline = facts.handlers.get(ancestor.getStart());
+
+    if (inline !== undefined) {
+      return inline;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * The delegate rule of the cascade's first step: the inline handler that owns
+ * a function-local declaration because it is the only code that calls it, or
+ * `undefined` when the rule declines.
+ *
+ * `onSubmit={(event) => { void send(event); }}`, with `send` declared in the
+ * component body, is the ordinary shape of a form whose submit logic is too
+ * long for markup. A request `send` issues used to fall through to the
+ * component's `symbol` node, because `send` is function-local and no node
+ * exists for it — so the handler node `./event-handlers.ts` emits for the
+ * arrow had no outgoing edge, and no path through the interaction could hold
+ * it. When the arrow is the only caller, the request is issued exactly when
+ * the handler runs, so it is the handler's.
+ *
+ * Claimed only when every one of these holds, each read from syntax alone —
+ * the conditions `./server-functions.ts` applies to the same rule:
+ *
+ * 1. the ancestor has a delegate's shape ({@link delegateShapeOf}) and the
+ *    site lies inside the function it declares — a request in a dependency
+ *    list next to a `useCallback` argument is not the function's;
+ * 2. every identifier of the declaring block that resolves to it through
+ *    {@link resolveInScopes} — excluding its own name and member names
+ *    ({@link isMemberNamePosition}) — is the **callee of a call**, so a
+ *    markup binding, a value use, an argument or a dependency-list entry
+ *    declines;
+ * 3. every such call lies inside **one and the same inline** handler of this
+ *    file, reached through anonymous callbacks only
+ *    ({@link inlineHandlerCalling});
+ * 4. there is at least one such call.
+ *
+ * Anything else declines and the walk continues outward exactly as before, to
+ * a node that certainly exists. One level only: a delegate that only another
+ * delegate calls falls through. A file holds few request sites, so the block
+ * is read once per site that sits in a delegate rather than memoised.
+ *
+ * @param ancestor One ancestor of the call site.
+ * @param site The call site.
+ * @param facts What this module's own syntax says.
+ * @returns The inline handler's index entry, or `undefined`.
+ */
+function delegateHandlerOf(
+  ancestor: Node,
+  site: CallSite,
+  facts: ModuleFacts,
+): HandlerRef | undefined {
+  const delegate = delegateShapeOf(ancestor);
+
+  if (delegate === undefined || !isInside(site.expression, delegate.fn)) {
+    return undefined;
+  }
+
+  const name = delegate.nameNode.getText();
+  const own = delegate.nameNode.compilerNode;
+  let handler: HandlerRef | undefined;
+
+  for (const identifier of delegate.block.getDescendantsOfKind(SyntaxKind.Identifier)) {
+    if (
+      identifier.getText() !== name ||
+      identifier.compilerNode === own ||
+      isMemberNamePosition(identifier)
+    ) {
+      continue;
+    }
+
+    // A parameter or nested local of the same name shadows the delegate, so
+    // an identifier resolving elsewhere is simply not a reference to it.
+    if (resolveInScopes(identifier, name)?.compilerNode !== own) {
+      continue;
+    }
+
+    const caller = inlineHandlerCalling(identifier, facts);
+
+    if (caller === undefined || (handler !== undefined && handler.id !== caller.id)) {
+      return undefined;
+    }
+
+    handler = caller;
+  }
+
+  return handler;
+}
+
+/**
  * Whether one declaration is the request handler of this route module.
  *
  * The convention decides what counts, which is why
@@ -4162,7 +4540,9 @@ function fileOwner(ctx: ExtractorContext, site: CallSite): Owner {
  * 2. a declaration — of *any* scope, see {@link declarationAnchorOf} — whose
  *    anchor a markup binding resolved to → the **handler** node (this is the
  *    memoised shape: the declaration is reached *through* the `useCallback`
- *    call, which the walk simply steps over);
+ *    call, which the walk simply steps over), or a function-local delegate
+ *    only one inline handler calls → that inline **handler** node
+ *    ({@link delegateHandlerOf});
  * 3. the innermost addressable declaration otherwise → its **api-route**,
  *    **server-function** or **symbol** node, per {@link declaredOwner};
  * 4. nothing addressable anywhere up the chain → the **file** node.
@@ -4195,6 +4575,12 @@ function ownerOf(ctx: ExtractorContext, site: CallSite, facts: ModuleFacts): Own
       if (named !== undefined) {
         return { kind: 'handler', id: named.id, symbol: named.name };
       }
+    }
+
+    const delegated = delegateHandlerOf(ancestor, site, facts);
+
+    if (delegated !== undefined) {
+      return { kind: 'handler', id: delegated.id, symbol: delegated.name };
     }
 
     const declaration = addressableDeclarationOf(ancestor);

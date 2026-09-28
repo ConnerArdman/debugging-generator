@@ -67,7 +67,15 @@
  * - **Chain heads only.** A follow-up plan version layers a new record over an
  *   earlier one for the same file; only the newest record's `instrumentedHash`
  *   describes the bytes on disk, so one entry per file is kept — the head from
- *   `latestRecordForFile` — and an older link is never evaluated.
+ *   `latestRecordForFile` — and an older link is never evaluated. The one
+ *   thing the rest of the chain decides is where the original is: only the
+ *   **chain root** (the first link) backed up the pristine file, while every
+ *   later link's backup holds the previous version's still-instrumented
+ *   output. A conflict on a chained head therefore resolves its root with
+ *   `findChainRoot` over the session's open records and hands it to
+ *   `detectConflict`, so "Original saved at ‹backup path›", the notice's
+ *   `backupPath`, the report's `originalBackupPath` and the "original" side
+ *   of its diff all name the root's backup, never the intermediate one.
  * - **Containment and no symbolic links.** Every `record.file` is resolved
  *   inside the session's project root with `resolveWithinProject`, and every
  *   directory between the root and the watched directory must be a real
@@ -110,7 +118,7 @@
  * Log records and notices carry project-relative paths, record ids, statuses,
  * reasons and error codes only — never file content, a diff, a digest or a
  * backup path in a log line (AAP §0.5.2). The developer-facing sentence names
- * the backup path because AAP §0.5.5 requires it to.
+ * the pristine original's backup path because AAP §0.5.5 requires it to.
  *
  * ## Layering
  *
@@ -126,16 +134,20 @@
 import { lstatSync, promises as fsPromises, statSync, watch as nodeWatch } from 'node:fs';
 
 import {
+  OPEN_MODIFICATION_STATUSES,
   buildConflictReport,
   createBackupStore,
   detectConflict,
+  findChainRoot,
   isConflictVerdict,
 } from '@debuggen/instrumentation';
 import type {
+  BackupState,
   BackupStore,
   ModificationConflict,
   ModificationConflictReason,
   ModificationRecord,
+  RecordedBackup,
 } from '@debuggen/instrumentation';
 import type { ProgressStage, ProgressStatus } from '@debuggen/protocol';
 import {
@@ -150,7 +162,7 @@ import {
   resolveWithinProject,
 } from '@debuggen/shared';
 import type { DebuggenErrorCode, LogFields, Logger, Result } from '@debuggen/shared';
-import { sha256OfFile } from '@debuggen/shared/node';
+import { sha256Hex, sha256OfFile } from '@debuggen/shared/node';
 
 import type { ServiceConfig } from '../config.js';
 import { LOG_BINDING_KEYS, describeException, guardLogger, subsystemLogger } from '../logging.js';
@@ -321,10 +333,15 @@ export type WatcherModifications = Pick<
  * apart).
  *
  * - `content-changed` — the file holds bytes that are neither what the tool
- *   wrote nor the original.
- * - `reverted-to-original` — the developer restored the original bytes by
- *   hand. Still a conflict under AAP §0.5.1's literal rule: the product did not
- *   write those bytes and will not touch them.
+ *   wrote nor the original. For a chained record (a follow-up plan version
+ *   layered on an earlier one) that includes the earlier version's
+ *   instrumented output: those bytes still carry the tool's wrapper, so they
+ *   are not the original, even though the record backed them up.
+ * - `reverted-to-original` — the developer restored the pristine original by
+ *   hand: the record's own original for an unchained record, and the chain
+ *   root's original for a chained one. Still a conflict under AAP §0.5.1's
+ *   literal rule: the product did not write those bytes and will not touch
+ *   them.
  * - `file-missing` — the file was deleted, moved or renamed away.
  * - `not-a-regular-file` — something other than a regular file (a symbolic
  *   link, a directory) now stands at the path.
@@ -348,13 +365,25 @@ export interface ConflictNotice {
   readonly recordId: string;
   /** The conflicting file, project-relative POSIX. */
   readonly file: string;
-  /** Where the original bytes are kept. Never deleted by this module. */
+  /**
+   * Where the pristine original is kept: the path the sentence names after
+   * "Original saved at". For an unchained record that is the record's own
+   * backup; for a chained record it is the **chain root's** backup
+   * (`ModificationConflict.originalBackupPath`), because the record's own
+   * backup holds the previous plan version's instrumented output. It falls
+   * back to the record's own backup only when the chain root could not be
+   * resolved from the journal, which is logged. Never deleted by this module.
+   */
   readonly backupPath: string;
   /** The journal's reason, from `MODIFICATION_CONFLICT_REASONS`. */
   readonly reason: ModificationConflict['reason'];
   /** How the change presented itself; see {@link ConflictObservation}. */
   readonly observation: ConflictObservation;
-  /** Whether the saved original was read back and verified against its digest. */
+  /**
+   * Whether the saved original at {@link ConflictNotice.backupPath} was read
+   * back and verified against its digest — for a chained record, the chain
+   * root's backup against the root's `originalHash`.
+   */
   readonly backupVerified: boolean;
 }
 
@@ -362,10 +391,11 @@ export interface ConflictNotice {
  * Receives every conflict this module reports, after the journal transition
  * has been committed.
  *
- * A consumer-declared structural port: `./service.ts` (or `src/main.ts`) wires
- * it to the session manager so the session record's modification list and
- * `cleanup.conflicts` reflect the conflict and a `session.updated` reaches both
- * user interfaces. This module never imports the manager to do that itself.
+ * A consumer-declared structural port: `src/main.ts` wires it to the session
+ * manager (`conflictReflectingListener`) so the session record's modification
+ * list reflects the conflict and a `session.updated` reaches both user
+ * interfaces. `cleanup.conflicts` is not touched: only a cleanup pass writes
+ * it. This module never imports the manager to do that itself.
  * A rejection or a throw is caught and logged; it never escapes the watcher.
  */
 export interface ModificationConflictListener {
@@ -612,13 +642,24 @@ export interface InstrumentationWatcher {
  *
  * The one definition of the sentence, exported so the suites and any user
  * interface reference the same builder. It names the project-relative file and
- * the backup path — both taken from the report, which carries the record's own
- * values — and nothing else: never file content, a diff or a digest.
+ * the pristine original's backup path — both taken from the report — and
+ * nothing else: never file content, a diff or a digest. The path is the
+ * report's `originalBackupPath` when it carries one (a chained record: the
+ * chain root's backup) and its `backupPath` otherwise; see
+ * {@link originalBackupPathOf}.
  *
  * @param record The record the conflict is about; its values are the fallback
  * when a report field is blank.
  * @param conflict The report from `detectConflict` or `buildConflictReport`.
  * @returns The sentence, verbatim.
+ *
+ * @example
+ * ```ts
+ * // A chained record whose report names its chain root's backup:
+ * buildConflictMessage(head, { ...conflict, originalBackupPath: root.backupPath });
+ * // → "‹file› was edited while instrumented. Debug Generator will not
+ * //    overwrite it. Original saved at ‹root.backupPath›."
+ * ```
  */
 export function buildConflictMessage(
   record: ModificationRecord,
@@ -626,8 +667,23 @@ export function buildConflictMessage(
 ): string {
   return composeConflictSentence(
     conflict.file.length > 0 ? conflict.file : record.file,
-    conflict.backupPath.length > 0 ? conflict.backupPath : record.backupPath,
+    originalBackupPathOf(record, conflict),
   );
+}
+
+/**
+ * Where the pristine original a conflict report names is kept: the report's
+ * `originalBackupPath` (a chained record's chain root), else its `backupPath`,
+ * else the record's own. The one resolution both the sentence and
+ * {@link ConflictNotice.backupPath} use, so the two can never name different
+ * files.
+ */
+function originalBackupPathOf(record: ModificationRecord, conflict: ModificationConflict): string {
+  if (conflict.originalBackupPath !== undefined && conflict.originalBackupPath.length > 0) {
+    return conflict.originalBackupPath;
+  }
+
+  return conflict.backupPath.length > 0 ? conflict.backupPath : record.backupPath;
 }
 
 /** The sentence itself, over the two values it names. */
@@ -899,6 +955,12 @@ interface ConflictFinding {
   readonly observation: ConflictObservation;
   readonly backupNote: string | undefined;
   readonly backupVerified: boolean;
+  /**
+   * The pristine original's backup path the sentence names: the chain root's
+   * for a chained record whose root was resolved, else the record's own. The
+   * notice's fallback when no report could be composed.
+   */
+  readonly originalBackupPath: string;
 }
 
 /**
@@ -1141,6 +1203,77 @@ function backupUnavailableNote(reason: string): string {
   const phrase = BACKUP_UNAVAILABLE_WORDING[reason] ?? 'could not be verified';
 
   return `The saved original ${phrase}, so it cannot be offered for recovery.`;
+}
+
+/**
+ * The digest of the pristine original a record's file could have been
+ * restored to by hand: the chain root's `originalHash` for a chained record
+ * whose root is known, the record's own `originalHash` for an unchained one,
+ * and `undefined` for a chained record whose root is not known — its own
+ * `originalHash` is the previous plan version's instrumented output, which is
+ * not the original.
+ */
+function pristineHashOf(
+  record: ModificationRecord,
+  chainRoot: ModificationRecord | undefined,
+): string | undefined {
+  if (chainRoot !== undefined) {
+    return chainRoot.originalHash;
+  }
+
+  return record.previousRecordId === undefined ? record.originalHash : undefined;
+}
+
+/**
+ * Reads a chain root's backup back and verifies it against the root's
+ * `originalHash`, so the notice's `backupVerified` and its backup note
+ * describe the backup its sentence names.
+ *
+ * `detectConflict` makes the same check of the judged record's own backup and,
+ * for a chained record, reads the root's back only to compose the diff; its
+ * verdict reports the record's own backup state, which for a chained record
+ * is the intermediate, still-instrumented copy. This is the same read-only
+ * check over the root: through `BackupStore.readRecorded` (the path the
+ * journal names, so a relocated backup is not reported missing), then a
+ * raw-byte SHA-256 of what was read. It writes nothing, never throws, and
+ * answers in the verdict's own {@link BackupState} vocabulary.
+ */
+async function inspectChainRootBackup(
+  backups: BackupStore,
+  chainRoot: ModificationRecord,
+): Promise<BackupState> {
+  const path = chainRoot.backupPath;
+  let read: Result<RecordedBackup, DebuggenError>;
+
+  try {
+    read = await backups.readRecorded(path, chainRoot.originalHash);
+  } catch (thrown) {
+    return { available: false, path, reason: 'unreadable', detail: errnoOf(thrown) };
+  }
+
+  if (isErr(read)) {
+    const storeReason = read.error.details?.['reason'];
+
+    return {
+      available: false,
+      path,
+      reason:
+        storeReason === 'backup-missing'
+          ? 'missing'
+          : storeReason === 'stored-digest-mismatch'
+            ? 'digest-mismatch'
+            : read.error.code === 'FS_UNSAFE_PATH'
+              ? 'unusable-path'
+              : 'unreadable',
+      detail: typeof storeReason === 'string' ? storeReason : read.error.code,
+    };
+  }
+
+  const { bytes } = read.value;
+
+  return sha256Hex(bytes) === chainRoot.originalHash
+    ? { available: true, path, byteLength: bytes.byteLength }
+    : { available: false, path, reason: 'digest-mismatch' };
 }
 
 /** A timer-backed promise that can be cancelled, so a bounded wait leaves no handle behind. */
@@ -2186,6 +2319,57 @@ export function createInstrumentationWatcher(
   }
 
   /**
+   * The chain root of a chained head: the first record of its follow-up
+   * chain, whose backup is the pristine file (AAP §0.4.2). `undefined` for an
+   * unchained head, whose own backup already is the pristine file.
+   *
+   * Resolved with `findChainRoot` over the session's open records — the set
+   * cleanup resolves it in — so the live notice and the cleanup report name
+   * the same original. A journal that cannot be read, or a chain whose parent
+   * is not among the open records, degrades to the head's own backup: the
+   * conflict is still reported, and the degradation is logged at `warn` with
+   * ids, statuses and codes only — never a path or a digest.
+   */
+  async function chainRootOf(
+    session: SessionState,
+    head: ModificationRecord,
+  ): Promise<ModificationRecord | undefined> {
+    if (head.previousRecordId === undefined) {
+      return undefined;
+    }
+
+    let listed: Result<ModificationRecord[], DebuggenError>;
+
+    try {
+      listed = await modifications.listBySession(session.sessionId, {
+        statuses: OPEN_MODIFICATION_STATUSES,
+      });
+    } catch (thrown) {
+      listed = err(DebuggenError.from(thrown, 'STORE_ERROR'));
+    }
+
+    if (isErr(listed)) {
+      log.warn(
+        "the chain root could not be read from the journal; the conflict names the record's own backup",
+        { ...recordFields(head), previousRecordId: head.previousRecordId, code: listed.error.code },
+      );
+
+      return undefined;
+    }
+
+    const root = findChainRoot(head, listed.value);
+
+    if (root === undefined) {
+      log.warn(
+        "a chained record's chain root is not among the open records; the conflict names the record's own backup",
+        { ...recordFields(head), previousRecordId: head.previousRecordId },
+      );
+    }
+
+    return root;
+  }
+
+  /**
    * Obtains the precise verdict and report from `detectConflict` — the
    * procedure cleanup uses — and turns it into a finding.
    *
@@ -2196,13 +2380,23 @@ export function createInstrumentationWatcher(
    * `backup-unavailable`, which is reached only with the instrumented content
    * present): the change was undone before it could be judged, so there is no
    * edit to report and the answer is `undefined`.
+   *
+   * For a chained head the finding is about the **chain root's** original:
+   * the root is handed to every `detectConflict` and `buildConflictReport`
+   * call, so the report carries `originalBackupPath` and its "original" diff
+   * side is the root's verified pristine text; the sentence names the root's
+   * backup; and whether that backup is verified is read from the root's own
+   * backup, not the head's intermediate one.
    */
   async function describeConflict(
     session: SessionState,
     head: ModificationRecord,
     observation: FileObservation,
   ): Promise<ConflictFinding | undefined> {
-    const sentence = composeConflictSentence(head.file, head.backupPath);
+    const chainRoot = await chainRootOf(session, head);
+    const originalBackupPath = chainRoot?.backupPath ?? head.backupPath;
+    const pristineHash = pristineHashOf(head, chainRoot);
+    const sentence = composeConflictSentence(head.file, originalBackupPath);
     const backups = backupStoreOf(session);
 
     if (isErr(backups)) {
@@ -2216,6 +2410,7 @@ export function createInstrumentationWatcher(
         backups: backups.value,
         now: stamp,
         message: sentence,
+        chainRoot,
       });
 
       if (isErr(verdict)) {
@@ -2235,37 +2430,59 @@ export function createInstrumentationWatcher(
           return undefined;
         }
 
-        const backupNote = judged.backup.available
-          ? undefined
-          : backupUnavailableNote(judged.backup.reason);
+        // The saved original the sentence names: the verdict's own backup
+        // state for an unchained head, and the chain root's backup — read back
+        // and verified here — for a chained one, whose own backup is the
+        // previous plan version's instrumented output.
+        const original =
+          chainRoot === undefined
+            ? judged.backup
+            : await inspectChainRootBackup(backups.value, chainRoot);
+        const backupNote = original.available ? undefined : backupUnavailableNote(original.reason);
 
         if (isConflictVerdict(judged)) {
           return {
             conflict: judged.conflict,
             reason: judged.conflict.reason,
+            // A chained head is judged against its own digests, so a file put
+            // back to the chain root's pristine original is `content-changed`
+            // to the detector; to the developer it is the original restored.
             observation:
               judged.kind === 'file-missing'
                 ? 'file-missing'
                 : observation.kind === 'not-regular'
                   ? 'not-a-regular-file'
-                  : 'content-changed',
+                  : judged.actualHash === pristineHash
+                    ? 'reverted-to-original'
+                    : 'content-changed',
             backupNote,
-            backupVerified: judged.backup.available,
+            backupVerified: original.available,
+            originalBackupPath,
           };
         }
 
-        // `already-reverted`: the developer put the original bytes back by
-        // hand. The detector reports no conflict for it, because nothing is
-        // left to restore; the watcher still must (the product did not write
-        // those bytes), so the report is composed through the same builder
-        // cleanup uses, with the tool's own change as its one diff.
+        // `already-reverted`: the file holds the bytes the head replaced. The
+        // detector reports no conflict for it, because nothing is left to
+        // restore; the watcher still must (the product did not write those
+        // bytes last), so the report is composed through the same builder
+        // cleanup uses.
+        //
+        // For an unchained head those bytes are the pristine original, and the
+        // tool's own change is the report's one diff. For a chained head they
+        // are the previous plan version's instrumented output, which still
+        // carries the tool's wrapper: the developer did not restore the
+        // original, and the head's diff starts from those intermediate bytes,
+        // so it is no "original → instrumented" view and no diff is offered.
+        const chained = head.previousRecordId !== undefined;
         const report = buildConflictReport({
           record: head,
           reason: 'content-changed',
           detectedAt: judged.detectedAt,
           actualHash: judged.actualHash,
           message: sentence,
-          diffs: head.diff.length > 0 ? { originalToInstrumented: head.diff } : undefined,
+          diffs:
+            !chained && head.diff.length > 0 ? { originalToInstrumented: head.diff } : undefined,
+          chainRoot,
         });
 
         if (isErr(report)) {
@@ -2278,16 +2495,18 @@ export function createInstrumentationWatcher(
         return {
           conflict: isErr(report) ? undefined : report.value,
           reason: 'content-changed',
-          observation: 'reverted-to-original',
+          observation: chained ? 'content-changed' : 'reverted-to-original',
           backupNote,
-          backupVerified: judged.backup.available,
+          backupVerified: original.available,
+          originalBackupPath,
         };
       }
     }
 
     // The detector could not be consulted or could not answer. The file still
     // differs from what the tool wrote, so the conflict stands; it is reported
-    // with what is known, without a diff.
+    // with what is known, without a diff — still naming the chain root's
+    // backup for a chained head.
     const reason: ModificationConflictReason =
       observation.kind === 'missing' ? 'file-missing' : 'content-changed';
     const report = buildConflictReport({
@@ -2296,6 +2515,7 @@ export function createInstrumentationWatcher(
       detectedAt: stamp(),
       actualHash: observation.kind === 'regular' ? observation.hash : undefined,
       message: sentence,
+      chainRoot,
     });
 
     if (isErr(report)) {
@@ -2313,9 +2533,12 @@ export function createInstrumentationWatcher(
           ? 'file-missing'
           : observation.kind === 'not-regular'
             ? 'not-a-regular-file'
-            : 'content-changed',
+            : observation.kind === 'regular' && observation.hash === pristineHash
+              ? 'reverted-to-original'
+              : 'content-changed',
       backupNote: undefined,
       backupVerified: false,
+      originalBackupPath,
     };
   }
 
@@ -2422,9 +2645,14 @@ export function createInstrumentationWatcher(
     finding: ConflictFinding,
   ): Promise<void> {
     const { conflict } = finding;
+    // The one path the sentence names and the notice carries: the report's
+    // pristine original when there is a report, the finding's otherwise —
+    // for a chained record, the chain root's backup either way.
+    const backupPath =
+      conflict === undefined ? finding.originalBackupPath : originalBackupPathOf(record, conflict);
     const message =
       conflict === undefined
-        ? composeConflictSentence(record.file, record.backupPath)
+        ? composeConflictSentence(record.file, backupPath)
         : buildConflictMessage(record, conflict);
     const notice: ConflictNotice = Object.freeze({
       message,
@@ -2432,7 +2660,7 @@ export function createInstrumentationWatcher(
       action: 'open-diff',
       recordId: record.id,
       file: record.file,
-      backupPath: record.backupPath,
+      backupPath,
       reason: finding.reason,
       observation: finding.observation,
       backupVerified: finding.backupVerified,

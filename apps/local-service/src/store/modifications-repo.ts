@@ -252,6 +252,28 @@ const REVERTED_STATUS: ModificationStatus = 'reverted';
  *                               nothing left to act on
  * ```
  *
+ * A chained record (invariant 2) also moves with its chain, over the same
+ * edges:
+ *
+ * - **The chain beneath a conflict.** When cleanup judges a chained record a
+ *   conflict because the file holds none of the chain's output — edited, or
+ *   gone — every open record beneath it moves to `conflict` with it
+ *   (`applied | pending | failed → conflict`) and keeps its backup. A root
+ *   left `applied` would claim the tool's bytes are on disk, which is exactly
+ *   what the patcher reads as another session holding the file, so an ended
+ *   session never leaves one beneath a conflict.
+ * - **The chain close.** Once the developer puts back an earlier version of
+ *   the file — typically the pristine one, the chain root's `originalHash` — a
+ *   head in `pending`, `failed` or `conflict` whose file hashes to the
+ *   `originalHash` of a record beneath it is closed, with every record down to
+ *   that one, without a write (`→ reverted`). An ended session's chain is
+ *   closed this way by start-up reconciliation, since ending the session again
+ *   answers from its stored verdict.
+ * - **Another session's bytes.** A record whose file holds exactly another
+ *   session's open claim over the same pristine original is closed without a
+ *   write (`→ reverted`), with the chain beneath it: that session's cleanup
+ *   restores the file.
+ *
  * A write of the status a record already carries is **not** a transition and is
  * not listed here: cleanup and the patcher retry idempotently, so
  * {@link ModificationsRepo.updateStatus} accepts that as a success. See

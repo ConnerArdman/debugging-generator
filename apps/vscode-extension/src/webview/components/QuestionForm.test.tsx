@@ -15,6 +15,9 @@
  *   - the protocol's question limit on the field: native `maxLength`, a paste
  *     cut off at it, and a counter that describes the field (not a live
  *     region) and warns once the limit is reached;
+ *   - the shortcut hint: the exact sentence, every key a `Kbd` chip, placed in
+ *     the submit row immediately before the button and describing the field
+ *     (`FollowUp.test.tsx` guards that it matches the follow-up field's hint);
  *   - the three states of AAP 0.5.5 and their precedence (error > pending >
  *     unavailable > data), each rendered through its design-system primitive
  *     and never as a blank area — pending keeps the labelled field on screen,
@@ -56,6 +59,55 @@ const LIMIT_REACHED_TEXT = 'Limit reached: longer text is cut off.';
 const OVER_LIMIT_TEXT = 'Over the limit: shorten it to ask.';
 /** The visible busy line while a question is in flight. */
 const PENDING_TEXT = 'Submitting your question…';
+/** The shortcut hint as read, word for word the follow-up field's hint. */
+const SHORTCUT_HINT_TEXT = 'Press Ctrl+Enter (Cmd+Enter on macOS) to ask. Enter starts a new line.';
+
+/** One `Kbd` chip of a hint: its element, its class list and the keys it prints. */
+interface HintChip {
+  readonly tag: string;
+  readonly className: string;
+  readonly keys: readonly string[];
+}
+
+/**
+ * The `Kbd` chips of the shortcut hint, in order: the two chords, which print one `dg-kbd__key`
+ * per key, then the lone Enter, which is itself the `dg-kbd__key`.
+ */
+const SHORTCUT_HINT_CHIPS: readonly HintChip[] = [
+  { tag: 'KBD', className: 'dg-kbd', keys: ['Ctrl', 'Enter'] },
+  { tag: 'KBD', className: 'dg-kbd', keys: ['Cmd', 'Enter'] },
+  { tag: 'KBD', className: 'dg-kbd dg-kbd__key', keys: ['Enter'] },
+];
+
+/**
+ * The shortcut hint, found by its exact text: no other element reads exactly that sentence.
+ *
+ * @returns Its element, or `null` when it is not on display.
+ */
+function queryShortcutHint(): HTMLElement | null {
+  return screen.queryByText((_content, element) => element?.textContent === SHORTCUT_HINT_TEXT);
+}
+
+/**
+ * The `Kbd` chips a hint holds, in order. Every chord separator must be hidden from assistive
+ * technology, or the hint would not be heard as the sentence it prints.
+ *
+ * @param hint The shortcut hint.
+ * @returns One entry per chip.
+ */
+function hintChips(hint: HTMLElement): HintChip[] {
+  return Array.from(hint.children, (chip) => {
+    for (const separator of chip.querySelectorAll('.dg-kbd__separator')) {
+      expect(separator.getAttribute('aria-hidden')).toBe('true');
+    }
+    const keys = chip.classList.contains('dg-kbd__key')
+      ? [chip.textContent]
+      : Array.from(chip.children)
+          .filter((key) => key.tagName === 'KBD' && key.classList.contains('dg-kbd__key'))
+          .map((key) => key.textContent);
+    return { tag: chip.tagName, className: chip.className, keys };
+  });
+}
 
 /** Formats a count as the counter does, in the test run's own locale. */
 const COUNT_FORMAT = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
@@ -183,7 +235,36 @@ describe('QuestionForm — default state', () => {
     const descriptions = describedBy.map((id) => document.getElementById(id)?.textContent ?? '');
 
     expect(descriptions.some((text) => text.includes('Chrome DevTools'))).toBe(true);
-    expect(descriptions.some((text) => text.includes('to ask'))).toBe(true);
+    expect(descriptions).toContain(SHORTCUT_HINT_TEXT);
+  });
+
+  it('prints the shortcut hint in Kbd keys immediately before the submit button, describing the field', () => {
+    render(<QuestionForm onSubmit={vi.fn()} />);
+
+    const hint = queryShortcutHint();
+    if (hint === null) {
+      throw new Error('expected the shortcut hint to be on display');
+    }
+    // Heard as exactly the sentence it prints: the chord separators are hidden.
+    expect(hint.textContent).toBe(SHORTCUT_HINT_TEXT);
+    // Every key a Kbd chip: the two chords, then the single Enter.
+    expect(hint.querySelectorAll('kbd.dg-kbd')).toHaveLength(SHORTCUT_HINT_CHIPS.length);
+    expect(hintChips(hint)).toEqual(SHORTCUT_HINT_CHIPS);
+    // Muted helper text, not a paragraph of its own.
+    expect(hint.tagName).toBe('SPAN');
+    expect(hint.classList.contains('dg-text--xs')).toBe(true);
+    expect(hint.classList.contains('dg-text--muted')).toBe(true);
+
+    // In the submit row, immediately before the submit button.
+    const submit = getSubmit();
+    expect(hint.nextElementSibling).toBe(submit);
+    expect(hint.parentElement).toBe(submit.parentElement);
+    expect(hint.closest('.dg-stack--horizontal')).not.toBeNull();
+
+    // Announced with the field, after the DevTools hint.
+    expect(hint.id).not.toBe('');
+    const describedBy = (getField().getAttribute('aria-describedby') ?? '').split(' ');
+    expect(describedBy.at(-1)).toBe(hint.id);
   });
 
   it('composes the root block class with the caller class', () => {
@@ -709,9 +790,10 @@ describe('QuestionForm — pending', () => {
     expect(container.querySelector('.dg-loading-state')).toBeNull();
 
     // It takes the shortcut hint's place, in the layout and in the field's description.
-    expect(screen.queryByText('to ask', { exact: false })).toBeNull();
+    expect(queryShortcutHint()).toBeNull();
+    expect(status?.nextElementSibling).toBe(getSubmit());
     const describedBy = (field.getAttribute('aria-describedby') ?? '').split(' ');
-    expect(describedBy).toContain(status?.id);
+    expect(describedBy.at(-1)).toBe(status?.id);
     expect(describedBy.every((id) => document.getElementById(id) !== null)).toBe(true);
   });
 

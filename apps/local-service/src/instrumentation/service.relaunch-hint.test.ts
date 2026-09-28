@@ -507,7 +507,7 @@ function createHarness(options: HarnessOptions): Harness {
     serverAgentChannel: { sendToServerAgent: () => ok(1) },
     watcher: idleWatcher(),
     agents: {
-      latestAgentReady: (tabId) => (tabId === TAB_ID ? healthyAgentReady() : undefined),
+      latestAgentReady: ({ tabId }) => (tabId === TAB_ID ? healthyAgentReady() : undefined),
       waitForAgentReady: () => Promise.resolve(undefined),
       latestAgentReadyAt: () => NOW,
     },

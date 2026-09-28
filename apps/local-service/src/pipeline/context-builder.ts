@@ -108,6 +108,7 @@ import type {
   RouteMap,
 } from '@debuggen/code-analysis';
 import {
+  PROBLEM_CATEGORIES,
   instrumentationPlanInputSchema,
   problemUnderstandingSchema,
 } from '@debuggen/instrumentation';
@@ -272,6 +273,16 @@ export interface PipelineStageContext {
    * and redacted before rendering, like the question.
    */
   readonly followUpQuestion?: string | undefined;
+  /**
+   * The structured focus of the follow-up this run answers, when the caller
+   * has already derived it: the follow-up stage sets it on the context it
+   * hands the analysis regeneration, from the declarations its decision
+   * resolved. Absent, `stages/followup.ts`'s `followUpFocusFor` derives it —
+   * from {@link followUpQuestion}, else from the session's new-capture
+   * follow-up whose plan version the capture ran under — and a run no
+   * follow-up governs has none. Structured data only, never question text.
+   */
+  readonly followUpFocus?: FollowUpFocus | undefined;
   /** The element the developer selected, when there is one. */
   readonly target?: SelectedTarget | undefined;
   /**
@@ -310,6 +321,12 @@ export interface PipelineStageContextInit {
   readonly logger: Logger;
   /** The follow-up question, on the follow-up path. */
   readonly followUpQuestion?: string | undefined;
+  /**
+   * The structured focus of the follow-up the run answers, when the caller
+   * has already derived it; see {@link PipelineStageContext.followUpFocus}.
+   * Stored as given; every request that carries it bounds it first.
+   */
+  readonly followUpFocus?: FollowUpFocus | undefined;
   /**
    * The page address to use instead of the session's bound tab URL — for
    * instance the URL a `session.bind` just reported. Stored as given; the
@@ -364,6 +381,7 @@ export function createPipelineStageContext(
     projectRoot,
     question: session.question,
     ...(init.followUpQuestion !== undefined ? { followUpQuestion: init.followUpQuestion } : {}),
+    ...(init.followUpFocus !== undefined ? { followUpFocus: init.followUpFocus } : {}),
     ...(session.target !== undefined ? { target: session.target } : {}),
     ...(currentUrl !== undefined ? { currentUrl } : {}),
     code: init.code,
@@ -1894,6 +1912,150 @@ export interface FollowUpDeclarationCandidate {
   readonly score: number;
 }
 
+/**
+ * One declaration a follow-up names, as {@link FollowUpFocus} carries it: a
+ * {@link FollowUpDeclarationCandidate} without its score. A plain type rather
+ * than an interface, like {@link FollowUpFocus}, so it stays assignable to
+ * `JsonObject`.
+ */
+export type FollowUpFocusDeclaration = {
+  /** The declaring file: project-relative, POSIX separators. */
+  readonly file: string;
+  /** The declared name, as the graph holds it. */
+  readonly symbol: string;
+  /** The graph node kind: `symbol`, `component` or `server-function`. */
+  readonly kind: string;
+};
+
+/**
+ * What a follow-up asks about, as structured data (AAP §0.4.2, Follow-up row;
+ * §0.5.4): the top-level `followUpFocus` section of the analyze and
+ * generate-panel requests' structured input whenever a follow-up governs them
+ * — the existing-evidence regeneration, and every capture taken under a plan
+ * version a new-capture follow-up installed. The rules-based provider reads it
+ * to compose the analysis and the panel for the follow-up rather than repeat
+ * the first question's; a model reads the follow-up in the prompt itself.
+ *
+ * Omitted, key and all, when no follow-up governs or both lists are empty, so
+ * a first question's inputs are exactly what they were. It never carries
+ * question text: the hints are closed-vocabulary categories and the
+ * declarations are names the code graph holds. A plain type rather than an
+ * interface so the analysis stage input that embeds it stays assignable to
+ * `JsonObject`.
+ *
+ * @example
+ * ```ts
+ * const focus: FollowUpFocus = {
+ *   categoryHints: ['performance'],
+ *   declarations: [{ file: 'src/ledger/totals.ts', symbol: 'settle', kind: 'symbol' }],
+ * };
+ * ```
+ */
+export type FollowUpFocus = {
+  /**
+   * The generic tokenizer's `categoryHints` of the redacted follow-up,
+   * verbatim and in its order — best supported first — from the closed
+   * vocabulary `performance`, `rendering`, `network`, `data`, `state`, `error`,
+   * `correctness`.
+   */
+  readonly categoryHints: readonly string[];
+  /**
+   * The declarations the follow-up names, resolved through the code graph —
+   * the follow-up decision's `candidates` without their scores — in resolution
+   * order, at most {@link FOLLOW_UP_FOCUS_LIMITS}`.maxDeclarations`.
+   */
+  readonly declarations: readonly FollowUpFocusDeclaration[];
+};
+
+/**
+ * The caps of a {@link FollowUpFocus} wherever it enters a request, applied by
+ * {@link boundedFollowUpFocus}.
+ */
+export const FOLLOW_UP_FOCUS_LIMITS = Object.freeze({
+  /** Category hints: never more than the problem-category vocabulary holds. */
+  maxCategoryHints: PROBLEM_CATEGORIES.length,
+  /** Declarations: the most one follow-up's names resolve to (`stages/followup.ts`). */
+  maxDeclarations: 8,
+  /** Characters of one hint, file, symbol or kind; a longer one is dropped, never cut. */
+  maxTextChars: CONTEXT_LIMITS.maxStringChars,
+});
+
+/**
+ * A {@link FollowUpFocus} held to {@link FOLLOW_UP_FOCUS_LIMITS} and reduced to
+ * its contract — the one bound every request that carries a focus applies, so
+ * the analysis and the panel of one follow-up read the same focus.
+ *
+ * Kept in order: category hints that are non-blank strings within
+ * `maxTextChars`, each once; declarations whose file is a safe project-relative
+ * path and whose file, symbol and kind are non-blank strings within
+ * `maxTextChars`, each file and symbol once, projected onto `file`, `symbol`
+ * and `kind` (a score or any other member is left behind). A value cut to fit
+ * would name a declaration the graph does not hold, so an entry over a cap is
+ * dropped rather than shortened. Both lists are capped.
+ *
+ * Pure and total; the input is not modified.
+ *
+ * @param focus The focus as its producer derived it, or `undefined`.
+ * @returns The bounded focus, frozen, or `undefined` when there is none or
+ * nothing in it survives.
+ */
+export function boundedFollowUpFocus(focus: FollowUpFocus | undefined): FollowUpFocus | undefined {
+  if (focus === undefined || typeof focus !== 'object' || focus === null) {
+    return undefined;
+  }
+  const within = (text: unknown): text is string =>
+    typeof text === 'string' &&
+    text.trim().length > 0 &&
+    text.length <= FOLLOW_UP_FOCUS_LIMITS.maxTextChars;
+
+  const hints = new Set<string>();
+  const givenHints: readonly unknown[] = Array.isArray(focus.categoryHints)
+    ? focus.categoryHints
+    : [];
+  for (const hint of givenHints) {
+    if (hints.size >= FOLLOW_UP_FOCUS_LIMITS.maxCategoryHints) {
+      break;
+    }
+    if (within(hint)) {
+      hints.add(hint);
+    }
+  }
+
+  const declarations: FollowUpFocusDeclaration[] = [];
+  const seen = new Set<string>();
+  const givenDeclarations: readonly unknown[] = Array.isArray(focus.declarations)
+    ? focus.declarations
+    : [];
+  for (const entry of givenDeclarations) {
+    if (declarations.length >= FOLLOW_UP_FOCUS_LIMITS.maxDeclarations) {
+      break;
+    }
+    if (typeof entry !== 'object' || entry === null) {
+      continue;
+    }
+    const file: unknown = Reflect.get(entry, 'file');
+    const symbol: unknown = Reflect.get(entry, 'symbol');
+    const kind: unknown = Reflect.get(entry, 'kind');
+    if (!within(file) || !within(symbol) || !within(kind) || !isSafeRelativePath(file)) {
+      continue;
+    }
+    const identity = `${file}\u0000${symbol}`;
+    if (seen.has(identity)) {
+      continue;
+    }
+    seen.add(identity);
+    declarations.push(Object.freeze({ file, symbol, kind }));
+  }
+
+  if (hints.size === 0 && declarations.length === 0) {
+    return undefined;
+  }
+  return Object.freeze({
+    categoryHints: Object.freeze([...hints]),
+    declarations: Object.freeze(declarations),
+  });
+}
+
 /** Input of {@link ContextBuilder.buildFollowUpRequest}. */
 export interface FollowUpRequestInput extends StageBuildOptions {
   /** The follow-up question, verbatim. Rendered into the prompt only. */
@@ -1959,7 +2121,10 @@ export interface ContextBuilder {
   buildInvestigateRequest(
     request: InvestigateRequestInput,
   ): Result<StageRequestBuild, DebuggenError>;
-  /** Stage 3: the understanding, the investigation and the adapter catalog. */
+  /**
+   * Stage 3: the understanding, the investigation and the adapter catalog,
+   * with the selected element's owner chain as structured data only.
+   */
   buildPlanRequest(request: PlanRequestInput): Result<StageRequestBuild, DebuggenError>;
   /** Stage 5: the understanding, the capture's analysis input and the code excerpts. */
   buildAnalyzeRequest(request: AnalyzeRequestInput): Result<StageRequestBuild, DebuggenError>;
@@ -2002,12 +2167,26 @@ const FOLLOW_UP_RESERVED_KEYS: readonly string[] = Object.freeze([
   'candidates',
 ]);
 
-/** Analysis-input fields that are prompt-only (the question) or rendered separately (excerpts). */
+/**
+ * Analysis-input fields that are prompt-only (the question), rendered
+ * separately (excerpts) or placed at the top level of the structured input
+ * rather than inside the capture's evidence (the follow-up focus).
+ */
 const ANALYZE_SEPARATED_KEYS: ReadonlySet<string> = new Set([
   'question',
   'followUpQuestion',
   'excerpts',
+  'followUpFocus',
 ]);
+
+/** How many entries a follow-up focus holds, for telling whether its bound removed any. */
+function focusEntries(focus: FollowUpFocus | undefined): number {
+  if (focus === undefined) {
+    return 0;
+  }
+  const hints = Array.isArray(focus.categoryHints) ? focus.categoryHints.length : 0;
+  return hints + (Array.isArray(focus.declarations) ? focus.declarations.length : 0);
+}
 
 /** Keys under which a query run nests the request that produced it, not its findings. */
 const QUERY_REQUEST_KEY = 'request';
@@ -2421,6 +2600,33 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
     };
   };
 
+  /**
+   * The selected element's owner chain, nearest first, as the plan request's
+   * `selectedComponents`: every name redacted before it is capped, exactly as
+   * {@link targetSection} treats it, since each is page content. Structured
+   * data only — never rendered — so a rules-based author names the component
+   * a plan's objective is about even when the selection arrived after the
+   * understanding was settled. Deliberately not a `target` section: the plan
+   * reads its candidates against the understanding, and a target beside it
+   * would change how they are scored. `undefined` without a selection or a
+   * chain.
+   */
+  const selectedComponentsSection = (
+    target: SelectedTarget | undefined,
+    truncated: Set<string>,
+  ): JsonValue | undefined => {
+    if (target === undefined || target.componentChain.length === 0) {
+      return undefined;
+    }
+    const chain = capList(target.componentChain, limits.maxListItems);
+    if (chain.truncated) {
+      truncated.add('selectedComponents');
+    }
+    return chain.items.map((name) =>
+      pageSectionText(name, limits.maxStringChars, 'selectedComponents', truncated),
+    );
+  };
+
   /** The bound tab's address, redacted and then capped, recording `currentUrl` when shortened. */
   const currentUrlSection = (
     url: string | undefined,
@@ -2715,11 +2921,13 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
       flows: boundSection(flows.items, 'investigation', fullyCapped, truncated) ?? [],
     };
     const adapterCatalog = catalogSection(request.adapterCatalog, 'adapterCatalog', truncated);
+    const selectedComponents = selectedComponentsSection(request.context.target, truncated);
 
     const input: JsonObject = {
       ...(understanding !== undefined ? { understanding } : {}),
       investigation,
       ...(adapterCatalog !== undefined ? { adapterCatalog } : {}),
+      ...(selectedComponents !== undefined ? { selectedComponents } : {}),
     };
 
     return finishStage({
@@ -2788,10 +2996,20 @@ export function createContextBuilder(deps: ContextBuilderDeps): ContextBuilder {
       truncated,
     );
 
+    // The follow-up this analysis answers, when one governs it: structured data at the top level,
+    // beside the evidence rather than inside it, held to the one bound every request applies.
+    const givenFocus = request.stageInput.followUpFocus;
+    const focus = boundedFollowUpFocus(givenFocus);
+    if (focusEntries(focus) < focusEntries(givenFocus)) {
+      truncated.add('followUpFocus');
+    }
+    const followUpFocus = focus === undefined ? undefined : canonicalJson(focus, new Set<object>());
+
     const input: JsonObject = {
       ...(understanding !== undefined ? { understanding } : {}),
       captureSummary,
       codeExcerpts,
+      ...(followUpFocus !== undefined ? { followUpFocus } : {}),
     };
 
     return finishStage({

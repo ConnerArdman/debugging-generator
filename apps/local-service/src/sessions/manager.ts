@@ -918,6 +918,48 @@ export interface SessionManager {
   ): Promise<Result<SessionRecord, DebuggenError>>;
 
   /**
+   * Reflects a modification the conflict watcher has just moved to `conflict`
+   * in the session record, and broadcasts `session.updated` — so the record
+   * both user interfaces render their modification lists from (the editor's
+   * `ModificationsList` badge, the DevTools `SessionSummary`) shows the
+   * conflict when the watcher reports it, rather than at the session's next
+   * unrelated change (AAP §0.5.1: the watcher "marks the record `conflict` and
+   * notifies both UIs").
+   *
+   * Addressed to `src/main.ts`, which wires it behind the watcher's
+   * `ModificationConflictListener` port; this module never imports the
+   * watcher. The journal already holds the transition when this is called.
+   *
+   * - The mirrored entry with `record.id` is replaced by `record` and the
+   *   session committed with a fresh `updatedAt` (never earlier than the one
+   *   held), then broadcast. The store overlays every mirrored entry with the
+   *   journal's current row on write, so what is stored and broadcast is the
+   *   journal's state even if it moved again in between.
+   * - `session.cleanup` is left as it is: its `conflicts[]` reports what a
+   *   cleanup pass refused to overwrite, and it is written — with
+   *   `cleanup.completed` — only by {@link SessionManager.recordCleanupOutcome}
+   *   when cleanup runs.
+   * - A record the session's mirror does not list is answered `ok` with the
+   *   session unchanged, and nothing is written or broadcast: the mirror
+   *   decides membership (the store never adds entries), and the install that
+   *   mirrors the record later carries its journal status with it.
+   *
+   * @param sessionId The session that owns the record.
+   * @param record The record as the journal now holds it: status `conflict`.
+   * @returns The session as stored (or, for an unmirrored record, as read), or
+   * `Err`: `INTERNAL` (`modification-session-mismatch`) when the record
+   * belongs to another session, `INTERNAL` (`modification-not-conflicted`)
+   * when its status is not `conflict`, `SESSION_NOT_FOUND` for an unknown
+   * session, `SESSION_INVALID_STATE` (`session-ended`) for an ended one, or
+   * the store's error when the session cannot be read or written. No refusal
+   * writes or broadcasts anything.
+   */
+  recordModificationConflict(
+    sessionId: SessionId,
+    record: ModificationRecord,
+  ): Promise<Result<SessionRecord, DebuggenError>>;
+
+  /**
    * Moves the session to `failed` for `failure` — the stage, code, message and
    * hint both user interfaces render — emitting that stage's `failed` progress
    * row. A stage failure surfaces this way, never as a partial success. The
@@ -1102,6 +1144,35 @@ function sessionEnded(sessionId: SessionId, operation: string): DebuggenError {
     'This session has ended and can no longer change.',
     'Start a new session to keep debugging; the ended one stays available to reopen.',
     { sessionId, operation, reason: 'session-ended' },
+  );
+}
+
+/**
+ * Why {@link SessionManager.recordModificationConflict} refused a record
+ * before reading the session: it belongs to another session, or its status is
+ * not `conflict`.
+ */
+type ModificationConflictRefusal = 'modification-session-mismatch' | 'modification-not-conflicted';
+
+/**
+ * The refusal of a conflict reflection whose record does not describe a
+ * conflict of the named session. Either is a defect in the caller — the
+ * watcher hands over the record it has just committed as `conflict` for that
+ * session — never something the developer did, so it is `INTERNAL`; it names
+ * ids only, never the record's file, and `reason` tells the two apart.
+ */
+function modificationConflictRefused(
+  sessionId: SessionId,
+  recordId: string,
+  reason: ModificationConflictRefusal,
+): DebuggenError {
+  return new DebuggenError(
+    'INTERNAL',
+    'A modification conflict was offered for a session it does not describe.',
+    {
+      hint: 'The modification journal still records the conflict; the session shows it at its next change or when it is reopened.',
+      details: { sessionId, recordId, reason },
+    },
   );
 }
 
@@ -3190,6 +3261,71 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     return recordOutcome(sessionId, outcome, 'recordCleanupOutcome');
   }
 
+  function recordModificationConflict(
+    sessionId: SessionId,
+    record: ModificationRecord,
+  ): Result<SessionRecord, DebuggenError> {
+    const operation = 'recordModificationConflict';
+
+    if (record.sessionId !== sessionId) {
+      return err(
+        modificationConflictRefused(sessionId, record.id, 'modification-session-mismatch'),
+      );
+    }
+
+    if (record.status !== 'conflict') {
+      return err(modificationConflictRefused(sessionId, record.id, 'modification-not-conflicted'));
+    }
+
+    const loaded = load(sessionId);
+
+    if (isErr(loaded)) {
+      return loaded;
+    }
+
+    const session = loaded.value;
+
+    if (isTerminalSessionStatus(session.status)) {
+      return err(sessionEnded(sessionId, operation));
+    }
+
+    const index = session.modifications.findIndex((entry) => entry.id === record.id);
+
+    // The mirror decides membership: the install that writes the entry later
+    // carries the journal's status with it through the store's overlay, and
+    // appending here could take the record past the contract's bound.
+    if (index === -1) {
+      scoped(sessionId).debug(
+        'the conflicted modification is not mirrored yet; nothing to update',
+        {
+          recordId: record.id,
+          status: record.status,
+        },
+      );
+      return ok(session);
+    }
+
+    // Only the modification list changes; `cleanup` stays as it is until a
+    // cleanup pass reports through `recordCleanupOutcome`.
+    const modifications = session.modifications.map((entry, at) => (at === index ? record : entry));
+    const stored = commit({ ...session, modifications, updatedAt: nextStamp(session) }, operation);
+
+    if (isErr(stored)) {
+      return stored;
+    }
+
+    const current = stored.value;
+    announceUpdated(current);
+    // The store's overlay neither reorders nor drops entries, so `index` still
+    // names the record: its status is the one both user interfaces were sent.
+    scoped(sessionId).info('the modification conflict is reflected in the session', {
+      recordId: record.id,
+      status: current.modifications[index]?.status,
+    });
+
+    return ok(current);
+  }
+
   async function endOnce(sessionId: SessionId): Promise<Result<SessionEndResult, DebuggenError>> {
     const loaded = load(sessionId);
 
@@ -3615,6 +3751,8 @@ export function createSessionManager(deps: SessionManagerDeps): SessionManager {
     end,
     recordCleanupOutcome: (sessionId, outcome) =>
       settle(() => recordCleanupOutcome(sessionId, outcome)),
+    recordModificationConflict: (sessionId, record) =>
+      settle(() => recordModificationConflict(sessionId, record)),
     fail: (sessionId, failure) => settle(() => fail(sessionId, failure)),
     retry: (sessionId, failure) => settle(() => retry(sessionId, failure)),
   } satisfies SessionManager);

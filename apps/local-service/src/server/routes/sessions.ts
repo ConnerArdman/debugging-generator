@@ -325,13 +325,14 @@
  * constant sentence naming the parameter over its ceiling — never a rejected
  * value. A `500` never carries the failure's own words: it carries a fixed
  * message and a freshly minted `ref`. A described failure is sent in its own
- * words only when its code is a lifecycle or readiness refusal and
- * `isProductAuthoredText` proves its message product text; a failure a
- * collaborator reported (the installer, cleanup, the model provider, the dev
- * server), a wrapped exception's text, and any refusal sentence no product
- * builder registered are answered with the code's fixed copy from
- * `../../sessions/progress.ts` and a
- * `ref` (CWE-209). Every `ref` is repeated by the failure's log record and by
+ * words only when its code is a lifecycle, readiness or request-content
+ * refusal and `isProductAuthoredText` proves its message product text — so a
+ * refused `devServerUrl` is answered with a constant sentence naming the
+ * field, never the URL; a failure a collaborator reported (the installer,
+ * cleanup, the model provider, the dev server), a wrapped exception's text,
+ * and any refusal sentence no product builder registered are answered with
+ * the code's fixed copy from `../../sessions/progress.ts` and a `ref`
+ * (CWE-209). Every `ref` is repeated by the failure's log record and by
  * that record's `debug` twin, which alone carries the failure's redacted
  * message and stack. Log records carry the operation, a
  * status, an error code, a kebab-case reason and counts — never a question, a
@@ -786,6 +787,25 @@ const PROJECT_ROOT_NOT_ABSOLUTE_MESSAGE = 'The project root must be an absolute 
 /** The recovery instruction of a project root that is not absolute. */
 const PROJECT_ROOT_NOT_ABSOLUTE_HINT =
   'Start the session from a workspace folder opened in VS Code, whose absolute path identifies the project.';
+
+/**
+ * The message of a `400` for a `session.create` whose `devServerUrl` the
+ * service's probe will not dial: another host, a scheme other than `http:` or
+ * `https:`, or embedded credentials.
+ *
+ * Worded like the schema refusals of the same body that `parseHttpRequest`
+ * builds ("Invalid session.create request body: devServerUrl (custom)"), so
+ * every refusal of the field names it and a client learns which field to fix.
+ * It names the field and the requirement only — never the rejected URL, its
+ * host or its credentials (CWE-209). Exported so a client-facing test can
+ * hold the reply to these exact words.
+ */
+export const REQUESTED_DEV_SERVER_URL_REFUSED_MESSAGE =
+  'Invalid session.create request body: devServerUrl must be a loopback http: or https: address without credentials.';
+
+/** The recovery instruction of {@link REQUESTED_DEV_SERVER_URL_REFUSED_MESSAGE}. */
+const REQUESTED_DEV_SERVER_URL_REFUSED_HINT =
+  'Set debuggen.devServerUrl to the local address the dev server prints, for example http://localhost:<port>.';
 
 /** The message of an ending refused because the session's pipeline did not stop in time. */
 const PIPELINE_STILL_RUNNING_MESSAGE =
@@ -1247,13 +1267,19 @@ export function devServerLookupFromLaunches(
  * The refusal of a client-supplied dev-server URL the probe would not dial —
  * another host, another scheme, embedded credentials. Refused request content,
  * in this module's own words, never the URL's.
+ *
+ * Like the refusals under "Failure vocabulary", its constant message is
+ * registered with `authorProductText` as it is built, so
+ * {@link describedRefusalBody} proves it product text and answers the `400`
+ * in these words — naming `devServerUrl` — rather than with the generic
+ * malformed-message copy.
  */
 function requestedUrlRefused(): DebuggenError {
   return new DebuggenError(
     'PROTOCOL_INVALID_MESSAGE',
-    'The dev-server URL in the request must be a loopback http: or https: address without credentials.',
+    authorProductText(REQUESTED_DEV_SERVER_URL_REFUSED_MESSAGE),
     {
-      hint: 'Set debuggen.devServerUrl to the local address the dev server prints, for example http://localhost:<port>.',
+      hint: REQUESTED_DEV_SERVER_URL_REFUSED_HINT,
       details: { reason: 'requested-url-refused' },
     },
   );
@@ -1377,6 +1403,14 @@ const STATUS_BY_CODE: ReadonlyMap<DebuggenErrorCode, DescribedStatus> = new Map<
  * developer learns what to change. It is registered as product text where it
  * is raised; any other `FS_UNSAFE_PATH` failure, whose message may quote a
  * path, is never registered and so still receives the fixed copy.
+ *
+ * `PROTOCOL_INVALID_MESSAGE` reaches this set through one refusal this module
+ * composes: a `session.create` `devServerUrl` the probe will not dial
+ * ({@link requestedUrlRefused}), whose constant sentence names the field and
+ * the requirement and never the URL. A body the schema refuses never gets
+ * here — {@link answerBodyRejection} sends it in the parser's own words — and
+ * any other `PROTOCOL_INVALID_MESSAGE` failure, never registered, still
+ * receives the fixed copy.
  */
 const VERBATIM_REFUSAL_CODES: ReadonlySet<DebuggenErrorCode> = new Set<DebuggenErrorCode>([
   'PROTOCOL_INVALID_MESSAGE',
@@ -1474,8 +1508,9 @@ function refusalFor(reason: AuthFailureReason): DebuggenError {
 }
 
 /*
- * The four refusals below are the ones this module composes and answers in
- * their own words. Each registers its constant message with
+ * The four refusals below — and {@link requestedUrlRefused}, which the
+ * dev-server lookup above raises — are the ones this module composes and
+ * answers in their own words. Each registers its constant message with
  * `authorProductText` as it is built — rather than once at load — so
  * {@link describedRefusalBody} proves it product text however many texts other
  * builders registered since, and sends it verbatim.

@@ -2,8 +2,10 @@
  * Tests for `./manager.ts`'s follow-up ladder: {@link SessionManager.appendFollowUp},
  * {@link placeFollowUpAttempt} and {@link SessionManager.recordFollowUpOutcome};
  * for how {@link SessionManager.end} stores `ended` with the tab binding's
- * removal; and for how {@link SessionManager.confirmProjectRoot} holds the
- * pipeline's sinks to the identity a session's root was admitted under.
+ * removal; for how {@link SessionManager.confirmProjectRoot} holds the
+ * pipeline's sinks to the identity a session's root was admitted under; and
+ * for how {@link SessionManager.recordModificationConflict} reflects a
+ * watcher conflict in the session record.
  *
  * The promise under test is that a Retry of a failed follow-up never leaves a
  * duplicate behind — on the record's ladder **or** in the store's `followups`
@@ -56,6 +58,13 @@
  *    ended session are refused, the ended one's identity released. These cases
  *    stage real symbolic links in the case's sandbox, and no log record names
  *    a path.
+ * 11. **A watcher conflict reaches the record**: a mirrored modification the
+ *    journal moved to `conflict` is rewritten in the stored document and sent
+ *    in exactly one `session.updated`, with `updatedAt` advanced and `cleanup`
+ *    left pending — no `cleanup.completed`; a record the mirror does not list
+ *    is answered unchanged with nothing written; a record of another session,
+ *    one not in `conflict`, an unknown session, an ended one and a refused
+ *    store write are refused with nothing sent; the log names ids only.
  *
  * The store is the real one — `openStore` against a file in a private `mkdtemp`
  * sandbox, never `:memory:` — and so are the sessions repository and the
@@ -84,10 +93,13 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { createModificationRecord } from '@debuggen/instrumentation';
+import type { ModificationRecord } from '@debuggen/instrumentation';
 import {
   FOLLOW_UP_ATTEMPT_ID_PREFIX,
   createAnalysisResult,
   parseAnalysisResult,
+  parseSessionRecord,
 } from '@debuggen/protocol';
 import type {
   AnalysisResult,
@@ -115,12 +127,13 @@ import type {
   Result,
   SessionId,
 } from '@debuggen/shared';
-import { SECURE_DIR_MODE } from '@debuggen/shared/node';
+import { SECURE_DIR_MODE, sha256Hex } from '@debuggen/shared/node';
 
 import { identifyProjectRoot } from '../server/auth.js';
 import type { AdmittedProjectRoot } from '../server/auth.js';
 import { openStore } from '../store/db.js';
 import type { Store } from '../store/db.js';
+import { createModificationsRepo } from '../store/modifications-repo.js';
 import { createSessionsRepo } from '../store/sessions-repo.js';
 import type { SessionsRepo } from '../store/sessions-repo.js';
 import {
@@ -1588,6 +1601,254 @@ describe('confirmProjectRoot holds every sink to the identity the root was admit
     expect(unwrap(await h.manager.end(session.id)).session.status).toBe('ended');
     expect(logged(RELEASED_LOG, session.id)).toHaveLength(1);
     expectNoPathLogged();
+  });
+});
+
+describe('recordModificationConflict reflects a watcher conflict in the session record', () => {
+  /** The project-relative file every seeded modification patched. */
+  const MODIFIED_FILE = 'src/alpha-view.ts';
+
+  /** The file's bytes before and after the seeded patch, hashed as the patcher hashes them. */
+  const ORIGINAL_TEXT = 'export function alphaView(): number {\n  return 1;\n}\n';
+  const INSTRUMENTED_TEXT = 'export function alphaView(): number {\n  return (globalThis, 1);\n}\n';
+
+  /** The unified diff of the two texts, as the patcher journals it. */
+  const PATCH_DIFF = [
+    `--- a/${MODIFIED_FILE}`,
+    `+++ b/${MODIFIED_FILE}`,
+    '@@ -1,3 +1,3 @@',
+    ' export function alphaView(): number {',
+    '-  return 1;',
+    '+  return (globalThis, 1);',
+    ' }',
+    '',
+  ].join('\n');
+
+  /** What {@link seedConflict} left behind. */
+  interface SeededConflict {
+    readonly session: SessionRecord;
+    /** The journal's record while the file still held the patch. */
+    readonly applied: ModificationRecord;
+    /** The journal's record once the watcher moved it: status `conflict`. */
+    readonly conflicted: ModificationRecord;
+  }
+
+  /**
+   * Leaves a session the way an install followed by a developer edit does:
+   * a `pending → applied` journal record through the real repository, the
+   * record mirrored onto the session (`patch`, as the install stage does) —
+   * or, with `mirror: false`, not mirrored yet — and then the journal alone
+   * moved to `conflict`, which is all the watcher writes.
+   */
+  async function seedConflict(options: { readonly mirror: boolean }): Promise<SeededConflict> {
+    const session = await createSession();
+    const journal = createModificationsRepo({ store: h.store, now: () => h.now() });
+    const originalHash = sha256Hex(ORIGINAL_TEXT);
+    const pending = unwrap(
+      createModificationRecord(
+        {
+          sessionId: session.id,
+          planVersion: 1,
+          file: MODIFIED_FILE,
+          originalHash,
+          backupPath: join(h.root, 'home', 'backups', session.id, originalHash),
+          instrumentedHash: sha256Hex(INSTRUMENTED_TEXT),
+          diff: PATCH_DIFF,
+          status: 'pending',
+        },
+        { now: () => h.now() },
+      ),
+    );
+    unwrap(await journal.append(pending));
+    const applied = unwrap(await journal.updateStatus(pending.id, 'applied'));
+    if (options.mirror) {
+      h.tick();
+      const mirrored = unwrap(await h.manager.patch(session.id, { modifications: [applied] }));
+      expect(mirrored.modifications).toEqual([applied]);
+    }
+    const conflicted = unwrap(await journal.updateStatus(applied.id, 'conflict'));
+    expect(conflicted.status).toBe('conflict');
+    return { session: stored(session.id), applied, conflicted };
+  }
+
+  /**
+   * The session's `sessions.record` document exactly as written, read around
+   * the repository — whose `get` overlays the journal on every read — so a case
+   * tells a rewritten document from one the read path merely refreshes.
+   */
+  function writtenDocument(sessionId: SessionId): SessionRecord {
+    const row: unknown = h.store
+      .statement('SELECT record FROM sessions WHERE id = ?')
+      .get(sessionId);
+    if (
+      typeof row !== 'object' ||
+      row === null ||
+      !('record' in row) ||
+      typeof row.record !== 'string'
+    ) {
+      throw new Error(`session ${sessionId} has no stored document`);
+    }
+    const document: unknown = JSON.parse(row.record);
+    return unwrap(parseSessionRecord(document));
+  }
+
+  /** The frames the manager sent since transcript index `from`. */
+  function framesSince(from: number): readonly SentFrame[] {
+    return h.frames.slice(from);
+  }
+
+  /** Asks the manager to reflect `record` and answers the refusal it must give. */
+  async function refusedReflection(
+    sessionId: SessionId,
+    record: ModificationRecord,
+  ): Promise<DebuggenError> {
+    h.tick();
+    const outcome = await h.manager.recordModificationConflict(sessionId, record);
+    if (!isErr(outcome)) {
+      throw new Error('the conflict was reflected, but a refusal was expected');
+    }
+    return outcome.error;
+  }
+
+  it('rewrites the mirrored entry and sends exactly one session.updated, leaving cleanup pending', async () => {
+    const { session, applied, conflicted } = await seedConflict({ mirror: true });
+    // The journal moved, the written document did not: only a read refreshes it so far.
+    const before = writtenDocument(session.id);
+    expect(before.modifications).toEqual([applied]);
+    const mark = h.frames.length;
+    const at = h.tick();
+
+    const reflected = unwrap(await h.manager.recordModificationConflict(session.id, conflicted));
+
+    expect(reflected.modifications).toEqual([conflicted]);
+    expect(reflected.status).toBe(session.status);
+    expect(reflected.updatedAt).toBe(at);
+    expect(reflected.updatedAt).toBeGreaterThan(before.updatedAt);
+    // Persisted before it was broadcast: the document itself now carries the conflict.
+    expect(writtenDocument(session.id)).toEqual(reflected);
+    expect(stored(session.id)).toEqual(reflected);
+    // `cleanup` is cleanup's: it stays pending, with nothing refused, until a pass runs.
+    expect(reflected.cleanup).toEqual({ status: 'pending', conflicts: [] });
+    expect(reflected.cleanup).toEqual(session.cleanup);
+
+    const sent = framesSince(mark);
+    expect(sent.map((frame) => frame.message.type)).toEqual(['session.updated']);
+    const [frame] = sent;
+    expect(frame?.sessionId).toBe(session.id);
+    expect(lastUpdated(session.id)).toEqual(reflected);
+    expect(sent.some((candidate) => candidate.message.type === 'cleanup.completed')).toBe(false);
+  });
+
+  it('logs ids and statuses only, never the file or its backup path', async () => {
+    const { session, conflicted } = await seedConflict({ mirror: true });
+    const mark = h.logs.length;
+
+    unwrap(await h.manager.recordModificationConflict(session.id, conflicted));
+
+    const logged = h.logs.slice(mark);
+    const reflected = logged.filter(
+      (entry) => entry.level === 'info' && entry.fields['recordId'] === conflicted.id,
+    );
+    expect(reflected).toHaveLength(1);
+    expect(reflected[0]?.fields).toMatchObject({
+      sessionId: session.id,
+      recordId: conflicted.id,
+      status: 'conflict',
+    });
+    const text = JSON.stringify(logged);
+    expect(text).not.toContain(MODIFIED_FILE);
+    expect(text).not.toContain(conflicted.backupPath);
+  });
+
+  it('answers the session unchanged, writing and sending nothing, for a record it does not mirror', async () => {
+    const { session, conflicted } = await seedConflict({ mirror: false });
+    const before = writtenDocument(session.id);
+    const mark = h.frames.length;
+    h.tick();
+
+    const answered = unwrap(await h.manager.recordModificationConflict(session.id, conflicted));
+
+    // The mirror decides membership: the record is not appended.
+    expect(answered.modifications).toEqual([]);
+    expect(answered).toEqual(session);
+    expect(writtenDocument(session.id)).toEqual(before);
+    expect(framesSince(mark)).toEqual([]);
+  });
+
+  it('refuses a record of another session, writing and sending nothing', async () => {
+    const { session, conflicted } = await seedConflict({ mirror: true });
+    const other = await createSession();
+    const before = { session: writtenDocument(session.id), other: writtenDocument(other.id) };
+    const mark = h.frames.length;
+
+    const refused = await refusedReflection(other.id, conflicted);
+
+    expect(refused.code).toBe('INTERNAL');
+    expect(refused.details?.['reason']).toBe('modification-session-mismatch');
+    expect(refused.details?.['recordId']).toBe(conflicted.id);
+    expect(writtenDocument(session.id)).toEqual(before.session);
+    expect(writtenDocument(other.id)).toEqual(before.other);
+    expect(framesSince(mark)).toEqual([]);
+  });
+
+  it('refuses a record whose status is not conflict, writing and sending nothing', async () => {
+    const { session, applied } = await seedConflict({ mirror: true });
+    const before = writtenDocument(session.id);
+    const mark = h.frames.length;
+
+    const refused = await refusedReflection(session.id, applied);
+
+    expect(refused.code).toBe('INTERNAL');
+    expect(refused.details?.['reason']).toBe('modification-not-conflicted');
+    expect(writtenDocument(session.id)).toEqual(before);
+    expect(framesSince(mark)).toEqual([]);
+  });
+
+  it('refuses an unknown session with SESSION_NOT_FOUND, sending nothing', async () => {
+    const { conflicted } = await seedConflict({ mirror: true });
+    const unknown = newSessionId();
+    const mark = h.frames.length;
+
+    const refused = await refusedReflection(unknown, { ...conflicted, sessionId: unknown });
+
+    expect(refused.code).toBe('SESSION_NOT_FOUND');
+    expect(framesSince(mark)).toEqual([]);
+  });
+
+  it('refuses an ended session, leaving its stored record and sending nothing', async () => {
+    const { session, conflicted } = await seedConflict({ mirror: true });
+    h.tick();
+    const ended = unwrap(await h.manager.end(session.id)).session;
+    expect(ended.status).toBe('ended');
+    const before = writtenDocument(session.id);
+    const mark = h.frames.length;
+
+    const refused = await refusedReflection(session.id, conflicted);
+
+    expect(refused.code).toBe('SESSION_INVALID_STATE');
+    expect(refused.details?.['reason']).toBe('session-ended');
+    expect(refused.details?.['operation']).toBe('recordModificationConflict');
+    expect(writtenDocument(session.id)).toEqual(before);
+    expect(framesSince(mark)).toEqual([]);
+  });
+
+  it('answers the store’s error and sends nothing when the record cannot be written; a retry reflects it', async () => {
+    const { session, applied, conflicted } = await seedConflict({ mirror: true });
+    const mark = h.frames.length;
+
+    const refused = await withRefusedWrites(session.id, 'record', () =>
+      refusedReflection(session.id, conflicted),
+    );
+
+    expect(refused.code).toBe('STORE_ERROR');
+    expect(writtenDocument(session.id).modifications).toEqual([applied]);
+    expect(framesSince(mark)).toEqual([]);
+
+    h.tick();
+    const reflected = unwrap(await h.manager.recordModificationConflict(session.id, conflicted));
+    expect(writtenDocument(session.id).modifications).toEqual([conflicted]);
+    expect(framesSince(mark).map((frame) => frame.message.type)).toEqual(['session.updated']);
+    expect(lastUpdated(session.id)).toEqual(reflected);
   });
 });
 

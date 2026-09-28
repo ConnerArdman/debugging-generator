@@ -141,7 +141,10 @@
  * a second entry file, and it is `unref`'d, so it never holds the process open.
  * It opens the database as a `file:` URL with `mode=rw`, so it can never create
  * a file the policy below has not judged. The in-memory store has no file for
- * a second connection to share and keeps SQLite's own checkpointing.
+ * a second connection to share and keeps SQLite's own checkpointing, and so
+ * does a store opened with {@link OpenStoreOptions.backgroundCheckpoint} set to
+ * `false` — the seam for a suite or an embedder that needs every checkpoint on
+ * the file to be one it asked for.
  *
  * The two threads coordinate through a small shared control block rather than
  * messages, because {@link Store.checkpoint} and {@link Store.close} are
@@ -207,8 +210,20 @@
  * while that checkpointer runs, the commit-time checkpoint is already off and a
  * suspension changes nothing, and the sweep's own checkpoints still bound the
  * log at the sweep's pace — the background one checkpoints `PASSIVE` on its
- * interval, which a run of large transactions can outpace. A checkpoint that
- * finds the other one busy is reported as `busy`, never as a failure.
+ * interval, which a run of large transactions can outpace. The two workers
+ * never share a checkpoint: a request that finds the other one checkpointing
+ * answers `failed` with {@link CONCURRENT_CHECKPOINT_REASON}, which names that
+ * condition and nothing else, and the retention sweep treats it as a wait the
+ * other worker pre-empted rather than as a failure — it keeps its suspension
+ * and waits again after its next batch.
+ *
+ * The threshold a suspension restores follows the background checkpointer, so
+ * neither undoes the other whenever the worker's handover lands. A suspension
+ * records the value it replaced ({@link AutoCheckpointSuspension.previousPages})
+ * as the value its last restore writes back; a handover while it is held
+ * changes that to `0`, so the connection does not start checkpointing on
+ * `COMMIT` again beside a worker that is running, and a hand-back while it is
+ * held — the worker failed or the store is closing — changes it to 1 000.
  *
  * ## The files, and what protects them
  *
@@ -1249,6 +1264,12 @@ class BackgroundCheckpointer {
   /**
    * The worker's connection is open: re-verify the store's files, then turn the
    * main connection's automatic checkpoint off.
+   *
+   * A suspension held on the connection at that moment
+   * ({@link suspendAutoCheckpoint}) is retargeted to `0`: it recorded the
+   * threshold from before the handover, and restoring that once it ends would
+   * have the connection checkpoint on `COMMIT` again beside a worker that is
+   * running.
    */
   #onReady(): void {
     if (this.#status !== 'starting' || !this.#db.isOpen) {
@@ -1272,6 +1293,7 @@ class BackgroundCheckpointer {
       this.#fail('handover', DebuggenError.from(cause, 'STORE_ERROR').message);
       return;
     }
+    retargetAutoCheckpointSuspension(this.#db, 0);
     this.#autocheckpointOff = true;
     this.#status = 'running';
     this.#logger.debug('the session store write-ahead log is checkpointed in the background', {
@@ -1311,12 +1333,21 @@ class BackgroundCheckpointer {
     this.#halt();
   }
 
-  /** Sets the main connection's `wal_autocheckpoint` back, when this checkpointer had turned it off. */
+  /**
+   * Sets the main connection's `wal_autocheckpoint` back, when this
+   * checkpointer had turned it off.
+   *
+   * A suspension held on the connection is retargeted to
+   * {@link DEFAULT_WAL_AUTOCHECKPOINT_PAGES} first, and whether or not the
+   * pragma below succeeds: the connection is on its own from here, so SQLite's
+   * commit-time checkpoint is what the last suspension must leave in force.
+   */
   #restoreAutocheckpoint(): void {
     if (!this.#autocheckpointOff) {
       return;
     }
     this.#autocheckpointOff = false;
+    retargetAutoCheckpointSuspension(this.#db, DEFAULT_WAL_AUTOCHECKPOINT_PAGES);
     if (!this.#db.isOpen) {
       return;
     }
@@ -1516,7 +1547,9 @@ interface SqliteStoreInit {
 
   /**
    * The store's background checkpointer; absent for the in-memory store, for
-   * a connection not in WAL mode, and when the runtime refused a worker.
+   * a connection not in WAL mode, when the runtime refused a worker, and when
+   * the caller opened the store with {@link OpenStoreOptions.backgroundCheckpoint}
+   * set to `false`.
    */
   readonly checkpointer?: BackgroundCheckpointer | undefined;
 }
@@ -2528,14 +2561,17 @@ export function openWalCheckpointer(store: Store): WalCheckpointer | undefined {
 export interface AutoCheckpointSuspension {
   /**
    * The connection's `wal_autocheckpoint` before the first suspension, in
-   * pages — what {@link restore} puts back once no suspension is left.
+   * pages — what {@link restore} puts back once no suspension is left, unless
+   * the store's background checkpointer took the commit-time checkpoint over
+   * (`0`) or handed it back ({@link DEFAULT_WAL_AUTOCHECKPOINT_PAGES}) while a
+   * suspension was held; then the checkpointer's setting is what remains.
    */
   readonly previousPages: number;
 
   /**
-   * Ends this suspension. The last one to end restores
-   * {@link previousPages}; a closed store has no setting left to restore, so
-   * that is skipped. Idempotent; never throws.
+   * Ends this suspension. The last one to end restores the threshold
+   * {@link previousPages} describes; a closed store has no setting left to
+   * restore, so that is skipped. Idempotent; never throws.
    *
    * @returns Whether this call ended the suspension (`false` when it had
    * already ended).
@@ -2543,16 +2579,55 @@ export interface AutoCheckpointSuspension {
   restore(): boolean;
 }
 
+/** The suspensions held on one connection, from {@link suspendAutoCheckpoint}. */
+interface HeldAutoCheckpointSuspensions {
+  /** How many suspensions are held; the record is dropped when the last one ends. */
+  depth: number;
+
+  /**
+   * The connection's `wal_autocheckpoint` before the first suspension, as
+   * {@link AutoCheckpointSuspension.previousPages} reports it. Never rewritten.
+   */
+  readonly previousPages: number;
+
+  /**
+   * What the last suspension to end writes back: {@link previousPages} when
+   * the suspension is taken, then whatever the store's background
+   * checkpointer last decided while it was held — `0` once it took the
+   * commit-time checkpoint over, {@link DEFAULT_WAL_AUTOCHECKPOINT_PAGES} once
+   * it handed it back. Always an integer SQLite answered or one of those two.
+   */
+  restorePages: number;
+}
+
 /**
- * The suspensions currently held on each connection, and the value the first
- * one replaced. Keyed on the connection rather than on the handle, because the
- * setting belongs to the connection: two handles — or a wrapper and the handle
- * it wraps — over one connection share one count.
+ * The suspensions currently held on each connection. Keyed on the connection
+ * rather than on the handle, because the setting belongs to the connection:
+ * two handles — or a wrapper and the handle it wraps — over one connection
+ * share one count and one restore target.
  */
-const autoCheckpointSuspensions = new WeakMap<
-  DatabaseSync,
-  { depth: number; readonly previousPages: number }
->();
+const autoCheckpointSuspensions = new WeakMap<DatabaseSync, HeldAutoCheckpointSuspensions>();
+
+/**
+ * Changes what the last suspension held on `connection` restores, when one is
+ * held; otherwise does nothing.
+ *
+ * Called by the store's {@link BackgroundCheckpointer} whenever it changes the
+ * connection's `wal_autocheckpoint` itself, so the handover and a suspension
+ * compose whichever lands first: a suspension that began before the worker
+ * took over does not hand the commit-time checkpoint back to the connection
+ * when it ends, and one that began before the worker failed does not take it
+ * away again.
+ *
+ * @param connection The store's main connection.
+ * @param pages `0` or {@link DEFAULT_WAL_AUTOCHECKPOINT_PAGES}.
+ */
+function retargetAutoCheckpointSuspension(connection: DatabaseSync, pages: number): void {
+  const held = autoCheckpointSuspensions.get(connection);
+  if (held !== undefined) {
+    held.restorePages = pages;
+  }
+}
 
 /**
  * Turns off the commit-time checkpoint of a store's connection until the
@@ -2564,6 +2639,13 @@ const autoCheckpointSuspensions = new WeakMap<
  * every commit. Reference-counted per connection, so two overlapping callers
  * — a start-up sweep and an on-demand purge, say — each restore only their own
  * suspension, and the original threshold returns when the last one ends.
+ *
+ * The store's own background checkpointer may take the commit-time checkpoint
+ * over, or hand it back, while a suspension is held — its handover is
+ * asynchronous, so a sweep that begins right after the open routinely meets
+ * it. Its decision is what the last suspension leaves in force: `0` beside a
+ * worker that runs, {@link DEFAULT_WAL_AUTOCHECKPOINT_PAGES} once it is gone
+ * (see {@link retargetAutoCheckpointSuspension}).
  *
  * @param store An open store.
  * @returns The suspension, or `undefined` when the connection is closed or its
@@ -2588,7 +2670,7 @@ export function suspendAutoCheckpoint(store: Store): AutoCheckpointSuspension | 
         return undefined;
       }
       connection.exec(SUSPEND_WAL_AUTOCHECKPOINT_SQL);
-      held = { depth: 0, previousPages };
+      held = { depth: 0, previousPages, restorePages: previousPages };
       autoCheckpointSuspensions.set(connection, held);
     }
   } catch {
@@ -2615,14 +2697,17 @@ export function suspendAutoCheckpoint(store: Store): AutoCheckpointSuspension | 
           // Restored only while the setting is still the suspension's own `0`:
           // the store's background checkpointer hands the commit-time
           // checkpoint back to this connection when its worker fails, and that
-          // hand-back must outlive a suspension that began before it.
+          // hand-back must outlive a suspension that began before it. What is
+          // written is the restore target that checkpointer keeps current, so
+          // a handover during the suspension leaves `0` — nothing to write.
           const current = toFiniteNumber(
             readPragma(connection, READ_WAL_AUTOCHECKPOINT_SQL, 'wal_autocheckpoint'),
           );
-          if (current === 0) {
-            // An integer SQLite itself answered, so the text is one of a known
-            // set rather than anything a caller supplied.
-            connection.exec(`PRAGMA wal_autocheckpoint = ${String(suspension.previousPages)};`);
+          if (current === 0 && suspension.restorePages !== 0) {
+            // An integer SQLite itself answered, or one of this module's own
+            // constants, so the text is one of a known set rather than
+            // anything a caller supplied.
+            connection.exec(`PRAGMA wal_autocheckpoint = ${String(suspension.restorePages)};`);
           }
         } catch {
           // The connection is going away; it takes the setting with it.
@@ -2715,6 +2800,24 @@ export interface OpenStoreOptions {
    * the store just as surely inside a trusted directory as inside any other.
    */
   readonly ensureDirectory?: boolean | undefined;
+
+  /**
+   * Whether a file-backed store in WAL mode starts its background
+   * checkpointer (see "Checkpointing off the event loop" in the module
+   * notes). Defaults to `true`, which is what the service always uses.
+   *
+   * With `false` no worker is spawned and the connection keeps SQLite's own
+   * commit-time checkpoint at {@link DEFAULT_WAL_AUTOCHECKPOINT_PAGES}, so every
+   * checkpoint of the file is either a commit's or one the caller asked for —
+   * {@link Store.checkpoint}, {@link Store.close}, or a
+   * {@link openWalCheckpointer} request under {@link suspendAutoCheckpoint}.
+   * Like {@link OpenStoreOptions.ddl} it is a seam: for a suite that asserts
+   * the exact outcome of a checkpoint or the connection's threshold, which a
+   * worker checkpointing `PASSIVE` on its own interval would otherwise race,
+   * and for an embedder that runs its own checkpoints. It changes nothing for
+   * the in-memory store, which never has a worker.
+   */
+  readonly backgroundCheckpoint?: boolean | undefined;
 }
 
 /** Where the database lives, and which tree the caller declared as its own. */
@@ -2783,7 +2886,8 @@ interface StoreTarget {
  *    leaks no handle.
  * 9. Read the stamped schema version back and build the handle.
  * 10. For a file-backed store in WAL mode, start the background checkpointer
- *    (see "Checkpointing off the event loop" in the module notes). It is
+ *    (see "Checkpointing off the event loop" in the module notes), unless
+ *    {@link OpenStoreOptions.backgroundCheckpoint} is `false`. It is
  *    asynchronous and never part of the open's outcome: until its worker has
  *    opened its connection and the store's files have been re-verified once
  *    more, the store checkpoints the way SQLite does by itself.
@@ -2816,7 +2920,7 @@ interface StoreTarget {
  * Every other file-policy outcome is fatal.
  *
  * @param options Exactly one of `databasePath` and `config`, plus the optional
- * logger, DDL source and directory switch.
+ * logger, DDL source, directory switch and background-checkpoint switch.
  * @returns `Ok` with an open, migrated {@link Store}, or `Err` with a
  * {@link DebuggenError}: `CONFIG_INVALID` when the options do not name exactly
  * one target, or when a configuration's `debuggenHome` is blank or does not
@@ -2982,15 +3086,22 @@ export function openStore(options: OpenStoreOptions): Result<Store, DebuggenErro
   // Step 10. Only a file has a second connection to share; `identity` is
   // defined exactly for a file-backed store.
   const judged = identity;
-  const checkpointer =
-    judged !== undefined && configured.value === 'wal'
-      ? BackgroundCheckpointer.start({
-          db,
-          path,
-          logger,
-          verify: () => verifyStoreFiles(path, judged, logger),
-        })
-      : undefined;
+  let checkpointer: BackgroundCheckpointer | undefined;
+  if (judged !== undefined && configured.value === 'wal') {
+    if (options.backgroundCheckpoint === false) {
+      logger.debug(
+        'the session store background checkpointer was not started, as the caller asked; commits checkpoint the write-ahead log themselves',
+        { subsystem: SUBSYSTEM, thresholdPages: DEFAULT_WAL_AUTOCHECKPOINT_PAGES },
+      );
+    } else {
+      checkpointer = BackgroundCheckpointer.start({
+        db,
+        path,
+        logger,
+        verify: () => verifyStoreFiles(path, judged, logger),
+      });
+    }
+  }
 
   const store = new SqliteStore({ db, path, schemaVersion, logger, checkpointer });
 

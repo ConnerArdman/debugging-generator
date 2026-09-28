@@ -3,7 +3,9 @@
  * (`./generate-panel.ts`): the panel a caller names in `supersedes` is handed
  * to the panel subsystem as `expectedPredecessor`, a stale refusal from that
  * subsystem fails the stage unchanged, and a returned panel that supersedes any
- * other panel fails the stage rather than being reported as a success.
+ * other panel fails the stage rather than being reported as a success. The
+ * request also carries the follow-up focus that governs a run and the members
+ * of the selected target's owner chain the project's code graph declares.
  *
  * The panel generator is a double: its own checks — before the model call and
  * inside the store's insert transaction — are pinned by
@@ -32,7 +34,12 @@ import type {
 } from '../../panels/generate.js';
 import type { SessionFailure } from '../../sessions/state-machine.js';
 import type { PipelineCodeHandles, PipelineStageContext } from '../context-builder.js';
-import { GENERATE_PANEL_STAGE, createGeneratePanelStage } from './generate-panel.js';
+import {
+  GENERATE_PANEL_STAGE,
+  MAX_DECLARED_CHAIN_MEMBERS,
+  createGeneratePanelStage,
+  declaredChainComponents,
+} from './generate-panel.js';
 import type {
   GeneratePanelStageDeps,
   GeneratePanelStageInput,
@@ -95,8 +102,12 @@ const SESSION: SessionRecord = {
 };
 
 /**
- * Code-analysis handles the stage never reads: the panel stage consults no
- * code graph, so the handles are opaque stand-ins.
+ * Code-analysis handles the stage never reads over the suite's context: the
+ * panel stage consults the code graph only to resolve the names a governing
+ * follow-up carries and the selected target's owner chain, and the suite's
+ * follow-up names none and its session selects nothing, so the handles are
+ * opaque stand-ins. The follow-up focus and owner-chain suites supply their
+ * own queries and graph.
  */
 const CODE: PipelineCodeHandles = {
   graph: {} as unknown as PipelineCodeHandles['graph'],
@@ -163,8 +174,14 @@ function row(stage: ProgressStage): Result<SessionProgressPayload, DebuggenError
   return ok({ sessionId: SESSION_ID, stage, status: 'done', message: 'row recorded by the suite' });
 }
 
-/** Builds the stage with a generator double answering every call with `answer`. */
-function rig(answer: () => Result<PanelGenerationResult, DebuggenError>): Rig {
+/**
+ * Builds the stage with a generator double answering every call with `answer`,
+ * over the suite's context with `overrides` applied.
+ */
+function rig(
+  answer: () => Result<PanelGenerationResult, DebuggenError>,
+  overrides: Partial<PipelineStageContext> = {},
+): Rig {
   const requests: PanelGenerationRequest[] = [];
   const rows: string[] = [];
   const failures: SessionFailure[] = [];
@@ -220,6 +237,7 @@ function rig(answer: () => Result<PanelGenerationResult, DebuggenError>): Rig {
     captureId: CAPTURE_ID,
     logger,
     now: () => FIXED_EPOCH_MS,
+    ...overrides,
   };
 
   return {
@@ -321,5 +339,283 @@ describe('createGeneratePanelStage — the expected predecessor', () => {
       },
     ]);
     expect(h.records.some((record) => record.message === PRODUCED_LOG)).toBe(false);
+  });
+});
+
+describe('createGeneratePanelStage — the follow-up focus (AAP §0.4.2, Follow-up row)', () => {
+  /** An invented plain-word declaration and the file that declares it. */
+  const FOCUS_NAME = 'tallyrefresh';
+  const FOCUS_FILE = 'src/tally/board.ts';
+
+  /** A follow-up naming {@link FOCUS_NAME} in {@link FOCUS_FILE}: a performance question. */
+  const GOVERNING_QUESTION = `Why does ${FOCUS_NAME} in ${FOCUS_FILE} take so long?`;
+
+  /** The focus {@link GOVERNING_QUESTION} makes over {@link queriesDeclaring}'s graph. */
+  const GOVERNING_FOCUS = {
+    categoryHints: ['performance'],
+    declarations: [{ file: FOCUS_FILE, symbol: FOCUS_NAME, kind: 'symbol' }],
+  };
+
+  /** Code queries whose graph declares {@link FOCUS_NAME} in {@link FOCUS_FILE} alone. */
+  function queriesDeclaring(lookups: string[]): PipelineCodeHandles['queries'] {
+    const queries = {
+      findByName: (name: string): readonly unknown[] => {
+        lookups.push(name);
+        return name === FOCUS_NAME
+          ? [{ nodeId: `node-${name}`, kind: 'symbol', name, file: FOCUS_FILE, score: 1 }]
+          : [];
+      },
+    };
+    return queries as unknown as PipelineCodeHandles['queries'];
+  }
+
+  /** The suite's session with its capture recorded under `planVersion`, and `followUps`. */
+  function sessionWith(
+    planVersion: number,
+    followUps: SessionRecord['followUps'] = [],
+  ): SessionRecord {
+    return {
+      ...SESSION,
+      captures: [{ id: CAPTURE_ID, planVersion, startedAt: FIXED_EPOCH_MS }],
+      followUps,
+    };
+  }
+
+  /** A follow-up that installed `planVersion` for a new capture. */
+  function newCaptureFollowUp(planVersion: number): SessionRecord['followUps'][number] {
+    return {
+      question: GOVERNING_QUESTION,
+      askedAt: FIXED_EPOCH_MS + 10,
+      needsNewCapture: true,
+      planVersion,
+    };
+  }
+
+  // A regeneration always answers a follow-up (the stage refuses one without it), so the
+  // session's first question reaches the panel subsystem through `generate` alone.
+  it('hands generate no focus member for the session’s first question, whose plan no follow-up installed', async () => {
+    const lookups: string[] = [];
+    const h = rig(() => generated(undefined), {
+      followUpQuestion: undefined,
+      session: sessionWith(1, [newCaptureFollowUp(2)]),
+      code: { ...CODE, queries: queriesDeclaring(lookups) },
+    });
+    const outcome = await h.run(inputOf());
+
+    expect(outcome.ok).toBe(true);
+    expect(h.requests).toHaveLength(1);
+    expect(Object.hasOwn(h.requests[0] ?? {}, 'followUpFocus')).toBe(false);
+    expect(lookups).toStrictEqual([]);
+  });
+
+  it('hands no focus member for a follow-up that names no category and no declaration', async () => {
+    const h = rig(() => generated(undefined));
+    const outcome = await h.run(inputOf());
+
+    expect(outcome.ok).toBe(true);
+    expect(Object.hasOwn(h.requests[0] ?? {}, 'followUpFocus')).toBe(false);
+  });
+
+  it('hands generate the focus of the new-capture follow-up whose plan version the capture ran under', async () => {
+    const lookups: string[] = [];
+    const h = rig(() => generated(undefined), {
+      followUpQuestion: undefined,
+      session: sessionWith(2, [
+        newCaptureFollowUp(2),
+        {
+          question: 'Why did the tally request fail?',
+          askedAt: FIXED_EPOCH_MS + 40,
+          needsNewCapture: false,
+          captureId: CAPTURE_ID,
+        },
+      ]),
+      code: { ...CODE, queries: queriesDeclaring(lookups) },
+    });
+    const outcome = await h.run(inputOf());
+
+    expect(outcome.ok).toBe(true);
+    expect(h.requests[0]?.followUpFocus).toStrictEqual(GOVERNING_FOCUS);
+    expect(lookups).toContain(FOCUS_NAME);
+    expect(JSON.stringify(h.requests[0]?.followUpFocus)).not.toMatch(/take|long|Why/u);
+  });
+
+  it('hands regenerate the focus of the follow-up the context names', async () => {
+    const h = rig(() => generated(EXPECTED_PANEL_ID), {
+      followUpQuestion: 'Why is this view slow?',
+    });
+    const outcome = await h.run(inputOf({ regenerate: true, supersedes: EXPECTED_PANEL_ID }));
+
+    expect(outcome.ok).toBe(true);
+    expect(h.requests[0]?.followUpFocus).toStrictEqual({
+      categoryHints: ['performance'],
+      declarations: [],
+    });
+    expect(h.records.some((record) => record.level === 'warn')).toBe(false);
+  });
+
+  it('prefers the focus the context carries over deriving one', async () => {
+    const lookups: string[] = [];
+    const carried = { categoryHints: ['data'], declarations: [] };
+    const h = rig(() => generated(undefined), {
+      followUpFocus: carried,
+      session: sessionWith(2, [newCaptureFollowUp(2)]),
+      code: { ...CODE, queries: queriesDeclaring(lookups) },
+    });
+    const outcome = await h.run(inputOf());
+
+    expect(outcome.ok).toBe(true);
+    expect(h.requests[0]?.followUpFocus).toStrictEqual(carried);
+    expect(lookups).toStrictEqual([]);
+  });
+});
+
+describe('createGeneratePanelStage — the owner-chain members the project declares', () => {
+  /** An invented owner chain: a building block, two application components, framework boundaries. */
+  const CHAIN: readonly string[] = [
+    'Tile',
+    'TallyBoardPanel',
+    'Ledger',
+    'OuterFrameBoundary',
+    'RouteSegmentNode',
+  ];
+
+  /** A `component` node as the graph holds one: name, display name, optional implementation. */
+  interface ComponentNodeStub {
+    readonly name: string;
+    readonly data: { readonly displayName: string; readonly implementation?: string };
+  }
+
+  /** A code graph whose `component` bucket is `nodes`, recording every bucket read. */
+  function graphDeclaring(
+    nodes: readonly ComponentNodeStub[],
+    reads: string[],
+  ): PipelineCodeHandles['graph'] {
+    const graph = {
+      nodesByKind: (kind: string): readonly ComponentNodeStub[] => {
+        reads.push(kind);
+        return kind === 'component' ? nodes : [];
+      },
+    };
+    return graph as unknown as PipelineCodeHandles['graph'];
+  }
+
+  /** The selected element whose owner chain is `chain`. */
+  function targetOf(chain: readonly string[]): NonNullable<PipelineStageContext['target']> {
+    return {
+      selector: 'main section button',
+      tagName: 'button',
+      componentChain: [...chain],
+      url: 'http://127.0.0.1:4173/tally',
+    };
+  }
+
+  it('hands generate the declared members of the chain, in chain order, each once', async () => {
+    const reads: string[] = [];
+    const h = rig(() => generated(undefined), {
+      followUpQuestion: undefined,
+      target: targetOf([...CHAIN, 'Ledger']),
+      code: {
+        ...CODE,
+        graph: graphDeclaring(
+          [
+            { name: 'Ledger', data: { displayName: 'Ledger' } },
+            { name: 'Tile', data: { displayName: 'Tile' } },
+            // Declared under another binding; the runtime display name is what the chain carries.
+            { name: 'BoardPanel', data: { displayName: 'TallyBoardPanel' } },
+            { name: 'Unrendered', data: { displayName: 'Unrendered' } },
+          ],
+          reads,
+        ),
+      },
+    });
+    const outcome = await h.run(inputOf());
+
+    expect(outcome.ok).toBe(true);
+    expect(h.requests[0]?.declaredComponents).toStrictEqual(['Tile', 'TallyBoardPanel', 'Ledger']);
+    expect(reads).toStrictEqual(['component']);
+  });
+
+  it('counts the implementation a wrapper declares as declared', async () => {
+    const h = rig(() => generated(undefined), {
+      followUpQuestion: undefined,
+      target: targetOf(['LedgerBody', 'OuterFrameBoundary']),
+      code: {
+        ...CODE,
+        graph: graphDeclaring(
+          [{ name: 'Ledger', data: { displayName: 'Ledger', implementation: 'LedgerBody' } }],
+          [],
+        ),
+      },
+    });
+    await h.run(inputOf());
+
+    expect(h.requests[0]?.declaredComponents).toStrictEqual(['LedgerBody']);
+  });
+
+  it('hands no member and reads no graph when nothing is selected', async () => {
+    const reads: string[] = [];
+    const h = rig(() => generated(undefined), {
+      followUpQuestion: undefined,
+      code: {
+        ...CODE,
+        graph: graphDeclaring([{ name: 'Ledger', data: { displayName: 'Ledger' } }], reads),
+      },
+    });
+    await h.run(inputOf());
+
+    expect(Object.hasOwn(h.requests[0] ?? {}, 'declaredComponents')).toBe(false);
+    expect(reads).toStrictEqual([]);
+  });
+
+  it('hands no member when the graph declares none of the chain', async () => {
+    const h = rig(() => generated(undefined), {
+      followUpQuestion: undefined,
+      target: targetOf(CHAIN),
+      code: { ...CODE, graph: graphDeclaring([], []) },
+    });
+    await h.run(inputOf());
+
+    expect(Object.hasOwn(h.requests[0] ?? {}, 'declaredComponents')).toBe(false);
+  });
+
+  it('titles from the chain alone, with a warn record and still a panel, when the graph cannot answer', async () => {
+    const graph = {
+      nodesByKind: (): never => {
+        throw new Error('index unavailable');
+      },
+    } as unknown as PipelineCodeHandles['graph'];
+    const h = rig(() => generated(undefined), {
+      followUpQuestion: undefined,
+      target: targetOf(CHAIN),
+      code: { ...CODE, graph },
+    });
+    const outcome = await h.run(inputOf());
+
+    expect(outcome.ok).toBe(true);
+    expect(Object.hasOwn(h.requests[0] ?? {}, 'declaredComponents')).toBe(false);
+    const warned = h.records.filter((record) => record.level === 'warn');
+    expect(warned).toHaveLength(1);
+    expect(JSON.stringify(warned[0])).not.toMatch(/index unavailable|Tally|Ledger/u);
+  });
+
+  it('checks only the nearest members the framing keeps', () => {
+    const reads: string[] = [];
+    const far = Array.from(
+      { length: MAX_DECLARED_CHAIN_MEMBERS },
+      (_, index) => `FrameLayer${String(index)}`,
+    );
+    const declared = declaredChainComponents(
+      {
+        target: targetOf([...far, 'Ledger']),
+        code: {
+          ...CODE,
+          graph: graphDeclaring([{ name: 'Ledger', data: { displayName: 'Ledger' } }], reads),
+        },
+      },
+      createConsoleLogger({ level: 'silent' }),
+    );
+
+    expect(declared).toStrictEqual([]);
+    expect(Object.isFrozen(declared)).toBe(true);
   });
 });

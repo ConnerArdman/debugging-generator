@@ -1,8 +1,9 @@
 /**
  * `webview/App` — request correlation and draft retention, end to end through the view.
  *
- * `./vscode-api` is replaced with a scripted host channel: `isVsCodeApiAvailable` answers `true`,
- * `postToHost` records every message and answers whether it was delivered, and `subscribeToHost`
+ * `./vscode-api` is replaced with a scripted host channel: `isVsCodeApiAvailable` answers `true`
+ * unless a case withdraws the channel, `postToHost` records every message and answers whether it
+ * was delivered, and `subscribeToHost`
  * captures App's handler so each case pushes the frames the real host would — including the one
  * `actionResult` the host posts per request, echoing that request's id. The view is mounted under
  * `StrictMode`, as `main.tsx` mounts it, so reducers and effects run twice where React says they
@@ -38,7 +39,10 @@
  *     the follow-ups with their outcome in words; "Pick element" is offered only to a running
  *     session over a reachable service; the no-session, ended, failed and disconnected states say
  *     why instead of offering a control the host would refuse; and file modifications say
- *     "nothing modified yet" until the plan exists.
+ *     "nothing modified yet" until the plan exists;
+ *   - in every state — no host channel, waiting for the first snapshot, and loaded — the shell's
+ *     scroll region is the view's first tab stop and is a region named "Debug Generator" by the
+ *     view's own visually hidden title, never an anonymous focusable container.
  *
  * Fixtures are realistic `SessionRecord`s and `WebviewState`s with neutral, synthetic wording
  * (AAP 0.5.4).
@@ -53,6 +57,7 @@ import type {
   SessionStatus,
 } from '@debuggen/protocol';
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -79,6 +84,8 @@ import { PENDING_ACTION_TIMEOUT_MS } from './pending-actions';
 // ---------------------------------------------------------------------------
 
 const channel = vi.hoisted(() => ({
+  /** Whether the webview API exists — what `isVsCodeApiAvailable` answers when App mounts. */
+  available: true,
   /** App's subscription, once its effect has run. */
   handler: undefined as ((message: HostToWebviewMessage) => void) | undefined,
   /** Whether the next `postToHost` is delivered. */
@@ -88,7 +95,7 @@ const channel = vi.hoisted(() => ({
 }));
 
 vi.mock('./vscode-api', () => ({
-  isVsCodeApiAvailable: (): boolean => true,
+  isVsCodeApiAvailable: (): boolean => channel.available,
   postToHost: (message: WebviewToHostMessage): boolean => {
     channel.posted.push(message);
     return channel.deliver;
@@ -104,6 +111,7 @@ vi.mock('./vscode-api', () => ({
 }));
 
 beforeEach(() => {
+  channel.available = true;
   channel.handler = undefined;
   channel.deliver = true;
   channel.posted = [];
@@ -349,6 +357,91 @@ function questionPending(): boolean {
     !questionField.disabled
   );
 }
+
+// ---------------------------------------------------------------------------
+// The view's scroll region
+// ---------------------------------------------------------------------------
+
+/** The view's own title, which names the shell's scroll region in every state. */
+const VIEW_TITLE = 'Debug Generator';
+/** The class of `PanelShell`'s scroll viewport, the view's one scroll container. */
+const SHELL_VIEWPORT_CLASS = 'dg-panel-shell__viewport';
+/** The no-channel state's title. */
+const NO_CHANNEL_TITLE = 'This view cannot reach the editor';
+/** The loading state's label; `LoadingState` appends an ellipsis, so it is matched as a substring. */
+const LOADING_LABEL = 'Loading the Debug Generator session';
+
+/** Mounts the view as `main.tsx` does and delivers nothing, leaving it waiting for its snapshot. */
+function mountWithoutSnapshot(): void {
+  render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  );
+}
+
+/**
+ * Asserts the shell's scroll viewport is a focusable region named by the view's own hidden title,
+ * and that it is the first stop a keyboard user reaches from the top of the document.
+ */
+async function expectNamedFirstTabStop(): Promise<void> {
+  const viewports = document.getElementsByClassName(SHELL_VIEWPORT_CLASS);
+  expect(viewports).toHaveLength(1);
+  const viewport = viewports.item(0);
+
+  // A region, found by the name a screen reader announces, that is the shell's viewport itself.
+  const region = screen.getByRole('region', { name: VIEW_TITLE });
+  expect(region).toBe(viewport);
+  expect(region.getAttribute('tabindex')).toBe('0');
+
+  // Named by the one level-1 heading the view already renders — no second title was added.
+  const titles = screen.getAllByRole('heading', { level: 1 });
+  expect(titles).toHaveLength(1);
+  const [title] = titles;
+  expect(title?.textContent).toBe(VIEW_TITLE);
+  expect(title?.id).not.toBe('');
+  expect(region.getAttribute('aria-labelledby')).toBe(title?.id);
+  expect(region.contains(title ?? null)).toBe(true);
+
+  // From the top of the document, the first Tab lands on the named region.
+  if (document.activeElement instanceof HTMLElement) {
+    document.activeElement.blur();
+  }
+  expect(document.activeElement).toBe(document.body);
+  await userEvent.setup().tab();
+  expect(document.activeElement).toBe(region);
+}
+
+describe('App — the view’s scroll region is named and first in the tab order', () => {
+  it('without a host channel: the no-channel state’s region is named by the view title', async () => {
+    channel.available = false;
+    mountWithoutSnapshot();
+
+    expect(screen.getByText(NO_CHANNEL_TITLE)).toBeTruthy();
+    await expectNamedFirstTabStop();
+  });
+
+  it('before the first snapshot: the loading state’s region is named by the view title', async () => {
+    mountWithoutSnapshot();
+
+    expect(busy(LOADING_LABEL)).toBe(true);
+    await expectNamedFirstTabStop();
+  });
+
+  it('once loaded: the main view’s region is named by the view title', async () => {
+    mount(webviewState());
+
+    expect(field(QUESTION_FIELD)).toBeTruthy();
+    await expectNamedFirstTabStop();
+  });
+
+  it('once loaded with a session: keeps the same name through a later snapshot', async () => {
+    mount(sessionState('generated'));
+    pushState(sessionState('ended'));
+
+    await expectNamedFirstTabStop();
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Request ids

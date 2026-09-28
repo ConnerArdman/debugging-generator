@@ -144,6 +144,69 @@ function endedRecord(): SessionRecord {
   });
 }
 
+/**
+ * A plan-version-2 record layered on record 1's result: the same file, its
+ * `originalHash` record 1's `instrumentedHash`, and its own backup therefore
+ * record 1's instrumented output — bytes that still carry the tool's wrapper.
+ * Only record 1, the chain root, backed up the pristine file.
+ */
+function layeredRecord(status: ModificationRecord['status'] = 'conflict'): ModificationRecord {
+  const root = record(1);
+  return {
+    ...root,
+    id: `${SESSION_ID}-mod-layered`,
+    planVersion: 2,
+    originalHash: root.instrumentedHash,
+    backupPath: `/tmp/debuggen-home/backups/${SESSION_ID}/${root.instrumentedHash}`,
+    instrumentedHash: 'd'.repeat(64),
+    appliedAt: T0 + 10,
+    status,
+    previousRecordId: root.id,
+  };
+}
+
+/**
+ * The conflict cleanup reports for the layered record: edited while
+ * instrumented, its own backup beside the chain root's pristine one.
+ */
+const CHAINED_CONFLICT: ModificationConflict = {
+  recordId: layeredRecord().id,
+  sessionId: SESSION_ID,
+  file: layeredRecord().file,
+  reason: 'content-changed',
+  expectedHash: layeredRecord().instrumentedHash,
+  actualHash: 'e'.repeat(64),
+  backupPath: layeredRecord().backupPath,
+  originalBackupPath: record(1).backupPath,
+  detectedAt: T0 + 50,
+  message: `${layeredRecord().file} could not be restored; the original is still at ${record(1).backupPath}.`,
+};
+
+/** A second, unchained file of the same session, edited while instrumented. */
+const UNCHAINED_CONFLICT: ModificationConflict = {
+  recordId: record(2).id,
+  sessionId: SESSION_ID,
+  file: record(2).file,
+  reason: 'content-changed',
+  expectedHash: record(2).instrumentedHash,
+  actualHash: 'c'.repeat(64),
+  backupPath: record(2).backupPath,
+  detectedAt: T0 + 55,
+  message: `${record(2).file} could not be restored; the original is still at ${record(2).backupPath}.`,
+};
+
+/** The owner's record once cleanup left the layered record (and its root) in conflict. */
+function chainedEndedRecord(
+  conflicts: readonly ModificationConflict[] = [CHAINED_CONFLICT],
+): SessionRecord {
+  return sessionRecord({
+    status: 'ended',
+    updatedAt: T0 + 60,
+    modifications: [record(1, 'conflict'), layeredRecord()],
+    cleanup: { status: 'conflict', completedAt: T0 + 60, conflicts: [...conflicts] },
+  });
+}
+
 /** A journal page carrying `records`. */
 function page(
   records: readonly ModificationRecord[],
@@ -216,8 +279,15 @@ afterEach(() => {
  * Builds the fake context: the session adopted from {@link OWNER} with one
  * applied patch, a closed socket, `session.end` answering `conflict`, the
  * owner's ended record, and the scripted journal pages.
+ *
+ * @param pages The journal pages `getModifications` answers, in order.
+ * @param ownerRecord The record `getSession` answers; {@link endedRecord} by
+ *   default.
  */
-function createHarness(pages: readonly PageAnswer[]): Harness {
+function createHarness(
+  pages: readonly PageAnswer[],
+  ownerRecord: () => SessionRecord = endedRecord,
+): Harness {
   const logs: LogRecord[] = [];
   const calls: PageCall[] = [];
   const state = new ExtensionState({ serviceUrl: OWNER, provider: 'deterministic' });
@@ -243,7 +313,7 @@ function createHarness(pages: readonly PageAnswer[]): Harness {
       getSession: (sessionId: string, options?: SessionEndpointCallOptions) => {
         expect(sessionId).toBe(SESSION_ID);
         expect(options?.endpoint).toBe(OWNER);
-        return Promise.resolve(ok(endedRecord()));
+        return Promise.resolve(ok(ownerRecord()));
       },
       getModifications: (
         sessionId: string,
@@ -398,5 +468,71 @@ describe('debuggen.endSession — the journal of a conflicted cleanup', () => {
       },
     ]);
     expect(onlyNotice(harness).message).toContain(CONFLICT.file);
+  });
+});
+
+describe('debuggen.endSession — the original a chained conflict names', () => {
+  it('quotes the chain root’s pristine backup, never the layered record’s instrumented one', async () => {
+    const harness = createHarness(
+      [ok(page([record(1, 'conflict'), layeredRecord()], 0, 2, null))],
+      () => chainedEndedRecord(),
+    );
+
+    await endSession(harness.ctx);
+
+    const notice = onlyNotice(harness);
+    expect(notice.message).toBe(
+      `${CHAINED_CONFLICT.file} was edited while instrumented. Debug Generator will not overwrite it. Original saved at ${record(1).backupPath}.`,
+    );
+    expect(notice.message).not.toContain(layeredRecord().backupPath);
+    // The report keeps the record's own backup beside the pristine one.
+    expect(harness.state.cleanup.conflicts).toEqual([CHAINED_CONFLICT]);
+    expectNoPathLogged(harness);
+  });
+
+  it('names each file’s pristine original: the chain root’s for a chained file, its own otherwise', async () => {
+    const harness = createHarness(
+      [ok(page([record(1, 'conflict'), layeredRecord(), record(2, 'conflict')], 0, 3, null))],
+      () => chainedEndedRecord([CHAINED_CONFLICT, UNCHAINED_CONFLICT]),
+    );
+
+    await endSession(harness.ctx);
+
+    const notice = onlyNotice(harness);
+    expect(notice.message).toBe(
+      'Session ended, but 2 files were left untouched. Debug Generator will not overwrite them.',
+    );
+    const detail = notice.detail ?? '';
+    expect(detail).toContain(
+      `${CHAINED_CONFLICT.file} was edited while instrumented. Debug Generator will not overwrite it. Original saved at ${record(1).backupPath}.`,
+    );
+    expect(detail).toContain(
+      `${UNCHAINED_CONFLICT.file} was edited while instrumented. Debug Generator will not overwrite it. Original saved at ${record(2).backupPath}.`,
+    );
+    expect(detail).not.toContain(layeredRecord().backupPath);
+    expectNoPathLogged(harness);
+  });
+
+  it('keeps the service’s own message for a chained conflict of another reason', async () => {
+    // A deleted file has no bytes to hash, so the report carries no actualHash.
+    const missing: ModificationConflict = {
+      recordId: CHAINED_CONFLICT.recordId,
+      sessionId: SESSION_ID,
+      file: CHAINED_CONFLICT.file,
+      reason: 'file-missing',
+      expectedHash: CHAINED_CONFLICT.expectedHash,
+      backupPath: CHAINED_CONFLICT.backupPath,
+      originalBackupPath: record(1).backupPath,
+      detectedAt: T0 + 50,
+      message: `${CHAINED_CONFLICT.file} is missing; the original is still at ${record(1).backupPath}.`,
+    };
+    const harness = createHarness(
+      [ok(page([record(1, 'conflict'), layeredRecord()], 0, 2, null))],
+      () => chainedEndedRecord([missing]),
+    );
+
+    await endSession(harness.ctx);
+
+    expect(onlyNotice(harness).message).toBe(missing.message);
   });
 });

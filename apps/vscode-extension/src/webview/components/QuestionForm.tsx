@@ -60,6 +60,19 @@
  * `onClick` and the Ctrl/Cmd+Enter chord in the text area. Plain Enter keeps
  * inserting a newline, because a question may span several lines.
  *
+ * ## The shortcut hint
+ *
+ * The submit row says how the keyboard works, in the same words and the same
+ * form as the follow-up field of `FollowUp.tsx`: "Press Ctrl+Enter (Cmd+Enter
+ * on macOS) to ask. Enter starts a new line." Every key is a `Kbd` chip, whose
+ * chord separators are hidden from assistive technology, so the hint is heard
+ * as exactly that sentence; "Cmd" is spelled out because every screen reader
+ * speaks it, which a "⌘" glyph does not guarantee. It is a muted `Text` placed
+ * immediately before the submit button and it describes the field through
+ * `aria-describedby`. The two components share no runtime module, so each
+ * declares the key constants and the sentence itself; `FollowUp.test.tsx`
+ * renders both hints and fails when they drift apart.
+ *
  * ## States, in precedence order (AAP 0.5.5 — never a blank area)
  *
  *   1. `error` (non-blank) — `ErrorState` with the failure message and, when
@@ -75,7 +88,8 @@
  *   3. `unavailable` — `EmptyState` with this component's own generic wording,
  *      because `EmptyState` ships no default copy.
  *   4. Otherwise the field, the retry hint when the last submission failed,
- *      the DevTools hint and the submit row.
+ *      the DevTools hint and the submit row: the shortcut hint, then the
+ *      submit button.
  *
  * ## Focus
  *
@@ -256,9 +270,15 @@ const RETRY_HINT = `Your question was not confirmed, so it is kept here. Press �
  */
 const UNAVAILABLE_MESSAGE = 'Start the local service to begin a session.';
 
-/** The two submit chords, as printed by `Kbd`. */
+/**
+ * The keys the shortcut hint prints through `Kbd`: the two submit chords —
+ * Ctrl+Enter, then Cmd+Enter for macOS — and the lone Enter that inserts a new
+ * line. `FollowUp.tsx` declares the same three and prints the same sentence
+ * (see the module note).
+ */
 const SUBMIT_CHORD_CTRL: readonly string[] = ['Ctrl', 'Enter'];
 const SUBMIT_CHORD_CMD: readonly string[] = ['Cmd', 'Enter'];
+const NEW_LINE_KEY = 'Enter';
 
 /**
  * Formats the character counter: the locale's digit grouping and no fraction, the same format
@@ -552,8 +572,11 @@ export function QuestionForm(props: QuestionFormProps): ReactElement {
               {PENDING_TEXT}
             </Text>
           ) : (
+            // Reads "Press Ctrl+Enter (Cmd+Enter on macOS) to ask. Enter starts a new line.",
+            // word for word the follow-up field's hint.
             <Text size="xs" tone="muted" id={shortcutId}>
-              Press <Kbd keys={SUBMIT_CHORD_CTRL} /> or <Kbd keys={SUBMIT_CHORD_CMD} /> to ask
+              Press <Kbd keys={SUBMIT_CHORD_CTRL} /> (<Kbd keys={SUBMIT_CHORD_CMD} /> on macOS) to
+              ask. <Kbd>{NEW_LINE_KEY}</Kbd> starts a new line.
             </Text>
           )}
           <Button variant="primary" onClick={submit} disabled={!canSubmit}>

@@ -71,8 +71,11 @@
  *    original in `$DEBUGGEN_HOME/backups`, reported as a `ModificationConflict`.
  * 2. **A reported restore is a verified restore.** {@link verifyCleanupEndState}
  *    re-hashes every file the pass says it restored against the recorded
- *    original and every conflicted file against what the pass promised to
- *    leave, and a failed check can only make the reported status worse.
+ *    original (or the bytes another session on the project still claims),
+ *    every conflicted file against what the pass promised to leave, and every
+ *    backup a conflict points the developer at — a chained record's chain-root
+ *    original included — and a failed check can only make the reported status
+ *    worse.
  * 3. **Runtime hooks are disabled, not idled — and a disarm is confirmed, not
  *    assumed.** The dormant page-agent configuration and the capture-less
  *    dev-server preload configuration are built and sent by
@@ -128,6 +131,7 @@
 import {
   cleanupSession,
   createBackupStore,
+  findChainRoot,
   reconcileModifications,
 } from '@debuggen/instrumentation';
 import type {
@@ -138,7 +142,9 @@ import type {
   InstrumentationPlan,
   ModificationConflict,
   ModificationRecord,
+  ModificationStatus,
   ReconcileOutcome,
+  RecordedBackup,
 } from '@debuggen/instrumentation';
 import { CLEANUP_STATUSES } from '@debuggen/protocol';
 import type {
@@ -152,9 +158,11 @@ import {
   err,
   isErr,
   noopLogger,
+  normalizePosix,
   nowEpochMs,
   ok,
   resolveWithinProject,
+  toPosix,
 } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger, Result } from '@debuggen/shared';
 import { readFileNoFollow, sha256Hex } from '@debuggen/shared/node';
@@ -291,7 +299,8 @@ export interface CleanupContextRequest {
  * The result is typed as the engine's `CleanupContext` — a structural subset of
  * `InstrumentationContext` — because that is all a restore needs: the journal,
  * the session's own backup store (rooted at `<debuggenHome>/backups/<sessionId>`),
- * a logger, a clock and a signal. Any factory that produces a full
+ * a logger, a clock, a signal and, optionally, the project root of another
+ * session whose claim a restoration meets. Any factory that produces a full
  * `InstrumentationContext` satisfies this port unchanged.
  * {@link createCleanupContextFactory} is the default.
  */
@@ -438,12 +447,16 @@ export interface CleanupCounts {
  * The independent end-state checks of {@link verifyCleanupEndState}.
  *
  * - `restored-content` — a file the pass restored (or closed) no longer hashes
- *   to the original its chain recorded.
+ *   to the original its chain recorded, and no other session's open record on
+ *   the same project claims the bytes it holds instead.
  * - `conflict-content` — a conflicted file holds bytes the pass promised not to
  *   leave: the recorded original where the developer's edit was, or (for a
  *   `content-changed` conflict) the instrumented bytes the conflict said were
  *   gone.
- * - `conflict-backup` — the backup a conflict points the developer at is gone.
+ * - `conflict-backup` — a backup a conflict points the developer at is gone or
+ *   is not what the report says it is: the record's own backup, or — for a
+ *   chained record — the chain root's pristine original the report names as
+ *   `originalBackupPath`, which "Original saved at ‹path›" quotes.
  */
 export const VERIFICATION_CHECKS = Object.freeze([
   'restored-content',
@@ -468,13 +481,37 @@ export interface VerificationIssue {
   /**
    * Why, in the kebab-case vocabulary of this module: `hash-mismatch`,
    * `file-missing`, `file-unreadable`, `path-refused`, `original-over-edit`,
-   * `instrumented-content-present`, `backup-missing`, `backup-unreadable` or
-   * `record-unknown`.
+   * `instrumented-content-present`, `backup-missing`, `backup-unreadable`,
+   * `record-unknown`, or — for a conflict naming its chain root's backup as
+   * `originalBackupPath` — `chain-root-unknown` (no root-most ancestor of the
+   * record could be resolved), `chain-root-mismatch` (the named path is not
+   * that root's backup), `original-backup-missing`,
+   * `original-backup-unreadable` or `original-backup-corrupt` (its bytes do not
+   * hash to the root's `originalHash`).
    */
   readonly reason: string;
 
   /** The error code behind a read or containment failure, when there was one. */
   readonly code?: string | undefined;
+}
+
+/**
+ * A finished file whose bytes are not its chain's original but another
+ * session's recorded write, which that session's own cleanup unwinds. Ids and
+ * a project-relative path only.
+ */
+export interface ClaimedFinishedFile {
+  /** The root-most finished record of the file. */
+  readonly recordId: string;
+
+  /** Its project-relative file. */
+  readonly file: string;
+
+  /** The other session whose open record claims the file's current bytes. */
+  readonly claimantSessionId: string;
+
+  /** That record. */
+  readonly claimantRecordId: string;
 }
 
 /** What {@link verifyCleanupEndState} found. */
@@ -484,6 +521,13 @@ export interface VerificationReport {
 
   /** Every check that did not hold, in the order they ran. */
   readonly issues: readonly VerificationIssue[];
+
+  /**
+   * Every finished file that holds another session's claimed bytes rather
+   * than its own chain's original — not an issue, and reported so the log says
+   * why (see {@link CleanupEndStateInput.claims}).
+   */
+  readonly claimed: readonly ClaimedFinishedFile[];
 }
 
 /** One failure a reconciliation could not settle, as JSON: never a live error object. */
@@ -898,13 +942,61 @@ export interface CleanupContextFactoryDeps {
 
   /** The clock each context carries. */
   readonly now?: (() => number) | undefined;
+
+  /**
+   * The session store, from whose rows every context answers the engine's
+   * `projectRootOf`: the project another session's record lives in.
+   *
+   * The engine asks it about one kind of record only — another session's open
+   * record whose digest is exactly the bytes a restoration is about to write
+   * over — to tell that session's live claim on **this** project's file from
+   * one on a copy elsewhere. A claim it cannot place is never written over and
+   * never closed beside, so without the store every such file stays open and
+   * is reported as a failure, rather than closed once both chains are known to
+   * descend from the same pristine original.
+   */
+  readonly sessions?: Pick<SessionsRepo, 'get'> | undefined;
+}
+
+/**
+ * The engine's `projectRootOf` over the session store: the stored
+ * `projectRoot` of a session, or `undefined` when the session is unknown or
+ * its row cannot be read — which the engine treats as a claim it cannot place.
+ * A read that fails is logged by session id and code only.
+ */
+function storedProjectRootOf(
+  sessions: Pick<SessionsRepo, 'get'>,
+  logger: Logger,
+): (sessionId: string) => string | undefined {
+  return (sessionId) => {
+    let found: Result<SessionRecord | undefined, DebuggenError>;
+
+    try {
+      found = sessions.get(sessionId);
+    } catch (thrown) {
+      found = err(DebuggenError.from(thrown, 'STORE_ERROR'));
+    }
+
+    if (isErr(found)) {
+      logger.warn(
+        'the project of another session holding a file could not be read; its claim is not placed',
+        { claimantSessionId: sessionId, code: found.error.code },
+      );
+
+      return undefined;
+    }
+
+    return found.value?.projectRoot;
+  };
 }
 
 /**
  * The default {@link InstrumentationContextFactory}: the journal repository and
  * the session's own content-addressed backup store at
  * `<debuggenHome>/backups/<sessionId>` — the same store the patcher filed the
- * originals in, so the engine's store-belongs-to-record check holds.
+ * originals in, so the engine's store-belongs-to-record check holds — and,
+ * given the session store, the other sessions' project roots the engine places
+ * a cross-session claim by.
  *
  * Opening a store creates nothing on disk; it is a rooted path policy. A state
  * directory or session id the store refuses is answered as `err`, never thrown.
@@ -949,6 +1041,8 @@ export function createCleanupContextFactory(
       logger,
       now,
       signal: input.signal,
+      projectRootOf:
+        deps.sessions === undefined ? undefined : storedProjectRootOf(deps.sessions, logger),
     });
   };
 }
@@ -974,9 +1068,57 @@ export interface CleanupEndStateInput {
   /** Every conflict the pass reported. */
   readonly conflicts: readonly ModificationConflict[];
 
-  /** Reads a record the two lists do not hold, by id. */
+  /**
+   * Reads a record the two lists do not hold, by id: a conflict's record, and
+   * the ancestors a chained record's root is resolved through.
+   */
   readonly lookup?: ((recordId: string) => Promise<ModificationRecord | undefined>) | undefined;
+
+  /**
+   * Loads the open records **other sessions on the same project** hold for the
+   * given project-relative files — the claims the `restored-content` check
+   * weighs before it calls a finished file wrong.
+   *
+   * The engine never writes a restoration over bytes another session's open
+   * `applied`, `pending` or `failed` record claims (its `instrumentedHash` is
+   * the file's digest): the transform is deterministic, so a later session on
+   * the same file can reproduce an earlier session's instrumented bytes
+   * exactly, and those bytes are then the later session's to unwind. When both
+   * chains descend from the same pristine original the engine closes this
+   * session's records without a write, so the file still holds the other
+   * session's bytes — correct, and not an issue. A finished file is excused
+   * only by a claim that is exactly that: another session's record in one of
+   * those three statuses, for the same file, whose `instrumentedHash` is the
+   * digest read; everything the loader returns is checked against that rule
+   * again here.
+   *
+   * Called at most once per verification, and only when a finished file does
+   * not hash to its root-most record's original, so a pass whose files verify
+   * costs no read. Omitted, or answering nothing, every such file is an issue.
+   */
+  readonly claims?:
+    ((files: readonly string[]) => Promise<readonly ModificationRecord[]>) | undefined;
 }
+
+/**
+ * The statuses whose record claims that the file holds its `instrumentedHash`
+ * — the same three the patch layer treats as holding a file for a session. A
+ * `conflict` record makes no such claim (the file diverged from it), and a
+ * `reverted` one is history.
+ */
+const CLAIMING_STATUSES: ReadonlySet<ModificationStatus> = new Set<ModificationStatus>([
+  'applied',
+  'pending',
+  'failed',
+]);
+
+/**
+ * The most ancestors one chain-root resolution fetches through
+ * {@link CleanupEndStateInput.lookup} — the journal's own bound on a chain walk,
+ * so a corrupted journal can neither hang verification nor make it read the
+ * whole store.
+ */
+const MAX_CHAIN_ROOT_LOOKUPS = 256;
 
 /** What a file's bytes looked like when verification read them. */
 type FileReading =
@@ -1108,6 +1250,164 @@ async function backupIssue(
   };
 }
 
+/**
+ * The chain root of a conflicted record — the first record of its follow-up
+ * chain, whose backup is the pristine file — resolved by the one definition of
+ * a root, `findChainRoot`, over the records the pass reported and, for an
+ * ancestor it did not report, one journal read per missing link.
+ *
+ * Each round either ends the walk or adds one ancestor, so at most
+ * {@link MAX_CHAIN_ROOT_LOOKUPS} records are read however the journal is
+ * shaped; `findChainRoot` itself refuses a cycle and a link into another
+ * session or file. A lookup that fails reads as an absent ancestor.
+ *
+ * @returns The root-most ancestor reached, or `undefined` for an unchained
+ * record or one whose parent cannot be found.
+ */
+async function resolveChainRoot(
+  record: ModificationRecord,
+  known: ReadonlyMap<string, ModificationRecord>,
+  lookup: CleanupEndStateInput['lookup'],
+): Promise<ModificationRecord | undefined> {
+  const candidates = new Map(known);
+
+  for (let fetched = 0; fetched < MAX_CHAIN_ROOT_LOOKUPS; fetched += 1) {
+    const root = findChainRoot(record, candidates.values());
+    const parentId = (root ?? record).previousRecordId;
+
+    // The walk ended at a true root, or at a link `findChainRoot` would not
+    // follow (a cycle, another session's or another file's record): either
+    // way, a further read cannot change the answer.
+    if (parentId === undefined || candidates.has(parentId) || lookup === undefined) {
+      return root;
+    }
+
+    let parent: ModificationRecord | undefined;
+
+    try {
+      parent = await lookup(parentId);
+    } catch {
+      parent = undefined;
+    }
+
+    if (parent === undefined) {
+      return root;
+    }
+
+    candidates.set(parent.id, parent);
+  }
+
+  return findChainRoot(record, candidates.values());
+}
+
+/**
+ * Whether the pristine original a chained record's conflict names —
+ * `originalBackupPath`, the path "Original saved at ‹path›" quotes (AAP
+ * §0.5.5) — is what the report says it is: the backup of the record's chain
+ * root, still there, holding bytes that hash to the root's `originalHash`.
+ *
+ * The root is resolved independently of the engine ({@link resolveChainRoot});
+ * a root that still links to a parent is not the pristine file's record, and
+ * a named path that is not the root's own backup would point the developer at
+ * bytes this check never vouched for. The read goes through the session's own
+ * store, and a path the store would substitute for another is not the one the
+ * developer was given, so it cannot be vouched for either.
+ */
+async function originalBackupIssue(
+  backups: BackupStore,
+  originalBackupPath: string,
+  record: ModificationRecord,
+  root: ModificationRecord | undefined,
+): Promise<VerificationIssue | undefined> {
+  const base = { check: 'conflict-backup', recordId: record.id, file: record.file } as const;
+
+  if (root === undefined || root.previousRecordId !== undefined) {
+    return { ...base, reason: 'chain-root-unknown' };
+  }
+
+  if (root.backupPath !== originalBackupPath) {
+    return { ...base, reason: 'chain-root-mismatch' };
+  }
+
+  let read: Result<RecordedBackup, DebuggenError>;
+
+  try {
+    read = await backups.readRecorded(originalBackupPath, root.originalHash);
+  } catch (thrown) {
+    return {
+      ...base,
+      reason: 'original-backup-unreadable',
+      code: errnoCode(thrown) ?? DebuggenError.from(thrown, 'STORE_ERROR').code,
+    };
+  }
+
+  if (isErr(read)) {
+    return {
+      ...base,
+      reason:
+        detailsReason(read.error) === 'backup-missing'
+          ? 'original-backup-missing'
+          : 'original-backup-unreadable',
+      code: read.error.code,
+    };
+  }
+
+  if (read.value.source === 'substituted') {
+    return { ...base, reason: 'original-backup-unreadable' };
+  }
+
+  return sha256Hex(read.value.bytes) === root.originalHash
+    ? undefined
+    : { ...base, reason: 'original-backup-corrupt' };
+}
+
+/** A project-relative path in the one spelling two records of one file share. */
+function samePathKey(file: string): string {
+  return normalizePosix(toPosix(file));
+}
+
+/**
+ * The other session's open record that claims the bytes a finished file holds,
+ * when one does — see {@link CleanupEndStateInput.claims} for the rule, which
+ * is re-applied here to whatever the loader returned.
+ */
+function claimantOf(
+  claims: readonly ModificationRecord[],
+  root: ModificationRecord,
+  file: string,
+  digest: string,
+): ModificationRecord | undefined {
+  const key = samePathKey(file);
+
+  return claims.find(
+    (claim) =>
+      claim.sessionId !== root.sessionId &&
+      CLAIMING_STATUSES.has(claim.status) &&
+      claim.instrumentedHash === digest &&
+      samePathKey(claim.file) === key,
+  );
+}
+
+/**
+ * The claims {@link CleanupEndStateInput.claims} loads for `files`, or none
+ * when there is no loader or it fails: a claim that cannot be read excuses
+ * nothing.
+ */
+async function loadClaims(
+  input: CleanupEndStateInput,
+  files: readonly string[],
+): Promise<readonly ModificationRecord[]> {
+  if (input.claims === undefined || files.length === 0) {
+    return [];
+  }
+
+  try {
+    return await input.claims(files);
+  } catch {
+    return [];
+  }
+}
+
 /** Whether a conflicted file holds bytes the pass promised not to leave there. */
 function conflictContentIssue(
   projectRoot: string,
@@ -1149,26 +1449,46 @@ function conflictContentIssue(
  * the claim.
  *
  * - Every file the pass restored or closed must hash to the recorded original
- *   of its root-most finished record (see {@link rootMostRecord}).
+ *   of its root-most finished record (see {@link rootMostRecord}) — or to the
+ *   instrumented bytes another session on the same project still claims
+ *   ({@link CleanupEndStateInput.claims}), which that session's own cleanup
+ *   unwinds.
  * - Every conflicted file must still be as the pass found it: the recorded
  *   original must not have appeared over bytes the pass observed to differ, and
  *   a `content-changed` file must not hold the instrumented bytes again.
- * - Every conflict's backup must still exist — except for a `backup-missing`
- *   conflict, whose definition is its absence — because it is the copy the
- *   developer is pointed at.
+ * - Every conflict's own backup must still exist — except for a
+ *   `backup-missing` conflict, whose definition is its absence — and a chained
+ *   record's conflict that names its chain root's backup as
+ *   `originalBackupPath` must name exactly that root's backup, still holding
+ *   the pristine original: that is the copy the developer is pointed at.
  *
  * Reads only; writes nothing, deletes nothing and throws nothing. A failed check
  * is an issue in the report, which a caller turns into a worse verdict — never a
  * better one.
  *
  * @param input The project, the session's backup store and what the pass reported.
- * @returns How many checks ran and which of them did not hold.
+ * @returns How many checks ran, which of them did not hold, and which finished
+ * files hold another session's claimed bytes.
  */
 export async function verifyCleanupEndState(
   input: CleanupEndStateInput,
 ): Promise<VerificationReport> {
   const issues: VerificationIssue[] = [];
+  const claimed: ClaimedFinishedFile[] = [];
   let checked = 0;
+
+  // Each finished file's verdict, in file order; a digest that is not the
+  // original is settled once every such file is known, so the claims are read
+  // at most once and only when a file needs them.
+  const verdicts: (
+    | { readonly kind: 'issue'; readonly issue: VerificationIssue }
+    | {
+        readonly kind: 'mismatch';
+        readonly root: ModificationRecord;
+        readonly file: string;
+        readonly digest: string;
+      }
+  )[] = [];
 
   for (const [file, records] of groupByFile(input.finished)) {
     const root = rootMostRecord(records);
@@ -1181,15 +1501,48 @@ export async function verifyCleanupEndState(
     const reading = readDigest(input.projectRoot, file);
 
     if (reading.kind !== 'present') {
-      issues.push({
-        check: 'restored-content',
-        recordId: root.id,
-        file,
-        reason: readingReason(reading),
-        code: reading.kind === 'missing' ? undefined : reading.code,
+      verdicts.push({
+        kind: 'issue',
+        issue: {
+          check: 'restored-content',
+          recordId: root.id,
+          file,
+          reason: readingReason(reading),
+          code: reading.kind === 'missing' ? undefined : reading.code,
+        },
       });
     } else if (reading.hash !== root.originalHash) {
-      issues.push({ check: 'restored-content', recordId: root.id, file, reason: 'hash-mismatch' });
+      verdicts.push({ kind: 'mismatch', root, file, digest: reading.hash });
+    }
+  }
+
+  const mismatchedFiles = verdicts.flatMap((verdict) =>
+    verdict.kind === 'mismatch' ? [verdict.file] : [],
+  );
+  const claims = await loadClaims(input, mismatchedFiles);
+
+  for (const verdict of verdicts) {
+    if (verdict.kind === 'issue') {
+      issues.push(verdict.issue);
+      continue;
+    }
+
+    const claimant = claimantOf(claims, verdict.root, verdict.file, verdict.digest);
+
+    if (claimant === undefined) {
+      issues.push({
+        check: 'restored-content',
+        recordId: verdict.root.id,
+        file: verdict.file,
+        reason: 'hash-mismatch',
+      });
+    } else {
+      claimed.push({
+        recordId: verdict.root.id,
+        file: verdict.file,
+        claimantSessionId: claimant.sessionId,
+        claimantRecordId: claimant.id,
+      });
     }
   }
 
@@ -1228,9 +1581,27 @@ export async function verifyCleanupEndState(
         issues.push(backup);
       }
     }
+
+    // The pristine original a chained record's report points the developer
+    // at is checked whatever the reason: a missing or corrupt *own* backup
+    // says nothing about the root's.
+    if (conflict.originalBackupPath !== undefined && record.sessionId === input.backups.sessionId) {
+      checked += 1;
+      const root = await resolveChainRoot(record, known, input.lookup);
+      const original = await originalBackupIssue(
+        input.backups,
+        conflict.originalBackupPath,
+        record,
+        root,
+      );
+
+      if (original !== undefined) {
+        issues.push(original);
+      }
+    }
   }
 
-  return { checked, issues };
+  return { checked, issues, claimed };
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,6 +1686,83 @@ function recordLookup(
   };
 }
 
+/**
+ * The {@link CleanupEndStateInput.claims} loader for one session's pass: the
+ * open records other sessions on the same project hold for the files asked
+ * about, read from the journal as it stands **after** the pass — so a session
+ * an earlier pass of the same start-up already restored claims nothing any
+ * more.
+ *
+ * One `listOpen()` across every session, narrowed to the files asked about
+ * and to the statuses that claim a file's bytes, then one session read per
+ * distinct owner left, because a record names only a project-relative file:
+ * two copies of a project share every relative path, and only a claimant on
+ * this session's own project describes the bytes in this file. A journal or
+ * session row that does not answer excuses nothing — it is logged, and the
+ * file is then reported as it stands.
+ *
+ * @param deps The journal and the session store.
+ * @param sessionId The session the pass cleaned up; its own records are no claim.
+ * @param projectRoot Its project root, as its session row records it.
+ * @param logger The pass's logger. Ids, project-relative paths and codes only.
+ */
+function projectClaimsLoader(
+  deps: Pick<StartupReconciliationDeps, 'modifications' | 'sessions'>,
+  sessionId: string,
+  projectRoot: string,
+  logger: Logger,
+): (files: readonly string[]) => Promise<readonly ModificationRecord[]> {
+  return async (files) => {
+    const wanted = new Set(files.map(samePathKey));
+    const listed = await settle(() => deps.modifications.listOpen(), 'STORE_ERROR');
+
+    if (isErr(listed)) {
+      logger.warn(
+        'the open records of other sessions could not be read; a finished file holding other bytes is reported as it stands',
+        { code: listed.error.code },
+      );
+
+      return [];
+    }
+
+    const candidates = listed.value.filter(
+      (record) =>
+        record.sessionId !== sessionId &&
+        CLAIMING_STATUSES.has(record.status) &&
+        wanted.has(samePathKey(record.file)),
+    );
+    const onProject = new Map<string, boolean>();
+    const claims: ModificationRecord[] = [];
+
+    for (const record of candidates) {
+      let sameProject = onProject.get(record.sessionId);
+
+      if (sameProject === undefined) {
+        const owner = await settle(() => deps.sessions.get(record.sessionId), 'STORE_ERROR');
+
+        if (isErr(owner)) {
+          logger.warn(
+            'the session of a claiming record could not be read; its claim is not counted',
+            {
+              claimantSessionId: record.sessionId,
+              code: owner.error.code,
+            },
+          );
+        }
+
+        sameProject = !isErr(owner) && owner.value?.projectRoot === projectRoot;
+        onProject.set(record.sessionId, sameProject);
+      }
+
+      if (sameProject) {
+        claims.push(record);
+      }
+    }
+
+    return claims;
+  };
+}
+
 /** Logs the records a pass could not finish, by id, file and code only. */
 function logFailures(logger: Logger, failures: readonly CleanupFailure[]): void {
   if (failures.length === 0) {
@@ -1333,6 +1781,16 @@ function logFailures(logger: Logger, failures: readonly CleanupFailure[]): void 
 
 /** Logs the end-state checks that did not hold. */
 function logVerification(logger: Logger, report: VerificationReport): void {
+  if (report.claimed.length > 0) {
+    logger.info(
+      'finished files hold instrumented bytes another session on the project still claims; that session’s cleanup restores them',
+      {
+        claimed: report.claimed.slice(0, MAX_LOGGED_RECORD_IDS),
+        count: report.claimed.length,
+      },
+    );
+  }
+
   if (report.issues.length === 0) {
     logger.debug('cleanup end state verified', { checked: report.checked });
 
@@ -1665,6 +2123,7 @@ async function reconcileSession(
     open: [...outcome.retained, ...outcome.skipped],
     conflicts,
     lookup: recordLookup(runtime.deps.modifications),
+    claims: projectClaimsLoader(runtime.deps, sessionId, session.projectRoot, logger),
   });
 
   logFailures(logger, outcome.failures);
@@ -1736,6 +2195,7 @@ async function reconcileAcross(
       deps.buildContext ??
       createCleanupContextFactory({
         modifications: deps.modifications,
+        sessions: deps.sessions,
         config: deps.config,
         logger: deps.logger,
         now,
@@ -1983,6 +2443,7 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
     deps.buildContext ??
     createCleanupContextFactory({
       modifications: deps.modifications,
+      sessions: deps.sessions,
       config: deps.config,
       logger: deps.logger,
       now,
@@ -2602,6 +3063,7 @@ export function createSessionCleanup(deps: SessionCleanupDeps): SessionCleanup {
       open: outcome.skipped,
       conflicts,
       lookup: recordLookup(deps.modifications),
+      claims: projectClaimsLoader(deps, sessionId, session.projectRoot, scoped),
     });
 
     logFailures(scoped, outcome.failures);

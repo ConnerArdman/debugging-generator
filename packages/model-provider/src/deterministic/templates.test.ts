@@ -25,23 +25,34 @@ import { describe, expect, it } from 'vitest';
 import {
   CONTEXT_PROVIDER_LIST_MAX_ITEMS,
   EVIDENCE_PATTERN_FALLBACK_LABEL,
+  FOCUS_SUBJECT_MAX_ITEMS,
+  HEADLINE_MAX_LENGTH,
   LABEL_MAX_LENGTH,
   METRIC_COUNT_NOUNS,
+  OBJECTIVE_MAX_LENGTH,
+  OBJECTIVE_MAX_ROUTES,
   PROBLEM_CATEGORY_FALLBACK_LABEL,
   STATEMENT_MAX_LENGTH,
   TELEMETRY_TIER_FALLBACK_LABEL,
   TRUNCATION_MARKER,
+  UNNAMED_SYMBOL_LABEL,
+  codeRelevanceReason,
+  codeSymbolKindLabel,
   contextChangeRenderCause,
   contextTriggeredRenderFact,
   dominantSpanCause,
   duplicateRequestCause,
   duplicateRequestFact,
   evidencePatternLabel,
+  focusSubjectLabel,
+  focusedDeclarationFact,
   formatDurationMs,
   longTaskFact,
   metricCountNoun,
+  panelFocusSentence,
   panelSummaryHeadline,
   panelTitle,
+  planObjective,
   problemCategoryLabel,
   repeatedQueryShapeCause,
   slowestSpanFact,
@@ -424,5 +435,218 @@ describe('per-component trigger facts', () => {
       expect(sentence.length).toBeLessThanOrEqual(STATEMENT_MAX_LENGTH);
       expect(sentence.startsWith('Component') || sentence.includes(' of Component')).toBe(true);
     }
+  });
+});
+
+describe('plan objective: structured facts, never a fixed tail', () => {
+  it('restates the 500-character objective bound of the plan schema', () => {
+    expect(OBJECTIVE_MAX_LENGTH).toBe(500);
+    expect(OBJECTIVE_MAX_ROUTES).toBe(3);
+  });
+
+  it('reproduces an input-driven behaviour through an interaction with the target', () => {
+    expect(
+      planObjective(problemCategoryLabel('performance'), '‹component›', 'interaction', [
+        'POST /‹route›',
+      ]),
+    ).toBe(
+      'Determine what accounts for the latency recorded at ‹component› and POST /‹route› while an interaction with ‹component› is reproduced.',
+    );
+  });
+
+  it('observes the page for a behaviour that shows without input', () => {
+    expect(planObjective(problemCategoryLabel('rendering'), '‹component›')).toBe(
+      'Determine what accounts for the render activity recorded at ‹component› while the page is observed.',
+    );
+    expect(
+      planObjective(problemCategoryLabel('network'), undefined, 'page', ['GET /‹route›']),
+    ).toBe(
+      'Determine what accounts for the network requests recorded at GET /‹route› while the page is observed.',
+    );
+  });
+
+  it('names no target and no location when there is nothing to name', () => {
+    expect(planObjective(problemCategoryLabel('performance'), undefined, 'interaction')).toBe(
+      'Determine what accounts for the latency recorded while the interaction is reproduced.',
+    );
+    expect(planObjective(problemCategoryLabel('performance'), '  ', 'interaction')).toBe(
+      'Determine what accounts for the latency recorded while the interaction is reproduced.',
+    );
+    expect(planObjective(problemCategoryLabel('other'), '  ')).toBe(
+      'Determine what accounts for the reported behaviour recorded while the page is observed.',
+    );
+  });
+
+  it('names each traced route once, never the target twice, and counts the rest', () => {
+    expect(
+      planObjective(problemCategoryLabel('data'), '‹component›', 'interaction', [
+        'GET /‹a›',
+        ' ',
+        'GET /‹a›',
+        '‹component›',
+        'GET /‹b›',
+        'GET /‹c›',
+        'GET /‹d›',
+        'GET /‹e›',
+      ]),
+    ).toBe(
+      'Determine what accounts for the database queries recorded at ‹component›, GET /‹a›, GET /‹b›, GET /‹c› and 2 more while an interaction with ‹component› is reproduced.',
+    );
+  });
+
+  it('never carries the old fixed tail', () => {
+    for (const reproduction of ['interaction', 'page'] as const) {
+      expect(planObjective('latency', '‹component›', reproduction)).not.toContain(
+        'reported behaviour is reproduced',
+      );
+    }
+  });
+
+  it('stays within the objective bound with every label at the label cap', () => {
+    const target = longLabel('‹component›');
+    const routes = ['GET /', 'POST /', 'PUT /', 'DELETE /'].map((method) => longLabel(method));
+    const objective = planObjective('latency', target, 'interaction', routes);
+    expect(objective.length).toBeLessThanOrEqual(OBJECTIVE_MAX_LENGTH);
+    expect(
+      objective.startsWith('Determine what accounts for the latency recorded at ‹component›'),
+    ).toBe(true);
+    expect(objective.endsWith(' is reproduced.')).toBe(true);
+    expect(objective).toContain(' and 1 more while an interaction with ‹component›');
+  });
+});
+
+describe('follow-up focus: the fact about a focused declaration', () => {
+  it('states the runs, their summed time and their share of the interaction byte for byte', () => {
+    expect(focusedDeclarationFact('‹symbol›', 3, 900, 1200)).toBe(
+      '‹symbol› ran 3 times for 900.00 ms in total (75% of the 1.200 s recorded for the interaction).',
+    );
+    expect(focusedDeclarationFact('‹symbol›', 1, 42.5)).toBe(
+      '‹symbol› ran 1 time for 42.50 ms in total.',
+    );
+  });
+
+  it('never states a share below one percent as zero, nor one above the whole', () => {
+    expect(focusedDeclarationFact('‹symbol›', 2, 3, 1200)).toContain(
+      '(less than 1% of the 1.200 s recorded',
+    );
+    expect(focusedDeclarationFact('‹symbol›', 2, 0, 1200)).toContain('(0% of the 1.200 s');
+    expect(focusedDeclarationFact('‹symbol›', 2, 1500, 1200)).toContain('(100% of the 1.200 s');
+    expect(focusedDeclarationFact('‹symbol›', 2, 5, 0)).toContain('(0% of the 0.00 ms');
+  });
+
+  it('reads a blank name with the unnamed-symbol wording', () => {
+    expect(focusedDeclarationFact('  ', 2, 10)).toBe(
+      `${UNNAMED_SYMBOL_LABEL} ran 2 times for 10.00 ms in total.`,
+    );
+  });
+
+  it('stays within the statement bound with a name at the label cap', () => {
+    const sentence = focusedDeclarationFact(longLabel('‹symbol›'), 9_999_999, 1e12, 1e12);
+    expect(sentence.length).toBeLessThanOrEqual(STATEMENT_MAX_LENGTH);
+    expect(sentence.endsWith('recorded for the interaction).')).toBe(true);
+    expect(sentence.startsWith('‹symbol›')).toBe(true);
+  });
+});
+
+describe('follow-up focus: the subject a focused panel is titled and headlined by', () => {
+  it('joins up to three declarations and counts the rest', () => {
+    expect(FOCUS_SUBJECT_MAX_ITEMS).toBe(3);
+    expect(focusSubjectLabel(['‹a›'])).toBe('‹a›');
+    expect(focusSubjectLabel(['‹a›', '‹b›'])).toBe('‹a› and ‹b›');
+    expect(focusSubjectLabel(['‹a›', '‹b›', '‹c›'])).toBe('‹a›, ‹b› and ‹c›');
+    expect(focusSubjectLabel(['‹a›', '‹b›', '‹c›', '‹d›', '‹e›'])).toBe('‹a›, ‹b›, ‹c› and 2 more');
+  });
+
+  it('drops blank names and reads an empty list with the unnamed-symbol wording', () => {
+    expect(focusSubjectLabel(['‹a›', ' ', '‹b›'])).toBe('‹a› and ‹b›');
+    expect(focusSubjectLabel([])).toBe(UNNAMED_SYMBOL_LABEL);
+    expect(focusSubjectLabel(['', '  '])).toBe(UNNAMED_SYMBOL_LABEL);
+  });
+
+  it('titles a panel by the focus subject', () => {
+    expect(panelTitle(problemCategoryLabel('performance'), focusSubjectLabel(['‹a›', '‹b›']))).toBe(
+      'Latency — ‹a› and ‹b›',
+    );
+  });
+});
+
+describe('follow-up focus: the headline sentence naming the focus', () => {
+  const counts = [{ count: 4, noun: metricCountNoun('request_count') }];
+
+  it('names a focus category or a focus subject in one non-evidentiary sentence', () => {
+    expect(panelFocusSentence(problemCategoryLabel('data'))).toBe('Focused on database queries.');
+    expect(panelFocusSentence('‹symbol›')).toBe('Focused on ‹symbol›.');
+    expect(panelFocusSentence(' ')).toBe(`Focused on ${PROBLEM_CATEGORY_FALLBACK_LABEL}.`);
+  });
+
+  it('closes the headline with the focus sentence, after any silent-tier sentence', () => {
+    expect(panelSummaryHeadline(counts, 1175, [], '‹symbol›')).toBe(
+      'The capture recorded 4 requests across 1.175 s. Focused on ‹symbol›.',
+    );
+    expect(panelSummaryHeadline(counts, 1175, [telemetryTierLabel('db')], '‹symbol›')).toBe(
+      'The capture recorded 4 requests across 1.175 s. No database telemetry was recorded, so the views show no work in that tier. Focused on ‹symbol›.',
+    );
+  });
+
+  it('keeps a focused headline within the headline bound, shortening only the focus', () => {
+    expect(HEADLINE_MAX_LENGTH).toBe(500);
+    const many = Array.from({ length: 6 }, (_, index) => ({
+      count: Number.MAX_SAFE_INTEGER - index,
+      noun: metricCountNoun('unchanged_render_count'),
+    }));
+    const focus = focusSubjectLabel([longLabel('‹a›'), longLabel('‹b›'), longLabel('‹c›')]);
+    const headline = panelSummaryHeadline(
+      many,
+      1e15,
+      [telemetryTierLabel('browser'), telemetryTierLabel('server'), telemetryTierLabel('db')],
+      focus,
+    );
+    expect(headline.length).toBeLessThanOrEqual(HEADLINE_MAX_LENGTH);
+    expect(headline).toContain('so the views show no work in those tiers. Focused on ‹a›');
+    expect(headline.endsWith('.')).toBe(true);
+  });
+
+  it('leaves the headline unchanged without a focus, or with a blank one', () => {
+    const unfocused = panelSummaryHeadline(counts, 1175, []);
+    expect(panelSummaryHeadline(counts, 1175, [], undefined)).toBe(unfocused);
+    expect(panelSummaryHeadline(counts, 1175, [], '   ')).toBe(unfocused);
+  });
+});
+
+describe('code-relevance reasons: a relation the graph recorded, or none claimed', () => {
+  it('names the related entity byte for byte', () => {
+    expect(codeRelevanceReason(codeSymbolKindLabel('component'), '‹route›')).toBe(
+      'The code graph associates this component with ‹route›.',
+    );
+    expect(codeRelevanceReason(codeSymbolKindLabel('file'), '  ‹looked-up name›\n')).toBe(
+      'The code graph associates this file with ‹looked-up name›.',
+    );
+  });
+
+  it('words a candidate nothing relates without an entity, never an unnamed one', () => {
+    const expected = "The code graph returned this symbol in the investigation's query results.";
+    for (const blank of ['', '   ', '\n\t']) {
+      const reason = codeRelevanceReason(codeSymbolKindLabel('symbol'), blank);
+      expect(reason).toBe(expected);
+      expect(reason).not.toContain('unnamed');
+    }
+    expect(codeRelevanceReason(codeSymbolKindLabel('symbol'))).toBe(expected);
+  });
+
+  it('reads the code graph’s handler kind as an event handler, in both spellings', () => {
+    expect(codeSymbolKindLabel('handler')).toBe('event handler');
+    expect(codeSymbolKindLabel('event-handler')).toBe('event handler');
+    expect(codeRelevanceReason(codeSymbolKindLabel('handler'), '‹route›')).toBe(
+      'The code graph associates this event handler with ‹route›.',
+    );
+    expect(codeRelevanceReason(codeSymbolKindLabel('handler'), '')).toBe(
+      "The code graph returned this event handler in the investigation's query results.",
+    );
+  });
+
+  it('keeps the generic kind wording for a kind the graph does not report', () => {
+    expect(codeRelevanceReason(codeSymbolKindLabel('‹newer kind›'), '‹route›')).toBe(
+      'The code graph associates this symbol with ‹route›.',
+    );
   });
 });

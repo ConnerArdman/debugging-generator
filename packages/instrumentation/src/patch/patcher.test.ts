@@ -161,6 +161,7 @@ import {
   describeTargetYield,
 } from './patcher.js';
 import type {
+  PatchBatchResult,
   PatchFileSystem,
   PatchOutcome,
   PatchStage,
@@ -4407,6 +4408,12 @@ describe('byte fidelity across file kinds', () => {
  * step 1a with `PATCH_TARGET_HELD_REASON`, having backed up, journaled and
  * written nothing. These cases run two real sessions over one project copy
  * and one shared journal, which is how the service holds them.
+ *
+ * The transform is deterministic, so two sessions can record the same
+ * `instrumentedHash` for one file — the second patching it after the first
+ * session's patch was undone by hand. Bytes a session's own record claims are
+ * never held against it, and the cases after the batch ones pin both halves:
+ * the own claim clears the file, and nothing short of it does.
  */
 
 /**
@@ -4460,6 +4467,64 @@ function heldWording(
     reason: `${file} is already instrumented by session ${owningSessionId}`,
     hint: `End session ${owningSessionId} — its cleanup restores ${file} — then ask again to time ${symbol} in this session.`,
   };
+}
+
+/**
+ * The two outcomes of a batch that chained two patches over one file, or a
+ * failed test naming what the batch reported instead.
+ */
+function chainedPair(batch: PatchBatchResult): readonly [PatchOutcome, PatchOutcome] {
+  const [root, head] = batch.applied;
+
+  if (
+    batch.failure !== undefined ||
+    batch.applied.length !== 2 ||
+    root === undefined ||
+    head === undefined
+  ) {
+    throw new Error(
+      `Expected two applied links, received ${batch.applied.length} and ${
+        batch.failure === undefined
+          ? 'no failure'
+          : `${batch.failure.error.code}: ${JSON.stringify(batch.failure.error.details)}`
+      }`,
+    );
+  }
+
+  return [root, head];
+}
+
+/**
+ * Puts a file's pristine bytes back in place, as a developer resolving a
+ * conflict with `git checkout -- <file>` does. No journal is told: that is the
+ * state a session which ended in a conflict leaves its records in.
+ */
+function restoreByHand(pristine: Pristine): void {
+  writeFileSync(pristine.path, pristine.bytes);
+}
+
+/**
+ * Asserts `error` is the held-target refusal naming `holding` — code, details,
+ * message and hint exactly as `../installer.ts` and the service parse them.
+ */
+function expectHeldBy(
+  error: DebuggenError,
+  file: string,
+  symbol: string,
+  holding: ModificationRecord,
+): void {
+  const wording = heldWording(file, symbol, holding.sessionId);
+
+  expect(error.code).toBe('PATCH_UNSUPPORTED');
+  expect(error.details).toEqual({
+    reason: PATCH_TARGET_HELD_REASON,
+    file,
+    symbol,
+    owningSessionId: holding.sessionId,
+    recordId: holding.id,
+  });
+  expect(error.message).toBe(`${wording.reason}, so this session cannot patch it as well.`);
+  expect(error.hint).toBe(wording.hint);
 }
 
 describe('a file another session already instrumented', () => {
@@ -4638,6 +4703,229 @@ describe('a file another session already instrumented', () => {
 
     expect(second.log.pins).toEqual([pinnedTarget, pinnedTarget]);
     expect(second.log.snapshots).toHaveLength(2);
+  });
+
+  it('chains a session’s two patches over a file restored after another session’s chain ended in a conflict', async () => {
+    // Session 1 chained two records over one file and ended in a conflict:
+    // its head record is `conflict`, its root still `applied`. The developer
+    // restored the pristine original, and session 2 plans the same two symbols
+    // in the same order. The transform is deterministic, so session 2's first
+    // patch reproduces session 1's root digest byte for byte — and its second
+    // patch must find its own bytes there, not bytes session 1 holds.
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, CHAIN_FILE);
+    const first = buildPatcher(sandbox);
+    const [staleRoot, conflicted] = chainedPair(
+      await first.patcher.patchActions([
+        patchAction(CHAIN_FILE, CHAIN_FIRST_SYMBOL),
+        patchAction(CHAIN_FILE, CHAIN_SECOND_SYMBOL),
+      ]),
+    );
+
+    expect(conflicted.previousRecordId).toBe(staleRoot.record.id);
+    expect(isOk(await first.journal.updateStatus(conflicted.record.id, 'conflict'))).toBe(true);
+    restoreByHand(pristine);
+
+    const sessionOneRows = first.journal.rows.map((row) => ({ ...row }));
+
+    expect(sessionOneRows.map((row) => row.status)).toEqual(['applied', 'conflict']);
+
+    const second = sessionSharing(sandbox, first.journal, newSessionId());
+    const [ownRoot, ownHead] = chainedPair(
+      await second.patcher.patchActions([
+        patchAction(CHAIN_FILE, CHAIN_FIRST_SYMBOL),
+        patchAction(CHAIN_FILE, CHAIN_SECOND_SYMBOL),
+      ]),
+    );
+
+    // The collision that used to refuse the second patch: one digest, claimed
+    // by an `applied` record of each session.
+    expect(ownRoot.originalHash).toBe(pristine.hash);
+    expect(ownRoot.instrumentedHash).toBe(staleRoot.instrumentedHash);
+
+    // Both links are session 2's, the second layered on the first, and the
+    // file holds the head's bytes.
+    expect(ownRoot.record.sessionId).toBe(second.sessionId);
+    expect(ownHead.record.sessionId).toBe(second.sessionId);
+    expect(ownRoot.previousRecordId).toBeUndefined();
+    expect(ownHead.previousRecordId).toBe(ownRoot.record.id);
+    expect(ownHead.originalHash).toBe(ownRoot.instrumentedHash);
+    expect(ownHead.status).toBe('applied');
+    expect(digestOnDisk(pristine.path)).toBe(ownHead.instrumentedHash);
+
+    // Session 1's records are exactly as it left them: a patch never
+    // reconciles another session's records.
+    expect(first.journal.rows).toHaveLength(4);
+    expect(first.journal.rows.slice(0, 2)).toStrictEqual(sessionOneRows);
+    expect(first.journal.rows.slice(2).map((row) => row.id)).toEqual([
+      ownRoot.record.id,
+      ownHead.record.id,
+    ]);
+
+    // And session 2's own chain unwinds the bytes it wrote, head first, to the
+    // original it recorded — which is why its claim over them is the one that
+    // stands.
+    const context = {
+      projectRoot: sandbox.projectRoot,
+      backups: second.backups,
+      journal: first.journal,
+    };
+
+    for (const link of [ownHead, ownRoot]) {
+      const restored = restoredOutcome(await restoreModification(link.record, context));
+
+      expect(restored.kind).toBe('restored');
+      expect(restored.record.status).toBe('reverted');
+    }
+
+    expectPristine(pristine);
+    expect(first.journal.rows.slice(0, 2)).toStrictEqual(sessionOneRows);
+  });
+
+  it.each(['applied', 'pending', 'failed'] as const)(
+    'holds nothing against a session whose own applied record claims the bytes another session’s %s record names',
+    async (status) => {
+      // Session 1's record names the bytes of one patch of the file. The file
+      // was restored by hand, session 2 patched the same symbol and so wrote
+      // those very bytes, and now it asks for another symbol in the file. The
+      // batch probes the file — session 1's record makes it a candidate — and
+      // the probe, like the attempt after it, finds session 2's own claim.
+      const sandbox = makeSandbox();
+      const first = buildPatcher(sandbox);
+      const stale = appliedOutcome(
+        await first.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+      );
+
+      if (status !== 'applied') {
+        expect(isOk(await first.journal.updateStatus(stale.record.id, status))).toBe(true);
+      }
+
+      writeFileSync(sandbox.targetPath, sandbox.originalBytes);
+
+      const second = sessionSharing(sandbox, first.journal, newSessionId());
+      const own = appliedOutcome(
+        await second.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+      );
+
+      expect(own.originalHash).toBe(sandbox.originalHash);
+      expect(own.instrumentedHash).toBe(stale.instrumentedHash);
+      expect(digestOnDisk(sandbox.targetPath)).toBe(stale.instrumentedHash);
+
+      const pinsBefore = second.log.pins.length;
+      const batch = await second.patcher.patchActions([patchAction(TARGET_FILE, OTHER_SYMBOL)]);
+      const layered = batch.applied[0];
+
+      expect(batch.failure).toBeUndefined();
+      expect(batch.applied).toHaveLength(1);
+      expect(layered?.record.sessionId).toBe(second.sessionId);
+      expect(layered?.previousRecordId).toBe(own.record.id);
+      expect(layered?.originalHash).toBe(own.instrumentedHash);
+      expect(digestOnDisk(sandbox.targetPath)).toBe(layered?.instrumentedHash);
+
+      // The candidate was probed once, then read once more to be patched: the
+      // probe ran, and the own claim is what cleared it.
+      const pinnedTarget = `${realpathSync(sandbox.projectRoot)}::${TARGET_FILE}`;
+
+      expect(second.log.pins.slice(pinsBefore)).toEqual([pinnedTarget, pinnedTarget]);
+
+      // Session 1's record is untouched.
+      expect(first.journal.rows).toHaveLength(3);
+      expect(first.journal.rows[0]).toStrictEqual({ ...stale.record, status });
+    },
+  );
+
+  it('still refuses a file whose bytes another session holds when the own record names other bytes of it', async () => {
+    // The asking session's own `applied` record describes a patch of the file
+    // that was undone by hand; the holding session then patched a different
+    // symbol, so the bytes on disk are the holding session's alone. An own
+    // record for the same file is not a claim over these bytes, and the
+    // refusal stands.
+    const sandbox = makeSandbox();
+    const asking = buildPatcher(sandbox);
+    const ownStale = appliedOutcome(
+      await asking.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+    );
+
+    writeFileSync(sandbox.targetPath, sandbox.originalBytes);
+
+    const holding = sessionSharing(sandbox, asking.journal, newSessionId());
+    const held = appliedOutcome(
+      await holding.patcher.patchAction(patchAction(TARGET_FILE, OTHER_SYMBOL)),
+    );
+
+    expect(held.instrumentedHash).not.toBe(ownStale.instrumentedHash);
+
+    const writesBefore = asking.log.writes.length;
+    const error = refusalOf(
+      await asking.patcher.patchAction(patchAction(TARGET_FILE, OTHER_SYMBOL)),
+    );
+
+    expectHeldBy(error, TARGET_FILE, OTHER_SYMBOL, held.record);
+    expect(asking.log.writes).toHaveLength(writesBefore);
+    expect(asking.journal.rows).toHaveLength(2);
+    expect(digestOnDisk(sandbox.targetPath)).toBe(held.instrumentedHash);
+  });
+
+  it('still refuses a file whose bytes the own record names only under `conflict`', async () => {
+    // `conflict` stays out of the holding statuses for a session's own records
+    // too: the record is waiting on the developer, and claims nothing. The
+    // asking session's conflicted patch was undone by hand and the holding
+    // session reproduced its bytes; they are the holding session's to restore.
+    const sandbox = makeSandbox();
+    const asking = buildPatcher(sandbox);
+    const ownConflicted = appliedOutcome(
+      await asking.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+    );
+
+    expect(isOk(await asking.journal.updateStatus(ownConflicted.record.id, 'conflict'))).toBe(true);
+    writeFileSync(sandbox.targetPath, sandbox.originalBytes);
+
+    const holding = sessionSharing(sandbox, asking.journal, newSessionId());
+    const held = appliedOutcome(
+      await holding.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+    );
+
+    expect(held.instrumentedHash).toBe(ownConflicted.instrumentedHash);
+
+    const writesBefore = asking.log.writes.length;
+    const batch = await asking.patcher.patchActions([patchAction(TARGET_FILE, OTHER_SYMBOL)]);
+
+    expect(batch.applied).toEqual([]);
+    expect(batch.journaled).toEqual([]);
+    expect(batch.failure?.stage).toBe('baseline-check');
+    expect(batch.failure?.error).toBeInstanceOf(DebuggenError);
+
+    if (batch.failure !== undefined) {
+      expectHeldBy(batch.failure.error, TARGET_FILE, OTHER_SYMBOL, held.record);
+    }
+
+    expect(asking.log.writes).toHaveLength(writesBefore);
+    expect(asking.journal.rows).toHaveLength(2);
+    expect(digestOnDisk(sandbox.targetPath)).toBe(held.instrumentedHash);
+  });
+
+  it('still refuses a held file when the session’s own claim is over bytes of another file', async () => {
+    // An own claim clears only the file it names: the asking session's applied
+    // record over another file leaves this one held.
+    const sandbox = makeSandbox();
+    const holding = buildPatcher(sandbox);
+    const held = appliedOutcome(
+      await holding.patcher.patchAction(patchAction(TARGET_FILE, TARGET_SYMBOL)),
+    );
+    const asking = sessionSharing(sandbox, holding.journal, newSessionId());
+
+    appliedOutcome(await asking.patcher.patchAction(patchAction(CHAIN_FILE, CHAIN_FIRST_SYMBOL)));
+
+    const writesBefore = asking.log.writes.length;
+    const error = refusalOf(
+      await asking.patcher.patchAction(patchAction(TARGET_FILE, OTHER_SYMBOL)),
+    );
+
+    expectHeldBy(error, TARGET_FILE, OTHER_SYMBOL, held.record);
+    expect(asking.log.writes).toHaveLength(writesBefore);
+    expect(hasBackupsFor(sandbox, asking.sessionId)).toBe(true);
+    expect(holding.journal.rows).toHaveLength(2);
+    expect(digestOnDisk(sandbox.targetPath)).toBe(held.instrumentedHash);
   });
 
   it('fails the attempt with the journal’s own error when the open records cannot be listed', async () => {

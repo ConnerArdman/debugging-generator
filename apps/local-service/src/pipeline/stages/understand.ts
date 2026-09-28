@@ -41,16 +41,20 @@
  * exists for the tokenizer alone. Every comparison against question-derived
  * text in this file therefore lives in the tokenizer's helpers
  * ({@link splitCamelCase}, `questionWords`, `identifierCandidateOf`,
- * `isKeptToken`), and none of them maps a phrase to a signal set, a plan or a
- * panel: they only cut text into words and filter words against two
- * vocabularies of ordinary English and generic debugging terms. The one
- * projection beyond filtering is `categoryHintsOf`, a table lookup of the
- * already-filtered generic terms into the product's problem categories
- * ({@link SIGNAL_TERM_CATEGORIES}) — the "pre-classified category hint" the
- * rules-based provider echoes, since it reads the structured input alone. No
- * application vocabulary is involved, and the model still decides what the
- * question means. The stage itself (`createUnderstandStage`) never reads the
- * question except to hand it, redacted, to the tokenizer.
+ * `isKeptToken`, and the path reader's `unwrappedWord` and `pathCandidateOf`),
+ * and none of them maps a phrase to a signal set, a plan or a panel: they only
+ * cut text into words and filter words against two vocabularies of ordinary
+ * English and generic debugging terms, or keep the words shaped like a
+ * project-relative source path ({@link pathCandidatesOf}, which the follow-up
+ * stage reads to accept a declaration the code graph holds in a file the
+ * question names). The one projection beyond filtering is `categoryHintsOf`, a
+ * table lookup of the already-filtered generic terms into the product's
+ * problem categories ({@link SIGNAL_TERM_CATEGORIES}) — the "pre-classified
+ * category hint" the rules-based provider echoes, since it reads the
+ * structured input alone. No application vocabulary is involved, and the model
+ * still decides what the question means. The stage itself
+ * (`createUnderstandStage`) never reads the question except to hand it,
+ * redacted, to the tokenizer.
  *
  * ## Wording invariance
  *
@@ -728,6 +732,78 @@ const INNER_JOINER_PATTERN = /[\p{L}\p{N}][_$]+[\p{L}\p{N}]/u;
 /** The shared empty result of {@link splitCamelCase}. */
 const NO_PARTS: readonly string[] = Object.freeze([]);
 
+/** The most path candidates reported: a question names a file or two, rarely more. */
+const MAX_PATH_CANDIDATES = 8;
+
+/**
+ * Path candidates longer than this are dropped rather than cut: a cut path
+ * names no file, and a run this long without whitespace is pasted data.
+ */
+const MAX_PATH_CANDIDATE_LENGTH = 256;
+
+/** Where {@link pathCandidatesOf} cuts the question into words. */
+const WHITESPACE_RUN_PATTERN = /\s+/u;
+
+/** One whitespace character: tells whether the read bound lands inside a word. */
+const WHITESPACE_CHARACTER_PATTERN = /\s/u;
+
+/**
+ * The shape of a project-relative path: segments of letters, digits, combining
+ * marks and the punctuation file and route-segment names carry (`_ $ @ + ~ . -`
+ * and the brackets and parentheses of dynamic and grouped segments), joined by
+ * single slashes. No leading slash (an absolute path or a route), no empty
+ * segment, and none of the characters a URL, a query, a fragment or a drive
+ * letter needs (`:`, `?`, `#`, `=`, `&`, `%`), so a link or an address never
+ * reads as a file.
+ */
+const PATH_SHAPE_PATTERN = /^[\p{L}\p{N}\p{M}_$@+~.()[\]-]+(?:\/[\p{L}\p{N}\p{M}_$@+~.()[\]-]+)*$/u;
+
+/**
+ * A source-file extension the code graph indexes: `.ts`, `.tsx`, `.js`,
+ * `.jsx`, `.mjs`, `.cjs`, `.mts` and `.cts`.
+ */
+const SOURCE_EXTENSION_PATTERN = /\.(?:[cm]?[jt]s|[jt]sx)$/u;
+
+/** A `:line` or `:line:column` suffix an editor or a stack trace appends to a path. */
+const LINE_SUFFIX_PATTERN = /(?::\p{Nd}+){1,2}$/u;
+
+/** Quotes and backticks a question wraps a path in, dropped from either end of a word. */
+const PATH_QUOTES: ReadonlySet<string> = new Set([
+  '"',
+  "'",
+  '`',
+  '\u2018',
+  '\u2019',
+  '\u201C',
+  '\u201D',
+  '\u00AB',
+  '\u00BB',
+]);
+
+/** Sentence punctuation that may follow a path, dropped from the end of a word. */
+const PATH_TRAILING_PUNCTUATION: ReadonlySet<string> = new Set([
+  '.',
+  ',',
+  ';',
+  ':',
+  '!',
+  '?',
+  '\u2026',
+]);
+
+/** The brackets a question may wrap a path in, each opener with its closer. */
+const PATH_BRACKET_CLOSERS: ReadonlyMap<string, string> = new Map([
+  ['(', ')'],
+  ['[', ']'],
+  ['{', '}'],
+  ['<', '>'],
+]);
+
+/** {@link PATH_BRACKET_CLOSERS} read the other way: each closer with its opener. */
+const PATH_BRACKET_OPENERS: ReadonlyMap<string, string> = new Map(
+  [...PATH_BRACKET_CLOSERS].map(([opener, closer]) => [closer, opener]),
+);
+
 /* -------------------------------------------------------------------------------------------------
  * The generic tokenizer — the exempt region (AAP §0.5.4)
  *
@@ -1016,6 +1092,138 @@ export function tokenizeQuestion(question: string): QuestionTokens {
       CATEGORY_HINT_PRECEDENCE.length,
     ),
   });
+}
+
+/** How many times `character` occurs in `text`. */
+function occurrencesOf(text: string, character: string): number {
+  return text.split(character).length - 1;
+}
+
+/**
+ * A whitespace-delimited word without what a sentence wraps a path in:
+ * surrounding quotes and backticks, trailing sentence punctuation, and a
+ * bracket pair around the whole word or a bracket left unbalanced at either
+ * end (`(in ./a/b.ts)` → `./a/b.ts`). A balanced bracket inside the word is
+ * part of the path — `app/(group)/[slug]/page.tsx` keeps both — so only an
+ * outer or unmatched one is removed. Repeated until nothing changes; every
+ * pass shortens the word, so the loop ends.
+ */
+function unwrappedWord(word: string): string {
+  let text = word;
+  while (text.length > 0) {
+    const first = text.charAt(0);
+    const last = text.charAt(text.length - 1);
+    const closer = PATH_BRACKET_CLOSERS.get(first);
+    const opener = PATH_BRACKET_OPENERS.get(last);
+    if (PATH_QUOTES.has(first)) {
+      text = text.slice(1);
+    } else if (PATH_QUOTES.has(last) || PATH_TRAILING_PUNCTUATION.has(last)) {
+      text = text.slice(0, -1);
+    } else if (closer !== undefined && last === closer) {
+      text = text.slice(1, -1);
+    } else if (closer !== undefined && occurrencesOf(text, first) > occurrencesOf(text, closer)) {
+      text = text.slice(1);
+    } else if (opener !== undefined && occurrencesOf(text, last) > occurrencesOf(text, opener)) {
+      text = text.slice(0, -1);
+    } else {
+      return text;
+    }
+  }
+  return text;
+}
+
+/**
+ * The project-relative path a whitespace-delimited word spells, or `undefined`
+ * when the word is not one.
+ *
+ * The word is unwrapped ({@link unwrappedWord}), its backslashes read as
+ * slashes (a path typed on Windows), and a trailing `:line[:column]`, any
+ * leading `./` and any trailing `/` removed. What remains must have the shape
+ * of {@link PATH_SHAPE_PATTERN}, at most {@link MAX_PATH_CANDIDATE_LENGTH}
+ * characters, no `.` or `..` segment — the graph holds no path that climbs out
+ * of the project — and either a directory separator or a
+ * {@link SOURCE_EXTENSION_PATTERN} extension, so a lone word never reads as a
+ * file. Nothing is looked up: whether a file of that name exists is the code
+ * graph's to answer.
+ */
+function pathCandidateOf(word: string): string | undefined {
+  let text = unwrappedWord(word.replaceAll('\\', '/')).replace(LINE_SUFFIX_PATTERN, '');
+  while (text.startsWith('./')) {
+    text = text.slice(2);
+  }
+  while (text.endsWith('/')) {
+    text = text.slice(0, -1);
+  }
+  if (
+    text.length === 0 ||
+    text.length > MAX_PATH_CANDIDATE_LENGTH ||
+    !PATH_SHAPE_PATTERN.test(text)
+  ) {
+    return undefined;
+  }
+  const segments = text.split('/');
+  if (segments.some((segment) => segment === '.' || segment === '..')) {
+    return undefined;
+  }
+  return segments.length > 1 || SOURCE_EXTENSION_PATTERN.test(text) ? text : undefined;
+}
+
+/**
+ * The project-relative source paths a question names — the second lexical
+ * projection of the question the follow-up stage reads, beside
+ * {@link tokenizeQuestion} (AAP §0.5.4, the `question-branch` exemption of
+ * `scripts/check-no-hardcoding.mjs`).
+ *
+ * Purely lexical, in this order: bound the text exactly as the tokenizer does
+ * (a word the bound lands inside is dropped), NFKC-normalise, drop possessive
+ * `'s`, cut at whitespace, and keep each word that spells a path
+ * (`pathCandidateOf`: unwrapped of quotes, backticks, brackets and trailing
+ * sentence punctuation; backslashes read as slashes; `:line`, a leading `./`
+ * and a trailing `/` removed; containing a `/` or ending in a source extension
+ * — `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.mts`, `.cts`; no `..`
+ * segment, no leading `/`, nothing a URL or query needs). The survivors are
+ * de-duplicated, sorted by code unit and capped at {@link MAX_PATH_CANDIDATES}.
+ *
+ * A path is structure, not wording: it names a file the code graph may hold,
+ * and the follow-up stage uses it only to accept an exact declaration lookup
+ * of the question's plain words within that file. Nothing here decides which
+ * file matters, reads the project or maps a path to a signal, a plan or a panel.
+ *
+ * Pure and total: the same input always yields a deeply equal, frozen list;
+ * the input is not modified; a question that names no path yields an empty
+ * list.
+ *
+ * @param question The developer's question, already redacted by the caller.
+ * @returns The named paths, project-relative with POSIX separators, sorted.
+ *
+ * @example
+ * ```ts
+ * pathCandidatesOf('Why does settle in `src/ledger/totals.ts` take so long?'); // ['src/ledger/totals.ts']
+ * pathCandidatesOf('Why is /reset?code=? slow?'); // []
+ * ```
+ */
+export function pathCandidatesOf(question: string): readonly string[] {
+  if (typeof question !== 'string' || question.length === 0) {
+    return NO_PARTS;
+  }
+  const limit = readLimitOf(question);
+  const words = question
+    .slice(0, limit)
+    .normalize('NFKC')
+    .replace(POSSESSIVE_PATTERN, '')
+    .split(WHITESPACE_RUN_PATTERN);
+  if (limit < question.length && !WHITESPACE_CHARACTER_PATTERN.test(question.charAt(limit))) {
+    // The bound cut the last word short: a fragment of a path names no file.
+    words.pop();
+  }
+  const candidates = new Set<string>();
+  for (const word of words) {
+    const candidate = pathCandidateOf(word);
+    if (candidate !== undefined) {
+      candidates.add(candidate);
+    }
+  }
+  return frozenHead(sortedUnique(candidates), MAX_PATH_CANDIDATES);
 }
 
 /* -------------------------------------------------------------------------------------------------

@@ -12,7 +12,10 @@
  *
  * 1. Mounts the theme root (`../layout/PanelShell`), which is the one module in
  *    the package that writes the theme attribute and the one scroll region a
- *    panel has.
+ *    panel has. That region is a keyboard focus stop, so it is named: its
+ *    `labelledBy` is the id this component hands the head's visible title, and
+ *    the region is announced by the panel's own title rather than as an
+ *    anonymous container, with no second heading added to the outline.
  * 2. Provides the ambient contracts — the data provider, the session the
  *    specification belongs to, and the action contract — around the whole
  *    subtree, so that every view beneath it reaches its evidence and reports its
@@ -135,7 +138,7 @@
 import { PANEL_CHILDREN_FIELD, PANEL_LAYOUT_PATH_ROOT } from '@debuggen/panel-schema';
 import type { PanelNode, PanelNodePath, PanelSpec } from '@debuggen/panel-schema';
 import { LayoutTemplate, TriangleAlert } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { FocusEvent, ReactElement, ReactNode } from 'react';
 
 import { PanelShell } from '../layout/PanelShell';
@@ -1197,6 +1200,14 @@ export function PanelHost(props: PanelHostProps): ReactElement {
   const supersedesPrevious = spec.supersedes !== undefined;
   const panelKey = panelIdentityKey(spec);
 
+  // The id of the head's visible title, which also names the shell's scroll
+  // region. Generated once per mounted host rather than per document: the head
+  // remounts with every replaced panel (it sits in the keyed column below), and
+  // handing each new title the same id keeps the region's `aria-labelledby`
+  // resolving to whichever title is on screen. `useId` keeps two hosts on one
+  // page — the editor mirrors the DevTools panel — from sharing it.
+  const titleId = useId();
+
   // The selection the views and the head reported, with the panel it was made
   // in. Recording a selection equal to the current one keeps the recorded
   // object, so a repeated click re-renders nothing.
@@ -1295,7 +1306,8 @@ export function PanelHost(props: PanelHostProps): ReactElement {
   // re-renders when a different event is selected and not otherwise. The
   // generation travels as the two primitives the document carries — its
   // number and whether it names a predecessor — and the head decides whether
-  // to state it, so a first version renders exactly as before.
+  // to state it, so a first version renders exactly as before. The title takes
+  // the id the shell's scroll region is labelled by.
   const selectedId = selection?.eventId;
   const head = useMemo<ReactElement>(
     () => (
@@ -1308,9 +1320,19 @@ export function PanelHost(props: PanelHostProps): ReactElement {
         selectedEventId={selectedId}
         openSource={openSource}
         className={SUMMARY_CLASS}
+        titleId={titleId}
       />
     ),
-    [title, summary, panelVersion, supersedesPrevious, selectEvent, selectedId, openSource],
+    [
+      title,
+      summary,
+      panelVersion,
+      supersedesPrevious,
+      selectEvent,
+      selectedId,
+      openSource,
+      titleId,
+    ],
   );
 
   // The layout, rendered once per `spec.layout` value. Handing React the very
@@ -1438,7 +1460,7 @@ export function PanelHost(props: PanelHostProps): ReactElement {
   );
 
   return (
-    <PanelShell theme={theme} className={className} id={id}>
+    <PanelShell theme={theme} className={className} id={id} labelledBy={titleId}>
       {/* All four contracts wrap the head as well as the layout. The head is
           handed its two callbacks directly, because it imports nothing from
           this folder, but a component it composes still reads the ambient

@@ -1760,6 +1760,96 @@ describe('redactEvent — personal data and labelled values in free text', () =>
     expect(report.maskedValues).toBe(1);
   });
 
+  it('masks the whole of each labelled value the QA report found passing (F04)', () => {
+    // The report's own reproduction, through the same entry point: the value
+    // once ended at its first special character, so the first and last came
+    // back unchanged and the middle two kept their `!` tail.
+    const bag = {
+      b: 'password=p@ss/w0rd%21',
+      e: 'passwd: hunter2!!!',
+      s: 'secret: s3cr3tValue!!',
+      t: 'token: x-y.z_!q',
+    };
+    const { attributes, report } = redactAttributesWithFindings(bag);
+
+    expect(attributes).toEqual({
+      b: `password=${REDACTION_MARKER}`,
+      e: `passwd: ${REDACTION_MARKER}`,
+      s: `secret: ${REDACTION_MARKER}`,
+      t: `token: ${REDACTION_MARKER}`,
+    });
+    expect(report.rules).toEqual(['labelled-secret']);
+    expect(report.maskedValues).toBe(4);
+    expect(redactAttributes(bag)).toEqual(attributes);
+    const text = JSON.stringify(attributes);
+    for (const fragment of ['p@ss', 'w0rd', '%21', 'hunter2', '!!', 's3cr3t', 'x-y.z', '!q']) {
+      expect(text).not.toContain(fragment);
+    }
+    expect(redactAttributes(attributes)).toEqual(attributes);
+  });
+
+  it('masks a special-character value in the event text it arrives in, and keeps the pairs around it', () => {
+    const log = redactEventWithFindings(
+      checkedEvent(
+        eventOfKind('log', 'log', {
+          'log.message': 'login failed: password=hunter2&remember=1',
+        }),
+      ),
+    );
+    const error = redactEventWithFindings(
+      checkedEvent(
+        eventOfKind('error', 'Error', {
+          'error.type': 'Error',
+          'error.message': 'rejected {"password":"p@ss!1","next":2} and token pa$$word',
+        }),
+      ),
+    );
+    const interaction = redactEvent(
+      checkedEvent(
+        eventOfKind('interaction', 'click button', {
+          'event.type': 'click',
+          'target.text': 'Sign in token: ab#1x',
+        }),
+      ),
+    );
+
+    expect(log.event.attributes['log.message']).toBe(
+      `login failed: password=${REDACTION_MARKER}&remember=1`,
+    );
+    expect(error.event.attributes['error.message']).toBe(
+      `rejected {"password":"${REDACTION_MARKER}","next":2} and token ${REDACTION_MARKER}`,
+    );
+    expect(interaction.attributes['target.text']).toBe(`Sign in token: ${REDACTION_MARKER}`);
+    expect(log.report.rules).toEqual(['labelled-secret']);
+    expect(error.report.rules).toEqual(['labelled-secret']);
+    for (const event of [log.event, error.event, interaction]) {
+      expect(telemetryEventIngressSchema.safeParse(event).success).toBe(true);
+      expect(redactEvent(event)).toEqual(event);
+    }
+  });
+
+  it('keeps positional placeholders after a credential word in a statement', () => {
+    // `$` is a value character now, and the statement is scrubbed before it is
+    // scanned, so a placeholder after `token =` must still read as structure.
+    for (const statement of [
+      'UPDATE items_t SET token = $1::uuid WHERE id = $2',
+      'SELECT id FROM items_t WHERE password = $100',
+    ]) {
+      const { attributes, report } = redactAttributesWithFindings(
+        { 'db.statement': statement },
+        { kind: 'db.query' },
+      );
+
+      expect(attributes['db.statement']).toBe(statement);
+      expect(redactSqlStatement(statement)).toBe(statement);
+      expect(report.rules).toEqual([]);
+    }
+    // A written value after the same word is data, and goes like any literal.
+    expect(redactSqlStatement("UPDATE items_t SET password = 'p@ss!w0rd' WHERE id = $1")).toBe(
+      `UPDATE items_t SET password = ${REDACTION_MASK} WHERE id = $1`,
+    );
+  });
+
   it('keeps a span reference the product wrote even when its digits pass a card checksum', () => {
     const state = redactEvent(
       checkedEvent(

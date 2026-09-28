@@ -1497,6 +1497,107 @@ describe('PanelHost theme application', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * The scroll region's name
+ * ---------------------------------------------------------------------------
+ */
+
+/** The title of the generation that replaces the panel in the replacement case. */
+const REPLACED_PANEL_TITLE = 'Panel under test, regenerated';
+
+/**
+ * The shell's one scroll viewport.
+ *
+ * @param container The render's container.
+ * @returns The viewport element.
+ */
+function soleViewport(container: HTMLElement): HTMLElement {
+  const viewports = container.querySelectorAll<HTMLElement>('.dg-panel-shell__viewport');
+  expect(viewports).toHaveLength(1);
+
+  const [viewport] = viewports;
+  if (viewport === undefined) {
+    throw new Error('the panel rendered no scroll viewport');
+  }
+
+  return viewport;
+}
+
+describe('PanelHost scroll region', () => {
+  it('makes the viewport a focusable region named by the visible panel title', async () => {
+    const { container } = await renderPanel(makeSpec());
+    const viewport = soleViewport(container);
+
+    // Found the way assistive technology finds it: a region, by its name.
+    const region = screen.getByRole('region', { name: PANEL_TITLE });
+    expect(region).toBe(viewport);
+    expect(region.getAttribute('tabindex')).toBe('0');
+
+    // The name is the head's own visible title, referenced rather than copied.
+    const title = screen.getByRole('heading', { level: 2, name: PANEL_TITLE });
+    expect(title.classList.contains('dg-summary-header__title')).toBe(true);
+    expect(title.id).not.toBe('');
+    expect(region.getAttribute('aria-labelledby')).toBe(title.id);
+    expect(region.contains(title)).toBe(true);
+
+    // No heading was added for it: the title is the one heading bearing the
+    // panel's name, the one heading at its level, and the outline still opens
+    // with it.
+    expect(screen.getAllByRole('heading', { name: PANEL_TITLE })).toEqual([title]);
+    expect(screen.getAllByRole('heading', { level: 2 })).toEqual([title]);
+    expect(headingLevels()[0]).toBe(2);
+  });
+
+  it('is the first stop a keyboard user reaches, and announces the title there', async () => {
+    const user = userEvent.setup();
+    await renderPanel(makeSpec());
+
+    await user.tab();
+
+    expect(document.activeElement).toBe(screen.getByRole('region', { name: PANEL_TITLE }));
+  });
+
+  it('stays named by the title on screen when a later generation replaces the panel', async () => {
+    const spec = makeSpec();
+    const { container, provider, rerender } = await renderPanel(spec);
+    const viewport = soleViewport(container);
+
+    rerender({
+      ...makeSpec({ title: REPLACED_PANEL_TITLE, summary: spec.summary, layout: spec.layout }),
+      panelVersion: 2,
+    });
+    await waitFor(() => {
+      expect(provider.resolve).toHaveBeenCalledTimes(2);
+    });
+    await screen.findByRole('list', { name: METRIC_VIEW_NAME });
+
+    // The same shell element, now announced by the new document's title.
+    const title = screen.getByRole('heading', { level: 2, name: REPLACED_PANEL_TITLE });
+    expect(screen.getByRole('region', { name: REPLACED_PANEL_TITLE })).toBe(viewport);
+    expect(viewport.getAttribute('aria-labelledby')).toBe(title.id);
+    expect(screen.queryByRole('region', { name: PANEL_TITLE })).toBeNull();
+  });
+
+  it('gives two hosts on one page two distinct names', async () => {
+    const { container } = await renderPanel(makeSpec());
+    const other = render(
+      <PanelHost
+        spec={{ ...makeSpec({ title: REPLACED_PANEL_TITLE }), id: OTHER_PANEL_ID }}
+        dataProvider={makeDataProvider().provider}
+        actions={makeActions().actions}
+      />,
+    );
+    await within(other.container).findAllByRole('list', { name: METRIC_VIEW_NAME });
+
+    const first = soleViewport(container);
+    const second = soleViewport(other.container);
+    expect(first.getAttribute('aria-labelledby')).not.toBe(second.getAttribute('aria-labelledby'));
+    expect(screen.getByRole('region', { name: PANEL_TITLE })).toBe(first);
+    expect(screen.getByRole('region', { name: REPLACED_PANEL_TITLE })).toBe(second);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * Observed facts against inferred causes
  * ---------------------------------------------------------------------------
  */

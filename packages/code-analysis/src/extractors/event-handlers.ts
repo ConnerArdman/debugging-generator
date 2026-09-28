@@ -140,9 +140,16 @@
  *   shape `CODE_EDGE_KINDS` permits for "this handler is what issues the
  *   request" — must derive the handler's id by this same rule: the declared
  *   identifier of the resolved declaration, at that declaration's 1-based
- *   position, in the declaring file. Attributing the call to the enclosing
- *   function's own node instead is equally valid and needs no coordination; what
- *   does not work is guessing a third spelling of the handler's id.
+ *   position, in the declaring file — or, for an inline handler, the property
+ *   as written at the function expression's own position. That inline
+ *   spelling is also what `./server-functions.ts` and `./api-calls.ts` credit
+ *   the calls of a **function-local delegate** with: a named function declared
+ *   in the component body whose every reference is a call from one and the
+ *   same inline handler (`onSubmit={(event) => { void send(event); }}`), whose
+ *   calls therefore run exactly when that handler does. Attributing the call to
+ *   the enclosing function's own node instead is equally valid and needs no
+ *   coordination; what does not work is guessing a third spelling of the
+ *   handler's id.
  *
  * ## The component-naming rule, shared with `./react-components.ts`
  *

@@ -395,47 +395,130 @@ const SECRET_LABEL_TERMS: readonly string[] = [
   'access[_-]?key',
 ];
 
-/** Characters of a labelled value: the credential characters a token, key or password is written in. */
-const LABEL_VALUE_CHARS = '[A-Za-z0-9._~+/=-]';
+/**
+ * A parameter name followed by `=` — what an `&` or a `#` opens when it
+ * starts another `name=value` pair (`&remember=1`, `#section=2`) instead of
+ * continuing a value. The class is the characters a form, query or fragment
+ * parameter name is written in, percent-encoding included.
+ */
+const LABEL_PAIR_NAME = '[A-Za-z0-9_.~%+-]{1,64}=';
+
+/**
+ * One character of a labelled value.
+ *
+ * A password or token may be written in any printable character, so a value
+ * is everything up to the first character that ends it rather than a run of
+ * an enumerated credential alphabet — an enumeration is what let
+ * `p@ss/w0rd%21` stop at its `@` and `hunter2!!!` keep its `!!!`. A value
+ * ends at:
+ *
+ * - whitespace, because the rule reads free text;
+ * - a quote (`"`, `'` or a backtick), which closes a quoted or JSON value;
+ * - a backslash, so a JSON-escaped closing quote (`\"`) ends the value too;
+ * - one of `, ; ( ) [ ] { } < > |`, the delimiters around a value in a list,
+ *   a call, an object literal, markup or a table. `[` is also what keeps the
+ *   rule a fixed point of its own output: no value can start with the `[` of
+ *   {@link REDACTION_MARKER};
+ * - an `&` or a `#` that opens another pair ({@link LABEL_PAIR_NAME}), so
+ *   `password=hunter2&remember=1` loses `hunter2` and keeps `&remember=1`.
+ *   Any other `&` or `#` — `p@ss&word1`, `abc#1x` — belongs to the value.
+ *
+ * The two alternatives are disjoint (the first excludes `&` and `#`), so a
+ * run of them never offers the engine two readings of one character, and the
+ * pair lookahead stops at the first character that cannot continue a name,
+ * so a run of them stays linear.
+ */
+const LABEL_VALUE_CHAR = '(?:[^\\s"\'`\\\\,;()\\[\\]{}<>|&#]|[&#](?!' + LABEL_PAIR_NAME + '))';
 
 /** An optional quote around a label or a value, written plain or JSON-escaped (`\"`). */
 const LABEL_QUOTE = '(?:\\\\?["\'])?';
 
 /**
- * A digit within the first 256 characters of the value.
- *
- * The requirement is what separates a value from prose: "Invalid token
- * provided", "password: Required" and "token expired" carry no digit, while
- * generated tokens, keys and nearly every password do. The window is bounded
- * so that a hostile run of labels inside one long value costs a bounded amount
- * per label rather than a rescan of the whole run.
+ * A symbol that marks a value as written rather than worded when it sits
+ * inside one: `! @ # $ % ^ & *`, each only as a value character — so an `&`
+ * or a `#` that opens another pair never counts.
  */
-const LABEL_DIGIT_AHEAD = '(?=' + LABEL_VALUE_CHARS + '{0,255}[0-9])';
+const LABEL_INTERIOR_SYMBOL = '(?:[!@$%^*]|[&#](?!' + LABEL_PAIR_NAME + '))';
+
+/**
+ * Evidence, within the first 256 characters of the value, that it is a value
+ * rather than prose: a digit, or an interior symbol — one of
+ * {@link LABEL_INTERIOR_SYMBOL} preceded by at least one value character and
+ * directly followed by an ASCII letter or digit.
+ *
+ * The requirement is what separates a value from prose. Generated tokens,
+ * keys and nearly every password carry a digit (`hunter2!!!`) or a symbol
+ * between two of their characters (`x-y.z_!q`, `p@ss`, `pa$$word`), while
+ * validation messages, placeholders and masks carry neither: "Invalid token
+ * provided", `password: Required!` and `password: hunter!!` end in their
+ * symbols, `token: #hashtag` and `password=%PASSWORD%` open with theirs,
+ * `api_key=YOUR_API_KEY` has none, and in `password: ********` none is
+ * followed by a letter or digit. Every character the window reads is a value
+ * character, so the evidence always lies inside the value it admits. The
+ * window is bounded so that a hostile run of labels inside one long value
+ * costs a bounded amount per label rather than a rescan of the whole run.
+ */
+const LABEL_EVIDENCE_AHEAD =
+  '(?=' +
+  LABEL_VALUE_CHAR +
+  '{0,255}[0-9]|' +
+  LABEL_VALUE_CHAR +
+  '{1,254}' +
+  LABEL_INTERIOR_SYMBOL +
+  '[A-Za-z0-9])';
+
+/**
+ * Refuses a value that is a bare SQL positional placeholder: `$` and one to
+ * five digits, optionally cast (`::uuid`, up to four casts), with no further
+ * value character after it.
+ *
+ * `$` is a value character, and `./sql.ts` scrubs a raw `db.statement` before
+ * it scans it, so without this `UPDATE t SET token = $1::uuid` and
+ * `WHERE password = $100` would lose their placeholders — which AAP §0.5.2
+ * keeps, because they are structure rather than data. Only the placeholder
+ * alone is refused: `$1abc` or `$12!x` after a label is a written value and
+ * is masked like any other.
+ */
+const LABEL_NOT_SQL_PLACEHOLDER =
+  '(?!\\$[0-9]{1,5}(?:::[A-Za-z_][A-Za-z0-9_]{0,62}){0,4}(?!' + LABEL_VALUE_CHAR + '))';
 
 /** `token: …`, `password=…`: an assignment, with blanks allowed around the separator. */
 const LABEL_ASSIGNED = '[ \\t]{0,16}[:=][ \\t]{0,16}' + LABEL_QUOTE;
 
 /**
  * `token …`: a label followed by blanks only. A value in that position needs
- * six characters as well as a digit, because prose puts short words and
- * numbers after these terms far more often than an assignment does.
+ * six characters as well as the evidence of {@link LABEL_EVIDENCE_AHEAD},
+ * because prose puts short words and numbers after these terms far more often
+ * than an assignment does.
  */
-const LABEL_SPACED = '[ \\t]{1,16}' + LABEL_QUOTE + '(?=' + LABEL_VALUE_CHARS + '{6})';
+const LABEL_SPACED = '[ \\t]{1,16}' + LABEL_QUOTE + '(?=' + LABEL_VALUE_CHAR + '{6})';
 
 /**
  * `labelled-secret`: a value introduced by a credential word. The kept prefix
  * (group 1) is everything up to the value — the boundary, the label, its
  * quotes and the separator — so `token secret-token-123` becomes
- * `token [redacted]` and the label stays diagnosable.
+ * `token [redacted]` and the label stays diagnosable. The value is replaced
+ * whole, up to the first character {@link LABEL_VALUE_CHAR} excludes, so
+ * `password=p@ss/w0rd%21` becomes `password=[redacted]` with nothing of the
+ * value left behind.
  *
  * A label directly after `?`, `&` or `#` is a query or fragment parameter, and
  * is left to `./url.ts`, which masks the value positionally to `?`; masking it
  * here first would leave the marker standing as the parameter's value, which
- * reads worse and says less. The two denied header names that end in a label
- * (`X-Api-Key:`, `X-Auth-Token:`) are left to the `sensitive-header` line rule,
- * which already replaces their whole value, so one header line is one
- * finding. A value is never `[redacted]` — `[` is outside
- * {@link LABEL_VALUE_CHARS} — so the rule is a fixed point of its own output.
+ * reads worse and says less. The boundary is decided by the pattern alone, on
+ * purpose: whether an `&` sits in a URL could only be read from a `?` or `#`
+ * earlier in the token, and that character may belong to a value this rule
+ * replaces (`password=abc#1&token=…`), so a decision taken from it would
+ * change between one pass and the next and `scrub` would stop being
+ * idempotent. The two denied header names that end in a label (`X-Api-Key:`,
+ * `X-Auth-Token:`) are left to the `sensitive-header` line rule, which already
+ * replaces their whole value, so one header line is one finding.
+ *
+ * The rule is a fixed point of its own output. A value can never be
+ * `[redacted]`, because `[` is not a value character, nor the query mask `?`,
+ * which is one character where a value needs four; and the character after a
+ * replaced value is the one that ended it, so it still ends the mask on the
+ * next pass.
  */
 const LABELLED_SECRET_SOURCE =
   '((?:^|[^A-Za-z0-9_?&#-])(?!(?:x-api-key|x-auth-token)[ \\t]*:)[A-Za-z0-9_-]{0,32}(?:' +
@@ -447,9 +530,10 @@ const LABELLED_SECRET_SOURCE =
   '|' +
   LABEL_SPACED +
   ')' +
-  LABEL_DIGIT_AHEAD +
+  LABEL_NOT_SQL_PLACEHOLDER +
+  LABEL_EVIDENCE_AHEAD +
   ')' +
-  LABEL_VALUE_CHARS +
+  LABEL_VALUE_CHAR +
   '{4,' +
   RUN_LIMIT +
   '}';
@@ -793,7 +877,10 @@ const CARD_RUN_LOCATE = new RegExp(CARD_RUN_SOURCE, 'g');
  * Case-insensitive, so `Password:`, `API_KEY=` and `accessToken` are labels.
  * The flag is safe here where it is not for the header line rule: this rule's
  * already-redacted test is structural (`[` cannot start a value), not a
- * byte-for-byte comparison with the marker.
+ * byte-for-byte comparison with the marker. Detection is a plain `test`
+ * because every match is a finding: a value is at least four characters and
+ * can be neither the marker nor the one-character query mask, so the
+ * replacement always changes the text it matched.
  */
 const LABELLED_DETECT = new RegExp(LABELLED_SECRET_SOURCE, 'i');
 const LABELLED_REPLACE = new RegExp(LABELLED_SECRET_SOURCE, 'gi');
@@ -934,11 +1021,11 @@ function redactEmailAddresses(input: string): string {
 }
 
 /**
- * Keeps a labelled value's label and separator and replaces only the value,
+ * Keeps a labelled value's label and separator and replaces the whole value,
  * with the mask of {@link contentMaskAt}.
  *
  * @param _match The whole match: `label` followed by the value.
- * @param label Capture group 1, the kept label, separator and quote.
+ * @param label Capture group 1, the kept boundary, label, quote and separator.
  * @param offset Offset of the match in `input`.
  * @param input The whole text being scanned.
  */
@@ -1293,7 +1380,8 @@ const PATTERN_RULES: readonly PatternRule[] = Object.freeze<PatternRule[]>([
   // match that begins before a cut always ends inside the examined window.
   // A labelled value can be longer, but its rule needs no terminator after
   // the value, so it matches across a cut whatever the value's length; its
-  // continuation only stands in for the digit its value requires.
+  // continuation only stands in for the evidence its value requires — a run
+  // of digits, which are value characters and satisfy it on their own.
   {
     id: 'email-address',
     detect: EMAIL_DETECTOR,

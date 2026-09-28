@@ -2295,6 +2295,51 @@ describe('followup: decisions over the service-shaped capture summary', () => {
     expect(asArray(asObject(first.raw).additionalActions)).toHaveLength(1);
   });
 
+  /**
+   * The covered context with a follow-up focus naming `declarations`, the
+   * structured section the service carries beside the graph-resolved candidates.
+   */
+  function focusedOn(
+    declarations: readonly JsonObject[],
+    candidates: readonly JsonObject[] = [],
+  ): JsonObject {
+    return {
+      ...coveredWith(candidates),
+      followUpFocus: { categoryHints: ['performance'], declarations: [...declarations] },
+    };
+  }
+
+  it('times a declaration the follow-up focus names when no candidate carries it', async () => {
+    const decision = await decisionFor(
+      focusedOn([{ file: ROUTE_FILE, symbol: HELPER_SYMBOL, kind: 'server-function' }]),
+    );
+    expect(decision.needsNewCapture).toBe(true);
+    expect(decision.additionalActions).toEqual([
+      expect.objectContaining({ file: ROUTE_FILE, symbol: HELPER_SYMBOL, type: 'function-timing' }),
+    ]);
+  });
+
+  it('adds one action for a declaration both the candidates and the focus name', async () => {
+    const named = namedDeclaration(ROUTE_FILE, HELPER_SYMBOL, 'server-function');
+    const both = await decisionFor(
+      focusedOn([{ file: ROUTE_FILE, symbol: HELPER_SYMBOL, kind: 'server-function' }], [named]),
+    );
+    expect(both).toEqual(await decisionFor(coveredWith([named])));
+    expect(both.additionalActions).toHaveLength(1);
+  });
+
+  it('adds nothing for a focus declaration without a file, or one an installed timing wraps', async () => {
+    const fileless = await decisionFor(
+      focusedOn([{ symbol: HELPER_SYMBOL, kind: 'server-function' }]),
+    );
+    expect(fileless).toEqual({ needsNewCapture: false, additionalActions: [] });
+
+    const wrapped = await decisionFor(
+      focusedOn([{ file: ROUTE_FILE, symbol: ROUTE_SYMBOL, kind: 'api-route' }]),
+    );
+    expect(wrapped).toEqual({ needsNewCapture: false, additionalActions: [] });
+  });
+
   it('decides identically however the zero-filled tally is ordered', async () => {
     const input = followUpInput({ wantedSignals: CHECKOUT_SIGNALS, recordedKinds: CHECKOUT_KINDS });
     const summary = asObject(input.captureSummary);
@@ -3129,6 +3174,368 @@ describe('property 4c: the understanding category composes the panel', () => {
   });
 });
 
+/* -------------------------------------------------------------------------------------------------
+ * property 4d — the title and the objective name the application component
+ *
+ * A selected element's owner chain starts at the component that rendered it,
+ * which in a project built on a design system is a bare building block
+ * (`Button`, `Card`), and it ends in the framework's own boundaries. The panel
+ * title and the plan objective name the first application component: the
+ * nearest owner the project declares (the service's `declaredComponents`; the
+ * plan stage's resolved investigation symbols) whose name is domain-qualified
+ * — two or more camel-case words — else the nearest declared owner; with no
+ * declaration reported, the nearest domain-qualified owner, else the nearest
+ * owner. The chain itself reaches the
+ * understanding and the investigation unchanged. The objective states how the
+ * capture reproduces the behaviour and where it was traced, from structure
+ * alone.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A building block a design system exports, as the nearest owner of a selected element. */
+const PRIMITIVE_OWNER = 'Button';
+
+describe('property 4d: the title and the objective name the application component', () => {
+  it.each([
+    {
+      chain: [PRIMITIVE_OWNER, WIDGET_SYMBOL, FORM_SYMBOL],
+      title: `Latency — ${WIDGET_SYMBOL}`,
+    },
+    { chain: ['Card', TILE_SYMBOL, FORM_SYMBOL], title: `Latency — ${TILE_SYMBOL}` },
+    { chain: [WIDGET_SYMBOL, FORM_SYMBOL], title: `Latency — ${WIDGET_SYMBOL}` },
+    // A namespaced part and a minified name are not a declaration's own name.
+    { chain: ['zQ', 'Tooltip.Trigger', FORM_SYMBOL], title: `Latency — ${FORM_SYMBOL}` },
+    // With no domain-qualified owner, the nearest one still names the target.
+    { chain: [PRIMITIVE_OWNER, 'Slot'], title: `Latency — ${PRIMITIVE_OWNER}` },
+  ])('titles a panel over the chain $chain as $title', async ({ chain, title }) => {
+    const answer = await answerFor(
+      'generate-panel',
+      framedPanelInput(serviceLatencyPanelInput(), 'performance', chain),
+    );
+    expect(asString(answer.title)).toBe(title);
+  });
+
+  it('names the application component of a render panel', async () => {
+    const answer = await answerFor(
+      'generate-panel',
+      framedPanelInput(serviceStatefulRenderPanelInput(), 'rendering', ['Card', TILE_SYMBOL]),
+    );
+    expect(asString(answer.title)).toBe(`Render activity — ${TILE_SYMBOL}`);
+  });
+
+  /** A single-word component the project declares, and the framework boundaries above it. */
+  const LEDGER_COMPONENT = 'Ledger';
+  const FRAMEWORK_BOUNDARIES: readonly string[] = ['OuterFrameBoundary', 'RouteSegmentNode'];
+
+  it.each([
+    // A single-word application component outranks the framework boundaries above it.
+    {
+      chain: [LEDGER_COMPONENT, ...FRAMEWORK_BOUNDARIES],
+      declared: [LEDGER_COMPONENT],
+      title: `Latency — ${LEDGER_COMPONENT}`,
+    },
+    // A qualified library part nearer than the application component does not.
+    {
+      chain: ['MenuTriggerPart', WIDGET_SYMBOL, ...FRAMEWORK_BOUNDARIES],
+      declared: [WIDGET_SYMBOL],
+      title: `Latency — ${WIDGET_SYMBOL}`,
+    },
+    // Among declared owners, the domain-qualified one still names the target.
+    {
+      chain: [PRIMITIVE_OWNER, WIDGET_SYMBOL, ...FRAMEWORK_BOUNDARIES],
+      declared: [PRIMITIVE_OWNER, WIDGET_SYMBOL],
+      title: `Latency — ${WIDGET_SYMBOL}`,
+    },
+    // A declaration outside the chain changes nothing.
+    {
+      chain: [PRIMITIVE_OWNER, WIDGET_SYMBOL],
+      declared: [FORM_SYMBOL],
+      title: `Latency — ${WIDGET_SYMBOL}`,
+    },
+  ])(
+    'titles a panel over the chain $chain with declarations $declared as $title',
+    async ({ chain, declared, title }) => {
+      const answer = await answerFor('generate-panel', {
+        ...framedPanelInput(serviceLatencyPanelInput(), 'performance', chain),
+        declaredComponents: [...declared],
+      });
+      expect(asString(answer.title)).toBe(title);
+    },
+  );
+
+  it('reads the declarations beside the chain as well as at the top level', async () => {
+    const answer = await answerFor('generate-panel', {
+      ...framedPanelInput(serviceLatencyPanelInput(), 'performance'),
+      target: {
+        componentChain: [LEDGER_COMPONENT, ...FRAMEWORK_BOUNDARIES],
+        declaredComponents: [LEDGER_COMPONENT],
+      },
+    });
+    expect(asString(answer.title)).toBe(`Latency — ${LEDGER_COMPONENT}`);
+  });
+
+  it('titles by the qualified owner when the context reports no declaration', async () => {
+    const answer = await answerFor(
+      'generate-panel',
+      framedPanelInput(serviceLatencyPanelInput(), 'performance', [
+        LEDGER_COMPONENT,
+        ...FRAMEWORK_BOUNDARIES,
+      ]),
+    );
+    expect(asString(answer.title)).toBe(`Latency — ${FRAMEWORK_BOUNDARIES[0] ?? ''}`);
+  });
+
+  it('hands the whole chain, building block included, to the understanding', async () => {
+    const answer = await answerFor(
+      'understand',
+      understandInput({ componentChain: [PRIMITIVE_OWNER, WIDGET_SYMBOL, FORM_SYMBOL] }),
+    );
+    const components = asArray(answer.entities)
+      .map((entity) => asObject(entity))
+      .filter((entity) => entity.kind === 'component')
+      .map((entity) => entity.name);
+    expect(components.slice(0, 3)).toEqual([PRIMITIVE_OWNER, WIDGET_SYMBOL, FORM_SYMBOL]);
+  });
+
+  /** A planning context whose investigation traced the target through a route. */
+  function tracedPlanInput(options: PlanOptions): JsonObject {
+    return {
+      ...planInput(options),
+      flows: [
+        `${WIDGET_SYMBOL} → POST /tally/rows → ${ROUTE_SYMBOL} → ${STORE_SYMBOL}`,
+        `${FORM_SYMBOL} → POST /tally/rows → ${ROUTE_SYMBOL}`,
+      ],
+    };
+  }
+
+  it('reproduces an input-driven behaviour through the target, named with its traced route', async () => {
+    const plan = await answerFor(
+      'plan',
+      tracedPlanInput({
+        category: 'performance',
+        componentChain: [PRIMITIVE_OWNER, WIDGET_SYMBOL, FORM_SYMBOL],
+      }),
+    );
+    expect(asString(plan.objective)).toBe(
+      `Determine what accounts for the latency recorded at ${WIDGET_SYMBOL} and POST /tally/rows while an interaction with ${WIDGET_SYMBOL} is reproduced.`,
+    );
+  });
+
+  it('observes the page for a behaviour that shows without input', async () => {
+    const rendering = await answerFor(
+      'plan',
+      tracedPlanInput({ category: 'rendering', componentChain: ['Card', TILE_SYMBOL] }),
+    );
+    expect(asString(rendering.objective)).toBe(
+      `Determine what accounts for the render activity recorded at ${TILE_SYMBOL} and POST /tally/rows while the page is observed.`,
+    );
+  });
+
+  it('reproduces an input-driven behaviour through the interaction when nothing names a target', async () => {
+    const untargeted = await answerFor(
+      'plan',
+      planInput({ category: 'performance', withoutTarget: true, withoutFlows: true }),
+    );
+    expect(asString(untargeted.objective)).toBe(
+      'Determine what accounts for the latency recorded while the interaction is reproduced.',
+    );
+  });
+
+  /**
+   * A planning context in the shape the service's plan stage sends: the
+   * validated understanding — whose `component` entities list the selected
+   * element's owner chain first, nearest first — the investigation's flows and
+   * the adapter catalog, and no selected target of its own.
+   */
+  function servicePlanInput(understanding: JsonObject): JsonObject {
+    return {
+      understanding,
+      investigation: {
+        relevantFiles: [
+          { file: WIDGET_FILE, symbol: WIDGET_SYMBOL, reason: 'selected component', score: 0.9 },
+        ],
+        flows: [`${WIDGET_SYMBOL} → POST /tally/rows → ${ROUTE_SYMBOL} → ${STORE_SYMBOL}`],
+      },
+      adapterCatalog: [
+        {
+          id: 'runtime-adapter',
+          actionTypes: ['interaction-tracking', 'server-span', 'function-timing'],
+          mode: 'runtime',
+          signals: ['interaction', 'fetch', 'http.server', 'route.handler'],
+        },
+      ],
+    };
+  }
+
+  /** The owner chain as the understand stage lists it, building block first. */
+  const POINTED_COMPONENTS: readonly JsonObject[] = [
+    { kind: 'component', name: PRIMITIVE_OWNER },
+    { kind: 'component', name: WIDGET_SYMBOL, file: WIDGET_FILE },
+    { kind: 'component', name: FORM_SYMBOL },
+    { kind: 'route', name: 'POST /tally/rows' },
+  ];
+
+  it('names the component the understanding points at when the plan context carries no target', async () => {
+    const plan = await answerFor(
+      'plan',
+      servicePlanInput({
+        category: 'performance',
+        signalsNeeded: ['interactions', 'fetch'],
+        entities: [...POINTED_COMPONENTS],
+      }),
+    );
+    expect(asString(plan.objective)).toBe(
+      `Determine what accounts for the latency recorded at ${WIDGET_SYMBOL} and POST /tally/rows while an interaction with ${WIDGET_SYMBOL} is reproduced.`,
+    );
+  });
+
+  it('names a single-word component the investigation resolved over the framework boundary above it', async () => {
+    const resolved = servicePlanInput({
+      category: 'performance',
+      signalsNeeded: ['interactions'],
+      entities: [
+        { kind: 'component', name: LEDGER_COMPONENT },
+        ...FRAMEWORK_BOUNDARIES.map((name) => ({ kind: 'component', name })),
+      ],
+    });
+    const plan = await answerFor('plan', {
+      ...resolved,
+      investigation: {
+        relevantFiles: [
+          { file: TILE_FILE, symbol: LEDGER_COMPONENT, reason: 'selected component', score: 0.9 },
+        ],
+        flows: [`${LEDGER_COMPONENT} → POST /tally/rows → ${ROUTE_SYMBOL}`],
+      },
+    });
+    expect(asString(plan.objective)).toBe(
+      `Determine what accounts for the latency recorded at ${LEDGER_COMPONENT} and POST /tally/rows while an interaction with ${LEDGER_COMPONENT} is reproduced.`,
+    );
+  });
+
+  it('names the selection the plan context carries, even when the understanding lists no component', async () => {
+    const plan = await answerFor('plan', {
+      ...servicePlanInput({
+        category: 'performance',
+        signalsNeeded: ['interactions'],
+        entities: [{ kind: 'route', name: 'POST /tally/rows' }],
+      }),
+      selectedComponents: [PRIMITIVE_OWNER, WIDGET_SYMBOL, ...FRAMEWORK_BOUNDARIES],
+    });
+    expect(asString(plan.objective)).toBe(
+      `Determine what accounts for the latency recorded at ${WIDGET_SYMBOL} and POST /tally/rows while an interaction with ${WIDGET_SYMBOL} is reproduced.`,
+    );
+  });
+
+  it('prefers the selection over the understanding’s components, and leaves the plan’s targets alone', async () => {
+    const base = servicePlanInput({
+      category: 'performance',
+      signalsNeeded: ['interactions'],
+      entities: [...POINTED_COMPONENTS],
+    });
+    const selected = await answerFor('plan', {
+      ...base,
+      selectedComponents: [LEDGER_COMPONENT, ...FRAMEWORK_BOUNDARIES],
+      investigation: {
+        relevantFiles: [
+          { file: WIDGET_FILE, symbol: WIDGET_SYMBOL, reason: 'selected component', score: 0.9 },
+          { file: TILE_FILE, symbol: LEDGER_COMPONENT, reason: 'selected component', score: 0.5 },
+        ],
+        flows: [`${WIDGET_SYMBOL} → POST /tally/rows → ${ROUTE_SYMBOL} → ${STORE_SYMBOL}`],
+      },
+    });
+    expect(asString(selected.objective)).toMatch(
+      new RegExp(`while an interaction with ${LEDGER_COMPONENT} is reproduced\\.$`),
+    );
+
+    const unselected = await answerFor('plan', base);
+    const withSelection = await answerFor('plan', {
+      ...base,
+      selectedComponents: [PRIMITIVE_OWNER, WIDGET_SYMBOL],
+    });
+    expect(withSelection.instrumentationTargets).toEqual(unselected.instrumentationTargets);
+    expect(withSelection.capture).toEqual(unselected.capture);
+  });
+
+  it('falls back to the nearest pointed component when none of them is domain-qualified', async () => {
+    const plan = await answerFor(
+      'plan',
+      servicePlanInput({
+        category: 'performance',
+        signalsNeeded: ['interactions'],
+        entities: [
+          { kind: 'component', name: PRIMITIVE_OWNER },
+          { kind: 'component', name: 'Card' },
+        ],
+      }),
+    );
+    expect(asString(plan.objective)).toBe(
+      `Determine what accounts for the latency recorded at ${PRIMITIVE_OWNER} and POST /tally/rows while an interaction with ${PRIMITIVE_OWNER} is reproduced.`,
+    );
+  });
+
+  it('reproduces an unprofiled category by interaction exactly when the understanding asks for interactions', async () => {
+    const withInteractions = await answerFor(
+      'plan',
+      servicePlanInput({
+        category: 'other',
+        signalsNeeded: ['interactions', 'fetch'],
+        entities: [...POINTED_COMPONENTS],
+      }),
+    );
+    expect(asString(withInteractions.objective)).toMatch(
+      new RegExp(`while an interaction with ${WIDGET_SYMBOL} is reproduced\\.$`),
+    );
+
+    const withoutInteractions = await answerFor(
+      'plan',
+      servicePlanInput({
+        category: 'other',
+        signalsNeeded: ['fetch'],
+        entities: [...POINTED_COMPONENTS],
+      }),
+    );
+    expect(asString(withoutInteractions.objective)).toMatch(/while the page is observed\.$/);
+    expect(asString(withoutInteractions.objective)).toContain(`at ${WIDGET_SYMBOL} and`);
+  });
+
+  it('states the same objective for two understandings that differ only in entity order beyond the chain', async () => {
+    const first = await answerFor(
+      'plan',
+      servicePlanInput({
+        category: 'performance',
+        signalsNeeded: ['interactions'],
+        entities: [...POINTED_COMPONENTS],
+      }),
+    );
+    const routeFirst = [
+      ...POINTED_COMPONENTS.filter((entity) => entity.kind !== 'component'),
+      ...POINTED_COMPONENTS.filter((entity) => entity.kind === 'component'),
+    ];
+    const second = await answerFor(
+      'plan',
+      servicePlanInput({
+        category: 'performance',
+        signalsNeeded: ['interactions'],
+        entities: routeFirst,
+      }),
+    );
+    expect(routeFirst[0]?.kind).toBe('route');
+    expect(asString(second.objective)).toBe(asString(first.objective));
+  });
+
+  it('states the objective without the old fixed tail, whatever the framing', async () => {
+    for (const input of [
+      planInput(),
+      planInput({ withoutTarget: true }),
+      tracedPlanInput({ category: 'network' }),
+    ]) {
+      const objective = asString((await answerFor('plan', input)).objective);
+      expect(objective).not.toContain('reported behaviour is reproduced');
+      expect(objective.endsWith('.')).toBe(true);
+      expect(objective).not.toContain('\n');
+    }
+  });
+});
+
 /** How the cascade analysis context may be varied. */
 interface CascadeOptions {
   /** Drops the consumers' context-triggered renders, so there is no cascade to explain. */
@@ -3897,14 +4304,44 @@ const FORM_TRACE: JsonObject = {
   edgeKinds: ['calls', 'routes-to'],
 };
 
-/** The trace from a resolved route back to the component whose code issues its request. */
+/**
+ * The trace from a resolved route back to the component whose code issues its
+ * request: upstream, so every hop follows an edge into the node the search
+ * stands on.
+ */
 const CALLER_TRACE: JsonObject = {
   tool: 'pathBetween',
   from: { file: ROUTE_FILE, kind: 'api-route' },
   to: { kind: 'component' },
   edgeKinds: ['routes-to', 'calls', 'handles'],
-  direction: 'both',
+  direction: 'in',
 };
+
+/** The trace from the event handlers of `file` to the route the request they issue reaches. */
+function handlerRequestTrace(file: string): JsonObject {
+  return {
+    tool: 'pathBetween',
+    from: { file, kind: 'handler' },
+    to: { kind: 'api-route' },
+    edgeKinds: ['calls', 'routes-to'],
+  };
+}
+
+/** The handler-issued request trace of the widget's module, proposed first for an input-driven question. */
+const WIDGET_HANDLER_REQUEST = handlerRequestTrace(WIDGET_FILE);
+
+/** The same trace for the form's module. */
+const FORM_HANDLER_REQUEST = handlerRequestTrace(FORM_FILE);
+
+/** The widget module's handlers issue no request: the trace found no path. */
+const WIDGET_HANDLER_UNREACHED = executedRun(1, WIDGET_HANDLER_REQUEST, null);
+
+/** The form module's handlers issue no request either. */
+const FORM_HANDLER_UNREACHED = executedRun(2, FORM_HANDLER_REQUEST, null);
+
+/** The form's submit handler, as the code graph names a `handler` node, and the function it calls. */
+const FORM_HANDLER_NAME = 'handleKestrelSend';
+const FORM_SENDER_NAME = 'postKestrelRows';
 
 /** A run of the log the executor refused, in the shape the investigate stage records it. */
 function refusedRun(index: number, request: JsonObject, code: string): JsonObject {
@@ -4001,6 +4438,8 @@ interface TraceContextOptions {
   readonly components?: readonly string[];
   /** The seed turn's runs; {@link SEED_RUN} alone by default. */
   readonly seeds?: readonly JsonObject[];
+  /** The understanding's category; an input-driven latency category by default. */
+  readonly category?: string;
 }
 
 /** The candidates the context builder projects from a query log: every code node a payload named. */
@@ -4043,7 +4482,7 @@ function traceContext(options: TraceContextOptions): JsonObject {
   const runs = [...(options.seeds ?? [SEED_RUN]), ...options.runs];
   return {
     understanding: {
-      category: 'slow-interaction',
+      category: options.category ?? 'slow-interaction',
       signalsNeeded: ['interaction', 'fetch'],
       entities: components.map((name) => ({ kind: 'component', name })),
       searchHints: [],
@@ -4065,7 +4504,7 @@ const investigateReplyMirror = z.union([
           from: z.record(z.string(), z.string()),
           to: z.record(z.string(), z.string()),
           edgeKinds: z.array(z.string().min(1)).optional(),
-          direction: z.enum(['out', 'both']).optional(),
+          direction: z.enum(['out', 'in', 'both']).optional(),
         }),
       )
       .min(1),
@@ -4089,7 +4528,14 @@ describe('investigate follow-ups: the selected element is followed to its route 
     const reply = await investigateReply(traceContext({ runs: [], remainingQueries: 8 }));
 
     // The form is in the chain but the log never found it, so it is not traced.
-    expect(reply.queries).toEqual([COMPONENT_TRACE]);
+    // A latency question is reproduced by input: the widget's handlers go first.
+    expect(reply.queries).toEqual([WIDGET_HANDLER_REQUEST]);
+
+    // Its handlers issue no request, so the widget's own calls are traced next.
+    const bodyTurn = await investigateReply(
+      traceContext({ runs: [WIDGET_HANDLER_UNREACHED], remainingQueries: 7 }),
+    );
+    expect(bodyTurn.queries).toEqual([COMPONENT_TRACE]);
   });
 
   it('reads the owner chain from a carried target as well', async () => {
@@ -4100,12 +4546,12 @@ describe('investigate follow-ups: the selected element is followed to its route 
       candidates: projectedCandidates([SEED_RUN]),
     });
 
-    expect(reply.queries).toEqual([COMPONENT_TRACE]);
+    expect(reply.queries).toEqual([WIDGET_HANDLER_REQUEST]);
   });
 
   it('traces the route a component trace reached on to its data-layer call', async () => {
     const reply = await investigateReply(
-      traceContext({ runs: [COMPONENT_TRACE_RUN], remainingQueries: 7 }),
+      traceContext({ runs: [WIDGET_HANDLER_UNREACHED, COMPONENT_TRACE_RUN], remainingQueries: 6 }),
     );
 
     expect(reply.queries).toEqual([ROUTE_TRACE]);
@@ -4114,8 +4560,8 @@ describe('investigate follow-ups: the selected element is followed to its route 
   it('answers once the walk is done, keeping the traced route and data layer on the shortlist', async () => {
     const reply = await investigateReply(
       traceContext({
-        runs: [COMPONENT_TRACE_RUN, ROUTE_TRACE_RUN, DECOY_RUN],
-        remainingQueries: 5,
+        runs: [WIDGET_HANDLER_UNREACHED, COMPONENT_TRACE_RUN, ROUTE_TRACE_RUN, DECOY_RUN],
+        remainingQueries: 4,
       }),
     );
 
@@ -4143,7 +4589,7 @@ describe('investigate follow-ups: the selected element is followed to its route 
       traceContext({ runs: [], remainingQueries: 8, components: [] }),
     );
 
-    expect(reply.queries).toEqual([COMPONENT_TRACE]);
+    expect(reply.queries).toEqual([WIDGET_HANDLER_REQUEST]);
   });
 
   it('proposes nothing when there is nothing to follow, or no budget remains', async () => {
@@ -4176,18 +4622,24 @@ describe('investigate follow-ups: the selected element is followed to its route 
     });
 
     const handlerTurn = await investigateReply(
-      traceContext({ runs: [unreached], remainingQueries: 7 }),
+      traceContext({ runs: [WIDGET_HANDLER_UNREACHED, unreached], remainingQueries: 6 }),
     );
     expect(handlerTurn.queries).toEqual([HANDLER_TRACE]);
 
     const routeTurn = await investigateReply(
-      traceContext({ runs: [unreached, throughHandler], remainingQueries: 6 }),
+      traceContext({
+        runs: [WIDGET_HANDLER_UNREACHED, unreached, throughHandler],
+        remainingQueries: 5,
+      }),
     );
     expect(routeTurn.queries).toEqual([ROUTE_TRACE]);
 
     // The handler lies on a traced path already, so no binding lookup follows.
     const final = await investigateReply(
-      traceContext({ runs: [unreached, throughHandler, ROUTE_TRACE_RUN], remainingQueries: 5 }),
+      traceContext({
+        runs: [WIDGET_HANDLER_UNREACHED, unreached, throughHandler, ROUTE_TRACE_RUN],
+        remainingQueries: 4,
+      }),
     );
     expect(final.queries).toBeUndefined();
     const relevant = asArray(final.relevantFiles).map((entry) => asObject(entry));
@@ -4216,22 +4668,34 @@ describe('investigate follow-ups: the selected element is followed to its route 
       edges: [],
       depth: 1,
     });
+    // Neither module's handlers issue a request — the form sends it from its
+    // own code — so the handler-issued traces fall through to the body-first walk.
+    const handlersUnreached = [WIDGET_HANDLER_UNREACHED, FORM_HANDLER_UNREACHED];
+
+    const formHandlersTurn = await investigateReply(
+      traceContext({ seeds, runs: [WIDGET_HANDLER_UNREACHED], remainingQueries: 7 }),
+    );
+    expect(formHandlersTurn.queries).toEqual([FORM_HANDLER_REQUEST]);
 
     const formTurn = await investigateReply(
-      traceContext({ seeds, runs: [widgetUnreached], remainingQueries: 6 }),
+      traceContext({ seeds, runs: [...handlersUnreached, widgetUnreached], remainingQueries: 5 }),
     );
     expect(formTurn.queries).toEqual([FORM_TRACE]);
 
     const routeTurn = await investigateReply(
-      traceContext({ seeds, runs: [widgetUnreached, formReached], remainingQueries: 5 }),
+      traceContext({
+        seeds,
+        runs: [...handlersUnreached, widgetUnreached, formReached],
+        remainingQueries: 4,
+      }),
     );
     expect(routeTurn.queries).toEqual([ROUTE_TRACE]);
 
     const bindingTurn = await investigateReply(
       traceContext({
         seeds,
-        runs: [widgetUnreached, formReached, ROUTE_TRACE_RUN],
-        remainingQueries: 4,
+        runs: [...handlersUnreached, widgetUnreached, formReached, ROUTE_TRACE_RUN],
+        remainingQueries: 3,
       }),
     );
     expect(bindingTurn.queries).toEqual([HANDLER_BINDING]);
@@ -4239,8 +4703,8 @@ describe('investigate follow-ups: the selected element is followed to its route 
     const final = await investigateReply(
       traceContext({
         seeds,
-        runs: [widgetUnreached, formReached, ROUTE_TRACE_RUN, binding],
-        remainingQueries: 3,
+        runs: [...handlersUnreached, widgetUnreached, formReached, ROUTE_TRACE_RUN, binding],
+        remainingQueries: 2,
       }),
     );
     expect(final.queries).toBeUndefined();
@@ -4256,13 +4720,16 @@ describe('investigate follow-ups: the selected element is followed to its route 
       traceContext({ seeds, runs: [], remainingQueries: 8, components: [] }),
     );
     expect(first.queries).toEqual([ROUTE_TRACE, CALLER_TRACE]);
+    // The caller trace searches upstream only, never undirected.
+    expect(asObject(asArray(first.queries)[1]).direction).toBe('in');
 
-    // The caller trace walked every hop against its edge's direction: the flow read backwards.
+    // An upstream search travels every hop against its edge's direction and
+    // lists the route first: the flow read backwards.
     const reversedHop = { kind: 'calls', traversedAgainstDirection: true };
     const callers = executedRun(2, CALLER_TRACE, {
       nodes: [TRACED_ROUTE_NODE, WIDGET_HANDLER_NODE, WIDGET_NODE],
       edges: [reversedHop, { ...reversedHop, kind: 'handles' }],
-      undirected: true,
+      undirected: false,
       depth: 2,
     });
     const final = await investigateReply(
@@ -4280,7 +4747,11 @@ describe('investigate follow-ups: the selected element is followed to its route 
     const flows = asArray(final.flows).map((flow) => asString(flow));
     const upstream = flows.find((flow) => flow.includes(WIDGET_SYMBOL));
     expect(upstream).toBeDefined();
+    // Read downstream: the component, the handler it binds, then the route.
     expect(upstream?.indexOf(WIDGET_SYMBOL)).toBeLessThan(
+      upstream?.indexOf(WIDGET_HANDLER_NAME) ?? -1,
+    );
+    expect(upstream?.indexOf(WIDGET_HANDLER_NAME)).toBeLessThan(
       upstream?.indexOf(TRACED_ROUTE_NAME) ?? -1,
     );
 
@@ -4320,6 +4791,386 @@ describe('investigate follow-ups: the selected element is followed to its route 
 
   it('proposes the same follow-ups however the question is worded', async () => {
     const input = traceContext({ runs: [], remainingQueries: 8 });
+
+    const first = await investigateReply(input, 'first');
+    const second = await investigateReply(input, 'second-asked-with-completely-different-words');
+
+    expect(second).toEqual(first);
+  });
+
+  it('traces an input-driven question from the followed components’ handlers first, innermost first', async () => {
+    const seeds = [
+      SEED_RUN,
+      executedRun(1, { tool: 'findByName', name: FORM_SYMBOL }, [FORM_NODE]),
+    ];
+    // The form's submit handler calls the function that issues the request.
+    const formHandler = graphNode('handler', FORM_HANDLER_NAME, FORM_FILE);
+    const formSender = graphNode('symbol', FORM_SENDER_NAME, FORM_FILE);
+    const formHandlerReached = executedRun(3, FORM_HANDLER_REQUEST, {
+      nodes: [
+        formHandler,
+        formSender,
+        graphNode('api-call', 'fetch', FORM_FILE),
+        TRACED_ROUTE_NODE,
+      ],
+      edges: [],
+      depth: 3,
+    });
+
+    const widgetTurn = await investigateReply(
+      traceContext({ seeds, runs: [], remainingQueries: 8 }),
+    );
+    expect(widgetTurn.queries).toEqual([WIDGET_HANDLER_REQUEST]);
+
+    const formTurn = await investigateReply(
+      traceContext({ seeds, runs: [WIDGET_HANDLER_UNREACHED], remainingQueries: 7 }),
+    );
+    expect(formTurn.queries).toEqual([FORM_HANDLER_REQUEST]);
+
+    // The form's handler reached a route: that route, and only it, is traced on.
+    const routeTurn = await investigateReply(
+      traceContext({
+        seeds,
+        runs: [WIDGET_HANDLER_UNREACHED, formHandlerReached],
+        remainingQueries: 6,
+      }),
+    );
+    expect(routeTurn.queries).toEqual([ROUTE_TRACE]);
+
+    // The path holds the handler: no body trace, no handler trace, no binding lookup.
+    const final = await investigateReply(
+      traceContext({
+        seeds,
+        runs: [WIDGET_HANDLER_UNREACHED, formHandlerReached, ROUTE_TRACE_RUN],
+        remainingQueries: 5,
+      }),
+    );
+    expect(final.queries).toBeUndefined();
+    const relevant = asArray(final.relevantFiles).map((entry) => asObject(entry));
+    const handlerEntry = relevant.find(
+      (entry) => entry.file === FORM_FILE && entry.symbol === FORM_HANDLER_NAME,
+    );
+    expect(asString(handlerEntry?.reason)).toBe(
+      `The code graph associates this event handler with ${TRACED_ROUTE_NAME}.`,
+    );
+    const files = relevant.map((entry) => asString(entry.file));
+    expect(files).toContain(ROUTE_FILE);
+    expect(files).toContain(STORE_FILE);
+    const flows = asArray(final.flows).map((flow) => asString(flow));
+    const issued = flows.find((flow) => flow.startsWith(FORM_HANDLER_NAME));
+    expect(issued).toBeDefined();
+    expect(issued).toContain(FORM_SENDER_NAME);
+    expect(issued?.endsWith(TRACED_ROUTE_NAME)).toBe(true);
+  });
+
+  it('traces a question not reproduced by input body first, as before', async () => {
+    for (const category of ['rendering', 'network', 'state']) {
+      const reply = await investigateReply(
+        traceContext({ runs: [], remainingQueries: 8, category }),
+      );
+      expect(reply.queries).toEqual([COMPONENT_TRACE]);
+    }
+  });
+
+  it('tells path queries apart by direction, reading an absent one as downstream', async () => {
+    const seeds = [routeLookupRun(0, 'route-handler', ROUTE_FILE)];
+    // The same endpoints searched downstream or undirected ask other questions:
+    // the upstream caller trace is still due after both.
+    const downstream = executedRun(2, { ...CALLER_TRACE, direction: 'out' }, null);
+    const undirected = executedRun(3, { ...CALLER_TRACE, direction: 'both' }, null);
+    const pending = await investigateReply(
+      traceContext({
+        seeds,
+        runs: [ROUTE_TRACE_RUN, downstream, undirected],
+        remainingQueries: 5,
+        components: [],
+      }),
+    );
+    expect(pending.queries).toEqual([CALLER_TRACE]);
+
+    // A data-layer trace run with an explicit downstream direction is the one proposed without it.
+    const explicitOut = executedRun(1, { ...ROUTE_TRACE, direction: 'out' }, null);
+    const upstreamRun = executedRun(2, CALLER_TRACE, null);
+    const done = await investigateReply(
+      traceContext({
+        seeds,
+        runs: [explicitOut, upstreamRun],
+        remainingQueries: 6,
+        components: [],
+      }),
+    );
+    expect(done.queries).toBeUndefined();
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * investigate reasons: every relevant file names what relates it, or claims no relation
+ *
+ * The candidates below are projected exactly as the service's context builder
+ * projects them (`candidatesFrom` in `apps/local-service/src/pipeline/context-builder.ts`):
+ * every object of the log with a project-relative `file` and a `symbol`, or
+ * failing that a `name`, nested ones included and `request` keys skipped — so a
+ * URL lookup's route `location` becomes a candidate here exactly as it does at
+ * runtime, with no kind, no signal and no entity to relate it to.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The name a lookup asked for, which a near match's file only contains. */
+const LOOKED_UP_NAME = 'tally';
+
+/** A file the lookup matched by substring: the graph names a `file` node by its path. */
+const SHELL_FILE = 'src/app/tally-shell.tsx';
+
+/** The method handler the route module declares, as the route map's location names it. */
+const ROUTE_METHOD_SYMBOL = 'GET';
+
+/** A code-graph location of `file`, naming `symbol` when the resolver knew it. */
+function located(file: string, resolvedBy: string, symbol?: string): JsonObject {
+  return {
+    file,
+    line: 3,
+    column: 1,
+    ...(symbol === undefined ? {} : { symbol }),
+    resolvedBy,
+    confidence: 1,
+  };
+}
+
+/** The candidates the context builder projects from a query log, in its first-seen order. */
+function builderCandidates(runs: readonly JsonObject[]): JsonObject[] {
+  const candidates: JsonObject[] = [];
+  const seen = new Set<string>();
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value !== 'object' || value === null) {
+      return;
+    }
+    const node = value as Record<string, unknown>;
+    const symbol = node.symbol ?? node.name;
+    if (typeof node.file === 'string' && typeof symbol === 'string') {
+      const identity = `${node.file}|${symbol}`;
+      if (!seen.has(identity)) {
+        seen.add(identity);
+        candidates.push({
+          file: node.file,
+          symbol,
+          ...(typeof node.kind === 'string' ? { kind: node.kind } : {}),
+          ...(typeof node.score === 'number' ? { score: node.score } : {}),
+        });
+      }
+    }
+    for (const key of Object.keys(node).sort()) {
+      if (key !== 'request') {
+        visit(node[key]);
+      }
+    }
+  };
+  runs.forEach(visit);
+  return candidates;
+}
+
+/** A name lookup whose only match is a file that contains the name. */
+const SUBSTRING_LOOKUP_RUN = executedRun(0, { tool: 'findByName', name: LOOKED_UP_NAME }, [
+  {
+    ...graphNode('file', SHELL_FILE, SHELL_FILE),
+    location: located(SHELL_FILE, 'code-graph'),
+    score: 0.25,
+  },
+]);
+
+/** A URL lookup resolving the traced route: its locations name the method handler. */
+const ROUTE_LOCATION_RUN = executedRun(
+  1,
+  { tool: 'routeForUrl', url: TRACED_ROUTE_NAME },
+  {
+    match: {
+      entry: {
+        routePath: TRACED_ROUTE_NAME,
+        file: ROUTE_FILE,
+        location: located(ROUTE_FILE, 'route-map', ROUTE_METHOD_SYMBOL),
+      },
+      params: {},
+      pathname: TRACED_ROUTE_NAME,
+    },
+    routePath: TRACED_ROUTE_NAME,
+    router: 'app',
+    kind: 'route-handler',
+    methods: [ROUTE_METHOD_SYMBOL],
+    params: {},
+    file: ROUTE_FILE,
+    location: located(ROUTE_FILE, 'route-map', ROUTE_METHOD_SYMBOL),
+    node: graphNode('api-route', TRACED_ROUTE_NAME, ROUTE_FILE),
+  },
+);
+
+/** A final investigate turn over `runs`: no budget left, no entity named, projected as the builder does. */
+function finalReasonContext(runs: readonly JsonObject[]): JsonObject {
+  return {
+    understanding: {
+      category: 'slow-interaction',
+      signalsNeeded: ['interaction', 'fetch'],
+      entities: [],
+      searchHints: [],
+    },
+    toolCatalog: 'findByName, routeForUrl, pathBetween',
+    queryResults: [...runs],
+    remainingQueries: 0,
+    candidates: builderCandidates(runs),
+  };
+}
+
+/** The final answer's relevant files, keyed by `file#symbol`. */
+function reasonsOf(reply: Record<string, unknown>): Map<string, string> {
+  expect(reply.queries).toBeUndefined();
+  const reasons = new Map<string, string>();
+  for (const entry of asArray(reply.relevantFiles).map((member) => asObject(member))) {
+    reasons.set(`${asString(entry.file)}#${asString(entry.symbol)}`, asString(entry.reason));
+  }
+  return reasons;
+}
+
+describe('investigate reasons: every relevant file names what relates it, or claims no relation', () => {
+  it('names the route path a URL lookup resolved and the name a lookup asked for', async () => {
+    const reasons = reasonsOf(
+      await investigateReply(finalReasonContext([SUBSTRING_LOOKUP_RUN, ROUTE_LOCATION_RUN])),
+    );
+
+    // The route module's method handler, a candidate only through the lookup's nested location.
+    expect(reasons.get(`${ROUTE_FILE}#${ROUTE_METHOD_SYMBOL}`)).toBe(
+      `The code graph associates this symbol with ${TRACED_ROUTE_NAME}.`,
+    );
+    // The file a substring match returned is related to the name looked up.
+    expect(reasons.get(`${SHELL_FILE}#${SHELL_FILE}`)).toBe(
+      `The code graph associates this file with ${LOOKED_UP_NAME}.`,
+    );
+    // The route node is found by its own route path, which relates it to nothing.
+    expect(reasons.get(`${ROUTE_FILE}#${TRACED_ROUTE_NAME}`)).toBe(
+      "The code graph returned this route handler in the investigation's query results.",
+    );
+    for (const reason of reasons.values()) {
+      expect(reason).not.toContain('unnamed');
+    }
+  });
+
+  it('relates a traced path’s origin to the path’s end, and its other members to the origin', async () => {
+    const reasons = reasonsOf(
+      await investigateReply(
+        traceContext({
+          runs: [COMPONENT_TRACE_RUN, ROUTE_TRACE_RUN],
+          remainingQueries: 0,
+          components: [],
+        }),
+      ),
+    );
+
+    expect(reasons.get(`${WIDGET_FILE}#${WIDGET_SYMBOL}`)).toBe(
+      `The code graph associates this component with ${TRACED_ROUTE_NAME}.`,
+    );
+    expect(reasons.get(`${ROUTE_FILE}#${TRACED_ROUTE_NAME}`)).toBe(
+      `The code graph associates this route handler with ${WIDGET_SYMBOL}.`,
+    );
+    // A call site is listed by its file; the route it was traced from names it.
+    expect(reasons.get(`${STORE_FILE}#${STORE_FILE}`)).toBe(
+      `The code graph associates this database call site with ${TRACED_ROUTE_NAME}.`,
+    );
+  });
+
+  it('never relates a node to itself: a one-node path and a lookup by its own name claim nothing', async () => {
+    const selfPath = executedRun(1, COMPONENT_TRACE, { nodes: [WIDGET_NODE], edges: [], depth: 0 });
+    const reasons = reasonsOf(
+      await investigateReply(
+        traceContext({ runs: [selfPath], remainingQueries: 0, components: [] }),
+      ),
+    );
+
+    const reason = reasons.get(`${WIDGET_FILE}#${WIDGET_SYMBOL}`);
+    expect(reason).toBe(
+      "The code graph returned this component in the investigation's query results.",
+    );
+    expect(reason).not.toContain(WIDGET_SYMBOL);
+  });
+
+  it('gives a handler node the event-handler wording', async () => {
+    const throughHandler = executedRun(1, HANDLER_TRACE, {
+      nodes: [WIDGET_NODE, WIDGET_HANDLER_NODE, TRACED_ROUTE_NODE],
+      edges: [],
+      depth: 2,
+    });
+    const reasons = reasonsOf(
+      await investigateReply(
+        traceContext({ runs: [throughHandler], remainingQueries: 0, components: [] }),
+      ),
+    );
+
+    expect(reasons.get(`${WIDGET_FILE}#${WIDGET_HANDLER_NAME}`)).toBe(
+      `The code graph associates this event handler with ${WIDGET_SYMBOL}.`,
+    );
+  });
+
+  it('words a candidate the projection met without a kind by the kind of the log’s node for it', async () => {
+    // A hop's site names the handler that holds it, and the projection meets the
+    // path's `edges` before its `nodes`: the handler arrives as a kind-less candidate.
+    const throughHandler = executedRun(1, HANDLER_TRACE, {
+      nodes: [WIDGET_NODE, WIDGET_HANDLER_NODE, TRACED_ROUTE_NODE],
+      edges: [
+        {
+          kind: 'handles',
+          from: asString(WIDGET_NODE.nodeId),
+          to: asString(WIDGET_HANDLER_NODE.nodeId),
+          traversedAgainstDirection: false,
+        },
+        {
+          kind: 'calls',
+          from: asString(WIDGET_HANDLER_NODE.nodeId),
+          to: asString(TRACED_ROUTE_NODE.nodeId),
+          traversedAgainstDirection: false,
+          location: located(WIDGET_FILE, 'code-graph', WIDGET_HANDLER_NAME),
+        },
+      ],
+      depth: 2,
+    });
+    const input = finalReasonContext([SEED_RUN, throughHandler]);
+    const projected = asArray(input.candidates).map((candidate) => asObject(candidate));
+    expect(
+      projected.find((candidate) => candidate.symbol === WIDGET_HANDLER_NAME)?.kind,
+    ).toBeUndefined();
+
+    const reasons = reasonsOf(await investigateReply(input));
+    expect(reasons.get(`${WIDGET_FILE}#${WIDGET_HANDLER_NAME}`)).toBe(
+      `The code graph associates this event handler with ${WIDGET_SYMBOL}.`,
+    );
+  });
+
+  it('relates the declaration a traced hop is written in to the node the hop leaves', async () => {
+    // The route's call into the data layer is written inside its method handler,
+    // which is no node of the path: only the hop's site names it.
+    const hopRun = executedRun(1, ROUTE_TRACE, {
+      nodes: [TRACED_ROUTE_NODE, TRACED_STORE_NODE],
+      edges: [
+        {
+          kind: 'calls',
+          from: asString(TRACED_ROUTE_NODE.nodeId),
+          to: asString(TRACED_STORE_NODE.nodeId),
+          traversedAgainstDirection: false,
+          location: located(ROUTE_FILE, 'code-graph', ROUTE_METHOD_SYMBOL),
+        },
+      ],
+      depth: 1,
+    });
+    const reasons = reasonsOf(await investigateReply(finalReasonContext([hopRun])));
+
+    expect(reasons.get(`${ROUTE_FILE}#${ROUTE_METHOD_SYMBOL}`)).toBe(
+      `The code graph associates this symbol with ${TRACED_ROUTE_NAME}.`,
+    );
+    for (const reason of reasons.values()) {
+      expect(reason).not.toContain('unnamed');
+    }
+  });
+
+  it('reasons identically however the question is worded', async () => {
+    const input = finalReasonContext([SUBSTRING_LOOKUP_RUN, ROUTE_LOCATION_RUN]);
 
     const first = await investigateReply(input, 'first');
     const second = await investigateReply(input, 'second-asked-with-completely-different-words');

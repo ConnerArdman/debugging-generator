@@ -232,6 +232,40 @@ describe('SummaryHeader version indicator', () => {
   });
 });
 
+describe('SummaryHeader title id', () => {
+  /** The id a host hands in so it can name a region of its own after the title. */
+  const HOST_TITLE_ID = 'host-named-panel-title';
+
+  it('gives the title heading the id a host supplies, so a region elsewhere can be named by it', () => {
+    render(
+      <>
+        <div role="region" aria-labelledby={HOST_TITLE_ID} />
+        <SummaryHeader title={TITLE} summary={summaryOf([FACT], [])} titleId={HOST_TITLE_ID} />
+      </>,
+    );
+
+    const heading = screen.getByRole('heading', { level: 2, name: TITLE });
+    expect(heading.id).toBe(HOST_TITLE_ID);
+    expect(document.querySelectorAll(`[id="${HOST_TITLE_ID}"]`)).toHaveLength(1);
+
+    // The host's region is announced by the visible title, and the head's own
+    // regions keep their own names.
+    screen.getByRole('region', { name: TITLE });
+    expect(observedRegion().getAttribute('aria-labelledby')).not.toBe(HOST_TITLE_ID);
+  });
+
+  it.each([
+    { what: 'no id', titleId: undefined },
+    { what: 'a blank id', titleId: '   ' },
+  ])('keeps a generated, non-empty title id for $what', ({ titleId }) => {
+    render(<SummaryHeader title={TITLE} summary={summaryOf([FACT], [])} titleId={titleId} />);
+
+    const heading = screen.getByRole('heading', { level: 2, name: TITLE });
+    expect(heading.id.trim()).not.toBe('');
+    expect(heading.id).not.toBe(titleId);
+  });
+});
+
 describe('SummaryHeader evidence chips in the tab order', () => {
   /** Two facts citing three events between them, in one observed region. */
   const FACTS: readonly Fact[] = [

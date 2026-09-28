@@ -103,7 +103,7 @@ import {
 } from '../dev-server/detect.js';
 import type { LaunchedDevServer } from '../dev-server/launcher.js';
 import { LOG_ERROR_FIELD_KEY } from '../logging.js';
-import { createAgentReadyLedger } from '../main.js';
+import { createAgentReadyLedger, type AgentReadyLedgerDeps } from '../main.js';
 import { createCaptureStage } from '../pipeline/stages/capture.js';
 import type { WsConnectionFacts } from '../server/ws.js';
 import {
@@ -126,6 +126,8 @@ import {
   collectReadinessEvidence,
   evaluateReadiness,
   toObservedBrowserAgent,
+  waitForNextAgentReady,
+  type BoundTabRef,
   type BrowserAgentRegistry,
   type CollectObservedReadinessDeps,
   type CollectObservedReadinessRequest,
@@ -218,8 +220,10 @@ interface FakeAgents {
 
 /**
  * A scripted `BrowserAgentRegistry`: queue-controlled latest reports and a
- * test-controlled wait. Like the real client registry it is keyed by tab, so a
- * report for another tab is never answered for this one.
+ * test-controlled wait. Like the service's ledger it answers only for the tab
+ * the `BoundTabRef` names, so a report for another tab is never answered for
+ * this one; every case here asks about the suite's one session, so the ref's
+ * session is not modelled (the ledger-backed cases below exercise it).
  */
 function fakeAgents(input: FakeAgentsInput = {}): FakeAgents {
   const queue: (AgentReadyPayload | undefined)[] =
@@ -241,7 +245,7 @@ function fakeAgents(input: FakeAgentsInput = {}): FakeAgents {
   };
 
   const registry: BrowserAgentRegistry = {
-    latestAgentReady(tabId) {
+    latestAgentReady({ tabId }) {
       latestCalls.push(tabId);
 
       if (input.throwOnLatest === true) {
@@ -251,7 +255,7 @@ function fakeAgents(input: FakeAgentsInput = {}): FakeAgents {
       const head = queue.length > 1 ? queue.shift() : queue[0];
       return head?.tabId === tabId ? head : undefined;
     },
-    waitForAgentReady(tabId, options) {
+    waitForAgentReady({ tabId }, options) {
       waitCalls.push({ tabId, options });
       markWaitStarted();
 
@@ -746,16 +750,17 @@ describe('the suite’s doubles', () => {
   it('scripts the page-agent registry: queued reports per tab and a deferred wait', async () => {
     const agents = fakeAgents({ latestSequence: [undefined, agentReady()], next: 'deferred' });
 
-    expect(agents.registry.latestAgentReady(TAB_ID)).toBeUndefined();
-    expect(agents.registry.latestAgentReady(TAB_ID)?.documentId).toBe('doc_first');
-    expect(agents.registry.latestAgentReady(TAB_ID + 1)).toBeUndefined();
+    const bound = { sessionId: SESSION_ID, tabId: TAB_ID };
+    expect(agents.registry.latestAgentReady(bound)).toBeUndefined();
+    expect(agents.registry.latestAgentReady(bound)?.documentId).toBe('doc_first');
+    expect(agents.registry.latestAgentReady({ ...bound, tabId: TAB_ID + 1 })).toBeUndefined();
 
-    const waiting = agents.registry.waitForAgentReady(TAB_ID, { timeoutMs: 5 });
+    const waiting = agents.registry.waitForAgentReady(bound, { timeoutMs: 5 });
     await agents.waitStarted;
     agents.settleWait(agentReady({ documentId: 'doc_second' }));
 
     expect((await waiting)?.documentId).toBe('doc_second');
-    expect(agents.registry.latestAgentReady(TAB_ID)?.documentId).toBe('doc_second');
+    expect(agents.registry.latestAgentReady(bound)?.documentId).toBe('doc_second');
     expect(agents.latestCalls).toEqual([TAB_ID, TAB_ID, TAB_ID + 1, TAB_ID]);
   });
 });
@@ -2805,6 +2810,31 @@ describe('evaluateReadiness — over the service’s agent-ready ledger', () => 
     },
   };
 
+  /** The credential the relaying connection's binding, reports and navigations are kept under. */
+  const HOLDER = RELAY.principal.tokenHash;
+
+  /**
+   * The live binding the ledger resolves the suite's session through: its tab,
+   * bound by the relaying connection's credential, as the client registry
+   * holds it once the panel has bound.
+   */
+  const BINDINGS: AgentReadyLedgerDeps['bindings'] = {
+    bindingForSession: (sessionId) =>
+      sessionId === SESSION_ID
+        ? {
+            tabId: TAB_ID,
+            sessionId,
+            url: BOUND_TAB.url,
+            boundBy: HOLDER,
+            boundAt: NOW,
+            online: true,
+          }
+        : undefined,
+  };
+
+  /** The suite's session's bound tab, as readiness asks the ledger about it. */
+  const BOUND: BoundTabRef = { sessionId: SESSION_ID, tabId: TAB_ID };
+
   const reactPlan = (): InstrumentationPlan =>
     plan([action('react-render-tracking', PAGE_ADAPTER_ID)]);
 
@@ -2843,14 +2873,14 @@ describe('evaluateReadiness — over the service’s agent-ready ledger', () => 
   }
 
   it('distrusts the report a same-millisecond reload left behind, waits for the reloaded document and judges it', async () => {
-    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock });
+    const ledger = createAgentReadyLedger({ logger: noopLogger, bindings: BINDINGS, now: clock });
 
     try {
       expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
       // The reload: the URL is unchanged, so only the recorded navigation
       // tells readiness that doc_first may be the document the tab left.
-      ledger.recordNavigation(TAB_ID);
-      expect(ledger.latestNavigationAt(TAB_ID)).toBe(NOW + 1);
+      ledger.recordNavigation(HOLDER, TAB_ID);
+      expect(ledger.latestNavigationAt(BOUND)).toBe(NOW + 1);
 
       const { progress, emit } = fakeProgress();
       const adapter = pageAdapter();
@@ -2897,12 +2927,12 @@ describe('evaluateReadiness — over the service’s agent-ready ledger', () => 
   });
 
   it('trusts on sight a report the ledger received after the latest navigation, answering without a wait', async () => {
-    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock });
+    const ledger = createAgentReadyLedger({ logger: noopLogger, bindings: BINDINGS, now: clock });
 
     try {
-      ledger.recordNavigation(TAB_ID);
+      ledger.recordNavigation(HOLDER, TAB_ID);
       expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
-      expect(ledger.latestAgentReadyAt(TAB_ID)).toBe(ledger.latestNavigationAt(TAB_ID));
+      expect(ledger.latestAgentReadyAt(BOUND)).toBe(ledger.latestNavigationAt(BOUND));
 
       const adapter = pageAdapter();
       const evaluation = startEvaluation(ledger, adapter);
@@ -2921,10 +2951,10 @@ describe('evaluateReadiness — over the service’s agent-ready ledger', () => 
   });
 
   it('waits for the first report of a tab bound before its page agent reported, and judges it without a reload request', async () => {
-    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock });
+    const ledger = createAgentReadyLedger({ logger: noopLogger, bindings: BINDINGS, now: clock });
 
     try {
-      expect(ledger.latestAgentReady(TAB_ID)).toBeUndefined();
+      expect(ledger.latestAgentReady(BOUND)).toBeUndefined();
 
       const { progress, emit } = fakeProgress();
       const adapter = pageAdapter();
@@ -2960,15 +2990,15 @@ describe('evaluateReadiness — over the service’s agent-ready ledger', () => 
    */
   function replayFirstDocument(ledger: ReturnType<typeof createAgentReadyLedger>): void {
     expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
-    ledger.recordNavigation(TAB_ID);
+    ledger.recordNavigation(HOLDER, TAB_ID);
     expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
     // The replay confirms nothing: it keeps its pre-navigation receipt.
-    expect(ledger.latestAgentReadyAt(TAB_ID)).toBe(NOW);
-    expect(ledger.latestNavigationAt(TAB_ID)).toBe(NOW + 1);
+    expect(ledger.latestAgentReadyAt(BOUND)).toBe(NOW);
+    expect(ledger.latestNavigationAt(BOUND)).toBe(NOW + 1);
   }
 
   it('still distrusts the report a reload left behind when it is replayed, waits, and judges the reloaded document', async () => {
-    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock });
+    const ledger = createAgentReadyLedger({ logger: noopLogger, bindings: BINDINGS, now: clock });
 
     try {
       replayFirstDocument(ledger);
@@ -3018,7 +3048,7 @@ describe('evaluateReadiness — over the service’s agent-ready ledger', () => 
 
   it('waits the settle bound, and no longer, over a replayed report no new document follows, then keeps it', async () => {
     useFakeTimeouts();
-    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock });
+    const ledger = createAgentReadyLedger({ logger: noopLogger, bindings: BINDINGS, now: clock });
 
     try {
       replayFirstDocument(ledger);
@@ -3054,17 +3084,22 @@ describe('evaluateReadiness — over the service’s agent-ready ledger', () => 
   });
 
   it('asks for a reload, not trusting a report on sight, once navigations of other tabs have churned its navigation out of the ledger', async () => {
-    const ledger = createAgentReadyLedger({ logger: noopLogger, now: clock, maxTabs: 2 });
+    const ledger = createAgentReadyLedger({
+      logger: noopLogger,
+      bindings: BINDINGS,
+      now: clock,
+      maxTabs: 2,
+    });
 
     try {
       expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
-      ledger.recordNavigation(TAB_ID);
+      ledger.recordNavigation(HOLDER, TAB_ID);
       // Unrelated tabs navigate (recorded bound or not) until the bound tab's
       // entry is the oldest beyond the bound: its report goes with its stamp.
-      ledger.recordNavigation(TAB_ID + 1);
-      ledger.recordNavigation(TAB_ID + 2);
-      expect(ledger.latestAgentReady(TAB_ID)).toBeUndefined();
-      expect(ledger.latestNavigationAt(TAB_ID)).toBeUndefined();
+      ledger.recordNavigation(HOLDER, TAB_ID + 1);
+      ledger.recordNavigation(HOLDER, TAB_ID + 2);
+      expect(ledger.latestAgentReady(BOUND)).toBeUndefined();
+      expect(ledger.latestNavigationAt(BOUND)).toBeUndefined();
 
       const adapter = pageAdapter();
       const verdict = await startEvaluation(ledger, adapter).verdict;
@@ -3076,6 +3111,135 @@ describe('evaluateReadiness — over the service’s agent-ready ledger', () => 
       expect(JSON.stringify(verdict)).not.toContain('doc_first');
     } finally {
       ledger.close();
+    }
+  });
+
+  it('never judges another paired browser’s report of the same tab id: it waits for the bound credential’s own report and judges that', async () => {
+    const ledger = createAgentReadyLedger({ logger: noopLogger, bindings: BINDINGS, now: clock });
+    /** A second paired browser, inspecting a tab whose id is the bound tab's. */
+    const otherBrowser: WsConnectionFacts = {
+      id: 'cli_readinessotherbrowser',
+      kind: 'devtools',
+      principal: {
+        role: 'devtools',
+        tokenHash: 'd'.repeat(64),
+        scope: { kind: 'extension', extensionId: 'ponmlkjihgfedcbaponmlkjihgfedcba' },
+        issuedAt: 0,
+      },
+    };
+
+    try {
+      // Its tab 7 reports on the bound origin and page, installed in time.
+      expect(
+        isOk(
+          ledger.agentReady(
+            agentReady({ documentId: 'doc_other_browser', producerId: 'prd_other_browser' }),
+            otherBrowser,
+          ),
+        ),
+      ).toBe(true);
+      expect(ledger.latestAgentReady(BOUND)).toBeUndefined();
+
+      const { progress, emit } = fakeProgress();
+      const adapter = pageAdapter();
+      const evaluation = startEvaluation(ledger, adapter, progress);
+
+      await nextTask();
+      expect(evaluation.answered()).toBe(false);
+
+      // It reports another document while readiness waits: still not this
+      // session's tab, so the wait for the bound tab's first report goes on.
+      expect(
+        isOk(
+          ledger.agentReady(
+            agentReady({ documentId: 'doc_other_browser_next', producerId: 'prd_other_next' }),
+            otherBrowser,
+          ),
+        ),
+      ).toBe(true);
+      await nextTask();
+      expect(evaluation.answered()).toBe(false);
+      expect(adapter.calls).toHaveLength(0);
+
+      // The bound credential's own page agent reports: that is what is judged.
+      expect(isOk(ledger.agentReady(agentReady(), RELAY))).toBe(true);
+      const verdict = await evaluation.verdict;
+
+      expect(verdict.satisfied).toBe(true);
+      expect(verdict.observed.browserAgent?.documentId).toBe('doc_first');
+      expect(adapter.calls).toHaveLength(1);
+      expect(adapter.calls[0]?.readiness.browserAgent?.documentId).toBe('doc_first');
+      expect(emit).not.toHaveBeenCalled();
+      expect(JSON.stringify(verdict)).not.toContain('doc_other_browser');
+    } finally {
+      ledger.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The page-agent registry is asked about the session's own bound tab
+// ---------------------------------------------------------------------------
+
+describe('the page-agent registry is asked about the session’s own bound tab', () => {
+  it('names the session and its tab in every read and wait of collection, evaluation and the exported wait', async () => {
+    const refs: BoundTabRef[] = [];
+    const registry: BrowserAgentRegistry = {
+      latestAgentReady: (tab) => {
+        refs.push(tab);
+        return undefined;
+      },
+      latestAgentReadyAt: (tab) => {
+        refs.push(tab);
+        return undefined;
+      },
+      latestNavigationAt: (tab) => {
+        refs.push(tab);
+        return undefined;
+      },
+      waitForAgentReady: (tab) => {
+        refs.push(tab);
+        return Promise.resolve(undefined);
+      },
+    };
+
+    const collected = await collectReadinessEvidence(collectDeps({ agents: registry }), {
+      sessionId: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      boundTab: BOUND_TAB,
+    });
+    if (isErr(collected)) throw collected.error;
+    const collectedRefs = refs.length;
+
+    // No report on file: the first report is awaited, then a reload is asked
+    // for and awaited — two waits, each for the session's own bound tab.
+    const verdict = await evaluate(
+      { adapters: registryOf(pageAdapter()), agents: registry, navigationSettleMs: 5 },
+      { plan: plan([action('react-render-tracking', PAGE_ADAPTER_ID)]), boundTab: BOUND_TAB },
+    );
+    expect(remediationOf(verdict, 'reload-page')).toEqual({ kind: 'reload-page', tabId: TAB_ID });
+
+    const exportedSession = 'ses_readinessexportedwait';
+    await waitForNextAgentReady(
+      registry,
+      {
+        sessionId: exportedSession,
+        tabId: TAB_ID,
+        afterDocumentId: undefined,
+        timeoutMs: 5,
+        signal: undefined,
+        failureMessage: 'Waiting for the page agent failed',
+      },
+      noopLogger,
+    );
+
+    expect(collectedRefs).toBeGreaterThan(0);
+    // The evaluation's read, its first-report wait, its reload wait, and the exported wait.
+    expect(refs.length).toBeGreaterThanOrEqual(collectedRefs + 4);
+    const exported = refs.pop();
+    expect(exported).toEqual({ sessionId: exportedSession, tabId: TAB_ID });
+    for (const ref of refs) {
+      expect(ref).toEqual({ sessionId: SESSION_ID, tabId: TAB_ID });
     }
   });
 });

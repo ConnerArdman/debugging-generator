@@ -48,6 +48,18 @@
  * record at a time and needs no chain awareness beyond honouring the record it
  * is handed.
  *
+ * The one thing a chain changes is the **report**. A chained record's own
+ * backup holds the previous plan version's instrumented output, not the
+ * pristine file, so a report that called it "the original" would send the
+ * developer to bytes that still carry the tool's wrapper. A caller that knows
+ * the record's chain root (`findChainRoot` in `../schema/modification.ts`)
+ * passes it as {@link ConflictDetectionContext.chainRoot}; the report then
+ * names the root's backup as `originalBackupPath`, the default message points
+ * there, and the "original" side of the diff views is the root's verified
+ * backup. The verdict is untouched by it: it is still judged against the
+ * record's own two digests, and the root's backup is read only to explain a
+ * conflict, never to authorise a write.
+ *
  * ## The report
  *
  * A conflict is **data, not a failure**: it is returned inside a successful
@@ -74,13 +86,20 @@
  * obtained (AAP §0.5.1):
  *
  * - `originalToInstrumented` — what the tool did. Taken from the record's own
- *   `diff`, which the patcher produced over the exact bytes it hashed.
+ *   `diff`, which the patcher produced over the exact bytes it hashed. For a
+ *   chained record with a known root it is **rendered** instead, from the
+ *   root's verified backup to the reconstructed instrumented text, so it spans
+ *   every plan version up to this one; the record's own `diff` starts from the
+ *   intermediate bytes and is never used for it.
  * - `instrumentedToCurrent` — what the developer changed on top of the patch,
  *   and the most useful hunk set for "Open diff". The instrumented text is not
  *   on disk any more, so it is reconstructed by applying the record's diff to
- *   the backup and is used **only** if the reconstruction hashes to
- *   `instrumentedHash`.
- * - `originalToCurrent` — the net divergence from the pristine file.
+ *   the record's own backup and is used **only** if the reconstruction hashes
+ *   to `instrumentedHash`.
+ * - `originalToCurrent` — the net divergence from the pristine file: the
+ *   record's own backup, or the chain root's for a chained record. When the
+ *   root's backup cannot be read back or verified, both views that start from
+ *   the original are omitted rather than rendered from the intermediate bytes.
  *
  * Every patch is rendered with `ignoreWhitespace` and `stripTrailingCr` left at
  * their defaults (`false`), and reconstruction runs with
@@ -119,9 +138,11 @@ import {
   err,
   isErr,
   noopLogger,
+  normalizePosix,
   nowEpochMs,
   ok,
   resolveWithinProject,
+  toPosix,
 } from '@debuggen/shared';
 import type { Logger, Result } from '@debuggen/shared';
 import { readFileNoFollow, sha256Hex } from '@debuggen/shared/node';
@@ -649,6 +670,27 @@ export interface ConflictDetectionContext {
    * {@link CONFLICT_MESSAGE_CHARACTER_LIMIT}.
    */
   readonly message?: string | undefined;
+
+  /**
+   * The chain root of the record being judged, when it is a chained record:
+   * the first record of its follow-up chain, whose backup is the pristine
+   * file. `findChainRoot` in `../schema/modification.ts` resolves it from the
+   * records beside the judged one.
+   *
+   * Used only to explain a conflict — never to reach a verdict, which is
+   * judged against the record's own digests as ever. When it is usable (see
+   * {@link isUsableChainRoot}) and the verdict is a conflict, the root's backup
+   * is read back and verified against the root's `originalHash`, read-only
+   * like the record's own; the report carries the root's backup path as
+   * `originalBackupPath`; the default message for `'content-changed'` and
+   * `'file-missing'` names that path and what became of it; and both views
+   * that start from the original start from the root's verified text, or are
+   * omitted when it cannot be had. A root that is not usable — the record
+   * itself, another session's record, another file's, or one given for an
+   * unchained record — is ignored with a warning, and the report is composed
+   * exactly as without one.
+   */
+  readonly chainRoot?: ModificationRecord | undefined;
 }
 
 /**
@@ -687,6 +729,15 @@ export interface ConflictReportInput {
    * cap is dropped from the report rather than shortened.
    */
   readonly diffs?: ConflictDiffs | undefined;
+
+  /**
+   * The record's chain root, when it is a chained record whose root the caller
+   * resolved. A usable root (see {@link isUsableChainRoot}) puts its backup
+   * path on the report as `originalBackupPath`; an unusable one is ignored, so
+   * a report never names another file's or another session's backup as the
+   * original.
+   */
+  readonly chainRoot?: ModificationRecord | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -727,6 +778,36 @@ export function isConflictVerdict(verdict: ConflictVerdict): verdict is Conflict
   );
 }
 
+/**
+ * Whether a candidate chain root may stand in for a record's pristine
+ * original.
+ *
+ * The one gate every use of {@link ConflictDetectionContext.chainRoot} and
+ * {@link ConflictReportInput.chainRoot} passes through, so a report can never
+ * name the wrong file's backup as "the original": the candidate must be a
+ * different record than the one judged, of the same session (backups are filed
+ * per session, and the judged record's store is the one that reads it) and of
+ * the same file, compared in normalised POSIX form — and the judged record must
+ * itself be chained, because an unchained record's own backup already is the
+ * pristine file.
+ *
+ * @param record The record a conflict is about.
+ * @param chainRoot The candidate root, if the caller supplied one.
+ * @returns `true` when `chainRoot` is present and usable for `record`.
+ */
+export function isUsableChainRoot(
+  record: ModificationRecord,
+  chainRoot: ModificationRecord | undefined,
+): boolean {
+  return (
+    chainRoot !== undefined &&
+    record.previousRecordId !== undefined &&
+    chainRoot.id !== record.id &&
+    chainRoot.sessionId === record.sessionId &&
+    normalizePosix(toPosix(chainRoot.file)) === normalizePosix(toPosix(record.file))
+  );
+}
+
 // ---------------------------------------------------------------------------
 // The public API.
 // ---------------------------------------------------------------------------
@@ -756,6 +837,12 @@ export function isConflictVerdict(verdict: ConflictVerdict): verdict is Conflict
  *    `'backup-unavailable'` if the original cannot be read back);
  *    `originalHash` → `'already-reverted'`; neither → `'content-changed'`; no
  *    file → `'file-missing'`.
+ * 6. For a conflicting verdict of a chained record whose usable
+ *    {@link ConflictDetectionContext.chainRoot} was supplied, the root's backup
+ *    is read back and verified against the root's `originalHash` too, so the
+ *    report can name and diff against the pristine file. Nothing about the
+ *    verdict changes, and a restorable or already-reverted verdict never reads
+ *    it.
  *
  * A record whose two digests are equal — a transform that changed nothing,
  * which `./patcher.ts` refuses to journal — resolves as `'restorable'`, and
@@ -779,11 +866,11 @@ export function isConflictVerdict(verdict: ConflictVerdict): verdict is Conflict
  * @param record The journal entry to judge. Both expected digests are taken
  * from it, never re-derived, and it is judged on its own terms — which is what
  * makes a chained record (`previousRecordId`) correct without this function
- * knowing anything about chains.
+ * knowing anything about chains beyond what its report says.
  * @param context The project root, the session's backup store, and optionally a
- * logger, a clock, the filesystem primitives and the developer-facing message.
- * An `InstrumentationContext` satisfies it structurally and can be passed
- * straight through.
+ * logger, a clock, the filesystem primitives, the developer-facing message and
+ * the record's chain root. An `InstrumentationContext` satisfies it
+ * structurally and can be passed straight through.
  * @returns `ok(verdict)` with one of the five verdicts, or `err(error)` for one
  * of the conditions above.
  *
@@ -844,6 +931,18 @@ export async function detectConflict(
   }
 
   const backup = await inspectBackup(record, context.backups, files, logger);
+  const chainRoot = usableChainRootOf(record, context.chainRoot, logger);
+
+  // Read only on the conflicting branches below, and at most once: the root's
+  // backup explains a conflict and never decides one, so a restorable or
+  // already-reverted verdict performs exactly the reads it always did.
+  const rootOriginal = async (): Promise<ChainRootOriginal | undefined> =>
+    chainRoot === undefined
+      ? undefined
+      : {
+          record: chainRoot,
+          inspection: await inspectBackup(chainRoot, context.backups, files, logger),
+        };
 
   const base: ConflictVerdictBase = {
     recordId: record.id,
@@ -870,6 +969,7 @@ export async function detectConflict(
       detectedAt,
       backup: backup.state,
       backupBytes: backup.bytes,
+      root: await rootOriginal(),
       message: context.message,
       files,
       logger,
@@ -929,6 +1029,7 @@ export async function detectConflict(
       backup: backup.state,
       backupBytes: backup.bytes,
       currentBytes: target.bytes,
+      root: await rootOriginal(),
       message: context.message,
       files,
       logger,
@@ -975,6 +1076,7 @@ export async function detectConflict(
     backup: backup.state,
     backupBytes: backup.bytes,
     currentBytes: target.bytes,
+    root: await rootOriginal(),
     message: context.message,
     files,
     logger,
@@ -1009,8 +1111,14 @@ export async function detectConflict(
  * malformed one fails this function's own validation of the composed report,
  * which is where the diagnostic belongs.
  *
+ * `backupPath` is always the record's own. A usable
+ * {@link ConflictReportInput.chainRoot} adds `originalBackupPath`, the root's
+ * backup path — the pristine file "Original saved at ‹path›" must name for a
+ * chained record — and an unusable one is ignored.
+ *
  * @param input The record, the reason, the detection time and the
- * developer-facing message, plus the optional current digest and views.
+ * developer-facing message, plus the optional current digest, views and chain
+ * root.
  * @returns `ok(conflict)` with a report that satisfies
  * `modificationConflictSchema`, or `err(error)` when the message is blank
  * (`INTERNAL`) or the composed report fails validation
@@ -1033,6 +1141,7 @@ export function buildConflictReport(input: ConflictReportInput): Result<Modifica
   }
 
   const diffs = input.diffs === undefined ? undefined : boundDiffs(input.diffs);
+  const chainRoot = isUsableChainRoot(input.record, input.chainRoot) ? input.chainRoot : undefined;
 
   return parseModificationConflict({
     recordId: input.record.id,
@@ -1042,6 +1151,7 @@ export function buildConflictReport(input: ConflictReportInput): Result<Modifica
     expectedHash: input.record.instrumentedHash,
     ...(input.actualHash === undefined ? {} : { actualHash: input.actualHash }),
     backupPath: input.record.backupPath,
+    ...(chainRoot === undefined ? {} : { originalBackupPath: chainRoot.backupPath }),
     detectedAt: input.detectedAt,
     message,
     ...(diffs === undefined ? {} : { diffs }),
@@ -1125,6 +1235,60 @@ interface BackupInspection {
    * describe a change that never happened.
    */
   readonly bytes?: Uint8Array | undefined;
+}
+
+/**
+ * A chained record's pristine original: its chain root, and what reading the
+ * root's backup back found.
+ *
+ * Only ever built for a root {@link isUsableChainRoot} accepted, and only on a
+ * conflicting branch — see {@link detectConflict}.
+ */
+interface ChainRootOriginal {
+  /** The chain root whose backup is the pristine file. */
+  readonly record: ModificationRecord;
+
+  /** Its backup, inspected exactly as the judged record's own is. */
+  readonly inspection: BackupInspection;
+}
+
+/**
+ * The caller's chain root when it is usable for the record, and `undefined`
+ * otherwise — with a warning when a root was supplied but refused, since that
+ * is a caller resolving the wrong record, and the report falls back to the
+ * record's own backup as the only path it can vouch for.
+ *
+ * Ids and the enumerated refusal only: no path and no content.
+ */
+function usableChainRootOf(
+  record: ModificationRecord,
+  chainRoot: ModificationRecord | undefined,
+  logger: Logger,
+): ModificationRecord | undefined {
+  if (chainRoot === undefined) {
+    return undefined;
+  }
+
+  if (isUsableChainRoot(record, chainRoot)) {
+    return chainRoot;
+  }
+
+  logger.warn('conflict detection ignored a chain root that does not belong to the record', {
+    recordId: record.id,
+    sessionId: record.sessionId,
+    chainRootId: chainRoot.id,
+    chainRootSessionId: chainRoot.sessionId,
+    reason:
+      record.previousRecordId === undefined
+        ? 'record-not-chained'
+        : chainRoot.id === record.id
+          ? 'chain-root-is-record'
+          : chainRoot.sessionId === record.sessionId
+            ? 'chain-root-other-file'
+            : 'chain-root-other-session',
+  });
+
+  return undefined;
 }
 
 /**
@@ -1294,6 +1458,13 @@ interface ConflictCompositionInput {
   /** The file's current bytes, when it is there. */
   readonly currentBytes?: Uint8Array | undefined;
 
+  /**
+   * The chained record's pristine original, when a usable chain root was
+   * supplied. Present, it replaces the record's own backup as the "original"
+   * of the views and of the default message's backup sentence.
+   */
+  readonly root?: ChainRootOriginal | undefined;
+
   /** The caller's message, if it authored one. Blank counts as absent. */
   readonly message?: string | undefined;
 
@@ -1318,8 +1489,9 @@ function composeConflictParts(
   input: ConflictCompositionInput,
 ): Result<ConflictingVerdictParts, DebuggenError> {
   const sides = gatherDiffSides(input);
-  const composed = composeDiffViews(input.record, sides);
+  const composed = composeDiffViews(input.record, sides, input.root !== undefined);
   const message = firstNonBlank(input.message) ?? composeDefaultMessage(input, composed.omissions);
+  const chainRoot = input.root?.record;
 
   const report = buildConflictReport({
     record: input.record,
@@ -1328,6 +1500,7 @@ function composeConflictParts(
     ...(input.actualHash === undefined ? {} : { actualHash: input.actualHash }),
     message,
     ...(composed.diffs === undefined ? {} : { diffs: composed.diffs }),
+    chainRoot,
   });
 
   if (!isErr(report)) {
@@ -1350,6 +1523,7 @@ function composeConflictParts(
     detectedAt: input.detectedAt,
     ...(input.actualHash === undefined ? {} : { actualHash: input.actualHash }),
     message: composeDefaultMessage(input, composed.omissions),
+    chainRoot,
   });
 
   if (isErr(minimal)) {
@@ -1369,7 +1543,10 @@ type DiffText =
 
 /** The three texts the views are composed from. */
 interface DiffSides {
-  /** The pristine file, from the verified backup. */
+  /**
+   * The pristine file: the record's own verified backup, or — for a chained
+   * record with a usable root — the root's verified backup.
+   */
   readonly original: DiffText;
 
   /** What the tool wrote, reconstructed and hash-verified. */
@@ -1384,18 +1561,27 @@ interface DiffSides {
  *
  * The instrumented text is the interesting case: it is no longer on disk once a
  * developer has edited over it, and no amount of reading recovers it. It is
- * therefore reconstructed by applying the record's own diff to the verified
- * backup — except when the file still holds the instrumented content, where the
- * current text *is* the instrumented text and no reconstruction is needed.
+ * therefore reconstructed by applying the record's own diff to the record's own
+ * verified backup — except when the file still holds the instrumented content,
+ * where the current text *is* the instrumented text and no reconstruction is
+ * needed.
+ *
+ * The original is the record's own backup for an unchained record. For a
+ * chained one it is the chain root's, and only the chain root's: the record's
+ * own backup is the previous plan version's instrumented output, so a root
+ * backup that cannot be read back or verified leaves the original unavailable
+ * rather than falling back to bytes that would present the tool's wrapper as
+ * the developer's file.
  */
 function gatherDiffSides(input: ConflictCompositionInput): DiffSides {
-  const original = textOf(input.backupBytes);
+  const recorded = textOf(input.backupBytes);
   const current = textOf(input.currentBytes);
+  const original = input.root === undefined ? recorded : textOf(input.root.inspection.bytes);
 
   const instrumented =
     input.actualHash !== undefined && input.actualHash === input.record.instrumentedHash
       ? current
-      : reconstructInstrumented(original, input);
+      : reconstructInstrumented(recorded, input);
 
   return { original, instrumented, current };
 }
@@ -1456,15 +1642,26 @@ function reconstructInstrumented(original: DiffText, input: ConflictCompositionI
  * the bytes it hashed, so it is used verbatim when it fits the cap; only when it
  * does not is a fresh patch rendered from the two texts, whose narrower context
  * may fit where the recorded one did not.
+ *
+ * A chained record's own diff starts from the previous plan version's output,
+ * so it is **never** used when the original is the chain root's: the view is
+ * always rendered from the root's text to the instrumented text, and omitted
+ * when either cannot be had.
+ *
+ * @param record The record the views describe.
+ * @param sides The three texts.
+ * @param fromChainRoot Whether `sides.original` is the chain root's backup
+ * rather than the record's own.
  */
 function composeDiffViews(
   record: ModificationRecord,
   sides: DiffSides,
+  fromChainRoot: boolean,
 ): { readonly diffs: ConflictDiffs | undefined; readonly omissions: ConflictDiffOmission[] } {
   const diffs: ConflictDiffs = {};
   const omissions: ConflictDiffOmission[] = [];
 
-  const recorded = firstNonBlank(record.diff);
+  const recorded = fromChainRoot ? undefined : firstNonBlank(record.diff);
 
   if (recorded !== undefined && recorded.length <= CONFLICT_DIFF_CHARACTER_LIMIT) {
     diffs.originalToInstrumented = recorded;
@@ -1635,6 +1832,12 @@ function omissionsFor(
  * and a path-free form replaces it when the result would not fit. The path is
  * on the report as a field regardless, which is where a user interface reads it
  * from anyway.
+ *
+ * For a chained record with a usable root, the two reasons whose headline is
+ * about the file — `'content-changed'` and `'file-missing'` — say where the
+ * **pristine** original is: the root's backup, and what reading it back found.
+ * `'backup-missing'` and `'backup-corrupt'` are about the record's own backup
+ * and keep describing it.
  */
 function composeDefaultMessage(
   input: ConflictCompositionInput,
@@ -1642,6 +1845,13 @@ function composeDefaultMessage(
 ): string {
   const file = input.record.file;
   const backup = input.backup;
+  const pristine =
+    input.root === undefined
+      ? { backup, subject: 'The recorded original' }
+      : {
+          backup: input.root.inspection.state,
+          subject: 'The original from before this file was first instrumented',
+        };
 
   const oversized = omissions
     .filter((omission) => omission.reason === 'exceeds-length-limit')
@@ -1654,9 +1864,13 @@ function composeDefaultMessage(
 
   const compose = (withPath: boolean): string => {
     const where = withPath ? ` at '${backup.path}'` : " in this session's backup directory";
+    const pristineWhere = withPath
+      ? ` at '${pristine.backup.path}'`
+      : " in this session's backup directory";
+    const pristineFate = backupFate(pristine.backup, pristineWhere, pristine.subject);
 
     if (input.reason === 'file-missing') {
-      return `'${file}' is no longer present, so this modification could not be reverted and nothing was written. ${backupFate(backup, where)}${sizeClause}`;
+      return `'${file}' is no longer present, so this modification could not be reverted and nothing was written. ${pristineFate}${sizeClause}`;
     }
 
     if (input.reason === 'backup-corrupt') {
@@ -1669,7 +1883,7 @@ function composeDefaultMessage(
       return `'${file}' still holds the content this tool wrote, but the recorded original could not be read back${where} (${why}), so nothing was written to it.${sizeClause}`;
     }
 
-    return `'${file}' was changed after it was instrumented, so nothing was written to it. ${backupFate(backup, where)}${sizeClause}`;
+    return `'${file}' was changed after it was instrumented, so nothing was written to it. ${pristineFate}${sizeClause}`;
   };
 
   const withPath = compose(true);
@@ -1686,21 +1900,25 @@ function composeDefaultMessage(
  * trusted; or it could not be read back at all, with the reason and — where it
  * adds something — the errno or store reason behind it.
  *
- * @param backup The backup state the verdict carries.
+ * @param backup The state of the backup the sentence is about: the record's
+ * own, or a chained record's root.
  * @param where Where the original is, as the caller's path-bearing or path-free
  * form words it.
+ * @param subject How the sentence names that original — "The recorded
+ * original" for the record's own backup, or the wording that makes plain a
+ * chain root's backup is the pristine file.
  * @returns One sentence.
  */
-function backupFate(backup: BackupState, where: string): string {
+function backupFate(backup: BackupState, where: string, subject: string): string {
   if (backup.available) {
-    return `The recorded original is retained${where}.`;
+    return `${subject} is retained${where}.`;
   }
 
   if (backup.reason === 'digest-mismatch') {
-    return `The recorded original${where} no longer hashes to the digest it was filed under, so it cannot be trusted; it was kept for inspection.`;
+    return `${subject}${where} no longer hashes to the digest it was filed under, so it cannot be trusted; it was kept for inspection.`;
   }
 
-  return `The recorded original could not be read back${where} (${unavailableDetail(backup)}).`;
+  return `${subject} could not be read back${where} (${unavailableDetail(backup)}).`;
 }
 
 /**

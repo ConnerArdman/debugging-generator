@@ -514,8 +514,9 @@ export interface ComponentRef {
  * One hop of a {@link CodePath}.
  *
  * `from` and `to` are the **edge's own** endpoints — the direction the
- * relationship is written in — which for a hop taken by an undirected search
- * (`direction: 'both'`) can be the reverse of the direction the path travels.
+ * relationship is written in — which for a hop taken by an upstream search
+ * (`direction: 'in'`) is always, and for one taken by an undirected search
+ * (`direction: 'both'`) can be, the reverse of the direction the path travels.
  * The traversal order is {@link CodePath.nodes}; this records what the
  * relationship actually says, and
  * {@link CodePathEdge.traversedAgainstDirection} says which of the two applies.
@@ -534,10 +535,12 @@ export interface CodePathEdge {
    * Whether the path travelled this relationship **backwards**: from its `to`
    * endpoint to its `from` endpoint.
    *
-   * Always `false` on a path found by the default downstream search, and
-   * possibly `true` on any hop of an undirected one (`direction: 'both'`),
-   * where "are these two things related at all" is answered by following an
-   * edge either way round.
+   * Always `false` on a path found by the default downstream search, always
+   * `true` on a path found by an upstream one (`direction: 'in'`), which
+   * follows every relationship back to what reaches it, and possibly `true`
+   * on any hop of an undirected one (`direction: 'both'`), where "are these
+   * two things related at all" is answered by following an edge either way
+   * round.
    *
    * It exists because the alternative is a result that reads as something it is
    * not. `edges[i]` always joins `nodes[i]` to `nodes[i + 1]`, so a consumer
@@ -581,9 +584,10 @@ export interface CodePath {
    *
    * Exactly one shorter than {@link CodePath.nodes}, and ordered as a walk of
    * that list rather than as a chain of the edges' own endpoints — which is the
-   * same thing for a downstream path and is not for an undirected one, where
-   * {@link CodePathEdge.traversedAgainstDirection} marks each hop the walk took
-   * backwards.
+   * same thing for a downstream path and is not for an upstream or an
+   * undirected one, where {@link CodePathEdge.traversedAgainstDirection} marks
+   * each hop the walk took backwards: every hop of an upstream path, some of an
+   * undirected one.
    */
   readonly edges: readonly CodePathEdge[];
 
@@ -595,9 +599,12 @@ export interface CodePath {
    * ({@link PathBetweenOptions.direction} `'both'`).
    *
    * The one field that answers "may I read this as a flow?" without inspecting
-   * every hop: `false` means every hop points downstream, so the node list is a
-   * genuine call/render/query chain; `true` means the path establishes that the
-   * endpoints are *connected*, and only
+   * every hop: `false` means the search was directed, so every hop points the
+   * same way and the node list is a genuine call/render/query chain — read as
+   * listed for a downstream search (`'out'`, no hop against its direction),
+   * and read from the `to` endpoint back to the `from` endpoint for an
+   * upstream one (`'in'`, every hop against its direction); `true` means the
+   * path establishes that the endpoints are *connected*, and only
    * {@link CodePathEdge.traversedAgainstDirection} per hop says how. A caller
    * rendering evidence for a developer or a prompt should say "related to"
    * rather than "calls" for an undirected path, and this is the field that
@@ -806,13 +813,30 @@ export interface PathBetweenOptions {
   readonly edgeKinds?: readonly CodeEdgeKind[] | undefined;
 
   /**
-   * Which way to traverse: `'out'` downstream (the default) or `'both'` for an
-   * undirected search.
+   * Which way to traverse: `'out'` downstream (the default), `'in'` upstream,
+   * or `'both'` for an undirected search. Any other value is read as `'out'`.
    *
    * `'out'` answers "what does this reach", which is the direction a flow is
-   * read in. `'both'` answers "are these two things related at all" and is
+   * read in. `'in'` answers "what reaches this" — from an API route back to the
+   * handler and the component whose code issues its request — by following
+   * incoming edges only, so its path is the same flow found from the other
+   * end: `nodes` still runs from `from` to `to`, and every hop is marked
+   * {@link CodePathEdge.traversedAgainstDirection}. It costs what `'out'`
+   * costs, and it cannot wander downstream of the start the way an undirected
+   * search does. `'both'` answers "are these two things related at all" and is
    * markedly more expensive, since every node's incoming edges join the
-   * frontier as well.
+   * frontier as well as its outgoing ones.
+   *
+   * @example
+   * ```ts
+   * // Who issues the request this route answers?
+   * queries.pathBetween(
+   *   { file: 'app/api/items/route.ts', kind: 'api-route' },
+   *   { kind: 'component' },
+   *   { edgeKinds: ['routes-to', 'calls', 'handles'], direction: 'in' },
+   * );
+   * // nodes: api-route → api-call → handler → component, every hop reversed
+   * ```
    */
   readonly direction?: CodePathDirection | undefined;
 
@@ -823,8 +847,11 @@ export interface PathBetweenOptions {
   readonly maxNodes?: number | undefined;
 }
 
-/** The traversal directions {@link CodeQueries.pathBetween} supports. */
-export type CodePathDirection = 'out' | 'both';
+/**
+ * The traversal directions {@link CodeQueries.pathBetween} supports:
+ * downstream along each edge, upstream against it, or either way.
+ */
+export type CodePathDirection = 'out' | 'in' | 'both';
 
 /**
  * A region of a file to excerpt.
@@ -1129,15 +1156,30 @@ export interface CodeQueries {
    * Unreachable within those bounds is `undefined`; reachable but with a bound
    * hit during the search sets {@link CodePath.truncated}.
    *
-   * **A path is only a flow when it is a downstream one.** The default
+   * **A path is only a flow when it is a directed one.** The default
    * `direction: 'out'` answers "what does this reach", and every hop of the
-   * result then points the way the path travels. An undirected search
-   * (`direction: 'both'`) answers the weaker "are these related at all", and
-   * its result says so in two places rather than looking like the first:
-   * {@link CodePath.undirected} is `true`, and every hop the walk took
-   * backwards carries {@link CodePathEdge.traversedAgainstDirection}. Both
-   * kinds of result are read the same way — walk {@link CodePath.nodes}, where
-   * `edges[i]` is the hop from `nodes[i]` to `nodes[i + 1]`.
+   * result then points the way the path travels. `direction: 'in'` answers
+   * "what reaches this": it follows incoming edges only, so the result is the
+   * same kind of flow found from its far end, and every hop carries
+   * {@link CodePathEdge.traversedAgainstDirection} — the flow runs from `to`
+   * back to `from`. An undirected search (`direction: 'both'`) answers the
+   * weaker "are these related at all", and its result says so in two places
+   * rather than looking like either: {@link CodePath.undirected} is `true`,
+   * and every hop the walk took backwards carries
+   * {@link CodePathEdge.traversedAgainstDirection}. Every kind of result is
+   * read the same way — walk {@link CodePath.nodes}, where `edges[i]` is the
+   * hop from `nodes[i]` to `nodes[i + 1]`.
+   *
+   * **The node budget is spent only on nodes that can lead somewhere.** A
+   * discovered node that is not a target, and none of whose expansion edges —
+   * under the requested direction and edge-kind filter — reaches a node the
+   * search has not yet discovered, is never queued: expanding it later could
+   * discover nothing, because the discovered set only grows, and would only
+   * spend an expansion. A source is judged the same way. Target checks happen
+   * at discovery exactly as before, so the path returned is the one an
+   * unbounded search returns; the difference is that a search whose sources or
+   * whose frontier fan out into many leaves — every inline handler of a
+   * component, say — reaches the target within a budget it used to exhaust.
    *
    * An argument that is neither a `nodeId` string nor a selector naming at
    * least one of `file`, `symbol`, `name` or `kind` resolves to nothing, which
@@ -2109,6 +2151,13 @@ interface FrontierStep {
 
   /** How many hops from the nearest `from` endpoint it sits. */
   readonly depth: number;
+
+  /**
+   * The node's expansion edges under the search's direction and edge-kind
+   * filter, in canonical order — computed once, when the node was discovered
+   * and judged worth queuing, and reused when it is expanded.
+   */
+  readonly edges: readonly CodeEdge[];
 }
 
 /** How a node was first reached, so a completed search can be walked back. */
@@ -3035,6 +3084,7 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
   /**
    * The edges to expand from one node, in the graph's canonical edge-`id` order.
    *
+   * Outgoing edges for `'out'`, incoming edges for `'in'`, both for `'both'`.
    * The canonical order is what makes the search's outcome reproducible: the
    * frontier is extended in the same sequence on every run, so the first
    * complete path found is always the same path.
@@ -3044,9 +3094,12 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
     direction: CodePathDirection,
     edgeKinds: readonly CodeEdgeKind[] | undefined,
   ): readonly CodeEdge[] => {
-    const outgoing = graph.outgoing(nodeId);
     const candidates =
-      direction === 'both' ? [...outgoing, ...graph.incoming(nodeId)] : [...outgoing];
+      direction === 'out'
+        ? [...graph.outgoing(nodeId)]
+        : direction === 'in'
+          ? [...graph.incoming(nodeId)]
+          : [...graph.outgoing(nodeId), ...graph.incoming(nodeId)];
     const filtered =
       edgeKinds === undefined
         ? candidates
@@ -3153,7 +3206,11 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
 
     const maxDepth = clampCap(queryOptions?.maxDepth, limits.maxPathDepth);
     const maxNodes = clampCap(queryOptions?.maxNodes, limits.maxPathNodes);
-    const direction: CodePathDirection = queryOptions?.direction === 'both' ? 'both' : 'out';
+    // `'both'` and `'in'` as asked; anything else — absent, or a value of
+    // unknown provenance forwarded from a model's query — is the default.
+    const requested = queryOptions?.direction;
+    const direction: CodePathDirection =
+      requested === 'both' || requested === 'in' ? requested : 'out';
 
     const sources = resolveEndpoint(from);
     const targets = resolveEndpoint(to);
@@ -3166,6 +3223,31 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
     const visited = new Set<string>();
     const frontier: FrontierStep[] = [];
 
+    /**
+     * Queues a discovered node that is not a target, unless it is a dead end.
+     *
+     * A dead end is a node none of whose expansion edges reaches a node not
+     * yet discovered — a leaf, or a node reachable only from where the walk
+     * came. Expanding one later could discover nothing, because the
+     * discovered set only grows, so leaving it out changes no discovery and
+     * therefore no answer: it only stops the node budget being spent on it,
+     * and a dead end sets no {@link CodePath.truncated} either, since no bound
+     * cut anything short there.
+     */
+    const enqueue = (node: CodeNode, depth: number): void => {
+      const edges = expansionEdges(node.id, direction, edgeKinds);
+      const leadsSomewhere = edges.some(
+        (edge) => !visited.has(edge.from === node.id ? edge.to : edge.from),
+      );
+
+      if (leadsSomewhere) {
+        frontier.push({ node, depth, edges });
+      }
+    };
+
+    // Every source is marked discovered before any is judged, so a source
+    // whose only neighbours are other sources is recognised as a dead end.
+    const seeds: CodeNode[] = [];
     for (const source of sources) {
       if (targetIds.has(source.id)) {
         // The endpoints name the same node: a path of one node and no hops.
@@ -3173,8 +3255,11 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
       }
       if (!visited.has(source.id)) {
         visited.add(source.id);
-        frontier.push({ node: source, depth: 0 });
+        seeds.push(source);
       }
+    }
+    for (const seed of seeds) {
+      enqueue(seed, 0);
     }
 
     let expanded = 0;
@@ -3195,7 +3280,7 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
       }
       expanded += 1;
 
-      for (const edge of expansionEdges(step.node.id, direction, edgeKinds)) {
+      for (const edge of step.edges) {
         const nextId = edge.from === step.node.id ? edge.to : edge.from;
         if (visited.has(nextId)) {
           continue;
@@ -3210,7 +3295,7 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
         if (targetIds.has(nextId)) {
           return reconstructPath(next, links, maxDepth, direction, truncated);
         }
-        frontier.push({ node: next, depth: step.depth + 1 });
+        enqueue(next, step.depth + 1);
       }
     }
 

@@ -99,8 +99,14 @@
  * each record's actions and scrolls a wide diff line with the arrow keys once
  * the region has focus. Each disclosure carries `aria-expanded` and, while its
  * diff is open, `aria-controls` naming the detail it opened. Each button's
- * accessible name starts with its visible text and ends with the record's
- * file, so a screen-reader user hears which record it acts on.
+ * accessible name starts with its visible text and names the record's file,
+ * so a screen-reader user hears which record it acts on. When the list holds
+ * more than one record on a file — a follow-up plan layering a record onto an
+ * earlier one — the file alone no longer tells the items apart, so each of
+ * their names continues with the record's place among them and its plan
+ * version ("View diff of ‹file›, change 2 of 2, plan v2"; see
+ * {@link rowDisambiguator}). No two items' controls share a name, and nothing
+ * painted changes.
  *
  * Spacing is `Stack`'s; every other value resolves through the
  * `dgv-modifications` and `dgv-path` blocks of `../styles.css` to a `--dg-*`
@@ -148,13 +154,19 @@
  * A `conflict` item says what the product did, in AAP 0.5.5's words: "‹file›
  * was edited while instrumented. Debug Generator will not overwrite it.
  * Original saved at ‹backup path›." — the file and the backup path taken from
- * the record, never constructed. When the service reported a different reason
- * (the file was deleted, the backup could not be read, …) its own message is
- * shown instead, verbatim, because the edit sentence would then be untrue. It
- * never says the file was reverted, which keeps each item consistent with the
- * session's cleanup outcome that `App.tsx` shows on its own (AAP 0.5.1, 0.5.5).
- * A `failed` item says why it is not applied — the write stopped part-way —
- * and what cleanup will do about it, beside the saved original.
+ * the records, never constructed. The backup path is the pristine original's:
+ * for a record layered on an earlier plan version's (`previousRecordId`), whose
+ * own backup holds that version's instrumented output, it is the chain root's
+ * backup — the conflict entry's `originalBackupPath`, or
+ * {@link originalBackupPathOf} over the listed records while no entry names
+ * it — and for any other record its own. When the service reported a
+ * different reason (the file was deleted, the backup could not be read, …) its
+ * own message is shown instead, verbatim, because the edit sentence would then
+ * be untrue. It never says the file was reverted, which keeps each item
+ * consistent with the session's cleanup outcome that `App.tsx` shows on its
+ * own (AAP 0.5.1, 0.5.5). A `failed` item says why it is not applied — the
+ * write stopped part-way — and what cleanup will do about it, beside the same
+ * pristine original.
  *
  * ## States (AAP 0.5.5 — never a blank area)
  *
@@ -201,7 +213,7 @@ import {
 } from '@debuggen/panel-renderer';
 import type { BadgeTone } from '@debuggen/panel-renderer';
 import type { ModificationConflict, ModificationRecord } from '@debuggen/protocol';
-import { assertNever } from '@debuggen/shared';
+import { assertNever, normalizePosix, toPosix } from '@debuggen/shared';
 
 import { describePath, describePaths } from '../path-display';
 import type { PathDisplay } from '../path-display';
@@ -448,6 +460,17 @@ const HIDE_DIFF_LABEL = 'Hide diff';
 const OPEN_FILE_LABEL = 'Open file';
 
 /**
+ * The words of the row disambiguator — ", change ‹k› of ‹n›, plan v‹N›" — that
+ * {@link rowDisambiguator} appends to the accessible name of every control of
+ * an item whose file the list names more than once. Generic product
+ * vocabulary; "plan v" matches the meta line's visible "Plan v‹N›", so the
+ * version a reader hears is the one painted on the item.
+ */
+const ROW_CHANGE_LABEL = 'change';
+const ROW_OF_LABEL = 'of';
+const ROW_PLAN_LABEL = 'plan v';
+
+/**
  * What each diff compares, shown in the diff's header and in its region's
  * name, so the reader never has to infer which of a conflict's two diffs is on
  * screen.
@@ -602,6 +625,80 @@ type PathDisplays = ReadonlyMap<string, PathDisplay>;
  */
 function displayOf(displays: PathDisplays, file: string): PathDisplay {
   return displays.get(file) ?? describePath(file);
+}
+
+/**
+ * Where one record stands among the list's records on the same file.
+ *
+ * A follow-up plan that instruments a file again layers a record onto the
+ * earlier one — the same `file`, a later `planVersion`, `previousRecordId`
+ * set — so one list can hold several items for one file, and the file alone
+ * cannot tell their controls apart.
+ */
+interface FileOccurrence {
+  /** The record's 1-based position among the list's records on its file, in list order. */
+  readonly position: number;
+  /** How many of the list's records name that file; `1` for a file named once. */
+  readonly count: number;
+}
+
+/** The occurrence of a record whose file the list names once. */
+const SOLE_OCCURRENCE: FileOccurrence = Object.freeze({ position: 1, count: 1 });
+
+/**
+ * Counts, for every record of the list, how many records share its file and
+ * where it stands among them. Positions follow list order — the order the
+ * installer applied the plans in — so "change 1" is a file's earliest layer.
+ *
+ * Files are compared exactly as received, the key `describePaths` uses too, so
+ * two paths that differ only in an invisible character stay two files here as
+ * they do in the path chip.
+ *
+ * @param files Every record's `file`, in list order.
+ * @returns One occurrence per entry of `files`, at the same index.
+ */
+function fileOccurrences(files: readonly string[]): readonly FileOccurrence[] {
+  const counts = new Map<string, number>();
+  for (const file of files) {
+    counts.set(file, (counts.get(file) ?? 0) + 1);
+  }
+
+  const seen = new Map<string, number>();
+  return files.map((file) => {
+    const position = (seen.get(file) ?? 0) + 1;
+    seen.set(file, position);
+    return { position, count: counts.get(file) ?? position };
+  });
+}
+
+/**
+ * What follows the record's file in the accessible name of each control of its
+ * item, so that no two items' controls share a name.
+ *
+ * Empty for a file the list names once, whose names therefore stay exactly
+ * "View diff of ‹file›", "Open file ‹file›" and so on. For a file named more
+ * than once it is ", change ‹k› of ‹n›, plan v‹N›": the position is what makes
+ * the name unique — a journal may hold two records of one plan version on one
+ * file — and the plan version ties the name to the version the item's meta
+ * line shows. Appended after the file, the suffix leaves every name starting
+ * with its control's visible text (WCAG 2.5.3, label in name), and it is never
+ * painted: the meta line already shows the version, and the item's place in
+ * the list shows its order.
+ *
+ * @example
+ * rowDisambiguator({ position: 2, count: 2 }, 2); // ", change 2 of 2, plan v2"
+ * rowDisambiguator({ position: 1, count: 1 }, 1); // ""
+ *
+ * @param occurrence Where the record stands among the list's records on its file.
+ * @param planVersion The record's `planVersion`.
+ * @returns The suffix, or `''` for a file the list names once.
+ */
+function rowDisambiguator(occurrence: FileOccurrence, planVersion: number): string {
+  if (occurrence.count <= 1) {
+    return '';
+  }
+
+  return `, ${ROW_CHANGE_LABEL} ${String(occurrence.position)} ${ROW_OF_LABEL} ${String(occurrence.count)}, ${ROW_PLAN_LABEL}${String(planVersion)}`;
 }
 
 /**
@@ -811,6 +908,122 @@ function editDiffOf(conflict: ModificationConflict | undefined): EditDiff | unde
 }
 
 /**
+ * A record's file in the one spelling a chain is matched on: POSIX
+ * separators, normalised, so `./src/a.ts` and `src/a.ts` are one file — the
+ * comparison the service's own chain lookup makes.
+ *
+ * @param record The record.
+ * @returns Its normalised project-relative path.
+ */
+function chainFileKey(record: ModificationRecord): string {
+  return normalizePosix(toPosix(record.file));
+}
+
+/**
+ * Finds a record's chain root among the records given: the root-most ancestor
+ * reachable through `previousRecordId`, or `undefined` for an unchained record
+ * or one whose parent is not among them.
+ *
+ * The same walk the service resolves a conflict's `originalBackupPath` with,
+ * over the same candidates:
+ *
+ * - only records of the record's **session** and **file** (normalised, see
+ *   {@link chainFileKey}) are followed — a chain crosses neither boundary;
+ * - a `reverted` record is not a candidate, because its restore verified and
+ *   its backup was deleted, so it can no longer be the saved original;
+ * - a **missing parent** ends the walk at the deepest ancestor present;
+ * - a **cycle** (`A → B → A`) ends the walk at the last record before it would
+ *   repeat, and the walk visits each candidate at most once, so a malformed
+ *   journal can neither hang it nor answer with the record itself;
+ * - when two candidates share an id, the first one given is used.
+ *
+ * @param record The record whose root is wanted.
+ * @param records The records to look its ancestors up in — the session's
+ *   listed records; may include `record` itself.
+ * @returns The chain root, or `undefined`.
+ */
+function chainRootOf(
+  record: ModificationRecord,
+  records: readonly ModificationRecord[],
+): ModificationRecord | undefined {
+  if (record.previousRecordId === undefined) {
+    return undefined;
+  }
+
+  const file = chainFileKey(record);
+  const candidates = new Map<string, ModificationRecord>();
+  for (const candidate of records) {
+    if (
+      candidate.status !== 'reverted' &&
+      candidate.sessionId === record.sessionId &&
+      !candidates.has(candidate.id) &&
+      chainFileKey(candidate) === file
+    ) {
+      candidates.set(candidate.id, candidate);
+    }
+  }
+
+  const visited = new Set<string>([record.id]);
+  let root: ModificationRecord | undefined;
+  let parentId: string | undefined = record.previousRecordId;
+
+  // Each step either reaches a record not yet visited or stops, so the walk
+  // takes at most one step per candidate.
+  while (parentId !== undefined && !visited.has(parentId)) {
+    const parent = candidates.get(parentId);
+    if (parent === undefined) {
+      break;
+    }
+    visited.add(parent.id);
+    root = parent;
+    parentId = parent.previousRecordId;
+  }
+
+  return root;
+}
+
+/**
+ * Where the pristine original of a record's file is saved — the path "Original
+ * saved at" names for it.
+ *
+ * A record layered on an earlier plan version's result (`previousRecordId`)
+ * backed up that version's instrumented output, which still carries Debug
+ * Generator's wrapper; only the first record of its chain backed up the file
+ * as it was before the session instrumented it. So a chained record's original
+ * is its **chain root's** backup (see {@link chainRootOf}), and an unchained
+ * record's is its own `backupPath`. The service reports the same path as a
+ * conflict's `originalBackupPath`; this resolves it from the listed records,
+ * for the surfaces that show a record without a conflict entry — a failed
+ * record, a record a partial cleanup did not restore, a conflict whose entry
+ * has not arrived.
+ *
+ * Pure: it reads only the records it is handed and never constructs a path.
+ * A root is used even if its path were blank — the caller then shows no
+ * saved-at sentence — because falling back to the layered record's own backup
+ * would present instrumented bytes as the original.
+ *
+ * @param record The record whose original is wanted.
+ * @param records The session's listed records, in any order; may include
+ *   `record` itself.
+ * @returns The chain root's `backupPath`, or `record.backupPath` when the record
+ *   is unchained or its parent is not among `records`.
+ *
+ * @example
+ * ```ts
+ * // root: the plan-v1 record; layered: plan v2 on the same file, previousRecordId = root.id
+ * originalBackupPathOf(layered, [root, layered]); // root.backupPath
+ * originalBackupPathOf(root, [root, layered]); // root.backupPath
+ * ```
+ */
+export function originalBackupPathOf(
+  record: ModificationRecord,
+  records: readonly ModificationRecord[],
+): string {
+  const root = chainRootOf(record, records);
+  return root === undefined ? record.backupPath : root.backupPath;
+}
+
+/**
  * A saved original's path as a sentence of its own — "Original saved at
  * ‹path›." — with the path wrapped, never shortened, and identified so a
  * refused copy can select it.
@@ -832,7 +1045,16 @@ interface ConflictCalloutProps {
   readonly record: ModificationRecord;
   readonly conflict: ModificationConflict | undefined;
   readonly edit: EditDiff | undefined;
+  /**
+   * Where the file's pristine original is saved: the conflict entry's
+   * `originalBackupPath` when it carries one, otherwise
+   * {@link originalBackupPathOf} over the listed records — for a chained
+   * record its chain root's backup, for any other its own.
+   */
+  readonly originalPath: string;
   readonly pathId: string;
+  /** The "Copy path" control's accessible name, unique to this item (see {@link RecordNote}). */
+  readonly copyPathLabel: string;
 }
 
 /**
@@ -842,27 +1064,30 @@ interface ConflictCalloutProps {
  * whose conflict entry has not arrived — the message is AAP 0.5.5's sentence,
  * "‹file› was edited while instrumented. Debug Generator will not overwrite
  * it. Original saved at ‹backup path›.", composed from the record's own file
- * and backup path. For any other reason the service reported, its own message
- * is shown verbatim instead, and the saved original follows as a sentence of
- * its own — except when the reason is that the backup is missing, where naming
- * its path would promise a file that is not there.
+ * and the path of its pristine original (`props.originalPath`: for a record
+ * layered on an earlier plan version's, the chain root's backup, never the
+ * record's own, which holds that version's instrumented output). For any other
+ * reason the service reported, its own message is shown verbatim instead, and
+ * the saved original follows as a sentence of its own — except when the reason
+ * is that the backup is missing, where naming its path would promise a file
+ * that is not there.
  *
  * Both values render through `Code wrap`, byte-faithful and broken across lines
  * in a narrow view rather than clipped or ellipsized, and "Copy path" copies
- * the backup path exactly. The schema requires a non-blank backup path; should
- * a record arrive without one anyway, only the saved-at sentence and its copy
+ * the original's path exactly. The schema requires a non-blank backup path;
+ * should one arrive blank anyway, only the saved-at sentence and its copy
  * control are left out — a path is never constructed or guessed. The message
  * never says the file was reverted, which keeps the item consistent with the
  * session's cleanup outcome.
  */
 function ConflictCallout(props: ConflictCalloutProps): ReactElement {
-  const { record, conflict, edit, pathId } = props;
+  const { record, conflict, edit, originalPath, pathId, copyPathLabel } = props;
   const reason = conflict?.reason;
   const serviceMessage =
     conflict !== undefined && reason !== 'content-changed' && hasText(conflict.message)
       ? conflict.message
       : undefined;
-  const showPath = hasText(record.backupPath) && reason !== 'backup-missing';
+  const showPath = hasText(originalPath) && reason !== 'backup-missing';
 
   return (
     <div className="dgv-modifications__note dgv-modifications__callout dgv-modifications__callout--warning">
@@ -876,7 +1101,7 @@ function ConflictCallout(props: ConflictCalloutProps): ReactElement {
             <>
               {CONFLICT_SAVED_AT}
               <Code size="sm" wrap id={pathId}>
-                {record.backupPath}
+                {originalPath}
               </Code>
               {CONFLICT_END}
             </>
@@ -887,7 +1112,7 @@ function ConflictCallout(props: ConflictCalloutProps): ReactElement {
           <Text as="p" size="sm" className="dgv-modifications__message">
             {serviceMessage}
           </Text>
-          {showPath ? <SavedAt path={record.backupPath} pathId={pathId} /> : null}
+          {showPath ? <SavedAt path={originalPath} pathId={pathId} /> : null}
         </>
       )}
       {reason === 'content-changed' && edit === undefined ? (
@@ -896,11 +1121,7 @@ function ConflictCallout(props: ConflictCalloutProps): ReactElement {
         </Text>
       ) : null}
       {showPath ? (
-        <CopyPathButton
-          path={record.backupPath}
-          accessibleLabel={copyBackupPathLabel(record.file)}
-          targetId={pathId}
-        />
+        <CopyPathButton path={originalPath} accessibleLabel={copyPathLabel} targetId={pathId} />
       ) : null}
     </div>
   );
@@ -910,28 +1131,27 @@ function ConflictCallout(props: ConflictCalloutProps): ReactElement {
  * A failed record's explanation, at the item's full width: why it is not
  * applied and what cleanup will do (see {@link describeStatus}), then the
  * saved original with its copy control, which the lifecycle keeps for exactly
- * this record.
+ * this record — for a record layered on an earlier plan version's, its chain
+ * root's backup (`props.originalPath`, {@link originalBackupPathOf}), the file
+ * as it was before the session instrumented it.
  */
 function FailedCallout(props: {
-  readonly record: ModificationRecord;
   readonly note: string;
+  readonly originalPath: string;
   readonly pathId: string;
+  readonly copyPathLabel: string;
 }): ReactElement {
-  const { record, note, pathId } = props;
+  const { note, originalPath, pathId, copyPathLabel } = props;
 
   return (
     <div className="dgv-modifications__note dgv-modifications__callout dgv-modifications__callout--danger">
       <Text as="p" size="sm" className="dgv-modifications__message">
         {note}
       </Text>
-      {hasText(record.backupPath) ? (
+      {hasText(originalPath) ? (
         <>
-          <SavedAt path={record.backupPath} pathId={pathId} />
-          <CopyPathButton
-            path={record.backupPath}
-            accessibleLabel={copyBackupPathLabel(record.file)}
-            targetId={pathId}
-          />
+          <SavedAt path={originalPath} pathId={pathId} />
+          <CopyPathButton path={originalPath} accessibleLabel={copyPathLabel} targetId={pathId} />
         </>
       ) : null}
     </div>
@@ -942,17 +1162,34 @@ function FailedCallout(props: {
  * The explanation under a record's path, at the item's full width: the
  * conflict callout for a `conflict`, the failure callout for `failed`, the
  * status's own sentence for `pending`, and nothing for `applied` and
- * `reverted`, whose labels say everything.
+ * `reverted`, whose labels say everything. `originalPath` is where the file's
+ * pristine original is saved, which both callouts name.
+ *
+ * `copyPathLabel` is the accessible name of a callout's "Copy path" control:
+ * "Copy path of the saved original of ‹file›", followed by the item's
+ * {@link rowDisambiguator} when the list holds more than one record on the
+ * file — the item composes it, because only the list knows that.
  */
 function RecordNote(props: {
   readonly record: ModificationRecord;
   readonly conflict: ModificationConflict | undefined;
   readonly edit: EditDiff | undefined;
+  readonly originalPath: string;
   readonly pathId: string;
+  readonly copyPathLabel: string;
 }): ReactElement | null {
-  const { record, conflict, edit, pathId } = props;
+  const { record, conflict, edit, originalPath, pathId, copyPathLabel } = props;
   if (record.status === 'conflict') {
-    return <ConflictCallout record={record} conflict={conflict} edit={edit} pathId={pathId} />;
+    return (
+      <ConflictCallout
+        record={record}
+        conflict={conflict}
+        edit={edit}
+        originalPath={originalPath}
+        pathId={pathId}
+        copyPathLabel={copyPathLabel}
+      />
+    );
   }
 
   const { note } = describeStatus(record.status);
@@ -961,7 +1198,14 @@ function RecordNote(props: {
   }
 
   if (record.status === 'failed') {
-    return <FailedCallout record={record} note={note} pathId={pathId} />;
+    return (
+      <FailedCallout
+        note={note}
+        originalPath={originalPath}
+        pathId={pathId}
+        copyPathLabel={copyPathLabel}
+      />
+    );
   }
 
   return (
@@ -993,7 +1237,11 @@ function HashItem(props: { readonly label: string; readonly hash: string }): Rea
 interface DiffToggleProps {
   /** The visible text while collapsed: "View diff" or "Open diff". */
   readonly label: string;
-  /** What follows the visible text in the accessible name: "of ‹file›". */
+  /**
+   * What follows the visible text in the accessible name: "of ‹file›", with
+   * the item's {@link rowDisambiguator} after the file when the list holds
+   * more than one record on it.
+   */
   readonly target: string;
   readonly expanded: boolean;
   /** The id of the open detail; set only while this toggle's diff is open. */
@@ -1029,6 +1277,12 @@ interface ModificationItemProps {
   readonly record: ModificationRecord;
   /** The record's conflict entry; considered only for a `conflict` record. */
   readonly conflict: ModificationConflict | undefined;
+  /**
+   * Where the record's pristine original is saved according to the listed
+   * records ({@link originalBackupPathOf}); a conflict entry's own
+   * `originalBackupPath` takes precedence over it.
+   */
+  readonly originalBackupPath: string;
   /** Which of this record's diffs is open, if any. */
   readonly openKind: DiffKind | undefined;
   readonly onToggle: (recordId: string, kind: DiffKind) => void;
@@ -1037,6 +1291,11 @@ interface ModificationItemProps {
   readonly idBase: string;
   /** The display split of the record's file within this list. */
   readonly display: PathDisplay;
+  /**
+   * Where the record stands among the list's records on its file; it decides
+   * whether the item's control names carry a {@link rowDisambiguator}.
+   */
+  readonly occurrence: FileOccurrence;
 }
 
 /**
@@ -1055,16 +1314,35 @@ interface ModificationItemProps {
  * path reaches the accessibility tree through a visually hidden copy of the
  * whole path, which a browser reads without the spaces it inserts between
  * flex parts. The chip's tooltip is the whole path.
+ *
+ * Every control's accessible name is its visible text, then the record's file,
+ * then — only when the list holds more than one record on that file — the
+ * item's {@link rowDisambiguator}, so a chained record's controls never share a
+ * name with its predecessor's.
  */
 function ModificationItem(props: ModificationItemProps): ReactElement {
-  const { record, conflict, openKind, onToggle, onOpenFile, idBase, display } = props;
+  const {
+    record,
+    conflict,
+    originalBackupPath,
+    openKind,
+    onToggle,
+    onOpenFile,
+    idBase,
+    display,
+    occurrence,
+  } = props;
   const recorded = formatRecordedAt(record.appliedAt);
   const tone = STATUS_TONE[record.status];
   const { label } = describeStatus(record.status);
   const entry = record.status === 'conflict' ? conflict : undefined;
   const edit = editDiffOf(entry);
+  // The service resolved the chain root over the whole journal, so its answer
+  // wins over the listed records', which may be a partial page of it.
+  const originalPath = entry?.originalBackupPath ?? originalBackupPath;
   const detailId = `${idBase}-diff`;
   const pathId = `${idBase}-backup`;
+  const row = rowDisambiguator(occurrence, record.planVersion);
 
   // An "edit" disclosure whose diff has since gone (a newer conflict entry
   // without one) shows nothing rather than a stale diff.
@@ -1112,7 +1390,14 @@ function ModificationItem(props: ModificationItemProps): ReactElement {
           </Text>
         )}
       </Stack>
-      <RecordNote record={record} conflict={entry} edit={edit} pathId={pathId} />
+      <RecordNote
+        record={record}
+        conflict={entry}
+        edit={edit}
+        originalPath={originalPath}
+        pathId={pathId}
+        copyPathLabel={`${copyBackupPathLabel(record.file)}${row}`}
+      />
       <Stack
         direction="horizontal"
         gap={1}
@@ -1123,7 +1408,7 @@ function ModificationItem(props: ModificationItemProps): ReactElement {
         {edit === undefined ? null : (
           <DiffToggle
             label={OPEN_DIFF_LABEL}
-            target={`of your edit to ${record.file}`}
+            target={`of your edit to ${record.file}${row}`}
             expanded={shown === 'edit'}
             controls={shown === 'edit' ? detailId : undefined}
             onToggle={() => {
@@ -1133,7 +1418,7 @@ function ModificationItem(props: ModificationItemProps): ReactElement {
         )}
         <DiffToggle
           label={VIEW_DIFF_LABEL}
-          target={`of ${record.file}`}
+          target={`of ${record.file}${row}`}
           expanded={shown === 'change'}
           controls={shown === 'change' ? detailId : undefined}
           onToggle={() => {
@@ -1144,7 +1429,7 @@ function ModificationItem(props: ModificationItemProps): ReactElement {
           <Button
             variant="ghost"
             size="sm"
-            aria-label={`${OPEN_FILE_LABEL} ${record.file}`}
+            aria-label={`${OPEN_FILE_LABEL} ${record.file}${row}`}
             onClick={() => {
               onOpenFile(record.file);
             }}
@@ -1273,6 +1558,21 @@ export function ModificationsList(props: ModificationsListProps): ReactElement {
     [modifications],
   );
 
+  // Where each record's pristine original is saved, index-aligned with the
+  // records: a chain is a property of the whole list, like the path splits.
+  const originalPaths = useMemo(
+    () => modifications.map((record) => originalBackupPathOf(record, modifications)),
+    [modifications],
+  );
+
+  // Likewise whether a file is named by more than one record, and where each
+  // record stands among them: indexed like `modifications`, so an item's
+  // control names carry a row disambiguator only when its file repeats.
+  const occurrences = useMemo(
+    () => fileOccurrences(modifications.map((record) => record.file)),
+    [modifications],
+  );
+
   // Records the journal holds that the list does not: stated, never hidden.
   const shortfall =
     total !== undefined && total > modifications.length ? (
@@ -1298,16 +1598,18 @@ export function ModificationsList(props: ModificationsListProps): ReactElement {
   } else {
     const list = (
       <ol className="dgv-modifications__list" aria-label={CAPTION}>
-        {modifications.map((record) => (
+        {modifications.map((record, index) => (
           <li key={record.id} className="dgv-modifications__item">
             <ModificationItem
               record={record}
               conflict={conflictByRecord.get(record.id)}
+              originalBackupPath={originalPaths[index] ?? record.backupPath}
               openKind={open?.recordId === record.id ? open.kind : undefined}
               onToggle={toggle}
               onOpenFile={onOpenFile}
               idBase={`${idPrefix}-${record.id}`}
               display={displayOf(displays, record.file)}
+              occurrence={occurrences[index] ?? SOLE_OCCURRENCE}
             />
           </li>
         ))}

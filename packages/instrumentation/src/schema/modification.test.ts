@@ -90,6 +90,7 @@ import {
   OPEN_MODIFICATION_STATUSES,
   SHA256_HEX_PATTERN,
   createModificationRecord,
+  findChainRoot,
   isModificationStatus,
   isOpenModificationStatus,
   modificationConflictReasonSchema,
@@ -1047,6 +1048,128 @@ describe('a follow-up chain over one file', () => {
   });
 });
 
+describe('findChainRoot', () => {
+  /** The digest a third plan version writes on top of {@link CHAINED_HASH}. */
+  const THIRD_HASH = hashFixture('5e');
+
+  /**
+   * One link of a chain over {@link TARGET_FILE}: its own backup is filed
+   * under the bytes it replaced, exactly as the patcher files it.
+   */
+  const link = (
+    label: string,
+    originalHash: string,
+    instrumentedHash: string,
+    overrides: RecordOverrides = {},
+  ): ModificationRecord =>
+    validRecord({
+      id: modificationIdFixture(label),
+      originalHash,
+      instrumentedHash,
+      backupPath: backupPathFixture(SESSION_ID, originalHash),
+      status: 'applied',
+      ...overrides,
+    });
+
+  const root = link('root', PRISTINE_HASH, PATCHED_HASH);
+  const middle = link('middle', PATCHED_HASH, CHAINED_HASH, {
+    planVersion: 2,
+    previousRecordId: root.id,
+  });
+  const tip = link('tip', CHAINED_HASH, THIRD_HASH, {
+    planVersion: 3,
+    previousRecordId: middle.id,
+  });
+
+  it('answers undefined for an unchained record: its own backup is already the pristine file', () => {
+    expect(findChainRoot(root, [root, middle, tip])).toBeUndefined();
+  });
+
+  it('finds the root of a two-link chain, whose backup is the pristine file', () => {
+    const found = findChainRoot(middle, [root, middle]);
+
+    expect(found?.id).toBe(root.id);
+    expect(found?.backupPath).toBe(backupPathFixture(SESSION_ID, PRISTINE_HASH));
+    // The chained record's own backup holds the first version's output instead.
+    expect(middle.backupPath).toBe(backupPathFixture(SESSION_ID, PATCHED_HASH));
+  });
+
+  it('walks a three-link chain to its root, whatever order the records arrive in', () => {
+    for (const records of [
+      [root, middle, tip],
+      [tip, middle, root],
+      [middle, root, tip],
+    ]) {
+      expect(findChainRoot(tip, records)?.id).toBe(root.id);
+    }
+
+    // An iterable, not only an array: a caller may hand over a Map's values.
+    expect(
+      findChainRoot(
+        tip,
+        new Map([
+          [middle.id, middle],
+          [root.id, root],
+        ]).values(),
+      )?.id,
+    ).toBe(root.id);
+  });
+
+  it('answers undefined when the parent is not among the records', () => {
+    expect(findChainRoot(middle, [middle, tip])).toBeUndefined();
+    expect(findChainRoot(middle, [])).toBeUndefined();
+  });
+
+  it('stops at the deepest ancestor present when a record mid-chain is missing', () => {
+    const rootless = link('rootless', PATCHED_HASH, CHAINED_HASH, {
+      planVersion: 2,
+      previousRecordId: modificationIdFixture('gone'),
+    });
+    const above = link('above', CHAINED_HASH, THIRD_HASH, {
+      planVersion: 3,
+      previousRecordId: rootless.id,
+    });
+
+    expect(findChainRoot(above, [rootless, above])?.id).toBe(rootless.id);
+    expect(findChainRoot(tip, [tip, middle])?.id).toBe(middle.id);
+  });
+
+  it('terminates on a cycle and never answers with the record itself', () => {
+    const firstId = modificationIdFixture('cyclea');
+    const secondId = modificationIdFixture('cycleb');
+    const first = link('cyclea', PATCHED_HASH, CHAINED_HASH, { previousRecordId: secondId });
+    const second = link('cycleb', CHAINED_HASH, PATCHED_HASH, { previousRecordId: firstId });
+
+    expect(findChainRoot(first, [first, second])?.id).toBe(second.id);
+    expect(findChainRoot(second, [first, second])?.id).toBe(first.id);
+  });
+
+  it('follows no link into another session or another file', () => {
+    const otherSessionParent = link('root', PRISTINE_HASH, PATCHED_HASH, {
+      sessionId: OTHER_SESSION_ID,
+      backupPath: backupPathFixture(OTHER_SESSION_ID, PRISTINE_HASH),
+    });
+    const otherFileParent = link('root', PRISTINE_HASH, PATCHED_HASH, {
+      file: 'src/lib/elsewhere.ts',
+    });
+
+    expect(findChainRoot(middle, [otherSessionParent])).toBeUndefined();
+    expect(findChainRoot(middle, [otherFileParent])).toBeUndefined();
+    // The same file spelled with a `./` prefix — a host-side spelling the
+    // record constructor would have normalised — is still the same file.
+    const spelledDifferently: ModificationRecord = { ...root, file: `./${TARGET_FILE}` };
+
+    expect(findChainRoot(middle, [spelledDifferently])).toBe(spelledDifferently);
+  });
+
+  it('uses the first of two candidates that share an id', () => {
+    const impostor = link('root', PRISTINE_HASH, THIRD_HASH, { planVersion: 9 });
+
+    expect(findChainRoot(middle, [root, impostor])).toBe(root);
+    expect(findChainRoot(middle, [impostor, root])).toBe(impostor);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Failure reporting — AAP §0.5.2 applies to errors, not only to telemetry.
 // ---------------------------------------------------------------------------
@@ -1298,10 +1421,14 @@ const CONFLICT_FIELDS = [
   'expectedHash',
   'actualHash',
   'backupPath',
+  'originalBackupPath',
   'detectedAt',
   'message',
   'diffs',
 ];
+
+/** The fields a conflict report may leave out: each is absent for a reason the schema documents. */
+const OPTIONAL_CONFLICT_FIELDS: readonly string[] = ['actualHash', 'originalBackupPath', 'diffs'];
 
 describe('MODIFICATION_CONFLICT_REASONS', () => {
   it('declares one reason per branch of the AAP §0.5.1 reconciliation table', () => {
@@ -1479,7 +1606,56 @@ describe('modificationConflictSchema', () => {
     expect(modificationConflictSchema.safeParse(conflictWithout('backupPath')).success).toBe(false);
   });
 
-  it.each([...CONFLICT_FIELDS.filter((field) => field !== 'actualHash' && field !== 'diffs')])(
+  it('leaves originalBackupPath out of an unchained record’s report, since backupPath is already the pristine file', () => {
+    // The default fixture is an unchained record's report: its own backup is
+    // the pristine file, and the chain root's path has nothing to add.
+    const unchained = validConflict();
+
+    expect('originalBackupPath' in unchained).toBe(false);
+    expect(unchained.originalBackupPath).toBeUndefined();
+  });
+
+  it('carries the chain root’s backup as originalBackupPath beside the record’s own backup', () => {
+    // A chained record backed up the previous plan version's instrumented
+    // output; the pristine file is its chain root's backup, filed under the
+    // pristine digest. "Original saved at ‹path›" quotes that one.
+    const ownBackup = backupPathFixture(SESSION_ID, PATCHED_HASH);
+    const rootBackup = backupPathFixture(SESSION_ID, PRISTINE_HASH);
+    const chained = validConflict({
+      recordId: modificationIdFixture('second'),
+      expectedHash: CHAINED_HASH,
+      backupPath: ownBackup,
+      originalBackupPath: rootBackup,
+    });
+
+    expect(chained.backupPath).toBe(ownBackup);
+    expect(chained.originalBackupPath).toBe(rootBackup);
+    expect(Object.keys(chained)).toEqual(CONFLICT_FIELDS);
+    expect(JSON.parse(JSON.stringify(chained))).toEqual(chained);
+  });
+
+  it.each([
+    ['an empty string', ''],
+    ['a blank string', '   '],
+    ['a NUL byte', `${DEBUGGEN_HOME}/backups/${SESSION_ID}/\u0000${PRISTINE_HASH}`],
+    ['a line feed', `${DEBUGGEN_HOME}/backups/${SESSION_ID}/\n${PRISTINE_HASH}`],
+    ['a C1 control character', `${DEBUGGEN_HOME}/backups/${SESSION_ID}/\u0085${PRISTINE_HASH}`],
+    ['a number', 42],
+    ['null', null],
+  ] as readonly (readonly [string, unknown])[])(
+    'rejects %s as originalBackupPath and names the field',
+    (label, originalBackupPath) => {
+      const error = errValue(
+        parseModificationConflict(makeConflict({ originalBackupPath })),
+        `a conflict whose originalBackupPath is ${label}`,
+      );
+
+      expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(issuePaths(error)).toContain('originalBackupPath');
+    },
+  );
+
+  it.each([...CONFLICT_FIELDS.filter((field) => !OPTIONAL_CONFLICT_FIELDS.includes(field))])(
     'rejects a report missing %s',
     (field) => {
       const error = errValue(

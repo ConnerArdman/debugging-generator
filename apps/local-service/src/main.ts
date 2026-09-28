@@ -130,9 +130,10 @@
  * another's concrete surface where the two are not already structurally the
  * same object:
  *
- * - an **agent-readiness ledger** — the relayed `agent.ready` reports per tab,
- *   written by the WebSocket router, and each tab's latest committed
- *   navigation, written by the binding route, both read by the readiness gate;
+ * - an **agent-readiness ledger** — the relayed `agent.ready` reports per
+ *   DevTools credential and tab, written by the WebSocket router, and each
+ *   such tab's latest committed navigation, written by the binding route, both
+ *   read by the readiness gate for a session's live binding;
  * - the **server-agent presence** view of the client registry;
  * - the **source-open delivery** port over the client registry;
  * - the **credential issuer** the dev-server launcher mints, renews and revokes
@@ -145,6 +146,10 @@
  *   capture has its page agent reconciled to dormant, and a cleanup verdict
  *   upgraded once a producer took its dormant configuration is recorded
  *   through the session manager;
+ * - the **conflict reflection** ({@link conflictReflectingListener}): a
+ *   conflict the watcher detects updates the session record through the
+ *   session manager, which broadcasts `session.updated` to both user
+ *   interfaces;
  * - an **effective configuration** whose `port` is the bound port once the
  *   socket listens, which is what a launched dev server's ingest URL and the
  *   dev-server probe's self-exclusion need under `port: 0`.
@@ -292,6 +297,7 @@ import {
   evaluateReadiness,
 } from './instrumentation/readiness.js';
 import type {
+  BoundTabRef,
   BrowserAgentRegistry,
   CollectObservedReadinessDeps,
   ReadinessVerdict,
@@ -305,7 +311,10 @@ import type {
   ProducerReconciler,
 } from './instrumentation/service.js';
 import { createInstrumentationWatcher } from './instrumentation/watcher.js';
-import type { InstrumentationWatcher } from './instrumentation/watcher.js';
+import type {
+  InstrumentationWatcher,
+  ModificationConflictListener,
+} from './instrumentation/watcher.js';
 import {
   LOG_ERROR_FIELD_KEY,
   createServiceLogger,
@@ -331,6 +340,7 @@ import {
   DEFAULT_MAX_CLIENTS,
   WS_CLOSE_GOING_AWAY,
   createClientRegistry,
+  heldTabKey,
 } from './server/clients.js';
 import type { ClientRegistry } from './server/clients.js';
 import {
@@ -768,13 +778,14 @@ const DEV_SERVERS_SURVIVED_MESSAGE = 'launched dev servers are still running aft
 const CLIENT_SWEEP_INTERVAL_MS = 30_000;
 
 /**
- * The most tabs the agent-readiness ledger remembers. One entry per tab holds
- * both its latest report and its latest navigation, so the two share one
- * lifetime: a write of either makes the tab the most recent, and the least
- * recently written tab is forgotten whole. That fails closed — readiness then
- * sees no report for the tab and asks for a reload, and the page agent reports
- * again on its next document load — whereas a report that outlived the
- * navigation recorded after it would be trusted on sight.
+ * The most tabs the agent-readiness ledger remembers, counted per DevTools
+ * credential and tab. One entry per credential's tab holds both its latest
+ * report and its latest navigation, so the two share one lifetime: a write of
+ * either makes the entry the most recent, and the least recently written entry
+ * is forgotten whole. That fails closed — readiness then sees no report for the
+ * tab and asks for a reload, and the page agent reports again on its next
+ * document load — whereas a report that outlived the navigation recorded after
+ * it would be trusted on sight.
  */
 const MAX_TRACKED_AGENT_TABS = 256;
 
@@ -1704,13 +1715,25 @@ function revokeLaunchedCredentials(
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The relayed page-agent reports and the committed navigations, per tab: the
- * one object that is the WebSocket router's {@link AgentReadinessPort} (where
- * a relayed `agent.ready` is written), the binding route's
- * {@link NavigationRecorder} (where every accepted `tab.navigated` is written)
- * and the readiness gate's {@link BrowserAgentRegistry} (where both are read),
- * so the report the gate judges is exactly the report the router accepted, and
- * a reload the route accepted marks it as possibly left behind.
+ * The relayed page-agent reports and the committed navigations, per DevTools
+ * credential and tab: the one object that is the WebSocket router's
+ * {@link AgentReadinessPort} (where a relayed `agent.ready` is written), the
+ * binding route's {@link NavigationRecorder} (where every accepted
+ * `tab.navigated` is written) and the readiness gate's
+ * {@link BrowserAgentRegistry} (where both are read), so the report the gate
+ * judges is exactly the report the router accepted, and a reload the route
+ * accepted marks it as possibly left behind.
+ *
+ * **Whose evidence.** A Chrome tab id is unique only within one browser, so two
+ * paired browsers inspect tabs whose ids collide. Every report and navigation
+ * is therefore kept under the credential that relayed it — the connection
+ * principal's `tokenHash`, the `boundBy` of that credential's binding — and
+ * the tab id together (`heldTabKey`), and every read names a
+ * {@link BoundTabRef}: the session's live binding supplies the holder, and a
+ * session whose binding is absent or is another tab reads nothing. One
+ * browser's report of its tab 7 never makes another browser's session bound
+ * to *its* tab 7 ready (AAP §0.5.6, §0.7.1 Group 2). The credential digest is
+ * a map key only: no log line carries it or the key.
  *
  * **A report's receipt time** is when its document was last confirmed as the
  * tab's current one. Readiness distrusts a report on sight when
@@ -1730,20 +1753,23 @@ function revokeLaunchedCredentials(
  * navigation's stamp when that is ahead of the clock). Otherwise both carry
  * the clock's reading.
  *
- * **One lifetime per tab.** A tab's report and its navigation are one entry:
- * a write of either makes the tab the most recent, and beyond the size bound
- * the least recently written tab is forgotten whole. A report therefore never
- * outlives the navigation recorded after it — which would read as current —
- * and a forgotten tab reads as one no agent reported for, so readiness asks
- * for a reload.
+ * **One lifetime per credential's tab.** A tab's report and its navigation,
+ * under one credential, are one entry: a write of either makes the entry the
+ * most recent, and beyond the size bound the least recently written entry is
+ * forgotten whole. A report therefore never outlives the navigation recorded
+ * after it — which would read as current — and a forgotten entry reads as a
+ * tab no agent reported for, so readiness asks for a reload.
  */
 export interface AgentReadyLedger
   extends AgentReadinessPort, BrowserAgentRegistry, NavigationRecorder {
   /**
-   * Records a relayed report as the tab's newest one, with its receipt time as
-   * the ledger overview describes, and wakes the waits it answers: those for
-   * any report, and those for a document other than the one it names — so a
-   * replay of the known document answers none. Synchronous; refused with
+   * Records a relayed report as the newest one of the tab it names under the
+   * relaying connection's credential, with its receipt time as the ledger
+   * overview describes, and wakes the waits it answers: those of a session
+   * whose live binding is that credential's binding of that tab, for any
+   * report or for a document other than the one it names — so a replay of the
+   * known document answers none, and another browser's session bound to a tab
+   * of the same id is never woken. Synchronous; refused with
    * `TRANSPORT_DISCONNECTED` after {@link AgentReadyLedger.close}.
    */
   agentReady(
@@ -1753,26 +1779,30 @@ export interface AgentReadyLedger
 
   /**
    * When the document of the report {@link BrowserAgentRegistry.latestAgentReady}
-   * returns was last confirmed current, in epoch milliseconds: its receipt, or
-   * that of a later report of the same document no navigation preceded.
-   * `undefined` when no report is remembered.
+   * returns for `tab` was last confirmed current, in epoch milliseconds: its
+   * receipt, or that of a later report of the same document no navigation
+   * preceded. `undefined` when no report is remembered for the session's
+   * binding of that tab.
    */
-  latestAgentReadyAt(tabId: number): number | undefined;
+  latestAgentReadyAt(tab: BoundTabRef): number | undefined;
 
   /**
-   * When the binding route last recorded a committed navigation of `tabId`, in
-   * epoch milliseconds; `undefined` when none is remembered. Always after the
-   * receipt time of the report the tab held when the navigation was recorded.
+   * When the binding route last recorded a committed navigation of the
+   * session's bound tab by its binding's credential, in epoch milliseconds;
+   * `undefined` when none is remembered. Always after the receipt time of the
+   * report that entry held when the navigation was recorded.
    */
-  latestNavigationAt(tabId: number): number | undefined;
+  latestNavigationAt(tab: BoundTabRef): number | undefined;
 
   /**
-   * Records a committed navigation of `tabId`, stamped as the ledger overview
-   * describes, and notes it at `debug` by tab id alone. Synchronous; throws
-   * nothing of its own. A no-op after {@link AgentReadyLedger.close} and for a
-   * tab id that is not a non-negative safe integer.
+   * Records a committed navigation of `tabId` by the credential `holder` (the
+   * navigating connection's `tokenHash`), stamped as the ledger overview
+   * describes, and notes it at `debug` by tab id alone — never the holder.
+   * Synchronous; throws nothing of its own. A no-op after
+   * {@link AgentReadyLedger.close}, for an empty holder and for a tab id that
+   * is not a non-negative safe integer.
    */
-  recordNavigation(tabId: number): void;
+  recordNavigation(holder: string, tabId: number): void;
 
   /** Resolves every pending wait with `undefined` and forgets every report and navigation. Idempotent. */
   close(): void;
@@ -1793,13 +1823,22 @@ export interface AgentReadyLedgerDeps {
    * (`./instrumentation/document-fingerprint.ts`).
    */
   readonly logger: Logger;
+  /**
+   * The live bindings — the client registry in production. A
+   * {@link BoundTabRef}'s holder is the `boundBy` of its session's binding
+   * when that binding is the named tab, read at every lookup and at every
+   * wake, so a bind made after a wait started still lets the binding's own
+   * browser answer it.
+   */
+  readonly bindings: Pick<ClientRegistry, 'bindingForSession'>;
   /** The clock a report and a navigation are stamped with, in epoch milliseconds. */
   readonly now?: (() => number) | undefined;
   /**
-   * The most tabs remembered, {@link MAX_TRACKED_AGENT_TABS} by default (and
-   * for a value that is not a positive safe integer). A tab's report and its
-   * navigation are one entry: a write of either makes the tab the most recent,
-   * and beyond the bound the least recently written tab is forgotten whole.
+   * The most entries remembered — one per credential and tab —
+   * {@link MAX_TRACKED_AGENT_TABS} by default (and for a value that is not a
+   * positive safe integer). An entry's report and its navigation are one:
+   * a write of either makes the entry the most recent, and beyond the bound
+   * the least recently written entry is forgotten whole.
    */
   readonly maxTabs?: number | undefined;
 }
@@ -1817,11 +1856,16 @@ interface AgentReport {
 }
 
 /**
- * Everything the ledger knows about one tab: at least one member is present.
- * One entry, so a report and the navigation that may have left it behind are
- * remembered and forgotten together.
+ * Everything the ledger knows about one credential's tab: its tab id, and at
+ * least one of the other members. One entry, so a report and the navigation
+ * that may have left it behind are remembered and forgotten together.
  */
 interface TabEvidence {
+  /**
+   * The tab the entry is about. Kept in the entry because the map key carries
+   * a credential digest and is never logged: log lines name this id alone.
+   */
+  readonly tabId: number;
   /** The tab's newest relayed report; absent until one arrives. */
   readonly report?: AgentReport;
   /**
@@ -1833,6 +1877,8 @@ interface TabEvidence {
 
 /** One pending {@link BrowserAgentRegistry.waitForAgentReady}. */
 interface AgentWaiter {
+  /** The session and tab awaited; its holder is resolved when a report arrives. */
+  readonly tab: BoundTabRef;
   readonly afterDocumentId: string | undefined;
   readonly settle: (payload: AgentReadyPayload | undefined) => void;
 }
@@ -1840,70 +1886,113 @@ interface AgentWaiter {
 /**
  * Creates the agent-readiness ledger.
  *
- * The ledger replaces a tab's report on every accepted `agent.ready`, so the
- * newest document's facts are the only ones returned; the WebSocket router
- * calls it only after the relaying DevTools connection has been authorized for
- * the tab the report names. A wait resolves with the first report whose
- * document differs from the one the caller already knows (or with any report
- * when it knows none), with `undefined` on its timeout, on abort and on
- * {@link AgentReadyLedger.close}; it never rejects and never outlives its bound.
+ * The ledger replaces a credential's tab's report on every accepted
+ * `agent.ready`, so the newest document's facts are the only ones returned;
+ * the WebSocket router calls it only after the relaying DevTools connection
+ * has been authorized for the tab the report names. Every read and wait names
+ * a {@link BoundTabRef} and is answered from the entry of the session's
+ * binding credential for that tab — nothing when the session's live binding
+ * is absent or is another tab — so one paired browser's report never answers
+ * for another browser's session bound to a tab of the same id. A wait
+ * resolves with the first such report whose document differs from the one the
+ * caller already knows (or with any report when it knows none), with
+ * `undefined` on its timeout, on abort and on {@link AgentReadyLedger.close};
+ * it never rejects and never outlives its bound.
  *
  * It is also the binding route's {@link NavigationRecorder}: every
- * `tab.navigated` the route accepts is stamped here, and readiness reads the
- * stamp back through {@link BrowserAgentRegistry.latestNavigationAt}, which is
- * how a reload or a same-URL load marks the stored report as possibly left
- * behind. A report's receipt time is when its document was last confirmed
- * current, so a replay of that document after a later navigation confirms
- * nothing and stays behind the navigation; stamps are ordered within one
- * millisecond; and a tab's report and navigation share one eviction lifetime —
- * each as the {@link AgentReadyLedger} overview describes. A navigation logs
- * the tab id alone at `debug`, and so does forgetting a tab.
+ * `tab.navigated` the route accepts is stamped here under the navigating
+ * credential, and readiness reads the stamp back through
+ * {@link BrowserAgentRegistry.latestNavigationAt}, which is how a reload or a
+ * same-URL load marks the stored report as possibly left behind. A report's
+ * receipt time is when its document was last confirmed current, so a replay of
+ * that document after a later navigation confirms nothing and stays behind the
+ * navigation; stamps are ordered within one millisecond; and an entry's report
+ * and navigation share one eviction lifetime — each as the
+ * {@link AgentReadyLedger} overview describes. A navigation logs the tab id
+ * alone at `debug`, and so does forgetting an entry: no line carries a
+ * credential digest or an entry key.
  *
- * @param deps The logger, and optionally a clock and a size bound.
+ * @param deps The logger and the live bindings, and optionally a clock and a size bound.
  * @returns The ledger.
  *
  * @example
  * ```ts
- * const ledger = createAgentReadyLedger({ logger });
+ * const ledger = createAgentReadyLedger({ logger, bindings: clients });
+ * // `clients` holds `connection`'s binding of payload.tabId to sessionId.
+ * const tab = { sessionId, tabId: payload.tabId };
  * ledger.agentReady(payload, connection); // from the WebSocket router
- * ledger.latestAgentReady(payload.tabId); // → payload
- * ledger.recordNavigation(payload.tabId); // from the binding route: a reload
- * ledger.latestNavigationAt(payload.tabId); // → later than latestAgentReadyAt(payload.tabId)
+ * ledger.latestAgentReady(tab); // → payload
+ * ledger.latestAgentReady({ sessionId: otherBrowsersSession, tabId: payload.tabId }); // → undefined
+ * ledger.recordNavigation(connection.principal.tokenHash, payload.tabId); // the binding route: a reload
+ * ledger.latestNavigationAt(tab); // → later than latestAgentReadyAt(tab)
  * ledger.agentReady(payload, connection); // the old document replayed: confirms nothing
- * ledger.latestNavigationAt(payload.tabId); // → still later than latestAgentReadyAt(payload.tabId)
+ * ledger.latestNavigationAt(tab); // → still later than latestAgentReadyAt(tab)
  * ```
  */
 export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLedger {
   const log = subsystemLogger(deps.logger, SUBSYSTEM_READINESS);
+  const { bindings } = deps;
   const now = deps.now ?? nowEpochMs;
   const requestedMax = deps.maxTabs ?? MAX_TRACKED_AGENT_TABS;
   const maxTabs =
     Number.isSafeInteger(requestedMax) && requestedMax > 0 ? requestedMax : MAX_TRACKED_AGENT_TABS;
   /**
-   * Each tab's report and navigation, in one entry. Insertion order is
-   * recency order: every write deletes and re-inserts its tab's entry.
+   * Each credential's tab's report and navigation, in one entry, by
+   * `heldTabKey(holder, tabId)`. Insertion order is recency order: every
+   * write deletes and re-inserts its entry. The keys carry credential digests
+   * and are never logged.
    */
-  const evidence = new Map<number, TabEvidence>();
+  const evidence = new Map<string, TabEvidence>();
+  /** Pending waits by the tab id they await; each resolves its holder on wake. */
   const waiters = new Map<number, Set<AgentWaiter>>();
   let closed = false;
 
   /**
-   * Stores a tab's merged evidence as the most recently written entry, then
-   * forgets whole entries, least recently written first, beyond the bound — so
-   * a report never outlives the navigation recorded after it, nor the reverse.
+   * The credential whose evidence answers for `tab`: the `boundBy` of the
+   * session's live binding when that binding is the named tab, else
+   * `undefined` — the session has no evidence for that tab. A lookup that
+   * throws answers `undefined` too, noted at `debug` by the tab id alone, so
+   * a faulty registry can withhold evidence but never lend another's.
    */
-  function remember(tabId: number, entry: TabEvidence): void {
-    evidence.delete(tabId);
-    evidence.set(tabId, entry);
+  function holderOf(tab: BoundTabRef): string | undefined {
+    try {
+      const binding = bindings.bindingForSession(tab.sessionId);
+      return binding !== undefined && binding.tabId === tab.tabId ? binding.boundBy : undefined;
+    } catch (cause) {
+      log.debug('the binding of a session could not be read; its tab reads as unreported', {
+        tabId: tab.tabId,
+        errorName: cause instanceof Error ? cause.name : typeof cause,
+      });
+      return undefined;
+    }
+  }
+
+  /** The entry that answers for `tab`, or `undefined` when its session has none. */
+  function evidenceOf(tab: BoundTabRef): TabEvidence | undefined {
+    const holder = holderOf(tab);
+    return holder === undefined ? undefined : evidence.get(heldTabKey(holder, tab.tabId));
+  }
+
+  /**
+   * Stores a credential's tab's merged evidence as the most recently written
+   * entry, then forgets whole entries, least recently written first, beyond
+   * the bound — so a report never outlives the navigation recorded after it,
+   * nor the reverse.
+   */
+  function remember(key: string, entry: TabEvidence): void {
+    evidence.delete(key);
+    evidence.set(key, entry);
     while (evidence.size > maxTabs) {
-      const oldest = evidence.keys().next();
+      const oldest = evidence.entries().next();
       if (oldest.done === true) {
         break;
       }
-      evidence.delete(oldest.value);
+      const [oldestKey, forgotten] = oldest.value;
+      evidence.delete(oldestKey);
       // Readiness now finds no report for that tab and asks for a reload.
+      // The entry's own tab id, never its key: that carries a credential digest.
       log.debug('forgot the readiness evidence of the least recently written tab', {
-        tabId: oldest.value,
+        tabId: forgotten.tabId,
       });
     }
   }
@@ -1927,7 +2016,11 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
       );
     }
     const clockNow = now();
-    const known = evidence.get(payload.tabId);
+    // The relaying credential's own entry for the tab: another paired
+    // browser's tab of the same id is another entry, never read or written here.
+    const holder = client.principal.tokenHash;
+    const key = heldTabKey(holder, payload.tabId);
+    const known = evidence.get(key);
     const stored = known?.report;
     const navigatedAt = known?.navigatedAt;
     // A replay: the document the tab already reported, relayed again after a
@@ -1953,9 +2046,10 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
     } else if (navigatedAt !== undefined && navigatedAt > clockNow) {
       receivedAt = navigatedAt;
     }
-    remember(payload.tabId, { ...known, report: { payload, receivedAt } });
+    remember(key, { ...known, tabId: payload.tabId, report: { payload, receivedAt } });
     // The id is page-controlled text: the ledger keeps it for matching, the
-    // log line carries only its fingerprint and shape flag (CWE-532).
+    // log line carries only its fingerprint and shape flag (CWE-532). The
+    // credential is named by the connection id alone, never by its digest.
     log.debug('recorded a page-agent readiness report', {
       tabId: payload.tabId,
       ...documentLogFields(payload.documentId),
@@ -1967,7 +2061,10 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
     const pending = waiters.get(payload.tabId);
     if (pending !== undefined) {
       for (const waiter of [...pending]) {
-        if (answers(waiter.afterDocumentId, payload)) {
+        // Resolved now, not when the wait began: a session bound after its
+        // wait started is still woken by its own binding's browser, and one
+        // whose tab of this id another browser reports is not woken at all.
+        if (holderOf(waiter.tab) === holder && answers(waiter.afterDocumentId, payload)) {
           waiter.settle(payload);
         }
       }
@@ -1976,10 +2073,10 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
   }
 
   function waitForAgentReady(
-    tabId: number,
+    tab: BoundTabRef,
     options: WaitForAgentReadyOptions,
   ): Promise<AgentReadyPayload | undefined> {
-    const current = evidence.get(tabId)?.report?.payload;
+    const current = evidenceOf(tab)?.report?.payload;
     if (current !== undefined && answers(options.afterDocumentId, current)) {
       return Promise.resolve(current);
     }
@@ -1989,6 +2086,7 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
 
     const requested = options.timeoutMs ?? MAX_RELOAD_WAIT_MS;
     const timeoutMs = Math.min(Math.max(0, requested), MAX_RELOAD_WAIT_MS);
+    const { tabId } = tab;
 
     return new Promise((resolve) => {
       const signal = options.signal;
@@ -2005,6 +2103,7 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
       timer.unref();
 
       const waiter: AgentWaiter = {
+        tab: { sessionId: tab.sessionId, tabId },
         afterDocumentId: options.afterDocumentId,
         settle: (payload) => {
           if (!owner.delete(waiter)) {
@@ -2024,22 +2123,31 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
     });
   }
 
-  function recordNavigation(tabId: number): void {
-    if (closed || !Number.isSafeInteger(tabId) || tabId < 0) {
+  function recordNavigation(holder: string, tabId: number): void {
+    if (
+      closed ||
+      typeof holder !== 'string' ||
+      holder.length === 0 ||
+      !Number.isSafeInteger(tabId) ||
+      tabId < 0
+    ) {
       return;
     }
     // Strictly after the report it follows: when the clock has not moved past
     // the report's receipt (one millisecond, or a clock stepped back), the
     // navigation is stamped one past it, so readiness's `navigatedAt >
-    // observedAt` holds and the report is not trusted on sight.
+    // observedAt` holds and the report is not trusted on sight. Only the
+    // navigating credential's entry is touched: another browser's report of a
+    // tab with the same id is not made to look left behind.
     const clockNow = now();
-    const known = evidence.get(tabId);
+    const key = heldTabKey(holder, tabId);
+    const known = evidence.get(key);
     const reportedAt = known?.report?.receivedAt;
     const navigatedAt =
       reportedAt !== undefined && reportedAt >= clockNow ? reportedAt + 1 : clockNow;
-    remember(tabId, { ...known, navigatedAt });
+    remember(key, { ...known, tabId, navigatedAt });
     // The tab id alone: the navigated URL is page-shaped text and never reaches
-    // the ledger (CWE-532).
+    // the ledger (CWE-532), and the holder is a credential digest.
     log.debug('recorded a committed navigation of a tab', { tabId });
   }
 
@@ -2059,11 +2167,11 @@ export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLe
 
   return Object.freeze({
     agentReady,
-    latestAgentReady: (tabId: number): AgentReadyPayload | undefined =>
-      evidence.get(tabId)?.report?.payload,
-    latestAgentReadyAt: (tabId: number): number | undefined =>
-      evidence.get(tabId)?.report?.receivedAt,
-    latestNavigationAt: (tabId: number): number | undefined => evidence.get(tabId)?.navigatedAt,
+    latestAgentReady: (tab: BoundTabRef): AgentReadyPayload | undefined =>
+      evidenceOf(tab)?.report?.payload,
+    latestAgentReadyAt: (tab: BoundTabRef): number | undefined =>
+      evidenceOf(tab)?.report?.receivedAt,
+    latestNavigationAt: (tab: BoundTabRef): number | undefined => evidenceOf(tab)?.navigatedAt,
     recordNavigation,
     waitForAgentReady,
     close,
@@ -2200,6 +2308,71 @@ function targetSelectionOf(manager: SessionManager): TargetSelectionPort {
   return Object.freeze({
     selected: (sessionId: SessionId, target: SelectedTarget) =>
       manager.patch(sessionId, { target: redactSelectedTarget(target) }),
+  });
+}
+
+/**
+ * Where the conflict watcher's {@link ModificationConflictListener} goes: the
+ * session manager's `recordModificationConflict`, which rewrites the session
+ * record's mirrored modification and broadcasts `session.updated` — so the
+ * record-driven views of both user interfaces (the editor's modification
+ * badge, the DevTools session summary) show `conflict` as soon as the
+ * watcher's progress row does (AAP §0.5.1), not at the session's next change.
+ *
+ * Late-bound: the watcher is created before the manager (the manager needs
+ * the cleanup runner, which needs the watcher), so the listener reads
+ * `managerRef.current` on each call. A conflict reported before the manager
+ * exists — nothing is watched before `listen`, so none is expected — is
+ * logged and dropped: the journal and the persisted progress row already
+ * hold it, and the record catches up at its next write through the store's
+ * overlay. A refusal from the manager is logged the same way. Log records
+ * carry the session id, the record id and the error code only, never a
+ * path or the conflict's diff (AAP §0.5.2). A rejection is left to the
+ * watcher, which catches and logs every listener failure.
+ *
+ * @param managerRef The cell `startService` fills once the manager exists.
+ * @param logger Where a dropped or refused reflection is reported.
+ * @returns The listener handed to `createInstrumentationWatcher`.
+ *
+ * @example
+ * ```ts
+ * const managerRef: { current?: SessionManager } = {};
+ * const watcher = createInstrumentationWatcher({
+ *   modifications,
+ *   listener: conflictReflectingListener(managerRef, loggers.service),
+ *   config,
+ * });
+ * // … the cleanup runner, then:
+ * managerRef.current = createSessionManager({ … });
+ * ```
+ */
+export function conflictReflectingListener(
+  managerRef: {
+    readonly current?: Pick<SessionManager, 'recordModificationConflict'> | undefined;
+  },
+  logger: Logger,
+): ModificationConflictListener {
+  return Object.freeze({
+    async onModificationConflict({
+      sessionId,
+      record,
+    }: Parameters<ModificationConflictListener['onModificationConflict']>[0]): Promise<void> {
+      const manager = managerRef.current;
+      if (manager === undefined) {
+        logger.warn(
+          'a modification conflict arrived before the session manager was ready; the session shows it at its next change',
+          { sessionId, recordId: record.id },
+        );
+        return;
+      }
+      const reflected = await manager.recordModificationConflict(sessionId, record);
+      if (isErr(reflected)) {
+        logger.warn(
+          'a modification conflict could not be reflected in its session; the journal still records it',
+          { sessionId, recordId: record.id, code: reflected.error.code },
+        );
+      }
+    },
   });
 }
 
@@ -4443,7 +4616,9 @@ export async function startService(
   });
 
   // 10 — subsystem wiring, in dependency order.
-  const ledger = createAgentReadyLedger({ logger: root, ...clock });
+  // Readiness evidence is kept per DevTools credential and read for a
+  // session's live binding, so the ledger reads the bindings from the registry.
+  const ledger = createAgentReadyLedger({ logger: root, bindings: clients, ...clock });
   parts.ledger = ledger;
   const serverAgents = serverAgentPresenceOf(clients);
   const adapters = createAdapterRegistry({ logger: root });
@@ -4480,10 +4655,14 @@ export async function startService(
   // session manager who owns a project's capture; the manager does not exist
   // yet (it needs the cleanup runner, which needs the driver), so the lookup is
   // late-bound and answers "nobody" until it does — before `listen`, nothing can
-  // ask.
+  // ask. The watcher's conflict listener reaches the manager through the same
+  // late-bound cell, so a conflict updates the session record (and sends
+  // `session.updated`) the moment the watcher reports it.
+  const managerRef: { current?: SessionManager } = {};
   const watcher = createInstrumentationWatcher({
     modifications: repos.modifications,
     progress,
+    listener: conflictReflectingListener(managerRef, loggers.service),
     config,
     logger: root,
     ...clock,
@@ -4502,7 +4681,6 @@ export async function startService(
     ...clock,
   });
   parts.launcher = launcher;
-  const managerRef: { current?: SessionManager } = {};
   const instrumentation = createInstrumentationService({
     config,
     // The one canonical state root, re-checked before every install writes.

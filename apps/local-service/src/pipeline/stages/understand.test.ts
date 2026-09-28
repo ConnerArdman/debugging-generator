@@ -96,6 +96,7 @@ import {
   QUESTION_STOP_WORDS,
   SIGNAL_TERM_CATEGORIES,
   createUnderstandStage,
+  pathCandidatesOf,
   splitCamelCase,
   tokenizeQuestion,
   type QuestionTokens,
@@ -1386,6 +1387,99 @@ describe('the generic question tokenizer (AAP §0.5.4)', () => {
         );
       });
     });
+  });
+});
+
+// The follow-up stage accepts an exact declaration lookup of a plain word only
+// inside a file the question names, so the path reader decides nothing on its
+// own: it keeps the words shaped like a project-relative source path, and
+// every other word — prose, a route, a link, a path that climbs out of the
+// project — yields nothing.
+describe('pathCandidatesOf — the source paths a question names (AAP §0.5.4)', () => {
+  it('keeps a named source path', () => {
+    expect(pathCandidatesOf('Why does settle in src/ledger/totals.ts take so long?')).toEqual([
+      'src/ledger/totals.ts',
+    ]);
+  });
+
+  it.each([
+    ['backticks', 'Why is `src/ledger/totals.ts` slow?', 'src/ledger/totals.ts'],
+    ['a bracket pair and a leading ./', 'Slow (in ./src/ledger/totals.ts)', 'src/ledger/totals.ts'],
+    ['quotes and a trailing comma', 'See "lib/format.mjs", then retry.', 'lib/format.mjs'],
+    ['curly quotes', 'Why is \u201Csrc/ledger/totals.ts\u201D slow?', 'src/ledger/totals.ts'],
+    ['a line and column', 'It stalls at src/ledger/export.ts:42:7.', 'src/ledger/export.ts'],
+    ['backslashes', 'Is src\\ledger\\export.ts slow?', 'src/ledger/export.ts'],
+    ['a trailing slash', 'Anything in src/ledger/ that loops?', 'src/ledger'],
+    ['a possessive', 'Is src/ledger/totals.ts’s loop slow?', 'src/ledger/totals.ts'],
+    ['a bare file name with a source extension', 'Why is totals.ts slow?', 'totals.ts'],
+    [
+      'balanced route segments',
+      'Why does app/(reports)/[period]/page.tsx render twice?',
+      'app/(reports)/[period]/page.tsx',
+    ],
+  ] as const)('unwraps %s', (_label, question, path) => {
+    expect(pathCandidatesOf(question)).toEqual([path]);
+  });
+
+  it.each([
+    ['plain prose', 'Why did this query run twice?'],
+    ['a word without a separator or a source extension', 'Does settle read README.md?'],
+    ['an absolute path or a route', 'Why is /ledger/totals slow? And /api/totals?'],
+    ['a redacted queried route', 'Why is /reset?code=? slow?'],
+    ['a link', 'Why is http://127.0.0.1:4173/ledger/totals slow?'],
+    ['a relative query', 'Why does ledger/totals?period=? stall?'],
+    ['a path that climbs out of the project', 'Is ../outside/secret.ts or src/../x.ts slow?'],
+    ['a dot segment', 'Is src/./x.ts slow?'],
+    ['a drive letter', 'Is C:\\work\\ledger\\x.ts slow?'],
+    ['punctuation only', '?!…,;:—()[]{}"\'/\\'],
+    ['an empty string', ''],
+    ['whitespace only', ' \t\r\n  '],
+    ['a path longer than any file name', `src/${'x'.repeat(300)}.ts`],
+  ])('yields nothing for %s', (_label, question) => {
+    expect(pathCandidatesOf(question)).toEqual([]);
+  });
+
+  it('sorts, de-duplicates and caps the paths, frozen and unchanged by a JSON round trip', () => {
+    const named = Array.from({ length: 12 }, (_, index) => `src/part${String(11 - index)}.ts`);
+    const question = `Compare ${named.join(' and ')} with src/part3.ts again.`;
+    const paths = pathCandidatesOf(question);
+
+    expect(paths).toHaveLength(8);
+    expect([...paths]).toEqual([...new Set(named)].sort(byCodeUnit).slice(0, 8));
+    expect(Object.isFrozen(paths)).toBe(true);
+    expect(JSON.parse(JSON.stringify(paths))).toEqual(paths);
+  });
+
+  it('is wording-invariant and pure', () => {
+    const first = 'Why do src/ledger/totals.ts and lib/format.mjs stall?';
+    const second = 'lib/format.mjs stalls — and src/ledger/totals.ts, why?';
+    const original = first.slice();
+    expect(pathCandidatesOf(first)).toEqual(['lib/format.mjs', 'src/ledger/totals.ts']);
+    expect(pathCandidatesOf(second)).toEqual(pathCandidatesOf(first));
+    expect(pathCandidatesOf(first)).toEqual(pathCandidatesOf(first));
+    expect(first).toBe(original);
+  });
+
+  it('reads no further than the tokenizer and drops a path the bound cuts short', () => {
+    // The bound lands after `src/ledger/tot`: a fragment that is itself shaped
+    // like a path, so only the cut-word rule keeps it out.
+    const kept = 'src/ledger/tot'.length;
+    const head = 'src/ledger/export.ts ';
+    const filler = 'y'.repeat(CONTEXT_LIMITS.maxQuestionChars - head.length - 1 - kept);
+    const question = `${head}${filler} src/ledger/totals.ts`;
+    expect(question.indexOf('src/ledger/totals.ts')).toBe(CONTEXT_LIMITS.maxQuestionChars - kept);
+    expect(pathCandidatesOf(question)).toEqual(['src/ledger/export.ts']);
+    // Within the bound, the same path is read.
+    expect(pathCandidatesOf(`${head}src/ledger/totals.ts`)).toEqual([
+      'src/ledger/export.ts',
+      'src/ledger/totals.ts',
+    ]);
+  });
+
+  it('leaves the tokenizer’s projection exactly as it was', () => {
+    expect(Object.keys(tokenizeQuestion('Why is src/ledger/totals.ts slow?')).sort()).toEqual(
+      ['categoryHints', 'identifierCandidates', 'signalTerms', 'tokens'].sort(),
+    );
   });
 });
 

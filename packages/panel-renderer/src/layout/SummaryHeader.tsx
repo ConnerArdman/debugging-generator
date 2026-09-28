@@ -79,7 +79,9 @@
  * `tabindex="-1"`, so a host can move focus to it by script — the panel host
  * does when a replaced document took the focused element with it — while it
  * never becomes a stop in the tab order. Its focus ring is the global
- * `:focus-visible` indicator of `../styles/base.css`.
+ * `:focus-visible` indicator of `../styles/base.css`. It is also a name by
+ * contract: a host may hand its `id` in through `titleId`, and the panel host
+ * does, so the panel's scroll region is named by this visible title.
  *
  * `__none` is the muted sentence a region holds when its register is empty —
  * the observed region always, the likely-cause region only under
@@ -941,6 +943,16 @@ export interface SummaryHeaderProps {
 
   /** The `id` of the rendered `header` element. */
   id?: string | undefined;
+
+  /**
+   * The `id` to give the title heading, for a host that names a region after
+   * the panel title — the panel host hands the same value to `PanelShell`'s
+   * `labelledBy`, so the scroll region is announced by the title the reader
+   * sees. The caller keeps it unique in the document, typically with `useId`.
+   * Omitted, or blank, the heading keeps an id generated here, which nothing
+   * outside this head is expected to reference.
+   */
+  titleId?: string | undefined;
 }
 
 /**
@@ -980,14 +992,20 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
     showEmptyCauses = false,
     className,
     id,
+    titleId: suppliedTitleId,
   } = props;
 
-  // One generated prefix for the three ids this head needs. `useId` rather than
-  // a counter or the caller's `id`: two panels can be on one page — the editor
+  // One generated prefix for the ids this head needs. `useId` rather than a
+  // counter or the caller's `id`: two panels can be on one page — the editor
   // webview mirrors the DevTools panel — and a collision would point a region's
-  // `aria-labelledby` at another panel's heading.
+  // `aria-labelledby` at another panel's heading. The title alone may take a
+  // caller's id instead, so a host can name its own region after it; a blank
+  // one is ignored, because an empty `id` would leave that reference dangling.
   const generatedId = useId();
-  const titleId = `${generatedId}-title`;
+  const titleId =
+    suppliedTitleId !== undefined && suppliedTitleId.trim() !== ''
+      ? suppliedTitleId
+      : `${generatedId}-title`;
   const observedHeadingId = `${generatedId}-observed`;
   const causesHeadingId = `${generatedId}-causes`;
 

@@ -21,6 +21,10 @@
  *     present at mount is not applied, and focus lost while the field was replaced or its submit
  *     control disabled returns to the field — focus moved elsewhere is left alone;
  *   - the keyboard contract: `Ctrl`/`⌘`+`Enter` submits, plain `Enter` inserts a line break;
+ *   - the shortcut hint: the exact sentence, every key a `Kbd` chip, placed in the actions row
+ *     immediately before the submit button and describing the field — and identical, in text and
+ *     in markup, to the hint of `QuestionForm`, so the view's two question fields never describe
+ *     the same shortcut differently;
  *   - the states and their precedence (error > pending > unavailable > ready), each rendered
  *     through its design-system primitive and never as a blank area (AAP 0.5.5);
  *   - the question is data: two wordings travel through identically and nothing is ever written
@@ -47,6 +51,7 @@ import type { SubmissionOutcome } from '../pending-actions';
 
 import { FollowUp } from './FollowUp';
 import type { FollowUpUnavailableReason } from './FollowUp';
+import { QuestionForm } from './QuestionForm';
 
 /** The inline validation of a blank draft submitted by the chord. */
 const BLANK_DRAFT_TEXT = 'Type a follow-up question before asking.';
@@ -106,6 +111,81 @@ const ERROR_TITLE = 'The follow-up question could not be processed';
 
 /** The block class every state renders on its root. */
 const ROOT_CLASS = 'dgv-followup';
+
+/** The shortcut hint as read, word for word the question field's hint. */
+const SHORTCUT_HINT_TEXT = 'Press Ctrl+Enter (Cmd+Enter on macOS) to ask. Enter starts a new line.';
+
+/** The question field of `QuestionForm` and its submit control, for the drift guard. */
+const QUESTION_FIELD_LABEL = 'What do you want to debug?';
+const QUESTION_SUBMIT_NAME = 'Ask question';
+
+/** One `Kbd` chip of a hint: its element, its class list and the keys it prints. */
+interface HintChip {
+  readonly tag: string;
+  readonly className: string;
+  readonly keys: readonly string[];
+}
+
+/**
+ * The `Kbd` chips of the shortcut hint, in order: the two chords, which print one `dg-kbd__key`
+ * per key, then the lone Enter, which is itself the `dg-kbd__key`.
+ */
+const SHORTCUT_HINT_CHIPS: readonly HintChip[] = [
+  { tag: 'KBD', className: 'dg-kbd', keys: ['Ctrl', 'Enter'] },
+  { tag: 'KBD', className: 'dg-kbd', keys: ['Cmd', 'Enter'] },
+  { tag: 'KBD', className: 'dg-kbd dg-kbd__key', keys: ['Enter'] },
+];
+
+/**
+ * The elements a field names in `aria-describedby`, in order.
+ *
+ * @param field The field.
+ * @returns Each description element; an id that resolves to nothing fails the case.
+ */
+function descriptionsOf(field: HTMLElement): HTMLElement[] {
+  return (field.getAttribute('aria-describedby') ?? '').split(' ').map((id) => {
+    const element = document.getElementById(id);
+    if (element === null) {
+      throw new Error(`expected the description "${id}" to be on display`);
+    }
+    return element;
+  });
+}
+
+/**
+ * The shortcut hint describing a field: the description that prints keys.
+ *
+ * @param field The field.
+ * @returns The hint element.
+ */
+function getShortcutHint(field: HTMLElement): HTMLElement {
+  const hint = descriptionsOf(field).find((element) => element.querySelector('kbd') !== null);
+  if (hint === undefined) {
+    throw new Error('expected the field to be described by its shortcut hint');
+  }
+  return hint;
+}
+
+/**
+ * The `Kbd` chips a hint holds, in order. Every chord separator must be hidden from assistive
+ * technology, or the hint would not be heard as the sentence it prints.
+ *
+ * @param hint The shortcut hint.
+ * @returns One entry per chip.
+ */
+function hintChips(hint: HTMLElement): HintChip[] {
+  return Array.from(hint.children, (chip) => {
+    for (const separator of chip.querySelectorAll('.dg-kbd__separator')) {
+      expect(separator.getAttribute('aria-hidden')).toBe('true');
+    }
+    const keys = chip.classList.contains('dg-kbd__key')
+      ? [chip.textContent]
+      : Array.from(chip.children)
+          .filter((key) => key.tagName === 'KBD' && key.classList.contains('dg-kbd__key'))
+          .map((key) => key.textContent);
+    return { tag: chip.tagName, className: chip.className, keys };
+  });
+}
 
 /** The five console methods the component must never reach, whatever its state (AAP 0.5.2). */
 const CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug'] as const;
@@ -259,9 +339,8 @@ describe('FollowUp — the gate', () => {
     expect(field.getAttribute('aria-label')).toBeNull();
 
     // The keyboard hint is announced with the field.
-    const describedBy = (field.getAttribute('aria-describedby') ?? '').split(' ');
-    const descriptions = describedBy.map((id) => document.getElementById(id)?.textContent ?? '');
-    expect(descriptions.some((text) => text.includes('Ctrl+Enter'))).toBe(true);
+    const descriptions = descriptionsOf(field).map((element) => element.textContent);
+    expect(descriptions).toContain(SHORTCUT_HINT_TEXT);
 
     // Nothing to send yet, so the submit control starts disabled.
     expect(getSubmit().disabled).toBe(true);
@@ -395,6 +474,83 @@ describe('FollowUp — submission', () => {
   });
 });
 
+describe('FollowUp — the shortcut hint', () => {
+  it('prints the shortcut hint in Kbd keys immediately before the submit button, describing the field', () => {
+    render(<FollowUp onSubmit={submitSpy()} enabled />);
+
+    const hint = getShortcutHint(getField());
+    // Heard as exactly the sentence it prints: the chord separators are hidden.
+    expect(hint.textContent).toBe(SHORTCUT_HINT_TEXT);
+    // Every key a Kbd chip: the two chords, then the single Enter.
+    expect(hint.querySelectorAll('kbd.dg-kbd')).toHaveLength(SHORTCUT_HINT_CHIPS.length);
+    expect(hintChips(hint)).toEqual(SHORTCUT_HINT_CHIPS);
+    // Muted helper text beside the control, no longer the field's own hint line.
+    expect(hint.tagName).toBe('SPAN');
+    expect(hint.classList.contains('dg-text--xs')).toBe(true);
+    expect(hint.classList.contains('dg-text--muted')).toBe(true);
+    expect(document.querySelector('.dg-field__hint')).toBeNull();
+
+    // In the actions row, immediately before the submit button.
+    const submit = getSubmit();
+    expect(hint.nextElementSibling).toBe(submit);
+    expect(hint.parentElement).toBe(submit.parentElement);
+    expect(hint.parentElement?.classList.contains('dgv-followup__actions')).toBe(true);
+
+    // Announced with the field, after the counter.
+    expect(hint.id).not.toBe('');
+    expect(getField().getAttribute('aria-describedby')).toBe(
+      `${getCounter(getField()).id} ${hint.id}`,
+    );
+  });
+
+  it('keeps the shortcut hint after the counter and the retry hint in the field description', () => {
+    const onSubmit = submitSpy();
+    const { rerender } = render(<FollowUp onSubmit={onSubmit} enabled />);
+
+    fireEvent.change(getField(), { target: { value: 'Why does the second step wait?' } });
+    fireEvent.click(getSubmit());
+    rerender(<FollowUp onSubmit={onSubmit} enabled submission={outcome(1, 'failed')} />);
+
+    const retryHint = queryRetryHint();
+    if (retryHint === null) {
+      throw new Error('expected the retry hint to be on display');
+    }
+    const hint = getShortcutHint(getField());
+    expect(hint.textContent).toBe(SHORTCUT_HINT_TEXT);
+    expect(getField().getAttribute('aria-describedby')).toBe(
+      `${getCounter(getField()).id} ${retryHint.id} ${hint.id}`,
+    );
+  });
+
+  it('reads and renders exactly as the question field’s hint', () => {
+    render(
+      <>
+        <QuestionForm onSubmit={submitSpy()} />
+        <FollowUp onSubmit={submitSpy()} enabled />
+      </>,
+    );
+
+    const questionField = screen.getByRole('textbox', { name: QUESTION_FIELD_LABEL });
+    const questionHint = getShortcutHint(questionField);
+    const followUpHint = getShortcutHint(getField());
+    expect(questionHint).not.toBe(followUpHint);
+
+    // The same words, and the same form: element, classes, Kbd chips and their markup.
+    expect(followUpHint.textContent).toBe(SHORTCUT_HINT_TEXT);
+    expect(questionHint.textContent).toBe(followUpHint.textContent);
+    expect(questionHint.tagName).toBe(followUpHint.tagName);
+    expect(questionHint.className).toBe(followUpHint.className);
+    expect(hintChips(questionHint)).toEqual(hintChips(followUpHint));
+    expect(questionHint.innerHTML).toBe(followUpHint.innerHTML);
+
+    // The same place: immediately before each field's own submit button.
+    expect(questionHint.nextElementSibling).toBe(
+      screen.getByRole('button', { name: QUESTION_SUBMIT_NAME }),
+    );
+    expect(followUpHint.nextElementSibling).toBe(getSubmit());
+  });
+});
+
 describe('FollowUp — the question limit', () => {
   it('bounds the field natively by the protocol question limit', () => {
     render(<FollowUp onSubmit={submitSpy()} enabled />);
@@ -411,9 +567,8 @@ describe('FollowUp — the question limit', () => {
     expect(counter.getAttribute('aria-live')).toBeNull();
     expect(counter.getAttribute('role')).toBeNull();
     // The keyboard hint still describes the field beside the counter.
-    const describedBy = (getField().getAttribute('aria-describedby') ?? '').split(' ');
-    const descriptions = describedBy.map((id) => document.getElementById(id)?.textContent ?? '');
-    expect(descriptions.some((text) => text.includes('Ctrl+Enter'))).toBe(true);
+    const descriptions = descriptionsOf(getField()).map((element) => element.textContent);
+    expect(descriptions).toEqual([counterFor(0), SHORTCUT_HINT_TEXT]);
 
     fireEvent.change(getField(), { target: { value: 'f'.repeat(1234) } });
     expect(getCounter(getField()).textContent).toBe(counterFor(1234));
